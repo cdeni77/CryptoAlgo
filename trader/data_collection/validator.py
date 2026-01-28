@@ -6,7 +6,7 @@ Validates incoming data for quality and integrity before storage.
 
 import logging
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dataclasses import dataclass
 
@@ -75,13 +75,6 @@ class DataValidator:
     ) -> DataValidationResult:
         """
         Validate OHLCV bar data.
-        
-        Checks:
-        1. Price bounds and OHLC consistency
-        2. Volume validity
-        3. Timestamp validity
-        4. Price continuity with previous bar
-        5. Gap detection
         """
         result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
         
@@ -349,8 +342,16 @@ class DataValidator:
         3. Neither too far in past
         """
         result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
-        now = datetime.utcnow()
         
+        # FIX: Make 'now' timezone-aware (UTC) to match incoming data
+        now = datetime.now(timezone.utc)
+        
+        # Safety check: Ensure inputs are aware before comparing
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        if available_time.tzinfo is None:
+            available_time = available_time.replace(tzinfo=timezone.utc)
+            
         # available_time should be >= event_time
         if available_time < event_time:
             result.add_issue(
@@ -384,9 +385,13 @@ class DataValidator:
     ) -> Optional[int]:
         """
         Detect data gaps.
-        
-        Returns gap duration in minutes if gap exceeds threshold, None otherwise.
         """
+        # Ensure aware comparison
+        if prev_time.tzinfo is None:
+            prev_time = prev_time.replace(tzinfo=timezone.utc)
+        if curr_time.tzinfo is None:
+            curr_time = curr_time.replace(tzinfo=timezone.utc)
+
         # Parse timeframe to minutes
         tf_minutes = self._timeframe_to_minutes(timeframe)
         expected_gap = timedelta(minutes=tf_minutes)

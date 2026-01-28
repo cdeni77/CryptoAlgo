@@ -36,17 +36,11 @@ class CCXTConnector:
     # Symbol mapping between exchanges
     SYMBOL_MAPPING = {
         # Coinbase symbol -> CCXT unified symbol
-        "BTC-PERP": "BTC/USDT:USDT",
-        "ETH-PERP": "ETH/USDT:USDT",
-        "SOL-PERP": "SOL/USDT:USDT",
-        "XRP-PERP": "XRP/USDT:USDT",
-        "DOGE-PERP": "DOGE/USDT:USDT",  # Added DOGE
-        "AVAX-PERP": "AVAX/USDT:USDT",
-        "LINK-PERP": "LINK/USDT:USDT",
-        "ADA-PERP": "ADA/USDT:USDT",
-        "DOT-PERP": "DOT/USDT:USDT",
-        "MATIC-PERP": "MATIC/USDT:USDT",
-        "LTC-PERP": "LTC/USDT:USDT",
+        "BIP": "BTC/USDT:USDT",
+        "ETP": "ETH/USDT:USDT",
+        "SLP": "SOL/USDT:USDT",
+        "XPP": "XRP/USDT:USDT",
+        "DOP": "DOGE/USDT:USDT",
     }
     
     # Alternative exchanges that may work in restricted regions
@@ -193,9 +187,19 @@ class CCXTConnector:
     
     def _get_ccxt_symbol(self, coinbase_symbol: str, exchange_id: str) -> Optional[str]:
         """Convert Coinbase symbol to CCXT symbol for specific exchange."""
+        
+        # 1. Try exact match
         base_symbol = self.SYMBOL_MAPPING.get(coinbase_symbol)
+        
+        # 2. [NEW] Try partial match (e.g. find "BIP" inside "BIP-20DEC30-CDE")
         if not base_symbol:
-            # Try to construct from Coinbase symbol
+            for key, val in self.SYMBOL_MAPPING.items():
+                if key in coinbase_symbol:
+                    base_symbol = val
+                    break
+
+        if not base_symbol:
+            # Try to construct from Coinbase symbol (legacy fallback)
             # BTC-PERP -> BTC/USDT:USDT
             base = coinbase_symbol.replace("-PERP", "")
             base_symbol = f"{base}/USDT:USDT"
@@ -216,7 +220,7 @@ class CCXTConnector:
                 if alt in exchange.symbols:
                     return alt
         
-        return base_symbol  # Return default and let caller handle errors
+        return base_symbol
     
     async def fetch_ohlcv(
         self,

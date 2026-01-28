@@ -11,7 +11,7 @@ This means:
 - Round-trip cost: ~0.2% (0.1% entry + 0.1% exit)
 - Plus funding costs if holding with positive funding rate
 
-Run: python run_backtest_v4.py
+Run: python run_backtest.py
 """
 
 import sys
@@ -46,7 +46,7 @@ def load_data(symbols: list, timeframe: str = "1h"):
     db.initialize()
     
     end = datetime.utcnow()
-    start = end - timedelta(days=365)
+    start = end - timedelta(days=1000)
     
     ohlcv_data = {}
     for symbol in symbols:
@@ -366,7 +366,7 @@ def main():
     3. Signal strength (IC ~0.06) is borderline for these costs
     
     Recommended actions:
-    1. Backfill 1 year of data: python run_pipeline.py --backfill-days 365
+    1. Backfill 1 year of data: python run_pipeline.py --backfill-days 1000
     2. Add funding rate data to features (can improve signals)
     3. Consider a funding rate arbitrage strategy
     4. Focus on highest-conviction signals only

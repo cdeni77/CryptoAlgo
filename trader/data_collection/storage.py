@@ -562,6 +562,21 @@ class SQLiteDatabase(DatabaseBase):
             if result and result["max_time"]:
                 return datetime.fromisoformat(result["max_time"])
             return None
+        
+    def get_earliest_ohlcv_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
+        """Get the most recent OHLCV event time for a symbol."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MIN(event_time) as min_time
+                FROM ohlcv
+                WHERE symbol = ? AND timeframe = ?
+            """, (symbol, timeframe))
+            
+            result = cursor.fetchone()
+            if result and result["min_time"]:
+                return datetime.fromisoformat(result["min_time"])
+            return None
     
     def get_data_quality_summary(
         self,
