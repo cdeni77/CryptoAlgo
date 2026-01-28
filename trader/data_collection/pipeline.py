@@ -164,9 +164,9 @@ class DataPipeline:
         
         # Initialize CCXT connector for backfill
         self._ccxt_connector = CCXTConnector(
-            exchanges=config.ccxt_exchanges,
-            proxy=config.proxy,
-            use_fallbacks=config.ccxt_use_fallbacks,
+            exchanges=self.config.ccxt_exchanges,
+            proxy=self.config.proxy,
+            use_fallbacks=self.config.ccxt_use_fallbacks,
         )
         await self._ccxt_connector.initialize()
         logger.info("CCXT connector initialized")
