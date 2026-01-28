@@ -1,10 +1,13 @@
 """
-Feature Engineering Module for Crypto Perpetual Futures Trading System.
+Feature Engineering Module - Enhanced for Phase 1
 
-This module implements all features from design.md Section 7 with strict
-point-in-time constraints to prevent lookahead bias.
+Key enhancements:
+1. Proper funding rate feature integration
+2. Funding rate z-score (primary signal)
+3. Cumulative funding (carry cost/benefit)
+4. Funding persistence (long/short imbalance proxy)
 
-CRITICAL: All features are computed using ONLY data available at each point in time.
+All features are computed with strict point-in-time constraints.
 """
 
 import logging
@@ -12,40 +15,28 @@ import numpy as np
 import pandas as pd
 
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Point-in-Time Normalization (Prevents Lookahead Bias)
+# Point-in-Time Normalization
 # =============================================================================
 
 def normalize_point_in_time(
     series: pd.Series,
-    lookback: int = 168,  # 1 week of hourly data
+    lookback: int = 168,
     min_periods: int = 24
 ) -> pd.Series:
     """
     Normalize using only data available at each point in time.
     
-    CRITICAL: This is the CORRECT way to normalize for backtesting.
-    Using sklearn's StandardScaler on full data would cause lookahead bias.
-    
-    Args:
-        series: Input series to normalize
-        lookback: Rolling window size
-        min_periods: Minimum observations required
-    
-    Returns:
-        Z-score normalized series
+    CRITICAL: Prevents lookahead bias.
     """
     rolling_mean = series.rolling(window=lookback, min_periods=min_periods).mean()
     rolling_std = series.rolling(window=lookback, min_periods=min_periods).std()
-    
-    # Avoid division by zero
     rolling_std = rolling_std.replace(0, np.nan)
-    
     return (series - rolling_mean) / rolling_std
 
 
@@ -55,74 +46,41 @@ def winsorize_point_in_time(
     lower_pct: float = 0.01,
     upper_pct: float = 0.99
 ) -> pd.Series:
-    """
-    Winsorize using rolling quantiles (point-in-time safe).
-    """
+    """Winsorize using rolling quantiles."""
     rolling_lower = series.rolling(window=lookback, min_periods=24).quantile(lower_pct)
     rolling_upper = series.rolling(window=lookback, min_periods=24).quantile(upper_pct)
-    
     return series.clip(lower=rolling_lower, upper=rolling_upper)
 
 
 # =============================================================================
-# Price-Based Features (Section 7.1)
+# Price Features
 # =============================================================================
 
 class PriceFeatures:
-    """Price-derived features for perpetual futures trading."""
+    """Price-derived features."""
     
-    DEFAULT_LOOKBACKS = [1, 4, 12, 24, 48, 168]  # hours
+    DEFAULT_LOOKBACKS = [1, 4, 12, 24, 48, 168]
     
     @classmethod
-    def compute(
-        cls,
-        df: pd.DataFrame,
-        lookbacks: Optional[List[int]] = None,
-        normalize: bool = True
-    ) -> pd.DataFrame:
-        """
-        Compute price features with multiple lookback periods.
-        
-        Args:
-            df: DataFrame with columns: open, high, low, close, volume
-            lookbacks: List of lookback periods in bars
-            normalize: Whether to z-score normalize features
-        
-        Returns:
-            DataFrame of features (same index as input)
-        """
+    def compute(cls, df: pd.DataFrame, lookbacks: Optional[List[int]] = None) -> pd.DataFrame:
+        """Compute price features."""
         lookbacks = lookbacks or cls.DEFAULT_LOOKBACKS
         features = pd.DataFrame(index=df.index)
         
         for lb in lookbacks:
-            # Returns
             features[f'return_{lb}h'] = df['close'].pct_change(lb)
-            
-            # Log returns (more suitable for modeling)
             features[f'log_return_{lb}h'] = np.log(df['close'] / df['close'].shift(lb))
-            
-            # Momentum (rate of change)
-            features[f'roc_{lb}h'] = (df['close'] - df['close'].shift(lb)) / df['close'].shift(lb)
-            
-            # Volatility (realized)
             features[f'volatility_{lb}h'] = df['close'].pct_change().rolling(lb).std()
             
-            # Range (high-low as % of close)
-            features[f'range_{lb}h'] = (
-                df['high'].rolling(lb).max() - df['low'].rolling(lb).min()
-            ) / df['close']
-            
-            # Distance from moving average
             ma = df['close'].rolling(lb).mean()
             features[f'ma_distance_{lb}h'] = (df['close'] - ma) / ma
             
-            # Price position within range (0 = at low, 1 = at high)
             rolling_high = df['high'].rolling(lb).max()
             rolling_low = df['low'].rolling(lb).min()
             range_size = rolling_high - rolling_low
             features[f'range_position_{lb}h'] = (df['close'] - rolling_low) / range_size.replace(0, np.nan)
         
-        # RSI (Relative Strength Index)
+        # RSI
         features['rsi_14'] = cls._compute_rsi(df['close'], 14)
         features['rsi_7'] = cls._compute_rsi(df['close'], 7)
         
@@ -133,7 +91,7 @@ class PriceFeatures:
         features['macd_signal'] = features['macd'].ewm(span=9, adjust=False).mean()
         features['macd_hist'] = features['macd'] - features['macd_signal']
         
-        # Bollinger Bands position
+        # Bollinger Bands
         ma_20 = df['close'].rolling(20).mean()
         std_20 = df['close'].rolling(20).std()
         features['bb_upper'] = ma_20 + 2 * std_20
@@ -141,44 +99,31 @@ class PriceFeatures:
         features['bb_position'] = (df['close'] - ma_20) / (2 * std_20)
         features['bb_width'] = (features['bb_upper'] - features['bb_lower']) / ma_20
         
-        # Trend strength (ADX-like)
+        # Trend strength
         features['trend_strength'] = cls._compute_trend_strength(df, 14)
-        
-        if normalize:
-            # Normalize features that aren't already bounded
-            cols_to_normalize = [c for c in features.columns 
-                               if not any(x in c for x in ['rsi', 'bb_position', 'range_position'])]
-            for col in cols_to_normalize:
-                features[f'{col}_z'] = normalize_point_in_time(features[col])
         
         return features
     
     @staticmethod
     def _compute_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
-        """Compute RSI indicator."""
+        """Compute RSI."""
         delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        
         rs = gain / loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+        return 100 - (100 / (1 + rs))
     
     @staticmethod
     def _compute_trend_strength(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Compute trend strength (simplified ADX)."""
-        high = df['high']
-        low = df['low']
-        close = df['close']
+        """Compute ADX-like trend strength."""
+        high, low, close = df['high'], df['low'], df['close']
         
-        # True Range
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(period).mean()
         
-        # Directional movement
         up_move = high - high.shift()
         down_move = low.shift() - low
         
@@ -189,13 +134,11 @@ class PriceFeatures:
         minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
         
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
-        adx = dx.rolling(period).mean()
-        
-        return adx
+        return dx.rolling(period).mean()
 
 
 # =============================================================================
-# Volume and Volatility Features (Section 7.2)
+# Volume Features
 # =============================================================================
 
 class VolumeVolatilityFeatures:
@@ -204,176 +147,197 @@ class VolumeVolatilityFeatures:
     DEFAULT_LOOKBACKS = [1, 4, 12, 24, 48]
     
     @classmethod
-    def compute(
-        cls,
-        df: pd.DataFrame,
-        lookbacks: Optional[List[int]] = None,
-        normalize: bool = True
-    ) -> pd.DataFrame:
-        """
-        Compute volume and volatility features.
-        
-        Args:
-            df: DataFrame with columns: open, high, low, close, volume
-            lookbacks: List of lookback periods
-            normalize: Whether to normalize features
-        """
+    def compute(cls, df: pd.DataFrame, lookbacks: Optional[List[int]] = None) -> pd.DataFrame:
         lookbacks = lookbacks or cls.DEFAULT_LOOKBACKS
         features = pd.DataFrame(index=df.index)
         
         for lb in lookbacks:
-            # Volume relative to average
             avg_volume = df['volume'].rolling(lb).mean()
             features[f'volume_ratio_{lb}h'] = df['volume'] / avg_volume.replace(0, np.nan)
-            
-            # Volume trend (is volume increasing?)
-            features[f'volume_trend_{lb}h'] = df['volume'].rolling(lb).apply(
-                lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0,
-                raw=False
-            )
-            
-            # Volume-weighted average price distance
-            vwap = (df['close'] * df['volume']).rolling(lb).sum() / df['volume'].rolling(lb).sum()
-            features[f'vwap_distance_{lb}h'] = (df['close'] - vwap) / vwap.replace(0, np.nan)
-            
-            # Volatility ratio (short vs long)
-            if lb > 1:
-                short_vol = df['close'].pct_change().rolling(lb).std()
-                long_vol = df['close'].pct_change().rolling(lb * 4).std()
-                features[f'vol_ratio_{lb}h'] = short_vol / long_vol.replace(0, np.nan)
         
-        # Parkinson volatility (more efficient estimator using high/low)
+        # Parkinson volatility
         features['parkinson_vol_24h'] = np.sqrt(
             (1 / (4 * np.log(2))) * 
             (np.log(df['high'] / df['low']) ** 2).rolling(24).mean()
         )
         
-        # Garman-Klass volatility (uses OHLC)
-        features['gk_vol_24h'] = cls._garman_klass_volatility(df, 24)
-        
-        # Volume-price correlation (divergence detection)
+        # Volume-price correlation
         features['volume_price_corr_24h'] = df['close'].pct_change().rolling(24).corr(
             df['volume'].pct_change()
         )
         
-        # On-Balance Volume trend
-        obv = cls._compute_obv(df)
-        features['obv_trend_24h'] = obv.rolling(24).apply(
-            lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0,
-            raw=False
-        )
-        
-        if normalize:
-            for col in features.columns:
-                if 'ratio' not in col and 'corr' not in col:
-                    features[f'{col}_z'] = normalize_point_in_time(features[col])
-        
         return features
-    
-    @staticmethod
-    def _garman_klass_volatility(df: pd.DataFrame, window: int) -> pd.Series:
-        """Garman-Klass volatility estimator."""
-        log_hl = np.log(df['high'] / df['low']) ** 2
-        log_co = np.log(df['close'] / df['open']) ** 2
-        
-        gk = 0.5 * log_hl - (2 * np.log(2) - 1) * log_co
-        return np.sqrt(gk.rolling(window).mean())
-    
-    @staticmethod
-    def _compute_obv(df: pd.DataFrame) -> pd.Series:
-        """Compute On-Balance Volume."""
-        direction = np.sign(df['close'].diff())
-        return (direction * df['volume']).cumsum()
 
 
 # =============================================================================
-# Derivatives-Specific Features (Section 7.3)
+# FUNDING RATE FEATURES - KEY FOR PHASE 1
 # =============================================================================
 
-class DerivativesFeatures:
-    """Features specific to perpetual futures."""
+class FundingFeatures:
+    """
+    Funding rate features - PRIMARY SIGNAL SOURCE.
+    
+    These features capture:
+    1. Funding rate extremes (mean reversion opportunity)
+    2. Cumulative funding costs (carry)
+    3. Market positioning (long/short imbalance)
+    
+    Key insight from design.md:
+    - Extreme funding rates (|z| > 2) tend to revert
+    - This creates profitable opportunities for contrarian positions
+    """
     
     @classmethod
     def compute(
         cls,
-        df: pd.DataFrame,
-        funding_df: Optional[pd.DataFrame] = None,
-        oi_df: Optional[pd.DataFrame] = None,
-        normalize: bool = True
+        ohlcv_df: pd.DataFrame,
+        funding_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Compute derivatives-specific features.
+        Compute funding rate features.
         
         Args:
-            df: OHLCV DataFrame
-            funding_df: Funding rate DataFrame (columns: rate, mark_price, index_price)
-            oi_df: Open interest DataFrame (columns: open_interest_contracts)
-            normalize: Whether to normalize features
+            ohlcv_df: OHLCV data (hourly)
+            funding_df: Funding rate data (8-hourly from exchanges)
         
         Returns:
-            DataFrame of derivatives features
+            DataFrame of funding features aligned to OHLCV index
         """
+        features = pd.DataFrame(index=ohlcv_df.index)
+        
+        if funding_df is None or funding_df.empty:
+            logger.warning("No funding data - returning empty features")
+            return features
+        
+        # Resample funding to hourly using forward fill
+        # (Funding rate announced every 8h, but applies to next period)
+        funding_hourly = funding_df['rate'].resample('1h').ffill()
+        funding_aligned = funding_hourly.reindex(ohlcv_df.index, method='ffill')
+        
+        # 1. Raw funding rate (in basis points for readability)
+        features['funding_rate'] = funding_aligned
+        features['funding_rate_bps'] = funding_aligned * 10000
+        
+        # 2. Funding rate moving averages
+        # Note: 24 hours = 3 funding periods (8h each)
+        features['funding_rate_ma_24h'] = funding_aligned.rolling(24).mean()
+        features['funding_rate_ma_72h'] = funding_aligned.rolling(72).mean()  # ~9 funding periods
+        features['funding_rate_ma_168h'] = funding_aligned.rolling(168).mean()  # 1 week
+        
+        # 3. FUNDING RATE Z-SCORE - KEY SIGNAL
+        # This is the primary signal from design.md Section 5.1.1
+        # Extreme funding (|z| > 2) suggests mean reversion opportunity
+        features['funding_rate_zscore'] = normalize_point_in_time(
+            funding_aligned, 
+            lookback=168,  # 1 week baseline
+            min_periods=72  # Need 3 days minimum
+        )
+        
+        # 4. Funding rate momentum (is funding increasing or decreasing?)
+        features['funding_rate_change_24h'] = funding_aligned.diff(24)
+        features['funding_rate_change_72h'] = funding_aligned.diff(72)
+        
+        # 5. Cumulative funding (carry cost/benefit)
+        # This is how much you'd pay/receive holding a position
+        # For 8h funding data resampled to hourly, we sum over periods
+        features['cumulative_funding_24h'] = funding_aligned.rolling(24).sum()
+        features['cumulative_funding_72h'] = funding_aligned.rolling(72).sum()
+        features['cumulative_funding_168h'] = funding_aligned.rolling(168).sum()
+        
+        # 6. Annualized funding rate (for comparison with other yields)
+        # Assuming 3 funding periods per day
+        features['funding_rate_annualized'] = funding_aligned * 3 * 365
+        
+        # 7. Funding persistence (long/short imbalance proxy)
+        # What fraction of recent funding periods were positive?
+        # High persistence = market consistently bullish (longs pay shorts)
+        features['funding_persistence_24h'] = funding_aligned.rolling(24).apply(
+            lambda x: (x > 0).sum() / len(x) if len(x) > 0 else 0.5
+        )
+        features['funding_persistence_72h'] = funding_aligned.rolling(72).apply(
+            lambda x: (x > 0).sum() / len(x) if len(x) > 0 else 0.5
+        )
+        
+        # 8. Funding rate volatility (how stable is the funding?)
+        features['funding_rate_vol_24h'] = funding_aligned.rolling(24).std()
+        features['funding_rate_vol_72h'] = funding_aligned.rolling(72).std()
+        
+        # 9. Extreme funding flags (for filtering)
+        features['funding_extreme_positive'] = (features['funding_rate_zscore'] > 2.0).astype(int)
+        features['funding_extreme_negative'] = (features['funding_rate_zscore'] < -2.0).astype(int)
+        
+        # 10. Funding rate percentile (rolling)
+        features['funding_rate_percentile'] = funding_aligned.rolling(168).apply(
+            lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5
+        )
+        
+        return features
+    
+    @classmethod
+    def compute_funding_carry_signal(
+        cls,
+        funding_zscore: pd.Series,
+        threshold: float = 1.5,
+    ) -> pd.Series:
+        """
+        Generate funding carry/arbitrage signal.
+        
+        Signal interpretation:
+        - +1: Funding is extremely positive (go SHORT to receive funding)
+        - -1: Funding is extremely negative (go LONG to receive funding)
+        -  0: Funding is neutral (no funding-based signal)
+        
+        This is a CONTRARIAN signal - we bet against the crowd.
+        """
+        signal = pd.Series(0, index=funding_zscore.index)
+        
+        # High positive funding -> Short (receive funding from longs)
+        signal[funding_zscore > threshold] = -1
+        
+        # High negative funding -> Long (receive funding from shorts)
+        signal[funding_zscore < -threshold] = 1
+        
+        return signal
+
+
+# =============================================================================
+# Regime Features
+# =============================================================================
+
+class RegimeFeatures:
+    """Market regime detection."""
+    
+    @classmethod
+    def compute(cls, df: pd.DataFrame) -> pd.DataFrame:
         features = pd.DataFrame(index=df.index)
         
-        # If funding data is available
-        if funding_df is not None and not funding_df.empty:
-            # Align funding data to OHLCV index
-            funding_aligned = funding_df.reindex(df.index, method='ffill')
-            
-            # Funding rate features
-            features['funding_rate'] = funding_aligned['rate']
-            features['funding_rate_ma_24h'] = funding_aligned['rate'].rolling(24).mean()
-            features['funding_rate_ma_168h'] = funding_aligned['rate'].rolling(168).mean()
-            
-            # Funding rate z-score (key signal from design.md)
-            features['funding_rate_zscore'] = normalize_point_in_time(
-                funding_aligned['rate'], lookback=168
-            )
-            
-            # Cumulative funding (carry cost/benefit)
-            features['cumulative_funding_24h'] = funding_aligned['rate'].rolling(24).sum()
-            features['cumulative_funding_168h'] = funding_aligned['rate'].rolling(168).sum()
-            
-            # Funding rate persistence (long/short imbalance proxy)
-            features['funding_persistence_48h'] = funding_aligned['rate'].rolling(48).apply(
-                lambda x: (x > 0).sum() / len(x) if len(x) > 0 else 0.5
-            )
-            
-            # Basis (perp vs spot) if mark/index available
-            if 'mark_price' in funding_aligned.columns and 'index_price' in funding_aligned.columns:
-                basis = (funding_aligned['mark_price'] - funding_aligned['index_price']) / funding_aligned['index_price']
-                features['basis'] = basis
-                features['basis_ma_24h'] = basis.rolling(24).mean()
-                features['basis_zscore'] = normalize_point_in_time(basis, lookback=168)
+        # Trend detection
+        sma_20 = df['close'].rolling(20).mean()
+        sma_50 = df['close'].rolling(50).mean()
+        features['trend_sma20_50'] = (sma_20 > sma_50).astype(int)
         
-        # If open interest data is available
-        if oi_df is not None and not oi_df.empty:
-            oi_aligned = oi_df.reindex(df.index, method='ffill')
-            
-            if 'open_interest_contracts' in oi_aligned.columns:
-                oi = oi_aligned['open_interest_contracts']
-                
-                features['oi_change_1h'] = oi.pct_change()
-                features['oi_change_24h'] = oi.pct_change(24)
-                features['oi_ma_distance'] = (oi - oi.rolling(168).mean()) / oi.rolling(168).mean()
-                
-                # Price vs OI divergence (potential liquidation signal)
-                price_direction = np.sign(df['close'].pct_change(24))
-                oi_direction = np.sign(oi.pct_change(24))
-                features['price_oi_divergence'] = (price_direction != oi_direction).astype(int)
-                
-                # OI-weighted returns
-                features['oi_weighted_return_24h'] = df['close'].pct_change(24) * (oi / oi.rolling(168).mean())
+        # Volatility regime
+        vol_short = df['close'].pct_change().rolling(24).std()
+        vol_long = df['close'].pct_change().rolling(168).std()
+        features['vol_regime_ratio'] = vol_short / vol_long.replace(0, np.nan)
+        
+        # Momentum
+        features['momentum_24h_positive'] = (df['close'].pct_change(24) > 0).astype(int)
+        features['momentum_168h_positive'] = (df['close'].pct_change(168) > 0).astype(int)
+        
+        # Drawdown from high
+        rolling_max = df['close'].rolling(168).max()
+        features['drawdown_from_high'] = (df['close'] - rolling_max) / rolling_max
         
         return features
 
 
 # =============================================================================
-# Cross-Asset Features (Section 7.4)
+# Cross-Asset Features
 # =============================================================================
 
 class CrossAssetFeatures:
-    """Features capturing cross-asset relationships."""
+    """Cross-asset relationship features."""
     
     @classmethod
     def compute(
@@ -382,19 +346,7 @@ class CrossAssetFeatures:
         reference: str = 'BTC-PERP',
         lookback: int = 168
     ) -> Dict[str, pd.DataFrame]:
-        """
-        Compute cross-asset features.
-        
-        Args:
-            dfs: Dictionary of {symbol: DataFrame} with OHLCV data
-            reference: Reference asset (typically BTC)
-            lookback: Rolling window for correlations
-        
-        Returns:
-            Dictionary of {symbol: features_df}
-        """
         if reference not in dfs:
-            logger.warning(f"Reference asset {reference} not in data")
             return {}
         
         ref_df = dfs[reference]
@@ -403,45 +355,28 @@ class CrossAssetFeatures:
         features = {}
         
         for symbol, df in dfs.items():
+            symbol_features = pd.DataFrame(index=df.index)
+            
             if symbol == reference:
-                # Reference asset gets self-features
-                symbol_features = pd.DataFrame(index=df.index)
                 symbol_features['is_reference'] = 1
                 features[symbol] = symbol_features
                 continue
             
-            symbol_features = pd.DataFrame(index=df.index)
             asset_returns = df['close'].pct_change()
-            
-            # Align indices
             aligned_ref, aligned_asset = ref_returns.align(asset_returns, join='inner')
             
-            # Beta to reference
+            # Beta
             rolling_cov = aligned_ref.rolling(lookback).cov(aligned_asset)
             rolling_var = aligned_ref.rolling(lookback).var()
             symbol_features[f'beta_to_{reference}'] = rolling_cov / rolling_var.replace(0, np.nan)
             
-            # Correlation to reference
+            # Correlation
             symbol_features[f'corr_to_{reference}'] = aligned_ref.rolling(lookback).corr(aligned_asset)
             
-            # Lead-lag relationships (does BTC lead this asset?)
-            for lag in [1, 2, 4, 8]:
-                lagged_corr = aligned_ref.shift(lag).rolling(lookback).corr(aligned_asset)
-                symbol_features[f'lag_{lag}h_corr_to_{reference}'] = lagged_corr
-            
-            # Relative strength (outperformance vs BTC)
+            # Relative strength
             ref_perf_24h = ref_df['close'].pct_change(24).reindex(df.index)
             asset_perf_24h = df['close'].pct_change(24)
             symbol_features['relative_strength_24h'] = asset_perf_24h - ref_perf_24h
-            
-            ref_perf_168h = ref_df['close'].pct_change(168).reindex(df.index)
-            asset_perf_168h = df['close'].pct_change(168)
-            symbol_features['relative_strength_168h'] = asset_perf_168h - ref_perf_168h
-            
-            # Volatility relative to BTC
-            ref_vol = ref_returns.rolling(24).std().reindex(df.index)
-            asset_vol = asset_returns.rolling(24).std()
-            symbol_features['vol_ratio_vs_btc'] = asset_vol / ref_vol.replace(0, np.nan)
             
             features[symbol] = symbol_features
         
@@ -449,101 +384,27 @@ class CrossAssetFeatures:
 
 
 # =============================================================================
-# Regime Detection Features
-# =============================================================================
-
-class RegimeFeatures:
-    """Market regime detection features."""
-    
-    @classmethod
-    def compute(cls, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Compute regime classification features.
-        
-        Returns features that help identify:
-        - Trending vs mean-reverting
-        - High vs low volatility
-        - Risk-on vs risk-off
-        """
-        features = pd.DataFrame(index=df.index)
-        
-        # Trend detection
-        sma_20 = df['close'].rolling(20).mean()
-        sma_50 = df['close'].rolling(50).mean()
-        sma_200 = df['close'].rolling(200).mean()
-        
-        features['trend_sma20_50'] = (sma_20 > sma_50).astype(int)
-        features['trend_sma50_200'] = (sma_50 > sma_200).astype(int)
-        features['trend_strength'] = (sma_20 - sma_50) / sma_50
-        
-        # Volatility regime
-        vol_short = df['close'].pct_change().rolling(24).std()
-        vol_long = df['close'].pct_change().rolling(168).std()
-        features['vol_regime_ratio'] = vol_short / vol_long.replace(0, np.nan)
-        
-        # Classify volatility regime
-        features['vol_regime'] = pd.cut(
-            features['vol_regime_ratio'],
-            bins=[0, 0.7, 1.3, np.inf],
-            labels=['low_vol', 'normal_vol', 'high_vol']
-        )
-        
-        # Mean reversion indicators
-        rsi = PriceFeatures._compute_rsi(df['close'], 14)
-        features['oversold'] = (rsi < 30).astype(int)
-        features['overbought'] = (rsi > 70).astype(int)
-        
-        # Momentum regime
-        returns_24h = df['close'].pct_change(24)
-        returns_168h = df['close'].pct_change(168)
-        
-        features['momentum_24h_positive'] = (returns_24h > 0).astype(int)
-        features['momentum_168h_positive'] = (returns_168h > 0).astype(int)
-        features['momentum_alignment'] = (
-            (returns_24h > 0) == (returns_168h > 0)
-        ).astype(int)
-        
-        # Drawdown from recent high
-        rolling_max = df['close'].rolling(168).max()
-        features['drawdown_from_high'] = (df['close'] - rolling_max) / rolling_max
-        
-        return features
-
-
-# =============================================================================
-# Feature Pipeline (Main Entry Point)
+# Feature Pipeline
 # =============================================================================
 
 @dataclass
 class FeatureConfig:
-    """Configuration for feature computation."""
-    
-    # Lookback periods
-    price_lookbacks: List[int] = None
-    volume_lookbacks: List[int] = None
-    
-    # Normalization
+    """Feature computation configuration."""
+    price_lookbacks: List[int] = field(default_factory=lambda: [1, 4, 12, 24, 48, 168])
+    volume_lookbacks: List[int] = field(default_factory=lambda: [1, 4, 12, 24, 48])
     normalize_features: bool = True
-    
-    # Which feature groups to compute
     compute_price: bool = True
     compute_volume: bool = True
-    compute_derivatives: bool = True
+    compute_funding: bool = True  # NEW: Enable funding features
     compute_cross_asset: bool = True
     compute_regime: bool = True
-    
-    def __post_init__(self):
-        if self.price_lookbacks is None:
-            self.price_lookbacks = [1, 4, 12, 24, 48, 168]
-        if self.volume_lookbacks is None:
-            self.volume_lookbacks = [1, 4, 12, 24, 48]
 
 
 class FeaturePipeline:
     """
     Main feature engineering pipeline.
     
-    Computes all features while ensuring no lookahead bias.
+    Enhanced for Phase 1: Funding rate integration.
     """
     
     def __init__(self, config: Optional[FeatureConfig] = None):
@@ -561,28 +422,21 @@ class FeaturePipeline:
         
         Args:
             ohlcv_data: Dict of {symbol: ohlcv_df}
-            funding_data: Dict of {symbol: funding_df}
+            funding_data: Dict of {symbol: funding_df} - NEW for Phase 1
             oi_data: Dict of {symbol: oi_df}
-            reference_symbol: Symbol to use as reference for cross-asset features
-        
-        Returns:
-            Dict of {symbol: features_df}
+            reference_symbol: Reference for cross-asset features
         """
         funding_data = funding_data or {}
         oi_data = oi_data or {}
         
         all_features = {}
         
-        # Compute cross-asset features first (needs all symbols)
+        # Cross-asset features
         if self.config.compute_cross_asset and len(ohlcv_data) > 1:
-            cross_features = CrossAssetFeatures.compute(
-                ohlcv_data, 
-                reference=reference_symbol
-            )
+            cross_features = CrossAssetFeatures.compute(ohlcv_data, reference=reference_symbol)
         else:
             cross_features = {}
         
-        # Compute features for each symbol
         for symbol, df in ohlcv_data.items():
             logger.info(f"Computing features for {symbol}...")
             
@@ -590,31 +444,21 @@ class FeaturePipeline:
             
             # Price features
             if self.config.compute_price:
-                price_features = PriceFeatures.compute(
-                    df,
-                    lookbacks=self.config.price_lookbacks,
-                    normalize=self.config.normalize_features
-                )
+                price_features = PriceFeatures.compute(df, self.config.price_lookbacks)
                 feature_dfs.append(price_features)
             
-            # Volume/volatility features
+            # Volume features
             if self.config.compute_volume:
-                vol_features = VolumeVolatilityFeatures.compute(
-                    df,
-                    lookbacks=self.config.volume_lookbacks,
-                    normalize=self.config.normalize_features
-                )
+                vol_features = VolumeVolatilityFeatures.compute(df, self.config.volume_lookbacks)
                 feature_dfs.append(vol_features)
             
-            # Derivatives features
-            if self.config.compute_derivatives:
-                deriv_features = DerivativesFeatures.compute(
-                    df,
-                    funding_df=funding_data.get(symbol),
-                    oi_df=oi_data.get(symbol),
-                    normalize=self.config.normalize_features
-                )
-                feature_dfs.append(deriv_features)
+            # FUNDING FEATURES - KEY FOR PHASE 1
+            if self.config.compute_funding and symbol in funding_data:
+                funding_features = FundingFeatures.compute(df, funding_data[symbol])
+                feature_dfs.append(funding_features)
+                logger.info(f"  ✓ Added {len(funding_features.columns)} funding features")
+            elif self.config.compute_funding:
+                logger.warning(f"  ⚠️ No funding data for {symbol}")
             
             # Regime features
             if self.config.compute_regime:
@@ -625,10 +469,9 @@ class FeaturePipeline:
             if symbol in cross_features:
                 feature_dfs.append(cross_features[symbol])
             
-            # Combine all features
+            # Combine
             if feature_dfs:
                 combined = pd.concat(feature_dfs, axis=1)
-                # Remove duplicate columns if any
                 combined = combined.loc[:, ~combined.columns.duplicated()]
                 all_features[symbol] = combined
         
@@ -640,33 +483,12 @@ class FeaturePipeline:
         horizon: int = 1,
         target_type: str = 'return'
     ) -> pd.Series:
-        """
-        Compute prediction target.
-        
-        CRITICAL: Target is computed using FUTURE data, which is correct.
-        The key is that features don't use future data.
-        
-        Args:
-            df: OHLCV DataFrame
-            horizon: Prediction horizon in bars
-            target_type: 'return', 'direction', or 'volatility'
-        
-        Returns:
-            Target series (shifted appropriately)
-        """
+        """Compute prediction target."""
         if target_type == 'return':
-            # Forward return
             target = df['close'].pct_change(horizon).shift(-horizon)
-        
         elif target_type == 'direction':
-            # Direction of next move: -1, 0, +1
             forward_return = df['close'].pct_change(horizon).shift(-horizon)
             target = np.sign(forward_return)
-        
-        elif target_type == 'volatility':
-            # Forward realized volatility
-            target = df['close'].pct_change().rolling(horizon).std().shift(-horizon)
-        
         else:
             raise ValueError(f"Unknown target type: {target_type}")
         
@@ -679,28 +501,15 @@ class FeaturePipeline:
         target: pd.Series,
         dropna: bool = True
     ) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Prepare features and target for ML training.
-        
-        Args:
-            features: Feature DataFrame
-            target: Target series
-            dropna: Whether to drop rows with NaN
-        
-        Returns:
-            (X, y) tuple ready for model training
-        """
-        # Align features and target
+        """Prepare features and target for ML."""
         X = features.copy()
         y = target.reindex(X.index)
         
         if dropna:
-            # Create mask of valid rows
             valid_mask = ~(X.isna().any(axis=1) | y.isna())
             X = X[valid_mask]
             y = y[valid_mask]
         
-        # Convert categorical columns to numeric
         for col in X.select_dtypes(include=['category']).columns:
             X[col] = X[col].cat.codes
         
@@ -708,24 +517,20 @@ class FeaturePipeline:
 
 
 # =============================================================================
-# Utility Functions
+# Utility
 # =============================================================================
 
 def get_feature_importance_names() -> Dict[str, str]:
-    """Get human-readable descriptions of features."""
+    """Human-readable feature descriptions."""
     return {
         'return_1h': 'Return over last 1 hour',
         'return_24h': 'Return over last 24 hours',
         'volatility_24h': 'Realized volatility (24h)',
         'rsi_14': 'Relative Strength Index (14 period)',
-        'macd_hist': 'MACD histogram',
         'bb_position': 'Bollinger Band position (-1 to 1)',
-        'volume_ratio_24h': 'Volume relative to 24h average',
-        'funding_rate_zscore': 'Funding rate z-score (key signal)',
-        'basis_zscore': 'Basis z-score (perp vs spot)',
-        'corr_to_BTC-PERP': 'Correlation to BTC',
-        'beta_to_BTC-PERP': 'Beta to BTC',
-        'relative_strength_24h': 'Relative performance vs BTC (24h)',
+        'funding_rate_zscore': 'Funding rate z-score (KEY SIGNAL)',
+        'funding_rate_bps': 'Funding rate in basis points',
+        'cumulative_funding_24h': 'Cumulative funding (24h)',
+        'funding_persistence_72h': 'Funding rate persistence (72h)',
         'vol_regime_ratio': 'Short-term vs long-term volatility',
-        'trend_strength': 'Trend strength (SMA20 vs SMA50)',
     }

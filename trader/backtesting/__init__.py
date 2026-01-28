@@ -13,15 +13,11 @@ from .engine import (
     Trade,
 )
 
-from .validation import (
-    WalkForwardValidator,
-    WalkForwardResult,
-)
-
 from .strategies import (
-    BaseStrategy,
-    MeanReversionStrategy,
-    MomentumReversalStrategy,
+    FundingArbitrageStrategy,
+    FundingAwareMeanReversion,
+    PureFundingCarryStrategy,
+    CombinedFundingPriceStrategy,
 )
 
 __all__ = [
@@ -33,9 +29,8 @@ __all__ = [
     'Signal',
     'Position',
     'Trade',
-    'WalkForwardValidator',
-    'WalkForwardResult',
-    'BaseStrategy',
-    'MeanReversionStrategy',
-    'MomentumReversalStrategy',
+    'FundingArbitrageStrategy',
+    'FundingAwareMeanReversion',
+    'PureFundingCarryStrategy',
+    'CombinedFundingPriceStrategy',
 ]

@@ -84,7 +84,23 @@ def main():
     print(f"Available symbols: {symbols}")
     
     ohlcv_data = load_ohlcv_data(db, symbols, "1h")
-    
+    # Load funding data from DB
+    funding_data = {}
+    for symbol, ohlcv_df in ohlcv_data.items():
+        try:
+            # Fetch all funding rates (start/end = None)
+            funding_df = db.get_funding_rates(symbol)
+            
+            if not funding_df.empty:
+                funding_df = funding_df[['rate']]  # Keep only rate column
+                funding_df = funding_df.sort_index()
+                funding_data[symbol] = funding_df
+                print(f"  Loaded funding for {symbol}: {len(funding_df)} rates")
+            else:
+                print(f"  No funding data for {symbol}")
+        except Exception as e:
+            print(f"  Error loading funding for {symbol}: {e}")
+
     if not ohlcv_data:
         print("No data available! Run backfill first.")
         return
@@ -99,9 +115,9 @@ def main():
         normalize_features=True,
         compute_price=True,
         compute_volume=True,
-        compute_derivatives=True,
         compute_cross_asset=len(ohlcv_data) > 1,
         compute_regime=True,
+        compute_funding=True
     )
     
     pipeline = FeaturePipeline(config)
@@ -109,6 +125,7 @@ def main():
     # Compute features
     all_features = pipeline.compute_features(
         ohlcv_data,
+        funding_data=funding_data,
         reference_symbol='BTC-PERP' if 'BTC-PERP' in ohlcv_data else list(ohlcv_data.keys())[0]
     )
     

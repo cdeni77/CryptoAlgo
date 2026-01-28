@@ -30,6 +30,7 @@ class Signal:
     direction: Side
     confidence: float = 1.0
     target_weight: float = 1.0
+    reason: str = ""
     metadata: Dict = field(default_factory=dict)
 
 
@@ -57,6 +58,7 @@ class Trade:
     slippage: float
     signal_price: float
     pnl: float = 0.0
+    reason: str = ""
 
 
 @dataclass
@@ -105,12 +107,18 @@ class PerformanceMetrics:
 
 @dataclass
 class CostModel:
-    """Realistic cost model for perpetual futures trading."""
-    maker_fee_bps: float = 40.0
-    taker_fee_bps: float = 60.0
-    base_slippage_bps: float = 5.0
-    volatility_slippage_multiplier: float = 2.0
-    size_impact_coefficient: float = 0.1
+    """
+    Realistic cost model for perpetual futures trading.
+    
+    Coinbase US Perps fees (as of Jan 2026):
+    - Trading fee: 0.1% per trade (10 bps)
+    - Round-trip: ~0.2% (20 bps)
+    """
+    maker_fee_bps: float = 10.0    # 0.10%
+    taker_fee_bps: float = 10.0    # 0.10%
+    base_slippage_bps: float = 2.0  # ~0.02%
+    volatility_slippage_multiplier: float = 1.5
+    size_impact_coefficient: float = 0.02
     
     def calculate_cost(
         self,
@@ -194,18 +202,14 @@ class Portfolio:
         
         # Determine trade
         if signal.direction == Side.FLAT and current_pos:
-            # Close position
             trade_size = current_size
             trade_side = Side.SHORT if current_side == Side.LONG else Side.LONG
         elif signal.direction == current_side:
-            # Already in position, skip
             return None
         elif current_pos and signal.direction != Side.FLAT:
-            # Reverse: close then open
             trade_size = current_size + target_size
             trade_side = signal.direction
         else:
-            # New position
             trade_size = target_size
             trade_side = signal.direction
         
@@ -217,7 +221,7 @@ class Portfolio:
             trade_size, is_maker=False, volatility_ratio=volatility_ratio
         )
         
-        # Fill price with slippage
+        # Fill price
         slippage_pct = slippage / trade_size if trade_size > 0 else 0
         if trade_side == Side.LONG:
             fill_price = current_price * (1 + slippage_pct)
@@ -232,8 +236,6 @@ class Portfolio:
             else:
                 trade_pnl = current_size * (current_pos.entry_price - current_price) / current_pos.entry_price
             trade_pnl -= (fee + slippage)
-            
-            # Close existing position
             self.cash += trade_pnl
             del self.positions[signal.symbol]
         else:
@@ -249,13 +251,14 @@ class Portfolio:
             slippage=slippage,
             signal_price=current_price,
             pnl=trade_pnl,
+            reason=getattr(signal, 'reason', ''),
         )
         self.trades.append(trade)
         
         if current_pos:
             self.closed_trades.append(trade)
         
-        # Open new position if not flat
+        # Open new position
         if signal.direction != Side.FLAT:
             self.positions[signal.symbol] = Position(
                 symbol=signal.symbol,
@@ -417,7 +420,6 @@ class Backtester:
             gross_loss = abs(sum(losses))
             profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
             
-            # Consecutive
             max_wins = max_losses = curr_wins = curr_losses = 0
             for pnl in trade_pnls:
                 if pnl > 0:

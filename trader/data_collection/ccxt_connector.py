@@ -169,7 +169,7 @@ class CCXTConnector:
                 
                 # Clean up failed exchange
                 try:
-                    if hasattr(exchange, 'close'):
+                    if 'exchange' in locals() and hasattr(exchange, 'close'):
                         await exchange.close()
                 except:
                     pass
@@ -191,7 +191,7 @@ class CCXTConnector:
         # 1. Try exact match
         base_symbol = self.SYMBOL_MAPPING.get(coinbase_symbol)
         
-        # 2. [NEW] Try partial match (e.g. find "BIP" inside "BIP-20DEC30-CDE")
+        # 2. Try partial match (e.g. find "BIP" inside "BIP-20DEC30-CDE")
         if not base_symbol:
             for key, val in self.SYMBOL_MAPPING.items():
                 if key in coinbase_symbol:
@@ -366,6 +366,8 @@ class CCXTConnector:
         if not ccxt_symbol:
             return []
         
+        logger.info(f"Fetching funding rates for {symbol} ({ccxt_symbol}) from {exchange_id}")
+        
         funding_rates = []
         
         # Make start and end naive
@@ -400,20 +402,21 @@ class CCXTConnector:
                             event_time=event_time,
                             available_time=event_time + timedelta(seconds=5),
                             rate=float(entry.get("fundingRate", 0)),
-                            mark_price=float(entry.get("markPrice", 0)),
-                            index_price=float(entry.get("indexPrice", 0)),
+                            mark_price=float(entry.get("markPrice", 0)) if entry.get("markPrice") else 0.0,
+                            index_price=float(entry.get("indexPrice", 0)) if entry.get("indexPrice") else 0.0,
                             quality=DataQuality.VALID,
                         )
                         funding_rates.append(funding)
                     
                     since_ms = history[-1]["timestamp"] + 1
+                
+                logger.info(f"✓ Got {len(funding_rates)} funding rates from {exchange_id}")
             else:
                 logger.warning(f"{exchange_id} does not support funding rate history")
                 
         except Exception as e:
             logger.error(f"Error fetching funding rates from {exchange_id}: {e}")
         
-        logger.info(f"Fetched {len(funding_rates)} funding rates from {exchange_id}")
         return funding_rates
     
     async def fetch_open_interest(
@@ -437,21 +440,83 @@ class CCXTConnector:
         
         try:
             if hasattr(exchange, 'fetch_open_interest'):
-                oi_data = await exchange.fetch_open_interest(ccxt_symbol)
+                oi_data = await exchange.fetch_open_interest_(ccxt_symbol)
+                
+                # Handle possible None values
+                open_interest_contracts = float(oi_data.get("openInterestAmount") or oi_data.get("openInterest") or 0)
+                open_interest_value = float(oi_data.get("openInterestValue") or oi_data.get("sumOpenInterestValue") or 0)
                 
                 now = datetime.utcnow().replace(tzinfo=None)  # naive
+                
                 return OpenInterest(
                     symbol=symbol,
                     event_time=now,
                     available_time=now,
-                    open_interest_contracts=float(oi_data.get("openInterest", 0)),
-                    open_interest_usd=float(oi_data.get("openInterestValue", 0)),
+                    open_interest_contracts=open_interest_contracts,
+                    open_interest_usd=open_interest_value,
                     quality=DataQuality.VALID,
                 )
         except Exception as e:
             logger.error(f"Error fetching OI from {exchange_id}: {e}")
         
         return None
+    
+    async def fetch_open_interest_history(
+        self,
+        symbol: str,
+        timeframe: str = '1h',
+        start: datetime = None,
+        end: datetime = None,
+        limit: int = 500,
+        exchange_id: Optional[str] = None,
+    ) -> List[Dict]:
+        """Fetch historical open interest data."""
+        if not self._initialized:
+            await self.initialize()
+        
+        exchange_id = exchange_id or "binance"
+        exchange = self._exchanges.get(exchange_id)
+        
+        if not exchange:
+            logger.error(f"Exchange {exchange_id} not available")
+            return []
+        
+        if not hasattr(exchange, 'fetch_open_interest_history'):
+            logger.warning(f"{exchange_id} does not support OI history")
+            return []
+        
+        ccxt_symbol = self._get_ccxt_symbol(symbol, exchange_id)
+        if not ccxt_symbol:
+            return []
+        
+        history = []
+        
+        since_ms = int(start.timestamp() * 1000) if start else None
+        end_ms = int(end.timestamp() * 1000) if end else None
+        
+        while since_ms < end_ms if end_ms else True:
+            try:
+                batch = await exchange.fetch_open_interest_history(
+                    ccxt_symbol,
+                    timeframe=timeframe,
+                    since=since_ms,
+                    limit=limit,
+                )
+                
+                if not batch:
+                    break
+                
+                history.extend(batch)
+                
+                since_ms = batch[-1]['timestamp'] + 1
+                
+                if len(batch) < limit:
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error fetching OI history: {e}")
+                break
+        return history
     
     async def fetch_multi_exchange_ohlcv(
         self,
@@ -487,16 +552,40 @@ class CCXTConnector:
         return value * multipliers.get(unit, 60)
     
     async def close(self):
-        """Close all exchange connections."""
-        for exchange_id, exchange in self._exchanges.items():
+        """Close all exchange connections properly."""
+        if not self._exchanges:
+            logger.info("CCXT connector closed (no exchanges to close)")
+            return
+        
+        close_tasks = []
+        for exchange_id, exchange in list(self._exchanges.items()):
             try:
-                await exchange.close()
+                if exchange and hasattr(exchange, 'close'):
+                    close_tasks.append(self._close_exchange(exchange_id, exchange))
             except Exception as e:
-                logger.warning(f"Error closing {exchange_id}: {e}")
+                logger.warning(f"Error preparing close for {exchange_id}: {e}")
+        
+        if close_tasks:
+            # Wait for all closes with timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*close_tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for exchanges to close")
         
         self._exchanges.clear()
         self._initialized = False
         logger.info("CCXT connector closed")
+    
+    async def _close_exchange(self, exchange_id: str, exchange):
+        """Close a single exchange connection."""
+        try:
+            await exchange.close()
+            logger.debug(f"Closed {exchange_id}")
+        except Exception as e:
+            logger.warning(f"Error closing {exchange_id}: {e}")
     
     def get_available_exchanges(self) -> List[str]:
         """Get list of initialized exchanges."""

@@ -15,13 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
-
-
 from .models import (
     OHLCVBar,
     FundingRate,
     OpenInterest,
-    OrderBookSnapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,22 +51,17 @@ class DatabaseBase(ABC):
         end: datetime,
         as_of: Optional[datetime] = None
     ) -> pd.DataFrame:
-        """
-        Get OHLCV data.
-        
-        Args:
-            symbol: Trading pair symbol
-            timeframe: Candle timeframe (1m, 1h, etc.)
-            start: Start time (inclusive)
-            end: End time (exclusive)
-            as_of: Point-in-time query - only return data that was available
-                   at this time. Critical for backtesting.
-        """
+        """Get OHLCV data."""
         pass
     
     @abstractmethod
     def insert_funding_rate(self, funding: FundingRate) -> bool:
         """Insert funding rate."""
+        pass
+    
+    @abstractmethod
+    def insert_funding_rate_batch(self, rates: List[FundingRate]) -> int:
+        """Insert batch of funding rates."""
         pass
     
     @abstractmethod
@@ -81,22 +73,6 @@ class DatabaseBase(ABC):
         as_of: Optional[datetime] = None
     ) -> pd.DataFrame:
         """Get funding rate history."""
-        pass
-    
-    @abstractmethod
-    def insert_open_interest(self, oi: OpenInterest) -> bool:
-        """Insert open interest snapshot."""
-        pass
-    
-    @abstractmethod
-    def get_open_interest(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        """Get open interest history."""
         pass
     
     @abstractmethod
@@ -171,29 +147,7 @@ class SQLiteDatabase(DatabaseBase):
                 ON ohlcv(available_time)
             """)
             
-            # Trades table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    trade_id TEXT NOT NULL,
-                    event_time TIMESTAMP NOT NULL,
-                    available_time TIMESTAMP NOT NULL,
-                    price REAL NOT NULL,
-                    size REAL NOT NULL,
-                    side TEXT NOT NULL,
-                    quality TEXT DEFAULT 'valid',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, trade_id)
-                )
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_trades_symbol_event 
-                ON trades(symbol, event_time)
-            """)
-            
-            # Funding rates table
+            # Funding rates table - ENHANCED
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS funding_rates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,10 +155,11 @@ class SQLiteDatabase(DatabaseBase):
                     event_time TIMESTAMP NOT NULL,
                     available_time TIMESTAMP NOT NULL,
                     rate REAL NOT NULL,
-                    mark_price REAL NOT NULL,
-                    index_price REAL NOT NULL,
+                    mark_price REAL,
+                    index_price REAL,
                     is_settlement INTEGER DEFAULT 0,
                     quality TEXT DEFAULT 'valid',
+                    source TEXT DEFAULT 'unknown',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, event_time)
                 )
@@ -226,6 +181,7 @@ class SQLiteDatabase(DatabaseBase):
                     open_interest_base REAL,
                     open_interest_usd REAL,
                     quality TEXT DEFAULT 'valid',
+                    source TEXT DEFAULT 'unknown',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, event_time)
                 )
@@ -234,42 +190,6 @@ class SQLiteDatabase(DatabaseBase):
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_oi_symbol_event 
                 ON open_interest(symbol, event_time)
-            """)
-            
-            # Order book snapshots (compressed JSON for efficiency)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS orderbook_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    event_time TIMESTAMP NOT NULL,
-                    available_time TIMESTAMP NOT NULL,
-                    best_bid REAL,
-                    best_ask REAL,
-                    mid_price REAL,
-                    spread_bps REAL,
-                    bids_json TEXT NOT NULL,
-                    asks_json TEXT NOT NULL,
-                    quality TEXT DEFAULT 'valid',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_event 
-                ON orderbook_snapshots(symbol, event_time)
-            """)
-            
-            # Data quality tracking
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS data_quality_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_type TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    event_time TIMESTAMP NOT NULL,
-                    quality TEXT NOT NULL,
-                    issues TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
             """)
             
             conn.commit()
@@ -354,13 +274,7 @@ class SQLiteDatabase(DatabaseBase):
         end: datetime,
         as_of: Optional[datetime] = None
     ) -> pd.DataFrame:
-        """
-        Get OHLCV data with optional point-in-time constraint.
-        
-        The as_of parameter is CRITICAL for backtesting:
-        - If None: returns all data (for analysis only)
-        - If set: returns only data that was available at that time
-        """
+        """Get OHLCV data with optional point-in-time constraint."""
         with self._get_connection() as conn:
             query = """
                 SELECT event_time, open, high, low, close, volume, 
@@ -373,7 +287,6 @@ class SQLiteDatabase(DatabaseBase):
             """
             params: List[Any] = [symbol, timeframe, start, end]
             
-            # Point-in-time constraint
             if as_of is not None:
                 query += " AND available_time <= ?"
                 params.append(as_of)
@@ -400,8 +313,8 @@ class SQLiteDatabase(DatabaseBase):
                 cursor.execute("""
                     INSERT OR REPLACE INTO funding_rates
                     (symbol, event_time, available_time, rate, 
-                     mark_price, index_price, is_settlement, quality)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     mark_price, index_price, is_settlement, quality, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     funding.symbol,
                     funding.event_time,
@@ -411,6 +324,7 @@ class SQLiteDatabase(DatabaseBase):
                     funding.index_price,
                     1 if funding.is_settlement else 0,
                     funding.quality.value,
+                    "coinbase",
                 ))
                 conn.commit()
                 return True
@@ -418,43 +332,81 @@ class SQLiteDatabase(DatabaseBase):
                 logger.error(f"Failed to insert funding rate: {e}")
                 return False
     
+    def insert_funding_rate_batch(self, rates: List[FundingRate]) -> int:
+        """Insert batch of funding rates."""
+        if not rates:
+            return 0
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            inserted = 0
+            
+            for funding in rates:
+                try:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO funding_rates
+                        (symbol, event_time, available_time, rate, 
+                         mark_price, index_price, is_settlement, quality, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        funding.symbol,
+                        funding.event_time,
+                        funding.available_time,
+                        funding.rate,
+                        funding.mark_price,
+                        funding.index_price,
+                        1 if funding.is_settlement else 0,
+                        funding.quality.value,
+                        getattr(funding, 'source', 'ccxt'),
+                    ))
+                    inserted += 1
+                except Exception as e:
+                    logger.error(f"Failed to insert funding rate: {e}")
+            
+            conn.commit()
+            return inserted
+    
     def get_funding_rates(
         self,
         symbol: str,
-        start: datetime,
-        end: datetime,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
         as_of: Optional[datetime] = None
     ) -> pd.DataFrame:
-        """Get funding rate history."""
+        """Get funding rate history for a symbol."""
+        query = """
+            SELECT event_time, rate
+            FROM funding_rates
+            WHERE symbol = ?
+        """
+        params: List[Any] = [symbol]
+        
+        if start is not None:
+            query += " AND event_time >= ?"
+            params.append(start)
+        
+        if end is not None:
+            query += " AND event_time < ?"
+            params.append(end)
+        
+        if as_of is not None:
+            query += " AND available_time <= ?"
+            params.append(as_of)
+        
+        query += " ORDER BY event_time ASC"
+        
         with self._get_connection() as conn:
-            query = """
-                SELECT event_time, rate, mark_price, index_price, 
-                       is_settlement, quality
-                FROM funding_rates
-                WHERE symbol = ?
-                  AND event_time >= ?
-                  AND event_time < ?
-            """
-            params: List[Any] = [symbol, start, end]
-            
-            if as_of is not None:
-                query += " AND available_time <= ?"
-                params.append(as_of)
-            
-            query += " ORDER BY event_time ASC"
-            
             df = pd.read_sql_query(
                 query,
                 conn,
                 params=params,
                 parse_dates=["event_time"]
             )
-            
-            if not df.empty:
-                df.set_index("event_time", inplace=True)
-                df["is_settlement"] = df["is_settlement"].astype(bool)
-            
-            return df
+        
+        if not df.empty:
+            df.set_index("event_time", inplace=True)
+        
+        return df
     
     def insert_open_interest(self, oi: OpenInterest) -> bool:
         """Insert open interest snapshot."""
@@ -464,8 +416,8 @@ class SQLiteDatabase(DatabaseBase):
                 cursor.execute("""
                     INSERT OR REPLACE INTO open_interest
                     (symbol, event_time, available_time, open_interest_contracts,
-                     open_interest_base, open_interest_usd, quality)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                     open_interest_base, open_interest_usd, quality, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     oi.symbol,
                     oi.event_time,
@@ -474,12 +426,46 @@ class SQLiteDatabase(DatabaseBase):
                     oi.open_interest_base,
                     oi.open_interest_usd,
                     oi.quality.value,
+                    "ccxt",
                 ))
                 conn.commit()
                 return True
             except Exception as e:
                 logger.error(f"Failed to insert open interest: {e}")
                 return False
+    
+    def insert_open_interest_batch(self, oi_list: List[OpenInterest]) -> int:
+        """Insert batch of open interest records."""
+        if not oi_list:
+            return 0
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            inserted = 0
+            
+            for oi in oi_list:
+                try:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO open_interest
+                        (symbol, event_time, available_time, open_interest_contracts,
+                         open_interest_base, open_interest_usd, quality, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        oi.symbol,
+                        oi.event_time,
+                        oi.available_time,
+                        oi.open_interest_contracts,
+                        oi.open_interest_base,
+                        oi.open_interest_usd,
+                        oi.quality.value,
+                        "ccxt",
+                    ))
+                    inserted += 1
+                except Exception as e:
+                    logger.error(f"Failed to insert OI: {e}")
+            
+            conn.commit()
+            return inserted
     
     def get_open_interest(
         self,
@@ -518,36 +504,6 @@ class SQLiteDatabase(DatabaseBase):
             
             return df
     
-    def insert_orderbook_snapshot(self, book: OrderBookSnapshot) -> bool:
-        """Insert order book snapshot."""
-        import json
-        
-        with self._get_connection() as conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO orderbook_snapshots
-                    (symbol, event_time, available_time, best_bid, best_ask,
-                     mid_price, spread_bps, bids_json, asks_json, quality)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    book.symbol,
-                    book.event_time,
-                    book.available_time,
-                    book.best_bid,
-                    book.best_ask,
-                    book.mid_price,
-                    book.spread_bps,
-                    json.dumps([l.to_tuple() for l in book.bids]),
-                    json.dumps([l.to_tuple() for l in book.asks]),
-                    book.quality.value,
-                ))
-                conn.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Failed to insert orderbook: {e}")
-                return False
-    
     def get_latest_ohlcv_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
         """Get the most recent OHLCV event time for a symbol."""
         with self._get_connection() as conn:
@@ -562,9 +518,9 @@ class SQLiteDatabase(DatabaseBase):
             if result and result["max_time"]:
                 return datetime.fromisoformat(result["max_time"])
             return None
-        
+    
     def get_earliest_ohlcv_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
-        """Get the most recent OHLCV event time for a symbol."""
+        """Get the earliest OHLCV event time for a symbol."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -578,182 +534,74 @@ class SQLiteDatabase(DatabaseBase):
                 return datetime.fromisoformat(result["min_time"])
             return None
     
-    def get_data_quality_summary(
-        self,
-        data_type: str,
-        start: datetime,
-        end: datetime
-    ) -> Dict[str, Any]:
-        """Get data quality summary for a time period."""
-        table_map = {
-            "ohlcv": "ohlcv",
-            "funding": "funding_rates",
-            "oi": "open_interest",
-            "orderbook": "orderbook_snapshots",
-        }
-        
-        table = table_map.get(data_type)
-        if not table:
-            return {}
-        
+    def get_latest_funding_time(self, symbol: str) -> Optional[datetime]:
+        """Get the most recent funding rate time for a symbol."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MAX(event_time) as max_time
+                FROM funding_rates
+                WHERE symbol = ?
+            """, (symbol,))
+            
+            result = cursor.fetchone()
+            if result and result["max_time"]:
+                return datetime.fromisoformat(result["max_time"])
+            return None
+    
+    def get_earliest_funding_time(self, symbol: str) -> Optional[datetime]:
+        """Get the earliest funding rate time for a symbol."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MIN(event_time) as min_time
+                FROM funding_rates
+                WHERE symbol = ?
+            """, (symbol,))
+            
+            result = cursor.fetchone()
+            if result and result["min_time"]:
+                return datetime.fromisoformat(result["min_time"])
+            return None
+    
+    def get_funding_stats(self) -> Dict[str, Any]:
+        """Get statistics about stored funding data."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            cursor.execute(f"""
-                SELECT quality, COUNT(*) as count
-                FROM {table}
-                WHERE event_time >= ? AND event_time < ?
-                GROUP BY quality
-            """, (start, end))
+            cursor.execute("""
+                SELECT symbol, 
+                       COUNT(*) as count,
+                       MIN(event_time) as earliest,
+                       MAX(event_time) as latest,
+                       AVG(rate) as avg_rate,
+                       MIN(rate) as min_rate,
+                       MAX(rate) as max_rate
+                FROM funding_rates
+                GROUP BY symbol
+            """)
             
-            results = cursor.fetchall()
+            results = {}
+            for row in cursor.fetchall():
+                results[row["symbol"]] = {
+                    "count": row["count"],
+                    "earliest": row["earliest"],
+                    "latest": row["latest"],
+                    "avg_rate_bps": row["avg_rate"] * 10000 if row["avg_rate"] else 0,
+                    "min_rate_bps": row["min_rate"] * 10000 if row["min_rate"] else 0,
+                    "max_rate_bps": row["max_rate"] * 10000 if row["max_rate"] else 0,
+                }
             
-            summary = {
-                "total": 0,
-                "valid": 0,
-                "suspicious": 0,
-                "invalid": 0,
-            }
-            
-            for row in results:
-                quality = row["quality"]
-                count = row["count"]
-                summary["total"] += count
-                summary[quality] = count
-            
-            if summary["total"] > 0:
-                summary["validity_rate"] = summary["valid"] / summary["total"] * 100
-            else:
-                summary["validity_rate"] = 0.0
-            
-            return summary
+            return results
     
     def close(self) -> None:
         """Close database (no-op for SQLite with context manager pattern)."""
         logger.info("SQLite database closed")
 
 
-class TimescaleDatabase(DatabaseBase):
-    """
-    TimescaleDB database for production.
-    
-    Uses hypertables for efficient time-series storage and querying.
-    """
-    
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        database: str,
-        user: str,
-        password: str,
-        pool_size: int = 5
-    ):
-        self.host = host
-        self.port = port
-        self.database = database
-        self.user = user
-        self.password = password
-        self.pool_size = pool_size
-        self._pool = None
-    
-    async def connect(self):
-        """Create connection pool."""
-        try:
-            import asyncpg
-            
-            self._pool = await asyncpg.create_pool(
-                host=self.host,
-                port=self.port,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                min_size=2,
-                max_size=self.pool_size,
-            )
-            logger.info(f"Connected to TimescaleDB at {self.host}:{self.port}")
-            
-        except ImportError:
-            raise ImportError(
-                "asyncpg required for TimescaleDB. "
-                "Install with: pip install asyncpg"
-            )
-    
-    def initialize(self) -> None:
-        """
-        Initialize TimescaleDB schema.
-        
-        Note: This is a simplified version. Production would need
-        proper async handling and migration system.
-        """
-        # TimescaleDB schema would use hypertables
-        # This is a placeholder - actual implementation would be async
-        logger.info("TimescaleDB initialization - implement with proper async")
-        raise NotImplementedError("Use SQLite for now, TimescaleDB coming soon")
-    
-    def insert_ohlcv(self, bar: OHLCVBar) -> bool:
-        raise NotImplementedError()
-    
-    def insert_ohlcv_batch(self, bars: List[OHLCVBar]) -> int:
-        raise NotImplementedError()
-    
-    def get_ohlcv(
-        self,
-        symbol: str,
-        timeframe: str,
-        start: datetime,
-        end: datetime,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        raise NotImplementedError()
-    
-    def insert_funding_rate(self, funding: FundingRate) -> bool:
-        raise NotImplementedError()
-    
-    def get_funding_rates(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        raise NotImplementedError()
-    
-    def insert_open_interest(self, oi: OpenInterest) -> bool:
-        raise NotImplementedError()
-    
-    def get_open_interest(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        raise NotImplementedError()
-    
-    def close(self) -> None:
-        if self._pool:
-            # Would need async close
-            pass
-
-
-def create_database(
-    db_type: str = "sqlite",
-    **kwargs
-) -> DatabaseBase:
-    """
-    Factory function to create appropriate database implementation.
-    
-    Args:
-        db_type: "sqlite" or "timescaledb"
-        **kwargs: Database-specific configuration
-    
-    Returns:
-        DatabaseBase instance
-    """
+def create_database(db_type: str = "sqlite", **kwargs) -> DatabaseBase:
+    """Factory function to create appropriate database implementation."""
     if db_type == "sqlite":
         return SQLiteDatabase(kwargs.get("db_path", "data/trading.db"))
-    elif db_type == "timescaledb":
-        return TimescaleDatabase(**kwargs)
     else:
         raise ValueError(f"Unknown database type: {db_type}")

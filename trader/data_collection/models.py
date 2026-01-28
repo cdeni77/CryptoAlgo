@@ -192,6 +192,19 @@ class FundingRate(BiTemporalMixin):
             "is_settlement": self.is_settlement,
             "quality": self.quality.value,
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FundingRate":
+        return cls(
+            symbol=data["symbol"],
+            event_time=datetime.fromisoformat(data["event_time"]),
+            available_time=datetime.fromisoformat(data["available_time"]),
+            rate=float(data["rate"]),
+            mark_price=float(data.get("mark_price", 0)),
+            index_price=float(data.get("index_price", 0)),
+            is_settlement=data.get("is_settlement", False),
+            quality=DataQuality(data.get("quality", "valid")),
+        )
 
 
 @dataclass 
