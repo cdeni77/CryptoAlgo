@@ -338,6 +338,73 @@ class CoinbaseRESTClient:
             logger.error(f"Failed to parse ticker: {e}")
             return None
     
+    async def get_funding_rate(self, product_id: str) -> Optional[FundingRate]:
+        """
+        Get current funding rate for a perpetual product.
+        
+        Note: This endpoint may require specific permissions and the product
+        must be a perpetual futures contract.
+        """
+        if not self.auth:
+            logger.warning("Authentication required for funding rate")
+            return None
+        
+        try:
+            # Try the perpetuals-specific endpoint
+            path = f"/api/v3/brokerage/intx/products/{product_id}"
+            status, data = await self._request("GET", path, authenticated=True)
+            
+            if status != 200:
+                # Fallback: try to get from portfolio summary
+                return await self._get_funding_rate_from_portfolio(product_id)
+            
+            now = datetime.utcnow()
+            
+            # Parse funding rate from product info
+            funding_rate = float(data.get("funding_rate", 0))
+            mark_price = float(data.get("mark_price", 0))
+            index_price = float(data.get("index_price", 0))
+            
+            return FundingRate(
+                symbol=product_id,
+                event_time=now,
+                available_time=now,
+                rate=funding_rate,
+                mark_price=mark_price,
+                index_price=index_price,
+                quality=DataQuality.VALID,
+            )
+            
+        except Exception as e:
+            logger.debug(f"Could not get funding rate for {product_id}: {e}")
+            return None
+    
+    async def _get_funding_rate_from_portfolio(self, product_id: str) -> Optional[FundingRate]:
+        """Try to get funding rate from portfolio summary as fallback."""
+        try:
+            summary = await self.get_perpetuals_portfolio_summary()
+            if not summary:
+                return None
+            
+            # Look for funding info in the portfolio data
+            positions = summary.get("positions", [])
+            for pos in positions:
+                if pos.get("product_id") == product_id:
+                    now = datetime.utcnow()
+                    return FundingRate(
+                        symbol=product_id,
+                        event_time=now,
+                        available_time=now,
+                        rate=float(pos.get("funding_rate", 0)),
+                        mark_price=float(pos.get("mark_price", 0)),
+                        index_price=float(pos.get("index_price", 0)),
+                        quality=DataQuality.VALID,
+                    )
+            return None
+        except Exception as e:
+            logger.debug(f"Could not get funding rate from portfolio: {e}")
+            return None
+    
     async def get_perpetuals_portfolio_summary(self) -> Optional[Dict]:
         """Get perpetuals portfolio summary (authenticated)."""
         if not self.auth:

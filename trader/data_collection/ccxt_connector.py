@@ -39,7 +39,13 @@ class CCXTConnector:
         "ETH-PERP": "ETH/USDT:USDT",
         "SOL-PERP": "SOL/USDT:USDT",
         "XRP-PERP": "XRP/USDT:USDT",
+        "DOGE-PERP": "DOGE/USDT:USDT",  # Added DOGE
         "AVAX-PERP": "AVAX/USDT:USDT",
+        "LINK-PERP": "LINK/USDT:USDT",
+        "ADA-PERP": "ADA/USDT:USDT",
+        "DOT-PERP": "DOT/USDT:USDT",
+        "MATIC-PERP": "MATIC/USDT:USDT",
+        "LTC-PERP": "LTC/USDT:USDT",
     }
     
     # Alternative exchanges that may work in restricted regions
@@ -218,6 +224,7 @@ class CCXTConnector:
         start: datetime,
         end: datetime,
         exchange_id: Optional[str] = None,
+        progress_callback: Optional[callable] = None,
     ) -> List[OHLCVBar]:
         """
         Fetch OHLCV data using CCXT.
@@ -228,6 +235,7 @@ class CCXTConnector:
             start: Start datetime
             end: End datetime
             exchange_id: Specific exchange to use (default: first available)
+            progress_callback: Optional callback(bars_fetched, symbol) for progress updates
         """
         if not self._initialized:
             await self.initialize()
@@ -257,7 +265,6 @@ class CCXTConnector:
         )
         
         all_bars = []
-        current_start = start
         
         # Make start and end naive to avoid timezone comparison issues
         start = start.replace(tzinfo=None) if start.tzinfo else start
@@ -318,6 +325,8 @@ class CCXTConnector:
                 # Progress logging
                 if len(all_bars) % 1000 == 0:
                     logger.info(f"Fetched {len(all_bars)} bars from {exchange_id}...")
+                    if progress_callback:
+                        progress_callback(len(all_bars), symbol)
                 
         except Exception as e:
             logger.error(f"Error fetching OHLCV from {exchange_id}: {e}")

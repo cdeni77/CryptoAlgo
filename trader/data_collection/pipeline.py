@@ -11,7 +11,7 @@ Coordinates all components of the data collection system:
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
@@ -31,6 +31,29 @@ from .coinbase_connector import CoinbaseRESTClient, CoinbaseWebSocketClient
 from .ccxt_connector import CCXTConnector
 
 logger = logging.getLogger(__name__)
+
+
+def ensure_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Convert datetime to naive UTC for consistent comparison.
+    
+    All internal datetime handling uses naive UTC to avoid timezone issues.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        # Convert to UTC then strip timezone
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def ensure_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Convert datetime to timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass
@@ -71,6 +94,9 @@ class PipelineConfig:
     
     # Validation
     validation_config: ValidationConfig = field(default_factory=ValidationConfig)
+    
+    # Feature flags
+    enable_funding_polling: bool = True  # Set to False if no Coinbase credentials
 
 
 class DataPipeline:
@@ -183,6 +209,8 @@ class DataPipeline:
             for timeframe in self.config.timeframes:
                 last_time = self._database.get_latest_ohlcv_time(symbol, timeframe)
                 if last_time:
+                    # Ensure naive UTC
+                    last_time = ensure_naive_utc(last_time)
                     self._last_ohlcv_times[symbol][timeframe] = last_time
                     logger.debug(f"Last {symbol} {timeframe} bar: {last_time}")
     
@@ -212,10 +240,13 @@ class DataPipeline:
         # Start background tasks
         self._tasks = [
             asyncio.create_task(self._ohlcv_poll_loop()),
-            asyncio.create_task(self._funding_poll_loop()),
             asyncio.create_task(self._validation_loop()),
             asyncio.create_task(self._health_check_loop()),
         ]
+        
+        # Only poll funding if enabled
+        if self.config.enable_funding_polling and self.config.coinbase_api_key:
+            self._tasks.append(asyncio.create_task(self._funding_poll_loop()))
         
         logger.info("Data pipeline started")
     
@@ -268,8 +299,9 @@ class DataPipeline:
             timeframes: Timeframes to backfill (default: config.timeframes)
             use_ccxt: Use CCXT for backfill (Coinbase may have limited history)
         """
-        end = end or datetime.utcnow()
-        start = start or (end - timedelta(days=self.config.backfill_days))
+        # Normalize to naive UTC for consistent handling
+        end = ensure_naive_utc(end) if end else datetime.utcnow()
+        start = ensure_naive_utc(start) if start else (end - timedelta(days=self.config.backfill_days))
         symbols = symbols or self.config.symbols
         timeframes = timeframes or self.config.timeframes
         
@@ -280,6 +312,11 @@ class DataPipeline:
             for timeframe in timeframes:
                 # Check if we already have data
                 last_time = self._last_ohlcv_times.get(symbol, {}).get(timeframe)
+                
+                # Ensure last_time is also naive UTC for comparison
+                if last_time:
+                    last_time = ensure_naive_utc(last_time)
+                
                 actual_start = last_time if last_time and last_time > start else start
                 
                 if actual_start >= end:
@@ -327,10 +364,12 @@ class DataPipeline:
                         
                         # Update last time
                         if valid_bars:
-                            self._last_ohlcv_times.setdefault(symbol, {})[timeframe] = valid_bars[-1].event_time
+                            self._last_ohlcv_times.setdefault(symbol, {})[timeframe] = ensure_naive_utc(valid_bars[-1].event_time)
                     
                 except Exception as e:
                     logger.error(f"Error backfilling {symbol} {timeframe}: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         logger.info("Backfill complete")
         logger.info(f"Quality summary: {self._quality_tracker.get_summary()}")
@@ -443,7 +482,7 @@ class DataPipeline:
                         )
                         
                         # Update tracking
-                        self._last_ohlcv_times.setdefault(bar.symbol, {})[bar.timeframe] = bar.event_time
+                        self._last_ohlcv_times.setdefault(bar.symbol, {})[bar.timeframe] = ensure_naive_utc(bar.event_time)
                 
                 # Process raw funding
                 funding_messages = await self._queue.get_batch(
@@ -580,6 +619,11 @@ class DataPipeline:
             end: End time
             as_of: Point-in-time query (for backtesting)
         """
+        # Ensure naive UTC for database queries
+        start = ensure_naive_utc(start)
+        end = ensure_naive_utc(end)
+        as_of = ensure_naive_utc(as_of)
+        
         return self._database.get_ohlcv(symbol, timeframe, start, end, as_of)
     
     def get_funding_rates(
@@ -590,6 +634,11 @@ class DataPipeline:
         as_of: Optional[datetime] = None,
     ):
         """Get funding rate history from database."""
+        # Ensure naive UTC for database queries
+        start = ensure_naive_utc(start)
+        end = ensure_naive_utc(end)
+        as_of = ensure_naive_utc(as_of)
+        
         return self._database.get_funding_rates(symbol, start, end, as_of)
     
     def get_quality_summary(self) -> Dict[str, Any]:
