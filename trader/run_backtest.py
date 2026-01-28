@@ -15,19 +15,11 @@ Run: python run_backtest_v4.py
 """
 
 import sys
-from pathlib import Path
-from datetime import datetime, timedelta
 import warnings
 import logging
 
-import numpy as np
-import pandas as pd
-
-warnings.filterwarnings('ignore')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger(__name__)
-
-sys.path.insert(0, str(Path(__file__).parent))
+from pathlib import Path
+from datetime import datetime, timedelta
 
 from data_collection.storage import SQLiteDatabase
 from features.engineering import FeaturePipeline, FeatureConfig
@@ -37,9 +29,13 @@ from backtesting.strategies_v2 import (
     LowFrequencyMeanReversion,
     WeeklyMomentumReversal,
     MultiFactorStrategy,
-    VolatilityBreakoutStrategy,
 )
-from backtesting.validation import WalkForwardValidator
+
+warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 DB_PATH = "./data/trading.db"
 

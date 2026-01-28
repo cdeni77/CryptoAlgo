@@ -5,6 +5,7 @@ All configuration is centralized here for easy modification and environment-base
 """
 
 import os
+
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from enum import Enum
@@ -80,7 +81,7 @@ class DatabaseConfig:
     
     # SQLite path (for development)
     sqlite_path: str = field(default_factory=lambda: os.environ.get(
-        "SQLITE_PATH", "/home/claude/crypto_trading_system/data/trading.db"
+        "SQLITE_PATH", "./data/trading.db"
     ))
     
     # Connection pool settings
@@ -180,7 +181,7 @@ class LoggingConfig:
     
     # File logging
     log_to_file: bool = True
-    log_file_path: str = "/home/claude/crypto_trading_system/logs/data_collection.log"
+    log_file_path: str = "./logs/data_collection.log"
     max_log_size_mb: int = 100
     backup_count: int = 5
 

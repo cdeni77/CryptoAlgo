@@ -5,10 +5,10 @@ Based on signals identified in feature engineering:
 - Mean reversion (Bollinger Bands)
 - Momentum reversal (RSI + returns)
 """
+import pandas as pd
 
 from datetime import datetime
-from typing import Dict, List, Optional
-import pandas as pd
+from typing import Dict, List
 
 from .engine import Side, Signal, Portfolio
 

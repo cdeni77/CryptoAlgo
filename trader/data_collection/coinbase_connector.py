@@ -10,23 +10,20 @@ import hmac
 import json
 import logging
 import time
+import aiohttp
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
-
-import aiohttp
-from coinbase import jwt_generator  # Official SDK import
+from coinbase import jwt_generator  
 
 from .models import (
     OHLCVBar,
-    Trade,
     FundingRate,
-    OpenInterest,
     OrderBookSnapshot,
     OrderBookLevel,
     TickerUpdate,
-    Side,
     DataQuality,
 )
 

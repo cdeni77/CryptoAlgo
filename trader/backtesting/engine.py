@@ -5,12 +5,13 @@ Implements event-driven backtesting with realistic execution simulation.
 """
 
 import logging
-from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
-import numpy as np
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 

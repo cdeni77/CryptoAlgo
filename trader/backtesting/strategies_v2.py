@@ -17,12 +17,10 @@ Strategy adjustments:
 3. Multi-factor confirmation (reduce false signals)
 4. Time-based exits (not just indicator-based)
 """
-
-from datetime import datetime, timedelta
-from typing import Dict, List
 import pandas as pd
-import numpy as np
 
+from datetime import datetime
+from typing import Dict, List
 from backtesting.engine import Side, Signal, Portfolio
 
 

@@ -12,10 +12,6 @@ pandas>=2.0.0
 numpy>=1.24.0
 coinbase-advanced-py
 
-# Database (optional - for production)
-# asyncpg>=0.28.0  # PostgreSQL/TimescaleDB
-# redis>=5.0.0     # Redis message queue
-
 # Utilities
 python-dateutil>=2.8.0
 

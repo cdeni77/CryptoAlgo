@@ -7,22 +7,21 @@ All data is stored with bi-temporal timestamps for backtesting integrity.
 
 import logging
 import sqlite3
+import pandas as pd
+
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
-import pandas as pd
+
 
 from .models import (
     OHLCVBar,
-    Trade,
     FundingRate,
     OpenInterest,
     OrderBookSnapshot,
-    OrderBookLevel,
-    DataQuality,
 )
 
 logger = logging.getLogger(__name__)

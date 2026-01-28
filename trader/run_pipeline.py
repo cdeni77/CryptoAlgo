@@ -38,15 +38,16 @@ import asyncio
 import logging
 import os
 import sys
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from data_collection.coinbase_connector import CoinbaseRESTClient
+from data_collection.pipeline import create_pipeline, PipelineConfig
+from data_collection.models import OHLCVBar, TickerUpdate, FundingRate
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from data_collection.coinbase_connector import CoinbaseRESTClient
-from data_collection.pipeline import create_pipeline, PipelineConfig, DataPipeline
-from data_collection.models import OHLCVBar, TickerUpdate, FundingRate
 
 # ----------------------------------------------------------------------
 # Configuration

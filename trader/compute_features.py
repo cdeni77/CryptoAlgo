@@ -13,24 +13,22 @@ Run: python compute_features.py
 """
 
 import sys
-from pathlib import Path
-from datetime import datetime, timedelta
-import warnings
-
 import numpy as np
 import pandas as pd
+import warnings
 
-warnings.filterwarnings('ignore')
-
-sys.path.insert(0, str(Path(__file__).parent))
+from pathlib import Path
+from datetime import datetime, timedelta
 
 from data_collection.storage import SQLiteDatabase
 from features.engineering import (
     FeaturePipeline,
     FeatureConfig,
-    PriceFeatures,
-    get_feature_importance_names,
 )
+
+warnings.filterwarnings('ignore')
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")

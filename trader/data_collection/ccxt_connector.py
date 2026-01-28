@@ -7,8 +7,9 @@ for cross-reference and supplementary data.
 
 import asyncio
 import logging
+
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 from .models import (
     OHLCVBar,

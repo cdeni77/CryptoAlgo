@@ -11,15 +11,14 @@ Coordinates all components of the data collection system:
 
 import asyncio
 import logging
+
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
 from .models import (
     OHLCVBar,
-    Trade,
     FundingRate,
-    OpenInterest,
     OrderBookSnapshot,
     TickerUpdate,
     DataQuality,

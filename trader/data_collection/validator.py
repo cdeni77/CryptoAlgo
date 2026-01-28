@@ -5,8 +5,9 @@ Validates incoming data for quality and integrity before storage.
 """
 
 import logging
+
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Optional
 from dataclasses import dataclass
 
 from .models import (
