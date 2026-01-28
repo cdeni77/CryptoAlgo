@@ -27,25 +27,52 @@ As of July 2025, Coinbase Financial Markets (CFM) offers CFTC-regulated perpetua
 
 Based on global crypto derivatives volume patterns:
 
-1. **BTC-PERP** (nano Bitcoin perpetual, 1/100 BTC)
-2. **ETH-PERP** (nano Ether perpetual, 1/10 ETH)
-3. **SOL-PERP** (if/when launched)
-4. **XRP-PERP** (if/when launched)
-5. **DOGE-PERP** or **AVAX-PERP** (depending on listing availability)
+1. **BTC-PERP** (nano BTC Perp-Style Futures (BIP), 1/100 BTC)
+2. **ETH-PERP** (nano ETH Perp-Style Futures (ETP), 1/10 ETH)
+3. **SOL-PERP** (nano Solana Perp-Style Futures (SLP), 5 SOL)
+4. **XRP-PERP** (nano XRP Perp-Style Futures (XPP), 500 XRP )
+5. **DOGE-PERP** (nano DOGE Perp-Style Futures, 5000 DOGE)
 
-**Note**: At launch, only BTC and ETH perpetuals are available. This design assumes expansion to 5 contracts. If fewer are available, the system should scale down accordingly.
+### 1.3 Fee Structure (CORRECTED - January 2026)
 
-### 1.3 Fee Structure
+**IMPORTANT: The fee structure for Coinbase US Perpetual Futures (via CFM) is:**
 
-| Volume Tier | Maker Fee | Taker Fee |
-|-------------|-----------|-----------|
-| < $10K/month | 0.40% | 0.60% |
-| $10K - $50K | 0.35% | 0.55% |
-| > $400M | 0.00% | 0.05% |
+| Fee Type | Rate | Notes |
+|----------|------|-------|
+| **Trading Fee** | 0.10% | Per trade (entry and exit) |
+| **Round-trip Cost** | ~0.20% | Entry + exit |
+| **Slippage (estimated)** | ~0.02% | Market conditions dependent |
+| **Total Round-trip** | ~0.22% | Trading fee + slippage |
 
-**Critical Warning**: Coinbase's perpetual futures fees are among the highest globally. Any strategy must generate sufficient alpha to overcome ~0.5% round-trip costs at typical volume tiers.
+**Funding Rates (Variable):**
 
----
+| Condition | Typical Rate | Daily Cost (24h) |
+|-----------|--------------|------------------|
+| Neutral market | 0.001%/hour | ~0.024%/day |
+| Bullish market (longs pay) | 0.003%/hour | ~0.072%/day |
+| Extreme bullish | 0.005%+/hour | ~.12%+/day |
+| Bearish market (shorts pay) | Negative | Longs receive |
+
+**Key Cost Implications:**
+
+```
+Round-trip trading cost:     ~0.22%
+Daily funding (if positive): ~0.024-0.072%
+Weekly funding (if positive): ~.17-.50%
+
+Break-even analysis:
+- Each trade needs > 0.22% profit to overcome trading costs
+- Long positions in bullish markets face additional funding drag
+- Short-term trades (< 24h): Funding impact ~0.02-0.07%
+- Long-term trades (> 7 days): Funding can dominate returns
+```
+
+**Strategy Implications:**
+
+1. **High-frequency strategies** (100+ trades/month): Cost drag of 22%+ makes profitability very difficult
+2. **Medium-frequency** (20-50 trades/month): Cost drag of 4-11%, requires strong signals (IC > 0.10)
+3. **Low-frequency** (5-15 trades/month): Cost drag of 1-3%, more viable with moderate signals
+4. **Funding arbitrage**: Consider shorting when funding rates are extremely positive
 
 ## 2. Data Sources and Collection Architecture
 
