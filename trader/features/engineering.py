@@ -6,6 +6,7 @@ Key enhancements:
 2. Funding rate z-score (primary signal)
 3. Cumulative funding (carry cost/benefit)
 4. Funding persistence (long/short imbalance proxy)
+5. Open Interest features (NEW)
 
 All features are computed with strict point-in-time constraints.
 """
@@ -301,6 +302,129 @@ class FundingFeatures:
 
 
 # =============================================================================
+# OPEN INTEREST FEATURES - NEW
+# =============================================================================
+
+class OpenInterestFeatures:
+    """
+    Open Interest features for position analysis.
+    
+    OI provides insights into:
+    1. Market participation (rising OI = new positions entering)
+    2. Liquidation risk (high OI + price move = cascade potential)
+    3. Trend confirmation (OI rising with price = trend strength)
+    """
+    
+    @classmethod
+    def compute(
+        cls,
+        ohlcv_df: pd.DataFrame,
+        oi_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Compute open interest features.
+        
+        Args:
+            ohlcv_df: OHLCV data (hourly)
+            oi_df: Open interest data
+        
+        Returns:
+            DataFrame of OI features aligned to OHLCV index
+        """
+        features = pd.DataFrame(index=ohlcv_df.index)
+        
+        if oi_df is None or oi_df.empty:
+            logger.warning("No OI data - returning empty features")
+            return features
+        
+        # Resample OI to hourly using forward fill
+        if 'open_interest_contracts' in oi_df.columns:
+            oi_col = 'open_interest_contracts'
+        elif 'open_interest' in oi_df.columns:
+            oi_col = 'open_interest'
+        else:
+            logger.warning("No OI column found in dataframe")
+            return features
+        
+        oi_hourly = oi_df[oi_col].resample('1h').ffill()
+        oi_aligned = oi_hourly.reindex(ohlcv_df.index, method='ffill')
+        
+        # 1. Raw OI
+        features['open_interest'] = oi_aligned
+        
+        # 2. OI changes (position buildup/unwind)
+        features['oi_change_1h'] = oi_aligned.pct_change(1)
+        features['oi_change_4h'] = oi_aligned.pct_change(4)
+        features['oi_change_24h'] = oi_aligned.pct_change(24)
+        features['oi_change_168h'] = oi_aligned.pct_change(168)
+        
+        # 3. OI moving averages
+        features['oi_ma_24h'] = oi_aligned.rolling(24).mean()
+        features['oi_ma_168h'] = oi_aligned.rolling(168).mean()
+        
+        # 4. OI distance from MA (relative positioning)
+        features['oi_ma_distance_24h'] = (oi_aligned - features['oi_ma_24h']) / features['oi_ma_24h'].replace(0, np.nan)
+        features['oi_ma_distance_168h'] = (oi_aligned - features['oi_ma_168h']) / features['oi_ma_168h'].replace(0, np.nan)
+        
+        # 5. OI z-score (extreme positioning detection)
+        features['oi_zscore'] = normalize_point_in_time(
+            oi_aligned,
+            lookback=168,
+            min_periods=72
+        )
+        
+        # 6. OI-Price divergence (potential liquidation cascade signal)
+        # When price moves significantly but OI doesn't follow -> weak move
+        # When price moves and OI increases -> strong move
+        price_change_24h = ohlcv_df['close'].pct_change(24)
+        oi_change_24h = oi_aligned.pct_change(24)
+        
+        # Divergence: price up but OI down (or vice versa) = weak move
+        features['oi_price_divergence'] = (
+            np.sign(price_change_24h) != np.sign(oi_change_24h)
+        ).astype(int)
+        
+        # Confirmation: price and OI moving together
+        features['oi_price_correlation_24h'] = price_change_24h.rolling(24).corr(oi_change_24h)
+        
+        # 7. OI velocity (rate of change of OI change)
+        oi_change = oi_aligned.pct_change()
+        features['oi_velocity_24h'] = oi_change.rolling(24).mean()
+        features['oi_acceleration'] = features['oi_velocity_24h'].diff()
+        
+        # 8. OI-Volume relationship (participation quality)
+        # High volume + rising OI = conviction
+        # High volume + falling OI = liquidations
+        if 'volume' in ohlcv_df.columns:
+            vol_ratio = ohlcv_df['volume'] / ohlcv_df['volume'].rolling(24).mean()
+            features['oi_vol_score'] = vol_ratio * np.sign(oi_change_24h)
+        
+        # 9. Extreme OI flags
+        features['oi_extreme_high'] = (features['oi_zscore'] > 2.0).astype(int)
+        features['oi_extreme_low'] = (features['oi_zscore'] < -2.0).astype(int)
+        
+        # 10. OI percentile (rolling)
+        features['oi_percentile'] = oi_aligned.rolling(168).apply(
+            lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5
+        )
+        
+        # 11. Liquidation cascade detector (from design.md)
+        # Sharp price move + elevated volume + OI decline
+        price_zscore = normalize_point_in_time(price_change_24h.abs(), lookback=168, min_periods=24)
+        volume_ratio = ohlcv_df['volume'] / ohlcv_df['volume'].rolling(168).mean() if 'volume' in ohlcv_df.columns else pd.Series(1, index=ohlcv_df.index)
+        
+        cascade_score = (
+            (price_zscore.abs() > 2).astype(int) +
+            (volume_ratio > 3).astype(int) +
+            (oi_change_24h < -0.05).astype(int)  # > 5% OI decline
+        )
+        features['liquidation_cascade_score'] = cascade_score
+        features['liquidation_cascade_likely'] = (cascade_score >= 2).astype(int)
+        
+        return features
+
+
+# =============================================================================
 # Regime Features
 # =============================================================================
 
@@ -395,7 +519,8 @@ class FeatureConfig:
     normalize_features: bool = True
     compute_price: bool = True
     compute_volume: bool = True
-    compute_funding: bool = True  # NEW: Enable funding features
+    compute_funding: bool = True
+    compute_oi: bool = True  # NEW: Enable OI features
     compute_cross_asset: bool = True
     compute_regime: bool = True
 
@@ -404,7 +529,7 @@ class FeaturePipeline:
     """
     Main feature engineering pipeline.
     
-    Enhanced for Phase 1: Funding rate integration.
+    Enhanced for Phase 1: Funding rate and OI integration.
     """
     
     def __init__(self, config: Optional[FeatureConfig] = None):
@@ -422,8 +547,8 @@ class FeaturePipeline:
         
         Args:
             ohlcv_data: Dict of {symbol: ohlcv_df}
-            funding_data: Dict of {symbol: funding_df} - NEW for Phase 1
-            oi_data: Dict of {symbol: oi_df}
+            funding_data: Dict of {symbol: funding_df}
+            oi_data: Dict of {symbol: oi_df} - NEW
             reference_symbol: Reference for cross-asset features
         """
         funding_data = funding_data or {}
@@ -452,13 +577,21 @@ class FeaturePipeline:
                 vol_features = VolumeVolatilityFeatures.compute(df, self.config.volume_lookbacks)
                 feature_dfs.append(vol_features)
             
-            # FUNDING FEATURES - KEY FOR PHASE 1
+            # FUNDING FEATURES
             if self.config.compute_funding and symbol in funding_data:
                 funding_features = FundingFeatures.compute(df, funding_data[symbol])
                 feature_dfs.append(funding_features)
                 logger.info(f"  ✓ Added {len(funding_features.columns)} funding features")
             elif self.config.compute_funding:
                 logger.warning(f"  ⚠️ No funding data for {symbol}")
+            
+            # OI FEATURES
+            if self.config.compute_oi and symbol in oi_data:
+                oi_features = OpenInterestFeatures.compute(df, oi_data[symbol])
+                feature_dfs.append(oi_features)
+                logger.info(f"  ✓ Added {len(oi_features.columns)} OI features")
+            elif self.config.compute_oi:
+                logger.warning(f"  ⚠️ No OI data for {symbol}")
             
             # Regime features
             if self.config.compute_regime:
@@ -533,4 +666,9 @@ def get_feature_importance_names() -> Dict[str, str]:
         'cumulative_funding_24h': 'Cumulative funding (24h)',
         'funding_persistence_72h': 'Funding rate persistence (72h)',
         'vol_regime_ratio': 'Short-term vs long-term volatility',
+        'open_interest': 'Current open interest',
+        'oi_change_24h': 'OI change over 24 hours',
+        'oi_zscore': 'OI z-score (positioning extremes)',
+        'oi_price_divergence': 'OI-Price divergence flag',
+        'liquidation_cascade_score': 'Liquidation cascade risk score',
     }

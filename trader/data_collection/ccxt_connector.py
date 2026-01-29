@@ -440,7 +440,7 @@ class CCXTConnector:
         
         try:
             if hasattr(exchange, 'fetch_open_interest'):
-                oi_data = await exchange.fetch_open_interest_(ccxt_symbol)
+                oi_data = await exchange.fetch_open_interest(ccxt_symbol)
                 
                 # Handle possible None values
                 open_interest_contracts = float(oi_data.get("openInterestAmount") or oi_data.get("openInterest") or 0)
@@ -467,56 +467,317 @@ class CCXTConnector:
         timeframe: str = '1h',
         start: datetime = None,
         end: datetime = None,
-        limit: int = 500,
+        limit: int = 200,
         exchange_id: Optional[str] = None,
     ) -> List[Dict]:
-        """Fetch historical open interest data."""
+        """
+        Fetch historical open interest data.
+        
+        Exchange capabilities:
+        - Bybit: Full historical data back to symbol launch (preferred)
+        - Binance: Only last 30 days
+        - OKX: Limited historical data
+        
+        Bybit is prioritized for historical OI due to superior data availability.
+        """
         if not self._initialized:
             await self.initialize()
         
-        exchange_id = exchange_id or "binance"
-        exchange = self._exchanges.get(exchange_id)
+        # Prioritize Bybit for OI history - it has full historical data
+        # Binance only provides last 30 days
+        if exchange_id:
+            exchanges_to_try = [exchange_id]
+        else:
+            # Order by OI history capability
+            preferred_order = ['bybit', 'okx', 'binance']
+            exchanges_to_try = [e for e in preferred_order if e in self._exchanges]
+            # Add any others
+            for e in self._exchanges.keys():
+                if e not in exchanges_to_try:
+                    exchanges_to_try.append(e)
         
-        if not exchange:
-            logger.error(f"Exchange {exchange_id} not available")
-            return []
+        for exch_id in exchanges_to_try:
+            exchange = self._exchanges.get(exch_id)
+            
+            if not exchange:
+                continue
+            
+            if not hasattr(exchange, 'fetch_open_interest_history'):
+                logger.debug(f"{exch_id} does not support OI history")
+                continue
+            
+            ccxt_symbol = self._get_ccxt_symbol(symbol, exch_id)
+            if not ccxt_symbol:
+                continue
+            
+            # Verify symbol exists on this exchange
+            if ccxt_symbol not in exchange.symbols:
+                logger.debug(f"Symbol {ccxt_symbol} not found on {exch_id}")
+                continue
+            
+            logger.info(f"Fetching OI history for {symbol} ({ccxt_symbol}) from {exch_id}")
+            
+            history = []
+            
+            # Handle timestamps - ensure they're valid milliseconds
+            if start:
+                start = start.replace(tzinfo=None) if start.tzinfo else start
+                since_ms = int(start.timestamp() * 1000)
+            else:
+                # Default to 365 days ago
+                since_ms = int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000)
+            
+            if end:
+                end = end.replace(tzinfo=None) if end.tzinfo else end
+                end_ms = int(end.timestamp() * 1000)
+            else:
+                end_ms = int(datetime.utcnow().timestamp() * 1000)
+            
+            # Calculate timeframe in milliseconds for proper pagination
+            tf_ms = self._timeframe_to_ms(timeframe)
+            
+            try:
+                # Different strategies per exchange
+                if exch_id == 'bybit':
+                    # Bybit supports full historical with startTime/endTime
+                    # Use cursor-based pagination with limit 200
+                    history = await self._fetch_bybit_oi_history(
+                        exchange, ccxt_symbol, timeframe, since_ms, end_ms, limit
+                    )
+                elif exch_id == 'binance':
+                    # Binance only has last 30 days
+                    # Warn user and fetch what we can
+                    thirty_days_ago_ms = int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)
+                    if since_ms < thirty_days_ago_ms:
+                        logger.warning(f"Binance OI history limited to last 30 days. Requested start is older.")
+                        since_ms = thirty_days_ago_ms
+                    history = await self._fetch_binance_oi_history(
+                        exchange, ccxt_symbol, timeframe, since_ms, end_ms, limit
+                    )
+                else:
+                    # Generic fallback
+                    history = await self._fetch_generic_oi_history(
+                        exchange, exch_id, ccxt_symbol, timeframe, since_ms, end_ms, limit
+                    )
+                
+                if history:
+                    logger.info(f"✓ Got {len(history)} OI records from {exch_id}")
+                    return history
+                    
+            except Exception as e:
+                logger.error(f"Error fetching OI history from {exch_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
-        if not hasattr(exchange, 'fetch_open_interest_history'):
-            logger.warning(f"{exchange_id} does not support OI history")
-            return []
+        logger.warning(f"Could not fetch OI history for {symbol} from any exchange")
+        return []
+    
+    async def _fetch_bybit_oi_history(
+        self,
+        exchange,
+        ccxt_symbol: str,
+        timeframe: str,
+        since_ms: int,
+        end_ms: int,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """
+        Fetch OI history from Bybit - supports full historical data.
         
-        ccxt_symbol = self._get_ccxt_symbol(symbol, exchange_id)
-        if not ccxt_symbol:
-            return []
-        
+        Bybit API notes:
+        - Supports startTime and endTime
+        - Limit max 200 per request
+        - Returns data from oldest to newest
+        - Can query back to symbol launch
+        """
         history = []
+        current_start = since_ms
+        tf_ms = self._timeframe_to_ms(timeframe)
         
-        since_ms = int(start.timestamp() * 1000) if start else None
-        end_ms = int(end.timestamp() * 1000) if end else None
+        while current_start < end_ms:
+            try:
+                # Calculate end for this batch (limit * timeframe)
+                batch_end = min(current_start + (limit * tf_ms), end_ms)
+                
+                batch = await exchange.fetch_open_interest_history(
+                    ccxt_symbol,
+                    timeframe=timeframe,
+                    since=current_start,
+                    limit=limit,
+                    params={'endTime': batch_end}
+                )
+                
+                if not batch:
+                    # No more data, move forward
+                    current_start = batch_end
+                    continue
+                
+                # Add valid entries
+                for entry in batch:
+                    ts = entry.get('timestamp')
+                    if ts and since_ms <= ts <= end_ms:
+                        history.append(entry)
+                
+                # Move to next batch
+                last_ts = batch[-1].get('timestamp', current_start)
+                if last_ts <= current_start:
+                    # No progress, skip ahead
+                    current_start = batch_end
+                else:
+                    current_start = last_ts + 1
+                
+                # Progress logging
+                if len(history) % 500 == 0 and len(history) > 0:
+                    logger.info(f"  Fetched {len(history)} OI records so far...")
+                
+                # Rate limit
+                await asyncio.sleep(0.05)
+                
+            except Exception as e:
+                logger.warning(f"Bybit OI fetch error: {e}")
+                # Skip ahead on error
+                current_start += limit * tf_ms
+                await asyncio.sleep(0.5)
         
-        while since_ms < end_ms if end_ms else True:
+        return history
+    
+    async def _fetch_binance_oi_history(
+        self,
+        exchange,
+        ccxt_symbol: str,
+        timeframe: str,
+        since_ms: int,
+        end_ms: int,
+        limit: int = 500,
+    ) -> List[Dict]:
+        """
+        Fetch OI history from Binance - LIMITED TO LAST 30 DAYS.
+        
+        Binance API notes:
+        - Only provides last 30 days of data
+        - Max 500 per request
+        - Uses startTime/endTime
+        """
+        history = []
+        current_start = since_ms
+        tf_ms = self._timeframe_to_ms(timeframe)
+        
+        while current_start < end_ms:
             try:
                 batch = await exchange.fetch_open_interest_history(
                     ccxt_symbol,
                     timeframe=timeframe,
-                    since=since_ms,
-                    limit=limit,
+                    since=current_start,
+                    limit=min(limit, 500),
                 )
                 
                 if not batch:
                     break
                 
-                history.extend(batch)
+                for entry in batch:
+                    ts = entry.get('timestamp')
+                    if ts and since_ms <= ts <= end_ms:
+                        history.append(entry)
                 
-                since_ms = batch[-1]['timestamp'] + 1
+                last_ts = batch[-1].get('timestamp', current_start)
+                if last_ts <= current_start:
+                    break
+                current_start = last_ts + 1
                 
                 if len(batch) < limit:
                     break
+                    
+                await asyncio.sleep(0.1)
                 
             except Exception as e:
-                logger.error(f"Error fetching OI history: {e}")
+                error_str = str(e).lower()
+                if "1 month" in error_str or "30 day" in error_str:
+                    logger.warning("Binance OI history limited to 30 days")
+                    break
+                logger.warning(f"Binance OI error: {e}")
                 break
+        
         return history
+    
+    async def _fetch_generic_oi_history(
+        self,
+        exchange,
+        exch_id: str,
+        ccxt_symbol: str,
+        timeframe: str,
+        since_ms: int,
+        end_ms: int,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """Generic OI history fetch with error handling."""
+        history = []
+        current_start = since_ms
+        
+        try:
+            while current_start < end_ms:
+                try:
+                    batch = await exchange.fetch_open_interest_history(
+                        ccxt_symbol,
+                        timeframe=timeframe,
+                        since=current_start,
+                        limit=limit,
+                    )
+                    
+                    if not batch:
+                        break
+                    
+                    for entry in batch:
+                        ts = entry.get('timestamp')
+                        if ts and since_ms <= ts <= end_ms:
+                            history.append(entry)
+                    
+                    last_ts = batch[-1].get('timestamp', current_start)
+                    if last_ts <= current_start:
+                        break
+                    current_start = last_ts + 1
+                    
+                    if len(batch) < limit:
+                        break
+                    
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    if "startTime" in error_str or "invalid" in error_str.lower():
+                        logger.warning(f"{exch_id} doesn't support startTime, fetching recent only")
+                        # Fall back to recent data only
+                        try:
+                            batch = await exchange.fetch_open_interest_history(
+                                ccxt_symbol,
+                                timeframe=timeframe,
+                                limit=limit,
+                            )
+                            if batch:
+                                history.extend(batch)
+                        except:
+                            pass
+                        break
+                    else:
+                        raise
+        except Exception as e:
+            logger.error(f"Error in generic OI fetch from {exch_id}: {e}")
+        
+        return history
+    
+    def _timeframe_to_ms(self, timeframe: str) -> int:
+        """Convert timeframe string to milliseconds."""
+        multipliers = {
+            "1m": 60 * 1000,
+            "5m": 5 * 60 * 1000,
+            "15m": 15 * 60 * 1000,
+            "30m": 30 * 60 * 1000,
+            "1h": 60 * 60 * 1000,
+            "4h": 4 * 60 * 60 * 1000,
+            "1d": 24 * 60 * 60 * 1000,
+            "D": 24 * 60 * 60 * 1000,
+        }
+        return multipliers.get(timeframe, 60 * 60 * 1000)  # Default 1h
     
     async def fetch_multi_exchange_ohlcv(
         self,

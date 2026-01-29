@@ -336,7 +336,7 @@ async def backfill_open_interest(
     
     # Initialize CCXT connector
     connector = CCXTConnector(
-        exchanges=["binance", "okx", "bybit"],
+        exchanges=["bybit", "okx", "binance"],
         proxy=proxy,
         use_fallbacks=True,
     )

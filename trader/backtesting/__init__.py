@@ -18,6 +18,8 @@ from .strategies import (
     FundingAwareMeanReversion,
     PureFundingCarryStrategy,
     CombinedFundingPriceStrategy,
+    OIDivergenceStrategy,
+    CombinedOIFundingStrategy,
 )
 
 __all__ = [
@@ -33,4 +35,6 @@ __all__ = [
     'FundingAwareMeanReversion',
     'PureFundingCarryStrategy',
     'CombinedFundingPriceStrategy',
+    'OIDivergenceStrategy',
+    'CombinedOIFundingStrategy',
 ]
