@@ -40,7 +40,7 @@ EXPORT_DIR = Path("./data/features")
 def load_ohlcv_data(db: SQLiteDatabase, symbols: list, timeframe: str = "1h") -> dict:
     """Load OHLCV data for multiple symbols."""
     end = datetime.utcnow()
-    start = end - timedelta(days=1000)  # Get all available data
+    start = end - timedelta(days=2190)  # Get all available data
     
     data = {}
     for symbol in symbols:
@@ -77,7 +77,7 @@ def load_oi_data(db: SQLiteDatabase, symbols: list) -> dict:
     """Load open interest data from database."""
     oi_data = {}
     end = datetime.utcnow()
-    start = end - timedelta(days=1000)
+    start = end - timedelta(days=2190)
     
     for symbol in symbols:
         try:

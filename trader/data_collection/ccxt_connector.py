@@ -59,7 +59,7 @@ class CCXTConnector:
         rate_limit_enabled: bool = True,
         proxy: Optional[str] = None,
         aiohttp_proxy: Optional[str] = None,
-        timeout: int = 30000,
+        timeout: int = 60000,
         use_fallbacks: bool = True,
     ):
         """
@@ -661,7 +661,6 @@ class CCXTConnector:
         """
         history = []
         current_start = since_ms
-        tf_ms = self._timeframe_to_ms(timeframe)
         
         while current_start < end_ms:
             try:
