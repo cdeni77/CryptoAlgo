@@ -1,54 +1,49 @@
-#!/usr/bin/env python3
 """
-Per-Coin Backtest Runner
+Per-Coin Backtest Analysis - FIXED VERSION
 
-Runs backtests for EACH coin individually to find optimal parameters per asset.
-This is better than running all coins together because:
-1. Each coin has different volatility/funding dynamics
-2. Optimal thresholds vary by asset (BTC vs DOGE)
-3. Uses full available history per coin (BTC 6yr, SOL 3.5yr)
+Uses fixed backtesting engine with:
+- Proper stop-loss enforcement
+- Liquidation simulation
+- Leverage limits
+- Regime-aware strategies
 
 Usage:
-    python run_backtest_per_coin.py
-    python run_backtest_per_coin.py --symbols BIP-20DEC30-CDE ETP-20DEC30-CDE
+    python run_backtest.py --db-path ./data/trading.db --features-dir ./data/features
 """
 
 import argparse
-import sys
-import warnings
 import logging
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import pandas as pd
-import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from data_collection.storage import SQLiteDatabase
-from backtesting.engine import Backtester, CostModel, PerformanceMetrics
+# Import fixed modules
+from backtesting.engine import (
+    Backtester,
+    CostModel,
+    PerformanceMetrics,
+)
 from backtesting.strategies import (
     FundingArbitrageStrategy,
-    FundingAwareMeanReversion,
-    PureFundingCarryStrategy,
-    CombinedFundingPriceStrategy,
     OIDivergenceStrategy,
     CombinedOIFundingStrategy,
 )
 
-warnings.filterwarnings('ignore')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Default paths
 DEFAULT_DB_PATH = "./data/trading.db"
 DEFAULT_FEATURES_DIR = "./data/features"
 
 
 @dataclass
 class CoinResult:
-    """Results for a single coin."""
+    """Result for a single strategy on a single coin."""
     symbol: str
     strategy_name: str
     params: Dict
@@ -58,27 +53,88 @@ class CoinResult:
     num_bars: int
 
 
-def load_features_from_csv(features_dir: Path, symbol: str) -> Optional[pd.DataFrame]:
-    """Load features for a single symbol."""
-    # Try different filename patterns
-    patterns = [
-        f"{symbol.replace('-', '_')}_features.csv",
+def load_features(features_dir: Path, symbol: str) -> Optional[pd.DataFrame]:
+    """
+    Load precomputed features for a symbol.
+    
+    Handles various CSV formats:
+    - 'timestamp' column
+    - 'event_time' column  
+    - First column as index
+    - Unnamed index column
+    """
+    # Try different filename formats
+    possible_names = [
         f"{symbol}_features.csv",
+        f"{symbol.replace('-', '_')}_features.csv",
+        f"{symbol.lower()}_features.csv",
+        f"{symbol.lower().replace('-', '_')}_features.csv",
     ]
     
-    for pattern in patterns:
-        filepath = features_dir / pattern
-        if filepath.exists():
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-            return df
+    for name in possible_names:
+        path = features_dir / name
+        if path.exists():
+            try:
+                # First, read just the header to inspect columns
+                df_header = pd.read_csv(path, nrows=0)
+                columns = df_header.columns.tolist()
+                
+                # Identify the datetime column
+                datetime_col = None
+                possible_ts_cols = ['timestamp', 'event_time', 'datetime', 'date', 'time', 'Timestamp', 'Event_time']
+                
+                for col in possible_ts_cols:
+                    if col in columns:
+                        datetime_col = col
+                        break
+                
+                # Check for unnamed index column (common when saving with index=True)
+                if datetime_col is None:
+                    for col in columns:
+                        if col.startswith('Unnamed'):
+                            datetime_col = col
+                            break
+                
+                # If still no datetime column found, try the first column
+                if datetime_col is None and len(columns) > 0:
+                    # Read a sample to check if first column looks like datetime
+                    df_sample = pd.read_csv(path, nrows=5)
+                    first_col = columns[0]
+                    try:
+                        pd.to_datetime(df_sample[first_col].iloc[0])
+                        datetime_col = first_col
+                    except:
+                        pass
+                
+                # If we found a datetime column, parse it
+                if datetime_col:
+                    df = pd.read_csv(path, parse_dates=[datetime_col])
+                    df.set_index(datetime_col, inplace=True)
+                    df.index.name = 'timestamp'  # Normalize index name
+                    logger.info(f"Loaded features from {path} using '{datetime_col}' as datetime column")
+                    return df
+                
+                # Last resort: try reading with index_col=0
+                df = pd.read_csv(path, index_col=0)
+                try:
+                    df.index = pd.to_datetime(df.index)
+                    df.index.name = 'timestamp'
+                    logger.info(f"Loaded features from {path} using first column as index")
+                    return df
+                except Exception as e:
+                    logger.warning(f"Could not parse index as datetime: {e}")
+                    # Return anyway, might still work
+                    return df
+                    
+            except Exception as e:
+                logger.error(f"Error loading {path}: {e}")
+                continue
     
     return None
 
 
-def load_ohlcv_from_db(db_path: str, symbol: str, timeframe: str = "1h") -> Optional[pd.DataFrame]:
-    """Load OHLCV for a single symbol."""
-    import sqlite3
-    
+def load_ohlcv(db_path: str, symbol: str, timeframe: str = '1h') -> Optional[pd.DataFrame]:
+    """Load OHLCV data from database."""
     conn = sqlite3.connect(db_path)
     query = """
         SELECT event_time, open, high, low, close, volume
@@ -120,13 +176,16 @@ def run_single_backtest(
     ohlcv: pd.DataFrame,
     features: pd.DataFrame,
     cost_model: CostModel,
+    stop_loss_pct: float = 0.15,
 ) -> PerformanceMetrics:
-    """Run backtest for single coin."""
+    """Run backtest for single coin with fixed engine."""
     backtester = Backtester(
         initial_capital=100000,
         cost_model=cost_model,
-        max_position_pct=0.5,  # Higher since single coin
-        max_leverage=3.0,
+        max_position_pct=0.3,      # Max 30% per position
+        max_leverage=3.0,          # Max 3x leverage
+        default_stop_loss_pct=stop_loss_pct,
+        apply_funding=True,        # Apply funding rates
     )
     
     _, metrics = backtester.run(
@@ -139,67 +198,79 @@ def run_single_backtest(
 
 
 def get_funding_arb_strategies(symbol: str) -> List[tuple]:
-    """Get Funding Arbitrage strategies with various thresholds."""
+    """Get Funding Arbitrage strategies with regime filter."""
     strategies = []
     
-    # Different entry thresholds
-    for entry_thresh in [1.2, 1.5, 1.8, 2.0, 2.5]:
-        for use_confirm in [True, False]:
-            name = f"FundingArb(z>{entry_thresh}"
-            if use_confirm:
-                name += ",BB)"
-            else:
+    # Test different entry thresholds with regime filter ON
+    for entry_thresh in [1.5, 2.0, 2.5]:
+        for use_regime in [True, False]:
+            for use_trend in [True, False]:
+                # Skip non-regime + non-trend (that's the broken version)
+                if not use_regime and not use_trend:
+                    continue
+                
+                name = f"FundingArb(z>{entry_thresh}"
+                if use_regime:
+                    name += ",Regime"
+                if use_trend:
+                    name += ",Trend"
                 name += ")"
-            
-            strategies.append((
-                FundingArbitrageStrategy(
-                    symbols=[symbol],
-                    entry_threshold=entry_thresh,
-                    exit_threshold=0.5,
-                    min_hold_hours=24,
-                    max_hold_hours=168,
-                    position_size=0.3,
-                    use_price_confirmation=use_confirm,
-                    bb_confirmation_threshold=1.5,
-                ),
-                name,
-                {'entry_threshold': entry_thresh, 'use_price_confirmation': use_confirm}
-            ))
+                
+                strategies.append((
+                    FundingArbitrageStrategy(
+                        symbols=[symbol],
+                        entry_threshold=entry_thresh,
+                        exit_threshold=0.5,
+                        min_hold_hours=24,
+                        max_hold_hours=168,
+                        position_size=0.15,
+                        use_price_confirmation=True,
+                        bb_confirmation_threshold=1.5,
+                        use_regime_filter=use_regime,
+                        use_trend_filter=use_trend,
+                    ),
+                    name,
+                    {
+                        'entry_threshold': entry_thresh,
+                        'use_regime_filter': use_regime,
+                        'use_trend_filter': use_trend,
+                    }
+                ))
     
     return strategies
 
 
 def get_oi_strategies(symbol: str) -> List[tuple]:
-    """Get OI-based strategies."""
+    """Get OI-based strategies with regime filter."""
     strategies = []
     
-    for div_thresh in [0.3, 0.5, 0.7]:
-        for use_zscore in [True, False]:
-            name = f"OI_Div(>{div_thresh}"
-            if use_zscore:
-                name += ",z-filter)"
-            else:
-                name += ")"
-            
-            strategies.append((
-                OIDivergenceStrategy(
-                    symbols=[symbol],
-                    divergence_threshold=div_thresh,
-                    use_oi_zscore_filter=use_zscore,
-                    oi_zscore_threshold=1.5,
-                    position_size=0.3,
-                    min_hold_hours=12,
-                    max_hold_hours=72,
-                ),
-                name,
-                {'divergence_threshold': div_thresh, 'use_oi_zscore_filter': use_zscore}
-            ))
+    for use_regime in [True, False]:
+        name = "OIDivergence"
+        if use_regime:
+            name += "(Regime)"
+        else:
+            name += "(NoRegime)"
+        
+        strategies.append((
+            OIDivergenceStrategy(
+                symbols=[symbol],
+                divergence_threshold=0.5,
+                use_oi_zscore_filter=True,
+                oi_zscore_threshold=1.5,
+                position_size=0.15,
+                min_hold_hours=12,
+                max_hold_hours=72,
+                use_regime_filter=use_regime,
+            ),
+            name,
+            {'use_regime_filter': use_regime}
+        ))
     
     return strategies
 
 
 def get_combined_strategies(symbol: str) -> List[tuple]:
-    """Get combined strategies."""
+    """Get combined strategies with different factor requirements."""
     strategies = []
     
     for min_factors in [2, 3]:
@@ -213,25 +284,28 @@ def get_combined_strategies(symbol: str) -> List[tuple]:
                     funding_threshold=funding_thresh,
                     bb_threshold=1.5,
                     min_factors=min_factors,
-                    position_size=0.3,
+                    position_size=0.15,
                     min_hold_hours=24,
                     max_hold_hours=120,
+                    use_regime_filter=True,  # Always use regime filter
                 ),
                 name,
-                {'min_factors': min_factors, 'funding_threshold': funding_thresh}
+                {
+                    'min_factors': min_factors,
+                    'funding_threshold': funding_thresh,
+                }
             ))
     
     return strategies
 
 
-def run_coin_analysis(
+def analyze_coin(
     symbol: str,
     ohlcv: pd.DataFrame,
     features: pd.DataFrame,
     cost_model: CostModel,
 ) -> List[CoinResult]:
-    """Run all strategy variations for a single coin."""
-    
+    """Run all strategies on a single coin."""
     results = []
     available = check_features(features)
     
@@ -265,6 +339,11 @@ def run_coin_analysis(
                 data_end=data_end,
                 num_bars=num_bars,
             ))
+            
+            logger.info(f"  {name}: Return={metrics.total_return*100:.2f}%, "
+                       f"Sharpe={metrics.sharpe_ratio:.2f}, "
+                       f"StopLosses={metrics.num_stop_losses}")
+            
         except Exception as e:
             logger.warning(f"  Error running {name}: {e}")
     
@@ -277,17 +356,19 @@ def print_coin_results(symbol: str, results: List[CoinResult]):
         print(f"  No results for {symbol}")
         return
     
-    # Sort by Sharpe
+    # Sort by Sharpe ratio
     results = sorted(results, key=lambda x: x.metrics.sharpe_ratio, reverse=True)
     
-    print(f"\n  {'Strategy':<35} {'Return':>9} {'Sharpe':>8} {'MaxDD':>8} {'Trades':>7} {'Win%':>6}")
-    print(f"  {'-'*80}")
+    print(f"\n  {'Strategy':<40} {'Return':>9} {'Sharpe':>8} {'MaxDD':>8} "
+          f"{'Trades':>7} {'Win%':>6} {'Stops':>6} {'Liq':>5}")
+    print(f"  {'-'*100}")
     
-    for r in results[:10]:  # Top 10
+    for r in results[:15]:  # Top 15
         m = r.metrics
         sharpe_str = f"{m.sharpe_ratio:.2f}" if abs(m.sharpe_ratio) < 100 else "N/A"
-        print(f"  {r.strategy_name:<35} {m.total_return*100:>8.2f}% {sharpe_str:>8} "
-              f"{m.max_drawdown*100:>7.2f}% {m.num_trades:>7} {m.win_rate*100:>5.1f}%")
+        print(f"  {r.strategy_name:<40} {m.total_return*100:>8.2f}% {sharpe_str:>8} "
+              f"{m.max_drawdown*100:>7.2f}% {m.num_trades:>7} {m.win_rate*100:>5.1f}% "
+              f"{m.num_stop_losses:>6} {m.num_liquidations:>5}")
     
     # Best strategy summary
     best = results[0]
@@ -295,27 +376,37 @@ def print_coin_results(symbol: str, results: List[CoinResult]):
     print(f"     Params: {best.params}")
     print(f"     Sharpe: {best.metrics.sharpe_ratio:.2f}, Return: {best.metrics.total_return*100:.2f}%")
     print(f"     Trades: {best.metrics.num_trades}, Win Rate: {best.metrics.win_rate*100:.1f}%")
+    print(f"     Stop Losses: {best.metrics.num_stop_losses}, Liquidations: {best.metrics.num_liquidations}")
+    print(f"     Fees Paid: ${best.metrics.total_fees_paid:.2f}, Funding Paid: ${best.metrics.total_funding_paid:.2f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-coin backtest analysis")
+    parser = argparse.ArgumentParser(description="Per-coin backtest analysis (FIXED)")
     parser.add_argument("--db-path", type=str, default=DEFAULT_DB_PATH)
     parser.add_argument("--features-dir", type=str, default=DEFAULT_FEATURES_DIR)
     parser.add_argument("--symbols", type=str, nargs="+", help="Specific symbols to test")
+    parser.add_argument("--stop-loss", type=float, default=0.15, help="Stop loss percentage (default 15%)")
     args = parser.parse_args()
     
     features_dir = Path(args.features_dir)
     
-    print("=" * 90)
-    print("🎯 PER-COIN BACKTEST ANALYSIS")
-    print("=" * 90)
-    print("\nFinding optimal strategy parameters for each coin individually.\n")
+    print("=" * 100)
+    print("🎯 PER-COIN BACKTEST ANALYSIS (FIXED VERSION)")
+    print("=" * 100)
+    print("\nKey fixes applied:")
+    print("  ✓ Stop-loss enforcement (default 15%)")
+    print("  ✓ Liquidation simulation (5% maintenance margin)")
+    print("  ✓ Regime filter (avoids shorting in bull markets)")
+    print("  ✓ Trend filter (confirms reversal signals)")
+    print("  ✓ Leverage limits (max 3x)")
+    print("  ✓ Funding rate application to positions")
+    print()
     
-    # Cost model
+    # Cost model with Coinbase fees
     cost_model = CostModel(
-        maker_fee_bps=10,
-        taker_fee_bps=10,
-        base_slippage_bps=2,
+        maker_fee_bps=10,    # 0.10%
+        taker_fee_bps=10,    # 0.10%
+        base_slippage_bps=2, # 0.02%
     )
     
     # Find available symbols from feature files
@@ -329,32 +420,34 @@ def main():
     
     if not symbols:
         print("❌ No feature files found!")
+        print(f"   Looking in: {features_dir}")
         return
     
     print(f"Symbols to analyze: {symbols}\n")
     
-    # Store all results
-    all_results: Dict[str, List[CoinResult]] = {}
-    best_per_coin: Dict[str, CoinResult] = {}
+    all_results = {}
     
-    # Process each coin
     for symbol in symbols:
-        print("=" * 90)
+        print("=" * 100)
         print(f"📊 {symbol}")
-        print("=" * 90)
+        print("=" * 100)
         
         # Load data
-        features = load_features_from_csv(features_dir, symbol)
+        features = load_features(features_dir, symbol)
         if features is None:
             print(f"  ❌ No features found for {symbol}")
             continue
         
-        ohlcv = load_ohlcv_from_db(args.db_path, symbol)
+        # Debug: print feature columns and index info
+        print(f"  Features loaded: {len(features)} rows, {len(features.columns)} columns")
+        print(f"  Index type: {type(features.index).__name__}, range: {features.index.min()} to {features.index.max()}")
+        
+        ohlcv = load_ohlcv(args.db_path, symbol)
         if ohlcv is None:
             print(f"  ❌ No OHLCV data found for {symbol}")
             continue
         
-        # Align
+        # Align data
         ohlcv, features = align_data(ohlcv, features)
         if ohlcv is None:
             print(f"  ❌ No overlapping data for {symbol}")
@@ -366,74 +459,42 @@ def main():
         print(f"  Features: Funding={available['funding']}, OI={available['oi']}, Price={available['price']}")
         
         # Run analysis
-        results = run_coin_analysis(symbol, ohlcv, features, cost_model)
+        results = analyze_coin(symbol, ohlcv, features, cost_model)
         all_results[symbol] = results
         
         # Print results
         print_coin_results(symbol, results)
-        
-        # Track best
+    
+    # Summary across all coins
+    print("\n" + "=" * 100)
+    print("📈 SUMMARY ACROSS ALL COINS")
+    print("=" * 100)
+    
+    # Find best strategy per coin
+    print(f"\n{'Symbol':<25} {'Best Strategy':<45} {'Return':>10} {'Sharpe':>8}")
+    print("-" * 95)
+    
+    for symbol, results in all_results.items():
         if results:
             best = max(results, key=lambda x: x.metrics.sharpe_ratio)
-            best_per_coin[symbol] = best
+            print(f"{symbol:<25} {best.strategy_name:<45} "
+                  f"{best.metrics.total_return*100:>9.2f}% {best.metrics.sharpe_ratio:>8.2f}")
     
-    # Final Summary
-    print("\n" + "=" * 90)
-    print("📈 FINAL SUMMARY - BEST STRATEGY PER COIN")
-    print("=" * 90)
+    # Overall statistics
+    all_sharpes = []
+    all_returns = []
+    for results in all_results.values():
+        for r in results:
+            if abs(r.metrics.sharpe_ratio) < 100:  # Filter valid Sharpes
+                all_sharpes.append(r.metrics.sharpe_ratio)
+            all_returns.append(r.metrics.total_return)
     
-    print(f"\n{'Symbol':<20} {'Best Strategy':<30} {'Sharpe':>8} {'Return':>10} {'Trades':>7} {'Data Range':<25}")
-    print("-" * 100)
-    
-    for symbol, best in sorted(best_per_coin.items()):
-        m = best.metrics
-        date_range = f"{best.data_start.date()} to {best.data_end.date()}"
-        sharpe_str = f"{m.sharpe_ratio:.2f}" if abs(m.sharpe_ratio) < 100 else "N/A"
-        print(f"{symbol:<20} {best.strategy_name:<30} {sharpe_str:>8} {m.total_return*100:>9.2f}% "
-              f"{m.num_trades:>7} {date_range:<25}")
-    
-    # Recommendations
-    print("\n" + "=" * 90)
-    print("🎯 RECOMMENDATIONS")
-    print("=" * 90)
-    
-    good_coins = [(s, r) for s, r in best_per_coin.items() 
-                  if r.metrics.sharpe_ratio > 0.5 and r.metrics.num_trades >= 10]
-    weak_coins = [(s, r) for s, r in best_per_coin.items() 
-                  if 0 < r.metrics.sharpe_ratio <= 0.5]
-    bad_coins = [(s, r) for s, r in best_per_coin.items() 
-                 if r.metrics.sharpe_ratio <= 0]
-    
-    if good_coins:
-        print("\n✅ TRADE THESE (Sharpe > 0.5, sufficient trades):")
-        for symbol, r in good_coins:
-            print(f"   {symbol}: {r.strategy_name} (Sharpe={r.metrics.sharpe_ratio:.2f})")
-    
-    if weak_coins:
-        print("\n⚠️  PAPER TRADE FIRST (Weak edge):")
-        for symbol, r in weak_coins:
-            print(f"   {symbol}: {r.strategy_name} (Sharpe={r.metrics.sharpe_ratio:.2f})")
-    
-    if bad_coins:
-        print("\n❌ SKIP THESE (No edge):")
-        for symbol, r in bad_coins:
-            print(f"   {symbol}: Best Sharpe={r.metrics.sharpe_ratio:.2f}")
-    
-    # Output optimal params
-    print("\n" + "=" * 90)
-    print("📋 OPTIMAL PARAMETERS FOR DEPLOYMENT")
-    print("=" * 90)
-    
-    print("\nCopy this config for paper trading:\n")
-    print("COIN_CONFIGS = {")
-    for symbol, best in best_per_coin.items():
-        if best.metrics.sharpe_ratio > 0:
-            print(f"    '{symbol}': {{")
-            print(f"        'strategy': '{best.strategy_name}',")
-            print(f"        'params': {best.params},")
-            print(f"        'expected_sharpe': {best.metrics.sharpe_ratio:.2f},")
-            print(f"    }},")
-    print("}")
+    if all_sharpes:
+        print(f"\nOverall Statistics (all strategies, all coins):")
+        print(f"  Average Sharpe: {sum(all_sharpes)/len(all_sharpes):.2f}")
+        print(f"  Best Sharpe: {max(all_sharpes):.2f}")
+        print(f"  Median Return: {sorted(all_returns)[len(all_returns)//2]*100:.2f}%")
+        print(f"  % Profitable: {sum(1 for r in all_returns if r > 0)/len(all_returns)*100:.1f}%")
 
 
 if __name__ == "__main__":

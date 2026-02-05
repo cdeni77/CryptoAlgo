@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Per-Coin Walk-Forward Validation with Automatic Window Sizing
+Per-Coin Walk-Forward Validation with Auto Window Sizing - UPDATED VERSION
+
+Updates from original:
+- Uses fixed backtester with stop-loss, liquidation, funding
+- Tests regime_filter and trend_filter parameters
+- Updated param grids based on backtest results
 
 Automatically calculates optimal train/test windows based on available data:
 - More data = larger windows, more windows
 - Less data = smaller windows, fewer windows
 - Ensures minimum statistical significance
 
-Rules:
-- Minimum 60 days training, 30 days testing
-- Target 4-8 walk-forward windows per coin
-- Non-overlapping test periods
-
 Usage:
-    python run_walkforward_per_coin.py
-    python run_walkforward_per_coin.py --symbols BIP-20DEC30-CDE
-    python run_walkforward_per_coin.py --min-windows 3 --max-windows 10
+    python run_walkforward.py
+    python run_walkforward.py --symbols BIP-20DEC30-CDE
+    python run_walkforward.py --min-windows 3 --max-windows 10
 """
 
 import argparse
 import sys
 import warnings
 import logging
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -30,6 +31,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 import numpy as np
 
+# Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backtesting.engine import Backtester, CostModel, PerformanceMetrics
@@ -45,6 +47,40 @@ logger = logging.getLogger(__name__)
 
 FEATURES_DIR = Path("./data/features")
 DB_PATH = "./data/trading.db"
+
+
+# =============================================================================
+# Parameter Grids - UPDATED with regime/trend filters
+# =============================================================================
+
+FUNDING_ARB_PARAMS = [
+    # Best performers from backtest - with regime filter
+    {'entry_threshold': 2.5, 'use_regime_filter': True, 'use_trend_filter': False},
+    {'entry_threshold': 2.0, 'use_regime_filter': True, 'use_trend_filter': True},
+    {'entry_threshold': 2.0, 'use_regime_filter': True, 'use_trend_filter': False},
+    {'entry_threshold': 1.5, 'use_regime_filter': True, 'use_trend_filter': True},
+    {'entry_threshold': 1.5, 'use_regime_filter': True, 'use_trend_filter': False},
+    # Without regime filter for comparison
+    {'entry_threshold': 2.0, 'use_regime_filter': False, 'use_trend_filter': True},
+    {'entry_threshold': 1.5, 'use_regime_filter': False, 'use_trend_filter': True},
+]
+
+OI_DIVERGENCE_PARAMS = [
+    {'divergence_threshold': 0.5, 'use_oi_zscore_filter': True, 'use_regime_filter': True},
+    {'divergence_threshold': 0.3, 'use_oi_zscore_filter': True, 'use_regime_filter': True},
+    {'divergence_threshold': 0.5, 'use_oi_zscore_filter': False, 'use_regime_filter': True},
+    {'divergence_threshold': 0.3, 'use_oi_zscore_filter': False, 'use_regime_filter': False},
+]
+
+COMBINED_PARAMS = [
+    # Best from backtest
+    {'min_factors': 2, 'funding_threshold': 1.0, 'use_regime_filter': True},
+    {'min_factors': 2, 'funding_threshold': 1.5, 'use_regime_filter': True},
+    {'min_factors': 2, 'funding_threshold': 2.0, 'use_regime_filter': True},
+    # 3 factors (stricter)
+    {'min_factors': 3, 'funding_threshold': 1.0, 'use_regime_filter': True},
+    {'min_factors': 3, 'funding_threshold': 1.5, 'use_regime_filter': True},
+]
 
 
 # =============================================================================
@@ -106,7 +142,7 @@ class CoinWalkForwardResult:
     total_test_trades: int = 0
     avg_trades_per_window: float = 0.0
     best_overall_params: Dict = field(default_factory=dict)
-    param_stability: float = 0.0  # How often same params chosen
+    param_stability: float = 0.0
     
     def compute_stats(self):
         """Compute aggregate statistics."""
@@ -118,128 +154,161 @@ class CoinWalkForwardResult:
         test_returns = [w.test_return for w in self.windows]
         test_trades = [w.test_trades for w in self.windows]
         
-        self.avg_train_sharpe = np.mean(train_sharpes)
-        self.avg_test_sharpe = np.mean(test_sharpes)
+        self.avg_train_sharpe = np.mean(train_sharpes) if train_sharpes else 0
+        self.avg_test_sharpe = np.mean(test_sharpes) if test_sharpes else 0
         self.sharpe_decay = self.avg_train_sharpe - self.avg_test_sharpe
-        self.cumulative_test_return = np.prod([1 + r for r in test_returns]) - 1
-        self.pct_profitable_windows = sum(1 for r in test_returns if r > 0) / len(test_returns) * 100
+        
+        # Cumulative return (compounded)
+        self.cumulative_test_return = np.prod([1 + r for r in test_returns]) - 1 if test_returns else 0
+        
+        self.pct_profitable_windows = sum(1 for r in test_returns if r > 0) / len(test_returns) * 100 if test_returns else 0
         self.total_test_trades = sum(test_trades)
-        self.avg_trades_per_window = np.mean(test_trades)
+        self.avg_trades_per_window = np.mean(test_trades) if test_trades else 0
         
-        # Parameter stability - how often was the same param set chosen?
-        param_strings = [str(sorted(w.best_params.items())) for w in self.windows]
-        unique_params = set(param_strings)
-        most_common_count = max(param_strings.count(p) for p in unique_params)
-        self.param_stability = most_common_count / len(self.windows)
-        
-        # Most common params
-        param_counts = {}
-        for w in self.windows:
-            key = str(sorted(w.best_params.items()))
-            param_counts[key] = param_counts.get(key, 0) + 1
-        
-        most_common_key = max(param_counts, key=param_counts.get)
-        # Find the actual params dict
-        for w in self.windows:
-            if str(sorted(w.best_params.items())) == most_common_key:
-                self.best_overall_params = w.best_params.copy()
-                break
+        # Parameter stability
+        param_strs = [str(sorted(w.best_params.items())) for w in self.windows]
+        if param_strs:
+            most_common = max(set(param_strs), key=param_strs.count)
+            self.param_stability = param_strs.count(most_common) / len(param_strs) * 100
+            # Find the actual params
+            for w in self.windows:
+                if str(sorted(w.best_params.items())) == most_common:
+                    self.best_overall_params = w.best_params
+                    break
 
 
 # =============================================================================
-# Automatic Window Calculation
+# Data Loading
+# =============================================================================
+
+def load_features_from_csv(features_dir: Path, symbol: str) -> Optional[pd.DataFrame]:
+    """Load precomputed features for a symbol."""
+    possible_names = [
+        f"{symbol}_features.csv",
+        f"{symbol.replace('-', '_')}_features.csv",
+        f"{symbol.lower()}_features.csv",
+        f"{symbol.lower().replace('-', '_')}_features.csv",
+    ]
+    
+    for name in possible_names:
+        path = features_dir / name
+        if path.exists():
+            try:
+                df_header = pd.read_csv(path, nrows=0)
+                columns = df_header.columns.tolist()
+                
+                datetime_col = None
+                for col in ['timestamp', 'event_time', 'datetime', 'Timestamp', 'Event_time']:
+                    if col in columns:
+                        datetime_col = col
+                        break
+                
+                if datetime_col is None:
+                    for col in columns:
+                        if col.startswith('Unnamed'):
+                            datetime_col = col
+                            break
+                
+                if datetime_col:
+                    df = pd.read_csv(path, parse_dates=[datetime_col])
+                    df.set_index(datetime_col, inplace=True)
+                    return df
+                
+                df = pd.read_csv(path, index_col=0)
+                df.index = pd.to_datetime(df.index)
+                return df
+                    
+            except Exception as e:
+                logger.error(f"Error loading {path}: {e}")
+                continue
+    return None
+
+
+def load_ohlcv_from_db(db_path: str, symbol: str, timeframe: str = '1h') -> Optional[pd.DataFrame]:
+    """Load OHLCV data from database."""
+    try:
+        conn = sqlite3.connect(db_path)
+        query = """
+            SELECT event_time, open, high, low, close, volume
+            FROM ohlcv
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY event_time ASC
+        """
+        df = pd.read_sql_query(query, conn, params=(symbol, timeframe), parse_dates=['event_time'])
+        conn.close()
+        
+        if df.empty:
+            return None
+        
+        df.set_index('event_time', inplace=True)
+        return df
+    except Exception as e:
+        logger.error(f"Error loading OHLCV for {symbol}: {e}")
+        return None
+
+
+def check_features(features: pd.DataFrame) -> Dict[str, bool]:
+    """Check which feature types are available."""
+    cols = features.columns.tolist()
+    return {
+        'funding': any('funding' in c.lower() for c in cols),
+        'oi': any('oi' in c.lower() or 'open_interest' in c.lower() for c in cols),
+        'price': any('bb_' in c.lower() or 'rsi' in c.lower() for c in cols),
+    }
+
+
+# =============================================================================
+# Window Configuration
 # =============================================================================
 
 def calculate_window_config(
     total_days: int,
     min_windows: int = 3,
     max_windows: int = 10,
-    min_train_days: int = 60,
-    min_test_days: int = 30,
 ) -> Optional[WindowConfig]:
     """
-    Automatically calculate optimal window configuration based on data length.
+    Calculate optimal window configuration based on data length.
     
-    Strategy:
-    - Target 4-8 windows for good statistical power
-    - Train period should be 2-3x test period
-    - Larger datasets get larger windows (more robust)
-    - Smaller datasets get smaller windows (more windows)
-    
-    Returns None if not enough data.
+    Rules:
+    - Training period should be 3-4x test period
+    - Minimum 180 days training (6 months)
+    - Minimum 60 days testing (2 months)
+    - Test periods don't overlap (step = test_days)
     """
+    MIN_TRAIN_DAYS = 180  # 6 months minimum training
+    MIN_TEST_DAYS = 60    # 2 months minimum testing
+    TRAIN_TEST_RATIO = 3  # Train should be 3x test
     
-    # Minimum data required
-    min_required = min_train_days + min_test_days + min_test_days  # At least 2 windows
-    if total_days < min_required:
+    MIN_TOTAL = MIN_TRAIN_DAYS + MIN_TEST_DAYS * 2  # At least 2 windows
+    
+    if total_days < MIN_TOTAL:
         return None
     
-    # Calculate based on data length tiers
+    # Start with reasonable defaults based on data length
     if total_days >= 1800:  # 5+ years
-        train_days = 365
-        test_days = 90
-        step_days = 90
-    elif total_days >= 1095:  # 3-5 years
-        train_days = 270
-        test_days = 90
-        step_days = 90
-    elif total_days >= 730:  # 2-3 years
-        train_days = 180
-        test_days = 60
-        step_days = 60
-    elif total_days >= 365:  # 1-2 years
-        train_days = 120
-        test_days = 45
-        step_days = 45
-    elif total_days >= 240:  # 8-12 months
-        train_days = 90
-        test_days = 30
-        step_days = 30
-    else:  # 4-8 months
-        train_days = 60
-        test_days = 30
-        step_days = 30
+        train_days = 365  # 1 year training
+        test_days = 90    # 3 months testing
+    elif total_days >= 1000:  # ~3 years
+        train_days = 270  # 9 months training
+        test_days = 90    # 3 months testing
+    elif total_days >= 500:  # ~1.5 years
+        train_days = 180  # 6 months training
+        test_days = 60    # 2 months testing
+    else:  # Less data
+        train_days = MIN_TRAIN_DAYS
+        test_days = MIN_TEST_DAYS
     
-    # Calculate number of windows
-    # Formula: num_windows = (total_days - train_days - test_days) / step_days + 1
-    usable_days = total_days - train_days
-    num_windows = max(1, int((usable_days - test_days) / step_days) + 1)
+    # Calculate how many windows fit with non-overlapping test periods
+    # Layout: [train][test1][test2][test3]...
+    # Total = train_days + test_days * num_windows
+    available_for_test = total_days - train_days
+    num_windows = available_for_test // test_days
     
-    # Adjust if too few or too many windows
-    iterations = 0
-    while num_windows < min_windows and iterations < 10:
-        # Reduce window sizes to get more windows
-        if train_days > min_train_days:
-            train_days = max(min_train_days, train_days - 30)
-        if test_days > min_test_days:
-            test_days = max(min_test_days, test_days - 15)
-        step_days = test_days  # Keep non-overlapping
-        
-        usable_days = total_days - train_days
-        num_windows = max(1, int((usable_days - test_days) / step_days) + 1)
-        iterations += 1
+    # Clamp to min/max
+    num_windows = min(max_windows, max(min_windows, num_windows))
     
-    while num_windows > max_windows and iterations < 20:
-        # Increase window sizes to reduce windows
-        train_days += 30
-        test_days += 15
-        step_days = test_days
-        
-        usable_days = total_days - train_days
-        num_windows = max(1, int((usable_days - test_days) / step_days) + 1)
-        iterations += 1
-    
-    # Final check
-    if num_windows < 2:
-        # Try minimum config
-        train_days = min_train_days
-        test_days = min_test_days
-        step_days = min_test_days
-        usable_days = total_days - train_days
-        num_windows = max(1, int((usable_days - test_days) / step_days) + 1)
-    
-    if num_windows < 2:
-        return None
+    # Step = test_days for non-overlapping test periods
+    step_days = test_days
     
     return WindowConfig(
         train_days=train_days,
@@ -251,74 +320,43 @@ def calculate_window_config(
 
 
 def generate_windows(
-    start_date: datetime,
-    end_date: datetime,
+    data_start: datetime,
+    data_end: datetime,
     config: WindowConfig,
 ) -> List[WalkForwardWindow]:
-    """Generate walk-forward windows from config."""
+    """Generate walk-forward windows based on config."""
     windows = []
+    
+    train_delta = timedelta(days=config.train_days)
+    test_delta = timedelta(days=config.test_days)
+    step_delta = timedelta(days=config.step_days)
+    
+    current_train_start = data_start
     window_id = 0
-    current_start = start_date
     
     while True:
-        train_end = current_start + timedelta(days=config.train_days)
+        train_end = current_train_start + train_delta
         test_start = train_end
-        test_end = test_start + timedelta(days=config.test_days)
+        test_end = test_start + test_delta
         
-        if test_end > end_date:
+        if test_end > data_end:
             break
         
         windows.append(WalkForwardWindow(
-            train_start=current_start,
+            train_start=current_train_start,
             train_end=train_end,
             test_start=test_start,
             test_end=test_end,
             window_id=window_id,
         ))
         
+        current_train_start += step_delta
         window_id += 1
-        current_start += timedelta(days=config.step_days)
+        
+        if window_id >= config.num_windows:
+            break
     
     return windows
-
-
-# =============================================================================
-# Data Loading
-# =============================================================================
-
-def load_features_from_csv(features_dir: Path, symbol: str) -> Optional[pd.DataFrame]:
-    """Load features for a single symbol."""
-    patterns = [
-        f"{symbol.replace('-', '_')}_features.csv",
-        f"{symbol}_features.csv",
-    ]
-    
-    for pattern in patterns:
-        filepath = features_dir / pattern
-        if filepath.exists():
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-            return df
-    return None
-
-
-def load_ohlcv_from_db(db_path: str, symbol: str, timeframe: str = "1h") -> Optional[pd.DataFrame]:
-    """Load OHLCV for a single symbol."""
-    import sqlite3
-    
-    conn = sqlite3.connect(db_path)
-    query = """
-        SELECT event_time, open, high, low, close, volume
-        FROM ohlcv
-        WHERE symbol = ? AND timeframe = ?
-        ORDER BY event_time ASC
-    """
-    df = pd.read_sql_query(query, conn, params=(symbol, timeframe), parse_dates=['event_time'])
-    conn.close()
-    
-    if df.empty:
-        return None
-    df.set_index('event_time', inplace=True)
-    return df
 
 
 def filter_data_by_time(
@@ -328,54 +366,16 @@ def filter_data_by_time(
     end: datetime,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Filter data to time range."""
-    ohlcv_mask = (ohlcv.index >= start) & (ohlcv.index < end)
-    feat_mask = (features.index >= start) & (features.index < end)
-    return ohlcv[ohlcv_mask].copy(), features[feat_mask].copy()
-
-
-def check_features(features: pd.DataFrame) -> Dict[str, bool]:
-    """Check available feature types."""
-    cols = features.columns.tolist()
-    return {
-        'funding': any('funding' in c.lower() for c in cols),
-        'oi': any('oi' in c.lower() or 'open_interest' in c.lower() for c in cols),
-        'price': any('bb_' in c.lower() or 'rsi' in c.lower() for c in cols),
-    }
+    mask = (ohlcv.index >= start) & (ohlcv.index < end)
+    return ohlcv[mask], features[mask]
 
 
 # =============================================================================
-# Strategy Configuration
+# Strategy Creation - UPDATED with new parameters
 # =============================================================================
-
-FUNDING_ARB_PARAMS = [
-    {'entry_threshold': 1.2, 'exit_threshold': 0.5, 'use_price_confirmation': False},
-    {'entry_threshold': 1.5, 'exit_threshold': 0.5, 'use_price_confirmation': False},
-    {'entry_threshold': 1.5, 'exit_threshold': 0.5, 'use_price_confirmation': True},
-    {'entry_threshold': 1.8, 'exit_threshold': 0.5, 'use_price_confirmation': True},
-    {'entry_threshold': 2.0, 'exit_threshold': 0.5, 'use_price_confirmation': True},
-    {'entry_threshold': 2.0, 'exit_threshold': 0.3, 'use_price_confirmation': True},
-    {'entry_threshold': 2.5, 'exit_threshold': 0.5, 'use_price_confirmation': True},
-]
-
-OI_DIVERGENCE_PARAMS = [
-    {'divergence_threshold': 0.3, 'use_oi_zscore_filter': False},
-    {'divergence_threshold': 0.3, 'use_oi_zscore_filter': True},
-    {'divergence_threshold': 0.5, 'use_oi_zscore_filter': False},
-    {'divergence_threshold': 0.5, 'use_oi_zscore_filter': True},
-    {'divergence_threshold': 0.7, 'use_oi_zscore_filter': True},
-]
-
-COMBINED_PARAMS = [
-    {'funding_threshold': 1.0, 'min_factors': 2},
-    {'funding_threshold': 1.5, 'min_factors': 2},
-    {'funding_threshold': 1.5, 'min_factors': 3},
-    {'funding_threshold': 2.0, 'min_factors': 2},
-    {'funding_threshold': 2.0, 'min_factors': 3},
-]
-
 
 def create_strategy(strategy_type: str, symbol: str, params: Dict):
-    """Create strategy instance."""
+    """Create strategy instance with given parameters."""
     if strategy_type == 'funding_arb':
         return FundingArbitrageStrategy(
             symbols=[symbol],
@@ -385,7 +385,9 @@ def create_strategy(strategy_type: str, symbol: str, params: Dict):
             bb_confirmation_threshold=1.5,
             min_hold_hours=24,
             max_hold_hours=168,
-            position_size=0.3,
+            position_size=0.15,  # Reduced from 0.3
+            use_regime_filter=params.get('use_regime_filter', True),  # NEW
+            use_trend_filter=params.get('use_trend_filter', False),   # NEW
         )
     elif strategy_type == 'oi_divergence':
         return OIDivergenceStrategy(
@@ -393,9 +395,10 @@ def create_strategy(strategy_type: str, symbol: str, params: Dict):
             divergence_threshold=params.get('divergence_threshold', 0.5),
             use_oi_zscore_filter=params.get('use_oi_zscore_filter', True),
             oi_zscore_threshold=1.5,
-            position_size=0.3,
+            position_size=0.15,
             min_hold_hours=12,
             max_hold_hours=72,
+            use_regime_filter=params.get('use_regime_filter', True),  # NEW
         )
     elif strategy_type == 'combined':
         return CombinedOIFundingStrategy(
@@ -404,9 +407,10 @@ def create_strategy(strategy_type: str, symbol: str, params: Dict):
             funding_threshold=params.get('funding_threshold', 1.5),
             bb_threshold=1.5,
             min_factors=params.get('min_factors', 2),
-            position_size=0.3,
+            position_size=0.15,
             min_hold_hours=24,
             max_hold_hours=120,
+            use_regime_filter=params.get('use_regime_filter', True),  # NEW
         )
     else:
         raise ValueError(f"Unknown strategy type: {strategy_type}")
@@ -424,7 +428,7 @@ def get_param_grid(strategy_type: str) -> List[Dict]:
 
 
 # =============================================================================
-# Backtesting
+# Backtesting - UPDATED with fixed engine settings
 # =============================================================================
 
 def run_backtest(
@@ -434,12 +438,14 @@ def run_backtest(
     features: pd.DataFrame,
     cost_model: CostModel,
 ) -> PerformanceMetrics:
-    """Run single backtest."""
+    """Run single backtest with fixed engine."""
     backtester = Backtester(
         initial_capital=100000,
         cost_model=cost_model,
-        max_position_pct=0.5,
+        max_position_pct=0.3,
         max_leverage=3.0,
+        default_stop_loss_pct=0.15,  # 15% stop loss
+        apply_funding=True,           # Apply funding rates
     )
     
     _, metrics = backtester.run(
@@ -461,7 +467,6 @@ def run_walk_forward_for_strategy(
     cost_model: CostModel,
 ) -> CoinWalkForwardResult:
     """Run walk-forward for one strategy type on one coin."""
-    
     param_grid = get_param_grid(strategy_type)
     window_results = []
     
@@ -474,8 +479,8 @@ def run_walk_forward_for_strategy(
             ohlcv, features, window.test_start, window.test_end
         )
         
-        # Check data sufficiency (at least 100 bars train, 50 test)
-        if len(train_ohlcv) < 100 or len(test_ohlcv) < 50:
+        # Check data sufficiency
+        if len(train_ohlcv) < 500 or len(test_ohlcv) < 100:
             continue
         
         # Find best params on training data
@@ -489,12 +494,14 @@ def run_walk_forward_for_strategy(
                 strategy = create_strategy(strategy_type, symbol, params)
                 metrics = run_backtest(symbol, strategy, train_ohlcv, train_features, cost_model)
                 
-                if metrics.sharpe_ratio > best_train_sharpe:
+                # Prefer higher Sharpe, but require minimum trades
+                if metrics.num_trades >= 3 and metrics.sharpe_ratio > best_train_sharpe:
                     best_train_sharpe = metrics.sharpe_ratio
                     best_train_return = metrics.total_return
                     best_train_trades = metrics.num_trades
                     best_params = params
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error with params {params}: {e}")
                 continue
         
         if best_params is None:
@@ -515,7 +522,8 @@ def run_walk_forward_for_strategy(
                 test_return=test_metrics.total_return,
                 test_trades=test_metrics.num_trades,
             ))
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error testing window {window.window_id}: {e}")
             continue
     
     # Create result object
@@ -541,46 +549,48 @@ def print_coin_results(results: List[CoinWalkForwardResult]):
     if not results:
         return
     
-    print(f"  {'Strategy':<15} {'Windows':>8} {'Train SR':>10} {'Test SR':>10} {'Decay':>8} {'OOS Ret':>10} {'Win%':>7} {'Trades':>7} {'Stability':>10}")
-    print(f"  {'-'*100}")
+    print(f"\n  {'Strategy':<15} {'Train SR':>10} {'Test SR':>10} {'Decay':>8} "
+          f"{'Cum Ret':>10} {'Win%':>8} {'Trades':>8} {'Param Stab':>10}")
+    print(f"  {'-'*95}")
     
     for r in results:
         if not r.windows:
+            print(f"  {r.strategy_type:<15} {'No valid windows':>30}")
             continue
-        print(f"  {r.strategy_type:<15} {len(r.windows):>8} {r.avg_train_sharpe:>10.2f} "
-              f"{r.avg_test_sharpe:>10.2f} {r.sharpe_decay:>8.2f} "
-              f"{r.cumulative_test_return*100:>9.2f}% {r.pct_profitable_windows:>6.1f}% "
-              f"{r.total_test_trades:>7} {r.param_stability*100:>9.1f}%")
+        
+        # Highlight good results
+        status = ""
+        if r.avg_test_sharpe > 0.5 and r.pct_profitable_windows >= 50:
+            status = "✅"
+        elif r.avg_test_sharpe > 0 and r.pct_profitable_windows >= 40:
+            status = "⚠️"
+        else:
+            status = "❌"
+        
+        print(f"  {r.strategy_type:<15} {r.avg_train_sharpe:>10.2f} {r.avg_test_sharpe:>10.2f} "
+              f"{r.sharpe_decay:>8.2f} {r.cumulative_test_return*100:>9.1f}% "
+              f"{r.pct_profitable_windows:>7.1f}% {r.total_test_trades:>8} "
+              f"{r.param_stability:>9.0f}% {status}")
     
     # Best strategy
-    valid = [r for r in results if r.windows and r.avg_test_sharpe > -np.inf]
-    if valid:
-        best = max(valid, key=lambda x: x.avg_test_sharpe)
+    valid_results = [r for r in results if r.windows]
+    if valid_results:
+        best = max(valid_results, key=lambda x: x.avg_test_sharpe)
+        print(f"\n  🏆 Best OOS: {best.strategy_type}")
+        print(f"     Avg Test Sharpe: {best.avg_test_sharpe:.2f}")
+        print(f"     Cumulative Test Return: {best.cumulative_test_return*100:.1f}%")
+        print(f"     Best Params: {best.best_overall_params}")
+        print(f"     Param Stability: {best.param_stability:.0f}%")
         
-        # Quality assessment
-        if best.avg_test_sharpe > 0.5 and best.sharpe_decay < 0.5 and best.param_stability > 0.5:
-            quality = "✅ STRONG"
-        elif best.avg_test_sharpe > 0.3 and best.sharpe_decay < 0.7:
-            quality = "✅ GOOD"
-        elif best.avg_test_sharpe > 0 and best.sharpe_decay < 1.0:
-            quality = "⚠️  MODERATE"
-        else:
-            quality = "❌ WEAK"
-        
-        print(f"  Best: {best.strategy_type} {quality}")
-        print(f"  └─ Test Sharpe: {best.avg_test_sharpe:.2f}, Decay: {best.sharpe_decay:.2f}, Param Stability: {best.param_stability*100:.0f}%")
-        print(f"  └─ Optimal params: {best.best_overall_params}")
-        
-        # Per-window breakdown
-        print(f"  Window details:")
-        for w in best.windows:
-            status = "✅" if w.test_return > 0 else "❌"
-            print(f"    W{w.window.window_id}: {w.window.train_start.date()} → {w.window.test_end.date()} | "
-                  f"Test: {w.test_return*100:+.2f}%, SR={w.test_sharpe:.2f}, {w.test_trades} trades {status}")
+        # Overfitting check
+        if best.sharpe_decay > 0.5:
+            print(f"     ⚠️  HIGH DECAY: Train-Test Sharpe gap = {best.sharpe_decay:.2f}")
+        if best.pct_profitable_windows < 50:
+            print(f"     ⚠️  LOW WIN RATE: Only {best.pct_profitable_windows:.0f}% of windows profitable")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-coin walk-forward with automatic window sizing")
+    parser = argparse.ArgumentParser(description="Walk-forward validation (UPDATED)")
     parser.add_argument("--db-path", type=str, default=DB_PATH)
     parser.add_argument("--features-dir", type=str, default=str(FEATURES_DIR))
     parser.add_argument("--symbols", type=str, nargs="+", help="Specific symbols")
@@ -591,11 +601,17 @@ def main():
     features_dir = Path(args.features_dir)
     
     print("=" * 105)
-    print("🔄 PER-COIN WALK-FORWARD VALIDATION (Auto Window Sizing)")
+    print("🔄 WALK-FORWARD VALIDATION (UPDATED with Regime/Trend Filters)")
     print("=" * 105)
-    print(f"Target: {args.min_windows}-{args.max_windows} windows per coin (auto-calculated based on data length)")
+    print(f"\nSettings:")
+    print(f"  - Target {args.min_windows}-{args.max_windows} windows per coin (auto-sized)")
+    print(f"  - Stop-loss: 15%")
+    print(f"  - Leverage limit: 3x")
+    print(f"  - Funding rates applied")
+    print(f"  - Testing regime_filter and trend_filter parameters")
+    print()
     
-    # Cost model
+    # Cost model (Coinbase fees)
     cost_model = CostModel(
         maker_fee_bps=10,
         taker_fee_bps=10,
@@ -615,12 +631,10 @@ def main():
         print("❌ No symbols found!")
         return
     
-    print(f"Symbols: {symbols}")
+    print(f"Symbols: {symbols}\n")
     
-    # Store all results
     all_results: Dict[str, List[CoinWalkForwardResult]] = {}
     
-    # Process each coin
     for symbol in symbols:
         print("=" * 105)
         print(f"📊 {symbol}")
@@ -652,7 +666,7 @@ def main():
         
         print(f"  Data: {data_start.date()} to {data_end.date()} ({total_days} days, {len(ohlcv)} bars)")
         
-        # Calculate optimal window config
+        # Calculate window config
         window_config = calculate_window_config(
             total_days=total_days,
             min_windows=args.min_windows,
@@ -669,14 +683,11 @@ def main():
         windows = generate_windows(data_start, data_end, window_config)
         print(f"  Generated {len(windows)} windows")
         
-        if len(windows) < 2:
-            print(f"  ⚠️  Only {len(windows)} window(s) - results may not be reliable")
-        
-        # Check available features
+        # Check features
         available = check_features(features)
         print(f"  Features: Funding={available['funding']}, OI={available['oi']}, Price={available['price']}")
         
-        # Determine which strategies to run
+        # Determine strategies
         strategy_types = []
         if available['funding']:
             strategy_types.append('funding_arb')
@@ -689,7 +700,7 @@ def main():
             print(f"  ❌ No applicable strategies")
             continue
         
-        # Run walk-forward for each strategy type
+        # Run walk-forward
         coin_results = []
         for strategy_type in strategy_types:
             print(f"  Running {strategy_type}...", end=" ", flush=True)
@@ -705,97 +716,57 @@ def main():
     # ==========================================================================
     # Final Summary
     # ==========================================================================
-    print("=" * 105)
+    print("\n" + "=" * 105)
     print("📈 FINAL SUMMARY")
     print("=" * 105)
     
-    print(f"{'Symbol':<20} {'Data Days':>10} {'Windows':>8} {'Strategy':<15} {'Test SR':>10} {'Decay':>8} {'Win%':>7} {'Status':<12}")
-    print("-" * 105)
-    
-    deployment_configs = {}
+    print(f"\n{'Symbol':<20} {'Strategy':<15} {'Test SR':>10} {'Decay':>8} {'Win%':>8} {'Cum Ret':>10} {'Status':<10}")
+    print("-" * 90)
     
     for symbol, results in all_results.items():
         valid = [r for r in results if r.windows and len(r.windows) >= 2]
         if not valid:
-            wc = results[0].window_config if results else None
-            days = wc.total_days if wc else "?"
-            print(f"{symbol:<20} {days:>10} {'N/A':>8} {'N/A':<15} {'N/A':>10} {'N/A':>8} {'N/A':>7} {'❌ No data':<12}")
+            print(f"{symbol:<20} {'No valid results':<15}")
             continue
         
         best = max(valid, key=lambda x: x.avg_test_sharpe)
         
-        # Status determination
-        if (best.avg_test_sharpe > 0.5 and 
-            best.sharpe_decay < 0.5 and 
-            best.total_test_trades >= 10 and
-            best.param_stability >= 0.4):
+        # Status
+        if best.avg_test_sharpe > 0.5 and best.pct_profitable_windows >= 50 and best.sharpe_decay < 0.5:
             status = "✅ DEPLOY"
-        elif (best.avg_test_sharpe > 0.2 and 
-              best.sharpe_decay < 0.8 and
-              best.total_test_trades >= 5):
-            status = "⚠️  PAPER"
-        elif best.avg_test_sharpe > 0:
-            status = "⚠️  WEAK"
+        elif best.avg_test_sharpe > 0 and best.pct_profitable_windows >= 40:
+            status = "⚠️ MAYBE"
         else:
             status = "❌ SKIP"
         
-        print(f"{symbol:<20} {best.window_config.total_days:>10} {len(best.windows):>8} "
-              f"{best.strategy_type:<15} {best.avg_test_sharpe:>10.2f} "
-              f"{best.sharpe_decay:>8.2f} {best.pct_profitable_windows:>6.1f}% {status:<12}")
-        
-        if best.avg_test_sharpe > 0:
-            deployment_configs[symbol] = {
-                'strategy': best.strategy_type,
-                'params': best.best_overall_params,
-                'expected_sharpe': round(best.avg_test_sharpe, 2),
-                'sharpe_decay': round(best.sharpe_decay, 2),
-                'windows_tested': len(best.windows),
-                'param_stability': round(best.param_stability, 2),
-                'data_days': best.window_config.total_days,
-            }
+        print(f"{symbol:<20} {best.strategy_type:<15} {best.avg_test_sharpe:>10.2f} "
+              f"{best.sharpe_decay:>8.2f} {best.pct_profitable_windows:>7.0f}% "
+              f"{best.cumulative_test_return*100:>9.1f}% {status:<10}")
     
-    # Output config
-    print("=" * 105)
-    print("📋 DEPLOYMENT CONFIG")
+    # Deployment recommendations
+    print("\n" + "=" * 105)
+    print("🚀 DEPLOYMENT RECOMMENDATIONS")
     print("=" * 105)
     
-    print("# Copy this for paper trading:")
-    print("COIN_CONFIGS = {")
-    for symbol, config in sorted(deployment_configs.items(), key=lambda x: -x[1]['expected_sharpe']):
-        print(f"    '{symbol}': {{")
-        for k, v in config.items():
-            if isinstance(v, str):
-                print(f"        '{k}': '{v}',")
-            elif isinstance(v, dict):
-                print(f"        '{k}': {v},")
-            else:
-                print(f"        '{k}': {v},")
-        print(f"    }},")
-    print("}")
+    deployable = []
+    for symbol, results in all_results.items():
+        valid = [r for r in results if r.windows and len(r.windows) >= 2]
+        if valid:
+            best = max(valid, key=lambda x: x.avg_test_sharpe)
+            if best.avg_test_sharpe > 0.3 and best.pct_profitable_windows >= 50:
+                deployable.append((symbol, best))
     
-    # Interpretation
-    print("=" * 105)
-    print("📊 INTERPRETATION GUIDE")
-    print("=" * 105)
-    print("""
-    Test SR (Sharpe):  Out-of-sample risk-adjusted return
-                       > 0.5 = Strong, 0.2-0.5 = Moderate, < 0.2 = Weak
-    
-    Decay:             Train Sharpe - Test Sharpe (overfitting measure)
-                       < 0.3 = Excellent, 0.3-0.5 = Good, 0.5-1.0 = Moderate, > 1.0 = Severe
-    
-    Win%:              Percentage of test windows with positive return
-                       > 60% = Consistent, 40-60% = Mixed, < 40% = Inconsistent
-    
-    Param Stability:   How often the same params were chosen across windows
-                       > 60% = Stable, 40-60% = Moderate, < 40% = Unstable (possible overfit)
-    
-    Status:
-    ✅ DEPLOY  = Strong edge, ready for paper trading
-    ⚠️  PAPER  = Some edge, needs more validation
-    ⚠️  WEAK   = Marginal edge, high risk
-    ❌ SKIP    = No reliable edge detected
-    """)
+    if deployable:
+        print("\nStrategies ready for paper trading:")
+        for symbol, result in deployable:
+            print(f"\n  {symbol}:")
+            print(f"    Strategy: {result.strategy_type}")
+            print(f"    Params: {result.best_overall_params}")
+            print(f"    Expected Sharpe: {result.avg_test_sharpe:.2f}")
+            print(f"    OOS Win Rate: {result.pct_profitable_windows:.0f}%")
+    else:
+        print("\n⚠️  No strategies meet deployment criteria.")
+        print("    Consider: loosening entry thresholds, more data, or different instruments.")
 
 
 if __name__ == "__main__":
