@@ -26,3 +26,4 @@ mypy>=1.0.0
 
 # Training 
 scikit-learn
+lightgbm

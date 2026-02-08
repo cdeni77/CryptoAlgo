@@ -9,11 +9,9 @@ from .engineering import (
     VolumeVolatilityFeatures,
     FundingFeatures,
     OpenInterestFeatures,
-    CrossAssetFeatures,
     RegimeFeatures,
     normalize_point_in_time,
     winsorize_point_in_time,
-    get_feature_importance_names,
 )
 
 __all__ = [
@@ -23,9 +21,7 @@ __all__ = [
     'VolumeVolatilityFeatures',
     'FundingFeatures',
     'OpenInterestFeatures',
-    'CrossAssetFeatures',
     'RegimeFeatures',
     'normalize_point_in_time',
     'winsorize_point_in_time',
-    'get_feature_importance_names',
 ]
