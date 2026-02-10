@@ -183,22 +183,19 @@ class Config:
     retrain_frequency_days: int = 7
     min_train_samples: int = 400
 
-    # Signal Filters — v7.2: TRADE MUCH LESS
-    # With 0.20% round-trip fees, we need avg raw PnL > 0.30% per trade.
-    # That means ONLY taking high-conviction setups with large expected moves.
-    signal_threshold: float = 0.70
+    # Signal Filters — Optuna-optimized (75 trials, accurate backtest, 10/10 top profitable)
+    # Converged: thr=0.74, mom=0.04 across all top 5 configs
+    signal_threshold: float = 0.74
     min_funding_z: float = 0.0
-    min_momentum_magnitude: float = 0.06
+    min_momentum_magnitude: float = 0.04
 
-    # Exit Strategy — WIDER TARGETS to increase avg win size
-    # At 0.20% fees, we need winners to be large enough to compensate.
-    # 4:2 (TP:SL) gives us bigger winners even at lower win rate.
-    vol_mult_tp: float = 4.0         # TP at 4x vol — let winners run
-    vol_mult_sl: float = 2.0         # SL at 2x vol (2:1 R:R maintained)
-    breakeven_trigger: float = 999.0  # Disabled
+    # Exit Strategy — Optuna-optimized (wider SL = fewer stop-outs = 48% WR)
+    vol_mult_tp: float = 4.5         # 4.5x vol TP
+    vol_mult_sl: float = 2.75        # 2.75x vol SL (wider = room to breathe)
+    breakeven_trigger: float = 999.0
     trailing_active: bool = False
     trailing_mult: float = 999.0
-    max_hold_hours: int = 96          # 4 days — more time for big moves
+    max_hold_hours: int = 96
 
     # Symbol selection — exclude underperformers
     # BTC: too efficient, momentum edge doesn't persist (36% WR, -0.04% net)
@@ -839,7 +836,8 @@ def run_backtest(all_data: Dict, config: Config):
         print(f"   Models accepted: {models_accepted}, rejected: {models_rejected}")
         print(f"   Regime filtered: {regime_filtered}")
         print(f"   No contracts (too small): {no_contracts}")
-        return
+        return {'n_trades': 0, 'sharpe_annual': -99, 'total_return': -1, 'max_drawdown': 1.0,
+                'profit_factor': 0, 'ann_return': -1, 'final_equity': equity}
 
     df = pd.DataFrame([t.__dict__ for t in completed_trades])
     win_rate = (df['net_pnl'] > 0).mean()
@@ -919,10 +917,23 @@ def run_backtest(all_data: Dict, config: Config):
         print(f"  {sym:12s}: {len(sym_df):3d} trades | WR: {sym_wr:.0%} | "
               f"PnL: ${sym_pnl:+,.0f} | Avg: {sym_avg:.4%} | Fee: {sym_fee:.4%}")
     print(f"{'=' * 70}")
-
-
-# =============================================================================
-# LIVE SIGNALS
+    
+    # Return metrics for optimization
+    return {
+        'total_return': total_ret,
+        'ann_return': ann_return,
+        'sharpe_annual': ann_sharpe,
+        'sharpe_per_trade': sharpe_per_trade,
+        'max_drawdown': max_drawdown,
+        'profit_factor': profit_factor,
+        'win_rate': win_rate,
+        'n_trades': len(df),
+        'trades_per_year': trades_per_year,
+        'avg_net_pnl': avg_pnl,
+        'avg_raw_pnl': avg_raw,
+        'avg_fee_pnl': avg_fee,
+        'final_equity': equity,
+    }
 # =============================================================================
 def run_signals(all_data: Dict, config: Config, debug: bool = False):
     system = MLSystem(config)
@@ -1015,7 +1026,7 @@ if __name__ == "__main__":
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--signals", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--threshold", type=float, default=0.70)
+    parser.add_argument("--threshold", type=float, default=0.74)
     parser.add_argument("--min-auc", type=float, default=0.54)
     parser.add_argument("--leverage", type=int, default=4)
     parser.add_argument("--exclude", type=str, default="BIP,DOP",

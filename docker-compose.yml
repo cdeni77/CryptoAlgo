@@ -1,0 +1,53 @@
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: ./backend/api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
+    depends_on:
+      - db
+    volumes:
+      - ./backend/api:/app  
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload  
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"           
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_BASE_URL=http://backend:8000  
+
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: yourpassword
+      POSTGRES_DB: trades_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  trader:
+    build:
+      context: ./backend/trader  
+      dockerfile: Dockerfile
+    environment:
+      - TZ=America/New_York  
+    depends_on:
+      - db
+    volumes:
+      - ./backend/trader:/app  
+
+volumes:
+  postgres_data:
