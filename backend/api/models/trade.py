@@ -1,11 +1,3 @@
-"""
-Unified SQLAlchemy models for the trading system.
-
-IMPORTANT: All models share the same Base so that
-    Base.metadata.create_all(engine)
-creates every table in one shot (trades, wallet, signals).
-"""
-
 import enum
 from datetime import datetime
 from typing import Optional
@@ -126,25 +118,3 @@ class TradeResponse(TradeBase):
         from_attributes = True
 
 
-# ── Signal ──
-class SignalResponse(BaseModel):
-    id: int
-    coin: str
-    timestamp: datetime
-    direction: str
-    confidence: float
-    raw_probability: Optional[float] = None
-    model_auc: Optional[float] = None
-    price_at_signal: Optional[float] = None
-    momentum_pass: Optional[bool] = None
-    trend_pass: Optional[bool] = None
-    regime_pass: Optional[bool] = None
-    ml_pass: Optional[bool] = None
-    contracts_suggested: Optional[int] = None
-    notional_usd: Optional[float] = None
-    acted_on: bool = False
-    trade_id: Optional[int] = None
-    created_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
