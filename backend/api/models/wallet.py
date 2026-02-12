@@ -3,7 +3,9 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
 Base = declarative_base()
-
+# ====================================================================
+# WALLET
+# ====================================================================
 class Wallet(Base):
     __tablename__ = "wallet"
 

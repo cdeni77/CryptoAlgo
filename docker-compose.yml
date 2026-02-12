@@ -1,31 +1,9 @@
 version: '3.9'
 
 services:
-  backend:
-    build:
-      context: ./backend/api
-      dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
-    depends_on:
-      - db
-    volumes:
-      - ./backend/api:/app  
-    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload  
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    ports:
-      - "3000:80"           
-    depends_on:
-      - backend
-    environment:
-      - VITE_API_BASE_URL=http://backend:8000  
-
+  # ===========================================================================
+  # PostgreSQL — trade history database (for the API/frontend)
+  # ===========================================================================
   db:
     image: postgres:16
     restart: always
@@ -37,6 +15,137 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Backend API — FastAPI serving prices, trades, wallet to the frontend
+  # ===========================================================================
+  backend:
+    build:
+      context: ./backend/api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
+      - COINBASE_API_KEY=${COINBASE_API_KEY:-}
+      - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend/api:/app
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+  # ===========================================================================
+  # Frontend — React/Vite dashboard
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_BASE_URL=http://backend:8000
+
+  # ===========================================================================
+  # Trader — ML Pipeline (data collection → features → signals)
+  #
+  # Lifecycle:
+  #   1. On startup: backfill 30 days of OHLCV, funding rates, OI
+  #   2. Compute features from raw data
+  #   3. Every hour: incremental data fetch → recompute features → generate signals
+  #
+  # The live_orchestrator.py handles the full cycle:
+  #   run_pipeline.py  →  compute_features.py  →  train_model.py --signals
+  #
+  # Configurable via environment variables (see defaults below).
+  # ===========================================================================
+  trader:
+    build:
+      context: ./backend/trader
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Coinbase API credentials (required for OHLCV + real-time data)
+      - CDP_API_KEY=${CDP_API_KEY:-}
+      - CDP_API_SECRET=${CDP_API_SECRET:-}
+
+      # Optional: Coinbase REST API keys (for the spot price API in the backend)
+      - COINBASE_API_KEY=${COINBASE_API_KEY:-}
+      - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
+
+      # Timezone
+      - TZ=America/New_York
+
+      # Pipeline database (SQLite inside the container, persisted via volume)
+      - TRADER_DB_PATH=/app/data/trading.db
+
+      # Signal generation parameters (from train_model.py defaults)
+      - SIGNAL_THRESHOLD=0.74
+      - MIN_AUC=0.54
+      - LEVERAGE=4
+      - EXCLUDE_SYMBOLS=BIP,DOP
+
+      # Scheduling
+      - CYCLE_INTERVAL_SECONDS=3600          # Run every 1 hour
+      - INCREMENTAL_BACKFILL_HOURS=6         # Fetch last 6h of data each cycle
+
+      # Logging
+      - LOG_LEVEL=INFO
+
+      # Optional: HTTP proxy for exchange API calls
+      # - HTTPS_PROXY=http://your-proxy:8080
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Persist the SQLite DB, trained models, feature CSVs, and logs across restarts
+      - trader_data:/app/data
+      - trader_models:/app/models
+      - trader_logs:/app/logs
+      # Mount source for development (remove in production)
+      - ./backend/trader:/app
+    # The orchestrator: initial backfill (30d) then hourly cycles
+    command: >
+      python live_orchestrator.py
+        --backfill-days 30
+        --include-oi
+        --debug
+
+  # ===========================================================================
+  # Trader — Backtest mode (run once, then exit)
+  # Uncomment to run a backtest instead of live signals.
+  # ===========================================================================
+  # trader-backtest:
+  #   build:
+  #     context: ./backend/trader
+  #     dockerfile: Dockerfile
+  #   environment:
+  #     - TRADER_DB_PATH=/app/data/trading.db
+  #     - LOG_LEVEL=INFO
+  #   volumes:
+  #     - trader_data:/app/data
+  #     - trader_models:/app/models
+  #     - trader_logs:/app/logs
+  #     - ./backend/trader:/app
+  #   command: >
+  #     python train_model.py
+  #       --backtest
+  #       --threshold 0.74
+  #       --min-auc 0.54
+  #       --leverage 4
+  #       --exclude BIP,DOP
 
 volumes:
   postgres_data:
+  trader_data:
+  trader_models:
+  trader_logs:

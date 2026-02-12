@@ -22,14 +22,61 @@ def get_coinbase_client():
     
     return RESTClient(api_key=api_key, api_secret=api_secret)
 
+# Spot products on Coinbase
 COINBASE_PRODUCTS = {
     "BTC": "BTC-USD",
     "ETH": "ETH-USD",
-    "SOL": "SOL-USD"
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+    "DOGE": "DOGE-USD",
 }
+
+# CDE (Contract for Difference / Perpetual) product mappings
+# These are the nano perpetual futures on Coinbase CDE
+CDE_PRODUCTS = {
+    "BTC": {
+        "symbol": "BIP-20DEC30-CDE",
+        "code": "BIP",
+        "units_per_contract": 0.01,
+        "approx_contract_value": 675.70,
+        "fee_pct": 0.00100,  # 0.100% per side
+    },
+    "ETH": {
+        "symbol": "ETP-20DEC30-CDE",
+        "code": "ETP",
+        "units_per_contract": 0.1,
+        "approx_contract_value": 196.50,
+        "fee_pct": 0.00102,  # 0.102% per side
+    },
+    "SOL": {
+        "symbol": "SLP-20DEC30-CDE",
+        "code": "SLP",
+        "units_per_contract": 5,
+        "approx_contract_value": 400.90,
+        "fee_pct": 0.00100,  # 0.100% per side
+    },
+    "XRP": {
+        "symbol": "XPP-20DEC30-CDE",
+        "code": "XPP",
+        "units_per_contract": 500,
+        "approx_contract_value": 690.45,
+        "fee_pct": 0.00100,  # 0.100% per side
+    },
+    "DOGE": {
+        "symbol": "DOP-20DEC30-CDE",
+        "code": "DOP",
+        "units_per_contract": 5000,
+        "approx_contract_value": 458.35,
+        "fee_pct": 0.00100,  # 0.100% per side
+    },
+}
+
+VALID_SYMBOLS = list(COINBASE_PRODUCTS.keys())
+
 
 @router.get("/prices", response_model=Dict[str, dict])
 def get_current_prices():
+    """Get current spot prices for all tracked coins."""
     client = get_coinbase_client()
     result = {}
 
@@ -68,16 +115,23 @@ def get_current_prices():
         raise HTTPException(status_code=503, detail=str(e))
 
 
+@router.get("/cde-specs", response_model=Dict[str, dict])
+def get_cde_specs():
+    """Return CDE contract specifications for all coins."""
+    return CDE_PRODUCTS
+
+
 @router.get("/history/{symbol}", response_model=List[Dict])
 def get_historical_prices(
-    symbol: str = Path(..., enum=["BTC", "ETH", "SOL"]),
+    symbol: str = Path(..., enum=VALID_SYMBOLS),
     days: int | None = Query(None, ge=1, le=730, description="Number of days (for ranges ≥1d)"),
     hours: int | None = Query(None, ge=1, le=24, description="Number of hours (for 1h range)"),
     granularity: str = Query(
-        None,  # will be set automatically if not provided
+        None,
         enum=["ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "ONE_HOUR", "SIX_HOUR", "ONE_DAY"]
     )
 ):
+    """Get historical spot OHLCV data from Coinbase."""
     if symbol not in COINBASE_PRODUCTS:
         raise HTTPException(400, "Invalid symbol")
 
@@ -90,11 +144,9 @@ def get_historical_prices(
     # Determine total time window and default granularity
     if hours is not None:
         total_seconds = hours * 3600
-        # Default to 1-minute for short ranges
         granularity = granularity or "ONE_MINUTE"
     else:
         total_seconds = days * 24 * 3600
-        # Choose sensible default granularity based on days
         if days <= 1:
             granularity = granularity or "FIFTEEN_MINUTE"
         elif days <= 7:
@@ -102,57 +154,65 @@ def get_historical_prices(
         else:
             granularity = granularity or "ONE_DAY"
 
-    granularity_map = {
+    # Map granularity to seconds for chunking
+    gran_seconds = {
         "ONE_MINUTE": 60,
         "FIVE_MINUTE": 300,
         "FIFTEEN_MINUTE": 900,
         "ONE_HOUR": 3600,
         "SIX_HOUR": 21600,
-        "ONE_DAY": 86400
+        "ONE_DAY": 86400,
     }
-    interval_sec = granularity_map.get(granularity, 900)
+    interval = gran_seconds.get(granularity, 3600)
 
-    MAX_CANDLES_PER_REQUEST = 280
+    # Coinbase returns max 300 candles per request; chunk if needed
+    max_candles = 300
+    chunk_seconds = max_candles * interval
 
-    all_history = []
-    end_ts = int(datetime.now(timezone.utc).timestamp())
-    start_limit_ts = end_ts - total_seconds
+    now = int(datetime.now(timezone.utc).timestamp())
+    start = now - total_seconds
 
-    while end_ts > start_limit_ts:
-        start_ts = max(end_ts - (MAX_CANDLES_PER_REQUEST * interval_sec), start_limit_ts)
+    all_candles = []
+    current_start = start
 
-        try:
+    try:
+        while current_start < now:
+            current_end = min(current_start + chunk_seconds, now)
+
             response = client.get_public_candles(
                 product_id=product_id,
-                start=str(start_ts),
-                end=str(end_ts),
+                start=str(current_start),
+                end=str(current_end),
                 granularity=granularity,
-                limit=MAX_CANDLES_PER_REQUEST
             )
 
-            chunk = [{
-                "timestamp": datetime.fromtimestamp(int(candle.start), tz=timezone.utc).isoformat(),
-                "open": float(candle.open),
-                "high": float(candle.high),
-                "low": float(candle.low),
-                "close": float(candle.close),
-                "volume": float(candle.volume)
-            } for candle in response.candles]
+            candles = response.candles if hasattr(response, 'candles') else response.get("candles", [])
 
-            all_history.extend(chunk)
+            for c in candles:
+                ts = int(c.start) if hasattr(c, 'start') else int(c["start"])
+                all_candles.append({
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "open": float(c.open if hasattr(c, 'open') else c["open"]),
+                    "high": float(c.high if hasattr(c, 'high') else c["high"]),
+                    "low": float(c.low if hasattr(c, 'low') else c["low"]),
+                    "close": float(c.close if hasattr(c, 'close') else c["close"]),
+                    "volume": float(c.volume if hasattr(c, 'volume') else c["volume"]),
+                })
 
-            if len(chunk) == 0:
-                break
+            current_start = current_end
 
-            end_ts = start_ts - 1
+        all_candles.sort(key=lambda x: x["timestamp"])
 
-        except Exception as e:
-            print(f"Error fetching candles {symbol} {granularity} {start_ts}-{end_ts}: {e}")
-            break
+        # Deduplicate
+        seen = set()
+        deduped = []
+        for candle in all_candles:
+            if candle["timestamp"] not in seen:
+                seen.add(candle["timestamp"])
+                deduped.append(candle)
 
-    # Sort + deduplicate
-    all_history.sort(key=lambda x: x["timestamp"])
-    seen = set()
-    unique = [entry for entry in all_history if not (entry["timestamp"] in seen or seen.add(entry["timestamp"]))]
+        return deduped
 
-    return unique
+    except Exception as e:
+        print(f"Error fetching history for {symbol}: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
