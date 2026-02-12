@@ -563,6 +563,34 @@ class SQLiteDatabase(DatabaseBase):
             if result and result["min_time"]:
                 return datetime.fromisoformat(result["min_time"])
             return None
+        
+    def get_latest_oi_time(self, symbol: str) -> Optional[datetime]:
+        """Get the most recent open interest event time for a symbol."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MAX(event_time) as max_time
+                FROM open_interest
+                WHERE symbol = ?
+            """, (symbol,))
+            result = cursor.fetchone()
+            if result and result["max_time"]:
+                return datetime.fromisoformat(result["max_time"])
+            return None
+
+    def get_earliest_oi_time(self, symbol: str) -> Optional[datetime]:
+        """Get the earliest open interest event time for a symbol."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MIN(event_time) as min_time
+                FROM open_interest
+                WHERE symbol = ?
+            """, (symbol,))
+            result = cursor.fetchone()
+            if result and result["min_time"]:
+                return datetime.fromisoformat(result["min_time"])
+            return None
     
     def get_funding_stats(self) -> Dict[str, Any]:
         """Get statistics about stored funding data."""

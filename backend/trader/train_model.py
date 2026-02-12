@@ -183,15 +183,15 @@ class Config:
     retrain_frequency_days: int = 7
     min_train_samples: int = 400
 
-    # Signal Filters — Optuna-optimized (75 trials, accurate backtest, 10/10 top profitable)
-    # Converged: thr=0.74, mom=0.04 across all top 5 configs
-    signal_threshold: float = 0.74
+    # Signal Filters — Ensemble Optuna + stability tested (7/7 profitable, ±41% variance)
+    # ETH + XRP only. Ensemble 3-model averaging with offsets [0, 3, 6] days.
+    signal_threshold: float = 0.80
     min_funding_z: float = 0.0
-    min_momentum_magnitude: float = 0.04
+    min_momentum_magnitude: float = 0.07
 
-    # Exit Strategy — Optuna-optimized (wider SL = fewer stop-outs = 48% WR)
-    vol_mult_tp: float = 4.5         # 4.5x vol TP
-    vol_mult_sl: float = 2.75        # 2.75x vol SL (wider = room to breathe)
+    # Exit Strategy — wide exits for ensemble (gives trades room, 43% WR)
+    vol_mult_tp: float = 5.5
+    vol_mult_sl: float = 3.0
     breakeven_trigger: float = 999.0
     trailing_active: bool = False
     trailing_mult: float = 999.0
@@ -222,6 +222,7 @@ class Config:
 
     # Safety
     min_equity: float = 1000.0
+    cooldown_hours: float = 24.0  # Hours after exit before re-entry on same symbol
 
     # Validation
     val_fraction: float = 0.20
@@ -559,41 +560,52 @@ def run_backtest(all_data: Dict, config: Config):
         weekly_equity_base = min(equity, weekly_equity_base * (1 + config.max_weekly_equity_growth))
         weekly_equity_base = max(weekly_equity_base, equity * 0.9)
 
-        # --- TRAINING ---
-        train_start = current_date - timedelta(days=config.train_lookback_days)
+        # --- TRAINING (ENSEMBLE: 3 lookback offsets for stability) ---
+        ensemble_offsets = [0, 3, 6]  # Train with lookback, lookback+3, lookback+6
+        all_ensemble_models = {}  # sym -> list of (model, scaler, cols, iso, auc)
+
+        for offset in ensemble_offsets:
+            train_start = current_date - timedelta(days=config.train_lookback_days + offset)
+
+            for sym, d in all_data.items():
+                feat, ohlc = d['features'], d['ohlcv']
+                cols = system.get_feature_columns(feat.columns)
+                if not cols:
+                    continue
+
+                train_feat = feat.loc[train_start:current_date]
+                train_ohlc = ohlc.loc[train_start:current_date + timedelta(hours=config.max_hold_hours)]
+
+                if len(train_feat) < config.min_train_samples:
+                    continue
+
+                y = system.create_labels(train_ohlc, train_feat)
+                valid_idx = y.dropna().index
+                X_all = train_feat.loc[valid_idx, cols]
+                y_all = y.loc[valid_idx]
+
+                if len(X_all) < config.min_train_samples:
+                    continue
+
+                split_idx = int(len(X_all) * (1 - config.val_fraction))
+                X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
+                y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
+
+                result = system.train(X_tr, y_tr, X_vl, y_vl)
+                if result:
+                    model, scaler, iso, auc = result
+                    if sym not in all_ensemble_models:
+                        all_ensemble_models[sym] = []
+                    all_ensemble_models[sym].append((model, scaler, cols, iso, auc))
+                    models_accepted += 1
+                else:
+                    models_rejected += 1
+
+        # Build final models dict: keep all ensemble members per symbol
         models = {}
-
-        for sym, d in all_data.items():
-            feat, ohlc = d['features'], d['ohlcv']
-            cols = system.get_feature_columns(feat.columns)
-            if not cols:
-                continue
-
-            train_feat = feat.loc[train_start:current_date]
-            train_ohlc = ohlc.loc[train_start:current_date + timedelta(hours=config.max_hold_hours)]
-
-            if len(train_feat) < config.min_train_samples:
-                continue
-
-            y = system.create_labels(train_ohlc, train_feat)
-            valid_idx = y.dropna().index
-            X_all = train_feat.loc[valid_idx, cols]
-            y_all = y.loc[valid_idx]
-
-            if len(X_all) < config.min_train_samples:
-                continue
-
-            split_idx = int(len(X_all) * (1 - config.val_fraction))
-            X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
-            y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
-
-            result = system.train(X_tr, y_tr, X_vl, y_vl)
-            if result:
-                model, scaler, iso, auc = result
-                models[sym] = (model, scaler, cols, iso, auc)
-                models_accepted += 1
-            else:
-                models_rejected += 1
+        for sym, ensemble_list in all_ensemble_models.items():
+            if ensemble_list:
+                models[sym] = ensemble_list  # list of (model, scaler, cols, iso, auc)
 
         # --- TRADING ---
         test_hours = pd.date_range(current_date, week_end, freq='1h')
@@ -709,13 +721,13 @@ def run_backtest(all_data: Dict, config: Config):
             # 2. ENTRIES
             # ============================================================
             if len(active_positions) < config.max_positions and equity >= config.min_equity:
-                for sym, (model, scaler, cols, iso, auc) in models.items():
+                for sym, ensemble_models in models.items():
                     if sym in active_positions or ts not in all_data[sym]['features'].index:
                         continue
                     if ts not in all_data[sym]['ohlcv'].index:
                         continue
-                    # v7.2: 24h cooldown after exit
-                    if sym in last_exit_time and (ts - last_exit_time[sym]).total_seconds() < 24 * 3600:
+                    # v7.2: cooldown after exit
+                    if sym in last_exit_time and (ts - last_exit_time[sym]).total_seconds() < config.cooldown_hours * 3600:
                         continue
                     # v7.3: Symbol exclusion
                     if config.excluded_symbols:
@@ -790,11 +802,16 @@ def run_backtest(all_data: Dict, config: Config):
                     if not check_correlation(sym, direction, active_positions, all_data, ts, config):
                         continue
 
-                    x_in = np.nan_to_num(
-                        np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
-                    )
-                    raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
-                    prob = float(iso.predict([raw_prob])[0])
+                    # ENSEMBLE PREDICTION: average probability across all models
+                    probs = []
+                    for (model, scaler, cols, iso, auc) in models[sym]:
+                        x_in = np.nan_to_num(
+                            np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
+                        )
+                        raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
+                        cal_prob = float(iso.predict([raw_prob])[0])
+                        probs.append(cal_prob)
+                    prob = np.mean(probs)
 
                     if prob >= config.signal_threshold:
                         vol = vol_24h if vol_24h > 0 else 0.02
@@ -1026,11 +1043,16 @@ if __name__ == "__main__":
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--signals", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--threshold", type=float, default=0.74)
+    parser.add_argument("--threshold", type=float, default=0.80)
     parser.add_argument("--min-auc", type=float, default=0.54)
     parser.add_argument("--leverage", type=int, default=4)
-    parser.add_argument("--exclude", type=str, default="BIP,DOP",
-                        help="Comma-separated symbol prefixes to exclude (default: BIP,DOP)")
+    parser.add_argument("--tp", type=float, default=5.5, help="Take profit vol multiplier")
+    parser.add_argument("--sl", type=float, default=3.0, help="Stop loss vol multiplier")
+    parser.add_argument("--momentum", type=float, default=0.07, help="Min 72h momentum magnitude")
+    parser.add_argument("--hold", type=int, default=96, help="Max hold hours")
+    parser.add_argument("--cooldown", type=float, default=24, help="Hours cooldown after exit")
+    parser.add_argument("--exclude", type=str, default="BIP,SLP,DOP",
+                        help="Comma-separated symbol prefixes to exclude (default: BIP,DOP,SLP)")
     args = parser.parse_args()
 
     excluded = [s.strip() for s in args.exclude.split(',')] if args.exclude else None
@@ -1038,6 +1060,11 @@ if __name__ == "__main__":
         signal_threshold=args.threshold,
         min_val_auc=args.min_auc,
         leverage=args.leverage,
+        vol_mult_tp=args.tp,
+        vol_mult_sl=args.sl,
+        min_momentum_magnitude=args.momentum,
+        max_hold_hours=args.hold,
+        cooldown_hours=args.cooldown,
         excluded_symbols=excluded,
     )
     data = load_data()

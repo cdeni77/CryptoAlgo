@@ -358,30 +358,59 @@ async def backfill_open_interest(
         for symbol in symbols:
             logger.info(f"\n📊 Processing OI history for {symbol}")
             
-            # Fetch historical OI
-            history = await connector.fetch_open_interest_history(
-                symbol=symbol,
-                timeframe='1h', 
-                start=start,
-                end=end,
-                limit=100
-            )
+            # Check existing data
+            existing_start = db.get_earliest_oi_time(symbol)
+            existing_end = db.get_latest_oi_time(symbol)
             
-            if history:
+            if existing_start and existing_end:
+                logger.info(f"  Existing OI data: {existing_start.date()} to {existing_end.date()}")
+            else:
+                logger.info(f"  No existing OI data")
+            
+            all_history = []
+            
+            if existing_start and existing_end:
+                # Prepend if needed
+                if start < existing_start:
+                    logger.info(f"  📥 Fetching OI pre-history: {start.date()} to {existing_start.date()}")
+                    history = await connector.fetch_open_interest_history(
+                        symbol=symbol, timeframe='1h',
+                        start=start, end=existing_start, limit=200
+                    )
+                    if history:
+                        all_history.extend(history)
+                
+                # Append if needed
+                if end > existing_end:
+                    logger.info(f"  📥 Fetching new OI data: {existing_end.date()} to {end.date()}")
+                    history = await connector.fetch_open_interest_history(
+                        symbol=symbol, timeframe='1h',
+                        start=existing_end, end=end, limit=200
+                    )
+                    if history:
+                        all_history.extend(history)
+                
+                if not all_history:
+                    logger.info(f"  ✓ OI data already up to date")
+            else:
+                # Full range fetch
+                logger.info(f"  📥 Fetching full OI range: {start.date()} to {end.date()}")
+                all_history = await connector.fetch_open_interest_history(
+                    symbol=symbol, timeframe='1h',
+                    start=start, end=end, limit=200
+                )
+            
+            if all_history:
                 # Parse dicts to OpenInterest objects
                 oi_list = []
-                for entry in history:
+                for entry in all_history:
                     try:
                         event_time = datetime.fromtimestamp(entry['timestamp'] / 1000).replace(tzinfo=None)
-                        
-                        # Handle None values
                         contracts = float(entry.get('openInterestAmount') or entry.get('baseVolume') or 0)
                         value = float(entry.get('openInterestValue') or entry.get('quoteVolume') or 0)
-                        
                         oi = OpenInterest(
-                            symbol=symbol,
-                            event_time=event_time,
-                            available_time=event_time + timedelta(seconds=5),  # Small buffer
+                            symbol=symbol, event_time=event_time,
+                            available_time=event_time + timedelta(seconds=5),
                             open_interest_contracts=contracts,
                             open_interest_usd=value,
                             quality=DataQuality.VALID,
@@ -397,12 +426,8 @@ async def backfill_open_interest(
                         logger.info(f"  ✓ Inserted {inserted} OI records")
                     except Exception as e:
                         logger.error(f"Failed to insert OI batch: {e}")
-                else:
-                    logger.warning(f"  ⚠️ No valid OI data parsed for {symbol}")
-            else:
-                logger.warning(f"  ⚠️ No OI history found for {symbol}")
             
-            progress.task_complete(symbol, count=len(oi_list) if 'oi_list' in locals() else 0)
+            progress.task_complete(symbol, count=len(all_history))
         
         progress.summary()
         print(f"\nTotal OI records inserted: {total_inserted}")

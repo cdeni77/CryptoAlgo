@@ -38,16 +38,5 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  trader:
-    build:
-      context: ./backend/trader  
-      dockerfile: Dockerfile
-    environment:
-      - TZ=America/New_York  
-    depends_on:
-      - db
-    volumes:
-      - ./backend/trader:/app  
-
 volumes:
   postgres_data:
