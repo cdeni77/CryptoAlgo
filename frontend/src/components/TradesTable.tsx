@@ -8,76 +8,87 @@ interface TradesTableProps {
 export default function TradesTable({ trades, loading = false }: TradesTableProps) {
   if (loading) {
     return (
-      <div className="glass rounded-2xl p-12 flex flex-col items-center justify-center h-96">
-        <div className="w-16 h-16 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-6"></div>
-        <p className="text-gray-400">Loading trade history...</p>
+      <div className="glass-card rounded-xl p-10 flex flex-col items-center justify-center h-80">
+        <div className="w-10 h-10 border-2 border-[var(--accent-cyan)] border-t-transparent rounded-full animate-spin mb-4" />
+        <p className="text-sm text-[var(--text-muted)]">Loading trades...</p>
       </div>
     );
   }
 
   return (
-    <div className="glass rounded-2xl overflow-hidden shadow-2xl">
+    <div className="glass-card rounded-xl overflow-hidden">
       <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-indigo-900/50">
-          <thead className="bg-gray-900/70">
-            <tr>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">ID</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Coin</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Open Time</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Side</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Contracts</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Entry</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Exit</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">PNL</th>
-              <th className="px-6 py-5 text-left text-sm font-semibold text-indigo-300">Status</th>
+        <table className="min-w-full">
+          <thead>
+            <tr className="border-b border-[var(--border-subtle)]">
+              {['ID', 'Coin', 'Opened', 'Side', 'Contracts', 'Entry', 'Exit', 'PNL', 'Status'].map(h => (
+                <th key={h} className="px-4 py-3 text-left text-[10px] font-mono-trade font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+                  {h}
+                </th>
+              ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-800">
+          <tbody className="divide-y divide-[var(--border-subtle)]">
             {trades.length === 0 ? (
               <tr>
-                <td colSpan={9} className="px-6 py-16 text-center text-gray-400">
-                  <svg className="w-16 h-16 mx-auto mb-6 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  <p className="text-xl font-medium">No trades recorded yet</p>
-                  <p className="mt-2 text-gray-500">Your bot will automatically populate this table</p>
+                <td colSpan={9} className="px-4 py-12 text-center text-[var(--text-muted)] text-sm">
+                  No trades recorded yet
                 </td>
               </tr>
             ) : (
               trades.map((trade) => (
-                <tr key={trade.id} className="hover:bg-indigo-950/20 transition-colors">
-                  <td className="px-6 py-5 text-sm text-gray-300">{trade.id}</td>
-                  <td className="px-6 py-5 text-sm font-medium text-white">{trade.coin}</td>
-                  <td className="px-6 py-5 text-sm text-gray-400">
-                    {new Date(trade.datetime_open).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}
+                <tr key={trade.id} className="hover:bg-[var(--bg-elevated)]/50 transition-colors">
+                  <td className="px-4 py-3 font-mono-trade text-xs text-[var(--text-muted)]">
+                    #{trade.id}
                   </td>
-                  <td className="px-6 py-5">
-                    <span className={`inline-flex px-4 py-1.5 rounded-full text-xs font-semibold tracking-wide ${
-                      trade.side === 'long' 
-                        ? 'bg-green-900/70 text-green-300 border border-green-700/50' 
-                        : 'bg-red-900/70 text-red-300 border border-red-700/50'
-                    }`}>
-                      {trade.side.toUpperCase()}
+                  <td className="px-4 py-3">
+                    <span className="text-sm font-semibold text-[var(--text-primary)]">{trade.coin}</span>
+                  </td>
+                  <td className="px-4 py-3 font-mono-trade text-xs text-[var(--text-secondary)]">
+                    {new Date(trade.datetime_open).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                    {' '}
+                    {new Date(trade.datetime_open).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </td>
+                  <td className="px-4 py-3">
+                    <span className={`
+                      inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono-trade font-bold uppercase
+                      ${trade.side === 'long'
+                        ? 'bg-emerald-500/10 text-[var(--accent-emerald)] ring-1 ring-emerald-500/20'
+                        : 'bg-rose-500/10 text-[var(--accent-rose)] ring-1 ring-rose-500/20'
+                      }
+                    `}>
+                      {trade.side}
                     </span>
                   </td>
-                  <td className="px-6 py-5 text-sm text-gray-300">{trade.contracts.toFixed(4)}</td>
-                  <td className="px-6 py-5 text-sm text-gray-300">${trade.entry_price.toLocaleString()}</td>
-                  <td className="px-6 py-5 text-sm text-gray-300">
-                    {trade.exit_price ? `$${trade.exit_price.toLocaleString()}` : '—'}
+                  <td className="px-4 py-3 font-mono-trade text-sm text-[var(--text-primary)]">
+                    {trade.contracts}
                   </td>
-                  <td className={`px-6 py-5 text-sm font-semibold ${
-                    trade.net_pnl === null ? 'text-gray-500' :
-                    trade.net_pnl > 0 ? 'text-green-400' : 'text-red-400'
-                  }`}>
-                    {trade.net_pnl !== null ? `$${trade.net_pnl.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '—'}
+                  <td className="px-4 py-3 font-mono-trade text-sm text-[var(--text-secondary)]">
+                    ${Number(trade.entry_price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
-                  <td className="px-6 py-5">
-                    <span className={`inline-flex px-4 py-1.5 rounded-full text-xs font-semibold tracking-wide ${
-                      trade.status === 'open' 
-                        ? 'bg-yellow-900/70 text-yellow-300 border border-yellow-700/50' 
-                        : 'bg-gray-800 text-gray-300 border border-gray-700'
-                    }`}>
-                      {trade.status.toUpperCase()}
+                  <td className="px-4 py-3 font-mono-trade text-sm text-[var(--text-secondary)]">
+                    {trade.exit_price !== null
+                      ? `$${Number(trade.exit_price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                      : '—'}
+                  </td>
+                  <td className="px-4 py-3">
+                    {trade.net_pnl !== null ? (
+                      <span className={`font-mono-trade text-sm font-semibold ${trade.net_pnl >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]'}`}>
+                        {trade.net_pnl >= 0 ? '+' : ''}${trade.net_pnl.toFixed(2)}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--text-muted)] text-sm">—</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    <span className={`
+                      inline-flex items-center gap-1.5 text-xs font-medium
+                      ${trade.status === 'open' ? 'text-[var(--accent-cyan)]' : 'text-[var(--text-muted)]'}
+                    `}>
+                      {trade.status === 'open' && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-cyan)] animate-pulse" />
+                      )}
+                      {trade.status}
                     </span>
                   </td>
                 </tr>

@@ -3,11 +3,11 @@ export interface PriceInfo {
   change24h: number | null;
 }
 
-export type PriceData = {
-  BTC: PriceInfo;
-  ETH: PriceInfo;
-  SOL: PriceInfo;
-};
+export type CoinSymbol = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE';
+
+export type PriceData = Record<CoinSymbol, PriceInfo>;
+
+export type DataSource = 'spot' | 'cde';
 
 export interface HistoryEntry {
   timestamp: string;
@@ -17,6 +17,16 @@ export interface HistoryEntry {
   close: number;
   volume: number;
 }
+
+export interface CDESpec {
+  symbol: string;
+  code: string;
+  units_per_contract: number;
+  approx_contract_value: number;
+  fee_pct: number;
+}
+
+export type CDESpecs = Record<CoinSymbol, CDESpec>;
 
 export interface Trade {
   id: number;
@@ -35,6 +45,26 @@ export interface Trade {
   reason_entry: string | null;
   reason_exit: string | null;
   status: 'open' | 'closed';
+}
+
+export interface Signal {
+  id: number;
+  coin: string;
+  timestamp: string;
+  direction: 'long' | 'short' | 'neutral';
+  confidence: number;
+  raw_probability: number | null;
+  model_auc: number | null;
+  price_at_signal: number | null;
+  momentum_pass: boolean | null;
+  trend_pass: boolean | null;
+  regime_pass: boolean | null;
+  ml_pass: boolean | null;
+  contracts_suggested: number | null;
+  notional_usd: number | null;
+  acted_on: boolean;
+  trade_id: number | null;
+  created_at: string | null;
 }
 
 export interface WalletData {

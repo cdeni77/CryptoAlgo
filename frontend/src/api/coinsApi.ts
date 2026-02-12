@@ -1,4 +1,4 @@
-import { PriceData, HistoryEntry } from '../types';
+import { PriceData, HistoryEntry, CDESpecs, CoinSymbol } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
@@ -15,8 +15,12 @@ export async function getCurrentPrices(): Promise<PriceData> {
   return fetchWithError(`${API_BASE}/coins/prices`);
 }
 
+export async function getCDESpecs(): Promise<CDESpecs> {
+  return fetchWithError(`${API_BASE}/coins/cde-specs`);
+}
+
 export async function getCoinHistory(
-  symbol: 'BTC' | 'ETH' | 'SOL',
+  symbol: CoinSymbol,
   range: '1h' | '1d' | '1w' | '1m' | '1y' = '1d'
 ): Promise<HistoryEntry[]> {
   const params = new URLSearchParams();
@@ -25,23 +29,18 @@ export async function getCoinHistory(
     case '1h':
       params.set('hours', '1');
       break;
-
     case '1d':
       params.set('days', '1');
       break;
-
     case '1w':
       params.set('days', '7');
       break;
-
     case '1m':
       params.set('days', '30');
       break;
-
     case '1y':
       params.set('days', '365');
       break;
-
     default:
       params.set('days', '60');
   }

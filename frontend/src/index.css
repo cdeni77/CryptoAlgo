@@ -1,77 +1,96 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Custom global styles */
 @layer base {
   :root {
-    --background: 0 0% 4%;      /* dark gray-black */
-    --foreground: 0 0% 98%;     /* light text */
-    --primary: 243 75% 59%;     /* indigo/blue */
-    --primary-foreground: 0 0% 98%;
-    --secondary: 217 32% 17%;
-    --secondary-foreground: 210 40% 98%;
-    --accent: 243 75% 59%;
-    --accent-foreground: 0 0% 98%;
+    --bg-primary: #0a0e17;
+    --bg-secondary: #0f1420;
+    --bg-card: #131927;
+    --bg-elevated: #1a2235;
+    --border-subtle: rgba(56, 189, 248, 0.08);
+    --border-accent: rgba(56, 189, 248, 0.20);
+    --accent-cyan: #38bdf8;
+    --accent-emerald: #34d399;
+    --accent-rose: #fb7185;
+    --accent-amber: #fbbf24;
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
   }
 
   body {
-    @apply bg-[hsl(var(--background))] text-[hsl(var(--foreground))] min-h-screen;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: 'Outfit', sans-serif;
+    min-height: 100vh;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(56, 189, 248, 0.15) transparent;
   }
 }
 
-/* Glassmorphism utility class */
 @layer utilities {
-  .glass {
-    background: rgba(30, 41, 59, 0.6); /* semi-transparent slate */
-    backdrop-filter: blur(16px);
-    border: 1px solid rgba(99, 102, 241, 0.2); /* subtle indigo border */
-    box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.6);
+  .glass-card {
+    background: linear-gradient(135deg, rgba(19, 25, 39, 0.9), rgba(15, 20, 32, 0.95));
+    border: 1px solid var(--border-subtle);
+    box-shadow:
+      0 0 0 1px rgba(56, 189, 248, 0.03),
+      0 4px 24px -4px rgba(0, 0, 0, 0.5),
+      inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  }
+
+  .glass-card-hover {
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .glass-card-hover:hover {
+    border-color: var(--border-accent);
+    box-shadow:
+      0 0 0 1px rgba(56, 189, 248, 0.08),
+      0 8px 32px -4px rgba(0, 0, 0, 0.6),
+      0 0 24px -8px rgba(56, 189, 248, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    transform: translateY(-1px);
+  }
+
+  .font-mono-trade {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .glow-line {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+    opacity: 0.3;
+  }
+
+  .text-gradient-cyan {
+    background: linear-gradient(135deg, #38bdf8, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
 }
 
-/* Gradient text utility */
-.gradient-text {
-  background: linear-gradient(to right, #60a5fa, #a78bfa);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+/* Price flash animations */
+@keyframes flash-green {
+  0% { color: #34d399; text-shadow: 0 0 12px rgba(52, 211, 153, 0.6); }
+  100% { color: var(--text-primary); text-shadow: none; }
 }
-
-/* Quick highlight + fade back to white */
-@keyframes price-up {
-  0% {
-    color: rgb(34 197 94);          /* green-500 */
-    text-shadow: 0 0 16px rgba(34, 197, 94, 0.7);
-  }
-  25% {
-    color: rgb(134 239 172);        /* green-300 */
-    text-shadow: 0 0 24px rgba(134, 239, 172, 0.9);
-  }
-  100% {
-    color: white;
-    text-shadow: none;
-  }
+@keyframes flash-red {
+  0% { color: #fb7185; text-shadow: 0 0 12px rgba(251, 113, 133, 0.6); }
+  100% { color: var(--text-primary); text-shadow: none; }
 }
+.animate-price-up { animation: flash-green 1.2s ease-out forwards; }
+.animate-price-down { animation: flash-red 1.2s ease-out forwards; }
 
-@keyframes price-down {
-  0% {
-    color: rgb(239 68 68);          /* red-500 */
-    text-shadow: 0 0 16px rgba(239, 68, 68, 0.7);
-  }
-  25% {
-    color: rgb(248 113 113);        /* red-400 */
-    text-shadow: 0 0 24px rgba(248, 113, 113, 0.9);
-  }
-  100% {
-    color: white;
-    text-shadow: none;
-  }
-}
-
-.animate-price-up {
-  animation: price-up 1s ease-out forwards;
-}
-
-.animate-price-down {
-  animation: price-down 1s ease-out forwards;
+/* Subtle grid background */
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(56, 189, 248, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56, 189, 248, 0.02) 1px, transparent 1px);
+  background-size: 48px 48px;
 }

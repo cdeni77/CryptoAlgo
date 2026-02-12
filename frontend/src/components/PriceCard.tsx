@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { CDESpec, DataSource } from '../types';
+import DataSourceToggle from './DataSourceToggle';
 
 interface PriceCardProps {
   coin: string;
@@ -7,9 +9,18 @@ interface PriceCardProps {
   change24h: number | null;
   loading: boolean;
   error?: string;
+  cdeSpec?: CDESpec;
+  dataSource: DataSource;
+  onDataSourceChange: (source: DataSource) => void;
+  selected?: boolean;
+  onClick?: () => void;
 }
 
-export default function PriceCard({ coin, icon, price, change24h, loading, error }: PriceCardProps) {
+export default function PriceCard({
+  coin, icon, price, change24h, loading, error,
+  cdeSpec, dataSource, onDataSourceChange,
+  selected = false, onClick,
+}: PriceCardProps) {
   const prevPriceRef = useRef<number | null>(null);
   const [direction, setDirection] = useState<'up' | 'down' | null>(null);
 
@@ -19,98 +30,112 @@ export default function PriceCard({ coin, icon, price, change24h, loading, error
       setDirection(null);
       return;
     }
-
-    // Coerce to number early
     const currentPrice = Number(price);
-    if (isNaN(currentPrice)) {
-      console.log(`[${coin}] Invalid price: ${price}`); // Temp log for bad data
-      prevPriceRef.current = null;
-      setDirection(null);
-      return;
-    }
+    if (isNaN(currentPrice)) { prevPriceRef.current = null; setDirection(null); return; }
 
     const prev = prevPriceRef.current;
-
     if (prev !== null) {
       const diff = currentPrice - prev;
-      const threshold = 0.01;
-      if (Math.abs(diff) > threshold) {
+      if (Math.abs(diff) > 0.01) {
         setDirection(diff > 0 ? 'up' : 'down');
-
-        const timer = setTimeout(() => {
-          setDirection(null);
-        }, 1200); 
-
-        return () => {
-          clearTimeout(timer);
-        };
+        const timer = setTimeout(() => setDirection(null), 1200);
+        return () => clearTimeout(timer);
       } else {
-        setDirection(null); 
+        setDirection(null);
       }
     }
-
     prevPriceRef.current = currentPrice;
+  }, [price, loading, error, coin]);
 
-  }, [price, loading, error, coin]); 
+  const priceTextClass =
+    direction === 'up' ? 'animate-price-up' :
+    direction === 'down' ? 'animate-price-down' : '';
 
-  const priceTextClass = 
-    direction === 'up' ? 'text-green-400 animate-price-up' :
-    direction === 'down' ? 'text-red-400 animate-price-down' :
-    'text-white';
+  const formattedPrice = price !== null
+    ? `$${Number(price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : '—';
 
-  const formattedPrice =
-    price !== null
-      ? `$${Number(price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-      : '—';
+  const changeClass = change24h === null ? 'text-[var(--text-muted)]'
+    : change24h >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]';
+  const changeText = change24h === null ? '—'
+    : `${change24h >= 0 ? '+' : ''}${change24h.toFixed(2)}%`;
 
-  const changeClass =
-    change24h === null
-      ? 'text-gray-500'
-      : change24h >= 0
-        ? 'text-green-400'
-        : 'text-red-400';
-
-  const changeText =
-    change24h === null
-      ? '—'
-      : `${change24h >= 0 ? '+' : ''}${change24h.toFixed(2)}%`;
+  // CDE computed price (contract value based on current spot)
+  const cdeContractValue = (price !== null && cdeSpec)
+    ? price * cdeSpec.units_per_contract
+    : null;
 
   return (
-    <div className="glass rounded-2xl p-6 transition-all duration-300 hover:scale-[1.02] hover:shadow-indigo-900/40">
+    <div
+      onClick={onClick}
+      className={`
+        glass-card glass-card-hover rounded-xl p-5 cursor-pointer relative overflow-hidden
+        ${selected ? 'border-[var(--accent-cyan)] shadow-lg shadow-cyan-500/5' : ''}
+      `}
+    >
+      {/* Selection indicator */}
+      {selected && (
+        <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-[var(--accent-cyan)] to-transparent" />
+      )}
+
+      {/* Header row */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-full bg-gradient-to-br from-indigo-600 to-blue-600 flex items-center justify-center text-white text-2xl font-bold shadow-md">
+          <div className="w-9 h-9 rounded-lg bg-[var(--bg-elevated)] flex items-center justify-center text-xl font-bold text-[var(--accent-cyan)] border border-[var(--border-subtle)]">
             {icon}
           </div>
-          <h3 className="text-xl font-bold text-indigo-300">{coin}</h3>
+          <div>
+            <h3 className="text-base font-bold text-[var(--text-primary)]">{coin}</h3>
+            {dataSource === 'cde' && cdeSpec && (
+              <span className="text-[10px] font-mono-trade text-[var(--accent-amber)]">{cdeSpec.code}</span>
+            )}
+          </div>
         </div>
-        <span className="text-xs px-3 py-1 rounded-full bg-indigo-900/60 text-indigo-200">
-          Live
-        </span>
+        <DataSourceToggle source={dataSource} onChange={onDataSourceChange} compact />
       </div>
 
+      {/* Price */}
       {loading ? (
-        <div className="space-y-3">
-          <div className="h-10 bg-gray-700/50 rounded animate-pulse"></div>
-          <div className="h-6 w-24 bg-gray-700/50 rounded animate-pulse mx-auto"></div>
+        <div className="space-y-2">
+          <div className="h-8 bg-[var(--bg-elevated)] rounded animate-pulse w-3/4" />
+          <div className="h-5 bg-[var(--bg-elevated)] rounded animate-pulse w-1/3" />
         </div>
       ) : error ? (
-        <div className="text-red-400 text-sm text-center">Error loading</div>
+        <p className="text-sm text-[var(--accent-rose)]">Error loading</p>
       ) : (
-        <div className="text-center">
-          <div
-            className={`text-4xl md:text-5xl font-mono font-extrabold tracking-tight transition-colors duration-300 ${priceTextClass}`}
-          >
+        <>
+          <div className={`text-2xl font-bold font-mono-trade mb-1 ${priceTextClass}`}>
             {formattedPrice}
           </div>
-
-          {/* 24h change display */}
-          <div className={`mt-3 text-lg font-semibold flex items-center justify-center gap-1.5 ${changeClass}`}>
-            {change24h !== null && change24h >= 0 ? '▲' : change24h !== null ? '▼' : ''}
+          <div className={`text-sm font-medium font-mono-trade ${changeClass}`}>
             {changeText}
-            <span className="text-gray-400 text-base ml-1">24h</span>
+            <span className="text-[var(--text-muted)] ml-2 text-xs font-normal">24h</span>
           </div>
-        </div>
+
+          {/* CDE contract details */}
+          {dataSource === 'cde' && cdeSpec && (
+            <div className="mt-3 pt-3 border-t border-[var(--border-subtle)] space-y-1.5">
+              <div className="flex justify-between text-xs">
+                <span className="text-[var(--text-muted)]">Contract</span>
+                <span className="font-mono-trade text-[var(--accent-amber)]">{cdeSpec.symbol}</span>
+              </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-[var(--text-muted)]">Units/contract</span>
+                <span className="font-mono-trade text-[var(--text-secondary)]">{cdeSpec.units_per_contract}</span>
+              </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-[var(--text-muted)]">Contract value</span>
+                <span className="font-mono-trade text-[var(--text-primary)]">
+                  ~${cdeContractValue !== null ? cdeContractValue.toFixed(2) : cdeSpec.approx_contract_value.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-[var(--text-muted)]">Fee/side</span>
+                <span className="font-mono-trade text-[var(--text-secondary)]">{(cdeSpec.fee_pct * 100).toFixed(3)}%</span>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
