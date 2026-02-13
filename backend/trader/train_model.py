@@ -51,9 +51,7 @@ def init_writer() -> Optional[PgWriter]:
 FEATURES_DIR = Path("./data/features")
 DB_PATH = "./data/trading.db"
 
-# =============================================================================
 # COINBASE CDE CONTRACT SPECIFICATIONS — EXACT
-# =============================================================================
 CONTRACT_SPECS = {
     'BIP': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
     'ETP': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
@@ -84,15 +82,10 @@ def get_contract_spec(symbol: str) -> dict:
     return CONTRACT_SPECS['DEFAULT']
 
 
-# =============================================================================
 # BASE FEATURE LIST (fallback — coin_profiles provides per-coin lists)
-# =============================================================================
 FEATURE_COLUMNS = BASE_FEATURES
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 @dataclass
 class Trade:
     symbol: str
@@ -177,9 +170,6 @@ class Config:
     oos_eval_days: int = 60
 
 
-# =============================================================================
-# EXACT COINBASE FEE CALCULATION
-# =============================================================================
 def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
                            config: Config) -> float:
     spec = get_contract_spec(symbol)
@@ -229,9 +219,6 @@ def calculate_n_contracts(equity: float, price: float, symbol: str,
     return max(n_contracts, 0)
 
 
-# =============================================================================
-# CORE ML ENGINE
-# =============================================================================
 class MLSystem:
     def __init__(self, config: Config):
         self.config = config
@@ -355,9 +342,6 @@ class MLSystem:
         return (base_model, scaler, iso, auc)
 
 
-# =============================================================================
-# DATA LOADING
-# =============================================================================
 def load_data():
     data = {}
     print("⏳ Loading data from features and database...")
@@ -401,9 +385,6 @@ def load_data():
     return data
 
 
-# =============================================================================
-# CORRELATION FILTER
-# =============================================================================
 def check_correlation(sym: str, direction: int, active_positions: Dict,
                       all_data: Dict, ts, config: Config) -> bool:
     if not active_positions:
@@ -428,9 +409,7 @@ def check_correlation(sym: str, direction: int, active_positions: Dict,
     return True
 
 
-# =============================================================================
 # BACKTEST — v8 PER-COIN PROFILES
-# =============================================================================
 def _get_profile(symbol: str, profile_overrides: Optional[Dict[str, CoinProfile]] = None) -> CoinProfile:
     if profile_overrides:
         prefix = symbol.split('-')[0].upper()
@@ -540,9 +519,7 @@ def run_backtest(all_data: Dict, config: Config,
         test_hours = pd.date_range(test_start, week_end, freq='1h')
 
         for ts in test_hours:
-            # ============================================================
             # 1. MANAGE EXITS
-            # ============================================================
             to_close = []
             for sym, pos in active_positions.items():
                 if ts not in all_data[sym]['ohlcv'].index:
@@ -640,9 +617,7 @@ def run_backtest(all_data: Dict, config: Config,
             for sym in to_close:
                 del active_positions[sym]
 
-            # ============================================================
             # 2. ENTRIES
-            # ============================================================
             if len(active_positions) < config.max_positions and equity >= config.min_equity:
                 candidates = []
                 for sym, ensemble_models in models.items():
@@ -727,7 +702,6 @@ def run_backtest(all_data: Dict, config: Config,
                     if not check_correlation(sym, direction, active_positions, all_data, ts, config):
                         continue
 
-                    # ENSEMBLE PREDICTION
                     probs = []
                     for (model, scaler, cols, iso, auc) in models[sym]:
                         x_in = np.nan_to_num(
@@ -1013,9 +987,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
     }
 
 
-# =============================================================================
 # LIVE SIGNALS — v8
-# =============================================================================
 def run_signals(all_data: Dict, config: Config, debug: bool = False):
     system = MLSystem(config)
     writer = init_writer()

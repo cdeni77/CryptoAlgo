@@ -9,18 +9,17 @@ from pathlib import Path
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
 
-# Usage:
 #   python parallel_launch.py --trials 200 --jobs 16
-#   python parallel_launch.py --trials 250 --jobs 16 --holdout-days 90
+#   python parallel_launch.py --trials 250 --jobs 16 --holdout-days 120
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch parallel Optuna optimization workers")
     parser.add_argument("--trials", type=int, default=200, help="Total trials per coin")
     parser.add_argument("--jobs", type=int, default=16, help="Total worker processes")
     parser.add_argument("--coins", type=str, default=",".join(COINS), help="Comma-separated coin list")
-    parser.add_argument("--plateau-patience", type=int, default=120, help="Stop if no best-score improvement for N trials")
-    parser.add_argument("--plateau-min-delta", type=float, default=0.01, help="Min score improvement to reset plateau")
-    parser.add_argument("--plateau-warmup", type=int, default=80, help="Warmup completed trials before plateau checks")
-    parser.add_argument("--holdout-days", type=int, default=90, help="Days reserved as true holdout (never seen by Optuna)")
+    parser.add_argument("--plateau-patience", type=int, default=100, help="Stop if no best-score improvement for N trials")
+    parser.add_argument("--plateau-min-delta", type=float, default=0.02, help="Min score improvement to reset plateau")
+    parser.add_argument("--plateau-warmup", type=int, default=60, help="Warmup completed trials before plateau checks")
+    parser.add_argument("--holdout-days", type=int, default=120, help="Days reserved as true holdout (never seen by Optuna)")
     parser.add_argument("--debug-trials", action="store_true", help="Enable verbose per-trial output in optimize workers")
     args = parser.parse_args()
 
@@ -28,21 +27,8 @@ if __name__ == "__main__":
     if not target_coins:
         raise SystemExit("No coins selected")
 
-    # =========================================================================
-    # RESOLVE WORKING DIRECTORY
-    #
-    # Critical for Docker: When the API container spawns this script via
-    # ops_service._spawn(cwd=/trader), this script runs with cwd=/trader.
-    # Child optimize.py processes MUST also run in the same directory so they
-    # can find train_model.py, coin_profiles.py, data/, etc.
-    #
-    # We resolve the script's own directory as the canonical working dir,
-    # which works both locally (script is in backend/trader/) and in Docker
-    # (script is at /trader/parallel_launch.py).
-    # =========================================================================
     script_dir = Path(__file__).resolve().parent
 
-    # Verify critical files exist in the working directory
     optimize_path = script_dir / "optimize.py"
     train_model_path = script_dir / "train_model.py"
 
@@ -57,7 +43,6 @@ if __name__ == "__main__":
         print(f"❌ Cannot find train_model.py at {train_model_path}")
         raise SystemExit(1)
 
-    # Check for data
     data_dir = script_dir / "data"
     db_path = data_dir / "trading.db"
     features_dir = data_dir / "features"
@@ -70,7 +55,6 @@ if __name__ == "__main__":
         print(f"⚠️  WARNING: No feature files in {features_dir}")
         print(f"   Workers will fail to load data. Run compute_features.py first.")
 
-    # Split the requested workers across selected coins.
     n_coins = len(target_coins)
     base_workers = max(1, args.jobs // n_coins)
     remainder_workers = max(0, args.jobs - (base_workers * n_coins))
@@ -97,7 +81,6 @@ if __name__ == "__main__":
     run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
     print(f"   Study run id: {run_id}")
 
-    # Report optuna DB state
     optuna_db = script_dir / "optuna_trading.db"
     if optuna_db.exists():
         print(f"   ℹ️  Existing optuna DB found at {optuna_db} ({optuna_db.stat().st_size / 1024:.0f} KB)")
@@ -106,11 +89,9 @@ if __name__ == "__main__":
     processes = []
     failed_starts = []
 
-    # Launch per-coin workers. Total running processes ~= requested --jobs.
     for coin in target_coins:
         workers_for_coin = max(1, worker_counts[coin])
 
-        # Split trials across workers as evenly as possible per coin.
         base_trials = args.trials // workers_for_coin
         extra = args.trials % workers_for_coin
         trial_splits = [base_trials + (1 if i < extra else 0) for i in range(workers_for_coin)]
@@ -118,7 +99,7 @@ if __name__ == "__main__":
         for i, trial_count in enumerate(trial_splits):
             base_cmd = [
                 sys.executable,
-                str(optimize_path),  # Use absolute path to optimize.py
+                str(optimize_path),
                 "--coin",
                 coin,
                 "--jobs",
@@ -152,14 +133,13 @@ if __name__ == "__main__":
                 p = subprocess.Popen(
                     base_cmd,
                     env=env,
-                    cwd=str(script_dir),  # CRITICAL: ensure children run in trader dir
+                    cwd=str(script_dir),
                 )
                 processes.append((coin, i, p))
             except Exception as e:
                 print(f"   ❌ Failed to start {coin} worker #{i+1}: {e}")
                 failed_starts.append((coin, i, str(e)))
 
-            # Stagger starts to reduce initial DB lock contention
             time.sleep(0.35)
 
     if failed_starts:
@@ -192,7 +172,6 @@ if __name__ == "__main__":
         print("\n🛑 Stopping all workers...")
         for coin, idx, p in processes:
             p.terminate()
-        # Give them a moment to clean up
         for coin, idx, p in processes:
             try:
                 p.wait(timeout=5)
