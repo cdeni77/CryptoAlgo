@@ -42,13 +42,17 @@ BASE_FEATURES = [
     'volatility_1h', 'volatility_4h', 'volatility_24h',
     'volume_ratio_1h', 'volume_ratio_24h',
     'parkinson_vol_24h',
+    # Market microstructure / distribution
+    'body_to_range', 'close_to_high', 'close_to_low', 'atr_pct_24h',
+    'buy_volume_ratio_24h', 'volume_zscore_24h',
+    'ret_skew_72h', 'ret_kurt_72h',
     # Funding
     'funding_rate_bps', 'funding_rate_zscore',
     'cumulative_funding_24h', 'cumulative_funding_72h',
     # OI
     'oi_change_1h', 'oi_change_4h', 'oi_change_24h',
     # Regime
-    'trend_sma20_50', 'vol_regime_ratio',
+    'trend_sma20_50', 'vol_regime_ratio', 'trend_strength_24h',
 ]
 
 # =============================================================================
