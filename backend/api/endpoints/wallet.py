@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from coinbase.rest import RESTClient
 from database import get_db
-from models.trade import Trade, TradeSide, TradeStatus
+from models.trade import PaperEquityCurve, Trade, TradeSide, TradeStatus
 from models.wallet import Wallet
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
