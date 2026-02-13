@@ -1,1 +1,0 @@
-# Canonical SQLAlchemy model modules.

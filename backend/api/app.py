@@ -11,9 +11,10 @@ from endpoints.wallet import router as wallet_router
 from models.base import Base
 
 # Ensure model modules are imported so SQLAlchemy registers tables on Base.metadata.
-from models import signals as _signals_models  # noqa: F401
-from models import trade as _trade_models  # noqa: F401
-from models import wallet as _wallet_models  # noqa: F401
+from models import signals as _signals_models 
+from models import trade as _trade_models  
+from models import wallet as _wallet_models  
+from models import ops as _ops_models
 
 Base.metadata.create_all(bind=engine)
 

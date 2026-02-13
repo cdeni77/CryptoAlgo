@@ -22,8 +22,8 @@ class CoinbaseAPIConfig:
     """Coinbase Advanced Trade API configuration."""
     
     # API credentials (loaded from environment)
-    api_key: str = field(default_factory=lambda: os.environ.get("CDP_API_KEY", ""))
-    api_secret: str = field(default_factory=lambda: os.environ.get("CDP_API_SECRET", ""))
+    api_key: str = field(default_factory=lambda: os.environ.get("COINBASE_API_KEY", ""))
+    api_secret: str = field(default_factory=lambda: os.environ.get("COINBASE_API_SECRET", ""))
     
     # Base URLs
     rest_base_url: str = "https://api.coinbase.com"

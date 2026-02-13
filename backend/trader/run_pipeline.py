@@ -531,8 +531,8 @@ Examples:
     proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     
     # API credentials
-    api_key = os.environ.get("CDP_API_KEY")
-    api_secret = os.environ.get("CDP_API_SECRET")
+    api_key = os.environ.get("COINBASE_API_KEY")
+    api_secret = os.environ.get("COINBASE_API_SECRET")
     
     print("=" * 70)
     print("🚀 UNIFIED DATA PIPELINE - Coinbase Perps Trading")

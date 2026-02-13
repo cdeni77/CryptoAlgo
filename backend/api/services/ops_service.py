@@ -190,6 +190,32 @@ class OpsService:
             self._training_proc = self._spawn(cmd, extra_env=env)
             return self._training_proc.pid
 
+    def launch_parallel(self, trials: int = 200, jobs: int = 16) -> int:
+        with self._lock:
+            if self._parallel_proc and self._parallel_proc.poll() is None:
+                return self._parallel_proc.pid
+
+            self._phase = "optimization"
+            self._parallel_proc = self._spawn([
+                "python",
+                "parallel_launch.py",
+                "--trials",
+                str(trials),
+                "--jobs",
+                str(jobs),
+            ])
+            return self._parallel_proc.pid
+
+    def train_from_scratch(self) -> int:
+        with self._lock:
+            if self._training_proc and self._training_proc.poll() is None:
+                return self._training_proc.pid
+
+            self._phase = "training"
+            self._next_run_time = datetime.utcnow() + timedelta(hours=1)
+            self._training_proc = self._spawn(["python", "live_orchestrator.py", "--retrain-only", "--run-once"])
+            return self._training_proc.pid
+
     def _parse_timestamp(self, value: str) -> Optional[datetime]:
         for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S"):
             try:
