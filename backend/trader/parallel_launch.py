@@ -23,7 +23,7 @@ if __name__ == "__main__":
     if not target_coins:
         raise SystemExit("No coins selected")
 
-    # Distribute workers as evenly as possible while using all requested cores.
+    # Split the requested workers across selected coins.
     n_coins = len(target_coins)
     base_workers = max(1, args.jobs // n_coins)
     remainder_workers = max(0, args.jobs - (base_workers * n_coins))
@@ -39,6 +39,8 @@ if __name__ == "__main__":
     print(f"   Coins:        {target_coins}")
     print(f"   Target/coin:  {args.trials} trials")
     print(f"   Worker split: {worker_counts}")
+    print("   Note: each optimize.py worker runs with --jobs 1 (single process).")
+    print("         Parallelism comes from launching many worker processes.")
     print(f"{'='*60}")
 
     run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S')
@@ -46,35 +48,43 @@ if __name__ == "__main__":
 
     processes = []
 
-    # Launch one process per coin and let Optuna handle intra-coin parallelism via
-    # --jobs. This keeps logs readable, avoids repeatedly loading the same data,
-    # and makes the reported "Cores" value match the configured split.
+    # Launch per-coin workers. Total running processes ~= requested --jobs.
     for coin in target_coins:
         workers_for_coin = max(1, worker_counts[coin])
-        base_cmd = [
-            sys.executable,
-            "optimize.py",
-            "--coin",
-            coin,
-            "--jobs",
-            str(workers_for_coin),
-            "--trials",
-            str(max(1, args.trials)),
-            "--plateau-patience",
-            str(args.plateau_patience),
-            "--plateau-min-delta",
-            str(args.plateau_min_delta),
-            "--plateau-warmup",
-            str(args.plateau_warmup),
-            "--study-suffix",
-            run_id,
-        ]
 
-        print(f"   Starting {coin} ({args.trials} trials, {workers_for_coin} cores)...")
-        p = subprocess.Popen(base_cmd)
-        processes.append(p)
-        # Stagger starts to reduce initial DB lock contention
-        time.sleep(0.35)
+        # Split trials across workers as evenly as possible per coin.
+        base_trials = args.trials // workers_for_coin
+        extra = args.trials % workers_for_coin
+        trial_splits = [base_trials + (1 if i < extra else 0) for i in range(workers_for_coin)]
+
+        for i, trial_count in enumerate(trial_splits):
+            base_cmd = [
+                sys.executable,
+                "optimize.py",
+                "--coin",
+                coin,
+                "--jobs",
+                "1",
+                "--trials",
+                str(max(1, trial_count)),
+                "--plateau-patience",
+                str(args.plateau_patience),
+                "--plateau-min-delta",
+                str(args.plateau_min_delta),
+                "--plateau-warmup",
+                str(args.plateau_warmup),
+                "--study-suffix",
+                run_id,
+            ]
+
+            print(
+                f"   Starting {coin} worker #{i + 1}/{workers_for_coin} "
+                f"({trial_count} trials, process-level parallelism)..."
+            )
+            p = subprocess.Popen(base_cmd)
+            processes.append(p)
+            # Stagger starts to reduce initial DB lock contention
+            time.sleep(0.35)
 
     print(f"\n✅ All {len(processes)} workers started. Monitor CPU usage now!")
     print("   Press Ctrl+C to stop all workers.\n")
