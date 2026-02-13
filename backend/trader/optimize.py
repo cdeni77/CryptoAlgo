@@ -78,6 +78,62 @@ def get_extra_features(coin_name: str):
     }
     return mapping.get(coin_name, [])
 
+
+def _as_number(value, default: Optional[float] = None) -> Optional[float]:
+    """Safely coerce values from Optuna attrs/JSON to float for formatting."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_pct(value, decimals: int = 1, fallback: str = "?") -> str:
+    n = _as_number(value)
+    return f"{n:.{decimals}%}" if n is not None else fallback
+
+
+def _fmt_float(value, decimals: int = 3, fallback: str = "?") -> str:
+    n = _as_number(value)
+    return f"{n:.{decimals}f}" if n is not None else fallback
+
+
+def _set_reject_reason(trial: optuna.Trial, reason: str) -> None:
+    trial.set_user_attr('reject_reason', reason)
+
+
+def resolve_target_symbol(all_data: Dict, coin_prefix: str, coin_name: str) -> Optional[str]:
+    """Resolve symbol robustly for legacy/new prefix styles (e.g. DOP vs DOGE)."""
+    # 1) Direct prefix map from loaded dataset keys
+    target = PREFIX_TO_SYMBOL.get(coin_prefix)
+    if target:
+        return target
+
+    # 2) Common aliases used in this repo
+    aliases = {
+        'BIP': 'BTC', 'ETP': 'ETH', 'XPP': 'XRP', 'SLP': 'SOL', 'DOP': 'DOGE',
+        'BTC': 'BTC', 'ETH': 'ETH', 'XRP': 'XRP', 'SOL': 'SOL', 'DOGE': 'DOGE',
+    }
+    candidates = [coin_prefix, coin_name, aliases.get(coin_prefix), aliases.get(coin_name)]
+    for c in candidates:
+        if not c:
+            continue
+        # Try direct prefix lookup
+        direct = PREFIX_TO_SYMBOL.get(c)
+        if direct:
+            return direct
+        # Try scanning loaded symbols by prefix/base substring
+        c_up = str(c).upper()
+        for sym in all_data:
+            sym_up = sym.upper()
+            sym_prefix = sym_up.split('-')[0] if '-' in sym_up else sym_up
+            if sym_prefix == c_up or c_up in sym_prefix or c_up in sym_up:
+                return sym
+    return None
+
 def create_trial_profile(trial: optuna.Trial, coin_name: str) -> CoinProfile:
     """Create a CoinProfile from Optuna trial suggestions."""
     base_profile = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
@@ -127,8 +183,9 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     """
     profile = create_trial_profile(trial, coin_name)
 
-    target_sym = PREFIX_TO_SYMBOL.get(coin_prefix)
+    target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
     if not target_sym:
+        _set_reject_reason(trial, f'missing_symbol:{coin_prefix}/{coin_name}')
         return -99.0
 
     # Filter data to only this coin (reduces pickling overhead to workers)
@@ -154,12 +211,18 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     try:
         sys.stdout = captured_output
         result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
-    except Exception:
+    except Exception as e:
+        _set_reject_reason(trial, f'run_backtest_error:{type(e).__name__}')
         return -99.0
     finally:
         sys.stdout = original_stdout # Restore stdout immediately
 
-    if result is None or result.get('n_trades', 0) < 15:
+    if result is None:
+        _set_reject_reason(trial, 'result_none')
+        return -99.0
+
+    if result.get('n_trades', 0) < 15:
+        _set_reject_reason(trial, f"too_few_trades:{result.get('n_trades', 0)}")
         return -99.0
 
     # Scoring Logic
@@ -181,6 +244,7 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     trade_penalty = 0.0
 
     if n_trades < 12:  # Hard reject only extreme noise (<~2–3/year total)
+        _set_reject_reason(trial, f'too_few_trades_hard:{n_trades}')
         return -99.0
 
     if trades_per_year < 10:  # <~1/year total — noticeable for ultra-selective
@@ -244,7 +308,8 @@ class PlateauStopper:
             self.best_trial_number = study.best_trial.number
             return
 
-        since_best = trial.number - (self.best_trial_number if self.best_trial_number is not None else trial.number)
+        best_num = self.best_trial_number if self.best_trial_number is not None else trial.number
+        since_best = sum(1 for t in completed if t.number > best_num)
         if since_best >= self.patience:
             print(
                 f"\n🛑 Plateau stop: no improvement > {self.min_delta:.4f} "
@@ -260,13 +325,14 @@ class PlateauStopper:
 def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str, 
                   n_trials: int = 50, n_jobs: int = 1,
                   plateau_patience: int = 80, plateau_min_delta: float = 0.02,
-                  plateau_warmup: int = 40):
+                  plateau_warmup: int = 40,
+                  study_suffix: str = ""):
     """Run Optuna optimization for a single coin with parallel support."""
     
     # 1. Setup Persistent Storage (Required for parallel jobs)
     # This allows multiple processes to write results to the same DB
     storage_url = "sqlite:///optuna_trading.db"
-    study_name = f"optimize_{coin_name}"  # Persistent name so we can resume
+    study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
 
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} ({coin_prefix})")
@@ -319,14 +385,25 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
 
     # 3. Report Results
     best = study.best_trial
+
+    if _as_number(best.value) == -99.0:
+        reason_counts = {}
+        for t in study.trials:
+            reason = t.user_attrs.get('reject_reason', 'unknown')
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        if top_reasons:
+            print("  ⚠️ Top reject reasons:")
+            for reason, count in top_reasons:
+                print(f"    - {reason}: {count}")
     print(f"\n✅ BEST RESULT for {coin_name}:")
-    print(f"  Score:        {best.value:.3f}")
+    print(f"  Score:        {_fmt_float(best.value, 3)}")
     print(f"  Trades:       {best.user_attrs.get('n_trades', '?')}")
-    print(f"  Win Rate:     {best.user_attrs.get('win_rate', '?'):.1%}")
-    print(f"  Ann Return:   {best.user_attrs.get('ann_return', '?'):.2%}")
-    print(f"  Sharpe:       {best.user_attrs.get('sharpe', '?'):.3f}")
-    print(f"  Profit Factor:{best.user_attrs.get('profit_factor', '?'):.3f}")
-    print(f"  Max Drawdown: {best.user_attrs.get('max_drawdown', '?'):.2%}")
+    print(f"  Win Rate:     {_fmt_pct(best.user_attrs.get('win_rate'), 1)}")
+    print(f"  Ann Return:   {_fmt_pct(best.user_attrs.get('ann_return'), 2)}")
+    print(f"  Sharpe:       {_fmt_float(best.user_attrs.get('sharpe'), 3)}")
+    print(f"  Profit Factor:{_fmt_float(best.user_attrs.get('profit_factor'), 3)}")
+    print(f"  Max Drawdown: {_fmt_pct(best.user_attrs.get('max_drawdown'), 2)}")
 
     # 4. Save JSON
     result_data = {
@@ -355,7 +432,8 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         print(f"        extra_features=[],")
     for k, v in sorted(best.params.items()):
         if isinstance(v, float):
-            print(f"        {k}={v:.4f},".rstrip('0').rstrip('.') + ',')
+            pretty = f"{v:.4f}".rstrip('0').rstrip('.')
+            print(f"        {k}={pretty},")
         else:
             print(f"        {k}={v},")
     print(f"    ),")
@@ -378,9 +456,14 @@ def show_results():
             r = json.load(f)
         m = r.get('metrics', {})
         print(f"\n{r['coin']} ({r.get('prefix','?')}) — {r['n_trials']} trials — {r['timestamp'][:16]}")
-        print(f"  Score: {r['score']:.3f} | Sharpe: {m.get('sharpe', '?')} | "
-              f"WR: {m.get('win_rate', 0):.1%} | PF: {m.get('profit_factor', '?')} | "
-              f"DD: {m.get('max_drawdown', 0):.1%} | Trades: {m.get('n_trades', '?')}")
+        print(
+            f"  Score: {_fmt_float(r.get('score'), 3)} | "
+            f"Sharpe: {_fmt_float(m.get('sharpe'), 3)} | "
+            f"WR: {_fmt_pct(m.get('win_rate'), 1)} | "
+            f"PF: {_fmt_float(m.get('profit_factor'), 3)} | "
+            f"DD: {_fmt_pct(m.get('max_drawdown'), 1)} | "
+            f"Trades: {m.get('n_trades', '?')}"
+        )
 
 # -----------------------------------------------------------------------------
 # RUNTIME CONFIG
@@ -405,6 +488,8 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=50, help="Number of trials")
     parser.add_argument("--jobs", type=int, default=1, help="Parallel jobs (-1 = all cores)")
     parser.add_argument("--show", action="store_true", help="Show saved results")
+    parser.add_argument("--study-suffix", type=str, default="",
+                        help="Optional suffix to isolate studies per launch (useful for parallel runs)")
     parser.add_argument("--plateau-patience", type=int, default=80,
                         help="Stop if best score does not improve for this many trials")
     parser.add_argument("--plateau-min-delta", type=float, default=0.02,
@@ -447,6 +532,7 @@ if __name__ == "__main__":
                     plateau_patience=args.plateau_patience,
                     plateau_min_delta=args.plateau_min_delta,
                     plateau_warmup=args.plateau_warmup,
+                    study_suffix=args.study_suffix,
                 )
     else:
         # Single coin
@@ -472,4 +558,5 @@ if __name__ == "__main__":
             plateau_patience=args.plateau_patience,
             plateau_min_delta=args.plateau_min_delta,
             plateau_warmup=args.plateau_warmup,
+            study_suffix=args.study_suffix,
         )
