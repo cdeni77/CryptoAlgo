@@ -82,19 +82,19 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
       color: 'text-[var(--text-primary)]',
     },
     {
-      label: 'Portfolio Total',
-      value: wallet.coinbase?.total_value_usd != null ? fmt(wallet.coinbase.total_value_usd) : 'N/A',
-      color: 'text-[var(--accent-cyan)]',
-    },
-    {
       label: 'Ledger Wallet',
       value:
         wallet.wallets?.ledger?.value_usd != null
-          ? `${fmt(wallet.wallets.ledger.value_usd)} (${wallet.wallets.ledger.address_count} addresses)`
+          ? fmt(wallet.wallets.ledger.value_usd)
           : wallet.wallets?.ledger?.address_count
-            ? `${wallet.wallets.ledger.address_count} addresses`
+            ? '$0.00'
             : 'Not configured',
       color: 'text-[var(--text-primary)]',
+    },
+    {
+      label: 'Portfolio Total',
+      value: wallet.coinbase?.total_value_usd != null ? fmt(wallet.coinbase.total_value_usd) : 'N/A',
+      color: 'text-[var(--accent-cyan)]',
     },
   ];
 

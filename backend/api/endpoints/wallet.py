@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
 
@@ -22,6 +22,9 @@ client = RESTClient(api_key=api_key, api_secret=api_secret)
 STABLE_COINS = {"USD", "USDC", "USDT"}
 ONDO_ETH_CONTRACT = "0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3"
 ONDO_SOL_MINT = "A3eMEJQqN3EAx2FQwPDhJGFH3M9x4W8M7mWUPR8iY5Wg"
+ETH_RPC_URL = "https://ethereum-rpc.publicnode.com"
+
+_ETHPLORER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def _to_dict(payload: Any) -> Dict[str, Any]:
@@ -71,6 +74,105 @@ def _fetch_json(url: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str,
         return {}
 
 
+
+
+def _fetch_json_list(url: str) -> List[Any]:
+    try:
+        req = request.Request(url, headers={"accept": "application/json"})
+        with request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+    except (error.HTTPError, error.URLError, json.JSONDecodeError, TimeoutError, ValueError):
+        return []
+
+
+def _combine_assets(*asset_groups: List[Dict[str, Any]]) -> Dict[str, float]:
+    combined: Dict[str, float] = {}
+    for group in asset_groups:
+        for asset in group or []:
+            symbol = str(asset.get("asset") or "").upper()
+            amount = _safe_float(asset.get("amount")) or 0.0
+            if not symbol or amount <= 0:
+                continue
+            combined[symbol] = combined.get(symbol, 0.0) + amount
+    return combined
+
+
+def _get_historical_daily_closes(asset: str, start: datetime, end: datetime) -> Dict[str, float]:
+    if asset in STABLE_COINS:
+        closes: Dict[str, float] = {}
+        cursor = start
+        while cursor.date() <= end.date():
+            closes[cursor.date().isoformat()] = 1.0
+            cursor += timedelta(days=1)
+        return closes
+
+    product = f"{asset}-USD"
+    params = parse.urlencode(
+        {
+            "granularity": 86400,
+            "start": start.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end": end.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+    )
+    candles = _fetch_json_list(f"https://api.exchange.coinbase.com/products/{product}/candles?{params}")
+    closes: Dict[str, float] = {}
+    for candle in candles:
+        if not isinstance(candle, list) or len(candle) < 5:
+            continue
+        ts = _safe_float(candle[0])
+        close = _safe_float(candle[4])
+        if ts is None or close is None:
+            continue
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        closes[day] = close
+    return closes
+
+
+def _build_backfilled_portfolio_history(
+    holdings: Dict[str, float],
+    paper_equity_usd: float,
+    perps_usd: float,
+    days: int = 365,
+    step_days: int = 7,
+) -> List[Dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+
+    historical_prices: Dict[str, Dict[str, float]] = {}
+    for asset in holdings:
+        historical_prices[asset] = _get_historical_daily_closes(asset, start, now)
+
+    history: List[Dict[str, Any]] = []
+    last_price_by_asset: Dict[str, float] = {}
+    cursor = start
+    while cursor <= now:
+        day_key = cursor.date().isoformat()
+        external_total = perps_usd
+        for asset, amount in holdings.items():
+            prices = historical_prices.get(asset, {})
+            px = prices.get(day_key)
+            if px is None:
+                px = last_price_by_asset.get(asset)
+            if px is None:
+                continue
+            last_price_by_asset[asset] = px
+            external_total += amount * px
+
+        history.append(
+            {
+                "timestamp": cursor.isoformat(),
+                "paper_equity_usd": round(paper_equity_usd, 2),
+                "external_usd": round(external_total, 2),
+                "total_value_usd": round(paper_equity_usd + external_total, 2),
+                "source": "backfilled_holdings",
+            }
+        )
+        cursor += timedelta(days=step_days)
+
+    return history
+
 def get_current_price(spot_id: str) -> Optional[float]:
     try:
         product = client.get_product(product_id=spot_id)
@@ -114,6 +216,15 @@ def get_ledger_wallets_from_env() -> Dict[str, Any]:
     }
 
 
+def _get_ethplorer_address_info(address: str) -> Dict[str, Any]:
+    normalized = address.lower()
+    if normalized in _ETHPLORER_CACHE:
+        return _ETHPLORER_CACHE[normalized]
+    payload = _fetch_json(f"https://api.ethplorer.io/getAddressInfo/{address}?apiKey=freekey")
+    _ETHPLORER_CACHE[normalized] = payload
+    return payload
+
+
 def _get_btc_balance(address: str) -> Optional[float]:
     payload = _fetch_json(f"https://blockstream.info/api/address/{address}")
     chain_stats = _to_dict(payload.get("chain_stats"))
@@ -123,13 +234,69 @@ def _get_btc_balance(address: str) -> Optional[float]:
 
 
 def _get_eth_balance(address: str) -> Optional[float]:
+    ethplorer = _get_ethplorer_address_info(address)
+    eth = _to_dict(ethplorer.get("ETH"))
+    eth_balance = _safe_float(eth.get("balance"))
+    if eth_balance is not None:
+        return eth_balance
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBalance",
+        "params": [address, "latest"],
+    }
+    response = _fetch_json(ETH_RPC_URL, payload=payload)
+    result = str(response.get("result") or "")
+    if result.startswith("0x"):
+        try:
+            return int(result, 16) / 1e18
+        except ValueError:
+            return None
+
+    # Fallback for explorer-style payloads.
     query = parse.urlencode({"module": "account", "action": "balance", "address": address})
-    payload = _fetch_json(f"https://eth.blockscout.com/api?{query}")
-    wei = _safe_float(payload.get("result"))
+    explorer_payload = _fetch_json(f"https://eth.blockscout.com/api?{query}")
+    wei = _safe_float(explorer_payload.get("result"))
     return wei / 1e18 if wei is not None else None
 
 
 def _get_erc20_balance(address: str, contract_address: str, decimals: int) -> Optional[float]:
+    ethplorer = _get_ethplorer_address_info(address)
+    for raw_token in ethplorer.get("tokens", []) or []:
+        token = _to_dict(raw_token)
+        token_info = _to_dict(token.get("tokenInfo"))
+        token_contract = str(token_info.get("address") or "").lower()
+        if token_contract != contract_address.lower():
+            continue
+        raw_balance = _safe_float(token.get("rawBalance"))
+        token_decimals = int(_safe_float(token_info.get("decimals")) or decimals)
+        if raw_balance is not None:
+            return raw_balance / (10 ** token_decimals)
+
+    selector = "70a08231"
+    encoded_address = address.lower().replace("0x", "").rjust(64, "0")
+    call_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [
+            {
+                "to": contract_address,
+                "data": f"0x{selector}{encoded_address}",
+            },
+            "latest",
+        ],
+    }
+    response = _fetch_json(ETH_RPC_URL, payload=call_payload)
+    result = str(response.get("result") or "")
+    if result.startswith("0x"):
+        try:
+            return int(result, 16) / (10 ** decimals)
+        except ValueError:
+            return None
+
+    # Fallback for explorer-style payloads.
     query = parse.urlencode(
         {
             "module": "account",
@@ -476,10 +643,21 @@ def get_wallet(db: Session = Depends(get_db)):
             "paper_equity_usd": round(point.equity, 2),
             "external_usd": round(portfolio_total, 2),
             "total_value_usd": round(point.equity + portfolio_total, 2),
+            "source": "paper_equity",
         }
         for point in equity_points
         if point.timestamp is not None
     ]
+
+    if not portfolio_history:
+        holdings = _combine_assets(spot.get("assets", []), ledger.get("assets", []))
+        portfolio_history = _build_backfilled_portfolio_history(
+            holdings=holdings,
+            paper_equity_usd=paper_balance,
+            perps_usd=perps_usd or 0.0,
+            days=365,
+            step_days=7,
+        )
 
     total_pnl = realized_pnl + unrealized_pnl
     return {
