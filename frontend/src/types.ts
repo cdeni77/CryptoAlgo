@@ -72,6 +72,19 @@ export interface WalletData {
   realized_pnl: number;
   unrealized_pnl: number;
   total_pnl: number;
+  coinbase?: {
+    spot?: {
+      value_usd: number | null;
+      status: string;
+      error?: string;
+    };
+    perps?: {
+      value_usd: number | null;
+      status: string;
+      error?: string;
+    };
+    total_value_usd: number | null;
+  };
 }
 
 export interface PaperOrder {

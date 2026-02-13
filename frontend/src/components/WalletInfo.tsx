@@ -6,6 +6,11 @@ interface WalletData {
   realized_pnl: number;
   unrealized_pnl: number;
   total_pnl: number;
+  coinbase?: {
+    spot?: { value_usd: number | null; status: string };
+    perps?: { value_usd: number | null; status: string };
+    total_value_usd: number | null;
+  };
 }
 
 interface WalletInfoProps {
@@ -49,6 +54,21 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
     { label: 'Realized PNL', value: `${wallet.realized_pnl >= 0 ? '+' : ''}${fmt(wallet.realized_pnl)}`, color: pnlColor(wallet.realized_pnl) },
     { label: 'Unrealized PNL', value: `${wallet.unrealized_pnl >= 0 ? '+' : ''}${fmt(wallet.unrealized_pnl)}`, color: pnlColor(wallet.unrealized_pnl) },
     { label: 'Total PNL', value: `${wallet.total_pnl >= 0 ? '+' : ''}${fmt(wallet.total_pnl)}`, color: pnlColor(wallet.total_pnl) },
+    {
+      label: 'Coinbase Spot',
+      value: wallet.coinbase?.spot?.value_usd != null ? fmt(wallet.coinbase.spot.value_usd) : 'N/A',
+      color: 'text-[var(--text-primary)]',
+    },
+    {
+      label: 'Coinbase Perps',
+      value: wallet.coinbase?.perps?.value_usd != null ? fmt(wallet.coinbase.perps.value_usd) : 'N/A',
+      color: 'text-[var(--text-primary)]',
+    },
+    {
+      label: 'Coinbase Total',
+      value: wallet.coinbase?.total_value_usd != null ? fmt(wallet.coinbase.total_value_usd) : 'N/A',
+      color: 'text-[var(--accent-cyan)]',
+    },
   ];
 
   return (
