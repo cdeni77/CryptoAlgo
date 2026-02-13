@@ -17,6 +17,7 @@ if __name__ == "__main__":
     parser.add_argument("--plateau-patience", type=int, default=120, help="Stop if no best-score improvement for N trials")
     parser.add_argument("--plateau-min-delta", type=float, default=0.01, help="Min score improvement to reset plateau")
     parser.add_argument("--plateau-warmup", type=int, default=80, help="Warmup completed trials before plateau checks")
+    parser.add_argument("--debug-trials", action="store_true", help="Enable verbose per-trial output in optimize workers")
     args = parser.parse_args()
 
     target_coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
@@ -76,6 +77,9 @@ if __name__ == "__main__":
                 "--study-suffix",
                 run_id,
             ]
+
+            if args.debug_trials:
+                base_cmd.append("--debug-trials")
 
             print(
                 f"   Starting {coin} worker #{i + 1}/{workers_for_coin} "

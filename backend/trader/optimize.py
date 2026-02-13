@@ -19,6 +19,8 @@ import os
 import logging
 import sqlite3
 import functools  # <--- Critical for multiprocessing
+import traceback
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -54,6 +56,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 # Map coin prefix to symbol (filled at runtime)
 PREFIX_TO_SYMBOL: Dict[str, str] = {}
+DEBUG_TRIALS = False
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -203,19 +206,34 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
         oos_eval_days=60,
     )
 
-    # Capture stdout to prevent console spam from parallel processes
-    # We use a context manager to silence prints during the backtest
+    # Capture stdout in normal mode to reduce noise, but allow full logs when debugging.
     captured_output = io.StringIO()
     original_stdout = sys.stdout
-    
+    start_ts = time.time()
+
     try:
-        sys.stdout = captured_output
+        if not DEBUG_TRIALS:
+            sys.stdout = captured_output
         result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception as e:
-        _set_reject_reason(trial, f'run_backtest_error:{type(e).__name__}')
+        err_name = type(e).__name__
+        err_msg = str(e).strip() or '<no-message>'
+        tb_last = traceback.format_exc().strip().splitlines()[-1]
+        trial.set_user_attr('error_type', err_name)
+        trial.set_user_attr('error_message', err_msg[:300])
+        trial.set_user_attr('error_tail', tb_last[:300])
+        _set_reject_reason(trial, f'run_backtest_error:{err_name}')
+        if DEBUG_TRIALS:
+            print(f"\n❌ Trial {trial.number} backtest exception: {err_name}: {err_msg}")
+            print(traceback.format_exc())
         return -99.0
     finally:
-        sys.stdout = original_stdout # Restore stdout immediately
+        sys.stdout = original_stdout  # Restore stdout immediately
+
+    trial.set_user_attr('elapsed_sec', round(time.time() - start_ts, 3))
+    if DEBUG_TRIALS and captured_output.getvalue().strip():
+        tail = '\n'.join(captured_output.getvalue().strip().splitlines()[-8:])
+        print(f"\n--- trial {trial.number} backtest tail ---\n{tail}\n--- end tail ---")
 
     if result is None:
         _set_reject_reason(trial, 'result_none')
@@ -500,7 +518,11 @@ if __name__ == "__main__":
                         help="Minimum best-score improvement to reset plateau counter")
     parser.add_argument("--plateau-warmup", type=int, default=40,
                         help="Minimum completed trials before plateau checks start")
+    parser.add_argument("--debug-trials", action="store_true",
+                        help="Show per-trial backtest logs/exceptions for debugging")
     args = parser.parse_args()
+
+    DEBUG_TRIALS = args.debug_trials
 
     # Initialize SQLite WAL mode BEFORE running anything else
     init_db_wal()
