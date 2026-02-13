@@ -15,6 +15,8 @@ Usage in train_model.py:
 """
 
 import os
+import json
+import hashlib
 import joblib
 import logging
 from dataclasses import dataclass, field
@@ -287,6 +289,7 @@ def save_model(
     auc: float,
     profile_name: str,
     extra_meta: Optional[Dict] = None,
+    target_dir: Optional[Path] = None,
 ) -> Path:
     """
     Save a trained model + metadata to disk.
@@ -296,7 +299,12 @@ def save_model(
     """
     # Clean symbol for filename
     symbol_clean = symbol.replace('/', '_').replace('-', '_')
-    path = MODELS_DIR / f"{symbol_clean}.joblib"
+    models_dir = target_dir or MODELS_DIR
+    models_dir.mkdir(parents=True, exist_ok=True)
+    path = models_dir / f"{symbol_clean}.joblib"
+    feature_set_hash = hashlib.sha256(
+        json.dumps(sorted(feature_columns), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     
     payload = {
         'model': model,
@@ -307,10 +315,14 @@ def save_model(
         'profile_name': profile_name,
         'symbol': symbol,
     }
-    if extra_meta:
-        payload['meta'] = extra_meta
-    
-    joblib.dump(payload, path)
+    payload['meta'] = {
+        'feature_set_hash': feature_set_hash,
+        **(extra_meta or {}),
+    }
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    joblib.dump(payload, tmp_path)
+    os.replace(tmp_path, path)
     logger.info(f"💾 Saved model for {symbol} → {path} (AUC={auc:.3f})")
     return path
 

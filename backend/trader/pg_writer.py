@@ -5,7 +5,13 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text, create_engine
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+
+# ── Inline model definitions (mirror of the API models) ────────────
+# We duplicate the ORM classes here so the trader doesn't need to
+# import from the API codebase (they run in separate containers).
+from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text, create_engine, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import func
@@ -77,6 +83,22 @@ class Wallet(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class ModelRun(Base):
+    __tablename__ = "model_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    run_started_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    run_finished_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String, nullable=False, index=True)
+    retrain_window_days = Column(Integer, nullable=False, default=90)
+    symbols_total = Column(Integer, nullable=False, default=0)
+    symbols_trained = Column(Integer, nullable=False, default=0)
+    artifacts_version = Column(String, nullable=True)
+    metrics = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ====================================================================
 class PaperOrder(Base):
     __tablename__ = "paper_orders"
     id = Column(Integer, primary_key=True, index=True)
@@ -281,6 +303,40 @@ class PgWriter:
                 db.add(Wallet(balance=new_balance))
             db.commit()
 
+    # ── Model runs ──────────────────────────────────────────────────
+    def create_model_run(self, retrain_window_days: int, symbols_total: int, artifacts_version: str | None = None) -> int:
+        with self._session() as db:
+            run = ModelRun(
+                run_started_at=datetime.now(timezone.utc),
+                status="running",
+                retrain_window_days=retrain_window_days,
+                symbols_total=symbols_total,
+                artifacts_version=artifacts_version,
+            )
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+            return run.id
+
+    def complete_model_run(
+        self,
+        run_id: int,
+        success: bool,
+        symbols_trained: int,
+        metrics: dict | None = None,
+        error: str | None = None,
+    ) -> bool:
+        with self._session() as db:
+            run = db.query(ModelRun).filter(ModelRun.id == run_id).first()
+            if not run:
+                return False
+            run.run_finished_at = datetime.now(timezone.utc)
+            run.status = "success" if success else "failed"
+            run.symbols_trained = symbols_trained
+            run.metrics = metrics
+            run.error = error
+            db.commit()
+            return True
     def upsert_wallet_balance(self, new_balance: float) -> None:
         """Alias for wallet balance upsert used by the trader loops."""
         self.update_balance(new_balance)
