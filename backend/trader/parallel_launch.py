@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -84,7 +85,9 @@ if __name__ == "__main__":
                 f"   Starting {coin} worker #{i + 1}/{workers_for_coin} "
                 f"({trial_count} trials, process-level parallelism)..."
             )
-            p = subprocess.Popen(base_cmd)
+            env = os.environ.copy()
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            p = subprocess.Popen(base_cmd, env=env)
             processes.append(p)
             # Stagger starts to reduce initial DB lock contention
             time.sleep(0.35)
