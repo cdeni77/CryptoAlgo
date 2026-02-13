@@ -18,6 +18,8 @@ import os
 import logging
 import sqlite3
 import functools  # <--- Critical for multiprocessing
+import traceback
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -53,6 +55,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 # Map coin prefix to symbol (filled at runtime)
 PREFIX_TO_SYMBOL: Dict[str, str] = {}
+DEBUG_TRIALS = False
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -205,7 +208,16 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     try:
         result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception as e:
-        _set_reject_reason(trial, f'run_backtest_error:{type(e).__name__}')
+        err_name = type(e).__name__
+        err_msg = str(e).strip() or '<no-message>'
+        tb_last = traceback.format_exc().strip().splitlines()[-1]
+        trial.set_user_attr('error_type', err_name)
+        trial.set_user_attr('error_message', err_msg[:300])
+        trial.set_user_attr('error_tail', tb_last[:300])
+        _set_reject_reason(trial, f'run_backtest_error:{err_name}')
+        if DEBUG_TRIALS:
+            print(f"\n❌ Trial {trial.number} backtest exception: {err_name}: {err_msg}")
+            print(traceback.format_exc())
         return -99.0
 
     if result is None:
