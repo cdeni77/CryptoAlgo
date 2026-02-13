@@ -29,24 +29,48 @@ class OpsService:
         self._last_run_time: Optional[datetime] = None
         self._next_run_time: Optional[datetime] = None
 
-        self._repo_root = Path(__file__).resolve().parents[2]
-        self._trader_dir = self._repo_root / "trader"
+        self._trader_dir = self._resolve_trader_dir()
         self._logs_dir = self._trader_dir / "logs"
         self._logs_dir.mkdir(parents=True, exist_ok=True)
         self._log_file = Path(os.environ.get("TRADER_LOG_FILE", self._logs_dir / "trader.log"))
+
+    def _resolve_trader_dir(self) -> Path:
+        env_dir = os.environ.get("TRADER_DIR")
+        if env_dir:
+            p = Path(env_dir)
+            if p.exists():
+                return p
+
+        here = Path(__file__).resolve()
+        candidates = [
+            here.parents[3] / "backend" / "trader",  # repo checkout
+            here.parents[2] / "trader",  # legacy layout
+            Path("/trader"),  # docker-compose mount target
+            Path("/app/trader"),
+        ]
+        for candidate in candidates:
+            if (candidate / "live_orchestrator.py").exists():
+                return candidate
+
+        raise RuntimeError("Could not locate trader directory. Set TRADER_DIR environment variable.")
 
     @property
     def log_file(self) -> Path:
         return self._log_file
 
-    def _spawn(self, cmd: List[str]) -> subprocess.Popen:
+    def _spawn(self, cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
         log_handle = self._log_file.open("a", encoding="utf-8")
+        env = os.environ.copy()
+        if extra_env:
+            env.update({k: str(v) for k, v in extra_env.items() if v is not None})
+
         proc = subprocess.Popen(
             cmd,
             cwd=self._trader_dir,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            env=env,
         )
         self._last_run_time = datetime.utcnow()
         return proc
@@ -73,14 +97,97 @@ class OpsService:
             self._next_run_time = None
             return True
 
-    def retrain(self) -> int:
+    def retrain(self, train_window_days: int = 90, retrain_every_days: int = 7, debug: bool = False) -> int:
         with self._lock:
             if self._training_proc and self._training_proc.poll() is None:
                 return self._training_proc.pid
 
             self._phase = "training"
             self._next_run_time = datetime.utcnow() + timedelta(hours=1)
-            self._training_proc = self._spawn(["python", "live_orchestrator.py", "--retrain-only", "--run-once"])
+            cmd = [
+                "python",
+                "live_orchestrator.py",
+                "--retrain-only",
+                "--run-once",
+                "--train-window-days",
+                str(train_window_days),
+                "--retrain-every-days",
+                str(retrain_every_days),
+            ]
+            if debug:
+                cmd.append("--debug")
+            self._training_proc = self._spawn(cmd)
+            return self._training_proc.pid
+
+    def launch_parallel(
+        self,
+        trials: int = 200,
+        jobs: int = 16,
+        coins: str = "BTC,ETH,SOL,XRP,DOGE",
+        plateau_patience: int = 80,
+        plateau_min_delta: float = 0.02,
+        plateau_warmup: int = 40,
+    ) -> int:
+        with self._lock:
+            if self._parallel_proc and self._parallel_proc.poll() is None:
+                return self._parallel_proc.pid
+
+            self._phase = "optimization"
+            self._parallel_proc = self._spawn(
+                [
+                    "python",
+                    "parallel_launch.py",
+                    "--trials",
+                    str(trials),
+                    "--jobs",
+                    str(jobs),
+                    "--coins",
+                    coins,
+                    "--plateau-patience",
+                    str(plateau_patience),
+                    "--plateau-min-delta",
+                    str(plateau_min_delta),
+                    "--plateau-warmup",
+                    str(plateau_warmup),
+                ]
+            )
+            return self._parallel_proc.pid
+
+    def train_from_scratch(
+        self,
+        backfill_days: int = 30,
+        include_oi: bool = True,
+        debug: bool = False,
+        threshold: float = 0.74,
+        min_auc: float = 0.54,
+        leverage: int = 4,
+        exclude_symbols: str = "BIP,DOP",
+    ) -> int:
+        with self._lock:
+            if self._training_proc and self._training_proc.poll() is None:
+                return self._training_proc.pid
+
+            self._phase = "training"
+            self._next_run_time = datetime.utcnow() + timedelta(hours=1)
+            cmd = [
+                "python",
+                "live_orchestrator.py",
+                "--run-once",
+                "--backfill-days",
+                str(backfill_days),
+            ]
+            if include_oi:
+                cmd.append("--include-oi")
+            if debug:
+                cmd.append("--debug")
+
+            env = {
+                "SIGNAL_THRESHOLD": str(threshold),
+                "MIN_AUC": str(min_auc),
+                "LEVERAGE": str(leverage),
+                "EXCLUDE_SYMBOLS": exclude_symbols,
+            }
+            self._training_proc = self._spawn(cmd, extra_env=env)
             return self._training_proc.pid
 
     def launch_parallel(self, trials: int = 200, jobs: int = 16) -> int:
