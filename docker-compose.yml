@@ -34,6 +34,7 @@ services:
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
       - TRADER_DIR=/trader
+      - LEDGER_WALLETS_JSON=${LEDGER_WALLETS_JSON:-'[]'}
     depends_on:
       db:
         condition: service_healthy
@@ -78,7 +79,6 @@ services:
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
       - TRADER_DIR=/trader
-
       # Timezone
       - TZ=America/New_York
 

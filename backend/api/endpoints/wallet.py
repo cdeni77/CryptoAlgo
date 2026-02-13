@@ -60,13 +60,6 @@ def get_ledger_wallets_from_env() -> Dict[str, Any]:
     """Read optional ledger wallet addresses from environment only (never committed)."""
     entries: List[Dict[str, str]] = []
 
-    # Simple per-coin env vars for common assets.
-    for coin in ("SOL", "ONDO", "BTC", "ETH"):
-        address = os.getenv(f"LEDGER_{coin}_ADDRESS", "").strip()
-        if address:
-            entries.append({"coin": coin, "address": address})
-
-    # Optional JSON config for additional coins/addresses.
     raw_json = os.getenv("LEDGER_WALLETS_JSON", "").strip()
     if raw_json:
         try:

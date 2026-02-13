@@ -85,11 +85,6 @@ At minimum, export or place in shell env:
 ```bash
 export COINBASE_API_KEY="..."
 export COINBASE_API_SECRET="..."
-# Optional local Ledger addresses (never commit real addresses in repo files)
-export LEDGER_SOL_ADDRESS="..."
-export LEDGER_ONDO_ADDRESS="..."
-export LEDGER_BTC_ADDRESS="..."
-export LEDGER_ETH_ADDRESS="..."
 # Optional JSON for additional wallets: [{"coin":"SOL","address":"..."}, ...]
 export LEDGER_WALLETS_JSON='[]'
 ```
