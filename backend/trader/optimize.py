@@ -510,7 +510,7 @@ if __name__ == "__main__":
 
     # Default to fresh studies per run to avoid reusing stale/plateaued trials.
     effective_study_suffix = args.study_suffix
-    if not args.resume_study and not effective_study_suffix:
+    if not effective_study_suffix:
         effective_study_suffix = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         print(f"🆕 Using fresh study suffix: {effective_study_suffix}")
 
@@ -549,7 +549,6 @@ if __name__ == "__main__":
                     plateau_min_delta=args.plateau_min_delta,
                     plateau_warmup=args.plateau_warmup,
                     study_suffix=effective_study_suffix,
-                    resume_study=args.resume_study,
                 )
     else:
         # Single coin
@@ -576,5 +575,4 @@ if __name__ == "__main__":
             plateau_min_delta=args.plateau_min_delta,
             plateau_warmup=args.plateau_warmup,
             study_suffix=effective_study_suffix,
-            resume_study=args.resume_study,
         )
