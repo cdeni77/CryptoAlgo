@@ -609,8 +609,8 @@ Examples:
         if not args.ohlcv_only:
             await backfill_funding_rates(symbols, start_time, end_time, db, proxy)
         
-        # Open Interest Backfill
-        if not args.ohlcv_only:
+        # Open Interest Backfill (optional)
+        if args.include_oi and not args.ohlcv_only:
             await backfill_open_interest(symbols, start_time, end_time, db, proxy)
     
     # ------------------------------------------------------------------
