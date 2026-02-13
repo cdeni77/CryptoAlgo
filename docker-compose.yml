@@ -35,11 +35,13 @@ services:
       - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
+      - TRADER_DIR=/trader
     depends_on:
       db:
         condition: service_healthy
     volumes:
       - ./backend/api:/app
+      - ./backend/trader:/trader
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 
   # ===========================================================================
@@ -82,6 +84,7 @@ services:
       # Optional: Coinbase REST API keys (for the spot price API in the backend)
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
+      - TRADER_DIR=/trader
 
       # Timezone
       - TZ=America/New_York
@@ -127,7 +130,7 @@ services:
       - ./backend/trader:/app
     # The orchestrator: initial backfill (30d) then hourly cycles
     command: >
-      python live_orchestrator.py
+      live_orchestrator.py
         --backfill-days 30
         --include-oi
         --debug

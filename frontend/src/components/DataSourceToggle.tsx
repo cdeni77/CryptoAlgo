@@ -13,7 +13,7 @@ export default function DataSourceToggle({ source, onChange, compact = false }: 
         onClick={() => onChange('spot')}
         className={`
           ${compact ? 'px-3 py-1 text-xs' : 'px-4 py-1.5 text-sm'}
-          rounded-md font-medium font-mono-trade transition-all duration-200
+          rounded-md font-medium font-mono-trade transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-cyan)]/40
           ${source === 'spot'
             ? 'bg-[var(--accent-cyan)] text-[var(--bg-primary)] shadow-md shadow-cyan-500/20'
             : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
@@ -26,7 +26,7 @@ export default function DataSourceToggle({ source, onChange, compact = false }: 
         onClick={() => onChange('cde')}
         className={`
           ${compact ? 'px-3 py-1 text-xs' : 'px-4 py-1.5 text-sm'}
-          rounded-md font-medium font-mono-trade transition-all duration-200
+          rounded-md font-medium font-mono-trade transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-cyan)]/40
           ${source === 'cde'
             ? 'bg-[var(--accent-amber)] text-[var(--bg-primary)] shadow-md shadow-amber-500/20'
             : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
