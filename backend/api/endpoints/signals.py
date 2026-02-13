@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from models.signals import SignalResponse
+from models.trade import SignalResponse
 from controllers.signals import get_recent_signals, get_signals_by_coin, get_signal_by_id
 from database import get_db
 

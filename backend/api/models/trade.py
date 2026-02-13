@@ -1,29 +1,15 @@
-"""
-Unified SQLAlchemy models for the trading system.
-
-IMPORTANT: All models share the same Base so that
-    Base.metadata.create_all(engine)
-creates every table in one shot (trades, wallet, signals).
-"""
-
 import enum
 from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, Enum, Text, Boolean,
-)
+from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
-# ── Single shared Base ──────────────────────────────────────────────
 Base = declarative_base()
 
 
-# ====================================================================
-# ENUMS
-# ====================================================================
 class TradeSide(str, enum.Enum):
     LONG = "long"
     SHORT = "short"
@@ -34,9 +20,6 @@ class TradeStatus(str, enum.Enum):
     CLOSED = "closed"
 
 
-# ====================================================================
-# TRADE
-# ====================================================================
 class Trade(Base):
     __tablename__ = "trades"
 
@@ -57,46 +40,102 @@ class Trade(Base):
     reason_exit = Column(Text, nullable=True)
     status = Column(Enum(TradeStatus), default=TradeStatus.OPEN, nullable=False)
 
-    def __repr__(self):
-        return f"<Trade {self.id} | {self.coin} | {self.side} | {self.status}>"
 
-
-# ====================================================================
-# SIGNAL — hourly ML predictions written by the trader
-# ====================================================================
 class Signal(Base):
     __tablename__ = "signals"
 
     id = Column(Integer, primary_key=True, index=True)
     coin = Column(String, nullable=False, index=True)
     timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
-    direction = Column(String, nullable=False)          # "long", "short", "neutral"
-    confidence = Column(Float, nullable=False)           # calibrated probability 0-1
-    raw_probability = Column(Float, nullable=True)       # raw model output before calibration
-    model_auc = Column(Float, nullable=True)             # validation AUC of the model that produced this
-    price_at_signal = Column(Float, nullable=True)       # spot price when signal was generated
-    # Gate details — which filters passed
+    direction = Column(String, nullable=False)
+    confidence = Column(Float, nullable=False)
+    raw_probability = Column(Float, nullable=True)
+    model_auc = Column(Float, nullable=True)
+    price_at_signal = Column(Float, nullable=True)
     momentum_pass = Column(Boolean, nullable=True)
     trend_pass = Column(Boolean, nullable=True)
     regime_pass = Column(Boolean, nullable=True)
     ml_pass = Column(Boolean, nullable=True)
-    # Sizing
     contracts_suggested = Column(Integer, nullable=True)
     notional_usd = Column(Float, nullable=True)
-    # Was it acted on?
     acted_on = Column(Boolean, default=False)
-    trade_id = Column(Integer, nullable=True)            # FK-like link to trades.id
+    trade_id = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    def __repr__(self):
-        return f"<Signal {self.id} | {self.coin} | {self.direction} | conf={self.confidence:.1%}>"
+
+class Wallet(Base):
+    __tablename__ = "wallet"
+
+    id = Column(Integer, primary_key=True)
+    balance = Column(Float, default=10000.0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-# ====================================================================
-# PYDANTIC SCHEMAS
-# ====================================================================
+class PaperOrderStatus(str, enum.Enum):
+    NEW = "new"
+    FILLED = "filled"
+    CANCELED = "canceled"
 
-# ── Trade ──
+
+class PaperOrder(Base):
+    __tablename__ = "paper_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    coin = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False)
+    contracts = Column(Integer, nullable=False)
+    target_price = Column(Float, nullable=False)
+    status = Column(Enum(PaperOrderStatus), nullable=False, default=PaperOrderStatus.NEW)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PaperFill(Base):
+    __tablename__ = "paper_fills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, nullable=False, index=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    coin = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False)
+    contracts = Column(Integer, nullable=False)
+    fill_price = Column(Float, nullable=False)
+    fee = Column(Float, nullable=False)
+    notional = Column(Float, nullable=False)
+    slippage_bps = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PaperPosition(Base):
+    __tablename__ = "paper_positions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    coin = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False)
+    contracts = Column(Integer, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    mark_price = Column(Float, nullable=False)
+    notional = Column(Float, nullable=False)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    unrealized_pnl = Column(Float, nullable=False, default=0.0)
+    fees_paid = Column(Float, nullable=False, default=0.0)
+    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    is_open = Column(Boolean, nullable=False, default=True)
+
+
+class PaperEquityCurve(Base):
+    __tablename__ = "paper_equity_curve"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    equity = Column(Float, nullable=False)
+    cash_balance = Column(Float, nullable=False)
+    unrealized_pnl = Column(Float, nullable=False)
+    realized_pnl = Column(Float, nullable=False)
+    open_positions = Column(Integer, nullable=False, default=0)
+
+
 class TradeBase(BaseModel):
     coin: str
     datetime_open: datetime
@@ -108,10 +147,6 @@ class TradeBase(BaseModel):
     leverage: Optional[float] = None
     reason_entry: Optional[str] = None
     status: str
-
-
-class TradeCreate(TradeBase):
-    pass
 
 
 class TradeResponse(TradeBase):
@@ -126,3 +161,87 @@ class TradeResponse(TradeBase):
         from_attributes = True
 
 
+class SignalResponse(BaseModel):
+    id: int
+    coin: str
+    timestamp: datetime
+    direction: str
+    confidence: float
+    raw_probability: Optional[float] = None
+    model_auc: Optional[float] = None
+    price_at_signal: Optional[float] = None
+    momentum_pass: Optional[bool] = None
+    trend_pass: Optional[bool] = None
+    regime_pass: Optional[bool] = None
+    ml_pass: Optional[bool] = None
+    contracts_suggested: Optional[int] = None
+    notional_usd: Optional[float] = None
+    acted_on: bool = False
+    trade_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PaperOrderResponse(BaseModel):
+    id: int
+    signal_id: int
+    coin: str
+    side: str
+    contracts: int
+    target_price: float
+    status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaperFillResponse(BaseModel):
+    id: int
+    order_id: int
+    signal_id: int
+    coin: str
+    side: str
+    contracts: int
+    fill_price: float
+    fee: float
+    notional: float
+    slippage_bps: float
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaperPositionResponse(BaseModel):
+    id: int
+    coin: str
+    side: str
+    contracts: int
+    entry_price: float
+    mark_price: float
+    notional: float
+    realized_pnl: float
+    unrealized_pnl: float
+    fees_paid: float
+    opened_at: datetime
+    updated_at: Optional[datetime] = None
+    is_open: bool
+
+    class Config:
+        from_attributes = True
+
+
+class PaperEquityCurveResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    equity: float
+    cash_balance: float
+    unrealized_pnl: float
+    realized_pnl: float
+    open_positions: int
+
+    class Config:
+        from_attributes = True
