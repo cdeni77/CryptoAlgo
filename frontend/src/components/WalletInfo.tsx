@@ -8,8 +8,9 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { getCoinHistory } from '../api/coinsApi';
 import { getWallet } from '../api/walletApi';
-import { WalletData } from '../types';
+import { CoinSymbol, WalletData } from '../types';
 
 interface WalletInfoProps {
   loading: boolean;
@@ -18,6 +19,12 @@ interface WalletInfoProps {
 export default function WalletInfo({ loading }: WalletInfoProps) {
   const [wallet, setWallet] = useState<WalletData | null>(null);
   const [portfolioRange, setPortfolioRange] = useState<'1h' | '1d' | '1w' | '1m' | '1y'>('1d');
+  const [backfilledSeries, setBackfilledSeries] = useState<Array<{
+    timestamp: string;
+    paper_equity_usd: number;
+    external_usd: number;
+    total_value_usd: number;
+  }>>([]);
 
   useEffect(() => {
     const loadWallet = async () => {
@@ -46,6 +53,90 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
     const seriesFromRange = wallet.portfolio_history_by_range?.[portfolioRange];
     return seriesFromRange?.length ? seriesFromRange : wallet.portfolio_history ?? [];
   }, [wallet, portfolioRange]);
+
+  const shouldBackfill = useMemo(
+    () => portfolioSeries.length > 0 && portfolioSeries.every((point) => (point.total_value_usd ?? 0) === 0),
+    [portfolioSeries]
+  );
+
+  useEffect(() => {
+    const supportedCoins = new Set<CoinSymbol>(['BTC', 'ETH', 'SOL', 'XRP', 'DOGE']);
+
+    const normalizeSymbol = (value?: string | null): CoinSymbol | null => {
+      if (!value) return null;
+      const normalized = value.toUpperCase().replace(/[^A-Z]/g, '');
+      if (supportedCoins.has(normalized as CoinSymbol)) {
+        return normalized as CoinSymbol;
+      }
+      return null;
+    };
+
+    const buildBackfill = async () => {
+      if (!wallet || !shouldBackfill) {
+        setBackfilledSeries([]);
+        return;
+      }
+
+      const holdings = new Map<CoinSymbol, number>();
+
+      for (const asset of wallet.coinbase?.spot?.assets ?? []) {
+        const symbol = normalizeSymbol(asset.asset);
+        if (!symbol || !Number.isFinite(asset.amount) || asset.amount <= 0) continue;
+        holdings.set(symbol, (holdings.get(symbol) ?? 0) + asset.amount);
+      }
+
+      for (const asset of wallet.ledger?.assets ?? []) {
+        const symbol = normalizeSymbol(asset.asset);
+        if (!symbol || !Number.isFinite(asset.amount) || asset.amount <= 0) continue;
+        holdings.set(symbol, (holdings.get(symbol) ?? 0) + asset.amount);
+      }
+
+      if (!holdings.size) {
+        setBackfilledSeries([]);
+        return;
+      }
+
+      try {
+        const histories = await Promise.all(
+          Array.from(holdings.entries()).map(async ([symbol, amount]) => ({
+            amount,
+            history: await getCoinHistory(symbol, portfolioRange),
+          }))
+        );
+
+        const mergedSeries = new Map<string, { timestamp: string; total_value_usd: number }>();
+
+        for (const { amount, history } of histories) {
+          for (const candle of history) {
+            const existing = mergedSeries.get(candle.timestamp);
+            const value = amount * candle.close;
+            mergedSeries.set(candle.timestamp, {
+              timestamp: candle.timestamp,
+              total_value_usd: (existing?.total_value_usd ?? 0) + value,
+            });
+          }
+        }
+
+        const nextSeries = Array.from(mergedSeries.values())
+          .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+          .map((point) => ({
+            timestamp: point.timestamp,
+            paper_equity_usd: 0,
+            external_usd: point.total_value_usd,
+            total_value_usd: point.total_value_usd,
+          }));
+
+        setBackfilledSeries(nextSeries);
+      } catch (error) {
+        console.error('Failed to backfill portfolio chart from holdings:', error);
+        setBackfilledSeries([]);
+      }
+    };
+
+    buildBackfill();
+  }, [wallet, portfolioRange, shouldBackfill]);
+
+  const chartSeries = shouldBackfill && backfilledSeries.length ? backfilledSeries : portfolioSeries;
 
   if (loading || !wallet) {
     return (
@@ -139,9 +230,9 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
             ))}
           </div>
         </div>
-        {portfolioSeries.length ? (
+        {chartSeries.length ? (
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={portfolioSeries} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
+            <LineChart data={chartSeries} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" />
               <XAxis
                 dataKey="timestamp"
