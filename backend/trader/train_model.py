@@ -349,6 +349,7 @@ def load_data():
     data = {}
     print("⏳ Loading data from features and database...")
     feature_files = list(FEATURES_DIR.glob("*_features.csv"))
+    cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=90)
 
     for f in feature_files:
         sym = f.stem.replace("_features", "").replace("_", "-")
@@ -361,11 +362,13 @@ def load_data():
             ).set_index('event_time').sort_index()
             conn.close()
             ohlcv.index = pd.to_datetime(ohlcv.index, utc=True)
+            ohlcv = ohlcv.loc[ohlcv.index >= cutoff]
             ohlcv['sma_200'] = ohlcv['close'].rolling(200).mean()
 
             feat = pd.read_csv(f, index_col=0, parse_dates=True)
             feat = feat.replace([np.inf, -np.inf], 0).ffill().fillna(0)
             feat.index = pd.to_datetime(feat.index, utc=True)
+            feat = feat.loc[feat.index >= cutoff]
 
             common = feat.index.intersection(ohlcv.index)
             if len(common) > 1000:
@@ -901,6 +904,75 @@ def run_backtest(all_data: Dict, config: Config,
         'oos_trades': int(len(oos_df)),
         'oos_sharpe': oos_sharpe,
         'oos_return': oos_return,
+    }
+
+
+def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = None, train_window_days: int = 90) -> Dict:
+    system = MLSystem(config)
+    metrics = {}
+    symbols_trained = 0
+    train_end_global = pd.Timestamp.now(tz='UTC')
+    train_start_global = train_end_global - pd.Timedelta(days=train_window_days)
+
+    for sym, d in all_data.items():
+        profile = get_coin_profile(sym)
+        feat, ohlc = d['features'], d['ohlcv']
+        cols = system.get_feature_columns(feat.columns, profile.feature_columns)
+        if not cols:
+            continue
+
+        train_feat = feat.loc[feat.index >= train_start_global]
+        train_ohlc = ohlc.loc[ohlc.index >= train_start_global]
+
+        y = system.create_labels(train_ohlc, train_feat, profile=profile)
+        valid = y.dropna().index
+        X_all = train_feat.loc[valid, cols]
+        y_all = y.loc[valid]
+        if len(X_all) < config.min_train_samples:
+            continue
+
+        split_idx = int(len(X_all) * (1 - config.val_fraction))
+        X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
+        y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
+
+        result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile)
+        if not result:
+            continue
+
+        model, scaler, iso, auc = result
+        symbol_train_start = X_all.index.min()
+        symbol_train_end = X_all.index.max()
+        model_metrics = {
+            'auc': float(auc),
+            'train_samples': int(len(X_all)),
+            'val_samples': int(len(X_vl)),
+        }
+        save_model(
+            symbol=sym,
+            model=model,
+            scaler=scaler,
+            calibrator=iso,
+            feature_columns=cols,
+            auc=auc,
+            profile_name=profile.name,
+            target_dir=target_dir,
+            extra_meta={
+                'strategy': 'momentum',
+                'signal_threshold': profile.signal_threshold,
+                'train_start': symbol_train_start.isoformat() if symbol_train_start is not None else None,
+                'train_end': symbol_train_end.isoformat() if symbol_train_end is not None else None,
+                'metrics': model_metrics,
+            },
+        )
+        symbols_trained += 1
+        metrics[sym] = model_metrics
+
+    return {
+        'symbols_total': len(all_data),
+        'symbols_trained': symbols_trained,
+        'train_start': train_start_global.isoformat(),
+        'train_end': train_end_global.isoformat(),
+        'metrics': metrics,
     }
 
 
