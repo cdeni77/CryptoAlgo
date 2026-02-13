@@ -96,7 +96,13 @@ export default function PriceChart({
         <div className="flex items-center gap-4">
           <div>
             <h3 className="text-lg font-bold text-[var(--text-primary)]">{symbol} Price</h3>
-            <p className="text-xs text-[var(--text-muted)] font-mono-trade mt-0.5">{sourceLabel}</p>
+            <p
+              className={`text-xs font-mono-trade mt-0.5 ${
+                dataSource === 'cde' ? 'text-[var(--accent-cyan)]' : 'text-[var(--text-muted)]'
+              }`}
+            >
+              {sourceLabel}
+            </p>
           </div>
           <DataSourceToggle source={dataSource} onChange={onDataSourceChange} compact />
         </div>
