@@ -44,7 +44,7 @@ if __name__ == "__main__":
     print("         Parallelism comes from launching many worker processes.")
     print(f"{'='*60}")
 
-    run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+    run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
     print(f"   Study run id: {run_id}")
 
     processes = []
@@ -76,6 +76,7 @@ if __name__ == "__main__":
                 str(args.plateau_warmup),
                 "--study-suffix",
                 run_id,
+                "--resume-study",
             ]
 
 

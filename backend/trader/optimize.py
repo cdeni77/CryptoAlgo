@@ -348,13 +348,45 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     print(f"   Plateau stop: patience={plateau_patience}, min_delta={plateau_min_delta}, warmup={plateau_warmup}")
     print(f"{'='*60}")
 
-    study = optuna.create_study(
-        direction='maximize',
-        sampler=TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3)),
-        study_name=study_name,
-        storage=storage_url,
-        load_if_exists=resume_study 
-    )
+    sampler = TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3))
+    study = None
+    for attempt in range(3):
+        try:
+            study = optuna.create_study(
+                direction='maximize',
+                sampler=sampler,
+                study_name=study_name,
+                storage=storage_url,
+                load_if_exists=resume_study,
+            )
+            break
+        except Exception as e:
+            msg = str(e)
+            duplicate_name = (
+                isinstance(e, optuna.exceptions.DuplicatedStudyError)
+                or "already exists" in msg
+                or "UNIQUE constraint failed: studies.study_name" in msg
+            )
+            if duplicate_name:
+                print(f"ℹ️ Study '{study_name}' already exists; loading existing study.")
+                study = optuna.load_study(
+                    study_name=study_name,
+                    storage=storage_url,
+                    sampler=sampler,
+                )
+                break
+
+            # SQLite can intermittently report lock contention under heavy parallel startup.
+            if "database is locked" in msg and attempt < 2:
+                sleep_s = 0.25 * (attempt + 1)
+                print(f"⚠️ Study DB locked while creating '{study_name}'. Retrying in {sleep_s:.2f}s...")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+    if study is None:
+        print(f"❌ Could not create or load study '{study_name}'.")
+        return None
 
     # 2. Run Optimization
     # CRITICAL CHANGE: Use functools.partial instead of lambda.
@@ -549,6 +581,7 @@ if __name__ == "__main__":
                     plateau_min_delta=args.plateau_min_delta,
                     plateau_warmup=args.plateau_warmup,
                     study_suffix=effective_study_suffix,
+                    resume_study=args.resume_study,
                 )
     else:
         # Single coin
@@ -575,4 +608,5 @@ if __name__ == "__main__":
             plateau_min_delta=args.plateau_min_delta,
             plateau_warmup=args.plateau_warmup,
             study_suffix=effective_study_suffix,
+            resume_study=args.resume_study,
         )
