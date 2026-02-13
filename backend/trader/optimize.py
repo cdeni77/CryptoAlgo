@@ -127,11 +127,6 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     """
     profile = create_trial_profile(trial, coin_name)
 
-    # Monkey-patch the profile locally
-    # Note: In multiprocessing, this affects the worker process copy only
-    original = COIN_PROFILES.get(coin_name)
-    COIN_PROFILES[coin_name] = profile
-
     target_sym = PREFIX_TO_SYMBOL.get(coin_prefix)
     if not target_sym:
         return -99.0
@@ -145,6 +140,10 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     config = Config(
         max_positions=1,
         leverage=4,
+        min_signal_edge=0.02,
+        max_ensemble_std=0.10,
+        train_embargo_hours=24,
+        oos_eval_days=60,
     )
 
     # Capture stdout to prevent console spam from parallel processes
@@ -154,13 +153,11 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     
     try:
         sys.stdout = captured_output
-        result = run_backtest(single_data, config)
+        result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception:
         return -99.0
     finally:
         sys.stdout = original_stdout # Restore stdout immediately
-        if original:
-            COIN_PROFILES[coin_name] = original
 
     if result is None or result.get('n_trades', 0) < 15:
         return -99.0
@@ -173,6 +170,9 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     wr = result.get('win_rate', 0)
     ann_ret = result.get('ann_return', -1)
     trades_per_year = result.get('trades_per_year', 0)
+    oos_sharpe = result.get('oos_sharpe', -99.0)
+    oos_return = result.get('oos_return', -1.0)
+    oos_trades = result.get('oos_trades', 0)
 
     pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0
     dd_penalty = max(0, dd - 0.30) * 3.0
@@ -194,7 +194,13 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     if 30 <= trades_per_year <= 80: 
         trade_penalty -= 0.4
 
-    score = sharpe + pf_bonus - dd_penalty - trade_penalty
+    # Force generalization: prioritize out-of-sample behavior over in-sample optics
+    score = (0.6 * oos_sharpe) + (0.4 * sharpe) + pf_bonus - dd_penalty - trade_penalty
+
+    if oos_trades < 5:
+        score -= 0.5
+    if oos_return < 0:
+        score -= min(1.0, abs(oos_return) * 10)
 
     if ann_ret < -0.05:
         score = min(score, -1.0)
@@ -206,15 +212,55 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     trial.set_user_attr('sharpe', round(sharpe, 3))
     trial.set_user_attr('profit_factor', round(pf, 3))
     trial.set_user_attr('max_drawdown', round(dd, 4))
+    trial.set_user_attr('oos_trades', int(oos_trades))
+    trial.set_user_attr('oos_sharpe', round(oos_sharpe, 3))
+    trial.set_user_attr('oos_return', round(oos_return, 4))
 
     return score
+
+class PlateauStopper:
+    """Stop a study if no best-score improvement is observed for N completed trials."""
+
+    def __init__(self, patience: int = 80, min_delta: float = 0.02, warmup_trials: int = 40):
+        self.patience = max(1, patience)
+        self.min_delta = max(0.0, min_delta)
+        self.warmup_trials = max(0, warmup_trials)
+        self.best_value = None
+        self.best_trial_number = None
+
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial):
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+        if len(completed) < self.warmup_trials:
+            return
+
+        if self.best_value is None:
+            self.best_value = study.best_value
+            self.best_trial_number = study.best_trial.number
+            return
+
+        current_best = study.best_value
+        if current_best > (self.best_value + self.min_delta):
+            self.best_value = current_best
+            self.best_trial_number = study.best_trial.number
+            return
+
+        since_best = trial.number - (self.best_trial_number if self.best_trial_number is not None else trial.number)
+        if since_best >= self.patience:
+            print(
+                f"\n🛑 Plateau stop: no improvement > {self.min_delta:.4f} "
+                f"for {self.patience} trials (best={self.best_value:.4f} @ trial {self.best_trial_number})."
+            )
+            study.stop()
+
 
 # -----------------------------------------------------------------------------
 # MAIN OPTIMIZATION LOOP
 # -----------------------------------------------------------------------------
 
 def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str, 
-                  n_trials: int = 50, n_jobs: int = 1):
+                  n_trials: int = 50, n_jobs: int = 1,
+                  plateau_patience: int = 80, plateau_min_delta: float = 0.02,
+                  plateau_warmup: int = 40):
     """Run Optuna optimization for a single coin with parallel support."""
     
     # 1. Setup Persistent Storage (Required for parallel jobs)
@@ -225,6 +271,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} ({coin_prefix})")
     print(f"   Trials: {n_trials} | Cores: {n_jobs} | Storage: {storage_url}")
+    print(f"   Plateau stop: patience={plateau_patience}, min_delta={plateau_min_delta}, warmup={plateau_warmup}")
     print(f"{'='*60}")
 
     study = optuna.create_study(
@@ -246,12 +293,19 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         coin_name=coin_name
     )
 
+    stopper = PlateauStopper(
+        patience=plateau_patience,
+        min_delta=plateau_min_delta,
+        warmup_trials=plateau_warmup,
+    )
+
     try:
         study.optimize(
             objective_func,
             n_trials=n_trials,
             n_jobs=n_jobs,
-            show_progress_bar=True
+            show_progress_bar=True,
+            callbacks=[stopper],
         )
     except KeyboardInterrupt:
         print("\n🛑 Optimization stopped by user.")
@@ -351,6 +405,12 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=50, help="Number of trials")
     parser.add_argument("--jobs", type=int, default=1, help="Parallel jobs (-1 = all cores)")
     parser.add_argument("--show", action="store_true", help="Show saved results")
+    parser.add_argument("--plateau-patience", type=int, default=80,
+                        help="Stop if best score does not improve for this many trials")
+    parser.add_argument("--plateau-min-delta", type=float, default=0.02,
+                        help="Minimum best-score improvement to reset plateau counter")
+    parser.add_argument("--plateau-warmup", type=int, default=40,
+                        help="Minimum completed trials before plateau checks start")
     args = parser.parse_args()
 
     # Initialize SQLite WAL mode BEFORE running anything else
@@ -378,8 +438,16 @@ if __name__ == "__main__":
         for coin_name in ['ETH', 'BTC', 'SOL', 'XRP', 'DOGE']:
             prefix = PREFIX_FOR_COIN.get(coin_name)
             if prefix and prefix in PREFIX_TO_SYMBOL:
-                optimize_coin(all_data, prefix, coin_name, 
-                              n_trials=args.trials, n_jobs=args.jobs)
+                optimize_coin(
+                    all_data,
+                    prefix,
+                    coin_name,
+                    n_trials=args.trials,
+                    n_jobs=args.jobs,
+                    plateau_patience=args.plateau_patience,
+                    plateau_min_delta=args.plateau_min_delta,
+                    plateau_warmup=args.plateau_warmup,
+                )
     else:
         # Single coin
         coin_input = args.coin.upper()
@@ -395,5 +463,13 @@ if __name__ == "__main__":
                 print(f"❌ Coin '{args.coin}' not found. Available: {list(PREFIX_TO_SYMBOL.keys())}")
                 sys.exit(1)
         
-        optimize_coin(all_data, prefix, coin_name, 
-                      n_trials=args.trials, n_jobs=args.jobs)
+        optimize_coin(
+            all_data,
+            prefix,
+            coin_name,
+            n_trials=args.trials,
+            n_jobs=args.jobs,
+            plateau_patience=args.plateau_patience,
+            plateau_min_delta=args.plateau_min_delta,
+            plateau_warmup=args.plateau_warmup,
+        )
