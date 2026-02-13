@@ -67,6 +67,30 @@ export COINALYZE_API_KEY="your_free_key"  # Get at coinalyze.net
 
 ## Usage
 
+### Docker Compose Run Modes
+
+Use the following exact commands from the repository root:
+
+1. **Live mode** (continuous orchestration: initial backfill → features → signals, then hourly cycles):
+
+```bash
+docker compose up --build db backend frontend trader
+```
+
+2. **Backtest mode** (one-off historical evaluation, then exit):
+
+```bash
+docker compose run --rm trader \
+  python train_model.py --backtest --threshold 0.74 --min-auc 0.54 --leverage 4 --exclude BIP,DOP
+```
+
+3. **Retrain-only mode** (no long-running loop, recompute features + fresh signals once):
+
+```bash
+docker compose run --rm trader \
+  sh -lc "python compute_features.py && python train_model.py --signals --threshold 0.74 --min-auc 0.54 --leverage 4 --exclude BIP,DOP"
+```
+
 ### 1. Fetch Data
 
 ```bash
