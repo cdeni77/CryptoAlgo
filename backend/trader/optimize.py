@@ -140,6 +140,8 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     config = Config(
         max_positions=1,
         leverage=4,
+        min_signal_edge=0.02,
+        max_ensemble_std=0.10,
         train_embargo_hours=24,
         oos_eval_days=60,
     )

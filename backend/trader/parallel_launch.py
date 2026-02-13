@@ -1,41 +1,60 @@
+import argparse
 import subprocess
 import sys
 import time
-import argparse
 
-# Usage: python parallel_launch.py --trials 200 --jobs 16
+COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+
+
+# Usage:
+#   python parallel_launch.py --trials 200 --jobs 10
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=200, help="Total trials per coin")
-    parser.add_argument("--jobs", type=int, default=16, help="Number of parallel workers")
+    parser.add_argument("--jobs", type=int, default=10, help="Total worker processes")
+    parser.add_argument("--coins", type=str, default=",".join(COINS), help="Comma-separated coin list")
     args = parser.parse_args()
 
-    # Calculate how many trials each worker should do
-    trials_per_worker = max(1, args.trials // args.jobs)
-    
-    print(f"🚀 LAUNCHING {args.jobs} WORKERS")
-    print(f"   Total Target: {args.trials} trials")
-    print(f"   Per Worker:   {trials_per_worker} trials")
+    target_coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
+    if not target_coins:
+        raise SystemExit("No coins selected")
+
+    workers_per_coin = max(1, args.jobs // len(target_coins))
+    trials_per_worker = max(1, args.trials // workers_per_coin)
+
+    print(f"🚀 LAUNCHING {workers_per_coin * len(target_coins)} WORKERS")
+    print(f"   Coins:        {target_coins}")
+    print(f"   Target/coin:  {args.trials} trials")
+    print(f"   Workers/coin: {workers_per_coin}")
+    print(f"   Trials/worker:{trials_per_worker}")
     print(f"{'='*60}")
 
     processes = []
-    
-    # We pass '--all' so each worker iterates through all coins
-    # We pass '--jobs 1' so the worker itself is single-threaded (pure isolation)
-    base_cmd = [sys.executable, "optimize.py", "--all", "--jobs", "1", "--trials", str(trials_per_worker)]
 
-    for i in range(args.jobs):
-        print(f"   Starting Worker #{i+1}...")
-        p = subprocess.Popen(base_cmd)
-        processes.append(p)
-        # Stagger starts slightly to prevent initial DB clash
-        time.sleep(0.5)
+    # Launch per-coin workers to reduce study collisions and improve throughput.
+    for coin in target_coins:
+        base_cmd = [
+            sys.executable,
+            "optimize.py",
+            "--coin",
+            coin,
+            "--jobs",
+            "1",
+            "--trials",
+            str(trials_per_worker),
+        ]
+
+        for i in range(workers_per_coin):
+            print(f"   Starting {coin} worker #{i + 1}...")
+            p = subprocess.Popen(base_cmd)
+            processes.append(p)
+            # Stagger starts to reduce initial DB lock contention
+            time.sleep(0.4)
 
     print(f"\n✅ All {len(processes)} workers started. Monitor CPU usage now!")
     print("   Press Ctrl+C to stop all workers.\n")
 
     try:
-        # Wait for all to finish
         for p in processes:
             p.wait()
     except KeyboardInterrupt:

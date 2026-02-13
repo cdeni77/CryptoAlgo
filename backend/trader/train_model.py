@@ -155,6 +155,10 @@ class Config:
     # Position sizing control
     max_weekly_equity_growth: float = 0.03
 
+    # Entry quality filters
+    min_signal_edge: float = 0.02
+    max_ensemble_std: float = 0.12
+
     # Walk-forward leakage protection / evaluation
     train_embargo_hours: int = 24
     oos_eval_days: int = 60
@@ -616,6 +620,7 @@ def run_backtest(all_data: Dict, config: Config,
             # 2. ENTRIES
             # ============================================================
             if len(active_positions) < config.max_positions and equity >= config.min_equity:
+                candidates = []
                 for sym, ensemble_models in models.items():
                     if sym in active_positions or ts not in all_data[sym]['features'].index:
                         continue
@@ -707,41 +712,51 @@ def run_backtest(all_data: Dict, config: Config,
                         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
                         cal_prob = float(iso.predict([raw_prob])[0])
                         probs.append(cal_prob)
-                    prob = np.mean(probs)
+                    prob = float(np.mean(probs))
+                    prob_std = float(np.std(probs))
 
-                    # Per-coin signal threshold
-                    if prob >= profile.signal_threshold:
-                        vol = vol_24h if vol_24h > 0 else 0.02
+                    signal_cutoff = profile.signal_threshold + config.min_signal_edge
+                    if prob < signal_cutoff or prob_std > config.max_ensemble_std:
+                        continue
 
-                        n_contracts = calculate_n_contracts(
-                            weekly_equity_base, price, sym, config,
-                            vol_24h=vol_24h, profile=profile
-                        )
-                        if n_contracts < 1:
-                            no_contracts += 1
-                            continue
+                    edge_score = (prob - signal_cutoff) / max(0.01, prob_std + 0.01)
+                    momentum_strength = abs(ret_72h)
+                    rank_score = edge_score + (0.2 * momentum_strength)
+                    candidates.append((rank_score, sym, profile, price, vol_24h, direction))
 
-                        spec = get_contract_spec(sym)
-                        notional_per_contract = spec['units'] * price
-                        total_notional = n_contracts * notional_per_contract
-                        entry_fee = calculate_coinbase_fee(n_contracts, price, sym, config)
-                        exit_fee = entry_fee
-                        effective_fee_pct = (entry_fee + exit_fee) / total_notional
+                slots = max(config.max_positions - len(active_positions), 0)
+                for _, sym, profile, price, vol_24h, direction in sorted(candidates, key=lambda x: x[0], reverse=True)[:slots]:
+                    vol = vol_24h if vol_24h > 0 else 0.02
 
-                        # Per-coin TP/SL
-                        active_positions[sym] = {
-                            'time': ts,
-                            'entry': price,
-                            'dir': direction,
-                            'vol': vol,
-                            'tp': price * (1 + profile.vol_mult_tp * vol * direction),
-                            'sl': price * (1 - profile.vol_mult_sl * vol * direction),
-                            'accum_funding': 0.0,
-                            'n_contracts': n_contracts,
-                            'peak_price': price,
-                            'at_breakeven': False,
-                            'effective_fee_pct': effective_fee_pct,
-                        }
+                    n_contracts = calculate_n_contracts(
+                        weekly_equity_base, price, sym, config,
+                        vol_24h=vol_24h, profile=profile
+                    )
+                    if n_contracts < 1:
+                        no_contracts += 1
+                        continue
+
+                    spec = get_contract_spec(sym)
+                    notional_per_contract = spec['units'] * price
+                    total_notional = n_contracts * notional_per_contract
+                    entry_fee = calculate_coinbase_fee(n_contracts, price, sym, config)
+                    exit_fee = entry_fee
+                    effective_fee_pct = (entry_fee + exit_fee) / total_notional
+
+                    # Per-coin TP/SL
+                    active_positions[sym] = {
+                        'time': ts,
+                        'entry': price,
+                        'dir': direction,
+                        'vol': vol,
+                        'tp': price * (1 + profile.vol_mult_tp * vol * direction),
+                        'sl': price * (1 - profile.vol_mult_sl * vol * direction),
+                        'accum_funding': 0.0,
+                        'n_contracts': n_contracts,
+                        'peak_price': price,
+                        'at_breakeven': False,
+                        'effective_fee_pct': effective_fee_pct,
+                    }
 
         current_date = week_end
 
@@ -1044,6 +1059,8 @@ if __name__ == "__main__":
     parser.add_argument("--momentum", type=float, default=0.07, help="Default min 72h momentum magnitude")
     parser.add_argument("--hold", type=int, default=96, help="Default max hold hours")
     parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
+    parser.add_argument("--min-edge", type=float, default=0.02, help="Require prob >= threshold + min-edge")
+    parser.add_argument("--max-ensemble-std", type=float, default=0.12, help="Max std across ensemble probs")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
     args = parser.parse_args()
@@ -1058,6 +1075,8 @@ if __name__ == "__main__":
         min_momentum_magnitude=args.momentum,
         max_hold_hours=args.hold,
         cooldown_hours=args.cooldown,
+        min_signal_edge=args.min_edge,
+        max_ensemble_std=args.max_ensemble_std,
         excluded_symbols=excluded,
     )
     data = load_data()
