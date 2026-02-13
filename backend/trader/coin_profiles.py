@@ -30,9 +30,7 @@ MODELS_DIR = Path(os.getenv('MODELS_DIR', 'models'))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# =============================================================================
 # BASE FEATURES (shared across all coins)
-# =============================================================================
 BASE_FEATURES = [
     # Momentum
     'return_1h', 'return_4h', 'return_12h', 'return_24h', 'return_48h', 'return_168h',
@@ -57,9 +55,7 @@ BASE_FEATURES = [
     'trend_sma20_50', 'vol_regime_ratio', 'trend_strength_24h',
 ]
 
-# =============================================================================
 # COIN-SPECIFIC EXTRA FEATURES
-# =============================================================================
 BTC_EXTRA_FEATURES = [
     # Mean-reversion: MIN/MAX proximity
     'at_max_10d', 'at_min_10d', 'dist_from_max_10d', 'dist_from_min_10d',
@@ -110,9 +106,6 @@ DOGE_EXTRA_FEATURES = [
 ]
 
 
-# =============================================================================
-# COIN PROFILE DATACLASS
-# =============================================================================
 @dataclass
 class CoinProfile:
     """Per-coin trading configuration."""
@@ -157,10 +150,6 @@ class CoinProfile:
         """Full feature list = base + coin-specific extras."""
         return BASE_FEATURES + self.extra_features
 
-
-# =============================================================================
-# COIN PROFILES
-# =============================================================================
 
 COIN_PROFILES: Dict[str, CoinProfile] = {
     # ── ETH: momentum (already working, keep same params) ──
@@ -275,10 +264,6 @@ def get_coin_profile(symbol: str) -> CoinProfile:
     logger.warning(f"No profile for '{symbol}', using ETH defaults")
     return COIN_PROFILES['ETH']
 
-
-# =============================================================================
-# MODEL PERSISTENCE
-# =============================================================================
 
 def save_model(
     symbol: str,

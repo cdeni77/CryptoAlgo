@@ -50,9 +50,6 @@ from coin_profiles import (
     BTC_EXTRA_FEATURES, SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
 )
 
-# -----------------------------------------------------------------------------
-# LOGGING SETUP
-# -----------------------------------------------------------------------------
 warnings.filterwarnings('ignore')
 # Turn off Optuna/LightGBM logging to keep console clean during parallel runs
 optuna.logging.set_verbosity(optuna.logging.ERROR)
@@ -65,9 +62,6 @@ RESULTS_DIR.mkdir(exist_ok=True)
 PREFIX_TO_SYMBOL: Dict[str, str] = {}
 DEBUG_TRIALS = False
 
-# -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
-# -----------------------------------------------------------------------------
 
 def init_db_wal(db_name="optuna_trading.db"):
     """Enable Write-Ahead Logging and set a long timeout for concurrency."""
@@ -145,11 +139,9 @@ def resolve_target_symbol(all_data: Dict, coin_prefix: str, coin_name: str) -> O
     return None
 
 
-# -----------------------------------------------------------------------------
 # DATA SPLITTING — TRUE HOLDOUT
-# -----------------------------------------------------------------------------
 
-def split_data_temporal(all_data: Dict, holdout_days: int = 90) -> Tuple[Dict, Dict]:
+def split_data_temporal(all_data: Dict, holdout_days: int = 120) -> Tuple[Dict, Dict]:
     """
     Split data into optimization window and holdout window.
     
@@ -198,10 +190,6 @@ def split_data_temporal(all_data: Dict, holdout_days: int = 90) -> Tuple[Dict, D
     
     return optim_data, holdout_data
 
-
-# -----------------------------------------------------------------------------
-# TRIAL PROFILE CREATION
-# -----------------------------------------------------------------------------
 
 def create_trial_profile(trial: optuna.Trial, coin_name: str) -> CoinProfile:
     """Create a CoinProfile from Optuna trial suggestions."""
@@ -275,10 +263,6 @@ def profile_from_params(params: Dict, coin_name: str) -> CoinProfile:
     )
 
 
-# -----------------------------------------------------------------------------
-# OBJECTIVE FUNCTION
-# -----------------------------------------------------------------------------
-
 def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: str) -> float:
     """
     Optuna objective: run single-coin backtest on OPTIMIZATION WINDOW ONLY.
@@ -343,7 +327,6 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     if oos_sharpe <= -90:
         oos_sharpe = 0.0
 
-    # =========================================================================
     # SCORING v9 — NO OOS IN OPTIMIZATION SCORE
     # 
     # The optimization score uses ONLY the walk-forward backtest metrics from
@@ -354,7 +337,6 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     # We still use the internal OOS (last 60 days of optim window) as a
     # PENALTY signal to catch severe overfit, but it doesn't contribute
     # positively to the score.
-    # =========================================================================
 
     pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0.0
     dd_penalty = max(0.0, dd - 0.30) * 3.0
@@ -444,12 +426,8 @@ class PlateauStopper:
             study.stop()
 
 
-# -----------------------------------------------------------------------------
-# HOLDOUT EVALUATION
-# -----------------------------------------------------------------------------
-
 def evaluate_holdout(holdout_data: Dict, best_params: Dict, coin_name: str,
-                     coin_prefix: str, holdout_days: int = 90) -> Optional[Dict]:
+                     coin_prefix: str, holdout_days: int = 120) -> Optional[Dict]:
     """
     Run the best parameters on the FULL dataset (including holdout period).
     
@@ -497,22 +475,16 @@ def evaluate_holdout(holdout_data: Dict, best_params: Dict, coin_name: str,
     }
 
 
-# -----------------------------------------------------------------------------
-# MAIN OPTIMIZATION LOOP
-# -----------------------------------------------------------------------------
-
 def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   n_trials: int = 50, n_jobs: int = 1,
-                  plateau_patience: int = 80, plateau_min_delta: float = 0.02,
-                  plateau_warmup: int = 40,
+                  plateau_patience: int = 100, plateau_min_delta: float = 0.02,
+                  plateau_warmup: int = 60,
                   study_suffix: str = "",
                   resume_study: bool = False,
-                  holdout_days: int = 90):
+                  holdout_days: int = 120):
     """Run Optuna optimization for a single coin with true holdout evaluation."""
 
-    # =========================================================================
     # STEP 0: Split data into optimization + holdout windows
-    # =========================================================================
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
 
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
@@ -541,9 +513,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     print(f"   ⚠️  Optuna NEVER sees holdout data during optimization")
     print(f"{'='*60}")
 
-    # =========================================================================
     # STEP 1: Setup Optuna study
-    # =========================================================================
     storage_url = "sqlite:///optuna_trading.db"
     study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
 
@@ -586,9 +556,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         print(f"❌ Could not create or load study '{study_name}'.")
         return None
 
-    # =========================================================================
     # STEP 2: Run Optimization on OPTIMIZATION WINDOW ONLY
-    # =========================================================================
     objective_func = functools.partial(
         objective,
         all_data=optim_data,  # <-- KEY: only optimization data, no holdout
@@ -620,9 +588,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         print("No trials completed.")
         return None
 
-    # =========================================================================
     # STEP 3: Report optimization results
-    # =========================================================================
     best = study.best_trial
 
     if _as_number(best.value) == -99.0:
@@ -645,9 +611,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     print(f"  Profit Factor:{_fmt_float(best.user_attrs.get('profit_factor'), 3)}")
     print(f"  Max Drawdown: {_fmt_pct(best.user_attrs.get('max_drawdown'), 2)}")
 
-    # =========================================================================
     # STEP 4: TRUE HOLDOUT EVALUATION
-    # =========================================================================
     holdout_result = None
     if holdout_data and holdout_sym:
         print(f"\n🔬 HOLDOUT EVALUATION (last {holdout_days} days — never seen by Optuna)...")
@@ -683,9 +647,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     else:
         print(f"\n  ⚠️ Skipping holdout eval — insufficient holdout data.")
 
-    # =========================================================================
     # STEP 5: Save results
-    # =========================================================================
     result_data = {
         'coin': coin_name,
         'prefix': coin_prefix,
@@ -702,9 +664,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         json.dump(result_data, f, indent=2)
     print(f"\n  💾 Saved to {result_path}")
 
-    # =========================================================================
     # STEP 6: Generate code snippet
-    # =========================================================================
     print(f"\n  📝 Suggested CoinProfile:")
     print(f"    '{coin_name}': CoinProfile(")
     print(f"        name='{coin_name}',")
@@ -761,10 +721,6 @@ def show_results():
             )
 
 
-# -----------------------------------------------------------------------------
-# RUNTIME CONFIG
-# -----------------------------------------------------------------------------
-
 COIN_MAP = {
     'BIP': 'BTC', 'BTC': 'BTC',
     'ETP': 'ETH', 'ETH': 'ETH',
@@ -786,15 +742,15 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show saved results")
     parser.add_argument("--study-suffix", type=str, default="",
                         help="Optional suffix to isolate studies per launch (useful for parallel runs)")
-    parser.add_argument("--plateau-patience", type=int, default=120,
+    parser.add_argument("--plateau-patience", type=int, default=100,
                         help="Stop if best score does not improve for this many trials")
-    parser.add_argument("--plateau-min-delta", type=float, default=0.01,
+    parser.add_argument("--plateau-min-delta", type=float, default=0.02,
                         help="Minimum best-score improvement to reset plateau counter")
-    parser.add_argument("--plateau-warmup", type=int, default=80,
+    parser.add_argument("--plateau-warmup", type=int, default=60,
                         help="Minimum completed trials before plateau checks start")
     parser.add_argument("--resume-study", action="store_true",
                         help="Resume existing study name instead of starting a fresh one")
-    parser.add_argument("--holdout-days", type=int, default=90,
+    parser.add_argument("--holdout-days", type=int, default=120,
                         help="Days of data to reserve as true holdout (never seen by Optuna)")
     parser.add_argument("--debug-trials", action="store_true",
                         help="Enable verbose per-trial output")

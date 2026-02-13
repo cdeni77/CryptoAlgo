@@ -45,9 +45,7 @@ from data_collection.models import OHLCVBar, TickerUpdate, FundingRate, OpenInte
 from data_collection.ccxt_connector import CCXTConnector
 from data_collection.storage import SQLiteDatabase
 
-# ----------------------------------------------------------------------
 # Configuration
-# ----------------------------------------------------------------------
 
 # Map your desired Assets to Coinbase "Smart Perp" Codes
 ASSET_TO_CODE_MAP = {
@@ -68,9 +66,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------
 # Helper Classes
-# ----------------------------------------------------------------------
 
 class BackfillProgress:
     """Track and display backfill progress."""
@@ -103,9 +99,7 @@ class BackfillProgress:
         logger.info(f"🏁 {self.description} complete: {self.completed_tasks} tasks in {elapsed:.0f}s")
 
 
-# ----------------------------------------------------------------------
 # Callbacks for Real-time Data
-# ----------------------------------------------------------------------
 
 _ticker_last_log: Dict[str, datetime] = defaultdict(lambda: datetime.min)
 TICKER_LOG_INTERVAL = timedelta(minutes=1)
@@ -134,9 +128,7 @@ def on_funding_rate(funding: FundingRate):
     logger.info(f"🏦 FUNDING    | {funding.symbol} | {funding.rate*100:.6f}%")
 
 
-# ----------------------------------------------------------------------
 # Backfill Functions
-# ----------------------------------------------------------------------
 
 async def backfill_ohlcv(
     pipeline,
@@ -436,9 +428,7 @@ async def backfill_open_interest(
         await connector.close()
 
 
-# ----------------------------------------------------------------------
 # Symbol Resolution
-# ----------------------------------------------------------------------
 
 async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
     """
@@ -470,9 +460,7 @@ async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
         return []
 
 
-# ----------------------------------------------------------------------
 # Main
-# ----------------------------------------------------------------------
 
 async def main():
     parser = argparse.ArgumentParser(
@@ -543,9 +531,7 @@ Examples:
     print(f"Proxy: {proxy or 'None'}")
     print()
     
-    # ------------------------------------------------------------------
     # Step 1: Resolve Symbols
-    # ------------------------------------------------------------------
     if args.symbols:
         # User-specified symbols
         symbols = [s.strip() for s in args.symbols.split(",")]
@@ -565,16 +551,12 @@ Examples:
         logger.error("❌ No symbols to process!")
         return
     
-    # ------------------------------------------------------------------
     # Step 2: Initialize Database
-    # ------------------------------------------------------------------
     db = SQLiteDatabase(args.db_path)
     db.initialize()
     logger.info(f"✓ Database initialized: {args.db_path}")
     
-    # ------------------------------------------------------------------
     # Step 3: Backfill Data
-    # ------------------------------------------------------------------
     pipeline = None
     
     if not args.skip_backfill:
@@ -613,9 +595,7 @@ Examples:
         if args.include_oi and not args.ohlcv_only:
             await backfill_open_interest(symbols, start_time, end_time, db, proxy)
     
-    # ------------------------------------------------------------------
     # Step 4: Summary
-    # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("📊 DATA SUMMARY")
     print("=" * 70)
@@ -663,9 +643,7 @@ Examples:
             else:
                 print("  No open interest data")
     
-    # ------------------------------------------------------------------
     # Step 5: Real-time Collection
-    # ------------------------------------------------------------------
     if args.backfill_only:
         logger.info("\n🏁 Backfill-only mode, exiting.")
         db.close()

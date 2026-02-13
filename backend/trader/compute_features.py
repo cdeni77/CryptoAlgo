@@ -8,6 +8,7 @@ Combines:
 3. Strategy Alignment (Exports 1.8x Triple Barrier Targets for the Bot)
 """
 
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -29,15 +30,14 @@ from features.engineering import (
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")
+LOOKBACK_DAYS = int(os.getenv("FEATURE_LOOKBACK_DAYS", "2190"))
 
 
-# =============================================================================
 # 1. ROBUST LOADERS (UTC Enforced)
-# =============================================================================
 
 def load_ohlcv_data(db: SQLiteDatabase, symbols: list, timeframe: str = "1h") -> dict:
     end = datetime.utcnow()
-    start = end - timedelta(days=2190)
+    start = end - timedelta(days=LOOKBACK_DAYS)
     data = {}
     for symbol in symbols:
         df = db.get_ohlcv(symbol, timeframe, start, end)
@@ -67,7 +67,7 @@ def load_funding_data(db: SQLiteDatabase, symbols: list) -> dict:
 def load_oi_data(db: SQLiteDatabase, symbols: list) -> dict:
     oi_data = {}
     end = datetime.utcnow()
-    start = end - timedelta(days=2190)
+    start = end - timedelta(days=LOOKBACK_DAYS)
     for symbol in symbols:
         try:
             df = db.get_open_interest(symbol, start, end)
@@ -81,9 +81,7 @@ def load_oi_data(db: SQLiteDatabase, symbols: list) -> dict:
             pass
     return oi_data
 
-# =============================================================================
 # 2. ANALYSIS HELPERS
-# =============================================================================
 
 def analyze_feature_coverage(features: pd.DataFrame) -> pd.DataFrame:
     coverage = pd.DataFrame({
@@ -124,9 +122,7 @@ def prepare_robust_dataset(features: pd.DataFrame, target: pd.Series):
     
     return X, y
 
-# =============================================================================
 # 3. MAIN SCRIPT
-# =============================================================================
 
 def main():
     print("=" * 70)
