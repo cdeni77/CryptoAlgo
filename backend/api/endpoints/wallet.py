@@ -54,56 +54,97 @@ def get_current_price(spot_id: str) -> Optional[float]:
 
 
 def get_coinbase_spot_portfolio() -> Dict[str, Any]:
-    """Aggregate spot holdings from Advanced Trade accounts."""
+    """Aggregate spot holdings from Advanced Trade portfolios/accounts.
+
+    Prefers portfolio breakdown data (captures staked assets in `total_balance_crypto`
+    and `total_balance_fiat` where available). Falls back to account balances.
+    """
     try:
-        accounts_response = client.get_accounts(limit=250)
-        accounts = _to_dict(accounts_response).get("accounts", [])
-        total_usd = 0.0
+        asset_map: Dict[str, Dict[str, Any]] = {}
+
+        portfolios_response = client.get_portfolios()
+        portfolios = _to_dict(portfolios_response).get("portfolios", [])
+        for raw_portfolio in portfolios:
+            portfolio = _to_dict(raw_portfolio)
+            portfolio_uuid = portfolio.get("uuid")
+            if not portfolio_uuid:
+                continue
+            breakdown = _to_dict(client.get_portfolio_breakdown(portfolio_uuid=portfolio_uuid)).get("breakdown", {})
+            for raw_position in breakdown.get("spot_positions", []):
+                position = _to_dict(raw_position)
+                asset = position.get("asset")
+                if not asset:
+                    continue
+
+                amount = _safe_float(position.get("total_balance_crypto")) or 0.0
+                value_usd = _safe_float(position.get("total_balance_fiat"))
+                if value_usd is None and amount > 0:
+                    if asset in ("USD", "USDC", "USDT"):
+                        value_usd = amount
+                    else:
+                        px = get_current_price(f"{asset}-USD")
+                        value_usd = amount * px if px is not None else None
+
+                existing = asset_map.get(asset)
+                if not existing:
+                    existing = {"asset": asset, "amount": 0.0, "value_usd": 0.0, "price_usd": None}
+                    asset_map[asset] = existing
+
+                existing["amount"] += amount
+                if value_usd is not None:
+                    existing["value_usd"] += value_usd
+
         assets: List[Dict[str, Any]] = []
+        for item in asset_map.values():
+            amount = item["amount"]
+            value_usd = item["value_usd"]
+            price_usd = (value_usd / amount) if amount > 0 else None
+            assets.append(
+                {
+                    "asset": item["asset"],
+                    "amount": round(amount, 8),
+                    "price_usd": round(price_usd, 6) if price_usd is not None else None,
+                    "value_usd": round(value_usd, 2),
+                }
+            )
 
-        for account in accounts:
-            account_d = _to_dict(account)
-            currency = account_d.get("currency")
+        # Fallback to account balances when no portfolio breakdown positions are available.
+        if not assets:
+            accounts_response = client.get_accounts(limit=250)
+            accounts = _to_dict(accounts_response).get("accounts", [])
+            for account in accounts:
+                account_d = _to_dict(account)
+                currency = account_d.get("currency")
+                available_balance = _to_dict(account_d.get("available_balance")).get("value")
+                hold_balance = _to_dict(account_d.get("hold")).get("value")
+                if available_balance is None:
+                    available_balance = account_d.get("available_balance")
+                if hold_balance is None:
+                    hold_balance = account_d.get("hold")
 
-            available_balance = _to_dict(account_d.get("available_balance")).get("value")
-            hold_balance = _to_dict(account_d.get("hold")).get("value")
-            if available_balance is None:
-                available_balance = account_d.get("available_balance")
-            if hold_balance is None:
-                hold_balance = account_d.get("hold")
+                amount = (_safe_float(available_balance) or 0.0) + (_safe_float(hold_balance) or 0.0)
+                if amount <= 0 or not currency:
+                    continue
 
-            amount = (_safe_float(available_balance) or 0.0) + (_safe_float(hold_balance) or 0.0)
-            if amount <= 0:
-                continue
+                if currency in ("USD", "USDC", "USDT"):
+                    value_usd = amount
+                    price_usd = 1.0
+                else:
+                    price_usd = get_current_price(f"{currency}-USD")
+                    if price_usd is None:
+                        continue
+                    value_usd = amount * price_usd
 
-            if currency in ("USD", "USDC", "USDT"):
-                total_usd += amount
                 assets.append(
                     {
                         "asset": currency,
                         "amount": round(amount, 8),
-                        "price_usd": 1.0,
-                        "value_usd": round(amount, 2),
-                    }
-                )
-                continue
-
-            if not currency:
-                continue
-
-            price = get_current_price(f"{currency}-USD")
-            if price is not None:
-                value_usd = amount * price
-                total_usd += value_usd
-                assets.append(
-                    {
-                        "asset": currency,
-                        "amount": round(amount, 8),
-                        "price_usd": round(price, 6),
+                        "price_usd": round(price_usd, 6) if price_usd is not None else None,
                         "value_usd": round(value_usd, 2),
                     }
                 )
 
+        total_usd = sum((_safe_float(asset.get("value_usd")) or 0.0) for asset in assets)
         assets.sort(key=lambda item: item.get("value_usd") or 0.0, reverse=True)
 
         return {
@@ -184,16 +225,6 @@ def get_coinbase_perps_portfolio() -> Dict[str, Any]:
         }
 
 
-def _upsert_wallet_balance(db: Session, balance: float) -> None:
-    wallet = db.query(Wallet).order_by(Wallet.id.desc()).first()
-    if wallet:
-        wallet.balance = balance
-    else:
-        wallet = Wallet(balance=balance)
-        db.add(wallet)
-    db.commit()
-
-
 @router.get("/")
 def get_wallet(db: Session = Depends(get_db)):
     # Realized PNL: sum net_pnl from closed trades
@@ -210,38 +241,27 @@ def get_wallet(db: Session = Depends(get_db)):
         pnl = (current_price - trade.entry_price) * multiplier * trade.contracts
         unrealized_pnl += pnl
 
-    # Pull live Coinbase portfolios (spot + advanced perps) and persist aggregate
+    # Pull live Coinbase portfolios (spot + advanced perps)
     spot = get_coinbase_spot_portfolio()
     perps = get_coinbase_perps_portfolio()
     spot_usd = _safe_float(spot.get("value_usd"))
     perps_usd = _safe_float(perps.get("value_usd"))
     coinbase_total = (spot_usd or 0.0) + (perps_usd or 0.0)
 
-    if spot_usd is not None or perps_usd is not None:
-        _upsert_wallet_balance(db, coinbase_total)
-
-    # Current paper-trading wallet balance from latest wallet entry (DB fallback)
-    wallet = db.query(Wallet).order_by(Wallet.id.desc()).first()
-    paper_balance = wallet.balance if wallet else 10000.0
-
-    latest_equity = db.query(PaperEquityCurve).order_by(PaperEquityCurve.timestamp.desc()).first()
-    paper_equity = latest_equity.equity if latest_equity else None
-    paper_cash = latest_equity.cash_balance if latest_equity else None
-    paper_unrealized = latest_equity.unrealized_pnl if latest_equity else None
+    # Paper trading wallet remains fixed at starting balance until paper wallet accounting is enabled.
+    paper_balance = 10000.0
 
     total_pnl = realized_pnl + unrealized_pnl
-    effective_paper_balance = paper_equity if paper_equity is not None else paper_balance
-
     return {
-        "balance": effective_paper_balance,
+        "balance": paper_balance,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
         "total_pnl": total_pnl,
         "wallets": {
             "paper_trading": {
-                "value_usd": round(effective_paper_balance, 2),
-                "cash_usd": round(paper_cash, 2) if paper_cash is not None else None,
-                "unrealized_pnl": round(paper_unrealized, 2) if paper_unrealized is not None else None,
+                "value_usd": round(paper_balance, 2),
+                "cash_usd": round(paper_balance, 2),
+                "unrealized_pnl": 0.0,
                 "status": "ok",
             },
             "coinbase_spot": {"value_usd": spot.get("value_usd"), "status": spot.get("status")},
