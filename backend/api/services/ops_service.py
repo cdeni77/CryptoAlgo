@@ -61,6 +61,9 @@ class OpsService:
     def _spawn(self, cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
         log_handle = self._log_file.open("a", encoding="utf-8")
         env = os.environ.copy()
+        # Ensure Python workers flush stdout/stderr continuously so the UI log tail
+        # reflects progress in near-real time.
+        env.setdefault("PYTHONUNBUFFERED", "1")
         if extra_env:
             env.update({k: str(v) for k, v in extra_env.items() if v is not None})
 

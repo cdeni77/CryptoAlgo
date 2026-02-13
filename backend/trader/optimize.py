@@ -410,7 +410,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
             objective_func,
             n_trials=n_trials,
             n_jobs=n_jobs,
-            show_progress_bar=True,
+            # tqdm progress bars emit noisy carriage-return updates when output is
+            # redirected to log files (non-TTY), which can drown out useful lines.
+            show_progress_bar=sys.stderr.isatty(),
             callbacks=[stopper],
         )
     except KeyboardInterrupt:
