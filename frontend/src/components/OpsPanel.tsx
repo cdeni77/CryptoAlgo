@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getOpsLogs, getOpsStatus, startPipeline, stopPipeline, triggerRetrain } from '../api/opsApi';
+import { getOpsLogs, getOpsStatus, launchParallel, startPipeline, stopPipeline, trainScratch, triggerRetrain } from '../api/opsApi';
 import { OpsLogEntry, OpsStatus } from '../types';
 
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : '—');
@@ -69,8 +69,22 @@ export default function OpsPanel() {
           </button>
           <button
             disabled={busy}
-            onClick={() => onAction(triggerRetrain)}
+            onClick={() => onAction(() => launchParallel(200, 16))}
+            className="px-3 py-1.5 rounded-lg text-xs font-mono-trade bg-amber-500/10 text-[var(--accent-amber)] border border-amber-500/30 disabled:opacity-50"
+          >
+            Parallel Launch
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => onAction(trainScratch)}
             className="px-3 py-1.5 rounded-lg text-xs font-mono-trade bg-cyan-500/10 text-[var(--accent-cyan)] border border-cyan-500/30 disabled:opacity-50"
+          >
+            Train Scratch
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => onAction(triggerRetrain)}
+            className="px-3 py-1.5 rounded-lg text-xs font-mono-trade bg-sky-500/10 text-sky-300 border border-sky-500/30 disabled:opacity-50"
           >
             Retrain
           </button>
@@ -86,6 +100,7 @@ export default function OpsPanel() {
           <p className="text-[var(--text-secondary)]">Symbol: {status?.symbol ?? '—'}</p>
           <p className="text-[var(--text-secondary)]">Pipeline: {status?.pipeline_running ? 'running' : 'stopped'}</p>
           <p className="text-[var(--text-secondary)]">Training: {status?.training_running ? 'running' : 'idle'}</p>
+          <p className="text-[var(--text-secondary)]">Parallel: {status?.parallel_running ? 'running' : 'idle'}</p>
           <p className="text-[var(--text-secondary)]">Last run: {fmt(status?.last_run_time ?? null)}</p>
           <p className="text-[var(--text-secondary)]">Next run: {fmt(status?.next_run_time ?? null)}</p>
         </div>

@@ -22,6 +22,7 @@ class OpsService:
         self._lock = threading.Lock()
         self._pipeline_proc: Optional[subprocess.Popen] = None
         self._training_proc: Optional[subprocess.Popen] = None
+        self._parallel_proc: Optional[subprocess.Popen] = None
         self._phase: str = "idle"
         self._symbol: Optional[str] = None
         self._metrics: Dict[str, float] = {}
@@ -82,6 +83,32 @@ class OpsService:
             self._training_proc = self._spawn(["python", "live_orchestrator.py", "--retrain-only", "--run-once"])
             return self._training_proc.pid
 
+    def launch_parallel(self, trials: int = 200, jobs: int = 16) -> int:
+        with self._lock:
+            if self._parallel_proc and self._parallel_proc.poll() is None:
+                return self._parallel_proc.pid
+
+            self._phase = "optimization"
+            self._parallel_proc = self._spawn([
+                "python",
+                "parallel_launch.py",
+                "--trials",
+                str(trials),
+                "--jobs",
+                str(jobs),
+            ])
+            return self._parallel_proc.pid
+
+    def train_from_scratch(self) -> int:
+        with self._lock:
+            if self._training_proc and self._training_proc.poll() is None:
+                return self._training_proc.pid
+
+            self._phase = "training"
+            self._next_run_time = datetime.utcnow() + timedelta(hours=1)
+            self._training_proc = self._spawn(["python", "live_orchestrator.py", "--retrain-only", "--run-once"])
+            return self._training_proc.pid
+
     def _parse_timestamp(self, value: str) -> Optional[datetime]:
         for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S"):
             try:
@@ -98,6 +125,8 @@ class OpsService:
             return "funding"
         if "new candle" in lower or "ticker" in lower:
             return "live_trading"
+        if "launching" in lower and "workers" in lower:
+            return "optimization"
         if "train" in lower or "auc" in lower:
             return "training"
         return None
@@ -154,13 +183,15 @@ class OpsService:
 
         pipeline_running = bool(self._pipeline_proc and self._pipeline_proc.poll() is None)
         training_running = bool(self._training_proc and self._training_proc.poll() is None)
+        parallel_running = bool(self._parallel_proc and self._parallel_proc.poll() is None)
 
-        if not pipeline_running and not training_running and self._phase == "pipeline_running":
+        if not pipeline_running and not training_running and not parallel_running and self._phase in {"pipeline_running", "optimization"}:
             self._phase = "idle"
 
         return OpsStatusResponse(
             pipeline_running=pipeline_running,
             training_running=training_running,
+            parallel_running=parallel_running,
             phase=self._phase,
             symbol=self._symbol,
             metrics=self._metrics,

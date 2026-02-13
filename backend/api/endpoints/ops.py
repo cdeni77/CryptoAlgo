@@ -39,6 +39,28 @@ def retrain():
     )
 
 
+@router.post("/parallel-launch", response_model=OpsActionResponse)
+def parallel_launch(trials: int = Query(200, ge=1, le=5000), jobs: int = Query(16, ge=1, le=64)):
+    pid = ops_service.launch_parallel(trials=trials, jobs=jobs)
+    return OpsActionResponse(
+        action="parallel_launch",
+        status="ok",
+        detail="Parallel optimization started (or already running)",
+        pid=pid,
+    )
+
+
+@router.post("/train-scratch", response_model=OpsActionResponse)
+def train_scratch():
+    pid = ops_service.train_from_scratch()
+    return OpsActionResponse(
+        action="train_scratch",
+        status="ok",
+        detail="Scratch retraining started (or already running)",
+        pid=pid,
+    )
+
+
 @router.get("/status", response_model=OpsStatusResponse)
 def status():
     return ops_service.get_status()
