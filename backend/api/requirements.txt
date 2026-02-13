@@ -6,3 +6,10 @@ python-dotenv==1.0.1
 pydantic==2.9.2
 alembic==1.13.3
 coinbase-advanced-py
+
+# Needed when running /trader optimization/training scripts from the backend container
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn
+lightgbm
+optuna

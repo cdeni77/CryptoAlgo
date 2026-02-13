@@ -78,6 +78,28 @@ def get_extra_features(coin_name: str):
     }
     return mapping.get(coin_name, [])
 
+
+def _as_number(value, default: Optional[float] = None) -> Optional[float]:
+    """Safely coerce values from Optuna attrs/JSON to float for formatting."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_pct(value, decimals: int = 1, fallback: str = "?") -> str:
+    n = _as_number(value)
+    return f"{n:.{decimals}%}" if n is not None else fallback
+
+
+def _fmt_float(value, decimals: int = 3, fallback: str = "?") -> str:
+    n = _as_number(value)
+    return f"{n:.{decimals}f}" if n is not None else fallback
+
 def create_trial_profile(trial: optuna.Trial, coin_name: str) -> CoinProfile:
     """Create a CoinProfile from Optuna trial suggestions."""
     base_profile = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
@@ -320,13 +342,13 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     # 3. Report Results
     best = study.best_trial
     print(f"\n✅ BEST RESULT for {coin_name}:")
-    print(f"  Score:        {best.value:.3f}")
+    print(f"  Score:        {_fmt_float(best.value, 3)}")
     print(f"  Trades:       {best.user_attrs.get('n_trades', '?')}")
-    print(f"  Win Rate:     {best.user_attrs.get('win_rate', '?'):.1%}")
-    print(f"  Ann Return:   {best.user_attrs.get('ann_return', '?'):.2%}")
-    print(f"  Sharpe:       {best.user_attrs.get('sharpe', '?'):.3f}")
-    print(f"  Profit Factor:{best.user_attrs.get('profit_factor', '?'):.3f}")
-    print(f"  Max Drawdown: {best.user_attrs.get('max_drawdown', '?'):.2%}")
+    print(f"  Win Rate:     {_fmt_pct(best.user_attrs.get('win_rate'), 1)}")
+    print(f"  Ann Return:   {_fmt_pct(best.user_attrs.get('ann_return'), 2)}")
+    print(f"  Sharpe:       {_fmt_float(best.user_attrs.get('sharpe'), 3)}")
+    print(f"  Profit Factor:{_fmt_float(best.user_attrs.get('profit_factor'), 3)}")
+    print(f"  Max Drawdown: {_fmt_pct(best.user_attrs.get('max_drawdown'), 2)}")
 
     # 4. Save JSON
     result_data = {
@@ -378,9 +400,14 @@ def show_results():
             r = json.load(f)
         m = r.get('metrics', {})
         print(f"\n{r['coin']} ({r.get('prefix','?')}) — {r['n_trials']} trials — {r['timestamp'][:16]}")
-        print(f"  Score: {r['score']:.3f} | Sharpe: {m.get('sharpe', '?')} | "
-              f"WR: {m.get('win_rate', 0):.1%} | PF: {m.get('profit_factor', '?')} | "
-              f"DD: {m.get('max_drawdown', 0):.1%} | Trades: {m.get('n_trades', '?')}")
+        print(
+            f"  Score: {_fmt_float(r.get('score'), 3)} | "
+            f"Sharpe: {_fmt_float(m.get('sharpe'), 3)} | "
+            f"WR: {_fmt_pct(m.get('win_rate'), 1)} | "
+            f"PF: {_fmt_float(m.get('profit_factor'), 3)} | "
+            f"DD: {_fmt_pct(m.get('max_drawdown'), 1)} | "
+            f"Trades: {m.get('n_trades', '?')}"
+        )
 
 # -----------------------------------------------------------------------------
 # RUNTIME CONFIG
