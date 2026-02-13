@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import engine
 from endpoints.coins import router as coins_router
-from endpoints.ops import router as ops_router
 from endpoints.paper import router as paper_router
 from endpoints.signals import router as signals_router
 from endpoints.trade import router as trades_router
@@ -14,7 +13,6 @@ from models.base import Base
 from models import signals as _signals_models 
 from models import trade as _trade_models  
 from models import wallet as _wallet_models  
-from models import ops as _ops_models
 
 Base.metadata.create_all(bind=engine)
 
@@ -41,7 +39,6 @@ app.include_router(trades_router)
 app.include_router(coins_router)
 app.include_router(wallet_router)
 app.include_router(signals_router)
-app.include_router(ops_router)
 app.include_router(paper_router)
 
 
