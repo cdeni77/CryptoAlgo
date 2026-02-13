@@ -115,6 +115,8 @@ class PgWriter:
         timestamp: datetime,
         direction: str,
         confidence: float,
+        mode: str = "signals",
+        idempotency_key: str | None = None,
         raw_probability: float | None = None,
         model_auc: float | None = None,
         price_at_signal: float | None = None,
@@ -127,8 +129,16 @@ class PgWriter:
         acted_on: bool = False,
         trade_id: int | None = None,
     ) -> int:
-        """Insert one signal row. Returns the signal id."""
+        """Insert one signal row. Returns the signal id (idempotent for coin+timestamp+direction)."""
         with self._session() as db:
+            existing = db.query(Signal).filter(
+                Signal.coin == coin,
+                Signal.timestamp == timestamp,
+                Signal.direction == direction,
+            ).first()
+            if existing:
+                return existing.id
+
             sig = Signal(
                 coin=coin,
                 timestamp=timestamp,
@@ -158,6 +168,8 @@ class PgWriter:
         side: str,
         contracts: float,
         entry_price: float,
+        mode: str = "live",
+        idempotency_key: str | None = None,
         fee_open: float = 0.0,
         margin_used: float | None = None,
         leverage: float | None = None,
@@ -165,6 +177,14 @@ class PgWriter:
     ) -> int:
         """Insert an open trade. Returns trade id."""
         with self._session() as db:
+            if idempotency_key:
+                existing = db.query(Trade).filter(
+                    Trade.coin == coin,
+                    Trade.reason_entry == f"idem:{idempotency_key}",
+                ).first()
+                if existing:
+                    return existing.id
+
             t = Trade(
                 coin=coin,
                 side=TradeSide(side),
@@ -173,7 +193,7 @@ class PgWriter:
                 fee_open=fee_open,
                 margin_used=margin_used,
                 leverage=leverage,
-                reason_entry=reason_entry,
+                reason_entry=f"idem:{idempotency_key}" if idempotency_key else reason_entry,
                 status=TradeStatus.OPEN,
             )
             db.add(t)
@@ -185,19 +205,29 @@ class PgWriter:
         self,
         trade_id: int,
         exit_price: float,
+        mode: str = "live",
+        idempotency_key: str | None = None,
         fee_close: float = 0.0,
         net_pnl: float | None = None,
         reason_exit: str | None = None,
     ) -> bool:
         """Close an existing trade. Returns True on success."""
         with self._session() as db:
+            if idempotency_key:
+                existing = db.query(Trade).filter(
+                    Trade.reason_exit == f"idem:{idempotency_key}",
+                    Trade.status == TradeStatus.CLOSED,
+                ).first()
+                if existing:
+                    return True
+
             t = db.query(Trade).filter(Trade.id == trade_id).first()
             if not t:
                 return False
             t.exit_price = exit_price
             t.fee_close = fee_close
             t.net_pnl = net_pnl
-            t.reason_exit = reason_exit
+            t.reason_exit = f"idem:{idempotency_key}" if idempotency_key else reason_exit
             t.datetime_close = datetime.now(timezone.utc)
             t.status = TradeStatus.CLOSED
             db.commit()
@@ -213,3 +243,7 @@ class PgWriter:
             else:
                 db.add(Wallet(balance=new_balance))
             db.commit()
+
+    def upsert_wallet_balance(self, new_balance: float) -> None:
+        """Alias for wallet balance upsert used by the trader loops."""
+        self.update_balance(new_balance)
