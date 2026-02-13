@@ -115,11 +115,28 @@ export interface WalletData {
   };
   ledger?: {
     status: string;
+    value_usd: number | null;
     entries: Array<{
       coin: string;
       address: string;
+      amount: number | null;
+      price_usd: number | null;
+      value_usd: number | null;
     }>;
+    assets?: Array<{
+      asset: string;
+      amount: number;
+      price_usd: number | null;
+      value_usd: number | null;
+    }>;
+    updated_at?: string;
   };
+  portfolio_history?: Array<{
+    timestamp: string;
+    paper_equity_usd: number;
+    external_usd: number;
+    total_value_usd: number;
+  }>;
 }
 
 export interface PaperOrder {
