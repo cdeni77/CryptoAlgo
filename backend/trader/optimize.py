@@ -14,7 +14,6 @@ import argparse
 import json
 import warnings
 import sys
-import io
 import os
 import logging
 import sqlite3
@@ -145,15 +144,15 @@ def create_trial_profile(trial: optuna.Trial, coin_name: str) -> CoinProfile:
         extra_features=get_extra_features(coin_name),
 
         # Signal threshold
-        signal_threshold=trial.suggest_float('signal_threshold', 0.70, 0.90, step=0.01),
+        signal_threshold=trial.suggest_float('signal_threshold', 0.58, 0.86, step=0.01),
 
         # Model quality gate
-        min_val_auc=trial.suggest_float('min_val_auc', 0.52, 0.58, step=0.01),
+        min_val_auc=trial.suggest_float('min_val_auc', 0.50, 0.58, step=0.01),
 
         # Labeling
         label_forward_hours=trial.suggest_int('label_forward_hours', 12, 48, step=6),
         label_vol_target=trial.suggest_float('label_vol_target', 1.2, 2.4, step=0.2),
-        min_momentum_magnitude=trial.suggest_float('min_momentum_magnitude', 0.03, 0.15, step=0.01),
+        min_momentum_magnitude=trial.suggest_float('min_momentum_magnitude', 0.01, 0.12, step=0.01),
 
         # Exits
         vol_mult_tp=trial.suggest_float('vol_mult_tp', 3.0, 8.0, step=0.5),
@@ -197,62 +196,58 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     config = Config(
         max_positions=1,
         leverage=4,
-        min_signal_edge=0.02,
+        min_signal_edge=0.00,
         max_ensemble_std=0.10,
         train_embargo_hours=24,
         oos_eval_days=60,
     )
 
-    # Capture stdout to prevent console spam from parallel processes
-    # We use a context manager to silence prints during the backtest
-    captured_output = io.StringIO()
-    original_stdout = sys.stdout
-    
     try:
-        sys.stdout = captured_output
         result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception as e:
         _set_reject_reason(trial, f'run_backtest_error:{type(e).__name__}')
         return -99.0
-    finally:
-        sys.stdout = original_stdout # Restore stdout immediately
 
     if result is None:
         _set_reject_reason(trial, 'result_none')
         return -99.0
 
-    if result.get('n_trades', 0) < 15:
-        _set_reject_reason(trial, f"too_few_trades:{result.get('n_trades', 0)}")
-        return -99.0
-
     # Scoring Logic
-    n_trades = result['n_trades']
-    sharpe = result.get('sharpe_annual', -99)
-    pf = result.get('profit_factor', 0)
-    dd = result.get('max_drawdown', 1.0)
-    wr = result.get('win_rate', 0)
-    ann_ret = result.get('ann_return', -1)
-    trades_per_year = result.get('trades_per_year', 0)
-    oos_sharpe = result.get('oos_sharpe', -99.0)
-    oos_return = result.get('oos_return', -1.0)
-    oos_trades = result.get('oos_trades', 0)
+    n_trades = int(result.get('n_trades', 0) or 0)
+    sharpe = float(result.get('sharpe_annual', 0.0) or 0.0)
+    pf = float(result.get('profit_factor', 0.0) or 0.0)
+    dd = float(result.get('max_drawdown', 1.0) or 1.0)
+    wr = float(result.get('win_rate', 0.0) or 0.0)
+    ann_ret = float(result.get('ann_return', -1.0) or -1.0)
+    trades_per_year = float(result.get('trades_per_year', 0.0) or 0.0)
+    oos_sharpe = float(result.get('oos_sharpe', 0.0) or 0.0)
+    oos_return = float(result.get('oos_return', 0.0) or 0.0)
+    oos_trades = int(result.get('oos_trades', 0) or 0)
 
-    pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0
-    dd_penalty = max(0, dd - 0.30) * 3.0
-    
-   # === Final: Crypto-selective (favor 3–12 trades/year per coin) ===
+    # Treat sentinel values as missing data instead of a hard catastrophic score.
+    if sharpe <= -90:
+        sharpe = 0.0
+    if oos_sharpe <= -90:
+        oos_sharpe = 0.0
+
+    pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0.0
+    dd_penalty = max(0.0, dd - 0.30) * 3.0
+
+    # === Final: Crypto-selective (favor 3–12 trades/year per coin) ===
     trade_penalty = 0.0
 
-    if n_trades < 12:  # Hard reject only extreme noise (<~2–3/year total)
-        _set_reject_reason(trial, f'too_few_trades_hard:{n_trades}')
-        return -99.0
+    # Keep this as a soft penalty so Optuna can still rank and escape bad regions
+    # instead of collapsing to identical -99.0 values.
+    if n_trades < 15:
+        _set_reject_reason(trial, f'too_few_trades:{n_trades}')
+        trade_penalty += min(3.0, (15 - n_trades) * 0.2)
 
     if trades_per_year < 10:  # <~1/year total — noticeable for ultra-selective
-        trade_penalty = 0.5 + (5 - trades_per_year) * 0.05
+        trade_penalty += 0.5 + max(0.0, (5 - trades_per_year) * 0.05)
     elif trades_per_year < 25:  # Light if a bit sparse
-        trade_penalty = 0.25
+        trade_penalty += 0.25
     elif trades_per_year > 100:  # Overtrading penalty
-        trade_penalty = 0.5
+        trade_penalty += 0.5
 
     # Bonus for ideal single-coin selectivity (high-conviction, low noise)
     if 30 <= trades_per_year <= 80: 
@@ -326,7 +321,8 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   n_trials: int = 50, n_jobs: int = 1,
                   plateau_patience: int = 80, plateau_min_delta: float = 0.02,
                   plateau_warmup: int = 40,
-                  study_suffix: str = ""):
+                  study_suffix: str = "",
+                  resume_study: bool = False):
     """Run Optuna optimization for a single coin with parallel support."""
     
     # 1. Setup Persistent Storage (Required for parallel jobs)
@@ -345,7 +341,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         sampler=TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3)),
         study_name=study_name,
         storage=storage_url,
-        load_if_exists=True 
+        load_if_exists=resume_study 
     )
 
     # 2. Run Optimization
@@ -496,7 +492,15 @@ if __name__ == "__main__":
                         help="Minimum best-score improvement to reset plateau counter")
     parser.add_argument("--plateau-warmup", type=int, default=40,
                         help="Minimum completed trials before plateau checks start")
+    parser.add_argument("--resume-study", action="store_true",
+                        help="Resume existing study name instead of starting a fresh one")
     args = parser.parse_args()
+
+    # Default to fresh studies per run to avoid reusing stale/plateaued trials.
+    effective_study_suffix = args.study_suffix
+    if not args.resume_study and not effective_study_suffix:
+        effective_study_suffix = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        print(f"🆕 Using fresh study suffix: {effective_study_suffix}")
 
     # Initialize SQLite WAL mode BEFORE running anything else
     init_db_wal()
@@ -532,7 +536,8 @@ if __name__ == "__main__":
                     plateau_patience=args.plateau_patience,
                     plateau_min_delta=args.plateau_min_delta,
                     plateau_warmup=args.plateau_warmup,
-                    study_suffix=args.study_suffix,
+                    study_suffix=effective_study_suffix,
+                    resume_study=args.resume_study,
                 )
     else:
         # Single coin
@@ -558,5 +563,6 @@ if __name__ == "__main__":
             plateau_patience=args.plateau_patience,
             plateau_min_delta=args.plateau_min_delta,
             plateau_warmup=args.plateau_warmup,
-            study_suffix=args.study_suffix,
+            study_suffix=effective_study_suffix,
+            resume_study=args.resume_study,
         )
