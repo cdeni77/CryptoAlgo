@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import PriceCard from './components/PriceCard';
 import PriceChart from './components/PriceChart';
 import TradesTable from './components/TradesTable';
@@ -21,6 +21,14 @@ const coinIcons: Record<CoinSymbol, string> = {
 
 type BottomTab = 'trades' | 'signals';
 
+const formatAgo = (d: Date | null) => {
+  if (!d) return '—';
+  const sec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  return `${Math.floor(sec / 3600)}h ago`;
+};
+
 function App() {
   const [prices, setPrices] = useState<PriceData | null>(null);
   const [cdeSpecs, setCdeSpecs] = useState<CDESpecs | null>(null);
@@ -36,6 +44,9 @@ function App() {
   const [timeRange, setTimeRange] = useState<'1h' | '1d' | '1w' | '1m' | '1y'>('1d');
   const [loadingWallet, setLoadingWallet] = useState(true);
   const [bottomTab, setBottomTab] = useState<BottomTab>('signals');
+  const [pricesUpdatedAt, setPricesUpdatedAt] = useState<Date | null>(null);
+  const [signalsUpdatedAt, setSignalsUpdatedAt] = useState<Date | null>(null);
+  const [tradesUpdatedAt, setTradesUpdatedAt] = useState<Date | null>(null);
 
   // Per-card data source
   const [cardSources, setCardSources] = useState<Record<CoinSymbol, DataSource>>(
@@ -54,6 +65,7 @@ function App() {
       try {
         const data = await getCurrentPrices();
         setPrices(data);
+        setPricesUpdatedAt(new Date());
       } catch (err) {
         setError((err as Error).message);
       } finally {
@@ -87,6 +99,7 @@ function App() {
       setLoadingTrades(true);
       try {
         setTrades(await getAllTrades(0, 100));
+        setTradesUpdatedAt(new Date());
       } catch (err) {
         console.error('Trades fetch error:', err);
       } finally {
@@ -104,6 +117,7 @@ function App() {
       setLoadingSignals(true);
       try {
         setSignals(await getRecentSignals(100));
+        setSignalsUpdatedAt(new Date());
       } catch (err) {
         console.error('Signals fetch error:', err);
       } finally {
@@ -120,6 +134,23 @@ function App() {
     const t = setTimeout(() => setLoadingWallet(false), 1000);
     return () => clearTimeout(t);
   }, []);
+
+  const kpis = useMemo(() => {
+    const openTrades = trades.filter(t => t.status === 'open').length;
+    const closedTrades = trades.filter(t => t.status === 'closed');
+    const winners = closedTrades.filter(t => (t.net_pnl ?? 0) > 0).length;
+    const winRate = closedTrades.length > 0 ? (winners / closedTrades.length) * 100 : 0;
+
+    const actedSignals = signals.filter(s => s.acted_on).length;
+    const actedRate = signals.length > 0 ? (actedSignals / signals.length) * 100 : 0;
+
+    const validConf = signals.filter(s => Number.isFinite(s.confidence));
+    const avgConfidence = validConf.length > 0
+      ? (validConf.reduce((acc, s) => acc + s.confidence, 0) / validConf.length) * 100
+      : 0;
+
+    return { openTrades, closedTrades: closedTrades.length, winRate, actedRate, avgConfidence };
+  }, [trades, signals]);
 
   return (
     <div className="min-h-screen bg-grid font-sans antialiased">
@@ -141,6 +172,7 @@ function App() {
               <span className="w-2 h-2 rounded-full bg-[var(--accent-emerald)] animate-pulse" />
               <span className="text-[var(--accent-emerald)]">LIVE</span>
             </span>
+            <span className="hidden md:inline">Prices: {formatAgo(pricesUpdatedAt)}</span>
             <span className="hidden sm:inline">
               {new Date().toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
             </span>
@@ -173,6 +205,23 @@ function App() {
           </div>
         </section>
 
+        {/* Quick stats */}
+        <section className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          {[
+            { label: 'Open Trades', value: kpis.openTrades.toString(), sub: `Closed ${kpis.closedTrades}` },
+            { label: 'Closed Win Rate', value: `${kpis.winRate.toFixed(1)}%`, sub: `Trades refresh ${formatAgo(tradesUpdatedAt)}` },
+            { label: 'Signals Acted', value: `${kpis.actedRate.toFixed(1)}%`, sub: `${signals.filter(s => s.acted_on).length}/${signals.length}` },
+            { label: 'Avg Confidence', value: `${kpis.avgConfidence.toFixed(1)}%`, sub: `Signals refresh ${formatAgo(signalsUpdatedAt)}` },
+            { label: 'Selected Coin', value: selectedCoin, sub: `${chartSource.toUpperCase()} chart source` },
+          ].map((k) => (
+            <div key={k.label} className="glass-card rounded-xl p-3">
+              <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] font-mono-trade">{k.label}</p>
+              <p className="text-xl font-semibold mt-1 text-[var(--text-primary)]">{k.value}</p>
+              <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 font-mono-trade">{k.sub}</p>
+            </div>
+          ))}
+        </section>
+
         {/* Chart */}
         <section>
           <PriceChart
@@ -194,41 +243,46 @@ function App() {
 
         {/* Tabs: Signals + Trades */}
         <section>
-          <div className="flex items-center gap-1 mb-4">
-            <button
-              onClick={() => setBottomTab('signals')}
-              className={`
-                px-4 py-2 rounded-lg text-sm font-medium font-mono-trade transition-all
-                ${bottomTab === 'signals'
-                  ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] border border-[var(--border-accent)]'
-                  : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
-                }
-              `}
-            >
-              Signals
-              {signals.length > 0 && (
-                <span className="ml-2 text-[10px] bg-[var(--accent-cyan)]/10 text-[var(--accent-cyan)] px-1.5 py-0.5 rounded-full">
-                  {signals.length}
-                </span>
-              )}
-            </button>
-            <button
-              onClick={() => setBottomTab('trades')}
-              className={`
-                px-4 py-2 rounded-lg text-sm font-medium font-mono-trade transition-all
-                ${bottomTab === 'trades'
-                  ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] border border-[var(--border-accent)]'
-                  : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
-                }
-              `}
-            >
-              Trade History
-              {trades.length > 0 && (
-                <span className="ml-2 text-[10px] bg-[var(--accent-cyan)]/10 text-[var(--accent-cyan)] px-1.5 py-0.5 rounded-full">
-                  {trades.length}
-                </span>
-              )}
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setBottomTab('signals')}
+                className={`
+                  px-4 py-2 rounded-lg text-sm font-medium font-mono-trade transition-all
+                  ${bottomTab === 'signals'
+                    ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] border border-[var(--border-accent)]'
+                    : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
+                  }
+                `}
+              >
+                Signals
+                {signals.length > 0 && (
+                  <span className="ml-2 text-[10px] bg-[var(--accent-cyan)]/10 text-[var(--accent-cyan)] px-1.5 py-0.5 rounded-full">
+                    {signals.length}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setBottomTab('trades')}
+                className={`
+                  px-4 py-2 rounded-lg text-sm font-medium font-mono-trade transition-all
+                  ${bottomTab === 'trades'
+                    ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] border border-[var(--border-accent)]'
+                    : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
+                  }
+                `}
+              >
+                Trade History
+                {trades.length > 0 && (
+                  <span className="ml-2 text-[10px] bg-[var(--accent-cyan)]/10 text-[var(--accent-cyan)] px-1.5 py-0.5 rounded-full">
+                    {trades.length}
+                  </span>
+                )}
+              </button>
+            </div>
+            <p className="text-[11px] text-[var(--text-muted)] font-mono-trade">
+              {bottomTab === 'signals' ? `Signals refreshed ${formatAgo(signalsUpdatedAt)}` : `Trades refreshed ${formatAgo(tradesUpdatedAt)}`}
+            </p>
           </div>
 
           {bottomTab === 'signals' ? (

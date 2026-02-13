@@ -63,9 +63,9 @@ export default function SignalsTable({ signals, loading }: SignalsTableProps) {
 
   return (
     <div className="glass-card rounded-xl overflow-hidden">
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto max-h-[560px]">
         <table className="min-w-full">
-          <thead>
+          <thead className="sticky top-0 z-10 bg-[var(--bg-card)]/95 backdrop-blur">
             <tr className="border-b border-[var(--border-subtle)]">
               {['Time', 'Coin', 'Direction', 'Confidence', 'AUC', 'Price', 'Gates', 'Contracts', 'Acted'].map(h => (
                 <th key={h} className="px-4 py-3 text-left text-[10px] font-mono-trade font-semibold text-[var(--text-muted)] uppercase tracking-wider">

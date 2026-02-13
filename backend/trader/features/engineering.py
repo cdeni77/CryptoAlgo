@@ -78,7 +78,22 @@ class PriceFeatures:
         features['bb_width'] = (4 * std20) / ma20.replace(0, np.nan)
         # Alias expected by FEATURE_COLUMNS
         features['bb_position_20'] = features['bb_position']
-        
+
+        # ----- Microstructure / candle-shape -----
+        bar_range = (df['high'] - df['low']).replace(0, np.nan)
+        body = (df['close'] - df['open']).abs()
+        features['body_to_range'] = body / bar_range
+        features['close_to_high'] = (df['high'] - df['close']) / bar_range
+        features['close_to_low'] = (df['close'] - df['low']) / bar_range
+
+        # ----- ATR-style normalized range -----
+        tr1 = df['high'] - df['low']
+        tr2 = (df['high'] - df['close'].shift(1)).abs()
+        tr3 = (df['low'] - df['close'].shift(1)).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr24 = true_range.rolling(24).mean()
+        features['atr_pct_24h'] = atr24 / df['close'].replace(0, np.nan)
+
         return features
 
 class VolumeVolatilityFeatures:
@@ -95,6 +110,19 @@ class VolumeVolatilityFeatures:
         features['parkinson_vol_24h'] = np.sqrt(
             (1/(4*np.log(2))) * (np.log(df['high']/df['low'])**2).rolling(24).mean()
         )
+
+        # Volume pressure and shock regime
+        vol = df['volume']
+        up_volume = vol.where(df['close'] > df['open'], 0.0)
+        down_volume = vol.where(df['close'] <= df['open'], 0.0)
+        vol_total = (up_volume + down_volume).rolling(24).sum().replace(0, np.nan)
+        features['buy_volume_ratio_24h'] = up_volume.rolling(24).sum() / vol_total
+        features['volume_zscore_24h'] = normalize_point_in_time(vol, lookback=168, min_periods=48)
+
+        # Higher-moment return shape (tail/asymmetry)
+        r1h = df['close'].pct_change()
+        features['ret_skew_72h'] = r1h.rolling(72).skew()
+        features['ret_kurt_72h'] = r1h.rolling(72).kurt()
         return features
 
 class FundingFeatures:
@@ -177,6 +205,9 @@ class RegimeFeatures:
             df['close'].rolling(168).max().replace(0, np.nan)
         )
         features['momentum_168h_positive'] = (df['close'].pct_change(168) > 0).astype(int)
+        trend_num = df['close'] - df['close'].rolling(24).mean()
+        trend_den = df['close'].rolling(24).std().replace(0, np.nan)
+        features['trend_strength_24h'] = trend_num / trend_den
         return features
 
 
