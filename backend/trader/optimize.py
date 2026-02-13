@@ -5,6 +5,12 @@ optimize.py — Per-coin Optuna parameter optimization (Parallel Enabled).
 Runs the existing backtest filtered to a single coin at a time,
 optimizing threshold, exits, label params, and ML hyperparams.
 
+v9: TRUE HOLDOUT SCORING
+    - Data is split into optimization window + holdout window BEFORE Optuna runs
+    - Optuna only sees the optimization window when scoring trials
+    - After optimization completes, best params are evaluated on the holdout
+    - This prevents indirect overfitting to the OOS period through hyperparameter search
+
 Usage:
     python optimize.py --coin BIP --trials 50 --jobs 4
     python optimize.py --all --trials 200 --jobs 16
@@ -20,9 +26,9 @@ import sqlite3
 import functools  # <--- Critical for multiprocessing
 import traceback
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Force single-threaded linear algebra BEFORE importing numpy/pandas/sklearn
 # This prevents 16 workers x 20 threads = 320 threads crashing the CPU.
@@ -32,13 +38,15 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+import numpy as np
+import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
 
 # Import your existing logic
 from train_model import Config, load_data, run_backtest
 from coin_profiles import (
-    CoinProfile, COIN_PROFILES, 
+    CoinProfile, COIN_PROFILES,
     BTC_EXTRA_FEATURES, SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
 )
 
@@ -136,6 +144,65 @@ def resolve_target_symbol(all_data: Dict, coin_prefix: str, coin_name: str) -> O
                 return sym
     return None
 
+
+# -----------------------------------------------------------------------------
+# DATA SPLITTING — TRUE HOLDOUT
+# -----------------------------------------------------------------------------
+
+def split_data_temporal(all_data: Dict, holdout_days: int = 90) -> Tuple[Dict, Dict]:
+    """
+    Split data into optimization window and holdout window.
+    
+    The holdout window is the LAST `holdout_days` of data.
+    Optuna only ever sees the optimization window.
+    After optimization, the best params are evaluated on holdout.
+    
+    Returns:
+        (optim_data, holdout_data) — same structure as all_data
+    """
+    # Find the global end date across all symbols
+    all_ends = []
+    for sym, d in all_data.items():
+        if len(d['ohlcv']) > 0:
+            all_ends.append(d['ohlcv'].index.max())
+    
+    if not all_ends:
+        return all_data, {}
+    
+    global_end = max(all_ends)
+    holdout_start = global_end - pd.Timedelta(days=holdout_days)
+    
+    optim_data = {}
+    holdout_data = {}
+    
+    for sym, d in all_data.items():
+        feat = d['features']
+        ohlcv = d['ohlcv']
+        
+        # Optimization window: everything before holdout_start
+        optim_feat = feat[feat.index < holdout_start]
+        optim_ohlcv = ohlcv[ohlcv.index < holdout_start]
+        
+        # Holdout window: everything (model still trains walk-forward from beginning,
+        # but the holdout trades occur in the holdout period)
+        # We give holdout the FULL data so the walk-forward can train on earlier data
+        # and trade in the holdout period
+        holdout_feat = feat.copy()
+        holdout_ohlcv = ohlcv.copy()
+        
+        if len(optim_feat) > 500:  # Need enough data for walk-forward
+            optim_data[sym] = {'features': optim_feat, 'ohlcv': optim_ohlcv}
+        
+        if len(holdout_feat) > 500:
+            holdout_data[sym] = {'features': holdout_feat, 'ohlcv': holdout_ohlcv}
+    
+    return optim_data, holdout_data
+
+
+# -----------------------------------------------------------------------------
+# TRIAL PROFILE CREATION
+# -----------------------------------------------------------------------------
+
 def create_trial_profile(trial: optuna.Trial, coin_name: str) -> CoinProfile:
     """Create a CoinProfile from Optuna trial suggestions."""
     base_profile = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
@@ -178,10 +245,47 @@ def create_trial_profile(trial: optuna.Trial, coin_name: str) -> CoinProfile:
         min_child_samples=trial.suggest_int('min_child_samples', 15, 40, step=5),
     )
 
+
+def profile_from_params(params: Dict, coin_name: str) -> CoinProfile:
+    """Reconstruct a CoinProfile from saved Optuna params dict (for holdout eval)."""
+    base_profile = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    prefixes = base_profile.prefixes if base_profile else [coin_name]
+
+    return CoinProfile(
+        name=coin_name,
+        prefixes=prefixes,
+        extra_features=get_extra_features(coin_name),
+        signal_threshold=params['signal_threshold'],
+        min_val_auc=params['min_val_auc'],
+        label_forward_hours=params['label_forward_hours'],
+        label_vol_target=params['label_vol_target'],
+        min_momentum_magnitude=params['min_momentum_magnitude'],
+        vol_mult_tp=params['vol_mult_tp'],
+        vol_mult_sl=params['vol_mult_sl'],
+        max_hold_hours=params['max_hold_hours'],
+        cooldown_hours=params['cooldown_hours'],
+        min_vol_24h=params['min_vol_24h'],
+        max_vol_24h=params['max_vol_24h'],
+        position_size=params['position_size'],
+        vol_sizing_target=params['vol_sizing_target'],
+        n_estimators=params['n_estimators'],
+        max_depth=params['max_depth'],
+        learning_rate=params['learning_rate'],
+        min_child_samples=params['min_child_samples'],
+    )
+
+
+# -----------------------------------------------------------------------------
+# OBJECTIVE FUNCTION
+# -----------------------------------------------------------------------------
+
 def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: str) -> float:
     """
-    Optuna objective: run single-coin backtest, return composite score.
-    Thread-safe implementation for parallel execution.
+    Optuna objective: run single-coin backtest on OPTIMIZATION WINDOW ONLY.
+    
+    Key change from v8: This function only sees truncated data (holdout excluded).
+    Score is based on walk-forward metrics within the optimization window.
+    No OOS component in the score — that's reserved for the true holdout eval.
     """
     profile = create_trial_profile(trial, coin_name)
 
@@ -190,19 +294,16 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
         _set_reject_reason(trial, f'missing_symbol:{coin_prefix}/{coin_name}')
         return -99.0
 
-    # Filter data to only this coin (reduces pickling overhead to workers)
+    # Filter data to only this coin
     single_data = {target_sym: all_data[target_sym]}
 
-    # Config: 1 position max for single-coin test
-    # IMPORTANT: We force n_jobs=1 for LightGBM here via code if possible,
-    # but the environment variables at the top of the file are the real safeguard.
     config = Config(
         max_positions=1,
         leverage=4,
         min_signal_edge=0.00,
         max_ensemble_std=0.10,
         train_embargo_hours=24,
-        oos_eval_days=60,
+        oos_eval_days=60,  # Still computed but NOT used in the score
     )
 
     try:
@@ -224,7 +325,7 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
         _set_reject_reason(trial, 'result_none')
         return -99.0
 
-    # Scoring Logic
+    # Extract metrics
     n_trades = int(result.get('n_trades', 0) or 0)
     sharpe = float(result.get('sharpe_annual', 0.0) or 0.0)
     pf = float(result.get('profit_factor', 0.0) or 0.0)
@@ -236,47 +337,64 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     oos_return = float(result.get('oos_return', 0.0) or 0.0)
     oos_trades = int(result.get('oos_trades', 0) or 0)
 
-    # Treat sentinel values as missing data instead of a hard catastrophic score.
+    # Treat sentinel values as missing data
     if sharpe <= -90:
         sharpe = 0.0
     if oos_sharpe <= -90:
         oos_sharpe = 0.0
 
+    # =========================================================================
+    # SCORING v9 — NO OOS IN OPTIMIZATION SCORE
+    # 
+    # The optimization score uses ONLY the walk-forward backtest metrics from
+    # the optimization window. The walk-forward itself provides some protection
+    # (model never sees future data), but we no longer let Optuna optimize
+    # toward a specific OOS window — that's reserved for the holdout eval.
+    #
+    # We still use the internal OOS (last 60 days of optim window) as a
+    # PENALTY signal to catch severe overfit, but it doesn't contribute
+    # positively to the score.
+    # =========================================================================
+
     pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0.0
     dd_penalty = max(0.0, dd - 0.30) * 3.0
 
-    # === Final: Crypto-selective (favor 3–12 trades/year per coin) ===
+    # Trade frequency penalties
     trade_penalty = 0.0
-
-    # Keep this as a soft penalty so Optuna can still rank and escape bad regions
-    # instead of collapsing to identical -99.0 values.
     if n_trades < 15:
         _set_reject_reason(trial, f'too_few_trades:{n_trades}')
         trade_penalty += min(3.0, (15 - n_trades) * 0.2)
 
-    if trades_per_year < 10:  # <~1/year total — noticeable for ultra-selective
+    if trades_per_year < 10:
         trade_penalty += 0.5 + max(0.0, (5 - trades_per_year) * 0.05)
-    elif trades_per_year < 25:  # Light if a bit sparse
+    elif trades_per_year < 25:
         trade_penalty += 0.25
-    elif trades_per_year > 100:  # Overtrading penalty
+    elif trades_per_year > 100:
         trade_penalty += 0.5
 
-    # Bonus for ideal single-coin selectivity (high-conviction, low noise)
-    if 30 <= trades_per_year <= 80: 
+    # Bonus for ideal selectivity
+    if 30 <= trades_per_year <= 80:
         trade_penalty -= 0.4
 
-    # Force generalization: prioritize out-of-sample behavior over in-sample optics
-    score = (0.6 * oos_sharpe) + (0.4 * sharpe) + pf_bonus - dd_penalty - trade_penalty
+    # Base score: primarily walk-forward Sharpe + PF, penalized by DD and trades
+    score = sharpe + pf_bonus - dd_penalty - trade_penalty
 
-    if oos_trades < 5:
-        score -= 0.5
-    if oos_return < 0:
-        score -= min(1.0, abs(oos_return) * 10)
+    # Penalize if internal OOS is terrible (catch severe overfit within optim window)
+    # But do NOT reward good OOS — that would leak the optimization target
+    if oos_trades >= 5:
+        if oos_sharpe < -0.5:
+            score -= min(1.5, abs(oos_sharpe) * 0.5)
+        if oos_return < -0.05:
+            score -= min(1.0, abs(oos_return) * 5)
+
+    if oos_trades < 3 and n_trades >= 15:
+        # Very few OOS trades suggests extreme regime-fitting
+        score -= 0.3
 
     if ann_ret < -0.05:
         score = min(score, -1.0)
 
-    # Store metrics in trial (useful for analysis later)
+    # Store all metrics in trial for later analysis
     trial.set_user_attr('n_trades', n_trades)
     trial.set_user_attr('win_rate', round(wr, 3))
     trial.set_user_attr('ann_return', round(ann_ret, 4))
@@ -288,6 +406,7 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     trial.set_user_attr('oos_return', round(oos_return, 4))
 
     return score
+
 
 class PlateauStopper:
     """Stop a study if no best-score improvement is observed for N completed trials."""
@@ -326,27 +445,107 @@ class PlateauStopper:
 
 
 # -----------------------------------------------------------------------------
+# HOLDOUT EVALUATION
+# -----------------------------------------------------------------------------
+
+def evaluate_holdout(holdout_data: Dict, best_params: Dict, coin_name: str,
+                     coin_prefix: str, holdout_days: int = 90) -> Optional[Dict]:
+    """
+    Run the best parameters on the FULL dataset (including holdout period).
+    
+    Since the backtest is walk-forward, the model trains on earlier data and
+    trades into the holdout period. We then extract ONLY the trades from the
+    holdout window to get a true out-of-sample estimate.
+    """
+    target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
+    if not target_sym:
+        print(f"  ⚠️ Could not resolve {coin_name} for holdout eval")
+        return None
+
+    single_data = {target_sym: holdout_data[target_sym]}
+    profile = profile_from_params(best_params, coin_name)
+
+    config = Config(
+        max_positions=1,
+        leverage=4,
+        min_signal_edge=0.00,
+        max_ensemble_std=0.10,
+        train_embargo_hours=24,
+        oos_eval_days=holdout_days,  # This now matches our true holdout
+    )
+
+    try:
+        result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
+    except Exception as e:
+        print(f"  ❌ Holdout backtest error: {e}")
+        return None
+
+    if result is None:
+        print(f"  ⚠️ Holdout backtest returned None")
+        return None
+
+    return {
+        'holdout_sharpe': float(result.get('oos_sharpe', 0.0) or 0.0),
+        'holdout_return': float(result.get('oos_return', 0.0) or 0.0),
+        'holdout_trades': int(result.get('oos_trades', 0) or 0),
+        'full_sharpe': float(result.get('sharpe_annual', 0.0) or 0.0),
+        'full_trades': int(result.get('n_trades', 0) or 0),
+        'full_return': float(result.get('ann_return', 0.0) or 0.0),
+        'full_pf': float(result.get('profit_factor', 0.0) or 0.0),
+        'full_dd': float(result.get('max_drawdown', 0.0) or 0.0),
+        'full_wr': float(result.get('win_rate', 0.0) or 0.0),
+    }
+
+
+# -----------------------------------------------------------------------------
 # MAIN OPTIMIZATION LOOP
 # -----------------------------------------------------------------------------
 
-def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str, 
+def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   n_trials: int = 50, n_jobs: int = 1,
                   plateau_patience: int = 80, plateau_min_delta: float = 0.02,
                   plateau_warmup: int = 40,
                   study_suffix: str = "",
-                  resume_study: bool = False):
-    """Run Optuna optimization for a single coin with parallel support."""
-    
-    # 1. Setup Persistent Storage (Required for parallel jobs)
-    # This allows multiple processes to write results to the same DB
-    storage_url = "sqlite:///optuna_trading.db"
-    study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
+                  resume_study: bool = False,
+                  holdout_days: int = 90):
+    """Run Optuna optimization for a single coin with true holdout evaluation."""
+
+    # =========================================================================
+    # STEP 0: Split data into optimization + holdout windows
+    # =========================================================================
+    optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
+
+    target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
+    if not target_sym:
+        print(f"❌ {coin_name}: not enough data in optimization window after holdout split")
+        return None
+
+    # Report the split
+    ohlcv = optim_data[target_sym]['ohlcv']
+    optim_start = ohlcv.index.min()
+    optim_end = ohlcv.index.max()
+
+    holdout_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
+    if holdout_sym:
+        h_ohlcv = holdout_data[holdout_sym]['ohlcv']
+        holdout_end = h_ohlcv.index.max()
+    else:
+        holdout_end = optim_end
 
     print(f"\n{'='*60}")
-    print(f"🚀 OPTIMIZING {coin_name} ({coin_prefix})")
-    print(f"   Trials: {n_trials} | Cores: {n_jobs} | Storage: {storage_url}")
+    print(f"🚀 OPTIMIZING {coin_name} ({coin_prefix}) — v9 TRUE HOLDOUT")
+    print(f"   Optimization window: {optim_start.date()} → {optim_end.date()}")
+    print(f"   Holdout window:      last {holdout_days} days (→ {holdout_end.date()})")
+    print(f"   Trials: {n_trials} | Cores: {n_jobs}")
     print(f"   Plateau stop: patience={plateau_patience}, min_delta={plateau_min_delta}, warmup={plateau_warmup}")
+    print(f"   ⚠️  Optuna NEVER sees holdout data during optimization")
     print(f"{'='*60}")
+
+    # =========================================================================
+    # STEP 1: Setup Optuna study
+    # =========================================================================
+    storage_url = "sqlite:///optuna_trading.db"
+    study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
 
     sampler = TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3))
     study = None
@@ -376,7 +575,6 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                 )
                 break
 
-            # SQLite can intermittently report lock contention under heavy parallel startup.
             if "database is locked" in msg and attempt < 2:
                 sleep_s = 0.25 * (attempt + 1)
                 print(f"⚠️ Study DB locked while creating '{study_name}'. Retrying in {sleep_s:.2f}s...")
@@ -388,14 +586,13 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         print(f"❌ Could not create or load study '{study_name}'.")
         return None
 
-    # 2. Run Optimization
-    # CRITICAL CHANGE: Use functools.partial instead of lambda.
-    # Lambdas cannot be pickled, so joblib falls back to threading (single core).
-    # partials ARE pickleable, so joblib can spawn real parallel processes.
+    # =========================================================================
+    # STEP 2: Run Optimization on OPTIMIZATION WINDOW ONLY
+    # =========================================================================
     objective_func = functools.partial(
-        objective, 
-        all_data=all_data, 
-        coin_prefix=coin_prefix, 
+        objective,
+        all_data=optim_data,  # <-- KEY: only optimization data, no holdout
+        coin_prefix=coin_prefix,
         coin_name=coin_name
     )
 
@@ -410,8 +607,6 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
             objective_func,
             n_trials=n_trials,
             n_jobs=n_jobs,
-            # tqdm progress bars emit noisy carriage-return updates when output is
-            # redirected to log files (non-TTY), which can drown out useful lines.
             show_progress_bar=sys.stderr.isatty(),
             callbacks=[stopper],
         )
@@ -425,7 +620,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         print("No trials completed.")
         return None
 
-    # 3. Report Results
+    # =========================================================================
+    # STEP 3: Report optimization results
+    # =========================================================================
     best = study.best_trial
 
     if _as_number(best.value) == -99.0:
@@ -438,8 +635,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
             print("  ⚠️ Top reject reasons:")
             for reason, count in top_reasons:
                 print(f"    - {reason}: {count}")
-    print(f"\n✅ BEST RESULT for {coin_name}:")
-    print(f"  Score:        {_fmt_float(best.value, 3)}")
+
+    print(f"\n✅ BEST OPTIMIZATION RESULT for {coin_name}:")
+    print(f"  Optim Score:  {_fmt_float(best.value, 3)}")
     print(f"  Trades:       {best.user_attrs.get('n_trades', '?')}")
     print(f"  Win Rate:     {_fmt_pct(best.user_attrs.get('win_rate'), 1)}")
     print(f"  Ann Return:   {_fmt_pct(best.user_attrs.get('ann_return'), 2)}")
@@ -447,14 +645,56 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     print(f"  Profit Factor:{_fmt_float(best.user_attrs.get('profit_factor'), 3)}")
     print(f"  Max Drawdown: {_fmt_pct(best.user_attrs.get('max_drawdown'), 2)}")
 
-    # 4. Save JSON
+    # =========================================================================
+    # STEP 4: TRUE HOLDOUT EVALUATION
+    # =========================================================================
+    holdout_result = None
+    if holdout_data and holdout_sym:
+        print(f"\n🔬 HOLDOUT EVALUATION (last {holdout_days} days — never seen by Optuna)...")
+        holdout_result = evaluate_holdout(
+            holdout_data, best.params, coin_name, coin_prefix,
+            holdout_days=holdout_days
+        )
+
+        if holdout_result:
+            h = holdout_result
+            ho_sharpe = h['holdout_sharpe']
+            if ho_sharpe <= -90:
+                ho_sharpe = 0.0
+
+            print(f"\n  📊 HOLDOUT RESULTS (TRUE OUT-OF-SAMPLE):")
+            print(f"     Holdout Sharpe:  {_fmt_float(ho_sharpe, 3)}")
+            print(f"     Holdout Return:  {_fmt_pct(h['holdout_return'], 2)}")
+            print(f"     Holdout Trades:  {h['holdout_trades']}")
+            print(f"     Full Sharpe:     {_fmt_float(h['full_sharpe'], 3)}")
+            print(f"     Full Trades:     {h['full_trades']}")
+            print(f"     Full PF:         {_fmt_float(h['full_pf'], 3)}")
+            print(f"     Full DD:         {_fmt_pct(h['full_dd'], 2)}")
+
+            # Flag potential overfit
+            optim_sharpe = _as_number(best.user_attrs.get('sharpe'), 0.0)
+            if optim_sharpe and ho_sharpe < optim_sharpe * 0.3:
+                print(f"\n  ⚠️  WARNING: Holdout Sharpe ({ho_sharpe:.3f}) is much lower than")
+                print(f"     optimization Sharpe ({optim_sharpe:.3f}). Possible overfit!")
+            elif ho_sharpe > 0.5:
+                print(f"\n  ✅ Holdout Sharpe looks healthy — params likely generalize.")
+        else:
+            print(f"  ⚠️ Holdout evaluation failed or returned no results.")
+    else:
+        print(f"\n  ⚠️ Skipping holdout eval — insufficient holdout data.")
+
+    # =========================================================================
+    # STEP 5: Save results
+    # =========================================================================
     result_data = {
         'coin': coin_name,
         'prefix': coin_prefix,
-        'score': best.value,
-        'metrics': dict(best.user_attrs),
+        'optim_score': best.value,
+        'optim_metrics': dict(best.user_attrs),
+        'holdout_metrics': holdout_result if holdout_result else {},
         'params': best.params,
         'n_trials': len(study.trials),
+        'holdout_days': holdout_days,
         'timestamp': datetime.now().isoformat(),
     }
     result_path = RESULTS_DIR / f"{coin_name}_optimization.json"
@@ -462,7 +702,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         json.dump(result_data, f, indent=2)
     print(f"\n  💾 Saved to {result_path}")
 
-    # 5. Generate Code Snippet (Very helpful for copy-pasting)
+    # =========================================================================
+    # STEP 6: Generate code snippet
+    # =========================================================================
     print(f"\n  📝 Suggested CoinProfile:")
     print(f"    '{coin_name}': CoinProfile(")
     print(f"        name='{coin_name}',")
@@ -482,6 +724,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
 
     return result_data
 
+
 def show_results():
     """Display all saved optimization results."""
     results = sorted(RESULTS_DIR.glob("*_optimization.json"))
@@ -496,16 +739,27 @@ def show_results():
     for rpath in results:
         with open(rpath) as f:
             r = json.load(f)
-        m = r.get('metrics', {})
+        m = r.get('optim_metrics', r.get('metrics', {}))
+        h = r.get('holdout_metrics', {})
         print(f"\n{r['coin']} ({r.get('prefix','?')}) — {r['n_trials']} trials — {r['timestamp'][:16]}")
         print(
-            f"  Score: {_fmt_float(r.get('score'), 3)} | "
-            f"Sharpe: {_fmt_float(m.get('sharpe'), 3)} | "
-            f"WR: {_fmt_pct(m.get('win_rate'), 1)} | "
-            f"PF: {_fmt_float(m.get('profit_factor'), 3)} | "
-            f"DD: {_fmt_pct(m.get('max_drawdown'), 1)} | "
-            f"Trades: {m.get('n_trades', '?')}"
+            f"  Optim: Score={_fmt_float(r.get('optim_score', r.get('score')), 3)} | "
+            f"Sharpe={_fmt_float(m.get('sharpe'), 3)} | "
+            f"WR={_fmt_pct(m.get('win_rate'), 1)} | "
+            f"PF={_fmt_float(m.get('profit_factor'), 3)} | "
+            f"DD={_fmt_pct(m.get('max_drawdown'), 1)} | "
+            f"Trades={m.get('n_trades', '?')}"
         )
+        if h:
+            ho_sharpe = h.get('holdout_sharpe', 0)
+            if ho_sharpe and ho_sharpe <= -90:
+                ho_sharpe = 0.0
+            print(
+                f"  Holdout: Sharpe={_fmt_float(ho_sharpe, 3)} | "
+                f"Return={_fmt_pct(h.get('holdout_return'), 2)} | "
+                f"Trades={h.get('holdout_trades', '?')}"
+            )
+
 
 # -----------------------------------------------------------------------------
 # RUNTIME CONFIG
@@ -524,7 +778,7 @@ PREFIX_FOR_COIN = {
 }
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Per-coin Optuna parameter optimization")
+    parser = argparse.ArgumentParser(description="Per-coin Optuna parameter optimization (v9 — True Holdout)")
     parser.add_argument("--coin", type=str, help="Coin prefix or name (e.g. BIP, BTC)")
     parser.add_argument("--all", action="store_true", help="Optimize all coins")
     parser.add_argument("--trials", type=int, default=50, help="Number of trials")
@@ -540,7 +794,14 @@ if __name__ == "__main__":
                         help="Minimum completed trials before plateau checks start")
     parser.add_argument("--resume-study", action="store_true",
                         help="Resume existing study name instead of starting a fresh one")
+    parser.add_argument("--holdout-days", type=int, default=90,
+                        help="Days of data to reserve as true holdout (never seen by Optuna)")
+    parser.add_argument("--debug-trials", action="store_true",
+                        help="Enable verbose per-trial output")
     args = parser.parse_args()
+
+    if args.debug_trials:
+        DEBUG_TRIALS = True
 
     # Default to fresh studies per run to avoid reusing stale/plateaued trials.
     effective_study_suffix = args.study_suffix
@@ -560,7 +821,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Load data once in the main process
-    # (On Windows, this is pickled to workers. On Linux, it's efficient copy-on-write)
     print("⏳ Loading data...")
     all_data = load_data()
 
@@ -584,22 +844,21 @@ if __name__ == "__main__":
                     plateau_warmup=args.plateau_warmup,
                     study_suffix=effective_study_suffix,
                     resume_study=args.resume_study,
+                    holdout_days=args.holdout_days,
                 )
     else:
-        # Single coin
         coin_input = args.coin.upper()
         coin_name = COIN_MAP.get(coin_input, coin_input)
         prefix = PREFIX_FOR_COIN.get(coin_name, coin_input)
-        
+
         if prefix not in PREFIX_TO_SYMBOL:
-             # Try direct match
             if coin_input in PREFIX_TO_SYMBOL:
                 prefix = coin_input
                 coin_name = COIN_MAP.get(prefix, prefix)
             else:
                 print(f"❌ Coin '{args.coin}' not found. Available: {list(PREFIX_TO_SYMBOL.keys())}")
                 sys.exit(1)
-        
+
         optimize_coin(
             all_data,
             prefix,
@@ -611,4 +870,5 @@ if __name__ == "__main__":
             plateau_warmup=args.plateau_warmup,
             study_suffix=effective_study_suffix,
             resume_study=args.resume_study,
+            holdout_days=args.holdout_days,
         )

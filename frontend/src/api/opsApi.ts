@@ -26,6 +26,7 @@ export interface ParallelLaunchOptions {
   plateau_patience: number;
   plateau_min_delta: number;
   plateau_warmup: number;
+  holdout_days: number;
 }
 
 export interface TrainScratchOptions {

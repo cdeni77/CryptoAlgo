@@ -127,9 +127,10 @@ class OpsService:
         trials: int = 200,
         jobs: int = 16,
         coins: str = "BTC,ETH,SOL,XRP,DOGE",
-        plateau_patience: int = 80,
-        plateau_min_delta: float = 0.02,
-        plateau_warmup: int = 40,
+        plateau_patience: int = 120,
+        plateau_min_delta: float = 0.01,
+        plateau_warmup: int = 80,
+        holdout_days: int = 90,
     ) -> int:
         with self._lock:
             if self._parallel_proc and self._parallel_proc.poll() is None:
@@ -152,6 +153,8 @@ class OpsService:
                     str(plateau_min_delta),
                     "--plateau-warmup",
                     str(plateau_warmup),
+                    "--holdout-days",
+                    str(holdout_days),
                 ]
             )
             return self._parallel_proc.pid

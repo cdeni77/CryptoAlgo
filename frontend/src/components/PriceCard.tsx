@@ -87,7 +87,7 @@ export default function PriceCard({
           <div>
             <h3 className="text-base font-bold text-[var(--text-primary)]">{coin}</h3>
             {dataSource === 'cde' && cdeSpec && (
-              <span className="text-[10px] font-mono-trade text-[var(--accent-amber)]">{cdeSpec.code}</span>
+              <span className="text-[10px] font-mono-trade text-[var(--accent-cyan)]/70">{cdeSpec.code}</span>
             )}
           </div>
         </div>
@@ -117,7 +117,7 @@ export default function PriceCard({
             <div className="mt-3 pt-3 border-t border-[var(--border-subtle)] space-y-1.5">
               <div className="flex justify-between text-xs">
                 <span className="text-[var(--text-muted)]">Contract</span>
-                <span className="font-mono-trade text-[var(--accent-amber)]">{cdeSpec.symbol}</span>
+                <span className="font-mono-trade text-[var(--accent-cyan)]/80">{cdeSpec.symbol}</span>
               </div>
               <div className="flex justify-between text-xs">
                 <span className="text-[var(--text-muted)]">Units/contract</span>

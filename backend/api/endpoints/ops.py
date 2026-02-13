@@ -55,6 +55,7 @@ def parallel_launch(
     plateau_patience: int = Query(120, ge=1, le=10000),
     plateau_min_delta: float = Query(0.01, ge=0, le=2),
     plateau_warmup: int = Query(80, ge=1, le=5000),
+    holdout_days: int = Query(90, ge=30, le=365),
 ):
     pid = ops_service.launch_parallel(
         trials=trials,
@@ -63,6 +64,7 @@ def parallel_launch(
         plateau_patience=plateau_patience,
         plateau_min_delta=plateau_min_delta,
         plateau_warmup=plateau_warmup,
+        holdout_days=holdout_days,
     )
     return OpsActionResponse(
         action="parallel_launch",
