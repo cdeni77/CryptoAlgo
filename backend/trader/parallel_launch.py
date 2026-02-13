@@ -13,6 +13,9 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=200, help="Total trials per coin")
     parser.add_argument("--jobs", type=int, default=10, help="Total worker processes")
     parser.add_argument("--coins", type=str, default=",".join(COINS), help="Comma-separated coin list")
+    parser.add_argument("--plateau-patience", type=int, default=80, help="Stop if no best-score improvement for N trials")
+    parser.add_argument("--plateau-min-delta", type=float, default=0.02, help="Min score improvement to reset plateau")
+    parser.add_argument("--plateau-warmup", type=int, default=40, help="Warmup completed trials before plateau checks")
     args = parser.parse_args()
 
     target_coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
@@ -42,6 +45,12 @@ if __name__ == "__main__":
             "1",
             "--trials",
             str(trials_per_worker),
+            "--plateau-patience",
+            str(args.plateau_patience),
+            "--plateau-min-delta",
+            str(args.plateau_min_delta),
+            "--plateau-warmup",
+            str(args.plateau_warmup),
         ]
 
         for i in range(workers_per_coin):
