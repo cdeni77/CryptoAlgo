@@ -25,6 +25,7 @@ class OpsLogsResponse(BaseModel):
 class OpsStatusResponse(BaseModel):
     pipeline_running: bool
     training_running: bool
+    parallel_running: bool = False
     phase: str
     symbol: Optional[str] = None
     metrics: Dict[str, float] = Field(default_factory=dict)

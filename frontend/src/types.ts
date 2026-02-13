@@ -95,6 +95,7 @@ export interface OpsLogsResponse {
 export interface OpsStatus {
   pipeline_running: boolean;
   training_running: boolean;
+  parallel_running: boolean;
   phase: string;
   symbol: string | null;
   metrics: Record<string, number>;

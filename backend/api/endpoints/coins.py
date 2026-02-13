@@ -13,14 +13,13 @@ router = APIRouter(prefix="/coins", tags=["coins"])
 def get_coinbase_client():
     api_key = os.getenv("COINBASE_API_KEY")
     api_secret = os.getenv("COINBASE_API_SECRET")
-    
-    if not api_key or not api_secret:
-        raise HTTPException(
-            status_code=500,
-            detail="Coinbase API credentials not configured"
-        )
-    
-    return RESTClient(api_key=api_key, api_secret=api_secret)
+
+    # Public market-data endpoints do not require auth.
+    # If API keys are available we still pass them through.
+    if api_key and api_secret:
+        return RESTClient(api_key=api_key, api_secret=api_secret)
+
+    return RESTClient()
 
 # Spot products on Coinbase
 COINBASE_PRODUCTS = {
