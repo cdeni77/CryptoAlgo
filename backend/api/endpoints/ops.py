@@ -52,9 +52,9 @@ def parallel_launch(
     trials: int = Query(200, ge=1, le=5000),
     jobs: int = Query(16, ge=1, le=64),
     coins: str = Query("BTC,ETH,SOL,XRP,DOGE"),
-    plateau_patience: int = Query(80, ge=1, le=10000),
-    plateau_min_delta: float = Query(0.02, ge=0, le=2),
-    plateau_warmup: int = Query(40, ge=1, le=5000),
+    plateau_patience: int = Query(120, ge=1, le=10000),
+    plateau_min_delta: float = Query(0.01, ge=0, le=2),
+    plateau_warmup: int = Query(80, ge=1, le=5000),
 ):
     pid = ops_service.launch_parallel(
         trials=trials,

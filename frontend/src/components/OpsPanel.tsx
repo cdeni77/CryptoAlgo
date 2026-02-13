@@ -16,12 +16,12 @@ import { OpsLogEntry, OpsStatus } from '../types';
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : '—');
 
 const defaultParallel: ParallelLaunchOptions = {
-  trials: 200,
+  trials: 350,
   jobs: 16,
   coins: 'BTC,ETH,SOL,XRP,DOGE',
-  plateau_patience: 80,
-  plateau_min_delta: 0.02,
-  plateau_warmup: 40,
+  plateau_patience: 120,
+  plateau_min_delta: 0.01,
+  plateau_warmup: 80,
 };
 
 const defaultScratch: TrainScratchOptions = {
