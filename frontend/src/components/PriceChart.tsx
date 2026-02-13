@@ -1,9 +1,19 @@
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { HistoryEntry, CoinSymbol, DataSource, CDESpec } from '../types';
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Scatter,
+} from 'recharts';
+import { HistoryEntry, CoinSymbol, DataSource, CDESpec, PaperFill } from '../types';
 import DataSourceToggle from './DataSourceToggle';
 
 interface PriceChartProps {
   data: HistoryEntry[];
+  fills: PaperFill[];
   symbol: CoinSymbol;
   loading: boolean;
   timeRange: '1h' | '1d' | '1w' | '1m' | '1y';
@@ -14,7 +24,7 @@ interface PriceChartProps {
 }
 
 export default function PriceChart({
-  data, symbol, loading, timeRange, setTimeRange,
+  data, fills, symbol, loading, timeRange, setTimeRange,
   dataSource, onDataSourceChange, cdeSpec,
 }: PriceChartProps) {
   const ranges = ['1h', '1d', '1w', '1m', '1y'] as const;
@@ -51,6 +61,7 @@ export default function PriceChart({
     const multiplier = (dataSource === 'cde' && cdeSpec) ? cdeSpec.units_per_contract : 1;
     return {
       ...d,
+      timestampMs: new Date(d.timestamp).getTime(),
       close: d.close * multiplier,
     };
   });
@@ -88,6 +99,23 @@ export default function PriceChart({
   const sourceLabel = dataSource === 'cde' && cdeSpec
     ? `${cdeSpec.code} Contract Value`
     : `${symbol}/USD Spot`;
+
+  const chartStartMs = chartData[0].timestampMs;
+  const chartEndMs = chartData[chartData.length - 1].timestampMs;
+  const fillMultiplier = (dataSource === 'cde' && cdeSpec) ? cdeSpec.units_per_contract : 1;
+
+  const fillMarkers = fills
+    .filter((fill) => fill.coin === symbol)
+    .map((fill) => ({
+      ...fill,
+      timestampMs: new Date(fill.created_at).getTime(),
+      plottedPrice: fill.fill_price * fillMultiplier,
+    }))
+    .filter((fill) => fill.timestampMs >= chartStartMs && fill.timestampMs <= chartEndMs)
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+
+  const longFillMarkers = fillMarkers.filter((fill) => fill.side === 'long');
+  const shortFillMarkers = fillMarkers.filter((fill) => fill.side === 'short');
 
   return (
     <div className="glass-card rounded-xl overflow-hidden">
@@ -141,8 +169,11 @@ export default function PriceChart({
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(56, 189, 248, 0.04)" vertical={false} />
             <XAxis
-              dataKey="timestamp"
-              tickFormatter={formatXAxis}
+              dataKey="timestampMs"
+              type="number"
+              domain={[chartStartMs, chartEndMs]}
+              scale="time"
+              tickFormatter={(ts) => formatXAxis(new Date(ts).toISOString())}
               tick={{ fill: '#64748b', fontSize: 11, fontFamily: 'JetBrains Mono' }}
               axisLine={{ stroke: 'rgba(56, 189, 248, 0.06)' }}
               tickLine={false}
@@ -170,7 +201,14 @@ export default function PriceChart({
                 const d = new Date(label);
                 return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
               }}
-              formatter={(value: number) => [formatPrice(value), dataSource === 'cde' ? 'Contract' : 'Price']}
+              formatter={(value: number, _name, props) => {
+                if (props?.payload?.markerType === 'paper-fill') {
+                  const sideLabel = props.payload.side === 'long' ? 'Entry / Buy' : 'Exit / Sell';
+                  return [`${formatPrice(value)} (${props.payload.contracts} ctr)`, sideLabel];
+                }
+
+                return [formatPrice(value), dataSource === 'cde' ? 'Contract' : 'Price'];
+              }}
             />
             <Area
               type="monotone"
@@ -181,8 +219,33 @@ export default function PriceChart({
               dot={false}
               activeDot={{ r: 4, stroke: strokeColor, strokeWidth: 2, fill: '#0a0e17' }}
             />
+            <Scatter
+              data={longFillMarkers.map((fill) => ({ ...fill, markerType: 'paper-fill' }))}
+              dataKey="plottedPrice"
+              fill="#22c55e"
+              shape="triangle"
+              legendType="triangle"
+            />
+            <Scatter
+              data={shortFillMarkers.map((fill) => ({ ...fill, markerType: 'paper-fill' }))}
+              dataKey="plottedPrice"
+              fill="#ef4444"
+              shape="triangle"
+              legendType="triangle"
+            />
           </AreaChart>
         </ResponsiveContainer>
+        <div className="flex flex-wrap items-center gap-4 px-1 pt-3 text-[11px] text-[var(--text-muted)] font-mono-trade">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="text-[#22c55e]">▲</span>
+            Paper buy/entry
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="text-[#ef4444]">▼</span>
+            Paper sell/exit
+          </span>
+          <span>{fillMarkers.length} fill{fillMarkers.length === 1 ? '' : 's'} in view</span>
+        </div>
       </div>
     </div>
   );

@@ -217,6 +217,7 @@ function App() {
 
         <PriceChart
           data={history}
+          fills={paperFills}
           symbol={selectedCoin}
           loading={loadingHistory}
           timeRange={timeRange}
