@@ -1,274 +1,249 @@
-# Crypto ML Trading Pipeline
+# CryptoAlgo
 
-A production-ready machine learning pipeline for trading cryptocurrency perpetual futures on Coinbase, based on academic research and best practices.
+CryptoAlgo is a full-stack crypto trading research and monitoring workspace with:
 
-## Overview
+- a **FastAPI backend** for prices, trades, signals, wallet, and paper-trading telemetry,
+- a **React + Vite frontend** dashboard,
+- a **trader service** for data collection, feature engineering, signal generation, retraining, and optimization.
 
-This pipeline implements a momentum/trend-following strategy using:
-- **Triple Barrier Labeling** (Lopez de Prado, 2018)
-- **Purged K-Fold Cross-Validation** with embargo
-- **Ensemble of XGBoost + LightGBM** with probability calibration
-- **Proper position sizing** with volatility targeting
+It is designed for Coinbase CDE/perpetual workflows and includes both live orchestration and offline backtesting/optimization paths.
 
-## Key Academic References
+---
 
-1. **Lopez de Prado, M. (2018)** - "Advances in Financial Machine Learning"
-   - Triple Barrier Method for labeling
-   - Purged K-Fold CV to prevent leakage
-   - Sample uniqueness weighting
+## Repository Structure
 
-2. **Grądski et al. (2025)** - "Algorithmic crypto trading using information-driven bars"
-   - CUSUM filtering effectiveness
-   - Triple barrier with deep learning comparison
-
-3. **Recent Meta-Studies (2024-2025)**:
-   - Ensemble methods (XGBoost, LightGBM) consistently outperform deep learning for crypto
-   - Funding rates and liquidation data provide significant alpha
-   - Cross-exchange arbitrage signals remain effective
-
-## Architecture
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   fetch_data.py │────▶│ engineer_       │────▶│  train_model.py │
-│                 │     │ features.py     │     │                 │
-│ - Binance API   │     │                 │     │ - PurgedKFold   │
-│ - Coinbase API  │     │ - Volatility    │     │ - XGBoost       │
-│ - Hyperliquid   │     │ - Momentum      │     │ - LightGBM      │
-│ - Coinalyze     │     │ - Funding rates │     │ - Calibration   │
-└─────────────────┘     │ - Triple Barrier│     │ - Backtest      │
-                        └─────────────────┘     └─────────────────┘
-                                                        │
-                                                        ▼
-                                               ┌─────────────────┐
-                                               │ live_signals.py │
-                                               │                 │
-                                               │ - Real-time     │
-                                               │   predictions   │
-                                               │ - Trade signals │
-                                               └─────────────────┘
+```text
+backend/
+  api/        FastAPI service + PostgreSQL models/endpoints
+  trader/     Data pipeline, feature engineering, training, optimization, orchestrator
+frontend/     React/Vite dashboard
+docker-compose.yml
 ```
 
-## Installation
+Core trader scripts:
+
+- `run_pipeline.py` — OHLCV/funding/OI collection and backfill
+- `compute_features.py` — feature generation into CSV artifacts
+- `train_model.py` — backtesting + signal generation
+- `live_orchestrator.py` — scheduled cycle runner (pipeline → features → signals)
+- `optimize.py` — single-coin Optuna optimization with true holdout evaluation
+- `parallel_launch.py` — process-level multi-coin optimization launcher
+
+---
+
+## High-Level Architecture
+
+```text
+Exchanges / Coinbase
+        │
+        ▼
+backend/trader/run_pipeline.py
+        │
+        ▼
+backend/trader/compute_features.py
+        │
+        ├────────────► backend/trader/train_model.py --signals
+        │                  │
+        │                  ├─ model artifacts (joblib)
+        │                  └─ writes trades/signals/paper telemetry
+        │
+        └────────────► backend/trader/optimize.py (offline tuning)
+
+backend/api (FastAPI + Postgres) ◄──────── frontend (React dashboard)
+```
+
+---
+
+## Services (Docker Compose)
+
+`docker-compose.yml` defines:
+
+- **db**: PostgreSQL 16
+- **backend**: FastAPI (`/coins`, `/trades`, `/signals`, `/wallet`, `/paper`)
+- **frontend**: Nginx-served Vite build
+- **trader**: orchestrated ML/data pipeline service
+
+Default local ports:
+
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000`
+- Postgres: `localhost:5432`
+
+---
+
+## Quick Start
+
+### 1) Prerequisites
+
+- Docker + Docker Compose
+- Coinbase API credentials (optional for some public reads, required for full workflows)
+
+### 2) Configure environment
+
+At minimum, export or place in shell env:
 
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set environment variables
-export COINBASE_API_KEY="your_key"
-export COINBASE_API_SECRET="your_secret"
-export COINALYZE_API_KEY="your_free_key"  # Get at coinalyze.net
+export COINBASE_API_KEY="..."
+export COINBASE_API_SECRET="..."
 ```
 
-## Usage
-
-### Docker Compose Run Modes
-
-Use the following exact commands from the repository root:
-
-1. **Live mode** (continuous orchestration: initial backfill → features → signals, then hourly cycles):
+### 3) Start the stack
 
 ```bash
 docker compose up --build db backend frontend trader
 ```
 
-2. **Backtest mode** (one-off historical evaluation, then exit):
+This starts:
+
+- API + frontend,
+- trader orchestrator running periodic cycles,
+- persisted volumes for trader DB/models/logs and Postgres.
+
+---
+
+## Common Workflows
+
+### Live/trader cycle (default service behavior)
+
+The orchestrator runs:
+
+1. `run_pipeline.py` (backfill/incremental market data)
+2. `compute_features.py`
+3. `train_model.py --signals`
+
+with scheduled repetition controlled by env/CLI options in `live_orchestrator.py`.
+
+### One-off backtest
 
 ```bash
 docker compose run --rm trader \
-  python train_model.py --backtest --threshold 0.74 --min-auc 0.54 --leverage 4 --exclude BIP,DOP
+  python train_model.py --backtest --threshold 0.80 --min-auc 0.54 --leverage 4
 ```
 
-3. **Retrain-only mode** (no long-running loop, recompute features + fresh signals once):
+### Retrain-only run once
 
 ```bash
 docker compose run --rm trader \
-  sh -lc "python compute_features.py && python train_model.py --signals --threshold 0.74 --min-auc 0.54 --leverage 4 --exclude BIP,DOP"
+  live_orchestrator.py --retrain-only --run-once --train-window-days 90
 ```
 
-### 1. Fetch Data
+### Parallel Optuna launch
 
 ```bash
-python fetch_data.py
+docker compose run --rm trader \
+  python parallel_launch.py --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
 ```
 
-This fetches:
-- **Price data**: Coinbase and Binance perpetuals (5-minute, resampled to 1H)
-- **Spot prices**: For basis calculation
-- **Funding rates**: Hyperliquid (hourly), Binance/OKX (8-hourly)
-- **Open Interest**: Daily from Coinalyze
-- **Liquidations**: Daily from Coinalyze
+Current optimization defaults are tuned for stronger robustness:
 
-Output: `data/{COIN}_MASTER_1H.parquet`
+- `holdout-days=120`
+- `plateau-patience=100`
+- `plateau-min-delta=0.02`
+- `plateau-warmup=60`
 
-### 2. Engineer Features
+### Direct single-coin optimization
 
 ```bash
-python engineer_features.py
+docker compose run --rm trader \
+  python optimize.py --coin BTC --trials 100 --jobs 1
 ```
 
-Creates 60+ features including:
-- **Volatility**: Parkinson, rolling std, volatility ratios
-- **Momentum**: Multi-horizon returns, RSI, ADX
-- **Mean reversion**: MA deviations, Bollinger bands, z-scores
-- **Funding**: Cumulative funding, z-scores, cross-exchange spreads
-- **Market structure**: Volume ratios, efficiency ratio
-- **Labels**: Triple barrier with path-dependent outcomes
+---
 
-Output: `crypto_features_1h/{COIN}_ML_READY_1H.parquet`
+## API Surface
 
-### 3. Train Models
+Base URL: `http://localhost:8000`
 
-```bash
-python train_model.py
-```
+- `GET /` — API health message
+- `GET /coins/prices` — current tracked prices
+- `GET /coins/cde-specs` — contract metadata for tracked symbols
+- `GET /coins/history/{symbol}` — historical spot OHLCV
+- `GET /trades/*` — trade history endpoints
+- `GET /signals/*` — signal endpoints
+- `GET /wallet/` — wallet summary derived from DB + live price fetch
+- `GET /paper/*` — paper orders/fills/positions/equity telemetry
 
-Training process:
-1. **Data split**: 70% train, 30% test (chronological)
-2. **Cross-validation**: Purged K-Fold with 72-hour embargo
-3. **Hyperparameter optimization**: Optuna with 50 trials per model
-4. **Model training**: XGBoost + LightGBM ensemble
-5. **Calibration**: Isotonic regression for probability calibration
-6. **Backtesting**: Realistic with fees, slippage, funding costs
+Note: legacy `/ops` endpoints were intentionally removed; operational control is CLI/orchestrator-driven.
 
-Output: `models/{COIN}.joblib`
+---
 
-### 4. Generate Signals
+## Data & Artifacts
 
-```bash
-# Single coin
-python live_signals.py --coin BTC-PERP-INTX
+Trader service stores persistent artifacts via Docker volumes:
 
-# All coins
-python live_signals.py --all
+- `/app/data` — SQLite pipeline DB + exported features
+- `/app/models` — trained model artifacts
+- `/app/logs` — orchestrator/runtime logs
 
-# JSON output (for integration)
-python live_signals.py --all --json
-```
+Postgres service stores API-facing trade/signal/wallet/paper tables.
 
-## Key Improvements Over Original Code
+---
 
-### 1. No Lookahead Bias
-- All features computed using only past data
-- Triple barrier labels use proper path-dependent logic
-- Strict temporal ordering maintained throughout
+## Key Configuration Knobs
 
-### 2. Proper Cross-Validation
-- **Before**: GroupKFold (doesn't prevent temporal leakage)
-- **After**: PurgedKFold with 72-hour embargo matching max holding period
+### Trader / orchestration
 
-### 3. Simplified Model Ensemble
-- **Before**: XGBoost + LightGBM + CatBoost + LSTM + DQN (complex, unstable)
-- **After**: XGBoost + LightGBM with calibration (robust, interpretable)
+- `CYCLE_INTERVAL_SECONDS` (default 3600)
+- `INCREMENTAL_BACKFILL_HOURS` (default 6)
+- `TRAIN_WINDOW_DAYS`
+- `RETRAIN_EVERY_DAYS`
+- `SIGNAL_THRESHOLD`
+- `MIN_AUC`
+- `LEVERAGE`
+- `EXCLUDE_SYMBOLS`
 
-### 4. Better Signal Generation
-- **Before**: Very restrictive (41-48 trades in backtest)
-- **After**: More trades with proper confidence scaling
+### Feature generation
 
-### 5. Realistic Backtesting
-- Transaction costs (4 bps per side)
-- Slippage (volume-adjusted)
-- Funding rate costs
-- Weekend leverage reduction
+- `FEATURE_LOOKBACK_DAYS` (default `2190`) to cap historical span used by `compute_features.py`.
 
-## Feature Categories
+---
 
-### Volatility (Source of Risk Sizing)
-- `vol_24h/72h/168h`: Rolling realized volatility
-- `vol_parkinson_24h`: Range-based volatility (more efficient)
-- `vol_ratio_24_72/168`: Volatility regime changes
+## Frontend Notes
 
-### Momentum (Primary Alpha Source)
-- `ret_2h/4h/6h/12h/24h/48h/72h`: Multi-horizon returns
-- `rsi`, `rsi_deviation`: RSI and deviation from neutral
-- `efficiency_ratio`: Trend vs. mean-reversion indicator
-- `trend_direction`: Directional movement index
+The dashboard shows:
 
-### Funding Rates (Alpha + Cost)
-- `funding_sum_8h/24h/72h`: Cumulative funding
-- `funding_zscore`: Extreme funding conditions
-- `funding_spread`: Cross-exchange arbitrage signal
+- spot/CDE price cards,
+- charting and market history,
+- trades/signals tables,
+- paper positions/equity/performance views,
+- wallet summary.
 
-### Market Structure
-- `volume_ratio_24h/72h`: Volume relative to average
-- `oi_change_24h/72h`: Open interest momentum
-- `liq_zscore`: Liquidation pressure indicator
+Operations controls were removed from the frontend to match backend endpoint removal.
 
-## Configuration
+---
 
-Key parameters in `train_model.py`:
+## Local Development Without Docker
 
-```python
-TRAIN_RATIO = 0.70        # Train/test split
-PURGE_HOURS = 72          # Embargo period
-N_FOLDS = 5               # CV folds
-N_TRIALS = 50             # Optuna trials
+You can run each layer directly, but Docker Compose is the canonical path.
 
-TAKER_FEE = 0.0004        # 4 bps per side
-SLIPPAGE_BPS = 5.0        # Base slippage
-```
+- Frontend: `npm ci && npm run dev` in `frontend/`
+- API: install `backend/api/requirements.txt`, run `uvicorn app:app`
+- Trader: install `backend/trader/requirements.txt`, run scripts in `backend/trader/`
 
-Key parameters in `engineer_features.py`:
+Make sure DB paths and `DATABASE_URL` are aligned with your local setup.
 
-```python
-ATR_PERIOD = 14           # ATR lookback
-BARRIER_MULT_TP = 2.0     # Take profit multiplier
-BARRIER_MULT_SL = 2.0     # Stop loss multiplier
-MAX_HORIZON = 72          # Max holding period (hours)
-MIN_HORIZON = 12          # Min holding period (hours)
-```
-
-## Expected Performance
-
-Based on academic research, realistic expectations:
-- **Sharpe Ratio**: 0.5 - 1.5 (after costs)
-- **Win Rate**: 50-55%
-- **Profit Factor**: 1.1 - 1.3
-- **Max Drawdown**: 10-25%
-
-**Important**: These are not guaranteed returns. Markets evolve, alpha decays, and past performance doesn't guarantee future results.
-
-## Extending the Pipeline
-
-### Adding New Features
-1. Add computation in `engineer_features.py`
-2. Ensure feature uses only past data (no lookahead!)
-3. Add to the feature list (it's auto-detected)
-
-### Adding New Data Sources
-1. Add fetcher function in `fetch_data.py`
-2. Merge into the MASTER file
-3. Create derived features in `engineer_features.py`
-
-### Different Coins
-1. Add to `COINS` list
-2. Add to `SYMBOL_MAP` with exchange symbols
-3. Configure leverage in `LEVERAGE_CONFIG`
+---
 
 ## Troubleshooting
 
-### "Insufficient data"
-- Ensure data fetching completed successfully
-- Check that Coinalyze API key is valid
-- Some coins may have limited history
+### Not enough data / missing symbols in training
 
-### "No valid labels"
-- Triple barrier needs enough forward-looking data
-- Last 72 hours won't have valid labels (expected)
+- ensure `run_pipeline.py` has completed backfill,
+- verify feature CSVs exist under trader data dir,
+- check symbol mappings and available exchange history windows.
 
-### "Model not found"
-- Run `train_model.py` before `live_signals.py`
-- Check `models/` directory
+### API up but frontend missing data
 
-## License
+- verify backend reachable from frontend (`VITE_API_BASE_URL`),
+- confirm Postgres health and API DB connection,
+- inspect API logs for Coinbase request errors.
 
-MIT License - Use at your own risk.
+### Optimization appears to start from different years per coin
+
+This is expected when historical availability differs by symbol; holdout slicing is relative to each run’s global end, while earlier start dates depend on available historical bars.
+
+---
 
 ## Disclaimer
 
-This is for educational purposes only. Cryptocurrency trading involves substantial risk of loss. Never trade with money you can't afford to lose. Always do your own research and consult with financial professionals before making investment decisions.
+This repository is for research and engineering workflows, not financial advice. Crypto derivatives trading carries substantial risk.
