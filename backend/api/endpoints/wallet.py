@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from coinbase.rest import RESTClient
 from database import get_db
-from models.trade import PaperEquityCurve, Trade, TradeSide, TradeStatus
+from models.trade import Trade, TradeSide, TradeStatus
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
 
@@ -99,25 +99,31 @@ def _combine_assets(*asset_groups: List[Dict[str, Any]]) -> Dict[str, float]:
     return combined
 
 
-def _get_historical_daily_closes(asset: str, start: datetime, end: datetime) -> Dict[str, float]:
+def _get_historical_closes(
+    asset: str,
+    start: datetime,
+    end: datetime,
+    granularity_seconds: int,
+) -> Dict[int, float]:
     if asset in STABLE_COINS:
-        closes: Dict[str, float] = {}
-        cursor = start
-        while cursor.date() <= end.date():
-            closes[cursor.date().isoformat()] = 1.0
-            cursor += timedelta(days=1)
+        closes: Dict[int, float] = {}
+        cursor = int(start.timestamp())
+        end_ts = int(end.timestamp())
+        while cursor <= end_ts:
+            closes[cursor] = 1.0
+            cursor += granularity_seconds
         return closes
 
     product = f"{asset}-USD"
     params = parse.urlencode(
         {
-            "granularity": 86400,
+            "granularity": granularity_seconds,
             "start": start.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             "end": end.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
         }
     )
     candles = _fetch_json_list(f"https://api.exchange.coinbase.com/products/{product}/candles?{params}")
-    closes: Dict[str, float] = {}
+    closes: Dict[int, float] = {}
     for candle in candles:
         if not isinstance(candle, list) or len(candle) < 5:
             continue
@@ -125,34 +131,32 @@ def _get_historical_daily_closes(asset: str, start: datetime, end: datetime) -> 
         close = _safe_float(candle[4])
         if ts is None or close is None:
             continue
-        day = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-        closes[day] = close
+        closes[int(ts)] = close
     return closes
 
 
-def _build_backfilled_portfolio_history(
+def _build_holdings_portfolio_history(
     holdings: Dict[str, float],
-    paper_equity_usd: float,
     perps_usd: float,
-    days: int = 365,
-    step_days: int = 7,
+    lookback: timedelta,
+    granularity_seconds: int,
 ) -> List[Dict[str, Any]]:
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
+    start = now - lookback
 
-    historical_prices: Dict[str, Dict[str, float]] = {}
+    historical_prices: Dict[str, Dict[int, float]] = {}
     for asset in holdings:
-        historical_prices[asset] = _get_historical_daily_closes(asset, start, now)
+        historical_prices[asset] = _get_historical_closes(asset, start, now, granularity_seconds)
 
     history: List[Dict[str, Any]] = []
     last_price_by_asset: Dict[str, float] = {}
-    cursor = start
-    while cursor <= now:
-        day_key = cursor.date().isoformat()
+    cursor_ts = int(start.timestamp())
+    end_ts = int(now.timestamp())
+    while cursor_ts <= end_ts:
         external_total = perps_usd
         for asset, amount in holdings.items():
             prices = historical_prices.get(asset, {})
-            px = prices.get(day_key)
+            px = prices.get(cursor_ts)
             if px is None:
                 px = last_price_by_asset.get(asset)
             if px is None:
@@ -162,14 +166,14 @@ def _build_backfilled_portfolio_history(
 
         history.append(
             {
-                "timestamp": cursor.isoformat(),
-                "paper_equity_usd": round(paper_equity_usd, 2),
+                "timestamp": datetime.fromtimestamp(cursor_ts, tz=timezone.utc).isoformat(),
+                "paper_equity_usd": 0.0,
                 "external_usd": round(external_total, 2),
-                "total_value_usd": round(paper_equity_usd + external_total, 2),
-                "source": "backfilled_holdings",
+                "total_value_usd": round(external_total, 2),
+                "source": "holdings_price_backfill",
             }
         )
-        cursor += timedelta(days=step_days)
+        cursor_ts += granularity_seconds
 
     return history
 
@@ -630,34 +634,23 @@ def get_wallet(db: Session = Depends(get_db)):
 
     paper_balance = 10000.0
 
-    equity_points = (
-        db.query(PaperEquityCurve)
-        .order_by(sa.desc(PaperEquityCurve.timestamp))
-        .limit(200)
-        .all()
-    )
-    equity_points.reverse()
-    portfolio_history = [
-        {
-            "timestamp": point.timestamp.isoformat() if point.timestamp else None,
-            "paper_equity_usd": round(point.equity, 2),
-            "external_usd": round(portfolio_total, 2),
-            "total_value_usd": round(point.equity + portfolio_total, 2),
-            "source": "paper_equity",
-        }
-        for point in equity_points
-        if point.timestamp is not None
-    ]
-
-    if not portfolio_history:
-        holdings = _combine_assets(spot.get("assets", []), ledger.get("assets", []))
-        portfolio_history = _build_backfilled_portfolio_history(
+    holdings = _combine_assets(spot.get("assets", []), ledger.get("assets", []))
+    history_configs = {
+        "1h": {"lookback": timedelta(hours=1), "granularity_seconds": 60},
+        "1d": {"lookback": timedelta(days=1), "granularity_seconds": 900},
+        "1w": {"lookback": timedelta(days=7), "granularity_seconds": 3600},
+        "1y": {"lookback": timedelta(days=365), "granularity_seconds": 86400},
+    }
+    portfolio_history_by_range = {
+        key: _build_holdings_portfolio_history(
             holdings=holdings,
-            paper_equity_usd=paper_balance,
             perps_usd=perps_usd or 0.0,
-            days=365,
-            step_days=7,
+            lookback=config["lookback"],
+            granularity_seconds=config["granularity_seconds"],
         )
+        for key, config in history_configs.items()
+    }
+    portfolio_history = portfolio_history_by_range["1d"]
 
     total_pnl = realized_pnl + unrealized_pnl
     return {
@@ -689,4 +682,5 @@ def get_wallet(db: Session = Depends(get_db)):
         },
         "ledger": ledger,
         "portfolio_history": portfolio_history,
+        "portfolio_history_by_range": portfolio_history_by_range,
     }

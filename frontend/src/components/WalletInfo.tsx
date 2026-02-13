@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   CartesianGrid,
   Line,
@@ -17,6 +17,7 @@ interface WalletInfoProps {
 
 export default function WalletInfo({ loading }: WalletInfoProps) {
   const [wallet, setWallet] = useState<WalletData | null>(null);
+  const [portfolioRange, setPortfolioRange] = useState<'1h' | '1d' | '1w' | '1y'>('1d');
 
   useEffect(() => {
     const loadWallet = async () => {
@@ -46,6 +47,13 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
 
   const pnlColor = (v: number) =>
     v >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]';
+
+
+  const portfolioSeries = useMemo(() => {
+    if (!wallet) return [];
+    const seriesFromRange = wallet.portfolio_history_by_range?.[portfolioRange];
+    return seriesFromRange?.length ? seriesFromRange : wallet.portfolio_history ?? [];
+  }, [wallet, portfolioRange]);
 
   const items = [
     {
@@ -112,17 +120,38 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
       </div>
 
       <div className="mt-4 p-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)] h-72">
-        <p className="text-sm font-semibold text-[var(--text-primary)] mb-3">Total Portfolio Trend</p>
-        {wallet.portfolio_history?.length ? (
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <p className="text-sm font-semibold text-[var(--text-primary)]">Total Portfolio Trend</p>
+          <div className="flex gap-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-primary)] p-1">
+            {(['1h', '1d', '1w', '1y'] as const).map((range) => (
+              <button
+                key={range}
+                type="button"
+                onClick={() => setPortfolioRange(range)}
+                className={`px-2 py-1 text-xs rounded ${
+                  portfolioRange === range
+                    ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)]'
+                    : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                {range.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+        {portfolioSeries.length ? (
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={wallet.portfolio_history} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
+            <LineChart data={portfolioSeries} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" />
               <XAxis
                 dataKey="timestamp"
                 tick={{ fill: '#94a3b8', fontSize: 11 }}
-                tickFormatter={(v: string) =>
-                  new Date(v).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                }
+                tickFormatter={(v: string) => {
+                  const dt = new Date(v);
+                  return portfolioRange === '1y'
+                    ? dt.toLocaleDateString([], { month: 'short', day: 'numeric' })
+                    : dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }}
               />
               <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }} tickFormatter={(v: number) => `$${Math.round(v)}`} />
               <Tooltip
