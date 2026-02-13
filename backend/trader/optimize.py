@@ -18,6 +18,8 @@ import os
 import logging
 import sqlite3
 import functools  # <--- Critical for multiprocessing
+import traceback
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -53,6 +55,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 # Map coin prefix to symbol (filled at runtime)
 PREFIX_TO_SYMBOL: Dict[str, str] = {}
+DEBUG_TRIALS = False
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -205,7 +208,16 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     try:
         result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception as e:
-        _set_reject_reason(trial, f'run_backtest_error:{type(e).__name__}')
+        err_name = type(e).__name__
+        err_msg = str(e).strip() or '<no-message>'
+        tb_last = traceback.format_exc().strip().splitlines()[-1]
+        trial.set_user_attr('error_type', err_name)
+        trial.set_user_attr('error_message', err_msg[:300])
+        trial.set_user_attr('error_tail', tb_last[:300])
+        _set_reject_reason(trial, f'run_backtest_error:{err_name}')
+        if DEBUG_TRIALS:
+            print(f"\n❌ Trial {trial.number} backtest exception: {err_name}: {err_msg}")
+            print(traceback.format_exc())
         return -99.0
 
     if result is None:
@@ -321,7 +333,8 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   n_trials: int = 50, n_jobs: int = 1,
                   plateau_patience: int = 80, plateau_min_delta: float = 0.02,
                   plateau_warmup: int = 40,
-                  study_suffix: str = ""):
+                  study_suffix: str = "",
+                  resume_study: bool = False):
     """Run Optuna optimization for a single coin with parallel support."""
     
     # 1. Setup Persistent Storage (Required for parallel jobs)
@@ -340,7 +353,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         sampler=TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3)),
         study_name=study_name,
         storage=storage_url,
-        load_if_exists=True 
+        load_if_exists=resume_study 
     )
 
     # 2. Run Optimization
@@ -485,12 +498,14 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show saved results")
     parser.add_argument("--study-suffix", type=str, default="",
                         help="Optional suffix to isolate studies per launch (useful for parallel runs)")
-    parser.add_argument("--plateau-patience", type=int, default=80,
+    parser.add_argument("--plateau-patience", type=int, default=120,
                         help="Stop if best score does not improve for this many trials")
-    parser.add_argument("--plateau-min-delta", type=float, default=0.02,
+    parser.add_argument("--plateau-min-delta", type=float, default=0.01,
                         help="Minimum best-score improvement to reset plateau counter")
-    parser.add_argument("--plateau-warmup", type=int, default=40,
+    parser.add_argument("--plateau-warmup", type=int, default=80,
                         help="Minimum completed trials before plateau checks start")
+    parser.add_argument("--resume-study", action="store_true",
+                        help="Resume existing study name instead of starting a fresh one")
     args = parser.parse_args()
 
     # Default to fresh studies per run to avoid reusing stale/plateaued trials.
