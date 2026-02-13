@@ -64,14 +64,6 @@ export async function trainScratch(options: TrainScratchOptions): Promise<OpsAct
   return fetchWithError(`${API_BASE}/ops/train-scratch?${makeQuery(options)}`, { method: 'POST' });
 }
 
-export async function launchParallel(trials = 200, jobs = 16): Promise<OpsActionResponse> {
-  return fetchWithError(`${API_BASE}/ops/parallel-launch?trials=${trials}&jobs=${jobs}`, { method: 'POST' });
-}
-
-export async function trainScratch(): Promise<OpsActionResponse> {
-  return fetchWithError(`${API_BASE}/ops/train-scratch`, { method: 'POST' });
-}
-
 export async function getOpsStatus(): Promise<OpsStatus> {
   return fetchWithError(`${API_BASE}/ops/status`);
 }

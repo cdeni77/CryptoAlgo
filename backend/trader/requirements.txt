@@ -27,6 +27,7 @@ mypy>=1.0.0
 # Training
 scikit-learn
 lightgbm
+optuna
 
 # Postgres bridge (for pg_writer.py)
 sqlalchemy>=2.0.0
