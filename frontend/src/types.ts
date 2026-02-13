@@ -101,4 +101,53 @@ export interface OpsStatus {
   last_run_time: string | null;
   next_run_time: string | null;
   log_file: string;
+export interface PaperOrder {
+  id: number;
+  signal_id: number;
+  coin: string;
+  side: 'long' | 'short';
+  contracts: number;
+  target_price: number;
+  status: 'new' | 'filled' | 'canceled';
+  created_at: string;
+}
+
+export interface PaperFill {
+  id: number;
+  order_id: number;
+  signal_id: number;
+  coin: string;
+  side: 'long' | 'short';
+  contracts: number;
+  fill_price: number;
+  fee: number;
+  notional: number;
+  slippage_bps: number;
+  created_at: string;
+}
+
+export interface PaperPosition {
+  id: number;
+  coin: string;
+  side: 'long' | 'short';
+  contracts: number;
+  entry_price: number;
+  mark_price: number;
+  notional: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  fees_paid: number;
+  opened_at: string;
+  updated_at: string | null;
+  is_open: boolean;
+}
+
+export interface PaperEquityPoint {
+  id: number;
+  timestamp: string;
+  equity: number;
+  cash_balance: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  open_positions: number;
 }
