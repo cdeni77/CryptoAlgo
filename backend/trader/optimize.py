@@ -14,7 +14,6 @@ import argparse
 import json
 import warnings
 import sys
-import io
 import os
 import logging
 import sqlite3
@@ -206,14 +205,7 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
         oos_eval_days=60,
     )
 
-    # Capture stdout in normal mode to reduce noise, but allow full logs when debugging.
-    captured_output = io.StringIO()
-    original_stdout = sys.stdout
-    start_ts = time.time()
-
     try:
-        if not DEBUG_TRIALS:
-            sys.stdout = captured_output
         result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception as e:
         err_name = type(e).__name__
@@ -227,13 +219,6 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
             print(f"\n❌ Trial {trial.number} backtest exception: {err_name}: {err_msg}")
             print(traceback.format_exc())
         return -99.0
-    finally:
-        sys.stdout = original_stdout  # Restore stdout immediately
-
-    trial.set_user_attr('elapsed_sec', round(time.time() - start_ts, 3))
-    if DEBUG_TRIALS and captured_output.getvalue().strip():
-        tail = '\n'.join(captured_output.getvalue().strip().splitlines()[-8:])
-        print(f"\n--- trial {trial.number} backtest tail ---\n{tail}\n--- end tail ---")
 
     if result is None:
         _set_reject_reason(trial, 'result_none')
@@ -519,13 +504,9 @@ if __name__ == "__main__":
                         help="Minimum best-score improvement to reset plateau counter")
     parser.add_argument("--plateau-warmup", type=int, default=40,
                         help="Minimum completed trials before plateau checks start")
-    parser.add_argument("--debug-trials", action="store_true",
-                        help="Show per-trial backtest logs/exceptions for debugging")
     parser.add_argument("--resume-study", action="store_true",
                         help="Resume existing study name instead of starting a fresh one")
     args = parser.parse_args()
-
-    DEBUG_TRIALS = args.debug_trials
 
     # Default to fresh studies per run to avoid reusing stale/plateaued trials.
     effective_study_suffix = args.study_suffix

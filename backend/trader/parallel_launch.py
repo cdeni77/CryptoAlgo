@@ -78,8 +78,6 @@ if __name__ == "__main__":
                 run_id,
             ]
 
-            if args.debug_trials:
-                base_cmd.append("--debug-trials")
 
             print(
                 f"   Starting {coin} worker #{i + 1}/{workers_for_coin} "
