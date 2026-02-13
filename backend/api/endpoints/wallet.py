@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Any, Dict, List, Optional
 
@@ -52,6 +53,49 @@ def get_current_price(spot_id: str) -> Optional[float]:
     except Exception:
         return None
 
+
+
+
+def get_ledger_wallets_from_env() -> Dict[str, Any]:
+    """Read optional ledger wallet addresses from environment only (never committed)."""
+    entries: List[Dict[str, str]] = []
+
+    # Simple per-coin env vars for common assets.
+    for coin in ("SOL", "ONDO", "BTC", "ETH"):
+        address = os.getenv(f"LEDGER_{coin}_ADDRESS", "").strip()
+        if address:
+            entries.append({"coin": coin, "address": address})
+
+    # Optional JSON config for additional coins/addresses.
+    raw_json = os.getenv("LEDGER_WALLETS_JSON", "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    coin = str(item.get("coin", "")).strip().upper()
+                    address = str(item.get("address", "")).strip()
+                    if coin and address:
+                        entries.append({"coin": coin, "address": address})
+        except Exception:
+            pass
+
+    # Deduplicate by (coin,address).
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for entry in entries:
+        key = (entry["coin"], entry["address"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+
+    return {
+        "status": "configured" if deduped else "unconfigured",
+        "entries": deduped,
+    }
 
 def get_coinbase_spot_portfolio() -> Dict[str, Any]:
     """Aggregate spot holdings from Advanced Trade portfolios/accounts.
@@ -247,6 +291,7 @@ def get_wallet(db: Session = Depends(get_db)):
     spot_usd = _safe_float(spot.get("value_usd"))
     perps_usd = _safe_float(perps.get("value_usd"))
     coinbase_total = (spot_usd or 0.0) + (perps_usd or 0.0)
+    ledger = get_ledger_wallets_from_env()
 
     # Paper trading wallet remains fixed at starting balance until paper wallet accounting is enabled.
     paper_balance = 10000.0
@@ -266,10 +311,16 @@ def get_wallet(db: Session = Depends(get_db)):
             },
             "coinbase_spot": {"value_usd": spot.get("value_usd"), "status": spot.get("status")},
             "coinbase_perps": {"value_usd": perps.get("value_usd"), "status": perps.get("status")},
+            "ledger": {
+                "value_usd": None,
+                "status": ledger.get("status"),
+                "address_count": len(ledger.get("entries", [])),
+            },
         },
         "coinbase": {
             "spot": spot,
             "perps": perps,
             "total_value_usd": round(coinbase_total, 2) if (spot_usd is not None or perps_usd is not None) else None,
         },
+        "ledger": ledger,
     }

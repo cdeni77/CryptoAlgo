@@ -58,6 +58,11 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
       value: wallet.coinbase?.total_value_usd != null ? fmt(wallet.coinbase.total_value_usd) : 'N/A',
       color: 'text-[var(--accent-cyan)]',
     },
+    {
+      label: 'Ledger Wallet',
+      value: wallet.wallets?.ledger?.address_count ? `${wallet.wallets.ledger.address_count} addresses` : 'Not configured',
+      color: 'text-[var(--text-primary)]',
+    },
   ];
 
   return (
@@ -71,7 +76,7 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
         ))}
       </div>
 
-      <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
         <details className="p-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
           <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
             Coinbase Spot Holdings
@@ -111,6 +116,25 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
             )}
           </div>
         </details>
+
+        <details className="p-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
+          <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
+            Ledger Wallet Addresses
+          </summary>
+          <div className="mt-3 space-y-2 max-h-64 overflow-auto">
+            {wallet.ledger?.entries?.length ? (
+              wallet.ledger.entries.map((entry) => (
+                <div key={`${entry.coin}-${entry.address}`} className="text-xs flex items-center justify-between gap-3">
+                  <span className="text-[var(--text-muted)]">{entry.coin}</span>
+                  <span className="text-[var(--text-primary)] break-all">{entry.address}</span>
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-[var(--text-muted)]">No ledger addresses configured.</p>
+            )}
+          </div>
+        </details>
+
       </div>
     </div>
   );

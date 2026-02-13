@@ -85,6 +85,13 @@ At minimum, export or place in shell env:
 ```bash
 export COINBASE_API_KEY="..."
 export COINBASE_API_SECRET="..."
+# Optional local Ledger addresses (never commit real addresses in repo files)
+export LEDGER_SOL_ADDRESS="..."
+export LEDGER_ONDO_ADDRESS="..."
+export LEDGER_BTC_ADDRESS="..."
+export LEDGER_ETH_ADDRESS="..."
+# Optional JSON for additional wallets: [{"coin":"SOL","address":"..."}, ...]
+export LEDGER_WALLETS_JSON='[]'
 ```
 
 ### 3) Start the stack
@@ -160,7 +167,7 @@ Base URL: `http://localhost:8000`
 - `GET /coins/history/{symbol}` — historical spot OHLCV
 - `GET /trades/*` — trade history endpoints
 - `GET /signals/*` — signal endpoints
-- `GET /wallet/` — wallet summary exposing paper trading wallet + Coinbase spot/perps totals and coin/position breakdowns
+- `GET /wallet/` — wallet summary exposing paper trading + Coinbase spot/perps + optional env-configured Ledger addresses
 - `GET /paper/*` — paper orders/fills/positions/equity telemetry
 
 Note: legacy `/ops` endpoints were intentionally removed; operational control is CLI/orchestrator-driven.

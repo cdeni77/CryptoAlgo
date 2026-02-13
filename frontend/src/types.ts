@@ -81,6 +81,11 @@ export interface WalletData {
     };
     coinbase_spot?: { value_usd: number | null; status: string };
     coinbase_perps?: { value_usd: number | null; status: string };
+    ledger?: {
+      value_usd: number | null;
+      status: string;
+      address_count: number;
+    };
   };
   coinbase?: {
     spot?: {
@@ -107,6 +112,13 @@ export interface WalletData {
       }>;
     };
     total_value_usd: number | null;
+  };
+  ledger?: {
+    status: string;
+    entries: Array<{
+      coin: string;
+      address: string;
+    }>;
   };
 }
 
