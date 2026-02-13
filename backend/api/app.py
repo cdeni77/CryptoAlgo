@@ -1,19 +1,20 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from models.trade import Base          # single Base → trades + wallet + signals
-from endpoints.trade import router as trades_router
-from endpoints.coins import router as coins_router
-from endpoints.wallet import router as wallet_router
-from endpoints.signals import router as signals_router
-from database import engine
 
-# Create ALL tables (trades, wallet, signals) from the unified Base
+from database import engine
+from endpoints.coins import router as coins_router
+from endpoints.paper import router as paper_router
+from endpoints.signals import router as signals_router
+from endpoints.trade import router as trades_router
+from endpoints.wallet import router as wallet_router
+from models.trade import Base
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Trading History & Market API",
-    description="API for trades, signals, and coin prices",
-    version="0.2.0",
+    description="API for trades, signals, and paper trading telemetry",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -29,11 +30,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
 app.include_router(trades_router)
 app.include_router(coins_router)
 app.include_router(wallet_router)
 app.include_router(signals_router)
+app.include_router(paper_router)
 
 
 @app.get("/")
