@@ -1,3 +1,11 @@
+"""
+Unified SQLAlchemy models for the trading system.
+
+IMPORTANT: All models share the same Base so that
+    Base.metadata.create_all(engine)
+creates every table in one shot (trades, wallet, signals).
+"""
+
 import enum
 from datetime import datetime
 from typing import Optional

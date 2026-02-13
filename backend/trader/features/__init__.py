@@ -10,6 +10,10 @@ from .engineering import (
     FundingFeatures,
     OpenInterestFeatures,
     RegimeFeatures,
+    BTCMeanReversionFeatures,
+    SOLEcosystemFeatures,
+    DOGESentimentFeatures,
+    get_coin_feature_class,
     normalize_point_in_time,
     winsorize_point_in_time,
 )
@@ -22,6 +26,10 @@ __all__ = [
     'FundingFeatures',
     'OpenInterestFeatures',
     'RegimeFeatures',
+    'BTCMeanReversionFeatures',
+    'SOLEcosystemFeatures',
+    'DOGESentimentFeatures',
+    'get_coin_feature_class',
     'normalize_point_in_time',
     'winsorize_point_in_time',
 ]

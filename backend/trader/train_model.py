@@ -1,60 +1,18 @@
-#!/usr/bin/env python3
 """
-CRYPTO ML TRADING SYSTEM v7 — MOMENTUM + FUNDING CARRY
-=====================================================================
-FUNDAMENTAL STRATEGY CHANGE FROM v6:
+Crypto ML Trading System v8 — Per-Coin Profiles + Model Persistence
 
-v6 PROBLEM: Funding-rate contrarian direction (short when funding high).
-This fights the trend — Coinbase research confirms funding LAGS momentum.
-Result: -0.39% raw PnL per trade. No exit structure can fix negative edge.
+KEY CHANGES from v7:
+  - Per-coin profiles with tuned thresholds, exits, hyperparameters
+  - All 5 coins trade (no exclusions by default)
+  - Coin-specific extra features feed into ML model
+  - Model saving to disk after training (joblib)
+  - All coins use momentum strategy with per-coin parameter tuning
 
-v7 SOLUTION: MOMENTUM for direction, FUNDING as carry bonus.
-  - GO LONG when multi-timeframe momentum is bullish
-  - GO SHORT when multi-timeframe momentum is bearish  
-  - PREFER shorts when funding is positive (receive carry)
-  - AVOID longs when funding is extreme positive (pay carry)
-  - Size positions larger when funding ALIGNS with direction
-
-This combines crypto's strongest documented edge (momentum/trend) with
-the structural carry advantage from funding rates.
-
-Built for the EXACT contract specifications on Coinbase Derivatives Exchange (CDE):
-
-CONTRACT SPECS (from user's screenshot):
-  BTC-PERP:  0.01  BTC  per contract  | Vol $1.65B
-  ETH-PERP:  0.1   ETH  per contract  | Vol $209.70M
-  XRP-PERP:  500   XRP  per contract  | Vol $122.74M
-  SOL-PERP:  5     SOL  per contract  | Vol $99.27M
-  DOGE-PERP: 5000  DOGE per contract  | Vol $1.39M
-
-FEE STRUCTURE (confirmed from screenshot showing "Fee (0.10%): ~$0.85" on BTC):
-  - 0.10% per contract per SIDE (buy OR sell)
-  - Round-trip = 0.20% of notional
-  - Minimum $0.20 per contract per side
-  - Includes exchange, clearing, and NFA fees
-  - Liquidation fee: 0.80%
-  - This is a FLAT fee — no maker/taker distinction for US futures
-
-LEVERAGE (from screenshot showing "Leverage 4.1X" with overnight note):
-  - Intraday (Sun-Fri, 6PM-4PM ET = 22hrs/day): up to 10x
-  - Overnight (4PM-6PM ET): reduced, ~4.1x for BTC
-  - We use 4x as conservative overnight-safe level
-
-FUNDING:
-  - Settled HOURLY on Coinbase (not 8h like Binance!)
-  - Positive rate = longs pay shorts
-  - Our strategy shorts when funding is high → RECEIVES funding
-
-KEY v6 FIXES:
-  1. EXACT 0.10%/side fee (confirmed from screenshot)
-  2. DOGE not ADA (corrected per user)
-  3. DISCRETE CONTRACT SIZING (whole contracts only)
-  4. SINGLE EXIT per position (fixes v4 double-fee bug)
-  5. BREAKEVEN SL includes fees (exit at entry+fees, not entry)
-  6. WEEKLY EQUITY BASE (prevents compounding spiral)
-  7. 4x leverage (overnight-safe from screenshot)
+Coinbase CDE fee model: 0.10% per side, $0.20 minimum per contract.
+Funding: Binance 8h data, divided by 8 for hourly accrual.
 """
 import argparse
+import joblib
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -69,90 +27,54 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import RobustScaler
 import lightgbm as lgb
 
+from coin_profiles import (
+    get_coin_profile, save_model, load_model, list_saved_models,
+    COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
+)
+
 warnings.filterwarnings('ignore')
 
 # --- Paths ---
 FEATURES_DIR = Path("./data/features")
 DB_PATH = "./data/trading.db"
-MODEL_DIR = Path("./models")
-MODEL_DIR.mkdir(exist_ok=True)
 
 # =============================================================================
 # COINBASE CDE CONTRACT SPECIFICATIONS — EXACT
 # =============================================================================
-# Maps symbol -> (units_per_contract, min_fee_per_contract)
-# "units_per_contract" = how many of the base asset per 1 contract
-# From the screenshot: BTC 0.01, ETH 0.1, XRP 500, SOL 5, ADA 1000
-# Nano contract specs from Coinbase CDE
-# BIP = nano BTC Perp (0.01 BTC), ETP = nano ETH Perp (0.1 ETH), etc.
 CONTRACT_SPECS = {
-    # CDE product codes (actual symbol names in our data)
     'BIP': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
     'ETP': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
     'XPP': {'units': 500,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
     'SLP': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
     'DOP': {'units': 5000,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
-    # Legacy symbol formats (in case data uses these)
     'BTC': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
     'ETH': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
     'XRP': {'units': 500,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
     'SOL': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
     'DOGE': {'units': 5000, 'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
-    # Fallback
     'DEFAULT': {'units': 1, 'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'UNKNOWN'},
 }
 
 def get_contract_spec(symbol: str) -> dict:
-    """
-    Get contract spec for a symbol, matching by CDE product code prefix.
-    
-    Handles symbols like 'BIP-20DEC30-CDE', 'ETP-20DEC30-CDE', etc.
-    Extracts the product code (first part before '-') and looks it up.
-    """
-    # Try exact match first
     if symbol in CONTRACT_SPECS:
         return CONTRACT_SPECS[symbol]
-    
-    # Extract product code prefix (e.g., 'BIP' from 'BIP-20DEC30-CDE')
     prefix = symbol.split('-')[0] if '-' in symbol else symbol
-    
     if prefix in CONTRACT_SPECS:
         return CONTRACT_SPECS[prefix]
-    
-    # Try matching by known base asset names anywhere in the symbol
     symbol_upper = symbol.upper()
     for code, spec in CONTRACT_SPECS.items():
         if code == 'DEFAULT':
             continue
         if code in symbol_upper:
             return spec
-    
     print(f"  ⚠️ No contract spec found for '{symbol}', using DEFAULT (1 unit/contract)")
     return CONTRACT_SPECS['DEFAULT']
 
 
 # =============================================================================
-# EXPLICIT FEATURE LIST
+# BASE FEATURE LIST (fallback — coin_profiles provides per-coin lists)
 # =============================================================================
-FEATURE_COLUMNS = [
-    # Momentum features (PRIMARY — for direction)
-    'return_1h', 'return_4h', 'return_12h', 'return_24h', 'return_48h', 'return_168h',
-    'rsi_14', 'rsi_6',
-    'range_position_24h', 'range_position_72h',
-    'bb_position_20',  # Bollinger band position
-    'ma_distance_24h', 'ma_distance_168h',
-    # Volatility (for regime + sizing)
-    'volatility_1h', 'volatility_4h', 'volatility_24h',
-    'volume_ratio_1h', 'volume_ratio_24h',
-    'parkinson_vol_24h',
-    # Funding (SECONDARY — for carry/sizing, not direction)
-    'funding_rate_bps', 'funding_rate_zscore',
-    'cumulative_funding_24h', 'cumulative_funding_72h',
-    # OI (for crowding/liquidation signals)
-    'oi_change_1h', 'oi_change_4h', 'oi_change_24h',
-    # Regime
-    'trend_sma20_50', 'vol_regime_ratio',
-]
+FEATURE_COLUMNS = BASE_FEATURES
 
 
 # =============================================================================
@@ -166,13 +88,13 @@ class Trade:
     direction: int
     entry_price: float
     exit_price: float
-    net_pnl: float          # Percentage return on notional
-    raw_pnl: float          # Price return only
-    funding_pnl: float      # Accumulated funding
-    fee_pnl: float          # Total fees (negative)
-    pnl_dollars: float      # Actual dollar PnL
-    n_contracts: int         # Number of contracts traded
-    notional: float          # Total notional value
+    net_pnl: float
+    raw_pnl: float
+    funding_pnl: float
+    fee_pnl: float
+    pnl_dollars: float
+    n_contracts: int
+    notional: float
     exit_reason: str
 
 
@@ -183,13 +105,12 @@ class Config:
     retrain_frequency_days: int = 7
     min_train_samples: int = 400
 
-    # Signal Filters — Ensemble Optuna + stability tested (7/7 profitable, ±41% variance)
-    # ETH + XRP only. Ensemble 3-model averaging with offsets [0, 3, 6] days.
+    # Signal Filters (defaults — overridden per-coin by profiles)
     signal_threshold: float = 0.80
     min_funding_z: float = 0.0
     min_momentum_magnitude: float = 0.07
 
-    # Exit Strategy — wide exits for ensemble (gives trades room, 43% WR)
+    # Exit Strategy (defaults — overridden per-coin by profiles)
     vol_mult_tp: float = 5.5
     vol_mult_sl: float = 3.0
     breakeven_trigger: float = 999.0
@@ -197,32 +118,27 @@ class Config:
     trailing_mult: float = 999.0
     max_hold_hours: int = 96
 
-    # Symbol selection — exclude underperformers
-    # BTC: too efficient, momentum edge doesn't persist (36% WR, -0.04% net)
-    # DOGE: too noisy/memecoin, momentum signals unreliable (32% WR, -0.13% net)
-    excluded_symbols: Optional[List[str]] = None  # Set to ['BIP', 'DOP'] to exclude BTC and DOGE
-    
-    # Risk — volatility-adjusted sizing
-    max_positions: int = 3
-    position_size: float = 0.15      # 15% base — adjusted down for high-vol assets
+    # Symbol selection — v8: no exclusions by default
+    excluded_symbols: Optional[List[str]] = None
+
+    # Risk
+    max_positions: int = 5
+    position_size: float = 0.15
     leverage: int = 4
-    vol_sizing_target: float = 0.025  # Target 2.5% daily vol exposure per position
-    # Intraday (6PM-4PM ET Sun-Fri) allows up to 10x
-    # Overnight (4PM-6PM ET) reduces — screenshot shows 4.1x
-    # We use 4x as the conservative overnight-compatible level
+    vol_sizing_target: float = 0.025
 
-    # Fees — EXACT COINBASE US CDE (from screenshot: "Fee (0.10%)")
-    fee_pct_per_side: float = 0.0010  # 0.10% per contract per side (10 bps)
-    min_fee_per_contract: float = 0.20  # Minimum $0.20 per contract per side
-    slippage_bps: float = 0.0          # No added slippage — 0.10% fee already includes execution
+    # Fees — EXACT COINBASE US CDE
+    fee_pct_per_side: float = 0.0010
+    min_fee_per_contract: float = 0.20
+    slippage_bps: float = 0.0
 
-    # Regime Filter
+    # Regime Filter (defaults — overridden per-coin)
     min_vol_24h: float = 0.008
     max_vol_24h: float = 0.06
 
     # Safety
     min_equity: float = 1000.0
-    cooldown_hours: float = 24.0  # Hours after exit before re-entry on same symbol
+    cooldown_hours: float = 24.0
 
     # Validation
     val_fraction: float = 0.20
@@ -237,7 +153,7 @@ class Config:
     label_vol_target: float = 1.8
 
     # Position sizing control
-    max_weekly_equity_growth: float = 0.03  # Max 3% growth in sizing base per week
+    max_weekly_equity_growth: float = 0.03
 
 
 # =============================================================================
@@ -245,94 +161,50 @@ class Config:
 # =============================================================================
 def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
                            config: Config) -> float:
-    """
-    Calculate EXACT Coinbase CDE fee for one side (entry OR exit).
-    
-    Fee = max(n_contracts * min_fee_per_contract, 
-              n_contracts * units_per_contract * price * fee_pct_per_side)
-    
-    Returns total fee in USD for this side.
-    """
     spec = get_contract_spec(symbol)
-    
-    # Percentage-based fee
     notional_per_contract = spec['units'] * price
     pct_fee = n_contracts * notional_per_contract * config.fee_pct_per_side
-    
-    # Minimum fee
     min_fee = n_contracts * config.min_fee_per_contract
-    
     return max(pct_fee, min_fee)
 
 
 def calculate_pnl_exact(entry_price: float, exit_price: float, direction: int,
                          accum_funding: float, n_contracts: int, symbol: str,
                          config: Config) -> Tuple[float, float, float, float, float]:
-    """
-    Calculate PnL with EXACT Coinbase fee structure.
-    
-    Returns: (net_pnl_pct, raw_pnl_pct, total_fee_pct, pnl_dollars, total_notional)
-    """
     spec = get_contract_spec(symbol)
     notional_per_contract = spec['units'] * entry_price
     total_notional = n_contracts * notional_per_contract
-    
     if total_notional == 0:
         return 0.0, 0.0, 0.0, 0.0, 0.0
-    
-    # Raw PnL
     raw_pnl_pct = (exit_price - entry_price) / entry_price * direction
     raw_pnl_dollars = total_notional * raw_pnl_pct
-    
-    # Fees (entry + exit)
     entry_fee = calculate_coinbase_fee(n_contracts, entry_price, symbol, config)
     exit_fee = calculate_coinbase_fee(n_contracts, exit_price, symbol, config)
-    
-    # Slippage (applied to exit only)
     slippage = total_notional * (config.slippage_bps / 10000.0)
-    
     total_fee_dollars = entry_fee + exit_fee + slippage
     total_fee_pct = total_fee_dollars / total_notional
-    
-    # Funding PnL in dollars
     funding_dollars = accum_funding * total_notional
-    
-    # Net
     net_pnl_dollars = raw_pnl_dollars - total_fee_dollars + funding_dollars
     net_pnl_pct = net_pnl_dollars / total_notional
-    
     return net_pnl_pct, raw_pnl_pct, -total_fee_pct, net_pnl_dollars, total_notional
 
 
 def calculate_n_contracts(equity: float, price: float, symbol: str,
-                           config: Config, vol_24h: float = 0.0) -> int:
-    """
-    Calculate how many WHOLE contracts we can buy given equity allocation.
-    
-    v7.2: Volatility-adjusted sizing.
-    If vol_24h is provided, scale position size so that daily vol exposure
-    targets config.vol_sizing_target. This means high-vol assets (DOGE) get
-    smaller positions and low-vol assets (BTC) get normal/larger ones.
-    """
+                           config: Config, vol_24h: float = 0.0,
+                           profile: Optional[CoinProfile] = None) -> int:
     spec = get_contract_spec(symbol)
     notional_per_contract = spec['units'] * price
-    
     if notional_per_contract <= 0:
         return 0
-    
-    # Base position size
-    pos_size = config.position_size
-    
-    # Vol-adjust: scale down if asset vol exceeds target
-    if vol_24h > 0 and config.vol_sizing_target > 0:
-        vol_ratio = config.vol_sizing_target / vol_24h
-        vol_ratio = min(vol_ratio, 1.5)  # Cap upward scaling at 1.5x
-        vol_ratio = max(vol_ratio, 0.3)  # Floor at 0.3x (don't go too small)
+    pos_size = profile.position_size if profile else config.position_size
+    vol_target = profile.vol_sizing_target if profile else config.vol_sizing_target
+    if vol_24h > 0 and vol_target > 0:
+        vol_ratio = vol_target / vol_24h
+        vol_ratio = min(vol_ratio, 1.5)
+        vol_ratio = max(vol_ratio, 0.3)
         pos_size = pos_size * vol_ratio
-    
     target_notional = equity * pos_size * config.leverage
     n_contracts = int(target_notional / notional_per_contract)
-    
     return max(n_contracts, 0)
 
 
@@ -343,25 +215,30 @@ class MLSystem:
     def __init__(self, config: Config):
         self.config = config
 
-    def get_feature_columns(self, available_columns: pd.Index) -> List[str]:
-        cols = [c for c in FEATURE_COLUMNS if c in available_columns]
+    def get_feature_columns(self, available_columns: pd.Index,
+                            coin_features: Optional[List[str]] = None) -> List[str]:
+        feature_list = coin_features if coin_features else FEATURE_COLUMNS
+        cols = [c for c in feature_list if c in available_columns]
         return cols if len(cols) >= 4 else []
 
-    def create_labels(self, ohlcv: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
+    def create_labels(self, ohlcv: pd.DataFrame, features: pd.DataFrame,
+                      profile: Optional[CoinProfile] = None) -> pd.Series:
         """
-        MOMENTUM-BASED forward return label.
+        MOMENTUM-BASED forward return label (v7 original, v8 cleaned).
         
-        v7 change: Direction from multi-timeframe price momentum, NOT funding z-score.
-        Label = 1 if price moves >= threshold in the momentum direction within forward window.
+        Direction from multi-timeframe momentum consensus.
+        Label = 1 if price moves >= threshold in momentum direction within forward window.
         """
+        forward_hours = profile.label_forward_hours if profile else self.config.label_forward_hours
+        vol_target = profile.label_vol_target if profile else self.config.label_vol_target
+
         target = pd.Series(index=features.index, dtype=float)
         vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
-        fwd_hours = self.config.label_forward_hours
-        
-        # Multi-timeframe momentum for direction
-        ret_24h = ohlcv['close'].pct_change(24).ffill()
-        ret_72h = ohlcv['close'].pct_change(72).ffill()
-        sma_50 = ohlcv['close'].rolling(50).mean()
+
+        # Pre-compute momentum series (vectorized — matches v7 exactly)
+        ret_24h_series = ohlcv['close'].pct_change(24).ffill()
+        ret_72h_series = ohlcv['close'].pct_change(72).ffill()
+        sma_50_series = ohlcv['close'].rolling(50).mean()
 
         for ts in features.index:
             if ts not in ohlcv.index or ts not in vol.index:
@@ -373,29 +250,28 @@ class MLSystem:
                 pos_in_ohlcv = ohlcv.index.get_loc(ts)
             except KeyError:
                 continue
-            if pos_in_ohlcv + fwd_hours >= len(ohlcv):
+            if pos_in_ohlcv + forward_hours >= len(ohlcv):
                 continue
 
             entry_px = ohlcv.loc[ts, 'close']
-            future = ohlcv.iloc[pos_in_ohlcv + 1: pos_in_ohlcv + 1 + fwd_hours]
-            threshold = self.config.label_vol_target * row_vol
-            
-            # MOMENTUM DIRECTION: consensus of 24h return, 72h return, and price vs SMA50
-            r24 = ret_24h.get(ts, 0)
-            r72 = ret_72h.get(ts, 0)
-            sma = sma_50.get(ts, entry_px)
+            future = ohlcv.iloc[pos_in_ohlcv + 1: pos_in_ohlcv + 1 + forward_hours]
+            threshold = vol_target * row_vol
+
+            r24 = ret_24h_series.get(ts, 0)
+            r72 = ret_72h_series.get(ts, 0)
+            sma = sma_50_series.get(ts, entry_px)
             if pd.isna(r24): r24 = 0
             if pd.isna(r72): r72 = 0
             if pd.isna(sma): sma = entry_px
-            
+
             momentum_score = (1 if r24 > 0 else -1) + (1 if r72 > 0 else -1) + (1 if entry_px > sma else -1)
-            
+
             if momentum_score >= 2:
-                direction = 1   # Bullish momentum consensus
+                direction = 1
             elif momentum_score <= -2:
-                direction = -1  # Bearish momentum consensus
+                direction = -1
             else:
-                continue  # No consensus — skip this sample
+                continue
 
             if direction == 1:
                 max_excursion = (future['high'].max() - entry_px) / entry_px
@@ -403,10 +279,12 @@ class MLSystem:
                 max_excursion = (entry_px - future['low'].min()) / entry_px
 
             target.loc[ts] = 1.0 if max_excursion >= threshold else 0.0
+
         return target
 
     def train(self, X_train: pd.DataFrame, y_train: pd.Series,
-              X_val: pd.DataFrame, y_val: pd.Series) -> Optional[Tuple]:
+              X_val: pd.DataFrame, y_val: pd.Series,
+              profile: Optional[CoinProfile] = None) -> Optional[Tuple]:
         if len(X_train) < self.config.min_train_samples:
             return None
         if y_train.sum() < 15 or (1 - y_train).sum() < 15:
@@ -418,10 +296,21 @@ class MLSystem:
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
 
+        n_est = profile.n_estimators if profile else 100
+        depth = profile.max_depth if profile else 3
+        lr = profile.learning_rate if profile else 0.05
+        min_child = profile.min_child_samples if profile else 20
+
         base_model = lgb.LGBMClassifier(
-            n_estimators=100, max_depth=3, learning_rate=0.05,
-            class_weight='balanced', verbose=-1,
-            min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
+            n_estimators=n_est, 
+            max_depth=depth, 
+            learning_rate=lr,
+            class_weight='balanced', 
+            verbose=-1,
+            min_child_samples=min_child, 
+            reg_alpha=0.1, 
+            reg_lambda=0.1,
+            n_jobs=1  
         )
         base_model.fit(X_train_scaled, y_train)
 
@@ -430,7 +319,9 @@ class MLSystem:
             auc = roc_auc_score(y_val, val_probs)
         except ValueError:
             return None
-        if auc < self.config.min_val_auc:
+
+        min_auc = profile.min_val_auc if profile else self.config.min_val_auc
+        if auc < min_auc:
             return None
 
         iso = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
@@ -474,17 +365,18 @@ def load_data():
         except Exception as e:
             print(f"Skipping {sym}: {e}")
     print(f"✅ Loaded {len(data)} symbols.")
-    
-    # Show contract specs for loaded symbols
+
     for sym in data:
         spec = get_contract_spec(sym)
         price = data[sym]['ohlcv']['close'].iloc[-1]
         notional = spec['units'] * price
         eff_fee = max(0.20, notional * 0.0010) / notional * 100
+        profile = get_coin_profile(sym)
         print(f"  {sym}: {spec['units']} units/contract, "
               f"~${notional:.2f}/contract, "
-              f"effective fee: {eff_fee:.3f}% per side")
-    
+              f"effective fee: {eff_fee:.3f}% per side | "
+              f"profile: {profile.name} momentum")
+
     return data
 
 
@@ -516,7 +408,7 @@ def check_correlation(sym: str, direction: int, active_positions: Dict,
 
 
 # =============================================================================
-# BACKTEST — v6 EXACT COINBASE
+# BACKTEST — v8 PER-COIN PROFILES
 # =============================================================================
 def run_backtest(all_data: Dict, config: Config):
     system = MLSystem(config)
@@ -527,25 +419,25 @@ def run_backtest(all_data: Dict, config: Config):
     current_date = min(all_ts) + timedelta(days=config.train_lookback_days)
     end_date = max(all_ts)
 
-    print(f"\n⏩ STARTING BACKTEST (v7 — Momentum + Funding Carry)")
+    print(f"\n⏩ STARTING BACKTEST (v8 — Per-Coin Profiles)")
     print(f"   Period: {current_date.date()} to {end_date.date()}")
-    print(f"   TP: {config.vol_mult_tp}x vol | SL: {config.vol_mult_sl}x vol")
-    trail_status = "DISABLED" if not config.trailing_active else f"BE at +{config.breakeven_trigger}x vol | Trail {config.trailing_mult}x from peak"
-    print(f"   Trailing: {trail_status}")
     print(f"   Leverage: {config.leverage}x | Fee: 0.10%/side (0.20% round-trip)")
-    print(f"   Regime: {config.min_vol_24h:.1%}-{config.max_vol_24h:.1%}")
-    print(f"   Signal threshold: {config.signal_threshold}")
+    print(f"   Coin profiles:")
+    for sym in all_data:
+        p = get_coin_profile(sym)
+        print(f"     {sym}: {p.name} (momentum) | thresh={p.signal_threshold} | "
+              f"TP={p.vol_mult_tp}x SL={p.vol_mult_sl}x | hold={p.max_hold_hours}h")
 
     equity = 100_000.0
     peak_equity = equity
     max_drawdown = 0.0
     completed_trades = []
     active_positions = {}
-    last_exit_time = {}  # v7.2: cooldown tracking per symbol
+    last_exit_time = {}
     models_rejected = 0
     models_accepted = 0
     regime_filtered = 0
-    no_contracts = 0  # Times we couldn't buy even 1 contract
+    no_contracts = 0
 
     weekly_equity_base = equity
 
@@ -556,30 +448,30 @@ def run_backtest(all_data: Dict, config: Config):
 
         week_end = current_date + timedelta(days=config.retrain_frequency_days)
 
-        # Weekly equity base — damped growth to prevent compounding spiral
         weekly_equity_base = min(equity, weekly_equity_base * (1 + config.max_weekly_equity_growth))
         weekly_equity_base = max(weekly_equity_base, equity * 0.9)
 
         # --- TRAINING (ENSEMBLE: 3 lookback offsets for stability) ---
-        ensemble_offsets = [0, 3, 6]  # Train with lookback, lookback+3, lookback+6
-        all_ensemble_models = {}  # sym -> list of (model, scaler, cols, iso, auc)
+        ensemble_offsets = [0, 3, 6]
+        all_ensemble_models = {}
 
         for offset in ensemble_offsets:
             train_start = current_date - timedelta(days=config.train_lookback_days + offset)
 
             for sym, d in all_data.items():
+                profile = get_coin_profile(sym)
                 feat, ohlc = d['features'], d['ohlcv']
-                cols = system.get_feature_columns(feat.columns)
+                cols = system.get_feature_columns(feat.columns, profile.feature_columns)
                 if not cols:
                     continue
 
                 train_feat = feat.loc[train_start:current_date]
-                train_ohlc = ohlc.loc[train_start:current_date + timedelta(hours=config.max_hold_hours)]
+                train_ohlc = ohlc.loc[train_start:current_date + timedelta(hours=profile.max_hold_hours)]
 
                 if len(train_feat) < config.min_train_samples:
                     continue
 
-                y = system.create_labels(train_ohlc, train_feat)
+                y = system.create_labels(train_ohlc, train_feat, profile=profile)
                 valid_idx = y.dropna().index
                 X_all = train_feat.loc[valid_idx, cols]
                 y_all = y.loc[valid_idx]
@@ -591,7 +483,7 @@ def run_backtest(all_data: Dict, config: Config):
                 X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
                 y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
 
-                result = system.train(X_tr, y_tr, X_vl, y_vl)
+                result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile)
                 if result:
                     model, scaler, iso, auc = result
                     if sym not in all_ensemble_models:
@@ -601,11 +493,10 @@ def run_backtest(all_data: Dict, config: Config):
                 else:
                     models_rejected += 1
 
-        # Build final models dict: keep all ensemble members per symbol
         models = {}
         for sym, ensemble_list in all_ensemble_models.items():
             if ensemble_list:
-                models[sym] = ensemble_list  # list of (model, scaler, cols, iso, auc)
+                models[sym] = ensemble_list
 
         # --- TRADING ---
         test_hours = pd.date_range(current_date, week_end, freq='1h')
@@ -619,33 +510,26 @@ def run_backtest(all_data: Dict, config: Config):
                 if ts not in all_data[sym]['ohlcv'].index:
                     continue
 
-                # Funding accumulation
-                # CRITICAL: funding_rate_bps comes from Binance 8h data, forward-filled hourly
-                # by engineering.py. The value at each hour is the FULL 8h rate, not hourly.
-                # We must divide by 8 to get the per-hour accrual.
-                # (Coinbase settles hourly, but our data source is 8h from Binance)
+                pos_profile = get_coin_profile(sym)
+
                 funding_8h_bps = all_data[sym]['features'].loc[ts].get('funding_rate_bps', 0.0)
+                if pd.isna(funding_8h_bps):
+                    funding_8h_bps = 0.0
                 funding_hourly_bps = funding_8h_bps / 8.0
-                # If we're SHORT and funding is positive, we RECEIVE funding
-                # accum_funding is in fractional terms (e.g. 0.0001 = 1bps)
                 pos['accum_funding'] += -(funding_hourly_bps / 10000.0) * pos['dir']
 
                 bar = all_data[sym]['ohlcv'].loc[ts]
                 direction = pos['dir']
 
-                # Track peak favorable excursion
                 if direction == 1:
                     pos['peak_price'] = max(pos['peak_price'], bar['high'])
                 else:
                     pos['peak_price'] = min(pos['peak_price'], bar['low'])
 
-                # --- BREAKEVEN + TRAILING ---
                 peak_move = (pos['peak_price'] - pos['entry']) / pos['entry'] * direction
 
                 if not pos['at_breakeven'] and peak_move >= config.breakeven_trigger * pos['vol']:
-                    # Move SL to entry + enough to cover round-trip fees
-                    # We need to profit at least the fee amount to truly break even
-                    effective_fee_pct = pos['effective_fee_pct']  # Stored at entry
+                    effective_fee_pct = pos['effective_fee_pct']
                     pos['sl'] = pos['entry'] * (1 + effective_fee_pct * direction)
                     pos['at_breakeven'] = True
 
@@ -657,18 +541,14 @@ def run_backtest(all_data: Dict, config: Config):
                         trail_sl = pos['peak_price'] * (1 + config.trailing_mult * pos['vol'])
                         pos['sl'] = min(pos['sl'], trail_sl)
 
-                # --- CHECK EXITS ---
                 exit_price, reason = None, None
 
-                # TP
                 tp_hit = (direction == 1 and bar['high'] >= pos['tp']) or \
                          (direction == -1 and bar['low'] <= pos['tp'])
-                # SL
                 sl_hit = (direction == 1 and bar['low'] <= pos['sl']) or \
                          (direction == -1 and bar['high'] >= pos['sl'])
 
                 if tp_hit and sl_hit:
-                    # Both hit in same bar — use distance from open
                     dist_tp = abs(bar['open'] - pos['tp'])
                     dist_sl = abs(bar['open'] - pos['sl'])
                     if dist_sl <= dist_tp:
@@ -687,32 +567,27 @@ def run_backtest(all_data: Dict, config: Config):
                     else:
                         reason = 'stop_loss'
 
-                # Max hold
-                if not exit_price and (ts - pos['time']).total_seconds() / 3600 >= config.max_hold_hours:
+                # Max hold — use per-coin profile
+                if not exit_price and (ts - pos['time']).total_seconds() / 3600 >= pos_profile.max_hold_hours:
                     exit_price, reason = bar['close'], 'max_hold'
 
-                # --- CLOSE ---
                 if exit_price:
                     net_pnl, raw_pnl, fee_pnl, pnl_dollars, notional = calculate_pnl_exact(
                         pos['entry'], exit_price, direction,
                         pos['accum_funding'], pos['n_contracts'], sym, config
                     )
-
-                    # Cap loss at full notional
                     pnl_dollars = max(pnl_dollars, -notional)
                     equity += pnl_dollars
-
                     peak_equity = max(peak_equity, equity)
                     drawdown = (peak_equity - equity) / peak_equity
                     max_drawdown = max(max_drawdown, drawdown)
-
                     completed_trades.append(Trade(
                         sym, pos['time'], ts, direction, pos['entry'], exit_price,
                         net_pnl, raw_pnl, pos['accum_funding'], fee_pnl,
                         pnl_dollars, pos['n_contracts'], notional, reason
                     ))
                     to_close.append(sym)
-                    last_exit_time[sym] = ts  # Record for cooldown
+                    last_exit_time[sym] = ts
 
             for sym in to_close:
                 del active_positions[sym]
@@ -726,10 +601,15 @@ def run_backtest(all_data: Dict, config: Config):
                         continue
                     if ts not in all_data[sym]['ohlcv'].index:
                         continue
-                    # v7.2: cooldown after exit
-                    if sym in last_exit_time and (ts - last_exit_time[sym]).total_seconds() < config.cooldown_hours * 3600:
+
+                    profile = get_coin_profile(sym)
+
+                    # Cooldown — use per-coin profile
+                    if sym in last_exit_time and \
+                       (ts - last_exit_time[sym]).total_seconds() < profile.cooldown_hours * 3600:
                         continue
-                    # v7.3: Symbol exclusion
+
+                    # Symbol exclusion (CLI override)
                     if config.excluded_symbols:
                         sym_prefix = sym.split('-')[0] if '-' in sym else sym
                         if sym_prefix in config.excluded_symbols:
@@ -742,59 +622,55 @@ def run_backtest(all_data: Dict, config: Config):
                     if pd.isna(sma_200):
                         continue
 
-                    # Regime filter
+                    # Regime filter — per-coin thresholds
                     vol_24h = all_data[sym]['ohlcv']['close'].pct_change().rolling(24).std().get(ts, None)
                     if vol_24h is None or pd.isna(vol_24h):
                         continue
-                    if vol_24h < config.min_vol_24h or vol_24h > config.max_vol_24h:
+                    if vol_24h < profile.min_vol_24h or vol_24h > profile.max_vol_24h:
                         regime_filtered += 1
                         continue
 
-                    # ============================================================
-                    # v7: MOMENTUM DIRECTION (replaces funding contrarian)
-                    # ============================================================
+                    # ── Momentum direction (all coins) ──
+                    ts_loc = all_data[sym]['ohlcv'].index.get_loc(ts)
+
+                    # v7 guard: need at least 72 bars of history
+                    if ts_loc < 72:
+                        continue
+
                     ohlcv_ts = all_data[sym]['ohlcv']
-                    ts_loc = ohlcv_ts.index.get_loc(ts) if ts in ohlcv_ts.index else None
-                    if ts_loc is None or ts_loc < 72:
+                    ret_24h = (price / ohlcv_ts['close'].iloc[ts_loc - 24] - 1)
+                    ret_72h = (price / ohlcv_ts['close'].iloc[ts_loc - 72] - 1)
+                    sma_50 = ohlcv_ts['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
+
+                    # v7.3: Minimum momentum magnitude
+                    if abs(ret_72h) < profile.min_momentum_magnitude:
                         continue
-                    
-                    ret_24h = (price / ohlcv_ts['close'].iloc[ts_loc - 24] - 1) if ts_loc >= 24 else 0
-                    ret_72h = (price / ohlcv_ts['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
-                    sma_50 = ohlcv_ts['close'].iloc[max(0, ts_loc-50):ts_loc].mean()
-                    
-                    # Minimum momentum magnitude — avoid weak/choppy moves
-                    if abs(ret_72h) < config.min_momentum_magnitude:
-                        continue
-                    
+
                     # v7.3: Require 24h and 72h returns to agree on direction
                     if ret_24h * ret_72h < 0:
-                        continue  # 24h and 72h disagree — skip
-                    
-                    mom_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
-                    
-                    if mom_score >= 2:
-                        direction = 1   # Bullish
-                    elif mom_score <= -2:
-                        direction = -1  # Bearish
+                        continue
+
+                    momentum_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
+
+                    if momentum_score >= 2:
+                        direction = 1
+                    elif momentum_score <= -2:
+                        direction = -1
                     else:
-                        continue  # No momentum consensus — skip
-                    
-                    # Trend confirmation: long only above SMA200, short only below
+                        continue
+
+                    # Trend filter: long only above SMA200, short only below
                     if direction == 1 and price < sma_200:
                         continue
                     if direction == -1 and price > sma_200:
                         continue
-                    
-                    # ============================================================
-                    # FUNDING CARRY FILTER (bonus, not direction)
-                    # ============================================================
+
+                    # Funding carry filter
                     f_z = row.get('funding_rate_zscore', 0)
-                    if pd.isna(f_z): f_z = 0
-                    
-                    # Reject longs when funding is extremely positive (expensive carry)
+                    if pd.isna(f_z):
+                        f_z = 0
                     if direction == 1 and f_z > 2.5:
                         continue
-                    # Reject shorts when funding is extremely negative (expensive carry)
                     if direction == -1 and f_z < -2.5:
                         continue
 
@@ -802,7 +678,7 @@ def run_backtest(all_data: Dict, config: Config):
                     if not check_correlation(sym, direction, active_positions, all_data, ts, config):
                         continue
 
-                    # ENSEMBLE PREDICTION: average probability across all models
+                    # ENSEMBLE PREDICTION
                     probs = []
                     for (model, scaler, cols, iso, auc) in models[sym]:
                         x_in = np.nan_to_num(
@@ -813,31 +689,33 @@ def run_backtest(all_data: Dict, config: Config):
                         probs.append(cal_prob)
                     prob = np.mean(probs)
 
-                    if prob >= config.signal_threshold:
+                    # Per-coin signal threshold
+                    if prob >= profile.signal_threshold:
                         vol = vol_24h if vol_24h > 0 else 0.02
 
-                        # DISCRETE CONTRACT SIZING
-                        n_contracts = calculate_n_contracts(weekly_equity_base, price, sym, config, vol_24h=vol_24h)
+                        n_contracts = calculate_n_contracts(
+                            weekly_equity_base, price, sym, config,
+                            vol_24h=vol_24h, profile=profile
+                        )
                         if n_contracts < 1:
                             no_contracts += 1
                             continue
 
-                        # Calculate effective round-trip fee percentage for this position
                         spec = get_contract_spec(sym)
                         notional_per_contract = spec['units'] * price
                         total_notional = n_contracts * notional_per_contract
                         entry_fee = calculate_coinbase_fee(n_contracts, price, sym, config)
-                        # Estimate exit fee at same price (approximate)
                         exit_fee = entry_fee
                         effective_fee_pct = (entry_fee + exit_fee) / total_notional
 
+                        # Per-coin TP/SL
                         active_positions[sym] = {
                             'time': ts,
                             'entry': price,
                             'dir': direction,
                             'vol': vol,
-                            'tp': price * (1 + config.vol_mult_tp * vol * direction),
-                            'sl': price * (1 - config.vol_mult_sl * vol * direction),
+                            'tp': price * (1 + profile.vol_mult_tp * vol * direction),
+                            'sl': price * (1 - profile.vol_mult_sl * vol * direction),
                             'accum_funding': 0.0,
                             'n_contracts': n_contracts,
                             'peak_price': price,
@@ -875,7 +753,6 @@ def run_backtest(all_data: Dict, config: Config):
     years = days / 365.25
     ann_return = (1 + total_ret) ** (1 / years) - 1 if years > 0 and total_ret > -1 else -1
 
-    # Annualized Sharpe (approximate)
     trades_per_year = len(df) / years if years > 0 else 0
     ann_sharpe = sharpe_per_trade * np.sqrt(trades_per_year) if trades_per_year > 0 else 0
 
@@ -884,7 +761,7 @@ def run_backtest(all_data: Dict, config: Config):
     avg_funding = df['funding_pnl'].mean()
 
     print(f"\n{'=' * 70}")
-    print(f"📊 BACKTEST RESULTS (v7 — Momentum + Funding Carry)")
+    print(f"📊 BACKTEST RESULTS (v8 — Per-Coin Profiles)")
     print(f"{'=' * 70}")
     print(f"Total Trades:           {len(df)}")
     print(f"Win Rate:               {win_rate:.1%}")
@@ -923,7 +800,6 @@ def run_backtest(all_data: Dict, config: Config):
         avg_d = df[df['exit_reason'] == reason]['pnl_dollars'].mean()
         print(f"  {reason:20s}: {count:4d} ({pct:.1%}) | Avg: {avg:.4%} | ${avg_d:,.2f}")
 
-    # Per-symbol breakdown
     print(f"\nPer-Symbol Performance:")
     for sym in df['symbol'].unique():
         sym_df = df[df['symbol'] == sym]
@@ -931,11 +807,38 @@ def run_backtest(all_data: Dict, config: Config):
         sym_pnl = sym_df['pnl_dollars'].sum()
         sym_avg = sym_df['net_pnl'].mean()
         sym_fee = sym_df['fee_pnl'].mean()
-        print(f"  {sym:12s}: {len(sym_df):3d} trades | WR: {sym_wr:.0%} | "
-              f"PnL: ${sym_pnl:+,.0f} | Avg: {sym_avg:.4%} | Fee: {sym_fee:.4%}")
+        p = get_coin_profile(sym)
+        print(f"  {sym:20s}: {len(sym_df):3d} trades | WR: {sym_wr:.0%} | "
+              f"PnL: ${sym_pnl:+,.0f} | Avg: {sym_avg:.4%} | Fee: {sym_fee:.4%} | "
+              f"[{p.name}/momentum]")
     print(f"{'=' * 70}")
-    
-    # Return metrics for optimization
+
+    # ── Save final models from last walk-forward window ──
+    print(f"\n💾 Saving final models...")
+    saved_count = 0
+    for sym, ensemble_list in models.items():
+        if ensemble_list:
+            best = max(ensemble_list, key=lambda x: x[4])
+            model, scaler, cols, iso, auc = best
+            profile = get_coin_profile(sym)
+            save_model(
+                symbol=sym,
+                model=model,
+                scaler=scaler,
+                calibrator=iso,
+                feature_columns=cols,
+                auc=auc,
+                profile_name=profile.name,
+                extra_meta={
+                    'strategy': 'momentum',
+                    'signal_threshold': profile.signal_threshold,
+                    'n_ensemble': len(ensemble_list),
+                    'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
+                },
+            )
+            saved_count += 1
+    print(f"✅ Saved {saved_count} models to {MODELS_DIR}/")
+
     return {
         'total_return': total_ret,
         'ann_return': ann_return,
@@ -951,15 +854,22 @@ def run_backtest(all_data: Dict, config: Config):
         'avg_fee_pnl': avg_fee,
         'final_equity': equity,
     }
+
+
+# =============================================================================
+# LIVE SIGNALS — v8
 # =============================================================================
 def run_signals(all_data: Dict, config: Config, debug: bool = False):
     system = MLSystem(config)
-    print(f"\n🔍 ANALYZING LIVE MARKETS (v6 — Coinbase CDE)...")
+    print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
 
     for sym, d in all_data.items():
+        profile = get_coin_profile(sym)
         feat, ohlc = d['features'], d['ohlcv']
-        cols = system.get_feature_columns(feat.columns)
+        cols = system.get_feature_columns(feat.columns, profile.feature_columns)
         if not cols:
+            if debug:
+                print(f"\n[{sym}] ❌ Not enough features (need ≥4, got {len(cols)})")
             continue
 
         train_end = feat.index[-1]
@@ -967,95 +877,145 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         train_feat = feat.loc[train_start:train_end]
         train_ohlc = ohlc.loc[train_start:train_end]
 
-        y = system.create_labels(train_ohlc, train_feat)
+        y = system.create_labels(train_ohlc, train_feat, profile=profile)
         valid = y.dropna().index
         X_all = train_feat.loc[valid, cols]
         y_all = y.loc[valid]
 
         if len(X_all) < config.min_train_samples:
+            if debug:
+                print(f"\n[{sym}] ❌ Insufficient samples ({len(X_all)} < {config.min_train_samples})")
             continue
 
         split_idx = int(len(X_all) * (1 - config.val_fraction))
         X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
         y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
 
-        result = system.train(X_tr, y_tr, X_vl, y_vl)
+        result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile)
         if not result:
             if debug:
-                print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC)")
+                print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC < {profile.min_val_auc})")
             continue
 
         model, scaler, iso, auc = result
+
+        # ── Save model to disk ──
+        save_model(
+            symbol=sym,
+            model=model,
+            scaler=scaler,
+            calibrator=iso,
+            feature_columns=cols,
+            auc=auc,
+            profile_name=profile.name,
+            extra_meta={
+                'strategy': 'momentum',
+                'signal_threshold': profile.signal_threshold,
+                'train_samples': len(X_all),
+            },
+        )
+
         row = feat.iloc[-1]
         price = ohlc.iloc[-1]['close']
         sma_200 = ohlc.iloc[-1]['sma_200']
 
         f_z = row.get('funding_rate_zscore', 0)
-        
-        # v7: Momentum direction
+        if pd.isna(f_z):
+            f_z = 0
+
         ts_loc = len(ohlc) - 1
+
+        # ── Momentum direction (all coins) ──
         ret_24h = (price / ohlc['close'].iloc[ts_loc - 24] - 1) if ts_loc >= 24 else 0
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
-        sma_50 = ohlc['close'].iloc[max(0, ts_loc-50):ts_loc].mean()
-        mom_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
-        direction = 1 if mom_score >= 2 else (-1 if mom_score <= -2 else 0)
+        sma_50 = ohlc['close'].iloc[max(0, ts_loc - 50):ts_loc].mean() if ts_loc >= 10 else price
+        momentum_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
+        if momentum_score >= 2:
+            direction = 1
+        elif momentum_score <= -2:
+            direction = -1
+        else:
+            if debug:
+                print(f"\n[{sym}] ⏸️  No momentum consensus (score={momentum_score})")
+            continue
 
-        rule_pass = direction != 0  # Need momentum consensus
-        trend_pass = (direction == 1 and price > sma_200) or \
-                     (direction == -1 and price < sma_200)
+        # Trend filter: long only above SMA200, short only below
+        if direction == 1 and price < sma_200 and not pd.isna(sma_200):
+            if debug:
+                print(f"\n[{sym}] ⏸️  Long rejected: price < SMA200")
+            continue
+        if direction == -1 and price > sma_200 and not pd.isna(sma_200):
+            if debug:
+                print(f"\n[{sym}] ⏸️  Short rejected: price > SMA200")
+            continue
 
-        vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
-        regime_pass = config.min_vol_24h <= vol_24h <= config.max_vol_24h if not pd.isna(vol_24h) else False
+        # Funding carry filter
+        if direction == 1 and f_z > 2.5:
+            continue
+        if direction == -1 and f_z < -2.5:
+            continue
 
-        x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1))
+        # ML prediction
+        x_in = np.nan_to_num(
+            np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
+        )
         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
         prob = float(iso.predict([raw_prob])[0])
-        ml_pass = prob >= config.signal_threshold
+        ml_pass = prob >= profile.signal_threshold
 
-        # Calculate contract count for sizing info
-        spec = get_contract_spec(sym)
-        n_contracts = calculate_n_contracts(100000, price, sym, config)
+        vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
+        regime_pass = profile.min_vol_24h <= vol_24h <= profile.max_vol_24h if not pd.isna(vol_24h) else False
+
+        # Momentum gate
+        ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
+        momentum_pass = abs(ret_72h) >= profile.min_momentum_magnitude
 
         if debug:
-            all_pass = rule_pass and trend_pass and regime_pass and ml_pass
-            status = "✅ SIGNAL" if all_pass else "❌ NEUTRAL"
-            trend_str = "BULL" if price > sma_200 else "BEAR"
-            vol_str = f"{vol_24h:.2%}" if not pd.isna(vol_24h) else "N/A"
-            print(f"\n[{sym}] {status} (Val AUC: {auc:.3f})")
-            print(f"  Funding Z:     {f_z:.2f} ({'PASS' if rule_pass else 'FAIL'})")
-            print(f"  Trend:         {trend_str} ({'PASS' if trend_pass else 'FAIL'})")
-            print(f"  Regime Vol:    {vol_str} ({'PASS' if regime_pass else 'FAIL'})")
-            print(f"  ML Prob:       {prob:.1%} ({'PASS' if ml_pass else 'FAIL'})")
-            print(f"  Contracts:     {n_contracts} ({spec['units']} {sym.split('-')[0]}/contract)")
-            print(f"  Notional:      ${n_contracts * spec['units'] * price:,.2f}")
+            dir_str = 'LONG' if direction == 1 else 'SHORT'
+            print(f"\n[{sym}] ({profile.name})")
+            print(f"  Price: ${price:,.2f} | SMA200: ${sma_200:,.2f}" if not pd.isna(sma_200) else f"  Price: ${price:,.2f}")
+            print(f"  Direction: {dir_str}")
+            print(f"  Raw prob: {raw_prob:.3f} → Calibrated: {prob:.3f} (thresh: {profile.signal_threshold})")
+            print(f"  AUC: {auc:.3f}")
+            print(f"  Gates: ML={'✅' if ml_pass else '❌'} | Regime={'✅' if regime_pass else '❌'} | Mom={'✅' if momentum_pass else '❌'}")
+            print(f"  Funding z-score: {f_z:.2f}")
+            print(f"  24h Vol: {vol_24h:.4f}" if not pd.isna(vol_24h) else "  24h Vol: N/A")
 
-        elif rule_pass and trend_pass and regime_pass and ml_pass:
+        if ml_pass and regime_pass and momentum_pass:
+            n_contracts = calculate_n_contracts(
+                100_000, price, sym, config,
+                vol_24h=vol_24h if not pd.isna(vol_24h) else 0.02,
+                profile=profile
+            )
+            spec = get_contract_spec(sym)
             dir_str = 'LONG' if direction == 1 else 'SHORT'
             notional = n_contracts * spec['units'] * price
-            print(f"🎯 {sym}: {dir_str} | {n_contracts} contracts | "
-                  f"${notional:,.0f} notional | Prob: {prob:.1%} | AUC: {auc:.3f}")
+            print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
+                  f"{n_contracts} contracts | ${notional:,.0f} notional | "
+                  f"Prob: {prob:.1%} | AUC: {auc:.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Crypto ML Trading System v6 — Exact Coinbase CDE"
+        description="Crypto ML Trading System v8 — Per-Coin Profiles"
     )
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--signals", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--threshold", type=float, default=0.80)
+    parser.add_argument("--threshold", type=float, default=0.80,
+                        help="Default signal threshold (overridden by per-coin profiles)")
     parser.add_argument("--min-auc", type=float, default=0.54)
     parser.add_argument("--leverage", type=int, default=4)
-    parser.add_argument("--tp", type=float, default=5.5, help="Take profit vol multiplier")
-    parser.add_argument("--sl", type=float, default=3.0, help="Stop loss vol multiplier")
-    parser.add_argument("--momentum", type=float, default=0.07, help="Min 72h momentum magnitude")
-    parser.add_argument("--hold", type=int, default=96, help="Max hold hours")
-    parser.add_argument("--cooldown", type=float, default=24, help="Hours cooldown after exit")
-    parser.add_argument("--exclude", type=str, default="BIP,SLP,DOP",
-                        help="Comma-separated symbol prefixes to exclude (default: BIP,DOP,SLP)")
+    parser.add_argument("--tp", type=float, default=5.5, help="Default TP vol multiplier")
+    parser.add_argument("--sl", type=float, default=3.0, help="Default SL vol multiplier")
+    parser.add_argument("--momentum", type=float, default=0.07, help="Default min 72h momentum magnitude")
+    parser.add_argument("--hold", type=int, default=96, help="Default max hold hours")
+    parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
+    parser.add_argument("--exclude", type=str, default="",
+                        help="Comma-separated symbol prefixes to exclude (default: none)")
     args = parser.parse_args()
 
-    excluded = [s.strip() for s in args.exclude.split(',')] if args.exclude else None
+    excluded = [s.strip() for s in args.exclude.split(',') if s.strip()] if args.exclude else None
     config = Config(
         signal_threshold=args.threshold,
         min_val_auc=args.min_auc,
