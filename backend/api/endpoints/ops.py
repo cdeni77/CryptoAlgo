@@ -30,7 +30,7 @@ def stop_pipeline():
 
 @router.post("/retrain", response_model=OpsActionResponse)
 def retrain(
-    train_window_days: int = Query(90, ge=7, le=365),
+    train_window_days: int = Query(120, ge=7, le=365),
     retrain_every_days: int = Query(7, ge=1, le=90),
     debug: bool = Query(False),
 ):
