@@ -155,6 +155,10 @@ class Config:
     # Position sizing control
     max_weekly_equity_growth: float = 0.03
 
+    # Walk-forward leakage protection / evaluation
+    train_embargo_hours: int = 24
+    oos_eval_days: int = 60
+
 
 # =============================================================================
 # EXACT COINBASE FEE CALCULATION
@@ -410,7 +414,17 @@ def check_correlation(sym: str, direction: int, active_positions: Dict,
 # =============================================================================
 # BACKTEST — v8 PER-COIN PROFILES
 # =============================================================================
-def run_backtest(all_data: Dict, config: Config):
+def _get_profile(symbol: str, profile_overrides: Optional[Dict[str, CoinProfile]] = None) -> CoinProfile:
+    if profile_overrides:
+        prefix = symbol.split('-')[0].upper()
+        for profile in profile_overrides.values():
+            if prefix in profile.prefixes:
+                return profile
+    return get_coin_profile(symbol)
+
+
+def run_backtest(all_data: Dict, config: Config,
+                 profile_overrides: Optional[Dict[str, CoinProfile]] = None):
     system = MLSystem(config)
 
     all_ts = [ts for d in all_data.values() for ts in d['ohlcv'].index]
@@ -424,7 +438,7 @@ def run_backtest(all_data: Dict, config: Config):
     print(f"   Leverage: {config.leverage}x | Fee: 0.10%/side (0.20% round-trip)")
     print(f"   Coin profiles:")
     for sym in all_data:
-        p = get_coin_profile(sym)
+        p = _get_profile(sym, profile_overrides)
         print(f"     {sym}: {p.name} (momentum) | thresh={p.signal_threshold} | "
               f"TP={p.vol_mult_tp}x SL={p.vol_mult_sl}x | hold={p.max_hold_hours}h")
 
@@ -459,14 +473,19 @@ def run_backtest(all_data: Dict, config: Config):
             train_start = current_date - timedelta(days=config.train_lookback_days + offset)
 
             for sym, d in all_data.items():
-                profile = get_coin_profile(sym)
+                profile = _get_profile(sym, profile_overrides)
                 feat, ohlc = d['features'], d['ohlcv']
                 cols = system.get_feature_columns(feat.columns, profile.feature_columns)
                 if not cols:
                     continue
 
-                train_feat = feat.loc[train_start:current_date]
-                train_ohlc = ohlc.loc[train_start:current_date + timedelta(hours=profile.max_hold_hours)]
+                embargo_hours = max(config.train_embargo_hours, profile.label_forward_hours, 1)
+                train_end = current_date - timedelta(hours=embargo_hours)
+                if train_end <= train_start:
+                    continue
+
+                train_feat = feat.loc[train_start:train_end]
+                train_ohlc = ohlc.loc[train_start:train_end + timedelta(hours=profile.label_forward_hours)]
 
                 if len(train_feat) < config.min_train_samples:
                     continue
@@ -499,7 +518,8 @@ def run_backtest(all_data: Dict, config: Config):
                 models[sym] = ensemble_list
 
         # --- TRADING ---
-        test_hours = pd.date_range(current_date, week_end, freq='1h')
+        test_start = current_date + timedelta(hours=1)
+        test_hours = pd.date_range(test_start, week_end, freq='1h')
 
         for ts in test_hours:
             # ============================================================
@@ -510,7 +530,7 @@ def run_backtest(all_data: Dict, config: Config):
                 if ts not in all_data[sym]['ohlcv'].index:
                     continue
 
-                pos_profile = get_coin_profile(sym)
+                pos_profile = _get_profile(sym, profile_overrides)
 
                 funding_8h_bps = all_data[sym]['features'].loc[ts].get('funding_rate_bps', 0.0)
                 if pd.isna(funding_8h_bps):
@@ -602,7 +622,7 @@ def run_backtest(all_data: Dict, config: Config):
                     if ts not in all_data[sym]['ohlcv'].index:
                         continue
 
-                    profile = get_coin_profile(sym)
+                    profile = _get_profile(sym, profile_overrides)
 
                     # Cooldown — use per-coin profile
                     if sym in last_exit_time and \
@@ -807,7 +827,7 @@ def run_backtest(all_data: Dict, config: Config):
         sym_pnl = sym_df['pnl_dollars'].sum()
         sym_avg = sym_df['net_pnl'].mean()
         sym_fee = sym_df['fee_pnl'].mean()
-        p = get_coin_profile(sym)
+        p = _get_profile(sym, profile_overrides)
         print(f"  {sym:20s}: {len(sym_df):3d} trades | WR: {sym_wr:.0%} | "
               f"PnL: ${sym_pnl:+,.0f} | Avg: {sym_avg:.4%} | Fee: {sym_fee:.4%} | "
               f"[{p.name}/momentum]")
@@ -839,6 +859,16 @@ def run_backtest(all_data: Dict, config: Config):
             saved_count += 1
     print(f"✅ Saved {saved_count} models to {MODELS_DIR}/")
 
+    oos_cutoff = end_date - timedelta(days=max(config.oos_eval_days, 1))
+    oos_df = df[df['exit_time'] >= oos_cutoff]
+    oos_sharpe = -99.0
+    oos_return = -1.0
+    if len(oos_df) >= 5:
+        oos_avg = oos_df['net_pnl'].mean()
+        oos_std = oos_df['net_pnl'].std()
+        oos_sharpe = oos_avg / oos_std if oos_std > 0 else 0.0
+        oos_return = oos_df['pnl_dollars'].sum() / 100000.0
+
     return {
         'total_return': total_ret,
         'ann_return': ann_return,
@@ -853,6 +883,9 @@ def run_backtest(all_data: Dict, config: Config):
         'avg_raw_pnl': avg_raw,
         'avg_fee_pnl': avg_fee,
         'final_equity': equity,
+        'oos_trades': int(len(oos_df)),
+        'oos_sharpe': oos_sharpe,
+        'oos_return': oos_return,
     }
 
 

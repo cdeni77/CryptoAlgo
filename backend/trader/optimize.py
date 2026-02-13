@@ -127,11 +127,6 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     """
     profile = create_trial_profile(trial, coin_name)
 
-    # Monkey-patch the profile locally
-    # Note: In multiprocessing, this affects the worker process copy only
-    original = COIN_PROFILES.get(coin_name)
-    COIN_PROFILES[coin_name] = profile
-
     target_sym = PREFIX_TO_SYMBOL.get(coin_prefix)
     if not target_sym:
         return -99.0
@@ -145,6 +140,8 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     config = Config(
         max_positions=1,
         leverage=4,
+        train_embargo_hours=24,
+        oos_eval_days=60,
     )
 
     # Capture stdout to prevent console spam from parallel processes
@@ -154,13 +151,11 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     
     try:
         sys.stdout = captured_output
-        result = run_backtest(single_data, config)
+        result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception:
         return -99.0
     finally:
         sys.stdout = original_stdout # Restore stdout immediately
-        if original:
-            COIN_PROFILES[coin_name] = original
 
     if result is None or result.get('n_trades', 0) < 15:
         return -99.0
@@ -173,6 +168,9 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     wr = result.get('win_rate', 0)
     ann_ret = result.get('ann_return', -1)
     trades_per_year = result.get('trades_per_year', 0)
+    oos_sharpe = result.get('oos_sharpe', -99.0)
+    oos_return = result.get('oos_return', -1.0)
+    oos_trades = result.get('oos_trades', 0)
 
     pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0
     dd_penalty = max(0, dd - 0.30) * 3.0
@@ -194,7 +192,13 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     if 30 <= trades_per_year <= 80: 
         trade_penalty -= 0.4
 
-    score = sharpe + pf_bonus - dd_penalty - trade_penalty
+    # Force generalization: prioritize out-of-sample behavior over in-sample optics
+    score = (0.6 * oos_sharpe) + (0.4 * sharpe) + pf_bonus - dd_penalty - trade_penalty
+
+    if oos_trades < 5:
+        score -= 0.5
+    if oos_return < 0:
+        score -= min(1.0, abs(oos_return) * 10)
 
     if ann_ret < -0.05:
         score = min(score, -1.0)
@@ -206,6 +210,9 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     trial.set_user_attr('sharpe', round(sharpe, 3))
     trial.set_user_attr('profit_factor', round(pf, 3))
     trial.set_user_attr('max_drawdown', round(dd, 4))
+    trial.set_user_attr('oos_trades', int(oos_trades))
+    trial.set_user_attr('oos_sharpe', round(oos_sharpe, 3))
+    trial.set_user_attr('oos_return', round(oos_return, 4))
 
     return score
 
