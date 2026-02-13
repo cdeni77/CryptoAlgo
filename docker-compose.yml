@@ -75,11 +75,6 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      # Coinbase API credentials (required for OHLCV + real-time data)
-      - CDP_API_KEY=${CDP_API_KEY:-}
-      - CDP_API_SECRET=${CDP_API_SECRET:-}
-
-      # Optional: Coinbase REST API keys (for the spot price API in the backend)
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
 
