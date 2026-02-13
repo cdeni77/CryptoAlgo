@@ -1,11 +1,9 @@
-from sqlalchemy import Column, Integer, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, DateTime, Float, Integer
 from sqlalchemy.sql import func
 
-Base = declarative_base()
-# ====================================================================
-# WALLET
-# ====================================================================
+from models.base import Base
+
+
 class Wallet(Base):
     __tablename__ = "wallet"
 
