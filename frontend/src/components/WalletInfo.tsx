@@ -1,12 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getWallet } from '../api/walletApi';
-
-interface WalletData {
-  balance: number;
-  realized_pnl: number;
-  unrealized_pnl: number;
-  total_pnl: number;
-}
+import { WalletData } from '../types';
 
 interface WalletInfoProps {
   loading: boolean;
@@ -45,10 +39,30 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
     v >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]';
 
   const items = [
-    { label: 'Balance', value: fmt(wallet.balance), color: 'text-[var(--text-primary)]' },
+    { label: 'Paper Trading', value: wallet.wallets?.paper_trading?.value_usd != null ? fmt(wallet.wallets.paper_trading.value_usd) : fmt(wallet.balance), color: 'text-[var(--text-primary)]' },
     { label: 'Realized PNL', value: `${wallet.realized_pnl >= 0 ? '+' : ''}${fmt(wallet.realized_pnl)}`, color: pnlColor(wallet.realized_pnl) },
     { label: 'Unrealized PNL', value: `${wallet.unrealized_pnl >= 0 ? '+' : ''}${fmt(wallet.unrealized_pnl)}`, color: pnlColor(wallet.unrealized_pnl) },
     { label: 'Total PNL', value: `${wallet.total_pnl >= 0 ? '+' : ''}${fmt(wallet.total_pnl)}`, color: pnlColor(wallet.total_pnl) },
+    {
+      label: 'Coinbase Spot',
+      value: wallet.coinbase?.spot?.value_usd != null ? fmt(wallet.coinbase.spot.value_usd) : 'N/A',
+      color: 'text-[var(--text-primary)]',
+    },
+    {
+      label: 'Coinbase Perps',
+      value: wallet.coinbase?.perps?.value_usd != null ? fmt(wallet.coinbase.perps.value_usd) : 'N/A',
+      color: 'text-[var(--text-primary)]',
+    },
+    {
+      label: 'Coinbase Total',
+      value: wallet.coinbase?.total_value_usd != null ? fmt(wallet.coinbase.total_value_usd) : 'N/A',
+      color: 'text-[var(--accent-cyan)]',
+    },
+    {
+      label: 'Ledger Wallet',
+      value: wallet.wallets?.ledger?.address_count ? `${wallet.wallets.ledger.address_count} addresses` : 'Not configured',
+      color: 'text-[var(--text-primary)]',
+    },
   ];
 
   return (
@@ -60,6 +74,67 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
             <p className={`text-xl font-bold font-mono-trade ${color}`}>{value}</p>
           </div>
         ))}
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+        <details className="p-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
+          <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
+            Coinbase Spot Holdings
+          </summary>
+          <div className="mt-3 space-y-2 max-h-64 overflow-auto">
+            {wallet.coinbase?.spot?.assets?.length ? (
+              wallet.coinbase.spot.assets.map((asset) => (
+                <div key={asset.asset} className="text-xs flex items-center justify-between gap-3">
+                  <span className="text-[var(--text-muted)]">{asset.asset}</span>
+                  <span className="text-[var(--text-primary)]">
+                    {asset.amount.toLocaleString()} ({fmt(asset.value_usd)})
+                  </span>
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-[var(--text-muted)]">No spot holdings available.</p>
+            )}
+          </div>
+        </details>
+
+        <details className="p-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
+          <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
+            Coinbase Perps Positions
+          </summary>
+          <div className="mt-3 space-y-2 max-h-64 overflow-auto">
+            {wallet.coinbase?.perps?.positions?.length ? (
+              wallet.coinbase.perps.positions.map((position) => (
+                <div key={position.symbol} className="text-xs flex items-center justify-between gap-3">
+                  <span className="text-[var(--text-muted)]">{position.symbol}</span>
+                  <span className="text-[var(--text-primary)]">
+                    {position.contracts ?? 0} ({position.notional_usd != null ? fmt(position.notional_usd) : 'N/A'})
+                  </span>
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-[var(--text-muted)]">No perps positions available.</p>
+            )}
+          </div>
+        </details>
+
+        <details className="p-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
+          <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
+            Ledger Wallet Addresses
+          </summary>
+          <div className="mt-3 space-y-2 max-h-64 overflow-auto">
+            {wallet.ledger?.entries?.length ? (
+              wallet.ledger.entries.map((entry) => (
+                <div key={`${entry.coin}-${entry.address}`} className="text-xs flex items-center justify-between gap-3">
+                  <span className="text-[var(--text-muted)]">{entry.coin}</span>
+                  <span className="text-[var(--text-primary)] break-all">{entry.address}</span>
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-[var(--text-muted)]">No ledger addresses configured.</p>
+            )}
+          </div>
+        </details>
+
       </div>
     </div>
   );

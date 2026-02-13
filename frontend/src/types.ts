@@ -72,6 +72,54 @@ export interface WalletData {
   realized_pnl: number;
   unrealized_pnl: number;
   total_pnl: number;
+  wallets?: {
+    paper_trading?: {
+      value_usd: number;
+      cash_usd: number | null;
+      unrealized_pnl: number | null;
+      status: string;
+    };
+    coinbase_spot?: { value_usd: number | null; status: string };
+    coinbase_perps?: { value_usd: number | null; status: string };
+    ledger?: {
+      value_usd: number | null;
+      status: string;
+      address_count: number;
+    };
+  };
+  coinbase?: {
+    spot?: {
+      value_usd: number | null;
+      status: string;
+      error?: string;
+      assets?: Array<{
+        asset: string;
+        amount: number;
+        price_usd: number;
+        value_usd: number;
+      }>;
+    };
+    perps?: {
+      value_usd: number | null;
+      status: string;
+      error?: string;
+      positions?: Array<{
+        symbol: string;
+        contracts: number | null;
+        mark_price: number | null;
+        notional_usd: number | null;
+        unrealized_pnl_usd: number | null;
+      }>;
+    };
+    total_value_usd: number | null;
+  };
+  ledger?: {
+    status: string;
+    entries: Array<{
+      coin: string;
+      address: string;
+    }>;
+  };
 }
 
 export interface PaperOrder {
