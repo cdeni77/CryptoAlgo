@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from endpoints.coins import router as coins_router
+from endpoints.signals import router as signals_router
+from endpoints.trade import router as trades_router
+from endpoints.wallet import router as wallet_router
 from database import engine
 from endpoints.coins import router as coins_router
 from endpoints.paper import router as paper_router

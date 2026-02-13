@@ -3,6 +3,10 @@ from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
+from sqlalchemy import Column, DateTime, Enum, Float, Integer, String, Text
+from sqlalchemy.sql import func
+
+from models.base import Base
 from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
