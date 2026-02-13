@@ -3,7 +3,6 @@ import { getCDESpecs, getCoinHistory, getCurrentPrices } from './api/coinsApi';
 import { getPaperEquity, getPaperFills, getPaperPositions } from './api/paperApi';
 import { getRecentSignals } from './api/signalsApi';
 import { getAllTrades } from './api/tradesApi';
-import OpsPanel from './components/OpsPanel';
 import PaperEquityTable from './components/PaperEquityTable';
 import PaperPerformancePanel from './components/PaperPerformancePanel';
 import PaperPositionsTable from './components/PaperPositionsTable';
@@ -180,8 +179,6 @@ function App() {
       </header>
 
       <main className="max-w-[1400px] mx-auto px-5 py-6 space-y-6">
-        <OpsPanel />
-
         <section>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
             {COINS.map((coin) => (

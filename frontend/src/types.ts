@@ -74,36 +74,6 @@ export interface WalletData {
   total_pnl: number;
 }
 
-export interface OpsActionResponse {
-  action: string;
-  status: string;
-  detail: string;
-  pid?: number;
-}
-
-export interface OpsLogEntry {
-  raw: string;
-  timestamp: string | null;
-  level: string | null;
-  message: string | null;
-}
-
-export interface OpsLogsResponse {
-  entries: OpsLogEntry[];
-}
-
-export interface OpsStatus {
-  pipeline_running: boolean;
-  training_running: boolean;
-  parallel_running: boolean;
-  phase: string;
-  symbol: string | null;
-  metrics: Record<string, number>;
-  last_run_time: string | null;
-  next_run_time: string | null;
-  log_file: string;
-}
-
 export interface PaperOrder {
   id: number;
   signal_id: number;
