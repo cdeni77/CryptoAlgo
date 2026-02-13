@@ -4,7 +4,7 @@ from typing import List, Optional
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from models.signals import Signal
+from models.trade import Signal
 
 
 def get_recent_signals(db: Session, limit: int = 50) -> List[Signal]:
