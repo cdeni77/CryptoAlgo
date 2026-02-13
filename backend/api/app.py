@@ -5,6 +5,7 @@ from endpoints.trade import router as trades_router
 from endpoints.coins import router as coins_router
 from endpoints.wallet import router as wallet_router
 from endpoints.signals import router as signals_router
+from endpoints.ops import router as ops_router
 from database import engine
 
 # Create ALL tables (trades, wallet, signals) from the unified Base
@@ -34,6 +35,7 @@ app.include_router(trades_router)
 app.include_router(coins_router)
 app.include_router(wallet_router)
 app.include_router(signals_router)
+app.include_router(ops_router)
 
 
 @app.get("/")

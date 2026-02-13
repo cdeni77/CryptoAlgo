@@ -4,6 +4,7 @@ import PriceChart from './components/PriceChart';
 import TradesTable from './components/TradesTable';
 import SignalsTable from './components/SignalsTable';
 import WalletInfo from './components/WalletInfo';
+import OpsPanel from './components/OpsPanel';
 import { getCurrentPrices, getCoinHistory, getCDESpecs } from './api/coinsApi';
 import { getAllTrades } from './api/tradesApi';
 import { getRecentSignals } from './api/signalsApi';
@@ -239,6 +240,11 @@ function App() {
         {/* Wallet */}
         <section>
           <WalletInfo loading={loadingWallet} />
+        </section>
+
+        {/* Ops */}
+        <section>
+          <OpsPanel />
         </section>
 
         {/* Tabs: Signals + Trades */}
