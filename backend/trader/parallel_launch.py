@@ -2,6 +2,7 @@ import argparse
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
@@ -40,6 +41,9 @@ if __name__ == "__main__":
     print(f"   Worker split: {worker_counts}")
     print(f"{'='*60}")
 
+    run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+    print(f"   Study run id: {run_id}")
+
     processes = []
 
     # Launch per-coin workers to reduce study collisions and improve throughput.
@@ -67,6 +71,8 @@ if __name__ == "__main__":
                 str(args.plateau_min_delta),
                 "--plateau-warmup",
                 str(args.plateau_warmup),
+                "--study-suffix",
+                run_id,
             ]
 
             print(f"   Starting {coin} worker #{i + 1} ({trial_count} trials)...")
