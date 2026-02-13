@@ -498,11 +498,11 @@ if __name__ == "__main__":
     parser.add_argument("--show", action="store_true", help="Show saved results")
     parser.add_argument("--study-suffix", type=str, default="",
                         help="Optional suffix to isolate studies per launch (useful for parallel runs)")
-    parser.add_argument("--plateau-patience", type=int, default=80,
+    parser.add_argument("--plateau-patience", type=int, default=120,
                         help="Stop if best score does not improve for this many trials")
-    parser.add_argument("--plateau-min-delta", type=float, default=0.02,
+    parser.add_argument("--plateau-min-delta", type=float, default=0.01,
                         help="Minimum best-score improvement to reset plateau counter")
-    parser.add_argument("--plateau-warmup", type=int, default=40,
+    parser.add_argument("--plateau-warmup", type=int, default=80,
                         help="Minimum completed trials before plateau checks start")
     parser.add_argument("--resume-study", action="store_true",
                         help="Resume existing study name instead of starting a fresh one")
