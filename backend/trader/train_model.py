@@ -362,7 +362,6 @@ def load_data():
     data = {}
     print("⏳ Loading data from features and database...")
     feature_files = list(FEATURES_DIR.glob("*_features.csv"))
-    cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=90)
 
     for f in feature_files:
         sym = f.stem.replace("_features", "").replace("_", "-")
@@ -375,13 +374,11 @@ def load_data():
             ).set_index('event_time').sort_index()
             conn.close()
             ohlcv.index = pd.to_datetime(ohlcv.index, utc=True)
-            ohlcv = ohlcv.loc[ohlcv.index >= cutoff]
             ohlcv['sma_200'] = ohlcv['close'].rolling(200).mean()
 
             feat = pd.read_csv(f, index_col=0, parse_dates=True)
             feat = feat.replace([np.inf, -np.inf], 0).ffill().fillna(0)
             feat.index = pd.to_datetime(feat.index, utc=True)
-            feat = feat.loc[feat.index >= cutoff]
 
             common = feat.index.intersection(ohlcv.index)
             if len(common) > 1000:

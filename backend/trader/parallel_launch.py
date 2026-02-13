@@ -23,7 +23,7 @@ if __name__ == "__main__":
     if not target_coins:
         raise SystemExit("No coins selected")
 
-    # Distribute workers as evenly as possible while using all requested cores.
+    # Split the requested workers across selected coins.
     n_coins = len(target_coins)
     base_workers = max(1, args.jobs // n_coins)
     remainder_workers = max(0, args.jobs - (base_workers * n_coins))
@@ -39,6 +39,8 @@ if __name__ == "__main__":
     print(f"   Coins:        {target_coins}")
     print(f"   Target/coin:  {args.trials} trials")
     print(f"   Worker split: {worker_counts}")
+    print("   Note: each optimize.py worker runs with --jobs 1 (single process).")
+    print("         Parallelism comes from launching many worker processes.")
     print(f"{'='*60}")
 
     run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S')
@@ -46,7 +48,7 @@ if __name__ == "__main__":
 
     processes = []
 
-    # Launch per-coin workers to reduce study collisions and improve throughput.
+    # Launch per-coin workers. Total running processes ~= requested --jobs.
     for coin in target_coins:
         workers_for_coin = max(1, worker_counts[coin])
 
@@ -75,7 +77,11 @@ if __name__ == "__main__":
                 run_id,
             ]
 
-            print(f"   Starting {coin} worker #{i + 1} ({trial_count} trials)...")
+
+            print(
+                f"   Starting {coin} worker #{i + 1}/{workers_for_coin} "
+                f"({trial_count} trials, process-level parallelism)..."
+            )
             p = subprocess.Popen(base_cmd)
             processes.append(p)
             # Stagger starts to reduce initial DB lock contention
