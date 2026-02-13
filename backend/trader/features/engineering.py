@@ -13,9 +13,7 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
 # Point-in-Time Normalization Utilities
-# =============================================================================
 
 def normalize_point_in_time(series: pd.Series, lookback: int = 168, min_periods: int = 24) -> pd.Series:
     """Normalize using rolling window to prevent lookahead bias."""
@@ -29,9 +27,7 @@ def winsorize_point_in_time(series: pd.Series, lookback: int = 168) -> pd.Series
     upper = series.rolling(window=lookback, min_periods=24).quantile(0.99)
     return series.clip(lower=lower, upper=upper)
 
-# =============================================================================
 # Feature Blocks
-# =============================================================================
 
 class PriceFeatures:
     """Price-derived technical indicators."""
@@ -211,9 +207,7 @@ class RegimeFeatures:
         return features
 
 
-# =============================================================================
 # COIN-SPECIFIC FEATURE BLOCKS (v8)
-# =============================================================================
 
 class BTCMeanReversionFeatures:
     """
@@ -413,9 +407,7 @@ class DOGESentimentFeatures:
         return features
 
 
-# =============================================================================
 # Coin-Specific Feature Labels
-# =============================================================================
 
 # Map symbol prefixes to their coin-specific feature class
 COIN_FEATURE_MAP = {
@@ -434,9 +426,7 @@ def get_coin_feature_class(symbol: str):
     return COIN_FEATURE_MAP.get(prefix, None)
 
 
-# =============================================================================
 # Main Pipeline Class
-# =============================================================================
 
 @dataclass
 class FeatureConfig:
