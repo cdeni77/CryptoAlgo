@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends
@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from coinbase.rest import RESTClient
 from database import get_db
-from models.trade import Trade, TradeSide, TradeStatus
+from models.trade import PaperEquityCurve, Trade, TradeSide, TradeStatus
 from models.wallet import Wallet
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
@@ -59,6 +59,7 @@ def get_coinbase_spot_portfolio() -> Dict[str, Any]:
         accounts_response = client.get_accounts(limit=250)
         accounts = _to_dict(accounts_response).get("accounts", [])
         total_usd = 0.0
+        assets: List[Dict[str, Any]] = []
 
         for account in accounts:
             account_d = _to_dict(account)
@@ -77,6 +78,14 @@ def get_coinbase_spot_portfolio() -> Dict[str, Any]:
 
             if currency in ("USD", "USDC", "USDT"):
                 total_usd += amount
+                assets.append(
+                    {
+                        "asset": currency,
+                        "amount": round(amount, 8),
+                        "price_usd": 1.0,
+                        "value_usd": round(amount, 2),
+                    }
+                )
                 continue
 
             if not currency:
@@ -84,15 +93,28 @@ def get_coinbase_spot_portfolio() -> Dict[str, Any]:
 
             price = get_current_price(f"{currency}-USD")
             if price is not None:
-                total_usd += amount * price
+                value_usd = amount * price
+                total_usd += value_usd
+                assets.append(
+                    {
+                        "asset": currency,
+                        "amount": round(amount, 8),
+                        "price_usd": round(price, 6),
+                        "value_usd": round(value_usd, 2),
+                    }
+                )
+
+        assets.sort(key=lambda item: item.get("value_usd") or 0.0, reverse=True)
 
         return {
             "value_usd": round(total_usd, 2),
+            "assets": assets,
             "status": "ok",
         }
     except Exception as exc:
         return {
             "value_usd": None,
+            "assets": [],
             "status": "error",
             "error": str(exc),
         }
@@ -103,6 +125,7 @@ def get_coinbase_perps_portfolio() -> Dict[str, Any]:
     try:
         balances_response = client.get_perps_portfolio_balances()
         balances = _to_dict(balances_response)
+        positions: List[Dict[str, Any]] = []
 
         candidates = [
             balances.get("total_balance_usd"),
@@ -120,13 +143,42 @@ def get_coinbase_perps_portfolio() -> Dict[str, Any]:
             summary = _to_dict(summary_response)
             value_usd = _safe_float(summary.get("equity_usd") or summary.get("portfolio_value_usd"))
 
+        if hasattr(client, "get_perps_positions"):
+            try:
+                positions_response = client.get_perps_positions()
+                for raw_position in _to_dict(positions_response).get("positions", []):
+                    pos = _to_dict(raw_position)
+                    symbol = pos.get("product_id") or pos.get("symbol")
+                    contracts = _safe_float(pos.get("number_of_contracts") or pos.get("contracts"))
+                    mark_price = _safe_float(pos.get("mark_price"))
+                    notional = _safe_float(pos.get("notional_value_usd") or pos.get("notional_usd"))
+                    unrealized_pnl = _safe_float(pos.get("unrealized_pnl") or pos.get("unrealized_pnl_usd"))
+                    if symbol and (contracts is not None or notional is not None):
+                        positions.append(
+                            {
+                                "symbol": symbol,
+                                "contracts": round(contracts, 8) if contracts is not None else None,
+                                "mark_price": round(mark_price, 6) if mark_price is not None else None,
+                                "notional_usd": round(notional, 2) if notional is not None else None,
+                                "unrealized_pnl_usd": round(unrealized_pnl, 2)
+                                if unrealized_pnl is not None
+                                else None,
+                            }
+                        )
+            except Exception:
+                positions = []
+
+        positions.sort(key=lambda item: abs(item.get("notional_usd") or 0.0), reverse=True)
+
         return {
             "value_usd": round(value_usd, 2) if value_usd is not None else None,
+            "positions": positions,
             "status": "ok" if value_usd is not None else "unavailable",
         }
     except Exception as exc:
         return {
             "value_usd": None,
+            "positions": [],
             "status": "error",
             "error": str(exc),
         }
@@ -168,17 +220,33 @@ def get_wallet(db: Session = Depends(get_db)):
     if spot_usd is not None or perps_usd is not None:
         _upsert_wallet_balance(db, coinbase_total)
 
-    # Current balance from latest wallet entry (DB fallback if Coinbase unavailable)
+    # Current paper-trading wallet balance from latest wallet entry (DB fallback)
     wallet = db.query(Wallet).order_by(Wallet.id.desc()).first()
-    balance = wallet.balance if wallet else 10000.0
+    paper_balance = wallet.balance if wallet else 10000.0
+
+    latest_equity = db.query(PaperEquityCurve).order_by(PaperEquityCurve.timestamp.desc()).first()
+    paper_equity = latest_equity.equity if latest_equity else None
+    paper_cash = latest_equity.cash_balance if latest_equity else None
+    paper_unrealized = latest_equity.unrealized_pnl if latest_equity else None
 
     total_pnl = realized_pnl + unrealized_pnl
+    effective_paper_balance = paper_equity if paper_equity is not None else paper_balance
 
     return {
-        "balance": balance,
+        "balance": effective_paper_balance,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
         "total_pnl": total_pnl,
+        "wallets": {
+            "paper_trading": {
+                "value_usd": round(effective_paper_balance, 2),
+                "cash_usd": round(paper_cash, 2) if paper_cash is not None else None,
+                "unrealized_pnl": round(paper_unrealized, 2) if paper_unrealized is not None else None,
+                "status": "ok",
+            },
+            "coinbase_spot": {"value_usd": spot.get("value_usd"), "status": spot.get("status")},
+            "coinbase_perps": {"value_usd": perps.get("value_usd"), "status": perps.get("status")},
+        },
         "coinbase": {
             "spot": spot,
             "perps": perps,

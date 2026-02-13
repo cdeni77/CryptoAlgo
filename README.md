@@ -160,7 +160,7 @@ Base URL: `http://localhost:8000`
 - `GET /coins/history/{symbol}` — historical spot OHLCV
 - `GET /trades/*` — trade history endpoints
 - `GET /signals/*` — signal endpoints
-- `GET /wallet/` — wallet summary with Coinbase spot + perps portfolio sync (persisted to DB)
+- `GET /wallet/` — wallet summary exposing paper trading wallet + Coinbase spot/perps totals and coin/position breakdowns
 - `GET /paper/*` — paper orders/fills/positions/equity telemetry
 
 Note: legacy `/ops` endpoints were intentionally removed; operational control is CLI/orchestrator-driven.
