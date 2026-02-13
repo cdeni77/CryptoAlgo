@@ -46,40 +46,35 @@ if __name__ == "__main__":
 
     processes = []
 
-    # Launch per-coin workers to reduce study collisions and improve throughput.
+    # Launch one process per coin and let Optuna handle intra-coin parallelism via
+    # --jobs. This keeps logs readable, avoids repeatedly loading the same data,
+    # and makes the reported "Cores" value match the configured split.
     for coin in target_coins:
         workers_for_coin = max(1, worker_counts[coin])
+        base_cmd = [
+            sys.executable,
+            "optimize.py",
+            "--coin",
+            coin,
+            "--jobs",
+            str(workers_for_coin),
+            "--trials",
+            str(max(1, args.trials)),
+            "--plateau-patience",
+            str(args.plateau_patience),
+            "--plateau-min-delta",
+            str(args.plateau_min_delta),
+            "--plateau-warmup",
+            str(args.plateau_warmup),
+            "--study-suffix",
+            run_id,
+        ]
 
-        # Split trials across workers as evenly as possible per coin.
-        base_trials = args.trials // workers_for_coin
-        extra = args.trials % workers_for_coin
-        trial_splits = [base_trials + (1 if i < extra else 0) for i in range(workers_for_coin)]
-
-        for i, trial_count in enumerate(trial_splits):
-            base_cmd = [
-                sys.executable,
-                "optimize.py",
-                "--coin",
-                coin,
-                "--jobs",
-                "1",
-                "--trials",
-                str(max(1, trial_count)),
-                "--plateau-patience",
-                str(args.plateau_patience),
-                "--plateau-min-delta",
-                str(args.plateau_min_delta),
-                "--plateau-warmup",
-                str(args.plateau_warmup),
-                "--study-suffix",
-                run_id,
-            ]
-
-            print(f"   Starting {coin} worker #{i + 1} ({trial_count} trials)...")
-            p = subprocess.Popen(base_cmd)
-            processes.append(p)
-            # Stagger starts to reduce initial DB lock contention
-            time.sleep(0.35)
+        print(f"   Starting {coin} ({args.trials} trials, {workers_for_coin} cores)...")
+        p = subprocess.Popen(base_cmd)
+        processes.append(p)
+        # Stagger starts to reduce initial DB lock contention
+        time.sleep(0.35)
 
     print(f"\n✅ All {len(processes)} workers started. Monitor CPU usage now!")
     print("   Press Ctrl+C to stop all workers.\n")
