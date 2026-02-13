@@ -101,6 +101,8 @@ export interface OpsStatus {
   last_run_time: string | null;
   next_run_time: string | null;
   log_file: string;
+}
+
 export interface PaperOrder {
   id: number;
   signal_id: number;
