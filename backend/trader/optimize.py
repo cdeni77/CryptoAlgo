@@ -348,7 +348,8 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   n_trials: int = 50, n_jobs: int = 1,
                   plateau_patience: int = 80, plateau_min_delta: float = 0.02,
                   plateau_warmup: int = 40,
-                  study_suffix: str = ""):
+                  study_suffix: str = "",
+                  resume_study: bool = False):
     """Run Optuna optimization for a single coin with parallel support."""
     
     # 1. Setup Persistent Storage (Required for parallel jobs)
@@ -367,7 +368,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         sampler=TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3)),
         study_name=study_name,
         storage=storage_url,
-        load_if_exists=True 
+        load_if_exists=resume_study 
     )
 
     # 2. Run Optimization
@@ -520,9 +521,17 @@ if __name__ == "__main__":
                         help="Minimum completed trials before plateau checks start")
     parser.add_argument("--debug-trials", action="store_true",
                         help="Show per-trial backtest logs/exceptions for debugging")
+    parser.add_argument("--resume-study", action="store_true",
+                        help="Resume existing study name instead of starting a fresh one")
     args = parser.parse_args()
 
     DEBUG_TRIALS = args.debug_trials
+
+    # Default to fresh studies per run to avoid reusing stale/plateaued trials.
+    effective_study_suffix = args.study_suffix
+    if not args.resume_study and not effective_study_suffix:
+        effective_study_suffix = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        print(f"🆕 Using fresh study suffix: {effective_study_suffix}")
 
     # Initialize SQLite WAL mode BEFORE running anything else
     init_db_wal()
@@ -558,7 +567,8 @@ if __name__ == "__main__":
                     plateau_patience=args.plateau_patience,
                     plateau_min_delta=args.plateau_min_delta,
                     plateau_warmup=args.plateau_warmup,
-                    study_suffix=args.study_suffix,
+                    study_suffix=effective_study_suffix,
+                    resume_study=args.resume_study,
                 )
     else:
         # Single coin
@@ -584,5 +594,6 @@ if __name__ == "__main__":
             plateau_patience=args.plateau_patience,
             plateau_min_delta=args.plateau_min_delta,
             plateau_warmup=args.plateau_warmup,
-            study_suffix=args.study_suffix,
+            study_suffix=effective_study_suffix,
+            resume_study=args.resume_study,
         )
