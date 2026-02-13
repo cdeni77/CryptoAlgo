@@ -138,7 +138,7 @@ export interface WalletData {
     total_value_usd: number;
   }>;
   portfolio_history_by_range?: Record<
-    '1h' | '1d' | '1w' | '1y',
+    '1h' | '1d' | '1w' | '1m' | '1y',
     Array<{
       timestamp: string;
       paper_equity_usd: number;

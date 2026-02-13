@@ -17,7 +17,7 @@ interface WalletInfoProps {
 
 export default function WalletInfo({ loading }: WalletInfoProps) {
   const [wallet, setWallet] = useState<WalletData | null>(null);
-  const [portfolioRange, setPortfolioRange] = useState<'1h' | '1d' | '1w' | '1y'>('1d');
+  const [portfolioRange, setPortfolioRange] = useState<'1h' | '1d' | '1w' | '1m' | '1y'>('1d');
 
   useEffect(() => {
     const loadWallet = async () => {
@@ -34,14 +34,6 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
     return () => clearInterval(interval);
   }, []);
 
-  if (loading || !wallet) {
-    return (
-      <div className="glass-card rounded-xl p-10 flex items-center justify-center h-40">
-        <div className="w-10 h-10 border-2 border-[var(--accent-cyan)] border-t-transparent rounded-full animate-spin" />
-      </div>
-    );
-  }
-
   const fmt = (v: number) =>
     `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
@@ -54,6 +46,14 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
     const seriesFromRange = wallet.portfolio_history_by_range?.[portfolioRange];
     return seriesFromRange?.length ? seriesFromRange : wallet.portfolio_history ?? [];
   }, [wallet, portfolioRange]);
+
+  if (loading || !wallet) {
+    return (
+      <div className="glass-card rounded-xl p-10 flex items-center justify-center h-40">
+        <div className="w-10 h-10 border-2 border-[var(--accent-cyan)] border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
 
   const items = [
     {
@@ -123,7 +123,7 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
         <div className="mb-3 flex items-center justify-between gap-2">
           <p className="text-sm font-semibold text-[var(--text-primary)]">Total Portfolio Trend</p>
           <div className="flex gap-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-primary)] p-1">
-            {(['1h', '1d', '1w', '1y'] as const).map((range) => (
+            {(['1h', '1d', '1w', '1m', '1y'] as const).map((range) => (
               <button
                 key={range}
                 type="button"
