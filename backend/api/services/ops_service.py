@@ -79,7 +79,7 @@ class OpsService:
 
             self._phase = "training"
             self._next_run_time = datetime.utcnow() + timedelta(hours=1)
-            self._training_proc = self._spawn(["python", "train_model.py"])
+            self._training_proc = self._spawn(["python", "live_orchestrator.py", "--retrain-only", "--run-once"])
             return self._training_proc.pid
 
     def _parse_timestamp(self, value: str) -> Optional[datetime]:
