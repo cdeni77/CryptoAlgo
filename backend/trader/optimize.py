@@ -55,8 +55,7 @@ warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.ERROR)
 logging.getLogger("lightgbm").setLevel(logging.ERROR)
 
-RESULTS_DIR = Path("./optimization_results")
-RESULTS_DIR.mkdir(exist_ok=True)
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Map coin prefix to symbol (filled at runtime)
 PREFIX_TO_SYMBOL: Dict[str, str] = {}
@@ -514,7 +513,7 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
     print(f"{'='*60}")
 
     # STEP 1: Setup Optuna study
-    storage_url = "sqlite:///optuna_trading.db"
+    storage_url = _sqlite_url(_db_path())
     study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
 
     sampler = TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3))
@@ -589,7 +588,13 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         return None
 
     # STEP 3: Report optimization results
-    best = study.best_trial
+    best = _select_best_trial(study)
+
+    if best.number != study.best_trial.number:
+        print(
+            f"\n🛡️ Selected trial #{best.number} over raw best #{study.best_trial.number} "
+            "for better OOS robustness constraints."
+        )
 
     if _as_number(best.value) == -99.0:
         reason_counts = {}
@@ -659,10 +664,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         'holdout_days': holdout_days,
         'timestamp': datetime.now().isoformat(),
     }
-    result_path = RESULTS_DIR / f"{coin_name}_optimization.json"
-    with open(result_path, 'w') as f:
-        json.dump(result_data, f, indent=2)
-    print(f"\n  💾 Saved to {result_path}")
+    result_path = _persist_result_json(coin_name, result_data)
+    if result_path:
+        print(f"\n  💾 Saved to {result_path}")
 
     # STEP 6: Generate code snippet
     print(f"\n  📝 Suggested CoinProfile:")
@@ -687,7 +691,17 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
 
 def show_results():
     """Display all saved optimization results."""
-    results = sorted(RESULTS_DIR.glob("*_optimization.json"))
+    all_results = []
+    seen = set()
+    for result_dir in _candidate_results_dirs():
+        for p in result_dir.glob("*_optimization.json"):
+            rp = str(p.resolve())
+            if rp in seen:
+                continue
+            seen.add(rp)
+            all_results.append(p)
+
+    results = sorted(all_results)
     if not results:
         print("No optimization results found.")
         return
@@ -719,6 +733,79 @@ def show_results():
                 f"Return={_fmt_pct(h.get('holdout_return'), 2)} | "
                 f"Trades={h.get('holdout_trades', '?')}"
             )
+
+
+def _db_path() -> Path:
+    """Return the Optuna DB path anchored to this script's directory."""
+    return SCRIPT_DIR / "optuna_trading.db"
+
+
+def _sqlite_url(path: Path) -> str:
+    """Build a sqlite URL that is independent of the current working directory."""
+    return f"sqlite:///{path.resolve()}"
+
+
+def _candidate_results_dirs() -> list[Path]:
+    """Candidate locations for optimization result JSON files.
+
+    We prefer script-local paths so optimize.py and parallel_launch.py agree, but
+    we keep fallbacks for environments where script directories are read-only.
+    """
+    return [
+        SCRIPT_DIR / "optimization_results",
+        Path.cwd() / "optimization_results",
+        Path.home() / ".cryptoalgo" / "optimization_results",
+    ]
+
+
+def _persist_result_json(coin_name: str, result_data: Dict) -> Optional[Path]:
+    """Persist optimization results with writable-path fallbacks."""
+    last_error = None
+    for candidate_dir in _candidate_results_dirs():
+        try:
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            result_path = candidate_dir / f"{coin_name}_optimization.json"
+            with open(result_path, 'w') as f:
+                json.dump(result_data, f, indent=2)
+            return result_path
+        except PermissionError as e:
+            last_error = e
+            continue
+        except OSError as e:
+            last_error = e
+            continue
+
+    print(f"\n  ❌ Failed to save optimization result for {coin_name}: {last_error}")
+    print("     Tried paths:")
+    for p in _candidate_results_dirs():
+        print(f"       - {p}")
+    return None
+
+
+def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades: int = 8) -> optuna.trial.FrozenTrial:
+    """Prefer robust trials over raw best score to reduce overfit selection."""
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+    if not completed:
+        return study.best_trial
+
+    filtered = []
+    for t in completed:
+        if (t.user_attrs.get('n_trades', 0) or 0) < min_trades:
+            continue
+        if (t.user_attrs.get('oos_trades', 0) or 0) < min_oos_trades:
+            continue
+        oos_sharpe = _as_number(t.user_attrs.get('oos_sharpe'), 0.0) or 0.0
+        if oos_sharpe <= -0.2:
+            continue
+        filtered.append(t)
+
+    if filtered:
+        return max(filtered, key=lambda t: t.value)
+
+    return study.best_trial
 
 
 COIN_MAP = {
@@ -759,18 +846,18 @@ if __name__ == "__main__":
     if args.debug_trials:
         DEBUG_TRIALS = True
 
+    # Initialize SQLite WAL mode BEFORE running anything else
+    init_db_wal(str(_db_path()))
+
+    if args.show:
+        show_results()
+        sys.exit(0)
+
     # Default to fresh studies per run to avoid reusing stale/plateaued trials.
     effective_study_suffix = args.study_suffix
     if not effective_study_suffix:
         effective_study_suffix = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         print(f"🆕 Using fresh study suffix: {effective_study_suffix}")
-
-    # Initialize SQLite WAL mode BEFORE running anything else
-    init_db_wal()
-
-    if args.show:
-        show_results()
-        sys.exit(0)
 
     if not args.coin and not args.all:
         parser.print_help()
