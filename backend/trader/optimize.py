@@ -94,6 +94,14 @@ def _as_number(value, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _finite_metric(value, default: float = 0.0) -> float:
+    """Return finite float metrics, replacing NaN/inf with a safe default."""
+    n = _as_number(value, default=default)
+    if n is None or not np.isfinite(n):
+        return default
+    return float(n)
+
+
 def _fmt_pct(value, decimals: int = 1, fallback: str = "?") -> str:
     n = _as_number(value)
     return f"{n:.{decimals}%}" if n is not None else fallback
@@ -262,7 +270,7 @@ def profile_from_params(params: Dict, coin_name: str) -> CoinProfile:
     )
 
 
-def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: str) -> float:
+def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: str, internal_oos_days: int = 90) -> float:
     """
     Optuna objective: run single-coin backtest on OPTIMIZATION WINDOW ONLY.
     
@@ -286,7 +294,7 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
         min_signal_edge=0.00,
         max_ensemble_std=0.10,
         train_embargo_hours=24,
-        oos_eval_days=60,  # Still computed but NOT used in the score
+        oos_eval_days=max(30, int(internal_oos_days)),  # penalty-only OOS diagnostic window
     )
 
     try:
@@ -310,14 +318,15 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
 
     # Extract metrics
     n_trades = int(result.get('n_trades', 0) or 0)
-    sharpe = float(result.get('sharpe_annual', 0.0) or 0.0)
-    pf = float(result.get('profit_factor', 0.0) or 0.0)
-    dd = float(result.get('max_drawdown', 1.0) or 1.0)
-    wr = float(result.get('win_rate', 0.0) or 0.0)
-    ann_ret = float(result.get('ann_return', -1.0) or -1.0)
-    trades_per_year = float(result.get('trades_per_year', 0.0) or 0.0)
-    oos_sharpe = float(result.get('oos_sharpe', 0.0) or 0.0)
-    oos_return = float(result.get('oos_return', 0.0) or 0.0)
+    sharpe = _finite_metric(result.get('sharpe_annual', 0.0), default=0.0)
+    pf_raw = _as_number(result.get('profit_factor', 0.0), default=0.0) or 0.0
+    pf = float(pf_raw) if np.isfinite(pf_raw) else 5.0
+    dd = _finite_metric(result.get('max_drawdown', 1.0), default=1.0)
+    wr = _finite_metric(result.get('win_rate', 0.0), default=0.0)
+    ann_ret = _finite_metric(result.get('ann_return', -1.0), default=-1.0)
+    trades_per_year = _finite_metric(result.get('trades_per_year', 0.0), default=0.0)
+    oos_sharpe = _finite_metric(result.get('oos_sharpe', 0.0), default=0.0)
+    oos_return = _finite_metric(result.get('oos_return', 0.0), default=0.0)
     oos_trades = int(result.get('oos_trades', 0) or 0)
 
     # Treat sentinel values as missing data
@@ -333,11 +342,13 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     # (model never sees future data), but we no longer let Optuna optimize
     # toward a specific OOS window — that's reserved for the holdout eval.
     #
-    # We still use the internal OOS (last 60 days of optim window) as a
+    # We still use the internal OOS (penalty-only diagnostic window) as a
     # PENALTY signal to catch severe overfit, but it doesn't contribute
     # positively to the score.
 
-    pf_bonus = max(0, (pf - 1.0)) * 0.5 if pf > 0 else 0.0
+    # Cap PF contribution to prevent infinite/unstable trial values from dominating.
+    pf_capped = min(max(0.0, pf), 5.0)
+    pf_bonus = max(0, (pf_capped - 1.0)) * 0.5 if pf_capped > 0 else 0.0
     dd_penalty = max(0.0, dd - 0.30) * 3.0
 
     # Trade frequency penalties
@@ -380,7 +391,7 @@ def objective(trial: optuna.Trial, all_data: Dict, coin_prefix: str, coin_name: 
     trial.set_user_attr('win_rate', round(wr, 3))
     trial.set_user_attr('ann_return', round(ann_ret, 4))
     trial.set_user_attr('sharpe', round(sharpe, 3))
-    trial.set_user_attr('profit_factor', round(pf, 3))
+    trial.set_user_attr('profit_factor', round(pf_capped, 3))
     trial.set_user_attr('max_drawdown', round(dd, 4))
     trial.set_user_attr('oos_trades', int(oos_trades))
     trial.set_user_attr('oos_sharpe', round(oos_sharpe, 3))
@@ -556,11 +567,13 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         return None
 
     # STEP 2: Run Optimization on OPTIMIZATION WINDOW ONLY
+    internal_oos_days = min(120, max(60, holdout_days // 2))
     objective_func = functools.partial(
         objective,
         all_data=optim_data,  # <-- KEY: only optimization data, no holdout
         coin_prefix=coin_prefix,
-        coin_name=coin_name
+        coin_name=coin_name,
+        internal_oos_days=internal_oos_days,
     )
 
     stopper = PlateauStopper(
@@ -782,7 +795,7 @@ def _persist_result_json(coin_name: str, result_data: Dict) -> Optional[Path]:
     return None
 
 
-def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades: int = 8) -> optuna.trial.FrozenTrial:
+def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades: int = 10) -> optuna.trial.FrozenTrial:
     """Prefer robust trials over raw best score to reduce overfit selection."""
     completed = [
         t for t in study.trials
@@ -824,7 +837,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Per-coin Optuna parameter optimization (v9 — True Holdout)")
     parser.add_argument("--coin", type=str, help="Coin prefix or name (e.g. BIP, BTC)")
     parser.add_argument("--all", action="store_true", help="Optimize all coins")
-    parser.add_argument("--trials", type=int, default=50, help="Number of trials")
+    parser.add_argument("--trials", type=int, default=150, help="Number of trials")
     parser.add_argument("--jobs", type=int, default=1, help="Parallel jobs (-1 = all cores)")
     parser.add_argument("--show", action="store_true", help="Show saved results")
     parser.add_argument("--study-suffix", type=str, default="",
@@ -837,7 +850,7 @@ if __name__ == "__main__":
                         help="Minimum completed trials before plateau checks start")
     parser.add_argument("--resume-study", action="store_true",
                         help="Resume existing study name instead of starting a fresh one")
-    parser.add_argument("--holdout-days", type=int, default=120,
+    parser.add_argument("--holdout-days", type=int, default=180,
                         help="Days of data to reserve as true holdout (never seen by Optuna)")
     parser.add_argument("--debug-trials", action="store_true",
                         help="Enable verbose per-trial output")
