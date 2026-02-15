@@ -767,7 +767,6 @@ def _candidate_results_dirs() -> list[Path]:
     return [
         SCRIPT_DIR / "optimization_results",
         Path.cwd() / "optimization_results",
-        Path.home() / ".cryptoalgo" / "optimization_results",
     ]
 
 
