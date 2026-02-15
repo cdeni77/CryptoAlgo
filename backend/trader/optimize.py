@@ -854,6 +854,45 @@ def show_results():
         )
 
 
+
+
+def apply_runtime_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply curated runtime presets for more robust holdout-oriented searches."""
+    presets = {
+        'robust180': {
+            'trials': 350,
+            'plateau_patience': 140,
+            'plateau_warmup': 80,
+            'plateau_min_delta': 0.015,
+            'holdout_days': 180,
+            'min_internal_oos_trades': 14,
+            'min_total_trades': 45,
+        },
+        'robust120': {
+            'trials': 280,
+            'plateau_patience': 120,
+            'plateau_warmup': 70,
+            'plateau_min_delta': 0.02,
+            'holdout_days': 120,
+            'min_internal_oos_trades': 10,
+            'min_total_trades': 35,
+        },
+    }
+
+    preset_name = getattr(args, 'preset', 'none')
+    if preset_name in (None, '', 'none'):
+        return args
+
+    config = presets.get(preset_name)
+    if not config:
+        return args
+
+    for k, v in config.items():
+        setattr(args, k, v)
+
+    print(f"🧭 Applied preset '{preset_name}': " + ", ".join(f"{k}={v}" for k, v in config.items()))
+    return args
+
 def _db_path() -> Path:
     """Return the Optuna DB path anchored to this script's directory."""
     return SCRIPT_DIR / "optuna_trading.db"
@@ -979,6 +1018,8 @@ if __name__ == "__main__":
                         help="Resume existing study name instead of starting a fresh one")
     parser.add_argument("--holdout-days", type=int, default=180,
                         help="Days of data to reserve as true holdout (never seen by Optuna)")
+    parser.add_argument("--preset", type=str, default="robust180", choices=["none", "robust120", "robust180"],
+                        help="Apply a curated optimization preset for holdout robustness")
     parser.add_argument("--min-internal-oos-trades", type=int, default=0,
                         help="Override minimum internal OOS trades required when selecting best trial (0=auto)")
     parser.add_argument("--min-total-trades", type=int, default=0,
@@ -986,6 +1027,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug-trials", action="store_true",
                         help="Enable verbose per-trial output")
     args = parser.parse_args()
+    args = apply_runtime_preset(args)
 
     if args.debug_trials:
         DEBUG_TRIALS = True
