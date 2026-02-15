@@ -560,7 +560,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   plateau_warmup: int = 60,
                   study_suffix: str = "",
                   resume_study: bool = False,
-                  holdout_days: int = 120):
+                  holdout_days: int = 120,
+                  min_internal_oos_trades: int = 0,
+                  min_total_trades: int = 0):
     """Run Optuna optimization for a single coin with true holdout evaluation."""
 
     # STEP 0: Split data into optimization + holdout windows
@@ -670,13 +672,28 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         return None
 
     # STEP 3: Report optimization results
-    best = _select_best_trial(study)
+    # Increase minimum internal-OOS trade requirement for longer holdouts.
+    # This encourages selecting parameter sets with enough signal cadence to
+    # actually produce trades in a 120-180d true holdout.
+    min_internal_oos_trades = min_internal_oos_trades or max(8, int(round(internal_oos_days / 8)))
+    min_total_trades = min_total_trades or max(20, int(round(internal_oos_days / 3)))
+    best = _select_best_trial(
+        study,
+        min_trades=min_total_trades,
+        min_oos_trades=min_internal_oos_trades,
+        min_oos_return=-0.01,
+    )
 
     if best.number != study.best_trial.number:
         print(
             f"\n🛡️ Selected trial #{best.number} over raw best #{study.best_trial.number} "
             "for better OOS robustness constraints."
         )
+
+    print(
+        f"  Robust trial gates: min_trades={min_total_trades}, "
+        f"min_internal_oos_trades={min_internal_oos_trades}, min_internal_oos_return=-1.00%"
+    )
 
     if _as_number(best.value) == -99.0:
         reason_counts = {}
@@ -883,8 +900,19 @@ def _persist_result_json(coin_name: str, result_data: Dict) -> Optional[Path]:
     return None
 
 
-def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades: int = 10) -> optuna.trial.FrozenTrial:
-    """Prefer robust trials over raw best score to reduce overfit selection."""
+def _select_best_trial(
+    study: optuna.Study,
+    min_trades: int = 20,
+    min_oos_trades: int = 10,
+    min_oos_return: float = -0.02,
+) -> optuna.trial.FrozenTrial:
+    """Prefer robust trials over raw best score to reduce overfit selection.
+
+    Selection rank (strict to relaxed):
+      1) Meets all robustness filters.
+      2) Meets trade-count filters only.
+      3) Raw Optuna best trial.
+    """
     completed = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
@@ -892,21 +920,32 @@ def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades
     if not completed:
         return study.best_trial
 
-    filtered = []
+    robust = []
+    trade_only = []
+
     for t in completed:
-        if (t.user_attrs.get('n_trades', 0) or 0) < min_trades:
+        n_trades = int(t.user_attrs.get('n_trades', 0) or 0)
+        oos_trades = int(t.user_attrs.get('oos_trades', 0) or 0)
+        if n_trades < min_trades or oos_trades < min_oos_trades:
             continue
-        if (t.user_attrs.get('oos_trades', 0) or 0) < min_oos_trades:
-            continue
+
+        trade_only.append(t)
+
         oos_sharpe = _as_number(t.user_attrs.get('oos_sharpe'), 0.0) or 0.0
+        oos_return = _as_number(t.user_attrs.get('oos_return'), 0.0) or 0.0
         if oos_sharpe <= -0.2:
             continue
-        filtered.append(t)
+        if oos_return < min_oos_return:
+            continue
+        robust.append(t)
 
-    if filtered:
-        return max(filtered, key=lambda t: t.value)
+    if robust:
+        return max(robust, key=lambda t: t.value)
+    if trade_only:
+        return max(trade_only, key=lambda t: t.value)
 
     return study.best_trial
+
 
 
 COIN_MAP = {
@@ -940,6 +979,10 @@ if __name__ == "__main__":
                         help="Resume existing study name instead of starting a fresh one")
     parser.add_argument("--holdout-days", type=int, default=180,
                         help="Days of data to reserve as true holdout (never seen by Optuna)")
+    parser.add_argument("--min-internal-oos-trades", type=int, default=0,
+                        help="Override minimum internal OOS trades required when selecting best trial (0=auto)")
+    parser.add_argument("--min-total-trades", type=int, default=0,
+                        help="Override minimum total trades required when selecting best trial (0=auto)")
     parser.add_argument("--debug-trials", action="store_true",
                         help="Enable verbose per-trial output")
     args = parser.parse_args()
@@ -989,6 +1032,8 @@ if __name__ == "__main__":
                     study_suffix=effective_study_suffix,
                     resume_study=args.resume_study,
                     holdout_days=args.holdout_days,
+                    min_internal_oos_trades=args.min_internal_oos_trades,
+                    min_total_trades=args.min_total_trades,
                 )
     else:
         coin_input = args.coin.upper()
@@ -1015,4 +1060,6 @@ if __name__ == "__main__":
             study_suffix=effective_study_suffix,
             resume_study=args.resume_study,
             holdout_days=args.holdout_days,
+            min_internal_oos_trades=args.min_internal_oos_trades,
+            min_total_trades=args.min_total_trades,
         )
