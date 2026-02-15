@@ -1018,7 +1018,7 @@ if __name__ == "__main__":
                         help="Resume existing study name instead of starting a fresh one")
     parser.add_argument("--holdout-days", type=int, default=180,
                         help="Days of data to reserve as true holdout (never seen by Optuna)")
-    parser.add_argument("--preset", type=str, default="none", choices=["none", "robust120", "robust180"],
+    parser.add_argument("--preset", type=str, default="robust180", choices=["none", "robust120", "robust180"],
                         help="Apply a curated optimization preset for holdout robustness")
     parser.add_argument("--min-internal-oos-trades", type=int, default=0,
                         help="Override minimum internal OOS trades required when selecting best trial (0=auto)")
