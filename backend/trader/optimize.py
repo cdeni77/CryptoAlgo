@@ -112,6 +112,66 @@ def _fmt_float(value, decimals: int = 3, fallback: str = "?") -> str:
     return f"{n:.{decimals}f}" if n is not None else fallback
 
 
+def _is_invalid_holdout_metric(holdout_sharpe: float, holdout_return: float, holdout_trades: int) -> bool:
+    """Detect sentinel / unusable holdout outputs produced when no real OOS test happened."""
+    if holdout_sharpe <= -90:
+        return True
+    if holdout_trades <= 0:
+        return True
+    if holdout_return <= -0.99:
+        return True
+    return False
+
+
+def assess_result_quality(result_data: Dict) -> Dict:
+    """Attach interpretable quality diagnostics so weak runs are easy to filter out."""
+    optim = result_data.get('optim_metrics', {}) or {}
+    holdout = result_data.get('holdout_metrics', {}) or {}
+
+    n_trials = int(result_data.get('n_trials', 0) or 0)
+    n_trades = int(optim.get('n_trades', 0) or 0)
+    pf = _finite_metric(optim.get('profit_factor', 0.0), default=0.0)
+    sharpe = _finite_metric(optim.get('sharpe', 0.0), default=0.0)
+
+    holdout_sharpe = _finite_metric(holdout.get('holdout_sharpe', 0.0), default=0.0)
+    holdout_return = _finite_metric(holdout.get('holdout_return', 0.0), default=0.0)
+    holdout_trades = int(holdout.get('holdout_trades', 0) or 0)
+    holdout_valid = not _is_invalid_holdout_metric(holdout_sharpe, holdout_return, holdout_trades)
+
+    issues = []
+    if n_trials < 50:
+        issues.append(f'low_trials:{n_trials}')
+    if n_trades < 30:
+        issues.append(f'low_optim_trades:{n_trades}')
+    if pf < 1.15:
+        issues.append(f'weak_profit_factor:{pf:.3f}')
+    if sharpe < 0.75:
+        issues.append(f'weak_sharpe:{sharpe:.3f}')
+
+    if not holdout_valid:
+        issues.append('invalid_holdout')
+    else:
+        if holdout_trades < 12:
+            issues.append(f'low_holdout_trades:{holdout_trades}')
+        if holdout_sharpe < 0.10:
+            issues.append(f'weak_holdout_sharpe:{holdout_sharpe:.3f}')
+        if holdout_return < 0.0:
+            issues.append(f'negative_holdout_return:{holdout_return:.4f}')
+
+    if not issues:
+        rating = 'promising'
+    elif len(issues) <= 2:
+        rating = 'watchlist'
+    else:
+        rating = 'reject'
+
+    return {
+        'rating': rating,
+        'holdout_valid': holdout_valid,
+        'issues': issues,
+    }
+
+
 def _set_reject_reason(trial: optuna.Trial, reason: str) -> None:
     trial.set_user_attr('reject_reason', reason)
 
@@ -472,10 +532,19 @@ def evaluate_holdout(holdout_data: Dict, best_params: Dict, coin_name: str,
         print(f"  ⚠️ Holdout backtest returned None")
         return None
 
+    holdout_sharpe = _finite_metric(result.get('oos_sharpe', 0.0), default=0.0)
+    holdout_return = _finite_metric(result.get('oos_return', 0.0), default=0.0)
+    holdout_trades = int(result.get('oos_trades', 0) or 0)
+
+    if _is_invalid_holdout_metric(holdout_sharpe, holdout_return, holdout_trades):
+        holdout_sharpe = 0.0
+        holdout_return = 0.0
+        holdout_trades = 0
+
     return {
-        'holdout_sharpe': float(result.get('oos_sharpe', 0.0) or 0.0),
-        'holdout_return': float(result.get('oos_return', 0.0) or 0.0),
-        'holdout_trades': int(result.get('oos_trades', 0) or 0),
+        'holdout_sharpe': holdout_sharpe,
+        'holdout_return': holdout_return,
+        'holdout_trades': holdout_trades,
         'full_sharpe': float(result.get('sharpe_annual', 0.0) or 0.0),
         'full_trades': int(result.get('n_trades', 0) or 0),
         'full_return': float(result.get('ann_return', 0.0) or 0.0),
@@ -677,6 +746,13 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         'holdout_days': holdout_days,
         'timestamp': datetime.now().isoformat(),
     }
+    result_data['quality'] = assess_result_quality(result_data)
+
+    quality = result_data['quality']
+    quality_issues = ', '.join(quality.get('issues', [])) if quality.get('issues') else 'none'
+    print(f"\n  🧪 Quality rating: {quality.get('rating', 'unknown')}")
+    print(f"     Holdout valid: {quality.get('holdout_valid', False)}")
+    print(f"     Issues:        {quality_issues}")
     result_path = _persist_result_json(coin_name, result_data)
     if result_path:
         print(f"\n  💾 Saved to {result_path}")
@@ -738,14 +814,27 @@ def show_results():
             f"Trades={m.get('n_trades', '?')}"
         )
         if h:
-            ho_sharpe = h.get('holdout_sharpe', 0)
-            if ho_sharpe and ho_sharpe <= -90:
+            ho_sharpe = _finite_metric(h.get('holdout_sharpe', 0.0), default=0.0)
+            ho_return = _finite_metric(h.get('holdout_return', 0.0), default=0.0)
+            ho_trades = int(h.get('holdout_trades', 0) or 0)
+            if _is_invalid_holdout_metric(ho_sharpe, ho_return, ho_trades):
                 ho_sharpe = 0.0
+                ho_return = 0.0
+                ho_trades = 0
             print(
                 f"  Holdout: Sharpe={_fmt_float(ho_sharpe, 3)} | "
-                f"Return={_fmt_pct(h.get('holdout_return'), 2)} | "
-                f"Trades={h.get('holdout_trades', '?')}"
+                f"Return={_fmt_pct(ho_return, 2)} | "
+                f"Trades={ho_trades}"
             )
+
+        quality = r.get('quality') or assess_result_quality(r)
+        issues = quality.get('issues', [])
+        issue_text = ', '.join(issues[:3]) if issues else 'none'
+        print(
+            f"  Quality: Rating={quality.get('rating', 'unknown')} | "
+            f"HoldoutValid={quality.get('holdout_valid', False)} | "
+            f"Issues={issue_text}"
+        )
 
 
 def _db_path() -> Path:
