@@ -9,17 +9,19 @@ from pathlib import Path
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
 
-#   python parallel_launch.py --trials 200 --jobs 16
-#   python parallel_launch.py --trials 250 --jobs 16 --holdout-days 120
+#   python parallel_launch.py                           # all coins, all cores, robust180 defaults
+#   python parallel_launch.py --trials 300 --preset robust180
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch parallel Optuna optimization workers")
     parser.add_argument("--trials", type=int, default=200, help="Total trials per coin")
-    parser.add_argument("--jobs", type=int, default=16, help="Total worker processes")
+    parser.add_argument("--jobs", type=int, default=(os.cpu_count() or 1), help="Total worker processes (default: all CPU cores)")
     parser.add_argument("--coins", type=str, default=",".join(COINS), help="Comma-separated coin list")
     parser.add_argument("--plateau-patience", type=int, default=100, help="Stop if no best-score improvement for N trials")
     parser.add_argument("--plateau-min-delta", type=float, default=0.02, help="Min score improvement to reset plateau")
     parser.add_argument("--plateau-warmup", type=int, default=60, help="Warmup completed trials before plateau checks")
-    parser.add_argument("--holdout-days", type=int, default=120, help="Days reserved as true holdout (never seen by Optuna)")
+    parser.add_argument("--holdout-days", type=int, default=180, help="Days reserved as true holdout (never seen by Optuna)")
+    parser.add_argument("--preset", type=str, default="robust180", choices=["none", "robust120", "robust180"],
+                        help="Optimization preset forwarded to optimize.py (default: robust180)")
     parser.add_argument("--debug-trials", action="store_true", help="Enable verbose per-trial output in optimize workers")
     args = parser.parse_args()
 
@@ -71,6 +73,7 @@ if __name__ == "__main__":
     print(f"   Target/coin:  {args.trials} trials")
     print(f"   Worker split: {worker_counts}")
     print(f"   Holdout:      {args.holdout_days} days (never seen by Optuna)")
+    print(f"   Preset:       {args.preset}")
     print(f"   Script dir:   {script_dir}")
     print(f"   Python:       {sys.executable}")
     print(f"   CWD:          {os.getcwd()}")
@@ -114,6 +117,8 @@ if __name__ == "__main__":
                 str(args.plateau_warmup),
                 "--holdout-days",
                 str(args.holdout_days),
+                "--preset",
+                args.preset,
                 "--study-suffix",
                 run_id,
                 "--resume-study",

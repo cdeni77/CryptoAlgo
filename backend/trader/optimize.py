@@ -112,6 +112,66 @@ def _fmt_float(value, decimals: int = 3, fallback: str = "?") -> str:
     return f"{n:.{decimals}f}" if n is not None else fallback
 
 
+def _is_invalid_holdout_metric(holdout_sharpe: float, holdout_return: float, holdout_trades: int) -> bool:
+    """Detect sentinel / unusable holdout outputs produced when no real OOS test happened."""
+    if holdout_sharpe <= -90:
+        return True
+    if holdout_trades <= 0:
+        return True
+    if holdout_return <= -0.99:
+        return True
+    return False
+
+
+def assess_result_quality(result_data: Dict) -> Dict:
+    """Attach interpretable quality diagnostics so weak runs are easy to filter out."""
+    optim = result_data.get('optim_metrics', {}) or {}
+    holdout = result_data.get('holdout_metrics', {}) or {}
+
+    n_trials = int(result_data.get('n_trials', 0) or 0)
+    n_trades = int(optim.get('n_trades', 0) or 0)
+    pf = _finite_metric(optim.get('profit_factor', 0.0), default=0.0)
+    sharpe = _finite_metric(optim.get('sharpe', 0.0), default=0.0)
+
+    holdout_sharpe = _finite_metric(holdout.get('holdout_sharpe', 0.0), default=0.0)
+    holdout_return = _finite_metric(holdout.get('holdout_return', 0.0), default=0.0)
+    holdout_trades = int(holdout.get('holdout_trades', 0) or 0)
+    holdout_valid = not _is_invalid_holdout_metric(holdout_sharpe, holdout_return, holdout_trades)
+
+    issues = []
+    if n_trials < 50:
+        issues.append(f'low_trials:{n_trials}')
+    if n_trades < 30:
+        issues.append(f'low_optim_trades:{n_trades}')
+    if pf < 1.15:
+        issues.append(f'weak_profit_factor:{pf:.3f}')
+    if sharpe < 0.75:
+        issues.append(f'weak_sharpe:{sharpe:.3f}')
+
+    if not holdout_valid:
+        issues.append('invalid_holdout')
+    else:
+        if holdout_trades < 12:
+            issues.append(f'low_holdout_trades:{holdout_trades}')
+        if holdout_sharpe < 0.10:
+            issues.append(f'weak_holdout_sharpe:{holdout_sharpe:.3f}')
+        if holdout_return < 0.0:
+            issues.append(f'negative_holdout_return:{holdout_return:.4f}')
+
+    if not issues:
+        rating = 'promising'
+    elif len(issues) <= 2:
+        rating = 'watchlist'
+    else:
+        rating = 'reject'
+
+    return {
+        'rating': rating,
+        'holdout_valid': holdout_valid,
+        'issues': issues,
+    }
+
+
 def _set_reject_reason(trial: optuna.Trial, reason: str) -> None:
     trial.set_user_attr('reject_reason', reason)
 
@@ -472,10 +532,19 @@ def evaluate_holdout(holdout_data: Dict, best_params: Dict, coin_name: str,
         print(f"  ⚠️ Holdout backtest returned None")
         return None
 
+    holdout_sharpe = _finite_metric(result.get('oos_sharpe', 0.0), default=0.0)
+    holdout_return = _finite_metric(result.get('oos_return', 0.0), default=0.0)
+    holdout_trades = int(result.get('oos_trades', 0) or 0)
+
+    if _is_invalid_holdout_metric(holdout_sharpe, holdout_return, holdout_trades):
+        holdout_sharpe = 0.0
+        holdout_return = 0.0
+        holdout_trades = 0
+
     return {
-        'holdout_sharpe': float(result.get('oos_sharpe', 0.0) or 0.0),
-        'holdout_return': float(result.get('oos_return', 0.0) or 0.0),
-        'holdout_trades': int(result.get('oos_trades', 0) or 0),
+        'holdout_sharpe': holdout_sharpe,
+        'holdout_return': holdout_return,
+        'holdout_trades': holdout_trades,
         'full_sharpe': float(result.get('sharpe_annual', 0.0) or 0.0),
         'full_trades': int(result.get('n_trades', 0) or 0),
         'full_return': float(result.get('ann_return', 0.0) or 0.0),
@@ -491,7 +560,9 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
                   plateau_warmup: int = 60,
                   study_suffix: str = "",
                   resume_study: bool = False,
-                  holdout_days: int = 120):
+                  holdout_days: int = 120,
+                  min_internal_oos_trades: int = 0,
+                  min_total_trades: int = 0):
     """Run Optuna optimization for a single coin with true holdout evaluation."""
 
     # STEP 0: Split data into optimization + holdout windows
@@ -601,13 +672,28 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         return None
 
     # STEP 3: Report optimization results
-    best = _select_best_trial(study)
+    # Increase minimum internal-OOS trade requirement for longer holdouts.
+    # This encourages selecting parameter sets with enough signal cadence to
+    # actually produce trades in a 120-180d true holdout.
+    min_internal_oos_trades = min_internal_oos_trades or max(8, int(round(internal_oos_days / 8)))
+    min_total_trades = min_total_trades or max(20, int(round(internal_oos_days / 3)))
+    best = _select_best_trial(
+        study,
+        min_trades=min_total_trades,
+        min_oos_trades=min_internal_oos_trades,
+        min_oos_return=-0.01,
+    )
 
     if best.number != study.best_trial.number:
         print(
             f"\n🛡️ Selected trial #{best.number} over raw best #{study.best_trial.number} "
             "for better OOS robustness constraints."
         )
+
+    print(
+        f"  Robust trial gates: min_trades={min_total_trades}, "
+        f"min_internal_oos_trades={min_internal_oos_trades}, min_internal_oos_return=-1.00%"
+    )
 
     if _as_number(best.value) == -99.0:
         reason_counts = {}
@@ -677,6 +763,13 @@ def optimize_coin(all_data: Dict, coin_prefix: str, coin_name: str,
         'holdout_days': holdout_days,
         'timestamp': datetime.now().isoformat(),
     }
+    result_data['quality'] = assess_result_quality(result_data)
+
+    quality = result_data['quality']
+    quality_issues = ', '.join(quality.get('issues', [])) if quality.get('issues') else 'none'
+    print(f"\n  🧪 Quality rating: {quality.get('rating', 'unknown')}")
+    print(f"     Holdout valid: {quality.get('holdout_valid', False)}")
+    print(f"     Issues:        {quality_issues}")
     result_path = _persist_result_json(coin_name, result_data)
     if result_path:
         print(f"\n  💾 Saved to {result_path}")
@@ -738,15 +831,67 @@ def show_results():
             f"Trades={m.get('n_trades', '?')}"
         )
         if h:
-            ho_sharpe = h.get('holdout_sharpe', 0)
-            if ho_sharpe and ho_sharpe <= -90:
+            ho_sharpe = _finite_metric(h.get('holdout_sharpe', 0.0), default=0.0)
+            ho_return = _finite_metric(h.get('holdout_return', 0.0), default=0.0)
+            ho_trades = int(h.get('holdout_trades', 0) or 0)
+            if _is_invalid_holdout_metric(ho_sharpe, ho_return, ho_trades):
                 ho_sharpe = 0.0
+                ho_return = 0.0
+                ho_trades = 0
             print(
                 f"  Holdout: Sharpe={_fmt_float(ho_sharpe, 3)} | "
-                f"Return={_fmt_pct(h.get('holdout_return'), 2)} | "
-                f"Trades={h.get('holdout_trades', '?')}"
+                f"Return={_fmt_pct(ho_return, 2)} | "
+                f"Trades={ho_trades}"
             )
 
+        quality = r.get('quality') or assess_result_quality(r)
+        issues = quality.get('issues', [])
+        issue_text = ', '.join(issues[:3]) if issues else 'none'
+        print(
+            f"  Quality: Rating={quality.get('rating', 'unknown')} | "
+            f"HoldoutValid={quality.get('holdout_valid', False)} | "
+            f"Issues={issue_text}"
+        )
+
+
+
+
+def apply_runtime_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply curated runtime presets for more robust holdout-oriented searches."""
+    presets = {
+        'robust180': {
+            'trials': 350,
+            'plateau_patience': 140,
+            'plateau_warmup': 80,
+            'plateau_min_delta': 0.015,
+            'holdout_days': 180,
+            'min_internal_oos_trades': 14,
+            'min_total_trades': 45,
+        },
+        'robust120': {
+            'trials': 280,
+            'plateau_patience': 120,
+            'plateau_warmup': 70,
+            'plateau_min_delta': 0.02,
+            'holdout_days': 120,
+            'min_internal_oos_trades': 10,
+            'min_total_trades': 35,
+        },
+    }
+
+    preset_name = getattr(args, 'preset', 'none')
+    if preset_name in (None, '', 'none'):
+        return args
+
+    config = presets.get(preset_name)
+    if not config:
+        return args
+
+    for k, v in config.items():
+        setattr(args, k, v)
+
+    print(f"🧭 Applied preset '{preset_name}': " + ", ".join(f"{k}={v}" for k, v in config.items()))
+    return args
 
 def _db_path() -> Path:
     """Return the Optuna DB path anchored to this script's directory."""
@@ -794,8 +939,19 @@ def _persist_result_json(coin_name: str, result_data: Dict) -> Optional[Path]:
     return None
 
 
-def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades: int = 10) -> optuna.trial.FrozenTrial:
-    """Prefer robust trials over raw best score to reduce overfit selection."""
+def _select_best_trial(
+    study: optuna.Study,
+    min_trades: int = 20,
+    min_oos_trades: int = 10,
+    min_oos_return: float = -0.02,
+) -> optuna.trial.FrozenTrial:
+    """Prefer robust trials over raw best score to reduce overfit selection.
+
+    Selection rank (strict to relaxed):
+      1) Meets all robustness filters.
+      2) Meets trade-count filters only.
+      3) Raw Optuna best trial.
+    """
     completed = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
@@ -803,21 +959,32 @@ def _select_best_trial(study: optuna.Study, min_trades: int = 20, min_oos_trades
     if not completed:
         return study.best_trial
 
-    filtered = []
+    robust = []
+    trade_only = []
+
     for t in completed:
-        if (t.user_attrs.get('n_trades', 0) or 0) < min_trades:
+        n_trades = int(t.user_attrs.get('n_trades', 0) or 0)
+        oos_trades = int(t.user_attrs.get('oos_trades', 0) or 0)
+        if n_trades < min_trades or oos_trades < min_oos_trades:
             continue
-        if (t.user_attrs.get('oos_trades', 0) or 0) < min_oos_trades:
-            continue
+
+        trade_only.append(t)
+
         oos_sharpe = _as_number(t.user_attrs.get('oos_sharpe'), 0.0) or 0.0
+        oos_return = _as_number(t.user_attrs.get('oos_return'), 0.0) or 0.0
         if oos_sharpe <= -0.2:
             continue
-        filtered.append(t)
+        if oos_return < min_oos_return:
+            continue
+        robust.append(t)
 
-    if filtered:
-        return max(filtered, key=lambda t: t.value)
+    if robust:
+        return max(robust, key=lambda t: t.value)
+    if trade_only:
+        return max(trade_only, key=lambda t: t.value)
 
     return study.best_trial
+
 
 
 COIN_MAP = {
@@ -851,9 +1018,16 @@ if __name__ == "__main__":
                         help="Resume existing study name instead of starting a fresh one")
     parser.add_argument("--holdout-days", type=int, default=180,
                         help="Days of data to reserve as true holdout (never seen by Optuna)")
+    parser.add_argument("--preset", type=str, default="none", choices=["none", "robust120", "robust180"],
+                        help="Apply a curated optimization preset for holdout robustness")
+    parser.add_argument("--min-internal-oos-trades", type=int, default=0,
+                        help="Override minimum internal OOS trades required when selecting best trial (0=auto)")
+    parser.add_argument("--min-total-trades", type=int, default=0,
+                        help="Override minimum total trades required when selecting best trial (0=auto)")
     parser.add_argument("--debug-trials", action="store_true",
                         help="Enable verbose per-trial output")
     args = parser.parse_args()
+    args = apply_runtime_preset(args)
 
     if args.debug_trials:
         DEBUG_TRIALS = True
@@ -900,6 +1074,8 @@ if __name__ == "__main__":
                     study_suffix=effective_study_suffix,
                     resume_study=args.resume_study,
                     holdout_days=args.holdout_days,
+                    min_internal_oos_trades=args.min_internal_oos_trades,
+                    min_total_trades=args.min_total_trades,
                 )
     else:
         coin_input = args.coin.upper()
@@ -926,4 +1102,6 @@ if __name__ == "__main__":
             study_suffix=effective_study_suffix,
             resume_study=args.resume_study,
             holdout_days=args.holdout_days,
+            min_internal_oos_trades=args.min_internal_oos_trades,
+            min_total_trades=args.min_total_trades,
         )
