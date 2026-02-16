@@ -65,8 +65,8 @@ services:
   #   2. Compute features from raw data
   #   3. Every hour: incremental data fetch → recompute features → generate signals
   #
-  # The live_orchestrator.py handles the full cycle:
-  #   run_pipeline.py  →  compute_features.py  →  train_model.py --signals
+  # The scripts.live_orchestrator module handles the full cycle:
+  #   scripts.run_pipeline  →  scripts.compute_features  →  scripts.train_model --signals
   #
   # Configurable via environment variables (see defaults below).
   # ===========================================================================
@@ -123,7 +123,7 @@ services:
       - ./backend/trader:/app
     # The orchestrator: initial backfill (30d) then hourly cycles
     command: >
-      live_orchestrator.py
+      -m scripts.live_orchestrator
         --backfill-days 30
         --include-oi
         --debug
@@ -145,7 +145,7 @@ services:
   #     - trader_logs:/app/logs
   #     - ./backend/trader:/app
   #   command: >
-  #     python train_model.py
+  #     python -m scripts.train_model
   #       --backtest
   #       --threshold 0.74
   #       --min-auc 0.54

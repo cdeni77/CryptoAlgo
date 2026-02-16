@@ -229,13 +229,12 @@ if __name__ == "__main__":
         raise SystemExit("No coins selected")
 
     script_dir = Path(__file__).resolve().parent
+    trader_root = script_dir.parent
 
     optimize_path = script_dir / "optimize.py"
     validate_path = script_dir / "validate_robustness.py"
-    train_model_path = script_dir / "train_model.py"
-
     # Validate paths
-    for name, path in [("optimize.py", optimize_path), ("train_model.py", train_model_path)]:
+    for name, path in [("optimize.py", optimize_path)]:
         if not path.exists():
             print(f"❌ Cannot find {name} at {path}")
             raise SystemExit(1)
@@ -245,7 +244,7 @@ if __name__ == "__main__":
         print(f"   Validation will be skipped.")
         args.skip_validation = True
 
-    data_dir = script_dir / "data"
+    data_dir = trader_root / "data"
     db_path = data_dir / "trading.db"
     features_dir = data_dir / "features"
 

@@ -27,11 +27,11 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import RobustScaler
 import lightgbm as lgb
 
-from coin_profiles import (
+from core.coin_profiles import (
     get_coin_profile, save_model, load_model, list_saved_models,
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
-from pg_writer import PgWriter
+from core.pg_writer import PgWriter
 
 warnings.filterwarnings('ignore')
 

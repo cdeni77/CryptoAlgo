@@ -157,8 +157,8 @@ def check_parameter_sensitivity(all_data: Dict, best_params: Dict, coin_name: st
 
     Returns sensitivity metrics + fragility flag.
     """
-    from train_model import Config, run_backtest
-    from optimize import profile_from_params, resolve_target_symbol
+    from scripts.train_model import Config, run_backtest
+    from scripts.optimize import profile_from_params, resolve_target_symbol
 
     target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
     if not target_sym:
@@ -563,8 +563,8 @@ def run_validation(coin_name: str, optimization_result: Dict, all_data: Dict) ->
     """
     Run the full robustness validation suite for a single coin.
     """
-    from train_model import Config, run_backtest
-    from optimize import (
+    from scripts.train_model import Config, run_backtest
+    from scripts.optimize import (
         profile_from_params, resolve_target_symbol,
         COIN_MAP, PREFIX_FOR_COIN,
     )
@@ -834,7 +834,7 @@ if __name__ == "__main__":
     # Load data once
     print("📂 Loading data...")
     sys.path.insert(0, str(SCRIPT_DIR))
-    from train_model import load_data
+    from scripts.train_model import load_data
 
     all_data = load_data()
     if not all_data:

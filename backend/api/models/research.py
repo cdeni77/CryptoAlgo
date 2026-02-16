@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ResearchSummaryKpis(BaseModel):
@@ -66,3 +66,16 @@ class ResearchFeaturesResponse(BaseModel):
     generated_at: datetime
     feature_importance: List[FeatureImportanceItem]
     signal_distribution: List[SignalDistributionItem]
+
+
+class ResearchJobLaunchRequest(BaseModel):
+    args: List[str] = Field(default_factory=list)
+
+
+class ResearchJobLaunchResponse(BaseModel):
+    job: str
+    module: str
+    pid: int
+    command: List[str]
+    cwd: str
+    launched_at: datetime

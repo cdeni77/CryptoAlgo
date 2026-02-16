@@ -17,9 +17,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
-from coin_profiles import MODELS_DIR
-from pg_writer import PgWriter
-from train_model import Config, load_data, retrain_models
+from core.coin_profiles import MODELS_DIR
+from core.pg_writer import PgWriter
+from scripts.train_model import Config, load_data, retrain_models
 
 LOGGER = logging.getLogger("live_orchestrator")
 STOP_REQUESTED = False
@@ -59,7 +59,7 @@ def _run_step(name: str, command: List[str]) -> None:
 
 
 def _build_train_model_cmd(args: argparse.Namespace) -> List[str]:
-    cmd = [sys.executable, "train_model.py", "--signals"]
+    cmd = [sys.executable, "-m", "scripts.train_model", "--signals"]
 
     threshold = os.getenv("SIGNAL_THRESHOLD")
     min_auc = os.getenv("MIN_AUC")
@@ -83,7 +83,7 @@ def _build_train_model_cmd(args: argparse.Namespace) -> List[str]:
 def _run_cycle(backfill_days: int, include_oi: bool, db_path: str, train_cmd: List[str]) -> None:
     run_pipeline_cmd = [
         sys.executable,
-        "run_pipeline.py",
+        "-m", "scripts.run_pipeline",
         "--backfill-only",
         "--backfill-days",
         str(backfill_days),
@@ -94,7 +94,7 @@ def _run_cycle(backfill_days: int, include_oi: bool, db_path: str, train_cmd: Li
         run_pipeline_cmd.append("--include-oi")
 
     _run_step("run_pipeline backfill", run_pipeline_cmd)
-    _run_step("compute_features", [sys.executable, "compute_features.py"])
+    _run_step("compute_features", [sys.executable, "-m", "scripts.compute_features"])
     _run_step("train_model signals", train_cmd)
 
 
