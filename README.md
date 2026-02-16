@@ -202,13 +202,15 @@ Postgres service stores API-facing trade/signal/wallet/paper tables.
 
 ## Frontend Notes
 
-The dashboard shows:
+The dashboard now has two routes:
 
-- spot/CDE price cards,
-- charting and market history,
-- trades/signals tables,
-- paper positions/equity/performance views,
-- wallet summary.
+- `/` (**Trading Terminal**): spot/CDE price cards, charting/market history, trades/signals tables, wallet summary.
+- `/strategy` (**Strategy Lab**): strategy-health KPIs, per-coin scoreboard, timeline, explainability-lite panel, and paper positions/equity/performance views.
+
+For Docker and local development parity, the frontend uses `/api` as the API base path by default:
+
+- In Docker/Nginx, `/api/*` is proxied to the backend service.
+- In `vite dev`, `/api/*` is proxied to `http://localhost:8000`.
 
 Operations controls were removed from the frontend to match backend endpoint removal.
 
