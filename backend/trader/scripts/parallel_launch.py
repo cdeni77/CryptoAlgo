@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -40,6 +41,14 @@ def format_duration(seconds: float) -> str:
         return f"{seconds / 60:.1f}m"
     else:
         return f"{seconds / 3600:.1f}h"
+
+
+def _fmt_metric(value, fmt: str, fallback: str = "?") -> str:
+    """Format a metric value safely."""
+    try:
+        return format(float(value), fmt)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def load_optimization_results(results_dir: Path) -> Dict[str, Dict]:
@@ -70,6 +79,74 @@ def load_validation_results(results_dir: Path) -> Dict[str, Dict]:
             except Exception:
                 pass
     return results
+
+
+def get_coin_trial_progress(optuna_db: Path, target_coins: List[str], run_id: str) -> Dict[str, Dict[str, object]]:
+    """Fetch completed trial counts + current best metrics for each coin in this launcher run."""
+    progress = {
+        coin: {"completed": 0, "best_score": None, "best_metrics": {}}
+        for coin in target_coins
+    }
+    if not optuna_db.exists():
+        return progress
+
+    completed_query = """
+        SELECT s.study_id, COUNT(*)
+        FROM studies s
+        JOIN trials t ON t.study_id = s.study_id
+        WHERE t.state = 1
+          AND s.study_name = ?
+        GROUP BY s.study_id
+    """
+
+    best_trial_query = """
+        SELECT t.trial_id, v.value
+        FROM studies s
+        JOIN trials t ON t.study_id = s.study_id
+        JOIN trial_values v ON v.trial_id = t.trial_id
+        WHERE s.study_name = ?
+          AND t.state = 1
+          AND v.objective = 0
+        ORDER BY v.value DESC
+        LIMIT 1
+    """
+
+    attrs_query = """
+        SELECT key, value_json
+        FROM trial_user_attributes
+        WHERE trial_id = ?
+          AND key IN ('sharpe', 'profit_factor', 'win_rate', 'max_drawdown', 'n_trades')
+    """
+
+    try:
+        with sqlite3.connect(optuna_db) as conn:
+            conn.execute("PRAGMA busy_timeout = 1000;")
+            for coin in target_coins:
+                study_name = f"optimize_{coin}_{run_id}"
+
+                completed_row = conn.execute(completed_query, (study_name,)).fetchone()
+                progress[coin]["completed"] = int(completed_row[1]) if completed_row else 0
+
+                best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
+                if not best_row:
+                    continue
+
+                best_trial_id, best_score = best_row
+                progress[coin]["best_score"] = float(best_score) if best_score is not None else None
+
+                metric_rows = conn.execute(attrs_query, (best_trial_id,)).fetchall()
+                metrics = {}
+                for key, value_json in metric_rows:
+                    try:
+                        metrics[key] = json.loads(value_json)
+                    except (TypeError, json.JSONDecodeError):
+                        metrics[key] = value_json
+                progress[coin]["best_metrics"] = metrics
+    except sqlite3.Error:
+        # Best-effort visibility only — keep the launcher running if the DB is busy.
+        return progress
+
+    return progress
 
 
 def print_final_report(script_dir: Path, target_coins: List[str], total_time: float):
@@ -359,6 +436,8 @@ if __name__ == "__main__":
             remaining = list(processes)
             last_report = time.time()
             completed_count = 0
+            last_trial_report = {coin: 0 for coin in target_coins}
+            trial_report_every = 10
 
             while remaining:
                 still_running = []
@@ -377,6 +456,30 @@ if __name__ == "__main__":
                     else:
                         still_running.append((coin, idx, p, lf))
                 remaining = still_running
+
+                # Per-coin trial progress updates (every 10 trials by default)
+                trial_progress = get_coin_trial_progress(optuna_db, target_coins, run_id)
+                for coin in target_coins:
+                    coin_progress = trial_progress.get(coin, {})
+                    current = min(int(coin_progress.get('completed', 0) or 0), args.trials)
+                    next_threshold = ((last_trial_report[coin] // trial_report_every) + 1) * trial_report_every
+                    if current >= next_threshold or (current == args.trials and current > last_trial_report[coin]):
+                        pct = (current / max(1, args.trials)) * 100
+                        best_score = _fmt_metric(coin_progress.get('best_score'), '.3f')
+
+                        best_metrics = coin_progress.get('best_metrics', {}) or {}
+                        sharpe = _fmt_metric(best_metrics.get('sharpe'), '.3f')
+                        profit_factor = _fmt_metric(best_metrics.get('profit_factor'), '.3f')
+                        win_rate = _fmt_metric(best_metrics.get('win_rate'), '.1%')
+                        drawdown = _fmt_metric(best_metrics.get('max_drawdown'), '.1%')
+                        trades = best_metrics.get('n_trades', '?')
+
+                        print(
+                            f"   📈 {coin}: {current}/{args.trials} trials ({pct:.0f}%) | "
+                            f"Best score={best_score} | Sharpe={sharpe} | PF={profit_factor} | "
+                            f"WR={win_rate} | DD={drawdown} | Trades={trades}"
+                        )
+                        last_trial_report[coin] = current
 
                 # Periodic progress
                 now = time.time()
