@@ -60,7 +60,7 @@ backend/api (FastAPI + Postgres) ◄──────── frontend (React das
 
 - **db**: PostgreSQL 16
 - **backend**: FastAPI (`/coins`, `/trades`, `/signals`, `/wallet`, `/paper`)
-- **frontend**: Nginx-served Vite build
+- **frontend**: Nginx-served Vite build with Trading Terminal (`/`) and Strategy Lab (`/strategy`) routes
 - **trader**: orchestrated ML/data pipeline service
 
 Default local ports:
@@ -164,6 +164,10 @@ Base URL: `http://localhost:8000`
 - `GET /signals/*` — signal endpoints
 - `GET /wallet/` — wallet summary exposing paper trading + Coinbase spot/perps + optional env-configured Ledger addresses
 - `GET /paper/*` — paper orders/fills/positions/equity telemetry
+- `GET /research/summary` — global strategy health KPIs + per-coin health rows
+- `GET /research/coins/{coin}` — single-coin strategy health detail
+- `GET /research/runs` — recent train/optimize/validate timeline events
+- `GET /research/features/{coin}` — explainability-lite feature importance + signal distribution
 
 Note: legacy `/ops` endpoints were intentionally removed; operational control is CLI/orchestrator-driven.
 
@@ -202,13 +206,10 @@ Postgres service stores API-facing trade/signal/wallet/paper tables.
 
 ## Frontend Notes
 
-The dashboard shows:
+The dashboard now has two pages:
 
-- spot/CDE price cards,
-- charting and market history,
-- trades/signals tables,
-- paper positions/equity/performance views,
-- wallet summary.
+- `/` **Trading Terminal**: spot/CDE price cards, charting, trades/signals tables, wallet summary.
+- `/strategy` **Strategy Lab**: model health KPIs, coin strategy scoreboard, experiment timeline, explainability-lite panels, and all paper positions/equity/performance/fills views.
 
 Operations controls were removed from the frontend to match backend endpoint removal.
 
