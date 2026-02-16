@@ -26,11 +26,38 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+
+PRESET_CONFIGS = {
+    "robust180": {
+        "plateau_patience": 140,
+        "plateau_min_delta": 0.015,
+        "plateau_warmup": 80,
+        "holdout_days": 180,
+    },
+    "robust120": {
+        "plateau_patience": 120,
+        "plateau_min_delta": 0.02,
+        "plateau_warmup": 70,
+        "holdout_days": 120,
+    },
+}
+
+
+def apply_runtime_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply launcher-side runtime preset values without mutating trial counts."""
+    config = PRESET_CONFIGS.get(args.preset)
+    if not config:
+        return args
+
+    for key, value in config.items():
+        setattr(args, key, value)
+
+    return args
 
 
 def format_duration(seconds: float) -> str:
@@ -298,6 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-dir", type=str, default="",
                         help="Directory to capture per-worker logs (default: no capture)")
     args = parser.parse_args()
+    args = apply_runtime_preset(args)
 
     pipeline_start = time.time()
 
@@ -362,7 +390,7 @@ if __name__ == "__main__":
         print(f"   Validation:   {'ENABLED' if not args.skip_validation else 'DISABLED'}")
         print(f"{'='*70}")
 
-        run_id = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
+        run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
         print(f"   Study run id: {run_id}")
 
         optuna_db = script_dir / "optuna_trading.db"
@@ -389,7 +417,7 @@ if __name__ == "__main__":
                     "--plateau-min-delta", str(args.plateau_min_delta),
                     "--plateau-warmup", str(args.plateau_warmup),
                     "--holdout-days", str(args.holdout_days),
-                    "--preset", args.preset,
+                    "--preset", "none",
                     "--study-suffix", run_id,
                     "--resume-study",
                 ]
