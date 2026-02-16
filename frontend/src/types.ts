@@ -198,3 +198,67 @@ export interface PaperEquityPoint {
   realized_pnl: number;
   open_positions: number;
 }
+
+export interface ResearchSummaryKpis {
+  holdout_auc: number | null;
+  pr_auc: number | null;
+  precision_at_threshold: number | null;
+  win_rate_realized: number;
+  acted_signal_rate: number;
+  drift_delta: number;
+  robustness_gate: boolean;
+}
+
+export interface ResearchCoinHealth {
+  coin: string;
+  holdout_auc: number | null;
+  pr_auc: number | null;
+  precision_at_threshold: number | null;
+  win_rate_realized: number;
+  acted_signal_rate: number;
+  drift_delta: number;
+  robustness_gate: boolean;
+  optimization_freshness_hours: number | null;
+  last_optimized_at: string | null;
+  health: 'healthy' | 'watch' | 'at_risk';
+}
+
+export interface ResearchSummary {
+  generated_at: string;
+  kpis: ResearchSummaryKpis;
+  coins: ResearchCoinHealth[];
+}
+
+export interface ResearchCoinDetail {
+  generated_at: string;
+  coin: ResearchCoinHealth;
+}
+
+export interface ResearchRun {
+  id: string;
+  coin: string;
+  run_type: 'train' | 'optimize' | 'validate';
+  status: string;
+  started_at: string;
+  finished_at: string;
+  duration_seconds: number;
+  holdout_auc: number | null;
+  robustness_gate: boolean;
+}
+
+export interface FeatureImportanceItem {
+  feature: string;
+  importance: number;
+}
+
+export interface SignalDistributionItem {
+  label: string;
+  value: number;
+}
+
+export interface ResearchFeatures {
+  coin: string;
+  generated_at: string;
+  feature_importance: FeatureImportanceItem[];
+  signal_distribution: SignalDistributionItem[];
+}

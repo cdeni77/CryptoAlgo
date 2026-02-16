@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import engine
 from endpoints.coins import router as coins_router
 from endpoints.paper import router as paper_router
+from endpoints.research import router as research_router
 from endpoints.signals import router as signals_router
 from endpoints.trade import router as trades_router
 from endpoints.wallet import router as wallet_router
@@ -40,6 +41,7 @@ app.include_router(coins_router)
 app.include_router(wallet_router)
 app.include_router(signals_router)
 app.include_router(paper_router)
+app.include_router(research_router)
 
 
 @app.get("/")
