@@ -1,4 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+import subprocess
+import sys
 from typing import List
 
 from sqlalchemy import desc, func
@@ -194,4 +198,48 @@ def get_research_features(db: Session, coin: str) -> ResearchFeaturesResponse:
         generated_at=datetime.now(timezone.utc),
         feature_importance=features,
         signal_distribution=distribution,
+    )
+
+
+SCRIPT_MODULES = {
+    "run_pipeline": "scripts.run_pipeline",
+    "compute_features": "scripts.compute_features",
+    "train_model": "scripts.train_model",
+    "optimize": "scripts.optimize",
+    "validate_robustness": "scripts.validate_robustness",
+    "parallel_launch": "scripts.parallel_launch",
+    "live_orchestrator": "scripts.live_orchestrator",
+    "paper_engine": "scripts.paper_engine",
+}
+
+
+def launch_research_job(job: str, args: List[str] | None = None):
+    job_key = job.strip().lower()
+    module = SCRIPT_MODULES.get(job_key)
+    if module is None:
+        allowed = ", ".join(sorted(SCRIPT_MODULES.keys()))
+        raise ValueError(f"Unknown research job '{job}'. Allowed jobs: {allowed}")
+
+    trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
+    if not trader_dir.exists():
+        raise FileNotFoundError(f"TRADER_DIR does not exist: {trader_dir}")
+
+    safe_args = [a for a in (args or []) if a and a.strip()]
+    command = [sys.executable, "-m", module, *safe_args]
+    process = subprocess.Popen(
+        command,
+        cwd=trader_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    from models.research import ResearchJobLaunchResponse
+
+    return ResearchJobLaunchResponse(
+        job=job_key,
+        module=module,
+        pid=process.pid,
+        command=command,
+        cwd=str(trader_dir),
+        launched_at=datetime.now(timezone.utc),
     )

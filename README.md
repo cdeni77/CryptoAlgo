@@ -22,12 +22,12 @@ docker-compose.yml
 
 Core trader scripts:
 
-- `run_pipeline.py` — OHLCV/funding/OI collection and backfill
-- `compute_features.py` — feature generation into CSV artifacts
-- `train_model.py` — backtesting + signal generation
-- `live_orchestrator.py` — scheduled cycle runner (pipeline → features → signals)
-- `optimize.py` — single-coin Optuna optimization with true holdout evaluation
-- `parallel_launch.py` — process-level multi-coin optimization launcher
+- `scripts/run_pipeline.py` — OHLCV/funding/OI collection and backfill
+- `scripts/compute_features.py` — feature generation into CSV artifacts
+- `scripts/train_model.py` — backtesting + signal generation
+- `scripts/live_orchestrator.py` — scheduled cycle runner (pipeline → features → signals)
+- `scripts/optimize.py` — single-coin Optuna optimization with true holdout evaluation
+- `scripts/parallel_launch.py` — process-level multi-coin optimization launcher
 
 ---
 
@@ -37,17 +37,17 @@ Core trader scripts:
 Exchanges / Coinbase
         │
         ▼
-backend/trader/run_pipeline.py
+backend/trader/scripts/run_pipeline.py
         │
         ▼
-backend/trader/compute_features.py
+backend/trader/scripts/compute_features.py
         │
-        ├────────────► backend/trader/train_model.py --signals
+        ├────────────► backend/trader/scripts/train_model.py --signals
         │                  │
         │                  ├─ model artifacts (joblib)
         │                  └─ writes trades/signals/paper telemetry
         │
-        └────────────► backend/trader/optimize.py (offline tuning)
+        └────────────► backend/trader/scripts/optimize.py (offline tuning)
 
 backend/api (FastAPI + Postgres) ◄──────── frontend (React dashboard)
 ```
@@ -109,31 +109,31 @@ This starts:
 
 The orchestrator runs:
 
-1. `run_pipeline.py` (backfill/incremental market data)
-2. `compute_features.py`
-3. `train_model.py --signals`
+1. `scripts/run_pipeline.py` (backfill/incremental market data)
+2. `scripts/compute_features.py`
+3. `scripts/train_model.py --signals`
 
-with scheduled repetition controlled by env/CLI options in `live_orchestrator.py`.
+with scheduled repetition controlled by env/CLI options in `scripts/live_orchestrator.py`.
 
 ### One-off backtest
 
 ```bash
 docker compose run --rm trader \
-  python train_model.py --backtest --threshold 0.80 --min-auc 0.54 --leverage 4
+  python -m scripts.train_model --backtest --threshold 0.80 --min-auc 0.54 --leverage 4
 ```
 
 ### Retrain-only run once
 
 ```bash
 docker compose run --rm trader \
-  live_orchestrator.py --retrain-only --run-once --train-window-days 90
+  python -m scripts.live_orchestrator --retrain-only --run-once --train-window-days 90
 ```
 
 ### Parallel Optuna launch
 
 ```bash
 docker compose run --rm trader \
-  python parallel_launch.py --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
+  python -m scripts.parallel_launch --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
 ```
 
 Current optimization defaults are tuned for stronger robustness:
@@ -147,7 +147,7 @@ Current optimization defaults are tuned for stronger robustness:
 
 ```bash
 docker compose run --rm trader \
-  python optimize.py --coin BTC --trials 100 --jobs 1
+  python -m scripts.optimize --coin BTC --trials 100 --jobs 1
 ```
 
 ---
@@ -168,6 +168,7 @@ Base URL: `http://localhost:8000`
 - `GET /research/coins/{coin}` — single-coin strategy health detail
 - `GET /research/runs` — recent train/optimize/validate timeline events
 - `GET /research/features/{coin}` — explainability-lite feature importance + signal distribution
+- `POST /research/launch/{job}` — launch supported trader scripts (`run_pipeline`, `compute_features`, `train_model`, `optimize`, `validate_robustness`, `parallel_launch`, `live_orchestrator`, `paper_engine`)
 
 Note: legacy `/ops` endpoints were intentionally removed; operational control is CLI/orchestrator-driven.
 
@@ -200,7 +201,7 @@ Postgres service stores API-facing trade/signal/wallet/paper tables.
 
 ### Feature generation
 
-- `FEATURE_LOOKBACK_DAYS` (default `2190`) to cap historical span used by `compute_features.py`.
+- `FEATURE_LOOKBACK_DAYS` (default `2190`) to cap historical span used by `scripts/compute_features.py`.
 
 ---
 
@@ -221,7 +222,7 @@ You can run each layer directly, but Docker Compose is the canonical path.
 
 - Frontend: `npm ci && npm run dev` in `frontend/`
 - API: install `backend/api/requirements.txt`, run `uvicorn app:app`
-- Trader: install `backend/trader/requirements.txt`, run scripts in `backend/trader/`
+- Trader: install `backend/trader/requirements.txt`, then run `python -m scripts.<name>` from `backend/trader/`.
 
 Make sure DB paths and `DATABASE_URL` are aligned with your local setup.
 
@@ -231,7 +232,7 @@ Make sure DB paths and `DATABASE_URL` are aligned with your local setup.
 
 ### Not enough data / missing symbols in training
 
-- ensure `run_pipeline.py` has completed backfill,
+- ensure `scripts/run_pipeline.py` has completed backfill,
 - verify feature CSVs exist under trader data dir,
 - check symbol mappings and available exchange history windows.
 

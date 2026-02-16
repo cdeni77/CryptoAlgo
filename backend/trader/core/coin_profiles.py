@@ -10,7 +10,7 @@ All coins use the same momentum strategy — differentiation is in
 threshold tuning, exit structure, and extra features.
 
 Usage in train_model.py:
-    from coin_profiles import get_coin_profile, COIN_PROFILES
+    from core.coin_profiles import get_coin_profile, COIN_PROFILES
     profile = get_coin_profile('BIP-20DEC30-CDE')
 """
 

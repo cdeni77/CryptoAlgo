@@ -43,8 +43,8 @@ import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
 
-from train_model import Config, load_data, run_backtest
-from coin_profiles import (
+from scripts.train_model import Config, load_data, run_backtest
+from core.coin_profiles import (
     CoinProfile, COIN_PROFILES,
     BTC_EXTRA_FEATURES, SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
 )

@@ -8,8 +8,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from pg_writer import PgWriter
-from train_model import Config, calculate_coinbase_fee, calculate_n_contracts, calculate_pnl_exact, get_contract_spec
+from core.pg_writer import PgWriter
+from scripts.train_model import Config, calculate_coinbase_fee, calculate_n_contracts, calculate_pnl_exact, get_contract_spec
 
 logger = logging.getLogger("paper_engine")
 

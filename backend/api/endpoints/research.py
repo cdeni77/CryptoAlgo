@@ -1,6 +1,6 @@
 from typing import List
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from controllers.research import (
@@ -8,11 +8,14 @@ from controllers.research import (
     get_research_features,
     get_research_runs,
     get_research_summary,
+    launch_research_job,
 )
 from database import get_db
 from models.research import (
     ResearchCoinDetailResponse,
     ResearchFeaturesResponse,
+    ResearchJobLaunchRequest,
+    ResearchJobLaunchResponse,
     ResearchRunResponse,
     ResearchSummaryResponse,
 )
@@ -38,3 +41,13 @@ def runs(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
 @router.get("/features/{coin}", response_model=ResearchFeaturesResponse)
 def features(coin: str, db: Session = Depends(get_db)):
     return get_research_features(db, coin)
+
+
+@router.post("/launch/{job}", response_model=ResearchJobLaunchResponse)
+def launch(job: str, request: ResearchJobLaunchRequest):
+    try:
+        return launch_research_job(job=job, args=request.args)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
