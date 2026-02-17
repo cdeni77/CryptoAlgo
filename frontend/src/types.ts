@@ -262,3 +262,21 @@ export interface ResearchFeatures {
   feature_importance: FeatureImportanceItem[];
   signal_distribution: SignalDistributionItem[];
 }
+
+
+export interface ResearchScriptListResponse {
+  scripts: string[];
+}
+
+export interface ResearchJobLaunchRequest {
+  args: string[];
+}
+
+export interface ResearchJobLaunchResponse {
+  job: string;
+  module: string;
+  pid: number;
+  command: string[];
+  cwd: string;
+  launched_at: string;
+}

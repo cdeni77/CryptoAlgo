@@ -9,6 +9,7 @@ from controllers.research import (
     get_research_runs,
     get_research_summary,
     launch_research_job,
+    list_research_scripts,
 )
 from database import get_db
 from models.research import (
@@ -17,6 +18,7 @@ from models.research import (
     ResearchJobLaunchRequest,
     ResearchJobLaunchResponse,
     ResearchRunResponse,
+    ResearchScriptListResponse,
     ResearchSummaryResponse,
 )
 
@@ -41,6 +43,16 @@ def runs(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
 @router.get("/features/{coin}", response_model=ResearchFeaturesResponse)
 def features(coin: str, db: Session = Depends(get_db)):
     return get_research_features(db, coin)
+
+
+
+
+@router.get("/scripts", response_model=ResearchScriptListResponse)
+def scripts():
+    try:
+        return ResearchScriptListResponse(scripts=list_research_scripts())
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/launch/{job}", response_model=ResearchJobLaunchResponse)

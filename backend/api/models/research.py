@@ -79,3 +79,7 @@ class ResearchJobLaunchResponse(BaseModel):
     command: List[str]
     cwd: str
     launched_at: datetime
+
+
+class ResearchScriptListResponse(BaseModel):
+    scripts: List[str]
