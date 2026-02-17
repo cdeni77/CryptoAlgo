@@ -1,17 +1,8 @@
 """Script entrypoints for the trader package.
 
-Use module-qualified execution, e.g.:
-    python -m scripts.live_orchestrator
+Keep this module side-effect free so `python -m scripts.<name>` only loads
+the target script instead of importing every script dependency.
 """
-
-from . import compute_features
-from . import live_orchestrator
-from . import optimize
-from . import paper_engine
-from . import parallel_launch
-from . import run_pipeline
-from . import train_model
-from . import validate_robustness
 
 __all__ = [
     "compute_features",
