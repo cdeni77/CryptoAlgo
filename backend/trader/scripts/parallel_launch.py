@@ -10,7 +10,7 @@ Changes from v9:
   - Added --skip-validation, --validate-only flags
   - Real-time progress tracking with ETA
   - Cross-coin summary report with go/no-go recommendations
-  - Log capture per worker for debugging
+  - Optional per-worker log capture for debugging
   - New preset: robust180_full (includes validation)
 
 Usage:
@@ -340,7 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--validate-only", action="store_true",
                         help="Skip optimization, only run validation on existing results")
     parser.add_argument("--log-dir", type=str, default="",
-                        help="Directory to capture per-worker logs (default: no capture)")
+                        help="Directory to capture per-worker logs (default: inherit main log)")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -405,10 +405,11 @@ if __name__ == "__main__":
         print(f"   Study run id: {run_id}")
 
         log_dir = Path(args.log_dir).expanduser() if args.log_dir else None
-        if log_dir is None:
-            log_dir = script_dir / "optimization_logs" / run_id
-        log_dir.mkdir(parents=True, exist_ok=True)
-        print(f"   Worker logs:  {log_dir}")
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            print(f"   Worker logs:  {log_dir}")
+        else:
+            print("   Worker logs:  inherited (combined with launcher output)")
 
         optuna_db = script_dir / "optuna_trading.db"
         if optuna_db.exists():
@@ -451,13 +452,15 @@ if __name__ == "__main__":
                     pythonpath_parts.append(existing_pythonpath)
                 env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
 
-                stdout_target = subprocess.DEVNULL
-                stderr_target = subprocess.DEVNULL
+                stdout_target = None
+                stderr_target = None
                 log_file = None
-                log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
-                log_file = open(log_file_path, 'w')
-                stdout_target = log_file
-                stderr_target = subprocess.STDOUT
+                log_file_path = None
+                if log_dir is not None:
+                    log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
+                    log_file = open(log_file_path, 'w')
+                    stdout_target = log_file
+                    stderr_target = subprocess.STDOUT
 
                 try:
                     p = subprocess.Popen(
