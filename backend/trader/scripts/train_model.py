@@ -31,21 +31,9 @@ from core.coin_profiles import (
     get_coin_profile, save_model, load_model, list_saved_models,
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
-from core.pg_writer import PgWriter
 
 warnings.filterwarnings('ignore')
 
-
-def make_idempotency_key(ts: datetime, coin: str, mode: str) -> str:
-    return f"{ts.isoformat()}:{coin}:{mode}"
-
-
-def init_writer() -> Optional[PgWriter]:
-    try:
-        return PgWriter()
-    except Exception as exc:
-        print(f"⚠️ PgWriter unavailable: {exc}")
-        return None
 
 # --- Paths ---
 FEATURES_DIR = Path("./data/features")
@@ -422,7 +410,6 @@ def _get_profile(symbol: str, profile_overrides: Optional[Dict[str, CoinProfile]
 def run_backtest(all_data: Dict, config: Config,
                  profile_overrides: Optional[Dict[str, CoinProfile]] = None):
     system = MLSystem(config)
-    writer = init_writer()
 
     all_ts = [ts for d in all_data.values() for ts in d['ohlcv'].index]
     if not all_ts:
@@ -601,16 +588,6 @@ def run_backtest(all_data: Dict, config: Config,
                         net_pnl, raw_pnl, pos['accum_funding'], fee_pnl,
                         pnl_dollars, pos['n_contracts'], notional, reason
                     ))
-                    if writer and pos.get('pg_trade_id'):
-                        writer.close_trade(
-                            trade_id=pos['pg_trade_id'],
-                            exit_price=float(exit_price),
-                            fee_close=float(calculate_coinbase_fee(pos['n_contracts'], exit_price, sym, config)),
-                            net_pnl=float(pnl_dollars),
-                            reason_exit=reason,
-                            mode="backtest",
-                            idempotency_key=make_idempotency_key(ts, sym, "backtest-close"),
-                        )
                     to_close.append(sym)
                     last_exit_time[sym] = ts
 
@@ -755,23 +732,7 @@ def run_backtest(all_data: Dict, config: Config,
                         'at_breakeven': False,
                         'effective_fee_pct': effective_fee_pct,
                     }
-                    if writer:
-                        trade_id = writer.open_trade(
-                            coin=sym,
-                            side='long' if direction == 1 else 'short',
-                            contracts=float(n_contracts),
-                            entry_price=float(price),
-                            fee_open=float(entry_fee),
-                            margin_used=float(total_notional / max(config.leverage, 1)),
-                            leverage=float(config.leverage),
-                            reason_entry='backtest_entry',
-                            mode="backtest",
-                            idempotency_key=make_idempotency_key(ts, sym, "backtest-open"),
-                        )
-                        active_positions[sym]['pg_trade_id'] = trade_id
 
-        if writer:
-            writer.upsert_wallet_balance(float(equity))
         current_date = week_end
 
     # --- REPORT ---
@@ -990,7 +951,6 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
 # LIVE SIGNALS — v8
 def run_signals(all_data: Dict, config: Config, debug: bool = False):
     system = MLSystem(config)
-    writer = init_writer()
     print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
 
     for sym, d in all_data.items():
@@ -1124,28 +1084,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                   f"{n_contracts} contracts | ${notional:,.0f} notional | "
                   f"Prob: {prob:.1%} | AUC: {auc:.3f}")
 
-        if writer:
-            signal_ts = pd.Timestamp(feat.index[-1]).to_pydatetime()
-            writer.write_signal(
-                coin=sym,
-                timestamp=signal_ts,
-                direction='long' if direction == 1 else 'short',
-                confidence=float(prob),
-                raw_probability=float(raw_prob),
-                model_auc=float(auc),
-                price_at_signal=float(price),
-                momentum_pass=bool(momentum_pass),
-                trend_pass=bool((direction == 1 and price >= sma_200) or (direction == -1 and price <= sma_200)),
-                regime_pass=bool(regime_pass),
-                ml_pass=bool(ml_pass),
-                contracts_suggested=int(n_contracts) if ml_pass and regime_pass and momentum_pass else 0,
-                notional_usd=float(notional) if ml_pass and regime_pass and momentum_pass else 0.0,
-                mode="signals",
-                idempotency_key=make_idempotency_key(signal_ts, sym, "signals"),
-            )
-
-    if writer:
-        writer.upsert_wallet_balance(100_000.0)
 
 
 if __name__ == "__main__":
