@@ -264,8 +264,14 @@ export interface ResearchFeatures {
 }
 
 
+export interface ResearchScriptInfo {
+  name: string;
+  module: string;
+  default_args: string[];
+}
+
 export interface ResearchScriptListResponse {
-  scripts: string[];
+  scripts: ResearchScriptInfo[];
 }
 
 export interface ResearchJobLaunchRequest {
@@ -279,4 +285,14 @@ export interface ResearchJobLaunchResponse {
   command: string[];
   cwd: string;
   launched_at: string;
+  log_path: string;
+}
+
+export interface ResearchJobLogResponse {
+  pid: number;
+  running: boolean;
+  command: string[];
+  launched_at: string;
+  log_path: string;
+  logs: string[];
 }

@@ -78,8 +78,24 @@ class ResearchJobLaunchResponse(BaseModel):
     pid: int
     command: List[str]
     cwd: str
+    log_path: str
     launched_at: datetime
 
 
+class ResearchScriptInfo(BaseModel):
+    name: str
+    module: str
+    default_args: List[str] = Field(default_factory=list)
+
+
 class ResearchScriptListResponse(BaseModel):
-    scripts: List[str]
+    scripts: List[ResearchScriptInfo]
+
+
+class ResearchJobLogResponse(BaseModel):
+    pid: int
+    running: bool
+    command: List[str]
+    launched_at: datetime
+    log_path: str
+    logs: List[str]

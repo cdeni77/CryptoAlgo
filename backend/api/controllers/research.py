@@ -1,9 +1,11 @@
+import ast
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
-from typing import List
+from typing import Any, List
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
@@ -202,6 +204,8 @@ def get_research_features(db: Session, coin: str) -> ResearchFeaturesResponse:
 
 
 SCRIPT_PACKAGE = "scripts"
+RUNNER_LOG_DIR = "logs/script_runner"
+_JOB_REGISTRY: dict[int, dict[str, Any]] = {}
 
 
 def _discover_script_modules(trader_dir: Path) -> dict[str, str]:
@@ -218,13 +222,85 @@ def _discover_script_modules(trader_dir: Path) -> dict[str, str]:
     return modules
 
 
-def list_research_scripts() -> List[str]:
+def _safe_literal(node: ast.AST):
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError):
+        return None
+
+
+def _script_default_args(script_path: Path) -> List[str]:
+    try:
+        tree = ast.parse(script_path.read_text(encoding="utf-8"))
+    except (SyntaxError, OSError, UnicodeDecodeError):
+        return []
+
+    defaults: List[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "add_argument":
+            continue
+
+        option_strings: List[str] = []
+        for arg in node.args:
+            value = _safe_literal(arg)
+            if isinstance(value, str) and value.startswith("--"):
+                option_strings.append(value)
+        if not option_strings:
+            continue
+
+        default_value = None
+        action_value = None
+        for kw in node.keywords:
+            if kw.arg == "default":
+                default_value = _safe_literal(kw.value)
+            elif kw.arg == "action":
+                action_value = _safe_literal(kw.value)
+
+        option = option_strings[0]
+        if action_value in {"store_true", "store_false"}:
+            if isinstance(default_value, bool) and default_value is True and action_value == "store_false":
+                defaults.append(option)
+            if isinstance(default_value, bool) and default_value is False and action_value == "store_true":
+                continue
+            continue
+
+        if default_value in (None, False, ""):
+            continue
+
+        if isinstance(default_value, (list, tuple)):
+            for item in default_value:
+                defaults.extend([option, str(item)])
+            continue
+
+        if isinstance(default_value, bool):
+            if default_value:
+                defaults.append(option)
+            continue
+
+        defaults.extend([option, str(default_value)])
+
+    return defaults
+
+
+def list_research_scripts() -> List[dict[str, Any]]:
     trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
     if not trader_dir.exists():
         raise FileNotFoundError(f"TRADER_DIR does not exist: {trader_dir}")
 
     script_modules = _discover_script_modules(trader_dir)
-    return sorted(script_modules.keys())
+    scripts = []
+    for script_name in sorted(script_modules.keys()):
+        scripts.append(
+            {
+                "name": script_name,
+                "module": script_modules[script_name],
+                "default_args": _script_default_args(trader_dir / SCRIPT_PACKAGE / f"{script_name}.py"),
+            }
+        )
+    return scripts
 
 
 def launch_research_job(job: str, args: List[str] | None = None):
@@ -241,12 +317,31 @@ def launch_research_job(job: str, args: List[str] | None = None):
 
     safe_args = [a for a in (args or []) if a and a.strip()]
     command = [sys.executable, "-m", module, *safe_args]
+
+    logs_dir = trader_dir / RUNNER_LOG_DIR
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    launched_at = datetime.now(timezone.utc)
+    log_file = logs_dir / f"{job_key}_{launched_at.strftime('%Y%m%d_%H%M%S')}.log"
+
+    log_handle = log_file.open("a", encoding="utf-8")
+    log_handle.write(f"# Launched at {launched_at.isoformat()}\n")
+    log_handle.write(f"# Command: {shlex.join(command)}\n\n")
+    log_handle.flush()
+
     process = subprocess.Popen(
         command,
         cwd=trader_dir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
     )
+    log_handle.close()
+
+    _JOB_REGISTRY[process.pid] = {
+        "pid": process.pid,
+        "command": command,
+        "launched_at": launched_at,
+        "log_path": str(log_file),
+    }
 
     from models.research import ResearchJobLaunchResponse
 
@@ -256,5 +351,36 @@ def launch_research_job(job: str, args: List[str] | None = None):
         pid=process.pid,
         command=command,
         cwd=str(trader_dir),
-        launched_at=datetime.now(timezone.utc),
+        log_path=str(log_file),
+        launched_at=launched_at,
+    )
+
+
+def get_research_job_logs(pid: int, lines: int = 200):
+    if pid not in _JOB_REGISTRY:
+        raise ValueError(f"No launched job found for pid {pid}")
+
+    job = _JOB_REGISTRY[pid]
+    log_path = Path(job["log_path"])
+    if not log_path.exists():
+        raise FileNotFoundError(f"Log file not found for pid {pid}: {log_path}")
+
+    raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail_lines = raw_lines[-max(1, lines):]
+
+    running = True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        running = False
+
+    from models.research import ResearchJobLogResponse
+
+    return ResearchJobLogResponse(
+        pid=pid,
+        running=running,
+        command=job["command"],
+        launched_at=job["launched_at"],
+        log_path=str(log_path),
+        logs=tail_lines,
     )
