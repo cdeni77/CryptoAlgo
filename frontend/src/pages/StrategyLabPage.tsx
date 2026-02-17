@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getPaperEquity, getPaperFills, getPaperPositions } from '../api/paperApi';
-import { getResearchCoin, getResearchFeatures, getResearchRuns, getResearchScripts, getResearchSummary, launchResearchJob } from '../api/researchApi';
+import { getResearchCoin, getResearchFeatures, getResearchJobLogs, getResearchRuns, getResearchScripts, getResearchSummary, launchResearchJob } from '../api/researchApi';
 import PaperEquityTable from '../components/PaperEquityTable';
 import PaperFillsTable from '../components/PaperFillsTable';
 import PaperPerformancePanel from '../components/PaperPerformancePanel';
 import PaperPositionsTable from '../components/PaperPositionsTable';
-import { PaperEquityPoint, PaperFill, PaperPosition, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchSummary } from '../types';
+import { PaperEquityPoint, PaperFill, PaperPosition, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchScriptInfo, ResearchSummary } from '../types';
 
 type PaperTab = 'positions' | 'equity' | 'performance' | 'fills';
 
@@ -32,10 +32,14 @@ export default function StrategyLabPage() {
   const [paperTab, setPaperTab] = useState<PaperTab>('positions');
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [paperUpdatedAt, setPaperUpdatedAt] = useState<Date | null>(null);
-  const [scripts, setScripts] = useState<string[]>([]);
+  const [scripts, setScripts] = useState<ResearchScriptInfo[]>([]);
   const [selectedScript, setSelectedScript] = useState('');
   const [cliArgs, setCliArgs] = useState('');
   const [launchResult, setLaunchResult] = useState<ResearchJobLaunchResponse | null>(null);
+  const [launchHistory, setLaunchHistory] = useState<ResearchJobLaunchResponse[]>([]);
+  const [selectedLogPid, setSelectedLogPid] = useState<number | null>(null);
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [logRunning, setLogRunning] = useState(false);
   const [launching, setLaunching] = useState(false);
 
   const loadResearch = useCallback(async () => {
@@ -78,12 +82,37 @@ export default function StrategyLabPage() {
     try {
       const response = await getResearchScripts();
       setScripts(response.scripts);
-      setSelectedScript((current) => current || response.scripts[0] || '');
+      setSelectedScript((current) => current || response.scripts[0]?.name || '');
     } catch (err) {
       setError((err as Error).message);
     }
   }, []);
 
+
+  useEffect(() => {
+    if (!selectedScript) return;
+    const selected = scripts.find((script) => script.name === selectedScript);
+    if (!selected) return;
+    const defaults = selected.default_args.join(' ');
+    setCliArgs(defaults);
+  }, [selectedScript, scripts]);
+
+  const loadLogs = useCallback(async (pid: number) => {
+    try {
+      const response = await getResearchJobLogs(pid, 300);
+      setLogLines(response.logs);
+      setLogRunning(response.running);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedLogPid) return;
+    loadLogs(selectedLogPid);
+    const iv = setInterval(() => loadLogs(selectedLogPid), 2500);
+    return () => clearInterval(iv);
+  }, [loadLogs, selectedLogPid]);
   const handleLaunchScript = useCallback(async () => {
     if (!selectedScript) return;
 
@@ -91,6 +120,8 @@ export default function StrategyLabPage() {
     try {
       const response = await launchResearchJob(selectedScript, parseCliArgs(cliArgs));
       setLaunchResult(response);
+      setLaunchHistory((current) => [response, ...current.filter((item) => item.pid !== response.pid)].slice(0, 12));
+      setSelectedLogPid(response.pid);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -259,7 +290,7 @@ export default function StrategyLabPage() {
               >
                 {scripts.length === 0 && <option value="">No scripts discovered</option>}
                 {scripts.map((script) => (
-                  <option key={script} value={script}>{script}</option>
+                  <option key={script.name} value={script.name}>{script.name}</option>
                 ))}
               </select>
             </label>
@@ -271,6 +302,7 @@ export default function StrategyLabPage() {
                 value={cliArgs}
                 onChange={(e) => setCliArgs(e.target.value)}
               />
+              <span className="block text-[10px] text-[var(--text-muted)]">Defaults auto-populate from the selected script and can be edited before launch.</span>
             </label>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -291,6 +323,33 @@ export default function StrategyLabPage() {
               {launchResult.command.join(' ')}
             </div>
           )}
+
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="space-y-2 lg:col-span-1">
+              <p className="text-xs uppercase text-[var(--text-muted)]">Launched Jobs</p>
+              {launchHistory.length === 0 ? (
+                <p className="text-xs text-[var(--text-muted)]">No jobs launched from this page yet.</p>
+              ) : launchHistory.map((job) => (
+                <button
+                  key={job.pid}
+                  type="button"
+                  onClick={() => setSelectedLogPid(job.pid)}
+                  className={`w-full text-left rounded-lg border px-3 py-2 text-xs font-mono ${selectedLogPid === job.pid ? 'border-[var(--border-accent)] text-[var(--accent-cyan)]' : 'border-[var(--border-subtle)] text-[var(--text-muted)]'}`}
+                >
+                  PID {job.pid} · {job.job}
+                </button>
+              ))}
+            </div>
+            <div className="lg:col-span-2">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs uppercase text-[var(--text-muted)]">Job Logs {selectedLogPid ? `(PID ${selectedLogPid})` : ''}</p>
+                {selectedLogPid && <span className={`text-xs ${logRunning ? 'text-[var(--accent-amber)]' : 'text-[var(--accent-emerald)]'}`}>{logRunning ? 'Running' : 'Exited'}</span>}
+              </div>
+              <pre className="h-56 overflow-y-auto rounded-lg bg-black/50 p-3 text-[11px] font-mono text-slate-200">
+{logLines.length > 0 ? logLines.join('\n') : 'Select a launched job to view logs.'}
+              </pre>
+            </div>
+          </div>
         </section>
 
         <section className="glass-card rounded-xl p-4">
