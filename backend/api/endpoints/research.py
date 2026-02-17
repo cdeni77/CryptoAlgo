@@ -10,6 +10,7 @@ from controllers.research import (
     get_research_summary,
     launch_research_job,
     list_research_scripts,
+    get_research_job_logs,
 )
 from database import get_db
 from models.research import (
@@ -17,6 +18,7 @@ from models.research import (
     ResearchFeaturesResponse,
     ResearchJobLaunchRequest,
     ResearchJobLaunchResponse,
+    ResearchJobLogResponse,
     ResearchRunResponse,
     ResearchScriptListResponse,
     ResearchSummaryResponse,
@@ -45,14 +47,22 @@ def features(coin: str, db: Session = Depends(get_db)):
     return get_research_features(db, coin)
 
 
-
-
 @router.get("/scripts", response_model=ResearchScriptListResponse)
 def scripts():
     try:
         return ResearchScriptListResponse(scripts=list_research_scripts())
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/jobs/{pid}/logs", response_model=ResearchJobLogResponse)
+def job_logs(pid: int, lines: int = Query(200, ge=1, le=2000)):
+    try:
+        return get_research_job_logs(pid=pid, lines=lines)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/launch/{job}", response_model=ResearchJobLaunchResponse)

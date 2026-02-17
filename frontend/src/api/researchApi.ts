@@ -2,6 +2,7 @@ import {
   ResearchCoinDetail,
   ResearchFeatures,
   ResearchJobLaunchResponse,
+  ResearchJobLogResponse,
   ResearchRun,
   ResearchScriptListResponse,
   ResearchSummary,
@@ -44,4 +45,9 @@ export async function launchResearchJob(job: string, args: string[]): Promise<Re
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ args }),
   });
+}
+
+
+export async function getResearchJobLogs(pid: number, lines = 200): Promise<ResearchJobLogResponse> {
+  return fetchWithError(`${API_BASE}/research/jobs/${pid}/logs?lines=${lines}`);
 }
