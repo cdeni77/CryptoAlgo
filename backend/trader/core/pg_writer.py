@@ -187,15 +187,16 @@ class PgWriter:
         trade_id: int | None = None,
     ) -> int:
         """Insert one signal row. Returns the signal id (idempotent for coin+timestamp+direction)."""
-    def write_signal(self, coin: str, timestamp: datetime, direction: str, confidence: float, raw_probability: float | None = None, model_auc: float | None = None, price_at_signal: float | None = None, momentum_pass: bool | None = None, trend_pass: bool | None = None, regime_pass: bool | None = None, ml_pass: bool | None = None, contracts_suggested: int | None = None, notional_usd: float | None = None, acted_on: bool = False, trade_id: int | None = None) -> int:
+        _ = mode
         with self._session() as db:
-            existing = db.query(Signal).filter(
-                Signal.coin == coin,
-                Signal.timestamp == timestamp,
-                Signal.direction == direction,
-            ).first()
-            if existing:
-                return existing.id
+            if idempotency_key:
+                existing = db.query(Signal).filter(
+                    Signal.coin == coin,
+                    Signal.timestamp == timestamp,
+                    Signal.direction == direction,
+                ).first()
+                if existing:
+                    return existing.id
 
             sig = Signal(
                 coin=coin,
@@ -234,7 +235,7 @@ class PgWriter:
         reason_entry: str | None = None,
     ) -> int:
         """Insert an open trade. Returns trade id."""
-    def open_trade(self, coin: str, side: str, contracts: float, entry_price: float, fee_open: float = 0.0, margin_used: float | None = None, leverage: float | None = None, reason_entry: str | None = None) -> int:
+        _ = mode
         with self._session() as db:
             if idempotency_key:
                 existing = db.query(Trade).filter(
@@ -271,7 +272,7 @@ class PgWriter:
         reason_exit: str | None = None,
     ) -> bool:
         """Close an existing trade. Returns True on success."""
-    def close_trade(self, trade_id: int, exit_price: float, fee_close: float = 0.0, net_pnl: float | None = None, reason_exit: str | None = None) -> bool:
+        _ = mode
         with self._session() as db:
             if idempotency_key:
                 existing = db.query(Trade).filter(
