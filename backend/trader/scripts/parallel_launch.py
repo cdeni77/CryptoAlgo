@@ -404,9 +404,9 @@ if __name__ == "__main__":
         run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
         print(f"   Study run id: {run_id}")
 
-        # Setup log directory (default on, to preserve worker failures for debugging)
-        log_dir = Path(args.log_dir) if args.log_dir else (script_dir / "worker_logs" / run_id)
-        log_dir.mkdir(parents=True, exist_ok=True)
+        if log_dir is None:
+            log_dir = script_dir / "optimization_logs" / run_id
+            log_dir.mkdir(parents=True, exist_ok=True)
         print(f"   Worker logs:  {log_dir}")
 
         optuna_db = script_dir / "optuna_trading.db"
@@ -444,16 +444,21 @@ if __name__ == "__main__":
 
                 env = os.environ.copy()
                 env.setdefault("PYTHONUNBUFFERED", "1")
+                existing_pythonpath = env.get("PYTHONPATH", "")
+                pythonpath_parts = [str(trader_root)]
+                if existing_pythonpath:
+                    pythonpath_parts.append(existing_pythonpath)
+                env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
 
                 stdout_target = subprocess.DEVNULL
                 stderr_target = subprocess.DEVNULL
                 log_file = None
                 log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
 
-                if log_dir:
-                    log_file = open(log_file_path, 'w')
-                    stdout_target = log_file
-                    stderr_target = subprocess.STDOUT
+                log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
+                log_file = open(log_file_path, 'w')
+                stdout_target = log_file
+                stderr_target = subprocess.STDOUT
 
                 try:
                     p = subprocess.Popen(
@@ -495,7 +500,17 @@ if __name__ == "__main__":
                                   f"{format_duration(time.time() - optim_start)} elapsed)")
                         else:
                             print(f"   ❌ {coin} worker #{idx+1} failed (code {ret})")
-                            _print_log_tail(log_path)
+                            if lf:
+                                try:
+                                    lf.flush()
+                                    with open(lf.name, 'r', encoding='utf-8', errors='replace') as r:
+                                        lines = r.readlines()[-12:]
+                                    if lines:
+                                        print("      ↳ log tail:")
+                                        for line in lines:
+                                            print(f"         {line.rstrip()}")
+                                except OSError:
+                                    pass
                         if lf:
                             lf.close()
                     else:
