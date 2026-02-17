@@ -404,9 +404,10 @@ if __name__ == "__main__":
         run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
         print(f"   Study run id: {run_id}")
 
+        log_dir = Path(args.log_dir).expanduser() if args.log_dir else None
         if log_dir is None:
             log_dir = script_dir / "optimization_logs" / run_id
-            log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
         print(f"   Worker logs:  {log_dir}")
 
         optuna_db = script_dir / "optuna_trading.db"
@@ -453,8 +454,6 @@ if __name__ == "__main__":
                 stdout_target = subprocess.DEVNULL
                 stderr_target = subprocess.DEVNULL
                 log_file = None
-                log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
-
                 log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
                 log_file = open(log_file_path, 'w')
                 stdout_target = log_file
