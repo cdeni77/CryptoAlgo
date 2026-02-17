@@ -303,6 +303,26 @@ def list_research_scripts() -> List[dict[str, Any]]:
     return scripts
 
 
+def list_research_jobs(limit: int = 25):
+    from models.research import ResearchJobLaunchResponse
+
+    jobs: List[ResearchJobLaunchResponse] = []
+    ordered_jobs = sorted(_JOB_REGISTRY.values(), key=lambda job: job["launched_at"], reverse=True)
+    for job in ordered_jobs[:max(1, limit)]:
+        jobs.append(
+            ResearchJobLaunchResponse(
+                job=job["job"],
+                module=job["module"],
+                pid=job["pid"],
+                command=job["command"],
+                cwd=job["cwd"],
+                log_path=job["log_path"],
+                launched_at=job["launched_at"],
+            )
+        )
+    return jobs
+
+
 def launch_research_job(job: str, args: List[str] | None = None):
     trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
     if not trader_dir.exists():
@@ -337,8 +357,11 @@ def launch_research_job(job: str, args: List[str] | None = None):
     log_handle.close()
 
     _JOB_REGISTRY[process.pid] = {
+        "job": job_key,
+        "module": module,
         "pid": process.pid,
         "command": command,
+        "cwd": str(trader_dir),
         "launched_at": launched_at,
         "log_path": str(log_file),
     }

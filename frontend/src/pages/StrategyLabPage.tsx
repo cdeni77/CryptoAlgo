@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getPaperEquity, getPaperFills, getPaperPositions } from '../api/paperApi';
-import { getResearchCoin, getResearchFeatures, getResearchJobLogs, getResearchRuns, getResearchScripts, getResearchSummary, launchResearchJob } from '../api/researchApi';
+import { getResearchCoin, getResearchFeatures, getResearchJobLogs, getResearchJobs, getResearchRuns, getResearchScripts, getResearchSummary, launchResearchJob } from '../api/researchApi';
 import PaperEquityTable from '../components/PaperEquityTable';
 import PaperFillsTable from '../components/PaperFillsTable';
 import PaperPerformancePanel from '../components/PaperPerformancePanel';
@@ -78,6 +78,16 @@ export default function StrategyLabPage() {
     return matches.map((token) => (token.startsWith('\"') || token.startsWith("'")) ? token.slice(1, -1) : token).filter(Boolean);
   };
 
+  const loadLaunchedJobs = useCallback(async () => {
+    try {
+      const jobs = await getResearchJobs(25);
+      setLaunchHistory(jobs);
+      setSelectedLogPid((current) => current ?? jobs[0]?.pid ?? null);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, []);
+
   const loadScripts = useCallback(async () => {
     try {
       const response = await getResearchScripts();
@@ -151,13 +161,14 @@ export default function StrategyLabPage() {
     loadResearch();
     loadPaper();
     loadScripts();
+    loadLaunchedJobs();
     const researchIv = setInterval(loadResearch, 45000);
     const paperIv = setInterval(loadPaper, 20000);
     return () => {
       clearInterval(researchIv);
       clearInterval(paperIv);
     };
-  }, [loadPaper, loadResearch, loadScripts]);
+  }, [loadLaunchedJobs, loadPaper, loadResearch, loadScripts]);
 
   const staleData = useMemo(() => {
     if (!updatedAt || !paperUpdatedAt) return false;
@@ -187,7 +198,7 @@ export default function StrategyLabPage() {
           </div>
           <div className="flex items-center gap-3">
             <span className="text-xs font-mono-trade text-[var(--text-muted)]">Research: {formatAgo(updatedAt)} · Paper: {formatAgo(paperUpdatedAt)}</span>
-            <button onClick={() => { loadResearch(); loadPaper(); loadScripts(); }} className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)]">Refresh All</button>
+            <button onClick={() => { loadResearch(); loadPaper(); loadScripts(); loadLaunchedJobs(); }} className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)]">Refresh All</button>
           </div>
         </div>
       </header>
