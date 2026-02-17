@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getPaperEquity, getPaperFills, getPaperPositions } from '../api/paperApi';
-import { getResearchCoin, getResearchFeatures, getResearchRuns, getResearchSummary } from '../api/researchApi';
+import { getResearchCoin, getResearchFeatures, getResearchRuns, getResearchScripts, getResearchSummary, launchResearchJob } from '../api/researchApi';
 import PaperEquityTable from '../components/PaperEquityTable';
 import PaperFillsTable from '../components/PaperFillsTable';
 import PaperPerformancePanel from '../components/PaperPerformancePanel';
 import PaperPositionsTable from '../components/PaperPositionsTable';
-import { PaperEquityPoint, PaperFill, PaperPosition, ResearchCoinHealth, ResearchFeatures, ResearchRun, ResearchSummary } from '../types';
+import { PaperEquityPoint, PaperFill, PaperPosition, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchSummary } from '../types';
 
 type PaperTab = 'positions' | 'equity' | 'performance' | 'fills';
 
@@ -32,6 +32,11 @@ export default function StrategyLabPage() {
   const [paperTab, setPaperTab] = useState<PaperTab>('positions');
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [paperUpdatedAt, setPaperUpdatedAt] = useState<Date | null>(null);
+  const [scripts, setScripts] = useState<string[]>([]);
+  const [selectedScript, setSelectedScript] = useState('');
+  const [cliArgs, setCliArgs] = useState('');
+  const [launchResult, setLaunchResult] = useState<ResearchJobLaunchResponse | null>(null);
+  const [launching, setLaunching] = useState(false);
 
   const loadResearch = useCallback(async () => {
     setLoading(true);
@@ -63,6 +68,37 @@ export default function StrategyLabPage() {
     }
   }, []);
 
+
+  const parseCliArgs = (rawArgs: string): string[] => {
+    const matches = rawArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+    return matches.map((token) => (token.startsWith('\"') || token.startsWith("'")) ? token.slice(1, -1) : token).filter(Boolean);
+  };
+
+  const loadScripts = useCallback(async () => {
+    try {
+      const response = await getResearchScripts();
+      setScripts(response.scripts);
+      setSelectedScript((current) => current || response.scripts[0] || '');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, []);
+
+  const handleLaunchScript = useCallback(async () => {
+    if (!selectedScript) return;
+
+    setLaunching(true);
+    try {
+      const response = await launchResearchJob(selectedScript, parseCliArgs(cliArgs));
+      setLaunchResult(response);
+      setError(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLaunching(false);
+    }
+  }, [cliArgs, selectedScript]);
+
   const loadPaper = useCallback(async () => {
     setLoadingPaper(true);
     try {
@@ -83,13 +119,14 @@ export default function StrategyLabPage() {
   useEffect(() => {
     loadResearch();
     loadPaper();
+    loadScripts();
     const researchIv = setInterval(loadResearch, 45000);
     const paperIv = setInterval(loadPaper, 20000);
     return () => {
       clearInterval(researchIv);
       clearInterval(paperIv);
     };
-  }, [loadPaper, loadResearch]);
+  }, [loadPaper, loadResearch, loadScripts]);
 
   const staleData = useMemo(() => {
     if (!updatedAt || !paperUpdatedAt) return false;
@@ -119,7 +156,7 @@ export default function StrategyLabPage() {
           </div>
           <div className="flex items-center gap-3">
             <span className="text-xs font-mono-trade text-[var(--text-muted)]">Research: {formatAgo(updatedAt)} · Paper: {formatAgo(paperUpdatedAt)}</span>
-            <button onClick={() => { loadResearch(); loadPaper(); }} className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)]">Refresh All</button>
+            <button onClick={() => { loadResearch(); loadPaper(); loadScripts(); }} className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)]">Refresh All</button>
           </div>
         </div>
       </header>
@@ -204,6 +241,56 @@ export default function StrategyLabPage() {
               </div>
             )}
           </div>
+        </section>
+
+
+        <section className="glass-card rounded-xl p-4 space-y-4">
+          <div>
+            <h2 className="text-sm font-semibold">Trader Script Runner</h2>
+            <p className="text-xs text-[var(--text-muted)] mt-1">Run any script under <code>trader/scripts</code> with arbitrary CLI flags.</p>
+          </div>
+          <div className="grid gap-3 lg:grid-cols-3">
+            <label className="text-xs text-[var(--text-muted)] space-y-1">
+              <span className="block uppercase">Script</span>
+              <select
+                className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm"
+                value={selectedScript}
+                onChange={(e) => setSelectedScript(e.target.value)}
+              >
+                {scripts.length === 0 && <option value="">No scripts discovered</option>}
+                {scripts.map((script) => (
+                  <option key={script} value={script}>{script}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs text-[var(--text-muted)] space-y-1 lg:col-span-2">
+              <span className="block uppercase">CLI Parameters</span>
+              <input
+                className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm font-mono"
+                placeholder="--coin BTC --trials 100 --run-once"
+                value={cliArgs}
+                onChange={(e) => setCliArgs(e.target.value)}
+              />
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleLaunchScript}
+              disabled={!selectedScript || launching}
+              className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)] disabled:opacity-50"
+            >
+              {launching ? 'Launching…' : 'Launch Script'}
+            </button>
+            {launchResult && (
+              <span className="text-xs text-[var(--text-muted)] font-mono">PID {launchResult.pid} · {launchResult.module}</span>
+            )}
+          </div>
+          {launchResult && (
+            <div className="text-xs bg-[var(--bg-secondary)]/60 rounded-lg p-3 font-mono break-all">
+              {launchResult.command.join(' ')}
+            </div>
+          )}
         </section>
 
         <section className="glass-card rounded-xl p-4">

@@ -201,28 +201,43 @@ def get_research_features(db: Session, coin: str) -> ResearchFeaturesResponse:
     )
 
 
-SCRIPT_MODULES = {
-    "run_pipeline": "scripts.run_pipeline",
-    "compute_features": "scripts.compute_features",
-    "train_model": "scripts.train_model",
-    "optimize": "scripts.optimize",
-    "validate_robustness": "scripts.validate_robustness",
-    "parallel_launch": "scripts.parallel_launch",
-    "live_orchestrator": "scripts.live_orchestrator",
-    "paper_engine": "scripts.paper_engine",
-}
+SCRIPT_PACKAGE = "scripts"
 
 
-def launch_research_job(job: str, args: List[str] | None = None):
-    job_key = job.strip().lower()
-    module = SCRIPT_MODULES.get(job_key)
-    if module is None:
-        allowed = ", ".join(sorted(SCRIPT_MODULES.keys()))
-        raise ValueError(f"Unknown research job '{job}'. Allowed jobs: {allowed}")
+def _discover_script_modules(trader_dir: Path) -> dict[str, str]:
+    scripts_dir = trader_dir / SCRIPT_PACKAGE
+    if not scripts_dir.exists():
+        return {}
 
+    modules: dict[str, str] = {}
+    for file in scripts_dir.glob("*.py"):
+        if file.name.startswith("_") or file.name == "__init__.py":
+            continue
+        script_name = file.stem
+        modules[script_name] = f"{SCRIPT_PACKAGE}.{script_name}"
+    return modules
+
+
+def list_research_scripts() -> List[str]:
     trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
     if not trader_dir.exists():
         raise FileNotFoundError(f"TRADER_DIR does not exist: {trader_dir}")
+
+    script_modules = _discover_script_modules(trader_dir)
+    return sorted(script_modules.keys())
+
+
+def launch_research_job(job: str, args: List[str] | None = None):
+    trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
+    if not trader_dir.exists():
+        raise FileNotFoundError(f"TRADER_DIR does not exist: {trader_dir}")
+
+    job_key = job.strip().lower()
+    script_modules = _discover_script_modules(trader_dir)
+    module = script_modules.get(job_key)
+    if module is None:
+        allowed = ", ".join(sorted(script_modules.keys()))
+        raise ValueError(f"Unknown research job '{job}'. Allowed jobs: {allowed}")
 
     safe_args = [a for a in (args or []) if a and a.strip()]
     command = [sys.executable, "-m", module, *safe_args]
