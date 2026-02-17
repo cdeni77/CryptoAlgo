@@ -39,6 +39,11 @@ export async function getResearchScripts(): Promise<ResearchScriptListResponse> 
   return fetchWithError(`${API_BASE}/research/scripts`);
 }
 
+
+export async function getResearchJobs(limit = 25): Promise<ResearchJobLaunchResponse[]> {
+  return fetchWithError(`${API_BASE}/research/jobs?limit=${limit}`);
+}
+
 export async function launchResearchJob(job: string, args: string[]): Promise<ResearchJobLaunchResponse> {
   return fetchWithError(`${API_BASE}/research/launch/${job}`, {
     method: 'POST',

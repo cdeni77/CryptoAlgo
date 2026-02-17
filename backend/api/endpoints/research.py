@@ -11,6 +11,7 @@ from controllers.research import (
     launch_research_job,
     list_research_scripts,
     get_research_job_logs,
+    list_research_jobs,
 )
 from database import get_db
 from models.research import (
@@ -63,6 +64,11 @@ def job_logs(pid: int, lines: int = Query(200, ge=1, le=2000)):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/jobs", response_model=List[ResearchJobLaunchResponse])
+def jobs(limit: int = Query(25, ge=1, le=200)):
+    return list_research_jobs(limit=limit)
 
 
 @router.post("/launch/{job}", response_model=ResearchJobLaunchResponse)
