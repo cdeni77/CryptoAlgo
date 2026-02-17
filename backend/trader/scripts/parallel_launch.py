@@ -199,7 +199,6 @@ def print_final_report(script_dir: Path, target_coins: List[str], total_time: fl
 
         optim_metrics = opt.get('optim_metrics', {})
         holdout_metrics = opt.get('holdout_metrics', {})
-        quality = opt.get('quality', {})
         readiness = val.get('readiness', {})
 
         # Optimization results
@@ -296,6 +295,24 @@ def print_final_report(script_dir: Path, target_coins: List[str], total_time: fl
     print(f"{'='*80}")
 
 
+def _print_log_tail(log_path: Path, max_lines: int = 30) -> None:
+    """Print a short tail from a worker log file for quick debugging."""
+    if not log_path.exists():
+        return
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+
+    tail = lines[-max_lines:]
+    if not tail:
+        return
+
+    print(f"      └─ Last {len(tail)} log lines from {log_path}:")
+    for line in tail:
+        print(f"         {line}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Launch parallel optimization + robustness validation (v10)")
@@ -358,12 +375,6 @@ if __name__ == "__main__":
     if not features_dir.exists() or not list(features_dir.glob("*_features.csv")):
         print(f"⚠️  WARNING: No feature files in {features_dir}")
 
-    # Setup log directory
-    log_dir = None
-    if args.log_dir:
-        log_dir = Path(args.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1: OPTIMIZATION
     # ═══════════════════════════════════════════════════════════════════
@@ -393,6 +404,11 @@ if __name__ == "__main__":
         run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
         print(f"   Study run id: {run_id}")
 
+        # Setup log directory (default on, to preserve worker failures for debugging)
+        log_dir = Path(args.log_dir) if args.log_dir else (script_dir / "worker_logs" / run_id)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        print(f"   Worker logs:  {log_dir}")
+
         optuna_db = script_dir / "optuna_trading.db"
         if optuna_db.exists():
             print(f"   ℹ️  Existing optuna DB: {optuna_db.stat().st_size / 1024:.0f} KB")
@@ -409,7 +425,7 @@ if __name__ == "__main__":
 
             for i, trial_count in enumerate(trial_splits):
                 base_cmd = [
-                    sys.executable, str(optimize_path),
+                    sys.executable, "-m", "scripts.optimize",
                     "--coin", coin,
                     "--jobs", "1",
                     "--trials", str(max(1, trial_count)),
@@ -432,19 +448,19 @@ if __name__ == "__main__":
                 stdout_target = subprocess.DEVNULL
                 stderr_target = subprocess.DEVNULL
                 log_file = None
+                log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
 
                 if log_dir:
-                    log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
                     log_file = open(log_file_path, 'w')
                     stdout_target = log_file
                     stderr_target = subprocess.STDOUT
 
                 try:
                     p = subprocess.Popen(
-                        base_cmd, env=env, cwd=str(script_dir),
+                        base_cmd, env=env, cwd=str(trader_root),
                         stdout=stdout_target, stderr=stderr_target,
                     )
-                    processes.append((coin, i, p, log_file))
+                    processes.append((coin, i, p, log_file, log_file_path))
                 except Exception as e:
                     print(f"   ❌ Failed to start {coin} worker #{i+1}: {e}")
                     failed_starts.append((coin, i, str(e)))
@@ -469,7 +485,7 @@ if __name__ == "__main__":
 
             while remaining:
                 still_running = []
-                for coin, idx, p, lf in remaining:
+                for coin, idx, p, lf, log_path in remaining:
                     ret = p.poll()
                     if ret is not None:
                         completed_count += 1
@@ -479,10 +495,11 @@ if __name__ == "__main__":
                                   f"{format_duration(time.time() - optim_start)} elapsed)")
                         else:
                             print(f"   ❌ {coin} worker #{idx+1} failed (code {ret})")
+                            _print_log_tail(log_path)
                         if lf:
                             lf.close()
                     else:
-                        still_running.append((coin, idx, p, lf))
+                        still_running.append((coin, idx, p, lf, log_path))
                 remaining = still_running
 
                 # Per-coin trial progress updates (every 10 trials by default)
@@ -525,9 +542,9 @@ if __name__ == "__main__":
 
         except KeyboardInterrupt:
             print("\n🛑 Stopping all workers...")
-            for coin, idx, p, lf in processes:
+            for coin, idx, p, lf, log_path in processes:
                 p.terminate()
-            for coin, idx, p, lf in processes:
+            for coin, idx, p, lf, log_path in processes:
                 try:
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -566,10 +583,10 @@ if __name__ == "__main__":
                 # Validate one at a time
                 for coin in coins_with_results:
                     print(f"\n   Running validation for {coin}...")
-                    cmd = [sys.executable, str(validate_path), "--coin", coin]
+                    cmd = [sys.executable, "-m", "scripts.validate_robustness", "--coin", coin]
                     try:
                         result = subprocess.run(
-                            cmd, cwd=str(script_dir),
+                            cmd, cwd=str(trader_root),
                             capture_output=not sys.stderr.isatty(),
                             text=True, timeout=1800,
                         )
@@ -583,9 +600,9 @@ if __name__ == "__main__":
                         print(f"   ❌ Validation error for {coin}: {e}")
             else:
                 print(f"\n   Running validation for all coins...")
-                cmd = [sys.executable, str(validate_path), "--all"]
+                cmd = [sys.executable, "-m", "scripts.validate_robustness", "--all"]
                 try:
-                    subprocess.run(cmd, cwd=str(script_dir), timeout=3600)
+                    subprocess.run(cmd, cwd=str(trader_root), timeout=3600)
                 except subprocess.TimeoutExpired:
                     print("   ⏰ Validation timed out")
                 except Exception as e:
