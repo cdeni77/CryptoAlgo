@@ -38,12 +38,16 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.015,
         "plateau_warmup": 80,
         "holdout_days": 180,
+        "min_internal_oos_trades": 14,
+        "min_total_trades": 45,
     },
     "robust120": {
         "plateau_patience": 120,
         "plateau_min_delta": 0.02,
         "plateau_warmup": 70,
         "holdout_days": 120,
+        "min_internal_oos_trades": 10,
+        "min_total_trades": 35,
     },
 }
 
@@ -333,6 +337,10 @@ if __name__ == "__main__":
     parser.add_argument("--preset", type=str, default="robust180",
                         choices=["none", "robust120", "robust180"],
                         help="Optimization preset (default: robust180)")
+    parser.add_argument("--min-internal-oos-trades", type=int, default=0,
+                        help="Minimum internal OOS trades to qualify best trial (0 = preset/default)")
+    parser.add_argument("--min-total-trades", type=int, default=0,
+                        help="Minimum total trades to qualify best trial (0 = preset/default)")
     parser.add_argument("--debug-trials", action="store_true",
                         help="Enable verbose per-trial output in optimize workers")
     parser.add_argument("--skip-validation", action="store_true",
@@ -397,6 +405,7 @@ if __name__ == "__main__":
         print(f"   Target/coin:  {args.trials} trials")
         print(f"   Worker split: {worker_counts}")
         print(f"   Holdout:      {args.holdout_days} days (never seen by Optuna)")
+        print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, internal_oos>={args.min_internal_oos_trades or 'auto'}")
         print(f"   Preset:       {args.preset}")
         print(f"   Validation:   {'ENABLED' if not args.skip_validation else 'DISABLED'}")
         print(f"{'='*70}")
@@ -435,6 +444,8 @@ if __name__ == "__main__":
                     "--plateau-min-delta", str(args.plateau_min_delta),
                     "--plateau-warmup", str(args.plateau_warmup),
                     "--holdout-days", str(args.holdout_days),
+                    "--min-internal-oos-trades", str(args.min_internal_oos_trades),
+                    "--min-total-trades", str(args.min_total_trades),
                     "--preset", "none",
                     "--study-suffix", run_id,
                     "--resume-study",

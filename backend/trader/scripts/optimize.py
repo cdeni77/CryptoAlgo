@@ -58,6 +58,17 @@ PREFIX_TO_SYMBOL: Dict[str, str] = {}
 DEBUG_TRIALS = False
 
 
+def _to_json_safe(obj):
+    """Recursively convert numpy/pandas scalars to JSON-safe Python values."""
+    if isinstance(obj, dict):
+        return {str(k): _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_json_safe(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
 # ---------------------------------------------------------------------------
 # UTILITY FUNCTIONS
 # ---------------------------------------------------------------------------
@@ -547,7 +558,7 @@ def _persist_result_json(coin_name, result_data):
         try:
             d.mkdir(parents=True, exist_ok=True)
             p = d / f"{coin_name}_optimization.json"
-            with open(p, 'w') as f: json.dump(result_data, f, indent=2)
+            with open(p, 'w') as f: json.dump(_to_json_safe(result_data), f, indent=2)
             return p
         except (PermissionError, OSError) as e:
             last_error = e
@@ -742,10 +753,10 @@ def show_results():
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'trials': 350, 'plateau_patience': 140, 'plateau_warmup': 80,
+        'robust180': {'plateau_patience': 140, 'plateau_warmup': 80,
                       'plateau_min_delta': 0.015, 'holdout_days': 180,
                       'min_internal_oos_trades': 14, 'min_total_trades': 45},
-        'robust120': {'trials': 280, 'plateau_patience': 120, 'plateau_warmup': 70,
+        'robust120': {'plateau_patience': 120, 'plateau_warmup': 70,
                       'plateau_min_delta': 0.02, 'holdout_days': 120,
                       'min_internal_oos_trades': 10, 'min_total_trades': 35},
     }
