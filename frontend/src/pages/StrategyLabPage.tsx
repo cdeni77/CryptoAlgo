@@ -5,6 +5,7 @@ import PaperEquityTable from '../components/PaperEquityTable';
 import PaperFillsTable from '../components/PaperFillsTable';
 import PaperPerformancePanel from '../components/PaperPerformancePanel';
 import PaperPositionsTable from '../components/PaperPositionsTable';
+import WalletInfo from '../components/WalletInfo';
 import { PaperEquityPoint, PaperFill, PaperPosition, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchScriptInfo, ResearchSummary } from '../types';
 
 type PaperTab = 'positions' | 'equity' | 'performance' | 'fills';
@@ -385,6 +386,11 @@ export default function StrategyLabPage() {
               ))}
             </div>
           )}
+        </section>
+
+        <section>
+          <h2 className="text-sm font-semibold mb-3">Paper Trading Wallet</h2>
+          <WalletInfo loading={false} showPaperMetrics />
         </section>
 
         <section>
