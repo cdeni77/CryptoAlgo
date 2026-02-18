@@ -14,9 +14,10 @@ import { CoinSymbol, WalletData } from '../types';
 
 interface WalletInfoProps {
   loading: boolean;
+  showPaperMetrics?: boolean;
 }
 
-export default function WalletInfo({ loading }: WalletInfoProps) {
+export default function WalletInfo({ loading, showPaperMetrics = true }: WalletInfoProps) {
   const [wallet, setWallet] = useState<WalletData | null>(null);
   const [portfolioRange, setPortfolioRange] = useState<'1h' | '1d' | '1w' | '1m' | '1y'>('1d');
   const [backfilledSeries, setBackfilledSeries] = useState<Array<{
@@ -147,29 +148,33 @@ export default function WalletInfo({ loading }: WalletInfoProps) {
   }
 
   const items = [
-    {
-      label: 'Paper Trading',
-      value:
-        wallet.wallets?.paper_trading?.value_usd != null
-          ? fmt(wallet.wallets.paper_trading.value_usd)
-          : fmt(wallet.balance),
-      color: 'text-[var(--text-primary)]',
-    },
-    {
-      label: 'Realized PNL',
-      value: `${wallet.realized_pnl >= 0 ? '+' : ''}${fmt(wallet.realized_pnl)}`,
-      color: pnlColor(wallet.realized_pnl),
-    },
-    {
-      label: 'Unrealized PNL',
-      value: `${wallet.unrealized_pnl >= 0 ? '+' : ''}${fmt(wallet.unrealized_pnl)}`,
-      color: pnlColor(wallet.unrealized_pnl),
-    },
-    {
-      label: 'Total PNL',
-      value: `${wallet.total_pnl >= 0 ? '+' : ''}${fmt(wallet.total_pnl)}`,
-      color: pnlColor(wallet.total_pnl),
-    },
+    ...(showPaperMetrics
+      ? [
+          {
+            label: 'Paper Trading',
+            value:
+              wallet.wallets?.paper_trading?.value_usd != null
+                ? fmt(wallet.wallets.paper_trading.value_usd)
+                : fmt(wallet.balance),
+            color: 'text-[var(--text-primary)]',
+          },
+          {
+            label: 'Realized PNL',
+            value: `${wallet.realized_pnl >= 0 ? '+' : ''}${fmt(wallet.realized_pnl)}`,
+            color: pnlColor(wallet.realized_pnl),
+          },
+          {
+            label: 'Unrealized PNL',
+            value: `${wallet.unrealized_pnl >= 0 ? '+' : ''}${fmt(wallet.unrealized_pnl)}`,
+            color: pnlColor(wallet.unrealized_pnl),
+          },
+          {
+            label: 'Total PNL',
+            value: `${wallet.total_pnl >= 0 ? '+' : ''}${fmt(wallet.total_pnl)}`,
+            color: pnlColor(wallet.total_pnl),
+          },
+        ]
+      : []),
     {
       label: 'Coinbase Spot',
       value: wallet.coinbase?.spot?.value_usd != null ? fmt(wallet.coinbase.spot.value_usd) : 'N/A',
