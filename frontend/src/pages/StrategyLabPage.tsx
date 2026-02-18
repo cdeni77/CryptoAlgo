@@ -390,7 +390,7 @@ export default function StrategyLabPage() {
 
         <section>
           <h2 className="text-sm font-semibold mb-3">Paper Trading Wallet</h2>
-          <WalletInfo loading={false} showPaperMetrics />
+          <WalletInfo loading={false} showPaperMetrics showExternalMetrics={false} showHoldingsBreakdown={false} chartMode="paper" />
         </section>
 
         <section>
