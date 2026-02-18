@@ -122,8 +122,9 @@ export default function TradingTerminalPage() {
 
     const actedSignals = signals.filter((s) => s.acted_on).length;
     const actedRate = signals.length > 0 ? (actedSignals / signals.length) * 100 : 0;
+    const realizedPnl = closedTrades.reduce((sum, trade) => sum + (trade.net_pnl ?? 0), 0);
 
-    return { openTrades, closedTrades: closedTrades.length, winRate, actedRate };
+    return { openTrades, closedTrades: closedTrades.length, winRate, actedRate, realizedPnl };
   }, [trades, signals]);
 
   return (
@@ -162,10 +163,16 @@ export default function TradingTerminalPage() {
             { label: 'Open Trades', value: kpis.openTrades.toString(), sub: `Closed ${kpis.closedTrades}` },
             { label: 'Closed Win Rate', value: `${kpis.winRate.toFixed(1)}%`, sub: `Trades ${formatAgo(tradesUpdatedAt)}` },
             { label: 'Signals Acted', value: `${kpis.actedRate.toFixed(1)}%`, sub: `Signals ${formatAgo(signalsUpdatedAt)}` },
+            {
+              label: 'Realized PNL',
+              value: `${kpis.realizedPnl >= 0 ? '+' : '-'}$${Math.abs(kpis.realizedPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              sub: 'Closed trades only',
+              valueClass: kpis.realizedPnl >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]',
+            },
           ].map((k) => (
-            <div key={k.label} className="glass-card rounded-xl p-3">
+            <div key={k.label} className="glass-card rounded-xl p-3 text-center">
               <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] font-mono-trade">{k.label}</p>
-              <p className="text-xl font-semibold mt-1 text-[var(--text-primary)]">{k.value}</p>
+              <p className={`text-xl font-semibold mt-1 ${k.valueClass ?? 'text-[var(--text-primary)]'}`}>{k.value}</p>
               <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 font-mono-trade">{k.sub}</p>
             </div>
           ))}
@@ -183,7 +190,7 @@ export default function TradingTerminalPage() {
           cdeSpec={cdeSpecs?.[selectedCoin]}
         />
 
-        <WalletInfo loading={loadingWallet} showPaperMetrics={false} />
+        <WalletInfo loading={loadingWallet} showPaperMetrics={false} showExternalMetrics showHoldingsBreakdown chartMode="portfolio" />
 
         <section>
           <div className="flex flex-wrap gap-2 mb-4">
