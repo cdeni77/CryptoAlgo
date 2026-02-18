@@ -183,7 +183,7 @@ export default function TradingTerminalPage() {
           cdeSpec={cdeSpecs?.[selectedCoin]}
         />
 
-        <WalletInfo loading={loadingWallet} showPaperMetrics={false} />
+        <WalletInfo loading={loadingWallet} showPaperMetrics={false} showExternalMetrics showHoldingsBreakdown chartMode="portfolio" />
 
         <section>
           <div className="flex flex-wrap gap-2 mb-4">
