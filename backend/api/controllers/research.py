@@ -336,21 +336,28 @@ def launch_research_job(job: str, args: List[str] | None = None):
         raise ValueError(f"Unknown research job '{job}'. Allowed jobs: {allowed}")
 
     safe_args = [a for a in (args or []) if a and a.strip()]
-    command = [sys.executable, "-m", module, *safe_args]
+    # Use unbuffered Python so script prints stream into the log file immediately
+    # (especially important for long-running jobs launched from the frontend).
+    command = [sys.executable, "-u", "-m", module, *safe_args]
 
     logs_dir = trader_dir / RUNNER_LOG_DIR
     logs_dir.mkdir(parents=True, exist_ok=True)
     launched_at = datetime.now(timezone.utc)
     log_file = logs_dir / f"{job_key}_{launched_at.strftime('%Y%m%d_%H%M%S')}.log"
 
-    log_handle = log_file.open("a", encoding="utf-8")
+    # Line buffering helps ensure launcher preamble entries are written promptly.
+    log_handle = log_file.open("a", encoding="utf-8", buffering=1)
     log_handle.write(f"# Launched at {launched_at.isoformat()}\n")
     log_handle.write(f"# Command: {shlex.join(command)}\n\n")
     log_handle.flush()
 
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+
     process = subprocess.Popen(
         command,
         cwd=trader_dir,
+        env=env,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
