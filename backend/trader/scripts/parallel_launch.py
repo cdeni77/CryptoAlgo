@@ -115,7 +115,7 @@ def load_validation_results(results_dir):
 
 def get_coin_trial_progress(optuna_db, target_coins, run_id):
     progress = {
-        coin: {"completed": 0, "best_score": None, "best_metrics": {}}
+        coin: {"started": 0, "completed": 0, "best_score": None, "best_metrics": {}}
         for coin in target_coins
     }
     if not optuna_db.exists():
@@ -123,10 +123,12 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
 
     # Simple count query as primary method (most reliable under contention)
     count_query = """
-        SELECT s.study_name, COUNT(*)
+        SELECT
+            s.study_name,
+            COUNT(*) AS started_trials,
+            SUM(CASE WHEN CAST(t.state AS TEXT) IN ('1', 'COMPLETE') THEN 1 ELSE 0 END) AS completed_trials
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
-        WHERE t.state = 1
         GROUP BY s.study_name
     """
     best_trial_query = """
@@ -134,7 +136,7 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
         JOIN trial_values v ON v.trial_id = t.trial_id
-        WHERE s.study_name = ? AND t.state = 1 AND v.objective = 0
+        WHERE s.study_name = ? AND CAST(t.state AS TEXT) IN ('1', 'COMPLETE') AND v.objective = 0
         ORDER BY v.value DESC LIMIT 1
     """
     attrs_query = """
@@ -152,11 +154,12 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
 
                 # Get all study counts in one query
                 rows = conn.execute(count_query).fetchall()
-                for study_name, count in rows:
+                for study_name, started_trials, completed_trials in rows:
                     for coin in target_coins:
                         expected = f"optimize_{coin}_{run_id}"
                         if study_name == expected:
-                            progress[coin]["completed"] = int(count)
+                            progress[coin]["started"] = int(started_trials or 0)
+                            progress[coin]["completed"] = int(completed_trials or 0)
                             break
 
                 # Get best trial details per coin
@@ -447,7 +450,8 @@ if __name__ == "__main__":
             status_parts = []
             for coin in target_coins:
                 p = progress[coin]
-                done = p['completed']
+                started = p.get('started', 0)
+                completed = p['completed']
                 best = p.get('best_score')
                 best_str = f" best={best:.3f}" if best is not None else ""
                 metrics = p.get('best_metrics', {})
@@ -455,7 +459,10 @@ if __name__ == "__main__":
                 oos_sr = metrics.get('mean_oos_sharpe', metrics.get('oos_sharpe'))
                 oos_str = f" OOS_SR={oos_sr:.3f}" if oos_sr is not None else ""
                 running = "🔄" if coin in still_running else "✅"
-                status_parts.append(f"{running}{coin}:{done}/{args.trials}{best_str}{oos_str}")
+                progress_str = f"{started}/{args.trials}"
+                if completed and completed != started:
+                    progress_str += f" (✓{completed})"
+                status_parts.append(f"{running}{coin}:{progress_str}{best_str}{oos_str}")
 
             print(f"   [{format_duration(elapsed)}] {' | '.join(status_parts)}", flush=True)
 
