@@ -121,12 +121,13 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
     if not optuna_db.exists():
         return progress
 
-    completed_query = """
-        SELECT s.study_id, COUNT(*)
+    # Simple count query as primary method (most reliable under contention)
+    count_query = """
+        SELECT s.study_name, COUNT(*)
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
-        WHERE t.state = 1 AND s.study_name = ?
-        GROUP BY s.study_id
+        WHERE t.state = 1
+        GROUP BY s.study_name
     """
     best_trial_query = """
         SELECT t.trial_id, v.value
@@ -143,30 +144,45 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
           AND key IN ('mean_oos_sharpe', 'oos_sharpe', 'n_trades', 'win_rate', 'max_drawdown', 'std_oos_sharpe')
     """
 
-    try:
-        with sqlite3.connect(optuna_db) as conn:
-            conn.execute("PRAGMA busy_timeout = 1000;")
-            for coin in target_coins:
-                study_name = f"optimize_{coin}_{run_id}"
-                completed_row = conn.execute(completed_query, (study_name,)).fetchone()
-                progress[coin]["completed"] = int(completed_row[1]) if completed_row else 0
+    for attempt in range(3):
+        try:
+            with sqlite3.connect(str(optuna_db), timeout=5) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000;")
+                conn.execute("PRAGMA journal_mode=WAL;")
 
-                best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
-                if not best_row:
-                    continue
-                best_trial_id, best_score = best_row
-                progress[coin]["best_score"] = float(best_score) if best_score is not None else None
+                # Get all study counts in one query
+                rows = conn.execute(count_query).fetchall()
+                for study_name, count in rows:
+                    for coin in target_coins:
+                        expected = f"optimize_{coin}_{run_id}"
+                        if study_name == expected:
+                            progress[coin]["completed"] = int(count)
+                            break
 
-                metric_rows = conn.execute(attrs_query, (best_trial_id,)).fetchall()
-                metrics = {}
-                for key, value_json in metric_rows:
-                    try:
-                        metrics[key] = json.loads(value_json)
-                    except (TypeError, json.JSONDecodeError):
-                        metrics[key] = value_json
-                progress[coin]["best_metrics"] = metrics
-    except sqlite3.Error:
-        return progress
+                # Get best trial details per coin
+                for coin in target_coins:
+                    if progress[coin]["completed"] == 0:
+                        continue
+                    study_name = f"optimize_{coin}_{run_id}"
+                    best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
+                    if not best_row:
+                        continue
+                    best_trial_id, best_score = best_row
+                    progress[coin]["best_score"] = float(best_score) if best_score is not None else None
+
+                    metric_rows = conn.execute(attrs_query, (best_trial_id,)).fetchall()
+                    metrics = {}
+                    for key, value_json in metric_rows:
+                        try:
+                            metrics[key] = json.loads(value_json)
+                        except (TypeError, json.JSONDecodeError):
+                            metrics[key] = value_json
+                    progress[coin]["best_metrics"] = metrics
+            return progress
+        except sqlite3.OperationalError:
+            time.sleep(0.5 * (attempt + 1))
+        except sqlite3.Error:
+            break
 
     return progress
 
@@ -406,7 +422,7 @@ if __name__ == "__main__":
                 log_file = open(log_dir / f"{coin}_{run_id}.log", 'w')
                 stdout_target = log_file
 
-            print(f"   🚀 Launching {coin} ({n_workers} workers)")
+            print(f"   🚀 Launching {coin} ({n_workers} workers)", flush=True)
             proc = subprocess.Popen(
                 cmd, cwd=str(trader_root),
                 stdout=stdout_target, stderr=subprocess.STDOUT if log_file else None,
@@ -414,7 +430,7 @@ if __name__ == "__main__":
             procs[coin] = {'proc': proc, 'log_file': log_file}
 
         # Monitor progress
-        print(f"\n   ⏳ Monitoring progress...\n")
+        print(f"\n   ⏳ Monitoring progress...\n", flush=True)
         all_done = False
         start_time = time.time()
 
@@ -441,7 +457,7 @@ if __name__ == "__main__":
                 running = "🔄" if coin in still_running else "✅"
                 status_parts.append(f"{running}{coin}:{done}/{args.trials}{best_str}{oos_str}")
 
-            print(f"   [{format_duration(elapsed)}] {' | '.join(status_parts)}")
+            print(f"   [{format_duration(elapsed)}] {' | '.join(status_parts)}", flush=True)
 
             if not still_running:
                 all_done = True
