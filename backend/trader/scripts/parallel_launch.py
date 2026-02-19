@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-parallel_launch.py — v10: Full optimization + robustness validation pipeline.
+parallel_launch.py — v11: Walk-Forward CV + Anti-Overfit Pipeline.
 
-Launches parallel Optuna workers per coin, then runs post-optimization
-robustness validation to produce a paper-trade readiness score.
-
-Changes from v9:
-  - Integrated validate_robustness.py as post-optimization step
-  - Added --skip-validation, --validate-only flags
-  - Real-time progress tracking with ETA
-  - Cross-coin summary report with go/no-go recommendations
-  - Optional per-worker log capture for debugging
-  - New preset: robust180_full (includes validation)
+v11 CHANGES:
+  - Default trials reduced: 200 → 100 (smaller search space needs fewer)
+  - Passes --n-cv-folds to optimize workers
+  - Updated presets with v11 defaults
+  - Cleaner progress reporting showing OOS metrics
+  - Tighter plateau settings (patience 60, not 140)
 
 Usage:
     python parallel_launch.py                                    # full pipeline
     python parallel_launch.py --validate-only                    # skip optim, just validate
-    python parallel_launch.py --trials 300 --preset robust180
+    python parallel_launch.py --trials 100 --preset robust180
     python parallel_launch.py --coins BTC,ETH --skip-validation  # optim only
 """
 import argparse
@@ -32,40 +28,48 @@ from typing import Dict, List
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
+# v11: Updated presets — tighter patience, CV folds
 PRESET_CONFIGS = {
     "robust180": {
-        "plateau_patience": 140,
-        "plateau_min_delta": 0.015,
-        "plateau_warmup": 80,
+        "plateau_patience": 60,
+        "plateau_min_delta": 0.02,
+        "plateau_warmup": 30,
         "holdout_days": 180,
-        "min_internal_oos_trades": 14,
-        "min_total_trades": 45,
+        "min_internal_oos_trades": 8,
+        "min_total_trades": 30,
+        "n_cv_folds": 3,
     },
     "robust120": {
-        "plateau_patience": 120,
+        "plateau_patience": 50,
         "plateau_min_delta": 0.02,
-        "plateau_warmup": 70,
+        "plateau_warmup": 25,
         "holdout_days": 120,
-        "min_internal_oos_trades": 10,
-        "min_total_trades": 35,
+        "min_internal_oos_trades": 6,
+        "min_total_trades": 25,
+        "n_cv_folds": 3,
+    },
+    "quick": {
+        "plateau_patience": 30,
+        "plateau_min_delta": 0.03,
+        "plateau_warmup": 15,
+        "holdout_days": 90,
+        "min_internal_oos_trades": 5,
+        "min_total_trades": 20,
+        "n_cv_folds": 2,
     },
 }
 
 
-def apply_runtime_preset(args: argparse.Namespace) -> argparse.Namespace:
-    """Apply launcher-side runtime preset values without mutating trial counts."""
+def apply_runtime_preset(args):
     config = PRESET_CONFIGS.get(args.preset)
     if not config:
         return args
-
     for key, value in config.items():
         setattr(args, key, value)
-
     return args
 
 
-def format_duration(seconds: float) -> str:
-    """Human-readable duration."""
+def format_duration(seconds):
     if seconds < 60:
         return f"{seconds:.0f}s"
     elif seconds < 3600:
@@ -74,16 +78,14 @@ def format_duration(seconds: float) -> str:
         return f"{seconds / 3600:.1f}h"
 
 
-def _fmt_metric(value, fmt: str, fallback: str = "?") -> str:
-    """Format a metric value safely."""
+def _fmt_metric(value, fmt, fallback="?"):
     try:
         return format(float(value), fmt)
     except (TypeError, ValueError):
         return fallback
 
 
-def load_optimization_results(results_dir: Path) -> Dict[str, Dict]:
-    """Load all optimization result JSONs."""
+def load_optimization_results(results_dir):
     results = {}
     if results_dir.exists():
         for p in results_dir.glob("*_optimization.json"):
@@ -97,8 +99,7 @@ def load_optimization_results(results_dir: Path) -> Dict[str, Dict]:
     return results
 
 
-def load_validation_results(results_dir: Path) -> Dict[str, Dict]:
-    """Load all validation result JSONs."""
+def load_validation_results(results_dir):
     results = {}
     if results_dir.exists():
         for p in results_dir.glob("*_validation.json"):
@@ -112,8 +113,7 @@ def load_validation_results(results_dir: Path) -> Dict[str, Dict]:
     return results
 
 
-def get_coin_trial_progress(optuna_db: Path, target_coins: List[str], run_id: str) -> Dict[str, Dict[str, object]]:
-    """Fetch completed trial counts + current best metrics for each coin in this launcher run."""
+def get_coin_trial_progress(optuna_db, target_coins, run_id):
     progress = {
         coin: {"completed": 0, "best_score": None, "best_metrics": {}}
         for coin in target_coins
@@ -125,28 +125,22 @@ def get_coin_trial_progress(optuna_db: Path, target_coins: List[str], run_id: st
         SELECT s.study_id, COUNT(*)
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
-        WHERE t.state = 1
-          AND s.study_name = ?
+        WHERE t.state = 1 AND s.study_name = ?
         GROUP BY s.study_id
     """
-
     best_trial_query = """
         SELECT t.trial_id, v.value
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
         JOIN trial_values v ON v.trial_id = t.trial_id
-        WHERE s.study_name = ?
-          AND t.state = 1
-          AND v.objective = 0
-        ORDER BY v.value DESC
-        LIMIT 1
+        WHERE s.study_name = ? AND t.state = 1 AND v.objective = 0
+        ORDER BY v.value DESC LIMIT 1
     """
-
     attrs_query = """
         SELECT key, value_json
         FROM trial_user_attributes
         WHERE trial_id = ?
-          AND key IN ('sharpe', 'profit_factor', 'win_rate', 'max_drawdown', 'n_trades')
+          AND key IN ('mean_oos_sharpe', 'oos_sharpe', 'n_trades', 'win_rate', 'max_drawdown', 'std_oos_sharpe')
     """
 
     try:
@@ -154,14 +148,12 @@ def get_coin_trial_progress(optuna_db: Path, target_coins: List[str], run_id: st
             conn.execute("PRAGMA busy_timeout = 1000;")
             for coin in target_coins:
                 study_name = f"optimize_{coin}_{run_id}"
-
                 completed_row = conn.execute(completed_query, (study_name,)).fetchone()
                 progress[coin]["completed"] = int(completed_row[1]) if completed_row else 0
 
                 best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
                 if not best_row:
                     continue
-
                 best_trial_id, best_score = best_row
                 progress[coin]["best_score"] = float(best_score) if best_score is not None else None
 
@@ -174,20 +166,18 @@ def get_coin_trial_progress(optuna_db: Path, target_coins: List[str], run_id: st
                         metrics[key] = value_json
                 progress[coin]["best_metrics"] = metrics
     except sqlite3.Error:
-        # Best-effort visibility only — keep the launcher running if the DB is busy.
         return progress
 
     return progress
 
 
-def print_final_report(script_dir: Path, target_coins: List[str], total_time: float):
-    """Print comprehensive summary combining optimization + validation results."""
+def print_final_report(script_dir, target_coins, total_time):
     results_dir = script_dir / "optimization_results"
     opt_results = load_optimization_results(results_dir)
     val_results = load_validation_results(results_dir)
 
     print(f"\n{'='*80}")
-    print(f"📊 COMPREHENSIVE PIPELINE REPORT")
+    print(f"📊 COMPREHENSIVE PIPELINE REPORT (v11 — Walk-Forward CV)")
     print(f"{'='*80}")
     print(f"   Total runtime: {format_duration(total_time)}")
     print(f"   Coins: {', '.join(target_coins)}")
@@ -197,6 +187,8 @@ def print_final_report(script_dir: Path, target_coins: List[str], total_time: fl
     cautious_coins = []
     reject_coins = []
 
+    _f = lambda v, d=3: _fmt_metric(v, f'.{d}f') if v is not None else '?'
+
     for coin in target_coins:
         opt = opt_results.get(coin, {})
         val = val_results.get(coin, {})
@@ -204,72 +196,48 @@ def print_final_report(script_dir: Path, target_coins: List[str], total_time: fl
         optim_metrics = opt.get('optim_metrics', {})
         holdout_metrics = opt.get('holdout_metrics', {})
         readiness = val.get('readiness', {})
+        version = opt.get('version', 'v10')
 
-        # Optimization results
-        opt_sharpe = optim_metrics.get('sharpe', '?')
-        opt_pf = optim_metrics.get('profit_factor', '?')
+        # v11: Show OOS metrics primarily
+        mean_oos_sr = optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe', '?'))
+        min_oos_sr = optim_metrics.get('min_oos_sharpe', '?')
+        std_oos_sr = optim_metrics.get('std_oos_sharpe', '?')
         opt_wr = optim_metrics.get('win_rate', '?')
         opt_dd = optim_metrics.get('max_drawdown', '?')
         opt_trades = optim_metrics.get('n_trades', '?')
-        n_trials = opt.get('n_trials', '?')
 
-        # Holdout results
         ho_sharpe = holdout_metrics.get('holdout_sharpe', '?')
         ho_return = holdout_metrics.get('holdout_return', '?')
         ho_trades = holdout_metrics.get('holdout_trades', '?')
 
-        # Validation results
-        val_score = readiness.get('score', '—')
-        val_rating = readiness.get('rating', 'NOT_RUN')
+        val_score = readiness.get('score', '?')
+        val_rating = readiness.get('rating', 'N/A')
 
-        dsr = val.get('deflated_sharpe', {})
-        mc = val.get('mc_shuffle', {})
-        sens = val.get('parameter_sensitivity', {})
+        emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(val_rating, '⬜')
 
-        emoji = {
-            'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡',
-            'REJECT': '❌', 'NOT_RUN': '⬜'
-        }.get(val_rating, '?')
-
-        print(f"  {emoji} {coin}")
-        print(f"     ┌─ Optimization ({n_trials} trials)")
-
-        # Format safely
-        def _f(v, fmt='.3f'):
-            try:
-                return f"{float(v):{fmt}}"
-            except (TypeError, ValueError):
-                return str(v)
-
-        print(f"     │  Sharpe={_f(opt_sharpe)} | PF={_f(opt_pf)} | "
-              f"WR={_f(opt_wr, '.1%')} | DD={_f(opt_dd, '.1%')} | Trades={opt_trades}")
+        print(f"  {emoji} {coin} [{version}]")
+        print(f"     ┌─ CV Optimization")
+        print(f"     │  Mean OOS SR={_f(mean_oos_sr)} | Min OOS SR={_f(min_oos_sr)} | "
+              f"Std={_f(std_oos_sr)} | WR={_fmt_metric(opt_wr, '.1%')} | "
+              f"DD={_fmt_metric(opt_dd, '.1%')} | Trades={opt_trades}")
         print(f"     ├─ Holdout")
-        print(f"     │  Sharpe={_f(ho_sharpe)} | Return={_f(ho_return, '.2%')} | Trades={ho_trades}")
+        print(f"     │  Sharpe={_f(ho_sharpe)} | Return={_fmt_metric(ho_return, '.2%')} | Trades={ho_trades}")
 
-        if val_rating != 'NOT_RUN':
-            print(f"     ├─ Validation Score: {val_score}/100 — {val_rating}")
-            if dsr.get('valid'):
-                print(f"     │  DSR={_f(dsr.get('dsr', 0))} (p={_f(dsr.get('p_value', 1))})")
-            if mc.get('valid'):
-                print(f"     │  MC DD95={_f(mc.get('mc_dd_95th', 0), '.1%')} | "
-                      f"P(ruin25%)={_f(mc.get('prob_ruin_25pct', 0), '.1%')}")
-            if sens.get('valid'):
-                print(f"     │  Param fragile={sens.get('fragile', '?')} | "
-                      f"Avg SR drop={_f(sens.get('avg_sharpe_drop', 0))}")
+        if readiness:
+            sens = val.get('parameter_sensitivity', {})
+            print(f"     ├─ Validation: {val_rating} ({_fmt_metric(val_score, '.0f')}/100)")
 
             checks = readiness.get('details', [])
             if checks:
                 failed = [c for c in checks if not c['passed']]
                 if failed:
-                    print(f"     └─ Failed checks: {', '.join(c['name'] for c in failed)}")
+                    print(f"     │  Failed: {', '.join(c['name'] for c in failed)}")
                 else:
-                    print(f"     └─ All {len(checks)} checks passed")
+                    print(f"     │  All {len(checks)} checks passed")
         else:
             print(f"     └─ Validation: not run")
-
         print()
 
-        # Categorize
         if val_rating == 'READY':
             ready_coins.append(coin)
         elif val_rating == 'CAUTIOUS':
@@ -277,7 +245,6 @@ def print_final_report(script_dir: Path, target_coins: List[str], total_time: fl
         else:
             reject_coins.append(coin)
 
-    # Final recommendation
     print(f"{'='*80}")
     print(f"📋 RECOMMENDATION")
     print(f"{'='*80}")
@@ -299,19 +266,16 @@ def print_final_report(script_dir: Path, target_coins: List[str], total_time: fl
     print(f"{'='*80}")
 
 
-def _print_log_tail(log_path: Path, max_lines: int = 30) -> None:
-    """Print a short tail from a worker log file for quick debugging."""
+def _print_log_tail(log_path, max_lines=30):
     if not log_path.exists():
         return
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return
-
     tail = lines[-max_lines:]
     if not tail:
         return
-
     print(f"      └─ Last {len(tail)} log lines from {log_path}:")
     for line in tail:
         print(f"         {line}")
@@ -319,36 +283,29 @@ def _print_log_tail(log_path: Path, max_lines: int = 30) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Launch parallel optimization + robustness validation (v10)")
-    parser.add_argument("--trials", type=int, default=200,
-                        help="Total trials per coin")
+        description="Launch parallel optimization + robustness validation (v11 — Walk-Forward CV)")
+    parser.add_argument("--trials", type=int, default=100,
+                        help="Total trials per coin (default: 100, was 200)")
     parser.add_argument("--jobs", type=int, default=(os.cpu_count() or 1),
-                        help="Total worker processes (default: all CPU cores)")
+                        help="Total worker processes")
     parser.add_argument("--coins", type=str, default=",".join(COINS),
                         help="Comma-separated coin list")
-    parser.add_argument("--plateau-patience", type=int, default=100,
-                        help="Stop if no best-score improvement for N trials")
-    parser.add_argument("--plateau-min-delta", type=float, default=0.02,
-                        help="Min score improvement to reset plateau")
-    parser.add_argument("--plateau-warmup", type=int, default=60,
-                        help="Warmup completed trials before plateau checks")
-    parser.add_argument("--holdout-days", type=int, default=180,
-                        help="Days reserved as true holdout (never seen by Optuna)")
+    parser.add_argument("--plateau-patience", type=int, default=60,
+                        help="Stop if no improvement for N trials (default: 60, was 100)")
+    parser.add_argument("--plateau-min-delta", type=float, default=0.02)
+    parser.add_argument("--plateau-warmup", type=int, default=30,
+                        help="Warmup trials before plateau checks (default: 30, was 60)")
+    parser.add_argument("--holdout-days", type=int, default=180)
     parser.add_argument("--preset", type=str, default="robust180",
-                        choices=["none", "robust120", "robust180"],
-                        help="Optimization preset (default: robust180)")
-    parser.add_argument("--min-internal-oos-trades", type=int, default=0,
-                        help="Minimum internal OOS trades to qualify best trial (0 = preset/default)")
-    parser.add_argument("--min-total-trades", type=int, default=0,
-                        help="Minimum total trades to qualify best trial (0 = preset/default)")
-    parser.add_argument("--debug-trials", action="store_true",
-                        help="Enable verbose per-trial output in optimize workers")
-    parser.add_argument("--skip-validation", action="store_true",
-                        help="Skip robustness validation (optimization only)")
-    parser.add_argument("--validate-only", action="store_true",
-                        help="Skip optimization, only run validation on existing results")
-    parser.add_argument("--log-dir", type=str, default="",
-                        help="Directory to capture per-worker logs (default: inherit main log)")
+                        choices=["none", "robust120", "robust180", "quick"])
+    parser.add_argument("--min-internal-oos-trades", type=int, default=0)
+    parser.add_argument("--min-total-trades", type=int, default=0)
+    parser.add_argument("--n-cv-folds", type=int, default=3,
+                        help="Walk-forward CV folds (default: 3)")
+    parser.add_argument("--debug-trials", action="store_true")
+    parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--log-dir", type=str, default="")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -363,7 +320,7 @@ if __name__ == "__main__":
 
     optimize_path = script_dir / "optimize.py"
     validate_path = script_dir / "validate_robustness.py"
-    # Validate paths
+
     for name, path in [("optimize.py", optimize_path)]:
         if not path.exists():
             print(f"❌ Cannot find {name} at {path}")
@@ -371,7 +328,6 @@ if __name__ == "__main__":
 
     if not args.skip_validation and not validate_path.exists():
         print(f"⚠️  validate_robustness.py not found at {validate_path}")
-        print(f"   Validation will be skipped.")
         args.skip_validation = True
 
     data_dir = trader_root / "data"
@@ -399,193 +355,112 @@ if __name__ == "__main__":
         total_workers = sum(worker_counts.values())
 
         print(f"{'='*70}")
-        print(f"🚀 PHASE 1: OPTIMIZATION ({total_workers} workers)")
+        print(f"🚀 PHASE 1: OPTIMIZATION v11 ({total_workers} workers)")
         print(f"{'='*70}")
         print(f"   Coins:        {target_coins}")
-        print(f"   Target/coin:  {args.trials} trials")
+        print(f"   Target/coin:  {args.trials} trials (was 200-350 in v10)")
         print(f"   Worker split: {worker_counts}")
-        print(f"   Holdout:      {args.holdout_days} days (never seen by Optuna)")
-        print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, internal_oos>={args.min_internal_oos_trades or 'auto'}")
+        print(f"   CV folds:     {args.n_cv_folds} (walk-forward)")
+        print(f"   Holdout:      {args.holdout_days} days")
+        print(f"   Params:       9 tunable (reduced from 18)")
+        print(f"   Scoring:      Mean OOS Sharpe across CV folds")
+        print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
         print(f"   Preset:       {args.preset}")
         print(f"   Validation:   {'ENABLED' if not args.skip_validation else 'DISABLED'}")
         print(f"{'='*70}")
 
         run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
-        print(f"   Study run id: {run_id}")
-
-        log_dir = Path(args.log_dir).expanduser() if args.log_dir else None
-        if log_dir is not None:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            print(f"   Worker logs:  {log_dir}")
-        else:
-            print("   Worker logs:  inherited (combined with launcher output)")
+        print(f"\n   Run ID: {run_id}")
 
         optuna_db = script_dir / "optuna_trading.db"
-        if optuna_db.exists():
-            print(f"   ℹ️  Existing optuna DB: {optuna_db.stat().st_size / 1024:.0f} KB")
-
-        processes = []
-        failed_starts = []
-        optim_start = time.time()
+        procs = {}
+        log_dir = Path(args.log_dir) if args.log_dir else None
+        if log_dir:
+            log_dir.mkdir(parents=True, exist_ok=True)
 
         for coin in target_coins:
-            workers_for_coin = max(1, worker_counts[coin])
-            base_trials = args.trials // workers_for_coin
-            extra = args.trials % workers_for_coin
-            trial_splits = [base_trials + (1 if i < extra else 0) for i in range(workers_for_coin)]
+            n_workers = worker_counts[coin]
+            cmd = [
+                sys.executable, "-m", "scripts.optimize",
+                "--coin", coin,
+                "--trials", str(args.trials),
+                "--jobs", str(n_workers),
+                "--plateau-patience", str(args.plateau_patience),
+                "--plateau-min-delta", str(args.plateau_min_delta),
+                "--plateau-warmup", str(args.plateau_warmup),
+                "--holdout-days", str(args.holdout_days),
+                "--n-cv-folds", str(args.n_cv_folds),
+                "--study-suffix", run_id,
+                "--preset", "none",  # already applied
+            ]
+            if args.min_internal_oos_trades:
+                cmd.extend(["--min-internal-oos-trades", str(args.min_internal_oos_trades)])
+            if args.min_total_trades:
+                cmd.extend(["--min-total-trades", str(args.min_total_trades)])
+            if args.debug_trials:
+                cmd.append("--debug-trials")
 
-            for i, trial_count in enumerate(trial_splits):
-                base_cmd = [
-                    sys.executable, "-m", "scripts.optimize",
-                    "--coin", coin,
-                    "--jobs", "1",
-                    "--trials", str(max(1, trial_count)),
-                    "--plateau-patience", str(args.plateau_patience),
-                    "--plateau-min-delta", str(args.plateau_min_delta),
-                    "--plateau-warmup", str(args.plateau_warmup),
-                    "--holdout-days", str(args.holdout_days),
-                    "--min-internal-oos-trades", str(args.min_internal_oos_trades),
-                    "--min-total-trades", str(args.min_total_trades),
-                    "--preset", "none",
-                    "--study-suffix", run_id,
-                    "--resume-study",
-                ]
-                if args.debug_trials:
-                    base_cmd.append("--debug-trials")
+            log_file = None
+            stdout_target = None
+            if log_dir:
+                log_file = open(log_dir / f"{coin}_{run_id}.log", 'w')
+                stdout_target = log_file
 
-                print(f"   Starting {coin} worker #{i+1}/{workers_for_coin} ({trial_count} trials)...")
+            print(f"   🚀 Launching {coin} ({n_workers} workers)")
+            proc = subprocess.Popen(
+                cmd, cwd=str(trader_root),
+                stdout=stdout_target, stderr=subprocess.STDOUT if log_file else None,
+            )
+            procs[coin] = {'proc': proc, 'log_file': log_file}
 
-                env = os.environ.copy()
-                env.setdefault("PYTHONUNBUFFERED", "1")
-                existing_pythonpath = env.get("PYTHONPATH", "")
-                pythonpath_parts = [str(trader_root)]
-                if existing_pythonpath:
-                    pythonpath_parts.append(existing_pythonpath)
-                env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+        # Monitor progress
+        print(f"\n   ⏳ Monitoring progress...\n")
+        all_done = False
+        start_time = time.time()
 
-                stdout_target = None
-                stderr_target = None
-                log_file = None
-                log_file_path = None
-                if log_dir is not None:
-                    log_file_path = log_dir / f"{coin}_worker_{i+1}.log"
-                    log_file = open(log_file_path, 'w')
-                    stdout_target = log_file
-                    stderr_target = subprocess.STDOUT
+        while not all_done:
+            time.sleep(30)
+            elapsed = time.time() - start_time
 
-                try:
-                    p = subprocess.Popen(
-                        base_cmd, env=env, cwd=str(trader_root),
-                        stdout=stdout_target, stderr=stderr_target,
-                    )
-                    processes.append((coin, i, p, log_file, log_file_path))
-                except Exception as e:
-                    print(f"   ❌ Failed to start {coin} worker #{i+1}: {e}")
-                    failed_starts.append((coin, i, str(e)))
-                    if log_file:
-                        log_file.close()
+            still_running = []
+            for coin, info in procs.items():
+                if info['proc'].poll() is None:
+                    still_running.append(coin)
 
-                time.sleep(0.35)
+            progress = get_coin_trial_progress(optuna_db, target_coins, run_id)
+            status_parts = []
+            for coin in target_coins:
+                p = progress[coin]
+                done = p['completed']
+                best = p.get('best_score')
+                best_str = f" best={best:.3f}" if best is not None else ""
+                metrics = p.get('best_metrics', {})
+                # v11: show OOS Sharpe in progress
+                oos_sr = metrics.get('mean_oos_sharpe', metrics.get('oos_sharpe'))
+                oos_str = f" OOS_SR={oos_sr:.3f}" if oos_sr is not None else ""
+                running = "🔄" if coin in still_running else "✅"
+                status_parts.append(f"{running}{coin}:{done}/{args.trials}{best_str}{oos_str}")
 
-        if failed_starts:
-            print(f"\n⚠️  {len(failed_starts)} workers failed to start!")
+            print(f"   [{format_duration(elapsed)}] {' | '.join(status_parts)}")
 
-        active = len(processes)
-        print(f"\n✅ {active} workers started. Waiting for completion...")
+            if not still_running:
+                all_done = True
 
-        # Wait with progress reporting
-        try:
-            remaining = list(processes)
-            last_report = time.time()
-            completed_count = 0
-            last_trial_report = {coin: 0 for coin in target_coins}
-            trial_report_every = 10
+        # Cleanup
+        for coin, info in procs.items():
+            if info['log_file']:
+                info['log_file'].close()
+            rc = info['proc'].returncode
+            if rc != 0:
+                print(f"   ⚠️  {coin} exited with code {rc}")
+                if log_dir:
+                    _print_log_tail(log_dir / f"{coin}_{run_id}.log")
 
-            while remaining:
-                still_running = []
-                for coin, idx, p, lf, log_path in remaining:
-                    ret = p.poll()
-                    if ret is not None:
-                        completed_count += 1
-                        if ret == 0:
-                            print(f"   ✅ {coin} worker #{idx+1} done "
-                                  f"({completed_count}/{active}, "
-                                  f"{format_duration(time.time() - optim_start)} elapsed)")
-                        else:
-                            print(f"   ❌ {coin} worker #{idx+1} failed (code {ret})")
-                            if lf:
-                                try:
-                                    lf.flush()
-                                    with open(lf.name, 'r', encoding='utf-8', errors='replace') as r:
-                                        lines = r.readlines()[-12:]
-                                    if lines:
-                                        print("      ↳ log tail:")
-                                        for line in lines:
-                                            print(f"         {line.rstrip()}")
-                                except OSError:
-                                    pass
-                        if lf:
-                            lf.close()
-                    else:
-                        still_running.append((coin, idx, p, lf, log_path))
-                remaining = still_running
-
-                # Per-coin trial progress updates (every 10 trials by default)
-                trial_progress = get_coin_trial_progress(optuna_db, target_coins, run_id)
-                for coin in target_coins:
-                    coin_progress = trial_progress.get(coin, {})
-                    current = min(int(coin_progress.get('completed', 0) or 0), args.trials)
-                    next_threshold = ((last_trial_report[coin] // trial_report_every) + 1) * trial_report_every
-                    if current >= next_threshold or (current == args.trials and current > last_trial_report[coin]):
-                        pct = (current / max(1, args.trials)) * 100
-                        best_score = _fmt_metric(coin_progress.get('best_score'), '.3f')
-
-                        best_metrics = coin_progress.get('best_metrics', {}) or {}
-                        sharpe = _fmt_metric(best_metrics.get('sharpe'), '.3f')
-                        profit_factor = _fmt_metric(best_metrics.get('profit_factor'), '.3f')
-                        win_rate = _fmt_metric(best_metrics.get('win_rate'), '.1%')
-                        drawdown = _fmt_metric(best_metrics.get('max_drawdown'), '.1%')
-                        trades = best_metrics.get('n_trades', '?')
-
-                        print(
-                            f"   📈 {coin}: {current}/{args.trials} trials ({pct:.0f}%) | "
-                            f"Best score={best_score} | Sharpe={sharpe} | PF={profit_factor} | "
-                            f"WR={win_rate} | DD={drawdown} | Trades={trades}"
-                        )
-                        last_trial_report[coin] = current
-
-                # Periodic progress
-                now = time.time()
-                if remaining and now - last_report > 60:
-                    elapsed = now - optim_start
-                    if completed_count > 0:
-                        eta = elapsed / completed_count * (active - completed_count)
-                        print(f"   ⏳ {completed_count}/{active} done | "
-                              f"Elapsed: {format_duration(elapsed)} | "
-                              f"ETA: ~{format_duration(eta)}")
-                    last_report = now
-
-                if remaining:
-                    time.sleep(2.0)
-
-        except KeyboardInterrupt:
-            print("\n🛑 Stopping all workers...")
-            for coin, idx, p, lf, log_path in processes:
-                p.terminate()
-            for coin, idx, p, lf, log_path in processes:
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                if lf:
-                    lf.close()
-            print("   Workers terminated.")
-
-        optim_duration = time.time() - optim_start
-        print(f"\n🏁 Optimization complete in {format_duration(optim_duration)}")
+        opt_time = time.time() - start_time
+        print(f"\n   ✅ Phase 1 complete in {format_duration(opt_time)}")
 
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 2: ROBUSTNESS VALIDATION
+    # PHASE 2: VALIDATION
     # ═══════════════════════════════════════════════════════════════════
 
     if not args.skip_validation:
@@ -593,48 +468,31 @@ if __name__ == "__main__":
         print(f"🔬 PHASE 2: ROBUSTNESS VALIDATION")
         print(f"{'='*70}")
 
-        # Check which coins have optimization results
         results_dir = script_dir / "optimization_results"
-        opt_results = load_optimization_results(results_dir)
-        coins_with_results = [c for c in target_coins if c in opt_results]
+        coins_with_results = [c for c in target_coins
+                              if (results_dir / f"{c}_optimization.json").exists()]
 
         if not coins_with_results:
-            print("   ⚠️  No optimization results found. Skipping validation.")
+            print("   No optimization results found. Skipping validation.")
         else:
             print(f"   Validating: {', '.join(coins_with_results)}")
-
-            validate_cmd = [
-                sys.executable, str(validate_path),
-                "--all" if len(coins_with_results) == len(target_coins) else "--coin",
-            ]
-            if len(coins_with_results) != len(target_coins):
-                # Validate one at a time
-                for coin in coins_with_results:
-                    print(f"\n   Running validation for {coin}...")
-                    cmd = [sys.executable, "-m", "scripts.validate_robustness", "--coin", coin]
-                    try:
-                        result = subprocess.run(
-                            cmd, cwd=str(trader_root),
-                            capture_output=not sys.stderr.isatty(),
-                            text=True, timeout=1800,
-                        )
-                        if result.returncode != 0:
-                            print(f"   ❌ Validation failed for {coin}")
-                            if result.stderr:
-                                print(f"      {result.stderr[:500]}")
-                    except subprocess.TimeoutExpired:
-                        print(f"   ⏰ Validation timed out for {coin}")
-                    except Exception as e:
-                        print(f"   ❌ Validation error for {coin}: {e}")
-            else:
-                print(f"\n   Running validation for all coins...")
-                cmd = [sys.executable, "-m", "scripts.validate_robustness", "--all"]
+            for coin in coins_with_results:
+                print(f"\n   Running validation for {coin}...")
+                cmd = [sys.executable, "-m", "scripts.validate_robustness", "--coin", coin]
                 try:
-                    subprocess.run(cmd, cwd=str(trader_root), timeout=3600)
+                    result = subprocess.run(
+                        cmd, cwd=str(trader_root),
+                        capture_output=not sys.stderr.isatty(),
+                        text=True, timeout=1800,
+                    )
+                    if result.returncode != 0:
+                        print(f"   ❌ Validation failed for {coin}")
+                        if result.stderr:
+                            print(f"      {result.stderr[:500]}")
                 except subprocess.TimeoutExpired:
-                    print("   ⏰ Validation timed out")
+                    print(f"   ⏰ Validation timed out for {coin}")
                 except Exception as e:
-                    print(f"   ❌ Validation error: {e}")
+                    print(f"   ❌ Validation error for {coin}: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 3: FINAL REPORT

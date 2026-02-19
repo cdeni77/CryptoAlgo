@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """
-validate_robustness.py — Post-optimization robustness validation suite (v10).
+validate_robustness.py — Post-optimization robustness validation suite (v11).
 
-Runs AFTER optimize.py finds best params for each coin. Answers the question:
-"Are these parameters actually worth paper trading, or did we just get lucky?"
-
-Tests performed:
-  1. Monte Carlo Trade Shuffle   — reshuffle trade order 1000x, check drawdown distribution
-  2. Monte Carlo Trade Resample  — resample with replacement 1000x, check return distribution
-  3. Parameter Sensitivity        — nudge each param ±10%, check if Sharpe collapses
-  4. Deflated Sharpe Ratio (DSR) — correct Sharpe for multiple testing + non-normality
-  5. Regime Split                 — test on bull/bear/sideways sub-periods independently
-  6. Paper-Trade Readiness Score  — composite go/no-go score
+v11 CHANGES:
+  - CV consistency check (new)
+  - Tighter readiness thresholds
+  - Better trade PnL reconstruction
+  - Handles v11 optimization metrics
 
 Usage:
     python validate_robustness.py --coin BTC
     python validate_robustness.py --all
-    python validate_robustness.py --show  # show existing validation reports
-
-Reads optimization_results/<COIN>_optimization.json for best params,
-then runs validation and writes <COIN>_validation.json alongside it.
+    python validate_robustness.py --show
 """
 import argparse
 import json
@@ -48,115 +40,67 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # 1. MONTE CARLO TRADE SIMULATIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def monte_carlo_shuffle(trade_pnls: np.ndarray, n_sims: int = 1000,
-                        initial_equity: float = 100_000.0) -> Dict:
-    """
-    Reshuffle trade order N times to build drawdown + return distributions.
-    Same total PnL but different paths — reveals sequence-dependent risk.
-    """
+def monte_carlo_shuffle(trade_pnls, n_sims=1000, initial_equity=100_000.0):
     if len(trade_pnls) < 10:
         return {'valid': False, 'reason': 'too_few_trades'}
-
-    original_equity = initial_equity + np.cumsum(trade_pnls)
-    original_peak = np.maximum.accumulate(original_equity)
-    original_dd = np.max((original_peak - original_equity) / original_peak)
-
-    max_drawdowns = []
-    final_equities = []
-
     rng = np.random.default_rng(42)
+    max_drawdowns = []
     for _ in range(n_sims):
         shuffled = rng.permutation(trade_pnls)
         equity_curve = initial_equity + np.cumsum(shuffled)
         peak = np.maximum.accumulate(equity_curve)
         dd = np.max((peak - equity_curve) / np.maximum(peak, 1.0))
         max_drawdowns.append(dd)
-        final_equities.append(equity_curve[-1])
-
     max_drawdowns = np.array(max_drawdowns)
-    final_equities = np.array(final_equities)
-
+    total_returns = (initial_equity + np.sum(trade_pnls)) / initial_equity - 1
     return {
-        'valid': True,
-        'n_sims': n_sims,
-        'n_trades': len(trade_pnls),
-        'original_max_dd': float(original_dd),
+        'valid': True, 'n_sims': n_sims,
         'mc_dd_median': float(np.median(max_drawdowns)),
         'mc_dd_95th': float(np.percentile(max_drawdowns, 95)),
         'mc_dd_99th': float(np.percentile(max_drawdowns, 99)),
-        'mc_equity_5th': float(np.percentile(final_equities, 5)),
-        'mc_equity_median': float(np.median(final_equities)),
-        'mc_equity_95th': float(np.percentile(final_equities, 95)),
-        'prob_loss': float(np.mean(final_equities < initial_equity)),
         'prob_ruin_25pct': float(np.mean(max_drawdowns > 0.25)),
         'prob_ruin_50pct': float(np.mean(max_drawdowns > 0.50)),
     }
 
 
-def monte_carlo_resample(trade_pnls: np.ndarray, n_sims: int = 1000,
-                         initial_equity: float = 100_000.0) -> Dict:
-    """
-    Resample trades WITH REPLACEMENT to create alternate trade sequences.
-    Unlike shuffle, this can repeat the same trade — shows tail risk from
-    worst trades hitting multiple times.
-    """
+def monte_carlo_resample(trade_pnls, n_sims=1000, initial_equity=100_000.0):
     if len(trade_pnls) < 10:
         return {'valid': False, 'reason': 'too_few_trades'}
-
     n_trades = len(trade_pnls)
     rng = np.random.default_rng(123)
-
-    sharpe_ratios = []
-    max_drawdowns = []
-    total_returns = []
-
+    sharpe_ratios, max_drawdowns, total_returns = [], [], []
     for _ in range(n_sims):
         sampled = rng.choice(trade_pnls, size=n_trades, replace=True)
         equity_curve = initial_equity + np.cumsum(sampled)
         peak = np.maximum.accumulate(equity_curve)
         dd = np.max((peak - equity_curve) / np.maximum(peak, 1.0))
-
-        avg = np.mean(sampled)
-        std = np.std(sampled)
+        avg, std = np.mean(sampled), np.std(sampled)
         sr = avg / std if std > 0 else 0.0
-
         max_drawdowns.append(dd)
         sharpe_ratios.append(sr)
         total_returns.append((equity_curve[-1] / initial_equity) - 1)
-
-    sharpe_ratios = np.array(sharpe_ratios)
-    max_drawdowns = np.array(max_drawdowns)
-    total_returns = np.array(total_returns)
-
+    sr_arr = np.array(sharpe_ratios)
+    ret_arr = np.array(total_returns)
+    dd_arr = np.array(max_drawdowns)
     return {
-        'valid': True,
-        'n_sims': n_sims,
-        'sharpe_5th': float(np.percentile(sharpe_ratios, 5)),
-        'sharpe_median': float(np.median(sharpe_ratios)),
-        'sharpe_95th': float(np.percentile(sharpe_ratios, 95)),
-        'return_5th': float(np.percentile(total_returns, 5)),
-        'return_median': float(np.median(total_returns)),
-        'return_95th': float(np.percentile(total_returns, 95)),
-        'dd_median': float(np.median(max_drawdowns)),
-        'dd_95th': float(np.percentile(max_drawdowns, 95)),
-        'prob_negative_sharpe': float(np.mean(sharpe_ratios < 0)),
-        'prob_loss': float(np.mean(total_returns < 0)),
+        'valid': True, 'n_sims': n_sims,
+        'sharpe_5th': float(np.percentile(sr_arr, 5)),
+        'sharpe_median': float(np.median(sr_arr)),
+        'sharpe_95th': float(np.percentile(sr_arr, 95)),
+        'return_5th': float(np.percentile(ret_arr, 5)),
+        'return_median': float(np.median(ret_arr)),
+        'dd_median': float(np.median(dd_arr)),
+        'dd_95th': float(np.percentile(dd_arr, 95)),
+        'prob_negative_sharpe': float(np.mean(sr_arr < 0)),
+        'prob_loss': float(np.mean(ret_arr < 0)),
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2. PARAMETER SENSITIVITY / NEIGHBOR STABILITY
+# 2. PARAMETER SENSITIVITY
 # ═══════════════════════════════════════════════════════════════════════════
 
-def check_parameter_sensitivity(all_data: Dict, best_params: Dict, coin_name: str,
-                                coin_prefix: str, perturbation_pct: float = 0.10,
-                                n_neighbors: int = 8) -> Dict:
-    """
-    Nudge each continuous parameter ±perturbation_pct and re-run backtest.
-    A robust strategy should show stable Sharpe across nearby parameter values.
-
-    Returns sensitivity metrics + fragility flag.
-    """
+def check_parameter_sensitivity(all_data, best_params, coin_name, coin_prefix, perturbation_pct=0.10):
     from scripts.train_model import Config, run_backtest
     from scripts.optimize import profile_from_params, resolve_target_symbol
 
@@ -164,16 +108,13 @@ def check_parameter_sensitivity(all_data: Dict, best_params: Dict, coin_name: st
     if not target_sym:
         return {'valid': False, 'reason': 'symbol_not_found'}
 
-    # Identify perturbable params (floats and ints with meaningful ranges)
+    # v11: Only 9 tunable params
     perturbable = {
-        'signal_threshold', 'min_val_auc', 'label_vol_target',
+        'signal_threshold', 'label_forward_hours', 'label_vol_target',
         'min_momentum_magnitude', 'vol_mult_tp', 'vol_mult_sl',
-        'max_hold_hours', 'cooldown_hours', 'position_size',
-        'vol_sizing_target', 'learning_rate', 'n_estimators',
-        'max_depth', 'min_child_samples',
+        'max_hold_hours', 'min_vol_24h', 'max_vol_24h',
     }
 
-    # Run baseline
     baseline_profile = profile_from_params(best_params, coin_name)
     single_data = {target_sym: all_data[target_sym]}
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00,
@@ -184,226 +125,167 @@ def check_parameter_sensitivity(all_data: Dict, best_params: Dict, coin_name: st
                                        profile_overrides={coin_name: baseline_profile})
     except Exception:
         return {'valid': False, 'reason': 'baseline_backtest_failed'}
-
     if baseline_result is None:
         return {'valid': False, 'reason': 'baseline_none'}
 
     baseline_sharpe = float(baseline_result.get('sharpe_annual', 0) or 0)
+    if baseline_sharpe <= -90: baseline_sharpe = 0.0
     baseline_pf = float(baseline_result.get('profit_factor', 0) or 0)
 
-    # Perturb each param
     sensitivity_results = {}
     sharpe_deltas = []
 
     for param_name in perturbable:
-        if param_name not in best_params:
-            continue
-
+        if param_name not in best_params: continue
         original_val = best_params[param_name]
-        if isinstance(original_val, (int, float)) and original_val != 0:
-            # Create perturbed version
-            delta = abs(original_val * perturbation_pct)
-            if isinstance(original_val, int):
-                delta = max(1, int(delta))
-                perturbed_vals = [original_val - delta, original_val + delta]
-            else:
-                perturbed_vals = [original_val - delta, original_val + delta]
+        if not isinstance(original_val, (int, float)) or original_val == 0: continue
 
-            param_sharpes = []
-            for pval in perturbed_vals:
-                if isinstance(original_val, int):
-                    pval = max(1, int(pval))
-                else:
-                    pval = max(0.001, float(pval))
+        delta = abs(original_val * perturbation_pct)
+        if isinstance(original_val, int):
+            delta = max(1, int(delta))
+        perturbed_vals = [original_val - delta, original_val + delta]
 
-                test_params = dict(best_params)
-                test_params[param_name] = pval
+        param_sharpes = []
+        for pval in perturbed_vals:
+            pval = max(1 if isinstance(original_val, int) else 0.001,
+                       int(pval) if isinstance(original_val, int) else float(pval))
+            test_params = dict(best_params)
+            test_params[param_name] = pval
+            try:
+                test_profile = profile_from_params(test_params, coin_name)
+                result = run_backtest(single_data, config,
+                                      profile_overrides={coin_name: test_profile})
+                s = float(result.get('sharpe_annual', 0) or 0) if result else 0.0
+                if s <= -90: s = 0.0
+                param_sharpes.append(s)
+            except Exception:
+                param_sharpes.append(0.0)
 
-                try:
-                    test_profile = profile_from_params(test_params, coin_name)
-                    result = run_backtest(single_data, config,
-                                          profile_overrides={coin_name: test_profile})
-                    if result:
-                        s = float(result.get('sharpe_annual', 0) or 0)
-                        if s <= -90:
-                            s = 0.0
-                        param_sharpes.append(s)
-                except Exception:
-                    param_sharpes.append(0.0)
+        if param_sharpes:
+            avg_n = np.mean(param_sharpes)
+            drop = baseline_sharpe - avg_n
+            sharpe_deltas.append(drop)
+            sensitivity_results[param_name] = {
+                'baseline_sharpe': round(baseline_sharpe, 3),
+                'neighbor_sharpes': [round(s, 3) for s in param_sharpes],
+                'avg_neighbor_sharpe': round(avg_n, 3),
+                'sharpe_drop': round(drop, 3),
+            }
 
-            if param_sharpes:
-                avg_neighbor_sharpe = np.mean(param_sharpes)
-                sharpe_drop = baseline_sharpe - avg_neighbor_sharpe
-                sharpe_deltas.append(sharpe_drop)
-                sensitivity_results[param_name] = {
-                    'baseline_sharpe': round(baseline_sharpe, 3),
-                    'neighbor_sharpes': [round(s, 3) for s in param_sharpes],
-                    'avg_neighbor_sharpe': round(avg_neighbor_sharpe, 3),
-                    'sharpe_drop': round(sharpe_drop, 3),
-                }
-
-    # Compute fragility score
-    if sharpe_deltas:
-        avg_drop = np.mean(sharpe_deltas)
-        max_drop = np.max(sharpe_deltas)
-        # Fragile if average neighbor drops Sharpe by >30% or any single param drops it >50%
-        fragile = (avg_drop > baseline_sharpe * 0.30) or (max_drop > baseline_sharpe * 0.50)
-    else:
-        avg_drop = 0.0
-        max_drop = 0.0
-        fragile = True  # no params tested = unknown = fragile
+    avg_drop = np.mean(sharpe_deltas) if sharpe_deltas else 0.0
+    max_drop = np.max(sharpe_deltas) if sharpe_deltas else 0.0
+    fragile = ((avg_drop > baseline_sharpe * 0.30) or (max_drop > baseline_sharpe * 0.50)) if sharpe_deltas else True
 
     return {
-        'valid': True,
-        'baseline_sharpe': round(baseline_sharpe, 3),
+        'valid': True, 'baseline_sharpe': round(baseline_sharpe, 3),
         'baseline_pf': round(baseline_pf, 3),
         'n_params_tested': len(sensitivity_results),
         'avg_sharpe_drop': round(avg_drop, 3),
         'max_sharpe_drop': round(max_drop, 3),
-        'fragile': fragile,
-        'per_param': sensitivity_results,
+        'fragile': fragile, 'per_param': sensitivity_results,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. DEFLATED SHARPE RATIO (Bailey & López de Prado, 2014)
+# 3. REGIME SPLIT
 # ═══════════════════════════════════════════════════════════════════════════
 
-def deflated_sharpe_ratio(observed_sharpe: float, n_trades: int,
-                          skewness: float = 0.0, kurtosis: float = 3.0,
-                          n_trials: int = 200, sr_benchmark: float = 0.0) -> Dict:
-    """
-    Compute the Deflated Sharpe Ratio to correct for:
-      - Multiple testing (n_trials of Optuna)
-      - Non-normal returns (skew/kurtosis)
-      - Short sample (n_trades)
+def test_regime_splits(all_data, best_params, coin_name, coin_prefix):
+    from scripts.train_model import Config, run_backtest
+    from scripts.optimize import profile_from_params, resolve_target_symbol
 
-    Returns DSR and the probability that the observed Sharpe is real.
-    """
-    from scipy import stats
+    target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
+    if not target_sym:
+        return {'valid': False, 'reason': 'symbol_not_found'}
 
-    if n_trades < 10 or observed_sharpe <= 0:
-        return {
-            'valid': False,
-            'dsr': 0.0,
-            'p_value': 1.0,
-            'reason': 'insufficient_data_or_negative_sharpe',
-        }
+    ohlcv = all_data[target_sym]['ohlcv']
+    if len(ohlcv) < 500:
+        return {'valid': False, 'reason': 'insufficient_data'}
 
-    # Expected max Sharpe from N random trials (Euler-Mascheroni approximation)
-    euler_mascheroni = 0.5772156649
-    expected_max_sr = sr_benchmark + np.sqrt(2 * np.log(n_trials)) - \
-        (np.log(np.pi) + euler_mascheroni) / (2 * np.sqrt(2 * np.log(max(n_trials, 2))))
+    monthly_returns = ohlcv['close'].resample('30D').last().pct_change().dropna()
+    regime_periods = {'bull': [], 'bear': [], 'sideways': []}
+    for date, ret in monthly_returns.items():
+        if ret > 0.05: regime_periods['bull'].append(date)
+        elif ret < -0.05: regime_periods['bear'].append(date)
+        else: regime_periods['sideways'].append(date)
 
-    # Variance of Sharpe ratio estimator (corrected for non-normality)
-    # Lo (2002) + Bailey & López de Prado (2014)
-    excess_kurtosis = kurtosis - 3.0
-    sr_var = (1.0 + 0.5 * observed_sharpe**2 - skewness * observed_sharpe +
-              (excess_kurtosis / 4.0) * observed_sharpe**2) / n_trades
-    sr_std = np.sqrt(max(sr_var, 1e-10))
+    profile = profile_from_params(best_params, coin_name)
+    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00,
+                    max_ensemble_std=0.10, train_embargo_hours=24)
 
-    # Test statistic: is observed Sharpe significantly above expected max from N trials?
-    z_stat = (observed_sharpe - expected_max_sr) / sr_std
-    p_value = 1.0 - stats.norm.cdf(z_stat)
+    regime_results = {}
+    profitable_count = 0
+    tested_count = 0
 
-    # DSR: the probability-adjusted Sharpe
-    dsr = observed_sharpe * (1.0 - p_value) if p_value < 1.0 else 0.0
-
-    return {
-        'valid': True,
-        'observed_sharpe': round(observed_sharpe, 4),
-        'expected_max_sr_from_trials': round(expected_max_sr, 4),
-        'sr_std_error': round(sr_std, 4),
-        'z_stat': round(z_stat, 4),
-        'p_value': round(p_value, 4),
-        'dsr': round(dsr, 4),
-        'n_trials': n_trials,
-        'n_trades': n_trades,
-        'significant_at_5pct': p_value < 0.05,
-        'significant_at_10pct': p_value < 0.10,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. REGIME SPLIT TEST
-# ═══════════════════════════════════════════════════════════════════════════
-
-def regime_split_test(trade_list: List[Dict], ohlcv: pd.DataFrame) -> Dict:
-    """
-    Split trades into market regimes (bull/bear/sideways) based on
-    the BTC price trend at entry time, then check if the strategy
-    works in each regime independently.
-    """
-    if len(trade_list) < 15:
-        return {'valid': False, 'reason': 'too_few_trades'}
-
-    # Compute 30-day rolling return for regime classification
-    close = ohlcv['close']
-    rolling_ret_30d = close.pct_change(30 * 24)  # 30 days in hourly bars
-
-    regime_trades = {'bull': [], 'bear': [], 'sideways': []}
-
-    for t in trade_list:
-        entry_time = pd.Timestamp(t['entry_time'])
-        # Find nearest regime classification
+    for regime_name, dates in regime_periods.items():
+        if len(dates) < 2: continue
+        regime_start = min(dates) - pd.Timedelta(days=120)
+        regime_end = max(dates) + pd.Timedelta(days=30)
+        regime_data = {}
+        for sym, d in all_data.items():
+            feat = d['features'][(d['features'].index >= regime_start) & (d['features'].index <= regime_end)]
+            ohlcv_r = d['ohlcv'][(d['ohlcv'].index >= regime_start) & (d['ohlcv'].index <= regime_end)]
+            if len(feat) > 200:
+                regime_data[sym] = {'features': feat, 'ohlcv': ohlcv_r}
+        if not regime_data: continue
         try:
-            nearest_idx = rolling_ret_30d.index.get_indexer([entry_time], method='ffill')[0]
-            if nearest_idx >= 0 and nearest_idx < len(rolling_ret_30d):
-                ret = rolling_ret_30d.iloc[nearest_idx]
-                if pd.isna(ret):
-                    regime_trades['sideways'].append(t)
-                elif ret > 0.10:
-                    regime_trades['bull'].append(t)
-                elif ret < -0.10:
-                    regime_trades['bear'].append(t)
-                else:
-                    regime_trades['sideways'].append(t)
-            else:
-                regime_trades['sideways'].append(t)
+            result = run_backtest(regime_data, config, profile_overrides={coin_name: profile})
+            if result:
+                sr = float(result.get('sharpe_annual', 0) or 0)
+                if sr <= -90: sr = 0.0
+                ret = float(result.get('ann_return', 0) or 0)
+                trades = int(result.get('n_trades', 0) or 0)
+                tested_count += 1
+                if sr > 0 or ret > 0: profitable_count += 1
+                regime_results[regime_name] = {
+                    'sharpe': round(sr, 3), 'return': round(ret, 4),
+                    'trades': trades, 'profitable': sr > 0 or ret > 0,
+                }
         except Exception:
-            regime_trades['sideways'].append(t)
-
-    results = {}
-    for regime, trades in regime_trades.items():
-        if len(trades) < 3:
-            results[regime] = {'n_trades': len(trades), 'sharpe': None, 'win_rate': None}
             continue
 
-        pnls = np.array([t['net_pnl'] for t in trades])
-        wr = float(np.mean(pnls > 0))
-        avg = float(np.mean(pnls))
-        std = float(np.std(pnls))
-        sr = avg / std if std > 0 else 0.0
-
-        results[regime] = {
-            'n_trades': len(trades),
-            'sharpe': round(sr, 3),
-            'win_rate': round(wr, 3),
-            'avg_pnl': round(avg, 6),
-            'total_pnl': round(float(np.sum(pnls)), 6),
-        }
-
-    # Check if strategy is regime-dependent (only profitable in one regime)
-    profitable_regimes = sum(
-        1 for r in results.values()
-        if r.get('sharpe') is not None and r['sharpe'] > 0 and r['n_trades'] >= 5
-    )
-    tested_regimes = sum(
-        1 for r in results.values()
-        if r.get('sharpe') is not None and r['n_trades'] >= 5
-    )
-
     return {
-        'valid': True,
-        'regimes': results,
-        'profitable_regimes': profitable_regimes,
-        'tested_regimes': tested_regimes,
-        'regime_dependent': profitable_regimes <= 1 and tested_regimes >= 2,
+        'valid': tested_count > 0, 'tested_regimes': tested_count,
+        'profitable_regimes': profitable_count,
+        'regime_dependent': profitable_count < max(1, tested_count - 1),
+        'results': regime_results,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5. COMPOSITE PAPER-TRADE READINESS SCORE
+# 4. CV CONSISTENCY CHECK (v11 NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_cv_consistency(optim_metrics):
+    mean_oos = optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe'))
+    min_oos = optim_metrics.get('min_oos_sharpe')
+    std_oos = optim_metrics.get('std_oos_sharpe')
+    n_folds = optim_metrics.get('n_folds', 1)
+
+    if mean_oos is None:
+        return {'valid': False, 'reason': 'no_cv_metrics'}
+
+    checks = {
+        'mean_oos_positive': float(mean_oos) > 0,
+        'min_fold_acceptable': min_oos is None or float(min_oos) > -0.3,
+        'low_variance': std_oos is None or float(std_oos) < 0.5,
+        'multiple_folds': n_folds >= 2,
+    }
+    passed = sum(checks.values())
+
+    return {
+        'valid': True,
+        'mean_oos_sharpe': float(mean_oos) if mean_oos is not None else None,
+        'min_oos_sharpe': float(min_oos) if min_oos is not None else None,
+        'std_oos_sharpe': float(std_oos) if std_oos is not None else None,
+        'n_folds': n_folds, 'checks': checks,
+        'checks_passed': passed, 'checks_total': len(checks),
+        'consistent': passed >= len(checks) - 1,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. READINESS SCORE (v11)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -411,370 +293,247 @@ class ReadinessCheck:
     name: str
     passed: bool
     weight: float
-    detail: str
+    detail: str = ""
 
 
-def compute_readiness_score(
-    mc_shuffle: Dict,
-    mc_resample: Dict,
-    sensitivity: Dict,
-    dsr: Dict,
-    regime: Dict,
-    holdout_metrics: Dict,
-    optim_metrics: Dict,
-) -> Dict:
-    """
-    Combine all robustness checks into a single go/no-go score.
+def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
+                            regime, cv_consistency, holdout_metrics, optim_metrics):
+    checks = []
 
-    Score 0-100:
-      80+ = READY for paper trading
-      60-79 = CAUTIOUS — paper trade with tight limits
-      40-59 = WEAK — needs more work
-      <40 = REJECT — do not paper trade
-    """
-    checks: List[ReadinessCheck] = []
-
-    # --- Monte Carlo Shuffle checks ---
     if mc_shuffle.get('valid'):
         checks.append(ReadinessCheck(
-            'mc_ruin_risk',
-            mc_shuffle['prob_ruin_25pct'] < 0.20,
-            15.0,
-            f"P(DD>25%)={mc_shuffle['prob_ruin_25pct']:.1%}"
-        ))
+            'mc_dd_acceptable', mc_shuffle['mc_dd_95th'] < 0.30, 15.0,
+            f"MC 95th DD={mc_shuffle['mc_dd_95th']:.1%}"))
         checks.append(ReadinessCheck(
-            'mc_loss_prob',
-            mc_shuffle['prob_loss'] < 0.40,
-            10.0,
-            f"P(loss)={mc_shuffle['prob_loss']:.1%}"
-        ))
-        checks.append(ReadinessCheck(
-            'mc_dd_95th',
-            mc_shuffle['mc_dd_95th'] < 0.35,
-            10.0,
-            f"95th DD={mc_shuffle['mc_dd_95th']:.1%}"
-        ))
+            'mc_ruin_low', mc_shuffle['prob_ruin_25pct'] < 0.10, 10.0,
+            f"P(DD>25%)={mc_shuffle['prob_ruin_25pct']:.1%}"))
 
-    # --- Monte Carlo Resample checks ---
     if mc_resample.get('valid'):
         checks.append(ReadinessCheck(
-            'mc_resample_sharpe',
-            mc_resample['sharpe_5th'] > -0.05,
-            10.0,
-            f"5th pctl Sharpe={mc_resample['sharpe_5th']:.3f}"
-        ))
-        checks.append(ReadinessCheck(
-            'mc_resample_neg_sharpe',
-            mc_resample['prob_negative_sharpe'] < 0.40,
-            5.0,
-            f"P(SR<0)={mc_resample['prob_negative_sharpe']:.1%}"
-        ))
+            'mc_sharpe_positive', mc_resample['sharpe_5th'] > 0, 15.0,
+            f"5th pctl Sharpe={mc_resample['sharpe_5th']:.3f}"))
 
-    # --- Parameter Sensitivity ---
     if sensitivity.get('valid'):
         checks.append(ReadinessCheck(
-            'param_stability',
-            not sensitivity['fragile'],
-            15.0,
-            f"Fragile={sensitivity['fragile']}, avg_drop={sensitivity['avg_sharpe_drop']:.3f}"
-        ))
+            'param_stability', not sensitivity['fragile'], 15.0,
+            f"Fragile={sensitivity['fragile']}, avg_drop={sensitivity['avg_sharpe_drop']:.3f}"))
 
-    # --- Deflated Sharpe Ratio ---
     if dsr.get('valid'):
+        sig = dsr.get('significant_at_10pct', dsr.get('significant_10pct', False))
         checks.append(ReadinessCheck(
-            'dsr_significant',
-            dsr['significant_at_10pct'],
-            15.0,
-            f"DSR={dsr['dsr']:.3f}, p={dsr['p_value']:.3f}"
-        ))
+            'dsr_significant', sig, 10.0,
+            f"DSR={dsr.get('dsr', 0):.3f}, p={dsr.get('p_value', 1):.3f}"))
 
-    # --- Regime test ---
     if regime.get('valid'):
         checks.append(ReadinessCheck(
-            'multi_regime',
-            not regime['regime_dependent'],
-            10.0,
-            f"Profitable in {regime['profitable_regimes']}/{regime['tested_regimes']} regimes"
-        ))
+            'multi_regime', not regime['regime_dependent'], 10.0,
+            f"Profitable {regime['profitable_regimes']}/{regime['tested_regimes']} regimes"))
 
-    # --- Holdout metrics ---
+    if cv_consistency.get('valid'):
+        checks.append(ReadinessCheck(
+            'cv_consistent', cv_consistency['consistent'], 15.0,
+            f"CV {cv_consistency['checks_passed']}/{cv_consistency['checks_total']} passed"))
+
     ho_sharpe = holdout_metrics.get('holdout_sharpe', 0)
     ho_trades = holdout_metrics.get('holdout_trades', 0)
     ho_return = holdout_metrics.get('holdout_return', 0)
 
     if ho_trades > 0:
         checks.append(ReadinessCheck(
-            'holdout_positive',
-            ho_sharpe > 0 and ho_return > -0.02,
-            10.0,
-            f"Holdout SR={ho_sharpe:.3f}, ret={ho_return:.2%}, trades={ho_trades}"
-        ))
+            'holdout_positive', ho_sharpe > 0 and ho_return > -0.02, 10.0,
+            f"Holdout SR={ho_sharpe:.3f}, ret={ho_return:.2%}"))
 
-    # --- Optim/Holdout Sharpe decay ---
-    optim_sharpe = optim_metrics.get('sharpe', 0)
-    if optim_sharpe > 0 and ho_sharpe > 0:
-        decay = 1.0 - (ho_sharpe / optim_sharpe)
+    n_trades = int(optim_metrics.get('n_trades', 0) or 0)
+    checks.append(ReadinessCheck(
+        'sufficient_trades', n_trades >= 30, 5.0,
+        f"Trades={n_trades} (need >=30)"))
+
+    optim_sr = optim_metrics.get('mean_oos_sharpe',
+                optim_metrics.get('sharpe', optim_metrics.get('oos_sharpe', 0)))
+    if optim_sr and float(optim_sr) > 0 and ho_sharpe and float(ho_sharpe) > 0:
+        decay = 1.0 - (float(ho_sharpe) / float(optim_sr))
         checks.append(ReadinessCheck(
-            'sharpe_decay',
-            decay < 0.60,  # less than 60% decay
-            10.0,
-            f"Sharpe decay={decay:.0%} (optim={optim_sharpe:.3f} → holdout={ho_sharpe:.3f})"
-        ))
+            'sharpe_decay', decay < 0.50, 10.0,
+            f"Decay={decay:.0%}"))
 
-    # Compute weighted score
     total_weight = sum(c.weight for c in checks)
     if total_weight == 0:
-        return {'score': 0, 'rating': 'UNKNOWN', 'checks': [], 'n_checks': 0}
+        return {'score': 0, 'rating': 'UNKNOWN', 'details': [], 'n_checks': 0,
+                'checks_passed': 0, 'checks_failed': 0}
 
     weighted_score = sum(c.weight for c in checks if c.passed) / total_weight * 100
 
-    if weighted_score >= 80:
-        rating = 'READY'
-    elif weighted_score >= 60:
-        rating = 'CAUTIOUS'
-    elif weighted_score >= 40:
-        rating = 'WEAK'
-    else:
-        rating = 'REJECT'
+    if weighted_score >= 80: rating = 'READY'
+    elif weighted_score >= 60: rating = 'CAUTIOUS'
+    elif weighted_score >= 40: rating = 'WEAK'
+    else: rating = 'REJECT'
 
     return {
-        'score': round(weighted_score, 1),
-        'rating': rating,
+        'score': round(weighted_score, 1), 'rating': rating,
         'n_checks': len(checks),
         'checks_passed': sum(1 for c in checks if c.passed),
         'checks_failed': sum(1 for c in checks if not c.passed),
-        'details': [
-            {
-                'name': c.name,
-                'passed': c.passed,
-                'weight': c.weight,
-                'detail': c.detail,
-            }
-            for c in checks
-        ],
+        'details': [{'name': c.name, 'passed': c.passed, 'weight': c.weight, 'detail': c.detail}
+                    for c in checks],
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. MAIN VALIDATION ORCHESTRATOR
+# MAIN VALIDATION ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_validation(coin_name: str, optimization_result: Dict, all_data: Dict) -> Dict:
-    """
-    Run the full robustness validation suite for a single coin.
-    """
+def run_validation(coin_name, optimization_result, all_data):
     from scripts.train_model import Config, run_backtest
     from scripts.optimize import (
         profile_from_params, resolve_target_symbol,
-        COIN_MAP, PREFIX_FOR_COIN,
+        COIN_MAP, PREFIX_FOR_COIN, compute_deflated_sharpe,
     )
 
     params = optimization_result.get('params', {})
     coin_prefix = optimization_result.get('prefix', PREFIX_FOR_COIN.get(coin_name, coin_name))
     holdout_metrics = optimization_result.get('holdout_metrics', {})
     optim_metrics = optimization_result.get('optim_metrics', {})
-    n_trials = int(optimization_result.get('n_trials', 200))
+    n_trials = int(optimization_result.get('n_trials', 100))
 
     print(f"\n{'='*70}")
-    print(f"🔬 ROBUSTNESS VALIDATION — {coin_name}")
+    print(f"🔬 ROBUSTNESS VALIDATION — {coin_name} (v11)")
     print(f"{'='*70}")
 
-    # Resolve symbol
     target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
     if not target_sym:
         print(f"  ❌ Cannot resolve symbol for {coin_name}")
-        return {'valid': False, 'reason': 'symbol_not_found'}
+        return {'valid': False, 'reason': 'symbol_not_found', 'coin': coin_name}
 
-    # --- Run full backtest to get trade list ---
-    print(f"  📊 Running full backtest to collect trade-level data...")
+    # Run baseline backtest
+    print(f"  📊 Running full backtest...")
     profile = profile_from_params(params, coin_name)
     single_data = {target_sym: all_data[target_sym]}
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00,
                     max_ensemble_std=0.10, train_embargo_hours=24)
 
     try:
-        result = run_backtest(single_data, config,
-                               profile_overrides={coin_name: profile})
+        result = run_backtest(single_data, config, profile_overrides={coin_name: profile})
     except Exception as e:
         print(f"  ❌ Backtest failed: {e}")
-        return {'valid': False, 'reason': f'backtest_error: {e}'}
+        return {'valid': False, 'reason': f'backtest_error: {e}', 'coin': coin_name}
 
     if result is None:
-        print(f"  ❌ Backtest returned None")
-        return {'valid': False, 'reason': 'backtest_none'}
+        return {'valid': False, 'reason': 'backtest_none', 'coin': coin_name}
 
-    # Extract trade PnLs (use the returned metrics)
     n_trades = int(result.get('n_trades', 0))
     sharpe = float(result.get('sharpe_annual', 0) or 0)
-    if sharpe <= -90:
-        sharpe = 0.0
+    if sharpe <= -90: sharpe = 0.0
 
-    # We need trade-level PnLs. Since run_backtest returns aggregate metrics,
-    # we'll reconstruct from the avg and std if individual trades aren't available.
+    # Synthesize trade PnLs
     avg_pnl = float(result.get('avg_net_pnl', 0) or 0)
-    # Generate synthetic trade PnLs from distribution parameters for MC
-    # This is an approximation — for production, modify run_backtest to return trade list
-    rng = np.random.default_rng(42)
-    if n_trades >= 10 and avg_pnl != 0:
-        # Reconstruct approximate trade PnLs
-        win_rate = float(result.get('win_rate', 0.5))
+    win_rate = float(result.get('win_rate', 0) or 0)
+    avg_notional = 100_000.0 * 0.12 * 4
+
+    trade_pnls = np.array([])
+    if n_trades >= 10:
+        rng = np.random.default_rng(42)
         n_wins = int(n_trades * win_rate)
         n_losses = n_trades - n_wins
+        avg_win = max(avg_pnl * 1.5, 0.001) if avg_pnl > 0 else 0.005
+        avg_loss = min(avg_pnl * 0.8 if avg_pnl < 0 else -0.003, -0.001)
+        win_pnls = rng.normal(avg_win * avg_notional, abs(avg_win * avg_notional) * 0.3, max(1, n_wins))
+        loss_pnls = rng.normal(avg_loss * avg_notional, abs(avg_loss * avg_notional) * 0.3, max(1, n_losses))
+        trade_pnls = np.concatenate([win_pnls, loss_pnls])
+        rng.shuffle(trade_pnls)
 
-        # Use profit factor to estimate win/loss magnitudes
-        pf = float(result.get('profit_factor', 1.5) or 1.5)
-        if pf > 0 and n_losses > 0 and n_wins > 0:
-            # avg_win * n_wins = pf * avg_loss * n_losses
-            # avg_pnl = (avg_win * n_wins - avg_loss * n_losses) / n_trades
-            avg_loss_abs = abs(avg_pnl * n_trades) / (pf * n_losses - n_losses) if (pf - 1) * n_losses > 0 else 0.01
-            avg_win = pf * avg_loss_abs if avg_loss_abs > 0 else abs(avg_pnl) * 2
+    # 1. MC Shuffle
+    print(f"  🎲 Monte Carlo shuffle...")
+    mc_shuffle = monte_carlo_shuffle(trade_pnls) if len(trade_pnls) >= 10 else {'valid': False}
+    if mc_shuffle.get('valid'):
+        print(f"     DD 95th: {mc_shuffle['mc_dd_95th']:.1%} | P(ruin): {mc_shuffle['prob_ruin_25pct']:.1%}")
 
-            wins = rng.exponential(avg_win, size=n_wins)
-            losses = -rng.exponential(avg_loss_abs, size=n_losses)
-            trade_pnls = np.concatenate([wins, losses])
-            rng.shuffle(trade_pnls)
-        else:
-            # Fallback: normal distribution
-            std_pnl = abs(avg_pnl) * 2
-            trade_pnls = rng.normal(avg_pnl, std_pnl, size=n_trades)
-    else:
-        trade_pnls = np.array([avg_pnl] * max(n_trades, 1))
+    # 2. MC Resample
+    print(f"  🎲 Monte Carlo resample...")
+    mc_resample = monte_carlo_resample(trade_pnls) if len(trade_pnls) >= 10 else {'valid': False}
+    if mc_resample.get('valid'):
+        print(f"     Sharpe 5th: {mc_resample['sharpe_5th']:.3f} | P(loss): {mc_resample['prob_loss']:.1%}")
 
-    # Convert to dollar PnLs
-    avg_pnl_dollars = float(result.get('avg_net_pnl', 0) or 0) * 100000  # rough approx
-
-    # --- 1. Monte Carlo Shuffle ---
-    print(f"  🎲 Monte Carlo Shuffle ({1000} sims)...")
-    mc_shuffle = monte_carlo_shuffle(trade_pnls * 100000, n_sims=1000)
-    if mc_shuffle['valid']:
-        print(f"     DD 95th: {mc_shuffle['mc_dd_95th']:.1%} | P(ruin 25%): {mc_shuffle['prob_ruin_25pct']:.1%}")
-
-    # --- 2. Monte Carlo Resample ---
-    print(f"  🎲 Monte Carlo Resample ({1000} sims)...")
-    mc_resample = monte_carlo_resample(trade_pnls * 100000, n_sims=1000)
-    if mc_resample['valid']:
-        print(f"     Sharpe 5th: {mc_resample['sharpe_5th']:.3f} | P(SR<0): {mc_resample['prob_negative_sharpe']:.1%}")
-
-    # --- 3. Parameter Sensitivity ---
-    print(f"  🔧 Parameter Sensitivity (±10%)...")
+    # 3. Param Sensitivity
+    print(f"  🔧 Parameter sensitivity...")
     sensitivity = check_parameter_sensitivity(all_data, params, coin_name, coin_prefix)
-    if sensitivity['valid']:
+    if sensitivity.get('valid'):
         print(f"     Fragile: {sensitivity['fragile']} | Avg drop: {sensitivity['avg_sharpe_drop']:.3f}")
 
-    # --- 4. Deflated Sharpe Ratio ---
-    print(f"  📐 Deflated Sharpe Ratio (correcting for {n_trials} trials)...")
-    # Compute skew/kurtosis from trade PnLs
-    if len(trade_pnls) > 10:
-        from scipy.stats import skew, kurtosis
-        sk = float(skew(trade_pnls))
-        ku = float(kurtosis(trade_pnls, fisher=False))  # excess=False -> raw kurtosis
-    else:
-        sk, ku = 0.0, 3.0
+    # 4. DSR
+    print(f"  📐 Deflated Sharpe Ratio...")
+    oos_sr = float(optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe', sharpe)) or 0)
+    dsr = compute_deflated_sharpe(oos_sr, n_trades, n_trials)
+    if dsr.get('valid'):
+        print(f"     DSR: {dsr['dsr']:.3f} (p={dsr['p_value']:.3f})")
 
-    dsr_result = deflated_sharpe_ratio(
-        observed_sharpe=sharpe,
-        n_trades=n_trades,
-        skewness=sk,
-        kurtosis=ku,
-        n_trials=n_trials,
-    )
-    if dsr_result['valid']:
-        print(f"     DSR: {dsr_result['dsr']:.3f} | p-value: {dsr_result['p_value']:.3f} | "
-              f"Significant@10%: {dsr_result['significant_at_10pct']}")
+    # 5. Regime Split
+    print(f"  🌤️ Regime split test...")
+    regime = test_regime_splits(all_data, params, coin_name, coin_prefix)
+    if regime.get('valid'):
+        print(f"     Profitable: {regime['profitable_regimes']}/{regime['tested_regimes']} regimes")
 
-    # --- 5. Regime Split ---
-    print(f"  🌤️  Regime Split Test...")
-    # Build trade list from approximation
-    trade_list = [{'net_pnl': p, 'entry_time': str(single_data[target_sym]['ohlcv'].index[
-        min(i * (len(single_data[target_sym]['ohlcv']) // max(n_trades, 1)),
-            len(single_data[target_sym]['ohlcv']) - 1)
-    ])} for i, p in enumerate(trade_pnls)]
+    # 6. CV Consistency (v11)
+    print(f"  📊 CV consistency check...")
+    cv_consistency = check_cv_consistency(optim_metrics)
+    if cv_consistency.get('valid'):
+        print(f"     Consistent: {cv_consistency['consistent']} "
+              f"({cv_consistency['checks_passed']}/{cv_consistency['checks_total']})")
 
-    regime = regime_split_test(trade_list, single_data[target_sym]['ohlcv'])
-    if regime['valid']:
-        print(f"     Profitable regimes: {regime['profitable_regimes']}/{regime['tested_regimes']} | "
-              f"Regime-dependent: {regime['regime_dependent']}")
-
-    # --- 6. Composite Score ---
-    print(f"\n  🏆 Computing Paper-Trade Readiness Score...")
+    # 7. Readiness Score
+    print(f"\n  🏁 Computing readiness score...")
     readiness = compute_readiness_score(
-        mc_shuffle, mc_resample, sensitivity, dsr_result, regime,
-        holdout_metrics, optim_metrics,
+        mc_shuffle, mc_resample, sensitivity, dsr,
+        regime, cv_consistency, holdout_metrics, optim_metrics,
     )
 
-    rating_emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(readiness['rating'], '?')
-    print(f"\n  {rating_emoji} READINESS SCORE: {readiness['score']:.0f}/100 — {readiness['rating']}")
+    emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(readiness['rating'], '?')
+    print(f"\n  {emoji} {coin_name}: {readiness['rating']} — Score: {readiness['score']:.0f}/100")
     print(f"     Checks: {readiness['checks_passed']}/{readiness['n_checks']} passed")
-    for check in readiness['details']:
-        icon = '✅' if check['passed'] else '❌'
-        print(f"       {icon} {check['name']}: {check['detail']}")
+    for detail in readiness['details']:
+        status = '✅' if detail['passed'] else '❌'
+        print(f"     {status} {detail['name']}: {detail['detail']}")
 
-    return {
-        'valid': True,
-        'coin': coin_name,
+    # Save
+    validation_data = {
+        'coin': coin_name, 'version': 'v11',
         'timestamp': datetime.now().isoformat(),
-        'readiness': readiness,
-        'mc_shuffle': mc_shuffle,
-        'mc_resample': mc_resample,
+        'mc_shuffle': mc_shuffle, 'mc_resample': mc_resample,
         'parameter_sensitivity': sensitivity,
-        'deflated_sharpe': dsr_result,
-        'regime_test': regime,
-        'backtest_sharpe': sharpe,
-        'backtest_trades': n_trades,
+        'deflated_sharpe': dsr, 'regime_split': regime,
+        'cv_consistency': cv_consistency,
+        'readiness': readiness,
     }
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _find_optimization_result(coin_name: str) -> Optional[Dict]:
-    """Load optimization result JSON for a coin."""
-    candidates = [
-        SCRIPT_DIR / "optimization_results" / f"{coin_name}_optimization.json",
-        Path.cwd() / "optimization_results" / f"{coin_name}_optimization.json",
-    ]
-    for p in candidates:
-        if p.exists():
-            with open(p) as f:
-                return json.load(f)
-    return None
-
-
-def _save_validation_result(coin_name: str, result: Dict) -> Optional[Path]:
-    """Save validation result alongside optimization result."""
-    candidates = [
-        SCRIPT_DIR / "optimization_results",
-        Path.cwd() / "optimization_results",
-    ]
-    for d in candidates:
+    for d in [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]:
         try:
             d.mkdir(parents=True, exist_ok=True)
-            path = d / f"{coin_name}_validation.json"
-            with open(path, 'w') as f:
-                json.dump(result, f, indent=2, default=str)
-            return path
+            p = d / f"{coin_name}_validation.json"
+            with open(p, 'w') as f:
+                json.dump(validation_data, f, indent=2, default=str)
+            print(f"  💾 Saved to {p}")
+            break
         except (PermissionError, OSError):
             continue
-    return None
+
+    return validation_data
 
 
 def show_validation_results():
-    """Display all saved validation results."""
     candidates = [
         SCRIPT_DIR / "optimization_results",
         Path.cwd() / "optimization_results",
     ]
     results = []
     for d in candidates:
-        results.extend(d.glob("*_validation.json")) if d.exists() else None
+        if d.exists():
+            results.extend(d.glob("*_validation.json"))
 
     if not results:
         print("No validation results found.")
         return
 
     print(f"\n{'='*80}")
-    print(f"🔬 VALIDATION RESULTS SUMMARY")
+    print(f"🔬 VALIDATION RESULTS SUMMARY (v11)")
     print(f"{'='*80}")
 
     for rpath in sorted(results):
@@ -789,6 +548,7 @@ def show_validation_results():
         dsr = r.get('deflated_sharpe', {})
         mc = r.get('mc_shuffle', {})
         sens = r.get('parameter_sensitivity', {})
+        cv = r.get('cv_consistency', {})
 
         print(f"\n{emoji} {r.get('coin', '?')} — Score: {score:.0f}/100 — {rating}")
         print(f"   Checks: {readiness.get('checks_passed', 0)}/{readiness.get('n_checks', 0)} passed")
@@ -799,6 +559,9 @@ def show_validation_results():
             print(f"   MC DD 95th: {mc.get('mc_dd_95th', 0):.1%} | P(ruin): {mc.get('prob_ruin_25pct', 0):.1%}")
         if sens.get('valid'):
             print(f"   Param Fragile: {sens.get('fragile', '?')} | Avg drop: {sens.get('avg_sharpe_drop', 0):.3f}")
+        if cv.get('valid'):
+            print(f"   CV Consistent: {cv.get('consistent', '?')} | "
+                  f"Mean OOS SR: {cv.get('mean_oos_sharpe', '?')}")
 
 
 COIN_MAP = {
@@ -806,70 +569,49 @@ COIN_MAP = {
     'XPP': 'XRP', 'XRP': 'XRP', 'SLP': 'SOL', 'SOL': 'SOL',
     'DOP': 'DOGE', 'DOGE': 'DOGE',
 }
-
 ALL_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE']
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Post-optimization robustness validation (v10)")
-    parser.add_argument("--coin", type=str, help="Coin to validate (e.g. BTC)")
-    parser.add_argument("--all", action="store_true", help="Validate all coins with optimization results")
-    parser.add_argument("--show", action="store_true", help="Show existing validation results")
+    parser = argparse.ArgumentParser(description="Post-optimization robustness validation (v11)")
+    parser.add_argument("--coin", type=str)
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
 
     if args.show:
         show_validation_results()
         sys.exit(0)
 
-    # Determine which coins to validate
     if args.all:
         coins_to_validate = ALL_COINS
     elif args.coin:
-        coin = COIN_MAP.get(args.coin.upper(), args.coin.upper())
-        coins_to_validate = [coin]
+        coins_to_validate = [COIN_MAP.get(args.coin.upper(), args.coin.upper())]
     else:
         parser.print_help()
         sys.exit(1)
 
-    # Load data once
     print("📂 Loading data...")
     sys.path.insert(0, str(SCRIPT_DIR))
     from scripts.train_model import load_data
-
     all_data = load_data()
     if not all_data:
-        print("❌ No data loaded. Run the pipeline first.")
+        print("❌ No data loaded.")
         sys.exit(1)
 
-    # Validate each coin
-    summary = []
-    for coin_name in coins_to_validate:
-        opt_result = _find_optimization_result(coin_name)
-        if not opt_result:
-            print(f"\n⚠️  No optimization result for {coin_name} — skipping")
+    for coin in coins_to_validate:
+        opt_file = None
+        for d in [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]:
+            candidate = d / f"{coin}_optimization.json"
+            if candidate.exists():
+                opt_file = candidate
+                break
+
+        if not opt_file:
+            print(f"\n⚠️ No optimization result for {coin}, skipping.")
             continue
 
-        validation = run_validation(coin_name, opt_result, all_data)
+        with open(opt_file) as f:
+            opt_result = json.load(f)
 
-        save_path = _save_validation_result(coin_name, validation)
-        if save_path:
-            print(f"  💾 Saved to {save_path}")
-
-        if validation.get('valid'):
-            summary.append((coin_name, validation['readiness']))
-
-    # Final summary
-    if summary:
-        print(f"\n{'='*70}")
-        print(f"📋 PAPER-TRADE READINESS SUMMARY")
-        print(f"{'='*70}")
-        for coin, readiness in summary:
-            emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(readiness['rating'], '?')
-            print(f"  {emoji} {coin:6s} — {readiness['score']:.0f}/100 — {readiness['rating']}")
-        print()
-
-        ready_coins = [c for c, r in summary if r['rating'] in ('READY', 'CAUTIOUS')]
-        if ready_coins:
-            print(f"  💡 Coins worth paper-testing: {', '.join(ready_coins)}")
-        else:
-            print(f"  ⚠️  No coins reached paper-trade readiness. Review parameters or collect more data.")
+        run_validation(coin, opt_result, all_data)
