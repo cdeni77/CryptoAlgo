@@ -338,7 +338,7 @@ def _print_log_tail(log_path, max_lines=30):
         print(f"         {line}")
 
 
-def _estimate_validation_timeout(result_path):
+def _estimate_validation_timeout(result_path, timeout_scale=1.0, timeout_cap=7200):
     base = 900
     try:
         with open(result_path) as f:
@@ -346,9 +346,12 @@ def _estimate_validation_timeout(result_path):
         trades = int(data.get('optim_metrics', {}).get('n_trades', 0) or 0)
         folds = int(data.get('n_cv_folds', 1) or 1)
         holdout_days = int(data.get('holdout_days', 180) or 180)
-        return int(min(3600, max(base, base + trades * 10 + folds * 120 + holdout_days * 2)))
+        estimated = max(base, base + trades * 10 + folds * 120 + holdout_days * 2)
+        scaled = int(estimated * max(0.5, timeout_scale))
+        return int(min(max(base, scaled), timeout_cap))
     except Exception:
-        return 1800
+        fallback = int(1800 * max(0.5, timeout_scale))
+        return int(min(max(900, fallback), timeout_cap))
 
 
 if __name__ == "__main__":
@@ -380,6 +383,12 @@ if __name__ == "__main__":
                         help="Comma-separated sampler seeds for consensus runs")
     parser.add_argument("--validation-jobs", type=int, default=3,
                         help="Max parallel validation processes")
+    parser.add_argument("--validation-timeout-scale", type=float, default=1.0,
+                        help="Multiplier applied to per-coin validation timeout estimates")
+    parser.add_argument("--validation-timeout-cap", type=int, default=7200,
+                        help="Maximum per-coin validation timeout in seconds")
+    parser.add_argument("--validation-fast", action="store_true",
+                        help="Run faster robustness checks (lower MC simulation counts)")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -568,8 +577,14 @@ if __name__ == "__main__":
                     coin = pending.pop(0)
                     print(f"\n   Running validation for {coin}...")
                     cmd = [sys.executable, "-m", "scripts.validate_robustness", "--coin", coin]
+                    if args.validation_fast:
+                        cmd.append("--fast")
                     result_path = results_dir / f"{coin}_optimization.json"
-                    timeout_s = _estimate_validation_timeout(result_path)
+                    timeout_s = _estimate_validation_timeout(
+                        result_path,
+                        timeout_scale=args.validation_timeout_scale,
+                        timeout_cap=args.validation_timeout_cap,
+                    )
                     proc = subprocess.Popen(
                         cmd, cwd=str(trader_root),
                         stdout=subprocess.PIPE if not sys.stderr.isatty() else None,
