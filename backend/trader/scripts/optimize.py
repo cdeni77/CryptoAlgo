@@ -420,6 +420,10 @@ def objective(
     min_internal_oos_trades=0,
     target_trades_per_week=1.0,
 ):
+    min_fold_sharpe_hard = -0.1
+    min_fold_win_rate = 0.35
+    min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 8)
+
     profile = create_trial_profile(trial, coin_name)
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10, train_embargo_hours=24)
     features = optim_data[target_sym]['features']
@@ -457,6 +461,39 @@ def objective(
     guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 4.0))
     guard_min_exp = float(guards.get('min_expectancy', 0.0))
     avg_tc = np.mean([r['n_trades'] for r in fold_results])
+
+    fold_metrics = [
+        {
+            'fold_idx': i,
+            'n_trades': int(r.get('n_trades', 0) or 0),
+            'sharpe': round(float(r.get('sharpe', 0.0) or 0.0), 6),
+            'win_rate': round(float(r.get('win_rate', 0.0) or 0.0), 6),
+            'profit_factor': round(float(r.get('profit_factor', 0.0) or 0.0), 6),
+            'max_drawdown': round(float(r.get('max_drawdown', 0.0) or 0.0), 6),
+            'total_return': round(float(r.get('total_return', 0.0) or 0.0), 6),
+        }
+        for i, r in enumerate(fold_results)
+    ]
+
+    if min_sr < min_fold_sharpe_hard:
+        _set_reject_reason(trial, f'guard_min_fold_sharpe:{min_sr:.3f}<{min_fold_sharpe_hard:.3f}')
+        return -99.0
+
+    low_wr_folds = [
+        f for f in fold_metrics
+        if f['n_trades'] >= min_fold_win_rate_trades and f['win_rate'] < min_fold_win_rate
+    ]
+    if low_wr_folds:
+        worst_fold = min(low_wr_folds, key=lambda f: f['win_rate'])
+        _set_reject_reason(
+            trial,
+            (
+                f"guard_min_fold_win_rate:fold{worst_fold['fold_idx']}="
+                f"{worst_fold['win_rate']:.3f}<{min_fold_win_rate:.2f}"
+                f"@trades>={min_fold_win_rate_trades}"
+            ),
+        )
+        return -99.0
 
     if total_trades < guard_min_trades:
         _set_reject_reason(trial, f'guard_total_trades:{total_trades}<{guard_min_trades}')
@@ -525,6 +562,12 @@ def objective(
     trial.set_user_attr('trades_per_year', round(tpy, 1))
     trial.set_user_attr('target_trades_per_week', round(float(target_trades_per_week), 2))
     trial.set_user_attr('frequency_ratio', round(float(freq_ratio), 3))
+    trial.set_user_attr('fold_metrics', fold_metrics)
+    trial.set_user_attr('fold_constraints', {
+        'min_fold_sharpe_hard': float(min_fold_sharpe_hard),
+        'min_fold_win_rate': float(min_fold_win_rate),
+        'min_fold_win_rate_trades': int(min_fold_win_rate_trades),
+    })
     ann_ret = np.mean([r['ann_return'] for r in fold_results])
     trial.set_user_attr('ann_return', round(ann_ret, 4))
     trial.set_user_attr('calmar', round(min(ann_ret / mean_dd if mean_dd > 0.01 else 0, 10.0), 3))
@@ -1062,10 +1105,10 @@ def show_results():
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 60, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 3, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'robust120': {'plateau_patience': 50, 'plateau_warmup': 25, 'plateau_min_delta': 0.02, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 3, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust180': {'plateau_patience': 60, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust120': {'plateau_patience': 50, 'plateau_warmup': 25, 'plateau_min_delta': 0.02, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
         'quick':     {'plateau_patience': 30, 'plateau_warmup': 15, 'plateau_min_delta': 0.03, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 10, 'holdout_min_sharpe': 0.0, 'holdout_min_return': -0.01, 'require_holdout_pass': False, 'target_trades_per_week': 0.8},
-        'paper_ready': {'plateau_patience': 80, 'plateau_warmup': 40, 'plateau_min_delta': 0.015, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 4, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'paper_ready': {'plateau_patience': 80, 'plateau_warmup': 40, 'plateau_min_delta': 0.015, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args

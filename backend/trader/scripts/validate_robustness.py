@@ -284,10 +284,31 @@ def test_regime_splits(all_data, best_params, coin_name, coin_prefix):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def check_cv_consistency(optim_metrics):
-    mean_oos = optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe'))
-    min_oos = optim_metrics.get('min_oos_sharpe')
-    std_oos = optim_metrics.get('std_oos_sharpe')
-    n_folds = optim_metrics.get('n_folds', 1)
+    fold_metrics = optim_metrics.get('fold_metrics') or []
+    sharpe_folds = []
+
+    if isinstance(fold_metrics, list):
+        for fold in fold_metrics:
+            if not isinstance(fold, dict):
+                continue
+            sharpe = fold.get('sharpe')
+            if sharpe is None:
+                continue
+            try:
+                sharpe_folds.append(float(sharpe))
+            except (TypeError, ValueError):
+                continue
+
+    if sharpe_folds:
+        mean_oos = float(np.mean(sharpe_folds))
+        min_oos = float(np.min(sharpe_folds))
+        std_oos = float(np.std(sharpe_folds)) if len(sharpe_folds) > 1 else 0.0
+        n_folds = len(sharpe_folds)
+    else:
+        mean_oos = optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe'))
+        min_oos = optim_metrics.get('min_oos_sharpe')
+        std_oos = optim_metrics.get('std_oos_sharpe')
+        n_folds = optim_metrics.get('n_folds', 1)
 
     if mean_oos is None:
         return {'valid': False, 'reason': 'no_cv_metrics'}
@@ -295,7 +316,7 @@ def check_cv_consistency(optim_metrics):
     checks = {
         'mean_oos_positive': float(mean_oos) > 0,
         'min_fold_acceptable': min_oos is None or float(min_oos) > -0.3,
-        'low_variance': std_oos is None or float(std_oos) < 0.5,
+        'low_variance': std_oos is None or float(std_oos) < 0.3,
         'multiple_folds': n_folds >= 2,
     }
     passed = sum(checks.values())
@@ -305,7 +326,9 @@ def check_cv_consistency(optim_metrics):
         'mean_oos_sharpe': float(mean_oos) if mean_oos is not None else None,
         'min_oos_sharpe': float(min_oos) if min_oos is not None else None,
         'std_oos_sharpe': float(std_oos) if std_oos is not None else None,
-        'n_folds': n_folds, 'checks': checks,
+        'n_folds': n_folds,
+        'used_fold_metrics': bool(sharpe_folds),
+        'checks': checks,
         'checks_passed': passed, 'checks_total': len(checks),
         'consistent': passed >= len(checks) - 1,
     }
