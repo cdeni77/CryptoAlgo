@@ -10,6 +10,24 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
+const normalizeTier = (tier: unknown, robustnessGate: boolean): 'FULL' | 'PILOT' | 'SHADOW' | 'REJECT' | 'UNKNOWN' => {
+  if (tier === 'FULL' || tier === 'PILOT' || tier === 'SHADOW' || tier === 'REJECT' || tier === 'UNKNOWN') {
+    return tier;
+  }
+  return robustnessGate ? 'PILOT' : 'REJECT';
+};
+
+const normalizeScale = (scale: unknown, tier: 'FULL' | 'PILOT' | 'SHADOW' | 'REJECT' | 'UNKNOWN'): number => {
+  if (typeof scale === 'number' && Number.isFinite(scale)) {
+    return scale;
+  }
+  if (tier === 'FULL') return 1.0;
+  if (tier === 'PILOT') return 0.5;
+  if (tier === 'SHADOW') return 0.2;
+  return 0.0;
+};
+
+
 async function fetchWithError<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
@@ -20,15 +38,50 @@ async function fetchWithError<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export async function getResearchSummary(): Promise<ResearchSummary> {
-  return fetchWithError(`${API_BASE}/research/summary`);
+  const data = await fetchWithError<ResearchSummary>(`${API_BASE}/research/summary`);
+  const coins = data.coins.map((coin) => {
+    const readinessTier = normalizeTier(coin.readiness_tier, coin.robustness_gate);
+    return {
+      ...coin,
+      readiness_tier: readinessTier,
+      recommended_position_scale: normalizeScale(coin.recommended_position_scale, readinessTier),
+    };
+  });
+
+  return {
+    ...data,
+    coins,
+    kpis: {
+      ...data.kpis,
+      readiness_tier: normalizeTier(data.kpis.readiness_tier, data.kpis.robustness_gate),
+      recommended_position_scale: normalizeScale(data.kpis.recommended_position_scale, normalizeTier(data.kpis.readiness_tier, data.kpis.robustness_gate)),
+    },
+  };
 }
 
 export async function getResearchCoin(coin: string): Promise<ResearchCoinDetail> {
-  return fetchWithError(`${API_BASE}/research/coins/${coin}`);
+  const data = await fetchWithError<ResearchCoinDetail>(`${API_BASE}/research/coins/${coin}`);
+  const readinessTier = normalizeTier(data.coin.readiness_tier, data.coin.robustness_gate);
+  return {
+    ...data,
+    coin: {
+      ...data.coin,
+      readiness_tier: readinessTier,
+      recommended_position_scale: normalizeScale(data.coin.recommended_position_scale, readinessTier),
+    },
+  };
 }
 
 export async function getResearchRuns(limit = 25): Promise<ResearchRun[]> {
-  return fetchWithError(`${API_BASE}/research/runs?limit=${limit}`);
+  const runs = await fetchWithError<ResearchRun[]>(`${API_BASE}/research/runs?limit=${limit}`);
+  return runs.map((run) => {
+    const readinessTier = normalizeTier(run.readiness_tier, run.robustness_gate);
+    return {
+      ...run,
+      readiness_tier: readinessTier,
+      recommended_position_scale: normalizeScale(run.recommended_position_scale, readinessTier),
+    };
+  });
 }
 
 export async function getResearchFeatures(coin: string): Promise<ResearchFeatures> {

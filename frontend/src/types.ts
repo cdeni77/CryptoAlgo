@@ -199,6 +199,14 @@ export interface PaperEquityPoint {
   open_positions: number;
 }
 
+export type ReadinessTier = 'FULL' | 'PILOT' | 'SHADOW' | 'REJECT' | 'UNKNOWN';
+
+export interface ReadinessTierDisplayMeta {
+  label: string;
+  tone: 'emerald' | 'amber' | 'slate' | 'rose';
+  description: string;
+}
+
 export interface ResearchSummaryKpis {
   holdout_auc: number | null;
   pr_auc: number | null;
@@ -206,6 +214,9 @@ export interface ResearchSummaryKpis {
   win_rate_realized: number;
   acted_signal_rate: number;
   drift_delta: number;
+  readiness_tier?: ReadinessTier;
+  recommended_position_scale?: number;
+  readiness_tier_meta?: ReadinessTierDisplayMeta;
   robustness_gate: boolean;
 }
 
@@ -217,6 +228,8 @@ export interface ResearchCoinHealth {
   win_rate_realized: number;
   acted_signal_rate: number;
   drift_delta: number;
+  readiness_tier?: ReadinessTier;
+  recommended_position_scale?: number;
   robustness_gate: boolean;
   optimization_freshness_hours: number | null;
   last_optimized_at: string | null;
@@ -243,6 +256,9 @@ export interface ResearchRun {
   finished_at: string;
   duration_seconds: number;
   holdout_auc: number | null;
+  readiness_tier?: ReadinessTier;
+  recommended_position_scale?: number;
+  readiness_tier_meta?: ReadinessTierDisplayMeta;
   robustness_gate: boolean;
 }
 

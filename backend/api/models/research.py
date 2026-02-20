@@ -1,7 +1,10 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+ReadinessTier = Literal["FULL", "PILOT", "SHADOW", "REJECT", "UNKNOWN"]
 
 
 class ResearchSummaryKpis(BaseModel):
@@ -11,6 +14,8 @@ class ResearchSummaryKpis(BaseModel):
     win_rate_realized: float
     acted_signal_rate: float
     drift_delta: float
+    readiness_tier: ReadinessTier = "UNKNOWN"
+    recommended_position_scale: float = 0.0
     robustness_gate: bool
 
 
@@ -22,6 +27,8 @@ class CoinHealthRow(BaseModel):
     win_rate_realized: float
     acted_signal_rate: float
     drift_delta: float
+    readiness_tier: ReadinessTier = "UNKNOWN"
+    recommended_position_scale: float = 0.0
     robustness_gate: bool
     optimization_freshness_hours: Optional[float] = None
     last_optimized_at: Optional[datetime] = None
@@ -48,6 +55,8 @@ class ResearchRunResponse(BaseModel):
     finished_at: datetime
     duration_seconds: int
     holdout_auc: Optional[float] = None
+    readiness_tier: ReadinessTier = "UNKNOWN"
+    recommended_position_scale: float = 0.0
     robustness_gate: bool
 
 

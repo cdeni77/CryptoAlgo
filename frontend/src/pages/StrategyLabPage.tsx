@@ -6,9 +6,32 @@ import PaperFillsTable from '../components/PaperFillsTable';
 import PaperPerformancePanel from '../components/PaperPerformancePanel';
 import PaperPositionsTable from '../components/PaperPositionsTable';
 import WalletInfo from '../components/WalletInfo';
-import { PaperEquityPoint, PaperFill, PaperPosition, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchScriptInfo, ResearchSummary } from '../types';
+import { PaperEquityPoint, PaperFill, PaperPosition, ReadinessTier, ReadinessTierDisplayMeta, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchScriptInfo, ResearchSummary } from '../types';
 
 type PaperTab = 'positions' | 'equity' | 'performance' | 'fills';
+
+const READINESS_TIER_META: Record<ReadinessTier, ReadinessTierDisplayMeta> = {
+  FULL: { label: 'Full', tone: 'emerald', description: 'Production-ready: normal position sizing is allowed.' },
+  PILOT: { label: 'Pilot', tone: 'amber', description: 'Limited deployment: run at reduced size while monitoring.' },
+  SHADOW: { label: 'Shadow', tone: 'slate', description: 'Shadow mode only: collect telemetry without full exposure.' },
+  REJECT: { label: 'Reject', tone: 'rose', description: 'Do not deploy: validation criteria are not met.' },
+  UNKNOWN: { label: 'Unknown', tone: 'slate', description: 'No validation tier available yet.' },
+};
+
+const TIER_BADGE_CLASS: Record<ReadinessTierDisplayMeta['tone'], string> = {
+  emerald: 'bg-emerald-500/15 text-[var(--accent-emerald)]',
+  amber: 'bg-amber-500/15 text-[var(--accent-amber)]',
+  slate: 'bg-slate-500/15 text-slate-300',
+  rose: 'bg-rose-500/15 text-[var(--accent-rose)]',
+};
+
+type TierAwareRow = { readiness_tier?: ReadinessTier; robustness_gate: boolean };
+
+const getTierMeta = (row: TierAwareRow | null | undefined): { tier: ReadinessTier; meta: ReadinessTierDisplayMeta } => {
+  const tier = row?.readiness_tier ?? (row?.robustness_gate ? 'PILOT' : 'REJECT');
+  const normalizedTier = (tier in READINESS_TIER_META ? tier : 'UNKNOWN') as ReadinessTier;
+  return { tier: normalizedTier, meta: READINESS_TIER_META[normalizedTier] };
+};
 
 const formatAgo = (d: Date | null) => {
   if (!d) return '—';
@@ -230,13 +253,18 @@ export default function StrategyLabPage() {
               <table className="min-w-full">
                 <thead>
                   <tr className="border-b border-[var(--border-subtle)] text-[10px] uppercase text-[var(--text-muted)]">
-                    {['Coin', 'Health', 'AUC', 'Win Rate', 'Acted', 'Drift', 'Freshness'].map((h) => <th key={h} className="text-left py-2">{h}</th>)}
+                    {['Coin', 'Tier', 'Health', 'AUC', 'Win Rate', 'Acted', 'Drift', 'Freshness'].map((h) => <th key={h} className="text-left py-2">{h}</th>)}
                   </tr>
                 </thead>
                 <tbody>
-                  {summary.coins.map((c) => (
+                  {summary.coins.map((c) => {
+                    const { meta } = getTierMeta(c);
+                    return (
                     <tr key={c.coin} className="border-b border-[var(--border-subtle)] hover:bg-[var(--bg-elevated)]/40 cursor-pointer" onClick={() => { setSelectedCoin(c.coin); loadCoinSpecific(c.coin); }}>
                       <td className="py-2 pr-4 font-semibold">{c.coin}</td>
+                      <td className="py-2 pr-4">
+                        <span className={`inline-flex px-2 py-0.5 rounded text-[10px] uppercase ${TIER_BADGE_CLASS[meta.tone]}`}>{meta.label}</span>
+                      </td>
                       <td className="py-2 pr-4">
                         <span className={`inline-flex px-2 py-0.5 rounded text-[10px] uppercase ${c.health === 'healthy' ? 'bg-emerald-500/15 text-[var(--accent-emerald)]' : c.health === 'watch' ? 'bg-amber-500/15 text-[var(--accent-amber)]' : 'bg-rose-500/15 text-[var(--accent-rose)]'}`}>{c.health.replace('_', ' ')}</span>
                       </td>
@@ -246,7 +274,7 @@ export default function StrategyLabPage() {
                       <td className="py-2 pr-4">{c.drift_delta.toFixed(1)}%</td>
                       <td className="py-2">{c.optimization_freshness_hours !== null ? `${(c.optimization_freshness_hours / 24).toFixed(1)}d` : '—'}</td>
                     </tr>
-                  ))}
+                  );})}
                 </tbody>
               </table>
             )}
@@ -280,7 +308,15 @@ export default function StrategyLabPage() {
                     ))}
                   </div>
                 </div>
-                {coinDetail && <p className="text-xs text-[var(--text-muted)]">Robustness gate: <span className={coinDetail.robustness_gate ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]'}>{coinDetail.robustness_gate ? 'pass' : 'fail'}</span></p>}
+                {coinDetail && (() => {
+                  const { meta } = getTierMeta(coinDetail);
+                  const scale = coinDetail.recommended_position_scale ?? (coinDetail.robustness_gate ? 0.5 : 0);
+                  return (
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Deployment status: <span className={`inline-flex rounded px-2 py-0.5 text-[10px] uppercase ${TIER_BADGE_CLASS[meta.tone]}`}>{meta.label}</span> · {meta.description} · Suggested scale <span className="text-[var(--text-primary)]">{scale.toFixed(2)}x</span>
+                    </p>
+                  );
+                })()}
               </div>
             )}
           </div>
@@ -380,7 +416,11 @@ export default function StrategyLabPage() {
                   <div className="flex items-center gap-3">
                     <span>AUC {run.holdout_auc !== null ? run.holdout_auc.toFixed(3) : '—'}</span>
                     <span>Duration {(run.duration_seconds / 60).toFixed(0)}m</span>
-                    <span className={run.robustness_gate ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]'}>{run.robustness_gate ? 'Gate Pass' : 'Gate Fail'}</span>
+                    {(() => {
+                      const { meta } = getTierMeta(run);
+                      const runScale = run.recommended_position_scale ?? (run.robustness_gate ? 0.5 : 0);
+                      return <span className={`inline-flex rounded px-2 py-0.5 text-[10px] uppercase ${TIER_BADGE_CLASS[meta.tone]}`}>{meta.label} · {runScale.toFixed(2)}x</span>;
+                    })()}
                   </div>
                 </div>
               ))}

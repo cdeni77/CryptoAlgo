@@ -1,11 +1,12 @@
 import ast
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
-from typing import Any, List
+from typing import Any, List, Optional, Tuple
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
@@ -24,6 +25,79 @@ from models.signals import Signal
 from models.trade import Trade
 
 DEFAULT_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+
+TIER_SCALE_DEFAULTS = {
+    "FULL": 1.0,
+    "PILOT": 0.5,
+    "SHADOW": 0.2,
+    "REJECT": 0.0,
+    "UNKNOWN": 0.0,
+}
+
+TIER_RANK = {"REJECT": 0, "SHADOW": 1, "PILOT": 2, "FULL": 3, "UNKNOWN": -1}
+
+LEGACY_RATING_TO_TIER = {
+    "READY": "FULL",
+    "CAUTIOUS": "PILOT",
+    "WEAK": "SHADOW",
+    "REJECT": "REJECT",
+}
+
+
+def _validation_file_candidates(coin: str) -> list[Path]:
+    trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
+    coin = coin.upper()
+    return [
+        trader_dir / "scripts" / "optimization_results" / f"{coin}_validation.json",
+        trader_dir / "optimization_results" / f"{coin}_validation.json",
+        Path.cwd() / "backend" / "trader" / "scripts" / "optimization_results" / f"{coin}_validation.json",
+        Path.cwd() / "optimization_results" / f"{coin}_validation.json",
+    ]
+
+
+def _load_validation_artifact(coin: str) -> Optional[dict[str, Any]]:
+    for candidate in _validation_file_candidates(coin):
+        if not candidate.exists():
+            continue
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, ValueError, TypeError):
+            continue
+    return None
+
+
+def _extract_tier_fields(validation_artifact: Optional[dict[str, Any]]) -> Tuple[str, float]:
+    readiness = (validation_artifact or {}).get("readiness", {})
+
+    tier_raw = readiness.get("readiness_tier")
+    if isinstance(tier_raw, str):
+        tier = tier_raw.strip().upper()
+    else:
+        rating = readiness.get("rating")
+        rating_key = rating.strip().upper() if isinstance(rating, str) else ""
+        tier = LEGACY_RATING_TO_TIER.get(rating_key, "UNKNOWN")
+
+    if tier not in TIER_SCALE_DEFAULTS:
+        tier = "UNKNOWN"
+
+    scale = readiness.get("recommended_position_scale")
+    if isinstance(scale, (int, float)):
+        position_scale = float(scale)
+    else:
+        position_scale = TIER_SCALE_DEFAULTS[tier]
+
+    return tier, position_scale
+
+
+def _derive_robustness_gate(
+    holdout_auc: Optional[float],
+    signal_count: int,
+    readiness_tier: str,
+) -> bool:
+    if readiness_tier in {"FULL", "PILOT", "SHADOW", "REJECT"}:
+        return readiness_tier in {"FULL", "PILOT"}
+    return bool(holdout_auc is not None and holdout_auc >= 0.54 and signal_count >= 20)
 
 
 def _coin_metrics(db: Session, coin: str) -> CoinHealthRow:
@@ -49,7 +123,9 @@ def _coin_metrics(db: Session, coin: str) -> CoinHealthRow:
     if last_opt_event:
         freshness_hours = max(0.0, (datetime.now(timezone.utc) - last_opt_event).total_seconds() / 3600)
 
-    robustness_gate = bool(holdout_auc is not None and holdout_auc >= 0.54 and signal_count >= 20)
+    validation_artifact = _load_validation_artifact(coin)
+    readiness_tier, recommended_position_scale = _extract_tier_fields(validation_artifact)
+    robustness_gate = _derive_robustness_gate(holdout_auc, signal_count, readiness_tier)
 
     healthy = (
         holdout_auc is not None
@@ -69,6 +145,8 @@ def _coin_metrics(db: Session, coin: str) -> CoinHealthRow:
         win_rate_realized=win_rate,
         acted_signal_rate=acted_rate,
         drift_delta=drift_delta,
+        readiness_tier=readiness_tier,
+        recommended_position_scale=recommended_position_scale,
         robustness_gate=robustness_gate,
         optimization_freshness_hours=freshness_hours,
         last_optimized_at=last_opt_event,
@@ -82,6 +160,17 @@ def _all_coin_rows(db: Session) -> List[CoinHealthRow]:
     return [_coin_metrics(db, coin) for coin in coins]
 
 
+
+
+def _summary_tier(rows: List[CoinHealthRow]) -> tuple[str, float]:
+    if not rows:
+        return "UNKNOWN", 0.0
+
+    ranked_rows = sorted(rows, key=lambda row: TIER_RANK.get(row.readiness_tier, -1))
+    representative = ranked_rows[0]
+    return representative.readiness_tier, representative.recommended_position_scale
+
+
 def get_research_summary(db: Session) -> ResearchSummaryResponse:
     rows = _all_coin_rows(db)
     if rows:
@@ -90,6 +179,8 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
         pr_values = [r.pr_auc for r in rows if r.pr_auc is not None]
         precision_values = [r.precision_at_threshold for r in rows if r.precision_at_threshold is not None]
 
+        summary_tier, summary_scale = _summary_tier(rows)
+
         kpis = ResearchSummaryKpis(
             holdout_auc=avg(auc_values) if auc_values else None,
             pr_auc=avg(pr_values) if pr_values else None,
@@ -97,9 +188,13 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
             win_rate_realized=avg([r.win_rate_realized for r in rows]),
             acted_signal_rate=avg([r.acted_signal_rate for r in rows]),
             drift_delta=avg([r.drift_delta for r in rows]),
+            readiness_tier=summary_tier,
+            recommended_position_scale=summary_scale,
             robustness_gate=all(r.robustness_gate for r in rows),
         )
     else:
+        summary_tier, summary_scale = _summary_tier(rows)
+
         kpis = ResearchSummaryKpis(
             holdout_auc=None,
             pr_auc=None,
@@ -107,6 +202,8 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
             win_rate_realized=0,
             acted_signal_rate=0,
             drift_delta=0,
+            readiness_tier="UNKNOWN",
+            recommended_position_scale=0.0,
             robustness_gate=False,
         )
 
@@ -121,10 +218,20 @@ def get_research_coin(db: Session, coin: str) -> ResearchCoinDetailResponse:
 def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]:
     signals = db.query(Signal).order_by(desc(Signal.timestamp)).limit(limit).all()
     runs: List[ResearchRunResponse] = []
+    tier_cache: dict[str, tuple[str, float]] = {}
+
+    def _run_tier(coin: str) -> tuple[str, float]:
+        key = coin.upper()
+        if key not in tier_cache:
+            tier_cache[key] = _extract_tier_fields(_load_validation_artifact(key))
+        return tier_cache[key]
+
     for s in signals:
         started_at = s.timestamp - timedelta(minutes=12)
         finished_at = s.timestamp
         auc = s.model_auc
+        readiness_tier, recommended_position_scale = _run_tier(s.coin)
+        run_gate = _derive_robustness_gate(auc, 0, readiness_tier)
         runs.extend(
             [
                 ResearchRunResponse(
@@ -136,7 +243,9 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
                     finished_at=finished_at,
                     duration_seconds=12 * 60,
                     holdout_auc=auc,
-                    robustness_gate=bool((auc or 0) >= 0.54),
+                    readiness_tier=readiness_tier,
+                    recommended_position_scale=recommended_position_scale,
+                    robustness_gate=run_gate,
                 ),
                 ResearchRunResponse(
                     id=f"optimize-{s.id}",
@@ -147,7 +256,9 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
                     finished_at=started_at,
                     duration_seconds=20 * 60,
                     holdout_auc=auc,
-                    robustness_gate=bool((auc or 0) >= 0.54),
+                    readiness_tier=readiness_tier,
+                    recommended_position_scale=recommended_position_scale,
+                    robustness_gate=run_gate,
                 ),
                 ResearchRunResponse(
                     id=f"validate-{s.id}",
@@ -158,7 +269,9 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
                     finished_at=finished_at + timedelta(minutes=8),
                     duration_seconds=8 * 60,
                     holdout_auc=auc,
-                    robustness_gate=bool((auc or 0) >= 0.54),
+                    readiness_tier=readiness_tier,
+                    recommended_position_scale=recommended_position_scale,
+                    robustness_gate=run_gate,
                 ),
             ]
         )
