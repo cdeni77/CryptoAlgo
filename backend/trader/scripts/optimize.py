@@ -86,6 +86,27 @@ def _fmt_pct(v, d=1, fb="?"): n = _as_number(v); return f"{n:.{d}%}" if n is not
 def _fmt_float(v, d=3, fb="?"): n = _as_number(v); return f"{n:.{d}f}" if n is not None else fb
 def _set_reject_reason(trial, reason): trial.set_user_attr('reject_reason', reason)
 
+
+def _reject_score(observed: float | None = None, threshold: float | None = None, *, base: float = -6.0, scale: float = 8.0) -> float:
+    """Return a strong but non-degenerate penalty for rejected trials.
+
+    We intentionally avoid a flat sentinel like -99 so Optuna can still rank
+    rejected trials by *how far* they are from meeting hard constraints.
+    """
+    if observed is None or threshold is None:
+        return base - scale
+    try:
+        obs = float(observed)
+        th = float(threshold)
+    except (TypeError, ValueError):
+        return base - scale
+    if not np.isfinite(obs) or not np.isfinite(th):
+        return base - scale
+    gap = max(0.0, th - obs)
+    norm = max(abs(th), 1e-6)
+    penalty = scale * min(3.0, gap / norm)
+    return base - penalty
+
 def compute_deflated_sharpe(observed_sharpe, n_trades, n_trials=200, skewness=0.0, kurtosis=3.0):
     from scipy import stats
     if n_trades < 10 or n_trials < 2:
@@ -339,7 +360,12 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
 # ═══════════════════════════════════════════════════════════════════════════
 
 FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
-FIXED_RISK = {'position_size': 0.12, 'vol_sizing_target': 0.025, 'min_val_auc': 0.53}
+FIXED_RISK = {
+    'position_size': 0.12,
+    'vol_sizing_target': 0.025,
+    'min_val_auc': 0.53,
+    'cooldown_hours': 24.0,
+}
 
 COIN_OPTIMIZATION_PRIORS = {
     # target_trades_per_year ~= at least weekly cadence while preserving quality
@@ -469,7 +495,7 @@ def objective(
                 )
                 if stressed_r is None:
                     _set_reject_reason(trial, 'missing_stressed_fold')
-                    return -99.0
+                    return _reject_score()
             else:
                 stressed_r = dict(r)
 
@@ -477,11 +503,13 @@ def objective(
             blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
 
     if len(fold_results) < max(1, len(cv_splits) // 2):
-        _set_reject_reason(trial, f'too_few_folds:{len(fold_results)}/{len(cv_splits)}'); return -99.0
+        _set_reject_reason(trial, f'too_few_folds:{len(fold_results)}/{len(cv_splits)}'); return _reject_score(len(fold_results), max(1, len(cv_splits) // 2))
     if min_internal_oos_trades > 0 and any(int(r.get('n_trades', 0) or 0) < min_internal_oos_trades for r in fold_results):
-        _set_reject_reason(trial, f'too_few_internal_oos_trades:{min_internal_oos_trades}'); return -99.0
+        worst_internal_trades = min(int(r.get('n_trades', 0) or 0) for r in fold_results)
+        _set_reject_reason(trial, f'too_few_internal_oos_trades:{min_internal_oos_trades}')
+        return _reject_score(worst_internal_trades, min_internal_oos_trades)
     if total_trades < 20:
-        _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return -99.0
+        _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return _reject_score(total_trades, 20)
 
     sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
     stressed_sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in stressed_fold_results]
@@ -523,7 +551,7 @@ def objective(
 
     if min_sr < min_fold_sharpe_hard:
         _set_reject_reason(trial, f'guard_min_fold_sharpe:{min_sr:.3f}<{min_fold_sharpe_hard:.3f}')
-        return -99.0
+        return _reject_score(min_sr, min_fold_sharpe_hard)
 
     low_wr_folds = [
         f for f in fold_metrics
@@ -539,29 +567,29 @@ def objective(
                 f"@trades>={min_fold_win_rate_trades}"
             ),
         )
-        return -99.0
+        return _reject_score(worst_fold['win_rate'], min_fold_win_rate)
 
     if total_trades < guard_min_trades:
         _set_reject_reason(trial, f'guard_total_trades:{total_trades}<{guard_min_trades}')
-        return -99.0
+        return _reject_score(total_trades, guard_min_trades)
     if avg_tc < guard_min_avg_tc:
         _set_reject_reason(trial, f'guard_avg_fold_trades:{avg_tc:.2f}<{guard_min_avg_tc:.2f}')
-        return -99.0
+        return _reject_score(avg_tc, guard_min_avg_tc)
     if mean_expectancy < guard_min_exp:
         _set_reject_reason(trial, f'guard_expectancy:{mean_expectancy:.6f}<{guard_min_exp:.6f}')
-        return -99.0
+        return _reject_score(mean_expectancy, guard_min_exp)
     if mean_raw_expectancy <= 0:
         _set_reject_reason(trial, f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}')
-        return -99.0
+        return _reject_score(mean_raw_expectancy, 1e-6)
     if enable_fee_stress and mean_stressed_sr < 0:
         _set_reject_reason(trial, f'negative_stressed_sharpe:{mean_stressed_sr:.6f}')
-        return -99.0
+        return _reject_score(mean_stressed_sr, 0.0)
     if enable_fee_stress and stressed_expectancy <= 0:
         _set_reject_reason(trial, f'nonpositive_stressed_expectancy:{stressed_expectancy:.6f}')
-        return -99.0
+        return _reject_score(stressed_expectancy, 1e-6)
     if psr.get('valid') and psr.get('psr', 0.0) < 0.55:
         _set_reject_reason(trial, f'low_psr:{psr.get("psr", 0.0):.3f}')
-        return -99.0
+        return _reject_score(psr.get('psr', 0.0), 0.55)
 
     score = mean_blended_sr
     if std_sr < 0.3 and len(sharpes) >= 2: score += 0.15
