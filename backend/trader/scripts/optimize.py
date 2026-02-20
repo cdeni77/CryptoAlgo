@@ -506,6 +506,15 @@ def assess_result_quality(rd):
 def _db_path(): return SCRIPT_DIR / "optuna_trading.db"
 def _sqlite_url(path): return f"sqlite:///{path.resolve()}"
 def _candidate_results_dirs(): return [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]
+
+def _is_transient_optuna_storage_error(exc):
+    msg = str(exc).lower()
+    return (
+        "database is locked" in msg
+        or "table alembic_version already exists" in msg
+        or "record does not exist" in msg
+    )
+
 def _persist_result_json(coin_name, data):
     for d in _candidate_results_dirs():
         try: d.mkdir(parents=True, exist_ok=True); p = d / f"{coin_name}_optimization.json"; open(p,'w').write(json.dumps(_to_json_safe(data), indent=2)); return p
