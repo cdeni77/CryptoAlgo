@@ -195,10 +195,14 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
 # v11.1: FAST LIGHTWEIGHT EVALUATOR (~2s per fold instead of ~10min)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config, symbol, fee_multiplier=1.0):
+def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config, symbol, fee_multiplier=1.0, pruned_only=True):
     """Train ONE model on data before train_end, simulate trading on test period."""
     system = MLSystem(config)
-    cols = system.get_feature_columns(features.columns, profile.feature_columns)
+    feature_candidates = profile.resolve_feature_columns(
+        use_pruned_features=bool(pruned_only),
+        strict_pruned=bool(pruned_only),
+    )
+    cols = system.get_feature_columns(features.columns, feature_candidates)
     if not cols or len(cols) < 4: return None
 
     embargo_hours = max(config.train_embargo_hours, profile.label_forward_hours, 1)
@@ -462,13 +466,15 @@ def objective(
     fee_stress_multiplier=2.0,
     fee_blend_normal_weight=0.6,
     fee_blend_stressed_weight=0.4,
+    pruned_only=True,
 ):
     min_fold_sharpe_hard = -0.1
     min_fold_win_rate = 0.35
     min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 8)
 
     profile = create_trial_profile(trial, coin_name)
-    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10, train_embargo_hours=24)
+    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
+                    train_embargo_hours=24, enforce_pruned_features=bool(pruned_only))
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
 
@@ -483,7 +489,8 @@ def objective(
     w_normal, w_stress = w_normal / w_total, w_stress / w_total
 
     for train_boundary, test_start, test_end in cv_splits:
-        r = fast_evaluate_fold(features, ohlcv_data, train_boundary, test_start, test_end, profile, config, target_sym, fee_multiplier=1.0)
+        r = fast_evaluate_fold(features, ohlcv_data, train_boundary, test_start, test_end, profile, config,
+                               target_sym, fee_multiplier=1.0, pruned_only=pruned_only)
         if r is not None:
             fold_results.append(r)
             total_trades += r['n_trades']
@@ -492,6 +499,7 @@ def objective(
                 stressed_r = fast_evaluate_fold(
                     features, ohlcv_data, train_boundary, test_start, test_end,
                     profile, config, target_sym, fee_multiplier=fee_stress_multiplier,
+                    pruned_only=pruned_only,
                 )
                 if stressed_r is None:
                     _set_reject_reason(trial, 'missing_stressed_fold')
@@ -770,11 +778,13 @@ def _passes_holdout_gate(holdout_metrics, min_trades=15, min_sharpe=0.0, min_ret
 # HOLDOUT (full run_backtest — called ONCE at the end)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days):
+def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days, pruned_only=True):
     target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
     if not target_sym: return None
     profile = profile_from_params(params, coin_name)
-    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10, train_embargo_hours=24, oos_eval_days=holdout_days)
+    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
+                    train_embargo_hours=24, oos_eval_days=holdout_days,
+                    enforce_pruned_features=bool(pruned_only))
     try: result = run_backtest({target_sym: holdout_data[target_sym]}, config, profile_overrides={coin_name: profile})
     except Exception as e: print(f"  ❌ Holdout error: {e}"); return None
     if not result: return None
@@ -923,7 +933,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
                   target_trades_per_week=1.0, preset_name="none", enable_fee_stress=True,
-                  fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4):
+                  fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
+                  pruned_only=True):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -983,7 +994,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             enable_fee_stress=enable_fee_stress,
                             fee_stress_multiplier=fee_stress_multiplier,
                             fee_blend_normal_weight=fee_blend_normal_weight,
-                            fee_blend_stressed_weight=fee_blend_stressed_weight)
+                            fee_blend_stressed_weight=fee_blend_stressed_weight,
+                            pruned_only=pruned_only)
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
                         callbacks=[PlateauStopper(plateau_patience, plateau_min_delta, plateau_warmup)])
     except KeyboardInterrupt: print("\n🛑 Stopped.")
@@ -1030,7 +1042,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         print(f"\n🔬 HOLDOUT ({holdout_days}d, full walk-forward) — evaluating {len(candidate_trials)} candidate(s)...")
         ranked_candidates = []
         for cand in candidate_trials:
-            holdout_metrics = evaluate_holdout(holdout_data, cand.params, coin_name, coin_prefix, holdout_days)
+            holdout_metrics = evaluate_holdout(holdout_data, cand.params, coin_name, coin_prefix, holdout_days,
+                                               pruned_only=pruned_only)
             if not holdout_metrics:
                 continue
             sel_score = _holdout_selection_score(holdout_metrics, cv_score=cand.value)
@@ -1117,6 +1130,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         },
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
+        'pruned_only': bool(pruned_only),
         'run_id': run_id,
         'trial_ledger': {
             'ledger_path': cumulative_trials.get('ledger_path'),
@@ -1276,8 +1290,13 @@ if __name__ == "__main__":
                         help="Blend weight for normal-fee fold Sharpe")
     parser.add_argument("--fee-blend-stressed-weight", type=float, default=0.4,
                         help="Blend weight for stressed-fee fold Sharpe")
+    parser.add_argument("--pruned-only", action="store_true",
+                        help="Require pruned feature artifacts during optimization and holdout")
+    parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only",
+                        help="Allow fallback to unpruned profile features if artifacts are missing")
     parser.add_argument("--sampler-seeds", type=str, default="")
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
+    parser.set_defaults(pruned_only=True)
     args = parser.parse_args(); args = apply_runtime_preset(args)
     if args.debug_trials: DEBUG_TRIALS = True
     if args.show: show_results(); sys.exit(0)
@@ -1302,4 +1321,5 @@ if __name__ == "__main__":
             fee_stress_multiplier=args.fee_stress_multiplier,
             fee_blend_normal_weight=args.fee_blend_normal_weight,
             fee_blend_stressed_weight=args.fee_blend_stressed_weight,
+            pruned_only=args.pruned_only,
             preset_name=args.preset)
