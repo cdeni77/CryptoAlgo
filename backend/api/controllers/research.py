@@ -398,6 +398,45 @@ def _script_default_args(script_path: Path) -> List[str]:
     return defaults
 
 
+
+
+def _script_launch_metadata(script_path: Path) -> dict[str, Any]:
+    try:
+        tree = ast.parse(script_path.read_text(encoding="utf-8"))
+    except (SyntaxError, OSError, UnicodeDecodeError):
+        return {}
+
+    metadata: dict[str, Any] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "add_argument":
+            continue
+
+        option_strings: List[str] = []
+        for arg in node.args:
+            value = _safe_literal(arg)
+            if isinstance(value, str) and value.startswith("--"):
+                option_strings.append(value)
+        if "--preset" not in option_strings:
+            continue
+
+        choices = None
+        default_value = None
+        for kw in node.keywords:
+            if kw.arg == "choices":
+                choices = _safe_literal(kw.value)
+            elif kw.arg == "default":
+                default_value = _safe_literal(kw.value)
+
+        if isinstance(choices, (list, tuple)):
+            metadata["preset_choices"] = [str(choice) for choice in choices]
+        if isinstance(default_value, str):
+            metadata["preset_default"] = default_value
+        break
+
+    return metadata
+
 def list_research_scripts() -> List[dict[str, Any]]:
     trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
     if not trader_dir.exists():
@@ -406,11 +445,13 @@ def list_research_scripts() -> List[dict[str, Any]]:
     script_modules = _discover_script_modules(trader_dir)
     scripts = []
     for script_name in sorted(script_modules.keys()):
+        script_path = trader_dir / SCRIPT_PACKAGE / f"{script_name}.py"
         scripts.append(
             {
                 "name": script_name,
                 "module": script_modules[script_name],
-                "default_args": _script_default_args(trader_dir / SCRIPT_PACKAGE / f"{script_name}.py"),
+                "default_args": _script_default_args(script_path),
+                "launch_metadata": _script_launch_metadata(script_path),
             }
         )
     return scripts

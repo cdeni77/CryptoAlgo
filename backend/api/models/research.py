@@ -95,6 +95,7 @@ class ResearchScriptInfo(BaseModel):
     name: str
     module: str
     default_args: List[str] = Field(default_factory=list)
+    launch_metadata: dict = Field(default_factory=dict)
 
 
 class ResearchScriptListResponse(BaseModel):
