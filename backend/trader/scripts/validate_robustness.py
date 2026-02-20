@@ -387,7 +387,13 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
 # MAIN VALIDATION ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_validation(coin_name, optimization_result, all_data):
+def run_validation(
+    coin_name,
+    optimization_result,
+    all_data,
+    mc_shuffle_sims=1000,
+    mc_resample_sims=1000,
+):
     from scripts.train_model import Config, run_backtest
     from scripts.optimize import (
         profile_from_params, resolve_target_symbol,
@@ -434,13 +440,19 @@ def run_validation(coin_name, optimization_result, all_data):
 
     # 1. MC Shuffle
     print(f"  🎲 Monte Carlo shuffle...")
-    mc_shuffle = monte_carlo_shuffle(trade_pnls) if len(trade_pnls) >= 10 else {'valid': False}
+    mc_shuffle = (
+        monte_carlo_shuffle(trade_pnls, n_sims=mc_shuffle_sims)
+        if len(trade_pnls) >= 10 else {'valid': False}
+    )
     if mc_shuffle.get('valid'):
         print(f"     DD 95th: {mc_shuffle['mc_dd_95th']:.1%} | P(ruin): {mc_shuffle['prob_ruin_25pct']:.1%}")
 
     # 2. MC Resample
     print(f"  🎲 Monte Carlo resample...")
-    mc_resample = monte_carlo_resample(trade_pnls) if len(trade_pnls) >= 10 else {'valid': False}
+    mc_resample = (
+        monte_carlo_resample(trade_pnls, n_sims=mc_resample_sims)
+        if len(trade_pnls) >= 10 else {'valid': False}
+    )
     if mc_resample.get('valid'):
         print(f"     Sharpe 5th: {mc_resample['sharpe_5th']:.3f} | P(loss): {mc_resample['prob_loss']:.1%}")
 
@@ -568,7 +580,17 @@ if __name__ == "__main__":
     parser.add_argument("--coin", type=str)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--show", action="store_true")
+    parser.add_argument("--mc-shuffle-sims", type=int, default=1000,
+                        help="Monte Carlo shuffle simulation count")
+    parser.add_argument("--mc-resample-sims", type=int, default=1000,
+                        help="Monte Carlo resample simulation count")
+    parser.add_argument("--fast", action="store_true",
+                        help="Use faster validation defaults for same-day screening")
     args = parser.parse_args()
+
+    if args.fast:
+        args.mc_shuffle_sims = min(args.mc_shuffle_sims, 300)
+        args.mc_resample_sims = min(args.mc_resample_sims, 300)
 
     if args.show:
         show_validation_results()
@@ -605,4 +627,10 @@ if __name__ == "__main__":
         with open(opt_file) as f:
             opt_result = json.load(f)
 
-        run_validation(coin, opt_result, all_data)
+        run_validation(
+            coin,
+            opt_result,
+            all_data,
+            mc_shuffle_sims=max(50, args.mc_shuffle_sims),
+            mc_resample_sims=max(50, args.mc_resample_sims),
+        )
