@@ -299,6 +299,14 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
 FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
 FIXED_RISK = {'position_size': 0.12, 'vol_sizing_target': 0.025, 'cooldown_hours': 24.0, 'min_val_auc': 0.53}
 
+COIN_OBJECTIVE_GUARDS = {
+    'BTC': {'min_total_trades': 16, 'min_avg_trades_per_fold': 4.0, 'min_expectancy': 0.0002},
+    'ETH': {'min_total_trades': 20, 'min_avg_trades_per_fold': 5.0, 'min_expectancy': 0.00015},
+    'SOL': {'min_total_trades': 20, 'min_avg_trades_per_fold': 5.0, 'min_expectancy': 0.0002},
+    'XRP': {'min_total_trades': 18, 'min_avg_trades_per_fold': 4.0, 'min_expectancy': 0.00015},
+    'DOGE': {'min_total_trades': 16, 'min_avg_trades_per_fold': 3.5, 'min_expectancy': 0.0002},
+}
+
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
 
@@ -386,7 +394,28 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     mean_pf = np.mean([r['profit_factor'] for r in fold_results])
     mean_ret = np.mean([r['total_return'] for r in fold_results])
     mean_fee_edge = np.mean([r.get('fee_edge_ratio', 1.0) for r in fold_results])
+    mean_expectancy = np.mean([r.get('avg_pnl', 0.0) for r in fold_results])
+    mean_raw_expectancy = np.mean([r.get('avg_raw_pnl', 0.0) for r in fold_results])
     exp_std = np.std([r.get('avg_pnl', 0.0) for r in fold_results]) if len(fold_results) > 1 else 0.0
+
+    guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
+    guard_min_trades = int(guards.get('min_total_trades', 20))
+    guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 4.0))
+    guard_min_exp = float(guards.get('min_expectancy', 0.0))
+    avg_tc = np.mean([r['n_trades'] for r in fold_results])
+
+    if total_trades < guard_min_trades:
+        _set_reject_reason(trial, f'guard_total_trades:{total_trades}<{guard_min_trades}')
+        return -99.0
+    if avg_tc < guard_min_avg_tc:
+        _set_reject_reason(trial, f'guard_avg_fold_trades:{avg_tc:.2f}<{guard_min_avg_tc:.2f}')
+        return -99.0
+    if mean_expectancy < guard_min_exp:
+        _set_reject_reason(trial, f'guard_expectancy:{mean_expectancy:.6f}<{guard_min_exp:.6f}')
+        return -99.0
+    if mean_raw_expectancy <= 0:
+        _set_reject_reason(trial, f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}')
+        return -99.0
 
     score = mean_sr
     if std_sr < 0.3 and len(sharpes) >= 2: score += 0.15
@@ -395,7 +424,6 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     elif min_sr < -0.5: score -= 0.30
     if min(max(0, mean_pf), 5.0) > 1.2: score += min(0.2, (mean_pf - 1.0) * 0.15)
     if mean_dd > 0.25: score -= (mean_dd - 0.25) * 2.0
-    avg_tc = np.mean([r['n_trades'] for r in fold_results])
     if avg_tc < 5: score -= 0.5
     elif avg_tc < 8: score -= 0.2
     if mean_wr > 0.75 and total_trades < 40: score -= 0.3
@@ -419,6 +447,8 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     trial.set_user_attr('oos_return', round(mean_ret, 4))
     trial.set_user_attr('oos_trades', total_trades)
     trial.set_user_attr('fee_edge_ratio', round(float(mean_fee_edge), 4))
+    trial.set_user_attr('expectancy', round(float(mean_expectancy), 6))
+    trial.set_user_attr('raw_expectancy', round(float(mean_raw_expectancy), 6))
     trial.set_user_attr('expectancy_std', round(float(exp_std), 6))
     tpy = np.mean([r['trades_per_year'] for r in fold_results])
     trial.set_user_attr('trades_per_month', round(tpy / 12.0, 1))
@@ -703,6 +733,7 @@ def apply_runtime_preset(args):
         'robust180': {'plateau_patience': 60, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 3},
         'robust120': {'plateau_patience': 50, 'plateau_warmup': 25, 'plateau_min_delta': 0.02, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 3},
         'quick':     {'plateau_patience': 30, 'plateau_warmup': 15, 'plateau_min_delta': 0.03, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2},
+        'paper_ready': {'plateau_patience': 80, 'plateau_warmup': 40, 'plateau_min_delta': 0.015, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 4},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -736,7 +767,7 @@ if __name__ == "__main__":
     parser.add_argument("--jobs", type=int, default=1); parser.add_argument("--plateau-patience", type=int, default=60)
     parser.add_argument("--plateau-min-delta", type=float, default=0.02); parser.add_argument("--plateau-warmup", type=int, default=30)
     parser.add_argument("--holdout-days", type=int, default=180)
-    parser.add_argument("--preset", type=str, default="robust180", choices=["none","robust120","robust180","quick"])
+    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=3); parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--sampler-seed", type=int, default=42)

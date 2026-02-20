@@ -30,6 +30,15 @@ COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
 # v11: Updated presets — tighter patience, CV folds
 PRESET_CONFIGS = {
+    "paper_ready": {
+        "plateau_patience": 80,
+        "plateau_min_delta": 0.015,
+        "plateau_warmup": 40,
+        "holdout_days": 240,
+        "min_internal_oos_trades": 10,
+        "min_total_trades": 28,
+        "n_cv_folds": 4,
+    },
     "robust180": {
         "plateau_patience": 60,
         "plateau_min_delta": 0.02,
@@ -357,8 +366,8 @@ if __name__ == "__main__":
     parser.add_argument("--plateau-warmup", type=int, default=30,
                         help="Warmup trials before plateau checks (default: 30, was 60)")
     parser.add_argument("--holdout-days", type=int, default=180)
-    parser.add_argument("--preset", type=str, default="robust180",
-                        choices=["none", "robust120", "robust180", "quick"])
+    parser.add_argument("--preset", type=str, default="paper_ready",
+                        choices=["none", "paper_ready", "robust120", "robust180", "quick"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0)
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=3,
