@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # Directory for persisted models
 MODELS_DIR = Path(os.getenv('MODELS_DIR', 'models'))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+PRUNED_FEATURES_DIR = Path(os.getenv('PRUNED_FEATURES_DIR', 'data/features'))
 
 
 # BASE FEATURES (shared across all coins)
@@ -156,11 +157,41 @@ class CoinProfile:
     max_depth: int = 3
     learning_rate: float = 0.05
     min_child_samples: int = 20
+
+    def load_pruned_features(self, features_dir: Optional[Path] = None) -> Optional[List[str]]:
+        """Load persisted pruned feature list for this coin if available."""
+        artifact_dir = features_dir or PRUNED_FEATURES_DIR
+        path = artifact_dir / f"pruned_features_{self.name.lower()}.json"
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            features = payload.get('selected_features')
+            if isinstance(features, list) and features:
+                return [f for f in features if isinstance(f, str)]
+        except Exception as exc:
+            logger.warning(f"Failed to load pruned features for {self.name}: {exc}")
+        return None
+
+    def resolve_feature_columns(
+        self,
+        use_pruned_features: bool = False,
+        features_dir: Optional[Path] = None,
+        strict_pruned: bool = False,
+    ) -> List[str]:
+        """Resolve feature list, optionally preferring pruned artifact features."""
+        if use_pruned_features:
+            pruned = self.load_pruned_features(features_dir=features_dir)
+            if pruned:
+                return pruned
+            if strict_pruned:
+                return []
+        return BASE_FEATURES + self.extra_features
     
     @property
     def feature_columns(self) -> List[str]:
         """Full feature list = base + coin-specific extras."""
-        return BASE_FEATURES + self.extra_features
+        return self.resolve_feature_columns(use_pruned_features=False)
 
 
 COIN_PROFILES: Dict[str, CoinProfile] = {
