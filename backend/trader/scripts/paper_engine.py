@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from core.pg_writer import PgWriter
 from scripts.train_model import Config, calculate_coinbase_fee, calculate_n_contracts, calculate_pnl_exact, get_contract_spec
@@ -22,12 +24,25 @@ class EngineState:
 
 
 class PaperTradingEngine:
-    def __init__(self, poll_seconds: float = 2.0, max_signal_age_minutes: float = 30.0):
+    def __init__(
+        self,
+        poll_seconds: float = 2.0,
+        max_signal_age_minutes: float = 30.0,
+        tier_map: dict[str, str] | None = None,
+        tier_size_multipliers: dict[str, float] | None = None,
+    ):
         self.poll_seconds = poll_seconds
         self.max_signal_age_minutes = max_signal_age_minutes
         self.writer = PgWriter()
         self.config = Config()
         self.state = EngineState()
+        self.tier_map = {k.upper(): v.upper() for k, v in (tier_map or {}).items()}
+        self.tier_size_multipliers = {"FULL": 1.0, "PILOT": 0.5, "SHADOW": 0.0}
+        if tier_size_multipliers:
+            self.tier_size_multipliers.update({k.upper(): float(v) for k, v in tier_size_multipliers.items()})
+
+    def _coin_tier(self, coin: str) -> str:
+        return self.tier_map.get((coin or "").upper(), "FULL")
 
     def _fill_price(self, base_price: float, side: str) -> float:
         slip = self.config.slippage_bps / 10000.0
@@ -70,6 +85,12 @@ class PaperTradingEngine:
             self.writer.mark_signal_acted(signal.id)
             return
 
+        deployment_tier = self._coin_tier(signal.coin)
+        if deployment_tier == "SHADOW":
+            logger.info("shadow tier signal logged only id=%s coin=%s", signal.id, signal.coin)
+            self.writer.mark_signal_acted(signal.id)
+            return
+
         open_positions = self.writer.count_open_positions()
         if open_positions >= self.config.max_positions:
             logger.info("max open positions reached (%s), skipping signal id=%s", open_positions, signal.id)
@@ -87,7 +108,11 @@ class PaperTradingEngine:
             symbol=signal.coin,
             config=self.config,
         )
+        size_multiplier = float(self.tier_size_multipliers.get(deployment_tier, 1.0))
+        contracts = int(contracts * max(0.0, size_multiplier))
         if contracts <= 0:
+            logger.info("tier multiplier reduced contracts to zero id=%s coin=%s tier=%s", signal.id, signal.coin, deployment_tier)
+            self.writer.mark_signal_acted(signal.id)
             return
 
         spec = get_contract_spec(signal.coin)
@@ -181,15 +206,46 @@ class PaperTradingEngine:
 
 
 def main() -> None:
+    def _parse_tier_map(raw: str) -> dict[str, str]:
+        if not raw:
+            return {}
+        maybe_path = Path(raw)
+        if maybe_path.exists():
+            payload = json.loads(maybe_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("deployment_tier_map"), dict):
+                payload = payload["deployment_tier_map"]
+            return {str(k).upper(): str(v).upper() for k, v in dict(payload).items()}
+        parsed = json.loads(raw)
+        return {str(k).upper(): str(v).upper() for k, v in dict(parsed).items()}
+
+    def _parse_multipliers(raw: str) -> dict[str, float]:
+        if not raw:
+            return {}
+        return {str(k).upper(): float(v) for k, v in dict(json.loads(raw)).items()}
+
     parser = argparse.ArgumentParser(description="paper trading engine")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--max-signal-age-minutes", type=float, default=30.0)
+    parser.add_argument(
+        "--tier-map",
+        type=str,
+        default="",
+        help="JSON string or path to JSON containing {coin: tier} or a launch_summary with deployment_tier_map",
+    )
+    parser.add_argument(
+        "--tier-size-multipliers",
+        type=str,
+        default='{"FULL":1.0,"PILOT":0.5,"SHADOW":0.0}',
+        help="JSON map of deployment tier to position size multiplier",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     PaperTradingEngine(
         poll_seconds=args.poll_seconds,
         max_signal_age_minutes=args.max_signal_age_minutes,
+        tier_map=_parse_tier_map(args.tier_map),
+        tier_size_multipliers=_parse_multipliers(args.tier_size_multipliers),
     ).run_forever()
 
 

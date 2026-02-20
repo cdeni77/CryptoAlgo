@@ -59,6 +59,7 @@ export default function StrategyLabPage() {
   const [scripts, setScripts] = useState<ResearchScriptInfo[]>([]);
   const [selectedScript, setSelectedScript] = useState('');
   const [cliArgs, setCliArgs] = useState('');
+  const [selectedPreset, setSelectedPreset] = useState('');
   const [launchResult, setLaunchResult] = useState<ResearchJobLaunchResponse | null>(null);
   const [launchHistory, setLaunchHistory] = useState<ResearchJobLaunchResponse[]>([]);
   const [selectedLogPid, setSelectedLogPid] = useState<number | null>(null);
@@ -102,6 +103,22 @@ export default function StrategyLabPage() {
     return matches.map((token) => (token.startsWith('\"') || token.startsWith("'")) ? token.slice(1, -1) : token).filter(Boolean);
   };
 
+  const upsertPresetArg = (rawArgs: string, presetValue: string): string => {
+    const parts = parseCliArgs(rawArgs).filter((token) => token !== '--preset');
+    const cleaned: string[] = [];
+    for (let i = 0; i < parts.length; i += 1) {
+      if (parts[i] === '--preset') {
+        i += 1;
+        continue;
+      }
+      cleaned.push(parts[i]);
+    }
+    if (presetValue) {
+      cleaned.push('--preset', presetValue);
+    }
+    return cleaned.join(' ');
+  };
+
   const loadLaunchedJobs = useCallback(async () => {
     try {
       const jobs = await getResearchJobs(25);
@@ -129,6 +146,14 @@ export default function StrategyLabPage() {
     if (!selected) return;
     const defaults = selected.default_args.join(' ');
     setCliArgs(defaults);
+  }, [selectedScript, scripts]);
+
+
+  useEffect(() => {
+    if (!selectedScript) return;
+    const selected = scripts.find((script) => script.name === selectedScript);
+    const defaultPreset = selected?.launch_metadata?.preset_default ?? '';
+    setSelectedPreset(defaultPreset);
   }, [selectedScript, scripts]);
 
   const loadLogs = useCallback(async (pid: number) => {
@@ -328,7 +353,7 @@ export default function StrategyLabPage() {
             <h2 className="text-sm font-semibold">Trader Script Runner</h2>
             <p className="text-xs text-[var(--text-muted)] mt-1">Run any script under <code>trader/scripts</code> with arbitrary CLI flags.</p>
           </div>
-          <div className="grid gap-3 lg:grid-cols-3">
+          <div className="grid gap-3 lg:grid-cols-4">
             <label className="text-xs text-[var(--text-muted)] space-y-1">
               <span className="block uppercase">Script</span>
               <select
@@ -339,6 +364,24 @@ export default function StrategyLabPage() {
                 {scripts.length === 0 && <option value="">No scripts discovered</option>}
                 {scripts.map((script) => (
                   <option key={script.name} value={script.name}>{script.name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs text-[var(--text-muted)] space-y-1">
+              <span className="block uppercase">Preset</span>
+              <select
+                className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm"
+                value={selectedPreset}
+                onChange={(e) => {
+                  const preset = e.target.value;
+                  setSelectedPreset(preset);
+                  setCliArgs((current) => upsertPresetArg(current, preset));
+                }}
+                disabled={!scripts.find((script) => script.name === selectedScript)?.launch_metadata?.preset_choices?.length}
+              >
+                <option value="">No preset</option>
+                {(scripts.find((script) => script.name === selectedScript)?.launch_metadata?.preset_choices ?? []).map((preset) => (
+                  <option key={preset} value={preset}>{preset}</option>
                 ))}
               </select>
             </label>

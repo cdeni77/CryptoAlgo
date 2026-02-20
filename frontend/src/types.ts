@@ -284,6 +284,10 @@ export interface ResearchScriptInfo {
   name: string;
   module: string;
   default_args: string[];
+  launch_metadata?: {
+    preset_choices?: string[];
+    preset_default?: string;
+  };
 }
 
 export interface ResearchScriptListResponse {

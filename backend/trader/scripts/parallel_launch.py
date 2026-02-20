@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, List
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+PILOT_ROLLOUT_DEFAULT_COINS = ["ETH", "SOL"]
 
 # v11: Updated presets — tighter patience, CV folds
 PRESET_CONFIGS = {
@@ -90,6 +91,23 @@ PRESET_CONFIGS = {
         "require_holdout_pass": False,
         "target_trades_per_week": 0.8,
     },
+    "pilot_rollout": {
+        "coins": ",".join(PILOT_ROLLOUT_DEFAULT_COINS),
+        "trials": 40,
+        "plateau_patience": 45,
+        "plateau_min_delta": 0.025,
+        "plateau_warmup": 20,
+        "holdout_days": 180,
+        "min_internal_oos_trades": 10,
+        "min_total_trades": 35,
+        "n_cv_folds": 5,
+        "holdout_candidates": 2,
+        "holdout_min_trades": 20,
+        "holdout_min_sharpe": 0.10,
+        "holdout_min_return": 0.01,
+        "require_holdout_pass": True,
+        "target_trades_per_week": 1.0,
+    },
 }
 
 
@@ -113,6 +131,8 @@ def apply_runtime_preset(args):
         "holdout_min_return": "--holdout-min-return",
         "require_holdout_pass": "--require-holdout-pass",
         "target_trades_per_week": "--target-trades-per-week",
+        "coins": "--coins",
+        "trials": "--trials",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -318,7 +338,6 @@ def print_final_report(script_dir, target_coins, total_time):
         print(f"     │  Sharpe={_f(ho_sharpe)} | Return={_fmt_metric(ho_return, '.2%')} | Trades={ho_trades}")
 
         if readiness:
-            sens = val.get('parameter_sensitivity', {})
             print(f"     ├─ Validation: {val_rating} ({_fmt_metric(val_score, '.0f')}/100)")
 
             checks = readiness.get('details', [])
@@ -360,6 +379,62 @@ def print_final_report(script_dir, target_coins, total_time):
         print(f"       - Simplifying the strategy (fewer parameters)")
         print(f"       - Testing on different timeframes")
     print(f"{'='*80}")
+
+
+def _coin_intent_from_rating(rating: str, coin: str, args) -> str:
+    rating_key = (rating or "").upper()
+    if args.preset == "pilot_rollout":
+        if coin in PILOT_ROLLOUT_DEFAULT_COINS and rating_key in {"READY", "CAUTIOUS", "FULL", "PILOT"}:
+            return "PILOT"
+        return "SHADOW"
+    if rating_key in {"READY", "CAUTIOUS", "FULL", "PILOT"}:
+        return "PILOT"
+    return "SHADOW"
+
+
+def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id: str, total_time: float) -> Path:
+    results_dir = script_dir / "optimization_results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    opt_results = load_optimization_results(results_dir)
+    val_results = load_validation_results(results_dir)
+
+    coins_summary = []
+    for coin in target_coins:
+        validation = val_results.get(coin, {})
+        readiness = validation.get("readiness", {}) if isinstance(validation, dict) else {}
+        rating = readiness.get("rating") or "UNKNOWN"
+        intent = _coin_intent_from_rating(rating, coin, args)
+        coins_summary.append(
+            {
+                "coin": coin,
+                "deployment_intent": intent,
+                "readiness_rating": rating,
+                "readiness_tier": readiness.get("readiness_tier"),
+                "recommended_position_scale": readiness.get("recommended_position_scale"),
+                "deployment_blocked": bool(opt_results.get(coin, {}).get("deployment_blocked", False)),
+                "deployment_block_reasons": opt_results.get(coin, {}).get("deployment_block_reasons", []),
+            }
+        )
+
+    summary = {
+        "run_id": run_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "preset": args.preset,
+        "coins": target_coins,
+        "trials": args.trials,
+        "runtime_seconds": round(total_time, 2),
+        "deployment_tier_map": {row["coin"]: row["deployment_intent"] for row in coins_summary},
+        "coin_summaries": coins_summary,
+    }
+
+    versioned_path = results_dir / f"launch_summary_{run_id}.json"
+    latest_path = results_dir / "launch_summary.json"
+    with open(versioned_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    with open(latest_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    print(f"\n🧾 Launch summary written: {latest_path}")
+    return latest_path
 
 
 def _print_log_tail(log_path, max_lines=30):
@@ -415,7 +490,7 @@ if __name__ == "__main__":
                         help="Warmup trials before plateau checks (default: 30, was 60)")
     parser.add_argument("--holdout-days", type=int, default=180)
     parser.add_argument("--preset", type=str, default="paper_ready",
-                        choices=["none", "paper_ready", "robust120", "robust180", "quick"])
+                        choices=["none", "paper_ready", "robust120", "robust180", "quick", "pilot_rollout"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0)
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=3,
@@ -450,6 +525,7 @@ if __name__ == "__main__":
     args = apply_runtime_preset(args)
 
     pipeline_start = time.time()
+    run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
 
     target_coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     if not target_coins:
@@ -515,7 +591,6 @@ if __name__ == "__main__":
         print(f"   Validation:   {'ENABLED' if not args.skip_validation else 'DISABLED'}")
         print(f"{'='*70}")
 
-        run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
         print(f"\n   Run ID: {run_id}")
 
         optuna_db = script_dir / "optuna_trading.db"
@@ -716,3 +791,4 @@ if __name__ == "__main__":
 
     total_time = time.time() - pipeline_start
     print_final_report(script_dir, target_coins, total_time)
+    write_launch_summary(script_dir, args, target_coins, run_id, total_time)
