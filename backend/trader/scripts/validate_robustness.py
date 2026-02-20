@@ -456,6 +456,22 @@ class ReadinessCheck:
     detail: str = ""
 
 
+TIER_CONFIG = {
+    'FULL': {'min_score': 80.0, 'recommended_position_scale': 1.0, 'legacy_rating': 'READY'},
+    'PILOT': {'min_score': 65.0, 'recommended_position_scale': 0.5, 'legacy_rating': 'CAUTIOUS'},
+    'SHADOW': {'min_score': 45.0, 'recommended_position_scale': 0.2, 'legacy_rating': 'WEAK'},
+    'REJECT': {'min_score': 0.0, 'recommended_position_scale': 0.0, 'legacy_rating': 'REJECT'},
+}
+
+
+def determine_readiness_tier(weighted_score: float) -> tuple[str, float, str]:
+    for tier_name in ('FULL', 'PILOT', 'SHADOW', 'REJECT'):
+        cfg = TIER_CONFIG[tier_name]
+        if weighted_score >= cfg['min_score']:
+            return tier_name, float(cfg['recommended_position_scale']), str(cfg['legacy_rating'])
+    return 'REJECT', 0.0, 'REJECT'
+
+
 def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
                             regime, cv_consistency, holdout_metrics, optim_metrics):
     checks = []
@@ -528,13 +544,12 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
 
     weighted_score = sum(c.weight for c in checks if c.passed) / total_weight * 100
 
-    if weighted_score >= 80: rating = 'READY'
-    elif weighted_score >= 60: rating = 'CAUTIOUS'
-    elif weighted_score >= 40: rating = 'WEAK'
-    else: rating = 'REJECT'
+    readiness_tier, recommended_position_scale, rating = determine_readiness_tier(weighted_score)
 
     return {
         'score': round(weighted_score, 1), 'rating': rating,
+        'readiness_tier': readiness_tier,
+        'recommended_position_scale': recommended_position_scale,
         'n_checks': len(checks),
         'checks_passed': sum(1 for c in checks if c.passed),
         'checks_failed': sum(1 for c in checks if not c.passed),
@@ -679,8 +694,12 @@ def run_validation(
         regime, cv_consistency, holdout_metrics, optim_metrics,
     )
 
-    emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(readiness['rating'], '?')
-    print(f"\n  {emoji} {coin_name}: {readiness['rating']} — Score: {readiness['score']:.0f}/100")
+    emoji = {'FULL': '✅', 'PILOT': '⚠️', 'SHADOW': '🟡', 'REJECT': '❌'}.get(readiness['readiness_tier'], '?')
+    print(
+        f"\n  {emoji} {coin_name}: {readiness['readiness_tier']} "
+        f"(legacy={readiness['rating']}) — Score: {readiness['score']:.0f}/100"
+    )
+    print(f"     Recommended position scale: {readiness['recommended_position_scale']:.2f}x")
     print(f"     Checks: {readiness['checks_passed']}/{readiness['n_checks']} passed")
     for detail in readiness['details']:
         status = '✅' if detail['passed'] else '❌'
@@ -737,8 +756,9 @@ def show_validation_results():
 
         readiness = r.get('readiness', {})
         rating = readiness.get('rating', '?')
+        readiness_tier = readiness.get('readiness_tier', 'UNKNOWN')
         score = readiness.get('score', 0)
-        emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(rating, '?')
+        emoji = {'FULL': '✅', 'PILOT': '⚠️', 'SHADOW': '🟡', 'REJECT': '❌'}.get(readiness_tier, '?')
 
         dsr = r.get('deflated_sharpe', {})
         dsr_meta = r.get('dsr_metadata', {})
@@ -746,7 +766,8 @@ def show_validation_results():
         sens = r.get('parameter_sensitivity', {})
         cv = r.get('cv_consistency', {})
 
-        print(f"\n{emoji} {r.get('coin', '?')} — Score: {score:.0f}/100 — {rating}")
+        print(f"\n{emoji} {r.get('coin', '?')} — Score: {score:.0f}/100 — {readiness_tier} (legacy={rating})")
+        print(f"   Recommended position scale: {readiness.get('recommended_position_scale', 0.0):.2f}x")
         print(f"   Checks: {readiness.get('checks_passed', 0)}/{readiness.get('n_checks', 0)} passed")
 
         if dsr.get('valid'):
