@@ -38,6 +38,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 10,
         "min_total_trades": 28,
         "n_cv_folds": 4,
+        "holdout_candidates": 4,
     },
     "robust180": {
         "plateau_patience": 60,
@@ -47,6 +48,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 8,
         "min_total_trades": 30,
         "n_cv_folds": 3,
+        "holdout_candidates": 3,
     },
     "robust120": {
         "plateau_patience": 50,
@@ -56,6 +58,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 6,
         "min_total_trades": 25,
         "n_cv_folds": 3,
+        "holdout_candidates": 2,
     },
     "quick": {
         "plateau_patience": 30,
@@ -65,6 +68,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 5,
         "min_total_trades": 20,
         "n_cv_folds": 2,
+        "holdout_candidates": 1,
     },
 }
 
@@ -83,6 +87,7 @@ def apply_runtime_preset(args):
         "min_internal_oos_trades": "--min-internal-oos-trades",
         "min_total_trades": "--min-total-trades",
         "n_cv_folds": "--n-cv-folds",
+        "holdout_candidates": "--holdout-candidates",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -338,7 +343,7 @@ def _print_log_tail(log_path, max_lines=30):
         print(f"         {line}")
 
 
-def _estimate_validation_timeout(result_path):
+def _estimate_validation_timeout(result_path, timeout_scale=1.0, timeout_cap=7200):
     base = 900
     try:
         with open(result_path) as f:
@@ -346,9 +351,12 @@ def _estimate_validation_timeout(result_path):
         trades = int(data.get('optim_metrics', {}).get('n_trades', 0) or 0)
         folds = int(data.get('n_cv_folds', 1) or 1)
         holdout_days = int(data.get('holdout_days', 180) or 180)
-        return int(min(3600, max(base, base + trades * 10 + folds * 120 + holdout_days * 2)))
+        estimated = max(base, base + trades * 10 + folds * 120 + holdout_days * 2)
+        scaled = int(estimated * max(0.5, timeout_scale))
+        return int(min(max(base, scaled), timeout_cap))
     except Exception:
-        return 1800
+        fallback = int(1800 * max(0.5, timeout_scale))
+        return int(min(max(900, fallback), timeout_cap))
 
 
 if __name__ == "__main__":
@@ -372,6 +380,8 @@ if __name__ == "__main__":
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=3,
                         help="Walk-forward CV folds (default: 3)")
+    parser.add_argument("--holdout-candidates", type=int, default=3,
+                        help="Top CV candidates to evaluate on holdout per coin")
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -380,6 +390,14 @@ if __name__ == "__main__":
                         help="Comma-separated sampler seeds for consensus runs")
     parser.add_argument("--validation-jobs", type=int, default=3,
                         help="Max parallel validation processes")
+    parser.add_argument("--validation-timeout-scale", type=float, default=1.0,
+                        help="Multiplier applied to per-coin validation timeout estimates")
+    parser.add_argument("--validation-timeout-cap", type=int, default=7200,
+                        help="Maximum per-coin validation timeout in seconds")
+    parser.add_argument("--validation-fast", action="store_true",
+                        help="Run faster robustness checks (lower MC simulation counts)")
+    parser.add_argument("--validation-no-timeout", action="store_true",
+                        help="Disable per-coin validation timeout (run until completion)")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -437,8 +455,9 @@ if __name__ == "__main__":
         print(f"   CV folds:     {args.n_cv_folds} (walk-forward)")
         print(f"   Holdout:      {args.holdout_days} days")
         print(f"   Params:       9 tunable (reduced from 18)")
-        print(f"   Scoring:      Mean OOS Sharpe across CV folds")
+        print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
+        print(f"   Holdout cands:{args.holdout_candidates}")
         print(f"   Preset:       {args.preset}")
         print(f"   Seeds:        {args.sampler_seeds}")
         seed_count = max(1, len([s for s in args.sampler_seeds.split(",") if s.strip()]))
@@ -466,6 +485,7 @@ if __name__ == "__main__":
                 "--plateau-warmup", str(args.plateau_warmup),
                 "--holdout-days", str(args.holdout_days),
                 "--n-cv-folds", str(args.n_cv_folds),
+                "--holdout-candidates", str(args.holdout_candidates),
                 "--study-suffix", run_id,
                 "--preset", "none",  # already applied
             ]
@@ -568,15 +588,21 @@ if __name__ == "__main__":
                     coin = pending.pop(0)
                     print(f"\n   Running validation for {coin}...")
                     cmd = [sys.executable, "-m", "scripts.validate_robustness", "--coin", coin]
+                    if args.validation_fast:
+                        cmd.append("--fast")
                     result_path = results_dir / f"{coin}_optimization.json"
-                    timeout_s = _estimate_validation_timeout(result_path)
+                    timeout_s = _estimate_validation_timeout(
+                        result_path,
+                        timeout_scale=args.validation_timeout_scale,
+                        timeout_cap=args.validation_timeout_cap,
+                    )
                     proc = subprocess.Popen(
                         cmd, cwd=str(trader_root),
                         stdout=subprocess.PIPE if not sys.stderr.isatty() else None,
                         stderr=subprocess.PIPE if not sys.stderr.isatty() else None,
                         text=True,
                     )
-                    running[coin] = {'proc': proc, 'start': time.time(), 'timeout': timeout_s}
+                    running[coin] = {'proc': proc, 'start': time.time(), 'timeout': (None if args.validation_no_timeout else timeout_s)}
 
                 time.sleep(1)
                 finished = []
@@ -590,7 +616,7 @@ if __name__ == "__main__":
                             print(f"   ❌ Validation failed for {coin}")
                             if err:
                                 print(f"      {err[:500]}")
-                    elif elapsed > info['timeout']:
+                    elif info['timeout'] is not None and elapsed > info['timeout']:
                         proc.kill()
                         finished.append(coin)
                         print(f"   ⏰ Validation timed out for {coin} after {int(info['timeout'])}s")
