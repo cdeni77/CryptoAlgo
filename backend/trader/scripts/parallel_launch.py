@@ -39,6 +39,11 @@ PRESET_CONFIGS = {
         "min_total_trades": 28,
         "n_cv_folds": 4,
         "holdout_candidates": 4,
+        "holdout_min_trades": 15,
+        "holdout_min_sharpe": 0.05,
+        "holdout_min_return": 0.0,
+        "require_holdout_pass": True,
+        "target_trades_per_week": 1.0,
     },
     "robust180": {
         "plateau_patience": 60,
@@ -49,6 +54,11 @@ PRESET_CONFIGS = {
         "min_total_trades": 30,
         "n_cv_folds": 3,
         "holdout_candidates": 3,
+        "holdout_min_trades": 15,
+        "holdout_min_sharpe": 0.0,
+        "holdout_min_return": 0.0,
+        "require_holdout_pass": True,
+        "target_trades_per_week": 1.0,
     },
     "robust120": {
         "plateau_patience": 50,
@@ -59,6 +69,11 @@ PRESET_CONFIGS = {
         "min_total_trades": 25,
         "n_cv_folds": 3,
         "holdout_candidates": 2,
+        "holdout_min_trades": 12,
+        "holdout_min_sharpe": 0.0,
+        "holdout_min_return": 0.0,
+        "require_holdout_pass": True,
+        "target_trades_per_week": 1.0,
     },
     "quick": {
         "plateau_patience": 30,
@@ -69,6 +84,11 @@ PRESET_CONFIGS = {
         "min_total_trades": 20,
         "n_cv_folds": 2,
         "holdout_candidates": 1,
+        "holdout_min_trades": 10,
+        "holdout_min_sharpe": 0.0,
+        "holdout_min_return": -0.01,
+        "require_holdout_pass": False,
+        "target_trades_per_week": 0.8,
     },
 }
 
@@ -88,6 +108,11 @@ def apply_runtime_preset(args):
         "min_total_trades": "--min-total-trades",
         "n_cv_folds": "--n-cv-folds",
         "holdout_candidates": "--holdout-candidates",
+        "holdout_min_trades": "--holdout-min-trades",
+        "holdout_min_sharpe": "--holdout-min-sharpe",
+        "holdout_min_return": "--holdout-min-return",
+        "require_holdout_pass": "--require-holdout-pass",
+        "target_trades_per_week": "--target-trades-per-week",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -267,6 +292,8 @@ def print_final_report(script_dir, target_coins, total_time):
         opt_wr = optim_metrics.get('win_rate', '?')
         opt_dd = optim_metrics.get('max_drawdown', '?')
         opt_trades = optim_metrics.get('n_trades', '?')
+        opt_tpy = optim_metrics.get('trades_per_year', '?')
+        freq_ratio = optim_metrics.get('frequency_ratio', '?')
 
         ho_sharpe = holdout_metrics.get('holdout_sharpe', '?')
         ho_return = holdout_metrics.get('holdout_return', '?')
@@ -274,6 +301,10 @@ def print_final_report(script_dir, target_coins, total_time):
 
         val_score = readiness.get('score', '?')
         val_rating = readiness.get('rating', 'N/A')
+        deployment_blocked = bool(opt.get('deployment_blocked', False))
+        block_reasons = opt.get('deployment_block_reasons', [])
+        if deployment_blocked:
+            val_rating = 'REJECT'
 
         emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(val_rating, '⬜')
 
@@ -282,6 +313,7 @@ def print_final_report(script_dir, target_coins, total_time):
         print(f"     │  Mean OOS SR={_f(mean_oos_sr)} | Min OOS SR={_f(min_oos_sr)} | "
               f"Std={_f(std_oos_sr)} | WR={_fmt_metric(opt_wr, '.1%')} | "
               f"DD={_fmt_metric(opt_dd, '.1%')} | Trades={opt_trades}")
+        print(f"     │  Trades/Year={_fmt_metric(opt_tpy, '.1f')} | Frequency ratio={_fmt_metric(freq_ratio, '.2f')}")
         print(f"     ├─ Holdout")
         print(f"     │  Sharpe={_f(ho_sharpe)} | Return={_fmt_metric(ho_return, '.2%')} | Trades={ho_trades}")
 
@@ -298,6 +330,8 @@ def print_final_report(script_dir, target_coins, total_time):
                     print(f"     │  All {len(checks)} checks passed")
         else:
             print(f"     └─ Validation: not run")
+        if deployment_blocked and block_reasons:
+            print(f"     │  Deployment blocked: {', '.join(block_reasons)}")
         print()
 
         if val_rating == 'READY':
@@ -382,6 +416,12 @@ if __name__ == "__main__":
                         help="Walk-forward CV folds (default: 3)")
     parser.add_argument("--holdout-candidates", type=int, default=3,
                         help="Top CV candidates to evaluate on holdout per coin")
+    parser.add_argument("--require-holdout-pass", action="store_true",
+                        help="Block coin deployment if no holdout candidate passes minimum thresholds")
+    parser.add_argument("--holdout-min-trades", type=int, default=15)
+    parser.add_argument("--holdout-min-sharpe", type=float, default=0.0)
+    parser.add_argument("--holdout-min-return", type=float, default=0.0)
+    parser.add_argument("--target-trades-per-week", type=float, default=1.0)
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -454,10 +494,13 @@ if __name__ == "__main__":
         print(f"   Worker split: {worker_counts}")
         print(f"   CV folds:     {args.n_cv_folds} (walk-forward)")
         print(f"   Holdout:      {args.holdout_days} days")
-        print(f"   Params:       9 tunable (reduced from 18)")
+        print(f"   Params:       10 tunable (includes cooldown cadence control)")
         print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
         print(f"   Holdout cands:{args.holdout_candidates}")
+        print(f"   Holdout gate: trades>={args.holdout_min_trades}, SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}")
+        print(f"   Enforce gate: {'YES' if args.require_holdout_pass else 'NO'}")
+        print(f"   Target cadence: {args.target_trades_per_week:.2f} trades/week")
         print(f"   Preset:       {args.preset}")
         print(f"   Seeds:        {args.sampler_seeds}")
         seed_count = max(1, len([s for s in args.sampler_seeds.split(",") if s.strip()]))
@@ -486,11 +529,17 @@ if __name__ == "__main__":
                 "--holdout-days", str(args.holdout_days),
                 "--n-cv-folds", str(args.n_cv_folds),
                 "--holdout-candidates", str(args.holdout_candidates),
+                "--holdout-min-trades", str(args.holdout_min_trades),
+                "--holdout-min-sharpe", str(args.holdout_min_sharpe),
+                "--holdout-min-return", str(args.holdout_min_return),
+                "--target-trades-per-week", str(args.target_trades_per_week),
                 "--study-suffix", run_id,
                 "--preset", "none",  # already applied
             ]
             if args.min_internal_oos_trades:
                 cmd.extend(["--min-internal-oos-trades", str(args.min_internal_oos_trades)])
+            if args.require_holdout_pass:
+                cmd.append("--require-holdout-pass")
             if args.min_total_trades:
                 cmd.extend(["--min-total-trades", str(args.min_total_trades)])
             if args.sampler_seeds:

@@ -106,6 +106,18 @@ DOGE_EXTRA_FEATURES = [
 ]
 
 
+ETH_EXTRA_FEATURES = [
+    'eth_trend_spread_12h', 'eth_trend_spread_24h', 'eth_trend_spread_72h', 'eth_trend_spread_168h',
+    'eth_impulse_12h', 'eth_impulse_24h', 'eth_impulse_48h',
+    'eth_volume_support', 'eth_pullback_depth_72h', 'eth_breakout_pressure',
+]
+
+XRP_EXTRA_FEATURES = [
+    'xrp_compression_ratio', 'xrp_breakout_distance', 'xrp_whipsaw_score',
+    'xrp_body_efficiency', 'xrp_volume_breakout_confirm', 'xrp_reversal_pressure',
+]
+
+
 @dataclass
 class CoinProfile:
     """Per-coin trading configuration."""
@@ -156,7 +168,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
     'ETH': CoinProfile(
         name='ETH',
         prefixes=['ETP', 'ETH'],
-        extra_features=[],
+        extra_features=ETH_EXTRA_FEATURES,
         signal_threshold=0.82,
         vol_mult_tp=5.8,
         vol_mult_sl=3.0,
@@ -168,7 +180,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
     'XRP': CoinProfile(
         name='XRP',
         prefixes=['XPP', 'XRP'],
-        extra_features=[],
+        extra_features=XRP_EXTRA_FEATURES,
         signal_threshold=0.84,
         vol_mult_tp=6.0,
         vol_mult_sl=3.0,
