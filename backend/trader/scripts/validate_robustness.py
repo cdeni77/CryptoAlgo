@@ -36,6 +36,33 @@ warnings.filterwarnings('ignore')
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+
+def aggregate_cumulative_trial_counts(ledger_path: Optional[Path] = None) -> Dict[str, object]:
+    from scripts.optimize import aggregate_cumulative_trial_counts as _aggregate_trial_counts
+
+    return _aggregate_trial_counts(ledger_path=ledger_path)
+
+
+def resolve_dsr_trial_count(coin_name: str, scope: str = "coin", ledger_path: Optional[Path] = None) -> Dict[str, object]:
+    counts = aggregate_cumulative_trial_counts(ledger_path=ledger_path)
+    trial_scope = (scope or "coin").lower()
+    coin_key = coin_name.upper()
+
+    if trial_scope == "global":
+        n_trials_used = int(counts.get('global_total', 0) or 0)
+    else:
+        n_trials_used = int(counts.get('coin_totals', {}).get(coin_key, 0) or 0)
+
+    return {
+        'n_trials_used': max(0, n_trials_used),
+        'scope': trial_scope,
+        'ledger_timestamp': counts.get('ledger_timestamp'),
+        'ledger_path': counts.get('ledger_path'),
+        'coin_cumulative_trials': int(counts.get('coin_totals', {}).get(coin_key, 0) or 0),
+        'global_cumulative_trials': int(counts.get('global_total', 0) or 0),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. MONTE CARLO TRADE SIMULATIONS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -393,6 +420,7 @@ def run_validation(
     all_data,
     mc_shuffle_sims=1000,
     mc_resample_sims=1000,
+    dsr_trial_scope="coin",
 ):
     from scripts.train_model import Config, run_backtest
     from scripts.optimize import (
@@ -404,7 +432,6 @@ def run_validation(
     coin_prefix = optimization_result.get('prefix', PREFIX_FOR_COIN.get(coin_name, coin_name))
     holdout_metrics = optimization_result.get('holdout_metrics', {})
     optim_metrics = optimization_result.get('optim_metrics', {})
-    n_trials = int(optimization_result.get('n_trials', 100))
 
     print(f"\n{'='*70}")
     print(f"🔬 ROBUSTNESS VALIDATION — {coin_name} (v11)")
@@ -464,10 +491,22 @@ def run_validation(
 
     # 4. DSR
     print(f"  📐 Deflated Sharpe Ratio...")
+    dsr_meta = resolve_dsr_trial_count(coin_name, scope=dsr_trial_scope)
+    n_trials_for_dsr = int(dsr_meta.get('n_trials_used', 0) or 0)
+    if n_trials_for_dsr < 2:
+        n_trials_for_dsr = int(optimization_result.get('n_trials', 100) or 100)
+        dsr_meta['n_trials_used'] = n_trials_for_dsr
+        dsr_meta['fallback_to_single_run'] = True
+    else:
+        dsr_meta['fallback_to_single_run'] = False
+
     oos_sr = float(optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe', sharpe)) or 0)
-    dsr = compute_deflated_sharpe(oos_sr, n_trades, n_trials)
+    dsr = compute_deflated_sharpe(oos_sr, n_trades, n_trials_for_dsr)
     if dsr.get('valid'):
-        print(f"     DSR: {dsr['dsr']:.3f} (p={dsr['p_value']:.3f})")
+        print(
+            f"     DSR: {dsr['dsr']:.3f} (p={dsr['p_value']:.3f}) "
+            f"| trials={n_trials_for_dsr} ({dsr_meta['scope']})"
+        )
 
     # 5. Regime Split
     print(f"  🌤️ Regime split test...")
@@ -502,7 +541,7 @@ def run_validation(
         'timestamp': datetime.now().isoformat(),
         'mc_shuffle': mc_shuffle, 'mc_resample': mc_resample,
         'parameter_sensitivity': sensitivity,
-        'deflated_sharpe': dsr, 'regime_split': regime,
+        'deflated_sharpe': dsr, 'dsr_metadata': dsr_meta, 'regime_split': regime,
         'cv_consistency': cv_consistency,
         'readiness': readiness,
     }
@@ -549,6 +588,7 @@ def show_validation_results():
         emoji = {'READY': '✅', 'CAUTIOUS': '⚠️', 'WEAK': '🟡', 'REJECT': '❌'}.get(rating, '?')
 
         dsr = r.get('deflated_sharpe', {})
+        dsr_meta = r.get('dsr_metadata', {})
         mc = r.get('mc_shuffle', {})
         sens = r.get('parameter_sensitivity', {})
         cv = r.get('cv_consistency', {})
@@ -557,7 +597,10 @@ def show_validation_results():
         print(f"   Checks: {readiness.get('checks_passed', 0)}/{readiness.get('n_checks', 0)} passed")
 
         if dsr.get('valid'):
-            print(f"   DSR: {dsr.get('dsr', 0):.3f} (p={dsr.get('p_value', 1):.3f})")
+            print(
+                f"   DSR: {dsr.get('dsr', 0):.3f} (p={dsr.get('p_value', 1):.3f})"
+                f" | trials={dsr_meta.get('n_trials_used', '?')} ({dsr_meta.get('scope', 'coin')})"
+            )
         if mc.get('valid'):
             print(f"   MC DD 95th: {mc.get('mc_dd_95th', 0):.1%} | P(ruin): {mc.get('prob_ruin_25pct', 0):.1%}")
         if sens.get('valid'):
@@ -586,6 +629,8 @@ if __name__ == "__main__":
                         help="Monte Carlo resample simulation count")
     parser.add_argument("--fast", action="store_true",
                         help="Use faster validation defaults for same-day screening")
+    parser.add_argument("--dsr-trial-scope", type=str, default="coin", choices=["coin", "global"],
+                        help="Use cumulative trial count by coin or globally when computing DSR")
     args = parser.parse_args()
 
     if args.fast:
@@ -633,4 +678,5 @@ if __name__ == "__main__":
             all_data,
             mc_shuffle_sims=max(50, args.mc_shuffle_sims),
             mc_resample_sims=max(50, args.mc_resample_sims),
+            dsr_trial_scope=args.dsr_trial_scope,
         )

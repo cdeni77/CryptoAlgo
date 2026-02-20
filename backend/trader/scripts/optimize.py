@@ -673,6 +673,92 @@ def _db_path(): return SCRIPT_DIR / "optuna_trading.db"
 def _sqlite_url(path): return f"sqlite:///{path.resolve()}"
 def _candidate_results_dirs(): return [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]
 
+
+def _candidate_trial_ledger_paths() -> List[Path]:
+    return [d / "trial_ledger.jsonl" for d in _candidate_results_dirs()]
+
+
+def resolve_trial_ledger_path() -> Optional[Path]:
+    for path in _candidate_trial_ledger_paths():
+        if path.exists():
+            return path
+    for path in _candidate_trial_ledger_paths():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return None
+
+
+def append_trial_ledger_entry(
+    coin_name: str,
+    preset_name: str,
+    run_id: str,
+    completed_trials: int,
+    timestamp: Optional[str] = None,
+) -> Optional[Path]:
+    ledger_path = resolve_trial_ledger_path()
+    if ledger_path is None:
+        return None
+
+    ts = timestamp or datetime.now().isoformat()
+    row = {
+        'coin': coin_name,
+        'preset': preset_name,
+        'run_id': run_id,
+        'timestamp': ts,
+        'completed_trials': int(max(0, completed_trials)),
+    }
+    with open(ledger_path, 'a') as f:
+        f.write(json.dumps(_to_json_safe(row), default=str) + "\n")
+    return ledger_path
+
+
+def aggregate_cumulative_trial_counts(ledger_path: Optional[Path] = None) -> Dict[str, object]:
+    path = Path(ledger_path) if ledger_path else resolve_trial_ledger_path()
+    by_coin: Dict[str, int] = {}
+    global_total = 0
+    last_timestamp = None
+
+    if path is None or not path.exists():
+        return {
+            'ledger_path': str(path) if path else None,
+            'ledger_timestamp': None,
+            'coin_totals': by_coin,
+            'global_total': global_total,
+            'entries': 0,
+        }
+
+    entries = 0
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            coin = str(item.get('coin', '')).upper()
+            trials = int(item.get('completed_trials', 0) or 0)
+            ts = item.get('timestamp')
+            if not coin or trials < 0:
+                continue
+            by_coin[coin] = by_coin.get(coin, 0) + trials
+            global_total += trials
+            entries += 1
+            if ts:
+                last_timestamp = str(ts)
+
+    return {
+        'ledger_path': str(path),
+        'ledger_timestamp': last_timestamp,
+        'coin_totals': by_coin,
+        'global_total': global_total,
+        'entries': entries,
+    }
+
 @contextmanager
 def _study_storage_lock(db_path: Path):
     """Serialize Optuna SQLite storage initialization across processes."""
@@ -697,7 +783,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
-                  target_trades_per_week=1.0):
+                  target_trades_per_week=1.0, preset_name="none"):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -770,6 +856,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
     nc = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None])
     dsr = compute_deflated_sharpe(_finite_metric(best.user_attrs.get('mean_sharpe', 0)), int(best.user_attrs.get('n_trades', 0) or 0), nc)
+    run_id = f"{study_name}_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+    ledger_path = append_trial_ledger_entry(
+        coin_name=coin_name,
+        preset_name=preset_name,
+        run_id=run_id,
+        completed_trials=nc,
+    )
+    cumulative_trials = aggregate_cumulative_trial_counts(ledger_path=ledger_path)
     print(f"  📐 DSR: {dsr['dsr']:.3f} p={dsr['p_value']:.3f}")
 
     holdout_result = None
@@ -872,7 +966,16 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'params': best.params, 'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
         'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
-        'deployment_block_reasons': blocked_reasons}
+        'deployment_block_reasons': blocked_reasons,
+        'run_id': run_id,
+        'trial_ledger': {
+            'ledger_path': cumulative_trials.get('ledger_path'),
+            'ledger_timestamp': cumulative_trials.get('ledger_timestamp'),
+            'coin_cumulative_trials': cumulative_trials.get('coin_totals', {}).get(coin_name, 0),
+            'global_cumulative_trials': cumulative_trials.get('global_total', 0),
+            'completed_trials_this_run': nc,
+            'preset': preset_name,
+        }}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
     p = _persist_result_json(coin_name, result_data)
@@ -1036,4 +1139,5 @@ if __name__ == "__main__":
             holdout_candidates=args.holdout_candidates, require_holdout_pass=args.require_holdout_pass,
             holdout_min_trades=args.holdout_min_trades, holdout_min_sharpe=args.holdout_min_sharpe,
             holdout_min_return=args.holdout_min_return,
-            target_trades_per_week=args.target_trades_per_week)
+            target_trades_per_week=args.target_trades_per_week,
+            preset_name=args.preset)
