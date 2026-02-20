@@ -64,7 +64,22 @@ def apply_runtime_preset(args):
     config = PRESET_CONFIGS.get(args.preset)
     if not config:
         return args
+
+    # Respect explicit CLI overrides; only backfill values not provided by user.
+    arg_flags = {
+        "plateau_patience": "--plateau-patience",
+        "plateau_min_delta": "--plateau-min-delta",
+        "plateau_warmup": "--plateau-warmup",
+        "holdout_days": "--holdout-days",
+        "min_internal_oos_trades": "--min-internal-oos-trades",
+        "min_total_trades": "--min-total-trades",
+        "n_cv_folds": "--n-cv-folds",
+    }
+    provided = set(sys.argv[1:])
     for key, value in config.items():
+        flag = arg_flags.get(key)
+        if flag and flag in provided:
+            continue
         setattr(args, key, value)
     return args
 

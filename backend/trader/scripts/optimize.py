@@ -553,11 +553,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             study = optuna.create_study(direction='maximize', sampler=sampler, study_name=study_name,
                                         storage=_sqlite_url(_db_path()), load_if_exists=resume_study); break
         except Exception as e:
-            if isinstance(e, optuna.exceptions.DuplicatedStudyError):
+            err = str(e).lower()
+            if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
                 study = optuna.load_study(study_name=study_name, storage=_sqlite_url(_db_path()), sampler=sampler); break
-            if _is_transient_optuna_storage_error(e) and attempt < 7:
-                time.sleep(0.3 * (attempt + 1))
-                continue
+            # SQLite schema races can raise "table <name> already exists" while another process initializes storage.
+            if ("table" in err and "already exists" in err) and attempt < 7:
+                time.sleep(0.25 * (attempt + 1)); continue
+            if "database is locked" in err and attempt < 7:
+                time.sleep(0.3*(attempt+1)); continue
             raise
     if not study: print("❌ Could not create study"); return None
 
@@ -685,8 +688,22 @@ def apply_runtime_preset(args):
     if name in (None, '', 'none'): return args
     cfg = presets.get(name)
     if cfg:
-        for k, v in cfg.items(): setattr(args, k, v)
-        print(f"🧭 Preset '{name}': " + ", ".join(f"{k}={v}" for k, v in cfg.items()))
+        arg_flags = {
+            'plateau_patience': '--plateau-patience',
+            'plateau_warmup': '--plateau-warmup',
+            'plateau_min_delta': '--plateau-min-delta',
+            'holdout_days': '--holdout-days',
+            'min_internal_oos_trades': '--min-internal-oos-trades',
+            'min_total_trades': '--min-total-trades',
+            'n_cv_folds': '--n-cv-folds',
+        }
+        provided = set(sys.argv[1:])
+        for k, v in cfg.items():
+            flag = arg_flags.get(k)
+            if flag and flag in provided:
+                continue
+            setattr(args, k, v)
+        print(f"🧭 Preset '{name}': " + ", ".join(f"{k}={getattr(args, k)}" for k in cfg.keys()))
     return args
 
 COIN_MAP = {'BIP':'BTC','BTC':'BTC','ETP':'ETH','ETH':'ETH','XPP':'XRP','XRP':'XRP','SLP':'SOL','SOL':'SOL','DOP':'DOGE','DOGE':'DOGE'}
