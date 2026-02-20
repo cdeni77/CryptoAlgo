@@ -152,27 +152,41 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
                 conn.execute("PRAGMA busy_timeout = 5000;")
                 conn.execute("PRAGMA journal_mode=WAL;")
 
-                # Get all study counts in one query
                 rows = conn.execute(count_query).fetchall()
+                studies_by_coin = {coin: [] for coin in target_coins}
+
+                # Match current run studies, including multi-seed suffixes like _s42
                 for study_name, started_trials, completed_trials in rows:
                     for coin in target_coins:
-                        expected = f"optimize_{coin}_{run_id}"
-                        if study_name == expected:
-                            progress[coin]["started"] = int(started_trials or 0)
-                            progress[coin]["completed"] = int(completed_trials or 0)
+                        expected_prefix = f"optimize_{coin}_{run_id}"
+                        if study_name.startswith(expected_prefix):
+                            progress[coin]["started"] += int(started_trials or 0)
+                            progress[coin]["completed"] += int(completed_trials or 0)
+                            studies_by_coin[coin].append(study_name)
                             break
 
-                # Get best trial details per coin
+                # Get best trial details per coin across all matching studies for this run_id
                 for coin in target_coins:
                     if progress[coin]["completed"] == 0:
                         continue
-                    study_name = f"optimize_{coin}_{run_id}"
-                    best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
-                    if not best_row:
-                        continue
-                    best_trial_id, best_score = best_row
-                    progress[coin]["best_score"] = float(best_score) if best_score is not None else None
 
+                    best_trial_id = None
+                    best_score = None
+                    for study_name in studies_by_coin.get(coin, []):
+                        best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
+                        if not best_row:
+                            continue
+                        candidate_trial_id, candidate_score = best_row
+                        if candidate_score is None:
+                            continue
+                        if best_score is None or float(candidate_score) > float(best_score):
+                            best_score = float(candidate_score)
+                            best_trial_id = candidate_trial_id
+
+                    if best_trial_id is None:
+                        continue
+
+                    progress[coin]["best_score"] = float(best_score)
                     metric_rows = conn.execute(attrs_query, (best_trial_id,)).fetchall()
                     metrics = {}
                     for key, value_json in metric_rows:
@@ -403,6 +417,7 @@ if __name__ == "__main__":
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
         print(f"   Preset:       {args.preset}")
         print(f"   Seeds:        {args.sampler_seeds}")
+        seed_count = max(1, len([s for s in args.sampler_seeds.split(",") if s.strip()]))
         print(f"   Validation:   {'ENABLED' if not args.skip_validation else 'DISABLED'}")
         print(f"{'='*70}")
 
@@ -479,7 +494,8 @@ if __name__ == "__main__":
                 oos_sr = metrics.get('mean_oos_sharpe', metrics.get('oos_sharpe'))
                 oos_str = f" OOS_SR={oos_sr:.3f}" if oos_sr is not None else ""
                 running = "🔄" if coin in still_running else "✅"
-                progress_str = f"{started}/{args.trials}"
+                progress_target = args.trials * seed_count
+                progress_str = f"{started}/{progress_target}"
                 if completed and completed != started:
                     progress_str += f" (✓{completed})"
                 status_parts.append(f"{running}{coin}:{progress_str}{best_str}{oos_str}")
