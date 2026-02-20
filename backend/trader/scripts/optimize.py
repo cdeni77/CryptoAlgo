@@ -15,8 +15,10 @@ Usage:
 """
 import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import fcntl
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -507,13 +509,17 @@ def _db_path(): return SCRIPT_DIR / "optuna_trading.db"
 def _sqlite_url(path): return f"sqlite:///{path.resolve()}"
 def _candidate_results_dirs(): return [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]
 
-def _is_transient_optuna_storage_error(exc):
-    msg = str(exc).lower()
-    return (
-        "database is locked" in msg
-        or "table alembic_version already exists" in msg
-        or "record does not exist" in msg
-    )
+@contextmanager
+def _study_storage_lock(db_path: Path):
+    """Serialize Optuna SQLite storage initialization across processes."""
+    lock_path = db_path.with_suffix(db_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 def _persist_result_json(coin_name, data):
     for d in _candidate_results_dirs():
@@ -548,19 +554,33 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
     sampler = TPESampler(seed=sampler_seed, n_startup_trials=min(10, n_trials // 3))
     study = None
-    for attempt in range(8):
+    storage_url = _sqlite_url(_db_path())
+    for attempt in range(10):
         try:
-            study = optuna.create_study(direction='maximize', sampler=sampler, study_name=study_name,
-                                        storage=_sqlite_url(_db_path()), load_if_exists=resume_study); break
+            with _study_storage_lock(_db_path()):
+                study = optuna.create_study(
+                    direction='maximize',
+                    sampler=sampler,
+                    study_name=study_name,
+                    storage=storage_url,
+                    load_if_exists=True,
+                )
+            break
         except Exception as e:
             err = str(e).lower()
             if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
-                study = optuna.load_study(study_name=study_name, storage=_sqlite_url(_db_path()), sampler=sampler); break
-            # SQLite schema races can raise "table <name> already exists" while another process initializes storage.
-            if ("table" in err and "already exists" in err) and attempt < 7:
-                time.sleep(0.25 * (attempt + 1)); continue
-            if "database is locked" in err and attempt < 7:
-                time.sleep(0.3*(attempt+1)); continue
+                with _study_storage_lock(_db_path()):
+                    study = optuna.load_study(study_name=study_name, storage=storage_url, sampler=sampler)
+                break
+            # SQLite schema/alembic races can happen when multiple processes initialize storage concurrently.
+            transient_schema_race = (
+                ("table" in err and "already exists" in err)
+                or ("alembic_version" in err and "unique constraint failed" in err)
+            )
+            if transient_schema_race and attempt < 9:
+                time.sleep(0.3 * (attempt + 1)); continue
+            if "database is locked" in err and attempt < 9:
+                time.sleep(0.4 * (attempt + 1)); continue
             raise
     if not study: print("❌ Could not create study"); return None
 
