@@ -157,6 +157,9 @@ class Config:
     train_embargo_hours: int = 24
     oos_eval_days: int = 60
 
+    # Feature controls
+    enforce_pruned_features: bool = False
+
 
 def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
                            config: Config) -> float:
@@ -459,7 +462,12 @@ def run_backtest(all_data: Dict, config: Config,
             for sym, d in all_data.items():
                 profile = _get_profile(sym, profile_overrides)
                 feat, ohlc = d['features'], d['ohlcv']
-                cols = system.get_feature_columns(feat.columns, profile.feature_columns)
+                coin_feature_list = profile.resolve_feature_columns(
+                    use_pruned_features=config.enforce_pruned_features,
+                    strict_pruned=config.enforce_pruned_features,
+                )
+                cols = system.get_feature_columns(feat.columns, coin_feature_list)
+                print(f"[{sym}] Features selected: {len(cols)} (pruned_only={config.enforce_pruned_features})")
                 if not cols:
                     continue
 
@@ -890,7 +898,12 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
     for sym, d in all_data.items():
         profile = get_coin_profile(sym)
         feat, ohlc = d['features'], d['ohlcv']
-        cols = system.get_feature_columns(feat.columns, profile.feature_columns)
+        coin_feature_list = profile.resolve_feature_columns(
+            use_pruned_features=config.enforce_pruned_features,
+            strict_pruned=config.enforce_pruned_features,
+        )
+        cols = system.get_feature_columns(feat.columns, coin_feature_list)
+        print(f"[{sym}] Features selected: {len(cols)} (pruned_only={config.enforce_pruned_features})")
         if not cols:
             continue
 
@@ -957,7 +970,12 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
     for sym, d in all_data.items():
         profile = get_coin_profile(sym)
         feat, ohlc = d['features'], d['ohlcv']
-        cols = system.get_feature_columns(feat.columns, profile.feature_columns)
+        coin_feature_list = profile.resolve_feature_columns(
+            use_pruned_features=config.enforce_pruned_features,
+            strict_pruned=config.enforce_pruned_features,
+        )
+        cols = system.get_feature_columns(feat.columns, coin_feature_list)
+        print(f"[{sym}] Features selected: {len(cols)} (pruned_only={config.enforce_pruned_features})")
         if not cols:
             if debug:
                 print(f"\n[{sym}] ❌ Not enough features (need ≥4, got {len(cols)})")
@@ -990,7 +1008,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
 
         model, scaler, iso, auc = result
 
-        # ── Save model to disk ──
         save_model(
             symbol=sym,
             model=model,
@@ -1016,7 +1033,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
 
         ts_loc = len(ohlc) - 1
 
-        # ── Momentum direction (all coins) ──
         ret_24h = (price / ohlc['close'].iloc[ts_loc - 24] - 1) if ts_loc >= 24 else 0
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
         sma_50 = ohlc['close'].iloc[max(0, ts_loc - 50):ts_loc].mean() if ts_loc >= 10 else price
@@ -1030,7 +1046,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 print(f"\n[{sym}] ⏸️  No momentum consensus (score={momentum_score})")
             continue
 
-        # Trend filter: long only above SMA200, short only below
         if direction == 1 and price < sma_200 and not pd.isna(sma_200):
             if debug:
                 print(f"\n[{sym}] ⏸️  Long rejected: price < SMA200")
@@ -1040,13 +1055,11 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 print(f"\n[{sym}] ⏸️  Short rejected: price > SMA200")
             continue
 
-        # Funding carry filter
         if direction == 1 and f_z > 2.5:
             continue
         if direction == -1 and f_z < -2.5:
             continue
 
-        # ML prediction
         x_in = np.nan_to_num(
             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
         )
@@ -1057,7 +1070,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
         regime_pass = profile.min_vol_24h <= vol_24h <= profile.max_vol_24h if not pd.isna(vol_24h) else False
 
-        # Momentum gate
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
         momentum_pass = abs(ret_72h) >= profile.min_momentum_magnitude
 
@@ -1086,7 +1098,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                   f"Prob: {prob:.1%} | AUC: {auc:.3f}")
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Crypto ML Trading System v8 — Per-Coin Profiles"
@@ -1107,6 +1118,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-ensemble-std", type=float, default=0.12, help="Max std across ensemble probs")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
+    parser.add_argument("--pruned-only", action="store_true",
+                        help="Require pruned feature artifacts from prune_features.py")
     args = parser.parse_args()
 
     excluded = [s.strip() for s in args.exclude.split(',') if s.strip()] if args.exclude else None
@@ -1122,6 +1135,7 @@ if __name__ == "__main__":
         min_signal_edge=args.min_edge,
         max_ensemble_std=args.max_ensemble_std,
         excluded_symbols=excluded,
+        enforce_pruned_features=args.pruned_only,
     )
     data = load_data()
 
