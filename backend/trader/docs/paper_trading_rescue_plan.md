@@ -18,6 +18,7 @@ Get at least **two coins** to `READY` or `CAUTIOUS` with complete validation evi
    - Prioritize coins with strongest holdout + CV stability combo (likely ETH/DOGE first from your run).
 3. **Re-optimize only shortlisted coins with tighter search and stability bias**
    - Increase holdout days, reduce hyperparameter freedom, and enforce stronger minimum trade counts.
+   - Use holdout-guided model selection (`--holdout-candidates`) so final params are chosen from top CV trials by real holdout behavior, not CV score alone.
 4. **Apply risk overlay for paper rollout**
    - Use fractional Kelly sizing cap (e.g., 0.25 Kelly capped by vol target) on top of existing vol-based sizing.
    - Start with reduced size until live paper metrics confirm expected behavior.
@@ -53,6 +54,7 @@ python -m scripts.parallel_launch \
   --coins ETH,DOGE,SOL \
   --trials 550 \
   --preset robust180 \
+  --holdout-candidates 4 \
   --validation-jobs 2 \
   --validation-timeout-scale 2.0 \
   --validation-timeout-cap 9000

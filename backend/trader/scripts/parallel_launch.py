@@ -38,6 +38,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 10,
         "min_total_trades": 28,
         "n_cv_folds": 4,
+        "holdout_candidates": 4,
     },
     "robust180": {
         "plateau_patience": 60,
@@ -47,6 +48,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 8,
         "min_total_trades": 30,
         "n_cv_folds": 3,
+        "holdout_candidates": 3,
     },
     "robust120": {
         "plateau_patience": 50,
@@ -56,6 +58,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 6,
         "min_total_trades": 25,
         "n_cv_folds": 3,
+        "holdout_candidates": 2,
     },
     "quick": {
         "plateau_patience": 30,
@@ -65,6 +68,7 @@ PRESET_CONFIGS = {
         "min_internal_oos_trades": 5,
         "min_total_trades": 20,
         "n_cv_folds": 2,
+        "holdout_candidates": 1,
     },
 }
 
@@ -83,6 +87,7 @@ def apply_runtime_preset(args):
         "min_internal_oos_trades": "--min-internal-oos-trades",
         "min_total_trades": "--min-total-trades",
         "n_cv_folds": "--n-cv-folds",
+        "holdout_candidates": "--holdout-candidates",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -375,6 +380,8 @@ if __name__ == "__main__":
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=3,
                         help="Walk-forward CV folds (default: 3)")
+    parser.add_argument("--holdout-candidates", type=int, default=3,
+                        help="Top CV candidates to evaluate on holdout per coin")
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -446,8 +453,9 @@ if __name__ == "__main__":
         print(f"   CV folds:     {args.n_cv_folds} (walk-forward)")
         print(f"   Holdout:      {args.holdout_days} days")
         print(f"   Params:       9 tunable (reduced from 18)")
-        print(f"   Scoring:      Mean OOS Sharpe across CV folds")
+        print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
+        print(f"   Holdout cands:{args.holdout_candidates}")
         print(f"   Preset:       {args.preset}")
         print(f"   Seeds:        {args.sampler_seeds}")
         seed_count = max(1, len([s for s in args.sampler_seeds.split(",") if s.strip()]))
@@ -475,6 +483,7 @@ if __name__ == "__main__":
                 "--plateau-warmup", str(args.plateau_warmup),
                 "--holdout-days", str(args.holdout_days),
                 "--n-cv-folds", str(args.n_cv_folds),
+                "--holdout-candidates", str(args.holdout_candidates),
                 "--study-suffix", run_id,
                 "--preset", "none",  # already applied
             ]
