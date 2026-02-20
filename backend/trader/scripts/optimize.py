@@ -174,7 +174,7 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
 # v11.1: FAST LIGHTWEIGHT EVALUATOR (~2s per fold instead of ~10min)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config):
+def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config, symbol, fee_multiplier=1.0):
     """Train ONE model on data before train_end, simulate trading on test period."""
     system = MLSystem(config)
     cols = system.get_feature_columns(features.columns, profile.feature_columns)
@@ -210,7 +210,15 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     last_exit = None
     equity = 100_000.0
     peak_equity = equity
-    fee_rt = config.fee_pct_per_side * 2
+    fee_multiplier = max(0.0, float(fee_multiplier))
+    stressed_config = config
+    if abs(fee_multiplier - 1.0) > 1e-9:
+        stressed_config = Config(**{**config.__dict__,
+                                    'fee_pct_per_side': config.fee_pct_per_side * fee_multiplier,
+                                    'min_fee_per_contract': config.min_fee_per_contract * fee_multiplier})
+
+    contract_spec = get_contract_spec(symbol)
+    units_per_contract = float(contract_spec.get('units', 1.0) or 1.0)
 
     for ts in test_feat.index:
         if ts not in test_ohlcv.index: continue
@@ -232,8 +240,13 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
                 exit_price, exit_reason = price, 'max_hold'
             if exit_price:
                 raw = (exit_price - active_pos['entry']) / active_pos['entry'] * d
-                net = raw - fee_rt
                 notional = equity * profile.position_size * config.leverage
+                notional_per_contract = max(units_per_contract * active_pos['entry'], 1e-9)
+                n_contracts = max(1, int(notional / notional_per_contract))
+                entry_fee = calculate_coinbase_fee(n_contracts, active_pos['entry'], symbol, stressed_config)
+                exit_fee = calculate_coinbase_fee(n_contracts, exit_price, symbol, stressed_config)
+                fee_rt = (entry_fee + exit_fee) / max(notional, 1e-9)
+                net = raw - fee_rt
                 pnl_d = net * notional
                 completed_trades.append({'raw_pnl': raw, 'net_pnl': net, 'pnl_dollars': pnl_d, 'exit_reason': exit_reason})
                 equity += pnl_d
@@ -419,6 +432,10 @@ def objective(
     target_sym,
     min_internal_oos_trades=0,
     target_trades_per_week=1.0,
+    enable_fee_stress=True,
+    fee_stress_multiplier=2.0,
+    fee_blend_normal_weight=0.6,
+    fee_blend_stressed_weight=0.4,
 ):
     min_fold_sharpe_hard = -0.1
     min_fold_win_rate = 0.35
@@ -430,10 +447,34 @@ def objective(
     ohlcv_data = optim_data[target_sym]['ohlcv']
 
     fold_results, total_trades = [], 0
+    stressed_fold_results = []
+    blended_fold_sharpes = []
+    w_normal = float(fee_blend_normal_weight)
+    w_stress = float(fee_blend_stressed_weight)
+    if w_normal <= 0 and w_stress <= 0:
+        w_normal, w_stress = 1.0, 0.0
+    w_total = w_normal + w_stress
+    w_normal, w_stress = w_normal / w_total, w_stress / w_total
+
     for train_boundary, test_start, test_end in cv_splits:
-        r = fast_evaluate_fold(features, ohlcv_data, train_boundary, test_start, test_end, profile, config)
+        r = fast_evaluate_fold(features, ohlcv_data, train_boundary, test_start, test_end, profile, config, target_sym, fee_multiplier=1.0)
         if r is not None:
-            fold_results.append(r); total_trades += r['n_trades']
+            fold_results.append(r)
+            total_trades += r['n_trades']
+
+            if enable_fee_stress:
+                stressed_r = fast_evaluate_fold(
+                    features, ohlcv_data, train_boundary, test_start, test_end,
+                    profile, config, target_sym, fee_multiplier=fee_stress_multiplier,
+                )
+                if stressed_r is None:
+                    _set_reject_reason(trial, 'missing_stressed_fold')
+                    return -99.0
+            else:
+                stressed_r = dict(r)
+
+            stressed_fold_results.append(stressed_r)
+            blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
 
     if len(fold_results) < max(1, len(cv_splits) // 2):
         _set_reject_reason(trial, f'too_few_folds:{len(fold_results)}/{len(cv_splits)}'); return -99.0
@@ -443,8 +484,11 @@ def objective(
         _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return -99.0
 
     sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
+    stressed_sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in stressed_fold_results]
     psr = compute_probabilistic_sharpe(sharpes, benchmark_sr=0.0)
     mean_sr, min_sr = np.mean(sharpes), np.min(sharpes)
+    mean_stressed_sr = np.mean(stressed_sharpes) if stressed_sharpes else mean_sr
+    mean_blended_sr = np.mean(blended_fold_sharpes) if blended_fold_sharpes else mean_sr
     std_sr = np.std(sharpes) if len(sharpes) > 1 else 0.0
     mean_wr = np.mean([r['win_rate'] for r in fold_results])
     mean_dd = np.mean([r['max_drawdown'] for r in fold_results])
@@ -453,6 +497,8 @@ def objective(
     mean_fee_edge = np.mean([r.get('fee_edge_ratio', 1.0) for r in fold_results])
     mean_expectancy = np.mean([r.get('avg_pnl', 0.0) for r in fold_results])
     mean_raw_expectancy = np.mean([r.get('avg_raw_pnl', 0.0) for r in fold_results])
+    stressed_expectancy = np.mean([r.get('avg_pnl', 0.0) for r in stressed_fold_results]) if stressed_fold_results else mean_expectancy
+    stressed_fee_edge_ratio = np.mean([r.get('fee_edge_ratio', 1.0) for r in stressed_fold_results]) if stressed_fold_results else mean_fee_edge
     exp_std = np.std([r.get('avg_pnl', 0.0) for r in fold_results]) if len(fold_results) > 1 else 0.0
     tpy = np.mean([r.get('trades_per_year', 0.0) for r in fold_results])
 
@@ -507,11 +553,17 @@ def objective(
     if mean_raw_expectancy <= 0:
         _set_reject_reason(trial, f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}')
         return -99.0
+    if enable_fee_stress and mean_stressed_sr < 0:
+        _set_reject_reason(trial, f'negative_stressed_sharpe:{mean_stressed_sr:.6f}')
+        return -99.0
+    if enable_fee_stress and stressed_expectancy <= 0:
+        _set_reject_reason(trial, f'nonpositive_stressed_expectancy:{stressed_expectancy:.6f}')
+        return -99.0
     if psr.get('valid') and psr.get('psr', 0.0) < 0.55:
         _set_reject_reason(trial, f'low_psr:{psr.get("psr", 0.0):.3f}')
         return -99.0
 
-    score = mean_sr
+    score = mean_blended_sr
     if std_sr < 0.3 and len(sharpes) >= 2: score += 0.15
     elif std_sr > 0.8: score -= 0.25
     if min_sr > 0: score += 0.10
@@ -541,6 +593,7 @@ def objective(
     trial.set_user_attr('mean_sharpe', round(mean_sr, 3))
     trial.set_user_attr('min_sharpe', round(min_sr, 3))
     trial.set_user_attr('std_sharpe', round(std_sr, 3))
+    trial.set_user_attr('blended_sharpe', round(mean_blended_sr, 3))
     trial.set_user_attr('mean_return', round(mean_ret, 4))
     trial.set_user_attr('win_rate', round(mean_wr, 3))
     trial.set_user_attr('profit_factor', round(min(mean_pf, 5), 3))
@@ -555,6 +608,9 @@ def objective(
     trial.set_user_attr('psr', round(float(psr.get('psr', 0.0)), 4))
     trial.set_user_attr('psr_z', round(float(psr.get('z_score', 0.0)), 4))
     trial.set_user_attr('fee_edge_ratio', round(float(mean_fee_edge), 4))
+    trial.set_user_attr('stressed_sharpe', round(float(mean_stressed_sr), 4))
+    trial.set_user_attr('stressed_fee_edge_ratio', round(float(stressed_fee_edge_ratio), 4))
+    trial.set_user_attr('stressed_expectancy', round(float(stressed_expectancy), 6))
     trial.set_user_attr('expectancy', round(float(mean_expectancy), 6))
     trial.set_user_attr('raw_expectancy', round(float(mean_raw_expectancy), 6))
     trial.set_user_attr('expectancy_std', round(float(exp_std), 6))
@@ -563,6 +619,18 @@ def objective(
     trial.set_user_attr('target_trades_per_week', round(float(target_trades_per_week), 2))
     trial.set_user_attr('frequency_ratio', round(float(freq_ratio), 3))
     trial.set_user_attr('fold_metrics', fold_metrics)
+    trial.set_user_attr('stressed_fold_metrics', [
+        {
+            'fold_idx': i,
+            'n_trades': int(r.get('n_trades', 0) or 0),
+            'sharpe': round(float(r.get('sharpe', 0.0) or 0.0), 6),
+            'win_rate': round(float(r.get('win_rate', 0.0) or 0.0), 6),
+            'profit_factor': round(float(r.get('profit_factor', 0.0) or 0.0), 6),
+            'max_drawdown': round(float(r.get('max_drawdown', 0.0) or 0.0), 6),
+            'total_return': round(float(r.get('total_return', 0.0) or 0.0), 6),
+        }
+        for i, r in enumerate(stressed_fold_results)
+    ])
     trial.set_user_attr('fold_constraints', {
         'min_fold_sharpe_hard': float(min_fold_sharpe_hard),
         'min_fold_win_rate': float(min_fold_win_rate),
@@ -826,7 +894,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
-                  target_trades_per_week=1.0, preset_name="none"):
+                  target_trades_per_week=1.0, preset_name="none", enable_fee_stress=True,
+                  fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -882,7 +951,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
                             min_internal_oos_trades=min_internal_oos_trades,
-                            target_trades_per_week=target_trades_per_week)
+                            target_trades_per_week=target_trades_per_week,
+                            enable_fee_stress=enable_fee_stress,
+                            fee_stress_multiplier=fee_stress_multiplier,
+                            fee_blend_normal_weight=fee_blend_normal_weight,
+                            fee_blend_stressed_weight=fee_blend_stressed_weight)
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
                         callbacks=[PlateauStopper(plateau_patience, plateau_min_delta, plateau_warmup)])
     except KeyboardInterrupt: print("\n🛑 Stopped.")
@@ -1008,6 +1081,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
         'params': best.params, 'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
         'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
+        'fee_stress': {
+            'enabled': bool(enable_fee_stress),
+            'multiplier': float(fee_stress_multiplier),
+            'blend_normal_weight': float(fee_blend_normal_weight),
+            'blend_stressed_weight': float(fee_blend_stressed_weight),
+        },
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
         'run_id': run_id,
@@ -1161,6 +1240,14 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-min-return", type=float, default=0.0)
     parser.add_argument("--target-trades-per-week", type=float, default=1.0,
                         help="Trade-frequency objective target used during CV scoring")
+    parser.add_argument("--disable-fee-stress", action="store_true",
+                        help="Disable stressed-fee scoring in CV objective")
+    parser.add_argument("--fee-stress-multiplier", type=float, default=2.0,
+                        help="Multiplier for stressed fee schedule (applies to pct + min contract fee)")
+    parser.add_argument("--fee-blend-normal-weight", type=float, default=0.6,
+                        help="Blend weight for normal-fee fold Sharpe")
+    parser.add_argument("--fee-blend-stressed-weight", type=float, default=0.4,
+                        help="Blend weight for stressed-fee fold Sharpe")
     parser.add_argument("--sampler-seeds", type=str, default="")
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
     args = parser.parse_args(); args = apply_runtime_preset(args)
@@ -1183,4 +1270,8 @@ if __name__ == "__main__":
             holdout_min_trades=args.holdout_min_trades, holdout_min_sharpe=args.holdout_min_sharpe,
             holdout_min_return=args.holdout_min_return,
             target_trades_per_week=args.target_trades_per_week,
+            enable_fee_stress=not args.disable_fee_stress,
+            fee_stress_multiplier=args.fee_stress_multiplier,
+            fee_blend_normal_weight=args.fee_blend_normal_weight,
+            fee_blend_stressed_weight=args.fee_blend_stressed_weight,
             preset_name=args.preset)
