@@ -13,7 +13,7 @@ Usage:
     python optimize.py --all --trials 100 --jobs 16
     python optimize.py --show
 """
-import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time
+import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -91,6 +91,28 @@ def compute_deflated_sharpe(observed_sharpe, n_trades, n_trials=200, skewness=0.
     dsr_z = (observed_sharpe - exp_max_sr) / sr_std
     p = 1 - stats.norm.cdf(dsr_z)
     return {'dsr': round(float(dsr_z),4), 'p_value': round(float(p),4), 'expected_max_sr': round(float(exp_max_sr),4), 'significant_10pct': p < 0.10, 'valid': True}
+
+
+def compute_probabilistic_sharpe(sharpes: List[float], benchmark_sr: float = 0.0) -> dict:
+    """Estimate P(true Sharpe > benchmark) from walk-forward fold sharpes.
+
+    The test is intentionally conservative: it treats each fold Sharpe as one
+    independent out-of-sample estimate and computes a one-sided z-score for the
+    mean Sharpe exceeding `benchmark_sr`.
+    """
+    valid = [float(s) for s in sharpes if s is not None and np.isfinite(s)]
+    if len(valid) < 2:
+        return {'valid': False, 'psr': 0.0, 'z_score': 0.0, 'n_folds': len(valid)}
+
+    mean_sr = float(np.mean(valid))
+    std_sr = float(np.std(valid, ddof=1))
+    if std_sr <= 1e-12:
+        psr = 1.0 if mean_sr > benchmark_sr else 0.0
+        return {'valid': True, 'psr': psr, 'z_score': 999.0 if psr == 1.0 else -999.0, 'n_folds': len(valid)}
+
+    z = (mean_sr - benchmark_sr) / (std_sr / math.sqrt(len(valid)))
+    psr = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    return {'valid': True, 'psr': float(psr), 'z_score': float(z), 'n_folds': len(valid)}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA SPLITTING
@@ -387,6 +409,7 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
         _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return -99.0
 
     sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
+    psr = compute_probabilistic_sharpe(sharpes, benchmark_sr=0.0)
     mean_sr, min_sr = np.mean(sharpes), np.min(sharpes)
     std_sr = np.std(sharpes) if len(sharpes) > 1 else 0.0
     mean_wr = np.mean([r['win_rate'] for r in fold_results])
@@ -416,6 +439,9 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     if mean_raw_expectancy <= 0:
         _set_reject_reason(trial, f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}')
         return -99.0
+    if psr.get('valid') and psr.get('psr', 0.0) < 0.55:
+        _set_reject_reason(trial, f'low_psr:{psr.get("psr", 0.0):.3f}')
+        return -99.0
 
     score = mean_sr
     if std_sr < 0.3 and len(sharpes) >= 2: score += 0.15
@@ -429,6 +455,11 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     if mean_wr > 0.75 and total_trades < 40: score -= 0.3
     if mean_fee_edge > 0.35: score -= min(0.35, (mean_fee_edge - 0.35) * 0.8)
     if exp_std > 0.01: score -= min(0.30, (exp_std - 0.01) * 12)
+    if psr.get('valid'):
+        if psr['psr'] >= 0.80:
+            score += 0.20
+        elif psr['psr'] < 0.60:
+            score -= 0.20
 
     trial.set_user_attr('n_trades', total_trades)
     trial.set_user_attr('n_folds', len(fold_results))
@@ -446,6 +477,8 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     trial.set_user_attr('std_oos_sharpe', round(std_sr, 3))
     trial.set_user_attr('oos_return', round(mean_ret, 4))
     trial.set_user_attr('oos_trades', total_trades)
+    trial.set_user_attr('psr', round(float(psr.get('psr', 0.0)), 4))
+    trial.set_user_attr('psr_z', round(float(psr.get('z_score', 0.0)), 4))
     trial.set_user_attr('fee_edge_ratio', round(float(mean_fee_edge), 4))
     trial.set_user_attr('expectancy', round(float(mean_expectancy), 6))
     trial.set_user_attr('raw_expectancy', round(float(mean_raw_expectancy), 6))

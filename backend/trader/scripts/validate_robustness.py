@@ -334,6 +334,11 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
             'cv_consistent', cv_consistency['consistent'], 15.0,
             f"CV {cv_consistency['checks_passed']}/{cv_consistency['checks_total']} passed"))
 
+    psr = float(optim_metrics.get('psr', 0.0) or 0.0)
+    checks.append(ReadinessCheck(
+        'psr_confident', psr >= 0.60, 10.0,
+        f"PSR={psr:.2f} (need >=0.60)"))
+
     ho_sharpe = holdout_metrics.get('holdout_sharpe', 0)
     ho_trades = holdout_metrics.get('holdout_trades', 0)
     ho_return = holdout_metrics.get('holdout_return', 0)

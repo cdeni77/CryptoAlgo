@@ -22,8 +22,9 @@ class EngineState:
 
 
 class PaperTradingEngine:
-    def __init__(self, poll_seconds: float = 2.0):
+    def __init__(self, poll_seconds: float = 2.0, max_signal_age_minutes: float = 30.0):
         self.poll_seconds = poll_seconds
+        self.max_signal_age_minutes = max_signal_age_minutes
         self.writer = PgWriter()
         self.config = Config()
         self.state = EngineState()
@@ -34,14 +35,50 @@ class PaperTradingEngine:
             return base_price * (1.0 + slip)
         return base_price * (1.0 - slip)
 
+    def _signal_is_fresh(self, signal) -> bool:
+        if signal.timestamp is None:
+            return False
+        signal_ts = signal.timestamp
+        if signal_ts.tzinfo is None:
+            signal_ts = signal_ts.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - signal_ts).total_seconds() / 60.0
+        return age_minutes <= self.max_signal_age_minutes
+
     def _simulate_fill(self, signal) -> None:
         if signal.direction not in {"long", "short"}:
+            return
+        if not self._signal_is_fresh(signal):
+            logger.info("skipping stale signal id=%s (%s)", signal.id, signal.coin)
+            self.writer.mark_signal_acted(signal.id)
             return
 
         side = signal.direction
         direction = 1 if side == "long" else -1
         price = float(signal.price_at_signal or 0)
         if price <= 0:
+            return
+
+        confidence = float(signal.confidence or 0.0)
+        if confidence < self.config.signal_threshold:
+            logger.info(
+                "skipping low-confidence signal id=%s coin=%s conf=%.3f<th=%.3f",
+                signal.id,
+                signal.coin,
+                confidence,
+                self.config.signal_threshold,
+            )
+            self.writer.mark_signal_acted(signal.id)
+            return
+
+        open_positions = self.writer.count_open_positions()
+        if open_positions >= self.config.max_positions:
+            logger.info("max open positions reached (%s), skipping signal id=%s", open_positions, signal.id)
+            return
+
+        open_position = self.writer.get_open_paper_position(signal.coin)
+        if open_position and open_position.side == side:
+            logger.info("same-side position already open for %s, skipping pyramiding signal id=%s", signal.coin, signal.id)
+            self.writer.mark_signal_acted(signal.id)
             return
 
         contracts = signal.contracts_suggested or calculate_n_contracts(
@@ -55,6 +92,13 @@ class PaperTradingEngine:
 
         spec = get_contract_spec(signal.coin)
         notional = contracts * spec["units"] * price
+        max_notional = max(self.state.cash_balance, 100.0) * self.config.leverage
+        if notional > max_notional:
+            contracts = int(max_notional / max(spec["units"] * price, 1e-9))
+            if contracts <= 0:
+                return
+            notional = contracts * spec["units"] * price
+
         fee = calculate_coinbase_fee(contracts, price, signal.coin, self.config)
         fill_price = self._fill_price(price, side)
 
@@ -78,10 +122,9 @@ class PaperTradingEngine:
             slippage_bps=self.config.slippage_bps,
         )
 
-        open_position = self.writer.get_open_paper_position(signal.coin)
         if open_position and open_position.side != side:
             close_dir = 1 if open_position.side == "long" else -1
-            _, _, _, pnl_dollars, close_notional = calculate_pnl_exact(
+            _, _, _, pnl_dollars, _ = calculate_pnl_exact(
                 entry_price=open_position.entry_price,
                 exit_price=fill_price,
                 direction=close_dir,
@@ -140,10 +183,14 @@ class PaperTradingEngine:
 def main() -> None:
     parser = argparse.ArgumentParser(description="paper trading engine")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument("--max-signal-age-minutes", type=float, default=30.0)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    PaperTradingEngine(poll_seconds=args.poll_seconds).run_forever()
+    PaperTradingEngine(
+        poll_seconds=args.poll_seconds,
+        max_signal_age_minutes=args.max_signal_age_minutes,
+    ).run_forever()
 
 
 if __name__ == "__main__":
