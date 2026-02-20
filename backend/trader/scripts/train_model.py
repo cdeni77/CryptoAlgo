@@ -742,7 +742,7 @@ def run_backtest(all_data: Dict, config: Config,
         print(f"   Regime filtered: {regime_filtered}")
         print(f"   No contracts (too small): {no_contracts}")
         return {'n_trades': 0, 'sharpe_annual': -99, 'total_return': -1, 'max_drawdown': 1.0,
-                'profit_factor': 0, 'ann_return': -1, 'final_equity': equity}
+                'profit_factor': 0, 'ann_return': -1, 'final_equity': equity, 'trade_pnls': []}
 
     df = pd.DataFrame([t.__dict__ for t in completed_trades])
     win_rate = (df['net_pnl'] > 0).mean()
@@ -876,6 +876,7 @@ def run_backtest(all_data: Dict, config: Config,
         'oos_trades': int(len(oos_df)),
         'oos_sharpe': oos_sharpe,
         'oos_return': oos_return,
+        'trade_pnls': [float(x) for x in df['pnl_dollars'].tolist()],
     }
 
 

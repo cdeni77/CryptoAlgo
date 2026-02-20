@@ -115,7 +115,7 @@ def split_data_temporal(all_data, holdout_days=180):
         if len(feat) > 500: holdout_data[sym] = {'features': feat.copy(), 'ohlcv': ohlcv.copy()}
     return optim_data, holdout_data
 
-def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120):
+def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days=2):
     """Anchored walk-forward CV splits. Returns [(train_end, test_start, test_end), ...]"""
     ohlcv = data[target_sym]['ohlcv']
     start, end = ohlcv.index.min(), ohlcv.index.max()
@@ -129,10 +129,14 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120):
     test_zone_start = start + pd.Timedelta(days=min_train_days)
     fold_days = (end - test_zone_start).days // n_folds
     splits = []
+    purge_delta = pd.Timedelta(days=max(0, purge_days))
     for i in range(n_folds):
         ts = test_zone_start + pd.Timedelta(days=i * fold_days)
         te = ts + pd.Timedelta(days=fold_days) if i < n_folds - 1 else end
-        splits.append((ts, ts, te))
+        train_end = ts - purge_delta
+        if train_end <= start + pd.Timedelta(days=min_train_days):
+            train_end = ts
+        splits.append((train_end, ts, te))
     return splits
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -200,7 +204,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
                 net = raw - fee_rt
                 notional = equity * profile.position_size * config.leverage
                 pnl_d = net * notional
-                completed_trades.append({'net_pnl': net, 'pnl_dollars': pnl_d, 'exit_reason': exit_reason})
+                completed_trades.append({'raw_pnl': raw, 'net_pnl': net, 'pnl_dollars': pnl_d, 'exit_reason': exit_reason})
                 equity += pnl_d
                 peak_equity = max(peak_equity, equity)
                 last_exit = ts
@@ -255,6 +259,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
                 'max_drawdown': 1.0, 'ann_return': -1.0, 'total_return': equity/100000-1, 'trades_per_year': 0}
 
     pnls = [t['net_pnl'] for t in completed_trades]
+    raw_pnls = [t['raw_pnl'] for t in completed_trades]
     pnl_d = [t['pnl_dollars'] for t in completed_trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
@@ -276,10 +281,14 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     tpd = n / test_days
     ann_sr = sr * np.sqrt(tpd * 252) if tpd > 0 else 0.0
 
+    avg_raw = float(np.mean(raw_pnls)) if raw_pnls else 0.0
+    fee_edge_ratio = abs((avg_raw - avg) / avg_raw) if abs(avg_raw) > 1e-9 else 1.0
+
     return {'n_trades': n, 'sharpe': round(ann_sr, 4), 'win_rate': round(wr, 4),
             'profit_factor': round(min(pf, 5.0), 4), 'max_drawdown': round(dd, 4),
             'ann_return': round(ann_ret, 4), 'total_return': round(total_ret, 4),
-            'trades_per_year': round(tpy, 1), 'avg_pnl': round(avg, 6)}
+            'trades_per_year': round(tpy, 1), 'avg_pnl': round(avg, 6),
+            'avg_raw_pnl': round(avg_raw, 6), 'fee_edge_ratio': round(float(fee_edge_ratio), 4)}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TRIAL PROFILE (9 tunable params)
@@ -290,18 +299,32 @@ FIXED_RISK = {'position_size': 0.12, 'vol_sizing_target': 0.025, 'cooldown_hours
 
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+
+    def clamp(v, low, high):
+        return max(low, min(high, v))
+
+    base_threshold = bp.signal_threshold if bp else 0.75
+    base_fwd = bp.label_forward_hours if bp else 24
+    base_label_vol = bp.label_vol_target if bp else 1.8
+    base_mom = bp.min_momentum_magnitude if bp else 0.06
+    base_tp = bp.vol_mult_tp if bp else 5.0
+    base_sl = bp.vol_mult_sl if bp else 3.0
+    base_hold = bp.max_hold_hours if bp else 72
+    base_min_vol = bp.min_vol_24h if bp else 0.008
+    base_max_vol = bp.max_vol_24h if bp else 0.06
+
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
         extra_features=get_extra_features(coin_name),
-        signal_threshold=trial.suggest_float('signal_threshold', 0.65, 0.85, step=0.02),
-        label_forward_hours=trial.suggest_int('label_forward_hours', 12, 48, step=12),
-        label_vol_target=trial.suggest_float('label_vol_target', 1.2, 2.4, step=0.3),
-        min_momentum_magnitude=trial.suggest_float('min_momentum_magnitude', 0.02, 0.10, step=0.02),
-        vol_mult_tp=trial.suggest_float('vol_mult_tp', 3.0, 7.0, step=1.0),
-        vol_mult_sl=trial.suggest_float('vol_mult_sl', 2.0, 4.0, step=0.5),
-        max_hold_hours=trial.suggest_int('max_hold_hours', 36, 96, step=12),
-        min_vol_24h=trial.suggest_float('min_vol_24h', 0.005, 0.015, step=0.005),
-        max_vol_24h=trial.suggest_float('max_vol_24h', 0.04, 0.08, step=0.02),
+        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.10, 0.62, 0.88), clamp(base_threshold + 0.08, 0.68, 0.90), step=0.01),
+        label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
+        label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
+        min_momentum_magnitude=trial.suggest_float('min_momentum_magnitude', clamp(base_mom - 0.04, 0.01, 0.12), clamp(base_mom + 0.04, 0.03, 0.14), step=0.01),
+        vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 2.0, 2.0, 8.0), clamp(base_tp + 2.0, 3.0, 9.0), step=0.5),
+        vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 1.5, 5.0), clamp(base_sl + 1.0, 2.0, 5.5), step=0.5),
+        max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
+        min_vol_24h=trial.suggest_float('min_vol_24h', clamp(base_min_vol - 0.004, 0.003, 0.02), clamp(base_min_vol + 0.004, 0.006, 0.024), step=0.001),
+        max_vol_24h=trial.suggest_float('max_vol_24h', clamp(base_max_vol - 0.02, 0.03, 0.10), clamp(base_max_vol + 0.02, 0.05, 0.12), step=0.005),
         cooldown_hours=FIXED_RISK['cooldown_hours'], position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
@@ -334,7 +357,7 @@ def profile_from_params(params, coin_name):
 # OBJECTIVE + STOPPER + SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym):
+def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, min_internal_oos_trades=0):
     profile = create_trial_profile(trial, coin_name)
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10, train_embargo_hours=24)
     features = optim_data[target_sym]['features']
@@ -348,6 +371,8 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym):
 
     if len(fold_results) < max(1, len(cv_splits) // 2):
         _set_reject_reason(trial, f'too_few_folds:{len(fold_results)}/{len(cv_splits)}'); return -99.0
+    if min_internal_oos_trades > 0 and any(int(r.get('n_trades', 0) or 0) < min_internal_oos_trades for r in fold_results):
+        _set_reject_reason(trial, f'too_few_internal_oos_trades:{min_internal_oos_trades}'); return -99.0
     if total_trades < 20:
         _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return -99.0
 
@@ -358,6 +383,8 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym):
     mean_dd = np.mean([r['max_drawdown'] for r in fold_results])
     mean_pf = np.mean([r['profit_factor'] for r in fold_results])
     mean_ret = np.mean([r['total_return'] for r in fold_results])
+    mean_fee_edge = np.mean([r.get('fee_edge_ratio', 1.0) for r in fold_results])
+    exp_std = np.std([r.get('avg_pnl', 0.0) for r in fold_results]) if len(fold_results) > 1 else 0.0
 
     score = mean_sr
     if std_sr < 0.3 and len(sharpes) >= 2: score += 0.15
@@ -370,6 +397,8 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym):
     if avg_tc < 5: score -= 0.5
     elif avg_tc < 8: score -= 0.2
     if mean_wr > 0.75 and total_trades < 40: score -= 0.3
+    if mean_fee_edge > 0.35: score -= min(0.35, (mean_fee_edge - 0.35) * 0.8)
+    if exp_std > 0.01: score -= min(0.30, (exp_std - 0.01) * 12)
 
     trial.set_user_attr('n_trades', total_trades)
     trial.set_user_attr('n_folds', len(fold_results))
@@ -387,6 +416,8 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym):
     trial.set_user_attr('std_oos_sharpe', round(std_sr, 3))
     trial.set_user_attr('oos_return', round(mean_ret, 4))
     trial.set_user_attr('oos_trades', total_trades)
+    trial.set_user_attr('fee_edge_ratio', round(float(mean_fee_edge), 4))
+    trial.set_user_attr('expectancy_std', round(float(exp_std), 6))
     tpy = np.mean([r['trades_per_year'] for r in fold_results])
     trial.set_user_attr('trades_per_month', round(tpy / 12.0, 1))
     ann_ret = np.mean([r['ann_return'] for r in fold_results])
@@ -453,10 +484,15 @@ def assess_result_quality(rd):
     m, h, dsr = rd.get('optim_metrics', {}), rd.get('holdout_metrics', {}), rd.get('deflated_sharpe', {})
     nt = int(m.get('n_trades', 0) or 0); sr = _finite_metric(m.get('mean_sharpe', m.get('sharpe', 0)))
     dd = _finite_metric(m.get('max_drawdown', 1), 1); ho_sr = _finite_metric(h.get('holdout_sharpe', 0))
+    ho_ret = _finite_metric(h.get('holdout_return', 0), 0)
+    ho_trades = int(h.get('holdout_trades', 0) or 0)
     if nt < 20: issues.append(f'low_trades:{nt}')
     if sr < 0: issues.append(f'neg_sharpe:{sr:.3f}')
     if dd > 0.30: issues.append(f'high_dd:{dd:.1%}')
-    if int(h.get('holdout_trades', 0) or 0) > 0 and ho_sr < -0.2: issues.append(f'bad_holdout:{ho_sr:.3f}')
+    if ho_trades > 0:
+        if ho_trades < 15: issues.append(f'holdout_too_few_trades:{ho_trades}')
+        if ho_sr <= 0: issues.append(f'bad_holdout_sharpe:{ho_sr:.3f}')
+        if ho_ret <= 0: issues.append(f'bad_holdout_return:{ho_ret:.3%}')
     if not issues and len(warns) <= 1: rating = 'GOOD'
     elif not issues: rating = 'ACCEPTABLE'
     elif len(issues) <= 1: rating = 'MARGINAL'
@@ -479,7 +515,8 @@ def _persist_result_json(coin_name, data):
 def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
                   study_suffix="", resume_study=False, holdout_days=180,
-                  min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3):
+                  min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3,
+                  sampler_seed=42):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -488,7 +525,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     optim_start, optim_end = ohlcv.index.min(), ohlcv.index.max()
     holdout_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
     holdout_end = holdout_data[holdout_sym]['ohlcv'].index.max() if holdout_sym else optim_end
-    cv_splits = create_cv_splits(optim_data, target_sym, n_folds=n_cv_folds)
+    cv_splits = create_cv_splits(optim_data, target_sym, n_folds=n_cv_folds, purge_days=2)
 
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} — v11.1 FAST CV")
@@ -500,7 +537,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"{'='*60}")
 
     study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
-    sampler = TPESampler(seed=42, n_startup_trials=min(10, n_trials // 3))
+    sampler = TPESampler(seed=sampler_seed, n_startup_trials=min(10, n_trials // 3))
     study = None
     for attempt in range(3):
         try:
@@ -514,7 +551,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     if not study: print("❌ Could not create study"); return None
 
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
-                            coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym)
+                            coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
+                            min_internal_oos_trades=min_internal_oos_trades)
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
                         callbacks=[PlateauStopper(plateau_patience, plateau_min_delta, plateau_warmup)])
     except KeyboardInterrupt: print("\n🛑 Stopped.")
@@ -557,6 +595,65 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"  )")
     return result_data
 
+
+def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None, **kwargs):
+    seeds = [int(s) for s in (sampler_seeds or [42])]
+    if len(seeds) <= 1:
+        return optimize_coin(all_data, coin_prefix, coin_name, sampler_seed=seeds[0], **kwargs)
+
+    print(f"\n🌱 Multi-seed optimization for {coin_name}: seeds={seeds}")
+    run_results = []
+    base_suffix = kwargs.get('study_suffix', '')
+    for seed in seeds:
+        seed_kwargs = dict(kwargs)
+        seed_kwargs['study_suffix'] = f"{base_suffix}_s{seed}" if base_suffix else f"s{seed}"
+        r = optimize_coin(all_data, coin_prefix, coin_name, sampler_seed=seed, **seed_kwargs)
+        if r:
+            run_results.append(r)
+
+    if not run_results:
+        return None
+
+    qualified = [
+        r for r in run_results
+        if r.get('holdout_metrics', {}).get('holdout_trades', 0) >= 15
+        and r.get('holdout_metrics', {}).get('holdout_sharpe', 0) > 0
+        and r.get('holdout_metrics', {}).get('holdout_return', 0) > 0
+    ]
+    pool = qualified or run_results
+
+    params_pool = [r.get('params', {}) for r in pool if r.get('params')]
+    consensus_params = {}
+    if params_pool:
+        keys = set().union(*[p.keys() for p in params_pool])
+        for k in keys:
+            vals = [p[k] for p in params_pool if k in p]
+            if not vals:
+                continue
+            if all(isinstance(v, (int, float)) for v in vals):
+                med = float(np.median(vals))
+                if all(isinstance(v, int) for v in vals):
+                    consensus_params[k] = int(round(med))
+                else:
+                    consensus_params[k] = round(med, 6)
+            else:
+                consensus_params[k] = max(set(vals), key=vals.count)
+
+    best_seed_result = max(pool, key=lambda r: _finite_metric(r.get('optim_score', -99), -99))
+    if consensus_params:
+        best_seed_result['params'] = consensus_params
+        best_seed_result.setdefault('meta', {})['seed_consensus'] = {
+            'seeds': seeds,
+            'qualified_runs': len(qualified),
+            'total_runs': len(run_results),
+        }
+        best_seed_result['quality'] = assess_result_quality(best_seed_result)
+        p = _persist_result_json(coin_name, best_seed_result)
+        if p:
+            print(f"  💾 Consensus result saved to {p}")
+
+    return best_seed_result
+
 def show_results():
     results = []
     for d in _candidate_results_dirs():
@@ -594,6 +691,8 @@ if __name__ == "__main__":
     parser.add_argument("--preset", type=str, default="robust180", choices=["none","robust120","robust180","quick"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=3); parser.add_argument("--study-suffix", type=str, default="")
+    parser.add_argument("--sampler-seed", type=int, default=42)
+    parser.add_argument("--sampler-seeds", type=str, default="")
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
     args = parser.parse_args(); args = apply_runtime_preset(args)
     if args.debug_trials: DEBUG_TRIALS = True
@@ -603,8 +702,10 @@ if __name__ == "__main__":
     if not all_data: print("❌ No data."); sys.exit(1)
     coins = list(dict.fromkeys(COIN_MAP.values())) if args.all else [COIN_MAP.get(args.coin.upper(), args.coin.upper())] if args.coin else []
     if not coins: parser.print_help(); sys.exit(1)
+    seeds = [int(s.strip()) for s in args.sampler_seeds.split(',') if s.strip()] if args.sampler_seeds else [args.sampler_seed]
     for cn in coins:
-        optimize_coin(all_data, PREFIX_FOR_COIN.get(cn, cn), cn, n_trials=args.trials, n_jobs=args.jobs,
+        optimize_coin_multiseed(all_data, PREFIX_FOR_COIN.get(cn, cn), cn, sampler_seeds=seeds,
+            n_trials=args.trials, n_jobs=args.jobs,
             plateau_patience=args.plateau_patience, plateau_min_delta=args.plateau_min_delta,
             plateau_warmup=args.plateau_warmup, study_suffix=args.study_suffix, resume_study=args.resume,
             holdout_days=args.holdout_days, min_internal_oos_trades=args.min_internal_oos_trades,

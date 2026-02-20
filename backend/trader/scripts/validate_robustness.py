@@ -340,8 +340,8 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
 
     if ho_trades > 0:
         checks.append(ReadinessCheck(
-            'holdout_positive', ho_sharpe > 0 and ho_return > -0.02, 10.0,
-            f"Holdout SR={ho_sharpe:.3f}, ret={ho_return:.2%}"))
+            'holdout_positive', ho_trades >= 15 and ho_sharpe > 0 and ho_return > 0, 10.0,
+            f"Holdout trades={ho_trades}, SR={ho_sharpe:.3f}, ret={ho_return:.2%}"))
 
     n_trades = int(optim_metrics.get('n_trades', 0) or 0)
     checks.append(ReadinessCheck(
@@ -424,22 +424,8 @@ def run_validation(coin_name, optimization_result, all_data):
     sharpe = float(result.get('sharpe_annual', 0) or 0)
     if sharpe <= -90: sharpe = 0.0
 
-    # Synthesize trade PnLs
-    avg_pnl = float(result.get('avg_net_pnl', 0) or 0)
-    win_rate = float(result.get('win_rate', 0) or 0)
-    avg_notional = 100_000.0 * 0.12 * 4
-
-    trade_pnls = np.array([])
-    if n_trades >= 10:
-        rng = np.random.default_rng(42)
-        n_wins = int(n_trades * win_rate)
-        n_losses = n_trades - n_wins
-        avg_win = max(avg_pnl * 1.5, 0.001) if avg_pnl > 0 else 0.005
-        avg_loss = min(avg_pnl * 0.8 if avg_pnl < 0 else -0.003, -0.001)
-        win_pnls = rng.normal(avg_win * avg_notional, abs(avg_win * avg_notional) * 0.3, max(1, n_wins))
-        loss_pnls = rng.normal(avg_loss * avg_notional, abs(avg_loss * avg_notional) * 0.3, max(1, n_losses))
-        trade_pnls = np.concatenate([win_pnls, loss_pnls])
-        rng.shuffle(trade_pnls)
+    # Use real trade-level PnLs from backtest when available
+    trade_pnls = np.array(result.get('trade_pnls', []) or [], dtype=float)
 
     # 1. MC Shuffle
     print(f"  🎲 Monte Carlo shuffle...")
