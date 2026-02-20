@@ -49,6 +49,10 @@ python -m scripts.parallel_launch \
   --validation-timeout-scale 1.8 \
   --validation-timeout-cap 9000
 
+# Optional if you want validation to run to completion no matter how long
+# (recommended overnight or when you can afford long runtime):
+# python -m scripts.parallel_launch --validate-only --coins BTC,ETH,SOL,XRP,DOGE --validation-no-timeout
+
 # 2) Re-optimize likely survivors with stronger robustness assumptions
 python -m scripts.parallel_launch \
   --coins ETH,DOGE,SOL \
@@ -58,6 +62,7 @@ python -m scripts.parallel_launch \
   --validation-jobs 2 \
   --validation-timeout-scale 2.0 \
   --validation-timeout-cap 9000
+
 ```
 
 ## Promotion criteria for paper trading tonight

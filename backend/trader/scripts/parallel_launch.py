@@ -396,6 +396,8 @@ if __name__ == "__main__":
                         help="Maximum per-coin validation timeout in seconds")
     parser.add_argument("--validation-fast", action="store_true",
                         help="Run faster robustness checks (lower MC simulation counts)")
+    parser.add_argument("--validation-no-timeout", action="store_true",
+                        help="Disable per-coin validation timeout (run until completion)")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -600,7 +602,7 @@ if __name__ == "__main__":
                         stderr=subprocess.PIPE if not sys.stderr.isatty() else None,
                         text=True,
                     )
-                    running[coin] = {'proc': proc, 'start': time.time(), 'timeout': timeout_s}
+                    running[coin] = {'proc': proc, 'start': time.time(), 'timeout': (None if args.validation_no_timeout else timeout_s)}
 
                 time.sleep(1)
                 finished = []
@@ -614,7 +616,7 @@ if __name__ == "__main__":
                             print(f"   ❌ Validation failed for {coin}")
                             if err:
                                 print(f"      {err[:500]}")
-                    elif elapsed > info['timeout']:
+                    elif info['timeout'] is not None and elapsed > info['timeout']:
                         proc.kill()
                         finished.append(coin)
                         print(f"   ⏰ Validation timed out for {coin} after {int(info['timeout'])}s")
