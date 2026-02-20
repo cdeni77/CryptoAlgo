@@ -4,7 +4,7 @@ optimize.py — Per-coin Optuna parameter optimization (v11.1: Fast CV).
 
 v11.1: CRITICAL PERFORMANCE FIX
   v11.0 called run_backtest() 3x per trial (~30 min/trial = 50h for 100 trials).
-  v11.1 uses fast_evaluate_fold() which trains ONE model per fold and simulates
+  v11.3 uses fast_evaluate_fold() which trains ONE model per fold and simulates
   trading directly (~2s/fold). run_backtest() only used for final holdout.
   Expected: 100 trials in ~30-60 minutes instead of 50 hours.
 
@@ -37,7 +37,8 @@ from scripts.train_model import (
 )
 from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
-    BTC_EXTRA_FEATURES, SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
+    BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
+    SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
 )
 
 warnings.filterwarnings('ignore')
@@ -63,7 +64,13 @@ def init_db_wal(db_name="optuna_trading.db"):
     except Exception as e: print(f"⚠️ WAL mode failed: {e}")
 
 def get_extra_features(coin_name):
-    return {'BTC': BTC_EXTRA_FEATURES, 'SOL': SOL_EXTRA_FEATURES, 'DOGE': DOGE_EXTRA_FEATURES}.get(coin_name, [])
+    return {
+        'BTC': BTC_EXTRA_FEATURES,
+        'ETH': ETH_EXTRA_FEATURES,
+        'XRP': XRP_EXTRA_FEATURES,
+        'SOL': SOL_EXTRA_FEATURES,
+        'DOGE': DOGE_EXTRA_FEATURES,
+    }.get(coin_name, [])
 
 def _as_number(value, default=None):
     if value is None: return default
@@ -319,7 +326,16 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
 # ═══════════════════════════════════════════════════════════════════════════
 
 FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
-FIXED_RISK = {'position_size': 0.12, 'vol_sizing_target': 0.025, 'cooldown_hours': 24.0, 'min_val_auc': 0.53}
+FIXED_RISK = {'position_size': 0.12, 'vol_sizing_target': 0.025, 'min_val_auc': 0.53}
+
+COIN_OPTIMIZATION_PRIORS = {
+    # target_trades_per_year ~= at least weekly cadence while preserving quality
+    'BTC': {'target_trades_per_year': 56.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0},
+    'ETH': {'target_trades_per_year': 64.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0},
+    'SOL': {'target_trades_per_year': 72.0, 'cooldown_min': 6.0, 'cooldown_max': 30.0},
+    'XRP': {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0},
+    'DOGE': {'target_trades_per_year': 52.0, 'cooldown_min': 10.0, 'cooldown_max': 42.0},
+}
 
 COIN_OBJECTIVE_GUARDS = {
     'BTC': {'min_total_trades': 16, 'min_avg_trades_per_fold': 4.0, 'min_expectancy': 0.0002},
@@ -331,6 +347,7 @@ COIN_OBJECTIVE_GUARDS = {
 
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, {})
 
     def clamp(v, low, high):
         return max(low, min(high, v))
@@ -344,6 +361,9 @@ def create_trial_profile(trial, coin_name):
     base_hold = bp.max_hold_hours if bp else 72
     base_min_vol = bp.min_vol_24h if bp else 0.008
     base_max_vol = bp.max_vol_24h if bp else 0.06
+    base_cooldown = bp.cooldown_hours if bp else 24.0
+    cooldown_min = float(priors.get('cooldown_min', max(4.0, base_cooldown - 12.0)))
+    cooldown_max = float(priors.get('cooldown_max', min(72.0, base_cooldown + 18.0)))
 
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
@@ -357,7 +377,8 @@ def create_trial_profile(trial, coin_name):
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
         min_vol_24h=trial.suggest_float('min_vol_24h', clamp(base_min_vol - 0.004, 0.003, 0.02), clamp(base_min_vol + 0.004, 0.006, 0.024), step=0.001),
         max_vol_24h=trial.suggest_float('max_vol_24h', clamp(base_max_vol - 0.02, 0.03, 0.10), clamp(base_max_vol + 0.02, 0.05, 0.12), step=0.005),
-        cooldown_hours=FIXED_RISK['cooldown_hours'], position_size=FIXED_RISK['position_size'],
+        cooldown_hours=trial.suggest_float('cooldown_hours', cooldown_min, cooldown_max, step=2.0),
+        position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
         learning_rate=FIXED_ML['learning_rate'], min_child_samples=FIXED_ML['min_child_samples'],
@@ -389,7 +410,16 @@ def profile_from_params(params, coin_name):
 # OBJECTIVE + STOPPER + SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, min_internal_oos_trades=0):
+def objective(
+    trial,
+    optim_data,
+    coin_prefix,
+    coin_name,
+    cv_splits,
+    target_sym,
+    min_internal_oos_trades=0,
+    target_trades_per_week=1.0,
+):
     profile = create_trial_profile(trial, coin_name)
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10, train_embargo_hours=24)
     features = optim_data[target_sym]['features']
@@ -420,6 +450,7 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     mean_expectancy = np.mean([r.get('avg_pnl', 0.0) for r in fold_results])
     mean_raw_expectancy = np.mean([r.get('avg_raw_pnl', 0.0) for r in fold_results])
     exp_std = np.std([r.get('avg_pnl', 0.0) for r in fold_results]) if len(fold_results) > 1 else 0.0
+    tpy = np.mean([r.get('trades_per_year', 0.0) for r in fold_results])
 
     guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
     guard_min_trades = int(guards.get('min_total_trades', 20))
@@ -461,6 +492,13 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
         elif psr['psr'] < 0.60:
             score -= 0.20
 
+    target_tpy = max(1.0, float(target_trades_per_week) * 52.0)
+    freq_ratio = (tpy / target_tpy) if target_tpy > 0 else 1.0
+    if freq_ratio < 1.0:
+        score -= min(0.60, (1.0 - freq_ratio) * 0.8)
+    elif freq_ratio >= 1.15:
+        score += min(0.20, (freq_ratio - 1.0) * 0.15)
+
     trial.set_user_attr('n_trades', total_trades)
     trial.set_user_attr('n_folds', len(fold_results))
     trial.set_user_attr('mean_sharpe', round(mean_sr, 3))
@@ -483,8 +521,10 @@ def objective(trial, optim_data, coin_prefix, coin_name, cv_splits, target_sym, 
     trial.set_user_attr('expectancy', round(float(mean_expectancy), 6))
     trial.set_user_attr('raw_expectancy', round(float(mean_raw_expectancy), 6))
     trial.set_user_attr('expectancy_std', round(float(exp_std), 6))
-    tpy = np.mean([r['trades_per_year'] for r in fold_results])
     trial.set_user_attr('trades_per_month', round(tpy / 12.0, 1))
+    trial.set_user_attr('trades_per_year', round(tpy, 1))
+    trial.set_user_attr('target_trades_per_week', round(float(target_trades_per_week), 2))
+    trial.set_user_attr('frequency_ratio', round(float(freq_ratio), 3))
     ann_ret = np.mean([r['ann_return'] for r in fold_results])
     trial.set_user_attr('ann_return', round(ann_ret, 4))
     trial.set_user_attr('calmar', round(min(ann_ret / mean_dd if mean_dd > 0.01 else 0, 10.0), 3))
@@ -578,6 +618,15 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
 
     return score + 0.10 * (_as_number(cv_score, 0.0) or 0.0)
 
+
+def _passes_holdout_gate(holdout_metrics, min_trades=15, min_sharpe=0.0, min_return=0.0):
+    if not holdout_metrics:
+        return False
+    ho_trades = int(holdout_metrics.get('holdout_trades', 0) or 0)
+    ho_sr = _as_number(holdout_metrics.get('holdout_sharpe'), 0.0) or 0.0
+    ho_ret = _as_number(holdout_metrics.get('holdout_return'), 0.0) or 0.0
+    return ho_trades >= int(min_trades) and ho_sr >= float(min_sharpe) and ho_ret >= float(min_return)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # HOLDOUT (full run_backtest — called ONCE at the end)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -646,7 +695,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
                   study_suffix="", resume_study=False, holdout_days=180,
                   min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3,
-                  sampler_seed=42, holdout_candidates=3):
+                  sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
+                  holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
+                  target_trades_per_week=1.0):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -658,9 +709,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     cv_splits = create_cv_splits(optim_data, target_sym, n_folds=n_cv_folds, purge_days=2)
 
     print(f"\n{'='*60}")
-    print(f"🚀 OPTIMIZING {coin_name} — v11.1 FAST CV")
+    print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
-    print(f"   CV folds: {len(cv_splits)} | Params: 9 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
+    print(f"   CV folds: {len(cv_splits)} | Params: 10 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     for i, (tb, ts, te) in enumerate(cv_splits):
         print(f"     Fold {i}: train→{tb.date()} | test {ts.date()}→{te.date()}")
     print(f"   Est: ~{n_trials * len(cv_splits) * 3 / 60 / max(n_jobs,1):.0f} min")
@@ -701,7 +752,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
-                            min_internal_oos_trades=min_internal_oos_trades)
+                            min_internal_oos_trades=min_internal_oos_trades,
+                            target_trades_per_week=target_trades_per_week)
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
                         callbacks=[PlateauStopper(plateau_patience, plateau_min_delta, plateau_warmup)])
     except KeyboardInterrupt: print("\n🛑 Stopped.")
@@ -722,6 +774,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
     holdout_result = None
     selection_meta = {}
+    deployment_blocked = False
+    blocked_reasons = []
+    effective_holdout_min_trades = max(
+        int(holdout_min_trades),
+        int((max(0.1, float(target_trades_per_week)) * max(7, int(holdout_days)) / 7.0) * 0.60),
+    )
     if holdout_data and holdout_sym:
         candidate_trials = _candidate_trials_for_holdout(
             study,
@@ -747,7 +805,24 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
         if ranked_candidates:
             ranked_candidates.sort(key=lambda x: x[2], reverse=True)
-            selected_trial, holdout_result, selected_score = ranked_candidates[0]
+            passing_candidates = [
+                (c, m, sc) for c, m, sc in ranked_candidates
+                if _passes_holdout_gate(
+                    m,
+                    min_trades=effective_holdout_min_trades,
+                    min_sharpe=holdout_min_sharpe,
+                    min_return=holdout_min_return,
+                )
+            ]
+            selected_pool = passing_candidates if require_holdout_pass else ranked_candidates
+            selected_trial, holdout_result, selected_score = selected_pool[0] if selected_pool else (None, None, None)
+            if require_holdout_pass and not passing_candidates:
+                deployment_blocked = True
+                blocked_reasons.append(
+                    f"holdout_gate_failed:trades>={effective_holdout_min_trades},sr>={holdout_min_sharpe},ret>={holdout_min_return}"
+                )
+                print("  🛑 Holdout gate failed for all candidates. Blocking deployment for this coin.")
+                selected_trial, holdout_result, selected_score = ranked_candidates[0]
             if selected_trial.number != best.number:
                 print(
                     f"  🧭 Holdout-guided selection: #{selected_trial.number} "
@@ -757,8 +832,17 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             selection_meta = {
                 'mode': 'holdout_guided',
                 'n_candidates': len(ranked_candidates),
+                'n_passing_candidates': len(passing_candidates),
                 'selected_trial': int(best.number),
                 'selected_score': round(float(selected_score), 6),
+                'require_holdout_pass': bool(require_holdout_pass),
+                'holdout_gate': {
+                    'min_trades': int(holdout_min_trades),
+                    'effective_min_trades': int(effective_holdout_min_trades),
+                    'min_sharpe': float(holdout_min_sharpe),
+                    'min_return': float(holdout_min_return),
+                },
+                'deployment_blocked': bool(deployment_blocked),
                 'candidates': [
                     {
                         'trial': int(c.number),
@@ -766,6 +850,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                         'holdout_sharpe': round(float(m.get('holdout_sharpe', 0.0) or 0.0), 6),
                         'holdout_return': round(float(m.get('holdout_return', 0.0) or 0.0), 6),
                         'holdout_trades': int(m.get('holdout_trades', 0) or 0),
+                        'passes_gate': _passes_holdout_gate(
+                            m,
+                            min_trades=effective_holdout_min_trades,
+                            min_sharpe=holdout_min_sharpe,
+                            min_return=holdout_min_return,
+                        ),
                     }
                     for c, m, sc in ranked_candidates
                 ],
@@ -780,8 +870,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     result_data = {'coin': coin_name, 'prefix': coin_prefix, 'optim_score': best.value,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
         'params': best.params, 'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
-        'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.2', 'timestamp': datetime.now().isoformat(),
-        'selection_meta': selection_meta}
+        'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
+        'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
+        'deployment_block_reasons': blocked_reasons}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
     p = _persist_result_json(coin_name, result_data)
@@ -814,9 +905,13 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
 
     qualified = [
         r for r in run_results
-        if r.get('holdout_metrics', {}).get('holdout_trades', 0) >= 15
-        and r.get('holdout_metrics', {}).get('holdout_sharpe', 0) > 0
-        and r.get('holdout_metrics', {}).get('holdout_return', 0) > 0
+        if not r.get('deployment_blocked', False)
+        and _passes_holdout_gate(
+            r.get('holdout_metrics', {}),
+            min_trades=kwargs.get('holdout_min_trades', 15),
+            min_sharpe=kwargs.get('holdout_min_sharpe', 0.0),
+            min_return=kwargs.get('holdout_min_return', 0.0),
+        )
     ]
     pool = qualified or run_results
 
@@ -864,10 +959,10 @@ def show_results():
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 60, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 3, 'holdout_candidates': 3},
-        'robust120': {'plateau_patience': 50, 'plateau_warmup': 25, 'plateau_min_delta': 0.02, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 3, 'holdout_candidates': 2},
-        'quick':     {'plateau_patience': 30, 'plateau_warmup': 15, 'plateau_min_delta': 0.03, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1},
-        'paper_ready': {'plateau_patience': 80, 'plateau_warmup': 40, 'plateau_min_delta': 0.015, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 4, 'holdout_candidates': 4},
+        'robust180': {'plateau_patience': 60, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 3, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust120': {'plateau_patience': 50, 'plateau_warmup': 25, 'plateau_min_delta': 0.02, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 3, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'quick':     {'plateau_patience': 30, 'plateau_warmup': 15, 'plateau_min_delta': 0.03, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 10, 'holdout_min_sharpe': 0.0, 'holdout_min_return': -0.01, 'require_holdout_pass': False, 'target_trades_per_week': 0.8},
+        'paper_ready': {'plateau_patience': 80, 'plateau_warmup': 40, 'plateau_min_delta': 0.015, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 4, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -882,6 +977,11 @@ def apply_runtime_preset(args):
             'min_total_trades': '--min-total-trades',
             'n_cv_folds': '--n-cv-folds',
             'holdout_candidates': '--holdout-candidates',
+            'holdout_min_trades': '--holdout-min-trades',
+            'holdout_min_sharpe': '--holdout-min-sharpe',
+            'holdout_min_return': '--holdout-min-return',
+            'require_holdout_pass': '--require-holdout-pass',
+            'target_trades_per_week': '--target-trades-per-week',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -896,7 +996,7 @@ COIN_MAP = {'BIP':'BTC','BTC':'BTC','ETP':'ETH','ETH':'ETH','XPP':'XRP','XRP':'X
 PREFIX_FOR_COIN = {'BTC':'BIP','ETH':'ETP','XRP':'XPP','SOL':'SLP','DOGE':'DOP'}
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="v11.1 Fast CV Optimization")
+    parser = argparse.ArgumentParser(description="v11.3 Fast CV Optimization")
     parser.add_argument("--coin", type=str); parser.add_argument("--all", action="store_true")
     parser.add_argument("--show", action="store_true"); parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--jobs", type=int, default=1); parser.add_argument("--plateau-patience", type=int, default=60)
@@ -908,6 +1008,13 @@ if __name__ == "__main__":
     parser.add_argument("--sampler-seed", type=int, default=42)
     parser.add_argument("--holdout-candidates", type=int, default=3,
                         help="Evaluate top-N CV candidates on holdout and pick the best")
+    parser.add_argument("--require-holdout-pass", action="store_true",
+                        help="Block deployment when no holdout candidate meets minimum gate")
+    parser.add_argument("--holdout-min-trades", type=int, default=15)
+    parser.add_argument("--holdout-min-sharpe", type=float, default=0.0)
+    parser.add_argument("--holdout-min-return", type=float, default=0.0)
+    parser.add_argument("--target-trades-per-week", type=float, default=1.0,
+                        help="Trade-frequency objective target used during CV scoring")
     parser.add_argument("--sampler-seeds", type=str, default="")
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
     args = parser.parse_args(); args = apply_runtime_preset(args)
@@ -926,4 +1033,7 @@ if __name__ == "__main__":
             plateau_warmup=args.plateau_warmup, study_suffix=args.study_suffix, resume_study=args.resume,
             holdout_days=args.holdout_days, min_internal_oos_trades=args.min_internal_oos_trades,
             min_total_trades=args.min_total_trades, n_cv_folds=args.n_cv_folds,
-            holdout_candidates=args.holdout_candidates)
+            holdout_candidates=args.holdout_candidates, require_holdout_pass=args.require_holdout_pass,
+            holdout_min_trades=args.holdout_min_trades, holdout_min_sharpe=args.holdout_min_sharpe,
+            holdout_min_return=args.holdout_min_return,
+            target_trades_per_week=args.target_trades_per_week)

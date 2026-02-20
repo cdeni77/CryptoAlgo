@@ -332,6 +332,70 @@ class SOLEcosystemFeatures:
         return features
 
 
+
+
+class ETHTrendStructureFeatures:
+    """
+    ETH-specific: trend-persistence and participation features.
+
+    Designed for smoother, institution-led momentum bursts with periodic mean-revert pullbacks.
+    """
+
+    @classmethod
+    def compute(cls, df: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        close = df['close']
+        returns = close.pct_change()
+
+        for lb in [12, 24, 72, 168]:
+            ema_fast = close.ewm(span=max(4, lb // 3), adjust=False).mean()
+            ema_slow = close.ewm(span=lb, adjust=False).mean()
+            features[f'eth_trend_spread_{lb}h'] = (ema_fast - ema_slow) / ema_slow.replace(0, np.nan)
+
+        vol_base = returns.rolling(168).std().replace(0, np.nan)
+        for lb in [12, 24, 48]:
+            impulse = returns.rolling(lb).sum()
+            features[f'eth_impulse_{lb}h'] = impulse / (vol_base * np.sqrt(lb / 24.0))
+
+        vol_ratio = df['volume'] / df['volume'].rolling(168).mean().replace(0, np.nan)
+        features['eth_volume_support'] = (vol_ratio * returns.clip(lower=0)).rolling(12).mean()
+        features['eth_pullback_depth_72h'] = (close / close.rolling(72).max().replace(0, np.nan)) - 1.0
+        features['eth_breakout_pressure'] = (close - close.rolling(48).max().shift(1)) / close.rolling(48).std().replace(0, np.nan)
+
+        return features
+
+
+class XRPFlowMicrostructureFeatures:
+    """
+    XRP-specific: compression-breakout and whipsaw detection features.
+
+    XRP often alternates between low-volatility compression and abrupt directional bursts.
+    """
+
+    @classmethod
+    def compute(cls, df: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        close = df['close']
+        returns = close.pct_change()
+
+        range_24 = (df['high'].rolling(24).max() - df['low'].rolling(24).min()).replace(0, np.nan)
+        range_168 = (df['high'].rolling(168).max() - df['low'].rolling(168).min()).replace(0, np.nan)
+        features['xrp_compression_ratio'] = range_24 / range_168
+
+        features['xrp_breakout_distance'] = (close - close.rolling(72).mean()) / close.rolling(72).std().replace(0, np.nan)
+        features['xrp_whipsaw_score'] = (returns.abs() > returns.rolling(168).std() * 1.7).rolling(24).mean()
+
+        body = (df['close'] - df['open']).abs()
+        full = (df['high'] - df['low']).replace(0, np.nan)
+        features['xrp_body_efficiency'] = (body / full).rolling(12).mean()
+
+        vol_ratio = df['volume'] / df['volume'].rolling(168).mean().replace(0, np.nan)
+        features['xrp_volume_breakout_confirm'] = ((close > close.rolling(48).max().shift(1)).astype(int) * vol_ratio).rolling(12).mean()
+        features['xrp_reversal_pressure'] = ((close - close.rolling(24).mean()) / close.rolling(24).std().replace(0, np.nan)).diff(6)
+
+        return features
+
+
 class DOGESentimentFeatures:
     """
     DOGE-specific: sentiment-proxy and meme-cycle features.
@@ -413,7 +477,11 @@ class DOGESentimentFeatures:
 COIN_FEATURE_MAP = {
     'BIP': BTCMeanReversionFeatures,     # BTC
     'BTC': BTCMeanReversionFeatures,
-    'SLP': SOLEcosystemFeatures,         # SOL
+    'ETP': ETHTrendStructureFeatures,     # ETH
+    'ETH': ETHTrendStructureFeatures,
+    'XPP': XRPFlowMicrostructureFeatures, # XRP
+    'XRP': XRPFlowMicrostructureFeatures,
+    'SLP': SOLEcosystemFeatures,          # SOL
     'SOL': SOLEcosystemFeatures,
     'DOP': DOGESentimentFeatures,         # DOGE
     'DOGE': DOGESentimentFeatures,
