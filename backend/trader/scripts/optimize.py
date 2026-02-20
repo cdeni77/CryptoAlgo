@@ -506,6 +506,15 @@ def assess_result_quality(rd):
 def _db_path(): return SCRIPT_DIR / "optuna_trading.db"
 def _sqlite_url(path): return f"sqlite:///{path.resolve()}"
 def _candidate_results_dirs(): return [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]
+
+def _is_transient_optuna_storage_error(exc):
+    msg = str(exc).lower()
+    return (
+        "database is locked" in msg
+        or "table alembic_version already exists" in msg
+        or "record does not exist" in msg
+    )
+
 def _persist_result_json(coin_name, data):
     for d in _candidate_results_dirs():
         try: d.mkdir(parents=True, exist_ok=True); p = d / f"{coin_name}_optimization.json"; open(p,'w').write(json.dumps(_to_json_safe(data), indent=2)); return p
@@ -539,14 +548,16 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
     sampler = TPESampler(seed=sampler_seed, n_startup_trials=min(10, n_trials // 3))
     study = None
-    for attempt in range(3):
+    for attempt in range(8):
         try:
             study = optuna.create_study(direction='maximize', sampler=sampler, study_name=study_name,
                                         storage=_sqlite_url(_db_path()), load_if_exists=resume_study); break
         except Exception as e:
-            if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in str(e):
+            if isinstance(e, optuna.exceptions.DuplicatedStudyError):
                 study = optuna.load_study(study_name=study_name, storage=_sqlite_url(_db_path()), sampler=sampler); break
-            if "database is locked" in str(e) and attempt < 2: time.sleep(0.3*(attempt+1)); continue
+            if _is_transient_optuna_storage_error(e) and attempt < 7:
+                time.sleep(0.3 * (attempt + 1))
+                continue
             raise
     if not study: print("❌ Could not create study"); return None
 
