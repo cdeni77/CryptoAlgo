@@ -377,20 +377,26 @@ def _print_log_tail(log_path, max_lines=30):
         print(f"         {line}")
 
 
-def _estimate_validation_timeout(result_path, timeout_scale=1.0, timeout_cap=7200):
-    base = 900
+def _estimate_validation_timeout(result_path, timeout_scale=1.0, timeout_cap=7200, mode="full"):
+    mode = (mode or "full").lower()
+    base = 420 if mode == "paper_screen" else 900
     try:
         with open(result_path) as f:
             data = json.load(f)
         trades = int(data.get('optim_metrics', {}).get('n_trades', 0) or 0)
         folds = int(data.get('n_cv_folds', 1) or 1)
         holdout_days = int(data.get('holdout_days', 180) or 180)
-        estimated = max(base, base + trades * 10 + folds * 120 + holdout_days * 2)
+        if mode == "paper_screen":
+            estimated = max(base, base + trades * 3 + folds * 45 + holdout_days)
+        else:
+            estimated = max(base, base + trades * 10 + folds * 120 + holdout_days * 2)
         scaled = int(estimated * max(0.5, timeout_scale))
         return int(min(max(base, scaled), timeout_cap))
     except Exception:
-        fallback = int(1800 * max(0.5, timeout_scale))
-        return int(min(max(900, fallback), timeout_cap))
+        fallback_seed = 900 if mode == "paper_screen" else 1800
+        fallback_min = 420 if mode == "paper_screen" else 900
+        fallback = int(fallback_seed * max(0.5, timeout_scale))
+        return int(min(max(fallback_min, fallback), timeout_cap))
 
 
 if __name__ == "__main__":
@@ -438,6 +444,8 @@ if __name__ == "__main__":
                         help="Run faster robustness checks (lower MC simulation counts)")
     parser.add_argument("--validation-no-timeout", action="store_true",
                         help="Disable per-coin validation timeout (run until completion)")
+    parser.add_argument("--screen-threshold", type=float, default=60.0,
+                        help="Run full validation only for coins with screen score >= this threshold")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -627,51 +635,79 @@ if __name__ == "__main__":
         if not coins_with_results:
             print("   No optimization results found. Skipping validation.")
         else:
-            print(f"   Validating: {', '.join(coins_with_results)}")
-            max_parallel = max(1, min(args.validation_jobs, len(coins_with_results)))
-            pending = list(coins_with_results)
-            running = {}
+            print(f"   Screening: {', '.join(coins_with_results)}")
 
-            while pending or running:
-                while pending and len(running) < max_parallel:
-                    coin = pending.pop(0)
-                    print(f"\n   Running validation for {coin}...")
-                    cmd = [sys.executable, "-m", "scripts.validate_robustness", "--coin", coin]
-                    if args.validation_fast:
-                        cmd.append("--fast")
-                    result_path = results_dir / f"{coin}_optimization.json"
-                    timeout_s = _estimate_validation_timeout(
-                        result_path,
-                        timeout_scale=args.validation_timeout_scale,
-                        timeout_cap=args.validation_timeout_cap,
-                    )
-                    proc = subprocess.Popen(
-                        cmd, cwd=str(trader_root),
-                        stdout=subprocess.PIPE if not sys.stderr.isatty() else None,
-                        stderr=subprocess.PIPE if not sys.stderr.isatty() else None,
-                        text=True,
-                    )
-                    running[coin] = {'proc': proc, 'start': time.time(), 'timeout': (None if args.validation_no_timeout else timeout_s)}
+            def _run_validation_mode(coins, mode):
+                if not coins:
+                    return
+                max_parallel = max(1, min(args.validation_jobs, len(coins)))
+                pending = list(coins)
+                running = {}
 
-                time.sleep(1)
-                finished = []
-                for coin, info in running.items():
-                    proc = info['proc']
-                    elapsed = time.time() - info['start']
-                    if proc.poll() is not None:
-                        finished.append(coin)
-                        out, err = proc.communicate() if not sys.stderr.isatty() else (None, None)
-                        if proc.returncode != 0:
-                            print(f"   ❌ Validation failed for {coin}")
-                            if err:
-                                print(f"      {err[:500]}")
-                    elif info['timeout'] is not None and elapsed > info['timeout']:
-                        proc.kill()
-                        finished.append(coin)
-                        print(f"   ⏰ Validation timed out for {coin} after {int(info['timeout'])}s")
+                while pending or running:
+                    while pending and len(running) < max_parallel:
+                        coin = pending.pop(0)
+                        print(f"\n   Running {mode} validation for {coin}...")
+                        cmd = [
+                            sys.executable, "-m", "scripts.validate_robustness",
+                            "--coin", coin,
+                            "--mode", mode,
+                        ]
+                        if args.validation_fast:
+                            cmd.append("--fast")
+                        result_path = results_dir / f"{coin}_optimization.json"
+                        timeout_s = _estimate_validation_timeout(
+                            result_path,
+                            timeout_scale=args.validation_timeout_scale,
+                            timeout_cap=args.validation_timeout_cap,
+                            mode=mode,
+                        )
+                        proc = subprocess.Popen(
+                            cmd, cwd=str(trader_root),
+                            stdout=subprocess.PIPE if not sys.stderr.isatty() else None,
+                            stderr=subprocess.PIPE if not sys.stderr.isatty() else None,
+                            text=True,
+                        )
+                        running[coin] = {
+                            'proc': proc,
+                            'start': time.time(),
+                            'timeout': (None if args.validation_no_timeout else timeout_s),
+                        }
 
-                for coin in finished:
-                    running.pop(coin, None)
+                    time.sleep(1)
+                    finished = []
+                    for coin, info in running.items():
+                        proc = info['proc']
+                        elapsed = time.time() - info['start']
+                        if proc.poll() is not None:
+                            finished.append(coin)
+                            out, err = proc.communicate() if not sys.stderr.isatty() else (None, None)
+                            if proc.returncode != 0:
+                                print(f"   ❌ Validation failed for {coin} ({mode})")
+                                if err:
+                                    print(f"      {err[:500]}")
+                        elif info['timeout'] is not None and elapsed > info['timeout']:
+                            proc.kill()
+                            finished.append(coin)
+                            print(f"   ⏰ Validation timed out for {coin} ({mode}) after {int(info['timeout'])}s")
+
+                    for coin in finished:
+                        running.pop(coin, None)
+
+            _run_validation_mode(coins_with_results, "paper_screen")
+
+            screen_results = load_validation_results(results_dir)
+            full_candidates = []
+            for coin in coins_with_results:
+                score = float(screen_results.get(coin, {}).get('readiness', {}).get('score', 0) or 0)
+                if score >= args.screen_threshold:
+                    full_candidates.append(coin)
+
+            if full_candidates:
+                print(f"\n   Full validation candidates (score >= {args.screen_threshold:.1f}): {', '.join(full_candidates)}")
+                _run_validation_mode(full_candidates, "full")
+            else:
+                print(f"\n   No coins met screen threshold {args.screen_threshold:.1f}; skipping full validation.")
 
 
     # ═══════════════════════════════════════════════════════════════════

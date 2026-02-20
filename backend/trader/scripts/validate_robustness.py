@@ -213,6 +213,116 @@ def check_parameter_sensitivity(all_data, best_params, coin_name, coin_prefix, p
     }
 
 
+def check_parameter_sensitivity_fast(all_data, best_params, coin_name, coin_prefix,
+                                     perturbation_pct=0.10, n_folds=3):
+    """Fast-path sensitivity check using fold approximations (no repeated full backtests)."""
+    from scripts.train_model import Config
+    from scripts.optimize import (
+        profile_from_params, resolve_target_symbol,
+        create_cv_splits, fast_evaluate_fold,
+    )
+
+    target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
+    if not target_sym:
+        return {'valid': False, 'reason': 'symbol_not_found', 'method': 'fast_fold_approx'}
+
+    if target_sym not in all_data:
+        return {'valid': False, 'reason': 'missing_data', 'method': 'fast_fold_approx'}
+
+    features = all_data[target_sym]['features']
+    ohlcv = all_data[target_sym]['ohlcv']
+    cv_splits = create_cv_splits(all_data, target_sym, n_folds=n_folds, min_train_days=120, purge_days=2)
+    if not cv_splits:
+        return {'valid': False, 'reason': 'no_cv_splits', 'method': 'fast_fold_approx'}
+
+    perturbable = {
+        'signal_threshold', 'label_forward_hours', 'label_vol_target',
+        'min_momentum_magnitude', 'vol_mult_tp', 'vol_mult_sl',
+        'max_hold_hours', 'min_vol_24h', 'max_vol_24h',
+    }
+
+    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00,
+                    max_ensemble_std=0.10, train_embargo_hours=24)
+
+    def _mean_fold_sharpe(profile):
+        fold_sharpes = []
+        for train_end, test_start, test_end in cv_splits:
+            result = fast_evaluate_fold(
+                features, ohlcv, train_end, test_start, test_end,
+                profile, config, target_sym, fee_multiplier=1.0,
+            )
+            if not result:
+                continue
+            s = float(result.get('sharpe', 0) or 0)
+            if s <= -90:
+                s = 0.0
+            fold_sharpes.append(s)
+        if not fold_sharpes:
+            return None
+        return float(np.mean(fold_sharpes))
+
+    baseline_profile = profile_from_params(best_params, coin_name)
+    baseline_sharpe = _mean_fold_sharpe(baseline_profile)
+    if baseline_sharpe is None:
+        return {'valid': False, 'reason': 'baseline_fast_eval_failed', 'method': 'fast_fold_approx'}
+
+    sensitivity_results = {}
+    sharpe_deltas = []
+
+    for param_name in perturbable:
+        if param_name not in best_params:
+            continue
+        original_val = best_params[param_name]
+        if not isinstance(original_val, (int, float)) or original_val == 0:
+            continue
+
+        delta = abs(original_val * perturbation_pct)
+        if isinstance(original_val, int):
+            delta = max(1, int(delta))
+        perturbed_vals = [original_val - delta, original_val + delta]
+
+        param_sharpes = []
+        for pval in perturbed_vals:
+            pval = max(1 if isinstance(original_val, int) else 0.001,
+                       int(pval) if isinstance(original_val, int) else float(pval))
+            test_params = dict(best_params)
+            test_params[param_name] = pval
+            try:
+                test_profile = profile_from_params(test_params, coin_name)
+                approx_s = _mean_fold_sharpe(test_profile)
+                param_sharpes.append(0.0 if approx_s is None else approx_s)
+            except Exception:
+                param_sharpes.append(0.0)
+
+        if param_sharpes:
+            avg_n = float(np.mean(param_sharpes))
+            drop = baseline_sharpe - avg_n
+            sharpe_deltas.append(drop)
+            sensitivity_results[param_name] = {
+                'baseline_sharpe': round(baseline_sharpe, 3),
+                'neighbor_sharpes': [round(s, 3) for s in param_sharpes],
+                'avg_neighbor_sharpe': round(avg_n, 3),
+                'sharpe_drop': round(drop, 3),
+            }
+
+    avg_drop = float(np.mean(sharpe_deltas)) if sharpe_deltas else 0.0
+    max_drop = float(np.max(sharpe_deltas)) if sharpe_deltas else 0.0
+    fragile = ((avg_drop > baseline_sharpe * 0.30) or (max_drop > baseline_sharpe * 0.50)) if sharpe_deltas else True
+
+    return {
+        'valid': True,
+        'method': 'fast_fold_approx',
+        'baseline_sharpe': round(baseline_sharpe, 3),
+        'baseline_pf': None,
+        'n_params_tested': len(sensitivity_results),
+        'n_folds': len(cv_splits),
+        'avg_sharpe_drop': round(avg_drop, 3),
+        'max_sharpe_drop': round(max_drop, 3),
+        'fragile': fragile,
+        'per_param': sensitivity_results,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. REGIME SPLIT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -444,6 +554,7 @@ def run_validation(
     mc_shuffle_sims=1000,
     mc_resample_sims=1000,
     dsr_trial_scope="coin",
+    mode="full",
 ):
     from scripts.train_model import Config, run_backtest
     from scripts.optimize import (
@@ -457,7 +568,7 @@ def run_validation(
     optim_metrics = optimization_result.get('optim_metrics', {})
 
     print(f"\n{'='*70}")
-    print(f"🔬 ROBUSTNESS VALIDATION — {coin_name} (v11)")
+    print(f"🔬 ROBUSTNESS VALIDATION — {coin_name} (v11, mode={mode})")
     print(f"{'='*70}")
 
     target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
@@ -490,8 +601,14 @@ def run_validation(
 
     # 1. MC Shuffle
     print(f"  🎲 Monte Carlo shuffle...")
+    mc_shuffle_sims_eff = mc_shuffle_sims
+    mc_resample_sims_eff = mc_resample_sims
+    if mode == "paper_screen":
+        mc_shuffle_sims_eff = min(mc_shuffle_sims_eff, 300)
+        mc_resample_sims_eff = min(mc_resample_sims_eff, 300)
+
     mc_shuffle = (
-        monte_carlo_shuffle(trade_pnls, n_sims=mc_shuffle_sims)
+        monte_carlo_shuffle(trade_pnls, n_sims=mc_shuffle_sims_eff)
         if len(trade_pnls) >= 10 else {'valid': False}
     )
     if mc_shuffle.get('valid'):
@@ -500,17 +617,23 @@ def run_validation(
     # 2. MC Resample
     print(f"  🎲 Monte Carlo resample...")
     mc_resample = (
-        monte_carlo_resample(trade_pnls, n_sims=mc_resample_sims)
+        monte_carlo_resample(trade_pnls, n_sims=mc_resample_sims_eff)
         if len(trade_pnls) >= 10 else {'valid': False}
     )
     if mc_resample.get('valid'):
         print(f"     Sharpe 5th: {mc_resample['sharpe_5th']:.3f} | P(loss): {mc_resample['prob_loss']:.1%}")
 
     # 3. Param Sensitivity
-    print(f"  🔧 Parameter sensitivity...")
-    sensitivity = check_parameter_sensitivity(all_data, params, coin_name, coin_prefix)
-    if sensitivity.get('valid'):
-        print(f"     Fragile: {sensitivity['fragile']} | Avg drop: {sensitivity['avg_sharpe_drop']:.3f}")
+    skipped_checks = []
+    if mode == "paper_screen":
+        print("  ⏭️ Skipping parameter sensitivity (paper_screen mode)")
+        sensitivity = {'valid': False, 'skipped': True, 'reason': 'paper_screen_mode'}
+        skipped_checks.append('parameter_sensitivity')
+    else:
+        print(f"  🔧 Parameter sensitivity (fast-path approximation)...")
+        sensitivity = check_parameter_sensitivity_fast(all_data, params, coin_name, coin_prefix)
+        if sensitivity.get('valid'):
+            print(f"     Fragile: {sensitivity['fragile']} | Avg drop: {sensitivity['avg_sharpe_drop']:.3f}")
 
     # 4. DSR
     print(f"  📐 Deflated Sharpe Ratio...")
@@ -532,10 +655,15 @@ def run_validation(
         )
 
     # 5. Regime Split
-    print(f"  🌤️ Regime split test...")
-    regime = test_regime_splits(all_data, params, coin_name, coin_prefix)
-    if regime.get('valid'):
-        print(f"     Profitable: {regime['profitable_regimes']}/{regime['tested_regimes']} regimes")
+    if mode == "paper_screen":
+        print("  ⏭️ Skipping regime split test (paper_screen mode)")
+        regime = {'valid': False, 'skipped': True, 'reason': 'paper_screen_mode'}
+        skipped_checks.append('regime_split')
+    else:
+        print(f"  🌤️ Regime split test...")
+        regime = test_regime_splits(all_data, params, coin_name, coin_prefix)
+        if regime.get('valid'):
+            print(f"     Profitable: {regime['profitable_regimes']}/{regime['tested_regimes']} regimes")
 
     # 6. CV Consistency (v11)
     print(f"  📊 CV consistency check...")
@@ -562,6 +690,8 @@ def run_validation(
     validation_data = {
         'coin': coin_name, 'version': 'v11',
         'timestamp': datetime.now().isoformat(),
+        'mode': mode,
+        'skipped_checks': skipped_checks,
         'mc_shuffle': mc_shuffle, 'mc_resample': mc_resample,
         'parameter_sensitivity': sensitivity,
         'deflated_sharpe': dsr, 'dsr_metadata': dsr_meta, 'regime_split': regime,
@@ -652,11 +782,17 @@ if __name__ == "__main__":
                         help="Monte Carlo resample simulation count")
     parser.add_argument("--fast", action="store_true",
                         help="Use faster validation defaults for same-day screening")
+    parser.add_argument("--mode", type=str, default="full", choices=["paper_screen", "full"],
+                        help="Validation depth mode: paper_screen (fast) or full")
     parser.add_argument("--dsr-trial-scope", type=str, default="coin", choices=["coin", "global"],
                         help="Use cumulative trial count by coin or globally when computing DSR")
     args = parser.parse_args()
 
     if args.fast:
+        args.mc_shuffle_sims = min(args.mc_shuffle_sims, 300)
+        args.mc_resample_sims = min(args.mc_resample_sims, 300)
+
+    if args.mode == "paper_screen":
         args.mc_shuffle_sims = min(args.mc_shuffle_sims, 300)
         args.mc_resample_sims = min(args.mc_resample_sims, 300)
 
@@ -702,4 +838,5 @@ if __name__ == "__main__":
             mc_shuffle_sims=max(50, args.mc_shuffle_sims),
             mc_resample_sims=max(50, args.mc_resample_sims),
             dsr_trial_scope=args.dsr_trial_scope,
+            mode=args.mode,
         )
