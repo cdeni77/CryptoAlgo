@@ -782,7 +782,21 @@ if __name__ == "__main__":
                 print(f"\n   Full validation candidates (score >= {args.screen_threshold:.1f}): {', '.join(full_candidates)}")
                 _run_validation_mode(full_candidates, "full")
             else:
-                print(f"\n   No coins met screen threshold {args.screen_threshold:.1f}; skipping full validation.")
+                ranked_screen = sorted(
+                    ((coin, float(screen_results.get(coin, {}).get('readiness', {}).get('score', 0) or 0))
+                     for coin in coins_with_results),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+                fallback_candidates = [coin for coin, score in ranked_screen if score >= max(35.0, args.screen_threshold - 20.0)][:2]
+                if fallback_candidates:
+                    ranked_str = ", ".join(f"{coin}:{score:.1f}" for coin, score in ranked_screen[:3])
+                    print(f"\n   No coins met screen threshold {args.screen_threshold:.1f}; running fallback full validation for: {', '.join(fallback_candidates)}")
+                    print(f"   Top screen scores: {ranked_str}")
+                    _run_validation_mode(fallback_candidates, "full")
+                else:
+                    print(f"\n   No coins met screen threshold {args.screen_threshold:.1f}; skipping full validation.")
+
 
 
     # ═══════════════════════════════════════════════════════════════════
