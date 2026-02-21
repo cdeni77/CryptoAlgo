@@ -476,6 +476,11 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
                             regime, cv_consistency, holdout_metrics, optim_metrics):
     checks = []
 
+    target_trades_per_week = max(0.25, float(optim_metrics.get('target_trades_per_week', 1.0) or 1.0))
+    holdout_days = max(30, int(optim_metrics.get('holdout_days', 180) or 180))
+    required_holdout_trades = max(8, int((target_trades_per_week * holdout_days / 7.0) * 0.55))
+    required_cv_trades = max(20, int((target_trades_per_week * 52.0) * 0.60))
+
     if mc_shuffle.get('valid'):
         checks.append(ReadinessCheck(
             'mc_dd_acceptable', mc_shuffle['mc_dd_95th'] < 0.30, 15.0,
@@ -521,13 +526,13 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
 
     if ho_trades > 0:
         checks.append(ReadinessCheck(
-            'holdout_positive', ho_trades >= 15 and ho_sharpe > 0 and ho_return > 0, 10.0,
-            f"Holdout trades={ho_trades}, SR={ho_sharpe:.3f}, ret={ho_return:.2%}"))
+            'holdout_positive', ho_trades >= required_holdout_trades and ho_sharpe > 0 and ho_return > 0, 10.0,
+            f"Holdout trades={ho_trades} (need >={required_holdout_trades}), SR={ho_sharpe:.3f}, ret={ho_return:.2%}"))
 
     n_trades = int(optim_metrics.get('n_trades', 0) or 0)
     checks.append(ReadinessCheck(
-        'sufficient_trades', n_trades >= 30, 5.0,
-        f"Trades={n_trades} (need >=30)"))
+        'sufficient_trades', n_trades >= required_cv_trades, 5.0,
+        f"Trades={n_trades} (need >={required_cv_trades})"))
 
     optim_sr = optim_metrics.get('mean_oos_sharpe',
                 optim_metrics.get('sharpe', optim_metrics.get('oos_sharpe', 0)))
@@ -580,7 +585,8 @@ def run_validation(
     params = optimization_result.get('params', {})
     coin_prefix = optimization_result.get('prefix', PREFIX_FOR_COIN.get(coin_name, coin_name))
     holdout_metrics = optimization_result.get('holdout_metrics', {})
-    optim_metrics = optimization_result.get('optim_metrics', {})
+    optim_metrics = dict(optimization_result.get('optim_metrics', {}) or {})
+    optim_metrics['holdout_days'] = int(optimization_result.get('holdout_days', optim_metrics.get('holdout_days', 180)) or 180)
 
     print(f"\n{'='*70}")
     print(f"🔬 ROBUSTNESS VALIDATION — {coin_name} (v11, mode={mode})")
