@@ -506,6 +506,7 @@ def objective(
     target_sym,
     min_internal_oos_trades=0,
     target_trades_per_week=1.0,
+    target_trades_per_year=None,
     enable_fee_stress=True,
     fee_stress_multiplier=2.0,
     fee_blend_normal_weight=0.6,
@@ -643,30 +644,33 @@ def objective(
         _set_reject_reason(trial, f'low_psr:{psr.get("psr", 0.0):.3f}')
         return _reject_score(psr.get('psr', 0.0), 0.55)
 
-    score = mean_blended_sr
-    if std_sr < 0.3 and len(sharpes) >= 2: score += 0.15
-    elif std_sr > 0.8: score -= 0.25
-    if min_sr > 0: score += 0.10
-    elif min_sr < -0.5: score -= 0.30
-    if min(max(0, mean_pf), 5.0) > 1.2: score += min(0.2, (mean_pf - 1.0) * 0.15)
-    if mean_dd > 0.25: score -= (mean_dd - 0.25) * 2.0
-    if avg_tc < 5: score -= 0.5
-    elif avg_tc < 8: score -= 0.2
-    if mean_wr > 0.75 and total_trades < 40: score -= 0.3
-    if mean_fee_edge > 0.35: score -= min(0.35, (mean_fee_edge - 0.35) * 0.8)
-    if exp_std > 0.01: score -= min(0.30, (exp_std - 0.01) * 12)
+    robust_score = mean_blended_sr
+    if std_sr < 0.3 and len(sharpes) >= 2: robust_score += 0.15
+    elif std_sr > 0.8: robust_score -= 0.25
+    if min_sr > 0: robust_score += 0.10
+    elif min_sr < -0.5: robust_score -= 0.30
+    if min(max(0, mean_pf), 5.0) > 1.2: robust_score += min(0.2, (mean_pf - 1.0) * 0.15)
+    if mean_dd > 0.25: robust_score -= (mean_dd - 0.25) * 2.0
+    if avg_tc < 5: robust_score -= 0.5
+    elif avg_tc < 8: robust_score -= 0.2
+    if mean_wr > 0.75 and total_trades < 40: robust_score -= 0.3
+    if mean_fee_edge > 0.35: robust_score -= min(0.35, (mean_fee_edge - 0.35) * 0.8)
+    if exp_std > 0.01: robust_score -= min(0.30, (exp_std - 0.01) * 12)
     if psr.get('valid'):
         if psr['psr'] >= 0.80:
-            score += 0.20
+            robust_score += 0.20
         elif psr['psr'] < 0.60:
-            score -= 0.20
+            robust_score -= 0.20
 
-    target_tpy = max(1.0, float(target_trades_per_week) * 52.0)
+    target_tpy = max(
+        1.0,
+        float(target_trades_per_year)
+        if target_trades_per_year is not None
+        else float(target_trades_per_week) * 52.0,
+    )
     freq_ratio = (tpy / target_tpy) if target_tpy > 0 else 1.0
-    if freq_ratio < 1.0:
-        score -= min(0.60, (1.0 - freq_ratio) * 0.8)
-    elif freq_ratio >= 1.15:
-        score += min(0.20, (freq_ratio - 1.0) * 0.15)
+    frequency_bonus = min(1.0, max(0.0, freq_ratio))
+    score = robust_score * frequency_bonus
 
     trial.set_user_attr('n_trades', total_trades)
     trial.set_user_attr('n_folds', len(fold_results))
@@ -674,6 +678,7 @@ def objective(
     trial.set_user_attr('min_sharpe', round(min_sr, 3))
     trial.set_user_attr('std_sharpe', round(std_sr, 3))
     trial.set_user_attr('blended_sharpe', round(mean_blended_sr, 3))
+    trial.set_user_attr('raw_sharpe_score', round(float(mean_blended_sr), 6))
     trial.set_user_attr('mean_return', round(mean_ret, 4))
     trial.set_user_attr('win_rate', round(mean_wr, 3))
     trial.set_user_attr('profit_factor', round(min(mean_pf, 5), 3))
@@ -697,7 +702,11 @@ def objective(
     trial.set_user_attr('trades_per_month', round(tpy / 12.0, 1))
     trial.set_user_attr('trades_per_year', round(tpy, 1))
     trial.set_user_attr('target_trades_per_week', round(float(target_trades_per_week), 2))
+    trial.set_user_attr('target_trades_per_year', round(float(target_tpy), 2))
     trial.set_user_attr('frequency_ratio', round(float(freq_ratio), 3))
+    trial.set_user_attr('frequency_bonus', round(float(frequency_bonus), 3))
+    trial.set_user_attr('raw_robust_score', round(float(robust_score), 6))
+    trial.set_user_attr('frequency_adjusted_score', round(float(score), 6))
     trial.set_user_attr('fold_metrics', fold_metrics)
     trial.set_user_attr('stressed_fold_metrics', [
         {
@@ -721,7 +730,22 @@ def objective(
     trial.set_user_attr('calmar', round(min(ann_ret / mean_dd if mean_dd > 0.01 else 0, 10.0), 3))
 
     if DEBUG_TRIALS:
-        print(f"  T{trial.number}: score={score:.3f} SR={mean_sr:.3f}±{std_sr:.3f} min={min_sr:.3f} trades={total_trades} folds={len(fold_results)}")
+        print(
+            f"  T{trial.number}: raw_sharpe={mean_blended_sr:.3f} robust={robust_score:.3f} freq_adj={score:.3f} "
+            f"freq_bonus={frequency_bonus:.3f} SR={mean_sr:.3f}±{std_sr:.3f} "
+            f"min={min_sr:.3f} trades={total_trades} folds={len(fold_results)}"
+        )
+    logger.debug(
+        "Trial %s scoring: raw_sharpe=%.4f robust_score=%.4f frequency_bonus=%.4f frequency_adjusted_score=%.4f "
+        "tpy=%.2f target_tpy=%.2f",
+        trial.number,
+        mean_blended_sr,
+        robust_score,
+        frequency_bonus,
+        score,
+        tpy,
+        target_tpy,
+    )
     return score
 
 class PlateauStopper:
@@ -994,7 +1018,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=5,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
-                  target_trades_per_week=1.0, preset_name="none", enable_fee_stress=True,
+                  target_trades_per_week=1.0, target_trades_per_year=None,
+                  preset_name="none", enable_fee_stress=True,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
                   pruned_only=True):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
@@ -1066,6 +1091,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
                             min_internal_oos_trades=min_internal_oos_trades,
                             target_trades_per_week=target_trades_per_week,
+                            target_trades_per_year=target_trades_per_year,
                             enable_fee_stress=enable_fee_stress,
                             fee_stress_multiplier=fee_stress_multiplier,
                             fee_blend_normal_weight=fee_blend_normal_weight,
@@ -1109,7 +1135,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     blocked_reasons = []
     est_ho_trades, effective_holdout_min_trades = estimate_holdout_trade_budget(
         holdout_days=holdout_days,
-        target_trades_per_week=max(0.1, float(target_trades_per_week)),
+        target_trades_per_week=max(
+            0.1,
+            float(target_trades_per_year) / 52.0
+            if target_trades_per_year is not None
+            else float(target_trades_per_week),
+        ),
         holdout_min_trades=holdout_min_trades,
     )
     if est_ho_trades < effective_holdout_min_trades:
@@ -1337,6 +1368,7 @@ def apply_runtime_preset(args):
             'holdout_min_return': '--holdout-min-return',
             'require_holdout_pass': '--require-holdout-pass',
             'target_trades_per_week': '--target-trades-per-week',
+            'target_trades_per_year': '--target-trades-per-year',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -1371,7 +1403,9 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-min-sharpe", type=float, default=0.0)
     parser.add_argument("--holdout-min-return", type=float, default=0.0)
     parser.add_argument("--target-trades-per-week", type=float, default=1.0,
-                        help="Trade-frequency objective target used during CV scoring")
+                        help="Trade-frequency objective target used during CV scoring (default: 1.0 ~= 52 trades/year)")
+    parser.add_argument("--target-trades-per-year", type=float, default=None,
+                        help="Optional annual target; overrides --target-trades-per-week when set")
     parser.add_argument("--disable-fee-stress", action="store_true",
                         help="Disable stressed-fee scoring in CV objective")
     parser.add_argument("--fee-stress-multiplier", type=float, default=2.0,
@@ -1410,6 +1444,7 @@ if __name__ == "__main__":
             holdout_min_trades=args.holdout_min_trades, holdout_min_sharpe=args.holdout_min_sharpe,
             holdout_min_return=args.holdout_min_return,
             target_trades_per_week=args.target_trades_per_week,
+            target_trades_per_year=args.target_trades_per_year,
             enable_fee_stress=not args.disable_fee_stress,
             fee_stress_multiplier=args.fee_stress_multiplier,
             fee_blend_normal_weight=args.fee_blend_normal_weight,
