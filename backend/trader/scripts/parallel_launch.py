@@ -32,9 +32,9 @@ PILOT_ROLLOUT_DEFAULT_COINS = ["ETH", "SOL"]
 # v11: Updated presets — tighter patience, CV folds
 PRESET_CONFIGS = {
     "paper_ready": {
-        "plateau_patience": 80,
-        "plateau_min_delta": 0.015,
-        "plateau_warmup": 40,
+        "plateau_patience": 150,
+        "plateau_min_delta": 0.012,
+        "plateau_warmup": 80,
         "holdout_days": 240,
         "min_internal_oos_trades": 10,
         "min_total_trades": 28,
@@ -45,11 +45,12 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.0,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "plateau_min_completed": 0,
     },
     "robust180": {
-        "plateau_patience": 60,
-        "plateau_min_delta": 0.02,
-        "plateau_warmup": 30,
+        "plateau_patience": 120,
+        "plateau_min_delta": 0.015,
+        "plateau_warmup": 60,
         "holdout_days": 180,
         "min_internal_oos_trades": 8,
         "min_total_trades": 30,
@@ -60,11 +61,12 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.0,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "plateau_min_completed": 0,
     },
     "robust120": {
-        "plateau_patience": 50,
-        "plateau_min_delta": 0.02,
-        "plateau_warmup": 25,
+        "plateau_patience": 90,
+        "plateau_min_delta": 0.015,
+        "plateau_warmup": 45,
         "holdout_days": 120,
         "min_internal_oos_trades": 6,
         "min_total_trades": 25,
@@ -75,11 +77,12 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.0,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "plateau_min_completed": 0,
     },
     "quick": {
-        "plateau_patience": 30,
+        "plateau_patience": 45,
         "plateau_min_delta": 0.03,
-        "plateau_warmup": 15,
+        "plateau_warmup": 20,
         "holdout_days": 90,
         "min_internal_oos_trades": 5,
         "min_total_trades": 20,
@@ -90,6 +93,7 @@ PRESET_CONFIGS = {
         "holdout_min_return": -0.01,
         "require_holdout_pass": False,
         "target_trades_per_week": 0.8,
+        "plateau_min_completed": 0,
     },
     "pilot_rollout": {
         "coins": ",".join(PILOT_ROLLOUT_DEFAULT_COINS),
@@ -107,6 +111,7 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.01,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "plateau_min_completed": 0,
     },
 }
 
@@ -121,6 +126,7 @@ def apply_runtime_preset(args):
         "plateau_patience": "--plateau-patience",
         "plateau_min_delta": "--plateau-min-delta",
         "plateau_warmup": "--plateau-warmup",
+        "plateau_min_completed": "--plateau-min-completed",
         "holdout_days": "--holdout-days",
         "min_internal_oos_trades": "--min-internal-oos-trades",
         "min_total_trades": "--min-total-trades",
@@ -483,11 +489,13 @@ if __name__ == "__main__":
                         help="Total worker processes")
     parser.add_argument("--coins", type=str, default=",".join(COINS),
                         help="Comma-separated coin list")
-    parser.add_argument("--plateau-patience", type=int, default=60,
-                        help="Stop if no improvement for N trials (default: 60, was 100)")
-    parser.add_argument("--plateau-min-delta", type=float, default=0.02)
-    parser.add_argument("--plateau-warmup", type=int, default=30,
-                        help="Warmup trials before plateau checks (default: 30, was 60)")
+    parser.add_argument("--plateau-patience", type=int, default=120,
+                        help="Stop if no improvement for N completed trials after warmup")
+    parser.add_argument("--plateau-min-delta", type=float, default=0.015)
+    parser.add_argument("--plateau-warmup", type=int, default=60,
+                        help="Warmup trials before plateau checks (default: 60)")
+    parser.add_argument("--plateau-min-completed", type=int, default=0,
+                        help="Never plateau-stop before this many completed trials (0 = auto 40%% of n_trials)")
     parser.add_argument("--holdout-days", type=int, default=180)
     parser.add_argument("--preset", type=str, default="paper_ready",
                         choices=["none", "paper_ready", "robust120", "robust180", "quick", "pilot_rollout"])
@@ -521,6 +529,10 @@ if __name__ == "__main__":
                         help="Disable per-coin validation timeout (run until completion)")
     parser.add_argument("--screen-threshold", type=float, default=60.0,
                         help="Run full validation only for coins with screen score >= this threshold")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip pre-launch data/feature QA checks")
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="Run preflight checks and exit without optimization/validation")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
 
@@ -555,6 +567,24 @@ if __name__ == "__main__":
     if not features_dir.exists() or not list(features_dir.glob("*_features.csv")):
         print(f"⚠️  WARNING: No feature files in {features_dir}")
 
+    if not args.skip_preflight or args.preflight_only:
+        preflight_output = script_dir / "optimization_results" / f"preflight_{run_id}.json"
+        preflight_cmd = [
+            sys.executable, "-m", "scripts.preflight_check",
+            "--coins", ",".join(target_coins),
+            "--db-path", str(db_path),
+            "--features-dir", str(features_dir),
+            "--output", str(preflight_output),
+        ]
+        print(f"\n🧪 Running preflight QA: {' '.join(preflight_cmd)}")
+        preflight_rc = subprocess.run(preflight_cmd, cwd=str(trader_root), check=False).returncode
+        if preflight_rc != 0:
+            print(f"⚠️  Preflight returned non-zero ({preflight_rc}). Review report: {preflight_output}")
+        else:
+            print(f"✅ Preflight complete: {preflight_output}")
+        if args.preflight_only:
+            raise SystemExit(preflight_rc)
+
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1: OPTIMIZATION
     # ═══════════════════════════════════════════════════════════════════
@@ -586,6 +616,7 @@ if __name__ == "__main__":
         print(f"   Enforce gate: {'YES' if args.require_holdout_pass else 'NO'}")
         print(f"   Target cadence: {args.target_trades_per_week:.2f} trades/week")
         print(f"   Preset:       {args.preset}")
+        print(f"   Plateau gate: patience={args.plateau_patience}, min_delta={args.plateau_min_delta}, warmup={args.plateau_warmup}, min_completed={args.plateau_min_completed or 'auto(40%)'}")
         print(f"   Seeds:        {args.sampler_seeds}")
         seed_count = max(1, len([s for s in args.sampler_seeds.split(",") if s.strip()]))
         print(f"   Validation:   {'ENABLED' if not args.skip_validation else 'DISABLED'}")
@@ -609,6 +640,7 @@ if __name__ == "__main__":
                 "--plateau-patience", str(args.plateau_patience),
                 "--plateau-min-delta", str(args.plateau_min_delta),
                 "--plateau-warmup", str(args.plateau_warmup),
+                "--plateau-min-completed", str(args.plateau_min_completed),
                 "--holdout-days", str(args.holdout_days),
                 "--n-cv-folds", str(args.n_cv_folds),
                 "--holdout-candidates", str(args.holdout_candidates),

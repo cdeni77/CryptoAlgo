@@ -681,16 +681,33 @@ def objective(
     return score
 
 class PlateauStopper:
-    def __init__(self, patience=60, min_delta=0.02, warmup_trials=30):
-        self.patience, self.min_delta, self.warmup_trials = max(1,patience), max(0,min_delta), max(0,warmup_trials)
+    def __init__(self, patience=60, min_delta=0.02, warmup_trials=30, min_completed_trials=0):
+        self.patience = max(1, patience)
+        self.min_delta = max(0, min_delta)
+        self.warmup_trials = max(0, warmup_trials)
+        self.min_completed_trials = max(0, min_completed_trials)
         self.best_value = self.best_trial_number = None
+
     def __call__(self, study, trial):
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
-        if len(completed) < self.warmup_trials: return
-        if self.best_value is None: self.best_value = study.best_value; self.best_trial_number = study.best_trial.number; return
-        if study.best_value > self.best_value + self.min_delta: self.best_value = study.best_value; self.best_trial_number = study.best_trial.number; return
+        min_trials_required = max(self.warmup_trials, self.min_completed_trials)
+        if len(completed) < min_trials_required:
+            return
+        if self.best_value is None:
+            self.best_value = study.best_value
+            self.best_trial_number = study.best_trial.number
+            return
+        if study.best_value > self.best_value + self.min_delta:
+            self.best_value = study.best_value
+            self.best_trial_number = study.best_trial.number
+            return
         if sum(1 for t in completed if t.number > (self.best_trial_number or 0)) >= self.patience:
-            print(f"\n🛑 Plateau: {self.patience} trials w/o improvement (best={self.best_value:.4f})"); study.stop()
+            print(
+                f"\n🛑 Plateau: {self.patience} trials w/o improvement "
+                f"(best={self.best_value:.4f}, completed={len(completed)}, "
+                f"min_completed={min_trials_required})"
+            )
+            study.stop()
 
 def _select_best_trial(study, min_trades=20):
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
@@ -928,6 +945,7 @@ def _persist_result_json(coin_name, data):
 
 def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
+                  plateau_min_completed=0,
                   study_suffix="", resume_study=False, holdout_days=180,
                   min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
@@ -996,8 +1014,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             fee_blend_normal_weight=fee_blend_normal_weight,
                             fee_blend_stressed_weight=fee_blend_stressed_weight,
                             pruned_only=pruned_only)
+    min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
-                        callbacks=[PlateauStopper(plateau_patience, plateau_min_delta, plateau_warmup)])
+                        callbacks=[PlateauStopper(
+                            plateau_patience,
+                            plateau_min_delta,
+                            plateau_warmup,
+                            min_completed_trials,
+                        )])
     except KeyboardInterrupt: print("\n🛑 Stopped.")
     except Exception as e: print(f"\n❌ {e}"); traceback.print_exc(); return None
     if not study.trials: print("No trials."); return None
@@ -1226,10 +1250,10 @@ def show_results():
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 60, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'robust120': {'plateau_patience': 50, 'plateau_warmup': 25, 'plateau_min_delta': 0.02, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'quick':     {'plateau_patience': 30, 'plateau_warmup': 15, 'plateau_min_delta': 0.03, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 10, 'holdout_min_sharpe': 0.0, 'holdout_min_return': -0.01, 'require_holdout_pass': False, 'target_trades_per_week': 0.8},
-        'paper_ready': {'plateau_patience': 80, 'plateau_warmup': 40, 'plateau_min_delta': 0.015, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 10, 'holdout_min_sharpe': 0.0, 'holdout_min_return': -0.01, 'require_holdout_pass': False, 'target_trades_per_week': 0.8},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -1239,6 +1263,7 @@ def apply_runtime_preset(args):
             'plateau_patience': '--plateau-patience',
             'plateau_warmup': '--plateau-warmup',
             'plateau_min_delta': '--plateau-min-delta',
+            'plateau_min_completed': '--plateau-min-completed',
             'holdout_days': '--holdout-days',
             'min_internal_oos_trades': '--min-internal-oos-trades',
             'min_total_trades': '--min-total-trades',
@@ -1266,8 +1291,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="v11.3 Fast CV Optimization")
     parser.add_argument("--coin", type=str); parser.add_argument("--all", action="store_true")
     parser.add_argument("--show", action="store_true"); parser.add_argument("--trials", type=int, default=100)
-    parser.add_argument("--jobs", type=int, default=1); parser.add_argument("--plateau-patience", type=int, default=60)
-    parser.add_argument("--plateau-min-delta", type=float, default=0.02); parser.add_argument("--plateau-warmup", type=int, default=30)
+    parser.add_argument("--jobs", type=int, default=1); parser.add_argument("--plateau-patience", type=int, default=120)
+    parser.add_argument("--plateau-min-delta", type=float, default=0.015); parser.add_argument("--plateau-warmup", type=int, default=60)
+    parser.add_argument("--plateau-min-completed", type=int, default=0,
+                        help="Never plateau-stop before this many completed trials (0 = auto 40%% of n_trials)")
     parser.add_argument("--holdout-days", type=int, default=180)
     parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
@@ -1310,7 +1337,8 @@ if __name__ == "__main__":
         optimize_coin_multiseed(all_data, PREFIX_FOR_COIN.get(cn, cn), cn, sampler_seeds=seeds,
             n_trials=args.trials, n_jobs=args.jobs,
             plateau_patience=args.plateau_patience, plateau_min_delta=args.plateau_min_delta,
-            plateau_warmup=args.plateau_warmup, study_suffix=args.study_suffix, resume_study=args.resume,
+            plateau_warmup=args.plateau_warmup, plateau_min_completed=args.plateau_min_completed,
+            study_suffix=args.study_suffix, resume_study=args.resume,
             holdout_days=args.holdout_days, min_internal_oos_trades=args.min_internal_oos_trades,
             min_total_trades=args.min_total_trades, n_cv_folds=args.n_cv_folds,
             holdout_candidates=args.holdout_candidates, require_holdout_pass=args.require_holdout_pass,
