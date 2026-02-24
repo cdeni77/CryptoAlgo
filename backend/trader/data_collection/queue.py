@@ -227,7 +227,8 @@ class RedisQueue(MessageQueueBase):
         self.password = password
         self._redis = None
         self._pubsub = None
-        self._subscriber_tasks: Dict[str, asyncio.Task] = {}
+        self._subscriber_callbacks: Dict[str, List[Callable[[QueueMessage], None]]] = {}
+        self._listener_task: Optional[asyncio.Task] = None
     
     async def connect(self):
         """Connect to Redis."""
@@ -292,36 +293,64 @@ class RedisQueue(MessageQueueBase):
         """Subscribe to Redis channel."""
         if not self._redis:
             await self.connect()
-        
-        await self._pubsub.subscribe(channel)
-        
-        async def listener():
-            async for message in self._pubsub.listen():
-                if message["type"] == "message":
-                    try:
-                        queue_msg = QueueMessage.from_json(message["data"])
-                        if asyncio.iscoroutinefunction(callback):
-                            await callback(queue_msg)
-                        else:
-                            callback(queue_msg)
-                    except Exception as e:
-                        logger.error(f"Callback error for {channel}: {e}")
-        
-        task = asyncio.create_task(listener())
-        self._subscriber_tasks[channel] = task
+
+        callbacks = self._subscriber_callbacks.setdefault(channel, [])
+        callbacks.append(callback)
+        if len(callbacks) == 1:
+            await self._pubsub.subscribe(channel)
+
+        if self._listener_task is None or self._listener_task.done():
+            self._listener_task = asyncio.create_task(self._listen_loop())
+
         logger.info(f"Subscribed to Redis channel: {channel}")
+
+    async def _listen_loop(self) -> None:
+        """Single Redis pub/sub listener dispatching by channel."""
+        if not self._pubsub:
+            return
+
+        async for message in self._pubsub.listen():
+            if message.get("type") != "message":
+                continue
+
+            channel_raw = message.get("channel")
+            if isinstance(channel_raw, bytes):
+                channel = channel_raw.decode("utf-8")
+            else:
+                channel = str(channel_raw)
+
+            callbacks = self._subscriber_callbacks.get(channel, [])
+            if not callbacks:
+                continue
+
+            try:
+                queue_msg = QueueMessage.from_json(message["data"])
+            except Exception as e:
+                logger.error(f"Failed to decode message for {channel}: {e}")
+                continue
+
+            for callback in list(callbacks):
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(queue_msg)
+                    else:
+                        callback(queue_msg)
+                except Exception as e:
+                    logger.error(f"Callback error for {channel}: {e}")
     
     async def unsubscribe(self, channel: str) -> None:
         """Unsubscribe from Redis channel."""
-        await self._pubsub.unsubscribe(channel)
-        
-        if channel in self._subscriber_tasks:
-            self._subscriber_tasks[channel].cancel()
+        if channel in self._subscriber_callbacks:
+            del self._subscriber_callbacks[channel]
+            await self._pubsub.unsubscribe(channel)
+
+        if not self._subscriber_callbacks and self._listener_task:
+            self._listener_task.cancel()
             try:
-                await self._subscriber_tasks[channel]
+                await self._listener_task
             except asyncio.CancelledError:
                 pass
-            del self._subscriber_tasks[channel]
+            self._listener_task = None
         
         logger.info(f"Unsubscribed from Redis channel: {channel}")
     
@@ -353,8 +382,15 @@ class RedisQueue(MessageQueueBase):
     
     async def close(self) -> None:
         """Close Redis connection."""
-        for task in self._subscriber_tasks.values():
-            task.cancel()
+        if self._listener_task:
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except asyncio.CancelledError:
+                pass
+            self._listener_task = None
+
+        self._subscriber_callbacks.clear()
         
         if self._pubsub:
             await self._pubsub.close()

@@ -17,3 +17,10 @@ aiohttp
 ccxt
 python-dateutil
 scipy
+joblib
+
+# Optional calibration backend used by trader scripts when beta calibration is enabled
+betacal
+
+# Optional Redis-backed queue for trader data pipeline
+redis>=5.0.0

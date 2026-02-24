@@ -28,6 +28,14 @@ mypy>=1.0.0
 scikit-learn
 lightgbm
 optuna
+scipy
+joblib
+
+# Optional calibration backend (used when calibration method is set to beta)
+betacal
+
+# Optional Redis-backed queue (in-memory queue remains default)
+redis>=5.0.0
 
 # Postgres bridge (for pg_writer.py)
 sqlalchemy>=2.0.0
