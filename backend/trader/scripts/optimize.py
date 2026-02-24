@@ -404,7 +404,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
             'avg_raw_pnl': round(avg_raw, 6), 'fee_edge_ratio': round(float(fee_edge_ratio), 4)}
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TRIAL PROFILE (9 tunable params)
+# TRIAL PROFILE (6 tunable params)
 # ═══════════════════════════════════════════════════════════════════════════
 
 FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
@@ -413,6 +413,9 @@ FIXED_RISK = {
     'vol_sizing_target': 0.025,
     'min_val_auc': 0.53,
     'cooldown_hours': 24.0,
+    'min_vol_24h': 0.008,
+    'max_vol_24h': 0.06,
+    'min_momentum_magnitude': 0.06,
 }
 
 COIN_OPTIMIZATION_PRIORS = {
@@ -434,23 +437,15 @@ COIN_OBJECTIVE_GUARDS = {
 
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
-    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, {})
-
     def clamp(v, low, high):
         return max(low, min(high, v))
 
     base_threshold = bp.signal_threshold if bp else 0.75
     base_fwd = bp.label_forward_hours if bp else 24
     base_label_vol = bp.label_vol_target if bp else 1.8
-    base_mom = bp.min_momentum_magnitude if bp else 0.06
     base_tp = bp.vol_mult_tp if bp else 5.0
     base_sl = bp.vol_mult_sl if bp else 3.0
     base_hold = bp.max_hold_hours if bp else 72
-    base_min_vol = bp.min_vol_24h if bp else 0.008
-    base_max_vol = bp.max_vol_24h if bp else 0.06
-    base_cooldown = bp.cooldown_hours if bp else 24.0
-    cooldown_min = float(priors.get('cooldown_min', max(4.0, base_cooldown - 12.0)))
-    cooldown_max = float(priors.get('cooldown_max', min(72.0, base_cooldown + 18.0)))
 
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
@@ -458,39 +453,65 @@ def create_trial_profile(trial, coin_name):
         signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.10, 0.62, 0.88), clamp(base_threshold + 0.08, 0.68, 0.90), step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
-        min_momentum_magnitude=trial.suggest_float('min_momentum_magnitude', clamp(base_mom - 0.04, 0.01, 0.12), clamp(base_mom + 0.04, 0.03, 0.14), step=0.01),
+        min_momentum_magnitude=FIXED_RISK['min_momentum_magnitude'],
         vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 2.0, 2.0, 8.0), clamp(base_tp + 2.0, 3.0, 9.0), step=0.5),
         vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 1.5, 5.0), clamp(base_sl + 1.0, 2.0, 5.5), step=0.5),
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
-        min_vol_24h=trial.suggest_float('min_vol_24h', clamp(base_min_vol - 0.004, 0.003, 0.02), clamp(base_min_vol + 0.004, 0.006, 0.024), step=0.001),
-        max_vol_24h=trial.suggest_float('max_vol_24h', clamp(base_max_vol - 0.02, 0.03, 0.10), clamp(base_max_vol + 0.02, 0.05, 0.12), step=0.005),
-        cooldown_hours=trial.suggest_float('cooldown_hours', cooldown_min, cooldown_max, step=2.0),
+        min_vol_24h=FIXED_RISK['min_vol_24h'],
+        max_vol_24h=FIXED_RISK['max_vol_24h'],
+        cooldown_hours=FIXED_RISK['cooldown_hours'],
         position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
         learning_rate=FIXED_ML['learning_rate'], min_child_samples=FIXED_ML['min_child_samples'],
     )
 
+
+def build_effective_params(params: Dict, coin_name: str) -> Dict:
+    bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    return {
+        'signal_threshold': params.get('signal_threshold', bp.signal_threshold if bp else 0.75),
+        'label_forward_hours': params.get('label_forward_hours', bp.label_forward_hours if bp else 24),
+        'label_vol_target': params.get('label_vol_target', bp.label_vol_target if bp else 1.8),
+        'vol_mult_tp': params.get('vol_mult_tp', bp.vol_mult_tp if bp else 5.0),
+        'vol_mult_sl': params.get('vol_mult_sl', bp.vol_mult_sl if bp else 3.0),
+        'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
+        # Frozen low-impact gates
+        'cooldown_hours': FIXED_RISK['cooldown_hours'],
+        'min_vol_24h': FIXED_RISK['min_vol_24h'],
+        'max_vol_24h': FIXED_RISK['max_vol_24h'],
+        'min_momentum_magnitude': FIXED_RISK['min_momentum_magnitude'],
+        # Fixed risk/ML knobs
+        'min_val_auc': FIXED_RISK['min_val_auc'],
+        'position_size': FIXED_RISK['position_size'],
+        'vol_sizing_target': FIXED_RISK['vol_sizing_target'],
+        'n_estimators': FIXED_ML['n_estimators'],
+        'max_depth': FIXED_ML['max_depth'],
+        'learning_rate': FIXED_ML['learning_rate'],
+        'min_child_samples': FIXED_ML['min_child_samples'],
+    }
+
 def profile_from_params(params, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    effective_params = build_effective_params(params, coin_name)
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
         extra_features=get_extra_features(coin_name),
-        signal_threshold=params.get('signal_threshold', 0.75),
-        min_val_auc=params.get('min_val_auc', FIXED_RISK['min_val_auc']),
-        label_forward_hours=params.get('label_forward_hours', 24),
-        label_vol_target=params.get('label_vol_target', 1.8),
-        min_momentum_magnitude=params.get('min_momentum_magnitude', 0.06),
-        vol_mult_tp=params.get('vol_mult_tp', 5.0), vol_mult_sl=params.get('vol_mult_sl', 3.0),
-        max_hold_hours=params.get('max_hold_hours', 72),
-        cooldown_hours=params.get('cooldown_hours', FIXED_RISK['cooldown_hours']),
-        min_vol_24h=params.get('min_vol_24h', 0.008), max_vol_24h=params.get('max_vol_24h', 0.06),
-        position_size=params.get('position_size', FIXED_RISK['position_size']),
-        vol_sizing_target=params.get('vol_sizing_target', FIXED_RISK['vol_sizing_target']),
-        n_estimators=params.get('n_estimators', FIXED_ML['n_estimators']),
-        max_depth=params.get('max_depth', FIXED_ML['max_depth']),
-        learning_rate=params.get('learning_rate', FIXED_ML['learning_rate']),
-        min_child_samples=params.get('min_child_samples', FIXED_ML['min_child_samples']),
+        signal_threshold=effective_params['signal_threshold'],
+        min_val_auc=effective_params['min_val_auc'],
+        label_forward_hours=effective_params['label_forward_hours'],
+        label_vol_target=effective_params['label_vol_target'],
+        min_momentum_magnitude=effective_params['min_momentum_magnitude'],
+        vol_mult_tp=effective_params['vol_mult_tp'], vol_mult_sl=effective_params['vol_mult_sl'],
+        max_hold_hours=effective_params['max_hold_hours'],
+        cooldown_hours=effective_params['cooldown_hours'],
+        min_vol_24h=effective_params['min_vol_24h'], max_vol_24h=effective_params['max_vol_24h'],
+        position_size=effective_params['position_size'],
+        vol_sizing_target=effective_params['vol_sizing_target'],
+        n_estimators=effective_params['n_estimators'],
+        max_depth=effective_params['max_depth'],
+        learning_rate=effective_params['learning_rate'],
+        min_child_samples=effective_params['min_child_samples'],
     )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -725,6 +746,8 @@ def objective(
         'min_fold_win_rate': float(min_fold_win_rate),
         'min_fold_win_rate_trades': int(min_fold_win_rate_trades),
     })
+    trial.set_user_attr('tunable_params', dict(trial.params))
+    trial.set_user_attr('effective_params', build_effective_params(trial.params, coin_name))
     ann_ret = np.mean([r['ann_return'] for r in fold_results])
     trial.set_user_attr('ann_return', round(ann_ret, 4))
     trial.set_user_attr('calmar', round(min(ann_ret / mean_dd if mean_dd > 0.01 else 0, 10.0), 3))
@@ -1038,7 +1061,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
-    print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 10 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
+    print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     for i, (tb, ts, te) in enumerate(cv_splits):
         print(f"     Fold {i}: train→{tb.date()} | test {ts.date()}→{te.date()}")
         logger.debug(
@@ -1236,9 +1259,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         else:
             print("  ⚠️ Holdout evaluation returned no valid candidates.")
 
+    effective_best_params = build_effective_params(best.params, coin_name)
     result_data = {'coin': coin_name, 'prefix': coin_prefix, 'optim_score': best.value,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
-        'params': best.params, 'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
+        'params': effective_best_params,
+        'tunable_params': dict(best.params),
+        'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
         'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'fee_stress': {
             'enabled': bool(enable_fee_stress),
@@ -1264,7 +1290,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     if p: print(f"  💾 {p}")
 
     print(f"\n  📝 CoinProfile(name='{coin_name}',")
-    for k, v in sorted(best.params.items()):
+    for k, v in sorted(effective_best_params.items()):
         print(f"    {k}={f'{v:.4f}'.rstrip('0').rstrip('.') if isinstance(v, float) else v},")
     print(f"  )")
     return result_data
