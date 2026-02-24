@@ -33,7 +33,7 @@ from optuna.samplers import TPESampler
 
 from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
-    get_contract_spec, calculate_coinbase_fee,
+    get_contract_spec, calculate_pnl_exact,
 )
 from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
@@ -282,6 +282,12 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
 
         # CHECK EXITS
         if active_pos is not None:
+            row = test_feat.loc[ts]
+            funding_8h_bps = row.get('funding_rate_bps', 0.0)
+            if pd.isna(funding_8h_bps):
+                funding_8h_bps = 0.0
+            funding_hourly_bps = funding_8h_bps / 8.0
+            active_pos['accum_funding'] += -(funding_hourly_bps / 10000.0) * active_pos['dir']
             d = active_pos['dir']
             exit_price = exit_reason = None
             if d == 1:
@@ -294,15 +300,13 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
             if hours_held >= profile.max_hold_hours and not exit_price:
                 exit_price, exit_reason = price, 'max_hold'
             if exit_price:
-                raw = (exit_price - active_pos['entry']) / active_pos['entry'] * d
                 notional = equity * profile.position_size * config.leverage
                 notional_per_contract = max(units_per_contract * active_pos['entry'], 1e-9)
                 n_contracts = max(1, int(notional / notional_per_contract))
-                entry_fee = calculate_coinbase_fee(n_contracts, active_pos['entry'], symbol, stressed_config)
-                exit_fee = calculate_coinbase_fee(n_contracts, exit_price, symbol, stressed_config)
-                fee_rt = (entry_fee + exit_fee) / max(notional, 1e-9)
-                net = raw - fee_rt
-                pnl_d = net * notional
+                net, raw, _, _, _, _, pnl_d, _ = calculate_pnl_exact(
+                    active_pos['entry'], exit_price, d,
+                    active_pos['accum_funding'], n_contracts, symbol, stressed_config
+                )
                 completed_trades.append({'raw_pnl': raw, 'net_pnl': net, 'pnl_dollars': pnl_d, 'exit_reason': exit_reason})
                 equity += pnl_d
                 peak_equity = max(peak_equity, equity)
@@ -349,6 +353,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
                 'time': ts, 'entry': price, 'dir': direction, 'vol': vol,
                 'tp': price * (1 + profile.vol_mult_tp * vol * direction),
                 'sl': price * (1 - profile.vol_mult_sl * vol * direction),
+                'accum_funding': 0.0,
             }
 
     # METRICS
