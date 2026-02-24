@@ -314,9 +314,76 @@ class MLSystem:
         y_out = valid.loc[non_neutral_idx].map({-1.0: 0.0, 1.0: 1.0})
         return X_out, y_out
 
+    @staticmethod
+    def _compute_average_uniqueness(index: pd.DatetimeIndex, label_horizon_hours: int) -> np.ndarray:
+        """Compute per-sample average uniqueness from overlapping label intervals."""
+        if len(index) == 0:
+            return np.array([], dtype=float)
+
+        ordered_index = pd.DatetimeIndex(index)
+        times_ns = ordered_index.view("int64")
+        horizon_ns = int(max(label_horizon_hours, 1) * 3600 * 1_000_000_000)
+        end_ns = times_ns + horizon_ns
+
+        start_pos = np.arange(len(times_ns), dtype=np.int64)
+        end_pos = np.searchsorted(times_ns, end_ns, side="right") - 1
+        end_pos = np.maximum(end_pos, start_pos)
+
+        # Sweep-line concurrency on sample timestamps.
+        delta = np.zeros(len(times_ns) + 1, dtype=np.float64)
+        np.add.at(delta, start_pos, 1.0)
+        valid_end = end_pos + 1
+        valid_end = np.minimum(valid_end, len(times_ns))
+        np.add.at(delta, valid_end, -1.0)
+        concurrency = np.cumsum(delta[:-1])
+        concurrency = np.maximum(concurrency, 1.0)
+
+        inv_concurrency = 1.0 / concurrency
+        inv_cumsum = np.concatenate(([0.0], np.cumsum(inv_concurrency)))
+        interval_lengths = (end_pos - start_pos + 1).astype(np.float64)
+        avg_uniqueness = (inv_cumsum[end_pos + 1] - inv_cumsum[start_pos]) / interval_lengths
+        return avg_uniqueness
+
+    def _build_sample_weights(
+        self,
+        y: pd.Series,
+        label_horizon_hours: int,
+        symbol: str,
+    ) -> np.ndarray:
+        """Combine uniqueness and class-balance weights for LightGBM training."""
+        if y.empty:
+            return np.array([], dtype=float)
+
+        uniqueness_weights = self._compute_average_uniqueness(y.index, label_horizon_hours)
+
+        counts = y.value_counts()
+        n_samples = float(len(y))
+        n_classes = float(max(len(counts), 1))
+        class_weights = {
+            cls: n_samples / (n_classes * cnt)
+            for cls, cnt in counts.items()
+            if cnt > 0
+        }
+        class_weight_vec = y.map(class_weights).to_numpy(dtype=float)
+
+        # Placeholder for any explicit recency weighting (currently neutral).
+        recency_weight_vec = np.ones(len(y), dtype=float)
+
+        sample_weights = uniqueness_weights * class_weight_vec * recency_weight_vec
+        sample_weights = np.clip(sample_weights, 1e-8, None)
+
+        ess = (sample_weights.sum() ** 2) / np.square(sample_weights).sum()
+        print(
+            f"[{symbol}] sample_weight stats: min={sample_weights.min():.6f} "
+            f"median={np.median(sample_weights):.6f} max={sample_weights.max():.6f} "
+            f"ESS={ess:.1f}/{len(sample_weights)}"
+        )
+        return sample_weights
+
     def train(self, X_train: pd.DataFrame, y_train: pd.Series,
               X_val: pd.DataFrame, y_val: pd.Series,
-              profile: Optional[CoinProfile] = None) -> Optional[Tuple]:
+              profile: Optional[CoinProfile] = None,
+              symbol: str = "UNKNOWN") -> Optional[Tuple]:
         if len(X_train) < self.config.min_train_samples:
             return None
         if y_train.sum() < 15 or (1 - y_train).sum() < 15:
@@ -332,19 +399,25 @@ class MLSystem:
         depth = profile.max_depth if profile else 3
         lr = profile.learning_rate if profile else 0.05
         min_child = profile.min_child_samples if profile else 20
+        label_horizon = resolve_label_horizon(profile, self.config)
+
+        train_sample_weights = self._build_sample_weights(
+            y_train,
+            label_horizon_hours=label_horizon,
+            symbol=f"{symbol}/train",
+        )
 
         base_model = lgb.LGBMClassifier(
             n_estimators=n_est, 
             max_depth=depth, 
             learning_rate=lr,
-            class_weight='balanced', 
             verbose=-1,
             min_child_samples=min_child, 
             reg_alpha=0.1, 
             reg_lambda=0.1,
             n_jobs=1  
         )
-        base_model.fit(X_train_scaled, y_train)
+        base_model.fit(X_train_scaled, y_train, sample_weight=train_sample_weights)
 
         val_probs = base_model.predict_proba(X_val_scaled)[:, 1]
         try:
@@ -361,7 +434,12 @@ class MLSystem:
 
         X_full = np.vstack([X_train_scaled, X_val_scaled])
         y_full = pd.concat([y_train, y_val])
-        base_model.fit(X_full, y_full)
+        full_sample_weights = self._build_sample_weights(
+            y_full,
+            label_horizon_hours=label_horizon,
+            symbol=f"{symbol}/full",
+        )
+        base_model.fit(X_full, y_full, sample_weight=full_sample_weights)
 
         return (base_model, scaler, iso, auc)
 
@@ -571,7 +649,7 @@ def run_backtest(all_data: Dict, config: Config,
                 X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
                 y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
 
-                result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile)
+                result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile, symbol=sym)
                 if result:
                     model, scaler, iso, auc = result
                     if sym not in all_ensemble_models:
@@ -1000,7 +1078,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
         X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
         y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
 
-        result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile)
+        result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile, symbol=sym)
         if not result:
             continue
 
@@ -1081,7 +1159,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
         y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
 
-        result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile)
+        result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile, symbol=sym)
         if not result:
             if debug:
                 print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC < {profile.min_val_auc})")
