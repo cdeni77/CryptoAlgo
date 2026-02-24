@@ -86,6 +86,9 @@ class Trade:
     raw_pnl: float
     funding_pnl: float
     fee_pnl: float
+    fee_pct_pnl: float
+    min_fee_pnl: float
+    slippage_pnl: float
     pnl_dollars: float
     n_contracts: int
     notional: float
@@ -124,7 +127,7 @@ class Config:
     # Fees — EXACT COINBASE US CDE
     fee_pct_per_side: float = 0.0010
     min_fee_per_contract: float = 0.20
-    slippage_bps: float = 0.0
+    slippage_bps: float = 2.0
 
     # Regime Filter (defaults — overridden per-coin)
     min_vol_24h: float = 0.008
@@ -170,25 +173,52 @@ def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
     return max(pct_fee, min_fee)
 
 
+def calculate_execution_costs(n_contracts: int, entry_price: float, exit_price: float,
+                              symbol: str, config: Config) -> Tuple[float, float, float, float]:
+    """Return round-trip cost components in dollars.
+
+    Returns: (total_cost, pct_fee_component, min_fee_component, slippage_component)
+    """
+    spec = get_contract_spec(symbol)
+    entry_notional = n_contracts * spec['units'] * entry_price
+    exit_notional = n_contracts * spec['units'] * exit_price
+
+    entry_pct_fee = entry_notional * config.fee_pct_per_side
+    exit_pct_fee = exit_notional * config.fee_pct_per_side
+    entry_min_fee = n_contracts * config.min_fee_per_contract
+    exit_min_fee = n_contracts * config.min_fee_per_contract
+
+    entry_fee = max(entry_pct_fee, entry_min_fee)
+    exit_fee = max(exit_pct_fee, exit_min_fee)
+
+    pct_component = min(entry_pct_fee, entry_fee) + min(exit_pct_fee, exit_fee)
+    min_component = max(entry_fee - entry_pct_fee, 0.0) + max(exit_fee - exit_pct_fee, 0.0)
+    slippage_component = (entry_notional + exit_notional) * (config.slippage_bps / 10000.0)
+    total_cost = entry_fee + exit_fee + slippage_component
+    return total_cost, pct_component, min_component, slippage_component
+
+
 def calculate_pnl_exact(entry_price: float, exit_price: float, direction: int,
                          accum_funding: float, n_contracts: int, symbol: str,
-                         config: Config) -> Tuple[float, float, float, float, float]:
+                         config: Config) -> Tuple[float, float, float, float, float, float, float, float]:
     spec = get_contract_spec(symbol)
     notional_per_contract = spec['units'] * entry_price
     total_notional = n_contracts * notional_per_contract
     if total_notional == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     raw_pnl_pct = (exit_price - entry_price) / entry_price * direction
     raw_pnl_dollars = total_notional * raw_pnl_pct
-    entry_fee = calculate_coinbase_fee(n_contracts, entry_price, symbol, config)
-    exit_fee = calculate_coinbase_fee(n_contracts, exit_price, symbol, config)
-    slippage = total_notional * (config.slippage_bps / 10000.0)
-    total_fee_dollars = entry_fee + exit_fee + slippage
+    total_fee_dollars, pct_fee_component, min_fee_component, slippage_component = calculate_execution_costs(
+        n_contracts, entry_price, exit_price, symbol, config
+    )
     total_fee_pct = total_fee_dollars / total_notional
+    pct_fee_pnl = -(pct_fee_component / total_notional)
+    min_fee_pnl = -(min_fee_component / total_notional)
+    slippage_pnl = -(slippage_component / total_notional)
     funding_dollars = accum_funding * total_notional
     net_pnl_dollars = raw_pnl_dollars - total_fee_dollars + funding_dollars
     net_pnl_pct = net_pnl_dollars / total_notional
-    return net_pnl_pct, raw_pnl_pct, -total_fee_pct, net_pnl_dollars, total_notional
+    return net_pnl_pct, raw_pnl_pct, -total_fee_pct, pct_fee_pnl, min_fee_pnl, slippage_pnl, net_pnl_dollars, total_notional
 
 
 def calculate_n_contracts(equity: float, price: float, symbol: str,
@@ -737,7 +767,7 @@ def run_backtest(all_data: Dict, config: Config,
                     exit_price, reason = bar['close'], 'max_hold'
 
                 if exit_price:
-                    net_pnl, raw_pnl, fee_pnl, pnl_dollars, notional = calculate_pnl_exact(
+                    net_pnl, raw_pnl, fee_pnl, fee_pct_pnl, min_fee_pnl, slippage_pnl, pnl_dollars, notional = calculate_pnl_exact(
                         pos['entry'], exit_price, direction,
                         pos['accum_funding'], pos['n_contracts'], sym, config
                     )
@@ -749,6 +779,7 @@ def run_backtest(all_data: Dict, config: Config,
                     completed_trades.append(Trade(
                         sym, pos['time'], ts, direction, pos['entry'], exit_price,
                         net_pnl, raw_pnl, pos['accum_funding'], fee_pnl,
+                        fee_pct_pnl, min_fee_pnl, slippage_pnl,
                         pnl_dollars, pos['n_contracts'], notional, reason
                     ))
                     to_close.append(sym)
@@ -877,9 +908,10 @@ def run_backtest(all_data: Dict, config: Config,
                     spec = get_contract_spec(sym)
                     notional_per_contract = spec['units'] * price
                     total_notional = n_contracts * notional_per_contract
-                    entry_fee = calculate_coinbase_fee(n_contracts, price, sym, config)
-                    exit_fee = entry_fee
-                    effective_fee_pct = (entry_fee + exit_fee) / total_notional
+                    est_roundtrip_cost, _, _, _ = calculate_execution_costs(
+                        n_contracts, price, price, sym, config
+                    )
+                    effective_fee_pct = est_roundtrip_cost / total_notional
 
                     # Per-coin TP/SL
                     active_positions[sym] = {
@@ -930,6 +962,9 @@ def run_backtest(all_data: Dict, config: Config,
     ann_sharpe = sharpe_per_trade * np.sqrt(trades_per_year) if trades_per_year > 0 else 0
 
     avg_fee = df['fee_pnl'].mean()
+    avg_fee_pct = df['fee_pct_pnl'].mean()
+    avg_min_fee = df['min_fee_pnl'].mean()
+    avg_slippage = df['slippage_pnl'].mean()
     avg_raw = df['raw_pnl'].mean()
     avg_funding = df['funding_pnl'].mean()
 
@@ -953,7 +988,10 @@ def run_backtest(all_data: Dict, config: Config,
     print(f"Edge Decomposition (% of notional):")
     print(f"  Avg Raw PnL:          {avg_raw:.4%}")
     print(f"  Avg Funding:          {avg_funding:.4%}")
-    print(f"  Avg Fees:             {avg_fee:.4%}")
+    print(f"  Avg Fee % Component:  {avg_fee_pct:.4%}")
+    print(f"  Avg Min-Fee Component:{avg_min_fee:.4%}")
+    print(f"  Avg Slippage:         {avg_slippage:.4%}")
+    print(f"  Avg Fees (Total):     {avg_fee:.4%}")
     print(f"  Avg Net PnL:          {avg_pnl:.4%}")
     if avg_raw != 0:
         print(f"  Fee/Edge Ratio:       {abs(avg_fee/avg_raw)*100:.0f}% of raw edge consumed by fees")
@@ -1035,6 +1073,9 @@ def run_backtest(all_data: Dict, config: Config,
         'avg_net_pnl': avg_pnl,
         'avg_raw_pnl': avg_raw,
         'avg_fee_pnl': avg_fee,
+        'avg_fee_pct_component': avg_fee_pct,
+        'avg_min_fee_component': avg_min_fee,
+        'avg_slippage_component': avg_slippage,
         'final_equity': equity,
         'oos_trades': int(len(oos_df)),
         'oos_sharpe': oos_sharpe,
