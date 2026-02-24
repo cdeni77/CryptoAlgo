@@ -1044,7 +1044,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   target_trades_per_week=1.0, target_trades_per_year=None,
                   preset_name="none", enable_fee_stress=True,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
-                  pruned_only=True):
+                  pruned_only=True, gate_mode="initial_paper_qualification"):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -1274,6 +1274,18 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         },
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
+        'gate_mode': gate_mode,
+        'gate_profile': {
+            'mode': gate_mode,
+            'screen_threshold': float(resolve_gate_mode(gate_mode).get('screen_threshold', 38.0)),
+            'holdout_min_trades': int(holdout_min_trades),
+            'holdout_min_sharpe': float(holdout_min_sharpe),
+            'holdout_min_return': float(holdout_min_return),
+            'escalation_policy': {
+                'window_days': '14-28',
+                'action': 'Tighten thresholds and switch to production_promotion after stable paper evidence.',
+            },
+        },
         'pruned_only': bool(pruned_only),
         'run_id': run_id,
         'trial_ledger': {
@@ -1368,6 +1380,28 @@ def show_results():
         print(f"\n{r['coin']} — {r['n_trials']}t — {r.get('version','?')} | SR={_fmt_float(m.get('mean_sharpe', m.get('sharpe')))} "
               f"Trades={m.get('n_trades','?')} | Holdout: SR={_fmt_float(h.get('holdout_sharpe'))} Ret={_fmt_pct(h.get('holdout_return'),2)}")
 
+
+GATE_MODE_CONFIGS = {
+    'initial_paper_qualification': {
+        'description': 'Lenient gate to allow controlled paper qualification of borderline models.',
+        'screen_threshold': 38.0,
+        'holdout_min_trades': 8,
+        'holdout_min_sharpe': -0.1,
+        'holdout_min_return': -0.05,
+    },
+    'production_promotion': {
+        'description': 'Stricter gate for production promotion after paper evidence is proven.',
+        'screen_threshold': 60.0,
+        'holdout_min_trades': 15,
+        'holdout_min_sharpe': 0.0,
+        'holdout_min_return': 0.0,
+    },
+}
+
+
+def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
+    return dict(GATE_MODE_CONFIGS.get(mode_name, GATE_MODE_CONFIGS['initial_paper_qualification']))
+
 def apply_runtime_preset(args):
     presets = {
         'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
@@ -1425,9 +1459,12 @@ if __name__ == "__main__":
                         help="Evaluate top-N CV candidates on holdout and pick the best")
     parser.add_argument("--require-holdout-pass", action="store_true",
                         help="Block deployment when no holdout candidate meets minimum gate")
-    parser.add_argument("--holdout-min-trades", type=int, default=15)
-    parser.add_argument("--holdout-min-sharpe", type=float, default=0.0)
-    parser.add_argument("--holdout-min-return", type=float, default=0.0)
+    parser.add_argument("--holdout-min-trades", type=int, default=8)
+    parser.add_argument("--holdout-min-sharpe", type=float, default=-0.1)
+    parser.add_argument("--holdout-min-return", type=float, default=-0.05)
+    parser.add_argument("--gate-mode", type=str, default="initial_paper_qualification",
+                        choices=sorted(GATE_MODE_CONFIGS.keys()),
+                        help="Gate profile: initial paper qualification (lenient) vs production promotion (strict)")
     parser.add_argument("--target-trades-per-week", type=float, default=1.0,
                         help="Trade-frequency objective target used during CV scoring (default: 1.0 ~= 52 trades/year)")
     parser.add_argument("--target-trades-per-year", type=float, default=None,
@@ -1448,6 +1485,19 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
     parser.set_defaults(pruned_only=True)
     args = parser.parse_args(); args = apply_runtime_preset(args)
+    gate_mode = resolve_gate_mode(args.gate_mode)
+    provided_flags = set(sys.argv[1:])
+    if "--holdout-min-trades" not in provided_flags:
+        args.holdout_min_trades = int(gate_mode["holdout_min_trades"])
+    if "--holdout-min-sharpe" not in provided_flags:
+        args.holdout_min_sharpe = float(gate_mode["holdout_min_sharpe"])
+    if "--holdout-min-return" not in provided_flags:
+        args.holdout_min_return = float(gate_mode["holdout_min_return"])
+    print(
+        f"🛡️ Gate mode: {args.gate_mode} | trades>={args.holdout_min_trades}, "
+        f"SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}"
+    )
+    print("   Escalation policy: tighten thresholds after 14-28 days of stable paper evidence.")
     if args.debug_trials:
         DEBUG_TRIALS = True
         logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -1476,4 +1526,5 @@ if __name__ == "__main__":
             fee_blend_normal_weight=args.fee_blend_normal_weight,
             fee_blend_stressed_weight=args.fee_blend_stressed_weight,
             pruned_only=args.pruned_only,
-            preset_name=args.preset)
+            preset_name=args.preset,
+            gate_mode=args.gate_mode)
