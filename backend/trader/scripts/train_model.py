@@ -12,6 +12,7 @@ Coinbase CDE fee model: 0.10% per side, $0.20 minimum per contract.
 Funding: Normalized hourly funding data (Coinbase native preferred, CCXT fallback).
 """
 import argparse
+import hashlib
 import joblib
 import sqlite3
 import warnings
@@ -172,6 +173,8 @@ class Config:
     # Entry quality filters
     min_signal_edge: float = 0.02
     max_ensemble_std: float = 0.12
+    min_directional_agreement: float = 0.67
+    disagreement_confidence_cap: float = 0.86
     meta_probability_threshold: float = 0.57
 
     # Walk-forward leakage protection / evaluation
@@ -183,6 +186,35 @@ class Config:
 
     # Recency weighting
     recency_half_life_days: float = 50.0
+
+
+@dataclass(frozen=True)
+class EnsembleMemberSpec:
+    name: str
+    train_window_days: int
+    feature_fraction: float
+    max_depth_range: Tuple[int, int]
+    num_leaves_range: Tuple[int, int]
+    n_estimators_range: Tuple[int, int]
+    min_child_samples_range: Tuple[int, int]
+
+
+CORE_ENSEMBLE_FEATURES = {
+    'fee_hurdle_pct',
+    'breakout_vs_cost',
+    'expected_cost_to_vol_ratio',
+    'vol_24h',
+    'funding_rate_zscore',
+}
+
+
+def build_ensemble_member_specs() -> List[EnsembleMemberSpec]:
+    return [
+        EnsembleMemberSpec("fast_90d", 90, 0.70, (2, 4), (15, 45), (70, 130), (12, 24)),
+        EnsembleMemberSpec("base_120d", 120, 0.78, (3, 5), (25, 70), (90, 170), (16, 30)),
+        EnsembleMemberSpec("slow_150d", 150, 0.85, (4, 6), (45, 100), (120, 220), (20, 40)),
+        EnsembleMemberSpec("robust_180d", 180, 0.82, (3, 6), (30, 90), (110, 210), (18, 36)),
+    ]
 
 
 def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
@@ -461,10 +493,66 @@ class MLSystem:
         )
         return sample_weights
 
+    @staticmethod
+    def _stable_seed(*parts: str) -> int:
+        joined = "|".join(parts).encode("utf-8")
+        return int(hashlib.sha256(joined).hexdigest()[:8], 16)
+
+    def build_member_features(self, symbol: str, cols: List[str], member: EnsembleMemberSpec) -> List[str]:
+        if not cols:
+            return []
+        mandatory = [c for c in cols if c in CORE_ENSEMBLE_FEATURES]
+        optional = [c for c in cols if c not in CORE_ENSEMBLE_FEATURES]
+        target = max(int(round(len(cols) * member.feature_fraction)), len(mandatory), 4)
+        optional_needed = max(target - len(mandatory), 0)
+        if optional_needed >= len(optional):
+            selected_optional = optional
+        else:
+            rng = np.random.default_rng(self._stable_seed(symbol, member.name, "feature_subset"))
+            idx = rng.choice(len(optional), size=optional_needed, replace=False)
+            selected_optional = [optional[i] for i in np.sort(idx)]
+        return mandatory + selected_optional
+
+    def sample_member_hyperparams(
+        self,
+        symbol: str,
+        member: EnsembleMemberSpec,
+        profile: Optional[CoinProfile],
+    ) -> Dict[str, float]:
+        rng = np.random.default_rng(self._stable_seed(symbol, member.name, "hparams"))
+        profile_lr = profile.learning_rate if profile else 0.05
+        return {
+            'n_estimators': int(rng.integers(member.n_estimators_range[0], member.n_estimators_range[1] + 1)),
+            'max_depth': int(rng.integers(member.max_depth_range[0], member.max_depth_range[1] + 1)),
+            'num_leaves': int(rng.integers(member.num_leaves_range[0], member.num_leaves_range[1] + 1)),
+            'min_child_samples': int(rng.integers(member.min_child_samples_range[0], member.min_child_samples_range[1] + 1)),
+            'learning_rate': float(profile_lr * rng.uniform(0.85, 1.15)),
+        }
+
+    @staticmethod
+    def log_member_pairwise_correlation(symbol: str, member_outputs: List[Dict[str, object]]) -> None:
+        if len(member_outputs) < 2:
+            return
+        print(f"[{symbol}] Ensemble pairwise correlation (validation probs):")
+        for i in range(len(member_outputs)):
+            for j in range(i + 1, len(member_outputs)):
+                a = np.asarray(member_outputs[i].get('val_probs', []), dtype=float)
+                b = np.asarray(member_outputs[j].get('val_probs', []), dtype=float)
+                if len(a) != len(b) or len(a) < 2:
+                    corr = np.nan
+                else:
+                    corr = float(np.corrcoef(a, b)[0, 1])
+                print(
+                    f"  {member_outputs[i].get('member_name', f'm{i}'):<14} vs "
+                    f"{member_outputs[j].get('member_name', f'm{j}'):<14}: corr={corr:.4f}"
+                )
+
     def train(self, X_train: pd.DataFrame, y_train: pd.Series,
               X_val: pd.DataFrame, y_val: pd.Series,
               profile: Optional[CoinProfile] = None,
-              symbol: str = "UNKNOWN") -> Optional[Tuple]:
+              symbol: str = "UNKNOWN",
+              member_spec: Optional[EnsembleMemberSpec] = None,
+              member_features: Optional[List[str]] = None) -> Optional[Tuple]:
         if len(X_train) < self.config.min_train_samples:
             return None
         if y_train.sum() < 15 or (1 - y_train).sum() < 15:
@@ -476,10 +564,20 @@ class MLSystem:
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
 
-        n_est = profile.n_estimators if profile else 100
-        depth = profile.max_depth if profile else 3
-        lr = profile.learning_rate if profile else 0.05
-        min_child = profile.min_child_samples if profile else 20
+        member_name = member_spec.name if member_spec else "single"
+        if member_spec:
+            sampled = self.sample_member_hyperparams(symbol, member_spec, profile)
+            n_est = int(sampled['n_estimators'])
+            depth = int(sampled['max_depth'])
+            num_leaves = int(sampled['num_leaves'])
+            lr = float(sampled['learning_rate'])
+            min_child = int(sampled['min_child_samples'])
+        else:
+            n_est = profile.n_estimators if profile else 100
+            depth = profile.max_depth if profile else 3
+            num_leaves = max(15, min(2 ** max(depth, 1), 63))
+            lr = profile.learning_rate if profile else 0.05
+            min_child = profile.min_child_samples if profile else 20
         label_horizon = resolve_label_horizon(profile, self.config)
 
         train_sample_weights = self._build_sample_weights(
@@ -491,6 +589,7 @@ class MLSystem:
         base_model = lgb.LGBMClassifier(
             n_estimators=n_est,
             max_depth=depth,
+            num_leaves=num_leaves,
             learning_rate=lr,
             verbose=-1,
             min_child_samples=min_child,
@@ -556,7 +655,26 @@ class MLSystem:
             'meta_threshold': float(self.config.meta_probability_threshold),
         }
 
-        return (base_model, scaler, iso, auc, meta_artifacts, stage_metrics)
+        member_meta = {
+            'member_name': member_name,
+            'member_spec': {
+                'train_window_days': member_spec.train_window_days if member_spec else None,
+                'feature_fraction': member_spec.feature_fraction if member_spec else None,
+            },
+            'feature_count': int(len(member_features) if member_features is not None else X_train.shape[1]),
+            'features': list(member_features) if member_features is not None else list(X_train.columns),
+            'hyperparameters': {
+                'n_estimators': n_est,
+                'max_depth': depth,
+                'num_leaves': num_leaves,
+                'learning_rate': lr,
+                'min_child_samples': min_child,
+            },
+            'val_probs': [float(x) for x in primary_val_probs],
+            'val_samples': int(len(y_val)),
+        }
+
+        return (base_model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta)
 
 
 def resolve_label_horizon(profile: Optional[CoinProfile], config: Config) -> int:
@@ -721,13 +839,11 @@ def run_backtest(all_data: Dict, config: Config,
         weekly_equity_base = min(equity, weekly_equity_base * (1 + config.max_weekly_equity_growth))
         weekly_equity_base = max(weekly_equity_base, equity * 0.9)
 
-        # --- TRAINING (ENSEMBLE: 3 lookback offsets for stability) ---
-        ensemble_offsets = [0, 3, 6]
+        # --- TRAINING (ENSEMBLE: heterogeneous members) ---
+        ensemble_members = build_ensemble_member_specs()
         all_ensemble_models = {}
 
-        for offset in ensemble_offsets:
-            train_start = current_date - timedelta(days=config.train_lookback_days + offset)
-
+        for member_spec in ensemble_members:
             for sym, d in all_data.items():
                 profile = _get_profile(sym, profile_overrides)
                 feat, ohlc = d['features'], d['ohlcv']
@@ -735,14 +851,19 @@ def run_backtest(all_data: Dict, config: Config,
                     use_pruned_features=config.enforce_pruned_features,
                     strict_pruned=config.enforce_pruned_features,
                 )
-                cols = system.get_feature_columns(feat.columns, coin_feature_list)
-                print(f"[{sym}] Features selected: {len(cols)} (pruned_only={config.enforce_pruned_features})")
+                base_cols = system.get_feature_columns(feat.columns, coin_feature_list)
+                cols = system.build_member_features(sym, base_cols, member_spec)
+                print(
+                    f"[{sym}/{member_spec.name}] Features selected: {len(cols)} / {len(base_cols)} "
+                    f"(window={member_spec.train_window_days}d, pruned_only={config.enforce_pruned_features})"
+                )
                 if not cols:
                     continue
 
                 label_horizon = resolve_label_horizon(profile, config)
                 embargo_hours = max(config.train_embargo_hours, label_horizon, 1)
                 train_end = current_date - timedelta(hours=embargo_hours)
+                train_start = train_end - timedelta(days=member_spec.train_window_days)
                 if train_end <= train_start:
                     continue
 
@@ -765,12 +886,23 @@ def run_backtest(all_data: Dict, config: Config,
                 X_tr, X_vl = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
                 y_tr, y_vl = y_all.iloc[:split_idx], y_all.iloc[split_idx:]
 
-                result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile, symbol=sym)
+                result = system.train(
+                    X_tr,
+                    y_tr,
+                    X_vl,
+                    y_vl,
+                    profile=profile,
+                    symbol=sym,
+                    member_spec=member_spec,
+                    member_features=cols,
+                )
                 if result:
-                    model, scaler, iso, auc, meta_artifacts, stage_metrics = result
+                    model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
                     if sym not in all_ensemble_models:
                         all_ensemble_models[sym] = []
-                    all_ensemble_models[sym].append((model, scaler, cols, iso, auc, meta_artifacts, stage_metrics))
+                    all_ensemble_models[sym].append((
+                        model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta
+                    ))
                     stage_metric_history.append(stage_metrics)
                     models_accepted += 1
                 else:
@@ -780,6 +912,8 @@ def run_backtest(all_data: Dict, config: Config,
         for sym, ensemble_list in all_ensemble_models.items():
             if ensemble_list:
                 models[sym] = ensemble_list
+                member_outputs = [m[7] for m in ensemble_list if len(m) > 7]
+                system.log_member_pairwise_correlation(sym, member_outputs)
 
         # --- TRADING ---
         test_start = current_date + timedelta(hours=1)
@@ -961,14 +1095,16 @@ def run_backtest(all_data: Dict, config: Config,
 
                     probs = []
                     meta_probs = []
+                    directional_votes = []
                     primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
-                    for (model, scaler, cols, iso, auc, meta_artifacts, stage_metrics) in models[sym]:
+                    for (model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta) in models[sym]:
                         x_in = np.nan_to_num(
                             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
                         )
                         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
                         cal_prob = float(iso.predict([raw_prob])[0])
                         probs.append(cal_prob)
+                        directional_votes.append(1 if (cal_prob >= 0.5 and direction == 1) or (cal_prob < 0.5 and direction == -1) else 0)
 
                         if cal_prob >= primary_cutoff and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
                             meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
@@ -978,8 +1114,16 @@ def run_backtest(all_data: Dict, config: Config,
                                 meta_cal = float(meta_raw)
                             meta_probs.append(meta_cal)
 
+                    if not probs:
+                        continue
+                    agreement = float(np.mean(directional_votes)) if directional_votes else 0.0
+                    if agreement < config.min_directional_agreement:
+                        continue
+
                     prob = float(np.mean(probs))
                     prob_std = float(np.std(probs))
+                    if agreement < 0.999:
+                        prob = min(prob, config.disagreement_confidence_cap)
                     if prob < primary_cutoff or prob_std > config.max_ensemble_std:
                         continue
 
@@ -1136,7 +1280,7 @@ def run_backtest(all_data: Dict, config: Config,
     for sym, ensemble_list in models.items():
         if ensemble_list:
             best = max(ensemble_list, key=lambda x: x[4])
-            model, scaler, cols, iso, auc, meta_artifacts, stage_metrics = best
+            model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta = best
             importance_summary = summarize_feature_importance(model, cols)
             profile = get_coin_profile(sym)
             save_model(
@@ -1154,6 +1298,8 @@ def run_backtest(all_data: Dict, config: Config,
                     'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
                     'stage_metrics': stage_metrics,
                     'feature_importance': importance_summary,
+                    'ensemble_member': member_meta,
+                    'ensemble_members': [m[7] for m in ensemble_list if len(m) > 7],
                 },
                 secondary_model=meta_artifacts.model,
                 secondary_scaler=meta_artifacts.scaler,
@@ -1235,7 +1381,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
         if not result:
             continue
 
-        model, scaler, iso, auc, meta_artifacts, stage_metrics = result
+        model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
         importance_summary = summarize_feature_importance(model, cols)
         symbol_train_start = X_all.index.min()
         symbol_train_end = X_all.index.max()
@@ -1265,6 +1411,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
                 'metrics': model_metrics,
                 'stage_metrics': stage_metrics,
                 'feature_importance': importance_summary,
+                    'ensemble_member': member_meta,
             },
             secondary_model=meta_artifacts.model,
             secondary_scaler=meta_artifacts.scaler,
@@ -1328,7 +1475,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC < {profile.min_val_auc})")
             continue
 
-        model, scaler, iso, auc, meta_artifacts, stage_metrics = result
+        model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
         importance_summary = summarize_feature_importance(model, cols)
 
         save_model(
@@ -1345,6 +1492,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 'train_samples': len(X_all),
                 'stage_metrics': stage_metrics,
                 'feature_importance': importance_summary,
+                    'ensemble_member': member_meta,
             },
             secondary_model=meta_artifacts.model,
             secondary_scaler=meta_artifacts.scaler,
@@ -1454,6 +1602,8 @@ if __name__ == "__main__":
     parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
     parser.add_argument("--min-edge", type=float, default=0.02, help="Require prob >= threshold + min-edge")
     parser.add_argument("--max-ensemble-std", type=float, default=0.12, help="Max std across ensemble probs")
+    parser.add_argument("--min-directional-agreement", type=float, default=0.67, help="Minimum fraction of members agreeing with momentum direction")
+    parser.add_argument("--disagreement-confidence-cap", type=float, default=0.86, help="Cap primary confidence when ensemble is not unanimous")
     parser.add_argument("--meta-threshold", type=float, default=0.57, help="Secondary meta-model probability threshold")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
@@ -1475,6 +1625,8 @@ if __name__ == "__main__":
         cooldown_hours=args.cooldown,
         min_signal_edge=args.min_edge,
         max_ensemble_std=args.max_ensemble_std,
+        min_directional_agreement=args.min_directional_agreement,
+        disagreement_confidence_cap=args.disagreement_confidence_cap,
         meta_probability_threshold=args.meta_threshold,
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
