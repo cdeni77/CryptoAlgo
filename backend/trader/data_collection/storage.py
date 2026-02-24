@@ -160,10 +160,17 @@ class SQLiteDatabase(DatabaseBase):
                     is_settlement INTEGER DEFAULT 0,
                     quality TEXT DEFAULT 'valid',
                     source TEXT DEFAULT 'unknown',
+                    funding_source TEXT DEFAULT 'unknown',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, event_time)
                 )
             """)
+
+            # Lightweight migration for existing DBs
+            cursor.execute("PRAGMA table_info(funding_rates)")
+            funding_columns = {row[1] for row in cursor.fetchall()}
+            if "funding_source" not in funding_columns:
+                cursor.execute("ALTER TABLE funding_rates ADD COLUMN funding_source TEXT DEFAULT 'unknown'")
             
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_funding_symbol_event 
@@ -313,8 +320,8 @@ class SQLiteDatabase(DatabaseBase):
                 cursor.execute("""
                     INSERT OR REPLACE INTO funding_rates
                     (symbol, event_time, available_time, rate, 
-                     mark_price, index_price, is_settlement, quality, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mark_price, index_price, is_settlement, quality, source, funding_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     funding.symbol,
                     funding.event_time,
@@ -325,6 +332,7 @@ class SQLiteDatabase(DatabaseBase):
                     1 if funding.is_settlement else 0,
                     funding.quality.value,
                     "coinbase",
+                    funding.funding_source,
                 ))
                 conn.commit()
                 return True
@@ -344,10 +352,10 @@ class SQLiteDatabase(DatabaseBase):
             for funding in rates:
                 try:
                     cursor.execute("""
-                        INSERT OR REPLACE INTO funding_rates
-                        (symbol, event_time, available_time, rate, 
-                         mark_price, index_price, is_settlement, quality, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO funding_rates
+                    (symbol, event_time, available_time, rate, 
+                         mark_price, index_price, is_settlement, quality, source, funding_source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         funding.symbol,
                         funding.event_time,
@@ -358,6 +366,7 @@ class SQLiteDatabase(DatabaseBase):
                         1 if funding.is_settlement else 0,
                         funding.quality.value,
                         getattr(funding, 'source', 'ccxt'),
+                        getattr(funding, 'funding_source', 'unknown'),
                     ))
                     inserted += 1
                 except Exception as e:

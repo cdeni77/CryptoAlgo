@@ -292,10 +292,9 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
         # CHECK EXITS
         if active_pos is not None:
             row = test_feat.loc[ts]
-            funding_8h_bps = row.get('funding_rate_bps', 0.0)
-            if pd.isna(funding_8h_bps):
-                funding_8h_bps = 0.0
-            funding_hourly_bps = funding_8h_bps / 8.0
+            funding_hourly_bps = row.get('funding_rate_bps', 0.0)
+            if pd.isna(funding_hourly_bps):
+                funding_hourly_bps = 0.0
             active_pos['accum_funding'] += -(funding_hourly_bps / 10000.0) * active_pos['dir']
             d = active_pos['dir']
             exit_price = exit_reason = None
