@@ -33,6 +33,8 @@ class CoinHealthRow(BaseModel):
     optimization_freshness_hours: Optional[float] = None
     last_optimized_at: Optional[datetime] = None
     health: str
+    model_status: str = "active"
+    quarantine_reasons: List[str] = Field(default_factory=list)
 
 
 class ResearchSummaryResponse(BaseModel):
@@ -58,6 +60,8 @@ class ResearchRunResponse(BaseModel):
     readiness_tier: ReadinessTier = "UNKNOWN"
     recommended_position_scale: float = 0.0
     robustness_gate: bool
+    model_status: str = "active"
+    quarantine_reasons: List[str] = Field(default_factory=list)
 
 
 class FeatureImportanceItem(BaseModel):

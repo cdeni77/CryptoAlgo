@@ -90,6 +90,30 @@ def _extract_tier_fields(validation_artifact: Optional[dict[str, Any]]) -> Tuple
     return tier, position_scale
 
 
+
+
+def _load_orchestrator_state() -> dict[str, Any]:
+    state_file = Path(os.getenv("RESEARCH_MONITORING_STATE_FILE", "/app/data/orchestrator_state.json"))
+    if not state_file.exists():
+        return {}
+    try:
+        return json.loads(state_file.read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _model_monitoring_status(state: dict[str, Any], coin: str) -> tuple[str, list[str]]:
+    qmodels = state.get("quarantined_models", {})
+    for key in (coin.upper(), "ALL"):
+        entry = qmodels.get(key)
+        if not isinstance(entry, dict):
+            continue
+        reasons = entry.get("reasons")
+        if isinstance(reasons, list):
+            return "quarantined", [str(r) for r in reasons]
+        return "quarantined", []
+    return "active", []
+
 def _derive_robustness_gate(
     holdout_auc: Optional[float],
     signal_count: int,
@@ -100,7 +124,7 @@ def _derive_robustness_gate(
     return bool(holdout_auc is not None and holdout_auc >= 0.54 and signal_count >= 20)
 
 
-def _coin_metrics(db: Session, coin: str) -> CoinHealthRow:
+def _coin_metrics(db: Session, coin: str, monitor_state: Optional[dict[str, Any]] = None) -> CoinHealthRow:
     latest_signal = db.query(Signal).filter(Signal.coin == coin).order_by(desc(Signal.timestamp)).first()
 
     signal_count = db.query(func.count(Signal.id)).filter(Signal.coin == coin).scalar() or 0
@@ -127,6 +151,9 @@ def _coin_metrics(db: Session, coin: str) -> CoinHealthRow:
     readiness_tier, recommended_position_scale = _extract_tier_fields(validation_artifact)
     robustness_gate = _derive_robustness_gate(holdout_auc, signal_count, readiness_tier)
 
+    monitor_state = monitor_state or {}
+    model_status, quarantine_reasons = _model_monitoring_status(monitor_state, coin)
+
     healthy = (
         holdout_auc is not None
         and holdout_auc >= 0.56
@@ -151,13 +178,16 @@ def _coin_metrics(db: Session, coin: str) -> CoinHealthRow:
         optimization_freshness_hours=freshness_hours,
         last_optimized_at=last_opt_event,
         health=health,
+        model_status=model_status,
+        quarantine_reasons=quarantine_reasons,
     )
 
 
 def _all_coin_rows(db: Session) -> List[CoinHealthRow]:
     db_coins = [c[0] for c in db.query(Signal.coin).distinct().all()]
     coins = sorted(set(DEFAULT_COINS + db_coins))
-    return [_coin_metrics(db, coin) for coin in coins]
+    monitor_state = _load_orchestrator_state()
+    return [_coin_metrics(db, coin, monitor_state=monitor_state) for coin in coins]
 
 
 
@@ -211,7 +241,7 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
 
 
 def get_research_coin(db: Session, coin: str) -> ResearchCoinDetailResponse:
-    row = _coin_metrics(db, coin.upper())
+    row = _coin_metrics(db, coin.upper(), monitor_state=_load_orchestrator_state())
     return ResearchCoinDetailResponse(generated_at=datetime.now(timezone.utc), coin=row)
 
 
@@ -219,6 +249,7 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
     signals = db.query(Signal).order_by(desc(Signal.timestamp)).limit(limit).all()
     runs: List[ResearchRunResponse] = []
     tier_cache: dict[str, tuple[str, float]] = {}
+    monitor_state = _load_orchestrator_state()
 
     def _run_tier(coin: str) -> tuple[str, float]:
         key = coin.upper()
@@ -232,6 +263,7 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
         auc = s.model_auc
         readiness_tier, recommended_position_scale = _run_tier(s.coin)
         run_gate = _derive_robustness_gate(auc, 0, readiness_tier)
+        model_status, quarantine_reasons = _model_monitoring_status(monitor_state, s.coin)
         runs.extend(
             [
                 ResearchRunResponse(
@@ -246,6 +278,8 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
                     readiness_tier=readiness_tier,
                     recommended_position_scale=recommended_position_scale,
                     robustness_gate=run_gate,
+                    model_status=model_status,
+                    quarantine_reasons=quarantine_reasons,
                 ),
                 ResearchRunResponse(
                     id=f"optimize-{s.id}",
@@ -259,6 +293,8 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
                     readiness_tier=readiness_tier,
                     recommended_position_scale=recommended_position_scale,
                     robustness_gate=run_gate,
+                    model_status=model_status,
+                    quarantine_reasons=quarantine_reasons,
                 ),
                 ResearchRunResponse(
                     id=f"validate-{s.id}",
@@ -272,6 +308,8 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
                     readiness_tier=readiness_tier,
                     recommended_position_scale=recommended_position_scale,
                     robustness_gate=run_gate,
+                    model_status=model_status,
+                    quarantine_reasons=quarantine_reasons,
                 ),
             ]
         )
