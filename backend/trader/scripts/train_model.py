@@ -23,8 +23,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.preprocessing import RobustScaler
 import lightgbm as lgb
 
@@ -38,9 +39,16 @@ from core.meta_labeling import (
     build_meta_dataset,
     primary_recall_threshold,
     train_meta_classifier,
+    calibrator_predict as meta_calibrator_predict,
+    calibrator_params as meta_calibrator_params,
 )
 
 warnings.filterwarnings('ignore')
+
+try:
+    from betacal import BetaCalibration  # type: ignore
+except Exception:
+    BetaCalibration = None
 
 
 # --- Paths ---
@@ -186,6 +194,105 @@ class Config:
 
     # Recency weighting
     recency_half_life_days: float = 50.0
+
+    # Calibration
+    calibration_strategy: str = 'platt'
+
+
+def _fit_calibrator(
+    strategy: str,
+    train_scores: np.ndarray,
+    train_labels: pd.Series,
+    *,
+    isotonic_min_samples: int = 200,
+):
+    strategy_normalized = (strategy or 'platt').lower()
+    x = np.clip(np.asarray(train_scores, dtype=float), 1e-6, 1 - 1e-6)
+    y = np.asarray(train_labels, dtype=int)
+
+    if strategy_normalized == 'isotonic':
+        if len(x) < isotonic_min_samples:
+            strategy_normalized = 'platt'
+        else:
+            iso = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
+            iso.fit(x, y)
+            return iso, 'isotonic'
+
+    if strategy_normalized == 'beta':
+        if BetaCalibration is not None:
+            beta_cal = BetaCalibration(parameters='abm')
+            beta_cal.fit(x.reshape(-1, 1), y)
+            return beta_cal, 'beta'
+        strategy_normalized = 'platt'
+
+    platt = LogisticRegression(solver='lbfgs', max_iter=2000)
+    platt.fit(x.reshape(-1, 1), y)
+    return platt, 'platt'
+
+
+def _calibrator_predict(calibrator, scores: np.ndarray) -> np.ndarray:
+    x = np.clip(np.asarray(scores, dtype=float), 1e-6, 1 - 1e-6)
+    if isinstance(calibrator, LogisticRegression):
+        return calibrator.predict_proba(x.reshape(-1, 1))[:, 1]
+    if BetaCalibration is not None and isinstance(calibrator, BetaCalibration):
+        return calibrator.predict(x.reshape(-1, 1))
+    return calibrator.predict(x)
+
+
+def _reliability_bins(labels: np.ndarray, probs: np.ndarray, n_bins: int = 10) -> List[Dict[str, float]]:
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bins: List[Dict[str, float]] = []
+    for i in range(n_bins):
+        lo = edges[i]
+        hi = edges[i + 1]
+        if i == n_bins - 1:
+            mask = (probs >= lo) & (probs <= hi)
+        else:
+            mask = (probs >= lo) & (probs < hi)
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        bins.append({
+            'bin_start': float(lo),
+            'bin_end': float(hi),
+            'count': count,
+            'avg_confidence': float(np.mean(probs[mask])),
+            'event_rate': float(np.mean(labels[mask])),
+        })
+    return bins
+
+
+def _calibration_report(labels: np.ndarray, raw_probs: np.ndarray, cal_probs: np.ndarray) -> Dict[str, object]:
+    if len(labels) < 2:
+        return {'samples': int(len(labels)), 'raw_brier': None, 'calibrated_brier': None, 'reliability_bins': []}
+    return {
+        'samples': int(len(labels)),
+        'raw_brier': float(brier_score_loss(labels, raw_probs)),
+        'calibrated_brier': float(brier_score_loss(labels, cal_probs)),
+        'reliability_bins': _reliability_bins(labels, cal_probs),
+    }
+
+
+def _calibrator_params(calibrator) -> Dict[str, object]:
+    if calibrator is None:
+        return {}
+    if isinstance(calibrator, LogisticRegression):
+        return {
+            'coef': [float(v) for v in calibrator.coef_.ravel().tolist()],
+            'intercept': [float(v) for v in calibrator.intercept_.ravel().tolist()],
+        }
+    if isinstance(calibrator, IsotonicRegression):
+        return {
+            'x_thresholds': [float(v) for v in np.asarray(calibrator.X_thresholds_).tolist()],
+            'y_thresholds': [float(v) for v in np.asarray(calibrator.y_thresholds_).tolist()],
+        }
+    if BetaCalibration is not None and isinstance(calibrator, BetaCalibration):
+        attrs = {}
+        for name in ('a_', 'b_', 'm_'):
+            if hasattr(calibrator, name):
+                attrs[name] = float(getattr(calibrator, name))
+        return attrs
+    return {'type': calibrator.__class__.__name__}
 
 
 @dataclass(frozen=True)
@@ -609,15 +716,31 @@ class MLSystem:
         if auc < min_auc:
             return None
 
-        iso = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
-        iso.fit(val_probs, y_val)
+        holdout_size = max(20, int(len(X_val) * 0.25)) if len(X_val) >= 80 else 0
+        cal_fit_probs = val_probs[:-holdout_size] if holdout_size > 0 else val_probs
+        cal_fit_y = y_val.iloc[:-holdout_size] if holdout_size > 0 else y_val
+
+        calibrator, calibrator_type = _fit_calibrator(
+            self.config.calibration_strategy,
+            cal_fit_probs,
+            cal_fit_y,
+        )
 
         primary_threshold = primary_recall_threshold(
             profile.signal_threshold if profile else self.config.signal_threshold,
             self.config.min_signal_edge,
         )
-        primary_train_probs = iso.predict(base_model.predict_proba(X_train_scaled)[:, 1])
-        primary_val_probs = iso.predict(val_probs)
+        primary_train_probs = _calibrator_predict(calibrator, base_model.predict_proba(X_train_scaled)[:, 1])
+        primary_val_probs = _calibrator_predict(calibrator, val_probs)
+
+        val_report = _calibration_report(y_val.to_numpy(dtype=int), val_probs, primary_val_probs)
+        holdout_report = None
+        if holdout_size > 0:
+            holdout_report = _calibration_report(
+                y_val.iloc[-holdout_size:].to_numpy(dtype=int),
+                val_probs[-holdout_size:],
+                primary_val_probs[-holdout_size:],
+            )
 
         X_meta_tr, y_meta_tr, _ = build_meta_dataset(X_train, y_train, primary_train_probs, primary_threshold)
         X_meta_vl, y_meta_vl, _ = build_meta_dataset(X_val, y_val, primary_val_probs, primary_threshold)
@@ -634,6 +757,7 @@ class MLSystem:
             max_depth=depth,
             learning_rate=lr,
             min_child_samples=min_child,
+            calibration_strategy=self.config.calibration_strategy,
         )
 
         X_full = np.vstack([X_train_scaled, X_val_scaled])
@@ -653,6 +777,9 @@ class MLSystem:
             'final_trade_precision': float(meta_artifacts.metrics.get('final_trade_precision', 0.0)),
             'primary_threshold': float(primary_threshold),
             'meta_threshold': float(self.config.meta_probability_threshold),
+            'calibration_strategy': calibrator_type,
+            'val_calibrated_brier': val_report.get('calibrated_brier'),
+            'holdout_calibrated_brier': holdout_report.get('calibrated_brier') if holdout_report else None,
         }
 
         member_meta = {
@@ -672,9 +799,19 @@ class MLSystem:
             },
             'val_probs': [float(x) for x in primary_val_probs],
             'val_samples': int(len(y_val)),
+            'calibration': {
+                'strategy_requested': self.config.calibration_strategy,
+                'strategy_used': calibrator_type,
+                'primary_params': _calibrator_params(calibrator),
+                'meta_strategy_used': meta_artifacts.calibrator_type,
+                'meta_params': meta_calibrator_params(meta_artifacts.calibrator),
+                'validation': val_report,
+                'holdout': holdout_report,
+                'meta_validation': meta_artifacts.calibration_metrics,
+            },
         }
 
-        return (base_model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta)
+        return (base_model, scaler, calibrator, auc, meta_artifacts, stage_metrics, member_meta)
 
 
 def resolve_label_horizon(profile: Optional[CoinProfile], config: Config) -> int:
@@ -1102,14 +1239,14 @@ def run_backtest(all_data: Dict, config: Config,
                             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
                         )
                         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
-                        cal_prob = float(iso.predict([raw_prob])[0])
+                        cal_prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
                         probs.append(cal_prob)
                         directional_votes.append(1 if (cal_prob >= 0.5 and direction == 1) or (cal_prob < 0.5 and direction == -1) else 0)
 
                         if cal_prob >= primary_cutoff and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
                             meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
                             if meta_artifacts.calibrator is not None:
-                                meta_cal = float(meta_artifacts.calibrator.predict([meta_raw])[0])
+                                meta_cal = float(meta_calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0])
                             else:
                                 meta_cal = float(meta_raw)
                             meta_probs.append(meta_cal)
@@ -1297,6 +1434,12 @@ def run_backtest(all_data: Dict, config: Config,
                     'n_ensemble': len(ensemble_list),
                     'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
                     'stage_metrics': stage_metrics,
+                    'calibration': member_meta.get('calibration', {}),
+                    'secondary_calibration': {
+                        'strategy_used': meta_artifacts.calibrator_type,
+                        'params': meta_calibrator_params(meta_artifacts.calibrator),
+                        'metrics': meta_artifacts.calibration_metrics,
+                    },
                     'feature_importance': importance_summary,
                     'ensemble_member': member_meta,
                     'ensemble_members': [m[7] for m in ensemble_list if len(m) > 7],
@@ -1410,8 +1553,14 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
                 'train_end': symbol_train_end.isoformat() if symbol_train_end is not None else None,
                 'metrics': model_metrics,
                 'stage_metrics': stage_metrics,
+                'calibration': member_meta.get('calibration', {}),
+                'secondary_calibration': {
+                    'strategy_used': meta_artifacts.calibrator_type,
+                    'params': meta_calibrator_params(meta_artifacts.calibrator),
+                    'metrics': meta_artifacts.calibration_metrics,
+                },
                 'feature_importance': importance_summary,
-                    'ensemble_member': member_meta,
+                'ensemble_member': member_meta,
             },
             secondary_model=meta_artifacts.model,
             secondary_scaler=meta_artifacts.scaler,
@@ -1491,8 +1640,14 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 'signal_threshold': profile.signal_threshold,
                 'train_samples': len(X_all),
                 'stage_metrics': stage_metrics,
+                'calibration': member_meta.get('calibration', {}),
+                'secondary_calibration': {
+                    'strategy_used': meta_artifacts.calibrator_type,
+                    'params': meta_calibrator_params(meta_artifacts.calibrator),
+                    'metrics': meta_artifacts.calibration_metrics,
+                },
                 'feature_importance': importance_summary,
-                    'ensemble_member': member_meta,
+                'ensemble_member': member_meta,
             },
             secondary_model=meta_artifacts.model,
             secondary_scaler=meta_artifacts.scaler,
@@ -1540,7 +1695,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
         )
         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
-        prob = float(iso.predict([raw_prob])[0])
+        prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
         primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
         ml_pass = prob >= primary_cutoff
         meta_prob = 0.0
@@ -1548,7 +1703,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         if ml_pass and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
             meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
             if meta_artifacts.calibrator is not None:
-                meta_prob = float(meta_artifacts.calibrator.predict([meta_raw])[0])
+                meta_prob = float(meta_calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0])
             else:
                 meta_prob = float(meta_raw)
             meta_pass = meta_prob >= config.meta_probability_threshold
@@ -1605,6 +1760,8 @@ if __name__ == "__main__":
     parser.add_argument("--min-directional-agreement", type=float, default=0.67, help="Minimum fraction of members agreeing with momentum direction")
     parser.add_argument("--disagreement-confidence-cap", type=float, default=0.86, help="Cap primary confidence when ensemble is not unanimous")
     parser.add_argument("--meta-threshold", type=float, default=0.57, help="Secondary meta-model probability threshold")
+    parser.add_argument("--calibration", choices=['isotonic', 'platt', 'beta'], default='platt',
+                        help="Calibration strategy for primary+meta models")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
     parser.add_argument("--pruned-only", action="store_true",
@@ -1628,6 +1785,7 @@ if __name__ == "__main__":
         min_directional_agreement=args.min_directional_agreement,
         disagreement_confidence_cap=args.disagreement_confidence_cap,
         meta_probability_threshold=args.meta_threshold,
+        calibration_strategy=args.calibration,
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
         recency_half_life_days=args.recency_half_life_days,
