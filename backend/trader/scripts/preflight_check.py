@@ -51,14 +51,17 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _pick_symbol(conn: sqlite3.Connection, prefix: str) -> str | None:
+    ohlcv_time_col = _resolve_time_column(conn, "ohlcv")
+    if not ohlcv_time_col:
+        return None
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT symbol
         FROM ohlcv
         WHERE timeframe='1h' AND symbol LIKE ?
         GROUP BY symbol
-        ORDER BY MAX(timestamp) DESC
+        ORDER BY MAX({ohlcv_time_col}) DESC
         LIMIT 1
         """,
         (f"{prefix}%",),
@@ -67,17 +70,30 @@ def _pick_symbol(conn: sqlite3.Connection, prefix: str) -> str | None:
     return row[0] if row else None
 
 
+def _resolve_time_column(conn: sqlite3.Connection, table: str) -> str | None:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {row[1] for row in cur.fetchall()}
+    for candidate in ("event_time", "timestamp", "time", "ts"):
+        if candidate in cols:
+            return candidate
+    return None
+
+
 def _count_rows(conn: sqlite3.Connection, table: str, symbol: str, start_iso: str, timeframe: str | None = None) -> int:
+    time_col = _resolve_time_column(conn, table)
+    if not time_col:
+        return 0
     cur = conn.cursor()
     if table == "ohlcv":
         cur.execute(
-            "SELECT COUNT(*) FROM ohlcv WHERE symbol=? AND timeframe=? AND timestamp>=?",
+            f"SELECT COUNT(*) FROM ohlcv WHERE symbol=? AND timeframe=? AND {time_col}>=?",
             (symbol, timeframe or "1h", start_iso),
         )
     elif table == "funding_rates":
-        cur.execute("SELECT COUNT(*) FROM funding_rates WHERE symbol=? AND timestamp>=?", (symbol, start_iso))
+        cur.execute(f"SELECT COUNT(*) FROM funding_rates WHERE symbol=? AND {time_col}>=?", (symbol, start_iso))
     elif table == "open_interest":
-        cur.execute("SELECT COUNT(*) FROM open_interest WHERE symbol=? AND timestamp>=?", (symbol, start_iso))
+        cur.execute(f"SELECT COUNT(*) FROM open_interest WHERE symbol=? AND {time_col}>=?", (symbol, start_iso))
     else:
         return 0
     row = cur.fetchone()
@@ -132,16 +148,24 @@ def main() -> int:
     try:
         for coin in coins:
             prefix = PREFIX_FOR_COIN.get(coin, coin)
-            symbol = _pick_symbol(conn, prefix)
+            try:
+                symbol = _pick_symbol(conn, prefix)
+            except sqlite3.Error as exc:
+                rows.append(CoinPreflight(coin, None, 0, 0, 0, 0, None, 0, 0.0, False, False, [f"sql_error:{exc}"]))
+                continue
             issues: List[str] = []
             if not symbol:
                 rows.append(CoinPreflight(coin, None, 0, 0, 0, 0, None, 0, 0.0, False, False, ["missing_symbol_data"]))
                 continue
 
-            ohlcv_365 = _count_rows(conn, "ohlcv", symbol, start_365, timeframe="1h")
-            ohlcv_30 = _count_rows(conn, "ohlcv", symbol, start_30, timeframe="1h")
-            fr_365 = _count_rows(conn, "funding_rates", symbol, start_365)
-            oi_365 = _count_rows(conn, "open_interest", symbol, start_365)
+            try:
+                ohlcv_365 = _count_rows(conn, "ohlcv", symbol, start_365, timeframe="1h")
+                ohlcv_30 = _count_rows(conn, "ohlcv", symbol, start_30, timeframe="1h")
+                fr_365 = _count_rows(conn, "funding_rates", symbol, start_365)
+                oi_365 = _count_rows(conn, "open_interest", symbol, start_365)
+            except sqlite3.Error as exc:
+                rows.append(CoinPreflight(coin, symbol, 0, 0, 0, 0, None, 0, 0.0, False, False, [f"sql_error:{exc}"]))
+                continue
 
             feature_path = _feature_file(features_dir, symbol)
             profile = COIN_PROFILES.get(coin)
