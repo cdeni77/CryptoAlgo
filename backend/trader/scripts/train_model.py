@@ -31,6 +31,12 @@ from core.coin_profiles import (
     get_coin_profile, save_model, load_model, list_saved_models,
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
+from core.meta_labeling import (
+    MetaArtifacts,
+    build_meta_dataset,
+    primary_recall_threshold,
+    train_meta_classifier,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -155,6 +161,7 @@ class Config:
     # Entry quality filters
     min_signal_edge: float = 0.02
     max_ensemble_std: float = 0.12
+    meta_probability_threshold: float = 0.57
 
     # Walk-forward leakage protection / evaluation
     train_embargo_hours: int = 24
@@ -438,14 +445,14 @@ class MLSystem:
         )
 
         base_model = lgb.LGBMClassifier(
-            n_estimators=n_est, 
-            max_depth=depth, 
+            n_estimators=n_est,
+            max_depth=depth,
             learning_rate=lr,
             verbose=-1,
-            min_child_samples=min_child, 
-            reg_alpha=0.1, 
+            min_child_samples=min_child,
+            reg_alpha=0.1,
             reg_lambda=0.1,
-            n_jobs=1  
+            n_jobs=1
         )
         base_model.fit(X_train_scaled, y_train, sample_weight=train_sample_weights)
 
@@ -462,6 +469,30 @@ class MLSystem:
         iso = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
         iso.fit(val_probs, y_val)
 
+        primary_threshold = primary_recall_threshold(
+            profile.signal_threshold if profile else self.config.signal_threshold,
+            self.config.min_signal_edge,
+        )
+        primary_train_probs = iso.predict(base_model.predict_proba(X_train_scaled)[:, 1])
+        primary_val_probs = iso.predict(val_probs)
+
+        X_meta_tr, y_meta_tr, _ = build_meta_dataset(X_train, y_train, primary_train_probs, primary_threshold)
+        X_meta_vl, y_meta_vl, _ = build_meta_dataset(X_val, y_val, primary_val_probs, primary_threshold)
+
+        meta_artifacts: MetaArtifacts = train_meta_classifier(
+            X_meta_tr,
+            y_meta_tr,
+            X_meta_vl,
+            y_meta_vl,
+            pd.Series(np.ones(len(X_meta_vl), dtype=bool), index=X_meta_vl.index),
+            primary_threshold=primary_threshold,
+            meta_threshold=self.config.meta_probability_threshold,
+            n_estimators=n_est,
+            max_depth=depth,
+            learning_rate=lr,
+            min_child_samples=min_child,
+        )
+
         X_full = np.vstack([X_train_scaled, X_val_scaled])
         y_full = pd.concat([y_train, y_val])
         full_sample_weights = self._build_sample_weights(
@@ -471,7 +502,17 @@ class MLSystem:
         )
         base_model.fit(X_full, y_full, sample_weight=full_sample_weights)
 
-        return (base_model, scaler, iso, auc)
+        primary_val_mask = primary_val_probs >= primary_threshold
+        primary_recall = float(((primary_val_mask) & (y_val.to_numpy() == 1)).sum() / max((y_val == 1).sum(), 1))
+        stage_metrics = {
+            'primary_recall': primary_recall,
+            'meta_precision': float(meta_artifacts.metrics.get('meta_precision', 0.0)),
+            'final_trade_precision': float(meta_artifacts.metrics.get('final_trade_precision', 0.0)),
+            'primary_threshold': float(primary_threshold),
+            'meta_threshold': float(self.config.meta_probability_threshold),
+        }
+
+        return (base_model, scaler, iso, auc, meta_artifacts, stage_metrics)
 
 
 def resolve_label_horizon(profile: Optional[CoinProfile], config: Config) -> int:
@@ -622,6 +663,7 @@ def run_backtest(all_data: Dict, config: Config,
     models_accepted = 0
     regime_filtered = 0
     no_contracts = 0
+    stage_metric_history: List[Dict[str, float]] = []
 
     weekly_equity_base = equity
 
@@ -681,10 +723,11 @@ def run_backtest(all_data: Dict, config: Config,
 
                 result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile, symbol=sym)
                 if result:
-                    model, scaler, iso, auc = result
+                    model, scaler, iso, auc, meta_artifacts, stage_metrics = result
                     if sym not in all_ensemble_models:
                         all_ensemble_models[sym] = []
-                    all_ensemble_models[sym].append((model, scaler, cols, iso, auc))
+                    all_ensemble_models[sym].append((model, scaler, cols, iso, auc, meta_artifacts, stage_metrics))
+                    stage_metric_history.append(stage_metrics)
                     models_accepted += 1
                 else:
                     models_rejected += 1
@@ -874,21 +917,36 @@ def run_backtest(all_data: Dict, config: Config,
                         continue
 
                     probs = []
-                    for (model, scaler, cols, iso, auc) in models[sym]:
+                    meta_probs = []
+                    primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
+                    for (model, scaler, cols, iso, auc, meta_artifacts, stage_metrics) in models[sym]:
                         x_in = np.nan_to_num(
                             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
                         )
                         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
                         cal_prob = float(iso.predict([raw_prob])[0])
                         probs.append(cal_prob)
+
+                        if cal_prob >= primary_cutoff and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
+                            meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
+                            if meta_artifacts.calibrator is not None:
+                                meta_cal = float(meta_artifacts.calibrator.predict([meta_raw])[0])
+                            else:
+                                meta_cal = float(meta_raw)
+                            meta_probs.append(meta_cal)
+
                     prob = float(np.mean(probs))
                     prob_std = float(np.std(probs))
-
-                    signal_cutoff = profile.signal_threshold + config.min_signal_edge
-                    if prob < signal_cutoff or prob_std > config.max_ensemble_std:
+                    if prob < primary_cutoff or prob_std > config.max_ensemble_std:
                         continue
 
-                    edge_score = (prob - signal_cutoff) / max(0.01, prob_std + 0.01)
+                    if not meta_probs:
+                        continue
+                    meta_prob = float(np.mean(meta_probs))
+                    if meta_prob < config.meta_probability_threshold:
+                        continue
+
+                    edge_score = (meta_prob - config.meta_probability_threshold) / max(0.01, prob_std + 0.01)
                     momentum_strength = abs(ret_72h)
                     rank_score = edge_score + (0.2 * momentum_strength)
                     candidates.append((rank_score, sym, profile, price, vol_24h, direction))
@@ -1003,6 +1061,11 @@ def run_backtest(all_data: Dict, config: Config,
     print(f"  Accepted: {models_accepted}  |  Rejected: {models_rejected}")
     print(f"  Regime filtered: {regime_filtered}")
     print(f"  No contracts (sizing): {no_contracts}")
+    if stage_metric_history:
+        avg_primary_recall = np.mean([m.get('primary_recall', 0.0) for m in stage_metric_history])
+        avg_meta_precision = np.mean([m.get('meta_precision', 0.0) for m in stage_metric_history])
+        avg_final_precision = np.mean([m.get('final_trade_precision', 0.0) for m in stage_metric_history])
+        print(f"  Stage Metrics: primary_recall={avg_primary_recall:.3f} | meta_precision={avg_meta_precision:.3f} | final_trade_precision={avg_final_precision:.3f}")
     print(f"")
     print(f"Exit Reasons:")
     for reason, count in reason_counts.items():
@@ -1030,7 +1093,7 @@ def run_backtest(all_data: Dict, config: Config,
     for sym, ensemble_list in models.items():
         if ensemble_list:
             best = max(ensemble_list, key=lambda x: x[4])
-            model, scaler, cols, iso, auc = best
+            model, scaler, cols, iso, auc, meta_artifacts, stage_metrics = best
             profile = get_coin_profile(sym)
             save_model(
                 symbol=sym,
@@ -1045,7 +1108,11 @@ def run_backtest(all_data: Dict, config: Config,
                     'signal_threshold': profile.signal_threshold,
                     'n_ensemble': len(ensemble_list),
                     'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
+                    'stage_metrics': stage_metrics,
                 },
+                secondary_model=meta_artifacts.model,
+                secondary_scaler=meta_artifacts.scaler,
+                secondary_calibrator=meta_artifacts.calibrator,
             )
             saved_count += 1
     print(f"✅ Saved {saved_count} models to {MODELS_DIR}/")
@@ -1123,13 +1190,16 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
         if not result:
             continue
 
-        model, scaler, iso, auc = result
+        model, scaler, iso, auc, meta_artifacts, stage_metrics = result
         symbol_train_start = X_all.index.min()
         symbol_train_end = X_all.index.max()
         model_metrics = {
             'auc': float(auc),
             'train_samples': int(len(X_all)),
             'val_samples': int(len(X_vl)),
+            'primary_recall': float(stage_metrics.get('primary_recall', 0.0)),
+            'meta_precision': float(stage_metrics.get('meta_precision', 0.0)),
+            'final_trade_precision': float(stage_metrics.get('final_trade_precision', 0.0)),
         }
         save_model(
             symbol=sym,
@@ -1146,7 +1216,11 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
                 'train_start': symbol_train_start.isoformat() if symbol_train_start is not None else None,
                 'train_end': symbol_train_end.isoformat() if symbol_train_end is not None else None,
                 'metrics': model_metrics,
+                'stage_metrics': stage_metrics,
             },
+            secondary_model=meta_artifacts.model,
+            secondary_scaler=meta_artifacts.scaler,
+            secondary_calibrator=meta_artifacts.calibrator,
         )
         symbols_trained += 1
         metrics[sym] = model_metrics
@@ -1206,7 +1280,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC < {profile.min_val_auc})")
             continue
 
-        model, scaler, iso, auc = result
+        model, scaler, iso, auc, meta_artifacts, stage_metrics = result
 
         save_model(
             symbol=sym,
@@ -1220,7 +1294,11 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 'strategy': 'momentum',
                 'signal_threshold': profile.signal_threshold,
                 'train_samples': len(X_all),
+                'stage_metrics': stage_metrics,
             },
+            secondary_model=meta_artifacts.model,
+            secondary_scaler=meta_artifacts.scaler,
+            secondary_calibrator=meta_artifacts.calibrator,
         )
 
         row = feat.iloc[-1]
@@ -1265,7 +1343,17 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         )
         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
         prob = float(iso.predict([raw_prob])[0])
-        ml_pass = prob >= profile.signal_threshold
+        primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
+        ml_pass = prob >= primary_cutoff
+        meta_prob = 0.0
+        meta_pass = False
+        if ml_pass and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
+            meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
+            if meta_artifacts.calibrator is not None:
+                meta_prob = float(meta_artifacts.calibrator.predict([meta_raw])[0])
+            else:
+                meta_prob = float(meta_raw)
+            meta_pass = meta_prob >= config.meta_probability_threshold
 
         vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
         regime_pass = profile.min_vol_24h <= vol_24h <= profile.max_vol_24h if not pd.isna(vol_24h) else False
@@ -1278,13 +1366,13 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
             print(f"\n[{sym}] ({profile.name})")
             print(f"  Price: ${price:,.2f} | SMA200: ${sma_200:,.2f}" if not pd.isna(sma_200) else f"  Price: ${price:,.2f}")
             print(f"  Direction: {dir_str}")
-            print(f"  Raw prob: {raw_prob:.3f} → Calibrated: {prob:.3f} (thresh: {profile.signal_threshold})")
+            print(f"  Primary prob: {raw_prob:.3f} → Calibrated: {prob:.3f} (thresh: {primary_cutoff:.3f})")
             print(f"  AUC: {auc:.3f}")
-            print(f"  Gates: ML={'✅' if ml_pass else '❌'} | Regime={'✅' if regime_pass else '❌'} | Mom={'✅' if momentum_pass else '❌'}")
+            print(f"  Gates: Primary={'✅' if ml_pass else '❌'} | Meta={'✅' if meta_pass else '❌'} | Regime={'✅' if regime_pass else '❌'} | Mom={'✅' if momentum_pass else '❌'}")
             print(f"  Funding z-score: {f_z:.2f}")
             print(f"  24h Vol: {vol_24h:.4f}" if not pd.isna(vol_24h) else "  24h Vol: N/A")
 
-        if ml_pass and regime_pass and momentum_pass:
+        if ml_pass and meta_pass and regime_pass and momentum_pass:
             n_contracts = calculate_n_contracts(
                 100_000, price, sym, config,
                 vol_24h=vol_24h if not pd.isna(vol_24h) else 0.02,
@@ -1295,7 +1383,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
             notional = n_contracts * spec['units'] * price
             print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
                   f"{n_contracts} contracts | ${notional:,.0f} notional | "
-                  f"Prob: {prob:.1%} | AUC: {auc:.3f}")
+                  f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")
 
 
 if __name__ == "__main__":
@@ -1316,6 +1404,7 @@ if __name__ == "__main__":
     parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
     parser.add_argument("--min-edge", type=float, default=0.02, help="Require prob >= threshold + min-edge")
     parser.add_argument("--max-ensemble-std", type=float, default=0.12, help="Max std across ensemble probs")
+    parser.add_argument("--meta-threshold", type=float, default=0.57, help="Secondary meta-model probability threshold")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
     parser.add_argument("--pruned-only", action="store_true",
@@ -1334,6 +1423,7 @@ if __name__ == "__main__":
         cooldown_hours=args.cooldown,
         min_signal_edge=args.min_edge,
         max_ensemble_std=args.max_ensemble_std,
+        meta_probability_threshold=args.meta_threshold,
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
     )
