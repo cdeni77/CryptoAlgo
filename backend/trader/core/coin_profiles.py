@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
-FEATURE_SCHEMA_VERSION = "v10-cost-aware"
+FEATURE_SCHEMA_VERSION = "v11-redundancy-pruned"
 
 # Directory for persisted models
 MODELS_DIR = Path(os.getenv('MODELS_DIR', 'models'))
@@ -36,11 +36,11 @@ PRUNED_FEATURES_DIR = Path(os.getenv('PRUNED_FEATURES_DIR', 'data/features'))
 # BASE FEATURES (shared across all coins)
 BASE_FEATURES = [
     # Momentum
-    'return_1h', 'return_4h', 'return_12h', 'return_24h', 'return_48h', 'return_168h',
+    'return_1h', 'return_12h', 'return_24h', 'return_168h',
     'rsi_14', 'rsi_6',
     'range_position_24h', 'range_position_72h',
     'bb_position_20',
-    'ma_distance_24h', 'ma_distance_168h',
+    'ma_distance_24h',
     # Volatility
     'volatility_1h', 'volatility_4h', 'volatility_24h',
     'volume_ratio_1h', 'volume_ratio_24h',
@@ -53,7 +53,7 @@ BASE_FEATURES = [
     'funding_rate_bps', 'funding_rate_zscore',
     'cumulative_funding_24h', 'cumulative_funding_72h',
     # OI
-    'oi_change_1h', 'oi_change_4h', 'oi_change_24h',
+    'oi_change_4h', 'oi_change_24h',
     # Regime
     'trend_sma20_50', 'vol_regime_ratio', 'trend_strength_24h',
     # Cost-aware execution hurdle

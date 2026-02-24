@@ -15,6 +15,13 @@ from core.trading_costs import get_contract_spec
 
 logger = logging.getLogger(__name__)
 
+REDUNDANT_BASE_FEATURES = {
+    'return_4h',
+    'return_48h',
+    'ma_distance_168h',
+    'oi_change_1h',
+}
+
 MAX_JOIN_NAN_RATIO = 0.35
 CROSS_ASSET_FEATURE_COLUMNS = [
     'btc_rel_return_4h',
@@ -49,12 +56,16 @@ class PriceFeatures:
     def compute(cls, df: pd.DataFrame, lookbacks: List[int]) -> pd.DataFrame:
         features = pd.DataFrame(index=df.index)
         for lb in lookbacks:
-            features[f'return_{lb}h'] = df['close'].pct_change(lb)
+            return_col = f'return_{lb}h'
+            if return_col not in REDUNDANT_BASE_FEATURES:
+                features[return_col] = df['close'].pct_change(lb)
             features[f'log_return_{lb}h'] = np.log(df['close'] / df['close'].shift(lb))
             features[f'volatility_{lb}h'] = df['close'].pct_change().rolling(lb).std()
             
             ma = df['close'].rolling(lb).mean()
-            features[f'ma_distance_{lb}h'] = (df['close'] - ma) / ma.replace(0, np.nan)
+            ma_col = f'ma_distance_{lb}h'
+            if ma_col not in REDUNDANT_BASE_FEATURES:
+                features[ma_col] = (df['close'] - ma) / ma.replace(0, np.nan)
             
             rolling_high = df['high'].rolling(lb).max()
             rolling_low = df['low'].rolling(lb).min()
@@ -177,7 +188,6 @@ class OpenInterestFeatures:
         oi_lagged = oi_raw.reindex(ohlcv_df.index, method='ffill').shift(1)
         
         features['open_interest'] = oi_lagged
-        features['oi_change_1h'] = oi_lagged.pct_change(1)
         features['oi_change_4h'] = oi_lagged.pct_change(4)
         features['oi_change_24h'] = oi_lagged.pct_change(24)
         features['oi_zscore'] = normalize_point_in_time(oi_lagged)
