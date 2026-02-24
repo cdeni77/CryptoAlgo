@@ -44,6 +44,7 @@ from core.coin_profiles import (
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.ERROR)
 logging.getLogger("lightgbm").setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEBUG_TRIALS = False
@@ -167,6 +168,12 @@ def split_data_temporal(all_data, holdout_days=180):
         if len(feat) > 500: holdout_data[sym] = {'features': feat.copy(), 'ohlcv': ohlcv.copy()}
     return optim_data, holdout_data
 
+
+def compute_purge_days(profile: CoinProfile) -> int:
+    """Compute purge window from max holding horizon (in hours)."""
+    max_hold_hours = max(1, int(getattr(profile, 'max_hold_hours', 24) or 24))
+    return int(math.ceil(max_hold_hours / 24.0) + 1)
+
 def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days=2):
     """Anchored walk-forward CV splits. Returns [(train_end, test_start, test_end), ...]"""
     ohlcv = data[target_sym]['ohlcv']
@@ -175,6 +182,13 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
     min_test_days = 60
     if total_days < min_train_days + min_test_days:
         boundary = start + pd.Timedelta(days=int(total_days * 0.7))
+        logger.debug(
+            "Fallback single-fold split for %s: train_end=%s test=[%s,%s]",
+            target_sym,
+            boundary,
+            boundary,
+            end,
+        )
         return [(boundary, boundary, end)]
     n_folds = min(n_folds, (total_days - min_train_days) // min_test_days)
     if n_folds < 1: n_folds = 1
@@ -186,8 +200,24 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
         ts = test_zone_start + pd.Timedelta(days=i * fold_days)
         te = ts + pd.Timedelta(days=fold_days) if i < n_folds - 1 else end
         train_end = ts - purge_delta
-        if train_end <= start + pd.Timedelta(days=min_train_days):
-            train_end = ts
+        min_train_end = start + pd.Timedelta(days=min_train_days)
+        if train_end <= min_train_end:
+            raise ValueError(
+                f"Purge removes all usable training data for fold {i} "
+                f"(target={target_sym}, purge_days={purge_days}, train_end={train_end}, "
+                f"min_train_end={min_train_end}, test_start={ts})"
+            )
+        logger.debug(
+            "Fold %s (%s): train=[%s,%s) purge=(%s,%s) test=[%s,%s]",
+            i,
+            target_sym,
+            start,
+            train_end,
+            train_end,
+            ts,
+            ts,
+            te,
+        )
         splits.append((train_end, ts, te))
     return splits
 
@@ -961,14 +991,26 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     optim_start, optim_end = ohlcv.index.min(), ohlcv.index.max()
     holdout_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
     holdout_end = holdout_data[holdout_sym]['ohlcv'].index.max() if holdout_sym else optim_end
-    cv_splits = create_cv_splits(optim_data, target_sym, n_folds=n_cv_folds, purge_days=2)
+    active_profile = get_coin_profile(coin_name)
+    purge_days = compute_purge_days(active_profile)
+    cv_splits = create_cv_splits(optim_data, target_sym, n_folds=n_cv_folds, purge_days=purge_days)
 
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
-    print(f"   CV folds: {len(cv_splits)} | Params: 10 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
+    print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 10 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     for i, (tb, ts, te) in enumerate(cv_splits):
         print(f"     Fold {i}: train→{tb.date()} | test {ts.date()}→{te.date()}")
+        logger.debug(
+            "Fold %s (%s): train_end=%s test=[%s,%s] purge=[%s,%s]",
+            i,
+            coin_name,
+            tb,
+            ts,
+            te,
+            tb,
+            ts,
+        )
     print(f"   Est: ~{n_trials * len(cv_splits) * 3 / 60 / max(n_jobs,1):.0f} min")
     print(f"{'='*60}")
 
@@ -1325,7 +1367,9 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
     parser.set_defaults(pruned_only=True)
     args = parser.parse_args(); args = apply_runtime_preset(args)
-    if args.debug_trials: DEBUG_TRIALS = True
+    if args.debug_trials:
+        DEBUG_TRIALS = True
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     if args.show: show_results(); sys.exit(0)
     init_db_wal(str(_db_path()))
     all_data = load_data()
