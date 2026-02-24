@@ -222,14 +222,16 @@ class MLSystem:
 
     def create_labels(self, ohlcv: pd.DataFrame, features: pd.DataFrame,
                       profile: Optional[CoinProfile] = None) -> pd.Series:
+        """Momentum-aware triple-barrier labels with explicit timeout class.
+
+        Label values:
+          1  -> TP first touch (in momentum direction)
+          -1 -> SL first touch
+          0  -> timeout within horizon (neutral)
         """
-        MOMENTUM-BASED forward return label (v7 original, v8 cleaned).
-        
-        Direction from multi-timeframe momentum consensus.
-        Label = 1 if price moves >= threshold in momentum direction within forward window.
-        """
-        forward_hours = profile.label_forward_hours if profile else self.config.label_forward_hours
-        vol_target = profile.label_vol_target if profile else self.config.label_vol_target
+        forward_hours = resolve_label_horizon(profile, self.config)
+        tp_mult = profile.vol_mult_tp if profile else self.config.vol_mult_tp
+        sl_mult = profile.vol_mult_sl if profile else self.config.vol_mult_sl
 
         target = pd.Series(index=features.index, dtype=float)
         vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
@@ -254,7 +256,8 @@ class MLSystem:
 
             entry_px = ohlcv.loc[ts, 'close']
             future = ohlcv.iloc[pos_in_ohlcv + 1: pos_in_ohlcv + 1 + forward_hours]
-            threshold = vol_target * row_vol
+            tp_move = tp_mult * row_vol
+            sl_move = sl_mult * row_vol
 
             r24 = ret_24h_series.get(ts, 0)
             r72 = ret_72h_series.get(ts, 0)
@@ -273,13 +276,43 @@ class MLSystem:
                 continue
 
             if direction == 1:
-                max_excursion = (future['high'].max() - entry_px) / entry_px
+                tp_px = entry_px * (1 + tp_move)
+                sl_px = entry_px * (1 - sl_move)
             else:
-                max_excursion = (entry_px - future['low'].min()) / entry_px
+                tp_px = entry_px * (1 - tp_move)
+                sl_px = entry_px * (1 + sl_move)
 
-            target.loc[ts] = 1.0 if max_excursion >= threshold else 0.0
+            label = 0.0
+            for _, bar in future.iterrows():
+                tp_hit = (direction == 1 and bar['high'] >= tp_px) or (direction == -1 and bar['low'] <= tp_px)
+                sl_hit = (direction == 1 and bar['low'] <= sl_px) or (direction == -1 and bar['high'] >= sl_px)
+
+                if tp_hit and not sl_hit:
+                    label = 1.0
+                    break
+                if sl_hit and not tp_hit:
+                    label = -1.0
+                    break
+                if tp_hit and sl_hit:
+                    label = -1.0
+                    break
+
+            target.loc[ts] = label
 
         return target
+
+    def prepare_binary_training_set(self, X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
+        """Explicitly remove neutral timeout labels, then map SL/TP to binary 0/1."""
+        valid = y.dropna()
+        if valid.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
+        non_neutral_idx = valid[valid != 0].index
+        if len(non_neutral_idx) == 0:
+            return pd.DataFrame(), pd.Series(dtype=float)
+
+        X_out = X.loc[non_neutral_idx]
+        y_out = valid.loc[non_neutral_idx].map({-1.0: 0.0, 1.0: 1.0})
+        return X_out, y_out
 
     def train(self, X_train: pd.DataFrame, y_train: pd.Series,
               X_val: pd.DataFrame, y_val: pd.Series,
@@ -331,6 +364,47 @@ class MLSystem:
         base_model.fit(X_full, y_full)
 
         return (base_model, scaler, iso, auc)
+
+
+def resolve_label_horizon(profile: Optional[CoinProfile], config: Config) -> int:
+    if profile and profile.max_hold_hours > 0:
+        return int(profile.max_hold_hours)
+    if profile:
+        return int(profile.label_forward_hours)
+    if config.max_hold_hours > 0:
+        return int(config.max_hold_hours)
+    return int(config.label_forward_hours)
+
+
+def validate_label_execution_config(symbol: str, profile: CoinProfile, config: Config) -> None:
+    label_cfg = {
+        'tp_mult': profile.vol_mult_tp,
+        'sl_mult': profile.vol_mult_sl,
+        'horizon_h': resolve_label_horizon(profile, config),
+        'profile_label_forward_h': profile.label_forward_hours,
+    }
+    exec_cfg = {
+        'tp_mult': profile.vol_mult_tp,
+        'sl_mult': profile.vol_mult_sl,
+        'horizon_h': profile.max_hold_hours,
+        'config_tp_default': config.vol_mult_tp,
+        'config_sl_default': config.vol_mult_sl,
+        'config_hold_default': config.max_hold_hours,
+    }
+    print(f"[{symbol}] Label config: {label_cfg} | Execution config: {exec_cfg}")
+    if (
+        label_cfg['tp_mult'] != exec_cfg['tp_mult']
+        or label_cfg['sl_mult'] != exec_cfg['sl_mult']
+        or label_cfg['horizon_h'] != exec_cfg['horizon_h']
+    ):
+        raise ValueError(f"Label/execution configuration mismatch for {symbol}.")
+
+
+def validate_all_symbol_configs(all_data: Dict, config: Config,
+                                profile_overrides: Optional[Dict[str, CoinProfile]] = None) -> None:
+    for sym in all_data:
+        profile = _get_profile(sym, profile_overrides)
+        validate_label_execution_config(sym, profile, config)
 
 
 def load_data():
@@ -413,6 +487,7 @@ def _get_profile(symbol: str, profile_overrides: Optional[Dict[str, CoinProfile]
 def run_backtest(all_data: Dict, config: Config,
                  profile_overrides: Optional[Dict[str, CoinProfile]] = None):
     system = MLSystem(config)
+    validate_all_symbol_configs(all_data, config, profile_overrides=profile_overrides)
 
     all_ts = [ts for d in all_data.values() for ts in d['ohlcv'].index]
     if not all_ts:
@@ -471,13 +546,14 @@ def run_backtest(all_data: Dict, config: Config,
                 if not cols:
                     continue
 
-                embargo_hours = max(config.train_embargo_hours, profile.label_forward_hours, 1)
+                label_horizon = resolve_label_horizon(profile, config)
+                embargo_hours = max(config.train_embargo_hours, label_horizon, 1)
                 train_end = current_date - timedelta(hours=embargo_hours)
                 if train_end <= train_start:
                     continue
 
                 train_feat = feat.loc[train_start:train_end]
-                train_ohlc = ohlc.loc[train_start:train_end + timedelta(hours=profile.label_forward_hours)]
+                train_ohlc = ohlc.loc[train_start:train_end + timedelta(hours=label_horizon)]
 
                 if len(train_feat) < config.min_train_samples:
                     continue
@@ -486,6 +562,7 @@ def run_backtest(all_data: Dict, config: Config,
                 valid_idx = y.dropna().index
                 X_all = train_feat.loc[valid_idx, cols]
                 y_all = y.loc[valid_idx]
+                X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
 
                 if len(X_all) < config.min_train_samples:
                     continue
@@ -890,6 +967,7 @@ def run_backtest(all_data: Dict, config: Config,
 
 def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = None, train_window_days: int = 90) -> Dict:
     system = MLSystem(config)
+    validate_all_symbol_configs(all_data, config)
     metrics = {}
     symbols_trained = 0
     train_end_global = pd.Timestamp.now(tz='UTC')
@@ -914,6 +992,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
         valid = y.dropna().index
         X_all = train_feat.loc[valid, cols]
         y_all = y.loc[valid]
+        X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
         if len(X_all) < config.min_train_samples:
             continue
 
@@ -965,6 +1044,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
 # LIVE SIGNALS — v8
 def run_signals(all_data: Dict, config: Config, debug: bool = False):
     system = MLSystem(config)
+    validate_all_symbol_configs(all_data, config)
     print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
 
     for sym, d in all_data.items():
@@ -990,6 +1070,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         valid = y.dropna().index
         X_all = train_feat.loc[valid, cols]
         y_all = y.loc[valid]
+        X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
 
         if len(X_all) < config.min_train_samples:
             if debug:
