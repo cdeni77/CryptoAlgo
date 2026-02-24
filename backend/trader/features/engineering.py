@@ -11,6 +11,8 @@ import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
+from core.trading_costs import get_contract_spec
+
 logger = logging.getLogger(__name__)
 
 MAX_JOIN_NAN_RATIO = 0.35
@@ -215,6 +217,56 @@ class RegimeFeatures:
         trend_num = df['close'] - df['close'].rolling(24).mean()
         trend_den = df['close'].rolling(24).std().replace(0, np.nan)
         features['trend_strength_24h'] = trend_num / trend_den
+        return features
+
+
+class CostAwareFeatures:
+    """Cost-of-trade features: estimate whether expected move can clear execution drag."""
+
+    @classmethod
+    def compute(
+        cls,
+        df: pd.DataFrame,
+        symbol: str,
+        funding_df: Optional[pd.DataFrame] = None,
+        fee_pct_per_side: float = 0.0010,
+        min_fee_per_contract: float = 0.20,
+        slippage_bps_per_side: float = 2.0,
+        vol_lookback_hours: int = 24,
+        expected_move_sigma: float = 1.5,
+        expected_holding_hours: int = 24,
+    ) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        close = df['close'].replace(0, np.nan)
+
+        spec = get_contract_spec(symbol)
+        units = float(spec.get('units', 1.0))
+        notional_per_contract = units * close
+
+        pct_fee_per_side = pd.Series(fee_pct_per_side, index=df.index)
+        min_fee_pct_per_side = float(min_fee_per_contract) / notional_per_contract
+        effective_fee_per_side = np.maximum(pct_fee_per_side, min_fee_pct_per_side)
+        slippage_pct_roundtrip = 2.0 * (slippage_bps_per_side / 10000.0)
+
+        funding_drag = pd.Series(0.0, index=df.index)
+        if funding_df is not None and not funding_df.empty and 'rate' in funding_df.columns:
+            funding_lagged = (
+                funding_df['rate']
+                .resample('1h')
+                .ffill()
+                .reindex(df.index, method='ffill')
+                .shift(1)
+            )
+            funding_drag = funding_lagged.abs().fillna(0.0) * float(expected_holding_hours)
+
+        recent_vol = close.pct_change().rolling(vol_lookback_hours).std()
+        expected_move_pct = recent_vol * expected_move_sigma
+
+        fee_hurdle_pct = (2.0 * effective_fee_per_side) + slippage_pct_roundtrip + funding_drag
+
+        features['fee_hurdle_pct'] = fee_hurdle_pct
+        features['breakout_vs_cost'] = expected_move_pct / fee_hurdle_pct.replace(0, np.nan)
+        features['expected_cost_to_vol_ratio'] = fee_hurdle_pct / recent_vol.replace(0, np.nan)
         return features
 
 
@@ -556,6 +608,7 @@ class FeatureConfig:
     compute_regime: bool = True
     compute_coin_specific: bool = True  # v8: coin-specific features
     compute_cross_asset: bool = True
+    compute_cost: bool = True
 
 
 class FeaturePipeline:
@@ -599,6 +652,8 @@ class FeaturePipeline:
                 f_list.append(OpenInterestFeatures.compute(df, oi_data[symbol]))
             if self.config.compute_regime:
                 f_list.append(RegimeFeatures.compute(df))
+            if self.config.compute_cost:
+                f_list.append(CostAwareFeatures.compute(df, symbol=symbol, funding_df=funding_data.get(symbol)))
             
             # v8: Coin-specific features
             if self.config.compute_coin_specific:

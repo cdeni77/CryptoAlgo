@@ -31,6 +31,7 @@ from core.coin_profiles import (
     get_coin_profile, save_model, load_model, list_saved_models,
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
+from core.trading_costs import get_contract_spec
 from core.meta_labeling import (
     MetaArtifacts,
     build_meta_dataset,
@@ -45,39 +46,49 @@ warnings.filterwarnings('ignore')
 FEATURES_DIR = Path("./data/features")
 DB_PATH = "./data/trading.db"
 
-# COINBASE CDE CONTRACT SPECIFICATIONS — EXACT
-CONTRACT_SPECS = {
-    'BIP': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
-    'ETP': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
-    'XPP': {'units': 500,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
-    'SLP': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
-    'DOP': {'units': 5000,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
-    'BTC': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
-    'ETH': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
-    'XRP': {'units': 500,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
-    'SOL': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
-    'DOGE': {'units': 5000, 'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
-    'DEFAULT': {'units': 1, 'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'UNKNOWN'},
-}
-
-def get_contract_spec(symbol: str) -> dict:
-    if symbol in CONTRACT_SPECS:
-        return CONTRACT_SPECS[symbol]
-    prefix = symbol.split('-')[0] if '-' in symbol else symbol
-    if prefix in CONTRACT_SPECS:
-        return CONTRACT_SPECS[prefix]
-    symbol_upper = symbol.upper()
-    for code, spec in CONTRACT_SPECS.items():
-        if code == 'DEFAULT':
-            continue
-        if code in symbol_upper:
-            return spec
-    print(f"  ⚠️ No contract spec found for '{symbol}', using DEFAULT (1 unit/contract)")
-    return CONTRACT_SPECS['DEFAULT']
-
-
 # BASE FEATURE LIST (fallback — coin_profiles provides per-coin lists)
 FEATURE_COLUMNS = BASE_FEATURES
+
+
+COST_AWARE_FEATURES = {
+    'fee_hurdle_pct',
+    'breakout_vs_cost',
+    'expected_cost_to_vol_ratio',
+}
+
+
+def summarize_feature_importance(model, feature_columns: List[str]) -> Dict[str, object]:
+    importances = getattr(model, 'feature_importances_', None)
+    if importances is None or len(importances) != len(feature_columns):
+        return {}
+
+    importance_map = {str(c): float(v) for c, v in zip(feature_columns, importances)}
+    total = sum(importance_map.values())
+    if total <= 0:
+        return {'cost_aware_block': {'share': 0.0, 'top_features': []}}
+
+    cost_items = sorted(
+        [(name, val) for name, val in importance_map.items() if name in COST_AWARE_FEATURES],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    cost_total = sum(v for _, v in cost_items)
+    top_cost_features = [
+        {'feature': name, 'importance_share': float(val / total)}
+        for name, val in cost_items[:3]
+    ]
+
+    top_overall = sorted(importance_map.items(), key=lambda x: x[1], reverse=True)[:10]
+    return {
+        'cost_aware_block': {
+            'share': float(cost_total / total),
+            'top_features': top_cost_features,
+        },
+        'top_features': [
+            {'feature': name, 'importance_share': float(val / total)}
+            for name, val in top_overall
+        ],
+    }
 
 
 @dataclass
@@ -1094,6 +1105,7 @@ def run_backtest(all_data: Dict, config: Config,
         if ensemble_list:
             best = max(ensemble_list, key=lambda x: x[4])
             model, scaler, cols, iso, auc, meta_artifacts, stage_metrics = best
+            importance_summary = summarize_feature_importance(model, cols)
             profile = get_coin_profile(sym)
             save_model(
                 symbol=sym,
@@ -1109,6 +1121,7 @@ def run_backtest(all_data: Dict, config: Config,
                     'n_ensemble': len(ensemble_list),
                     'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
                     'stage_metrics': stage_metrics,
+                    'feature_importance': importance_summary,
                 },
                 secondary_model=meta_artifacts.model,
                 secondary_scaler=meta_artifacts.scaler,
@@ -1191,6 +1204,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
             continue
 
         model, scaler, iso, auc, meta_artifacts, stage_metrics = result
+        importance_summary = summarize_feature_importance(model, cols)
         symbol_train_start = X_all.index.min()
         symbol_train_end = X_all.index.max()
         model_metrics = {
@@ -1200,6 +1214,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
             'primary_recall': float(stage_metrics.get('primary_recall', 0.0)),
             'meta_precision': float(stage_metrics.get('meta_precision', 0.0)),
             'final_trade_precision': float(stage_metrics.get('final_trade_precision', 0.0)),
+            'cost_aware_importance_share': float(importance_summary.get('cost_aware_block', {}).get('share', 0.0)),
         }
         save_model(
             symbol=sym,
@@ -1217,6 +1232,7 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
                 'train_end': symbol_train_end.isoformat() if symbol_train_end is not None else None,
                 'metrics': model_metrics,
                 'stage_metrics': stage_metrics,
+                'feature_importance': importance_summary,
             },
             secondary_model=meta_artifacts.model,
             secondary_scaler=meta_artifacts.scaler,
@@ -1281,6 +1297,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
             continue
 
         model, scaler, iso, auc, meta_artifacts, stage_metrics = result
+        importance_summary = summarize_feature_importance(model, cols)
 
         save_model(
             symbol=sym,
@@ -1295,6 +1312,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
                 'signal_threshold': profile.signal_threshold,
                 'train_samples': len(X_all),
                 'stage_metrics': stage_metrics,
+                'feature_importance': importance_summary,
             },
             secondary_model=meta_artifacts.model,
             secondary_scaler=meta_artifacts.scaler,

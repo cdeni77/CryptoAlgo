@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
-FEATURE_SCHEMA_VERSION = "v9-btc-relative"
+FEATURE_SCHEMA_VERSION = "v10-cost-aware"
 
 # Directory for persisted models
 MODELS_DIR = Path(os.getenv('MODELS_DIR', 'models'))
@@ -56,6 +56,8 @@ BASE_FEATURES = [
     'oi_change_1h', 'oi_change_4h', 'oi_change_24h',
     # Regime
     'trend_sma20_50', 'vol_regime_ratio', 'trend_strength_24h',
+    # Cost-aware execution hurdle
+    'fee_hurdle_pct', 'breakout_vs_cost', 'expected_cost_to_vol_ratio',
 ]
 
 # COIN-SPECIFIC EXTRA FEATURES
