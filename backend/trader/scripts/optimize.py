@@ -88,6 +88,15 @@ def _fmt_float(v, d=3, fb="?"): n = _as_number(v); return f"{n:.{d}f}" if n is n
 def _set_reject_reason(trial, reason): trial.set_user_attr('reject_reason', reason)
 
 
+def estimate_holdout_trade_budget(holdout_days: int, target_trades_per_week: float, holdout_min_trades: int) -> tuple[float, int]:
+    estimated_holdout_trades = max(0.0, float(target_trades_per_week)) * (max(0, int(holdout_days)) / 7.0)
+    effective_holdout_floor = max(
+        int(holdout_min_trades),
+        int(estimated_holdout_trades * 0.60),
+    )
+    return estimated_holdout_trades, effective_holdout_floor
+
+
 def _reject_score(observed: float | None = None, threshold: float | None = None, *, base: float = -6.0, scale: float = 8.0) -> float:
     """Return a strong but non-degenerate penalty for rejected trials.
 
@@ -981,8 +990,8 @@ def _persist_result_json(coin_name, data):
 def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
                   plateau_min_completed=0,
-                  study_suffix="", resume_study=False, holdout_days=180,
-                  min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=3,
+                  study_suffix="", resume_study=False, holdout_days=90,
+                  min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=5,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
                   target_trades_per_week=1.0, preset_name="none", enable_fee_stress=True,
@@ -1002,6 +1011,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
+    print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 10 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     for i, (tb, ts, te) in enumerate(cv_splits):
@@ -1097,10 +1107,16 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     selection_meta = {}
     deployment_blocked = False
     blocked_reasons = []
-    effective_holdout_min_trades = max(
-        int(holdout_min_trades),
-        int((max(0.1, float(target_trades_per_week)) * max(7, int(holdout_days)) / 7.0) * 0.60),
+    est_ho_trades, effective_holdout_min_trades = estimate_holdout_trade_budget(
+        holdout_days=holdout_days,
+        target_trades_per_week=max(0.1, float(target_trades_per_week)),
+        holdout_min_trades=holdout_min_trades,
     )
+    if est_ho_trades < effective_holdout_min_trades:
+        print(
+            f"⚠️  Trade-starved holdout risk: est_holdout_trades={est_ho_trades:.1f} "
+            f"< gate_floor={effective_holdout_min_trades}"
+        )
     if holdout_data and holdout_sym:
         candidate_trials = _candidate_trials_for_holdout(
             study,
@@ -1297,10 +1313,10 @@ def show_results():
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 180, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 120, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
         'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 10, 'holdout_min_sharpe': 0.0, 'holdout_min_return': -0.01, 'require_holdout_pass': False, 'target_trades_per_week': 0.8},
-        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 240, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -1342,10 +1358,10 @@ if __name__ == "__main__":
     parser.add_argument("--plateau-min-delta", type=float, default=0.015); parser.add_argument("--plateau-warmup", type=int, default=60)
     parser.add_argument("--plateau-min-completed", type=int, default=0,
                         help="Never plateau-stop before this many completed trials (0 = auto 40%% of n_trials)")
-    parser.add_argument("--holdout-days", type=int, default=180)
+    parser.add_argument("--holdout-days", type=int, default=90)
     parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
-    parser.add_argument("--n-cv-folds", type=int, default=3); parser.add_argument("--study-suffix", type=str, default="")
+    parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--sampler-seed", type=int, default=42)
     parser.add_argument("--holdout-candidates", type=int, default=3,
                         help="Evaluate top-N CV candidates on holdout and pick the best")
