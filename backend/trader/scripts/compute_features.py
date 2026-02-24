@@ -27,6 +27,7 @@ from features.engineering import (
     FeaturePipeline,
     FeatureConfig,
 )
+from core.coin_profiles import get_coin_profile, CoinProfile
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")
@@ -121,6 +122,55 @@ def prepare_robust_dataset(features: pd.DataFrame, target: pd.Series):
     X = X.ffill().fillna(0.0).replace([np.inf, -np.inf], 0.0)
     
     return X, y
+
+
+def resolve_label_horizon(profile: CoinProfile) -> int:
+    """Prefer execution hold horizon; fallback to explicit label horizon."""
+    if profile.max_hold_hours and profile.max_hold_hours > 0:
+        return int(profile.max_hold_hours)
+    return int(profile.label_forward_hours)
+
+
+def compute_profile_target(ohlcv: pd.DataFrame, profile: CoinProfile) -> pd.Series:
+    """Triple-barrier labels with profile TP/SL multipliers and neutral timeout class.
+
+    Label values:
+      1  -> take-profit first touch
+      -1 -> stop-loss first touch
+      0  -> timeout/no touch within horizon
+    """
+    horizon = resolve_label_horizon(profile)
+    target = pd.Series(index=ohlcv.index, dtype=float)
+    vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
+
+    for idx in range(len(ohlcv) - horizon):
+        ts = ohlcv.index[idx]
+        row_vol = vol.iloc[idx]
+        if pd.isna(row_vol) or row_vol <= 0:
+            continue
+
+        entry = ohlcv['close'].iloc[idx]
+        tp = entry * (1 + profile.vol_mult_tp * row_vol)
+        sl = entry * (1 - profile.vol_mult_sl * row_vol)
+        future = ohlcv.iloc[idx + 1: idx + 1 + horizon]
+
+        label = 0.0
+        for _, bar in future.iterrows():
+            tp_hit = bar['high'] >= tp
+            sl_hit = bar['low'] <= sl
+            if tp_hit and not sl_hit:
+                label = 1.0
+                break
+            if sl_hit and not tp_hit:
+                label = -1.0
+                break
+            if tp_hit and sl_hit:
+                label = -1.0
+                break
+
+        target.iloc[idx] = label
+
+    return target
 
 # 3. MAIN SCRIPT
 
@@ -228,9 +278,8 @@ def main():
         f_path = EXPORT_DIR / f"{symbol.replace('-', '_')}_features.csv"
         feats.to_csv(f_path)
         
-        # 2. Create ML Dataset (Strategy: 1.8x Triple Barrier)
-        # Note: We compute the target specifically for the ML export
-        target = pipeline.compute_target(ohlcv, horizon=24, vol_mult=1.8)
+        profile = get_coin_profile(symbol)
+        target = compute_profile_target(ohlcv, profile)
         
         # Ensure UTC match
         if target.index.tz is None: target.index = target.index.tz_localize('UTC')
@@ -244,8 +293,14 @@ def main():
             ml_path = EXPORT_DIR / f"{symbol.replace('-', '_')}_ml_dataset.csv"
             ml_df.to_csv(ml_path)
             
-            win_rate = (y_final == 1).mean()
-            print(f"  ✅ {symbol}: Saved {len(ml_df)} rows. Win Rate (1.8x): {win_rate:.1%}")
+            tp_rate = (y_final == 1).mean()
+            sl_rate = (y_final == -1).mean()
+            timeout_rate = (y_final == 0).mean()
+            print(
+                f"  ✅ {symbol}: Saved {len(ml_df)} rows | "
+                f"TP={tp_rate:.1%} SL={sl_rate:.1%} Timeout={timeout_rate:.1%} "
+                f"(TP={profile.vol_mult_tp}x, SL={profile.vol_mult_sl}x, H={resolve_label_horizon(profile)}h)"
+            )
         else:
             print(f"  ❌ {symbol}: Failed to generate ML dataset (0 rows)")
 
