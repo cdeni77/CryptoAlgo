@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import warnings
 import sqlite3
+import hashlib
+import json
 
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -27,7 +29,7 @@ from features.engineering import (
     FeaturePipeline,
     FeatureConfig,
 )
-from core.coin_profiles import get_coin_profile, CoinProfile
+from core.coin_profiles import FEATURE_SCHEMA_VERSION, get_coin_profile, CoinProfile
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")
@@ -122,6 +124,44 @@ def prepare_robust_dataset(features: pd.DataFrame, target: pd.Series):
     X = X.ffill().fillna(0.0).replace([np.inf, -np.inf], 0.0)
     
     return X, y
+
+
+REMOVED_REDUNDANT_FEATURES = ["return_4h", "return_48h", "ma_distance_168h", "oi_change_1h"]
+
+
+def count_high_correlation_pairs(df: pd.DataFrame, columns: list[str], threshold: float = 0.80) -> int:
+    available = [c for c in columns if c in df.columns]
+    if len(available) < 2:
+        return 0
+    numeric = df[available].select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan)
+    if numeric.shape[1] < 2:
+        return 0
+    corr = numeric.corr().abs()
+    upper = np.triu(np.ones(corr.shape), k=1).astype(bool)
+    return int((corr.where(upper) > threshold).sum().sum())
+
+
+def validate_profile_feature_mapping(symbol: str, features: pd.DataFrame, profile: CoinProfile) -> tuple[bool, list[str]]:
+    expected = profile.feature_columns
+    missing = [col for col in expected if col not in features.columns]
+    if missing:
+        return False, missing
+    return True, []
+
+
+def export_feature_metadata(path: Path, symbol: str, profile: CoinProfile, features: pd.DataFrame) -> None:
+    expected = profile.feature_columns
+    payload = {
+        "symbol": symbol,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_set_hash": hashlib.sha256(
+            json.dumps(sorted(expected), separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "feature_count": int(features.shape[1]),
+        "profile_feature_count": len(expected),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def resolve_label_horizon(profile: CoinProfile) -> int:
@@ -274,11 +314,31 @@ def main():
         feats = all_features[symbol]
         ohlcv = ohlcv_data[symbol]
         
-        # 1. Export Features
+        profile = get_coin_profile(symbol)
+
+        # 1. Feature integrity + collinearity diagnostics
+        is_valid, missing_features = validate_profile_feature_mapping(symbol, feats, profile)
+        if not is_valid:
+            print(f"  ❌ {symbol}: Missing profile features ({len(missing_features)}): {missing_features[:8]}")
+            continue
+
+        post_count = count_high_correlation_pairs(feats, profile.feature_columns, threshold=0.80)
+        pre_count = count_high_correlation_pairs(
+            feats,
+            profile.feature_columns + [c for c in REMOVED_REDUNDANT_FEATURES if c in feats.columns],
+            threshold=0.80,
+        )
+        print(
+            f"  📊 {symbol}: Collinearity pairs | pre={pre_count} post={post_count} "
+            f"(corr>|0.80|, delta={post_count - pre_count:+d})"
+        )
+
+        # 2. Export Features + schema metadata
         f_path = EXPORT_DIR / f"{symbol.replace('-', '_')}_features.csv"
         feats.to_csv(f_path)
-        
-        profile = get_coin_profile(symbol)
+        meta_path = EXPORT_DIR / f"{symbol.replace('-', '_')}_feature_meta.json"
+        export_feature_metadata(meta_path, symbol, profile, feats)
+
         target = compute_profile_target(ohlcv, profile)
         
         # Ensure UTC match
