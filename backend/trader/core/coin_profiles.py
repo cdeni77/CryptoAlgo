@@ -19,6 +19,7 @@ import json
 import hashlib
 import joblib
 import logging
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
@@ -318,6 +319,9 @@ def save_model(
     profile_name: str,
     extra_meta: Optional[Dict] = None,
     target_dir: Optional[Path] = None,
+    secondary_model: Any = None,
+    secondary_scaler: Any = None,
+    secondary_calibrator: Any = None,
 ) -> Path:
     """
     Save a trained model + metadata to disk.
@@ -338,6 +342,9 @@ def save_model(
         'model': model,
         'scaler': scaler,
         'calibrator': calibrator,
+        'secondary_model': secondary_model,
+        'secondary_scaler': secondary_scaler,
+        'secondary_calibrator': secondary_calibrator,
         'feature_columns': feature_columns,
         'auc': auc,
         'profile_name': profile_name,
@@ -345,6 +352,7 @@ def save_model(
     }
     payload['meta'] = {
         'feature_set_hash': feature_set_hash,
+        'model_version': datetime.utcnow().isoformat() + 'Z',
         **(extra_meta or {}),
     }
 
