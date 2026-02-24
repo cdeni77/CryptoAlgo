@@ -13,6 +13,17 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+MAX_JOIN_NAN_RATIO = 0.35
+CROSS_ASSET_FEATURE_COLUMNS = [
+    'btc_rel_return_4h',
+    'btc_rel_return_24h',
+    'btc_rel_return_72h',
+    'btc_corr_24h',
+    'btc_corr_72h',
+    'btc_beta_24h',
+    'btc_beta_72h',
+]
+
 # Point-in-Time Normalization Utilities
 
 def normalize_point_in_time(series: pd.Series, lookback: int = 168, min_periods: int = 24) -> pd.Series:
@@ -204,6 +215,44 @@ class RegimeFeatures:
         trend_num = df['close'] - df['close'].rolling(24).mean()
         trend_den = df['close'].rolling(24).std().replace(0, np.nan)
         features['trend_strength_24h'] = trend_num / trend_den
+        return features
+
+
+class BTCRelativeFeatures:
+    """Cross-asset features for altcoins relative to BTC behavior."""
+
+    @classmethod
+    def compute(
+        cls,
+        asset_df: pd.DataFrame,
+        btc_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        features = pd.DataFrame(index=asset_df.index)
+
+        aligned_btc = (
+            btc_df[['close']]
+            .sort_index()
+            .reindex(asset_df.index)
+            .ffill()
+        )
+        aligned_btc = aligned_btc.rename(columns={'close': 'btc_close'})
+
+        joined = asset_df[['close']].join(aligned_btc, how='left')
+        asset_returns_1h = joined['close'].pct_change()
+        btc_returns_1h = joined['btc_close'].pct_change()
+
+        for lookback in (4, 24, 72):
+            asset_ret = joined['close'].pct_change(lookback)
+            btc_ret = joined['btc_close'].pct_change(lookback)
+            features[f'btc_rel_return_{lookback}h'] = asset_ret - btc_ret
+
+        for window in (24, 72):
+            corr = asset_returns_1h.rolling(window).corr(btc_returns_1h)
+            btc_var = btc_returns_1h.rolling(window).var().replace(0, np.nan)
+            cov = asset_returns_1h.rolling(window).cov(btc_returns_1h)
+            features[f'btc_corr_{window}h'] = corr
+            features[f'btc_beta_{window}h'] = cov / btc_var
+
         return features
 
 
@@ -506,11 +555,29 @@ class FeatureConfig:
     compute_oi: bool = True
     compute_regime: bool = True
     compute_coin_specific: bool = True  # v8: coin-specific features
+    compute_cross_asset: bool = True
 
 
 class FeaturePipeline:
     def __init__(self, config: Optional[FeatureConfig] = None):
         self.config = config or FeatureConfig()
+
+    @staticmethod
+    def _validate_nan_leakage(symbol: str, features: pd.DataFrame):
+        """Fail fast when cross-asset joins introduce excessive NaN leakage."""
+        if features.empty:
+            return
+        cross_cols = [c for c in CROSS_ASSET_FEATURE_COLUMNS if c in features.columns]
+        if not cross_cols:
+            return
+        nan_ratio = features[cross_cols].isna().mean()
+        leaked = nan_ratio[nan_ratio > MAX_JOIN_NAN_RATIO]
+        if not leaked.empty:
+            leaked_str = ', '.join(f"{col}={ratio:.2f}" for col, ratio in leaked.items())
+            raise ValueError(
+                f"Excessive NaN leakage for {symbol}: {leaked_str} "
+                f"(threshold={MAX_JOIN_NAN_RATIO:.2f})"
+            )
 
     def compute_features(self, ohlcv_data, funding_data=None, oi_data=None, reference_symbol='BTC-PERP'):
         """Main entry: iterates symbols and returns feature dictionary."""
@@ -539,10 +606,16 @@ class FeaturePipeline:
                 if coin_cls:
                     logger.info(f"  Adding {coin_cls.__name__} for {symbol}")
                     f_list.append(coin_cls.compute(df))
+
+            if self.config.compute_cross_asset and symbol != reference_symbol and reference_symbol in ohlcv_data:
+                logger.info(f"  Adding BTCRelativeFeatures for {symbol} vs {reference_symbol}")
+                f_list.append(BTCRelativeFeatures.compute(df, ohlcv_data[reference_symbol]))
             
             if f_list:
                 combined = pd.concat(f_list, axis=1)
-                all_features[symbol] = combined.loc[:, ~combined.columns.duplicated()]
+                combined = combined.loc[:, ~combined.columns.duplicated()]
+                self._validate_nan_leakage(symbol, combined)
+                all_features[symbol] = combined
         
         return all_features
 
