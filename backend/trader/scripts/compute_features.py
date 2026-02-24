@@ -30,6 +30,13 @@ from features.engineering import (
     FeatureConfig,
 )
 from core.coin_profiles import FEATURE_SCHEMA_VERSION, get_coin_profile, CoinProfile
+from core.labeling import (
+    TripleBarrierSpec,
+    assert_label_path_consistency,
+    compute_labels_from_ohlcv_iteration,
+    momentum_direction_series,
+    resolve_profile_label_horizon,
+)
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")
@@ -165,52 +172,26 @@ def export_feature_metadata(path: Path, symbol: str, profile: CoinProfile, featu
 
 
 def resolve_label_horizon(profile: CoinProfile) -> int:
-    """Prefer execution hold horizon; fallback to explicit label horizon."""
-    if profile.max_hold_hours and profile.max_hold_hours > 0:
-        return int(profile.max_hold_hours)
-    return int(profile.label_forward_hours)
+    return resolve_profile_label_horizon(profile.max_hold_hours, profile.label_forward_hours)
 
 
 def compute_profile_target(ohlcv: pd.DataFrame, profile: CoinProfile) -> pd.Series:
-    """Triple-barrier labels with profile TP/SL multipliers and neutral timeout class.
+    """Momentum-direction triple-barrier labels aligned with train_model execution.
 
     Label values:
-      1  -> take-profit first touch
-      -1 -> stop-loss first touch
+      1  -> take-profit first touch (long/short aware)
+      -1 -> stop-loss first touch (long/short aware)
       0  -> timeout/no touch within horizon
+
+    Neutral direction entries (no momentum consensus) are not labeled (NaN).
     """
-    horizon = resolve_label_horizon(profile)
-    target = pd.Series(index=ohlcv.index, dtype=float)
-    vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
-
-    for idx in range(len(ohlcv) - horizon):
-        ts = ohlcv.index[idx]
-        row_vol = vol.iloc[idx]
-        if pd.isna(row_vol) or row_vol <= 0:
-            continue
-
-        entry = ohlcv['close'].iloc[idx]
-        tp = entry * (1 + profile.vol_mult_tp * row_vol)
-        sl = entry * (1 - profile.vol_mult_sl * row_vol)
-        future = ohlcv.iloc[idx + 1: idx + 1 + horizon]
-
-        label = 0.0
-        for _, bar in future.iterrows():
-            tp_hit = bar['high'] >= tp
-            sl_hit = bar['low'] <= sl
-            if tp_hit and not sl_hit:
-                label = 1.0
-                break
-            if sl_hit and not tp_hit:
-                label = -1.0
-                break
-            if tp_hit and sl_hit:
-                label = -1.0
-                break
-
-        target.iloc[idx] = label
-
-    return target
+    spec = TripleBarrierSpec(
+        horizon_hours=resolve_label_horizon(profile),
+        tp_mult=profile.vol_mult_tp,
+        sl_mult=profile.vol_mult_sl,
+    )
+    direction = momentum_direction_series(ohlcv)
+    return compute_labels_from_ohlcv_iteration(ohlcv, spec, direction)
 
 # 3. MAIN SCRIPT
 
@@ -315,6 +296,12 @@ def main():
         ohlcv = ohlcv_data[symbol]
         
         profile = get_coin_profile(symbol)
+        spec = TripleBarrierSpec(
+            horizon_hours=resolve_label_horizon(profile),
+            tp_mult=profile.vol_mult_tp,
+            sl_mult=profile.vol_mult_sl,
+        )
+        direction = momentum_direction_series(ohlcv)
 
         # 1. Feature integrity + collinearity diagnostics
         is_valid, missing_features = validate_profile_feature_mapping(symbol, feats, profile)
@@ -339,6 +326,7 @@ def main():
         meta_path = EXPORT_DIR / f"{symbol.replace('-', '_')}_feature_meta.json"
         export_feature_metadata(meta_path, symbol, profile, feats)
 
+        assert_label_path_consistency(ohlcv, feats.index, spec, direction, sample_size=200)
         target = compute_profile_target(ohlcv, profile)
         
         # Ensure UTC match

@@ -34,6 +34,12 @@ from core.coin_profiles import (
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
 from core.trading_costs import get_contract_spec
+from core.labeling import (
+    TripleBarrierSpec,
+    compute_labels_from_feature_index,
+    momentum_direction_series,
+    resolve_profile_label_horizon,
+)
 from core.meta_labeling import (
     MetaArtifacts,
     build_meta_dataset,
@@ -418,78 +424,16 @@ class MLSystem:
           1  -> TP first touch (in momentum direction)
           -1 -> SL first touch
           0  -> timeout within horizon (neutral)
+
+        Neutral-direction rows are left as NaN and excluded before binary mapping.
         """
-        forward_hours = resolve_label_horizon(profile, self.config)
-        tp_mult = profile.vol_mult_tp if profile else self.config.vol_mult_tp
-        sl_mult = profile.vol_mult_sl if profile else self.config.vol_mult_sl
-
-        target = pd.Series(index=features.index, dtype=float)
-        vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
-
-        # Pre-compute momentum series (vectorized — matches v7 exactly)
-        ret_24h_series = ohlcv['close'].pct_change(24).ffill()
-        ret_72h_series = ohlcv['close'].pct_change(72).ffill()
-        sma_50_series = ohlcv['close'].rolling(50).mean()
-
-        for ts in features.index:
-            if ts not in ohlcv.index or ts not in vol.index:
-                continue
-            row_vol = vol.loc[ts]
-            if pd.isna(row_vol) or row_vol == 0:
-                continue
-            try:
-                pos_in_ohlcv = ohlcv.index.get_loc(ts)
-            except KeyError:
-                continue
-            if pos_in_ohlcv + forward_hours >= len(ohlcv):
-                continue
-
-            entry_px = ohlcv.loc[ts, 'close']
-            future = ohlcv.iloc[pos_in_ohlcv + 1: pos_in_ohlcv + 1 + forward_hours]
-            tp_move = tp_mult * row_vol
-            sl_move = sl_mult * row_vol
-
-            r24 = ret_24h_series.get(ts, 0)
-            r72 = ret_72h_series.get(ts, 0)
-            sma = sma_50_series.get(ts, entry_px)
-            if pd.isna(r24): r24 = 0
-            if pd.isna(r72): r72 = 0
-            if pd.isna(sma): sma = entry_px
-
-            momentum_score = (1 if r24 > 0 else -1) + (1 if r72 > 0 else -1) + (1 if entry_px > sma else -1)
-
-            if momentum_score >= 2:
-                direction = 1
-            elif momentum_score <= -2:
-                direction = -1
-            else:
-                continue
-
-            if direction == 1:
-                tp_px = entry_px * (1 + tp_move)
-                sl_px = entry_px * (1 - sl_move)
-            else:
-                tp_px = entry_px * (1 - tp_move)
-                sl_px = entry_px * (1 + sl_move)
-
-            label = 0.0
-            for _, bar in future.iterrows():
-                tp_hit = (direction == 1 and bar['high'] >= tp_px) or (direction == -1 and bar['low'] <= tp_px)
-                sl_hit = (direction == 1 and bar['low'] <= sl_px) or (direction == -1 and bar['high'] >= sl_px)
-
-                if tp_hit and not sl_hit:
-                    label = 1.0
-                    break
-                if sl_hit and not tp_hit:
-                    label = -1.0
-                    break
-                if tp_hit and sl_hit:
-                    label = -1.0
-                    break
-
-            target.loc[ts] = label
-
-        return target
+        spec = TripleBarrierSpec(
+            horizon_hours=resolve_label_horizon(profile, self.config),
+            tp_mult=profile.vol_mult_tp if profile else self.config.vol_mult_tp,
+            sl_mult=profile.vol_mult_sl if profile else self.config.vol_mult_sl,
+        )
+        direction = momentum_direction_series(ohlcv)
+        return compute_labels_from_feature_index(ohlcv, features.index, spec, direction)
 
     def prepare_binary_training_set(self, X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
         """Explicitly remove neutral timeout labels, then map SL/TP to binary 0/1."""
@@ -815,13 +759,9 @@ class MLSystem:
 
 
 def resolve_label_horizon(profile: Optional[CoinProfile], config: Config) -> int:
-    if profile and profile.max_hold_hours > 0:
-        return int(profile.max_hold_hours)
-    if profile:
-        return int(profile.label_forward_hours)
-    if config.max_hold_hours > 0:
-        return int(config.max_hold_hours)
-    return int(config.label_forward_hours)
+    max_hold = profile.max_hold_hours if profile is not None else config.max_hold_hours
+    forward = profile.label_forward_hours if profile is not None else config.label_forward_hours
+    return resolve_profile_label_horizon(max_hold, forward)
 
 
 def validate_label_execution_config(symbol: str, profile: CoinProfile, config: Config) -> None:
