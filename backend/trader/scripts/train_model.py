@@ -181,6 +181,9 @@ class Config:
     # Feature controls
     enforce_pruned_features: bool = False
 
+    # Recency weighting
+    recency_half_life_days: float = 50.0
+
 
 def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
                            config: Config) -> float:
@@ -414,17 +417,47 @@ class MLSystem:
         }
         class_weight_vec = y.map(class_weights).to_numpy(dtype=float)
 
-        # Placeholder for any explicit recency weighting (currently neutral).
-        recency_weight_vec = np.ones(len(y), dtype=float)
+        half_life_hours = max(float(self.config.recency_half_life_days) * 24.0, 1e-8)
+        index = y.index
+        if isinstance(index, pd.DatetimeIndex):
+            index_ts = index
+        else:
+            try:
+                index_ts = pd.to_datetime(index, utc=True)
+            except (TypeError, ValueError):
+                index_ts = None
 
-        sample_weights = uniqueness_weights * class_weight_vec * recency_weight_vec
+        if isinstance(index_ts, pd.DatetimeIndex) and not index_ts.isna().any():
+            if index_ts.tz is None:
+                index_ts = index_ts.tz_localize("UTC")
+            most_recent_ts = index_ts.max()
+            age_hours = (most_recent_ts - index_ts).total_seconds() / 3600.0
+            age_hours = np.maximum(age_hours.astype(float), 0.0)
+        else:
+            age_hours = np.arange(len(y) - 1, -1, -1, dtype=float)
+            print(
+                f"[{symbol}] non-datetime index detected for sample weights; "
+                "using positional recency decay fallback."
+            )
+
+        recency_weight_vec = np.exp(-np.log(2.0) * age_hours / half_life_hours)
+
+        base_weights = uniqueness_weights * class_weight_vec
+        sample_weights = base_weights * recency_weight_vec
         sample_weights = np.clip(sample_weights, 1e-8, None)
 
-        ess = (sample_weights.sum() ** 2) / np.square(sample_weights).sum()
+        base_weights = np.clip(base_weights, 1e-8, None)
+        ess_before = (base_weights.sum() ** 2) / np.square(base_weights).sum()
+        ess_after = (sample_weights.sum() ** 2) / np.square(sample_weights).sum()
+        print(
+            f"[{symbol}] recency_weight stats: min={recency_weight_vec.min():.6f} "
+            f"median={np.median(recency_weight_vec):.6f} max={recency_weight_vec.max():.6f} "
+            f"half_life_days={self.config.recency_half_life_days:.2f}"
+        )
         print(
             f"[{symbol}] sample_weight stats: min={sample_weights.min():.6f} "
             f"median={np.median(sample_weights):.6f} max={sample_weights.max():.6f} "
-            f"ESS={ess:.1f}/{len(sample_weights)}"
+            f"ESS(before={ess_before:.1f}, after={ess_after:.1f})/{len(sample_weights)}"
         )
         return sample_weights
 
@@ -1427,6 +1460,8 @@ if __name__ == "__main__":
                         help="Comma-separated symbol prefixes to exclude (default: none)")
     parser.add_argument("--pruned-only", action="store_true",
                         help="Require pruned feature artifacts from prune_features.py")
+    parser.add_argument("--recency-half-life-days", type=float, default=50.0,
+                        help="Half-life in days for exponential recency sample weighting")
     args = parser.parse_args()
 
     excluded = [s.strip() for s in args.exclude.split(',') if s.strip()] if args.exclude else None
@@ -1444,6 +1479,7 @@ if __name__ == "__main__":
         meta_probability_threshold=args.meta_threshold,
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
+        recency_half_life_days=args.recency_half_life_days,
     )
     data = load_data()
 
