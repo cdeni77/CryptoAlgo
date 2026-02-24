@@ -29,6 +29,29 @@ from typing import Dict, List
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 PILOT_ROLLOUT_DEFAULT_COINS = ["ETH", "SOL"]
 
+GATE_MODE_CONFIGS = {
+    "initial_paper_qualification": {
+        "description": "Lenient gate for controlled paper qualification of borderline models.",
+        "screen_threshold": 38.0,
+        "holdout_min_trades": 8,
+        "holdout_min_sharpe": -0.1,
+        "holdout_min_return": -0.05,
+        "escalation_policy": "After 14-28 days of stable paper performance, tighten to production_promotion.",
+    },
+    "production_promotion": {
+        "description": "Strict gate for production promotion.",
+        "screen_threshold": 60.0,
+        "holdout_min_trades": 15,
+        "holdout_min_sharpe": 0.0,
+        "holdout_min_return": 0.0,
+        "escalation_policy": "Already in strict mode.",
+    },
+}
+
+
+def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
+    return dict(GATE_MODE_CONFIGS.get(mode_name, GATE_MODE_CONFIGS["initial_paper_qualification"]))
+
 # v11: Updated presets — tighter patience, CV folds
 PRESET_CONFIGS = {
     "paper_ready": {
@@ -318,6 +341,7 @@ def print_final_report(script_dir, target_coins, total_time):
         optim_metrics = opt.get('optim_metrics', {})
         holdout_metrics = opt.get('holdout_metrics', {})
         readiness = val.get('readiness', {})
+        gate_mode = opt.get('gate_mode', "initial_paper_qualification")
         version = opt.get('version', 'v10')
 
         # v11: Show OOS metrics primarily
@@ -349,7 +373,7 @@ def print_final_report(script_dir, target_coins, total_time):
               f"Std={_f(std_oos_sr)} | WR={_fmt_metric(opt_wr, '.1%')} | "
               f"DD={_fmt_metric(opt_dd, '.1%')} | Trades={opt_trades}")
         print(f"     │  Trades/Year={_fmt_metric(opt_tpy, '.1f')} | Frequency ratio={_fmt_metric(freq_ratio, '.2f')}")
-        print(f"     ├─ Holdout")
+        print(f"     ├─ Holdout (mode={gate_mode})")
         print(f"     │  Sharpe={_f(ho_sharpe)} | Return={_fmt_metric(ho_return, '.2%')} | Trades={ho_trades}")
 
         if readiness:
@@ -413,6 +437,7 @@ def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id
     opt_results = load_optimization_results(results_dir)
     val_results = load_validation_results(results_dir)
 
+    gate_mode = resolve_gate_mode(args.gate_mode)
     coins_summary = []
     for coin in target_coins:
         validation = val_results.get(coin, {})
@@ -440,6 +465,9 @@ def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id
         "runtime_seconds": round(total_time, 2),
         "deployment_tier_map": {row["coin"]: row["deployment_intent"] for row in coins_summary},
         "coin_summaries": coins_summary,
+        "gate_mode": args.gate_mode,
+        "gate_profile": gate_mode,
+        "escalation_policy": gate_mode.get("escalation_policy"),
     }
 
     versioned_path = results_dir / f"launch_summary_{run_id}.json"
@@ -516,9 +544,12 @@ if __name__ == "__main__":
                         help="Top CV candidates to evaluate on holdout per coin")
     parser.add_argument("--require-holdout-pass", action="store_true",
                         help="Block coin deployment if no holdout candidate passes minimum thresholds")
-    parser.add_argument("--holdout-min-trades", type=int, default=15)
-    parser.add_argument("--holdout-min-sharpe", type=float, default=0.0)
-    parser.add_argument("--holdout-min-return", type=float, default=0.0)
+    parser.add_argument("--holdout-min-trades", type=int, default=8)
+    parser.add_argument("--holdout-min-sharpe", type=float, default=-0.1)
+    parser.add_argument("--holdout-min-return", type=float, default=-0.05)
+    parser.add_argument("--gate-mode", type=str, default="initial_paper_qualification",
+                        choices=sorted(GATE_MODE_CONFIGS.keys()),
+                        help="Gate profile: initial paper qualification (lenient) vs production promotion (strict)")
     parser.add_argument("--target-trades-per-week", type=float, default=1.0)
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
@@ -536,7 +567,7 @@ if __name__ == "__main__":
                         help="Run faster robustness checks (lower MC simulation counts)")
     parser.add_argument("--validation-no-timeout", action="store_true",
                         help="Disable per-coin validation timeout (run until completion)")
-    parser.add_argument("--screen-threshold", type=float, default=60.0,
+    parser.add_argument("--screen-threshold", type=float, default=38.0,
                         help="Run full validation only for coins with screen score >= this threshold")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip pre-launch data/feature QA checks")
@@ -544,6 +575,16 @@ if __name__ == "__main__":
                         help="Run preflight checks and exit without optimization/validation")
     args = parser.parse_args()
     args = apply_runtime_preset(args)
+    gate_mode = resolve_gate_mode(args.gate_mode)
+    provided_flags = set(sys.argv[1:])
+    if "--holdout-min-trades" not in provided_flags:
+        args.holdout_min_trades = int(gate_mode["holdout_min_trades"])
+    if "--holdout-min-sharpe" not in provided_flags:
+        args.holdout_min_sharpe = float(gate_mode["holdout_min_sharpe"])
+    if "--holdout-min-return" not in provided_flags:
+        args.holdout_min_return = float(gate_mode["holdout_min_return"])
+    if "--screen-threshold" not in provided_flags:
+        args.screen_threshold = float(gate_mode["screen_threshold"])
 
     pipeline_start = time.time()
     run_id = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')
@@ -631,7 +672,9 @@ if __name__ == "__main__":
         print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
         print(f"   Holdout cands:{args.holdout_candidates}")
+        print(f"   Gate mode:    {args.gate_mode}")
         print(f"   Holdout gate: trades>={args.holdout_min_trades}, SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}")
+        print(f"   Escalation:   {gate_mode.get('escalation_policy')}")
         print(f"   Enforce gate: {'YES' if args.require_holdout_pass else 'NO'}")
         print(f"   Target cadence: {args.target_trades_per_week:.2f} trades/week")
         print(f"   Preset:       {args.preset}")
@@ -669,6 +712,7 @@ if __name__ == "__main__":
                 "--target-trades-per-week", str(args.target_trades_per_week),
                 "--study-suffix", run_id,
                 "--preset", "none",  # already applied
+                "--gate-mode", args.gate_mode,
             ]
             if args.min_internal_oos_trades:
                 cmd.extend(["--min-internal-oos-trades", str(args.min_internal_oos_trades)])
