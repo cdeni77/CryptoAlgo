@@ -9,7 +9,7 @@ KEY CHANGES from v7:
   - All coins use momentum strategy with per-coin parameter tuning
 
 Coinbase CDE fee model: 0.10% per side, $0.20 minimum per contract.
-Funding: Binance 8h data, divided by 8 for hourly accrual.
+Funding: Normalized hourly funding data (Coinbase native preferred, CCXT fallback).
 """
 import argparse
 import joblib
@@ -794,10 +794,9 @@ def run_backtest(all_data: Dict, config: Config,
 
                 pos_profile = _get_profile(sym, profile_overrides)
 
-                funding_8h_bps = all_data[sym]['features'].loc[ts].get('funding_rate_bps', 0.0)
-                if pd.isna(funding_8h_bps):
-                    funding_8h_bps = 0.0
-                funding_hourly_bps = funding_8h_bps / 8.0
+                funding_hourly_bps = all_data[sym]['features'].loc[ts].get('funding_rate_bps', 0.0)
+                if pd.isna(funding_hourly_bps):
+                    funding_hourly_bps = 0.0
                 pos['accum_funding'] += -(funding_hourly_bps / 10000.0) * pos['dir']
 
                 bar = all_data[sym]['ohlcv'].loc[ts]

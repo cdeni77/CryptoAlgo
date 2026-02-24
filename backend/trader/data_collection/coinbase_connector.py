@@ -217,6 +217,103 @@ class CoinbaseRESTClient:
             logger.error(f"Failed to parse ticker: {e}")
             return None
     
+    async def get_funding_rate_history(
+        self,
+        product_id: str,
+        start: datetime,
+        end: datetime,
+        limit: int = 200,
+    ) -> List[FundingRate]:
+        """
+        Fetch Coinbase International hourly funding history for a CDE product.
+
+        Returned rates are normalized to decimal/hour for downstream consistency.
+        """
+        if not self.auth:
+            logger.warning("Authentication required for funding rate history")
+            return []
+
+        start = start.replace(tzinfo=None) if start.tzinfo else start
+        end = end.replace(tzinfo=None) if end.tzinfo else end
+
+        path = "/api/v3/brokerage/intx/funding-rates"
+        cursor = None
+        all_rates: List[FundingRate] = []
+
+        while True:
+            params = {
+                "product_id": product_id,
+                "start": int(start.timestamp()),
+                "end": int(end.timestamp()),
+                "limit": limit,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            status, data = await self._request("GET", path, params=params, authenticated=True)
+            if status != 200:
+                logger.debug(f"Funding history request failed for {product_id}: {data}")
+                break
+
+            raw_rows = (
+                data.get("funding_rates")
+                or data.get("results")
+                or data.get("data")
+                or []
+            )
+            if not raw_rows:
+                break
+
+            for row in raw_rows:
+                ts = (
+                    row.get("timestamp")
+                    or row.get("event_time")
+                    or row.get("time")
+                    or row.get("funding_time")
+                )
+                if ts is None:
+                    continue
+                if isinstance(ts, str):
+                    try:
+                        event_time = datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except ValueError:
+                        continue
+                else:
+                    ts_num = float(ts)
+                    if ts_num > 10_000_000_000:
+                        ts_num /= 1000.0
+                    event_time = datetime.utcfromtimestamp(ts_num)
+
+                if event_time < start or event_time >= end:
+                    continue
+
+                rate_value = row.get("funding_rate")
+                if rate_value is None:
+                    rate_value = row.get("rate")
+                if rate_value is None:
+                    continue
+
+                interval_hours = float(row.get("interval_hours") or row.get("intervalHours") or 1.0)
+                interval_hours = max(interval_hours, 1.0)
+
+                all_rates.append(FundingRate(
+                    symbol=product_id,
+                    event_time=event_time,
+                    available_time=event_time + timedelta(seconds=5),
+                    rate=float(rate_value) / interval_hours,
+                    mark_price=float(row.get("mark_price") or row.get("markPrice") or 0.0),
+                    index_price=float(row.get("index_price") or row.get("indexPrice") or 0.0),
+                    is_settlement=bool(row.get("is_settlement", False)),
+                    funding_source="coinbase",
+                ))
+
+            cursor = data.get("cursor") or data.get("next_cursor")
+            if not cursor:
+                break
+
+        all_rates.sort(key=lambda x: x.event_time)
+        return all_rates
+
     async def get_funding_rate(self, product_id: str) -> Optional[FundingRate]:
         if not self.auth:
             logger.warning("Authentication required for funding rate")

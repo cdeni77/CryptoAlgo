@@ -166,6 +166,9 @@ class FundingRate(BiTemporalMixin):
     # Whether this is a settlement time or just accrual
     is_settlement: bool = False
     
+    # Data provenance
+    funding_source: str = "coinbase"  # coinbase | binance_proxy
+
     # Quality
     quality: DataQuality = DataQuality.VALID
     
@@ -190,6 +193,7 @@ class FundingRate(BiTemporalMixin):
             "mark_price": self.mark_price,
             "index_price": self.index_price,
             "is_settlement": self.is_settlement,
+            "funding_source": self.funding_source,
             "quality": self.quality.value,
         }
     
@@ -203,6 +207,7 @@ class FundingRate(BiTemporalMixin):
             mark_price=float(data.get("mark_price", 0)),
             index_price=float(data.get("index_price", 0)),
             is_settlement=data.get("is_settlement", False),
+            funding_source=data.get("funding_source", "coinbase"),
             quality=DataQuality(data.get("quality", "valid")),
         )
 

@@ -354,7 +354,7 @@ class CCXTConnector:
         if not self._initialized:
             await self.initialize()
         
-        # Binance is typically best for funding rate history
+        # Fallback source used when Coinbase native funding is unavailable.
         exchange_id = exchange_id or "binance"
         exchange = self._exchanges.get(exchange_id)
         
@@ -397,13 +397,23 @@ class CCXTConnector:
                         if event_time >= end:
                             break
                         
+                        raw_rate = float(entry.get("fundingRate", 0) or 0)
+                        interval_hours = float(
+                            entry.get("intervalHours")
+                            or entry.get("fundingIntervalHours")
+                            or 8
+                        )
+                        interval_hours = max(interval_hours, 1.0)
+
                         funding = FundingRate(
                             symbol=symbol,
                             event_time=event_time,
                             available_time=event_time + timedelta(seconds=5),
-                            rate=float(entry.get("fundingRate", 0)),
+                            # Normalize all fallback rates to decimal/hour.
+                            rate=raw_rate / interval_hours,
                             mark_price=float(entry.get("markPrice", 0)) if entry.get("markPrice") else 0.0,
                             index_price=float(entry.get("indexPrice", 0)) if entry.get("indexPrice") else 0.0,
+                            funding_source="binance_proxy",
                             quality=DataQuality.VALID,
                         )
                         funding_rates.append(funding)

@@ -157,7 +157,7 @@ class FundingFeatures:
         features['funding_persistence_24h'] = funding_lagged.rolling(24).apply(
             lambda x: (x > 0).mean(), raw=False
         )
-        features['funding_rate_annualized'] = funding_lagged * 3 * 365
+        features['funding_rate_annualized'] = funding_lagged * 24 * 365
         
         return features
 

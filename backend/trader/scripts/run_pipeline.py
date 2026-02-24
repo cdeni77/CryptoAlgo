@@ -5,7 +5,7 @@ Unified Data Pipeline for Coinbase Perps Trading Bot
 This script combines:
 1. Dynamic resolution of Coinbase "Smart Perp" product IDs
 2. Hybrid OHLCV backfill (Coinbase Native -> CCXT fallback)
-3. Funding rate backfill from CCXT exchanges (Binance, OKX, Bybit)
+3. Funding rate backfill preferring Coinbase native hourly history with CCXT fallback
 4. Real-time data collection via WebSocket
 
 Usage:
@@ -198,15 +198,61 @@ async def backfill_ohlcv(
     progress.summary()
 
 
+def _extract_coin_code(symbol: str) -> Optional[str]:
+    if not symbol:
+        return None
+    if "-" in symbol:
+        prefix = symbol.split("-")[0].upper()
+        if prefix in ASSET_TO_CODE_MAP.values():
+            return prefix
+        return ASSET_TO_CODE_MAP.get(prefix)
+    return ASSET_TO_CODE_MAP.get(symbol.upper())
+
+
+async def resolve_coinbase_funding_product_map(
+    api_key: str,
+    api_secret: str,
+    symbols: List[str],
+) -> Dict[str, str]:
+    """Map requested symbols to active Coinbase CDE product IDs for funding queries."""
+    client = CoinbaseRESTClient(api_key, api_secret)
+    try:
+        target_codes = sorted({c for c in (_extract_coin_code(s) for s in symbols) if c})
+        products = await client.get_perpetual_products(target_codes=target_codes)
+        code_to_product: Dict[str, str] = {}
+        for product in products:
+            product_id = product.get("product_id", "")
+            if not product_id:
+                continue
+            code = product_id.split("-")[0].upper()
+            code_to_product.setdefault(code, product_id)
+
+        mapping: Dict[str, str] = {}
+        for symbol in symbols:
+            code = _extract_coin_code(symbol)
+            if code and code in code_to_product:
+                mapping[symbol] = code_to_product[code]
+            elif symbol.endswith("-CDE"):
+                mapping[symbol] = symbol
+        return mapping
+    finally:
+        await client.close()
+
+
 async def backfill_funding_rates(
     symbols: List[str],
     start: datetime,
     end: datetime,
     db: SQLiteDatabase,
     proxy: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
 ):
     """
-    Backfill funding rates from CCXT exchanges.
+    Backfill funding rates with Coinbase-native hourly history as primary source.
+
+    Falls back to CCXT (Binance/OKX/Bybit) only when Coinbase history is unavailable.
+    All persisted rates are normalized to decimal/hour.
     """
     print("\n" + "=" * 70)
     print("🏦 FUNDING RATE BACKFILL")
@@ -214,99 +260,111 @@ async def backfill_funding_rates(
     print(f"Period: {start.date()} to {end.date()}")
     print(f"Symbols: {symbols}")
     print()
-    
-    # Initialize CCXT connector
+
     connector = CCXTConnector(
         exchanges=["binance", "okx", "bybit"],
         proxy=proxy,
         use_fallbacks=True,
     )
-    
+
+    coinbase_client = CoinbaseRESTClient(api_key, api_secret) if api_key and api_secret else None
+    funding_product_map: Dict[str, str] = {}
+    if coinbase_client:
+        try:
+            funding_product_map = await resolve_coinbase_funding_product_map(api_key, api_secret, symbols)
+        except Exception as e:
+            logger.warning(f"Failed to resolve Coinbase funding products: {e}")
+
+    source_metrics: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+        "coinbase": 0,
+        "binance_proxy": 0,
+        "start": None,
+        "end": None,
+    })
+
     try:
         await connector.initialize()
-        
-        available_exchanges = connector.get_available_exchanges()
-        if not available_exchanges:
-            logger.error("No exchanges available for funding rates! Check network/proxy.")
-            return
-        
-        print(f"✓ Connected to exchanges: {available_exchanges}")
-        print()
-        
         progress = BackfillProgress(len(symbols), "Funding Rate Backfill")
         total_inserted = 0
-        
+
         for symbol in symbols:
             logger.info(f"\n📊 Processing funding rates for {symbol}")
-            
-            # Check existing data
+            symbol_inserted = 0
+
             existing_start = db.get_earliest_funding_time(symbol)
             existing_end = db.get_latest_funding_time(symbol)
-            
+            windows = []
             if existing_start and existing_end:
-                logger.info(f"  Existing data: {existing_start.date()} to {existing_end.date()}")
-            else:
-                logger.info(f"  No existing funding data")
-            
-            symbol_inserted = 0
-            
-            if existing_start and existing_end:
-                # Prepend if needed
                 if start < existing_start:
-                    logger.info(f"  📥 Fetching pre-history: {start.date()} to {existing_start.date()}")
-                    rates = await connector.fetch_funding_rates(
-                        symbol=symbol,
-                        start=start,
-                        end=existing_start,
-                    )
-                    if rates:
-                        inserted = db.insert_funding_rate_batch(rates)
-                        symbol_inserted += inserted
-                        logger.info(f"  ✓ Inserted {inserted} pre-history rates")
-                
-                # Append if needed
+                    windows.append((start, existing_start))
                 if end > existing_end:
-                    logger.info(f"  📥 Fetching new data: {existing_end.date()} to {end.date()}")
-                    rates = await connector.fetch_funding_rates(
-                        symbol=symbol,
-                        start=existing_end,
-                        end=end,
-                    )
-                    if rates:
-                        inserted = db.insert_funding_rate_batch(rates)
-                        symbol_inserted += inserted
-                        logger.info(f"  ✓ Inserted {inserted} new rates")
+                    windows.append((existing_end, end))
             else:
-                # Full range fetch
-                logger.info(f"  📥 Fetching full range: {start.date()} to {end.date()}")
-                rates = await connector.fetch_funding_rates(
-                    symbol=symbol,
-                    start=start,
-                    end=end,
-                )
+                windows.append((start, end))
+
+            for win_start, win_end in windows:
+                if win_end <= win_start:
+                    continue
+
+                rates: List[FundingRate] = []
+                coinbase_product = funding_product_map.get(symbol)
+                if coinbase_client and coinbase_product:
+                    try:
+                        rates = await coinbase_client.get_funding_rate_history(coinbase_product, win_start, win_end)
+                        for r in rates:
+                            r.symbol = symbol
+                            r.funding_source = "coinbase"
+                    except Exception as e:
+                        logger.warning(f"Coinbase funding fetch failed for {symbol}: {e}")
+
+                source_used = "coinbase"
+                if not rates:
+                    rates = await connector.fetch_funding_rates(symbol=symbol, start=win_start, end=win_end)
+                    for r in rates:
+                        r.funding_source = "binance_proxy"
+                    source_used = "binance_proxy"
+
                 if rates:
                     inserted = db.insert_funding_rate_batch(rates)
                     symbol_inserted += inserted
-                    logger.info(f"  ✓ Inserted {inserted} rates")
+                    source_metrics[symbol][source_used] += inserted
+                    source_metrics[symbol]["start"] = win_start if source_metrics[symbol]["start"] is None else min(source_metrics[symbol]["start"], win_start)
+                    source_metrics[symbol]["end"] = win_end if source_metrics[symbol]["end"] is None else max(source_metrics[symbol]["end"], win_end)
+                    logger.info(f"  ✓ Inserted {inserted} normalized hourly funding rates via {source_used}")
                 else:
-                    logger.warning(f"  ⚠️ No funding rates found for {symbol}")
-            
+                    logger.warning(f"  ⚠️ No funding rates found for {symbol} in {win_start.date()}->{win_end.date()}")
+
             total_inserted += symbol_inserted
             progress.task_complete(symbol, count=symbol_inserted)
-        
+
         progress.summary()
-        
-        # Final summary
+
         print("\n📈 Funding Data Summary:")
         stats = db.get_funding_stats()
-        for symbol, s in stats.items():
-            daily_cost = s['avg_rate_bps'] * 3  # 3 funding periods per day (8h each)
-            print(f"  {symbol}: {s['count']} records, avg {s['avg_rate_bps']:.4f} bps/8h (~{daily_cost:.4f} bps/day)")
-        
+        for symbol, row in stats.items():
+            daily_cost = row['avg_rate_bps'] * 24
+            print(f"  {symbol}: {row['count']} records, avg {row['avg_rate_bps']:.4f} bps/hour (~{daily_cost:.4f} bps/day)")
+
+        print("\n📋 Funding Source Coverage:")
+        for symbol, m in source_metrics.items():
+            coverage_start = m['start'].date().isoformat() if m['start'] else 'n/a'
+            coverage_end = m['end'].date().isoformat() if m['end'] else 'n/a'
+            logger.info(
+                "Funding coverage %s [%s -> %s] coinbase=%s fallback=%s",
+                symbol,
+                coverage_start,
+                coverage_end,
+                m['coinbase'],
+                m['binance_proxy'],
+            )
+            print(f"  {symbol}: coinbase={m['coinbase']}, binance_proxy={m['binance_proxy']} ({coverage_start} -> {coverage_end})")
+
         print(f"\nTotal funding rates inserted: {total_inserted}")
-        
+
     finally:
         await connector.close()
+        if coinbase_client:
+            await coinbase_client.close()
 
 
 async def backfill_open_interest(
@@ -589,7 +647,7 @@ Examples:
         
         # Funding Rate Backfill
         if not args.ohlcv_only:
-            await backfill_funding_rates(symbols, start_time, end_time, db, proxy)
+            await backfill_funding_rates(symbols, start_time, end_time, db, proxy, api_key, api_secret)
         
         # Open Interest Backfill (optional)
         if args.include_oi and not args.ohlcv_only:
@@ -621,8 +679,8 @@ Examples:
     stats = db.get_funding_stats()
     if stats:
         for symbol, s in stats.items():
-            daily_cost = s['avg_rate_bps'] * 3
-            print(f"  {symbol}: {s['count']} records, avg {s['avg_rate_bps']:.4f} bps/8h (~{daily_cost:.2f} bps/day)")
+            daily_cost = s['avg_rate_bps'] * 24
+            print(f"  {symbol}: {s['count']} records, avg {s['avg_rate_bps']:.4f} bps/hour (~{daily_cost:.2f} bps/day)")
     else:
         print("  No funding rate data")
     
