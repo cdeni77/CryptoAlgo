@@ -13,3 +13,7 @@ pandas>=2.0.0
 scikit-learn
 lightgbm
 optuna
+aiohttp
+ccxt
+python-dateutil
+scipy
