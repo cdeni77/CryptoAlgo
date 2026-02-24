@@ -35,7 +35,7 @@ PRESET_CONFIGS = {
         "plateau_patience": 150,
         "plateau_min_delta": 0.012,
         "plateau_warmup": 80,
-        "holdout_days": 240,
+        "holdout_days": 90,
         "min_internal_oos_trades": 10,
         "min_total_trades": 28,
         "n_cv_folds": 5,
@@ -51,7 +51,7 @@ PRESET_CONFIGS = {
         "plateau_patience": 120,
         "plateau_min_delta": 0.015,
         "plateau_warmup": 60,
-        "holdout_days": 180,
+        "holdout_days": 90,
         "min_internal_oos_trades": 8,
         "min_total_trades": 30,
         "n_cv_folds": 5,
@@ -67,7 +67,7 @@ PRESET_CONFIGS = {
         "plateau_patience": 90,
         "plateau_min_delta": 0.015,
         "plateau_warmup": 45,
-        "holdout_days": 120,
+        "holdout_days": 90,
         "min_internal_oos_trades": 6,
         "min_total_trades": 25,
         "n_cv_folds": 5,
@@ -101,7 +101,7 @@ PRESET_CONFIGS = {
         "plateau_patience": 45,
         "plateau_min_delta": 0.025,
         "plateau_warmup": 20,
-        "holdout_days": 180,
+        "holdout_days": 90,
         "min_internal_oos_trades": 10,
         "min_total_trades": 35,
         "n_cv_folds": 5,
@@ -163,6 +163,15 @@ def _fmt_metric(value, fmt, fallback="?"):
         return format(float(value), fmt)
     except (TypeError, ValueError):
         return fallback
+
+
+def estimate_holdout_trade_budget(holdout_days, target_trades_per_week, holdout_min_trades):
+    estimated_holdout_trades = max(0.0, float(target_trades_per_week)) * (max(0, int(holdout_days)) / 7.0)
+    effective_holdout_floor = max(
+        int(holdout_min_trades),
+        int(estimated_holdout_trades * 0.60),
+    )
+    return estimated_holdout_trades, effective_holdout_floor
 
 
 def load_optimization_results(results_dir):
@@ -496,13 +505,13 @@ if __name__ == "__main__":
                         help="Warmup trials before plateau checks (default: 60)")
     parser.add_argument("--plateau-min-completed", type=int, default=0,
                         help="Never plateau-stop before this many completed trials (0 = auto 40%% of n_trials)")
-    parser.add_argument("--holdout-days", type=int, default=180)
+    parser.add_argument("--holdout-days", type=int, default=90)
     parser.add_argument("--preset", type=str, default="paper_ready",
                         choices=["none", "paper_ready", "robust120", "robust180", "quick", "pilot_rollout"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0)
     parser.add_argument("--min-total-trades", type=int, default=0)
-    parser.add_argument("--n-cv-folds", type=int, default=3,
-                        help="Walk-forward CV folds (default: 3)")
+    parser.add_argument("--n-cv-folds", type=int, default=5,
+                        help="Walk-forward CV folds (default: 5)")
     parser.add_argument("--holdout-candidates", type=int, default=3,
                         help="Top CV candidates to evaluate on holdout per coin")
     parser.add_argument("--require-holdout-pass", action="store_true",
@@ -608,6 +617,16 @@ if __name__ == "__main__":
         print(f"   Worker split: {worker_counts}")
         print(f"   CV folds:     {args.n_cv_folds} (walk-forward)")
         print(f"   Holdout:      {args.holdout_days} days")
+        est_ho_trades, eff_ho_floor = estimate_holdout_trade_budget(
+            holdout_days=args.holdout_days,
+            target_trades_per_week=args.target_trades_per_week,
+            holdout_min_trades=args.holdout_min_trades,
+        )
+        if est_ho_trades < eff_ho_floor:
+            print(
+                f"   ⚠️  Trade-starved risk: est_holdout_trades={est_ho_trades:.1f} "
+                f"< gate_floor={eff_ho_floor} (target={args.target_trades_per_week:.2f}/week)"
+            )
         print(f"   Params:       10 tunable (includes cooldown cadence control)")
         print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
