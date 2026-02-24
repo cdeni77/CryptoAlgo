@@ -14,8 +14,9 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 from core.coin_profiles import MODELS_DIR
 from core.pg_writer import PgWriter
@@ -23,7 +24,28 @@ from scripts.train_model import Config, load_data, retrain_models
 
 LOGGER = logging.getLogger("live_orchestrator")
 STOP_REQUESTED = False
-STATE_FILE = Path("./data/orchestrator_state.json")
+STATE_FILE = Path(os.getenv("ORCHESTRATOR_STATE_FILE", "./data/orchestrator_state.json"))
+
+
+@dataclass
+class KillSwitchThresholds:
+    min_win_rate: float
+    min_profit_factor: float
+    max_drawdown: float
+    min_trades_per_week: float
+    max_negative_expectancy_streak: int
+    min_samples: int
+
+
+def _monitoring_thresholds() -> KillSwitchThresholds:
+    return KillSwitchThresholds(
+        min_win_rate=float(os.getenv("PAPER_MONITOR_MIN_WIN_RATE", "0.42")),
+        min_profit_factor=float(os.getenv("PAPER_MONITOR_MIN_PROFIT_FACTOR", "0.9")),
+        max_drawdown=float(os.getenv("PAPER_MONITOR_MAX_DRAWDOWN", "0.12")),
+        min_trades_per_week=float(os.getenv("PAPER_MONITOR_MIN_TRADES_PER_WEEK", "2.0")),
+        max_negative_expectancy_streak=int(os.getenv("PAPER_MONITOR_NEG_EXPECTANCY_STREAK", "2")),
+        min_samples=int(os.getenv("PAPER_MONITOR_MIN_SAMPLES", "8")),
+    )
 
 
 def _handle_signal(signum, _frame):
@@ -112,6 +134,115 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
 
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _paper_kpis(writer: PgWriter, lookback_days: int = 14) -> dict[str, Any]:
+    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    closed_positions = writer.get_closed_paper_positions_since(since)
+    equity_points = writer.get_paper_equity_curve_since(since)
+
+    pnl_values = [_as_float(p.realized_pnl) for p in closed_positions]
+    trades = len(pnl_values)
+    wins = len([p for p in pnl_values if p > 0])
+    losses = [p for p in pnl_values if p < 0]
+    gross_profit = sum(p for p in pnl_values if p > 0)
+    gross_loss = abs(sum(losses))
+    win_rate = (wins / trades) if trades else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    expectancy = (sum(pnl_values) / trades) if trades else 0.0
+    trades_per_week = trades * (7 / lookback_days)
+
+    drawdown = 0.0
+    if equity_points:
+        peak = _as_float(equity_points[0].equity)
+        for point in equity_points:
+            equity = _as_float(point.equity)
+            peak = max(peak, equity)
+            if peak > 0:
+                drawdown = max(drawdown, (peak - equity) / peak)
+
+    return {
+        "window_days": lookback_days,
+        "trades": trades,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "drawdown": drawdown,
+        "expectancy": expectancy,
+        "trades_per_week": trades_per_week,
+    }
+
+
+def _quarantine_reasons(kpis: dict[str, Any], thresholds: KillSwitchThresholds, state: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if kpis["trades"] < thresholds.min_samples:
+        reasons.append(
+            f"insufficient_samples:{kpis['trades']}<{thresholds.min_samples}"
+        )
+        return reasons
+
+    if kpis["win_rate"] < thresholds.min_win_rate:
+        reasons.append(f"win_rate_collapse:{kpis['win_rate']:.3f}<{thresholds.min_win_rate:.3f}")
+    if kpis["profit_factor"] < thresholds.min_profit_factor:
+        reasons.append(f"profit_factor_breach:{kpis['profit_factor']:.3f}<{thresholds.min_profit_factor:.3f}")
+    if kpis["drawdown"] > thresholds.max_drawdown:
+        reasons.append(f"drawdown_breach:{kpis['drawdown']:.3f}>{thresholds.max_drawdown:.3f}")
+    if kpis["trades_per_week"] < thresholds.min_trades_per_week:
+        reasons.append(f"low_trade_velocity:{kpis['trades_per_week']:.2f}<{thresholds.min_trades_per_week:.2f}")
+
+    neg_streak = int(state.get("negative_expectancy_streak", 0))
+    if kpis["expectancy"] < 0:
+        neg_streak += 1
+    else:
+        neg_streak = 0
+    state["negative_expectancy_streak"] = neg_streak
+    if neg_streak >= thresholds.max_negative_expectancy_streak:
+        reasons.append(
+            f"sustained_negative_expectancy:{neg_streak}>={thresholds.max_negative_expectancy_streak}"
+        )
+
+    return reasons
+
+
+def _evaluate_paper_monitoring(version: str, writer: PgWriter | None) -> tuple[bool, dict[str, Any], list[str]]:
+    if writer is None:
+        return False, {}, []
+
+    state = _load_state()
+    thresholds = _monitoring_thresholds()
+    kpis = _paper_kpis(writer, lookback_days=int(os.getenv("PAPER_MONITOR_LOOKBACK_DAYS", "14")))
+    reasons = _quarantine_reasons(kpis, thresholds, state)
+    quarantined = any(not r.startswith("insufficient_samples") for r in reasons)
+
+    monitoring_record = {
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "version": version,
+        "kpis": kpis,
+        "thresholds": thresholds.__dict__,
+        "reasons": reasons,
+        "status": "quarantined" if quarantined else "active",
+    }
+    state["paper_monitoring"] = monitoring_record
+
+    quarantined_models = state.setdefault("quarantined_models", {})
+    if quarantined:
+        quarantined_models["ALL"] = {
+            "version": version,
+            "status": "quarantined",
+            "reasons": reasons,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    elif "ALL" in quarantined_models:
+        quarantined_models.pop("ALL", None)
+
+    _save_state(state)
+    return quarantined, monitoring_record, reasons
+
+
 def _promote_models(staging_dir: Path, target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     for staged in staging_dir.glob("*.joblib"):
@@ -138,6 +269,18 @@ def _run_retrain(train_window_days: int, retrain_every_days: int, writer: PgWrit
         result = retrain_models(data, config, target_dir=staged_dir, train_window_days=train_window_days)
         if result.get("symbols_trained", 0) == 0:
             raise RuntimeError("No models trained successfully; refusing promotion")
+
+        quarantined, monitoring_record, quarantine_reasons = _evaluate_paper_monitoring(version, writer)
+        result["paper_monitoring"] = monitoring_record
+        if quarantined:
+            LOGGER.error(
+                "Kill-switch triggered for version %s; quarantining models. Reasons: %s",
+                version,
+                ", ".join(quarantine_reasons),
+            )
+            raise RuntimeError(
+                "Model version quarantined by paper monitor: " + ", ".join(quarantine_reasons)
+            )
 
         _promote_models(staged_dir, MODELS_DIR)
 

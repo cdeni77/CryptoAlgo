@@ -474,3 +474,21 @@ class PgWriter:
     def count_open_positions(self) -> int:
         with self._session() as db:
             return db.query(PaperPosition).filter(PaperPosition.is_open.is_(True)).count()
+
+    def get_closed_paper_positions_since(self, since: datetime) -> list[PaperPosition]:
+        with self._session() as db:
+            return (
+                db.query(PaperPosition)
+                .filter(PaperPosition.is_open.is_(False), PaperPosition.updated_at >= since)
+                .order_by(PaperPosition.updated_at.asc())
+                .all()
+            )
+
+    def get_paper_equity_curve_since(self, since: datetime) -> list[PaperEquityCurve]:
+        with self._session() as db:
+            return (
+                db.query(PaperEquityCurve)
+                .filter(PaperEquityCurve.timestamp >= since)
+                .order_by(PaperEquityCurve.timestamp.asc())
+                .all()
+            )
