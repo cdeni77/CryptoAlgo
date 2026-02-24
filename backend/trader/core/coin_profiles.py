@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
+FEATURE_SCHEMA_VERSION = "v9-btc-relative"
 
 # Directory for persisted models
 MODELS_DIR = Path(os.getenv('MODELS_DIR', 'models'))
@@ -118,6 +119,16 @@ XRP_EXTRA_FEATURES = [
     'xrp_compression_ratio', 'xrp_breakout_distance', 'xrp_whipsaw_score',
     'xrp_body_efficiency', 'xrp_volume_breakout_confirm', 'xrp_reversal_pressure',
 ]
+
+BTC_RELATIVE_FEATURES = [
+    'btc_rel_return_4h', 'btc_rel_return_24h', 'btc_rel_return_72h',
+    'btc_corr_24h', 'btc_corr_72h', 'btc_beta_24h', 'btc_beta_72h',
+]
+
+ETH_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
+SOL_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
+XRP_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
+DOGE_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
 
 
 @dataclass
@@ -352,6 +363,7 @@ def save_model(
     }
     payload['meta'] = {
         'feature_set_hash': feature_set_hash,
+        'feature_schema_version': FEATURE_SCHEMA_VERSION,
         'model_version': datetime.utcnow().isoformat() + 'Z',
         **(extra_meta or {}),
     }
