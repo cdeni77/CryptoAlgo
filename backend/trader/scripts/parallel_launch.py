@@ -107,16 +107,17 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.03,
         "plateau_warmup": 20,
         "holdout_days": 90,
-        "min_internal_oos_trades": 5,
-        "min_total_trades": 20,
+        "min_internal_oos_trades": 0,
+        "min_total_trades": 8,
         "n_cv_folds": 2,
         "holdout_candidates": 1,
-        "holdout_min_trades": 10,
-        "holdout_min_sharpe": 0.0,
-        "holdout_min_return": -0.01,
+        "holdout_min_trades": 8,
+        "holdout_min_sharpe": -0.1,
+        "holdout_min_return": -0.05,
         "require_holdout_pass": False,
         "target_trades_per_week": 0.8,
         "plateau_min_completed": 0,
+        "disable_fee_stress": True,
     },
     "pilot_rollout": {
         "coins": ",".join(PILOT_ROLLOUT_DEFAULT_COINS),
@@ -162,6 +163,7 @@ def apply_runtime_preset(args):
         "target_trades_per_week": "--target-trades-per-week",
         "coins": "--coins",
         "trials": "--trials",
+        "disable_fee_stress": "--disable-fee-stress",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -609,6 +611,8 @@ if __name__ == "__main__":
                         choices=sorted(GATE_MODE_CONFIGS.keys()),
                         help="Gate profile: initial paper qualification (lenient) vs production promotion (strict)")
     parser.add_argument("--target-trades-per-week", type=float, default=1.0)
+    parser.add_argument("--disable-fee-stress", action="store_true",
+                        help="Disable stressed-fee objective gate in optimize workers")
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -782,6 +786,8 @@ if __name__ == "__main__":
                 cmd.extend(["--sampler-seeds", args.sampler_seeds])
             if args.debug_trials:
                 cmd.append("--debug-trials")
+            if args.disable_fee_stress:
+                cmd.append("--disable-fee-stress")
 
             log_file = None
             stdout_target = None

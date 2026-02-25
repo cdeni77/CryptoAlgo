@@ -630,6 +630,7 @@ def objective(
     fee_blend_normal_weight=0.6,
     fee_blend_stressed_weight=0.4,
     pruned_only=True,
+    min_total_trades_gate=0,
 ):
     min_fold_sharpe_hard = -0.1
     min_fold_win_rate = 0.35
@@ -742,6 +743,8 @@ def objective(
 
     guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
     guard_min_trades = int(guards.get('min_total_trades', 20))
+    if int(min_total_trades_gate or 0) > 0:
+        guard_min_trades = min(guard_min_trades, max(4, int(min_total_trades_gate)))
     guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 4.0))
     guard_min_exp = float(guards.get('min_expectancy', 0.0))
     avg_tc = np.mean([r['n_trades'] for r in fold_results])
@@ -1371,6 +1374,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
                             min_internal_oos_trades=min_internal_oos_trades,
+                            min_total_trades_gate=min_total_trades,
                             target_trades_per_week=target_trades_per_week,
                             target_trades_per_year=target_trades_per_year,
                             enable_fee_stress=enable_fee_stress,
@@ -1688,7 +1692,7 @@ def apply_runtime_preset(args):
     presets = {
         'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
         'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 5, 'min_total_trades': 10, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 10, 'holdout_min_sharpe': 0.0, 'holdout_min_return': -0.01, 'require_holdout_pass': False, 'target_trades_per_week': 0.8},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True},
         'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
@@ -1711,6 +1715,7 @@ def apply_runtime_preset(args):
             'require_holdout_pass': '--require-holdout-pass',
             'target_trades_per_week': '--target-trades-per-week',
             'target_trades_per_year': '--target-trades-per-year',
+            'disable_fee_stress': '--disable-fee-stress',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
