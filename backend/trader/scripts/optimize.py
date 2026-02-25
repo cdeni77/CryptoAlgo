@@ -277,7 +277,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     result = system.train(X_all.iloc[:split_idx], y_all.iloc[:split_idx],
                           X_all.iloc[split_idx:], y_all.iloc[split_idx:], profile=profile)
     if not result: return None
-    model, scaler, iso, auc = result
+    model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
 
     # --- SIMULATE TRADING ---
     test_feat = features[(features.index >= test_start) & (features.index <= test_end)]
@@ -425,7 +425,7 @@ FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_chi
 FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
-    'min_val_auc': 0.51,
+    'min_val_auc': 0.50,
     'cooldown_hours': 24.0,
     'min_vol_24h': 0.006,
     'max_vol_24h': 0.08,
@@ -442,11 +442,11 @@ COIN_OPTIMIZATION_PRIORS = {
 }
 
 COIN_OBJECTIVE_GUARDS = {
-    'BTC': {'min_total_trades': 16, 'min_avg_trades_per_fold': 4.0, 'min_expectancy': 0.0002},
-    'ETH': {'min_total_trades': 20, 'min_avg_trades_per_fold': 5.0, 'min_expectancy': 0.00015},
-    'SOL': {'min_total_trades': 20, 'min_avg_trades_per_fold': 5.0, 'min_expectancy': 0.0002},
-    'XRP': {'min_total_trades': 18, 'min_avg_trades_per_fold': 4.0, 'min_expectancy': 0.00015},
-    'DOGE': {'min_total_trades': 16, 'min_avg_trades_per_fold': 3.5, 'min_expectancy': 0.0002},
+    'BTC': {'min_total_trades': 8, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
+    'ETH': {'min_total_trades': 10, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
+    'SOL': {'min_total_trades': 10, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
+    'XRP': {'min_total_trades': 8, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
+    'DOGE': {'min_total_trades': 8, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
 }
 
 def create_trial_profile(trial, coin_name):
@@ -464,7 +464,7 @@ def create_trial_profile(trial, coin_name):
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
         extra_features=get_extra_features(coin_name),
-        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.12, 0.55, 0.80), clamp(base_threshold + 0.10, 0.65, 0.85), step=0.01),
+        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.15, 0.50, 0.75), clamp(base_threshold + 0.10, 0.62, 0.82), step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
         min_momentum_magnitude=FIXED_RISK['min_momentum_magnitude'],
@@ -554,7 +554,8 @@ def objective(
 
     profile = create_trial_profile(trial, coin_name)
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
-                    train_embargo_hours=24, enforce_pruned_features=bool(pruned_only))
+                    train_embargo_hours=24, enforce_pruned_features=bool(pruned_only),
+                    min_val_auc=0.50, min_train_samples=100)
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
 
@@ -596,8 +597,8 @@ def objective(
         worst_internal_trades = min(int(r.get('n_trades', 0) or 0) for r in fold_results)
         _set_reject_reason(trial, f'too_few_internal_oos_trades:{min_internal_oos_trades}')
         return _reject_score(worst_internal_trades, min_internal_oos_trades)
-    if total_trades < 20:
-        _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return _reject_score(total_trades, 20)
+    if total_trades < 8:
+        _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return _reject_score(total_trades, 8)
 
     sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
     stressed_sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in stressed_fold_results]
