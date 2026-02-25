@@ -201,8 +201,23 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
         return [(boundary, boundary, end)]
     n_folds = min(n_folds, (total_days - min_train_days) // min_test_days)
     if n_folds < 1: n_folds = 1
-    test_zone_start = start + pd.Timedelta(days=min_train_days)
+    # Account for purge when selecting the first test boundary, otherwise fold 0 can
+    # have no usable training range whenever purge_days > 0.
+    test_zone_start = start + pd.Timedelta(days=min_train_days + max(0, purge_days))
+    if test_zone_start >= end:
+        boundary = start + pd.Timedelta(days=int(total_days * 0.7))
+        logger.debug(
+            "Fallback single-fold split (purge-adjusted) for %s: train_end=%s test=[%s,%s]",
+            target_sym,
+            boundary,
+            boundary,
+            end,
+        )
+        return [(boundary, boundary, end)]
     fold_days = (end - test_zone_start).days // n_folds
+    if fold_days < 1:
+        n_folds = 1
+        fold_days = max(1, (end - test_zone_start).days)
     splits = []
     purge_delta = pd.Timedelta(days=max(0, purge_days))
     for i in range(n_folds):
@@ -210,7 +225,7 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
         te = ts + pd.Timedelta(days=fold_days) if i < n_folds - 1 else end
         train_end = ts - purge_delta
         min_train_end = start + pd.Timedelta(days=min_train_days)
-        if train_end <= min_train_end:
+        if train_end < min_train_end:
             raise ValueError(
                 f"Purge removes all usable training data for fold {i} "
                 f"(target={target_sym}, purge_days={purge_days}, train_end={train_end}, "
