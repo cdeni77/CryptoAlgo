@@ -515,7 +515,7 @@ class MLSystem:
                 index_ts = index_ts.tz_localize("UTC")
             most_recent_ts = index_ts.max()
             age_hours = (most_recent_ts - index_ts).total_seconds() / 3600.0
-            age_hours = np.maximum(age_hours.astype(float), 0.0)
+            age_hours = np.maximum(np.asarray(age_hours, dtype=float), 0.0)
         else:
             age_hours = np.arange(len(y) - 1, -1, -1, dtype=float)
             print(
@@ -523,10 +523,13 @@ class MLSystem:
                 "using positional recency decay fallback."
             )
 
-        recency_weight_vec = np.exp(-np.log(2.0) * age_hours / half_life_hours)
+        recency_weight_vec = np.asarray(
+            np.exp(-np.log(2.0) * age_hours / half_life_hours),
+            dtype=float,
+        )
 
         base_weights = uniqueness_weights * class_weight_vec
-        sample_weights = base_weights * recency_weight_vec
+        sample_weights = np.asarray(base_weights * recency_weight_vec, dtype=float)
         sample_weights = np.clip(sample_weights, 1e-8, None)
 
         base_weights = np.clip(base_weights, 1e-8, None)
