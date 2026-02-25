@@ -410,11 +410,11 @@ FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_chi
 FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
-    'min_val_auc': 0.52,
+    'min_val_auc': 0.51,
     'cooldown_hours': 24.0,
-    'min_vol_24h': 0.008,
-    'max_vol_24h': 0.06,
-    'min_momentum_magnitude': 0.06,
+    'min_vol_24h': 0.006,
+    'max_vol_24h': 0.08,
+    'min_momentum_magnitude': 0.04,
 }
 
 COIN_OPTIMIZATION_PRIORS = {
@@ -449,7 +449,7 @@ def create_trial_profile(trial, coin_name):
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
         extra_features=get_extra_features(coin_name),
-        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.10, 0.62, 0.88), clamp(base_threshold + 0.08, 0.68, 0.90), step=0.01),
+        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.12, 0.55, 0.80), clamp(base_threshold + 0.10, 0.65, 0.85), step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
         min_momentum_magnitude=FIXED_RISK['min_momentum_magnitude'],

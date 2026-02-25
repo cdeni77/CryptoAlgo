@@ -609,9 +609,9 @@ class MLSystem:
               member_features: Optional[List[str]] = None) -> Optional[Tuple]:
         if len(X_train) < self.config.min_train_samples:
             return None
-        if y_train.sum() < 15 or (1 - y_train).sum() < 15:
+        if y_train.sum() < 10 or (1 - y_train).sum() < 10:
             return None
-        if len(X_val) < 30 or y_val.sum() < 5:
+        if len(X_val) < 20 or y_val.sum() < 3:
             return None
 
         scaler = RobustScaler()
@@ -673,10 +673,8 @@ class MLSystem:
             cal_fit_y,
         )
 
-        primary_threshold = primary_recall_threshold(
-            min(profile.signal_threshold, self.config.signal_threshold) if profile else self.config.signal_threshold,
-            self.config.min_signal_edge,
-        )
+        effective_threshold = min(profile.signal_threshold, self.config.signal_threshold) if profile else self.config.signal_threshold
+        primary_threshold = primary_recall_threshold(effective_threshold, self.config.min_signal_edge)
         primary_train_probs = _calibrator_predict(calibrator, base_model.predict_proba(X_train_scaled)[:, 1])
         primary_val_probs = _calibrator_predict(calibrator, val_probs)
 
@@ -1138,7 +1136,8 @@ def run_backtest(all_data: Dict, config: Config,
                     sma_50 = ohlcv_ts['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
 
                     # v7.3: Minimum momentum magnitude
-                    if abs(ret_72h) < profile.min_momentum_magnitude:
+                    effective_momentum = min(profile.min_momentum_magnitude, config.min_momentum_magnitude)
+                    if abs(ret_72h) < effective_momentum:
                         continue
 
                     # v7.3: Require 24h and 72h returns to agree on direction
@@ -1176,7 +1175,8 @@ def run_backtest(all_data: Dict, config: Config,
                     probs = []
                     meta_probs = []
                     directional_votes = []
-                    primary_cutoff = primary_recall_threshold(min(profile.signal_threshold, config.signal_threshold), config.min_signal_edge)
+                    effective_threshold = min(profile.signal_threshold, config.signal_threshold)
+                    primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
                     for (model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta) in models[sym]:
                         x_in = np.nan_to_num(
                             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
@@ -1639,7 +1639,8 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         )
         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
         prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
-        primary_cutoff = primary_recall_threshold(min(profile.signal_threshold, config.signal_threshold), config.min_signal_edge)
+        effective_threshold = min(profile.signal_threshold, config.signal_threshold)
+        primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
         ml_pass = prob >= primary_cutoff
         meta_prob = 0.0
         meta_pass = False
@@ -1655,7 +1656,8 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         regime_pass = profile.min_vol_24h <= vol_24h <= profile.max_vol_24h if not pd.isna(vol_24h) else False
 
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
-        momentum_pass = abs(ret_72h) >= profile.min_momentum_magnitude
+        effective_momentum = min(profile.min_momentum_magnitude, config.min_momentum_magnitude)
+        momentum_pass = abs(ret_72h) >= effective_momentum
 
         if debug:
             dir_str = 'LONG' if direction == 1 else 'SHORT'
@@ -1689,20 +1691,20 @@ if __name__ == "__main__":
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--signals", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--threshold", type=float, default=0.80,
+    parser.add_argument("--threshold", type=float, default=0.68,
                         help="Default signal threshold (overridden by per-coin profiles)")
-    parser.add_argument("--min-auc", type=float, default=0.54)
+    parser.add_argument("--min-auc", type=float, default=0.51)
     parser.add_argument("--leverage", type=int, default=4)
     parser.add_argument("--tp", type=float, default=5.5, help="Default TP vol multiplier")
     parser.add_argument("--sl", type=float, default=3.0, help="Default SL vol multiplier")
-    parser.add_argument("--momentum", type=float, default=0.07, help="Default min 72h momentum magnitude")
+    parser.add_argument("--momentum", type=float, default=0.04, help="Default min 72h momentum magnitude")
     parser.add_argument("--hold", type=int, default=96, help="Default max hold hours")
     parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
-    parser.add_argument("--min-edge", type=float, default=0.02, help="Require prob >= threshold + min-edge")
-    parser.add_argument("--max-ensemble-std", type=float, default=0.12, help="Max std across ensemble probs")
-    parser.add_argument("--min-directional-agreement", type=float, default=0.67, help="Minimum fraction of members agreeing with momentum direction")
+    parser.add_argument("--min-edge", type=float, default=0.01, help="Require prob >= threshold + min-edge")
+    parser.add_argument("--max-ensemble-std", type=float, default=0.18, help="Max std across ensemble probs")
+    parser.add_argument("--min-directional-agreement", type=float, default=0.50, help="Minimum fraction of members agreeing with momentum direction")
     parser.add_argument("--disagreement-confidence-cap", type=float, default=0.86, help="Cap primary confidence when ensemble is not unanimous")
-    parser.add_argument("--meta-threshold", type=float, default=0.57, help="Secondary meta-model probability threshold")
+    parser.add_argument("--meta-threshold", type=float, default=0.52, help="Secondary meta-model probability threshold")
     parser.add_argument("--calibration", choices=['isotonic', 'platt', 'beta'], default='platt',
                         help="Calibration strategy for primary+meta models")
     parser.add_argument("--exclude", type=str, default="",

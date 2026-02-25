@@ -144,13 +144,13 @@ class CoinProfile:
     extra_features: List[str] = field(default_factory=list)
     
     # Signal thresholds
-    signal_threshold: float = 0.80
-    min_val_auc: float = 0.54
+    signal_threshold: float = 0.68
+    min_val_auc: float = 0.51
     
     # Labeling
     label_forward_hours: int = 24
     label_vol_target: float = 1.8
-    min_momentum_magnitude: float = 0.07
+    min_momentum_magnitude: float = 0.04
     
     # Exits
     vol_mult_tp: float = 5.5
@@ -214,12 +214,12 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='ETH',
         prefixes=['ETP', 'ETH'],
         extra_features=ETH_EXTRA_FEATURES,
-        signal_threshold=0.72,
-        min_val_auc=0.52,
+        signal_threshold=0.68,
+        min_val_auc=0.51,
         vol_mult_tp=5.8,
         vol_mult_sl=3.0,
         max_hold_hours=72,
-        min_momentum_magnitude=0.08,
+        min_momentum_magnitude=0.04,
     ),
     
     # ── XRP: momentum (balanced confidence to avoid over-filtering) ──
@@ -227,12 +227,12 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='XRP',
         prefixes=['XPP', 'XRP'],
         extra_features=XRP_EXTRA_FEATURES,
-        signal_threshold=0.72,
-        min_val_auc=0.52,
+        signal_threshold=0.68,
+        min_val_auc=0.51,
         vol_mult_tp=6.0,
         vol_mult_sl=3.0,
         max_hold_hours=108,
-        min_momentum_magnitude=0.08,
+        min_momentum_magnitude=0.04,
     ),
     
     # ── BTC: strict momentum (mean-reversion failed at 25% WR) ──
@@ -244,13 +244,13 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='BTC',
         prefixes=['BIP', 'BTC'],
         extra_features=BTC_EXTRA_FEATURES,
-        signal_threshold=0.70,          # Lower bar so calibrated probabilities can trigger
-        min_val_auc=0.52,
+        signal_threshold=0.68,          # Lower bar so calibrated probabilities can trigger
+        min_val_auc=0.51,
         label_forward_hours=36,         # Longer horizon for BTC trend persistence
         label_vol_target=1.8,           # Standard barriers
-        min_momentum_magnitude=0.12,    # Require only strongest trends to clear fees
-        vol_mult_tp=7.0,               # Push for larger winners
-        vol_mult_sl=2.5,               # Tighter risk control
+        min_momentum_magnitude=0.04,    # Require only strongest trends to clear fees
+        vol_mult_tp=5.0,               # Push for larger winners
+        vol_mult_sl=3.0,               # Tighter risk control
         max_hold_hours=72,
         cooldown_hours=48.0,            # Longer cooldown — reduce overtrading
         min_vol_24h=0.006,             # BTC has lower vol than alts
@@ -270,11 +270,11 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='SOL',
         prefixes=['SLP', 'SOL'],
         extra_features=SOL_EXTRA_FEATURES,
-        signal_threshold=0.72,
-        min_val_auc=0.52,
+        signal_threshold=0.68,
+        min_val_auc=0.51,
         label_forward_hours=24,         # Slightly longer horizon to capture full moves
         label_vol_target=1.6,           # Tighter barriers
-        min_momentum_magnitude=0.08,    # Filter weak breakouts
+        min_momentum_magnitude=0.05,    # Filter weak breakouts
         vol_mult_tp=6.0,               # Require larger move vs fees
         vol_mult_sl=3.5,               # Wider SL — avoid stop-hunting in SOL chop
         max_hold_hours=96,              # Let winners work when trend extends
@@ -293,11 +293,11 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='DOGE',
         prefixes=['DOP', 'DOGE'],
         extra_features=DOGE_EXTRA_FEATURES,
-        signal_threshold=0.74,
-        min_val_auc=0.52,
+        signal_threshold=0.70,
+        min_val_auc=0.51,
         label_forward_hours=12,          # Short horizon — DOGE moves fast
         label_vol_target=1.4,            # Tight barriers — high vol
-        min_momentum_magnitude=0.12,     # Require strong momentum — filter out noise
+        min_momentum_magnitude=0.06,     # Require strong momentum — filter out noise
         vol_mult_tp=5.5,                # Larger TP target to beat fees
         vol_mult_sl=3.0,                # Avoid noise stop-outs
         max_hold_hours=72,               # Give trends time to materialize
