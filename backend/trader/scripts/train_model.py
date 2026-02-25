@@ -14,6 +14,7 @@ Funding: Normalized hourly funding data (Coinbase native preferred, CCXT fallbac
 import argparse
 import hashlib
 import joblib
+import os
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
