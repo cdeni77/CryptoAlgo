@@ -85,7 +85,54 @@ def _finite_metric(value, default=0.0):
 
 def _fmt_pct(v, d=1, fb="?"): n = _as_number(v); return f"{n:.{d}%}" if n is not None else fb
 def _fmt_float(v, d=3, fb="?"): n = _as_number(v); return f"{n:.{d}f}" if n is not None else fb
-def _set_reject_reason(trial, reason): trial.set_user_attr('reject_reason', reason)
+
+
+def _set_partial_reject_attrs(trial, *, fold_results, stressed_fold_results=None, psr=None):
+    stressed_fold_results = stressed_fold_results or []
+    fold_trade_counts = [int(r.get('n_trades', 0) or 0) for r in (fold_results or [])]
+    sharpes = [float(r.get('sharpe', 0.0) or 0.0) for r in (fold_results or [])]
+    stressed_sharpes = [float(r.get('sharpe', 0.0) or 0.0) for r in stressed_fold_results]
+    total_trades_partial = int(sum(fold_trade_counts))
+    trial.set_user_attr('n_folds_evaluated', len(fold_trade_counts))
+    trial.set_user_attr('total_trades_partial', total_trades_partial)
+    trial.set_user_attr('fold_trade_counts', fold_trade_counts)
+    if sharpes:
+        trial.set_user_attr('mean_sr_partial', round(float(np.mean(sharpes)), 6))
+        trial.set_user_attr('min_sr_partial', round(float(np.min(sharpes)), 6))
+    if psr is not None:
+        trial.set_user_attr('psr_partial', round(float(psr.get('psr', 0.0) or 0.0), 6))
+    if stressed_sharpes:
+        trial.set_user_attr('stressed_sr_partial', round(float(np.mean(stressed_sharpes)), 6))
+
+
+def _reject_trial(
+    trial,
+    *,
+    code,
+    reason,
+    stage,
+    observed=None,
+    threshold=None,
+    base=-6.0,
+    scale=8.0,
+    fold_results=None,
+    stressed_fold_results=None,
+    psr=None,
+):
+    _set_partial_reject_attrs(
+        trial,
+        fold_results=fold_results or [],
+        stressed_fold_results=stressed_fold_results or [],
+        psr=psr,
+    )
+    penalty = _reject_score(observed, threshold, base=base, scale=scale)
+    trial.set_user_attr('reject_code', str(code))
+    trial.set_user_attr('reject_reason', str(reason))
+    trial.set_user_attr('reject_stage', str(stage))
+    trial.set_user_attr('reject_observed', observed if observed is None else float(observed))
+    trial.set_user_attr('reject_threshold', threshold if threshold is None else float(threshold))
+    trial.set_user_attr('reject_penalty', float(penalty))
+    return penalty
 
 
 def estimate_holdout_trade_budget(holdout_days: int, target_trades_per_week: float, holdout_min_trades: int) -> tuple[float, int]:
@@ -584,8 +631,14 @@ def objective(
                     pruned_only=pruned_only,
                 )
                 if stressed_r is None:
-                    _set_reject_reason(trial, 'missing_stressed_fold')
-                    return _reject_score()
+                    return _reject_trial(
+                        trial,
+                        code='MISSING_STRESSED_FOLD',
+                        reason='missing_stressed_fold',
+                        stage='fee_stress',
+                        fold_results=fold_results,
+                        stressed_fold_results=stressed_fold_results,
+                    )
             else:
                 stressed_r = dict(r)
 
@@ -593,13 +646,39 @@ def objective(
             blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
 
     if len(fold_results) < max(1, len(cv_splits) // 2):
-        _set_reject_reason(trial, f'too_few_folds:{len(fold_results)}/{len(cv_splits)}'); return _reject_score(len(fold_results), max(1, len(cv_splits) // 2))
+        return _reject_trial(
+            trial,
+            code='TOO_FEW_FOLDS',
+            reason=f'too_few_folds:{len(fold_results)}/{len(cv_splits)}',
+            stage='fold_eval',
+            observed=len(fold_results),
+            threshold=max(1, len(cv_splits) // 2),
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+        )
     if min_internal_oos_trades > 0 and any(int(r.get('n_trades', 0) or 0) < min_internal_oos_trades for r in fold_results):
         worst_internal_trades = min(int(r.get('n_trades', 0) or 0) for r in fold_results)
-        _set_reject_reason(trial, f'too_few_internal_oos_trades:{min_internal_oos_trades}')
-        return _reject_score(worst_internal_trades, min_internal_oos_trades)
+        return _reject_trial(
+            trial,
+            code='TOO_FEW_INTERNAL_OOS_TRADES',
+            reason=f'too_few_internal_oos_trades:{min_internal_oos_trades}',
+            stage='fold_eval',
+            observed=worst_internal_trades,
+            threshold=min_internal_oos_trades,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+        )
     if total_trades < 8:
-        _set_reject_reason(trial, f'too_few_trades:{total_trades}'); return _reject_score(total_trades, 8)
+        return _reject_trial(
+            trial,
+            code='TOO_FEW_TRADES',
+            reason=f'too_few_trades:{total_trades}',
+            stage='fold_eval',
+            observed=total_trades,
+            threshold=8,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+        )
 
     sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
     stressed_sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in stressed_fold_results]
@@ -640,8 +719,17 @@ def objective(
     ]
 
     if min_sr < min_fold_sharpe_hard:
-        _set_reject_reason(trial, f'guard_min_fold_sharpe:{min_sr:.3f}<{min_fold_sharpe_hard:.3f}')
-        return _reject_score(min_sr, min_fold_sharpe_hard)
+        return _reject_trial(
+            trial,
+            code='LOW_MIN_FOLD_SHARPE',
+            reason=f'guard_min_fold_sharpe:{min_sr:.3f}<{min_fold_sharpe_hard:.3f}',
+            stage='post_cv_gates',
+            observed=min_sr,
+            threshold=min_fold_sharpe_hard,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
 
     low_wr_folds = [
         f for f in fold_metrics
@@ -649,37 +737,106 @@ def objective(
     ]
     if low_wr_folds:
         worst_fold = min(low_wr_folds, key=lambda f: f['win_rate'])
-        _set_reject_reason(
+        return _reject_trial(
             trial,
-            (
+            code='LOW_FOLD_WIN_RATE',
+            reason=(
                 f"guard_min_fold_win_rate:fold{worst_fold['fold_idx']}="
                 f"{worst_fold['win_rate']:.3f}<{min_fold_win_rate:.2f}"
                 f"@trades>={min_fold_win_rate_trades}"
             ),
+            stage='post_cv_gates',
+            observed=worst_fold['win_rate'],
+            threshold=min_fold_win_rate,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
         )
-        return _reject_score(worst_fold['win_rate'], min_fold_win_rate)
 
     if total_trades < guard_min_trades:
-        _set_reject_reason(trial, f'guard_total_trades:{total_trades}<{guard_min_trades}')
-        return _reject_score(total_trades, guard_min_trades)
+        return _reject_trial(
+            trial,
+            code='GUARD_TOTAL_TRADES',
+            reason=f'guard_total_trades:{total_trades}<{guard_min_trades}',
+            stage='post_cv_gates',
+            observed=total_trades,
+            threshold=guard_min_trades,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
     if avg_tc < guard_min_avg_tc:
-        _set_reject_reason(trial, f'guard_avg_fold_trades:{avg_tc:.2f}<{guard_min_avg_tc:.2f}')
-        return _reject_score(avg_tc, guard_min_avg_tc)
+        return _reject_trial(
+            trial,
+            code='GUARD_AVG_FOLD_TRADES',
+            reason=f'guard_avg_fold_trades:{avg_tc:.2f}<{guard_min_avg_tc:.2f}',
+            stage='post_cv_gates',
+            observed=avg_tc,
+            threshold=guard_min_avg_tc,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
     if mean_expectancy < guard_min_exp:
-        _set_reject_reason(trial, f'guard_expectancy:{mean_expectancy:.6f}<{guard_min_exp:.6f}')
-        return _reject_score(mean_expectancy, guard_min_exp)
+        return _reject_trial(
+            trial,
+            code='GUARD_EXPECTANCY',
+            reason=f'guard_expectancy:{mean_expectancy:.6f}<{guard_min_exp:.6f}',
+            stage='post_cv_gates',
+            observed=mean_expectancy,
+            threshold=guard_min_exp,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
     if mean_raw_expectancy <= 0:
-        _set_reject_reason(trial, f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}')
-        return _reject_score(mean_raw_expectancy, 1e-6)
+        return _reject_trial(
+            trial,
+            code='RAW_EXPECTANCY_NONPOSITIVE',
+            reason=f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}',
+            stage='post_cv_gates',
+            observed=mean_raw_expectancy,
+            threshold=1e-6,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
     if enable_fee_stress and mean_stressed_sr < 0:
-        _set_reject_reason(trial, f'negative_stressed_sharpe:{mean_stressed_sr:.6f}')
-        return _reject_score(mean_stressed_sr, 0.0)
+        return _reject_trial(
+            trial,
+            code='NEG_STRESSED_SR',
+            reason=f'negative_stressed_sharpe:{mean_stressed_sr:.6f}',
+            stage='fee_stress',
+            observed=mean_stressed_sr,
+            threshold=0.0,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
     if enable_fee_stress and stressed_expectancy <= 0:
-        _set_reject_reason(trial, f'nonpositive_stressed_expectancy:{stressed_expectancy:.6f}')
-        return _reject_score(stressed_expectancy, 1e-6)
+        return _reject_trial(
+            trial,
+            code='NONPOSITIVE_STRESSED_EXPECTANCY',
+            reason=f'nonpositive_stressed_expectancy:{stressed_expectancy:.6f}',
+            stage='fee_stress',
+            observed=stressed_expectancy,
+            threshold=1e-6,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
     if psr.get('valid') and psr.get('psr', 0.0) < 0.55:
-        _set_reject_reason(trial, f'low_psr:{psr.get("psr", 0.0):.3f}')
-        return _reject_score(psr.get('psr', 0.0), 0.55)
+        return _reject_trial(
+            trial,
+            code='LOW_PSR',
+            reason=f'low_psr:{psr.get("psr", 0.0):.3f}',
+            stage='psr',
+            observed=psr.get('psr', 0.0),
+            threshold=0.55,
+            fold_results=fold_results,
+            stressed_fold_results=stressed_fold_results,
+            psr=psr,
+        )
 
     robust_score = mean_blended_sr
     if std_sr < 0.3 and len(sharpes) >= 2: robust_score += 0.15
@@ -788,18 +945,46 @@ def objective(
     return score
 
 class PlateauStopper:
-    def __init__(self, patience=60, min_delta=0.02, warmup_trials=30, min_completed_trials=0):
+    def __init__(
+        self,
+        patience=60,
+        min_delta=0.02,
+        warmup_trials=30,
+        min_completed_trials=0,
+        flatline_window=50,
+        flatline_reject_ratio=0.70,
+    ):
         self.patience = max(1, patience)
         self.min_delta = max(0, min_delta)
         self.warmup_trials = max(0, warmup_trials)
         self.min_completed_trials = max(0, min_completed_trials)
+        self.flatline_window = max(10, int(flatline_window))
+        self.flatline_reject_ratio = min(1.0, max(0.0, float(flatline_reject_ratio)))
         self.best_value = self.best_trial_number = None
+        self._flatline_announced = False
 
     def __call__(self, study, trial):
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
         min_trials_required = max(self.warmup_trials, self.min_completed_trials)
         if len(completed) < min_trials_required:
             return
+
+        recent = completed[-self.flatline_window:]
+        reject_counts = {}
+        for t in recent:
+            code = t.user_attrs.get('reject_code')
+            if code:
+                reject_counts[code] = int(reject_counts.get(code, 0)) + 1
+        if reject_counts:
+            top_code, top_count = max(reject_counts.items(), key=lambda kv: kv[1])
+            top_ratio = float(top_count) / float(max(1, len(recent)))
+            if top_ratio >= self.flatline_reject_ratio and not self._flatline_announced:
+                print(
+                    f"\n⚠️ Flatline detector: {top_ratio:.0%} recent rejects are {top_code} "
+                    f"(window={len(recent)}, best={study.best_value:.4f})."
+                )
+                self._flatline_announced = True
+
         if self.best_value is None:
             self.best_value = study.best_value
             self.best_trial_number = study.best_trial.number
@@ -1105,15 +1290,20 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                     sampler=sampler,
                     study_name=study_name,
                     storage=storage_url,
-                    load_if_exists=True,
+                    load_if_exists=bool(resume_study),
                 )
             break
         except Exception as e:
             err = str(e).lower()
             if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
-                with _study_storage_lock(_db_path()):
-                    study = optuna.load_study(study_name=study_name, storage=storage_url, sampler=sampler)
-                break
+                if resume_study:
+                    with _study_storage_lock(_db_path()):
+                        study = optuna.load_study(study_name=study_name, storage=storage_url, sampler=sampler)
+                    break
+                raise RuntimeError(
+                    f"Study '{study_name}' already exists but --resume was not set. "
+                    "Pass --resume to continue the existing study or change --study-suffix."
+                )
             # SQLite schema/alembic races can happen when multiple processes initialize storage concurrently.
             transient_schema_race = (
                 ("table" in err and "already exists" in err)
@@ -1125,6 +1315,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 time.sleep(0.4 * (attempt + 1)); continue
             raise
     if not study: print("❌ Could not create study"); return None
+
+    study.set_user_attr('sampler_seed', int(sampler_seed))
+    study.set_user_attr('study_name', study_name)
+    study.set_user_attr('run_id', study_suffix or '')
+    study.set_user_attr('target_trades_per_week', float(target_trades_per_week))
+    study.set_user_attr('target_trades_per_year', float(target_trades_per_year) if target_trades_per_year is not None else float(target_trades_per_week) * 52.0)
+    study.set_user_attr('gate_mode', str(gate_mode))
+    study.set_user_attr('fee_stress_enabled', bool(enable_fee_stress))
 
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
@@ -1275,6 +1473,22 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         else:
             print("  ⚠️ Holdout evaluation returned no valid candidates.")
 
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+    failed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
+    pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    reject_reason_counts = {}
+    reject_code_counts = {}
+    accepted_trials = 0
+    for trial_item in completed_trials:
+        reject_reason = trial_item.user_attrs.get('reject_reason')
+        reject_code = trial_item.user_attrs.get('reject_code')
+        if reject_reason:
+            reject_reason_counts[reject_reason] = int(reject_reason_counts.get(reject_reason, 0)) + 1
+        if reject_code:
+            reject_code_counts[reject_code] = int(reject_code_counts.get(reject_code, 0)) + 1
+        if not reject_reason and not reject_code:
+            accepted_trials += 1
+
     effective_best_params = build_effective_params(best.params, coin_name)
     result_data = {'coin': coin_name, 'prefix': coin_prefix, 'optim_score': best.value,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
@@ -1311,6 +1525,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'global_cumulative_trials': cumulative_trials.get('global_total', 0),
             'completed_trials_this_run': nc,
             'preset': preset_name,
+        },
+        'optimization_diagnostics': {
+            'completed_trials': len(completed_trials),
+            'failed_trials': len(failed_trials),
+            'pruned_trials': len(pruned_trials),
+            'accepted_trials': int(accepted_trials),
+            'reject_reason_counts': reject_reason_counts,
+            'reject_code_counts': reject_code_counts,
         }}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")

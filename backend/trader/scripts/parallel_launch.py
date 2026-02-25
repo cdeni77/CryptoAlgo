@@ -227,24 +227,40 @@ def load_validation_results(results_dir):
 
 def get_coin_trial_progress(optuna_db, target_coins, run_id):
     progress = {
-        coin: {"started": 0, "completed": 0, "best_score": None, "best_metrics": {}}
+        coin: {
+            "started": 0,
+            "completed": 0,
+            "failed": 0,
+            "pruned": 0,
+            "running": 0,
+            "best_score": None,
+            "best_metrics": {},
+            "best_completed": None,
+            "best_completed_reject": None,
+            "best_accepted": None,
+            "recent_reject_hist": {},
+            "current_seed": None,
+            "seed_progress": {},
+        }
         for coin in target_coins
     }
     if not optuna_db.exists():
         return progress
 
-    # Simple count query as primary method (most reliable under contention)
     count_query = """
         SELECT
             s.study_name,
             COUNT(*) AS started_trials,
-            SUM(CASE WHEN CAST(t.state AS TEXT) IN ('1', 'COMPLETE') THEN 1 ELSE 0 END) AS completed_trials
+            SUM(CASE WHEN CAST(t.state AS TEXT) IN ('1', 'COMPLETE') THEN 1 ELSE 0 END) AS completed_trials,
+            SUM(CASE WHEN CAST(t.state AS TEXT) IN ('3', 'FAIL') THEN 1 ELSE 0 END) AS failed_trials,
+            SUM(CASE WHEN CAST(t.state AS TEXT) IN ('2', 'PRUNED') THEN 1 ELSE 0 END) AS pruned_trials,
+            SUM(CASE WHEN CAST(t.state AS TEXT) IN ('0', 'RUNNING') THEN 1 ELSE 0 END) AS running_trials
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
         GROUP BY s.study_name
     """
     best_trial_query = """
-        SELECT t.trial_id, v.value
+        SELECT t.trial_id, t.number, v.value
         FROM studies s
         JOIN trials t ON t.study_id = s.study_id
         JOIN trial_values v ON v.trial_id = t.trial_id
@@ -255,7 +271,20 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
         SELECT key, value_json
         FROM trial_user_attributes
         WHERE trial_id = ?
-          AND key IN ('mean_oos_sharpe', 'oos_sharpe', 'n_trades', 'win_rate', 'max_drawdown', 'std_oos_sharpe')
+          AND key IN (
+              'mean_oos_sharpe', 'oos_sharpe', 'n_trades', 'win_rate', 'max_drawdown', 'std_oos_sharpe',
+              'reject_reason', 'reject_code', 'psr', 'psr_partial', 'stressed_sharpe', 'stressed_sr_partial',
+              'raw_robust_score', 'frequency_adjusted_score', 'n_folds', 'n_folds_evaluated'
+          )
+    """
+    recent_trials_query = """
+        SELECT t.trial_id, v.value
+        FROM studies s
+        JOIN trials t ON t.study_id = s.study_id
+        LEFT JOIN trial_values v ON v.trial_id = t.trial_id AND v.objective = 0
+        WHERE s.study_name = ? AND CAST(t.state AS TEXT) IN ('1', 'COMPLETE')
+        ORDER BY t.number DESC
+        LIMIT 50
     """
 
     for attempt in range(3):
@@ -267,38 +296,61 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
                 rows = conn.execute(count_query).fetchall()
                 studies_by_coin = {coin: [] for coin in target_coins}
 
-                # Match current run studies, including multi-seed suffixes like _s42
-                for study_name, started_trials, completed_trials in rows:
+                for study_name, started_trials, completed_trials, failed_trials, pruned_trials, running_trials in rows:
                     for coin in target_coins:
                         expected_prefix = f"optimize_{coin}_{run_id}"
                         if study_name.startswith(expected_prefix):
                             progress[coin]["started"] += int(started_trials or 0)
                             progress[coin]["completed"] += int(completed_trials or 0)
+                            progress[coin]["failed"] += int(failed_trials or 0)
+                            progress[coin]["pruned"] += int(pruned_trials or 0)
+                            progress[coin]["running"] += int(running_trials or 0)
                             studies_by_coin[coin].append(study_name)
+                            if '_s' in study_name:
+                                seed = study_name.rsplit('_s', 1)[-1]
+                                progress[coin]["seed_progress"][seed] = int(completed_trials or 0)
                             break
 
-                # Get best trial details per coin across all matching studies for this run_id
                 for coin in target_coins:
                     if progress[coin]["completed"] == 0:
                         continue
 
                     best_trial_id = None
                     best_score = None
+                    best_reject = None
+                    best_accepted = None
+                    recent_reject_hist = {}
+
                     for study_name in studies_by_coin.get(coin, []):
                         best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
-                        if not best_row:
-                            continue
-                        candidate_trial_id, candidate_score = best_row
-                        if candidate_score is None:
-                            continue
-                        if best_score is None or float(candidate_score) > float(best_score):
-                            best_score = float(candidate_score)
-                            best_trial_id = candidate_trial_id
+                        if best_row:
+                            candidate_trial_id, _, candidate_score = best_row
+                            if candidate_score is not None and (best_score is None or float(candidate_score) > float(best_score)):
+                                best_score = float(candidate_score)
+                                best_trial_id = candidate_trial_id
+
+                        recent_rows = conn.execute(recent_trials_query, (study_name,)).fetchall()
+                        for recent_trial_id, recent_value in recent_rows:
+                            attr_rows = conn.execute(attrs_query, (recent_trial_id,)).fetchall()
+                            attrs = {}
+                            for key, value_json in attr_rows:
+                                try:
+                                    attrs[key] = json.loads(value_json)
+                                except (TypeError, json.JSONDecodeError):
+                                    attrs[key] = value_json
+                            reject_code = attrs.get('reject_code') or attrs.get('reject_reason')
+                            if reject_code:
+                                recent_reject_hist[str(reject_code)] = int(recent_reject_hist.get(str(reject_code), 0)) + 1
+                            else:
+                                val = float(recent_value) if recent_value is not None else None
+                                if val is not None and (best_accepted is None or val > best_accepted):
+                                    best_accepted = val
 
                     if best_trial_id is None:
                         continue
 
                     progress[coin]["best_score"] = float(best_score)
+                    progress[coin]["best_completed"] = float(best_score)
                     metric_rows = conn.execute(attrs_query, (best_trial_id,)).fetchall()
                     metrics = {}
                     for key, value_json in metric_rows:
@@ -306,7 +358,13 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
                             metrics[key] = json.loads(value_json)
                         except (TypeError, json.JSONDecodeError):
                             metrics[key] = value_json
+                    best_reject = metrics.get('reject_code') or metrics.get('reject_reason')
+                    progress[coin]["best_completed_reject"] = best_reject
+                    progress[coin]["best_accepted"] = best_accepted
                     progress[coin]["best_metrics"] = metrics
+                    progress[coin]["recent_reject_hist"] = dict(sorted(recent_reject_hist.items(), key=lambda kv: kv[1], reverse=True)[:3])
+                    if progress[coin]["seed_progress"]:
+                        progress[coin]["current_seed"] = max(progress[coin]["seed_progress"], key=progress[coin]["seed_progress"].get)
             return progress
         except sqlite3.OperationalError:
             time.sleep(0.5 * (attempt + 1))
@@ -668,7 +726,7 @@ if __name__ == "__main__":
                 f"   ⚠️  Trade-starved risk: est_holdout_trades={est_ho_trades:.1f} "
                 f"< gate_floor={eff_ho_floor} (target={args.target_trades_per_week:.2f}/week)"
             )
-        print(f"   Params:       10 tunable (includes cooldown cadence control)")
+        print(f"   Params:       6 tunable (current optimize.py search space)")
         print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
         print(f"   Holdout cands:{args.holdout_candidates}")
@@ -743,6 +801,7 @@ if __name__ == "__main__":
         all_done = False
         start_time = time.time()
 
+        flatline_warned = set()
         while not all_done:
             time.sleep(30)
             elapsed = time.time() - start_time
@@ -757,19 +816,48 @@ if __name__ == "__main__":
             for coin in target_coins:
                 p = progress[coin]
                 started = p.get('started', 0)
-                completed = p['completed']
-                best = p.get('best_score')
-                best_str = f" best={best:.3f}" if best is not None else ""
+                completed = p.get('completed', 0)
+                failed = p.get('failed', 0)
+                pruned = p.get('pruned', 0)
+                best_completed = p.get('best_completed')
+                best_accepted = p.get('best_accepted')
+                best_reject = p.get('best_completed_reject')
                 metrics = p.get('best_metrics', {})
-                # v11: show OOS Sharpe in progress
+
+                best_completed_str = f" bestC={best_completed:.3f}" if best_completed is not None else ""
+                if best_reject:
+                    best_completed_str += f"(rej:{best_reject})"
+                best_accepted_str = f" bestA={best_accepted:.3f}" if best_accepted is not None else " bestA=NA"
+
                 oos_sr = metrics.get('mean_oos_sharpe', metrics.get('oos_sharpe'))
-                oos_str = f" OOS_SR={oos_sr:.3f}" if oos_sr is not None else ""
+                oos_str = f" OOS_SR={float(oos_sr):.3f}" if oos_sr is not None else ""
                 running = "🔄" if coin in still_running else "✅"
                 progress_target = args.trials * seed_count
-                progress_str = f"{started}/{progress_target}"
-                if completed and completed != started:
-                    progress_str += f" (✓{completed})"
-                status_parts.append(f"{running}{coin}:{progress_str}{best_str}{oos_str}")
+                progress_str = f"{started}/{progress_target}(✓{completed} F={failed} P={pruned})"
+
+                reject_hist = p.get('recent_reject_hist', {})
+                top_reject_str = ""
+                if reject_hist:
+                    top_reason, top_count = next(iter(reject_hist.items()))
+                    denom = max(1, sum(reject_hist.values()))
+                    top_ratio = (float(top_count) / float(denom)) * 100.0
+                    top_reject_str = f" top_reject={top_reason}({top_ratio:.0f}%)"
+                    if (coin not in flatline_warned and completed >= max(20, int(progress_target * 0.25)) and top_ratio >= 70.0 and best_accepted is None):
+                        print(
+                            f"   ⚠️ Flatline warning {coin}: dominant reject={top_reason} ({top_ratio:.0f}%) with no accepted trial yet.",
+                            flush=True,
+                        )
+                        flatline_warned.add(coin)
+
+                seed_info = ""
+                current_seed = p.get('current_seed')
+                seed_progress = p.get('seed_progress', {})
+                if current_seed and seed_progress:
+                    seed_info = f" seed=s{current_seed}:{seed_progress.get(current_seed, 0)}/{args.trials}"
+
+                status_parts.append(
+                    f"{running}{coin}:{progress_str}{best_completed_str}{best_accepted_str}{oos_str}{top_reject_str}{seed_info}"
+                )
 
             print(f"   [{format_duration(elapsed)}] {' | '.join(status_parts)}", flush=True)
 
