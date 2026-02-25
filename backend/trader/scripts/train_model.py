@@ -1706,6 +1706,8 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.68,
                         help="Default signal threshold (overridden by per-coin profiles)")
     parser.add_argument("--min-auc", type=float, default=0.51)
+    parser.add_argument("--min-train-samples", type=int, default=400,
+                        help="Minimum training samples per split (lower for smoke tests)")
     parser.add_argument("--leverage", type=int, default=4)
     parser.add_argument("--tp", type=float, default=5.5, help="Default TP vol multiplier")
     parser.add_argument("--sl", type=float, default=3.0, help="Default SL vol multiplier")
@@ -1725,12 +1727,19 @@ if __name__ == "__main__":
                         help="Require pruned feature artifacts from prune_features.py")
     parser.add_argument("--recency-half-life-days", type=float, default=50.0,
                         help="Half-life in days for exponential recency sample weighting")
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Relax model gates for quick sanity checks (min_auc=0.50, min_train_samples=200)")
     args = parser.parse_args()
+
+    if args.smoke_test:
+        args.min_auc = min(args.min_auc, 0.50)
+        args.min_train_samples = min(args.min_train_samples, 200)
 
     excluded = [s.strip() for s in args.exclude.split(',') if s.strip()] if args.exclude else None
     config = Config(
         signal_threshold=args.threshold,
         min_val_auc=args.min_auc,
+        min_train_samples=args.min_train_samples,
         leverage=args.leverage,
         vol_mult_tp=args.tp,
         vol_mult_sl=args.sl,

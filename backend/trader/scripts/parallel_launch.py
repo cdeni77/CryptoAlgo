@@ -107,16 +107,22 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.03,
         "plateau_warmup": 20,
         "holdout_days": 90,
-        "min_internal_oos_trades": 5,
-        "min_total_trades": 20,
+        "min_internal_oos_trades": 0,
+        "min_total_trades": 8,
         "n_cv_folds": 2,
         "holdout_candidates": 1,
-        "holdout_min_trades": 10,
-        "holdout_min_sharpe": 0.0,
-        "holdout_min_return": -0.01,
+        "holdout_min_trades": 8,
+        "holdout_min_sharpe": -0.1,
+        "holdout_min_return": -0.05,
         "require_holdout_pass": False,
         "target_trades_per_week": 0.8,
         "plateau_min_completed": 0,
+        "disable_fee_stress": True,
+        "min_fold_sharpe_hard": -0.5,
+        "min_fold_win_rate": 0.30,
+        "min_psr": 0.05,
+        "min_raw_expectancy": -0.0010,
+        "min_stressed_expectancy": -0.0010,
     },
     "pilot_rollout": {
         "coins": ",".join(PILOT_ROLLOUT_DEFAULT_COINS),
@@ -162,6 +168,12 @@ def apply_runtime_preset(args):
         "target_trades_per_week": "--target-trades-per-week",
         "coins": "--coins",
         "trials": "--trials",
+        "disable_fee_stress": "--disable-fee-stress",
+        "min_fold_sharpe_hard": "--min-fold-sharpe-hard",
+        "min_fold_win_rate": "--min-fold-win-rate",
+        "min_psr": "--min-psr",
+        "min_raw_expectancy": "--min-raw-expectancy",
+        "min_stressed_expectancy": "--min-stressed-expectancy",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -609,6 +621,18 @@ if __name__ == "__main__":
                         choices=sorted(GATE_MODE_CONFIGS.keys()),
                         help="Gate profile: initial paper qualification (lenient) vs production promotion (strict)")
     parser.add_argument("--target-trades-per-week", type=float, default=1.0)
+    parser.add_argument("--disable-fee-stress", action="store_true",
+                        help="Disable stressed-fee objective gate in optimize workers")
+    parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
+                        help="Hard reject if any fold Sharpe is below this threshold")
+    parser.add_argument("--min-fold-win-rate", type=float, default=0.35,
+                        help="Hard reject when sufficiently-active folds fall below this win-rate")
+    parser.add_argument("--min-psr", type=float, default=0.55,
+                        help="Minimum probabilistic Sharpe ratio gate")
+    parser.add_argument("--min-raw-expectancy", type=float, default=1e-6,
+                        help="Minimum pre-fee expectancy gate")
+    parser.add_argument("--min-stressed-expectancy", type=float, default=1e-6,
+                        help="Minimum stressed-fee expectancy gate")
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -729,6 +753,8 @@ if __name__ == "__main__":
         print(f"   Params:       6 tunable (current optimize.py search space)")
         print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
+        print(f"   CV gates:     fold_sr>={args.min_fold_sharpe_hard}, fold_wr>={args.min_fold_win_rate}, psr>={args.min_psr}")
+        print(f"   Expectancy:   raw>={args.min_raw_expectancy}, stressed>={args.min_stressed_expectancy}")
         print(f"   Holdout cands:{args.holdout_candidates}")
         print(f"   Gate mode:    {args.gate_mode}")
         print(f"   Holdout gate: trades>={args.holdout_min_trades}, SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}")
@@ -768,6 +794,11 @@ if __name__ == "__main__":
                 "--holdout-min-sharpe", str(args.holdout_min_sharpe),
                 "--holdout-min-return", str(args.holdout_min_return),
                 "--target-trades-per-week", str(args.target_trades_per_week),
+                "--min-fold-sharpe-hard", str(args.min_fold_sharpe_hard),
+                "--min-fold-win-rate", str(args.min_fold_win_rate),
+                "--min-psr", str(args.min_psr),
+                "--min-raw-expectancy", str(args.min_raw_expectancy),
+                "--min-stressed-expectancy", str(args.min_stressed_expectancy),
                 "--study-suffix", run_id,
                 "--preset", "none",  # already applied
                 "--gate-mode", args.gate_mode,
@@ -782,6 +813,8 @@ if __name__ == "__main__":
                 cmd.extend(["--sampler-seeds", args.sampler_seeds])
             if args.debug_trials:
                 cmd.append("--debug-trials")
+            if args.disable_fee_stress:
+                cmd.append("--disable-fee-stress")
 
             log_file = None
             stdout_target = None
