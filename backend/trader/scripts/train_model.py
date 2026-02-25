@@ -14,6 +14,7 @@ Funding: Normalized hourly funding data (Coinbase native preferred, CCXT fallbac
 import argparse
 import hashlib
 import joblib
+import os
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
@@ -596,13 +597,20 @@ class MLSystem:
             for j in range(i + 1, len(member_outputs)):
                 a = np.asarray(member_outputs[i].get('val_probs', []), dtype=float)
                 b = np.asarray(member_outputs[j].get('val_probs', []), dtype=float)
-                if len(a) != len(b) or len(a) < 2:
-                    corr = np.nan
-                else:
-                    corr = float(np.corrcoef(a, b)[0, 1])
+
+                corr_text = "n/a"
+                if len(a) == len(b) and len(a) >= 2:
+                    finite_mask = np.isfinite(a) & np.isfinite(b)
+                    a_f = a[finite_mask]
+                    b_f = b[finite_mask]
+                    if len(a_f) >= 2 and np.std(a_f) > 0 and np.std(b_f) > 0:
+                        corr = float(np.corrcoef(a_f, b_f)[0, 1])
+                        if np.isfinite(corr):
+                            corr_text = f"{corr:.4f}"
+
                 print(
                     f"  {member_outputs[i].get('member_name', f'm{i}'):<14} vs "
-                    f"{member_outputs[j].get('member_name', f'm{j}'):<14}: corr={corr:.4f}"
+                    f"{member_outputs[j].get('member_name', f'm{j}'):<14}: corr={corr_text}"
                 )
 
     def train(self, X_train: pd.DataFrame, y_train: pd.Series,
