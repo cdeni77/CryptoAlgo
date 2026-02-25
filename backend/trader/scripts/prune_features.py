@@ -36,9 +36,22 @@ def _symbol_from_dataset_name(path: Path) -> str:
     return stem.replace("_", "-")
 
 
-def _is_binary_target(y: pd.Series) -> bool:
-    unique = set(y.dropna().unique().tolist())
-    return unique.issubset({0, 1}) and bool(unique)
+def _normalize_target(y: pd.Series) -> Optional[pd.Series]:
+    """Normalize labels into binary class targets for SHAP ranking.
+
+    Supported label spaces:
+      - {0, 1}: already binary.
+      - {-1, 0, 1}: mapped to (target_tb > 0) -> 1 else 0.
+    """
+    clean = pd.to_numeric(y, errors="coerce").dropna()
+    unique = set(clean.unique().tolist())
+    if not unique:
+        return None
+    if unique.issubset({0, 1}):
+        return clean.astype(int)
+    if unique.issubset({-1, 0, 1}):
+        return (clean > 0).astype(int)
+    return None
 
 
 def load_ml_datasets(features_dir: Path = FEATURES_DIR) -> Dict[str, pd.DataFrame]:
@@ -74,8 +87,8 @@ def prune_coin_features(
     if target_col not in df.columns:
         return None
 
-    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0.0).astype(int)
-    if not _is_binary_target(y):
+    y = _normalize_target(df[target_col])
+    if y is None:
         return None
 
     feature_candidates = [
@@ -85,7 +98,11 @@ def prune_coin_features(
     if len(feature_candidates) < 4:
         return None
 
-    X = df[feature_candidates]
+    Xy = pd.concat([df[feature_candidates], y.rename("target")], axis=1).dropna(subset=["target"])
+    if Xy.empty:
+        return None
+    X = Xy[feature_candidates]
+    y = Xy["target"].astype(int)
     split_idx = int(len(X) * (1 - config.val_fraction))
     if split_idx <= 200:
         return None
