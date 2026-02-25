@@ -53,3 +53,17 @@ def test_pruned_features_are_deterministic_with_seed(tmp_path: Path) -> None:
 
     assert res1 is not None and res2 is not None
     assert json.dumps(res1["selected_features"]) == json.dumps(res2["selected_features"])
+
+
+def test_pruning_accepts_triple_barrier_labels(tmp_path: Path) -> None:
+    df = _build_dataset(seed=99)
+    df["target_tb"] = np.where(df["target_tb"] == 1, 1, -1)
+    out = tmp_path / "BIP_20DEC30_CDE_ml_dataset.csv"
+    df.to_csv(out)
+
+    datasets = load_ml_datasets(tmp_path)
+    cfg = PruneConfig(seed=11, top_n=12)
+    result = prune_coin_features(COIN_PROFILES["BTC"], datasets, cfg)
+
+    assert result is not None
+    assert result["selected_features"]
