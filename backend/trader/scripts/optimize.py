@@ -631,9 +631,12 @@ def objective(
     fee_blend_stressed_weight=0.4,
     pruned_only=True,
     min_total_trades_gate=0,
+    min_fold_sharpe_hard=-0.1,
+    min_fold_win_rate=0.35,
+    min_psr=0.55,
+    min_raw_expectancy=1e-6,
+    min_stressed_expectancy=1e-6,
 ):
-    min_fold_sharpe_hard = -0.1
-    min_fold_win_rate = 0.35
     min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 8)
 
     profile = create_trial_profile(trial, coin_name)
@@ -833,14 +836,14 @@ def objective(
             stressed_fold_results=stressed_fold_results,
             psr=psr,
         )
-    if mean_raw_expectancy <= 0:
+    if mean_raw_expectancy < float(min_raw_expectancy):
         return _reject_trial(
             trial,
             code='RAW_EXPECTANCY_NONPOSITIVE',
-            reason=f'raw_expectancy_nonpositive:{mean_raw_expectancy:.6f}',
+            reason=f'raw_expectancy_below_min:{mean_raw_expectancy:.6f}<{float(min_raw_expectancy):.6f}',
             stage='post_cv_gates',
             observed=mean_raw_expectancy,
-            threshold=1e-6,
+            threshold=float(min_raw_expectancy),
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
             psr=psr,
@@ -857,26 +860,26 @@ def objective(
             stressed_fold_results=stressed_fold_results,
             psr=psr,
         )
-    if enable_fee_stress and stressed_expectancy <= 0:
+    if enable_fee_stress and stressed_expectancy < float(min_stressed_expectancy):
         return _reject_trial(
             trial,
             code='NONPOSITIVE_STRESSED_EXPECTANCY',
-            reason=f'nonpositive_stressed_expectancy:{stressed_expectancy:.6f}',
+            reason=f'stressed_expectancy_below_min:{stressed_expectancy:.6f}<{float(min_stressed_expectancy):.6f}',
             stage='fee_stress',
             observed=stressed_expectancy,
-            threshold=1e-6,
+            threshold=float(min_stressed_expectancy),
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
             psr=psr,
         )
-    if psr.get('valid') and psr.get('psr', 0.0) < 0.55:
+    if psr.get('valid') and psr.get('psr', 0.0) < float(min_psr):
         return _reject_trial(
             trial,
             code='LOW_PSR',
-            reason=f'low_psr:{psr.get("psr", 0.0):.3f}',
+            reason=f'low_psr:{psr.get("psr", 0.0):.3f}<{float(min_psr):.3f}',
             stage='psr',
             observed=psr.get('psr', 0.0),
-            threshold=0.55,
+            threshold=float(min_psr),
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
             psr=psr,
@@ -963,6 +966,9 @@ def objective(
         'min_fold_sharpe_hard': float(min_fold_sharpe_hard),
         'min_fold_win_rate': float(min_fold_win_rate),
         'min_fold_win_rate_trades': int(min_fold_win_rate_trades),
+        'min_psr': float(min_psr),
+        'min_raw_expectancy': float(min_raw_expectancy),
+        'min_stressed_expectancy': float(min_stressed_expectancy),
     })
     trial.set_user_attr('tunable_params', dict(trial.params))
     trial.set_user_attr('effective_params', build_effective_params(trial.params, coin_name))
@@ -1292,6 +1298,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   target_trades_per_week=1.0, target_trades_per_year=None,
                   preset_name="none", enable_fee_stress=True,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
+                  min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.35, min_psr=0.55,
+                  min_raw_expectancy=1e-6, min_stressed_expectancy=1e-6,
                   pruned_only=True, gate_mode="initial_paper_qualification"):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
@@ -1310,6 +1318,10 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
+    print(
+        f"   Gates: fold_sr>={min_fold_sharpe_hard:.2f}, fold_wr>={min_fold_win_rate:.2f}, "
+        f"psr>={min_psr:.2f}, raw_exp>={min_raw_expectancy:.5f}"
+    )
     for i, (tb, ts, te) in enumerate(cv_splits):
         print(f"     Fold {i}: train→{tb.date()} | test {ts.date()}→{te.date()}")
         logger.debug(
@@ -1381,6 +1393,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             fee_stress_multiplier=fee_stress_multiplier,
                             fee_blend_normal_weight=fee_blend_normal_weight,
                             fee_blend_stressed_weight=fee_blend_stressed_weight,
+                            min_fold_sharpe_hard=min_fold_sharpe_hard,
+                            min_fold_win_rate=min_fold_win_rate,
+                            min_psr=min_psr,
+                            min_raw_expectancy=min_raw_expectancy,
+                            min_stressed_expectancy=min_stressed_expectancy,
                             pruned_only=pruned_only)
     min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
@@ -1692,7 +1709,7 @@ def apply_runtime_preset(args):
     presets = {
         'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
         'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010},
         'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
@@ -1716,6 +1733,11 @@ def apply_runtime_preset(args):
             'target_trades_per_week': '--target-trades-per-week',
             'target_trades_per_year': '--target-trades-per-year',
             'disable_fee_stress': '--disable-fee-stress',
+            'min_fold_sharpe_hard': '--min-fold-sharpe-hard',
+            'min_fold_win_rate': '--min-fold-win-rate',
+            'min_psr': '--min-psr',
+            'min_raw_expectancy': '--min-raw-expectancy',
+            'min_stressed_expectancy': '--min-stressed-expectancy',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -1764,6 +1786,16 @@ if __name__ == "__main__":
                         help="Blend weight for normal-fee fold Sharpe")
     parser.add_argument("--fee-blend-stressed-weight", type=float, default=0.4,
                         help="Blend weight for stressed-fee fold Sharpe")
+    parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
+                        help="Hard reject if any fold Sharpe is below this threshold")
+    parser.add_argument("--min-fold-win-rate", type=float, default=0.35,
+                        help="Hard reject when sufficiently-active folds fall below this win-rate")
+    parser.add_argument("--min-psr", type=float, default=0.55,
+                        help="Minimum probabilistic Sharpe ratio gate")
+    parser.add_argument("--min-raw-expectancy", type=float, default=1e-6,
+                        help="Minimum pre-fee expectancy gate")
+    parser.add_argument("--min-stressed-expectancy", type=float, default=1e-6,
+                        help="Minimum stressed-fee expectancy gate")
     parser.add_argument("--pruned-only", action="store_true",
                         help="Require pruned feature artifacts during optimization and holdout")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only",
@@ -1812,6 +1844,11 @@ if __name__ == "__main__":
             fee_stress_multiplier=args.fee_stress_multiplier,
             fee_blend_normal_weight=args.fee_blend_normal_weight,
             fee_blend_stressed_weight=args.fee_blend_stressed_weight,
+            min_fold_sharpe_hard=args.min_fold_sharpe_hard,
+            min_fold_win_rate=args.min_fold_win_rate,
+            min_psr=args.min_psr,
+            min_raw_expectancy=args.min_raw_expectancy,
+            min_stressed_expectancy=args.min_stressed_expectancy,
             pruned_only=args.pruned_only,
             preset_name=args.preset,
             gate_mode=args.gate_mode)
