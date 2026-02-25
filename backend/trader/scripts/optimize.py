@@ -35,6 +35,7 @@ from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
     get_contract_spec, calculate_pnl_exact,
 )
+from core.meta_labeling import calibrator_predict, primary_recall_threshold
 from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
@@ -441,12 +442,14 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
             if vol_24h is None or pd.isna(vol_24h): continue
             if vol_24h < profile.min_vol_24h or vol_24h > profile.max_vol_24h: continue
             if abs(ret_72h) < profile.min_momentum_magnitude: continue
+            if ret_24h * ret_72h < 0: continue
 
             x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0)
             raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
-            prob = float(iso.predict(np.array([[raw_prob]]))[0])
-            # Match production: require prob >= threshold + min_signal_edge
-            if prob < profile.signal_threshold + config.min_signal_edge: continue
+            prob = float(calibrator_predict(iso, np.array([raw_prob]))[0])
+            # Match production: apply recall-oriented primary threshold.
+            primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
+            if prob < primary_cutoff: continue
 
             # Match production: funding rate filter
             f_z = row.get('funding_rate_zscore', 0)
@@ -632,17 +635,17 @@ def objective(
     pruned_only=True,
     min_total_trades_gate=0,
     min_fold_sharpe_hard=-0.1,
-    min_fold_win_rate=0.35,
+    min_fold_win_rate=0.30,
     min_psr=0.55,
     min_raw_expectancy=1e-6,
     min_stressed_expectancy=1e-6,
 ):
-    min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 8)
+    min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 10)
 
     profile = create_trial_profile(trial, coin_name)
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
                     train_embargo_hours=24, enforce_pruned_features=bool(pruned_only),
-                    min_val_auc=0.50, min_train_samples=100)
+                    min_val_auc=0.50, min_train_samples=100, signal_threshold=0.50)
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
 
@@ -713,14 +716,14 @@ def objective(
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
         )
-    if total_trades < 8:
+    if total_trades < 6:
         return _reject_trial(
             trial,
             code='TOO_FEW_TRADES',
             reason=f'too_few_trades:{total_trades}',
             stage='fold_eval',
             observed=total_trades,
-            threshold=8,
+            threshold=6,
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
         )
@@ -745,7 +748,7 @@ def objective(
     tpy = np.mean([r.get('trades_per_year', 0.0) for r in fold_results])
 
     guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
-    guard_min_trades = int(guards.get('min_total_trades', 20))
+    guard_min_trades = int(guards.get('min_total_trades', 6))
     if int(min_total_trades_gate or 0) > 0:
         guard_min_trades = min(guard_min_trades, max(4, int(min_total_trades_gate)))
     guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 4.0))
@@ -1052,7 +1055,7 @@ class PlateauStopper:
             )
             study.stop()
 
-def _select_best_trial(study, min_trades=20):
+def _select_best_trial(study, min_trades=6):
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
     if not completed: return study.best_trial
     robust, acceptable = [], []
@@ -1298,7 +1301,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   target_trades_per_week=1.0, target_trades_per_year=None,
                   preset_name="none", enable_fee_stress=True,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
-                  min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.35, min_psr=0.55,
+                  min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.30, min_psr=0.55,
                   min_raw_expectancy=1e-6, min_stressed_expectancy=1e-6,
                   pruned_only=True, gate_mode="initial_paper_qualification"):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
@@ -1411,7 +1414,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     except Exception as e: print(f"\n❌ {e}"); traceback.print_exc(); return None
     if not study.trials: print("No trials."); return None
 
-    best = _select_best_trial(study, min_trades=min_total_trades or 20)
+    best = _select_best_trial(study, min_trades=min_total_trades or 6)
     if best.number != study.best_trial.number:
         print(f"\n🛡️ Selected #{best.number} over raw best #{study.best_trial.number}")
 
@@ -1454,7 +1457,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         candidate_trials = _candidate_trials_for_holdout(
             study,
             max_candidates=max(1, int(holdout_candidates or 1)),
-            min_trades=min_total_trades or 20,
+            min_trades=min_total_trades or 6,
         )
         if best not in candidate_trials:
             candidate_trials = [best] + candidate_trials
@@ -1788,7 +1791,7 @@ if __name__ == "__main__":
                         help="Blend weight for stressed-fee fold Sharpe")
     parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
                         help="Hard reject if any fold Sharpe is below this threshold")
-    parser.add_argument("--min-fold-win-rate", type=float, default=0.35,
+    parser.add_argument("--min-fold-win-rate", type=float, default=0.30,
                         help="Hard reject when sufficiently-active folds fall below this win-rate")
     parser.add_argument("--min-psr", type=float, default=0.55,
                         help="Minimum probabilistic Sharpe ratio gate")
