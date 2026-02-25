@@ -361,7 +361,8 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
             if abs(ret_72h) < profile.min_momentum_magnitude: continue
 
             x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0)
-            prob = float(iso.predict([model.predict_proba(scaler.transform(x_in))[0, 1]])[0])
+            raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
+            prob = float(iso.predict(np.array([[raw_prob]]))[0])
             # Match production: require prob >= threshold + min_signal_edge
             if prob < profile.signal_threshold + config.min_signal_edge: continue
 
