@@ -209,24 +209,26 @@ class CoinProfile:
 
 
 COIN_PROFILES: Dict[str, CoinProfile] = {
-    # ── ETH: momentum (strong baseline, slightly stricter filters) ──
+    # ── ETH: momentum (strong baseline, calibrated confidence floor) ──
     'ETH': CoinProfile(
         name='ETH',
         prefixes=['ETP', 'ETH'],
         extra_features=ETH_EXTRA_FEATURES,
-        signal_threshold=0.82,
+        signal_threshold=0.72,
+        min_val_auc=0.52,
         vol_mult_tp=5.8,
         vol_mult_sl=3.0,
         max_hold_hours=72,
         min_momentum_magnitude=0.08,
     ),
     
-    # ── XRP: momentum (raise bar to avoid fee-heavy chop) ──
+    # ── XRP: momentum (balanced confidence to avoid over-filtering) ──
     'XRP': CoinProfile(
         name='XRP',
         prefixes=['XPP', 'XRP'],
         extra_features=XRP_EXTRA_FEATURES,
-        signal_threshold=0.84,
+        signal_threshold=0.72,
+        min_val_auc=0.52,
         vol_mult_tp=6.0,
         vol_mult_sl=3.0,
         max_hold_hours=108,
@@ -237,13 +239,13 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
     # v7 momentum was never tested on BTC (it was excluded).
     # BTC is macro-driven — hourly RSI extremes don't predict bounces.
     # Use same momentum approach as ETH but with very strict filters:
-    # high threshold, high AUC bar, small position, long cooldown.
+    # balanced threshold/AUC bar, small position, long cooldown.
     'BTC': CoinProfile(
         name='BTC',
         prefixes=['BIP', 'BTC'],
         extra_features=BTC_EXTRA_FEATURES,
-        signal_threshold=0.88,          # Extra strict bar to avoid fee-churn
-        min_val_auc=0.56,               # Require strong model
+        signal_threshold=0.70,          # Lower bar so calibrated probabilities can trigger
+        min_val_auc=0.52,
         label_forward_hours=36,         # Longer horizon for BTC trend persistence
         label_vol_target=1.8,           # Standard barriers
         min_momentum_magnitude=0.12,    # Require only strongest trends to clear fees
@@ -268,8 +270,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='SOL',
         prefixes=['SLP', 'SOL'],
         extra_features=SOL_EXTRA_FEATURES,
-        signal_threshold=0.84,          # Raise confidence floor to reduce churn
-        min_val_auc=0.54,
+        signal_threshold=0.72,
+        min_val_auc=0.52,
         label_forward_hours=24,         # Slightly longer horizon to capture full moves
         label_vol_target=1.6,           # Tighter barriers
         min_momentum_magnitude=0.08,    # Filter weak breakouts
@@ -291,8 +293,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         name='DOGE',
         prefixes=['DOP', 'DOGE'],
         extra_features=DOGE_EXTRA_FEATURES,
-        signal_threshold=0.86,           # Very high bar — reduce noisy entries
-        min_val_auc=0.55,
+        signal_threshold=0.74,
+        min_val_auc=0.52,
         label_forward_hours=12,          # Short horizon — DOGE moves fast
         label_vol_target=1.4,            # Tight barriers — high vol
         min_momentum_magnitude=0.12,     # Require strong momentum — filter out noise

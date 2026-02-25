@@ -410,7 +410,7 @@ FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_chi
 FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
-    'min_val_auc': 0.53,
+    'min_val_auc': 0.52,
     'cooldown_hours': 24.0,
     'min_vol_24h': 0.008,
     'max_vol_24h': 0.06,
