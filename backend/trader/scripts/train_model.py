@@ -659,7 +659,7 @@ class MLSystem:
         except ValueError:
             return None
 
-        min_auc = profile.min_val_auc if profile else self.config.min_val_auc
+        min_auc = min(profile.min_val_auc, self.config.min_val_auc) if profile else self.config.min_val_auc
         if auc < min_auc:
             return None
 
@@ -674,7 +674,7 @@ class MLSystem:
         )
 
         primary_threshold = primary_recall_threshold(
-            profile.signal_threshold if profile else self.config.signal_threshold,
+            min(profile.signal_threshold, self.config.signal_threshold) if profile else self.config.signal_threshold,
             self.config.min_signal_edge,
         )
         primary_train_probs = _calibrator_predict(calibrator, base_model.predict_proba(X_train_scaled)[:, 1])
@@ -1176,7 +1176,7 @@ def run_backtest(all_data: Dict, config: Config,
                     probs = []
                     meta_probs = []
                     directional_votes = []
-                    primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
+                    primary_cutoff = primary_recall_threshold(min(profile.signal_threshold, config.signal_threshold), config.min_signal_edge)
                     for (model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta) in models[sym]:
                         x_in = np.nan_to_num(
                             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
@@ -1639,7 +1639,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         )
         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
         prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
-        primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
+        primary_cutoff = primary_recall_threshold(min(profile.signal_threshold, config.signal_threshold), config.min_signal_edge)
         ml_pass = prob >= primary_cutoff
         meta_prob = 0.0
         meta_pass = False
