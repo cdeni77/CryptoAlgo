@@ -467,9 +467,29 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
 
     # METRICS
     n = len(completed_trades)
+    if n == 0:
+        return None
     if n < 3:
-        return {'n_trades': n, 'sharpe': -99.0, 'win_rate': 0, 'profit_factor': 0,
-                'max_drawdown': 1.0, 'ann_return': -1.0, 'total_return': equity/100000-1, 'trades_per_year': 0}
+        pnls = [t['net_pnl'] for t in completed_trades]
+        raw_pnls = [t['raw_pnl'] for t in completed_trades]
+        wins = [p for p in pnls if p > 0]
+        wr = len(wins) / max(len(pnls), 1)
+        avg = float(np.mean(pnls))
+        total_ret = equity / 100000 - 1
+        test_days = max((test_end - test_start).days, 1)
+        return {
+            'n_trades': n,
+            'sharpe': 0.0,
+            'win_rate': round(wr, 4),
+            'profit_factor': 0.0,
+            'max_drawdown': 0.0,
+            'ann_return': 0.0,
+            'total_return': round(total_ret, 4),
+            'trades_per_year': round(n * 365.0 / test_days, 1),
+            'avg_pnl': round(avg, 6),
+            'avg_raw_pnl': round(float(np.mean(raw_pnls)), 6),
+            'fee_edge_ratio': 0.0,
+        }
 
     pnls = [t['net_pnl'] for t in completed_trades]
     raw_pnls = [t['raw_pnl'] for t in completed_trades]
