@@ -201,7 +201,7 @@ Postgres service stores API-facing trade/signal/wallet/paper tables.
 
 ### Feature generation
 
-- `FEATURE_LOOKBACK_DAYS` (default `2190`) to cap historical span used by `scripts/compute_features.py`.
+- `FEATURE_LOOKBACK_DAYS` (default `1095`) to cap historical span used by `scripts/compute_features.py`.
 
 ---
 

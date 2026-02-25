@@ -40,7 +40,7 @@ from core.labeling import (
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")
-LOOKBACK_DAYS = int(os.getenv("FEATURE_LOOKBACK_DAYS", "2190"))
+LOOKBACK_DAYS = int(os.getenv("FEATURE_LOOKBACK_DAYS", "1095"))
 
 
 # 1. ROBUST LOADERS (UTC Enforced)
@@ -225,7 +225,7 @@ def main():
     # --- 2. Compute Features ---
     print("\n2️⃣  COMPUTING FEATURES")
     config = FeatureConfig(
-        price_lookbacks=[1, 4, 12, 24, 48, 168],
+        price_lookbacks=[1, 4, 12, 24, 48, 72, 168],
         volume_lookbacks=[1, 4, 12, 24, 48],
         compute_price=True,
         compute_volume=True,
