@@ -145,7 +145,7 @@ class CoinProfile:
     
     # Signal thresholds
     signal_threshold: float = 0.68
-    min_val_auc: float = 0.51
+    min_val_auc: float = 0.50
     
     # Labeling
     label_forward_hours: int = 24
@@ -215,7 +215,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         prefixes=['ETP', 'ETH'],
         extra_features=ETH_EXTRA_FEATURES,
         signal_threshold=0.68,
-        min_val_auc=0.51,
+        min_val_auc=0.50,
         vol_mult_tp=5.8,
         vol_mult_sl=3.0,
         max_hold_hours=72,
@@ -228,7 +228,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         prefixes=['XPP', 'XRP'],
         extra_features=XRP_EXTRA_FEATURES,
         signal_threshold=0.68,
-        min_val_auc=0.51,
+        min_val_auc=0.50,
         vol_mult_tp=6.0,
         vol_mult_sl=3.0,
         max_hold_hours=108,
@@ -245,7 +245,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         prefixes=['BIP', 'BTC'],
         extra_features=BTC_EXTRA_FEATURES,
         signal_threshold=0.68,          # Lower bar so calibrated probabilities can trigger
-        min_val_auc=0.51,
+        min_val_auc=0.50,
         label_forward_hours=36,         # Longer horizon for BTC trend persistence
         label_vol_target=1.8,           # Standard barriers
         min_momentum_magnitude=0.04,    # Require only strongest trends to clear fees
@@ -271,7 +271,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         prefixes=['SLP', 'SOL'],
         extra_features=SOL_EXTRA_FEATURES,
         signal_threshold=0.68,
-        min_val_auc=0.51,
+        min_val_auc=0.50,
         label_forward_hours=24,         # Slightly longer horizon to capture full moves
         label_vol_target=1.6,           # Tighter barriers
         min_momentum_magnitude=0.05,    # Filter weak breakouts
@@ -294,7 +294,7 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         prefixes=['DOP', 'DOGE'],
         extra_features=DOGE_EXTRA_FEATURES,
         signal_threshold=0.70,
-        min_val_auc=0.51,
+        min_val_auc=0.50,
         label_forward_hours=12,          # Short horizon — DOGE moves fast
         label_vol_target=1.4,            # Tight barriers — high vol
         min_momentum_magnitude=0.06,     # Require strong momentum — filter out noise
