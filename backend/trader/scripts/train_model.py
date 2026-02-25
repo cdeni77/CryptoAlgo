@@ -485,6 +485,8 @@ class MLSystem:
         symbol: str,
     ) -> np.ndarray:
         """Combine uniqueness and class-balance weights for LightGBM training."""
+        debug_weights = str(os.getenv("TRAIN_DEBUG_WEIGHTS", "0")).lower() in {"1", "true", "yes", "on"}
+        symbol_label = symbol or "UNKNOWN"
         if y.empty:
             return np.array([], dtype=float)
 
@@ -518,10 +520,11 @@ class MLSystem:
             age_hours = np.maximum(np.asarray(age_hours, dtype=float), 0.0)
         else:
             age_hours = np.arange(len(y) - 1, -1, -1, dtype=float)
-            print(
-                f"[{symbol}] non-datetime index detected for sample weights; "
-                "using positional recency decay fallback."
-            )
+            if debug_weights:
+                print(
+                    f"[{symbol_label}] non-datetime index detected for sample weights; "
+                    "using positional recency decay fallback."
+                )
 
         recency_weight_vec = np.asarray(
             np.exp(-np.log(2.0) * age_hours / half_life_hours),
@@ -535,16 +538,17 @@ class MLSystem:
         base_weights = np.clip(base_weights, 1e-8, None)
         ess_before = (base_weights.sum() ** 2) / np.square(base_weights).sum()
         ess_after = (sample_weights.sum() ** 2) / np.square(sample_weights).sum()
-        print(
-            f"[{symbol}] recency_weight stats: min={recency_weight_vec.min():.6f} "
-            f"median={np.median(recency_weight_vec):.6f} max={recency_weight_vec.max():.6f} "
-            f"half_life_days={self.config.recency_half_life_days:.2f}"
-        )
-        print(
-            f"[{symbol}] sample_weight stats: min={sample_weights.min():.6f} "
-            f"median={np.median(sample_weights):.6f} max={sample_weights.max():.6f} "
-            f"ESS(before={ess_before:.1f}, after={ess_after:.1f})/{len(sample_weights)}"
-        )
+        if debug_weights:
+            print(
+                f"[{symbol_label}] recency_weight stats: min={recency_weight_vec.min():.6f} "
+                f"median={np.median(recency_weight_vec):.6f} max={recency_weight_vec.max():.6f} "
+                f"half_life_days={self.config.recency_half_life_days:.2f}"
+            )
+            print(
+                f"[{symbol_label}] sample_weight stats: min={sample_weights.min():.6f} "
+                f"median={np.median(sample_weights):.6f} max={sample_weights.max():.6f} "
+                f"ESS(before={ess_before:.1f}, after={ess_after:.1f})/{len(sample_weights)}"
+            )
         return sample_weights
 
     @staticmethod

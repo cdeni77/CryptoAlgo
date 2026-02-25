@@ -118,6 +118,7 @@ def _reject_trial(
     fold_results=None,
     stressed_fold_results=None,
     psr=None,
+    extra_attrs=None,
 ):
     _set_partial_reject_attrs(
         trial,
@@ -132,6 +133,9 @@ def _reject_trial(
     trial.set_user_attr('reject_observed', observed if observed is None else float(observed))
     trial.set_user_attr('reject_threshold', threshold if threshold is None else float(threshold))
     trial.set_user_attr('reject_penalty', float(penalty))
+    if isinstance(extra_attrs, dict):
+        for key, value in extra_attrs.items():
+            trial.set_user_attr(str(key), value)
     return penalty
 
 
@@ -296,15 +300,21 @@ def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days
 # v11.1: FAST LIGHTWEIGHT EVALUATOR (~2s per fold instead of ~10min)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config, symbol, fee_multiplier=1.0, pruned_only=True):
+def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config, symbol, fee_multiplier=1.0, pruned_only=True, diagnostics=None):
     """Train ONE model on data before train_end, simulate trading on test period."""
+    def _set_diag(reason):
+        if isinstance(diagnostics, dict):
+            diagnostics['skip_reason'] = str(reason)
+
     system = MLSystem(config)
     feature_candidates = profile.resolve_feature_columns(
         use_pruned_features=bool(pruned_only),
         strict_pruned=bool(pruned_only),
     )
     cols = system.get_feature_columns(features.columns, feature_candidates)
-    if not cols or len(cols) < 4: return None
+    if not cols or len(cols) < 4:
+        _set_diag('insufficient_features')
+        return None
 
     embargo_hours = max(config.train_embargo_hours, profile.label_forward_hours, 1)
     actual_train_end = train_end - pd.Timedelta(hours=embargo_hours)
@@ -312,24 +322,32 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     train_window_start = actual_train_end - pd.Timedelta(days=config.train_lookback_days)
     train_feat = features[(features.index >= train_window_start) & (features.index < actual_train_end)]
     train_ohlcv = ohlcv[(ohlcv.index >= train_window_start) & (ohlcv.index < train_end + pd.Timedelta(hours=profile.label_forward_hours))]
-    if len(train_feat) < config.min_train_samples: return None
+    if len(train_feat) < config.min_train_samples:
+        _set_diag('train_feat_too_small')
+        return None
 
     y = system.create_labels(train_ohlcv, train_feat, profile=profile)
     valid_idx = y.dropna().index
     X_all = train_feat.loc[valid_idx, cols]
     y_all = y.loc[valid_idx]
-    if len(X_all) < config.min_train_samples: return None
+    if len(X_all) < config.min_train_samples:
+        _set_diag('labeled_samples_too_small')
+        return None
 
     split_idx = int(len(X_all) * (1 - config.val_fraction))
     result = system.train(X_all.iloc[:split_idx], y_all.iloc[:split_idx],
                           X_all.iloc[split_idx:], y_all.iloc[split_idx:], profile=profile)
-    if not result: return None
+    if not result:
+        _set_diag('model_training_failed')
+        return None
     model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
 
     # --- SIMULATE TRADING ---
     test_feat = features[(features.index >= test_start) & (features.index <= test_end)]
     test_ohlcv = ohlcv[(ohlcv.index >= test_start) & (ohlcv.index <= test_end)]
-    if len(test_feat) < 50: return None
+    if len(test_feat) < 50:
+        _set_diag('test_window_too_small')
+        return None
 
     completed_trades = []
     active_pos = None
@@ -610,6 +628,7 @@ def objective(
     fold_results, total_trades = [], 0
     stressed_fold_results = []
     blended_fold_sharpes = []
+    fold_skip_reasons = {}
     w_normal = float(fee_blend_normal_weight)
     w_stress = float(fee_blend_stressed_weight)
     if w_normal <= 0 and w_stress <= 0:
@@ -618,8 +637,9 @@ def objective(
     w_normal, w_stress = w_normal / w_total, w_stress / w_total
 
     for train_boundary, test_start, test_end in cv_splits:
+        fold_diag = {}
         r = fast_evaluate_fold(features, ohlcv_data, train_boundary, test_start, test_end, profile, config,
-                               target_sym, fee_multiplier=1.0, pruned_only=pruned_only)
+                               target_sym, fee_multiplier=1.0, pruned_only=pruned_only, diagnostics=fold_diag)
         if r is not None:
             fold_results.append(r)
             total_trades += r['n_trades']
@@ -644,6 +664,9 @@ def objective(
 
             stressed_fold_results.append(stressed_r)
             blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
+        else:
+            skip_reason = fold_diag.get('skip_reason', 'unknown_fold_skip')
+            fold_skip_reasons[skip_reason] = int(fold_skip_reasons.get(skip_reason, 0)) + 1
 
     if len(fold_results) < max(1, len(cv_splits) // 2):
         return _reject_trial(
@@ -655,6 +678,7 @@ def objective(
             threshold=max(1, len(cv_splits) // 2),
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
+            extra_attrs={'fold_skip_reasons': fold_skip_reasons},
         )
     if min_internal_oos_trades > 0 and any(int(r.get('n_trades', 0) or 0) < min_internal_oos_trades for r in fold_results):
         worst_internal_trades = min(int(r.get('n_trades', 0) or 0) for r in fold_results)
@@ -902,6 +926,7 @@ def objective(
     trial.set_user_attr('raw_robust_score', round(float(robust_score), 6))
     trial.set_user_attr('frequency_adjusted_score', round(float(score), 6))
     trial.set_user_attr('fold_metrics', fold_metrics)
+    trial.set_user_attr('fold_skip_reasons', fold_skip_reasons)
     trial.set_user_attr('stressed_fold_metrics', [
         {
             'fold_idx': i,
@@ -1096,7 +1121,9 @@ def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days,
                     enforce_pruned_features=bool(pruned_only))
     try: result = run_backtest({target_sym: holdout_data[target_sym]}, config, profile_overrides={coin_name: profile})
     except Exception as e: print(f"  ❌ Holdout error: {e}"); return None
-    if not result: return None
+    if not result:
+        _set_diag('model_training_failed')
+        return None
     oos_sr = _finite_metric(result.get('oos_sharpe', 0))
     return {'holdout_sharpe': oos_sr if oos_sr > -90 else 0, 'holdout_return': _finite_metric(result.get('oos_return', 0)),
             'holdout_trades': int(result.get('oos_trades', 0) or 0), 'full_sharpe': _finite_metric(result.get('sharpe_annual', 0)),
