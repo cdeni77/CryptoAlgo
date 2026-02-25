@@ -330,13 +330,30 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     valid_idx = y.dropna().index
     X_all = train_feat.loc[valid_idx, cols]
     y_all = y.loc[valid_idx]
+    X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
     if len(X_all) < config.min_train_samples:
         _set_diag('labeled_samples_too_small')
         return None
 
     split_idx = int(len(X_all) * (1 - config.val_fraction))
-    result = system.train(X_all.iloc[:split_idx], y_all.iloc[:split_idx],
-                          X_all.iloc[split_idx:], y_all.iloc[split_idx:], profile=profile)
+    if split_idx <= 0 or split_idx >= len(X_all):
+        _set_diag('invalid_train_val_split')
+        return None
+
+    y_train = y_all.iloc[:split_idx]
+    y_val = y_all.iloc[split_idx:]
+    if y_train.nunique() < 2 or y_val.nunique() < 2:
+        _set_diag('single_class_split')
+        return None
+
+    result = system.train(
+        X_all.iloc[:split_idx],
+        y_train,
+        X_all.iloc[split_idx:],
+        y_val,
+        profile=profile,
+        symbol=symbol,
+    )
     if not result:
         _set_diag('model_training_failed')
         return None
