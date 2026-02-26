@@ -1352,6 +1352,168 @@ def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days,
     top_level['holdout_slices'] = holdout_slices
     return top_level
 
+
+def _proxy_fidelity_thresholds(
+    sharpe_delta_max=0.35,
+    trade_count_delta_max=8,
+    return_delta_max=0.03,
+    max_drawdown_delta_max=0.04,
+):
+    return {
+        'sharpe_delta_max': float(max(0.0, sharpe_delta_max)),
+        'trade_count_delta_max': int(max(0, trade_count_delta_max)),
+        'return_delta_max': float(max(0.0, return_delta_max)),
+        'max_drawdown_delta_max': float(max(0.0, max_drawdown_delta_max)),
+    }
+
+
+def _degrade_confidence_tier(tier: str) -> str:
+    rank = ['REJECT', 'RESEARCH_ONLY', 'PAPER_READY', 'PROMOTION_READY']
+    if tier not in rank:
+        return tier
+    idx = rank.index(tier)
+    return rank[max(0, idx - 1)]
+
+
+def calibrate_proxy_fidelity(
+    *,
+    holdout_data,
+    coin_prefix,
+    coin_name,
+    study,
+    max_candidates=3,
+    min_trades=8,
+    pruned_only=True,
+    eval_days=90,
+    thresholds=None,
+):
+    target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
+    if not target_sym:
+        return {'enabled': False, 'reason': 'missing_target_symbol'}
+
+    thresholds = thresholds or _proxy_fidelity_thresholds()
+    candidates = _candidate_trials_for_holdout(
+        study,
+        max_candidates=max(1, int(max_candidates or 1)),
+        min_trades=max(0, int(min_trades or 0)),
+    )
+    if not candidates:
+        return {
+            'enabled': True,
+            'reason': 'no_candidates',
+            'n_candidates_requested': int(max_candidates),
+            'n_candidates_evaluated': 0,
+            'thresholds': thresholds,
+            'summary': {},
+            'samples': [],
+            'warning': False,
+        }
+
+    features = holdout_data[target_sym]['features']
+    ohlcv = holdout_data[target_sym]['ohlcv']
+    test_end = ohlcv.index.max()
+    test_start = test_end - pd.Timedelta(days=max(1, int(eval_days)))
+    train_end = test_start
+
+    samples = []
+    for cand in candidates:
+        profile = profile_from_params(cand.params, coin_name)
+        config = Config(
+            max_positions=1,
+            leverage=4,
+            min_signal_edge=0.00,
+            max_ensemble_std=0.10,
+            train_embargo_hours=24,
+            oos_eval_days=int(eval_days),
+            enforce_pruned_features=bool(pruned_only),
+        )
+        fast_metrics = fast_evaluate_fold(
+            features,
+            ohlcv,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            profile=profile,
+            config=config,
+            symbol=target_sym,
+            pruned_only=pruned_only,
+        )
+        if not fast_metrics:
+            continue
+        backtest_metrics = _run_holdout_window(
+            holdout_data,
+            target_sym,
+            profile,
+            coin_name,
+            eval_days=int(eval_days),
+            pruned_only=pruned_only,
+        )
+        if not backtest_metrics:
+            continue
+
+        deltas = {
+            'sharpe': float((_as_number(fast_metrics.get('sharpe'), 0.0) or 0.0) - (_as_number(backtest_metrics.get('holdout_sharpe'), 0.0) or 0.0)),
+            'trade_count': int(fast_metrics.get('n_trades', 0) or 0) - int(backtest_metrics.get('holdout_trades', 0) or 0),
+            'return': float((_as_number(fast_metrics.get('total_return'), 0.0) or 0.0) - (_as_number(backtest_metrics.get('holdout_return'), 0.0) or 0.0)),
+            'max_drawdown': float((_as_number(fast_metrics.get('max_drawdown'), 0.0) or 0.0) - (_as_number(backtest_metrics.get('full_dd'), 0.0) or 0.0)),
+        }
+        samples.append({
+            'trial': int(cand.number),
+            'fast_evaluate_fold': {
+                'sharpe': _finite_metric(fast_metrics.get('sharpe', 0.0), 0.0),
+                'trade_count': int(fast_metrics.get('n_trades', 0) or 0),
+                'return': _finite_metric(fast_metrics.get('total_return', 0.0), 0.0),
+                'max_drawdown': _finite_metric(fast_metrics.get('max_drawdown', 0.0), 0.0),
+            },
+            'run_backtest': {
+                'sharpe': _finite_metric(backtest_metrics.get('holdout_sharpe', 0.0), 0.0),
+                'trade_count': int(backtest_metrics.get('holdout_trades', 0) or 0),
+                'return': _finite_metric(backtest_metrics.get('holdout_return', 0.0), 0.0),
+                'max_drawdown': _finite_metric(backtest_metrics.get('full_dd', 0.0), 0.0),
+            },
+            'delta': deltas,
+            'abs_delta': {k: abs(v) for k, v in deltas.items()},
+        })
+
+    summary = {}
+    if samples:
+        metric_map = {
+            'sharpe': 'sharpe_delta_max',
+            'trade_count': 'trade_count_delta_max',
+            'return': 'return_delta_max',
+            'max_drawdown': 'max_drawdown_delta_max',
+        }
+        warning = False
+        for metric, threshold_key in metric_map.items():
+            vals = np.asarray([float(s['delta'][metric]) for s in samples], dtype=float)
+            abs_vals = np.abs(vals)
+            threshold = float(thresholds[threshold_key])
+            exceeded = int(np.sum(abs_vals > threshold))
+            summary[metric] = {
+                'mean_delta': round(float(np.mean(vals)), 6),
+                'median_delta': round(float(np.median(vals)), 6),
+                'mean_abs_delta': round(float(np.mean(abs_vals)), 6),
+                'max_abs_delta': round(float(np.max(abs_vals)), 6),
+                'threshold': threshold,
+                'exceeded_count': exceeded,
+                'exceeded_ratio': round(float(exceeded / len(samples)), 6),
+            }
+            if exceeded > 0:
+                warning = True
+    else:
+        warning = False
+
+    return {
+        'enabled': True,
+        'eval_days': int(eval_days),
+        'n_candidates_requested': int(max_candidates),
+        'n_candidates_evaluated': len(samples),
+        'thresholds': thresholds,
+        'summary': summary,
+        'samples': samples,
+        'warning': bool(warning),
+    }
+
 def assess_result_quality(rd):
     issues, warns = [], []
     m, h, dsr = rd.get('optim_metrics', {}), rd.get('holdout_metrics', {}), rd.get('deflated_sharpe', {})
@@ -1619,7 +1781,13 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   pruned_only=True, gate_mode="initial_paper_qualification",
                   seed_stability_min_pass_rate=0.67,
                   seed_stability_max_param_dispersion=0.60,
-                  seed_stability_max_oos_sharpe_dispersion=0.35):
+                  seed_stability_max_oos_sharpe_dispersion=0.35,
+                  proxy_fidelity_candidates=3,
+                  proxy_fidelity_eval_days=90,
+                  proxy_fidelity_sharpe_delta_max=0.35,
+                  proxy_fidelity_trade_count_delta_max=8,
+                  proxy_fidelity_return_delta_max=0.03,
+                  proxy_fidelity_max_drawdown_delta_max=0.04):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -1921,7 +2089,40 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         max_seed_oos_sharpe_dispersion=seed_stability_max_oos_sharpe_dispersion,
     )
     selection_meta = dict(selection_meta)
+    proxy_fidelity = calibrate_proxy_fidelity(
+        holdout_data=holdout_data,
+        coin_prefix=coin_prefix,
+        coin_name=coin_name,
+        study=study,
+        max_candidates=proxy_fidelity_candidates,
+        min_trades=min_total_trades or 6,
+        pruned_only=pruned_only,
+        eval_days=proxy_fidelity_eval_days,
+        thresholds=_proxy_fidelity_thresholds(
+            sharpe_delta_max=proxy_fidelity_sharpe_delta_max,
+            trade_count_delta_max=proxy_fidelity_trade_count_delta_max,
+            return_delta_max=proxy_fidelity_return_delta_max,
+            max_drawdown_delta_max=proxy_fidelity_max_drawdown_delta_max,
+        ),
+    )
+    proxy_fidelity_warning = bool(proxy_fidelity.get('warning', False))
+    selection_meta['proxy_fidelity_warning'] = proxy_fidelity_warning
+    selection_meta['proxy_fidelity'] = {
+        'n_candidates_evaluated': int(proxy_fidelity.get('n_candidates_evaluated', 0) or 0),
+        'eval_days': int(proxy_fidelity.get('eval_days', proxy_fidelity_eval_days) or proxy_fidelity_eval_days),
+    }
+
     selection_meta['research_confidence_tier'] = research_confidence_tier
+    if proxy_fidelity_warning:
+        prior_tier = research_confidence_tier
+        research_confidence_tier = _degrade_confidence_tier(research_confidence_tier)
+        selection_meta['research_confidence_tier'] = research_confidence_tier
+        selection_meta['proxy_fidelity_tier_adjustment'] = {
+            'applied': True,
+            'previous_tier': prior_tier,
+            'new_tier': research_confidence_tier,
+        }
+
     selection_meta['seed_stability'] = seed_stability
     selection_meta['seed_stability_thresholds'] = {
         'min_pass_rate': float(seed_stability_min_pass_rate),
@@ -1943,6 +2144,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         },
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
+        'proxy_fidelity': proxy_fidelity,
+        'proxy_fidelity_warning': proxy_fidelity_warning,
         'seed_stability': seed_stability,
         'research_confidence_tier': research_confidence_tier,
         'gate_mode': gate_mode,
@@ -2067,6 +2270,8 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
         max_seed_param_dispersion=max_seed_param_dispersion,
         max_seed_oos_sharpe_dispersion=max_seed_oos_sharpe_dispersion,
     )
+    if bool(best_seed_result.get('proxy_fidelity_warning', False)):
+        research_confidence_tier = _degrade_confidence_tier(research_confidence_tier)
     best_seed_result['seed_stability'] = seed_stability
     best_seed_result['research_confidence_tier'] = research_confidence_tier
     best_seed_result.setdefault('selection_meta', {})['research_confidence_tier'] = research_confidence_tier
@@ -2233,6 +2438,18 @@ if __name__ == "__main__":
                         help="Maximum normalized (IQR/|median|) per-parameter seed dispersion for PROMOTION_READY")
     parser.add_argument("--seed-stability-max-oos-sharpe-dispersion", type=float, default=0.35,
                         help="Maximum holdout Sharpe std across seeds for PROMOTION_READY")
+    parser.add_argument("--proxy-fidelity-candidates", type=int, default=3,
+                        help="How many accepted candidates to sample for fast-vs-backtest calibration")
+    parser.add_argument("--proxy-fidelity-eval-days", type=int, default=90,
+                        help="Calibration evaluation horizon (days) shared by fast proxy and run_backtest")
+    parser.add_argument("--proxy-fidelity-sharpe-delta-max", type=float, default=0.35,
+                        help="Warning threshold for |fast_sharpe - backtest_sharpe|")
+    parser.add_argument("--proxy-fidelity-trade-count-delta-max", type=int, default=8,
+                        help="Warning threshold for |fast_trades - backtest_trades|")
+    parser.add_argument("--proxy-fidelity-return-delta-max", type=float, default=0.03,
+                        help="Warning threshold for |fast_return - backtest_return|")
+    parser.add_argument("--proxy-fidelity-max-drawdown-delta-max", type=float, default=0.04,
+                        help="Warning threshold for |fast_max_drawdown - backtest_max_drawdown|")
     parser.add_argument("--pruned-only", action="store_true",
                         help="Require pruned feature artifacts during optimization and holdout")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only",
@@ -2290,6 +2507,12 @@ if __name__ == "__main__":
             seed_stability_min_pass_rate=args.seed_stability_min_pass_rate,
             seed_stability_max_param_dispersion=args.seed_stability_max_param_dispersion,
             seed_stability_max_oos_sharpe_dispersion=args.seed_stability_max_oos_sharpe_dispersion,
+            proxy_fidelity_candidates=args.proxy_fidelity_candidates,
+            proxy_fidelity_eval_days=args.proxy_fidelity_eval_days,
+            proxy_fidelity_sharpe_delta_max=args.proxy_fidelity_sharpe_delta_max,
+            proxy_fidelity_trade_count_delta_max=args.proxy_fidelity_trade_count_delta_max,
+            proxy_fidelity_return_delta_max=args.proxy_fidelity_return_delta_max,
+            proxy_fidelity_max_drawdown_delta_max=args.proxy_fidelity_max_drawdown_delta_max,
             pruned_only=args.pruned_only,
             preset_name=args.preset,
             gate_mode=args.gate_mode)
