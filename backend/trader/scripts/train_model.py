@@ -217,6 +217,29 @@ class Config:
     # Calibration
     calibration_strategy: str = 'platt'
 
+    # Policy controls for directional macro filters
+    trend_filter_mode: str = 'hard'
+    funding_filter_mode: str = 'hard'
+
+
+@dataclass
+class FilterPolicyEffect:
+    reject: bool = False
+    rank_penalty: float = 0.0
+    size_multiplier: float = 1.0
+
+
+def _resolve_filter_policy(mode: str, violated: bool, *, rank_penalty: float, size_multiplier: float) -> FilterPolicyEffect:
+    normalized = (mode or 'hard').lower()
+    if normalized not in {'hard', 'soft', 'off'}:
+        normalized = 'hard'
+
+    if not violated or normalized == 'off':
+        return FilterPolicyEffect()
+    if normalized == 'hard':
+        return FilterPolicyEffect(reject=True)
+    return FilterPolicyEffect(reject=False, rank_penalty=rank_penalty, size_multiplier=size_multiplier)
+
 
 def _fit_calibrator(
     strategy: str,
@@ -1433,24 +1456,39 @@ def run_backtest(all_data: Dict, config: Config,
                         _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
                         continue
 
+                    candidate_rank_penalty = 0.0
+                    candidate_size_multiplier = 1.0
+
                     # Trend filter: long only above SMA200, short only below
-                    if direction == 1 and price < sma_200:
+                    trend_violated = (direction == 1 and price < sma_200) or (direction == -1 and price > sma_200)
+                    trend_effect = _resolve_filter_policy(
+                        config.trend_filter_mode,
+                        trend_violated,
+                        rank_penalty=0.30,
+                        size_multiplier=0.70,
+                    )
+                    if trend_effect.reject:
                         _increment_gate_counter(gate_counters, sym, 'trend_filter')
                         continue
-                    if direction == -1 and price > sma_200:
-                        _increment_gate_counter(gate_counters, sym, 'trend_filter')
-                        continue
+                    candidate_rank_penalty += trend_effect.rank_penalty
+                    candidate_size_multiplier *= trend_effect.size_multiplier
 
                     # Funding carry filter
                     f_z = row.get('funding_rate_zscore', 0)
                     if pd.isna(f_z):
                         f_z = 0
-                    if direction == 1 and f_z > 2.5:
+                    funding_violated = (direction == 1 and f_z > 2.5) or (direction == -1 and f_z < -2.5)
+                    funding_effect = _resolve_filter_policy(
+                        config.funding_filter_mode,
+                        funding_violated,
+                        rank_penalty=0.25,
+                        size_multiplier=0.75,
+                    )
+                    if funding_effect.reject:
                         _increment_gate_counter(gate_counters, sym, 'funding_filter')
                         continue
-                    if direction == -1 and f_z < -2.5:
-                        _increment_gate_counter(gate_counters, sym, 'funding_filter')
-                        continue
+                    candidate_rank_penalty += funding_effect.rank_penalty
+                    candidate_size_multiplier *= funding_effect.size_multiplier
 
                     # Correlation filter
                     if not check_correlation(sym, direction, active_positions, all_data, ts, config):
@@ -1506,17 +1544,18 @@ def run_backtest(all_data: Dict, config: Config,
 
                     edge_score = (meta_prob - config.meta_probability_threshold) / max(0.01, prob_std + 0.01)
                     momentum_strength = abs(ret_72h)
-                    rank_score = edge_score + (0.2 * momentum_strength)
-                    candidates.append((rank_score, sym, profile, price, vol_24h, direction))
+                    rank_score = edge_score + (0.2 * momentum_strength) - candidate_rank_penalty
+                    candidates.append((rank_score, sym, profile, price, vol_24h, direction, candidate_size_multiplier))
 
                 slots = max(config.max_positions - len(active_positions), 0)
-                for _, sym, profile, price, vol_24h, direction in sorted(candidates, key=lambda x: x[0], reverse=True)[:slots]:
+                for _, sym, profile, price, vol_24h, direction, size_multiplier in sorted(candidates, key=lambda x: x[0], reverse=True)[:slots]:
                     vol = vol_24h if vol_24h > 0 else 0.02
 
                     n_contracts = calculate_n_contracts(
                         weekly_equity_base, price, sym, config,
                         vol_24h=vol_24h, profile=profile
                     )
+                    n_contracts = int(np.floor(n_contracts * size_multiplier))
                     if n_contracts < 1:
                         _increment_gate_counter(gate_counters, sym, 'no_contract_size')
                         no_contracts += 1
@@ -1947,27 +1986,38 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
                 print(f"\n[{sym}] ⏸️  Missing SMA200 [missing_sma200]")
             continue
 
-        if direction == 1 and price < sma_200:
-            _increment_gate_counter(gate_counters, sym, 'trend_filter')
-            if debug:
-                print(f"\n[{sym}] ⏸️  Long rejected: price < SMA200 [trend_filter]")
-            continue
-        if direction == -1 and price > sma_200:
-            _increment_gate_counter(gate_counters, sym, 'trend_filter')
-            if debug:
-                print(f"\n[{sym}] ⏸️  Short rejected: price > SMA200 [trend_filter]")
-            continue
+        candidate_rank_penalty = 0.0
+        candidate_size_multiplier = 1.0
 
-        if direction == 1 and f_z > 2.5:
+        trend_violated = (direction == 1 and price < sma_200) or (direction == -1 and price > sma_200)
+        trend_effect = _resolve_filter_policy(
+            config.trend_filter_mode,
+            trend_violated,
+            rank_penalty=0.30,
+            size_multiplier=0.70,
+        )
+        if trend_effect.reject:
+            _increment_gate_counter(gate_counters, sym, 'trend_filter')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Rejected by trend filter policy=hard [trend_filter]")
+            continue
+        candidate_rank_penalty += trend_effect.rank_penalty
+        candidate_size_multiplier *= trend_effect.size_multiplier
+
+        funding_violated = (direction == 1 and f_z > 2.5) or (direction == -1 and f_z < -2.5)
+        funding_effect = _resolve_filter_policy(
+            config.funding_filter_mode,
+            funding_violated,
+            rank_penalty=0.25,
+            size_multiplier=0.75,
+        )
+        if funding_effect.reject:
             _increment_gate_counter(gate_counters, sym, 'funding_filter')
             if debug:
-                print(f"\n[{sym}] ⏸️  Funding filter rejected long [funding_filter]")
+                print(f"\n[{sym}] ⏸️  Rejected by funding filter policy=hard [funding_filter]")
             continue
-        if direction == -1 and f_z < -2.5:
-            _increment_gate_counter(gate_counters, sym, 'funding_filter')
-            if debug:
-                print(f"\n[{sym}] ⏸️  Funding filter rejected short [funding_filter]")
-            continue
+        candidate_rank_penalty += funding_effect.rank_penalty
+        candidate_size_multiplier *= funding_effect.size_multiplier
 
         x_in = np.nan_to_num(
             np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
@@ -2014,6 +2064,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             print(f"  AUC: {auc:.3f}")
             print(f"  Gates: Primary={'✅' if ml_pass else '❌'} | Meta={'✅' if meta_pass else '❌'} | Regime={'✅' if regime_pass else '❌'} | Mom={'✅' if momentum_pass else '❌'}")
             print(f"  Funding z-score: {f_z:.2f}")
+            print(f"  Policy penalties: rank={candidate_rank_penalty:.2f} | size_mult={candidate_size_multiplier:.2f}")
             print(f"  24h Vol: {vol_24h:.4f}" if not pd.isna(vol_24h) else "  24h Vol: N/A")
 
         if not momentum_pass:
@@ -2043,6 +2094,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
                 vol_24h=vol_24h if not pd.isna(vol_24h) else 0.02,
                 profile=profile
             )
+            n_contracts = int(np.floor(n_contracts * candidate_size_multiplier))
             if n_contracts < 1:
                 _increment_gate_counter(gate_counters, sym, 'no_contract_size')
                 if debug:
@@ -2097,6 +2149,10 @@ if __name__ == "__main__":
     parser.add_argument("--meta-threshold", type=float, default=0.52, help="Secondary meta-model probability threshold")
     parser.add_argument("--calibration", choices=['isotonic', 'platt', 'beta'], default='platt',
                         help="Calibration strategy for primary+meta models")
+    parser.add_argument("--trend-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
+                        help="Trend filter policy: hard=reject, soft=penalize rank/size, off=ignore")
+    parser.add_argument("--funding-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
+                        help="Funding filter policy: hard=reject, soft=penalize rank/size, off=ignore")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
     parser.add_argument("--pruned-only", action="store_true",
@@ -2134,6 +2190,8 @@ if __name__ == "__main__":
         disagreement_confidence_cap=args.disagreement_confidence_cap,
         meta_probability_threshold=args.meta_threshold,
         calibration_strategy=args.calibration,
+        trend_filter_mode=args.trend_filter_mode,
+        funding_filter_mode=args.funding_filter_mode,
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
         recency_half_life_days=args.recency_half_life_days,
