@@ -22,7 +22,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -220,6 +220,42 @@ class Config:
     # Policy controls for directional macro filters
     trend_filter_mode: str = 'hard'
     funding_filter_mode: str = 'hard'
+
+    # Names of fields explicitly provided via CLI flags (not parser defaults).
+    cli_overrides: Set[str] = field(default_factory=set)
+
+
+def resolve_param(
+    field_name: str,
+    profile: Optional[CoinProfile],
+    config: Config,
+    default: float,
+    mode: str = 'direct',
+) -> float:
+    """Resolve an effective parameter value with deterministic precedence.
+
+    Precedence is always:
+      1) CLI-provided config override
+      2) per-coin profile value
+      3) global default (Config dataclass default)
+
+    `mode` exists so floor/ceiling behavior is explicit at call sites:
+      - direct: no clamp
+      - ceiling: min(resolved, default)
+      - floor: max(resolved, default)
+    """
+    if field_name in config.cli_overrides:
+        resolved = float(getattr(config, field_name))
+    elif profile is not None and hasattr(profile, field_name):
+        resolved = float(getattr(profile, field_name))
+    else:
+        resolved = float(default)
+
+    if mode == 'ceiling':
+        return min(resolved, float(default))
+    if mode == 'floor':
+        return max(resolved, float(default))
+    return resolved
 
 
 @dataclass
@@ -849,7 +885,13 @@ class MLSystem:
         except ValueError:
             return None
 
-        min_auc = min(profile.min_val_auc, self.config.min_val_auc) if profile else self.config.min_val_auc
+        min_auc = resolve_param(
+            'min_val_auc',
+            profile,
+            self.config,
+            Config.min_val_auc,
+            mode='direct',
+        )
         if auc < min_auc:
             return None
 
@@ -863,7 +905,13 @@ class MLSystem:
             cal_fit_y,
         )
 
-        effective_threshold = min(profile.signal_threshold, self.config.signal_threshold) if profile else self.config.signal_threshold
+        effective_threshold = resolve_param(
+            'signal_threshold',
+            profile,
+            self.config,
+            Config.signal_threshold,
+            mode='direct',
+        )
         primary_threshold = primary_recall_threshold(effective_threshold, self.config.min_signal_edge)
         primary_train_probs = _calibrator_predict(calibrator, base_model.predict_proba(X_train_scaled)[:, 1])
         primary_val_probs = _calibrator_predict(calibrator, val_probs)
@@ -1440,7 +1488,13 @@ def run_backtest(all_data: Dict, config: Config,
                     sma_50 = ohlcv_ts['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
 
                     # v7.3: Minimum momentum magnitude
-                    effective_momentum = min(profile.min_momentum_magnitude, config.min_momentum_magnitude)
+                    effective_momentum = resolve_param(
+                        'min_momentum_magnitude',
+                        profile,
+                        config,
+                        Config.min_momentum_magnitude,
+                        mode='direct',
+                    )
                     if abs(ret_72h) < effective_momentum:
                         _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
                         continue
@@ -1497,7 +1551,13 @@ def run_backtest(all_data: Dict, config: Config,
                     probs = []
                     meta_probs = []
                     directional_votes = []
-                    effective_threshold = min(profile.signal_threshold, config.signal_threshold)
+                    effective_threshold = resolve_param(
+                        'signal_threshold',
+                        profile,
+                        config,
+                        Config.signal_threshold,
+                        mode='direct',
+                    )
                     primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
                     for (model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta) in models[sym]:
                         x_in = np.nan_to_num(
@@ -2024,7 +2084,13 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
         )
         raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
         prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
-        effective_threshold = min(profile.signal_threshold, config.signal_threshold)
+        effective_threshold = resolve_param(
+            'signal_threshold',
+            profile,
+            config,
+            Config.signal_threshold,
+            mode='direct',
+        )
         primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
         ml_pass = prob >= primary_cutoff
         meta_prob = 0.0
@@ -2052,7 +2118,13 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             regime_reason = ''
 
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
-        effective_momentum = min(profile.min_momentum_magnitude, config.min_momentum_magnitude)
+        effective_momentum = resolve_param(
+            'min_momentum_magnitude',
+            profile,
+            config,
+            Config.min_momentum_magnitude,
+            mode='direct',
+        )
         momentum_pass = abs(ret_72h) >= effective_momentum
 
         if debug:
@@ -2127,15 +2199,17 @@ if __name__ == "__main__":
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--signals", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--threshold", type=float, default=0.68,
-                        help="Default signal threshold (overridden by per-coin profiles)")
-    parser.add_argument("--min-auc", type=float, default=0.51)
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="CLI override for signal threshold. Precedence: CLI override > profile value > global default.")
+    parser.add_argument("--min-auc", type=float, default=None,
+                        help="CLI override for minimum validation AUC gate. Precedence: CLI override > profile value > global default.")
     parser.add_argument("--min-train-samples", type=int, default=400,
                         help="Minimum training samples per split (lower for smoke tests)")
     parser.add_argument("--leverage", type=int, default=4)
     parser.add_argument("--tp", type=float, default=5.5, help="Default TP vol multiplier")
     parser.add_argument("--sl", type=float, default=3.0, help="Default SL vol multiplier")
-    parser.add_argument("--momentum", type=float, default=0.04, help="Default min 72h momentum magnitude")
+    parser.add_argument("--momentum", type=float, default=None,
+                        help="CLI override for min 72h momentum magnitude. Precedence: CLI override > profile value > global default.")
     parser.add_argument("--momentum-score-threshold", type=float, default=2.0,
                         help="Momentum consensus score threshold (2.0 strict, 1.0 relaxed)")
     parser.add_argument("--strict-momentum-consensus", action="store_true",
@@ -2167,6 +2241,23 @@ if __name__ == "__main__":
                         help="Directory for gate-counter JSON artifacts")
     args = parser.parse_args()
 
+    cli_overrides = {
+        field_name
+        for field_name, cli_value in (
+            ('signal_threshold', args.threshold),
+            ('min_val_auc', args.min_auc),
+            ('min_momentum_magnitude', args.momentum),
+        )
+        if cli_value is not None
+    }
+
+    if args.threshold is None:
+        args.threshold = Config.signal_threshold
+    if args.min_auc is None:
+        args.min_auc = Config.min_val_auc
+    if args.momentum is None:
+        args.momentum = Config.min_momentum_magnitude
+
     if args.smoke_test:
         args.min_auc = min(args.min_auc, 0.50)
         args.min_train_samples = min(args.min_train_samples, 200)
@@ -2195,6 +2286,7 @@ if __name__ == "__main__":
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
         recency_half_life_days=args.recency_half_life_days,
+        cli_overrides=cli_overrides,
     )
     data = load_data()
 
