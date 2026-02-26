@@ -23,7 +23,8 @@ FEATURES_DIR = Path("./data/features")
 
 @dataclass
 class PruneConfig:
-    top_n: int = 18
+    # Keep a broader feature slate to reduce regime-specific underfitting.
+    top_n: int = 30
     val_fraction: float = 0.20
     n_splits: int = 4
     seed: int = 42
@@ -214,7 +215,7 @@ def run_pruning(config: PruneConfig, features_dir: Path = FEATURES_DIR) -> Dict[
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prune features per coin via validation SHAP")
-    parser.add_argument("--top-n", type=int, default=18, help="Number of features to keep per coin")
+    parser.add_argument("--top-n", type=int, default=30, help="Number of features to keep per coin")
     parser.add_argument("--val-fraction", type=float, default=0.20)
     parser.add_argument("--n-splits", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
