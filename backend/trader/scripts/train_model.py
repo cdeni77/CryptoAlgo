@@ -12,11 +12,13 @@ Coinbase CDE fee model: 0.10% per side, $0.20 minimum per contract.
 Funding: Normalized hourly funding data (Coinbase native preferred, CCXT fallback).
 """
 import argparse
+import json
 import hashlib
 import joblib
 import os
 import sqlite3
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1020,8 +1022,104 @@ def _get_profile(symbol: str, profile_overrides: Optional[Dict[str, CoinProfile]
     return get_coin_profile(symbol)
 
 
+GATE_REASON_CODES = [
+    'missing_sma200',
+    'vol_regime_low',
+    'vol_regime_high',
+    'momentum_magnitude',
+    'momentum_dir_agreement',
+    'trend_filter',
+    'funding_filter',
+    'primary_threshold',
+    'meta_threshold',
+    'ensemble_agreement',
+    'ensemble_std',
+    'cooldown',
+    'no_contract_size',
+]
+
+
+def _new_gate_counters() -> Dict[str, Dict[str, int]]:
+    return defaultdict(lambda: {'total_checks': 0, 'gate_counts': {reason: 0 for reason in GATE_REASON_CODES}})
+
+
+def _increment_gate_counter(counters: Dict[str, Dict[str, int]], symbol: str, reason_code: str):
+    symbol_counts = counters[symbol]
+    symbol_counts['total_checks'] += 1
+    symbol_counts['gate_counts'][reason_code] = symbol_counts['gate_counts'].get(reason_code, 0) + 1
+
+
+def _summarize_gate_counters(counters: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, object]]:
+    summary: Dict[str, Dict[str, object]] = {}
+    for symbol, symbol_counts in counters.items():
+        total_checks = int(symbol_counts['total_checks'])
+        gate_counts = {k: int(v) for k, v in symbol_counts['gate_counts'].items()}
+        percentages = {
+            reason: (count / total_checks) if total_checks > 0 else 0.0
+            for reason, count in gate_counts.items()
+        }
+        summary[symbol] = {
+            'total_candidate_checks': total_checks,
+            'gate_counts': gate_counts,
+            'percentages': percentages,
+        }
+    return summary
+
+
+def _print_gate_counter_summary(counters: Dict[str, Dict[str, int]], title: str, top_n: int = 5):
+    summary = _summarize_gate_counters(counters)
+    if not summary:
+        return
+    print(f"\n{title}")
+    for symbol in sorted(summary):
+        symbol_summary = summary[symbol]
+        total_checks = symbol_summary['total_candidate_checks']
+        if total_checks <= 0:
+            continue
+        ranked = sorted(
+            symbol_summary['gate_counts'].items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        top_ranked = [item for item in ranked if item[1] > 0][:top_n]
+        if not top_ranked:
+            continue
+        top_text = ', '.join(
+            f"{reason}={count} ({symbol_summary['percentages'][reason]:.1%})"
+            for reason, count in top_ranked
+        )
+        print(f"  {symbol}: checks={total_checks} | {top_text}")
+
+
+def _write_gate_counter_artifact(
+    counters: Dict[str, Dict[str, int]],
+    *,
+    run_type: str,
+    artifact_dir: Optional[Path],
+):
+    if artifact_dir is None:
+        return
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    run_ts = datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+    payload = {
+        'run_type': run_type,
+        'run_timestamp': run_ts,
+        'symbols': [
+            {
+                'symbol': symbol,
+                **summary,
+            }
+            for symbol, summary in sorted(_summarize_gate_counters(counters).items())
+        ],
+    }
+    out_path = artifact_dir / f"gate_counters_{run_type}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+    out_path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    print(f"🧾 Gate counter artifact written: {out_path}")
+
+
 def run_backtest(all_data: Dict, config: Config,
-                 profile_overrides: Optional[Dict[str, CoinProfile]] = None):
+                 profile_overrides: Optional[Dict[str, CoinProfile]] = None,
+                 gate_artifact_dir: Optional[Path] = None):
     system = MLSystem(config)
     validate_all_symbol_configs(all_data, config, profile_overrides=profile_overrides)
 
@@ -1050,6 +1148,7 @@ def run_backtest(all_data: Dict, config: Config,
     models_accepted = 0
     regime_filtered = 0
     no_contracts = 0
+    gate_counters = _new_gate_counters()
     stage_metric_history: List[Dict[str, float]] = []
 
     weekly_equity_base = equity
@@ -1247,6 +1346,7 @@ def run_backtest(all_data: Dict, config: Config,
                     # Cooldown — use per-coin profile
                     if sym in last_exit_time and \
                        (ts - last_exit_time[sym]).total_seconds() < profile.cooldown_hours * 3600:
+                        _increment_gate_counter(gate_counters, sym, 'cooldown')
                         continue
 
                     # Symbol exclusion (CLI override)
@@ -1260,13 +1360,20 @@ def run_backtest(all_data: Dict, config: Config,
                     price = ohlcv_row['close']
                     sma_200 = ohlcv_row['sma_200']
                     if pd.isna(sma_200):
+                        _increment_gate_counter(gate_counters, sym, 'missing_sma200')
                         continue
 
                     # Regime filter — per-coin thresholds
                     vol_24h = all_data[sym]['ohlcv']['close'].pct_change().rolling(24).std().get(ts, None)
                     if vol_24h is None or pd.isna(vol_24h):
+                        _increment_gate_counter(gate_counters, sym, 'vol_regime_low')
                         continue
-                    if vol_24h < profile.min_vol_24h or vol_24h > profile.max_vol_24h:
+                    if vol_24h < profile.min_vol_24h:
+                        _increment_gate_counter(gate_counters, sym, 'vol_regime_low')
+                        regime_filtered += 1
+                        continue
+                    if vol_24h > profile.max_vol_24h:
+                        _increment_gate_counter(gate_counters, sym, 'vol_regime_high')
                         regime_filtered += 1
                         continue
 
@@ -1275,6 +1382,7 @@ def run_backtest(all_data: Dict, config: Config,
 
                     # v7 guard: need at least 72 bars of history
                     if ts_loc < 72:
+                        _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
                         continue
 
                     ohlcv_ts = all_data[sym]['ohlcv']
@@ -1285,10 +1393,12 @@ def run_backtest(all_data: Dict, config: Config,
                     # v7.3: Minimum momentum magnitude
                     effective_momentum = min(profile.min_momentum_magnitude, config.min_momentum_magnitude)
                     if abs(ret_72h) < effective_momentum:
+                        _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
                         continue
 
                     # v7.3: Require 24h and 72h returns to agree on direction
                     if ret_24h * ret_72h < 0:
+                        _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
                         continue
 
                     momentum_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
@@ -1298,12 +1408,15 @@ def run_backtest(all_data: Dict, config: Config,
                     elif momentum_score <= -2:
                         direction = -1
                     else:
+                        _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
                         continue
 
                     # Trend filter: long only above SMA200, short only below
                     if direction == 1 and price < sma_200:
+                        _increment_gate_counter(gate_counters, sym, 'trend_filter')
                         continue
                     if direction == -1 and price > sma_200:
+                        _increment_gate_counter(gate_counters, sym, 'trend_filter')
                         continue
 
                     # Funding carry filter
@@ -1311,8 +1424,10 @@ def run_backtest(all_data: Dict, config: Config,
                     if pd.isna(f_z):
                         f_z = 0
                     if direction == 1 and f_z > 2.5:
+                        _increment_gate_counter(gate_counters, sym, 'funding_filter')
                         continue
                     if direction == -1 and f_z < -2.5:
+                        _increment_gate_counter(gate_counters, sym, 'funding_filter')
                         continue
 
                     # Correlation filter
@@ -1345,6 +1460,7 @@ def run_backtest(all_data: Dict, config: Config,
                         continue
                     agreement = float(np.mean(directional_votes)) if directional_votes else 0.0
                     if agreement < config.min_directional_agreement:
+                        _increment_gate_counter(gate_counters, sym, 'ensemble_agreement')
                         continue
 
                     prob = float(np.mean(probs))
@@ -1352,12 +1468,18 @@ def run_backtest(all_data: Dict, config: Config,
                     if agreement < 0.999:
                         prob = min(prob, config.disagreement_confidence_cap)
                     if prob < primary_cutoff or prob_std > config.max_ensemble_std:
+                        if prob < primary_cutoff:
+                            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
+                        else:
+                            _increment_gate_counter(gate_counters, sym, 'ensemble_std')
                         continue
 
                     if not meta_probs:
+                        _increment_gate_counter(gate_counters, sym, 'meta_threshold')
                         continue
                     meta_prob = float(np.mean(meta_probs))
                     if meta_prob < config.meta_probability_threshold:
+                        _increment_gate_counter(gate_counters, sym, 'meta_threshold')
                         continue
 
                     edge_score = (meta_prob - config.meta_probability_threshold) / max(0.01, prob_std + 0.01)
@@ -1374,6 +1496,7 @@ def run_backtest(all_data: Dict, config: Config,
                         vol_24h=vol_24h, profile=profile
                     )
                     if n_contracts < 1:
+                        _increment_gate_counter(gate_counters, sym, 'no_contract_size')
                         no_contracts += 1
                         continue
 
@@ -1408,6 +1531,16 @@ def run_backtest(all_data: Dict, config: Config,
         print(f"   Models accepted: {models_accepted}, rejected: {models_rejected}")
         print(f"   Regime filtered: {regime_filtered}")
         print(f"   No contracts (too small): {no_contracts}")
+        _print_gate_counter_summary(
+            gate_counters,
+            title="📉 Candidate Gate Failure Reasons (Backtest)",
+            top_n=6,
+        )
+        _write_gate_counter_artifact(
+            gate_counters,
+            run_type='backtest',
+            artifact_dir=gate_artifact_dir,
+        )
         return {'n_trades': 0, 'sharpe_annual': -99, 'total_return': -1, 'max_drawdown': 1.0,
                 'profit_factor': 0, 'ann_return': -1, 'final_equity': equity, 'trade_pnls': []}
 
@@ -1500,6 +1633,17 @@ def run_backtest(all_data: Dict, config: Config,
               f"PnL: ${sym_pnl:+,.0f} | Avg: {sym_avg:.4%} | Fee: {sym_fee:.4%} | "
               f"[{p.name}/momentum]")
     print(f"{'=' * 70}")
+
+    _print_gate_counter_summary(
+        gate_counters,
+        title="📉 Candidate Gate Failure Reasons (Backtest)",
+        top_n=6,
+    )
+    _write_gate_counter_artifact(
+        gate_counters,
+        run_type='backtest',
+        artifact_dir=gate_artifact_dir,
+    )
 
     # ── Save final models from last walk-forward window ──
     print(f"\n💾 Saving final models...")
@@ -1669,10 +1813,11 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
 
 
 # LIVE SIGNALS — v8
-def run_signals(all_data: Dict, config: Config, debug: bool = False):
+def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifact_dir: Optional[Path] = None):
     system = MLSystem(config)
     validate_all_symbol_configs(all_data, config)
     print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
+    gate_counters = _new_gate_counters()
 
     for sym, d in all_data.items():
         profile = get_coin_profile(sym)
@@ -1684,8 +1829,9 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         cols = system.get_feature_columns(feat.columns, coin_feature_list)
         print(f"[{sym}] Features selected: {len(cols)} (pruned_only={config.enforce_pruned_features})")
         if not cols:
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
             if debug:
-                print(f"\n[{sym}] ❌ Not enough features (need ≥4, got {len(cols)})")
+                print(f"\n[{sym}] ❌ Not enough features (need ≥4, got {len(cols)}) [primary_threshold]")
             continue
 
         train_end = feat.index[-1]
@@ -1700,8 +1846,9 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
 
         if len(X_all) < config.min_train_samples:
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
             if debug:
-                print(f"\n[{sym}] ❌ Insufficient samples ({len(X_all)} < {config.min_train_samples})")
+                print(f"\n[{sym}] ❌ Insufficient samples ({len(X_all)} < {config.min_train_samples}) [primary_threshold]")
             continue
 
         split_idx = int(len(X_all) * (1 - config.val_fraction))
@@ -1710,8 +1857,9 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
 
         result = system.train(X_tr, y_tr, X_vl, y_vl, profile=profile, symbol=sym)
         if not result:
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
             if debug:
-                print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC < {profile.min_val_auc})")
+                print(f"\n[{sym}] ❌ MODEL REJECTED (low AUC < {profile.min_val_auc}) [primary_threshold]")
             continue
 
         model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
@@ -1763,22 +1911,37 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
         elif momentum_score <= -2:
             direction = -1
         else:
+            _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
             if debug:
-                print(f"\n[{sym}] ⏸️  No momentum consensus (score={momentum_score})")
+                print(f"\n[{sym}] ⏸️  No momentum consensus (score={momentum_score}) [momentum_dir_agreement]")
             continue
 
-        if direction == 1 and price < sma_200 and not pd.isna(sma_200):
+        if pd.isna(sma_200):
+            _increment_gate_counter(gate_counters, sym, 'missing_sma200')
             if debug:
-                print(f"\n[{sym}] ⏸️  Long rejected: price < SMA200")
+                print(f"\n[{sym}] ⏸️  Missing SMA200 [missing_sma200]")
             continue
-        if direction == -1 and price > sma_200 and not pd.isna(sma_200):
+
+        if direction == 1 and price < sma_200:
+            _increment_gate_counter(gate_counters, sym, 'trend_filter')
             if debug:
-                print(f"\n[{sym}] ⏸️  Short rejected: price > SMA200")
+                print(f"\n[{sym}] ⏸️  Long rejected: price < SMA200 [trend_filter]")
+            continue
+        if direction == -1 and price > sma_200:
+            _increment_gate_counter(gate_counters, sym, 'trend_filter')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Short rejected: price > SMA200 [trend_filter]")
             continue
 
         if direction == 1 and f_z > 2.5:
+            _increment_gate_counter(gate_counters, sym, 'funding_filter')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Funding filter rejected long [funding_filter]")
             continue
         if direction == -1 and f_z < -2.5:
+            _increment_gate_counter(gate_counters, sym, 'funding_filter')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Funding filter rejected short [funding_filter]")
             continue
 
         x_in = np.nan_to_num(
@@ -1800,7 +1963,18 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
             meta_pass = meta_prob >= config.meta_probability_threshold
 
         vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
-        regime_pass = profile.min_vol_24h <= vol_24h <= profile.max_vol_24h if not pd.isna(vol_24h) else False
+        if pd.isna(vol_24h):
+            regime_pass = False
+            regime_reason = 'vol_regime_low'
+        elif vol_24h < profile.min_vol_24h:
+            regime_pass = False
+            regime_reason = 'vol_regime_low'
+        elif vol_24h > profile.max_vol_24h:
+            regime_pass = False
+            regime_reason = 'vol_regime_high'
+        else:
+            regime_pass = True
+            regime_reason = ''
 
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
         effective_momentum = min(profile.min_momentum_magnitude, config.min_momentum_magnitude)
@@ -1817,18 +1991,56 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False):
             print(f"  Funding z-score: {f_z:.2f}")
             print(f"  24h Vol: {vol_24h:.4f}" if not pd.isna(vol_24h) else "  24h Vol: N/A")
 
+        if not momentum_pass:
+            _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
+            if debug:
+                print(f"  Skip reason: momentum_magnitude (|72h|={abs(ret_72h):.4f} < {effective_momentum:.4f})")
+            continue
+        if not regime_pass:
+            _increment_gate_counter(gate_counters, sym, regime_reason)
+            if debug:
+                print(f"  Skip reason: {regime_reason}")
+            continue
+        if not ml_pass:
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
+            if debug:
+                print("  Skip reason: primary_threshold")
+            continue
+        if not meta_pass:
+            _increment_gate_counter(gate_counters, sym, 'meta_threshold')
+            if debug:
+                print("  Skip reason: meta_threshold")
+            continue
+
         if ml_pass and meta_pass and regime_pass and momentum_pass:
             n_contracts = calculate_n_contracts(
                 100_000, price, sym, config,
                 vol_24h=vol_24h if not pd.isna(vol_24h) else 0.02,
                 profile=profile
             )
+            if n_contracts < 1:
+                _increment_gate_counter(gate_counters, sym, 'no_contract_size')
+                if debug:
+                    print(f"  Skip reason: no_contract_size")
+                continue
             spec = get_contract_spec(sym)
             dir_str = 'LONG' if direction == 1 else 'SHORT'
             notional = n_contracts * spec['units'] * price
             print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
                   f"{n_contracts} contracts | ${notional:,.0f} notional | "
                   f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")
+
+    if debug:
+        _print_gate_counter_summary(
+            gate_counters,
+            title="📉 Candidate Gate Failure Reasons (Signals Debug)",
+            top_n=6,
+        )
+    _write_gate_counter_artifact(
+        gate_counters,
+        run_type='signals',
+        artifact_dir=gate_artifact_dir,
+    )
 
 
 if __name__ == "__main__":
@@ -1864,6 +2076,10 @@ if __name__ == "__main__":
                         help="Half-life in days for exponential recency sample weighting")
     parser.add_argument("--smoke-test", action="store_true",
                         help="Relax model gates for quick sanity checks (min_auc=0.50, min_train_samples=200)")
+    parser.add_argument("--gate-report-json", action="store_true",
+                        help="Write gate-counter JSON artifact to --gate-report-dir")
+    parser.add_argument("--gate-report-dir", type=str, default="data/logs",
+                        help="Directory for gate-counter JSON artifacts")
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -1893,9 +2109,11 @@ if __name__ == "__main__":
     )
     data = load_data()
 
+    gate_artifact_dir = Path(args.gate_report_dir) if args.gate_report_json else None
+
     if args.backtest:
-        run_backtest(data, config)
+        run_backtest(data, config, gate_artifact_dir=gate_artifact_dir)
     elif args.signals or args.debug:
-        run_signals(data, config, debug=args.debug)
+        run_signals(data, config, debug=args.debug, gate_artifact_dir=gate_artifact_dir)
     else:
         parser.print_help()
