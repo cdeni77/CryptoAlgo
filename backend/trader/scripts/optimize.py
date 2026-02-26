@@ -1372,6 +1372,125 @@ def assess_result_quality(rd):
     else: rating = 'POOR'
     return {'rating': rating, 'issues': issues, 'warnings': warns}
 
+
+def _compute_seed_stability(
+    run_results: List[dict],
+    *,
+    holdout_min_trades: int,
+    holdout_min_sharpe: float,
+    holdout_min_return: float,
+) -> dict:
+    seeds_total = len(run_results)
+    if seeds_total <= 0:
+        return {
+            'seeds_total': 0,
+            'seeds_passed_holdout': 0,
+            'pass_rate': 0.0,
+            'parameter_dispersion': {},
+            'oos_sharpe_dispersion': {'std': 0.0, 'iqr': 0.0, 'median': 0.0},
+        }
+
+    passed = []
+    for r in run_results:
+        if _passes_holdout_gate(
+            r.get('holdout_metrics', {}),
+            min_trades=holdout_min_trades,
+            min_sharpe=holdout_min_sharpe,
+            min_return=holdout_min_return,
+        ):
+            passed.append(r)
+
+    params_by_key: Dict[str, List[float]] = {}
+    for result in run_results:
+        params = result.get('tunable_params') or result.get('params') or {}
+        if not isinstance(params, dict):
+            continue
+        for key, value in params.items():
+            if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                params_by_key.setdefault(str(key), []).append(float(value))
+
+    parameter_dispersion = {}
+    for key, values in params_by_key.items():
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            continue
+        q1 = float(np.percentile(arr, 25))
+        q3 = float(np.percentile(arr, 75))
+        iqr = float(q3 - q1)
+        std = float(np.std(arr))
+        median = float(np.median(arr))
+        mean = float(np.mean(arr))
+        norm_base = max(abs(median), 1e-9)
+        parameter_dispersion[key] = {
+            'count': int(arr.size),
+            'iqr': iqr,
+            'std': std,
+            'median': median,
+            'mean': mean,
+            'iqr_over_median_abs': float(iqr / norm_base),
+            'std_over_median_abs': float(std / norm_base),
+        }
+
+    oos_vals = []
+    for result in run_results:
+        holdout_metrics = result.get('holdout_metrics', {}) if isinstance(result, dict) else {}
+        oos = _as_number(holdout_metrics.get('holdout_sharpe'), None)
+        if oos is None:
+            oos = _as_number(result.get('optim_metrics', {}).get('mean_oos_sharpe'), None)
+        if oos is not None and np.isfinite(oos):
+            oos_vals.append(float(oos))
+    if oos_vals:
+        oos_arr = np.asarray(oos_vals, dtype=float)
+        oos_dispersion = {
+            'count': int(oos_arr.size),
+            'std': float(np.std(oos_arr)),
+            'iqr': float(np.percentile(oos_arr, 75) - np.percentile(oos_arr, 25)),
+            'median': float(np.median(oos_arr)),
+            'mean': float(np.mean(oos_arr)),
+        }
+    else:
+        oos_dispersion = {'count': 0, 'std': 0.0, 'iqr': 0.0, 'median': 0.0, 'mean': 0.0}
+
+    return {
+        'seeds_total': int(seeds_total),
+        'seeds_passed_holdout': int(len(passed)),
+        'pass_rate': float(len(passed) / max(1, seeds_total)),
+        'parameter_dispersion': parameter_dispersion,
+        'oos_sharpe_dispersion': oos_dispersion,
+    }
+
+
+def _derive_confidence_tier(
+    *,
+    holdout_passed: bool,
+    seed_stability: Optional[dict],
+    min_seed_pass_rate: float,
+    max_seed_param_dispersion: float,
+    max_seed_oos_sharpe_dispersion: float,
+) -> str:
+    if not holdout_passed:
+        return 'SCREENED'
+    if not seed_stability or int(seed_stability.get('seeds_total', 0) or 0) < 2:
+        return 'PAPER_QUALIFIED'
+
+    pass_rate = float(seed_stability.get('pass_rate', 0.0) or 0.0)
+    oos_std = float(seed_stability.get('oos_sharpe_dispersion', {}).get('std', 0.0) or 0.0)
+    pdisp = seed_stability.get('parameter_dispersion', {}) if isinstance(seed_stability, dict) else {}
+    max_param_disp = 0.0
+    if isinstance(pdisp, dict):
+        for row in pdisp.values():
+            if not isinstance(row, dict):
+                continue
+            max_param_disp = max(max_param_disp, float(row.get('iqr_over_median_abs', 0.0) or 0.0))
+
+    if (
+        pass_rate >= float(min_seed_pass_rate)
+        and max_param_disp <= float(max_seed_param_dispersion)
+        and oos_std <= float(max_seed_oos_sharpe_dispersion)
+    ):
+        return 'PROMOTION_READY'
+    return 'PAPER_QUALIFIED'
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PATHS / PERSISTENCE / MAIN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1497,7 +1616,10 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
                   min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.30, min_psr=0.55,
                   min_raw_expectancy=1e-6, min_stressed_expectancy=1e-6,
-                  pruned_only=True, gate_mode="initial_paper_qualification"):
+                  pruned_only=True, gate_mode="initial_paper_qualification",
+                  seed_stability_min_pass_rate=0.67,
+                  seed_stability_max_param_dispersion=0.60,
+                  seed_stability_max_oos_sharpe_dispersion=0.35):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -1772,6 +1894,40 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     effective_best_params = build_effective_params(best.params, coin_name)
     tunable_best_params = dict(best.params)
     tunable_best_params['cooldown_hours'] = tunable_best_params.get('cooldown_hours', effective_best_params['cooldown_hours'])
+    holdout_passed = _passes_holdout_gate(
+        holdout_result or {},
+        min_trades=effective_holdout_min_trades,
+        min_sharpe=holdout_min_sharpe,
+        min_return=holdout_min_return,
+    ) if holdout_result else False
+    seed_stability = {
+        'seeds_total': 1,
+        'seeds_passed_holdout': 1 if holdout_passed else 0,
+        'pass_rate': 1.0 if holdout_passed else 0.0,
+        'parameter_dispersion': {},
+        'oos_sharpe_dispersion': {
+            'count': 1 if holdout_result else 0,
+            'std': 0.0,
+            'iqr': 0.0,
+            'median': _finite_metric((holdout_result or {}).get('holdout_sharpe', 0.0), 0.0),
+            'mean': _finite_metric((holdout_result or {}).get('holdout_sharpe', 0.0), 0.0),
+        },
+    }
+    research_confidence_tier = _derive_confidence_tier(
+        holdout_passed=bool(holdout_passed),
+        seed_stability=seed_stability,
+        min_seed_pass_rate=seed_stability_min_pass_rate,
+        max_seed_param_dispersion=seed_stability_max_param_dispersion,
+        max_seed_oos_sharpe_dispersion=seed_stability_max_oos_sharpe_dispersion,
+    )
+    selection_meta = dict(selection_meta)
+    selection_meta['research_confidence_tier'] = research_confidence_tier
+    selection_meta['seed_stability'] = seed_stability
+    selection_meta['seed_stability_thresholds'] = {
+        'min_pass_rate': float(seed_stability_min_pass_rate),
+        'max_param_dispersion': float(seed_stability_max_param_dispersion),
+        'max_oos_sharpe_dispersion': float(seed_stability_max_oos_sharpe_dispersion),
+    }
     result_data = {'coin': coin_name, 'prefix': coin_prefix, 'optim_score': best.value,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
         'params': effective_best_params,
@@ -1787,6 +1943,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         },
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
+        'seed_stability': seed_stability,
+        'research_confidence_tier': research_confidence_tier,
         'gate_mode': gate_mode,
         'gate_profile': {
             'mode': gate_mode,
@@ -1819,6 +1977,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         }}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
+    print(
+        "  🧭 Research tier: "
+        f"{research_confidence_tier} "
+        f"(seed pass {seed_stability.get('seeds_passed_holdout', 0)}/{seed_stability.get('seeds_total', 0)})"
+    )
     p = _persist_result_json(coin_name, result_data)
     if p: print(f"  💾 {p}")
 
@@ -1847,14 +2010,28 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
     if not run_results:
         return None
 
+    holdout_min_trades = int(kwargs.get('holdout_min_trades', 15) or 15)
+    holdout_min_sharpe = float(kwargs.get('holdout_min_sharpe', 0.0) or 0.0)
+    holdout_min_return = float(kwargs.get('holdout_min_return', 0.0) or 0.0)
+    min_seed_pass_rate = float(kwargs.get('seed_stability_min_pass_rate', 0.67) or 0.67)
+    max_seed_param_dispersion = float(kwargs.get('seed_stability_max_param_dispersion', 0.60) or 0.60)
+    max_seed_oos_sharpe_dispersion = float(kwargs.get('seed_stability_max_oos_sharpe_dispersion', 0.35) or 0.35)
+
+    seed_stability = _compute_seed_stability(
+        run_results,
+        holdout_min_trades=holdout_min_trades,
+        holdout_min_sharpe=holdout_min_sharpe,
+        holdout_min_return=holdout_min_return,
+    )
+
     qualified = [
         r for r in run_results
         if not r.get('deployment_blocked', False)
         and _passes_holdout_gate(
             r.get('holdout_metrics', {}),
-            min_trades=kwargs.get('holdout_min_trades', 15),
-            min_sharpe=kwargs.get('holdout_min_sharpe', 0.0),
-            min_return=kwargs.get('holdout_min_return', 0.0),
+            min_trades=holdout_min_trades,
+            min_sharpe=holdout_min_sharpe,
+            min_return=holdout_min_return,
         )
     ]
     pool = qualified or run_results
@@ -1877,6 +2054,36 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
                 consensus_params[k] = max(set(vals), key=vals.count)
 
     best_seed_result = max(pool, key=lambda r: _finite_metric(r.get('optim_score', -99), -99))
+    holdout_passed = _passes_holdout_gate(
+        best_seed_result.get('holdout_metrics', {}),
+        min_trades=holdout_min_trades,
+        min_sharpe=holdout_min_sharpe,
+        min_return=holdout_min_return,
+    )
+    research_confidence_tier = _derive_confidence_tier(
+        holdout_passed=bool(holdout_passed),
+        seed_stability=seed_stability,
+        min_seed_pass_rate=min_seed_pass_rate,
+        max_seed_param_dispersion=max_seed_param_dispersion,
+        max_seed_oos_sharpe_dispersion=max_seed_oos_sharpe_dispersion,
+    )
+    best_seed_result['seed_stability'] = seed_stability
+    best_seed_result['research_confidence_tier'] = research_confidence_tier
+    best_seed_result.setdefault('selection_meta', {})['research_confidence_tier'] = research_confidence_tier
+    best_seed_result['selection_meta']['seed_stability_thresholds'] = {
+        'min_pass_rate': float(min_seed_pass_rate),
+        'max_param_dispersion': float(max_seed_param_dispersion),
+        'max_oos_sharpe_dispersion': float(max_seed_oos_sharpe_dispersion),
+    }
+    best_seed_result['selection_meta']['seed_stability'] = seed_stability
+    print(
+        "  🌱 Seed stability: "
+        f"pass_rate={seed_stability.get('pass_rate', 0.0):.0%} "
+        f"({seed_stability.get('seeds_passed_holdout', 0)}/{seed_stability.get('seeds_total', 0)}) | "
+        f"oos_std={seed_stability.get('oos_sharpe_dispersion', {}).get('std', 0.0):.3f} | "
+        f"tier={research_confidence_tier}"
+    )
+
     if consensus_params:
         best_seed_result['params'] = consensus_params
         best_seed_result.setdefault('meta', {})['seed_consensus'] = {
@@ -1884,10 +2091,10 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
             'qualified_runs': len(qualified),
             'total_runs': len(run_results),
         }
-        best_seed_result['quality'] = assess_result_quality(best_seed_result)
-        p = _persist_result_json(coin_name, best_seed_result)
-        if p:
-            print(f"  💾 Consensus result saved to {p}")
+    best_seed_result['quality'] = assess_result_quality(best_seed_result)
+    p = _persist_result_json(coin_name, best_seed_result)
+    if p:
+        print(f"  💾 Consensus result saved to {p}")
 
     return best_seed_result
 
@@ -1925,10 +2132,10 @@ def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010},
-        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -1957,6 +2164,9 @@ def apply_runtime_preset(args):
             'min_psr': '--min-psr',
             'min_raw_expectancy': '--min-raw-expectancy',
             'min_stressed_expectancy': '--min-stressed-expectancy',
+            'seed_stability_min_pass_rate': '--seed-stability-min-pass-rate',
+            'seed_stability_max_param_dispersion': '--seed-stability-max-param-dispersion',
+            'seed_stability_max_oos_sharpe_dispersion': '--seed-stability-max-oos-sharpe-dispersion',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -2017,6 +2227,12 @@ if __name__ == "__main__":
                         help="Minimum pre-fee expectancy gate")
     parser.add_argument("--min-stressed-expectancy", type=float, default=1e-6,
                         help="Minimum stressed-fee expectancy gate")
+    parser.add_argument("--seed-stability-min-pass-rate", type=float, default=0.67,
+                        help="Minimum holdout pass-rate across sampler seeds for PROMOTION_READY")
+    parser.add_argument("--seed-stability-max-param-dispersion", type=float, default=0.60,
+                        help="Maximum normalized (IQR/|median|) per-parameter seed dispersion for PROMOTION_READY")
+    parser.add_argument("--seed-stability-max-oos-sharpe-dispersion", type=float, default=0.35,
+                        help="Maximum holdout Sharpe std across seeds for PROMOTION_READY")
     parser.add_argument("--pruned-only", action="store_true",
                         help="Require pruned feature artifacts during optimization and holdout")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only",
@@ -2071,6 +2287,9 @@ if __name__ == "__main__":
             min_psr=args.min_psr,
             min_raw_expectancy=args.min_raw_expectancy,
             min_stressed_expectancy=args.min_stressed_expectancy,
+            seed_stability_min_pass_rate=args.seed_stability_min_pass_rate,
+            seed_stability_max_param_dispersion=args.seed_stability_max_param_dispersion,
+            seed_stability_max_oos_sharpe_dispersion=args.seed_stability_max_oos_sharpe_dispersion,
             pruned_only=args.pruned_only,
             preset_name=args.preset,
             gate_mode=args.gate_mode)
