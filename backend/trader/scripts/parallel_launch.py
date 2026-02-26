@@ -73,6 +73,9 @@ PRESET_CONFIGS = {
         "seed_stability_min_pass_rate": 0.75,
         "seed_stability_max_param_dispersion": 0.50,
         "seed_stability_max_oos_sharpe_dispersion": 0.30,
+        "min_psr_cv": None,
+        "min_psr_holdout": None,
+        "min_dsr": None,
     },
     "robust180": {
         "plateau_patience": 120,
@@ -93,6 +96,9 @@ PRESET_CONFIGS = {
         "seed_stability_min_pass_rate": 0.67,
         "seed_stability_max_param_dispersion": 0.60,
         "seed_stability_max_oos_sharpe_dispersion": 0.35,
+        "min_psr_cv": None,
+        "min_psr_holdout": None,
+        "min_dsr": None,
     },
     "robust120": {
         "plateau_patience": 90,
@@ -113,6 +119,9 @@ PRESET_CONFIGS = {
         "seed_stability_min_pass_rate": 0.60,
         "seed_stability_max_param_dispersion": 0.70,
         "seed_stability_max_oos_sharpe_dispersion": 0.40,
+        "min_psr_cv": None,
+        "min_psr_holdout": None,
+        "min_dsr": None,
     },
     "quick": {
         "plateau_patience": 45,
@@ -134,6 +143,9 @@ PRESET_CONFIGS = {
         "min_fold_sharpe_hard": -0.5,
         "min_fold_win_rate": 0.30,
         "min_psr": 0.05,
+        "min_psr_cv": 0.05,
+        "min_psr_holdout": None,
+        "min_dsr": None,
         "min_raw_expectancy": -0.0010,
         "min_stressed_expectancy": -0.0010,
         "seed_stability_min_pass_rate": 0.50,
@@ -161,6 +173,9 @@ PRESET_CONFIGS = {
         "seed_stability_min_pass_rate": 0.80,
         "seed_stability_max_param_dispersion": 0.45,
         "seed_stability_max_oos_sharpe_dispersion": 0.25,
+        "min_psr_cv": None,
+        "min_psr_holdout": None,
+        "min_dsr": None,
     },
 }
 
@@ -193,6 +208,9 @@ def apply_runtime_preset(args):
         "min_fold_sharpe_hard": "--min-fold-sharpe-hard",
         "min_fold_win_rate": "--min-fold-win-rate",
         "min_psr": "--min-psr",
+        "min_psr_cv": "--min-psr-cv",
+        "min_psr_holdout": "--min-psr-holdout",
+        "min_dsr": "--min-dsr",
         "min_raw_expectancy": "--min-raw-expectancy",
         "min_stressed_expectancy": "--min-stressed-expectancy",
         "seed_stability_min_pass_rate": "--seed-stability-min-pass-rate",
@@ -575,6 +593,10 @@ def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id
                 "holdout_slices": opt_results.get(coin, {}).get("holdout_metrics", {}).get("holdout_slices", {}),
                 "seed_stability": opt_results.get(coin, {}).get("seed_stability", {}),
                 "research_confidence_tier": opt_results.get(coin, {}).get("research_confidence_tier", "SCREENED"),
+                "psr_cv": opt_results.get(coin, {}).get("psr_cv", {}),
+                "psr_holdout": opt_results.get(coin, {}).get("psr_holdout", {}),
+                "deflated_sharpe": opt_results.get(coin, {}).get("deflated_sharpe", {}),
+                "significance_gates": opt_results.get(coin, {}).get("significance_gates", {}),
             }
         )
 
@@ -684,6 +706,12 @@ if __name__ == "__main__":
                         help="Hard reject when sufficiently-active folds fall below this win-rate")
     parser.add_argument("--min-psr", type=float, default=0.55,
                         help="Minimum probabilistic Sharpe ratio gate")
+    parser.add_argument("--min-psr-cv", type=float, default=None,
+                        help="Optional CV PSR gate override (defaults to --min-psr)")
+    parser.add_argument("--min-psr-holdout", type=float, default=None,
+                        help="Optional holdout PSR gate")
+    parser.add_argument("--min-dsr", type=float, default=None,
+                        help="Optional holdout DSR gate")
     parser.add_argument("--min-raw-expectancy", type=float, default=1e-6,
                         help="Minimum pre-fee expectancy gate")
     parser.add_argument("--min-stressed-expectancy", type=float, default=1e-6,
@@ -815,11 +843,11 @@ if __name__ == "__main__":
         print(f"   Params:       6 tunable (current optimize.py search space)")
         print(f"   Scoring:      Mean OOS Sharpe across CV folds + holdout-guided candidate selection")
         print(f"   Min trades:   total>={args.min_total_trades or 'auto'}, oos>={args.min_internal_oos_trades or 'auto'}")
-        print(f"   CV gates:     fold_sr>={args.min_fold_sharpe_hard}, fold_wr>={args.min_fold_win_rate}, psr>={args.min_psr}")
+        print(f"   CV gates:     fold_sr>={args.min_fold_sharpe_hard}, fold_wr>={args.min_fold_win_rate}, psr_cv>={args.min_psr_cv if args.min_psr_cv is not None else args.min_psr}")
         print(f"   Expectancy:   raw>={args.min_raw_expectancy}, stressed>={args.min_stressed_expectancy}")
         print(f"   Holdout cands:{args.holdout_candidates}")
         print(f"   Gate mode:    {args.gate_mode}")
-        print(f"   Holdout gate: trades>={args.holdout_min_trades}, SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}")
+        print(f"   Holdout gate: trades>={args.holdout_min_trades}, SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}, PSR>={args.min_psr_holdout}, DSR>={args.min_dsr}")
         print(f"   Escalation:   {gate_mode.get('escalation_policy')}")
         print(f"   Enforce gate: {'YES' if args.require_holdout_pass else 'NO'}")
         print(
@@ -883,6 +911,12 @@ if __name__ == "__main__":
                 cmd.extend(["--min-total-trades", str(args.min_total_trades)])
             if args.sampler_seeds:
                 cmd.extend(["--sampler-seeds", args.sampler_seeds])
+            if args.min_psr_cv is not None:
+                cmd.extend(["--min-psr-cv", str(args.min_psr_cv)])
+            if args.min_psr_holdout is not None:
+                cmd.extend(["--min-psr-holdout", str(args.min_psr_holdout)])
+            if args.min_dsr is not None:
+                cmd.extend(["--min-dsr", str(args.min_dsr)])
             if args.debug_trials:
                 cmd.append("--debug-trials")
             if args.disable_fee_stress:

@@ -43,6 +43,11 @@ from core.coin_profiles import (
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
     SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
 )
+from core.metrics_significance import (
+    compute_deflated_sharpe as compute_deflated_sharpe_metric,
+    compute_psr_from_samples,
+    evaluate_significance_gates,
+)
 
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.ERROR)
@@ -186,39 +191,19 @@ def _reject_score(observed: float | None = None, threshold: float | None = None,
     return base - penalty
 
 def compute_deflated_sharpe(observed_sharpe, n_trades, n_trials=200, skewness=0.0, kurtosis=3.0):
-    from scipy import stats
-    if n_trades < 10 or n_trials < 2:
-        return {'dsr': 0.0, 'p_value': 1.0, 'expected_max_sr': 0.0, 'significant_10pct': False, 'valid': True}
-    em = 0.5772156649
-    max_z = ((1 - em) * stats.norm.ppf(1 - 1.0/n_trials) + em * stats.norm.ppf(1 - 1.0/(n_trials * np.e)))
-    exp_max_sr = max_z * np.sqrt(1.0 / n_trades)
-    sr_std = np.sqrt((1 + 0.5*observed_sharpe**2 - skewness*observed_sharpe + ((kurtosis-3)/4.0)*observed_sharpe**2) / max(n_trades,1))
-    if sr_std <= 0: sr_std = 0.001
-    dsr_z = (observed_sharpe - exp_max_sr) / sr_std
-    p = 1 - stats.norm.cdf(dsr_z)
-    return {'dsr': round(float(dsr_z),4), 'p_value': round(float(p),4), 'expected_max_sr': round(float(exp_max_sr),4), 'significant_10pct': p < 0.10, 'valid': True}
+    """Backward-compatible wrapper around canonical DSR helper."""
+    return compute_deflated_sharpe_metric(
+        observed_sharpe=observed_sharpe,
+        observations=n_trades,
+        effective_test_count=n_trials,
+        skewness=skewness,
+        kurtosis=kurtosis,
+    )
 
 
 def compute_probabilistic_sharpe(sharpes: List[float], benchmark_sr: float = 0.0) -> dict:
-    """Estimate P(true Sharpe > benchmark) from walk-forward fold sharpes.
-
-    The test is intentionally conservative: it treats each fold Sharpe as one
-    independent out-of-sample estimate and computes a one-sided z-score for the
-    mean Sharpe exceeding `benchmark_sr`.
-    """
-    valid = [float(s) for s in sharpes if s is not None and np.isfinite(s)]
-    if len(valid) < 2:
-        return {'valid': False, 'psr': 0.0, 'z_score': 0.0, 'n_folds': len(valid)}
-
-    mean_sr = float(np.mean(valid))
-    std_sr = float(np.std(valid, ddof=1))
-    if std_sr <= 1e-12:
-        psr = 1.0 if mean_sr > benchmark_sr else 0.0
-        return {'valid': True, 'psr': psr, 'z_score': 999.0 if psr == 1.0 else -999.0, 'n_folds': len(valid)}
-
-    z = (mean_sr - benchmark_sr) / (std_sr / math.sqrt(len(valid)))
-    psr = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-    return {'valid': True, 'psr': float(psr), 'z_score': float(z), 'n_folds': len(valid)}
+    """Backward-compatible wrapper around canonical PSR helper."""
+    return compute_psr_from_samples(sharpes, benchmark_sharpe=benchmark_sr)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA SPLITTING
@@ -671,6 +656,7 @@ def objective(
     min_fold_sharpe_hard=-0.1,
     min_fold_win_rate=0.30,
     min_psr=0.55,
+    min_psr_cv=None,
     min_raw_expectancy=1e-6,
     min_stressed_expectancy=1e-6,
 ):
@@ -799,7 +785,12 @@ def objective(
 
     sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
     stressed_sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in stressed_fold_results]
-    psr = compute_probabilistic_sharpe(sharpes, benchmark_sr=0.0)
+    cv_psr_threshold = float(min_psr_cv) if min_psr_cv is not None else float(min_psr)
+    psr = compute_psr_from_samples(
+        sharpes,
+        benchmark_sharpe=0.0,
+        effective_observations=len(sharpes),
+    )
     mean_sr, min_sr = np.mean(sharpes), np.min(sharpes)
     mean_stressed_sr = np.mean(stressed_sharpes) if stressed_sharpes else mean_sr
     mean_blended_sr = np.mean(blended_fold_sharpes) if blended_fold_sharpes else mean_sr
@@ -941,14 +932,18 @@ def objective(
             stressed_fold_results=stressed_fold_results,
             psr=psr,
         )
-    if psr.get('valid') and psr.get('psr', 0.0) < float(min_psr):
+    significance_gates = evaluate_significance_gates(
+        psr_cv=psr,
+        min_psr_cv=cv_psr_threshold,
+    )
+    if not significance_gates['psr_cv']['passed']:
         return _reject_trial(
             trial,
             code='LOW_PSR',
-            reason=f'low_psr:{psr.get("psr", 0.0):.3f}<{float(min_psr):.3f}',
+            reason=f'low_psr:{psr.get("psr", 0.0):.3f}<{cv_psr_threshold:.3f}',
             stage='psr',
             observed=psr.get('psr', 0.0),
-            threshold=float(min_psr),
+            threshold=cv_psr_threshold,
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
             psr=psr,
@@ -1003,6 +998,15 @@ def objective(
     trial.set_user_attr('oos_trades', total_trades)
     trial.set_user_attr('psr', round(float(psr.get('psr', 0.0)), 4))
     trial.set_user_attr('psr_z', round(float(psr.get('z_score', 0.0)), 4))
+    trial.set_user_attr('psr_meta', {
+        'observations': int(psr.get('observations', 0) or 0),
+        'benchmark_sharpe': float(psr.get('benchmark_sharpe', 0.0) or 0.0),
+        'sharpe_estimate': float(psr.get('sharpe_estimate', 0.0) or 0.0),
+        'skewness': float(psr.get('skewness', 0.0) or 0.0),
+        'kurtosis': float(psr.get('kurtosis', 3.0) or 3.0),
+        'fallback_moments_used': bool(psr.get('fallback_moments_used', False)),
+        'sample_count': int(psr.get('sample_count', 0) or 0),
+    })
     trial.set_user_attr('fee_edge_ratio', round(float(mean_fee_edge), 4))
     trial.set_user_attr('stressed_sharpe', round(float(mean_stressed_sr), 4))
     trial.set_user_attr('stressed_fee_edge_ratio', round(float(stressed_fee_edge_ratio), 4))
@@ -1037,6 +1041,7 @@ def objective(
         'min_fold_win_rate': float(min_fold_win_rate),
         'min_fold_win_rate_trades': int(min_fold_win_rate_trades),
         'min_psr': float(min_psr),
+        'min_psr_cv': float(cv_psr_threshold),
         'min_raw_expectancy': float(min_raw_expectancy),
         'min_stressed_expectancy': float(min_stressed_expectancy),
     })
@@ -1218,13 +1223,47 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
     return score + 0.10 * (_as_number(cv_score, 0.0) or 0.0)
 
 
-def _passes_holdout_gate(holdout_metrics, min_trades=15, min_sharpe=0.0, min_return=0.0):
+def _passes_holdout_gate(
+    holdout_metrics,
+    min_trades=15,
+    min_sharpe=0.0,
+    min_return=0.0,
+    min_psr_holdout=None,
+    min_dsr=None,
+):
     if not holdout_metrics:
         return False
     ho_trades = int(holdout_metrics.get('holdout_trades', 0) or 0)
     ho_sr = _as_number(holdout_metrics.get('holdout_sharpe'), 0.0) or 0.0
     ho_ret = _as_number(holdout_metrics.get('holdout_return'), 0.0) or 0.0
-    return ho_trades >= int(min_trades) and ho_sr >= float(min_sharpe) and ho_ret >= float(min_return)
+
+    psr_holdout = holdout_metrics.get('psr_holdout') if isinstance(holdout_metrics, dict) else None
+    dsr_holdout = holdout_metrics.get('dsr_holdout') if isinstance(holdout_metrics, dict) else None
+    significance = evaluate_significance_gates(
+        psr_holdout=psr_holdout if isinstance(psr_holdout, dict) else None,
+        dsr=dsr_holdout if isinstance(dsr_holdout, dict) else None,
+        min_psr_holdout=min_psr_holdout,
+        min_dsr=min_dsr,
+    )
+
+    base_gate = ho_trades >= int(min_trades) and ho_sr >= float(min_sharpe) and ho_ret >= float(min_return)
+    return bool(base_gate and significance.get('all_passed', True))
+
+def _compute_holdout_significance(holdout_metrics, *, completed_trials: int):
+    if not holdout_metrics:
+        return holdout_metrics
+    hm = dict(holdout_metrics)
+    ho_sr = _as_number(hm.get('holdout_sharpe'), 0.0) or 0.0
+    ho_trades = int(hm.get('holdout_trades', 0) or 0)
+    psr_holdout = compute_psr_from_samples([ho_sr], benchmark_sharpe=0.0, effective_observations=max(ho_trades, 1))
+    dsr_holdout = compute_deflated_sharpe_metric(
+        observed_sharpe=ho_sr,
+        observations=max(ho_trades, 1),
+        effective_test_count=max(1, int(completed_trials or 1)),
+    )
+    hm['psr_holdout'] = psr_holdout
+    hm['dsr_holdout'] = dsr_holdout
+    return hm
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HOLDOUT (full run_backtest — called ONCE at the end)
@@ -1513,6 +1552,8 @@ def _compute_seed_stability(
     holdout_min_trades: int,
     holdout_min_sharpe: float,
     holdout_min_return: float,
+    min_psr_holdout: float | None = None,
+    min_dsr: float | None = None,
 ) -> dict:
     seeds_total = len(run_results)
     if seeds_total <= 0:
@@ -1531,6 +1572,8 @@ def _compute_seed_stability(
             min_trades=holdout_min_trades,
             min_sharpe=holdout_min_sharpe,
             min_return=holdout_min_return,
+            min_psr_holdout=min_psr_holdout,
+            min_dsr=min_dsr,
         ):
             passed.append(r)
 
@@ -1749,6 +1792,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   preset_name="none", enable_fee_stress=True,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
                   min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.30, min_psr=0.55,
+                  min_psr_cv=None, min_psr_holdout=None, min_dsr=None,
                   min_raw_expectancy=1e-6, min_stressed_expectancy=1e-6,
                   pruned_only=True, gate_mode="initial_paper_qualification",
                   seed_stability_min_pass_rate=0.67,
@@ -1873,6 +1917,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             min_fold_sharpe_hard=min_fold_sharpe_hard,
                             min_fold_win_rate=min_fold_win_rate,
                             min_psr=min_psr,
+                            min_psr_cv=min_psr_cv,
                             min_raw_expectancy=min_raw_expectancy,
                             min_stressed_expectancy=min_stressed_expectancy,
                             pruned_only=pruned_only)
@@ -1941,6 +1986,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         for cand in candidate_trials:
             holdout_metrics = evaluate_holdout(holdout_data, cand.params, coin_name, coin_prefix, holdout_days,
                                                pruned_only=pruned_only, holdout_mode=holdout_mode)
+            holdout_metrics = _compute_holdout_significance(holdout_metrics, completed_trials=nc)
             if not holdout_metrics:
                 continue
             sel_score = _holdout_selection_score(holdout_metrics, cv_score=cand.value)
@@ -1971,6 +2017,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                     min_trades=effective_holdout_min_trades,
                     min_sharpe=holdout_min_sharpe,
                     min_return=holdout_min_return,
+                    min_psr_holdout=min_psr_holdout,
+                    min_dsr=min_dsr,
                 )
             ]
             selected_pool = passing_candidates if require_holdout_pass else ranked_candidates
@@ -1978,7 +2026,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             if require_holdout_pass and not passing_candidates:
                 deployment_blocked = True
                 blocked_reasons.append(
-                    f"holdout_gate_failed:trades>={effective_holdout_min_trades},sr>={holdout_min_sharpe},ret>={holdout_min_return}"
+                    f"holdout_gate_failed:trades>={effective_holdout_min_trades},sr>={holdout_min_sharpe},ret>={holdout_min_return},psr>={min_psr_holdout},dsr>={min_dsr}"
                 )
                 print("  🛑 Holdout gate failed for all candidates. Blocking deployment for this coin.")
                 selected_trial, holdout_result, selected_score = ranked_candidates[0]
@@ -2001,6 +2049,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                     'effective_min_trades': int(effective_holdout_min_trades),
                     'min_sharpe': float(holdout_min_sharpe),
                     'min_return': float(holdout_min_return),
+                    'min_psr_holdout': None if min_psr_holdout is None else float(min_psr_holdout),
+                    'min_dsr': None if min_dsr is None else float(min_dsr),
                 },
                 'deployment_blocked': bool(deployment_blocked),
                 'candidates': [
@@ -2016,6 +2066,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             min_trades=effective_holdout_min_trades,
                             min_sharpe=holdout_min_sharpe,
                             min_return=holdout_min_return,
+                            min_psr_holdout=min_psr_holdout,
+                            min_dsr=min_dsr,
                         ),
                     }
                     for c, m, sc in ranked_candidates
@@ -2057,7 +2109,22 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         min_trades=effective_holdout_min_trades,
         min_sharpe=holdout_min_sharpe,
         min_return=holdout_min_return,
+        min_psr_holdout=min_psr_holdout,
+        min_dsr=min_dsr,
     ) if holdout_result else False
+    cv_psr_metric = {
+        'valid': bool(best.user_attrs.get('psr_meta')),
+        'psr': _as_number(best.user_attrs.get('psr'), 0.0) or 0.0,
+    }
+    holdout_psr_metric = (holdout_result or {}).get('psr_holdout') if isinstance(holdout_result, dict) else None
+    significance_gates = evaluate_significance_gates(
+        psr_cv=cv_psr_metric,
+        psr_holdout=holdout_psr_metric if isinstance(holdout_psr_metric, dict) else None,
+        dsr=dsr,
+        min_psr_cv=min_psr_cv if min_psr_cv is not None else min_psr,
+        min_psr_holdout=min_psr_holdout,
+        min_dsr=min_dsr,
+    )
     seed_stability = {
         'seeds_total': 1,
         'seeds_passed_holdout': 1 if holdout_passed else 0,
@@ -2133,7 +2200,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'embargo_bars': None if embargo_bars is None else int(embargo_bars),
             'embargo_frac': float(embargo_frac or 0.0),
         },
-        'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
+        'deflated_sharpe': dsr, 'psr_cv': cv_psr_metric, 'psr_holdout': holdout_psr_metric or {},
+        'significance_gates': significance_gates, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'fee_stress': {
             'enabled': bool(enable_fee_stress),
             'multiplier': float(fee_stress_multiplier),
@@ -2153,6 +2221,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'holdout_min_trades': int(holdout_min_trades),
             'holdout_min_sharpe': float(holdout_min_sharpe),
             'holdout_min_return': float(holdout_min_return),
+            'min_psr_cv': float(min_psr_cv) if min_psr_cv is not None else float(min_psr),
+            'min_psr_holdout': None if min_psr_holdout is None else float(min_psr_holdout),
+            'min_dsr': None if min_dsr is None else float(min_dsr),
             'escalation_policy': {
                 'window_days': '14-28',
                 'action': 'Tighten thresholds and switch to production_promotion after stable paper evidence.',
@@ -2214,6 +2285,8 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
     holdout_min_trades = int(kwargs.get('holdout_min_trades', 15) or 15)
     holdout_min_sharpe = float(kwargs.get('holdout_min_sharpe', 0.0) or 0.0)
     holdout_min_return = float(kwargs.get('holdout_min_return', 0.0) or 0.0)
+    min_psr_holdout = kwargs.get('min_psr_holdout', None)
+    min_dsr = kwargs.get('min_dsr', None)
     min_seed_pass_rate = float(kwargs.get('seed_stability_min_pass_rate', 0.67) or 0.67)
     max_seed_param_dispersion = float(kwargs.get('seed_stability_max_param_dispersion', 0.60) or 0.60)
     max_seed_oos_sharpe_dispersion = float(kwargs.get('seed_stability_max_oos_sharpe_dispersion', 0.35) or 0.35)
@@ -2223,6 +2296,8 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
         holdout_min_trades=holdout_min_trades,
         holdout_min_sharpe=holdout_min_sharpe,
         holdout_min_return=holdout_min_return,
+        min_psr_holdout=min_psr_holdout,
+        min_dsr=min_dsr,
     )
 
     qualified = [
@@ -2233,6 +2308,8 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
             min_trades=holdout_min_trades,
             min_sharpe=holdout_min_sharpe,
             min_return=holdout_min_return,
+            min_psr_holdout=min_psr_holdout,
+            min_dsr=min_dsr,
         )
     ]
     pool = qualified or run_results
@@ -2335,10 +2412,10 @@ def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35},
-        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
-        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -2371,6 +2448,9 @@ def apply_runtime_preset(args):
             'min_fold_sharpe_hard': '--min-fold-sharpe-hard',
             'min_fold_win_rate': '--min-fold-win-rate',
             'min_psr': '--min-psr',
+            'min_psr_cv': '--min-psr-cv',
+            'min_psr_holdout': '--min-psr-holdout',
+            'min_dsr': '--min-dsr',
             'min_raw_expectancy': '--min-raw-expectancy',
             'min_stressed_expectancy': '--min-stressed-expectancy',
             'seed_stability_min_pass_rate': '--seed-stability-min-pass-rate',
@@ -2444,6 +2524,12 @@ if __name__ == "__main__":
                         help="Hard reject when sufficiently-active folds fall below this win-rate")
     parser.add_argument("--min-psr", type=float, default=0.55,
                         help="Minimum probabilistic Sharpe ratio gate")
+    parser.add_argument("--min-psr-cv", type=float, default=None,
+                        help="Optional CV PSR gate override (defaults to --min-psr)")
+    parser.add_argument("--min-psr-holdout", type=float, default=None,
+                        help="Optional holdout PSR gate (disabled when unset)")
+    parser.add_argument("--min-dsr", type=float, default=None,
+                        help="Optional holdout DSR gate (disabled when unset)")
     parser.add_argument("--min-raw-expectancy", type=float, default=1e-6,
                         help="Minimum pre-fee expectancy gate")
     parser.add_argument("--min-stressed-expectancy", type=float, default=1e-6,
@@ -2484,7 +2570,8 @@ if __name__ == "__main__":
         args.holdout_min_return = float(gate_mode["holdout_min_return"])
     print(
         f"🛡️ Gate mode: {args.gate_mode} | trades>={args.holdout_min_trades}, "
-        f"SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}"
+        f"SR>={args.holdout_min_sharpe}, Ret>={args.holdout_min_return}, "
+        f"PSR_HO>={args.min_psr_holdout}, DSR>={args.min_dsr}"
     )
     print("   Escalation policy: tighten thresholds after 14-28 days of stable paper evidence.")
     if args.debug_trials:
@@ -2519,6 +2606,9 @@ if __name__ == "__main__":
             min_fold_sharpe_hard=args.min_fold_sharpe_hard,
             min_fold_win_rate=args.min_fold_win_rate,
             min_psr=args.min_psr,
+            min_psr_cv=args.min_psr_cv,
+            min_psr_holdout=args.min_psr_holdout,
+            min_dsr=args.min_dsr,
             min_raw_expectancy=args.min_raw_expectancy,
             min_stressed_expectancy=args.min_stressed_expectancy,
             seed_stability_min_pass_rate=args.seed_stability_min_pass_rate,
