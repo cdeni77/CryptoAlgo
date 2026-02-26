@@ -1,0 +1,49 @@
+{
+  "version": "coinbase_us_perps_retail_v202602",
+  "exchange": "coinbase",
+  "market": "us_perps",
+  "fees": {
+    "maker_bps": 0.0,
+    "taker_bps": 0.0,
+    "min_fee_per_contract": 0.0,
+    "use_taker": true
+  },
+  "retail_execution_fee": {
+    "enabled": true,
+    "mode": "bps",
+    "taker_fee_bps": 10.0,
+    "maker_fee_bps": 10.0,
+    "use_taker": true
+  },
+  "exchange_fee": {
+    "enabled": false,
+    "mode": "per_contract_usd",
+    "per_contract_usd": 0.0
+  },
+  "slippage": {
+    "enabled": true,
+    "bps_per_side": 2.0
+  },
+  "impact": {
+    "enabled": false,
+    "bps_per_contract": 0.0,
+    "max_bps_per_side": 10.0
+  },
+  "funding": {
+    "enabled": true,
+    "funding_interval_hours": 1,
+    "method": "coinbase_us_perps_hourly"
+  },
+  "execution_fee_mode": "bps",
+  "exchange_fee_mode": "per_contract_usd",
+  "assumption_profile": "retail",
+  "observed_ui_fee_bps": 10.0,
+  "observed_ui_fee_source": "manual_app_ticket_observation",
+  "contract_sizes": {
+    "BIP": 0.0001,
+    "ETP": 0.001,
+    "SLP": 1.0,
+    "XPP": 1.0,
+    "DOP": 1.0
+  }
+}
