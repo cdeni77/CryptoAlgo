@@ -468,7 +468,20 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     # METRICS
     n = len(completed_trades)
     if n == 0:
-        return None
+        test_days = max((test_end - test_start).days, 1)
+        return {
+            'n_trades': 0,
+            'sharpe': 0.0,
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'max_drawdown': 0.0,
+            'ann_return': 0.0,
+            'total_return': 0.0,
+            'trades_per_year': 0.0,
+            'avg_pnl': 0.0,
+            'avg_raw_pnl': 0.0,
+            'fee_edge_ratio': 0.0,
+        }
     if n < 3:
         pnls = [t['net_pnl'] for t in completed_trades]
         raw_pnls = [t['raw_pnl'] for t in completed_trades]
@@ -712,14 +725,15 @@ def objective(
             skip_reason = fold_diag.get('skip_reason', 'unknown_fold_skip')
             fold_skip_reasons[skip_reason] = int(fold_skip_reasons.get(skip_reason, 0)) + 1
 
-    if len(fold_results) < max(1, len(cv_splits) // 2):
+    min_required_folds = max(1, len(cv_splits) // 3)
+    if len(fold_results) < min_required_folds:
         return _reject_trial(
             trial,
             code='TOO_FEW_FOLDS',
             reason=f'too_few_folds:{len(fold_results)}/{len(cv_splits)}',
             stage='fold_eval',
             observed=len(fold_results),
-            threshold=max(1, len(cv_splits) // 2),
+            threshold=min_required_folds,
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
             extra_attrs={'fold_skip_reasons': fold_skip_reasons},
