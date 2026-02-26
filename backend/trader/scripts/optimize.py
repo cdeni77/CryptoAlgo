@@ -56,6 +56,7 @@ from core.overfit_diagnostics import (
     compute_pbo_from_matrix,
     make_stress_costs_block,
 )
+from core.study_significance import compose_study_significance_diagnostic
 
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.ERROR)
@@ -1941,6 +1942,10 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   embargo_bars=None, embargo_frac=0.0,
                   cost_config_path=None,
                   enable_pbo_diagnostic=False,
+                  enable_study_significance=False,
+                  study_significance_bootstrap_iterations=500,
+                  study_significance_seed=42,
+                  study_significance_score_source='fold_sharpe',
                   enable_cost_stress_diagnostics=False,
                   cost_stress_finalists=2,
                   cost_stress_fee_multiplier=1.5,
@@ -2366,6 +2371,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         score_matrix = build_score_matrix_from_trials(completed_trials_for_diag, score_key='sharpe')
         pbo_diagnostic = compute_pbo_from_matrix(score_matrix, score_used='fold_metrics.sharpe')
 
+    study_significance = compose_study_significance_diagnostic(
+        enabled=bool(enable_study_significance),
+        trials=completed_trials_for_diag,
+        bootstrap_iterations=int(study_significance_bootstrap_iterations),
+        random_seed=int(study_significance_seed),
+        score_source=str(study_significance_score_source),
+    )
+
     stress_costs = None
     if enable_cost_stress_diagnostics and holdout_data and holdout_sym:
         finalists = _candidate_trials_for_holdout(
@@ -2472,6 +2485,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'proxy_fidelity': proxy_fidelity,
         'proxy_fidelity_warning': proxy_fidelity_warning,
         'robustness_diagnostics': robustness_diagnostics,
+        'study_significance': study_significance,
         'seed_stability': seed_stability,
         'research_confidence_tier': research_confidence_tier,
         'gate_mode': gate_mode,
@@ -2507,6 +2521,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'reject_reason_counts': reject_reason_counts,
             'reject_code_counts': reject_code_counts,
             'reject_prune_log_path': str(event_log_path) if event_log_path else None,
+            'study_significance_enabled': bool(enable_study_significance),
         }}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
@@ -2722,6 +2737,10 @@ def apply_runtime_preset(args):
             'seed_stability_max_oos_sharpe_dispersion': '--seed-stability-max-oos-sharpe-dispersion',
             'cost_config_path': '--cost-config-path',
             'enable_pbo_diagnostic': '--enable-pbo-diagnostic',
+            'enable_study_significance': '--enable-study-significance',
+            'study_significance_bootstrap_iterations': '--study-significance-bootstrap-iterations',
+            'study_significance_seed': '--study-significance-seed',
+            'study_significance_score_source': '--study-significance-score-source',
             'enable_cost_stress_diagnostics': '--enable-cost-stress-diagnostics',
             'cost_stress_finalists': '--cost-stress-finalists',
             'cost_stress_fee_multiplier': '--cost-stress-fee-multiplier',
@@ -2793,6 +2812,15 @@ if __name__ == "__main__":
                         help="Optional path to versioned exchange cost assumptions JSON")
     parser.add_argument("--enable-pbo-diagnostic", action="store_true",
                         help="Compute CSCV-style PBO diagnostic from trial fold metrics")
+    parser.add_argument("--enable-study-significance", action="store_true",
+                        help="Enable optional study-level RC/SPA-style bootstrap diagnostic")
+    parser.add_argument("--study-significance-bootstrap-iterations", type=int, default=500,
+                        help="Bootstrap iterations for study-level significance diagnostic")
+    parser.add_argument("--study-significance-seed", type=int, default=42,
+                        help="RNG seed for study-level significance bootstrap")
+    parser.add_argument("--study-significance-score-source", type=str, default="fold_sharpe",
+                        choices=["fold_sharpe", "fold_return", "fold_expectancy", "cv_sharpe", "frequency_adjusted_score"],
+                        help="Score source used by study-level significance diagnostic")
     parser.add_argument("--enable-cost-stress-diagnostics", action="store_true",
                         help="Run finalist holdout cost stress diagnostics (fees/slippage/funding)")
     parser.add_argument("--cost-stress-finalists", type=int, default=2,
@@ -2916,6 +2944,10 @@ if __name__ == "__main__":
             gate_mode=args.gate_mode,
             cost_config_path=args.cost_config_path,
             enable_pbo_diagnostic=args.enable_pbo_diagnostic,
+            enable_study_significance=args.enable_study_significance,
+            study_significance_bootstrap_iterations=args.study_significance_bootstrap_iterations,
+            study_significance_seed=args.study_significance_seed,
+            study_significance_score_source=args.study_significance_score_source,
             enable_cost_stress_diagnostics=args.enable_cost_stress_diagnostics,
             cost_stress_finalists=args.cost_stress_finalists,
             cost_stress_fee_multiplier=args.cost_stress_fee_multiplier,

@@ -219,6 +219,10 @@ def apply_runtime_preset(args):
         "seed_stability_max_param_dispersion": "--seed-stability-max-param-dispersion",
         "seed_stability_max_oos_sharpe_dispersion": "--seed-stability-max-oos-sharpe-dispersion",
         "enable_pbo_diagnostic": "--enable-pbo-diagnostic",
+        "enable_study_significance": "--enable-study-significance",
+        "study_significance_bootstrap_iterations": "--study-significance-bootstrap-iterations",
+        "study_significance_seed": "--study-significance-seed",
+        "study_significance_score_source": "--study-significance-score-source",
         "enable_cost_stress_diagnostics": "--enable-cost-stress-diagnostics",
     }
     provided = set(sys.argv[1:])
@@ -511,6 +515,14 @@ def print_final_report(script_dir, target_coins, total_time):
         if pbo_value is not None:
             split_count = (pbo.get('methodology') or {}).get('split_count', '?')
             print(f"     │  PBO: {float(pbo_value):.3f} (splits={split_count})")
+        study_sig = opt.get('study_significance', {}) if isinstance(opt, dict) else {}
+        if isinstance(study_sig, dict) and study_sig.get('enabled'):
+            rc_p = study_sig.get('p_value')
+            spa_p = study_sig.get('spa_like_p_value')
+            universe = (study_sig.get('methodology') or {}).get('candidate_universe_size', '?')
+            score_source = (study_sig.get('methodology') or {}).get('score_source', '?')
+            if isinstance(rc_p, (int, float)) and isinstance(spa_p, (int, float)):
+                print(f"     │  Study sig: RC-like p={float(rc_p):.3f}, SPA-like p={float(spa_p):.3f} | n={universe} | source={score_source}")
         if isinstance(stress, dict) and stress.get('finalists'):
             fragility_hits = 0
             finalists = stress.get('finalists', [])
@@ -710,6 +722,10 @@ def build_run_manifest(script_dir: Path, args, target_coins: List[str], run_id: 
             "proxy_fidelity_candidates": int(getattr(args, "proxy_fidelity_candidates", 3)),
             "proxy_fidelity_eval_days": int(getattr(args, "proxy_fidelity_eval_days", 90)),
             "enable_pbo_diagnostic": bool(getattr(args, "enable_pbo_diagnostic", False)),
+            "enable_study_significance": bool(getattr(args, "enable_study_significance", False)),
+            "study_significance_bootstrap_iterations": int(getattr(args, "study_significance_bootstrap_iterations", 500)),
+            "study_significance_seed": int(getattr(args, "study_significance_seed", 42)),
+            "study_significance_score_source": str(getattr(args, "study_significance_score_source", "fold_sharpe")),
             "enable_cost_stress_diagnostics": bool(getattr(args, "enable_cost_stress_diagnostics", False)),
         },
         "config_versions": {
@@ -801,6 +817,15 @@ if __name__ == "__main__":
                         help="Maximum holdout Sharpe std across seeds for PROMOTION_READY")
     parser.add_argument("--enable-pbo-diagnostic", action="store_true",
                         help="Enable CSCV-style PBO diagnostic in optimize workers")
+    parser.add_argument("--enable-study-significance", action="store_true",
+                        help="Enable study-level RC/SPA-style bootstrap diagnostic in optimize workers")
+    parser.add_argument("--study-significance-bootstrap-iterations", type=int, default=500,
+                        help="Bootstrap iterations for study-level significance diagnostic")
+    parser.add_argument("--study-significance-seed", type=int, default=42,
+                        help="RNG seed for study-level significance diagnostic")
+    parser.add_argument("--study-significance-score-source", type=str, default="fold_sharpe",
+                        choices=["fold_sharpe", "fold_return", "fold_expectancy", "cv_sharpe", "frequency_adjusted_score"],
+                        help="Score source for study-level significance diagnostic")
     parser.add_argument("--enable-cost-stress-diagnostics", action="store_true",
                         help="Enable finalist cost stress diagnostics in optimize workers")
     parser.add_argument("--cost-stress-finalists", type=int, default=2,
@@ -1010,6 +1035,11 @@ if __name__ == "__main__":
                 cmd.extend(["--min-dsr", str(args.min_dsr)])
             if args.enable_pbo_diagnostic:
                 cmd.append("--enable-pbo-diagnostic")
+            if args.enable_study_significance:
+                cmd.append("--enable-study-significance")
+                cmd.extend(["--study-significance-bootstrap-iterations", str(args.study_significance_bootstrap_iterations)])
+                cmd.extend(["--study-significance-seed", str(args.study_significance_seed)])
+                cmd.extend(["--study-significance-score-source", str(args.study_significance_score_source)])
             if args.enable_cost_stress_diagnostics:
                 cmd.append("--enable-cost-stress-diagnostics")
                 cmd.extend(["--cost-stress-finalists", str(args.cost_stress_finalists)])
