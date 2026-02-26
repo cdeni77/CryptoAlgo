@@ -46,3 +46,30 @@ Assumptions:
 - Diagnostics are **non-blocking** and disabled by default.
 - Cost stress is run only for a limited finalist set (`--cost-stress-finalists`) to avoid expensive reruns.
 - Adverse funding currently uses a conservative per-trade funding penalty proxy (`--cost-stress-funding-bps-per-trade`) when funding is enabled in the base config.
+
+## Phase 6 migration: study-level significance diagnostic (optional)
+
+A lightweight study-level multiple-testing diagnostic can now be enabled:
+
+```bash
+python -m scripts.optimize --coin BTC --enable-study-significance
+```
+
+Optional settings:
+
+- `--study-significance-bootstrap-iterations` (default: `500`)
+- `--study-significance-seed` (default: `42`)
+- `--study-significance-score-source` (`fold_sharpe`, `fold_return`, `fold_expectancy`, `cv_sharpe`, `frequency_adjusted_score`)
+
+Artifact output is persisted in `*_optimization.json` under `study_significance`:
+
+- `p_value`: Reality-Check-like p-value for max candidate mean score
+- `spa_like_p_value`: SPA-like p-value for the selected best candidate
+- `bootstrap`: iterations, seed, and resampling style metadata
+- `methodology`: score definition/source, candidate universe size, observation count
+
+Assumptions and limitations:
+
+- This is a **diagnostic-only** post-run check (non-blocking; default off).
+- It uses a recentered bootstrap with i.i.d. index resampling for runtime control.
+- With small fold counts and serial dependence, p-values should be interpreted cautiously as screening evidence rather than definitive significance proof.
