@@ -36,6 +36,8 @@ from scripts.train_model import (
     get_contract_spec, calculate_pnl_exact,
 )
 from core.meta_labeling import calibrator_predict, primary_recall_threshold
+from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
+from core.preprocessing_cv import fit_transform_fold
 from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
@@ -249,74 +251,40 @@ def compute_purge_days(profile: CoinProfile) -> int:
     max_hold_hours = max(1, int(getattr(profile, 'max_hold_hours', 24) or 24))
     return int(math.ceil(max_hold_hours / 24.0) + 1)
 
-def create_cv_splits(data, target_sym, n_folds=3, min_train_days=120, purge_days=2):
-    """Anchored walk-forward CV splits. Returns [(train_end, test_start, test_end), ...]"""
-    ohlcv = data[target_sym]['ohlcv']
-    start, end = ohlcv.index.min(), ohlcv.index.max()
-    total_days = (end - start).days
-    min_test_days = 60
-    if total_days < min_train_days + min_test_days:
-        boundary = start + pd.Timedelta(days=int(total_days * 0.7))
-        logger.debug(
-            "Fallback single-fold split for %s: train_end=%s test=[%s,%s]",
-            target_sym,
-            boundary,
-            boundary,
-            end,
+def create_cv_splits(
+    data,
+    target_sym,
+    n_folds=3,
+    min_train_days=120,
+    cv_mode='walk_forward',
+    purge_days=2,
+    purge_bars=None,
+    embargo_days=None,
+    embargo_bars=None,
+    embargo_frac=0.0,
+):
+    """Create CV folds with either walk-forward or purged+embargo behavior."""
+    index = data[target_sym]['ohlcv'].index
+    if cv_mode == 'purged_embargo':
+        return create_purged_embargo_splits(
+            index,
+            n_folds=n_folds,
+            min_train_days=min_train_days,
+            purge_days=purge_days,
+            purge_bars=purge_bars,
+            embargo_days=embargo_days,
+            embargo_bars=embargo_bars,
+            embargo_frac=embargo_frac,
         )
-        return [(boundary, boundary, end)]
-    n_folds = min(n_folds, (total_days - min_train_days) // min_test_days)
-    if n_folds < 1: n_folds = 1
-    # Account for purge when selecting the first test boundary, otherwise fold 0 can
-    # have no usable training range whenever purge_days > 0.
-    test_zone_start = start + pd.Timedelta(days=min_train_days + max(0, purge_days))
-    if test_zone_start >= end:
-        boundary = start + pd.Timedelta(days=int(total_days * 0.7))
-        logger.debug(
-            "Fallback single-fold split (purge-adjusted) for %s: train_end=%s test=[%s,%s]",
-            target_sym,
-            boundary,
-            boundary,
-            end,
-        )
-        return [(boundary, boundary, end)]
-    fold_days = (end - test_zone_start).days // n_folds
-    if fold_days < 1:
-        n_folds = 1
-        fold_days = max(1, (end - test_zone_start).days)
-    splits = []
-    purge_delta = pd.Timedelta(days=max(0, purge_days))
-    for i in range(n_folds):
-        ts = test_zone_start + pd.Timedelta(days=i * fold_days)
-        te = ts + pd.Timedelta(days=fold_days) if i < n_folds - 1 else end
-        train_end = ts - purge_delta
-        min_train_end = start + pd.Timedelta(days=min_train_days)
-        if train_end < min_train_end:
-            raise ValueError(
-                f"Purge removes all usable training data for fold {i} "
-                f"(target={target_sym}, purge_days={purge_days}, train_end={train_end}, "
-                f"min_train_end={min_train_end}, test_start={ts})"
-            )
-        logger.debug(
-            "Fold %s (%s): train=[%s,%s) purge=(%s,%s) test=[%s,%s]",
-            i,
-            target_sym,
-            start,
-            train_end,
-            train_end,
-            ts,
-            ts,
-            te,
-        )
-        splits.append((train_end, ts, te))
-    return splits
+    return create_walk_forward_splits(index, n_folds=n_folds, min_train_days=min_train_days, purge_days=purge_days)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # v11.1: FAST LIGHTWEIGHT EVALUATOR (~2s per fold instead of ~10min)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile, config, symbol, fee_multiplier=1.0, pruned_only=True, diagnostics=None):
-    """Train ONE model on data before train_end, simulate trading on test period."""
+def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, fee_multiplier=1.0, pruned_only=True, diagnostics=None):
+    """Train one model on train fold and simulate trading on the corresponding test fold."""
     def _set_diag(reason):
         if isinstance(diagnostics, dict):
             diagnostics['skip_reason'] = str(reason)
@@ -331,17 +299,12 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
         _set_diag('insufficient_features')
         return None
 
-    embargo_hours = max(config.train_embargo_hours, profile.label_forward_hours, 1)
-    actual_train_end = train_end - pd.Timedelta(hours=embargo_hours)
-    # Cap training window to match production's sliding window (default 120 days)
-    train_window_start = actual_train_end - pd.Timedelta(days=config.train_lookback_days)
-    train_feat = features[(features.index >= train_window_start) & (features.index < actual_train_end)]
-    train_ohlcv = ohlcv[(ohlcv.index >= train_window_start) & (ohlcv.index < train_end + pd.Timedelta(hours=profile.label_forward_hours))]
+    train_feat = features.loc[fold.train_idx.intersection(features.index)]
     if len(train_feat) < config.min_train_samples:
         _set_diag('train_feat_too_small')
         return None
 
-    y = system.create_labels(train_ohlcv, train_feat, profile=profile)
+    y = system.create_labels(ohlcv, train_feat, profile=profile)
     valid_idx = y.dropna().index
     X_all = train_feat.loc[valid_idx, cols]
     y_all = y.loc[valid_idx]
@@ -357,14 +320,15 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
 
     y_train = y_all.iloc[:split_idx]
     y_val = y_all.iloc[split_idx:]
+    x_train_fold, x_val_fold, _ = fit_transform_fold(X_all.iloc[:split_idx], X_all.iloc[split_idx:], y_train)
     if y_train.nunique() < 2 or y_val.nunique() < 2:
         _set_diag('single_class_split')
         return None
 
     result = system.train(
-        X_all.iloc[:split_idx],
+        x_train_fold,
         y_train,
-        X_all.iloc[split_idx:],
+        x_val_fold,
         y_val,
         profile=profile,
         symbol=symbol,
@@ -387,8 +351,8 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
 
     # --- SIMULATE TRADING ---
-    test_feat = features[(features.index >= test_start) & (features.index <= test_end)]
-    test_ohlcv = ohlcv[(ohlcv.index >= test_start) & (ohlcv.index <= test_end)]
+    test_feat = features.loc[fold.test_idx.intersection(features.index)]
+    test_ohlcv = ohlcv.loc[fold.test_idx.intersection(ohlcv.index)]
     if len(test_feat) < 50:
         _set_diag('test_window_too_small')
         return None
@@ -494,7 +458,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     # METRICS
     n = len(completed_trades)
     if n == 0:
-        test_days = max((test_end - test_start).days, 1)
+        test_days = max((fold.test_end - fold.test_start).days, 1)
         return {
             'n_trades': 0,
             'sharpe': 0.0,
@@ -515,7 +479,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
         wr = len(wins) / max(len(pnls), 1)
         avg = float(np.mean(pnls))
         total_ret = equity / 100000 - 1
-        test_days = max((test_end - test_start).days, 1)
+        test_days = max((fold.test_end - fold.test_start).days, 1)
         return {
             'n_trades': n,
             'sharpe': 0.0,
@@ -546,7 +510,7 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     peak = np.maximum.accumulate(eq_curve)
     dd = float(np.max((peak - eq_curve) / np.maximum(peak, 1.0)))
     total_ret = equity / 100000 - 1
-    test_days = max((test_end - test_start).days, 1)
+    test_days = max((fold.test_end - fold.test_start).days, 1)
     ann_f = 365.0 / test_days
     ann_ret = (1 + total_ret) ** ann_f - 1 if total_ret > -1 else -1.0
     tpy = n * ann_f
@@ -735,9 +699,9 @@ def objective(
     w_total = w_normal + w_stress
     w_normal, w_stress = w_normal / w_total, w_stress / w_total
 
-    for train_boundary, test_start, test_end in cv_splits:
+    for fold in cv_splits:
         fold_diag = {}
-        r = fast_evaluate_fold(features, ohlcv_data, train_boundary, test_start, test_end, profile, config,
+        r = fast_evaluate_fold(features, ohlcv_data, fold, profile, config,
                                target_sym, fee_multiplier=1.0, pruned_only=pruned_only, diagnostics=fold_diag)
         if r is not None:
             fold_results.append(r)
@@ -745,7 +709,7 @@ def objective(
 
             if enable_fee_stress:
                 stressed_r = fast_evaluate_fold(
-                    features, ohlcv_data, train_boundary, test_start, test_end,
+                    features, ohlcv_data, fold,
                     profile, config, target_sym, fee_multiplier=fee_stress_multiplier,
                     pruned_only=pruned_only,
                 )
@@ -1413,7 +1377,17 @@ def calibrate_proxy_fidelity(
     ohlcv = holdout_data[target_sym]['ohlcv']
     test_end = ohlcv.index.max()
     test_start = test_end - pd.Timedelta(days=max(1, int(eval_days)))
-    train_end = test_start
+    train_idx = features.index[features.index < test_start]
+    test_idx = features.index[(features.index >= test_start) & (features.index <= test_end)]
+    eval_fold = CVFold(
+        train_idx=train_idx,
+        test_idx=test_idx,
+        train_end=train_idx.max() if len(train_idx) else test_start,
+        test_start=test_start,
+        test_end=test_end,
+        purge_bars=0,
+        embargo_bars=0,
+    )
 
     samples = []
     for cand in candidates:
@@ -1430,9 +1404,7 @@ def calibrate_proxy_fidelity(
         fast_metrics = fast_evaluate_fold(
             features,
             ohlcv,
-            train_end=train_end,
-            test_start=test_start,
-            test_end=test_end,
+            eval_fold,
             profile=profile,
             config=config,
             symbol=target_sym,
@@ -1787,7 +1759,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   proxy_fidelity_sharpe_delta_max=0.35,
                   proxy_fidelity_trade_count_delta_max=8,
                   proxy_fidelity_return_delta_max=0.03,
-                  proxy_fidelity_max_drawdown_delta_max=0.04):
+                  proxy_fidelity_max_drawdown_delta_max=0.04,
+                  cv_mode='walk_forward', purge_days=None, purge_bars=None, embargo_days=None,
+                  embargo_bars=None, embargo_frac=0.0):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -1797,29 +1771,45 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     holdout_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
     holdout_end = holdout_data[holdout_sym]['ohlcv'].index.max() if holdout_sym else optim_end
     active_profile = get_coin_profile(coin_name)
-    purge_days = compute_purge_days(active_profile)
-    cv_splits = create_cv_splits(optim_data, target_sym, n_folds=n_cv_folds, purge_days=purge_days)
+    purge_days = int(purge_days if purge_days is not None else compute_purge_days(active_profile))
+    cv_splits = create_cv_splits(
+        optim_data,
+        target_sym,
+        n_folds=n_cv_folds,
+        cv_mode=cv_mode,
+        purge_days=purge_days,
+        purge_bars=purge_bars,
+        embargo_days=embargo_days,
+        embargo_bars=embargo_bars,
+        embargo_frac=embargo_frac,
+    )
 
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
-    print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}")
+    print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}, cv_mode={cv_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     print(
         f"   Gates: fold_sr>={min_fold_sharpe_hard:.2f}, fold_wr>={min_fold_win_rate:.2f}, "
         f"psr>={min_psr:.2f}, raw_exp>={min_raw_expectancy:.5f}"
     )
-    for i, (tb, ts, te) in enumerate(cv_splits):
-        print(f"     Fold {i}: train→{tb.date()} | test {ts.date()}→{te.date()}")
+    for i, fold in enumerate(cv_splits):
+        print(
+            f"     Fold {i}: train_n={len(fold.train_idx)} test_n={len(fold.test_idx)} "
+            f"| train_end={fold.train_end.date()} | test {fold.test_start.date()}→{fold.test_end.date()} "
+            f"| purge_bars={fold.purge_bars} embargo_bars={fold.embargo_bars}"
+        )
         logger.debug(
-            "Fold %s (%s): train_end=%s test=[%s,%s] purge=[%s,%s]",
+            "Fold %s (%s): train_end=%s test=[%s,%s] train_n=%s test_n=%s purge_bars=%s embargo_bars=%s",
             i,
             coin_name,
-            tb,
-            ts,
-            te,
-            tb,
-            ts,
+            fold.train_end,
+            fold.test_start,
+            fold.test_end,
+            len(fold.train_idx),
+            len(fold.test_idx),
+            fold.purge_bars,
+            fold.embargo_bars,
         )
     print(f"   Est: ~{n_trials * len(cv_splits) * 3 / 60 / max(n_jobs,1):.0f} min")
     print(f"{'='*60}")
@@ -2135,6 +2125,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'tunable_params': tunable_best_params,
         'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
         'holdout_days': holdout_days, 'holdout_mode': holdout_mode,
+        'cv_mode': cv_mode,
+        'cv_controls': {
+            'purge_days': int(purge_days),
+            'purge_bars': None if purge_bars is None else int(purge_bars),
+            'embargo_days': None if embargo_days is None else int(embargo_days),
+            'embargo_bars': None if embargo_bars is None else int(embargo_bars),
+            'embargo_frac': float(embargo_frac or 0.0),
+        },
         'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'fee_stress': {
             'enabled': bool(enable_fee_stress),
@@ -2356,6 +2354,12 @@ def apply_runtime_preset(args):
             'min_internal_oos_trades': '--min-internal-oos-trades',
             'min_total_trades': '--min-total-trades',
             'n_cv_folds': '--n-cv-folds',
+            'cv_mode': '--cv-mode',
+            'purge_days': '--purge-days',
+            'purge_bars': '--purge-bars',
+            'embargo_days': '--embargo-days',
+            'embargo_bars': '--embargo-bars',
+            'embargo_frac': '--embargo-frac',
             'holdout_candidates': '--holdout-candidates',
             'holdout_min_trades': '--holdout-min-trades',
             'holdout_min_sharpe': '--holdout-min-sharpe',
@@ -2399,6 +2403,18 @@ if __name__ == "__main__":
     parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
+    parser.add_argument("--cv-mode", type=str, default="walk_forward", choices=["walk_forward", "purged_embargo"],
+                        help="Cross-validation split mode")
+    parser.add_argument("--purge-days", type=int, default=None,
+                        help="Purge window in days for CV (defaults to max-hold-derived value)")
+    parser.add_argument("--purge-bars", type=int, default=None,
+                        help="Purge window in bars (overrides --purge-days)")
+    parser.add_argument("--embargo-days", type=int, default=None,
+                        help="Embargo window in days for purged_embargo CV")
+    parser.add_argument("--embargo-bars", type=int, default=None,
+                        help="Embargo window in bars (overrides --embargo-days)")
+    parser.add_argument("--embargo-frac", type=float, default=0.0,
+                        help="Embargo as a fraction of each test fold length")
     parser.add_argument("--sampler-seed", type=int, default=42)
     parser.add_argument("--holdout-candidates", type=int, default=3,
                         help="Evaluate top-N CV candidates on holdout and pick the best")
@@ -2482,6 +2498,7 @@ if __name__ == "__main__":
     if not coins: parser.print_help(); sys.exit(1)
     seeds = [int(s.strip()) for s in args.sampler_seeds.split(',') if s.strip()] if args.sampler_seeds else [args.sampler_seed]
     for cn in coins:
+        purge_days = args.purge_days if args.purge_days is not None else compute_purge_days(get_coin_profile(cn))
         optimize_coin_multiseed(all_data, PREFIX_FOR_COIN.get(cn, cn), cn, sampler_seeds=seeds,
             n_trials=args.trials, n_jobs=args.jobs,
             plateau_patience=args.plateau_patience, plateau_min_delta=args.plateau_min_delta,
@@ -2513,6 +2530,12 @@ if __name__ == "__main__":
             proxy_fidelity_trade_count_delta_max=args.proxy_fidelity_trade_count_delta_max,
             proxy_fidelity_return_delta_max=args.proxy_fidelity_return_delta_max,
             proxy_fidelity_max_drawdown_delta_max=args.proxy_fidelity_max_drawdown_delta_max,
+            cv_mode=args.cv_mode,
+            purge_bars=args.purge_bars,
+            purge_days=purge_days,
+            embargo_days=args.embargo_days,
+            embargo_bars=args.embargo_bars,
+            embargo_frac=args.embargo_frac,
             pruned_only=args.pruned_only,
             preset_name=args.preset,
             gate_mode=args.gate_mode)
