@@ -52,6 +52,7 @@ from core.meta_labeling import (
     calibrator_predict as meta_calibrator_predict,
     calibrator_params as meta_calibrator_params,
 )
+from core.strategies import StrategyContext, get_strategy_family
 
 warnings.filterwarnings('ignore')
 
@@ -221,6 +222,10 @@ class Config:
     trend_filter_mode: str = 'hard'
     funding_filter_mode: str = 'hard'
 
+    # Strategy family controls
+    strategy_family: str = 'momentum_trend'
+    trade_freq_bucket: str = 'balanced'
+
     # Names of fields explicitly provided via CLI flags (not parser defaults).
     cli_overrides: Set[str] = field(default_factory=set)
 
@@ -330,6 +335,28 @@ def _resolve_momentum_direction(
     if momentum_score <= -config.momentum_score_threshold:
         return -1
     return 0
+
+
+def _build_strategy_context(
+    row: pd.Series,
+    price: float,
+    sma_200: float,
+    ret_24h: float,
+    ret_72h: float,
+    sma_50: float,
+    *,
+    vol_24h: Optional[float] = None,
+) -> StrategyContext:
+    return StrategyContext(
+        ret_24h=float(ret_24h),
+        ret_72h=float(ret_72h),
+        price=float(price),
+        sma_50=float(sma_50),
+        sma_200=float(sma_200) if not pd.isna(sma_200) else float(price),
+        funding_z=float(row.get('funding_rate_zscore', 0.0) or 0.0),
+        vol_24h=float(vol_24h) if vol_24h is not None and not pd.isna(vol_24h) else None,
+        features={str(k): float(v) for k, v in row.items() if isinstance(v, (int, float, np.floating, np.integer)) and not pd.isna(v)},
+    )
 
 
 def _calibrator_predict(calibrator, scores: np.ndarray) -> np.ndarray:
@@ -1226,13 +1253,15 @@ def run_backtest(all_data: Dict, config: Config,
     current_date = min(all_ts) + timedelta(days=config.train_lookback_days)
     end_date = max(all_ts)
 
+    strategy_family = get_strategy_family(config.strategy_family)
     print(f"\n⏩ STARTING BACKTEST (v8 — Per-Coin Profiles)")
     print(f"   Period: {current_date.date()} to {end_date.date()}")
+    print(f"   Strategy family: {strategy_family.name} | trade_freq_bucket={config.trade_freq_bucket}")
     print(f"   Leverage: {config.leverage}x | Fee: 0.10%/side (0.20% round-trip)")
     print(f"   Coin profiles:")
     for sym in all_data:
         p = _get_profile(sym, profile_overrides)
-        print(f"     {sym}: {p.name} (momentum) | thresh={p.signal_threshold} | "
+        print(f"     {sym}: {p.name} ({strategy_family.name}) | thresh={p.signal_threshold} | "
               f"TP={p.vol_mult_tp}x SL={p.vol_mult_sl}x | hold={p.max_hold_hours}h")
 
     equity = 100_000.0
@@ -1499,14 +1528,23 @@ def run_backtest(all_data: Dict, config: Config,
                         _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
                         continue
 
-                    direction = _resolve_momentum_direction(
-                        ret_24h=ret_24h,
-                        ret_72h=ret_72h,
-                        price=price,
-                        sma_50=sma_50,
-                        config=config,
+                    strategy_context = _build_strategy_context(
+                        row,
+                        price,
+                        sma_200,
+                        ret_24h,
+                        ret_72h,
+                        sma_50,
+                        vol_24h=vol_24h,
                     )
-                    if direction == 0:
+                    strategy_decision = strategy_family.evaluate(
+                        strategy_context,
+                        min_momentum_magnitude=effective_momentum,
+                        score_threshold=config.momentum_score_threshold,
+                        strict_mode=config.momentum_strict_mode,
+                    )
+                    direction = strategy_decision.direction
+                    if not strategy_decision.gate_contributions.get('momentum_dir_agreement', direction != 0):
                         _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
                         continue
 
@@ -1603,8 +1641,7 @@ def run_backtest(all_data: Dict, config: Config,
                         continue
 
                     edge_score = (meta_prob - config.meta_probability_threshold) / max(0.01, prob_std + 0.01)
-                    momentum_strength = abs(ret_72h)
-                    rank_score = edge_score + (0.2 * momentum_strength) - candidate_rank_penalty
+                    rank_score = edge_score + strategy_decision.rank_modifier - candidate_rank_penalty
                     candidates.append((rank_score, sym, profile, price, vol_24h, direction, candidate_size_multiplier))
 
                 slots = max(config.max_positions - len(active_positions), 0)
@@ -1785,6 +1822,8 @@ def run_backtest(all_data: Dict, config: Config,
                 profile_name=profile.name,
                 extra_meta={
                     'strategy': 'momentum',
+                    'strategy_family': config.strategy_family or 'momentum_trend',
+                    'trade_freq_bucket': config.trade_freq_bucket or 'balanced',
                     'signal_threshold': profile.signal_threshold,
                     'n_ensemble': len(ensemble_list),
                     'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
@@ -1903,6 +1942,8 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
             target_dir=target_dir,
             extra_meta={
                 'strategy': 'momentum',
+                'strategy_family': config.strategy_family or 'momentum_trend',
+                'trade_freq_bucket': config.trade_freq_bucket or 'balanced',
                 'signal_threshold': profile.signal_threshold,
                 'train_start': symbol_train_start.isoformat() if symbol_train_start is not None else None,
                 'train_end': symbol_train_end.isoformat() if symbol_train_end is not None else None,
@@ -1937,7 +1978,9 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
 def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifact_dir: Optional[Path] = None):
     system = MLSystem(config)
     validate_all_symbol_configs(all_data, config)
+    strategy_family = get_strategy_family(config.strategy_family)
     print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
+    print(f"   Strategy family: {strategy_family.name} | trade_freq_bucket={config.trade_freq_bucket}")
     gate_counters = _new_gate_counters()
 
     for sym, d in all_data.items():
@@ -1996,6 +2039,8 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             profile_name=profile.name,
             extra_meta={
                 'strategy': 'momentum',
+                'strategy_family': config.strategy_family or 'momentum_trend',
+                'trade_freq_bucket': config.trade_freq_bucket or 'balanced',
                 'signal_threshold': profile.signal_threshold,
                 'train_samples': len(X_all),
                 'stage_metrics': stage_metrics,
@@ -2026,13 +2071,27 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
         ret_24h = (price / ohlc['close'].iloc[ts_loc - 24] - 1) if ts_loc >= 24 else 0
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
         sma_50 = ohlc['close'].iloc[max(0, ts_loc - 50):ts_loc].mean() if ts_loc >= 10 else price
-        direction = _resolve_momentum_direction(
-            ret_24h=ret_24h,
-            ret_72h=ret_72h,
-            price=price,
-            sma_50=sma_50,
-            config=config,
+        strategy_context = _build_strategy_context(
+            row,
+            price,
+            sma_200,
+            ret_24h,
+            ret_72h,
+            sma_50,
         )
+        strategy_decision = strategy_family.evaluate(
+            strategy_context,
+            min_momentum_magnitude=resolve_param(
+                'min_momentum_magnitude',
+                profile,
+                config,
+                Config.min_momentum_magnitude,
+                mode='direct',
+            ),
+            score_threshold=config.momentum_score_threshold,
+            strict_mode=config.momentum_strict_mode,
+        )
+        direction = strategy_decision.direction
         if direction == 0:
             _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
             if debug:
@@ -2117,7 +2176,6 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             regime_pass = True
             regime_reason = ''
 
-        ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
         effective_momentum = resolve_param(
             'min_momentum_magnitude',
             profile,
@@ -2125,7 +2183,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             Config.min_momentum_magnitude,
             mode='direct',
         )
-        momentum_pass = abs(ret_72h) >= effective_momentum
+        momentum_pass = bool(strategy_decision.gate_contributions.get('momentum_magnitude', abs(ret_72h) >= effective_momentum))
 
         if debug:
             dir_str = 'LONG' if direction == 1 else 'SHORT'
@@ -2142,7 +2200,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
         if not momentum_pass:
             _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
             if debug:
-                print(f"  Skip reason: momentum_magnitude (|72h|={abs(ret_72h):.4f} < {effective_momentum:.4f})")
+                print(f"  Skip reason: momentum_magnitude (family={strategy_family.name}, |72h|={abs(ret_72h):.4f}, min={effective_momentum:.4f})")
             continue
         if not regime_pass:
             _increment_gate_counter(gate_counters, sym, regime_reason)
@@ -2227,6 +2285,10 @@ if __name__ == "__main__":
                         help="Trend filter policy: hard=reject, soft=penalize rank/size, off=ignore")
     parser.add_argument("--funding-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
                         help="Funding filter policy: hard=reject, soft=penalize rank/size, off=ignore")
+    parser.add_argument("--strategy-family", choices=['momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay'],
+                        default='momentum_trend', help="Strategy family used for direction + ranking")
+    parser.add_argument("--trade-freq-bucket", choices=['conservative', 'balanced', 'aggressive'],
+                        default='balanced', help="Trade frequency cadence bucket")
     parser.add_argument("--exclude", type=str, default="",
                         help="Comma-separated symbol prefixes to exclude (default: none)")
     parser.add_argument("--pruned-only", action="store_true",
@@ -2283,6 +2345,8 @@ if __name__ == "__main__":
         calibration_strategy=args.calibration,
         trend_filter_mode=args.trend_filter_mode,
         funding_filter_mode=args.funding_filter_mode,
+        strategy_family=args.strategy_family,
+        trade_freq_bucket=args.trade_freq_bucket,
         excluded_symbols=excluded,
         enforce_pruned_features=args.pruned_only,
         recency_half_life_days=args.recency_half_life_days,
