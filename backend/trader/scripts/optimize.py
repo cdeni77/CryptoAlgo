@@ -133,16 +133,20 @@ def _build_cost_config(cost_assumptions: ExchangeCostAssumptions | None) -> tupl
     if cost_assumptions is None:
         return config, {
             'version': 'legacy_default',
+            'cost_config_id': 'legacy_default',
             'source_path': None,
+            'execution_fee_mode': 'bps',
+            'exchange_fee_mode': 'per_contract_usd',
+            'funding_interval_hours': 1,
+            'assumption_profile': 'legacy',
             'applied': {'funding': True, 'slippage': True, 'impact': False},
         }
 
-    fees = cost_assumptions.fees
     slippage = cost_assumptions.slippage
     impact = cost_assumptions.impact
     funding = cost_assumptions.funding
-    config.fee_pct_per_side = fees.fee_pct_per_side
-    config.min_fee_per_contract = float(fees.min_fee_per_contract)
+    config.fee_pct_per_side = cost_assumptions.effective_fee_pct_per_side()
+    config.min_fee_per_contract = float(cost_assumptions.effective_min_fee_per_contract())
     config.slippage_bps = float(slippage.bps_per_side)
     config.apply_funding = bool(funding.enabled)
     config.apply_slippage = bool(slippage.enabled)

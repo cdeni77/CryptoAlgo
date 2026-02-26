@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker, Session
 # We duplicate the ORM classes here so the trader doesn't need to
 # import from the API codebase (they run in separate containers).
 from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text, create_engine, JSON
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import func
 

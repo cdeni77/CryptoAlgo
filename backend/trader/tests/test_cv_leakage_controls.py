@@ -6,7 +6,7 @@ from core.preprocessing_cv import FoldPreprocessor, fit_transform_fold
 
 
 def _index(n: int = 400) -> pd.DatetimeIndex:
-    return pd.date_range('2024-01-01', periods=n, freq='H')
+    return pd.date_range('2024-01-01', periods=n, freq='h')
 
 
 def test_purged_embargo_splits_remove_train_test_overlap() -> None:

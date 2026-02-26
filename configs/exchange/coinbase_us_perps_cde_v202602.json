@@ -1,0 +1,72 @@
+{
+  "version": "coinbase_us_perps_cde_v202602",
+  "exchange": "coinbase",
+  "market": "us_perpetuals",
+  "assumption_profile": "cde",
+  "execution_fee_mode": "bps",
+  "exchange_fee_mode": "per_contract_usd",
+  "retail_execution_fee": {
+    "enabled": false,
+    "mode": "bps",
+    "taker_fee_bps": 0.0,
+    "maker_fee_bps": 0.0,
+    "use_taker": true
+  },
+  "exchange_fee": {
+    "enabled": true,
+    "mode": "per_contract_usd",
+    "per_contract_usd": 0.75,
+    "symbol_overrides": {
+      "BIP": 0.75,
+      "ETP": 0.75,
+      "SLP": 0.10,
+      "XPP": 0.10,
+      "DOP": 0.10
+    },
+    "participant_type_assumption": "non_professional",
+    "execution_type_assumption": "electronic",
+    "schedule_reference": {
+      "group_a": {
+        "symbols": ["BIP", "ETP"],
+        "market_maker": 0.45,
+        "non_professional": 0.75,
+        "professional": 0.75,
+        "block": 0.20
+      },
+      "group_b": {
+        "symbols": ["SLP", "XPP", "DOP"],
+        "market_maker": 0.07,
+        "non_professional": 0.10,
+        "professional": 0.10,
+        "block": 0.05
+      }
+    }
+  },
+  "fees": {
+    "maker_bps": 0.0,
+    "taker_bps": 0.0,
+    "min_fee_per_contract": 0.75,
+    "use_taker": true
+  },
+  "slippage": {
+    "enabled": true,
+    "bps_per_side": 2.0
+  },
+  "impact": {
+    "enabled": false,
+    "bps_per_contract": 0.0,
+    "max_bps_per_side": 10.0
+  },
+  "funding": {
+    "enabled": true,
+    "funding_interval_hours": 1,
+    "method": "coinbase_us_perps_hourly"
+  },
+  "contract_sizes": {
+    "BIP": 0.01,
+    "ETP": 0.10,
+    "SLP": 5.0,
+    "XPP": 500.0,
+    "DOP": 5000.0
+  }
+}
