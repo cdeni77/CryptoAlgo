@@ -28,6 +28,27 @@ The optimizer result JSON now stores cost metadata under `cost_model` with:
 - Fees/slippage/impact are modularized in `core/costs.py`.
 - Gross vs net metrics are both present in fold-level metrics (`avg_raw_pnl`/`avg_pnl`, `gross_total_return`/`net_total_return`).
 
+## Coinbase US perps configs (retail parity vs raw CDE)
+
+Use one of these two configs depending on your objective:
+
+- **Retail app parity (recommended default for next run):**
+  - `configs/exchange/coinbase_us_perps_retail_v202602.json`
+  - Models an app-style execution fee path (`0.10%` bps) with hourly funding metadata.
+  - Includes `observed_ui_fee_bps=10.0` and `observed_ui_fee_source=manual_app_ticket_observation` to document calibration rationale.
+
+- **Raw CDE schedule modeling:**
+  - `configs/exchange/coinbase_us_perps_cde_v202602.json`
+  - Models per-contract USD exchange fees with symbol overrides (BIP/ETP vs SLP/XPP/DOP) and assumption metadata (`non_professional`, `electronic`).
+
+Both configs encode Coinbase US perps hourly funding cadence and contract-size metadata.
+
+### Recommended next pipeline run
+
+```bash
+python -m scripts.optimize --coin BTC --cost-config-path configs/exchange/coinbase_us_perps_retail_v202602.json
+```
+
 ## Phase 5 migration: robustness diagnostics (optional)
 
 New optional optimizer diagnostics can be enabled via CLI:
