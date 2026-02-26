@@ -548,11 +548,11 @@ COIN_OPTIMIZATION_PRIORS = {
 }
 
 COIN_OBJECTIVE_GUARDS = {
-    'BTC': {'min_total_trades': 8, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
-    'ETH': {'min_total_trades': 10, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
-    'SOL': {'min_total_trades': 10, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
-    'XRP': {'min_total_trades': 8, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
-    'DOGE': {'min_total_trades': 8, 'min_avg_trades_per_fold': 2.0, 'min_expectancy': 0.0001},
+    'BTC': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
+    'ETH': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
+    'SOL': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
+    'XRP': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
+    'DOGE': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
 }
 
 def create_trial_profile(trial, coin_name):
@@ -736,14 +736,14 @@ def objective(
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
         )
-    if total_trades < 6:
+    if total_trades < 4:
         return _reject_trial(
             trial,
             code='TOO_FEW_TRADES',
             reason=f'too_few_trades:{total_trades}',
             stage='fold_eval',
             observed=total_trades,
-            threshold=6,
+            threshold=4,
             fold_results=fold_results,
             stressed_fold_results=stressed_fold_results,
         )
@@ -768,10 +768,10 @@ def objective(
     tpy = np.mean([r.get('trades_per_year', 0.0) for r in fold_results])
 
     guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
-    guard_min_trades = int(guards.get('min_total_trades', 6))
+    guard_min_trades = int(guards.get('min_total_trades', 5))
     if int(min_total_trades_gate or 0) > 0:
         guard_min_trades = min(guard_min_trades, max(4, int(min_total_trades_gate)))
-    guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 4.0))
+    guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 1.0))
     guard_min_exp = float(guards.get('min_expectancy', 0.0))
     avg_tc = np.mean([r['n_trades'] for r in fold_results])
 
