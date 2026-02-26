@@ -14,7 +14,7 @@ Usage:
     python optimize.py --show
 """
 import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,6 +43,7 @@ from core.coin_profiles import (
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
     SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
 )
+from core.reason_codes import ReasonCode
 from core.metrics_significance import (
     compute_deflated_sharpe as compute_deflated_sharpe_metric,
     compute_psr_from_samples,
@@ -57,6 +58,30 @@ logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEBUG_TRIALS = False
+
+
+# Example JSONL row: {"event_type":"reject","coin":"BTC","trial_number":12,"reason_code":"TOO_FEW_TRADES"}
+class EventLogger:
+    def __init__(self, path: Path | None):
+        self.path = path
+
+    def emit(self, event: dict):
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        row = dict(event)
+        row.setdefault('timestamp', datetime.now(timezone.utc).isoformat())
+        with open(self.path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(_to_json_safe(row)) + "\n")
+
+
+EVENT_LOGGER: EventLogger | None = None
+
+
+def _emit_event(event: dict):
+    if EVENT_LOGGER is not None:
+        EVENT_LOGGER.emit(event)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # UTILITIES
@@ -185,6 +210,22 @@ def _reject_trial(
     if isinstance(extra_attrs, dict):
         for key, value in extra_attrs.items():
             trial.set_user_attr(str(key), value)
+    _emit_event({
+        'event_type': 'reject',
+        'coin': trial.study.user_attrs.get('coin_name'),
+        'study_name': trial.study.study_name,
+        'trial_number': int(trial.number),
+        'stage': str(stage),
+        'reason_code': str(code),
+        'reason': str(reason),
+        'metrics': {
+            'n_folds_evaluated': int(len(fold_results or [])),
+            'total_trades_partial': int(sum(int(r.get('n_trades', 0) or 0) for r in (fold_results or []))),
+            'fold_trade_counts': [int(r.get('n_trades', 0) or 0) for r in (fold_results or [])],
+            'observed': observed,
+            'threshold': threshold,
+        },
+    })
     return penalty
 
 
@@ -743,7 +784,7 @@ def objective(
                 if stressed_r is None:
                     return _reject_trial(
                         trial,
-                        code='MISSING_STRESSED_FOLD',
+                        code=ReasonCode.MISSING_STRESSED_FOLD,
                         reason='missing_stressed_fold',
                         stage='fee_stress',
                         fold_results=fold_results,
@@ -763,7 +804,7 @@ def objective(
                 if projected_total < projected_floor_with_tolerance:
                     return _reject_trial(
                         trial,
-                        code='EARLY_TRADE_STARVATION',
+                        code=ReasonCode.EARLY_TRADE_STARVATION,
                         reason=(
                             f'early_trade_starvation:{projected_total:.2f}'
                             f'<{projected_floor_with_tolerance:.2f}'
@@ -791,7 +832,7 @@ def objective(
     if len(fold_results) < min_required_folds:
         return _reject_trial(
             trial,
-            code='TOO_FEW_FOLDS',
+            code=ReasonCode.TOO_FEW_FOLDS,
             reason=f'too_few_folds:{len(fold_results)}/{len(cv_splits)}',
             stage='fold_eval',
             observed=len(fold_results),
@@ -804,7 +845,7 @@ def objective(
         worst_internal_trades = min(int(r.get('n_trades', 0) or 0) for r in fold_results)
         return _reject_trial(
             trial,
-            code='TOO_FEW_INTERNAL_OOS_TRADES',
+            code=ReasonCode.TOO_FEW_INTERNAL_OOS_TRADES,
             reason=f'too_few_internal_oos_trades:{min_internal_oos_trades}',
             stage='fold_eval',
             observed=worst_internal_trades,
@@ -815,7 +856,7 @@ def objective(
     if total_trades < 4:
         return _reject_trial(
             trial,
-            code='TOO_FEW_TRADES',
+            code=ReasonCode.TOO_FEW_TRADES,
             reason=f'too_few_trades:{total_trades}',
             stage='fold_eval',
             observed=total_trades,
@@ -869,7 +910,7 @@ def objective(
     if min_sr < min_fold_sharpe_hard:
         return _reject_trial(
             trial,
-            code='LOW_MIN_FOLD_SHARPE',
+            code=ReasonCode.LOW_MIN_FOLD_SHARPE,
             reason=f'guard_min_fold_sharpe:{min_sr:.3f}<{min_fold_sharpe_hard:.3f}',
             stage='post_cv_gates',
             observed=min_sr,
@@ -887,7 +928,7 @@ def objective(
         worst_fold = min(low_wr_folds, key=lambda f: f['win_rate'])
         return _reject_trial(
             trial,
-            code='LOW_FOLD_WIN_RATE',
+            code=ReasonCode.LOW_FOLD_WIN_RATE,
             reason=(
                 f"guard_min_fold_win_rate:fold{worst_fold['fold_idx']}="
                 f"{worst_fold['win_rate']:.3f}<{min_fold_win_rate:.2f}"
@@ -904,7 +945,7 @@ def objective(
     if total_trades < guard_min_trades:
         return _reject_trial(
             trial,
-            code='GUARD_TOTAL_TRADES',
+            code=ReasonCode.GUARD_TOTAL_TRADES,
             reason=f'guard_total_trades:{total_trades}<{guard_min_trades}',
             stage='post_cv_gates',
             observed=total_trades,
@@ -916,7 +957,7 @@ def objective(
     if avg_tc < guard_min_avg_tc:
         return _reject_trial(
             trial,
-            code='GUARD_AVG_FOLD_TRADES',
+            code=ReasonCode.GUARD_AVG_FOLD_TRADES,
             reason=f'guard_avg_fold_trades:{avg_tc:.2f}<{guard_min_avg_tc:.2f}',
             stage='post_cv_gates',
             observed=avg_tc,
@@ -928,7 +969,7 @@ def objective(
     if mean_expectancy < guard_min_exp:
         return _reject_trial(
             trial,
-            code='GUARD_EXPECTANCY',
+            code=ReasonCode.GUARD_EXPECTANCY,
             reason=f'guard_expectancy:{mean_expectancy:.6f}<{guard_min_exp:.6f}',
             stage='post_cv_gates',
             observed=mean_expectancy,
@@ -940,7 +981,7 @@ def objective(
     if mean_raw_expectancy < float(min_raw_expectancy):
         return _reject_trial(
             trial,
-            code='RAW_EXPECTANCY_NONPOSITIVE',
+            code=ReasonCode.RAW_EXPECTANCY_NONPOSITIVE,
             reason=f'raw_expectancy_below_min:{mean_raw_expectancy:.6f}<{float(min_raw_expectancy):.6f}',
             stage='post_cv_gates',
             observed=mean_raw_expectancy,
@@ -952,7 +993,7 @@ def objective(
     if enable_fee_stress and mean_stressed_sr < 0:
         return _reject_trial(
             trial,
-            code='NEG_STRESSED_SR',
+            code=ReasonCode.NEG_STRESSED_SR,
             reason=f'negative_stressed_sharpe:{mean_stressed_sr:.6f}',
             stage='fee_stress',
             observed=mean_stressed_sr,
@@ -964,7 +1005,7 @@ def objective(
     if enable_fee_stress and stressed_expectancy < float(min_stressed_expectancy):
         return _reject_trial(
             trial,
-            code='NONPOSITIVE_STRESSED_EXPECTANCY',
+            code=ReasonCode.NONPOSITIVE_STRESSED_EXPECTANCY,
             reason=f'stressed_expectancy_below_min:{stressed_expectancy:.6f}<{float(min_stressed_expectancy):.6f}',
             stage='fee_stress',
             observed=stressed_expectancy,
@@ -980,7 +1021,7 @@ def objective(
     if not significance_gates['psr_cv']['passed']:
         return _reject_trial(
             trial,
-            code='LOW_PSR',
+            code=ReasonCode.LOW_PSR,
             reason=f'low_psr:{psr.get("psr", 0.0):.3f}<{cv_psr_threshold:.3f}',
             stage='psr',
             observed=psr.get('psr', 0.0),
@@ -1722,6 +1763,22 @@ def _sqlite_url(path): return f"sqlite:///{path.resolve()}"
 def _candidate_results_dirs(): return [SCRIPT_DIR / "optimization_results", Path.cwd() / "optimization_results"]
 
 
+def resolve_event_log_path(coin_name: str, run_id: str = "") -> Optional[Path]:
+    safe_run = (run_id or "default").replace("/", "_")
+    filename = f"{coin_name}_reject_prune_{safe_run}.jsonl"
+    for base in _candidate_results_dirs():
+        path = base / filename
+        if path.exists():
+            return path
+    for base in _candidate_results_dirs():
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return base / filename
+        except OSError:
+            continue
+    return None
+
+
 def _candidate_trial_ledger_paths() -> List[Path]:
     return [d / "trial_ledger.jsonl" for d in _candidate_results_dirs()]
 
@@ -1856,6 +1913,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
 
+    global EVENT_LOGGER
+    event_log_path = resolve_event_log_path(coin_name, study_suffix or '')
+    EVENT_LOGGER = EventLogger(event_log_path)
     cost_assumptions = load_exchange_cost_assumptions(cost_config_path) if cost_config_path else None
     base_cost_config, cost_model_metadata = _build_cost_config(cost_assumptions)
 
@@ -1949,6 +2009,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     study.set_user_attr('sampler_seed', int(sampler_seed))
     study.set_user_attr('study_name', study_name)
     study.set_user_attr('run_id', study_suffix or '')
+    study.set_user_attr('coin_name', coin_name)
     study.set_user_attr('target_trades_per_week', float(target_trades_per_week))
     study.set_user_attr('target_trades_per_year', float(target_trades_per_year) if target_trades_per_year is not None else float(target_trades_per_week) * 52.0)
     study.set_user_attr('gate_mode', str(gate_mode))
@@ -1975,13 +2036,31 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             pruned_only=pruned_only,
                             base_config=base_cost_config)
     min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
+
+    def _prune_event_callback(study, frozen_trial):
+        if frozen_trial.state != optuna.trial.TrialState.PRUNED:
+            return
+        _emit_event({
+            'event_type': 'prune',
+            'coin': coin_name,
+            'study_name': study.study_name,
+            'trial_number': int(frozen_trial.number),
+            'stage': frozen_trial.user_attrs.get('reject_stage', 'unknown'),
+            'reason_code': frozen_trial.user_attrs.get('reject_code', ReasonCode.PRUNED),
+            'reason': frozen_trial.user_attrs.get('reject_reason', 'optuna_pruned'),
+            'metrics': {
+                'n_trades': frozen_trial.user_attrs.get('n_trades'),
+                'n_folds': frozen_trial.user_attrs.get('n_folds'),
+            },
+        })
+
     try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
                         callbacks=[PlateauStopper(
                             plateau_patience,
                             plateau_min_delta,
                             plateau_warmup,
                             min_completed_trials,
-                        )])
+                        ), _prune_event_callback])
     except KeyboardInterrupt: print("\n🛑 Stopped.")
     except Exception as e: print(f"\n❌ {e}"); traceback.print_exc(); return None
     if not study.trials: print("No trials."); return None
@@ -2301,6 +2380,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'accepted_trials': int(accepted_trials),
             'reject_reason_counts': reject_reason_counts,
             'reject_code_counts': reject_code_counts,
+            'reject_prune_log_path': str(event_log_path) if event_log_path else None,
         }}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
@@ -2311,11 +2391,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     )
     p = _persist_result_json(coin_name, result_data)
     if p: print(f"  💾 {p}")
+    if event_log_path:
+        print(f"  🧾 Reject/prune log: {event_log_path}")
 
     print(f"\n  📝 CoinProfile(name='{coin_name}',")
     for k, v in sorted(effective_best_params.items()):
         print(f"    {k}={f'{v:.4f}'.rstrip('0').rstrip('.') if isinstance(v, float) else v},")
     print(f"  )")
+    EVENT_LOGGER = None
     return result_data
 
 
