@@ -35,6 +35,7 @@ from core.coin_profiles import (
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
 from core.trading_costs import get_contract_spec
+from core.costs import compute_cost_breakdown
 from core.labeling import (
     TripleBarrierSpec,
     compute_labels_from_feature_index,
@@ -161,6 +162,13 @@ class Config:
     fee_pct_per_side: float = 0.0010
     min_fee_per_contract: float = 0.20
     slippage_bps: float = 2.0
+    apply_funding: bool = True
+    apply_slippage: bool = True
+    apply_impact: bool = False
+    impact_bps_per_contract: float = 0.0
+    impact_max_bps_per_side: float = 10.0
+    cost_config_path: Optional[str] = None
+    cost_config_version: str = 'legacy_default'
 
     # Regime Filter (defaults — overridden per-coin)
     min_vol_24h: float = 0.008
@@ -350,18 +358,22 @@ def calculate_execution_costs(n_contracts: int, entry_price: float, exit_price: 
     entry_notional = n_contracts * spec['units'] * entry_price
     exit_notional = n_contracts * spec['units'] * exit_price
 
-    entry_pct_fee = entry_notional * config.fee_pct_per_side
-    exit_pct_fee = exit_notional * config.fee_pct_per_side
-    entry_min_fee = n_contracts * config.min_fee_per_contract
-    exit_min_fee = n_contracts * config.min_fee_per_contract
-
-    entry_fee = max(entry_pct_fee, entry_min_fee)
-    exit_fee = max(exit_pct_fee, exit_min_fee)
-
-    pct_component = min(entry_pct_fee, entry_fee) + min(exit_pct_fee, exit_fee)
-    min_component = max(entry_fee - entry_pct_fee, 0.0) + max(exit_fee - exit_pct_fee, 0.0)
-    slippage_component = (entry_notional + exit_notional) * (config.slippage_bps / 10000.0)
-    total_cost = entry_fee + exit_fee + slippage_component
+    cost_breakdown = compute_cost_breakdown(
+        entry_notional=entry_notional,
+        exit_notional=exit_notional,
+        n_contracts=n_contracts,
+        fee_pct_per_side=config.fee_pct_per_side,
+        min_fee_per_contract=config.min_fee_per_contract,
+        slippage_bps_per_side=config.slippage_bps,
+        impact_bps_per_contract=config.impact_bps_per_contract,
+        impact_max_bps_per_side=config.impact_max_bps_per_side,
+        apply_slippage=config.apply_slippage,
+        apply_impact=config.apply_impact,
+    )
+    total_cost = cost_breakdown.total_cost_dollars
+    pct_component = cost_breakdown.pct_fee_component
+    min_component = cost_breakdown.min_fee_component
+    slippage_component = cost_breakdown.slippage_component + cost_breakdown.impact_component
     return total_cost, pct_component, min_component, slippage_component
 
 
@@ -382,7 +394,7 @@ def calculate_pnl_exact(entry_price: float, exit_price: float, direction: int,
     pct_fee_pnl = -(pct_fee_component / total_notional)
     min_fee_pnl = -(min_fee_component / total_notional)
     slippage_pnl = -(slippage_component / total_notional)
-    funding_dollars = accum_funding * total_notional
+    funding_dollars = (accum_funding * total_notional) if config.apply_funding else 0.0
     net_pnl_dollars = raw_pnl_dollars - total_fee_dollars + funding_dollars
     net_pnl_pct = net_pnl_dollars / total_notional
     return net_pnl_pct, raw_pnl_pct, -total_fee_pct, pct_fee_pnl, min_fee_pnl, slippage_pnl, net_pnl_dollars, total_notional
