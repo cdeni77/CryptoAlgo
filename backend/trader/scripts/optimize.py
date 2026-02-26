@@ -1219,20 +1219,38 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
 def _holdout_selection_score(holdout_metrics, cv_score=0.0):
     if not holdout_metrics:
         return -999.0
-    ho_sr = _as_number(holdout_metrics.get('holdout_sharpe'), 0.0) or 0.0
-    ho_ret = _as_number(holdout_metrics.get('holdout_return'), 0.0) or 0.0
-    ho_trades = int(holdout_metrics.get('holdout_trades', 0) or 0)
+    slices = holdout_metrics.get('holdout_slices', {}) if isinstance(holdout_metrics, dict) else {}
+    slice_items = []
+    if isinstance(slices, dict):
+        for name, metrics in slices.items():
+            if isinstance(metrics, dict):
+                slice_items.append((name, metrics))
+    if not slice_items:
+        slice_items = [('legacy', holdout_metrics)]
 
-    trade_term = min(1.0, ho_trades / 25.0)
-    score = (0.60 * ho_sr) + (0.25 * ho_ret * 5.0) + (0.15 * trade_term)
+    sharpe_vals = [_as_number(m.get('holdout_sharpe'), 0.0) or 0.0 for _, m in slice_items]
+    return_vals = [_as_number(m.get('holdout_return'), 0.0) or 0.0 for _, m in slice_items]
+    trade_vals = [int(m.get('holdout_trades', 0) or 0) for _, m in slice_items]
 
-    if ho_trades < 10:
-        score -= 0.25
-    if ho_sr <= 0:
-        score -= 0.35
-    if ho_ret <= 0:
-        score -= 0.25
+    median_sr = float(np.median(sharpe_vals)) if sharpe_vals else 0.0
+    median_ret = float(np.median(return_vals)) if return_vals else 0.0
+    median_trade_term = min(1.0, (float(np.median(trade_vals)) if trade_vals else 0.0) / 25.0)
+    dispersion_penalty = 0.35 * (float(np.std(sharpe_vals)) if len(sharpe_vals) > 1 else 0.0)
 
+    trade_min_penalty = 0.0
+    for _, metrics in slice_items:
+        ho_sr = _as_number(metrics.get('holdout_sharpe'), 0.0) or 0.0
+        ho_ret = _as_number(metrics.get('holdout_return'), 0.0) or 0.0
+        ho_trades = int(metrics.get('holdout_trades', 0) or 0)
+        if ho_trades < 10:
+            trade_min_penalty += 0.20
+        if ho_sr <= 0:
+            trade_min_penalty += 0.20
+        if ho_ret <= 0:
+            trade_min_penalty += 0.15
+
+    score = (0.60 * median_sr) + (0.25 * median_ret * 5.0) + (0.15 * median_trade_term)
+    score -= (trade_min_penalty + dispersion_penalty)
     return score + 0.10 * (_as_number(cv_score, 0.0) or 0.0)
 
 
@@ -1248,23 +1266,91 @@ def _passes_holdout_gate(holdout_metrics, min_trades=15, min_sharpe=0.0, min_ret
 # HOLDOUT (full run_backtest — called ONCE at the end)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days, pruned_only=True):
-    target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
-    if not target_sym: return None
-    profile = profile_from_params(params, coin_name)
+def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days, pruned_only=True):
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
-                    train_embargo_hours=24, oos_eval_days=holdout_days,
+                    train_embargo_hours=24, oos_eval_days=int(eval_days),
                     enforce_pruned_features=bool(pruned_only))
-    try: result = run_backtest({target_sym: holdout_data[target_sym]}, config, profile_overrides={coin_name: profile})
-    except Exception as e: print(f"  ❌ Holdout error: {e}"); return None
+    try:
+        result = run_backtest({target_sym: holdout_data[target_sym]}, config, profile_overrides={coin_name: profile})
+    except Exception as e:
+        print(f"  ❌ Holdout error ({eval_days}d): {e}")
+        return None
     if not result:
         _set_diag('model_training_failed')
         return None
     oos_sr = _finite_metric(result.get('oos_sharpe', 0))
-    return {'holdout_sharpe': oos_sr if oos_sr > -90 else 0, 'holdout_return': _finite_metric(result.get('oos_return', 0)),
-            'holdout_trades': int(result.get('oos_trades', 0) or 0), 'full_sharpe': _finite_metric(result.get('sharpe_annual', 0)),
-            'full_pf': _finite_metric(result.get('profit_factor', 0)), 'full_dd': _finite_metric(result.get('max_drawdown', 1), 1),
-            'full_trades': int(result.get('n_trades', 0) or 0)}
+    return {
+        'holdout_sharpe': oos_sr if oos_sr > -90 else 0,
+        'holdout_return': _finite_metric(result.get('oos_return', 0)),
+        'holdout_trades': int(result.get('oos_trades', 0) or 0),
+        'full_sharpe': _finite_metric(result.get('sharpe_annual', 0)),
+        'full_pf': _finite_metric(result.get('profit_factor', 0)),
+        'full_dd': _finite_metric(result.get('max_drawdown', 1), 1),
+        'full_trades': int(result.get('n_trades', 0) or 0),
+    }
+
+
+def _derive_top_level_holdout(holdout_slices, holdout_mode):
+    if not holdout_slices:
+        return {}
+    recent = holdout_slices.get('recent90')
+    if holdout_mode == 'single90' and isinstance(recent, dict):
+        selected = dict(recent)
+        selected['selected_slice'] = 'recent90'
+        return selected
+
+    values = [m for m in holdout_slices.values() if isinstance(m, dict)]
+    if not values:
+        return {}
+    selected = {
+        'holdout_sharpe': float(np.median([_as_number(m.get('holdout_sharpe'), 0.0) or 0.0 for m in values])),
+        'holdout_return': float(np.median([_as_number(m.get('holdout_return'), 0.0) or 0.0 for m in values])),
+        'holdout_trades': int(min(int(m.get('holdout_trades', 0) or 0) for m in values)),
+        'full_sharpe': float(np.median([_as_number(m.get('full_sharpe'), 0.0) or 0.0 for m in values])),
+        'full_pf': float(np.median([_as_number(m.get('full_pf'), 0.0) or 0.0 for m in values])),
+        'full_dd': float(np.median([_as_number(m.get('full_dd'), 1.0) or 1.0 for m in values])),
+        'full_trades': int(min(int(m.get('full_trades', 0) or 0) for m in values)),
+        'selected_slice': 'median_composite',
+    }
+    return selected
+
+
+def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days, pruned_only=True, holdout_mode='single90'):
+    target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
+    if not target_sym: return None
+    profile = profile_from_params(params, coin_name)
+    holdout_slices = {}
+
+    recent_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only)
+    if recent_metrics:
+        holdout_slices['recent90'] = recent_metrics
+
+    sym_ohlcv = holdout_data[target_sym]['ohlcv']
+    end_ts = sym_ohlcv.index.max()
+    prior_end = end_ts - pd.Timedelta(days=90)
+    prior_dataset = {
+        target_sym: {
+            'features': holdout_data[target_sym]['features'][holdout_data[target_sym]['features'].index <= prior_end],
+            'ohlcv': sym_ohlcv[sym_ohlcv.index <= prior_end],
+        }
+    }
+    if len(prior_dataset[target_sym]['ohlcv']) > 500:
+        prior_metrics = _run_holdout_window(prior_dataset, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only)
+        if prior_metrics:
+            holdout_slices['prior90'] = prior_metrics
+
+    full_span_days = (sym_ohlcv.index.max() - sym_ohlcv.index.min()).days
+    if full_span_days >= 180:
+        full_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=180, pruned_only=pruned_only)
+        if full_metrics:
+            holdout_slices['full180'] = full_metrics
+
+    top_level = _derive_top_level_holdout(holdout_slices, holdout_mode=holdout_mode)
+    if not top_level:
+        return None
+    top_level['holdout_mode'] = holdout_mode
+    top_level['holdout_slices'] = holdout_slices
+    return top_level
 
 def assess_result_quality(rd):
     issues, warns = [], []
@@ -1405,6 +1491,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=5,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
+                  holdout_mode='single90',
                   target_trades_per_week=1.0, target_trades_per_year=None,
                   preset_name="none", enable_fee_stress=True,
                   fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
@@ -1425,7 +1512,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
-    print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}")
+    print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     print(
@@ -1573,7 +1660,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         ranked_candidates = []
         for cand in candidate_trials:
             holdout_metrics = evaluate_holdout(holdout_data, cand.params, coin_name, coin_prefix, holdout_days,
-                                               pruned_only=pruned_only)
+                                               pruned_only=pruned_only, holdout_mode=holdout_mode)
             if not holdout_metrics:
                 continue
             sel_score = _holdout_selection_score(holdout_metrics, cv_score=cand.value)
@@ -1583,6 +1670,17 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 f"SR={_fmt_float(holdout_metrics['holdout_sharpe'])} "
                 f"Ret={_fmt_pct(holdout_metrics['holdout_return'],2)} Trades={holdout_metrics['holdout_trades']}"
             )
+            slice_parts = []
+            for slice_name in ('recent90', 'prior90', 'full180'):
+                sm = holdout_metrics.get('holdout_slices', {}).get(slice_name)
+                if not sm:
+                    continue
+                slice_parts.append(
+                    f"{slice_name}:SR={_fmt_float(sm.get('holdout_sharpe'))},"
+                    f"Ret={_fmt_pct(sm.get('holdout_return'),2)},T={int(sm.get('holdout_trades', 0) or 0)}"
+                )
+            if slice_parts:
+                print(f"     slices[{holdout_mode}] -> " + " | ".join(slice_parts))
 
         if ranked_candidates:
             ranked_candidates.sort(key=lambda x: x[2], reverse=True)
@@ -1616,6 +1714,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 'n_passing_candidates': len(passing_candidates),
                 'selected_trial': int(best.number),
                 'selected_score': round(float(selected_score), 6),
+                'holdout_mode': holdout_mode,
                 'require_holdout_pass': bool(require_holdout_pass),
                 'holdout_gate': {
                     'min_trades': int(holdout_min_trades),
@@ -1631,6 +1730,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                         'holdout_sharpe': round(float(m.get('holdout_sharpe', 0.0) or 0.0), 6),
                         'holdout_return': round(float(m.get('holdout_return', 0.0) or 0.0), 6),
                         'holdout_trades': int(m.get('holdout_trades', 0) or 0),
+                        'holdout_slices': m.get('holdout_slices', {}),
                         'passes_gate': _passes_holdout_gate(
                             m,
                             min_trades=effective_holdout_min_trades,
@@ -1642,9 +1742,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 ],
             }
             h = holdout_result
-            print(f"  ✅ Selected holdout: SR={_fmt_float(h['holdout_sharpe'])} Ret={_fmt_pct(h['holdout_return'],2)} "
+            print(f"  ✅ Selected holdout[{holdout_mode}]: SR={_fmt_float(h['holdout_sharpe'])} Ret={_fmt_pct(h['holdout_return'],2)} "
                   f"Trades={h['holdout_trades']} | Full: SR={_fmt_float(h['full_sharpe'])} "
                   f"PF={_fmt_float(h['full_pf'])} DD={_fmt_pct(h['full_dd'],2)}")
+            if h.get('holdout_slices'):
+                print("     slice outcomes: " + ", ".join(
+                    f"{k}(SR={_fmt_float(v.get('holdout_sharpe'))},Ret={_fmt_pct(v.get('holdout_return'),2)},T={int(v.get('holdout_trades',0) or 0)})"
+                    for k, v in h['holdout_slices'].items() if isinstance(v, dict)
+                ))
         else:
             print("  ⚠️ Holdout evaluation returned no valid candidates.")
 
@@ -1672,7 +1777,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'params': effective_best_params,
         'tunable_params': tunable_best_params,
         'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
-        'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
+        'holdout_days': holdout_days, 'holdout_mode': holdout_mode,
+        'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'fee_stress': {
             'enabled': bool(enable_fee_stress),
             'multiplier': float(fee_stress_multiplier),
@@ -1819,10 +1925,10 @@ def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010},
-        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -1834,6 +1940,7 @@ def apply_runtime_preset(args):
             'plateau_min_delta': '--plateau-min-delta',
             'plateau_min_completed': '--plateau-min-completed',
             'holdout_days': '--holdout-days',
+            'holdout_mode': '--holdout-mode',
             'min_internal_oos_trades': '--min-internal-oos-trades',
             'min_total_trades': '--min-total-trades',
             'n_cv_folds': '--n-cv-folds',
@@ -1872,6 +1979,8 @@ if __name__ == "__main__":
     parser.add_argument("--plateau-min-completed", type=int, default=0,
                         help="Never plateau-stop before this many completed trials (0 = auto 40%% of n_trials)")
     parser.add_argument("--holdout-days", type=int, default=90)
+    parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
+                        help="Holdout aggregation mode for selection + backward-compatible top-level metrics")
     parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
@@ -1950,6 +2059,7 @@ if __name__ == "__main__":
             holdout_candidates=args.holdout_candidates, require_holdout_pass=args.require_holdout_pass,
             holdout_min_trades=args.holdout_min_trades, holdout_min_sharpe=args.holdout_min_sharpe,
             holdout_min_return=args.holdout_min_return,
+            holdout_mode=args.holdout_mode,
             target_trades_per_week=args.target_trades_per_week,
             target_trades_per_year=args.target_trades_per_year,
             enable_fee_stress=not args.disable_fee_stress,
