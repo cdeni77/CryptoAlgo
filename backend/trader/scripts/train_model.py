@@ -142,6 +142,8 @@ class Config:
     signal_threshold: float = 0.80
     min_funding_z: float = 0.0
     min_momentum_magnitude: float = 0.07
+    momentum_score_threshold: float = 2.0
+    momentum_strict_mode: bool = False
 
     # Exit Strategy (defaults — overridden per-coin by profiles)
     vol_mult_tp: float = 5.5
@@ -245,6 +247,30 @@ def _fit_calibrator(
     platt = LogisticRegression(solver='lbfgs', max_iter=2000)
     platt.fit(x.reshape(-1, 1), y)
     return platt, 'platt'
+
+
+def _resolve_momentum_direction(
+    ret_24h: float,
+    ret_72h: float,
+    price: float,
+    sma_50: float,
+    config: Config,
+) -> int:
+    """Returns momentum direction as {1, -1, 0} based on configured strictness and threshold."""
+    if config.momentum_strict_mode and ret_24h * ret_72h < 0:
+        return 0
+
+    momentum_score = (
+        (1 if ret_24h > 0 else -1)
+        + (1 if ret_72h > 0 else -1)
+        + (1 if price > sma_50 else -1)
+    )
+
+    if momentum_score >= config.momentum_score_threshold:
+        return 1
+    if momentum_score <= -config.momentum_score_threshold:
+        return -1
+    return 0
 
 
 def _calibrator_predict(calibrator, scores: np.ndarray) -> np.ndarray:
@@ -1396,18 +1422,14 @@ def run_backtest(all_data: Dict, config: Config,
                         _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
                         continue
 
-                    # v7.3: Require 24h and 72h returns to agree on direction
-                    if ret_24h * ret_72h < 0:
-                        _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
-                        continue
-
-                    momentum_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
-
-                    if momentum_score >= 2:
-                        direction = 1
-                    elif momentum_score <= -2:
-                        direction = -1
-                    else:
+                    direction = _resolve_momentum_direction(
+                        ret_24h=ret_24h,
+                        ret_72h=ret_72h,
+                        price=price,
+                        sma_50=sma_50,
+                        config=config,
+                    )
+                    if direction == 0:
                         _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
                         continue
 
@@ -1905,15 +1927,18 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
         ret_24h = (price / ohlc['close'].iloc[ts_loc - 24] - 1) if ts_loc >= 24 else 0
         ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
         sma_50 = ohlc['close'].iloc[max(0, ts_loc - 50):ts_loc].mean() if ts_loc >= 10 else price
-        momentum_score = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
-        if momentum_score >= 2:
-            direction = 1
-        elif momentum_score <= -2:
-            direction = -1
-        else:
+        direction = _resolve_momentum_direction(
+            ret_24h=ret_24h,
+            ret_72h=ret_72h,
+            price=price,
+            sma_50=sma_50,
+            config=config,
+        )
+        if direction == 0:
             _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
             if debug:
-                print(f"\n[{sym}] ⏸️  No momentum consensus (score={momentum_score}) [momentum_dir_agreement]")
+                strict_msg = "strict disagreement filter enabled" if config.momentum_strict_mode else "score below threshold"
+                print(f"\n[{sym}] ⏸️  No momentum consensus ({strict_msg}; threshold={config.momentum_score_threshold:.2f}) [momentum_dir_agreement]")
             continue
 
         if pd.isna(sma_200):
@@ -2059,6 +2084,10 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=float, default=5.5, help="Default TP vol multiplier")
     parser.add_argument("--sl", type=float, default=3.0, help="Default SL vol multiplier")
     parser.add_argument("--momentum", type=float, default=0.04, help="Default min 72h momentum magnitude")
+    parser.add_argument("--momentum-score-threshold", type=float, default=2.0,
+                        help="Momentum consensus score threshold (2.0 strict, 1.0 relaxed)")
+    parser.add_argument("--strict-momentum-consensus", action="store_true",
+                        help="Reject opposite-signed 24h/72h returns before score check")
     parser.add_argument("--hold", type=int, default=96, help="Default max hold hours")
     parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
     parser.add_argument("--min-edge", type=float, default=0.01, help="Require prob >= threshold + min-edge")
@@ -2095,6 +2124,8 @@ if __name__ == "__main__":
         vol_mult_tp=args.tp,
         vol_mult_sl=args.sl,
         min_momentum_magnitude=args.momentum,
+        momentum_score_threshold=args.momentum_score_threshold,
+        momentum_strict_mode=args.strict_momentum_consensus,
         max_hold_hours=args.hold,
         cooldown_hours=args.cooldown,
         min_signal_edge=args.min_edge,
