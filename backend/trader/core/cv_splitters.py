@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -17,7 +18,7 @@ class CVFold:
     embargo_bars: int
 
 
-def _bars_from_days(index: pd.DatetimeIndex, days: Optional[int]) -> int:
+def _bars_from_days(index: pd.DatetimeIndex, days: Optional[float]) -> int:
     if not days or days <= 0:
         return 0
     if len(index) < 2:
@@ -25,7 +26,7 @@ def _bars_from_days(index: pd.DatetimeIndex, days: Optional[int]) -> int:
     step = index.to_series().diff().dropna().median()
     if pd.isna(step) or step <= pd.Timedelta(0):
         return int(days)
-    return int((pd.Timedelta(days=int(days)) / step).ceil())
+    return int(math.ceil(pd.Timedelta(days=float(days)) / step))
 
 
 def _resolve_bars(index: pd.DatetimeIndex, *, days: Optional[int] = None, bars: Optional[int] = None) -> int:
