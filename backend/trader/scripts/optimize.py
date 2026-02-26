@@ -357,7 +357,19 @@ def fast_evaluate_fold(features, ohlcv, train_end, test_start, test_end, profile
     )
     if not result:
         _set_diag('model_training_failed')
-        return None
+        return {
+            'n_trades': 0,
+            'sharpe': 0.0,
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'max_drawdown': 0.0,
+            'ann_return': 0.0,
+            'total_return': 0.0,
+            'trades_per_year': 0.0,
+            'avg_pnl': 0.0,
+            'avg_raw_pnl': 0.0,
+            'fee_edge_ratio': 0.0,
+        }
     model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
 
     # --- SIMULATE TRADING ---
@@ -544,7 +556,7 @@ FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_chi
 FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
-    'min_val_auc': 0.50,
+    'min_val_auc': 0.48,
     'cooldown_hours': 24.0,
     'min_vol_24h': 0.006,
     'max_vol_24h': 0.08,
@@ -678,7 +690,7 @@ def objective(
     profile = create_trial_profile(trial, coin_name)
     config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
                     train_embargo_hours=24, enforce_pruned_features=bool(pruned_only),
-                    min_val_auc=0.50, min_train_samples=100, signal_threshold=0.50)
+                    min_val_auc=0.48, min_train_samples=100, signal_threshold=0.50)
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
 
