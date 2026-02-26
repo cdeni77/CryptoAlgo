@@ -42,6 +42,21 @@ def test_embargo_blocks_adjacent_samples_after_test_window() -> None:
         assert len(embargo_slice.intersection(fold.train_idx)) == 0
 
 
+def test_purged_embargo_splits_support_day_based_purge_and_embargo() -> None:
+    idx = _index()
+    folds = create_purged_embargo_splits(
+        idx,
+        n_folds=3,
+        min_train_days=5,
+        purge_days=2,
+        embargo_days=1,
+    )
+
+    for fold in folds:
+        assert fold.purge_bars == 48
+        assert fold.embargo_bars == 24
+
+
 class MeanRecorderScaler:
     def fit(self, x: pd.DataFrame) -> None:
         self.mean_ = x.mean()
