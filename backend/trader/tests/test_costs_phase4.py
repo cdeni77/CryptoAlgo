@@ -5,6 +5,14 @@ from scripts.optimize import _build_cost_config
 from scripts.train_model import Config, calculate_pnl_exact
 
 
+def _exchange_config_path(filename: str) -> Path:
+    for base in (Path(__file__).resolve(), *Path(__file__).resolve().parents):
+        candidate = base / "configs" / "exchange" / filename
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Unable to locate exchange config '{filename}' from {__file__}")
+
+
 def test_cost_breakdown_components_are_explicit() -> None:
     breakdown = compute_cost_breakdown(
         entry_notional=10_000.0,
@@ -26,7 +34,7 @@ def test_cost_breakdown_components_are_explicit() -> None:
 
 
 def test_exchange_cost_config_load_and_metadata() -> None:
-    cfg_path = Path(__file__).resolve().parents[3] / "configs/exchange/binance_perps_v202602.json"
+    cfg_path = _exchange_config_path("binance_perps_v202602.json")
     assumptions = load_exchange_cost_assumptions(cfg_path)
     config, metadata = _build_cost_config(assumptions)
 
@@ -39,7 +47,7 @@ def test_exchange_cost_config_load_and_metadata() -> None:
 
 
 def test_coinbase_retail_config_uses_bps_execution_fee_path() -> None:
-    cfg_path = Path(__file__).resolve().parents[3] / "configs/exchange/coinbase_us_perps_retail_v202602.json"
+    cfg_path = _exchange_config_path("coinbase_us_perps_retail_v202602.json")
     assumptions = load_exchange_cost_assumptions(cfg_path)
     _, metadata = _build_cost_config(assumptions)
 
@@ -67,7 +75,7 @@ def test_coinbase_retail_config_uses_bps_execution_fee_path() -> None:
 
 
 def test_coinbase_cde_config_uses_symbol_specific_per_contract_fees() -> None:
-    cfg_path = Path(__file__).resolve().parents[3] / "configs/exchange/coinbase_us_perps_cde_v202602.json"
+    cfg_path = _exchange_config_path("coinbase_us_perps_cde_v202602.json")
     assumptions = load_exchange_cost_assumptions(cfg_path)
     _, metadata = _build_cost_config(assumptions)
 
