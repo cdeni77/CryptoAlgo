@@ -59,6 +59,7 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.012,
         "plateau_warmup": 80,
         "holdout_days": 90,
+        "holdout_mode": "multi_slice",
         "min_internal_oos_trades": 10,
         "min_total_trades": 28,
         "n_cv_folds": 5,
@@ -75,6 +76,7 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.015,
         "plateau_warmup": 60,
         "holdout_days": 90,
+        "holdout_mode": "multi_slice",
         "min_internal_oos_trades": 8,
         "min_total_trades": 30,
         "n_cv_folds": 5,
@@ -91,6 +93,7 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.015,
         "plateau_warmup": 45,
         "holdout_days": 90,
+        "holdout_mode": "multi_slice",
         "min_internal_oos_trades": 6,
         "min_total_trades": 25,
         "n_cv_folds": 5,
@@ -107,6 +110,7 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.03,
         "plateau_warmup": 20,
         "holdout_days": 90,
+        "holdout_mode": "single90",
         "min_internal_oos_trades": 0,
         "min_total_trades": 8,
         "n_cv_folds": 2,
@@ -131,6 +135,7 @@ PRESET_CONFIGS = {
         "plateau_min_delta": 0.025,
         "plateau_warmup": 20,
         "holdout_days": 90,
+        "holdout_mode": "multi_slice",
         "min_internal_oos_trades": 10,
         "min_total_trades": 35,
         "n_cv_folds": 5,
@@ -157,6 +162,7 @@ def apply_runtime_preset(args):
         "plateau_warmup": "--plateau-warmup",
         "plateau_min_completed": "--plateau-min-completed",
         "holdout_days": "--holdout-days",
+        "holdout_mode": "--holdout-mode",
         "min_internal_oos_trades": "--min-internal-oos-trades",
         "min_total_trades": "--min-total-trades",
         "n_cv_folds": "--n-cv-folds",
@@ -412,6 +418,8 @@ def print_final_report(script_dir, target_coins, total_time):
         holdout_metrics = opt.get('holdout_metrics', {})
         readiness = val.get('readiness', {})
         gate_mode = opt.get('gate_mode', "initial_paper_qualification")
+        holdout_mode = opt.get('holdout_mode', holdout_metrics.get('holdout_mode', 'single90'))
+        holdout_slices = holdout_metrics.get('holdout_slices', {}) if isinstance(holdout_metrics, dict) else {}
         version = opt.get('version', 'v10')
 
         # v11: Show OOS metrics primarily
@@ -443,8 +451,19 @@ def print_final_report(script_dir, target_coins, total_time):
               f"Std={_f(std_oos_sr)} | WR={_fmt_metric(opt_wr, '.1%')} | "
               f"DD={_fmt_metric(opt_dd, '.1%')} | Trades={opt_trades}")
         print(f"     │  Trades/Year={_fmt_metric(opt_tpy, '.1f')} | Frequency ratio={_fmt_metric(freq_ratio, '.2f')}")
-        print(f"     ├─ Holdout (mode={gate_mode})")
+        print(f"     ├─ Holdout (mode={holdout_mode}, gate={gate_mode})")
         print(f"     │  Sharpe={_f(ho_sharpe)} | Return={_fmt_metric(ho_return, '.2%')} | Trades={ho_trades}")
+        if isinstance(holdout_slices, dict) and holdout_slices:
+            slice_parts = []
+            for slice_name in ('recent90', 'prior90', 'full180'):
+                sm = holdout_slices.get(slice_name)
+                if not isinstance(sm, dict):
+                    continue
+                slice_parts.append(
+                    f"{slice_name}:SR={_f(sm.get('holdout_sharpe'))},Ret={_fmt_metric(sm.get('holdout_return'), '.2%')},T={int(sm.get('holdout_trades', 0) or 0)}"
+                )
+            if slice_parts:
+                print(f"     │  Slices: {' | '.join(slice_parts)}")
 
         if readiness:
             print(f"     ├─ Validation: {val_rating} ({_fmt_metric(val_score, '.0f')}/100)")
@@ -523,6 +542,8 @@ def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id
                 "recommended_position_scale": readiness.get("recommended_position_scale"),
                 "deployment_blocked": bool(opt_results.get(coin, {}).get("deployment_blocked", False)),
                 "deployment_block_reasons": opt_results.get(coin, {}).get("deployment_block_reasons", []),
+                "holdout_mode": opt_results.get(coin, {}).get("holdout_mode", args.holdout_mode),
+                "holdout_slices": opt_results.get(coin, {}).get("holdout_metrics", {}).get("holdout_slices", {}),
             }
         )
 
@@ -536,6 +557,7 @@ def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id
         "deployment_tier_map": {row["coin"]: row["deployment_intent"] for row in coins_summary},
         "coin_summaries": coins_summary,
         "gate_mode": args.gate_mode,
+        "holdout_mode": args.holdout_mode,
         "gate_profile": gate_mode,
         "escalation_policy": gate_mode.get("escalation_policy"),
     }
@@ -604,6 +626,8 @@ if __name__ == "__main__":
     parser.add_argument("--plateau-min-completed", type=int, default=0,
                         help="Never plateau-stop before this many completed trials (0 = auto 40%% of n_trials)")
     parser.add_argument("--holdout-days", type=int, default=90)
+    parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
+                        help="Holdout aggregation mode for optimize workers")
     parser.add_argument("--preset", type=str, default="paper_ready",
                         choices=["none", "paper_ready", "robust120", "robust180", "quick", "pilot_rollout"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0)
@@ -740,6 +764,7 @@ if __name__ == "__main__":
         print(f"   Worker split: {worker_counts}")
         print(f"   CV folds:     {args.n_cv_folds} (walk-forward)")
         print(f"   Holdout:      {args.holdout_days} days")
+        print(f"   Holdout mode: {args.holdout_mode}")
         est_ho_trades, eff_ho_floor = estimate_holdout_trade_budget(
             holdout_days=args.holdout_days,
             target_trades_per_week=args.target_trades_per_week,
@@ -788,6 +813,7 @@ if __name__ == "__main__":
                 "--plateau-warmup", str(args.plateau_warmup),
                 "--plateau-min-completed", str(args.plateau_min_completed),
                 "--holdout-days", str(args.holdout_days),
+                "--holdout-mode", str(args.holdout_mode),
                 "--n-cv-folds", str(args.n_cv_folds),
                 "--holdout-candidates", str(args.holdout_candidates),
                 "--holdout-min-trades", str(args.holdout_min_trades),
