@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
+from core.run_manifest import best_effort_git_commit, best_effort_sha256, manifest_base, write_manifest
+
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 PILOT_ROLLOUT_DEFAULT_COINS = ["ETH", "SOL"]
 
@@ -567,7 +569,7 @@ def _coin_intent_from_rating(rating: str, coin: str, args) -> str:
     return "SHADOW"
 
 
-def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id: str, total_time: float) -> Path:
+def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id: str, total_time: float, manifest_path: Path | None = None) -> Path:
     results_dir = script_dir / "optimization_results"
     results_dir.mkdir(parents=True, exist_ok=True)
     opt_results = load_optimization_results(results_dir)
@@ -613,6 +615,7 @@ def write_launch_summary(script_dir: Path, args, target_coins: List[str], run_id
         "holdout_mode": args.holdout_mode,
         "gate_profile": gate_mode,
         "escalation_policy": gate_mode.get("escalation_policy"),
+        "artifacts": {"run_manifest": str(manifest_path) if manifest_path else None},
     }
 
     versioned_path = results_dir / f"launch_summary_{run_id}.json"
@@ -660,6 +663,59 @@ def _estimate_validation_timeout(result_path, timeout_scale=1.0, timeout_cap=720
         fallback_min = 420 if mode == "paper_screen" else 900
         fallback = int(fallback_seed * max(0.5, timeout_scale))
         return int(min(max(fallback_min, fallback), timeout_cap))
+
+
+def build_run_manifest(script_dir: Path, args, target_coins: List[str], run_id: str) -> dict:
+    trader_root = script_dir.parent
+    optuna_db = script_dir / "optuna_trading.db"
+    trader_db_path = Path(os.getenv("TRADER_DB_PATH", "/app/data/trading.db"))
+    manifest = manifest_base(run_id=run_id)
+    manifest.update({
+        "git_commit": best_effort_git_commit(trader_root.parent),
+        "preset": args.preset,
+        "args": vars(args),
+        "target_coins": target_coins,
+        "seed_policy": {
+            "sampler_seeds": [int(s.strip()) for s in str(args.sampler_seeds).split(',') if s.strip()],
+            "policy": "multi_seed_consensus" if ',' in str(args.sampler_seeds) else "single_seed",
+        },
+        "optimizer_flags": {
+            "holdout_mode": args.holdout_mode,
+            "require_holdout_pass": bool(args.require_holdout_pass),
+            "holdout_candidates": int(args.holdout_candidates),
+            "gate_mode": args.gate_mode,
+            "min_psr": float(args.min_psr),
+            "min_psr_cv": args.min_psr_cv,
+            "min_psr_holdout": args.min_psr_holdout,
+            "min_dsr": args.min_dsr,
+            "proxy_fidelity_candidates": int(getattr(args, "proxy_fidelity_candidates", 3)),
+            "proxy_fidelity_eval_days": int(getattr(args, "proxy_fidelity_eval_days", 90)),
+        },
+        "config_versions": {
+            "parallel_launch": "v11",
+            "optimizer": "v11.3",
+        },
+        "data_fingerprints": {
+            "optuna_db_sha256": best_effort_sha256(optuna_db),
+            "trader_db_path": str(trader_db_path),
+            "trader_db_sha256": best_effort_sha256(trader_db_path),
+        },
+        "notes": {
+            "git_commit_best_effort": True,
+            "data_checksums_best_effort": True,
+        },
+    })
+    return manifest
+
+
+def write_run_manifest(script_dir: Path, run_id: str, payload: dict) -> Path:
+    results_dir = script_dir / "optimization_results"
+    versioned = results_dir / f"run_manifest_{run_id}.json"
+    latest = results_dir / "run_manifest.json"
+    write_manifest(versioned, payload)
+    write_manifest(latest, payload)
+    return latest
+
 
 
 if __name__ == "__main__":
@@ -805,6 +861,11 @@ if __name__ == "__main__":
             print(f"✅ Preflight complete: {preflight_output}")
         if args.preflight_only:
             raise SystemExit(preflight_rc)
+
+    manifest_payload = build_run_manifest(script_dir, args, target_coins, run_id)
+    manifest_payload["status"] = "started"
+    manifest_path = write_run_manifest(script_dir, run_id, manifest_payload)
+    print(f"\n🧾 Run manifest: {manifest_path}")
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1: OPTIMIZATION
@@ -1127,4 +1188,8 @@ if __name__ == "__main__":
 
     total_time = time.time() - pipeline_start
     print_final_report(script_dir, target_coins, total_time)
-    write_launch_summary(script_dir, args, target_coins, run_id, total_time)
+    manifest_payload["status"] = "completed"
+    manifest_payload["runtime_seconds"] = round(total_time, 2)
+    manifest_payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+    manifest_path = write_run_manifest(script_dir, run_id, manifest_payload)
+    write_launch_summary(script_dir, args, target_coins, run_id, total_time, manifest_path=manifest_path)
