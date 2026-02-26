@@ -215,6 +215,7 @@ def _reject_trial(
     trial.set_user_attr('reject_code', str(code))
     trial.set_user_attr('reject_reason', str(reason))
     trial.set_user_attr('reject_stage', str(stage))
+    trial.set_user_attr('prune_reason', str(code))
     trial.set_user_attr('reject_observed', observed if observed is None else float(observed))
     trial.set_user_attr('reject_threshold', threshold if threshold is None else float(threshold))
     trial.set_user_attr('reject_penalty', float(penalty))
@@ -617,11 +618,66 @@ FIXED_RISK = {
 
 COIN_OPTIMIZATION_PRIORS = {
     # target_trades_per_year ~= at least weekly cadence while preserving quality
-    'BTC': {'target_trades_per_year': 56.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0},
-    'ETH': {'target_trades_per_year': 64.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0},
-    'SOL': {'target_trades_per_year': 72.0, 'cooldown_min': 6.0, 'cooldown_max': 30.0},
-    'XRP': {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0},
-    'DOGE': {'target_trades_per_year': 52.0, 'cooldown_min': 10.0, 'cooldown_max': 42.0},
+    'BTC': {
+        'target_trades_per_year': 56.0,
+        'cooldown_min': 12.0,
+        'cooldown_max': 48.0,
+        'min_momentum_magnitude': (0.030, 0.070),
+        'max_vol_24h': (0.055, 0.090),
+        'max_ensemble_std': (0.080, 0.130),
+        'min_directional_agreement': (0.62, 0.78),
+        'meta_probability_threshold': (0.53, 0.66),
+        'min_vol_24h': (0.004, 0.010),
+        'min_trade_frequency_ratio': 0.60,
+    },
+    'ETH': {
+        'target_trades_per_year': 64.0,
+        'cooldown_min': 8.0,
+        'cooldown_max': 36.0,
+        'min_momentum_magnitude': (0.028, 0.068),
+        'max_vol_24h': (0.050, 0.085),
+        'max_ensemble_std': (0.075, 0.125),
+        'min_directional_agreement': (0.61, 0.77),
+        'meta_probability_threshold': (0.52, 0.65),
+        'min_vol_24h': (0.003, 0.010),
+        'min_trade_frequency_ratio': 0.58,
+    },
+    'SOL': {
+        'target_trades_per_year': 72.0,
+        'cooldown_min': 6.0,
+        'cooldown_max': 30.0,
+        'min_momentum_magnitude': (0.025, 0.065),
+        'max_vol_24h': (0.060, 0.110),
+        'max_ensemble_std': (0.080, 0.140),
+        'min_directional_agreement': (0.60, 0.75),
+        'meta_probability_threshold': (0.50, 0.63),
+        'min_vol_24h': (0.004, 0.012),
+        'min_trade_frequency_ratio': 0.56,
+    },
+    'XRP': {
+        'target_trades_per_year': 60.0,
+        'cooldown_min': 8.0,
+        'cooldown_max': 36.0,
+        'min_momentum_magnitude': (0.028, 0.070),
+        'max_vol_24h': (0.050, 0.095),
+        'max_ensemble_std': (0.080, 0.130),
+        'min_directional_agreement': (0.61, 0.77),
+        'meta_probability_threshold': (0.52, 0.65),
+        'min_vol_24h': (0.003, 0.010),
+        'min_trade_frequency_ratio': 0.58,
+    },
+    'DOGE': {
+        'target_trades_per_year': 52.0,
+        'cooldown_min': 10.0,
+        'cooldown_max': 42.0,
+        'min_momentum_magnitude': (0.030, 0.080),
+        'max_vol_24h': (0.065, 0.120),
+        'max_ensemble_std': (0.085, 0.150),
+        'min_directional_agreement': (0.58, 0.74),
+        'meta_probability_threshold': (0.49, 0.62),
+        'min_vol_24h': (0.004, 0.012),
+        'min_trade_frequency_ratio': 0.54,
+    },
 }
 
 COIN_OBJECTIVE_GUARDS = {
@@ -636,6 +692,7 @@ def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
     default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0})
     priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
+
     def clamp(v, low, high):
         return max(low, min(high, v))
 
@@ -646,9 +703,37 @@ def create_trial_profile(trial, coin_name):
     base_sl = bp.vol_mult_sl if bp else 3.0
     base_hold = bp.max_hold_hours if bp else 72
 
-    # Search dimensionality is intentionally constrained: we only add one
-    # extra cadence parameter (min_vol_24h) while keeping momentum gating fixed.
-    min_vol_floor = FIXED_RISK['min_vol_24h']
+    min_momentum_magnitude = trial.suggest_float(
+        'min_momentum_magnitude',
+        *priors.get('min_momentum_magnitude', (0.03, 0.07)),
+        step=0.001,
+    )
+    max_vol_24h = trial.suggest_float(
+        'max_vol_24h',
+        *priors.get('max_vol_24h', (0.05, 0.09)),
+        step=0.001,
+    )
+    trial.suggest_float(
+        'max_ensemble_std',
+        *priors.get('max_ensemble_std', (0.08, 0.13)),
+        step=0.001,
+    )
+    trial.suggest_float(
+        'min_directional_agreement',
+        *priors.get('min_directional_agreement', (0.60, 0.78)),
+        step=0.01,
+    )
+    trial.suggest_float(
+        'meta_probability_threshold',
+        *priors.get('meta_probability_threshold', (0.50, 0.65)),
+        step=0.01,
+    )
+
+    min_vol_bounds = priors.get('min_vol_24h')
+    if min_vol_bounds:
+        min_vol_24h = trial.suggest_float('min_vol_24h', min_vol_bounds[0], min_vol_bounds[1], step=0.001)
+    else:
+        min_vol_24h = FIXED_RISK['min_vol_24h']
 
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
@@ -656,17 +741,12 @@ def create_trial_profile(trial, coin_name):
         signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.15, 0.50, 0.75), clamp(base_threshold + 0.10, 0.62, 0.82), step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
-        min_momentum_magnitude=FIXED_RISK['min_momentum_magnitude'],
+        min_momentum_magnitude=min_momentum_magnitude,
         vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 2.0, 2.0, 8.0), clamp(base_tp + 2.0, 3.0, 9.0), step=0.5),
         vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 1.5, 5.0), clamp(base_sl + 1.0, 2.0, 5.5), step=0.5),
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
-        min_vol_24h=trial.suggest_float(
-            'min_vol_24h',
-            max(0.003, min_vol_floor - 0.002),
-            min(0.012, min_vol_floor + 0.003),
-            step=0.001,
-        ),
-        max_vol_24h=FIXED_RISK['max_vol_24h'],
+        min_vol_24h=min_vol_24h,
+        max_vol_24h=max_vol_24h,
         cooldown_hours=trial.suggest_float('cooldown_hours', priors['cooldown_min'], priors['cooldown_max']),
         position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
@@ -677,6 +757,8 @@ def create_trial_profile(trial, coin_name):
 
 def build_effective_params(params: Dict, coin_name: str) -> Dict:
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {})
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
     base_cooldown = bp.cooldown_hours if bp and getattr(bp, 'cooldown_hours', None) is not None else 24.0
     return {
         'signal_threshold': params.get('signal_threshold', bp.signal_threshold if bp else 0.75),
@@ -685,11 +767,14 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'vol_mult_tp': params.get('vol_mult_tp', bp.vol_mult_tp if bp else 5.0),
         'vol_mult_sl': params.get('vol_mult_sl', bp.vol_mult_sl if bp else 3.0),
         'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
-        # Tuned cadence + frozen low-impact gates
+        # Tuned cadence + risk gates
         'cooldown_hours': params.get('cooldown_hours', base_cooldown),
         'min_vol_24h': params.get('min_vol_24h', FIXED_RISK['min_vol_24h']),
-        'max_vol_24h': FIXED_RISK['max_vol_24h'],
-        'min_momentum_magnitude': FIXED_RISK['min_momentum_magnitude'],
+        'max_vol_24h': params.get('max_vol_24h', FIXED_RISK['max_vol_24h']),
+        'min_momentum_magnitude': params.get('min_momentum_magnitude', FIXED_RISK['min_momentum_magnitude']),
+        'max_ensemble_std': params.get('max_ensemble_std', np.mean(priors.get('max_ensemble_std', (0.08, 0.13)))),
+        'min_directional_agreement': params.get('min_directional_agreement', np.mean(priors.get('min_directional_agreement', (0.60, 0.78)))),
+        'meta_probability_threshold': params.get('meta_probability_threshold', np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
         # Fixed risk/ML knobs
         'min_val_auc': FIXED_RISK['min_val_auc'],
         'position_size': FIXED_RISK['position_size'],
@@ -699,6 +784,7 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'learning_rate': FIXED_ML['learning_rate'],
         'min_child_samples': FIXED_ML['min_child_samples'],
     }
+
 
 def profile_from_params(params, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
@@ -754,14 +840,26 @@ def objective(
     min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 10)
 
     profile = create_trial_profile(trial, coin_name)
+    effective_params = build_effective_params(trial.params, coin_name)
     seed_config = base_config or Config()
     config = Config(**{**seed_config.__dict__,
-                    'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00, 'max_ensemble_std': 0.10,
+                    'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00,
+                    'max_ensemble_std': float(effective_params['max_ensemble_std']),
+                    'min_directional_agreement': float(effective_params['min_directional_agreement']),
+                    'meta_probability_threshold': float(effective_params['meta_probability_threshold']),
                     'train_embargo_hours': 24, 'enforce_pruned_features': bool(pruned_only),
                     'min_val_auc': 0.48, 'min_train_samples': 100, 'signal_threshold': 0.50})
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
     guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, COIN_OPTIMIZATION_PRIORS.get('ETH', {}))
+    target_tpy = float(
+        float(target_trades_per_year)
+        if target_trades_per_year is not None
+        else float(target_trades_per_week) * 52.0
+    )
+    min_trade_frequency_ratio = float(priors.get('min_trade_frequency_ratio', 0.55))
+    min_feasible_tpy = max(1.0, target_tpy * min_trade_frequency_ratio)
     guard_floor_trades = int(guards.get('min_total_trades', 5))
     required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
     early_trade_reject_tolerance = 0.10
@@ -785,6 +883,35 @@ def objective(
         if r is not None:
             fold_results.append(r)
             total_trades += r['n_trades']
+
+            fold_trade_counts = [int(fr.get('n_trades', 0) or 0) for fr in fold_results]
+            observed_tpy = float(np.mean([float(fr.get('trades_per_year', 0.0) or 0.0) for fr in fold_results]))
+            trial.set_user_attr('fold_trade_counts', fold_trade_counts)
+            trial.set_user_attr('projected_trades_per_year_partial', round(observed_tpy, 3))
+            trial.set_user_attr('projected_trades_per_year_threshold', round(min_feasible_tpy, 3))
+
+            folds_observed = len(fold_results)
+            if folds_observed >= early_trade_projection_min_folds and observed_tpy < min_feasible_tpy:
+                return _reject_trial(
+                    trial,
+                    code=ReasonCode.UNLIKELY_TRADE_FREQUENCY,
+                    reason=(
+                        f'unlikely_trade_frequency:{observed_tpy:.2f}'
+                        f'<{min_feasible_tpy:.2f}'
+                    ),
+                    stage='early_feasibility',
+                    observed=observed_tpy,
+                    threshold=min_feasible_tpy,
+                    fold_results=fold_results,
+                    stressed_fold_results=stressed_fold_results,
+                    extra_attrs={
+                        'observed_folds': int(folds_observed),
+                        'projected_trades_per_year_partial': round(observed_tpy, 6),
+                        'projected_trades_per_year_threshold': round(min_feasible_tpy, 6),
+                        'target_trades_per_year': round(target_tpy, 6),
+                        'min_trade_frequency_ratio': float(min_trade_frequency_ratio),
+                    },
+                )
 
             if enable_fee_stress:
                 stressed_r = fast_evaluate_fold(
@@ -833,6 +960,7 @@ def objective(
                             'projected_floor_with_tolerance': round(projected_floor_with_tolerance, 6),
                             'required_total_trades_floor': int(required_total_trades_floor),
                             'early_trade_reject_tolerance': float(early_trade_reject_tolerance),
+                            'prune_reason': str(ReasonCode.EARLY_TRADE_STARVATION),
                         },
                     )
         else:
@@ -1113,6 +1241,7 @@ def objective(
     trial.set_user_attr('target_trades_per_year', round(float(target_tpy), 2))
     trial.set_user_attr('frequency_ratio', round(float(freq_ratio), 3))
     trial.set_user_attr('frequency_bonus', round(float(frequency_bonus), 3))
+    trial.set_user_attr('projected_trades_per_year', round(float(tpy), 3))
     trial.set_user_attr('raw_robust_score', round(float(robust_score), 6))
     trial.set_user_attr('frequency_adjusted_score', round(float(score), 6))
     trial.set_user_attr('fold_metrics', fold_metrics)
@@ -1140,6 +1269,8 @@ def objective(
     })
     tunable_params = dict(trial.params)
     tunable_params['cooldown_hours'] = tunable_params.get('cooldown_hours', build_effective_params(trial.params, coin_name)['cooldown_hours'])
+    trial.set_user_attr('fold_trade_counts', [int(r.get('n_trades', 0) or 0) for r in fold_results])
+    trial.set_user_attr('prune_reason', trial.user_attrs.get('reject_code', ''))
     trial.set_user_attr('tunable_params', tunable_params)
     trial.set_user_attr('effective_params', build_effective_params(trial.params, coin_name))
     ann_ret = np.mean([r['ann_return'] for r in fold_results])
