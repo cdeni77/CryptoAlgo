@@ -593,6 +593,10 @@ def create_trial_profile(trial, coin_name):
     base_sl = bp.vol_mult_sl if bp else 3.0
     base_hold = bp.max_hold_hours if bp else 72
 
+    # Search dimensionality is intentionally constrained: we only add one
+    # extra cadence parameter (min_vol_24h) while keeping momentum gating fixed.
+    min_vol_floor = FIXED_RISK['min_vol_24h']
+
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
         extra_features=get_extra_features(coin_name),
@@ -603,7 +607,12 @@ def create_trial_profile(trial, coin_name):
         vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 2.0, 2.0, 8.0), clamp(base_tp + 2.0, 3.0, 9.0), step=0.5),
         vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 1.5, 5.0), clamp(base_sl + 1.0, 2.0, 5.5), step=0.5),
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
-        min_vol_24h=FIXED_RISK['min_vol_24h'],
+        min_vol_24h=trial.suggest_float(
+            'min_vol_24h',
+            max(0.003, min_vol_floor - 0.002),
+            min(0.012, min_vol_floor + 0.003),
+            step=0.001,
+        ),
         max_vol_24h=FIXED_RISK['max_vol_24h'],
         cooldown_hours=trial.suggest_float('cooldown_hours', priors['cooldown_min'], priors['cooldown_max']),
         position_size=FIXED_RISK['position_size'],
@@ -625,7 +634,7 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
         # Tuned cadence + frozen low-impact gates
         'cooldown_hours': params.get('cooldown_hours', base_cooldown),
-        'min_vol_24h': FIXED_RISK['min_vol_24h'],
+        'min_vol_24h': params.get('min_vol_24h', FIXED_RISK['min_vol_24h']),
         'max_vol_24h': FIXED_RISK['max_vol_24h'],
         'min_momentum_magnitude': FIXED_RISK['min_momentum_magnitude'],
         # Fixed risk/ML knobs
