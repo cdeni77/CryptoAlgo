@@ -121,6 +121,7 @@ services:
       - trader_logs:/app/logs
       # Mount source for development (remove in production)
       - ./backend/trader:/app
+      - ./configs:/app/configs:ro
     # The orchestrator: initial backfill (30d) then hourly cycles
     command: >
       -m scripts.live_orchestrator
