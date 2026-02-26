@@ -50,6 +50,12 @@ from core.metrics_significance import (
     evaluate_significance_gates,
 )
 from core.costs import ExchangeCostAssumptions, load_exchange_cost_assumptions
+from core.overfit_diagnostics import (
+    build_score_matrix_from_trials,
+    compose_robustness_diagnostics,
+    compute_pbo_from_matrix,
+    make_stress_costs_block,
+)
 
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.ERROR)
@@ -1783,6 +1789,31 @@ def _candidate_trial_ledger_paths() -> List[Path]:
     return [d / "trial_ledger.jsonl" for d in _candidate_results_dirs()]
 
 
+def _apply_cost_stress_config(base_config: Config, *, fee_multiplier: float = 1.0, slippage_multiplier: float = 1.0) -> Config:
+    return Config(**{
+        **base_config.__dict__,
+        'fee_pct_per_side': float(base_config.fee_pct_per_side) * float(max(0.0, fee_multiplier)),
+        'min_fee_per_contract': float(base_config.min_fee_per_contract) * float(max(0.0, fee_multiplier)),
+        'slippage_bps': float(base_config.slippage_bps) * float(max(0.0, slippage_multiplier)),
+    })
+
+
+def _funding_adverse_adjustment(metrics: Dict[str, object], funding_bps_per_trade: float) -> Dict[str, object]:
+    adjusted = dict(metrics or {})
+    trades = int(adjusted.get('holdout_trades', 0) or 0)
+    penalty = (float(funding_bps_per_trade) / 10000.0) * max(0, trades)
+    base_return = float(_as_number(adjusted.get('holdout_return'), 0.0) or 0.0)
+    adjusted['holdout_return'] = float(base_return - penalty)
+    base_sr = float(_as_number(adjusted.get('holdout_sharpe'), 0.0) or 0.0)
+    adjusted['holdout_sharpe'] = float(base_sr - min(0.5, penalty * 5.0))
+    adjusted['funding_penalty_applied'] = {
+        'funding_bps_per_trade': float(funding_bps_per_trade),
+        'estimated_penalty_return': float(penalty),
+        'trades': int(trades),
+    }
+    return adjusted
+
+
 def resolve_trial_ledger_path() -> Optional[Path]:
     for path in _candidate_trial_ledger_paths():
         if path.exists():
@@ -1908,7 +1939,13 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   proxy_fidelity_max_drawdown_delta_max=0.04,
                   cv_mode='walk_forward', purge_days=None, purge_bars=None, embargo_days=None,
                   embargo_bars=None, embargo_frac=0.0,
-                  cost_config_path=None):
+                  cost_config_path=None,
+                  enable_pbo_diagnostic=False,
+                  enable_cost_stress_diagnostics=False,
+                  cost_stress_finalists=2,
+                  cost_stress_fee_multiplier=1.5,
+                  cost_stress_slippage_multiplier=2.0,
+                  cost_stress_funding_bps_per_trade=2.0):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -2319,6 +2356,94 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'max_param_dispersion': float(seed_stability_max_param_dispersion),
         'max_oos_sharpe_dispersion': float(seed_stability_max_oos_sharpe_dispersion),
     }
+
+    completed_trials_for_diag = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+    pbo_diagnostic = None
+    if enable_pbo_diagnostic:
+        score_matrix = build_score_matrix_from_trials(completed_trials_for_diag, score_key='sharpe')
+        pbo_diagnostic = compute_pbo_from_matrix(score_matrix, score_used='fold_metrics.sharpe')
+
+    stress_costs = None
+    if enable_cost_stress_diagnostics and holdout_data and holdout_sym:
+        finalists = _candidate_trials_for_holdout(
+            study,
+            max_candidates=max(1, int(cost_stress_finalists or 1)),
+            min_trades=min_total_trades or 6,
+        )
+        finalist_rows = []
+        for finalist in finalists:
+            baseline_metrics = evaluate_holdout(
+                holdout_data,
+                finalist.params,
+                coin_name,
+                coin_prefix,
+                holdout_days,
+                pruned_only=pruned_only,
+                holdout_mode=holdout_mode,
+                base_config=base_cost_config,
+            )
+            if not baseline_metrics:
+                continue
+
+            scenario_metrics = {
+                'fees_plus_50pct': evaluate_holdout(
+                    holdout_data,
+                    finalist.params,
+                    coin_name,
+                    coin_prefix,
+                    holdout_days,
+                    pruned_only=pruned_only,
+                    holdout_mode=holdout_mode,
+                    base_config=_apply_cost_stress_config(base_cost_config, fee_multiplier=cost_stress_fee_multiplier),
+                ) or {},
+                'slippage_x2': evaluate_holdout(
+                    holdout_data,
+                    finalist.params,
+                    coin_name,
+                    coin_prefix,
+                    holdout_days,
+                    pruned_only=pruned_only,
+                    holdout_mode=holdout_mode,
+                    base_config=_apply_cost_stress_config(base_cost_config, slippage_multiplier=cost_stress_slippage_multiplier),
+                ) or {},
+            }
+            if bool(getattr(base_cost_config, 'apply_funding', True)):
+                scenario_metrics['adverse_funding'] = _funding_adverse_adjustment(
+                    baseline_metrics,
+                    funding_bps_per_trade=cost_stress_funding_bps_per_trade,
+                )
+
+            stress_block = make_stress_costs_block(
+                baseline_metrics=baseline_metrics,
+                scenario_metrics=scenario_metrics,
+            )
+            finalist_rows.append({
+                'trial_number': int(finalist.number),
+                'score': float(finalist.value),
+                **stress_block,
+            })
+
+        stress_costs = {
+            'enabled': True,
+            'finalists_requested': int(max(1, int(cost_stress_finalists or 1))),
+            'finalists_evaluated': int(len(finalist_rows)),
+            'scenarios': {
+                'fees_plus_50pct': {'fee_multiplier': float(cost_stress_fee_multiplier)},
+                'slippage_x2': {'slippage_multiplier': float(cost_stress_slippage_multiplier)},
+                'adverse_funding': {'funding_bps_per_trade': float(cost_stress_funding_bps_per_trade)},
+            },
+            'finalists': finalist_rows,
+        }
+
+    robustness_diagnostics = compose_robustness_diagnostics(
+        enabled=bool(enable_pbo_diagnostic or enable_cost_stress_diagnostics),
+        pbo=pbo_diagnostic,
+        stress_costs=stress_costs,
+    )
+
     result_data = {'coin': coin_name, 'prefix': coin_prefix, 'optim_score': best.value,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
         'params': effective_best_params,
@@ -2346,6 +2471,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'deployment_block_reasons': blocked_reasons,
         'proxy_fidelity': proxy_fidelity,
         'proxy_fidelity_warning': proxy_fidelity_warning,
+        'robustness_diagnostics': robustness_diagnostics,
         'seed_stability': seed_stability,
         'research_confidence_tier': research_confidence_tier,
         'gate_mode': gate_mode,
@@ -2595,6 +2721,12 @@ def apply_runtime_preset(args):
             'seed_stability_max_param_dispersion': '--seed-stability-max-param-dispersion',
             'seed_stability_max_oos_sharpe_dispersion': '--seed-stability-max-oos-sharpe-dispersion',
             'cost_config_path': '--cost-config-path',
+            'enable_pbo_diagnostic': '--enable-pbo-diagnostic',
+            'enable_cost_stress_diagnostics': '--enable-cost-stress-diagnostics',
+            'cost_stress_finalists': '--cost-stress-finalists',
+            'cost_stress_fee_multiplier': '--cost-stress-fee-multiplier',
+            'cost_stress_slippage_multiplier': '--cost-stress-slippage-multiplier',
+            'cost_stress_funding_bps_per_trade': '--cost-stress-funding-bps-per-trade',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -2659,6 +2791,18 @@ if __name__ == "__main__":
                         help="Blend weight for stressed-fee fold Sharpe")
     parser.add_argument("--cost-config-path", type=str, default=None,
                         help="Optional path to versioned exchange cost assumptions JSON")
+    parser.add_argument("--enable-pbo-diagnostic", action="store_true",
+                        help="Compute CSCV-style PBO diagnostic from trial fold metrics")
+    parser.add_argument("--enable-cost-stress-diagnostics", action="store_true",
+                        help="Run finalist holdout cost stress diagnostics (fees/slippage/funding)")
+    parser.add_argument("--cost-stress-finalists", type=int, default=2,
+                        help="Number of finalist candidates to stress-test")
+    parser.add_argument("--cost-stress-fee-multiplier", type=float, default=1.5,
+                        help="Fee multiplier for cost stress scenario")
+    parser.add_argument("--cost-stress-slippage-multiplier", type=float, default=2.0,
+                        help="Slippage multiplier for cost stress scenario")
+    parser.add_argument("--cost-stress-funding-bps-per-trade", type=float, default=2.0,
+                        help="Funding penalty (bps/trade) for adverse funding stress scenario")
     parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
                         help="Hard reject if any fold Sharpe is below this threshold")
     parser.add_argument("--min-fold-win-rate", type=float, default=0.30,
@@ -2770,4 +2914,10 @@ if __name__ == "__main__":
             pruned_only=args.pruned_only,
             preset_name=args.preset,
             gate_mode=args.gate_mode,
-            cost_config_path=args.cost_config_path)
+            cost_config_path=args.cost_config_path,
+            enable_pbo_diagnostic=args.enable_pbo_diagnostic,
+            enable_cost_stress_diagnostics=args.enable_cost_stress_diagnostics,
+            cost_stress_finalists=args.cost_stress_finalists,
+            cost_stress_fee_multiplier=args.cost_stress_fee_multiplier,
+            cost_stress_slippage_multiplier=args.cost_stress_slippage_multiplier,
+            cost_stress_funding_bps_per_trade=args.cost_stress_funding_bps_per_trade)

@@ -218,6 +218,8 @@ def apply_runtime_preset(args):
         "seed_stability_min_pass_rate": "--seed-stability-min-pass-rate",
         "seed_stability_max_param_dispersion": "--seed-stability-max-param-dispersion",
         "seed_stability_max_oos_sharpe_dispersion": "--seed-stability-max-oos-sharpe-dispersion",
+        "enable_pbo_diagnostic": "--enable-pbo-diagnostic",
+        "enable_cost_stress_diagnostics": "--enable-cost-stress-diagnostics",
     }
     provided = set(sys.argv[1:])
     for key, value in config.items():
@@ -502,6 +504,23 @@ def print_final_report(script_dir, target_coins, total_time):
                 f"     │  Seed stability: pass={seeds_passed}/{seeds_total} ({pass_rate:.0%}) | "
                 f"OOS SR std={oos_std:.3f} | Tier={confidence_tier}"
             )
+        diagnostics = opt.get('robustness_diagnostics', {}) if isinstance(opt, dict) else {}
+        pbo = diagnostics.get('pbo', {}) if isinstance(diagnostics, dict) else {}
+        stress = diagnostics.get('stress_costs', {}) if isinstance(diagnostics, dict) else {}
+        pbo_value = pbo.get('pbo') if isinstance(pbo, dict) else None
+        if pbo_value is not None:
+            split_count = (pbo.get('methodology') or {}).get('split_count', '?')
+            print(f"     │  PBO: {float(pbo_value):.3f} (splits={split_count})")
+        if isinstance(stress, dict) and stress.get('finalists'):
+            fragility_hits = 0
+            finalists = stress.get('finalists', [])
+            for row in finalists:
+                deltas = (row.get('deltas', {}) or {}).get('fees_plus_50pct', {})
+                fee_delta = deltas.get('holdout_sharpe') if isinstance(deltas, dict) else None
+                if isinstance(fee_delta, (int, float)) and fee_delta < -0.10:
+                    fragility_hits += 1
+            print(f"     │  Cost stress: finalists={len(finalists)} | fragility_flags={fragility_hits}")
+
         if isinstance(holdout_slices, dict) and holdout_slices:
             slice_parts = []
             for slice_name in ('recent90', 'prior90', 'full180'):
@@ -690,6 +709,8 @@ def build_run_manifest(script_dir: Path, args, target_coins: List[str], run_id: 
             "min_dsr": args.min_dsr,
             "proxy_fidelity_candidates": int(getattr(args, "proxy_fidelity_candidates", 3)),
             "proxy_fidelity_eval_days": int(getattr(args, "proxy_fidelity_eval_days", 90)),
+            "enable_pbo_diagnostic": bool(getattr(args, "enable_pbo_diagnostic", False)),
+            "enable_cost_stress_diagnostics": bool(getattr(args, "enable_cost_stress_diagnostics", False)),
         },
         "config_versions": {
             "parallel_launch": "v11",
@@ -778,6 +799,15 @@ if __name__ == "__main__":
                         help="Maximum normalized (IQR/|median|) per-parameter seed dispersion")
     parser.add_argument("--seed-stability-max-oos-sharpe-dispersion", type=float, default=0.35,
                         help="Maximum holdout Sharpe std across seeds for PROMOTION_READY")
+    parser.add_argument("--enable-pbo-diagnostic", action="store_true",
+                        help="Enable CSCV-style PBO diagnostic in optimize workers")
+    parser.add_argument("--enable-cost-stress-diagnostics", action="store_true",
+                        help="Enable finalist cost stress diagnostics in optimize workers")
+    parser.add_argument("--cost-stress-finalists", type=int, default=2,
+                        help="Number of finalist candidates to stress test")
+    parser.add_argument("--cost-stress-fee-multiplier", type=float, default=1.5)
+    parser.add_argument("--cost-stress-slippage-multiplier", type=float, default=2.0)
+    parser.add_argument("--cost-stress-funding-bps-per-trade", type=float, default=2.0)
     parser.add_argument("--debug-trials", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -978,6 +1008,14 @@ if __name__ == "__main__":
                 cmd.extend(["--min-psr-holdout", str(args.min_psr_holdout)])
             if args.min_dsr is not None:
                 cmd.extend(["--min-dsr", str(args.min_dsr)])
+            if args.enable_pbo_diagnostic:
+                cmd.append("--enable-pbo-diagnostic")
+            if args.enable_cost_stress_diagnostics:
+                cmd.append("--enable-cost-stress-diagnostics")
+                cmd.extend(["--cost-stress-finalists", str(args.cost_stress_finalists)])
+                cmd.extend(["--cost-stress-fee-multiplier", str(args.cost_stress_fee_multiplier)])
+                cmd.extend(["--cost-stress-slippage-multiplier", str(args.cost_stress_slippage_multiplier)])
+                cmd.extend(["--cost-stress-funding-bps-per-trade", str(args.cost_stress_funding_bps_per_trade)])
             if args.debug_trials:
                 cmd.append("--debug-trials")
             if args.disable_fee_stress:
