@@ -88,6 +88,20 @@ def _fmt_pct(v, d=1, fb="?"): n = _as_number(v); return f"{n:.{d}%}" if n is not
 def _fmt_float(v, d=3, fb="?"): n = _as_number(v); return f"{n:.{d}f}" if n is not None else fb
 
 
+def _compute_frequency_bonus(freq_ratio: float) -> float:
+    """Return a bounded soft bonus from trade-frequency ratio.
+
+    This keeps the bonus informative for ranking while avoiding hard-veto behavior.
+    """
+    ratio = max(0.0, float(freq_ratio))
+    floor_bonus = 0.40
+    cap_bonus = 1.10
+    slope = 2.0
+    center = 1.0
+    bonus = floor_bonus + (cap_bonus - floor_bonus) / (1.0 + math.exp(-slope * (ratio - center)))
+    return float(min(cap_bonus, max(floor_bonus, bonus)))
+
+
 def _set_partial_reject_attrs(trial, *, fold_results, stressed_fold_results=None, psr=None):
     stressed_fold_results = stressed_fold_results or []
     fold_trade_counts = [int(r.get('n_trades', 0) or 0) for r in (fold_results or [])]
@@ -1001,8 +1015,9 @@ def objective(
         else float(target_trades_per_week) * 52.0,
     )
     freq_ratio = (tpy / target_tpy) if target_tpy > 0 else 1.0
-    frequency_bonus = min(1.0, max(0.0, freq_ratio))
-    score = robust_score * frequency_bonus
+    frequency_bonus = _compute_frequency_bonus(freq_ratio)
+    frequency_rank_adjustment = (frequency_bonus - 1.0) * 0.30
+    score = robust_score + frequency_rank_adjustment
 
     trial.set_user_attr('n_trades', total_trades)
     trial.set_user_attr('n_folds', len(fold_results))
@@ -1072,16 +1087,18 @@ def objective(
     if DEBUG_TRIALS:
         print(
             f"  T{trial.number}: raw_sharpe={mean_blended_sr:.3f} robust={robust_score:.3f} freq_adj={score:.3f} "
-            f"freq_bonus={frequency_bonus:.3f} SR={mean_sr:.3f}±{std_sr:.3f} "
+            f"freq_bonus={frequency_bonus:.3f} freq_rank_adj={frequency_rank_adjustment:.3f} "
+            f"SR={mean_sr:.3f}±{std_sr:.3f} "
             f"min={min_sr:.3f} trades={total_trades} folds={len(fold_results)}"
         )
     logger.debug(
-        "Trial %s scoring: raw_sharpe=%.4f robust_score=%.4f frequency_bonus=%.4f frequency_adjusted_score=%.4f "
+        "Trial %s scoring: raw_sharpe=%.4f robust_score=%.4f frequency_bonus=%.4f frequency_rank_adjustment=%.4f frequency_adjusted_score=%.4f "
         "tpy=%.2f target_tpy=%.2f",
         trial.number,
         mean_blended_sr,
         robust_score,
         frequency_bonus,
+        frequency_rank_adjustment,
         score,
         tpy,
         target_tpy,
