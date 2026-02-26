@@ -704,6 +704,11 @@ def objective(
                     min_val_auc=0.48, min_train_samples=100, signal_threshold=0.50)
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
+    guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
+    guard_floor_trades = int(guards.get('min_total_trades', 5))
+    required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
+    early_trade_reject_tolerance = 0.10
+    early_trade_projection_min_folds = 2
 
     fold_results, total_trades = [], 0
     stressed_fold_results = []
@@ -744,6 +749,35 @@ def objective(
 
             stressed_fold_results.append(stressed_r)
             blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
+
+            folds_observed = len(fold_results)
+            if folds_observed >= early_trade_projection_min_folds:
+                observed_avg_trades_per_fold = float(total_trades) / float(folds_observed)
+                projected_total = observed_avg_trades_per_fold * float(len(cv_splits))
+                projected_floor_with_tolerance = float(required_total_trades_floor) * (1.0 - early_trade_reject_tolerance)
+                if projected_total < projected_floor_with_tolerance:
+                    return _reject_trial(
+                        trial,
+                        code='EARLY_TRADE_STARVATION',
+                        reason=(
+                            f'early_trade_starvation:{projected_total:.2f}'
+                            f'<{projected_floor_with_tolerance:.2f}'
+                        ),
+                        stage='fold_eval',
+                        observed=projected_total,
+                        threshold=required_total_trades_floor,
+                        fold_results=fold_results,
+                        stressed_fold_results=stressed_fold_results,
+                        extra_attrs={
+                            'observed_avg_trades_per_fold': round(observed_avg_trades_per_fold, 6),
+                            'observed_trades_so_far': int(total_trades),
+                            'observed_folds': int(folds_observed),
+                            'projected_total_trades': round(projected_total, 6),
+                            'projected_floor_with_tolerance': round(projected_floor_with_tolerance, 6),
+                            'required_total_trades_floor': int(required_total_trades_floor),
+                            'early_trade_reject_tolerance': float(early_trade_reject_tolerance),
+                        },
+                    )
         else:
             skip_reason = fold_diag.get('skip_reason', 'unknown_fold_skip')
             fold_skip_reasons[skip_reason] = int(fold_skip_reasons.get(skip_reason, 0)) + 1
@@ -804,10 +838,7 @@ def objective(
     exp_std = np.std([r.get('avg_pnl', 0.0) for r in fold_results]) if len(fold_results) > 1 else 0.0
     tpy = np.mean([r.get('trades_per_year', 0.0) for r in fold_results])
 
-    guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
-    guard_min_trades = int(guards.get('min_total_trades', 5))
-    if int(min_total_trades_gate or 0) > 0:
-        guard_min_trades = min(guard_min_trades, max(4, int(min_total_trades_gate)))
+    guard_min_trades = required_total_trades_floor
     guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 1.0))
     guard_min_exp = float(guards.get('min_expectancy', 0.0))
     avg_tc = np.mean([r['n_trades'] for r in fold_results])
