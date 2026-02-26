@@ -557,7 +557,6 @@ FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
     'min_val_auc': 0.48,
-    'cooldown_hours': 24.0,
     'min_vol_24h': 0.006,
     'max_vol_24h': 0.08,
     'min_momentum_magnitude': 0.04,
@@ -582,6 +581,8 @@ COIN_OBJECTIVE_GUARDS = {
 
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0})
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
     def clamp(v, low, high):
         return max(low, min(high, v))
 
@@ -604,7 +605,7 @@ def create_trial_profile(trial, coin_name):
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
         min_vol_24h=FIXED_RISK['min_vol_24h'],
         max_vol_24h=FIXED_RISK['max_vol_24h'],
-        cooldown_hours=FIXED_RISK['cooldown_hours'],
+        cooldown_hours=trial.suggest_float('cooldown_hours', priors['cooldown_min'], priors['cooldown_max']),
         position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
@@ -614,6 +615,7 @@ def create_trial_profile(trial, coin_name):
 
 def build_effective_params(params: Dict, coin_name: str) -> Dict:
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    base_cooldown = bp.cooldown_hours if bp and getattr(bp, 'cooldown_hours', None) is not None else 24.0
     return {
         'signal_threshold': params.get('signal_threshold', bp.signal_threshold if bp else 0.75),
         'label_forward_hours': params.get('label_forward_hours', bp.label_forward_hours if bp else 24),
@@ -621,8 +623,8 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'vol_mult_tp': params.get('vol_mult_tp', bp.vol_mult_tp if bp else 5.0),
         'vol_mult_sl': params.get('vol_mult_sl', bp.vol_mult_sl if bp else 3.0),
         'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
-        # Frozen low-impact gates
-        'cooldown_hours': FIXED_RISK['cooldown_hours'],
+        # Tuned cadence + frozen low-impact gates
+        'cooldown_hours': params.get('cooldown_hours', base_cooldown),
         'min_vol_24h': FIXED_RISK['min_vol_24h'],
         'max_vol_24h': FIXED_RISK['max_vol_24h'],
         'min_momentum_magnitude': FIXED_RISK['min_momentum_magnitude'],
@@ -1019,7 +1021,9 @@ def objective(
         'min_raw_expectancy': float(min_raw_expectancy),
         'min_stressed_expectancy': float(min_stressed_expectancy),
     })
-    trial.set_user_attr('tunable_params', dict(trial.params))
+    tunable_params = dict(trial.params)
+    tunable_params['cooldown_hours'] = tunable_params.get('cooldown_hours', build_effective_params(trial.params, coin_name)['cooldown_hours'])
+    trial.set_user_attr('tunable_params', tunable_params)
     trial.set_user_attr('effective_params', build_effective_params(trial.params, coin_name))
     ann_ret = np.mean([r['ann_return'] for r in fold_results])
     trial.set_user_attr('ann_return', round(ann_ret, 4))
@@ -1604,10 +1608,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             accepted_trials += 1
 
     effective_best_params = build_effective_params(best.params, coin_name)
+    tunable_best_params = dict(best.params)
+    tunable_best_params['cooldown_hours'] = tunable_best_params.get('cooldown_hours', effective_best_params['cooldown_hours'])
     result_data = {'coin': coin_name, 'prefix': coin_prefix, 'optim_score': best.value,
         'optim_metrics': dict(best.user_attrs), 'holdout_metrics': holdout_result or {},
         'params': effective_best_params,
-        'tunable_params': dict(best.params),
+        'tunable_params': tunable_best_params,
         'n_trials': len(study.trials), 'n_cv_folds': len(cv_splits),
         'holdout_days': holdout_days, 'deflated_sharpe': dsr, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'fee_stress': {
