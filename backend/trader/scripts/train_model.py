@@ -604,26 +604,141 @@ class MLSystem:
     def log_member_pairwise_correlation(symbol: str, member_outputs: List[Dict[str, object]]) -> None:
         if len(member_outputs) < 2:
             return
+        debug_corr = str(os.getenv("TRAIN_DEBUG_CORRELATION", "0")).lower() in {"1", "true", "yes", "on"}
+
         print(f"[{symbol}] Ensemble pairwise correlation (validation probs):")
+        pair_diagnostics: List[Dict[str, object]] = []
         for i in range(len(member_outputs)):
             for j in range(i + 1, len(member_outputs)):
-                a = np.asarray(member_outputs[i].get('val_probs', []), dtype=float)
-                b = np.asarray(member_outputs[j].get('val_probs', []), dtype=float)
+                pair_result = MLSystem.compute_member_pair_correlation(member_outputs[i], member_outputs[j])
+                pair_diagnostics.append(pair_result)
+                corr_text = f"{pair_result['corr']:.4f}" if pair_result['status'] == 'ok' else "n/a"
 
-                corr_text = "n/a"
-                if len(a) == len(b) and len(a) >= 2:
-                    finite_mask = np.isfinite(a) & np.isfinite(b)
-                    a_f = a[finite_mask]
-                    b_f = b[finite_mask]
-                    if len(a_f) >= 2 and np.std(a_f) > 0 and np.std(b_f) > 0:
-                        corr = float(np.corrcoef(a_f, b_f)[0, 1])
-                        if np.isfinite(corr):
-                            corr_text = f"{corr:.4f}"
-
-                print(
+                msg = (
                     f"  {member_outputs[i].get('member_name', f'm{i}'):<14} vs "
                     f"{member_outputs[j].get('member_name', f'm{j}'):<14}: corr={corr_text}"
                 )
+                if pair_result['status'] != 'ok' and debug_corr:
+                    msg += (
+                        f" (reason={pair_result['na_reason']}, overlap={pair_result['n_overlap']}, "
+                        f"valid={pair_result['n_valid_after_filter']})"
+                    )
+                    if pair_result.get('mean_abs_diff') is not None:
+                        msg += (
+                            f", abs_diff=(mean={pair_result['mean_abs_diff']:.6f}, "
+                            f"max={pair_result['max_abs_diff']:.6f})"
+                        )
+                print(msg)
+
+        total_pairs = len(pair_diagnostics)
+        valid_pairs = sum(1 for d in pair_diagnostics if d['status'] == 'ok')
+        valid_pct = (100.0 * valid_pairs / total_pairs) if total_pairs > 0 else 0.0
+        reason_hist: Dict[str, int] = {}
+        for d in pair_diagnostics:
+            reason = str(d['na_reason'] or 'ok')
+            reason_hist[reason] = reason_hist.get(reason, 0) + 1
+
+        print(
+            f"[{symbol}] Correlation summary: total_pairs={total_pairs}, "
+            f"valid={valid_pairs}/{total_pairs} ({valid_pct:.1f}%), reasons={reason_hist}"
+        )
+
+    @staticmethod
+    def _member_prediction_series(member_output: Dict[str, object]) -> pd.Series:
+        val_probs = np.asarray(member_output.get('val_probs', []), dtype=float)
+
+        val_predictions = member_output.get('val_predictions', None)
+        if isinstance(val_predictions, list) and len(val_predictions) > 0:
+            pred_df = pd.DataFrame(val_predictions)
+            if {'ts', 'prob'}.issubset(pred_df.columns):
+                ts = pd.to_datetime(pred_df['ts'], utc=True, errors='coerce')
+                probs = pd.to_numeric(pred_df['prob'], errors='coerce').to_numpy(dtype=float)
+                if len(ts) == len(probs):
+                    series = pd.Series(probs, index=ts)
+                    series = series[~series.index.isna()]
+                    if not series.empty:
+                        return series
+
+        val_index = member_output.get('val_index', None)
+        if isinstance(val_index, list) and len(val_index) == len(val_probs):
+            ts = pd.to_datetime(pd.Index(val_index), utc=True, errors='coerce')
+            series = pd.Series(val_probs, index=ts)
+            series = series[~series.index.isna()]
+            if not series.empty:
+                return series
+
+        fallback_index = pd.RangeIndex(start=0, stop=len(val_probs))
+        return pd.Series(val_probs, index=fallback_index)
+
+    @staticmethod
+    def compute_member_pair_correlation(left_member: Dict[str, object], right_member: Dict[str, object]) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            'status': 'na',
+            'na_reason': 'exception',
+            'corr': None,
+            'n_left_raw': 0,
+            'n_right_raw': 0,
+            'n_overlap': 0,
+            'n_valid_after_filter': 0,
+            'std_left': None,
+            'std_right': None,
+            'mean_abs_diff': None,
+            'max_abs_diff': None,
+        }
+        try:
+            left_series = MLSystem._member_prediction_series(left_member)
+            right_series = MLSystem._member_prediction_series(right_member)
+            result['n_left_raw'] = int(len(left_series))
+            result['n_right_raw'] = int(len(right_series))
+
+            if len(left_series) < 2 or len(right_series) < 2:
+                result['na_reason'] = 'insufficient_points'
+                return result
+
+            aligned = pd.concat([left_series, right_series], axis=1, join='inner')
+            aligned.columns = ['left', 'right']
+            result['n_overlap'] = int(len(aligned))
+            if len(aligned) < 2:
+                result['na_reason'] = 'no_timestamp_overlap'
+                return result
+
+            finite_mask = np.isfinite(aligned['left'].to_numpy(dtype=float)) & np.isfinite(aligned['right'].to_numpy(dtype=float))
+            aligned_valid = aligned.loc[finite_mask]
+            result['n_valid_after_filter'] = int(len(aligned_valid))
+            if len(aligned_valid) < 2:
+                result['na_reason'] = 'all_nonfinite_filtered'
+                return result
+
+            left_vals = aligned_valid['left'].to_numpy(dtype=float)
+            right_vals = aligned_valid['right'].to_numpy(dtype=float)
+            std_left = float(np.std(left_vals))
+            std_right = float(np.std(right_vals))
+            result['std_left'] = std_left
+            result['std_right'] = std_right
+
+            zero_eps = 1e-12
+            if std_left <= zero_eps and std_right <= zero_eps:
+                result['na_reason'] = 'zero_variance_both'
+            elif std_left <= zero_eps:
+                result['na_reason'] = 'zero_variance_left'
+            elif std_right <= zero_eps:
+                result['na_reason'] = 'zero_variance_right'
+            else:
+                corr = float(np.corrcoef(left_vals, right_vals)[0, 1])
+                if np.isfinite(corr):
+                    result['status'] = 'ok'
+                    result['na_reason'] = None
+                    result['corr'] = corr
+                    return result
+                result['na_reason'] = 'all_nonfinite_filtered'
+
+            abs_diff = np.abs(left_vals - right_vals)
+            if len(abs_diff) > 0:
+                result['mean_abs_diff'] = float(np.mean(abs_diff))
+                result['max_abs_diff'] = float(np.max(abs_diff))
+            return result
+        except Exception:
+            return result
 
     def train(self, X_train: pd.DataFrame, y_train: pd.Series,
               X_val: pd.DataFrame, y_val: pd.Series,
@@ -768,6 +883,14 @@ class MLSystem:
             },
             'val_probs': [float(x) for x in primary_val_probs],
             'val_samples': int(len(y_val)),
+            'val_index': [ts.isoformat() for ts in pd.to_datetime(X_val.index, utc=True)],
+            'val_predictions': [
+                {
+                    'ts': ts.isoformat(),
+                    'prob': float(prob),
+                }
+                for ts, prob in zip(pd.to_datetime(X_val.index, utc=True), primary_val_probs)
+            ],
             'calibration': {
                 'strategy_requested': self.config.calibration_strategy,
                 'strategy_used': calibrator_type,
