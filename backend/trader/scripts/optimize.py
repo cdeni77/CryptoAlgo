@@ -688,6 +688,33 @@ COIN_OBJECTIVE_GUARDS = {
     'DOGE': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
 }
 
+STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
+TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
+
+STRATEGY_FAMILY_PRIORS = {
+    'momentum_trend': {'min_momentum_multiplier': 1.00, 'cooldown_multiplier': 1.00, 'min_trade_frequency_ratio_delta': 0.00},
+    'breakout': {'min_momentum_multiplier': 0.90, 'cooldown_multiplier': 0.85, 'min_trade_frequency_ratio_delta': 0.03},
+    'mean_reversion': {'min_momentum_multiplier': 0.80, 'cooldown_multiplier': 0.95, 'min_trade_frequency_ratio_delta': -0.02},
+    'vol_overlay': {'min_momentum_multiplier': 0.95, 'cooldown_multiplier': 1.10, 'min_trade_frequency_ratio_delta': -0.01},
+}
+
+TRADE_FREQ_BUCKET_PRIORS = {
+    'conservative': {'cooldown_scale': 1.25, 'min_trade_frequency_ratio_delta': -0.06},
+    'balanced': {'cooldown_scale': 1.00, 'min_trade_frequency_ratio_delta': 0.00},
+    'aggressive': {'cooldown_scale': 0.80, 'min_trade_frequency_ratio_delta': 0.08},
+}
+
+
+def _resolve_strategy_and_bucket(params: Dict | None) -> tuple[str, str]:
+    params = params or {}
+    strategy_family = str(params.get('strategy_family') or 'momentum_trend')
+    trade_freq_bucket = str(params.get('trade_freq_bucket') or 'balanced')
+    if strategy_family not in STRATEGY_FAMILIES:
+        strategy_family = 'momentum_trend'
+    if trade_freq_bucket not in TRADE_FREQ_BUCKETS:
+        trade_freq_bucket = 'balanced'
+    return strategy_family, trade_freq_bucket
+
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
     default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0})
@@ -702,10 +729,16 @@ def create_trial_profile(trial, coin_name):
     base_tp = bp.vol_mult_tp if bp else 5.0
     base_sl = bp.vol_mult_sl if bp else 3.0
     base_hold = bp.max_hold_hours if bp else 72
+    strategy_family = trial.suggest_categorical('strategy_family', STRATEGY_FAMILIES)
+    trade_freq_bucket = trial.suggest_categorical('trade_freq_bucket', TRADE_FREQ_BUCKETS)
+    family_prior = STRATEGY_FAMILY_PRIORS.get(strategy_family, STRATEGY_FAMILY_PRIORS['momentum_trend'])
+    bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(trade_freq_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
 
+    mm_low, mm_high = priors.get('min_momentum_magnitude', (0.03, 0.07))
     min_momentum_magnitude = trial.suggest_float(
         'min_momentum_magnitude',
-        *priors.get('min_momentum_magnitude', (0.03, 0.07)),
+        max(0.005, mm_low * family_prior['min_momentum_multiplier']),
+        max(0.010, mm_high * family_prior['min_momentum_multiplier']),
         step=0.001,
     )
     max_vol_24h = trial.suggest_float(
@@ -747,7 +780,11 @@ def create_trial_profile(trial, coin_name):
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
         min_vol_24h=min_vol_24h,
         max_vol_24h=max_vol_24h,
-        cooldown_hours=trial.suggest_float('cooldown_hours', priors['cooldown_min'], priors['cooldown_max']),
+        cooldown_hours=trial.suggest_float(
+            'cooldown_hours',
+            priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
+            priors['cooldown_max'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
+        ),
         position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
@@ -759,6 +796,7 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
     default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {})
     priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
+    strategy_family, trade_freq_bucket = _resolve_strategy_and_bucket(params)
     base_cooldown = bp.cooldown_hours if bp and getattr(bp, 'cooldown_hours', None) is not None else 24.0
     return {
         'signal_threshold': params.get('signal_threshold', bp.signal_threshold if bp else 0.75),
@@ -775,6 +813,8 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'max_ensemble_std': params.get('max_ensemble_std', np.mean(priors.get('max_ensemble_std', (0.08, 0.13)))),
         'min_directional_agreement': params.get('min_directional_agreement', np.mean(priors.get('min_directional_agreement', (0.60, 0.78)))),
         'meta_probability_threshold': params.get('meta_probability_threshold', np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
+        'strategy_family': strategy_family,
+        'trade_freq_bucket': trade_freq_bucket,
         # Fixed risk/ML knobs
         'min_val_auc': FIXED_RISK['min_val_auc'],
         'position_size': FIXED_RISK['position_size'],
@@ -841,12 +881,17 @@ def objective(
 
     profile = create_trial_profile(trial, coin_name)
     effective_params = build_effective_params(trial.params, coin_name)
+    strategy_family, trade_freq_bucket = _resolve_strategy_and_bucket(trial.params)
+    family_prior = STRATEGY_FAMILY_PRIORS.get(strategy_family, STRATEGY_FAMILY_PRIORS['momentum_trend'])
+    bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(trade_freq_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
     seed_config = base_config or Config()
     config = Config(**{**seed_config.__dict__,
                     'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00,
                     'max_ensemble_std': float(effective_params['max_ensemble_std']),
                     'min_directional_agreement': float(effective_params['min_directional_agreement']),
                     'meta_probability_threshold': float(effective_params['meta_probability_threshold']),
+                    'strategy_family': strategy_family,
+                    'trade_freq_bucket': trade_freq_bucket,
                     'train_embargo_hours': 24, 'enforce_pruned_features': bool(pruned_only),
                     'min_val_auc': 0.48, 'min_train_samples': 100, 'signal_threshold': 0.50})
     features = optim_data[target_sym]['features']
@@ -859,7 +904,12 @@ def objective(
         else float(target_trades_per_week) * 52.0
     )
     min_trade_frequency_ratio = float(priors.get('min_trade_frequency_ratio', 0.55))
+    min_trade_frequency_ratio += float(family_prior.get('min_trade_frequency_ratio_delta', 0.0))
+    min_trade_frequency_ratio += float(bucket_prior.get('min_trade_frequency_ratio_delta', 0.0))
+    min_trade_frequency_ratio = float(min(0.95, max(0.35, min_trade_frequency_ratio)))
     min_feasible_tpy = max(1.0, target_tpy * min_trade_frequency_ratio)
+    trial.set_user_attr('strategy_family', strategy_family)
+    trial.set_user_attr('trade_freq_bucket', trade_freq_bucket)
     guard_floor_trades = int(guards.get('min_total_trades', 5))
     required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
     early_trade_reject_tolerance = 0.10
