@@ -49,6 +49,7 @@ from core.metrics_significance import (
     compute_psr_from_samples,
     evaluate_significance_gates,
 )
+from core.costs import ExchangeCostAssumptions, load_exchange_cost_assumptions
 
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.ERROR)
@@ -118,6 +119,32 @@ def _finite_metric(value, default=0.0):
 
 def _fmt_pct(v, d=1, fb="?"): n = _as_number(v); return f"{n:.{d}%}" if n is not None else fb
 def _fmt_float(v, d=3, fb="?"): n = _as_number(v); return f"{n:.{d}f}" if n is not None else fb
+
+
+def _build_cost_config(cost_assumptions: ExchangeCostAssumptions | None) -> tuple[Config, dict]:
+    config = Config()
+    if cost_assumptions is None:
+        return config, {
+            'version': 'legacy_default',
+            'source_path': None,
+            'applied': {'funding': True, 'slippage': True, 'impact': False},
+        }
+
+    fees = cost_assumptions.fees
+    slippage = cost_assumptions.slippage
+    impact = cost_assumptions.impact
+    funding = cost_assumptions.funding
+    config.fee_pct_per_side = fees.fee_pct_per_side
+    config.min_fee_per_contract = float(fees.min_fee_per_contract)
+    config.slippage_bps = float(slippage.bps_per_side)
+    config.apply_funding = bool(funding.enabled)
+    config.apply_slippage = bool(slippage.enabled)
+    config.apply_impact = bool(impact.enabled)
+    config.impact_bps_per_contract = float(impact.bps_per_contract)
+    config.impact_max_bps_per_side = float(impact.max_bps_per_side)
+    config.cost_config_path = cost_assumptions.source_path
+    config.cost_config_version = cost_assumptions.version
+    return config, cost_assumptions.to_metadata()
 
 
 def _compute_frequency_bonus(freq_ratio: float) -> float:
@@ -372,6 +399,8 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
             'trades_per_year': 0.0,
             'avg_pnl': 0.0,
             'avg_raw_pnl': 0.0,
+            'gross_total_return': 0.0,
+            'net_total_return': 0.0,
             'fee_edge_ratio': 0.0,
         }
     model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
@@ -429,7 +458,8 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
                     active_pos['entry'], exit_price, d,
                     active_pos['accum_funding'], n_contracts, symbol, stressed_config
                 )
-                completed_trades.append({'raw_pnl': raw, 'net_pnl': net, 'pnl_dollars': pnl_d, 'exit_reason': exit_reason})
+                raw_pnl_dollars = raw * notional
+                completed_trades.append({'raw_pnl': raw, 'net_pnl': net, 'pnl_dollars': pnl_d, 'raw_pnl_dollars': raw_pnl_dollars, 'exit_reason': exit_reason})
                 equity += pnl_d
                 peak_equity = max(peak_equity, equity)
                 last_exit = ts
@@ -496,15 +526,19 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
             'trades_per_year': 0.0,
             'avg_pnl': 0.0,
             'avg_raw_pnl': 0.0,
+            'gross_total_return': 0.0,
+            'net_total_return': 0.0,
             'fee_edge_ratio': 0.0,
         }
     if n < 3:
         pnls = [t['net_pnl'] for t in completed_trades]
         raw_pnls = [t['raw_pnl'] for t in completed_trades]
+        raw_pnl_d = [t.get('raw_pnl_dollars', 0.0) for t in completed_trades]
         wins = [p for p in pnls if p > 0]
         wr = len(wins) / max(len(pnls), 1)
         avg = float(np.mean(pnls))
         total_ret = equity / 100000 - 1
+        gross_total_return = float(np.sum(raw_pnl_d) / 100000.0)
         test_days = max((fold.test_end - fold.test_start).days, 1)
         return {
             'n_trades': n,
@@ -517,12 +551,16 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
             'trades_per_year': round(n * 365.0 / test_days, 1),
             'avg_pnl': round(avg, 6),
             'avg_raw_pnl': round(float(np.mean(raw_pnls)), 6),
+            'gross_total_return': round(gross_total_return, 4),
+            'net_total_return': round(total_ret, 4),
             'fee_edge_ratio': 0.0,
         }
+
 
     pnls = [t['net_pnl'] for t in completed_trades]
     raw_pnls = [t['raw_pnl'] for t in completed_trades]
     pnl_d = [t['pnl_dollars'] for t in completed_trades]
+    raw_pnl_d = [t.get('raw_pnl_dollars', 0.0) for t in completed_trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
     wr = len(wins) / len(pnls)
@@ -700,13 +738,16 @@ def objective(
     min_psr_cv=None,
     min_raw_expectancy=1e-6,
     min_stressed_expectancy=1e-6,
+    base_config=None,
 ):
     min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 10)
 
     profile = create_trial_profile(trial, coin_name)
-    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
-                    train_embargo_hours=24, enforce_pruned_features=bool(pruned_only),
-                    min_val_auc=0.48, min_train_samples=100, signal_threshold=0.50)
+    seed_config = base_config or Config()
+    config = Config(**{**seed_config.__dict__,
+                    'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00, 'max_ensemble_std': 0.10,
+                    'train_embargo_hours': 24, 'enforce_pruned_features': bool(pruned_only),
+                    'min_val_auc': 0.48, 'min_train_samples': 100, 'signal_threshold': 0.50})
     features = optim_data[target_sym]['features']
     ohlcv_data = optim_data[target_sym]['ohlcv']
     guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
@@ -1310,10 +1351,11 @@ def _compute_holdout_significance(holdout_metrics, *, completed_trials: int):
 # HOLDOUT (full run_backtest — called ONCE at the end)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days, pruned_only=True):
-    config = Config(max_positions=1, leverage=4, min_signal_edge=0.00, max_ensemble_std=0.10,
-                    train_embargo_hours=24, oos_eval_days=int(eval_days),
-                    enforce_pruned_features=bool(pruned_only))
+def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days, pruned_only=True, base_config=None):
+    seed_config = base_config or Config()
+    config = Config(**{**seed_config.__dict__, 'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00,
+                    'max_ensemble_std': 0.10, 'train_embargo_hours': 24, 'oos_eval_days': int(eval_days),
+                    'enforce_pruned_features': bool(pruned_only)})
     try:
         result = run_backtest({target_sym: holdout_data[target_sym]}, config, profile_overrides={coin_name: profile})
     except Exception as e:
@@ -1359,13 +1401,13 @@ def _derive_top_level_holdout(holdout_slices, holdout_mode):
     return selected
 
 
-def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days, pruned_only=True, holdout_mode='single90'):
+def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days, pruned_only=True, holdout_mode='single90', base_config=None):
     target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
     if not target_sym: return None
     profile = profile_from_params(params, coin_name)
     holdout_slices = {}
 
-    recent_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only)
+    recent_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only, base_config=base_config)
     if recent_metrics:
         holdout_slices['recent90'] = recent_metrics
 
@@ -1379,13 +1421,13 @@ def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days,
         }
     }
     if len(prior_dataset[target_sym]['ohlcv']) > 500:
-        prior_metrics = _run_holdout_window(prior_dataset, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only)
+        prior_metrics = _run_holdout_window(prior_dataset, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only, base_config=base_config)
         if prior_metrics:
             holdout_slices['prior90'] = prior_metrics
 
     full_span_days = (sym_ohlcv.index.max() - sym_ohlcv.index.min()).days
     if full_span_days >= 180:
-        full_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=180, pruned_only=pruned_only)
+        full_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=180, pruned_only=pruned_only, base_config=base_config)
         if full_metrics:
             holdout_slices['full180'] = full_metrics
 
@@ -1430,6 +1472,7 @@ def calibrate_proxy_fidelity(
     pruned_only=True,
     eval_days=90,
     thresholds=None,
+    base_config=None,
 ):
     target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
     if not target_sym:
@@ -1472,15 +1515,16 @@ def calibrate_proxy_fidelity(
     samples = []
     for cand in candidates:
         profile = profile_from_params(cand.params, coin_name)
-        config = Config(
-            max_positions=1,
-            leverage=4,
-            min_signal_edge=0.00,
-            max_ensemble_std=0.10,
-            train_embargo_hours=24,
-            oos_eval_days=int(eval_days),
-            enforce_pruned_features=bool(pruned_only),
-        )
+        seed_config = base_config or Config()
+        config = Config(**{**seed_config.__dict__,
+            'max_positions': 1,
+            'leverage': 4,
+            'min_signal_edge': 0.00,
+            'max_ensemble_std': 0.10,
+            'train_embargo_hours': 24,
+            'oos_eval_days': int(eval_days),
+            'enforce_pruned_features': bool(pruned_only),
+        })
         fast_metrics = fast_evaluate_fold(
             features,
             ohlcv,
@@ -1489,6 +1533,7 @@ def calibrate_proxy_fidelity(
             config=config,
             symbol=target_sym,
             pruned_only=pruned_only,
+            base_config=base_config,
         )
         if not fast_metrics:
             continue
@@ -1862,7 +1907,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   proxy_fidelity_return_delta_max=0.03,
                   proxy_fidelity_max_drawdown_delta_max=0.04,
                   cv_mode='walk_forward', purge_days=None, purge_bars=None, embargo_days=None,
-                  embargo_bars=None, embargo_frac=0.0):
+                  embargo_bars=None, embargo_frac=0.0,
+                  cost_config_path=None):
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -1870,6 +1916,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     global EVENT_LOGGER
     event_log_path = resolve_event_log_path(coin_name, study_suffix or '')
     EVENT_LOGGER = EventLogger(event_log_path)
+    cost_assumptions = load_exchange_cost_assumptions(cost_config_path) if cost_config_path else None
+    base_cost_config, cost_model_metadata = _build_cost_config(cost_assumptions)
 
     ohlcv = optim_data[target_sym]['ohlcv']
     optim_start, optim_end = ohlcv.index.min(), ohlcv.index.max()
@@ -1898,6 +1946,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         f"   Gates: fold_sr>={min_fold_sharpe_hard:.2f}, fold_wr>={min_fold_win_rate:.2f}, "
         f"psr>={min_psr:.2f}, raw_exp>={min_raw_expectancy:.5f}"
     )
+    print(f"   Cost model: {cost_model_metadata.get('version')} ({cost_model_metadata.get('source_path') or 'built-in legacy defaults'})")
     for i, fold in enumerate(cv_splits):
         print(
             f"     Fold {i}: train_n={len(fold.train_idx)} test_n={len(fold.test_idx)} "
@@ -1965,6 +2014,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     study.set_user_attr('target_trades_per_year', float(target_trades_per_year) if target_trades_per_year is not None else float(target_trades_per_week) * 52.0)
     study.set_user_attr('gate_mode', str(gate_mode))
     study.set_user_attr('fee_stress_enabled', bool(enable_fee_stress))
+    study.set_user_attr('cost_config_version', cost_model_metadata.get('version'))
+    study.set_user_attr('cost_config_path', cost_model_metadata.get('source_path'))
 
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
@@ -1982,7 +2033,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             min_psr_cv=min_psr_cv,
                             min_raw_expectancy=min_raw_expectancy,
                             min_stressed_expectancy=min_stressed_expectancy,
-                            pruned_only=pruned_only)
+                            pruned_only=pruned_only,
+                            base_config=base_cost_config)
     min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
 
     def _prune_event_callback(study, frozen_trial):
@@ -2241,6 +2293,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             return_delta_max=proxy_fidelity_return_delta_max,
             max_drawdown_delta_max=proxy_fidelity_max_drawdown_delta_max,
         ),
+        base_config=base_cost_config,
     )
     proxy_fidelity_warning = bool(proxy_fidelity.get('warning', False))
     selection_meta['proxy_fidelity_warning'] = proxy_fidelity_warning
@@ -2288,6 +2341,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'blend_normal_weight': float(fee_blend_normal_weight),
             'blend_stressed_weight': float(fee_blend_stressed_weight),
         },
+        'cost_model': cost_model_metadata,
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
         'proxy_fidelity': proxy_fidelity,
@@ -2540,6 +2594,7 @@ def apply_runtime_preset(args):
             'seed_stability_min_pass_rate': '--seed-stability-min-pass-rate',
             'seed_stability_max_param_dispersion': '--seed-stability-max-param-dispersion',
             'seed_stability_max_oos_sharpe_dispersion': '--seed-stability-max-oos-sharpe-dispersion',
+            'cost_config_path': '--cost-config-path',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -2602,6 +2657,8 @@ if __name__ == "__main__":
                         help="Blend weight for normal-fee fold Sharpe")
     parser.add_argument("--fee-blend-stressed-weight", type=float, default=0.4,
                         help="Blend weight for stressed-fee fold Sharpe")
+    parser.add_argument("--cost-config-path", type=str, default=None,
+                        help="Optional path to versioned exchange cost assumptions JSON")
     parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
                         help="Hard reject if any fold Sharpe is below this threshold")
     parser.add_argument("--min-fold-win-rate", type=float, default=0.30,
@@ -2712,4 +2769,5 @@ if __name__ == "__main__":
             embargo_frac=args.embargo_frac,
             pruned_only=args.pruned_only,
             preset_name=args.preset,
-            gate_mode=args.gate_mode)
+            gate_mode=args.gate_mode,
+            cost_config_path=args.cost_config_path)

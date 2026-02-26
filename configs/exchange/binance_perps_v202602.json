@@ -1,0 +1,24 @@
+{
+  "version": "binance_perps_v202602",
+  "exchange": "binance",
+  "market": "perpetuals",
+  "fees": {
+    "maker_bps": 2.0,
+    "taker_bps": 5.0,
+    "min_fee_per_contract": 0.02,
+    "use_taker": true
+  },
+  "slippage": {
+    "enabled": true,
+    "bps_per_side": 1.5
+  },
+  "impact": {
+    "enabled": true,
+    "bps_per_contract": 0.0002,
+    "max_bps_per_side": 6.0
+  },
+  "funding": {
+    "enabled": true,
+    "interval_hours": 8
+  }
+}
