@@ -32,33 +32,22 @@ def resolve_profile_label_horizon(max_hold_hours: int, label_forward_hours: int)
     return int(label_forward_hours)
 
 
-def momentum_direction_series(ohlcv: pd.DataFrame) -> pd.Series:
+def momentum_direction_series(ohlcv: pd.DataFrame, score_threshold: int = 2) -> pd.Series:
     """Return directional intent per bar: 1 long, -1 short, 0 neutral."""
     close = ohlcv['close']
-    ret_24h = close.pct_change(24).ffill()
-    ret_72h = close.pct_change(72).ffill()
-    sma_50 = close.rolling(50).mean()
+    ret_24h = close.pct_change(24).fillna(0.0)
+    ret_72h = close.pct_change(72).fillna(0.0)
+    sma_50 = close.rolling(50).mean().fillna(close)
 
-    direction = pd.Series(index=ohlcv.index, dtype=float)
-    for ts in ohlcv.index:
-        entry_px = close.loc[ts]
-        r24 = ret_24h.get(ts, 0.0)
-        r72 = ret_72h.get(ts, 0.0)
-        sma = sma_50.get(ts, entry_px)
-        if pd.isna(r24):
-            r24 = 0.0
-        if pd.isna(r72):
-            r72 = 0.0
-        if pd.isna(sma):
-            sma = entry_px
+    score = (
+        np.where(ret_24h > 0, 1, -1)
+        + np.where(ret_72h > 0, 1, -1)
+        + np.where(close > sma_50, 1, -1)
+    )
 
-        score = (1 if r24 > 0 else -1) + (1 if r72 > 0 else -1) + (1 if entry_px > sma else -1)
-        if score >= 2:
-            direction.loc[ts] = 1.0
-        elif score <= -2:
-            direction.loc[ts] = -1.0
-        else:
-            direction.loc[ts] = 0.0
+    direction = pd.Series(0.0, index=ohlcv.index, dtype=float)
+    direction[score >= score_threshold] = 1.0
+    direction[score <= -score_threshold] = -1.0
     return direction
 
 
