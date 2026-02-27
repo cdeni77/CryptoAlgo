@@ -146,6 +146,9 @@ class CoinProfile:
     # Signal thresholds
     signal_threshold: float = 0.68
     min_val_auc: float = 0.50
+    max_ensemble_std: float = 0.12
+    min_directional_agreement: float = 0.67
+    meta_probability_threshold: float = 0.57
     
     # Labeling
     label_forward_hours: int = 24

@@ -834,17 +834,17 @@ def create_trial_profile(trial, coin_name):
         *priors.get('max_vol_24h', (0.05, 0.09)),
         step=0.001,
     )
-    trial.suggest_float(
+    max_ensemble_std = trial.suggest_float(
         'max_ensemble_std',
         *priors.get('max_ensemble_std', (0.08, 0.13)),
         step=0.001,
     )
-    trial.suggest_float(
+    min_directional_agreement = trial.suggest_float(
         'min_directional_agreement',
         *priors.get('min_directional_agreement', (0.60, 0.78)),
         step=0.01,
     )
-    trial.suggest_float(
+    meta_probability_threshold = trial.suggest_float(
         'meta_probability_threshold',
         *priors.get('meta_probability_threshold', (0.50, 0.65)),
         step=0.01,
@@ -868,6 +868,9 @@ def create_trial_profile(trial, coin_name):
         max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
         min_vol_24h=min_vol_24h,
         max_vol_24h=max_vol_24h,
+        max_ensemble_std=max_ensemble_std,
+        min_directional_agreement=min_directional_agreement,
+        meta_probability_threshold=meta_probability_threshold,
         cooldown_hours=trial.suggest_float(
             'cooldown_hours',
             priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
@@ -898,9 +901,9 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'min_vol_24h': params.get('min_vol_24h', FIXED_RISK['min_vol_24h']),
         'max_vol_24h': params.get('max_vol_24h', FIXED_RISK['max_vol_24h']),
         'min_momentum_magnitude': params.get('min_momentum_magnitude', FIXED_RISK['min_momentum_magnitude']),
-        'max_ensemble_std': params.get('max_ensemble_std', np.mean(priors.get('max_ensemble_std', (0.08, 0.13)))),
-        'min_directional_agreement': params.get('min_directional_agreement', np.mean(priors.get('min_directional_agreement', (0.60, 0.78)))),
-        'meta_probability_threshold': params.get('meta_probability_threshold', np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
+        'max_ensemble_std': params.get('max_ensemble_std', bp.max_ensemble_std if bp else np.mean(priors.get('max_ensemble_std', (0.08, 0.13)))),
+        'min_directional_agreement': params.get('min_directional_agreement', bp.min_directional_agreement if bp else np.mean(priors.get('min_directional_agreement', (0.60, 0.78)))),
+        'meta_probability_threshold': params.get('meta_probability_threshold', bp.meta_probability_threshold if bp else np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
         'strategy_family': strategy_family,
         'trade_freq_bucket': trade_freq_bucket,
         # Fixed risk/ML knobs
@@ -929,6 +932,9 @@ def profile_from_params(params, coin_name):
         max_hold_hours=effective_params['max_hold_hours'],
         cooldown_hours=effective_params['cooldown_hours'],
         min_vol_24h=effective_params['min_vol_24h'], max_vol_24h=effective_params['max_vol_24h'],
+        max_ensemble_std=effective_params['max_ensemble_std'],
+        min_directional_agreement=effective_params['min_directional_agreement'],
+        meta_probability_threshold=effective_params['meta_probability_threshold'],
         position_size=effective_params['position_size'],
         vol_sizing_target=effective_params['vol_sizing_target'],
         n_estimators=effective_params['n_estimators'],
