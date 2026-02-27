@@ -475,13 +475,13 @@ def fast_evaluate_fold(
     effective_score_threshold = float(
         momentum_score_threshold
         if momentum_score_threshold is not None
-        else getattr(config, 'momentum_score_threshold', 2.0)
+        else getattr(config, 'momentum_score_threshold', 1.0)
     )
     effective_strict_mode = _as_bool(
         momentum_strict_mode,
         default=getattr(config, 'momentum_strict_mode', True),
     )
-    effective_trend_mode = str(trend_filter_mode or getattr(config, 'trend_filter_mode', 'hard'))
+    effective_trend_mode = str(trend_filter_mode or getattr(config, 'trend_filter_mode', 'soft'))
     effective_funding_mode = str(funding_filter_mode or getattr(config, 'funding_filter_mode', 'hard'))
 
     for ts in test_feat.index:
@@ -1004,13 +1004,13 @@ def objective(
     trial.set_user_attr('trade_freq_bucket', trade_freq_bucket)
     fast_momentum_score_threshold = _as_number(
         trial.params.get('momentum_score_threshold'),
-        default=getattr(config, 'momentum_score_threshold', 2.0),
+        default=getattr(config, 'momentum_score_threshold', 1.0),
     )
     fast_momentum_strict_mode = _as_bool(
         trial.params.get('momentum_strict_mode'),
         default=getattr(config, 'momentum_strict_mode', True),
     )
-    fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'hard')))
+    fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'soft')))
     fast_funding_filter_mode = str(trial.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'hard')))
     guard_floor_trades = int(guards.get('min_total_trades', 5))
     required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
@@ -1853,9 +1853,9 @@ def calibrate_proxy_fidelity(
             symbol=target_sym,
             pruned_only=pruned_only,
             strategy_family_name=strategy_family_name,
-            momentum_score_threshold=_as_number(cand.params.get('momentum_score_threshold'), default=getattr(config, 'momentum_score_threshold', 2.0)),
+            momentum_score_threshold=_as_number(cand.params.get('momentum_score_threshold'), default=getattr(config, 'momentum_score_threshold', 1.0)),
             momentum_strict_mode=_as_bool(cand.params.get('momentum_strict_mode'), default=getattr(config, 'momentum_strict_mode', True)),
-            trend_filter_mode=str(cand.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'hard'))),
+            trend_filter_mode=str(cand.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'soft'))),
             funding_filter_mode=str(cand.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'hard'))),
         )
         if not fast_metrics:

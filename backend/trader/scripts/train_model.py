@@ -535,7 +535,10 @@ class MLSystem:
             tp_mult=profile.vol_mult_tp if profile else self.config.vol_mult_tp,
             sl_mult=profile.vol_mult_sl if profile else self.config.vol_mult_sl,
         )
-        direction = momentum_direction_series(ohlcv)
+        direction = momentum_direction_series(
+            ohlcv,
+            score_threshold=int(round(self.config.momentum_score_threshold)),
+        )
         return compute_labels_from_feature_index(ohlcv, features.index, spec, direction)
 
     def prepare_binary_training_set(self, X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
