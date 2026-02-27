@@ -143,7 +143,7 @@ class Config:
     signal_threshold: float = 0.80
     min_funding_z: float = 0.0
     min_momentum_magnitude: float = 0.07
-    momentum_score_threshold: float = 2.0
+    momentum_score_threshold: float = 1.0
     momentum_strict_mode: bool = False
 
     # Exit Strategy (defaults — overridden per-coin by profiles)
@@ -219,7 +219,7 @@ class Config:
     calibration_strategy: str = 'platt'
 
     # Policy controls for directional macro filters
-    trend_filter_mode: str = 'hard'
+    trend_filter_mode: str = 'soft'
     funding_filter_mode: str = 'hard'
 
     # Strategy family controls
@@ -2280,7 +2280,7 @@ if __name__ == "__main__":
     parser.add_argument("--sl", type=float, default=3.0, help="Default SL vol multiplier")
     parser.add_argument("--momentum", type=float, default=None,
                         help="CLI override for min 72h momentum magnitude. Precedence: CLI override > profile value > global default.")
-    parser.add_argument("--momentum-score-threshold", type=float, default=2.0,
+    parser.add_argument("--momentum-score-threshold", type=float, default=1.0,
                         help="Momentum consensus score threshold (2.0 strict, 1.0 relaxed)")
     parser.add_argument("--strict-momentum-consensus", action="store_true",
                         help="Reject opposite-signed 24h/72h returns before score check")
@@ -2293,7 +2293,7 @@ if __name__ == "__main__":
     parser.add_argument("--meta-threshold", type=float, default=None, help="Secondary meta-model probability threshold")
     parser.add_argument("--calibration", choices=['isotonic', 'platt', 'beta'], default='platt',
                         help="Calibration strategy for primary+meta models")
-    parser.add_argument("--trend-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
+    parser.add_argument("--trend-filter-mode", choices=['hard', 'soft', 'off'], default='soft',
                         help="Trend filter policy: hard=reject, soft=penalize rank/size, off=ignore")
     parser.add_argument("--funding-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
                         help="Funding filter policy: hard=reject, soft=penalize rank/size, off=ignore")
