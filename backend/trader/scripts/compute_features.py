@@ -175,7 +175,11 @@ def resolve_label_horizon(profile: CoinProfile) -> int:
     return resolve_profile_label_horizon(profile.max_hold_hours, profile.label_forward_hours)
 
 
-def compute_profile_target(ohlcv: pd.DataFrame, profile: CoinProfile) -> pd.Series:
+def compute_profile_target(
+    ohlcv: pd.DataFrame,
+    profile: CoinProfile,
+    score_threshold: int = 1,
+) -> pd.Series:
     """Momentum-direction triple-barrier labels aligned with train_model execution.
 
     Label values:
@@ -190,7 +194,7 @@ def compute_profile_target(ohlcv: pd.DataFrame, profile: CoinProfile) -> pd.Seri
         tp_mult=profile.vol_mult_tp,
         sl_mult=profile.vol_mult_sl,
     )
-    direction = momentum_direction_series(ohlcv)
+    direction = momentum_direction_series(ohlcv, score_threshold=score_threshold)
     return compute_labels_from_ohlcv_iteration(ohlcv, spec, direction)
 
 # 3. MAIN SCRIPT
@@ -301,7 +305,7 @@ def main():
             tp_mult=profile.vol_mult_tp,
             sl_mult=profile.vol_mult_sl,
         )
-        direction = momentum_direction_series(ohlcv)
+        direction = momentum_direction_series(ohlcv, score_threshold=1)
 
         # 1. Feature integrity + collinearity diagnostics
         is_valid, missing_features = validate_profile_feature_mapping(symbol, feats, profile)
@@ -327,7 +331,13 @@ def main():
         export_feature_metadata(meta_path, symbol, profile, feats)
 
         assert_label_path_consistency(ohlcv, feats.index, spec, direction, sample_size=200)
-        target = compute_profile_target(ohlcv, profile)
+        target = compute_profile_target(ohlcv, profile, score_threshold=1)
+        total_bars = len(ohlcv)
+        labeled_bars = int(target.notna().sum())
+        neutral_bars = int(target.isna().sum())
+        print(
+            f"  🧪 {symbol}: Label diagnostics | total={total_bars} labeled={labeled_bars} neutral={neutral_bars}"
+        )
         
         # Ensure UTC match
         if target.index.tz is None: target.index = target.index.tz_localize('UTC')
