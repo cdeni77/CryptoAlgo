@@ -313,30 +313,6 @@ def _fit_calibrator(
     return platt, 'platt'
 
 
-def _resolve_momentum_direction(
-    ret_24h: float,
-    ret_72h: float,
-    price: float,
-    sma_50: float,
-    config: Config,
-) -> int:
-    """Returns momentum direction as {1, -1, 0} based on configured strictness and threshold."""
-    if config.momentum_strict_mode and ret_24h * ret_72h < 0:
-        return 0
-
-    momentum_score = (
-        (1 if ret_24h > 0 else -1)
-        + (1 if ret_72h > 0 else -1)
-        + (1 if price > sma_50 else -1)
-    )
-
-    if momentum_score >= config.momentum_score_threshold:
-        return 1
-    if momentum_score <= -config.momentum_score_threshold:
-        return -1
-    return 0
-
-
 def _build_strategy_context(
     row: pd.Series,
     price: float,
