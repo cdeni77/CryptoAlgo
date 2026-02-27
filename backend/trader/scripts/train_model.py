@@ -422,10 +422,10 @@ CORE_ENSEMBLE_FEATURES = {
 
 def build_ensemble_member_specs() -> List[EnsembleMemberSpec]:
     return [
-        EnsembleMemberSpec("fast_90d", 90, 0.70, (2, 4), (15, 45), (70, 130), (12, 24)),
-        EnsembleMemberSpec("base_120d", 120, 0.78, (3, 5), (25, 70), (90, 170), (16, 30)),
-        EnsembleMemberSpec("slow_150d", 150, 0.85, (4, 6), (45, 100), (120, 220), (20, 40)),
-        EnsembleMemberSpec("robust_180d", 180, 0.82, (3, 6), (30, 90), (110, 210), (18, 36)),
+        EnsembleMemberSpec("fast_90d", 90, 0.70, (2, 4), (15, 45), (70, 130), (6, 14)),
+        EnsembleMemberSpec("base_120d", 120, 0.78, (3, 5), (25, 70), (90, 170), (8, 20)),
+        EnsembleMemberSpec("slow_150d", 150, 0.90, (4, 6), (45, 100), (120, 220), (10, 28)),
+        EnsembleMemberSpec("robust_180d", 180, 0.65, (3, 5), (30, 70), (110, 210), (10, 28)),
     ]
 
 
@@ -879,8 +879,10 @@ class MLSystem:
             learning_rate=lr,
             verbose=-1,
             min_child_samples=min_child,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
+            reg_alpha=0.01,
+            reg_lambda=0.01,
+            min_gain_to_split=0.0,
+            min_child_weight=1e-3,
             n_jobs=1
         )
         base_model.fit(X_train_scaled, y_train, sample_weight=train_sample_weights)
