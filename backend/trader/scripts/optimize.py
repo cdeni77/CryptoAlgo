@@ -575,8 +575,6 @@ def fast_evaluate_fold(
 
             if vol_24h < profile.min_vol_24h or vol_24h > profile.max_vol_24h: continue
             if abs(ret_72h) < profile.min_momentum_magnitude: continue
-            if ret_24h * ret_72h < 0: continue
-
             x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0)
             raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
             prob = float(calibrator_predict(iso, np.array([raw_prob]))[0])
