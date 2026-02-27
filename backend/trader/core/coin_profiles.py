@@ -65,7 +65,6 @@ BTC_EXTRA_FEATURES = [
     # Mean-reversion: MIN/MAX proximity
     'at_max_10d', 'at_min_10d', 'dist_from_max_10d', 'dist_from_min_10d',
     'at_max_20d', 'at_min_20d', 'dist_from_max_20d', 'dist_from_min_20d',
-    'at_max_50d', 'at_min_50d', 'dist_from_max_50d', 'dist_from_min_50d',
     # Z-scores
     'zscore_24h', 'zscore_48h', 'zscore_72h', 'zscore_168h',
     # RSI extremes (contrarian)
