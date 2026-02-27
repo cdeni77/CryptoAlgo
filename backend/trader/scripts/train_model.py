@@ -1617,7 +1617,14 @@ def run_backtest(all_data: Dict, config: Config,
                     if not probs:
                         continue
                     agreement = float(np.mean(directional_votes)) if directional_votes else 0.0
-                    if agreement < config.min_directional_agreement:
+                    effective_directional_agreement = resolve_param(
+                        'min_directional_agreement',
+                        profile,
+                        config,
+                        Config.min_directional_agreement,
+                        mode='direct',
+                    )
+                    if agreement < effective_directional_agreement:
                         _increment_gate_counter(gate_counters, sym, 'ensemble_agreement')
                         continue
 
@@ -1625,7 +1632,14 @@ def run_backtest(all_data: Dict, config: Config,
                     prob_std = float(np.std(probs))
                     if agreement < 0.999:
                         prob = min(prob, config.disagreement_confidence_cap)
-                    if prob < primary_cutoff or prob_std > config.max_ensemble_std:
+                    effective_max_ensemble_std = resolve_param(
+                        'max_ensemble_std',
+                        profile,
+                        config,
+                        Config.max_ensemble_std,
+                        mode='direct',
+                    )
+                    if prob < primary_cutoff or prob_std > effective_max_ensemble_std:
                         if prob < primary_cutoff:
                             _increment_gate_counter(gate_counters, sym, 'primary_threshold')
                         else:
@@ -1636,11 +1650,18 @@ def run_backtest(all_data: Dict, config: Config,
                         _increment_gate_counter(gate_counters, sym, 'meta_threshold')
                         continue
                     meta_prob = float(np.mean(meta_probs))
-                    if meta_prob < config.meta_probability_threshold:
+                    effective_meta_threshold = resolve_param(
+                        'meta_probability_threshold',
+                        profile,
+                        config,
+                        Config.meta_probability_threshold,
+                        mode='direct',
+                    )
+                    if meta_prob < effective_meta_threshold:
                         _increment_gate_counter(gate_counters, sym, 'meta_threshold')
                         continue
 
-                    edge_score = (meta_prob - config.meta_probability_threshold) / max(0.01, prob_std + 0.01)
+                    edge_score = (meta_prob - effective_meta_threshold) / max(0.01, prob_std + 0.01)
                     rank_score = edge_score + strategy_decision.rank_modifier - candidate_rank_penalty
                     candidates.append((rank_score, sym, profile, price, vol_24h, direction, candidate_size_multiplier))
 
@@ -2154,13 +2175,20 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
         ml_pass = prob >= primary_cutoff
         meta_prob = 0.0
         meta_pass = False
+        effective_meta_threshold = resolve_param(
+            'meta_probability_threshold',
+            profile,
+            config,
+            Config.meta_probability_threshold,
+            mode='direct',
+        )
         if ml_pass and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
             meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
             if meta_artifacts.calibrator is not None:
                 meta_prob = float(meta_calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0])
             else:
                 meta_prob = float(meta_raw)
-            meta_pass = meta_prob >= config.meta_probability_threshold
+            meta_pass = meta_prob >= effective_meta_threshold
 
         vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
         if pd.isna(vol_24h):
@@ -2275,10 +2303,10 @@ if __name__ == "__main__":
     parser.add_argument("--hold", type=int, default=96, help="Default max hold hours")
     parser.add_argument("--cooldown", type=float, default=24, help="Default hours cooldown after exit")
     parser.add_argument("--min-edge", type=float, default=0.01, help="Require prob >= threshold + min-edge")
-    parser.add_argument("--max-ensemble-std", type=float, default=0.18, help="Max std across ensemble probs")
-    parser.add_argument("--min-directional-agreement", type=float, default=0.50, help="Minimum fraction of members agreeing with momentum direction")
+    parser.add_argument("--max-ensemble-std", type=float, default=None, help="Max std across ensemble probs")
+    parser.add_argument("--min-directional-agreement", type=float, default=None, help="Minimum fraction of members agreeing with momentum direction")
     parser.add_argument("--disagreement-confidence-cap", type=float, default=0.86, help="Cap primary confidence when ensemble is not unanimous")
-    parser.add_argument("--meta-threshold", type=float, default=0.52, help="Secondary meta-model probability threshold")
+    parser.add_argument("--meta-threshold", type=float, default=None, help="Secondary meta-model probability threshold")
     parser.add_argument("--calibration", choices=['isotonic', 'platt', 'beta'], default='platt',
                         help="Calibration strategy for primary+meta models")
     parser.add_argument("--trend-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
@@ -2309,6 +2337,9 @@ if __name__ == "__main__":
             ('signal_threshold', args.threshold),
             ('min_val_auc', args.min_auc),
             ('min_momentum_magnitude', args.momentum),
+            ('min_directional_agreement', args.min_directional_agreement),
+            ('max_ensemble_std', args.max_ensemble_std),
+            ('meta_probability_threshold', args.meta_threshold),
         )
         if cli_value is not None
     }
@@ -2319,6 +2350,12 @@ if __name__ == "__main__":
         args.min_auc = Config.min_val_auc
     if args.momentum is None:
         args.momentum = Config.min_momentum_magnitude
+    if args.min_directional_agreement is None:
+        args.min_directional_agreement = Config.min_directional_agreement
+    if args.max_ensemble_std is None:
+        args.max_ensemble_std = Config.max_ensemble_std
+    if args.meta_threshold is None:
+        args.meta_threshold = Config.meta_probability_threshold
 
     if args.smoke_test:
         args.min_auc = min(args.min_auc, 0.50)
