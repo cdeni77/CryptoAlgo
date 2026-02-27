@@ -67,6 +67,11 @@ logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEBUG_TRIALS = False
+EARLY_TRADE_FEASIBILITY_MODES = ('reject', 'penalize', 'off')
+DEFAULT_EARLY_TRADE_FEASIBILITY_MODE = 'penalize'
+DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS = 3
+DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS = 40
+DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE = 3.0
 
 
 # Example JSONL row: {"event_type":"reject","coin":"BTC","trial_number":12,"reason_code":"TOO_FEW_TRADES"}
@@ -287,6 +292,96 @@ def _reject_score(observed: float | None = None, threshold: float | None = None,
     norm = max(abs(th), 1e-6)
     penalty = scale * min(3.0, gap / norm)
     return base - penalty
+
+
+def _normalize_early_trade_feasibility_mode(mode: str | None) -> str:
+    normalized = str(mode or DEFAULT_EARLY_TRADE_FEASIBILITY_MODE).strip().lower()
+    return normalized if normalized in EARLY_TRADE_FEASIBILITY_MODES else DEFAULT_EARLY_TRADE_FEASIBILITY_MODE
+
+
+def _trade_frequency_attrs(*, folds_observed: int, observed_tpy: float, min_feasible_tpy: float, target_tpy: float,
+                           target_trades_per_week: float, min_trade_frequency_ratio: float,
+                           strategy_family: str, trade_freq_bucket: str, fold_trade_counts: List[int],
+                           coin_name: str | None = None) -> Dict[str, object]:
+    attrs: Dict[str, object] = {
+        'observed_folds': int(folds_observed),
+        'projected_trades_per_year_partial': round(float(observed_tpy), 6),
+        'projected_trades_per_year_threshold': round(float(min_feasible_tpy), 6),
+        'target_trades_per_year': round(float(target_tpy), 6),
+        'target_trades_per_week': round(float(target_trades_per_week), 6),
+        'min_trade_frequency_ratio': float(min_trade_frequency_ratio),
+        'strategy_family': str(strategy_family),
+        'trade_freq_bucket': str(trade_freq_bucket),
+        'fold_trade_counts': [int(x) for x in (fold_trade_counts or [])],
+    }
+    if coin_name:
+        attrs['coin_name'] = str(coin_name)
+    return attrs
+
+
+def _trade_frequency_penalty(*, observed_tpy: float, min_feasible_tpy: float, penalty_scale: float) -> float:
+    ratio = float(observed_tpy) / float(max(1e-9, min_feasible_tpy))
+    shortfall = max(0.0, 1.0 - ratio)
+    return float(shortfall * max(0.0, float(penalty_scale)))
+
+
+def build_trade_frequency_diagnostics(completed_trials, *, recent_limit: int = 40) -> Dict[str, object]:
+    freq_trials = []
+    family_counts: Dict[str, int] = {}
+    bucket_counts: Dict[str, int] = {}
+    for trial in reversed(list(completed_trials or [])):
+        if trial.user_attrs.get('reject_code') != str(ReasonCode.UNLIKELY_TRADE_FREQUENCY):
+            continue
+        freq_trials.append(trial)
+        fam = str(trial.user_attrs.get('strategy_family', 'unknown'))
+        bucket = str(trial.user_attrs.get('trade_freq_bucket', 'unknown'))
+        family_counts[fam] = int(family_counts.get(fam, 0)) + 1
+        bucket_counts[bucket] = int(bucket_counts.get(bucket, 0)) + 1
+        if len(freq_trials) >= int(max(1, recent_limit)):
+            break
+
+    projected_vals = [_as_number(t.user_attrs.get('projected_trades_per_year_partial'), None) for t in freq_trials]
+    projected_vals = [float(v) for v in projected_vals if v is not None and np.isfinite(v)]
+    threshold_vals = [_as_number(t.user_attrs.get('projected_trades_per_year_threshold'), None) for t in freq_trials]
+    threshold_vals = [float(v) for v in threshold_vals if v is not None and np.isfinite(v)]
+
+    def _stats(values: List[float]) -> Dict[str, float] | None:
+        if not values:
+            return None
+        arr = np.asarray(values, dtype=float)
+        return {
+            'mean': float(np.mean(arr)),
+            'median': float(np.median(arr)),
+            'min': float(np.min(arr)),
+            'max': float(np.max(arr)),
+        }
+
+    return {
+        'early_reject_count': int(sum(1 for t in (completed_trials or []) if t.user_attrs.get('reject_code') == str(ReasonCode.UNLIKELY_TRADE_FREQUENCY))),
+        'recent_projected_tpy_stats': _stats(projected_vals),
+        'recent_threshold_stats': _stats(threshold_vals),
+        'dominant_strategy_families': dict(sorted(family_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]),
+        'dominant_trade_freq_buckets': dict(sorted(bucket_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]),
+    }
+
+
+def format_trade_frequency_diagnostics_line(diag: Dict[str, object]) -> str:
+    stats = diag.get('recent_projected_tpy_stats') if isinstance(diag, dict) else None
+    threshold_stats = diag.get('recent_threshold_stats') if isinstance(diag, dict) else None
+    if not isinstance(stats, dict):
+        return ""
+    median = _as_number(stats.get('median'), None)
+    lo = _as_number(stats.get('min'), None)
+    hi = _as_number(stats.get('max'), None)
+    threshold_median = _as_number((threshold_stats or {}).get('median') if isinstance(threshold_stats, dict) else None, None)
+    if median is None:
+        return ""
+    out = f"proj_tpy={median:.1f}"
+    if lo is not None and hi is not None:
+        out += f"[{lo:.1f},{hi:.1f}]"
+    if threshold_median is not None:
+        out += f" thr≈{threshold_median:.1f}"
+    return out
 
 def compute_deflated_sharpe(observed_sharpe, n_trades, n_trials=200, skewness=0.0, kurtosis=3.0):
     """Backward-compatible wrapper around canonical DSR helper."""
@@ -967,6 +1062,10 @@ def objective(
     min_psr_cv=None,
     min_raw_expectancy=1e-6,
     min_stressed_expectancy=1e-6,
+    early_trade_feasibility_mode=DEFAULT_EARLY_TRADE_FEASIBILITY_MODE,
+    early_trade_feasibility_min_folds=DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS,
+    early_trade_feasibility_grace_trials=DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS,
+    early_trade_feasibility_penalty_scale=DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE,
     base_config=None,
 ):
     min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 10)
@@ -1002,6 +1101,8 @@ def objective(
     min_feasible_tpy = max(1.0, target_tpy * min_trade_frequency_ratio)
     trial.set_user_attr('strategy_family', strategy_family)
     trial.set_user_attr('trade_freq_bucket', trade_freq_bucket)
+    trial.set_user_attr('early_trade_feasibility_mode', _normalize_early_trade_feasibility_mode(early_trade_feasibility_mode))
+    trial.set_user_attr('early_trade_feasibility_grace_trials', max(0, int(early_trade_feasibility_grace_trials or 0)))
     fast_momentum_score_threshold = _as_number(
         trial.params.get('momentum_score_threshold'),
         default=getattr(config, 'momentum_score_threshold', 1.0),
@@ -1015,11 +1116,15 @@ def objective(
     guard_floor_trades = int(guards.get('min_total_trades', 5))
     required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
     early_trade_reject_tolerance = 0.10
-    early_trade_projection_min_folds = 2
+    early_trade_feasibility_mode = _normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)
+    early_trade_projection_min_folds = max(1, int(early_trade_feasibility_min_folds or 1))
+    early_trade_feasibility_grace_trials = max(0, int(early_trade_feasibility_grace_trials or 0))
+    early_trade_feasibility_penalty_scale = max(0.0, float(early_trade_feasibility_penalty_scale or 0.0))
 
     fold_results, total_trades = [], 0
     stressed_fold_results = []
     blended_fold_sharpes = []
+    cumulative_trade_frequency_penalty = 0.0
     fold_skip_reasons = {}
     w_normal = float(fee_blend_normal_weight)
     w_stress = float(fee_blend_stressed_weight)
@@ -1057,27 +1162,61 @@ def objective(
             trial.set_user_attr('projected_trades_per_year_threshold', round(min_feasible_tpy, 3))
 
             folds_observed = len(fold_results)
+            freq_attrs = _trade_frequency_attrs(
+                folds_observed=folds_observed,
+                observed_tpy=observed_tpy,
+                min_feasible_tpy=min_feasible_tpy,
+                target_tpy=target_tpy,
+                target_trades_per_week=float(target_trades_per_week),
+                min_trade_frequency_ratio=min_trade_frequency_ratio,
+                strategy_family=strategy_family,
+                trade_freq_bucket=trade_freq_bucket,
+                fold_trade_counts=fold_trade_counts,
+                coin_name=coin_name,
+            )
+            for key, value in freq_attrs.items():
+                trial.set_user_attr(key, value)
+
+            completed_study_trials = sum(
+                1
+                for t in trial.study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+            )
+            in_discovery_grace = completed_study_trials < early_trade_feasibility_grace_trials
+
             if folds_observed >= early_trade_projection_min_folds and observed_tpy < min_feasible_tpy:
-                return _reject_trial(
-                    trial,
-                    code=ReasonCode.UNLIKELY_TRADE_FREQUENCY,
-                    reason=(
-                        f'unlikely_trade_frequency:{observed_tpy:.2f}'
-                        f'<{min_feasible_tpy:.2f}'
-                    ),
-                    stage='early_feasibility',
-                    observed=observed_tpy,
-                    threshold=min_feasible_tpy,
-                    fold_results=fold_results,
-                    stressed_fold_results=stressed_fold_results,
-                    extra_attrs={
-                        'observed_folds': int(folds_observed),
-                        'projected_trades_per_year_partial': round(observed_tpy, 6),
-                        'projected_trades_per_year_threshold': round(min_feasible_tpy, 6),
-                        'target_trades_per_year': round(target_tpy, 6),
-                        'min_trade_frequency_ratio': float(min_trade_frequency_ratio),
-                    },
+                shortfall_penalty = _trade_frequency_penalty(
+                    observed_tpy=observed_tpy,
+                    min_feasible_tpy=min_feasible_tpy,
+                    penalty_scale=early_trade_feasibility_penalty_scale,
                 )
+                reason_text = (
+                    f'unlikely_trade_frequency:{observed_tpy:.2f}'
+                    f'<{min_feasible_tpy:.2f}'
+                )
+
+                if in_discovery_grace or early_trade_feasibility_mode == 'penalize':
+                    cumulative_trade_frequency_penalty += float(shortfall_penalty)
+                    trial.set_user_attr('early_trade_feasibility_action', 'penalized')
+                    trial.set_user_attr('early_trade_feasibility_penalty', float(cumulative_trade_frequency_penalty))
+                    trial.set_user_attr('early_trade_feasibility_in_grace', bool(in_discovery_grace))
+                    trial.set_user_attr('early_trade_feasibility_mode', str(early_trade_feasibility_mode))
+                elif early_trade_feasibility_mode == 'off':
+                    trial.set_user_attr('early_trade_feasibility_action', 'off')
+                    trial.set_user_attr('early_trade_feasibility_in_grace', bool(in_discovery_grace))
+                    trial.set_user_attr('early_trade_feasibility_mode', str(early_trade_feasibility_mode))
+                else:
+                    return _reject_trial(
+                        trial,
+                        code=ReasonCode.UNLIKELY_TRADE_FREQUENCY,
+                        reason=reason_text,
+                        stage='early_feasibility',
+                        observed=observed_tpy,
+                        threshold=min_feasible_tpy,
+                        fold_results=fold_results,
+                        stressed_fold_results=stressed_fold_results,
+                        extra_attrs={**freq_attrs, 'early_trade_feasibility_mode': str(early_trade_feasibility_mode), 'early_trade_feasibility_in_grace': bool(in_discovery_grace)},
+                    )
 
             if enable_fee_stress:
                 stressed_r = fast_evaluate_fold(
@@ -1115,7 +1254,7 @@ def objective(
                 observed_avg_trades_per_fold = float(total_trades) / float(folds_observed)
                 projected_total = observed_avg_trades_per_fold * float(len(cv_splits))
                 projected_floor_with_tolerance = float(required_total_trades_floor) * (1.0 - early_trade_reject_tolerance)
-                if projected_total < projected_floor_with_tolerance:
+                if projected_total < projected_floor_with_tolerance and not in_discovery_grace:
                     return _reject_trial(
                         trial,
                         code=ReasonCode.EARLY_TRADE_STARVATION,
@@ -1347,6 +1486,9 @@ def objective(
         )
 
     robust_score = mean_blended_sr
+    if cumulative_trade_frequency_penalty > 0:
+        robust_score -= float(cumulative_trade_frequency_penalty)
+        trial.set_user_attr('trade_frequency_penalty_applied', float(cumulative_trade_frequency_penalty))
     if std_sr < 0.3 and len(sharpes) >= 2: robust_score += 0.15
     elif std_sr > 0.8: robust_score -= 0.25
     if min_sr > 0: robust_score += 0.10
@@ -2244,6 +2386,10 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.30, min_psr=0.55,
                   min_psr_cv=None, min_psr_holdout=None, min_dsr=None,
                   min_raw_expectancy=1e-6, min_stressed_expectancy=1e-6,
+                  early_trade_feasibility_mode=DEFAULT_EARLY_TRADE_FEASIBILITY_MODE,
+                  early_trade_feasibility_min_folds=DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS,
+                  early_trade_feasibility_grace_trials=DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS,
+                  early_trade_feasibility_penalty_scale=DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE,
                   pruned_only=True, gate_mode="initial_paper_qualification",
                   seed_stability_min_pass_rate=0.67,
                   seed_stability_max_param_dispersion=0.60,
@@ -2303,6 +2449,13 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(
         f"   Gates: fold_sr>={min_fold_sharpe_hard:.2f}, fold_wr>={min_fold_win_rate:.2f}, "
         f"psr>={min_psr:.2f}, raw_exp>={min_raw_expectancy:.5f}"
+    )
+    phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
+    print(
+        f"   Phase: {phase_label} | trade_feasibility={_normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)} "
+        f"| grace={int(max(0, early_trade_feasibility_grace_trials))} "
+        f"| min_folds={int(max(1, early_trade_feasibility_min_folds))} "
+        f"| target_tpw={float(target_trades_per_week):.2f}"
     )
     print(f"   Cost model: {cost_model_metadata.get('version')} ({cost_model_metadata.get('source_path') or 'built-in legacy defaults'})")
     for i, fold in enumerate(cv_splits):
@@ -2370,6 +2523,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     study.set_user_attr('coin_name', coin_name)
     study.set_user_attr('target_trades_per_week', float(target_trades_per_week))
     study.set_user_attr('target_trades_per_year', float(target_trades_per_year) if target_trades_per_year is not None else float(target_trades_per_week) * 52.0)
+    study.set_user_attr('early_trade_feasibility_mode', str(_normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)))
+    study.set_user_attr('early_trade_feasibility_grace_trials', int(max(0, early_trade_feasibility_grace_trials)))
+    study.set_user_attr('early_trade_feasibility_min_folds', int(max(1, early_trade_feasibility_min_folds)))
     study.set_user_attr('gate_mode', str(gate_mode))
     study.set_user_attr('fee_stress_enabled', bool(enable_fee_stress))
     study.set_user_attr('cost_config_version', cost_model_metadata.get('version'))
@@ -2391,6 +2547,10 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                             min_psr_cv=min_psr_cv,
                             min_raw_expectancy=min_raw_expectancy,
                             min_stressed_expectancy=min_stressed_expectancy,
+                            early_trade_feasibility_mode=early_trade_feasibility_mode,
+                            early_trade_feasibility_min_folds=early_trade_feasibility_min_folds,
+                            early_trade_feasibility_grace_trials=early_trade_feasibility_grace_trials,
+                            early_trade_feasibility_penalty_scale=early_trade_feasibility_penalty_scale,
                             pruned_only=pruned_only,
                             base_config=base_cost_config)
     min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
@@ -2590,6 +2750,13 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             reject_code_counts[reject_code] = int(reject_code_counts.get(reject_code, 0)) + 1
         if not reject_reason and not reject_code:
             accepted_trials += 1
+
+    trade_frequency_diagnostics = build_trade_frequency_diagnostics(completed_trials)
+    top_reject = max(reject_code_counts.items(), key=lambda kv: kv[1])[0] if reject_code_counts else None
+    if top_reject == str(ReasonCode.UNLIKELY_TRADE_FREQUENCY):
+        freq_line = format_trade_frequency_diagnostics_line(trade_frequency_diagnostics)
+        if freq_line:
+            print(f"  🔎 Top reject diagnostics ({ReasonCode.UNLIKELY_TRADE_FREQUENCY}): {freq_line}")
 
     effective_best_params = build_effective_params(best.params, coin_name)
     tunable_best_params = dict(best.params)
@@ -2838,7 +3005,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'reject_code_counts': reject_code_counts,
             'reject_prune_log_path': str(event_log_path) if event_log_path else None,
             'study_significance_enabled': bool(enable_study_significance),
-        }}
+        },
+        'trade_frequency_diagnostics': trade_frequency_diagnostics}
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
     print(
@@ -3007,10 +3175,11 @@ def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
-        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
-        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'early_trade_feasibility_mode': 'reject', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 40, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'early_trade_feasibility_mode': 'reject', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 40, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'early_trade_feasibility_mode': 'off', 'early_trade_feasibility_min_folds': 2, 'early_trade_feasibility_grace_trials': 30, 'early_trade_feasibility_penalty_scale': 2.0, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
+        'discovery': {'plateau_patience': 70, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 2, 'min_total_trades': 10, 'n_cv_folds': 4, 'holdout_candidates': 2, 'holdout_min_trades': 10, 'holdout_min_sharpe': -0.05, 'holdout_min_return': -0.03, 'require_holdout_pass': False, 'target_trades_per_week': 0.6, 'early_trade_feasibility_mode': 'penalize', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 50, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.55, 'seed_stability_max_param_dispersion': 0.90, 'seed_stability_max_oos_sharpe_dispersion': 0.60, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'early_trade_feasibility_mode': 'reject', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 40, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -3039,6 +3208,10 @@ def apply_runtime_preset(args):
             'require_holdout_pass': '--require-holdout-pass',
             'target_trades_per_week': '--target-trades-per-week',
             'target_trades_per_year': '--target-trades-per-year',
+            'early_trade_feasibility_mode': '--early-trade-feasibility-mode',
+            'early_trade_feasibility_min_folds': '--early-trade-feasibility-min-folds',
+            'early_trade_feasibility_grace_trials': '--early-trade-feasibility-grace-trials',
+            'early_trade_feasibility_penalty_scale': '--early-trade-feasibility-penalty-scale',
             'disable_fee_stress': '--disable-fee-stress',
             'min_fold_sharpe_hard': '--min-fold-sharpe-hard',
             'min_fold_win_rate': '--min-fold-win-rate',
@@ -3086,7 +3259,7 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-days", type=int, default=90)
     parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
                         help="Holdout aggregation mode for selection + backward-compatible top-level metrics")
-    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready"])
+    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready", "discovery"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--cv-mode", type=str, default="walk_forward", choices=["walk_forward", "purged_embargo"],
@@ -3116,6 +3289,19 @@ if __name__ == "__main__":
                         help="Trade-frequency objective target used during CV scoring (default: 1.0 ~= 52 trades/year)")
     parser.add_argument("--target-trades-per-year", type=float, default=None,
                         help="Optional annual target; overrides --target-trades-per-week when set")
+    parser.add_argument("--early-trade-feasibility-mode", type=str,
+                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_MODE,
+                        choices=list(EARLY_TRADE_FEASIBILITY_MODES),
+                        help="How to handle early projected trade-frequency shortfall")
+    parser.add_argument("--early-trade-feasibility-min-folds", type=int,
+                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS,
+                        help="Minimum evaluated folds before early projected trade-frequency check")
+    parser.add_argument("--early-trade-feasibility-grace-trials", type=int,
+                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS,
+                        help="Completed-trial grace period before hard early trade-frequency rejection")
+    parser.add_argument("--early-trade-feasibility-penalty-scale", type=float,
+                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE,
+                        help="Penalty scale applied when early trade-frequency mode uses penalization")
     parser.add_argument("--disable-fee-stress", action="store_true",
                         help="Disable stressed-fee scoring in CV objective")
     parser.add_argument("--fee-stress-multiplier", type=float, default=2.0,
@@ -3203,6 +3389,11 @@ if __name__ == "__main__":
         f"PSR_HO>={args.min_psr_holdout}, DSR>={args.min_dsr}"
     )
     print("   Escalation policy: tighten thresholds after 14-28 days of stable paper evidence.")
+    print(
+        f"   Trade-feasibility: mode={args.early_trade_feasibility_mode}, "
+        f"min_folds={args.early_trade_feasibility_min_folds}, grace={args.early_trade_feasibility_grace_trials}, "
+        f"penalty_scale={args.early_trade_feasibility_penalty_scale}"
+    )
     if args.debug_trials:
         DEBUG_TRIALS = True
         logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -3228,6 +3419,10 @@ if __name__ == "__main__":
             holdout_mode=args.holdout_mode,
             target_trades_per_week=args.target_trades_per_week,
             target_trades_per_year=args.target_trades_per_year,
+            early_trade_feasibility_mode=args.early_trade_feasibility_mode,
+            early_trade_feasibility_min_folds=args.early_trade_feasibility_min_folds,
+            early_trade_feasibility_grace_trials=args.early_trade_feasibility_grace_trials,
+            early_trade_feasibility_penalty_scale=args.early_trade_feasibility_penalty_scale,
             enable_fee_stress=not args.disable_fee_stress,
             fee_stress_multiplier=args.fee_stress_multiplier,
             fee_blend_normal_weight=args.fee_blend_normal_weight,

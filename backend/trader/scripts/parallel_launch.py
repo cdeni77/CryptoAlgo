@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -71,6 +72,10 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.0,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "early_trade_feasibility_mode": "reject",
+        "early_trade_feasibility_min_folds": 3,
+        "early_trade_feasibility_grace_trials": 40,
+        "early_trade_feasibility_penalty_scale": 3.0,
         "plateau_min_completed": 0,
         "seed_stability_min_pass_rate": 0.75,
         "seed_stability_max_param_dispersion": 0.50,
@@ -94,6 +99,10 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.0,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "early_trade_feasibility_mode": "reject",
+        "early_trade_feasibility_min_folds": 3,
+        "early_trade_feasibility_grace_trials": 40,
+        "early_trade_feasibility_penalty_scale": 3.0,
         "plateau_min_completed": 0,
         "seed_stability_min_pass_rate": 0.67,
         "seed_stability_max_param_dispersion": 0.60,
@@ -117,6 +126,10 @@ PRESET_CONFIGS = {
         "holdout_min_return": 0.0,
         "require_holdout_pass": True,
         "target_trades_per_week": 1.0,
+        "early_trade_feasibility_mode": "reject",
+        "early_trade_feasibility_min_folds": 3,
+        "early_trade_feasibility_grace_trials": 40,
+        "early_trade_feasibility_penalty_scale": 3.0,
         "plateau_min_completed": 0,
         "seed_stability_min_pass_rate": 0.60,
         "seed_stability_max_param_dispersion": 0.70,
@@ -140,6 +153,10 @@ PRESET_CONFIGS = {
         "holdout_min_return": -0.05,
         "require_holdout_pass": False,
         "target_trades_per_week": 0.8,
+        "early_trade_feasibility_mode": "off",
+        "early_trade_feasibility_min_folds": 2,
+        "early_trade_feasibility_grace_trials": 30,
+        "early_trade_feasibility_penalty_scale": 2.0,
         "plateau_min_completed": 0,
         "disable_fee_stress": True,
         "min_fold_sharpe_hard": -0.5,
@@ -153,6 +170,33 @@ PRESET_CONFIGS = {
         "seed_stability_min_pass_rate": 0.50,
         "seed_stability_max_param_dispersion": 1.00,
         "seed_stability_max_oos_sharpe_dispersion": 0.80,
+    },
+    "discovery": {
+        "plateau_patience": 70,
+        "plateau_min_delta": 0.02,
+        "plateau_warmup": 30,
+        "holdout_days": 90,
+        "holdout_mode": "single90",
+        "min_internal_oos_trades": 2,
+        "min_total_trades": 10,
+        "n_cv_folds": 4,
+        "holdout_candidates": 2,
+        "holdout_min_trades": 10,
+        "holdout_min_sharpe": -0.05,
+        "holdout_min_return": -0.03,
+        "require_holdout_pass": False,
+        "target_trades_per_week": 0.6,
+        "early_trade_feasibility_mode": "penalize",
+        "early_trade_feasibility_min_folds": 3,
+        "early_trade_feasibility_grace_trials": 50,
+        "early_trade_feasibility_penalty_scale": 3.0,
+        "plateau_min_completed": 0,
+        "seed_stability_min_pass_rate": 0.55,
+        "seed_stability_max_param_dispersion": 0.90,
+        "seed_stability_max_oos_sharpe_dispersion": 0.60,
+        "min_psr_cv": None,
+        "min_psr_holdout": None,
+        "min_dsr": None,
     },
     "pilot_rollout": {
         "coins": ",".join(PILOT_ROLLOUT_DEFAULT_COINS),
@@ -204,6 +248,10 @@ def apply_runtime_preset(args):
         "holdout_min_return": "--holdout-min-return",
         "require_holdout_pass": "--require-holdout-pass",
         "target_trades_per_week": "--target-trades-per-week",
+        "early_trade_feasibility_mode": "--early-trade-feasibility-mode",
+        "early_trade_feasibility_min_folds": "--early-trade-feasibility-min-folds",
+        "early_trade_feasibility_grace_trials": "--early-trade-feasibility-grace-trials",
+        "early_trade_feasibility_penalty_scale": "--early-trade-feasibility-penalty-scale",
         "coins": "--coins",
         "trials": "--trials",
         "disable_fee_stress": "--disable-fee-stress",
@@ -301,6 +349,7 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
             "best_completed_reject": None,
             "best_accepted": None,
             "recent_reject_hist": {},
+            "recent_frequency_diag": {},
             "current_seed": None,
             "seed_progress": {},
         }
@@ -336,7 +385,9 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
           AND key IN (
               'mean_oos_sharpe', 'oos_sharpe', 'n_trades', 'win_rate', 'max_drawdown', 'std_oos_sharpe',
               'reject_reason', 'reject_code', 'psr', 'psr_partial', 'stressed_sharpe', 'stressed_sr_partial',
-              'raw_robust_score', 'frequency_adjusted_score', 'n_folds', 'n_folds_evaluated'
+              'raw_robust_score', 'frequency_adjusted_score', 'n_folds', 'n_folds_evaluated',
+              'projected_trades_per_year_partial', 'projected_trades_per_year_threshold',
+              'strategy_family', 'trade_freq_bucket'
           )
     """
     recent_trials_query = """
@@ -382,6 +433,10 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
                     best_reject = None
                     best_accepted = None
                     recent_reject_hist = {}
+                    recent_freq_projected = []
+                    recent_freq_threshold = []
+                    recent_freq_family = {}
+                    recent_freq_bucket = {}
 
                     for study_name in studies_by_coin.get(coin, []):
                         best_row = conn.execute(best_trial_query, (study_name,)).fetchone()
@@ -402,7 +457,25 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
                                     attrs[key] = value_json
                             reject_code = attrs.get('reject_code') or attrs.get('reject_reason')
                             if reject_code:
-                                recent_reject_hist[str(reject_code)] = int(recent_reject_hist.get(str(reject_code), 0)) + 1
+                                reject_code_str = str(reject_code)
+                                recent_reject_hist[reject_code_str] = int(recent_reject_hist.get(reject_code_str, 0)) + 1
+                                if reject_code_str == 'UNLIKELY_TRADE_FREQUENCY':
+                                    projected = attrs.get('projected_trades_per_year_partial')
+                                    threshold = attrs.get('projected_trades_per_year_threshold')
+                                    try:
+                                        if projected is not None:
+                                            recent_freq_projected.append(float(projected))
+                                    except (TypeError, ValueError):
+                                        pass
+                                    try:
+                                        if threshold is not None:
+                                            recent_freq_threshold.append(float(threshold))
+                                    except (TypeError, ValueError):
+                                        pass
+                                    fam = str(attrs.get('strategy_family') or 'unknown')
+                                    bucket = str(attrs.get('trade_freq_bucket') or 'unknown')
+                                    recent_freq_family[fam] = int(recent_freq_family.get(fam, 0)) + 1
+                                    recent_freq_bucket[bucket] = int(recent_freq_bucket.get(bucket, 0)) + 1
                             else:
                                 val = float(recent_value) if recent_value is not None else None
                                 if val is not None and (best_accepted is None or val > best_accepted):
@@ -425,6 +498,16 @@ def get_coin_trial_progress(optuna_db, target_coins, run_id):
                     progress[coin]["best_accepted"] = best_accepted
                     progress[coin]["best_metrics"] = metrics
                     progress[coin]["recent_reject_hist"] = dict(sorted(recent_reject_hist.items(), key=lambda kv: kv[1], reverse=True)[:3])
+                    if recent_freq_projected:
+                        median_proj = statistics.median(recent_freq_projected)
+                        progress[coin]["recent_frequency_diag"] = {
+                            "projected_median": float(median_proj),
+                            "projected_min": float(min(recent_freq_projected)),
+                            "projected_max": float(max(recent_freq_projected)),
+                            "threshold_median": float(statistics.median(recent_freq_threshold)) if recent_freq_threshold else None,
+                            "dominant_families": dict(sorted(recent_freq_family.items(), key=lambda kv: kv[1], reverse=True)[:2]),
+                            "dominant_buckets": dict(sorted(recent_freq_bucket.items(), key=lambda kv: kv[1], reverse=True)[:2]),
+                        }
                     if progress[coin]["seed_progress"]:
                         progress[coin]["current_seed"] = max(progress[coin]["seed_progress"], key=progress[coin]["seed_progress"].get)
             return progress
@@ -775,7 +858,7 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
                         help="Holdout aggregation mode for optimize workers")
     parser.add_argument("--preset", type=str, default="paper_ready",
-                        choices=["none", "paper_ready", "robust120", "robust180", "quick", "pilot_rollout"])
+                        choices=["none", "paper_ready", "robust120", "robust180", "quick", "discovery", "pilot_rollout"])
     parser.add_argument("--min-internal-oos-trades", type=int, default=0)
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5,
@@ -791,6 +874,10 @@ if __name__ == "__main__":
                         choices=sorted(GATE_MODE_CONFIGS.keys()),
                         help="Gate profile: initial paper qualification (lenient) vs production promotion (strict)")
     parser.add_argument("--target-trades-per-week", type=float, default=1.0)
+    parser.add_argument("--early-trade-feasibility-mode", type=str, default="penalize", choices=["reject", "penalize", "off"])
+    parser.add_argument("--early-trade-feasibility-min-folds", type=int, default=3)
+    parser.add_argument("--early-trade-feasibility-grace-trials", type=int, default=40)
+    parser.add_argument("--early-trade-feasibility-penalty-scale", type=float, default=3.0)
     parser.add_argument("--disable-fee-stress", action="store_true",
                         help="Disable stressed-fee objective gate in optimize workers")
     parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
@@ -974,6 +1061,7 @@ if __name__ == "__main__":
         )
         print(f"   Target cadence: {args.target_trades_per_week:.2f} trades/week")
         print(f"   Preset:       {args.preset}")
+        print(f"   Trade-feasibility: mode={args.early_trade_feasibility_mode}, min_folds={args.early_trade_feasibility_min_folds}, grace={args.early_trade_feasibility_grace_trials}, penalty={args.early_trade_feasibility_penalty_scale}")
         print(f"   Plateau gate: patience={args.plateau_patience}, min_delta={args.plateau_min_delta}, warmup={args.plateau_warmup}, min_completed={args.plateau_min_completed or 'auto(40%)'}")
         print(f"   Seeds:        {args.sampler_seeds}")
         seed_count = max(1, len([s for s in args.sampler_seeds.split(",") if s.strip()]))
@@ -1007,6 +1095,10 @@ if __name__ == "__main__":
                 "--holdout-min-sharpe", str(args.holdout_min_sharpe),
                 "--holdout-min-return", str(args.holdout_min_return),
                 "--target-trades-per-week", str(args.target_trades_per_week),
+                "--early-trade-feasibility-mode", str(args.early_trade_feasibility_mode),
+                "--early-trade-feasibility-min-folds", str(args.early_trade_feasibility_min_folds),
+                "--early-trade-feasibility-grace-trials", str(args.early_trade_feasibility_grace_trials),
+                "--early-trade-feasibility-penalty-scale", str(args.early_trade_feasibility_penalty_scale),
                 "--min-fold-sharpe-hard", str(args.min_fold_sharpe_hard),
                 "--min-fold-win-rate", str(args.min_fold_win_rate),
                 "--min-psr", str(args.min_psr),
@@ -1110,6 +1202,16 @@ if __name__ == "__main__":
                     denom = max(1, sum(reject_hist.values()))
                     top_ratio = (float(top_count) / float(denom)) * 100.0
                     top_reject_str = f" top_reject={top_reason}({top_ratio:.0f}%)"
+                    if top_reason == "UNLIKELY_TRADE_FREQUENCY":
+                        freq_diag = p.get("recent_frequency_diag", {})
+                        pm = freq_diag.get("projected_median")
+                        pmin = freq_diag.get("projected_min")
+                        pmax = freq_diag.get("projected_max")
+                        tm = freq_diag.get("threshold_median")
+                        if pm is not None:
+                            top_reject_str += f" tpy={pm:.1f}[{pmin:.1f},{pmax:.1f}]"
+                            if tm is not None:
+                                top_reject_str += f"<thr~{tm:.1f}"
                     if (coin not in flatline_warned and completed >= max(20, int(progress_target * 0.25)) and top_ratio >= 70.0 and best_accepted is None):
                         print(
                             f"   ⚠️ Flatline warning {coin}: dominant reject={top_reason} ({top_ratio:.0f}%) with no accepted trial yet.",
