@@ -955,6 +955,14 @@ class MLSystem:
         X_meta_tr, y_meta_tr, _ = build_meta_dataset(X_train, y_train, primary_train_probs, primary_threshold)
         X_meta_vl, y_meta_vl, _ = build_meta_dataset(X_val, y_val, primary_val_probs, primary_threshold)
 
+        effective_meta_threshold = resolve_param(
+            'meta_probability_threshold',
+            profile,
+            self.config,
+            Config.meta_probability_threshold,
+            mode='direct',
+        )
+
         meta_artifacts: MetaArtifacts = train_meta_classifier(
             X_meta_tr,
             y_meta_tr,
@@ -962,7 +970,7 @@ class MLSystem:
             y_meta_vl,
             pd.Series(np.ones(len(X_meta_vl), dtype=bool), index=X_meta_vl.index),
             primary_threshold=primary_threshold,
-            meta_threshold=self.config.meta_probability_threshold,
+            meta_threshold=effective_meta_threshold,
             n_estimators=n_est,
             max_depth=depth,
             learning_rate=lr,
@@ -986,7 +994,7 @@ class MLSystem:
             'meta_precision': float(meta_artifacts.metrics.get('meta_precision', 0.0)),
             'final_trade_precision': float(meta_artifacts.metrics.get('final_trade_precision', 0.0)),
             'primary_threshold': float(primary_threshold),
-            'meta_threshold': float(self.config.meta_probability_threshold),
+            'meta_threshold': float(effective_meta_threshold),
             'calibration_strategy': calibrator_type,
             'val_calibrated_brier': val_report.get('calibrated_brier'),
             'holdout_calibrated_brier': holdout_report.get('calibrated_brier') if holdout_report else None,
