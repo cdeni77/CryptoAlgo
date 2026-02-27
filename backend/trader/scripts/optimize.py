@@ -34,10 +34,12 @@ from optuna.samplers import TPESampler
 from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
     get_contract_spec, calculate_pnl_exact,
+    _build_strategy_context, _resolve_filter_policy,
 )
 from core.meta_labeling import calibrator_predict, primary_recall_threshold
 from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
 from core.preprocessing_cv import fit_transform_fold
+from core.strategies import get_strategy_family
 from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
@@ -119,6 +121,22 @@ def _as_number(value, default=None):
     if isinstance(value, (int, float)): return float(value)
     try: return float(value)
     except: return default
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+        if normalized in {'0', 'false', 'no', 'n', 'off'}:
+            return False
+    return bool(default)
 
 def _finite_metric(value, default=0.0):
     n = _as_number(value, default=default)
@@ -348,7 +366,22 @@ def create_cv_splits(
 # v11.1: FAST LIGHTWEIGHT EVALUATOR (~2s per fold instead of ~10min)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, fee_multiplier=1.0, pruned_only=True, diagnostics=None):
+def fast_evaluate_fold(
+    features,
+    ohlcv,
+    fold: CVFold,
+    profile,
+    config,
+    symbol,
+    fee_multiplier=1.0,
+    pruned_only=True,
+    diagnostics=None,
+    strategy_family_name=None,
+    momentum_score_threshold=None,
+    momentum_strict_mode=None,
+    trend_filter_mode=None,
+    funding_filter_mode=None,
+):
     """Train one model on train fold and simulate trading on the corresponding test fold."""
     def _set_diag(reason):
         if isinstance(diagnostics, dict):
@@ -438,6 +471,18 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
 
     contract_spec = get_contract_spec(symbol)
     units_per_contract = float(contract_spec.get('units', 1.0) or 1.0)
+    strategy_family = get_strategy_family(strategy_family_name or getattr(config, 'strategy_family', 'momentum_trend'))
+    effective_score_threshold = float(
+        momentum_score_threshold
+        if momentum_score_threshold is not None
+        else getattr(config, 'momentum_score_threshold', 2.0)
+    )
+    effective_strict_mode = _as_bool(
+        momentum_strict_mode,
+        default=getattr(config, 'momentum_strict_mode', True),
+    )
+    effective_trend_mode = str(trend_filter_mode or getattr(config, 'trend_filter_mode', 'hard'))
+    effective_funding_mode = str(funding_filter_mode or getattr(config, 'funding_filter_mode', 'hard'))
 
     for ts in test_feat.index:
         if ts not in test_ohlcv.index: continue
@@ -463,7 +508,8 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
             if hours_held >= profile.max_hold_hours and not exit_price:
                 exit_price, exit_reason = price, 'max_hold'
             if exit_price:
-                notional = equity * profile.position_size * config.leverage
+                pos_size_multiplier = max(0.0, float(active_pos.get('size_multiplier', 1.0) or 1.0))
+                notional = equity * profile.position_size * config.leverage * pos_size_multiplier
                 notional_per_contract = max(units_per_contract * active_pos['entry'], 1e-9)
                 n_contracts = max(1, int(notional / notional_per_contract))
                 net, raw, _, _, _, _, pnl_d, _ = calculate_pnl_exact(
@@ -487,17 +533,46 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
             ret_24h = price / test_ohlcv['close'].iloc[max(0, ts_loc-24)] - 1
             ret_72h = (price / test_ohlcv['close'].iloc[max(0, ts_loc-72)] - 1) if ts_loc >= 72 else 0
             sma_50 = test_ohlcv['close'].iloc[max(0,ts_loc-50):ts_loc].mean()
-            ms = (1 if ret_24h > 0 else -1) + (1 if ret_72h > 0 else -1) + (1 if price > sma_50 else -1)
-            if ms >= 2: direction = 1
-            elif ms <= -2: direction = -1
-            else: continue
-
-            if not pd.isna(sma_200):
-                if direction == 1 and price < sma_200: continue
-                if direction == -1 and price > sma_200: continue
-
             vol_24h = test_ohlcv['close'].pct_change().rolling(24).std().get(ts, None)
             if vol_24h is None or pd.isna(vol_24h): continue
+
+            strategy_context = _build_strategy_context(
+                row,
+                price,
+                sma_200,
+                ret_24h,
+                ret_72h,
+                sma_50,
+                vol_24h=vol_24h,
+            )
+            strategy_decision = strategy_family.evaluate(
+                strategy_context,
+                min_momentum_magnitude=float(profile.min_momentum_magnitude),
+                score_threshold=effective_score_threshold,
+                strict_mode=effective_strict_mode,
+            )
+            direction = strategy_decision.direction
+            if direction == 0:
+                continue
+
+            if pd.isna(sma_200):
+                continue
+
+            candidate_rank_penalty = 0.0
+            candidate_size_multiplier = 1.0
+
+            trend_violated = (direction == 1 and price < sma_200) or (direction == -1 and price > sma_200)
+            trend_effect = _resolve_filter_policy(
+                effective_trend_mode,
+                trend_violated,
+                rank_penalty=0.30,
+                size_multiplier=0.70,
+            )
+            if trend_effect.reject:
+                continue
+            candidate_rank_penalty += float(trend_effect.rank_penalty)
+            candidate_size_multiplier *= float(trend_effect.size_multiplier)
+
             if vol_24h < profile.min_vol_24h or vol_24h > profile.max_vol_24h: continue
             if abs(ret_72h) < profile.min_momentum_magnitude: continue
             if ret_24h * ret_72h < 0: continue
@@ -509,11 +584,23 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
             primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
             if prob < primary_cutoff: continue
 
-            # Match production: funding rate filter
+            # Match production: funding filter policy
             f_z = row.get('funding_rate_zscore', 0)
             if pd.isna(f_z): f_z = 0
-            if direction == 1 and f_z > 2.5: continue
-            if direction == -1 and f_z < -2.5: continue
+            funding_violated = (direction == 1 and f_z > 2.5) or (direction == -1 and f_z < -2.5)
+            funding_effect = _resolve_filter_policy(
+                effective_funding_mode,
+                funding_violated,
+                rank_penalty=0.25,
+                size_multiplier=0.75,
+            )
+            if funding_effect.reject:
+                continue
+            candidate_rank_penalty += float(funding_effect.rank_penalty)
+            candidate_size_multiplier *= float(funding_effect.size_multiplier)
+
+            if candidate_rank_penalty > 0.0 and (prob - candidate_rank_penalty) < primary_cutoff:
+                continue
 
             vol = vol_24h if vol_24h > 0 else 0.02
             active_pos = {
@@ -521,6 +608,7 @@ def fast_evaluate_fold(features, ohlcv, fold: CVFold, profile, config, symbol, f
                 'tp': price * (1 + profile.vol_mult_tp * vol * direction),
                 'sl': price * (1 - profile.vol_mult_sl * vol * direction),
                 'accum_funding': 0.0,
+                'size_multiplier': max(0.1, candidate_size_multiplier),
             }
 
     # METRICS
@@ -910,6 +998,16 @@ def objective(
     min_feasible_tpy = max(1.0, target_tpy * min_trade_frequency_ratio)
     trial.set_user_attr('strategy_family', strategy_family)
     trial.set_user_attr('trade_freq_bucket', trade_freq_bucket)
+    fast_momentum_score_threshold = _as_number(
+        trial.params.get('momentum_score_threshold'),
+        default=getattr(config, 'momentum_score_threshold', 2.0),
+    )
+    fast_momentum_strict_mode = _as_bool(
+        trial.params.get('momentum_strict_mode'),
+        default=getattr(config, 'momentum_strict_mode', True),
+    )
+    fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'hard')))
+    fast_funding_filter_mode = str(trial.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'hard')))
     guard_floor_trades = int(guards.get('min_total_trades', 5))
     required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
     early_trade_reject_tolerance = 0.10
@@ -928,8 +1026,22 @@ def objective(
 
     for fold in cv_splits:
         fold_diag = {}
-        r = fast_evaluate_fold(features, ohlcv_data, fold, profile, config,
-                               target_sym, fee_multiplier=1.0, pruned_only=pruned_only, diagnostics=fold_diag)
+        r = fast_evaluate_fold(
+            features,
+            ohlcv_data,
+            fold,
+            profile,
+            config,
+            target_sym,
+            fee_multiplier=1.0,
+            pruned_only=pruned_only,
+            diagnostics=fold_diag,
+            strategy_family_name=strategy_family,
+            momentum_score_threshold=fast_momentum_score_threshold,
+            momentum_strict_mode=fast_momentum_strict_mode,
+            trend_filter_mode=fast_trend_filter_mode,
+            funding_filter_mode=fast_funding_filter_mode,
+        )
         if r is not None:
             fold_results.append(r)
             total_trades += r['n_trades']
@@ -965,9 +1077,19 @@ def objective(
 
             if enable_fee_stress:
                 stressed_r = fast_evaluate_fold(
-                    features, ohlcv_data, fold,
-                    profile, config, target_sym, fee_multiplier=fee_stress_multiplier,
+                    features,
+                    ohlcv_data,
+                    fold,
+                    profile,
+                    config,
+                    target_sym,
+                    fee_multiplier=fee_stress_multiplier,
                     pruned_only=pruned_only,
+                    strategy_family_name=strategy_family,
+                    momentum_score_threshold=fast_momentum_score_threshold,
+                    momentum_strict_mode=fast_momentum_strict_mode,
+                    trend_filter_mode=fast_trend_filter_mode,
+                    funding_filter_mode=fast_funding_filter_mode,
                 )
                 if stressed_r is None:
                     return _reject_trial(
@@ -1717,6 +1839,7 @@ def calibrate_proxy_fidelity(
             'oos_eval_days': int(eval_days),
             'enforce_pruned_features': bool(pruned_only),
         })
+        strategy_family_name, _ = _resolve_strategy_and_bucket(cand.params)
         fast_metrics = fast_evaluate_fold(
             features,
             ohlcv,
@@ -1725,7 +1848,11 @@ def calibrate_proxy_fidelity(
             config=config,
             symbol=target_sym,
             pruned_only=pruned_only,
-            base_config=base_config,
+            strategy_family_name=strategy_family_name,
+            momentum_score_threshold=_as_number(cand.params.get('momentum_score_threshold'), default=getattr(config, 'momentum_score_threshold', 2.0)),
+            momentum_strict_mode=_as_bool(cand.params.get('momentum_strict_mode'), default=getattr(config, 'momentum_strict_mode', True)),
+            trend_filter_mode=str(cand.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'hard'))),
+            funding_filter_mode=str(cand.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'hard'))),
         )
         if not fast_metrics:
             continue
