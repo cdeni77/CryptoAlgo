@@ -73,7 +73,7 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
 
 
 def run_optimization(coins: list[str], config: OptimizationConfig, workers: int) -> dict[str, dict[str, Any] | None]:
-    all_data = load_data(days=2200)
+    all_data = load_data()
     run_id = datetime.utcnow().strftime("run_%Y%m%dT%H%M%S%fZ")
     work_items = [(all_data, coin, config, run_id) for coin in coins]
 
