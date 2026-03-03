@@ -75,6 +75,56 @@ DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS = 40
 DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE = 3.0
 
 
+class PlateauStopper:
+    """Stop an Optuna study when completed trials stop improving.
+
+    Uses absolute delta on the objective value and only considers completed
+    trials. Warmup/min_completed guardrails prevent premature stopping.
+    """
+
+    def __init__(self, patience: int, min_delta: float = 0.0, warmup: int = 0, min_completed: int = 0):
+        self.patience = max(1, int(patience or 1))
+        self.min_delta = max(0.0, float(min_delta or 0.0))
+        self.warmup = max(0, int(warmup or 0))
+        self.min_completed = max(0, int(min_completed or 0))
+        self._best_value: float | None = None
+        self._best_completed_count = 0
+
+    def _is_better(self, current: float, reference: float, direction: optuna.study.StudyDirection) -> bool:
+        if direction == optuna.study.StudyDirection.MINIMIZE:
+            return current <= (reference - self.min_delta)
+        return current >= (reference + self.min_delta)
+
+    def __call__(self, study: optuna.Study, frozen_trial: optuna.trial.FrozenTrial) -> None:
+        if frozen_trial.state != optuna.trial.TrialState.COMPLETE or frozen_trial.value is None:
+            return
+
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        completed_count = len(completed)
+
+        if completed_count <= self.warmup:
+            return
+        if completed_count < self.min_completed:
+            return
+
+        current_best = float(study.best_value)
+        if self._best_value is None or self._is_better(current_best, self._best_value, study.direction):
+            self._best_value = current_best
+            self._best_completed_count = completed_count
+            return
+
+        stagnant_completed = completed_count - self._best_completed_count
+        if stagnant_completed >= self.patience:
+            study.set_user_attr('plateau_stop_reason', 'no_improvement')
+            study.set_user_attr('plateau_patience', self.patience)
+            study.set_user_attr('plateau_min_delta', self.min_delta)
+            study.set_user_attr('plateau_last_improvement_completed', self._best_completed_count)
+            study.stop()
+
+
 # Example JSONL row: {"event_type":"reject","coin":"BTC","trial_number":12,"reason_code":"TOO_FEW_TRADES"}
 class EventLogger:
     def __init__(self, path: Path | None):
