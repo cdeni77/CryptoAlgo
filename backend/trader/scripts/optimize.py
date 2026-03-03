@@ -1495,160 +1495,10 @@ def _degrade_confidence_tier(tier: str) -> str:
     return rank[max(0, idx - 1)]
 
 
-def calibrate_proxy_fidelity(
-    *,
-    holdout_data,
-    coin_prefix,
-    coin_name,
-    study,
-    max_candidates=3,
-    min_trades=8,
-    pruned_only=True,
-    eval_days=90,
-    thresholds=None,
-    base_config=None,
-):
-    target_sym = resolve_target_symbol(holdout_data, coin_prefix, coin_name)
-    if not target_sym:
-        return {'enabled': False, 'reason': 'missing_target_symbol'}
+def calibrate_proxy_fidelity(**_kwargs):
+    """Deprecated after proxy objective refactor; retained as disabled metadata hook."""
+    return {'enabled': False, 'reason': 'deprecated_proxy_objective'}
 
-    thresholds = thresholds or _proxy_fidelity_thresholds()
-    candidates = _candidate_trials_for_holdout(
-        study,
-        max_candidates=max(1, int(max_candidates or 1)),
-        min_trades=max(0, int(min_trades or 0)),
-    )
-    if not candidates:
-        return {
-            'enabled': True,
-            'reason': 'no_candidates',
-            'n_candidates_requested': int(max_candidates),
-            'n_candidates_evaluated': 0,
-            'thresholds': thresholds,
-            'summary': {},
-            'samples': [],
-            'warning': False,
-        }
-
-    features = holdout_data[target_sym]['features']
-    ohlcv = holdout_data[target_sym]['ohlcv']
-    test_end = ohlcv.index.max()
-    test_start = test_end - pd.Timedelta(days=max(1, int(eval_days)))
-    train_idx = features.index[features.index < test_start]
-    test_idx = features.index[(features.index >= test_start) & (features.index <= test_end)]
-    eval_fold = CVFold(
-        train_idx=train_idx,
-        test_idx=test_idx,
-        train_end=train_idx.max() if len(train_idx) else test_start,
-        test_start=test_start,
-        test_end=test_end,
-        purge_bars=0,
-        embargo_bars=0,
-    )
-
-    samples = []
-    for cand in candidates:
-        profile = profile_from_params(cand.params, coin_name)
-        seed_config = base_config or Config()
-        config = Config(**{**seed_config.__dict__,
-            'max_positions': 1,
-            'leverage': 4,
-            'min_signal_edge': 0.00,
-            'max_ensemble_std': 0.10,
-            'train_embargo_hours': 24,
-            'oos_eval_days': int(eval_days),
-            'enforce_pruned_features': bool(pruned_only),
-        })
-        strategy_family_name, _ = _resolve_strategy_and_bucket(cand.params)
-        fast_metrics = fast_evaluate_fold(
-            features,
-            ohlcv,
-            eval_fold,
-            profile=profile,
-            config=config,
-            symbol=target_sym,
-            pruned_only=pruned_only,
-            strategy_family_name=strategy_family_name,
-            momentum_score_threshold=_as_number(cand.params.get('momentum_score_threshold'), default=getattr(config, 'momentum_score_threshold', 1.0)),
-            momentum_strict_mode=_as_bool(cand.params.get('momentum_strict_mode'), default=getattr(config, 'momentum_strict_mode', True)),
-            trend_filter_mode=str(cand.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'off'))),
-            funding_filter_mode=str(cand.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'soft'))),
-        )
-        if not fast_metrics:
-            continue
-        backtest_metrics = _run_holdout_window(
-            holdout_data,
-            target_sym,
-            profile,
-            coin_name,
-            eval_days=int(eval_days),
-            pruned_only=pruned_only,
-        )
-        if not backtest_metrics:
-            continue
-
-        deltas = {
-            'sharpe': float((_as_number(fast_metrics.get('sharpe'), 0.0) or 0.0) - (_as_number(backtest_metrics.get('holdout_sharpe'), 0.0) or 0.0)),
-            'trade_count': int(fast_metrics.get('n_trades', 0) or 0) - int(backtest_metrics.get('holdout_trades', 0) or 0),
-            'return': float((_as_number(fast_metrics.get('total_return'), 0.0) or 0.0) - (_as_number(backtest_metrics.get('holdout_return'), 0.0) or 0.0)),
-            'max_drawdown': float((_as_number(fast_metrics.get('max_drawdown'), 0.0) or 0.0) - (_as_number(backtest_metrics.get('full_dd'), 0.0) or 0.0)),
-        }
-        samples.append({
-            'trial': int(cand.number),
-            'fast_evaluate_fold': {
-                'sharpe': _finite_metric(fast_metrics.get('sharpe', 0.0), 0.0),
-                'trade_count': int(fast_metrics.get('n_trades', 0) or 0),
-                'return': _finite_metric(fast_metrics.get('total_return', 0.0), 0.0),
-                'max_drawdown': _finite_metric(fast_metrics.get('max_drawdown', 0.0), 0.0),
-            },
-            'run_backtest': {
-                'sharpe': _finite_metric(backtest_metrics.get('holdout_sharpe', 0.0), 0.0),
-                'trade_count': int(backtest_metrics.get('holdout_trades', 0) or 0),
-                'return': _finite_metric(backtest_metrics.get('holdout_return', 0.0), 0.0),
-                'max_drawdown': _finite_metric(backtest_metrics.get('full_dd', 0.0), 0.0),
-            },
-            'delta': deltas,
-            'abs_delta': {k: abs(v) for k, v in deltas.items()},
-        })
-
-    summary = {}
-    if samples:
-        metric_map = {
-            'sharpe': 'sharpe_delta_max',
-            'trade_count': 'trade_count_delta_max',
-            'return': 'return_delta_max',
-            'max_drawdown': 'max_drawdown_delta_max',
-        }
-        warning = False
-        for metric, threshold_key in metric_map.items():
-            vals = np.asarray([float(s['delta'][metric]) for s in samples], dtype=float)
-            abs_vals = np.abs(vals)
-            threshold = float(thresholds[threshold_key])
-            exceeded = int(np.sum(abs_vals > threshold))
-            summary[metric] = {
-                'mean_delta': round(float(np.mean(vals)), 6),
-                'median_delta': round(float(np.median(vals)), 6),
-                'mean_abs_delta': round(float(np.mean(abs_vals)), 6),
-                'max_abs_delta': round(float(np.max(abs_vals)), 6),
-                'threshold': threshold,
-                'exceeded_count': exceeded,
-                'exceeded_ratio': round(float(exceeded / len(samples)), 6),
-            }
-            if exceeded > 0:
-                warning = True
-    else:
-        warning = False
-
-    return {
-        'enabled': True,
-        'eval_days': int(eval_days),
-        'n_candidates_requested': int(max_candidates),
-        'n_candidates_evaluated': len(samples),
-        'thresholds': thresholds,
-        'summary': summary,
-        'samples': samples,
-        'warning': bool(warning),
-    }
 
 def assess_result_quality(rd):
     issues, warns = [], []
@@ -1950,43 +1800,30 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
                   plateau_min_completed=0,
                   study_suffix="", resume_study=False, holdout_days=90,
-                  min_internal_oos_trades=0, min_total_trades=0, n_cv_folds=5,
+                  min_total_trades=0, n_cv_folds=5,
                   sampler_seed=42, holdout_candidates=3, require_holdout_pass=False,
                   holdout_min_trades=15, holdout_min_sharpe=0.0, holdout_min_return=0.0,
                   holdout_mode='single90',
                   target_trades_per_week=1.0, target_trades_per_year=None,
-                  preset_name="none", enable_fee_stress=True,
-                  fee_stress_multiplier=2.0, fee_blend_normal_weight=0.6, fee_blend_stressed_weight=0.4,
-                  min_fold_sharpe_hard=-0.1, min_fold_win_rate=0.30, min_psr=0.55,
+                  preset_name="none", min_psr=0.55,
                   min_psr_cv=None, min_psr_holdout=None, min_dsr=None,
-                  min_raw_expectancy=1e-6, min_stressed_expectancy=1e-6,
-                  early_trade_feasibility_mode=DEFAULT_EARLY_TRADE_FEASIBILITY_MODE,
-                  early_trade_feasibility_min_folds=DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS,
-                  early_trade_feasibility_grace_trials=DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS,
-                  early_trade_feasibility_penalty_scale=DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE,
                   pruned_only=True, gate_mode="initial_paper_qualification",
                   seed_stability_min_pass_rate=0.67,
                   seed_stability_max_param_dispersion=0.60,
                   seed_stability_max_oos_sharpe_dispersion=0.35,
-                  proxy_fidelity_candidates=3,
-                  proxy_fidelity_eval_days=90,
-                  proxy_fidelity_sharpe_delta_max=0.35,
-                  proxy_fidelity_trade_count_delta_max=8,
-                  proxy_fidelity_return_delta_max=0.03,
-                  proxy_fidelity_max_drawdown_delta_max=0.04,
                   cv_mode='walk_forward', purge_days=None, purge_bars=None, embargo_days=None,
                   embargo_bars=None, embargo_frac=0.0,
-                  cost_config_path=None,
-                  enable_pbo_diagnostic=False,
-                  enable_study_significance=False,
-                  study_significance_bootstrap_iterations=500,
-                  study_significance_seed=42,
-                  study_significance_score_source='fold_sharpe',
-                  enable_cost_stress_diagnostics=False,
-                  cost_stress_finalists=2,
-                  cost_stress_fee_multiplier=1.5,
-                  cost_stress_slippage_multiplier=2.0,
-                  cost_stress_funding_bps_per_trade=2.0):
+                  cost_config_path=None):
+    enable_pbo_diagnostic = False
+    enable_study_significance = False
+    study_significance_bootstrap_iterations = 500
+    study_significance_seed = 42
+    study_significance_score_source = 'fold_sharpe'
+    enable_cost_stress_diagnostics = False
+    cost_stress_finalists = 2
+    cost_stress_fee_multiplier = 1.5
+    cost_stress_slippage_multiplier = 2.0
+    cost_stress_funding_bps_per_trade = 2.0
     optim_data, holdout_data = split_data_temporal(all_data, holdout_days=holdout_days)
     target_sym = resolve_target_symbol(optim_data, coin_prefix, coin_name)
     if not target_sym: print(f"❌ {coin_name}: no data after holdout split"); return None
@@ -2020,16 +1857,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}, cv_mode={cv_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
-    print(
-        f"   Gates: fold_sr>={min_fold_sharpe_hard:.2f}, fold_wr>={min_fold_win_rate:.2f}, "
-        f"psr>={min_psr:.2f}, raw_exp>={min_raw_expectancy:.5f}"
-    )
+    print("   Proxy score weights: model_quality=0.40, signal_density=0.30, label_quality=0.15, fold_consistency=0.15")
     phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
     print(
-        f"   Phase: {phase_label} | trade_feasibility={_normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)} "
-        f"| grace={int(max(0, early_trade_feasibility_grace_trials))} "
-        f"| min_folds={int(max(1, early_trade_feasibility_min_folds))} "
-        f"| target_tpw={float(target_trades_per_week):.2f}"
+        f"   Phase: {phase_label} | target_tpw={float(target_trades_per_week):.2f} "
+        f"| target_tpy={float(target_trades_per_year) if target_trades_per_year is not None else float(target_trades_per_week) * 52.0:.1f}"
     )
     print(f"   Cost model: {cost_model_metadata.get('version')} ({cost_model_metadata.get('source_path') or 'built-in legacy defaults'})")
     for i, fold in enumerate(cv_splits):
@@ -2097,34 +1929,12 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     study.set_user_attr('coin_name', coin_name)
     study.set_user_attr('target_trades_per_week', float(target_trades_per_week))
     study.set_user_attr('target_trades_per_year', float(target_trades_per_year) if target_trades_per_year is not None else float(target_trades_per_week) * 52.0)
-    study.set_user_attr('early_trade_feasibility_mode', str(_normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)))
-    study.set_user_attr('early_trade_feasibility_grace_trials', int(max(0, early_trade_feasibility_grace_trials)))
-    study.set_user_attr('early_trade_feasibility_min_folds', int(max(1, early_trade_feasibility_min_folds)))
     study.set_user_attr('gate_mode', str(gate_mode))
-    study.set_user_attr('fee_stress_enabled', bool(enable_fee_stress))
     study.set_user_attr('cost_config_version', cost_model_metadata.get('version'))
     study.set_user_attr('cost_config_path', cost_model_metadata.get('source_path'))
 
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
-                            min_internal_oos_trades=min_internal_oos_trades,
-                            min_total_trades_gate=min_total_trades,
-                            target_trades_per_week=target_trades_per_week,
-                            target_trades_per_year=target_trades_per_year,
-                            enable_fee_stress=enable_fee_stress,
-                            fee_stress_multiplier=fee_stress_multiplier,
-                            fee_blend_normal_weight=fee_blend_normal_weight,
-                            fee_blend_stressed_weight=fee_blend_stressed_weight,
-                            min_fold_sharpe_hard=min_fold_sharpe_hard,
-                            min_fold_win_rate=min_fold_win_rate,
-                            min_psr=min_psr,
-                            min_psr_cv=min_psr_cv,
-                            min_raw_expectancy=min_raw_expectancy,
-                            min_stressed_expectancy=min_stressed_expectancy,
-                            early_trade_feasibility_mode=early_trade_feasibility_mode,
-                            early_trade_feasibility_min_folds=early_trade_feasibility_min_folds,
-                            early_trade_feasibility_grace_trials=early_trade_feasibility_grace_trials,
-                            early_trade_feasibility_penalty_scale=early_trade_feasibility_penalty_scale,
                             pruned_only=pruned_only,
                             base_config=base_cost_config)
     min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
@@ -2377,40 +2187,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         max_seed_oos_sharpe_dispersion=seed_stability_max_oos_sharpe_dispersion,
     )
     selection_meta = dict(selection_meta)
-    proxy_fidelity = calibrate_proxy_fidelity(
-        holdout_data=holdout_data,
-        coin_prefix=coin_prefix,
-        coin_name=coin_name,
-        study=study,
-        max_candidates=proxy_fidelity_candidates,
-        min_trades=min_total_trades or 6,
-        pruned_only=pruned_only,
-        eval_days=proxy_fidelity_eval_days,
-        thresholds=_proxy_fidelity_thresholds(
-            sharpe_delta_max=proxy_fidelity_sharpe_delta_max,
-            trade_count_delta_max=proxy_fidelity_trade_count_delta_max,
-            return_delta_max=proxy_fidelity_return_delta_max,
-            max_drawdown_delta_max=proxy_fidelity_max_drawdown_delta_max,
-        ),
-        base_config=base_cost_config,
-    )
-    proxy_fidelity_warning = bool(proxy_fidelity.get('warning', False))
-    selection_meta['proxy_fidelity_warning'] = proxy_fidelity_warning
-    selection_meta['proxy_fidelity'] = {
-        'n_candidates_evaluated': int(proxy_fidelity.get('n_candidates_evaluated', 0) or 0),
-        'eval_days': int(proxy_fidelity.get('eval_days', proxy_fidelity_eval_days) or proxy_fidelity_eval_days),
-    }
-
     selection_meta['research_confidence_tier'] = research_confidence_tier
-    if proxy_fidelity_warning:
-        prior_tier = research_confidence_tier
-        research_confidence_tier = _degrade_confidence_tier(research_confidence_tier)
-        selection_meta['research_confidence_tier'] = research_confidence_tier
-        selection_meta['proxy_fidelity_tier_adjustment'] = {
-            'applied': True,
-            'previous_tier': prior_tier,
-            'new_tier': research_confidence_tier,
-        }
 
     selection_meta['seed_stability'] = seed_stability
     selection_meta['seed_stability_thresholds'] = {
@@ -2530,17 +2307,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         },
         'deflated_sharpe': dsr, 'psr_cv': cv_psr_metric, 'psr_holdout': holdout_psr_metric or {},
         'significance_gates': significance_gates, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
-        'fee_stress': {
-            'enabled': bool(enable_fee_stress),
-            'multiplier': float(fee_stress_multiplier),
-            'blend_normal_weight': float(fee_blend_normal_weight),
-            'blend_stressed_weight': float(fee_blend_stressed_weight),
-        },
         'cost_model': cost_model_metadata,
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
-        'proxy_fidelity': proxy_fidelity,
-        'proxy_fidelity_warning': proxy_fidelity_warning,
         'robustness_diagnostics': robustness_diagnostics,
         'study_significance': study_significance,
         'seed_stability': seed_stability,
@@ -2682,8 +2451,6 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
         max_seed_param_dispersion=max_seed_param_dispersion,
         max_seed_oos_sharpe_dispersion=max_seed_oos_sharpe_dispersion,
     )
-    if bool(best_seed_result.get('proxy_fidelity_warning', False)):
-        research_confidence_tier = _degrade_confidence_tier(research_confidence_tier)
     best_seed_result['seed_stability'] = seed_stability
     best_seed_result['research_confidence_tier'] = research_confidence_tier
     best_seed_result.setdefault('selection_meta', {})['research_confidence_tier'] = research_confidence_tier
@@ -2834,7 +2601,7 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
                         help="Holdout aggregation mode for selection + backward-compatible top-level metrics")
     parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready", "discovery"])
-    parser.add_argument("--min-internal-oos-trades", type=int, default=0); parser.add_argument("--min-total-trades", type=int, default=0)
+    parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--cv-mode", type=str, default="walk_forward", choices=["walk_forward", "purged_embargo"],
                         help="Cross-validation split mode")
@@ -2863,54 +2630,8 @@ if __name__ == "__main__":
                         help="Trade-frequency objective target used during CV scoring (default: 1.0 ~= 52 trades/year)")
     parser.add_argument("--target-trades-per-year", type=float, default=None,
                         help="Optional annual target; overrides --target-trades-per-week when set")
-    parser.add_argument("--early-trade-feasibility-mode", type=str,
-                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_MODE,
-                        choices=list(EARLY_TRADE_FEASIBILITY_MODES),
-                        help="How to handle early projected trade-frequency shortfall")
-    parser.add_argument("--early-trade-feasibility-min-folds", type=int,
-                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS,
-                        help="Minimum evaluated folds before early projected trade-frequency check")
-    parser.add_argument("--early-trade-feasibility-grace-trials", type=int,
-                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS,
-                        help="Completed-trial grace period before hard early trade-frequency rejection")
-    parser.add_argument("--early-trade-feasibility-penalty-scale", type=float,
-                        default=DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE,
-                        help="Penalty scale applied when early trade-frequency mode uses penalization")
-    parser.add_argument("--disable-fee-stress", action="store_true",
-                        help="Disable stressed-fee scoring in CV objective")
-    parser.add_argument("--fee-stress-multiplier", type=float, default=2.0,
-                        help="Multiplier for stressed fee schedule (applies to pct + min contract fee)")
-    parser.add_argument("--fee-blend-normal-weight", type=float, default=0.6,
-                        help="Blend weight for normal-fee fold Sharpe")
-    parser.add_argument("--fee-blend-stressed-weight", type=float, default=0.4,
-                        help="Blend weight for stressed-fee fold Sharpe")
     parser.add_argument("--cost-config-path", type=str, default=None,
                         help="Optional path to versioned exchange cost assumptions JSON")
-    parser.add_argument("--enable-pbo-diagnostic", action="store_true",
-                        help="Compute CSCV-style PBO diagnostic from trial fold metrics")
-    parser.add_argument("--enable-study-significance", action="store_true",
-                        help="Enable optional study-level RC/SPA-style bootstrap diagnostic")
-    parser.add_argument("--study-significance-bootstrap-iterations", type=int, default=500,
-                        help="Bootstrap iterations for study-level significance diagnostic")
-    parser.add_argument("--study-significance-seed", type=int, default=42,
-                        help="RNG seed for study-level significance bootstrap")
-    parser.add_argument("--study-significance-score-source", type=str, default="fold_sharpe",
-                        choices=["fold_sharpe", "fold_return", "fold_expectancy", "cv_sharpe", "frequency_adjusted_score"],
-                        help="Score source used by study-level significance diagnostic")
-    parser.add_argument("--enable-cost-stress-diagnostics", action="store_true",
-                        help="Run finalist holdout cost stress diagnostics (fees/slippage/funding)")
-    parser.add_argument("--cost-stress-finalists", type=int, default=2,
-                        help="Number of finalist candidates to stress-test")
-    parser.add_argument("--cost-stress-fee-multiplier", type=float, default=1.5,
-                        help="Fee multiplier for cost stress scenario")
-    parser.add_argument("--cost-stress-slippage-multiplier", type=float, default=2.0,
-                        help="Slippage multiplier for cost stress scenario")
-    parser.add_argument("--cost-stress-funding-bps-per-trade", type=float, default=2.0,
-                        help="Funding penalty (bps/trade) for adverse funding stress scenario")
-    parser.add_argument("--min-fold-sharpe-hard", type=float, default=-0.1,
-                        help="Hard reject if any fold Sharpe is below this threshold")
-    parser.add_argument("--min-fold-win-rate", type=float, default=0.30,
-                        help="Hard reject when sufficiently-active folds fall below this win-rate")
     parser.add_argument("--min-psr", type=float, default=0.55,
                         help="Minimum probabilistic Sharpe ratio gate")
     parser.add_argument("--min-psr-cv", type=float, default=None,
@@ -2919,28 +2640,12 @@ if __name__ == "__main__":
                         help="Optional holdout PSR gate (disabled when unset)")
     parser.add_argument("--min-dsr", type=float, default=None,
                         help="Optional holdout DSR gate (disabled when unset)")
-    parser.add_argument("--min-raw-expectancy", type=float, default=1e-6,
-                        help="Minimum pre-fee expectancy gate")
-    parser.add_argument("--min-stressed-expectancy", type=float, default=1e-6,
-                        help="Minimum stressed-fee expectancy gate")
     parser.add_argument("--seed-stability-min-pass-rate", type=float, default=0.67,
                         help="Minimum holdout pass-rate across sampler seeds for PROMOTION_READY")
     parser.add_argument("--seed-stability-max-param-dispersion", type=float, default=0.60,
                         help="Maximum normalized (IQR/|median|) per-parameter seed dispersion for PROMOTION_READY")
     parser.add_argument("--seed-stability-max-oos-sharpe-dispersion", type=float, default=0.35,
                         help="Maximum holdout Sharpe std across seeds for PROMOTION_READY")
-    parser.add_argument("--proxy-fidelity-candidates", type=int, default=3,
-                        help="How many accepted candidates to sample for fast-vs-backtest calibration")
-    parser.add_argument("--proxy-fidelity-eval-days", type=int, default=90,
-                        help="Calibration evaluation horizon (days) shared by fast proxy and run_backtest")
-    parser.add_argument("--proxy-fidelity-sharpe-delta-max", type=float, default=0.35,
-                        help="Warning threshold for |fast_sharpe - backtest_sharpe|")
-    parser.add_argument("--proxy-fidelity-trade-count-delta-max", type=int, default=8,
-                        help="Warning threshold for |fast_trades - backtest_trades|")
-    parser.add_argument("--proxy-fidelity-return-delta-max", type=float, default=0.03,
-                        help="Warning threshold for |fast_return - backtest_return|")
-    parser.add_argument("--proxy-fidelity-max-drawdown-delta-max", type=float, default=0.04,
-                        help="Warning threshold for |fast_max_drawdown - backtest_max_drawdown|")
     parser.add_argument("--pruned-only", action="store_true",
                         help="Require pruned feature artifacts during optimization and holdout")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only",
@@ -2963,11 +2668,6 @@ if __name__ == "__main__":
         f"PSR_HO>={args.min_psr_holdout}, DSR>={args.min_dsr}"
     )
     print("   Escalation policy: tighten thresholds after 14-28 days of stable paper evidence.")
-    print(
-        f"   Trade-feasibility: mode={args.early_trade_feasibility_mode}, "
-        f"min_folds={args.early_trade_feasibility_min_folds}, grace={args.early_trade_feasibility_grace_trials}, "
-        f"penalty_scale={args.early_trade_feasibility_penalty_scale}"
-    )
     if args.debug_trials:
         DEBUG_TRIALS = True
         logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -2980,44 +2680,37 @@ if __name__ == "__main__":
     seeds = [int(s.strip()) for s in args.sampler_seeds.split(',') if s.strip()] if args.sampler_seeds else [args.sampler_seed]
     for cn in coins:
         purge_days = args.purge_days if args.purge_days is not None else compute_purge_days(get_coin_profile(cn))
-        optimize_coin_multiseed(all_data, PREFIX_FOR_COIN.get(cn, cn), cn, sampler_seeds=seeds,
-            n_trials=args.trials, n_jobs=args.jobs,
-            plateau_patience=args.plateau_patience, plateau_min_delta=args.plateau_min_delta,
-            plateau_warmup=args.plateau_warmup, plateau_min_completed=args.plateau_min_completed,
-            study_suffix=args.study_suffix, resume_study=args.resume,
-            holdout_days=args.holdout_days, min_internal_oos_trades=args.min_internal_oos_trades,
-            min_total_trades=args.min_total_trades, n_cv_folds=args.n_cv_folds,
-            holdout_candidates=args.holdout_candidates, require_holdout_pass=args.require_holdout_pass,
-            holdout_min_trades=args.holdout_min_trades, holdout_min_sharpe=args.holdout_min_sharpe,
+        optimize_coin_multiseed(
+            all_data,
+            PREFIX_FOR_COIN.get(cn, cn),
+            cn,
+            sampler_seeds=seeds,
+            n_trials=args.trials,
+            n_jobs=args.jobs,
+            plateau_patience=args.plateau_patience,
+            plateau_min_delta=args.plateau_min_delta,
+            plateau_warmup=args.plateau_warmup,
+            plateau_min_completed=args.plateau_min_completed,
+            study_suffix=args.study_suffix,
+            resume_study=args.resume,
+            holdout_days=args.holdout_days,
+            min_total_trades=args.min_total_trades,
+            n_cv_folds=args.n_cv_folds,
+            holdout_candidates=args.holdout_candidates,
+            require_holdout_pass=args.require_holdout_pass,
+            holdout_min_trades=args.holdout_min_trades,
+            holdout_min_sharpe=args.holdout_min_sharpe,
             holdout_min_return=args.holdout_min_return,
             holdout_mode=args.holdout_mode,
             target_trades_per_week=args.target_trades_per_week,
             target_trades_per_year=args.target_trades_per_year,
-            early_trade_feasibility_mode=args.early_trade_feasibility_mode,
-            early_trade_feasibility_min_folds=args.early_trade_feasibility_min_folds,
-            early_trade_feasibility_grace_trials=args.early_trade_feasibility_grace_trials,
-            early_trade_feasibility_penalty_scale=args.early_trade_feasibility_penalty_scale,
-            enable_fee_stress=not args.disable_fee_stress,
-            fee_stress_multiplier=args.fee_stress_multiplier,
-            fee_blend_normal_weight=args.fee_blend_normal_weight,
-            fee_blend_stressed_weight=args.fee_blend_stressed_weight,
-            min_fold_sharpe_hard=args.min_fold_sharpe_hard,
-            min_fold_win_rate=args.min_fold_win_rate,
             min_psr=args.min_psr,
             min_psr_cv=args.min_psr_cv,
             min_psr_holdout=args.min_psr_holdout,
             min_dsr=args.min_dsr,
-            min_raw_expectancy=args.min_raw_expectancy,
-            min_stressed_expectancy=args.min_stressed_expectancy,
             seed_stability_min_pass_rate=args.seed_stability_min_pass_rate,
             seed_stability_max_param_dispersion=args.seed_stability_max_param_dispersion,
             seed_stability_max_oos_sharpe_dispersion=args.seed_stability_max_oos_sharpe_dispersion,
-            proxy_fidelity_candidates=args.proxy_fidelity_candidates,
-            proxy_fidelity_eval_days=args.proxy_fidelity_eval_days,
-            proxy_fidelity_sharpe_delta_max=args.proxy_fidelity_sharpe_delta_max,
-            proxy_fidelity_trade_count_delta_max=args.proxy_fidelity_trade_count_delta_max,
-            proxy_fidelity_return_delta_max=args.proxy_fidelity_return_delta_max,
-            proxy_fidelity_max_drawdown_delta_max=args.proxy_fidelity_max_drawdown_delta_max,
             cv_mode=args.cv_mode,
             purge_bars=args.purge_bars,
             purge_days=purge_days,
@@ -3028,13 +2721,4 @@ if __name__ == "__main__":
             preset_name=args.preset,
             gate_mode=args.gate_mode,
             cost_config_path=args.cost_config_path,
-            enable_pbo_diagnostic=args.enable_pbo_diagnostic,
-            enable_study_significance=args.enable_study_significance,
-            study_significance_bootstrap_iterations=args.study_significance_bootstrap_iterations,
-            study_significance_seed=args.study_significance_seed,
-            study_significance_score_source=args.study_significance_score_source,
-            enable_cost_stress_diagnostics=args.enable_cost_stress_diagnostics,
-            cost_stress_finalists=args.cost_stress_finalists,
-            cost_stress_fee_multiplier=args.cost_stress_fee_multiplier,
-            cost_stress_slippage_multiplier=args.cost_stress_slippage_multiplier,
-            cost_stress_funding_bps_per_trade=args.cost_stress_funding_bps_per_trade)
+        )

@@ -4,10 +4,10 @@
 import argparse
 import multiprocessing as mp
 from dataclasses import dataclass, field
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
-from scripts.optimize import load_data, optimize_coin_multiseed
+from scripts.optimize import PREFIX_FOR_COIN, load_data, optimize_coin_multiseed
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
@@ -25,13 +25,11 @@ class OptimizationConfig:
     plateau_min_delta: float = 0.012
     plateau_warmup: int = 60
     plateau_min_completed: int = 0
-    min_internal_oos_trades: int = 0
     min_total_trades: int = 8
     holdout_min_trades: int = 8
     holdout_min_sharpe: float = 0.0
     holdout_min_return: float = -0.05
     target_trades_per_week: float = 1.0
-    disable_fee_stress: bool = False
     require_holdout_pass: bool = False
     gate_mode: str = "initial_paper_qualification"
 
@@ -40,7 +38,7 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
     all_data, coin, config, run_id = args
     result = optimize_coin_multiseed(
         all_data,
-        coin_prefix=coin,
+        coin_prefix=PREFIX_FOR_COIN.get(coin, coin),
         coin_name=coin,
         n_trials=config.trials,
         n_jobs=config.jobs,
@@ -53,13 +51,11 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
         plateau_min_delta=config.plateau_min_delta,
         plateau_warmup=config.plateau_warmup,
         plateau_min_completed=config.plateau_min_completed,
-        min_internal_oos_trades=config.min_internal_oos_trades,
         min_total_trades=config.min_total_trades,
         holdout_min_trades=config.holdout_min_trades,
         holdout_min_sharpe=config.holdout_min_sharpe,
         holdout_min_return=config.holdout_min_return,
         target_trades_per_week=config.target_trades_per_week,
-        enable_fee_stress=not config.disable_fee_stress,
         require_holdout_pass=config.require_holdout_pass,
         gate_mode=config.gate_mode,
         study_suffix=run_id,
@@ -69,7 +65,7 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
 
 def run_optimization(coins: list[str], config: OptimizationConfig, workers: int) -> dict[str, dict[str, Any] | None]:
     all_data = load_data(days=2200)
-    run_id = Path(".").resolve().name
+    run_id = datetime.utcnow().strftime("run_%Y%m%dT%H%M%SZ")
     work_items = [(all_data, coin, config, run_id) for coin in coins]
 
     if workers <= 1 or len(work_items) == 1:
@@ -96,13 +92,11 @@ def main() -> None:
     parser.add_argument("--plateau-min-delta", type=float, default=0.012)
     parser.add_argument("--plateau-warmup", type=int, default=60)
     parser.add_argument("--plateau-min-completed", type=int, default=0)
-    parser.add_argument("--min-internal-oos-trades", type=int, default=0)
     parser.add_argument("--min-total-trades", type=int, default=8)
     parser.add_argument("--holdout-min-trades", type=int, default=8)
     parser.add_argument("--holdout-min-sharpe", type=float, default=0.0)
     parser.add_argument("--holdout-min-return", type=float, default=-0.05)
     parser.add_argument("--target-trades-per-week", type=float, default=1.0)
-    parser.add_argument("--disable-fee-stress", action="store_true")
     parser.add_argument("--require-holdout-pass", action="store_true")
     parser.add_argument("--gate-mode", type=str, default="initial_paper_qualification")
     args = parser.parse_args()
@@ -122,13 +116,11 @@ def main() -> None:
         plateau_min_delta=args.plateau_min_delta,
         plateau_warmup=args.plateau_warmup,
         plateau_min_completed=args.plateau_min_completed,
-        min_internal_oos_trades=args.min_internal_oos_trades,
         min_total_trades=args.min_total_trades,
         holdout_min_trades=args.holdout_min_trades,
         holdout_min_sharpe=args.holdout_min_sharpe,
         holdout_min_return=args.holdout_min_return,
         target_trades_per_week=args.target_trades_per_week,
-        disable_fee_stress=args.disable_fee_stress,
         require_holdout_pass=args.require_holdout_pass,
         gate_mode=args.gate_mode,
     )
