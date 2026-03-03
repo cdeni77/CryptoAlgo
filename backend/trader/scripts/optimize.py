@@ -576,8 +576,8 @@ def fast_evaluate_fold(
         momentum_strict_mode,
         default=getattr(config, 'momentum_strict_mode', True),
     )
-    effective_trend_mode = str(trend_filter_mode or getattr(config, 'trend_filter_mode', 'soft'))
-    effective_funding_mode = str(funding_filter_mode or getattr(config, 'funding_filter_mode', 'hard'))
+    effective_trend_mode = str(trend_filter_mode or getattr(config, 'trend_filter_mode', 'off'))
+    effective_funding_mode = str(funding_filter_mode or getattr(config, 'funding_filter_mode', 'soft'))
 
     for ts in test_feat.index:
         if ts not in test_ohlcv.index: continue
@@ -800,73 +800,73 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # target_trades_per_year ~= at least weekly cadence while preserving quality
     'BTC': {
-        'target_trades_per_year': 56.0,
-        'cooldown_min': 12.0,
-        'cooldown_max': 48.0,
-        'min_momentum_magnitude': (0.030, 0.070),
-        'max_vol_24h': (0.055, 0.090),
-        'max_ensemble_std': (0.080, 0.130),
-        'min_directional_agreement': (0.62, 0.78),
-        'meta_probability_threshold': (0.53, 0.66),
-        'min_vol_24h': (0.004, 0.010),
-        'min_trade_frequency_ratio': 0.60,
+        'target_trades_per_year': 40.0,
+        'cooldown_min': 6.0,
+        'cooldown_max': 36.0,
+        'min_momentum_magnitude': (0.010, 0.050),
+        'max_vol_24h': (0.045, 0.110),
+        'max_ensemble_std': (0.10, 0.20),
+        'min_directional_agreement': (0.50, 0.72),
+        'meta_probability_threshold': (0.48, 0.62),
+        'min_vol_24h': (0.001, 0.007),
+        'min_trade_frequency_ratio': 0.40,
     },
     'ETH': {
-        'target_trades_per_year': 64.0,
-        'cooldown_min': 8.0,
-        'cooldown_max': 36.0,
-        'min_momentum_magnitude': (0.028, 0.068),
-        'max_vol_24h': (0.050, 0.085),
-        'max_ensemble_std': (0.075, 0.125),
-        'min_directional_agreement': (0.61, 0.77),
-        'meta_probability_threshold': (0.52, 0.65),
-        'min_vol_24h': (0.003, 0.010),
-        'min_trade_frequency_ratio': 0.58,
+        'target_trades_per_year': 40.0,
+        'cooldown_min': 4.0,
+        'cooldown_max': 30.0,
+        'min_momentum_magnitude': (0.010, 0.050),
+        'max_vol_24h': (0.050, 0.100),
+        'max_ensemble_std': (0.10, 0.20),
+        'min_directional_agreement': (0.50, 0.72),
+        'meta_probability_threshold': (0.48, 0.62),
+        'min_vol_24h': (0.002, 0.008),
+        'min_trade_frequency_ratio': 0.40,
     },
     'SOL': {
-        'target_trades_per_year': 72.0,
-        'cooldown_min': 6.0,
-        'cooldown_max': 30.0,
-        'min_momentum_magnitude': (0.025, 0.065),
-        'max_vol_24h': (0.060, 0.110),
-        'max_ensemble_std': (0.080, 0.140),
-        'min_directional_agreement': (0.60, 0.75),
-        'meta_probability_threshold': (0.50, 0.63),
-        'min_vol_24h': (0.004, 0.012),
-        'min_trade_frequency_ratio': 0.56,
+        'target_trades_per_year': 48.0,
+        'cooldown_min': 3.0,
+        'cooldown_max': 24.0,
+        'min_momentum_magnitude': (0.010, 0.055),
+        'max_vol_24h': (0.055, 0.130),
+        'max_ensemble_std': (0.10, 0.20),
+        'min_directional_agreement': (0.50, 0.72),
+        'meta_probability_threshold': (0.48, 0.62),
+        'min_vol_24h': (0.002, 0.010),
+        'min_trade_frequency_ratio': 0.40,
     },
     'XRP': {
-        'target_trades_per_year': 60.0,
-        'cooldown_min': 8.0,
-        'cooldown_max': 36.0,
-        'min_momentum_magnitude': (0.028, 0.070),
-        'max_vol_24h': (0.050, 0.095),
-        'max_ensemble_std': (0.080, 0.130),
-        'min_directional_agreement': (0.61, 0.77),
-        'meta_probability_threshold': (0.52, 0.65),
-        'min_vol_24h': (0.003, 0.010),
-        'min_trade_frequency_ratio': 0.58,
+        'target_trades_per_year': 44.0,
+        'cooldown_min': 4.0,
+        'cooldown_max': 30.0,
+        'min_momentum_magnitude': (0.010, 0.055),
+        'max_vol_24h': (0.050, 0.110),
+        'max_ensemble_std': (0.10, 0.20),
+        'min_directional_agreement': (0.50, 0.72),
+        'meta_probability_threshold': (0.48, 0.62),
+        'min_vol_24h': (0.002, 0.008),
+        'min_trade_frequency_ratio': 0.40,
     },
     'DOGE': {
-        'target_trades_per_year': 52.0,
-        'cooldown_min': 10.0,
-        'cooldown_max': 42.0,
-        'min_momentum_magnitude': (0.030, 0.080),
-        'max_vol_24h': (0.065, 0.120),
-        'max_ensemble_std': (0.085, 0.150),
-        'min_directional_agreement': (0.58, 0.74),
-        'meta_probability_threshold': (0.49, 0.62),
-        'min_vol_24h': (0.004, 0.012),
-        'min_trade_frequency_ratio': 0.54,
+        'target_trades_per_year': 44.0,
+        'cooldown_min': 4.0,
+        'cooldown_max': 30.0,
+        'min_momentum_magnitude': (0.010, 0.060),
+        'max_vol_24h': (0.060, 0.150),
+        'max_ensemble_std': (0.10, 0.20),
+        'min_directional_agreement': (0.50, 0.72),
+        'meta_probability_threshold': (0.48, 0.62),
+        'min_vol_24h': (0.002, 0.010),
+        'min_trade_frequency_ratio': 0.40,
     },
 }
 
 COIN_OBJECTIVE_GUARDS = {
-    'BTC': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
-    'ETH': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
-    'SOL': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
-    'XRP': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
-    'DOGE': {'min_total_trades': 5, 'min_avg_trades_per_fold': 1.0, 'min_expectancy': 0.0},
+    'BTC': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
+    'ETH': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
+    'SOL': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
+    'XRP': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
+    'DOGE': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -1111,8 +1111,8 @@ def objective(
         trial.params.get('momentum_strict_mode'),
         default=getattr(config, 'momentum_strict_mode', True),
     )
-    fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'soft')))
-    fast_funding_filter_mode = str(trial.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'hard')))
+    fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'off')))
+    fast_funding_filter_mode = str(trial.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'soft')))
     guard_floor_trades = int(guards.get('min_total_trades', 5))
     required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
     early_trade_reject_tolerance = 0.10
@@ -1997,8 +1997,8 @@ def calibrate_proxy_fidelity(
             strategy_family_name=strategy_family_name,
             momentum_score_threshold=_as_number(cand.params.get('momentum_score_threshold'), default=getattr(config, 'momentum_score_threshold', 1.0)),
             momentum_strict_mode=_as_bool(cand.params.get('momentum_strict_mode'), default=getattr(config, 'momentum_strict_mode', True)),
-            trend_filter_mode=str(cand.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'soft'))),
-            funding_filter_mode=str(cand.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'hard'))),
+            trend_filter_mode=str(cand.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'off'))),
+            funding_filter_mode=str(cand.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'soft'))),
         )
         if not fast_metrics:
             continue
