@@ -219,8 +219,8 @@ class Config:
     calibration_strategy: str = 'platt'
 
     # Policy controls for directional macro filters
-    trend_filter_mode: str = 'soft'
-    funding_filter_mode: str = 'hard'
+    trend_filter_mode: str = 'off'
+    funding_filter_mode: str = 'soft'
 
     # Strategy family controls
     strategy_family: str = 'momentum_trend'
@@ -2298,9 +2298,9 @@ if __name__ == "__main__":
     parser.add_argument("--meta-threshold", type=float, default=None, help="Secondary meta-model probability threshold")
     parser.add_argument("--calibration", choices=['isotonic', 'platt', 'beta'], default='platt',
                         help="Calibration strategy for primary+meta models")
-    parser.add_argument("--trend-filter-mode", choices=['hard', 'soft', 'off'], default='soft',
+    parser.add_argument("--trend-filter-mode", choices=['hard', 'soft', 'off'], default='off',
                         help="Trend filter policy: hard=reject, soft=penalize rank/size, off=ignore")
-    parser.add_argument("--funding-filter-mode", choices=['hard', 'soft', 'off'], default='hard',
+    parser.add_argument("--funding-filter-mode", choices=['hard', 'soft', 'off'], default='soft',
                         help="Funding filter policy: hard=reject, soft=penalize rank/size, off=ignore")
     parser.add_argument("--strategy-family", choices=['momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay'],
                         default='momentum_trend', help="Strategy family used for direction + ranking")
