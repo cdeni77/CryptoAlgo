@@ -1187,10 +1187,11 @@ def proxy_evaluate_fold(features, ohlcv, fold: CVFold, profile: CoinProfile, con
         return None
 
     model, scaler, iso, *_ = result
-    y_test = system.create_labels(ohlcv, test_feat, profile=profile).dropna()
+    y_test_raw = system.create_labels(ohlcv, test_feat, profile=profile).dropna()
+    X_test_raw = test_feat.loc[y_test_raw.index, cols]
+    X_test, y_test = system.prepare_binary_training_set(X_test_raw, y_test_raw)
     if len(y_test) < 20 or y_test.nunique() < 2:
         return None
-    X_test = test_feat.loc[y_test.index, cols]
     raw_probs = model.predict_proba(scaler.transform(X_test))[:, 1]
     probs = calibrator_predict(iso, raw_probs)
 
