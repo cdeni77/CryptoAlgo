@@ -29,6 +29,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import numpy as np
 import pandas as pd
 import optuna
+from sklearn.metrics import brier_score_loss, roc_auc_score
 from optuna.samplers import TPESampler
 
 from scripts.train_model import (
@@ -1033,6 +1034,154 @@ def profile_from_params(params, coin_name):
         min_child_samples=effective_params['min_child_samples'],
     )
 
+
+def _score_model_quality(probs: np.ndarray, y_test: pd.Series) -> dict:
+    if len(probs) == 0 or len(y_test) == 0:
+        return {'auc': 0.5, 'brier': 1.0, 'prob_std': 0.0, 'prob_range': 0.0, 'score': -1.0}
+    if len(np.unique(y_test)) < 2:
+        auc = 0.5
+    else:
+        auc = float(roc_auc_score(y_test, probs))
+    brier = float(brier_score_loss(y_test, probs))
+    prob_std = float(np.std(probs))
+    prob_range = float(np.percentile(probs, 95) - np.percentile(probs, 5))
+    score = float((auc - 0.5) * 2.0 - brier)
+    return {'auc': auc, 'brier': brier, 'prob_std': prob_std, 'prob_range': prob_range, 'score': score}
+
+
+def _score_signal_density(probs: np.ndarray, ohlcv_test: pd.DataFrame, profile: CoinProfile) -> dict:
+    n_bars = max(len(probs), 1)
+    above_threshold = int(np.sum(probs >= float(profile.signal_threshold)))
+
+    close = ohlcv_test.get('close', pd.Series(index=ohlcv_test.index, dtype=float))
+    ret_72h = close.pct_change(72)
+    momentum_pass = int(np.sum(ret_72h.abs() >= float(profile.min_momentum_magnitude)))
+
+    vol_24h = close.pct_change().rolling(24).std()
+    vol_pass = int(np.sum((vol_24h >= float(profile.min_vol_24h)) & (vol_24h <= float(profile.max_vol_24h))))
+
+    signal_rate = above_threshold / n_bars
+    momentum_rate = momentum_pass / n_bars
+    vol_rate = vol_pass / n_bars
+
+    joint_rate = max(signal_rate * momentum_rate * vol_rate, 1e-6)
+    hours_per_trade = max(float(profile.cooldown_hours), 1.0 / joint_rate)
+    estimated_tpy = float(8760.0 / hours_per_trade)
+    score = float(np.log1p(estimated_tpy) / np.log1p(52.0))
+
+    return {
+        'signal_rate': signal_rate,
+        'momentum_rate': momentum_rate,
+        'vol_rate': vol_rate,
+        'estimated_tpy': estimated_tpy,
+        'score': score,
+    }
+
+
+def _score_label_quality(y_train: pd.Series, y_test: pd.Series) -> dict:
+    train_pos_rate = float((y_train == 1).mean()) if len(y_train) else 0.0
+    test_pos_rate = float((y_test == 1).mean()) if len(y_test) else 0.0
+    balance_score = 1.0 - abs(train_pos_rate - 0.30) * 2.0
+    drift = abs(train_pos_rate - test_pos_rate)
+    consistency_score = 1.0 - min(drift * 5.0, 1.0)
+    return {
+        'train_pos_rate': train_pos_rate,
+        'test_pos_rate': test_pos_rate,
+        'score': float(0.6 * max(0.0, balance_score) + 0.4 * consistency_score),
+    }
+
+
+def _score_fold_consistency(fold_aucs: list[float]) -> dict:
+    if len(fold_aucs) < 2:
+        return {'score': 0.5}
+    cv = float(np.std(fold_aucs) / max(abs(np.mean(fold_aucs)), 0.01))
+    return {'score': float(1.0 / (1.0 + cv))}
+
+
+def proxy_evaluate_fold(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
+    system = MLSystem(config)
+    feature_candidates = profile.resolve_feature_columns(
+        use_pruned_features=bool(pruned_only),
+        strict_pruned=bool(pruned_only),
+    )
+    cols = system.get_feature_columns(features.columns, feature_candidates)
+    if not cols or len(cols) < 4:
+        return None
+
+    train_feat = features.loc[fold.train_idx.intersection(features.index)]
+    test_feat = features.loc[fold.test_idx.intersection(features.index)]
+    test_ohlcv = ohlcv.loc[fold.test_idx.intersection(ohlcv.index)]
+    if len(train_feat) < config.min_train_samples or len(test_feat) < 24:
+        return None
+
+    y = system.create_labels(ohlcv, train_feat, profile=profile)
+    valid_idx = y.dropna().index
+    X_all = train_feat.loc[valid_idx, cols]
+    y_all = y.loc[valid_idx]
+    X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
+    if len(X_all) < config.min_train_samples or y_all.nunique() < 2:
+        return None
+
+    split_idx = int(len(X_all) * (1 - config.val_fraction))
+    if split_idx <= 0 or split_idx >= len(X_all):
+        return None
+
+    y_train = y_all.iloc[:split_idx]
+    y_val = y_all.iloc[split_idx:]
+    x_train_fold, x_val_fold, _ = fit_transform_fold(X_all.iloc[:split_idx], X_all.iloc[split_idx:], y_train)
+    if y_train.nunique() < 2 or y_val.nunique() < 2:
+        return None
+
+    result = system.train(x_train_fold, y_train, x_val_fold, y_val, profile=profile, symbol=symbol)
+    if not result:
+        return None
+
+    model, scaler, iso, *_ = result
+    y_test = system.create_labels(ohlcv, test_feat, profile=profile).dropna()
+    if len(y_test) < 20 or y_test.nunique() < 2:
+        return None
+    X_test = test_feat.loc[y_test.index, cols]
+    raw_probs = model.predict_proba(scaler.transform(X_test))[:, 1]
+    probs = calibrator_predict(iso, raw_probs)
+
+    model_quality = _score_model_quality(probs, y_test)
+    signal_density = _score_signal_density(probs, test_ohlcv.loc[y_test.index], profile)
+    label_quality = _score_label_quality(y_train, y_test)
+
+    return {
+        'model_quality': model_quality,
+        'signal_density': signal_density,
+        'label_quality': label_quality,
+    }
+
+
+def validate_candidates(candidate_trials, coin_name, coin_prefix, holdout_data, holdout_days, holdout_mode, n_top=10, pruned_only=True, base_config=None):
+    results = []
+    for cand in list(candidate_trials)[: max(1, int(n_top))]:
+        metrics = evaluate_holdout(
+            holdout_data,
+            cand.params,
+            coin_name,
+            coin_prefix,
+            holdout_days,
+            pruned_only=pruned_only,
+            holdout_mode=holdout_mode,
+            base_config=base_config,
+        )
+        if not metrics:
+            continue
+        results.append({
+            'trial_number': int(cand.number),
+            'params': cand.params,
+            'proxy_score': float(cand.value if cand.value is not None else -1.0),
+            'trades': int(metrics.get('holdout_trades', 0) or 0),
+            'sharpe': float(metrics.get('holdout_sharpe', 0.0) or 0.0),
+            'return': float(metrics.get('holdout_return', 0.0) or 0.0),
+            'win_rate': float(metrics.get('full_pf', 0.0) or 0.0),
+            'metrics': metrics,
+        })
+    return sorted(results, key=lambda row: row['sharpe'], reverse=True)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # OBJECTIVE + STOPPER + SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1044,601 +1193,59 @@ def objective(
     coin_name,
     cv_splits,
     target_sym,
-    min_internal_oos_trades=0,
-    target_trades_per_week=1.0,
-    target_trades_per_year=None,
-    enable_fee_stress=True,
-    fee_stress_multiplier=2.0,
-    fee_blend_normal_weight=0.6,
-    fee_blend_stressed_weight=0.4,
     pruned_only=True,
-    min_total_trades_gate=0,
-    min_fold_sharpe_hard=-0.1,
-    min_fold_win_rate=0.30,
-    min_psr=0.55,
-    min_psr_cv=None,
-    min_raw_expectancy=1e-6,
-    min_stressed_expectancy=1e-6,
-    early_trade_feasibility_mode=DEFAULT_EARLY_TRADE_FEASIBILITY_MODE,
-    early_trade_feasibility_min_folds=DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS,
-    early_trade_feasibility_grace_trials=DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS,
-    early_trade_feasibility_penalty_scale=DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE,
     base_config=None,
+    **_kwargs,
 ):
-    min_fold_win_rate_trades = max(5, int(min_internal_oos_trades) if min_internal_oos_trades else 10)
-
     profile = create_trial_profile(trial, coin_name)
-    effective_params = build_effective_params(trial.params, coin_name)
-    strategy_family, trade_freq_bucket = _resolve_strategy_and_bucket(trial.params)
-    family_prior = STRATEGY_FAMILY_PRIORS.get(strategy_family, STRATEGY_FAMILY_PRIORS['momentum_trend'])
-    bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(trade_freq_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
     seed_config = base_config or Config()
-    config = Config(**{**seed_config.__dict__,
-                    'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00,
-                    'max_ensemble_std': float(effective_params['max_ensemble_std']),
-                    'min_directional_agreement': float(effective_params['min_directional_agreement']),
-                    'meta_probability_threshold': float(effective_params['meta_probability_threshold']),
-                    'strategy_family': strategy_family,
-                    'trade_freq_bucket': trade_freq_bucket,
-                    'train_embargo_hours': 24, 'enforce_pruned_features': bool(pruned_only),
-                    'min_val_auc': 0.48, 'min_train_samples': 100, 'signal_threshold': 0.50})
-    features = optim_data[target_sym]['features']
-    ohlcv_data = optim_data[target_sym]['ohlcv']
-    guards = COIN_OBJECTIVE_GUARDS.get(coin_name, {})
-    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, COIN_OPTIMIZATION_PRIORS.get('ETH', {}))
-    target_tpy = float(
-        float(target_trades_per_year)
-        if target_trades_per_year is not None
-        else float(target_trades_per_week) * 52.0
-    )
-    min_trade_frequency_ratio = float(priors.get('min_trade_frequency_ratio', 0.55))
-    min_trade_frequency_ratio += float(family_prior.get('min_trade_frequency_ratio_delta', 0.0))
-    min_trade_frequency_ratio += float(bucket_prior.get('min_trade_frequency_ratio_delta', 0.0))
-    min_trade_frequency_ratio = float(min(0.95, max(0.35, min_trade_frequency_ratio)))
-    min_feasible_tpy = max(1.0, target_tpy * min_trade_frequency_ratio)
-    trial.set_user_attr('strategy_family', strategy_family)
-    trial.set_user_attr('trade_freq_bucket', trade_freq_bucket)
-    trial.set_user_attr('early_trade_feasibility_mode', _normalize_early_trade_feasibility_mode(early_trade_feasibility_mode))
-    trial.set_user_attr('early_trade_feasibility_grace_trials', max(0, int(early_trade_feasibility_grace_trials or 0)))
-    fast_momentum_score_threshold = _as_number(
-        trial.params.get('momentum_score_threshold'),
-        default=getattr(config, 'momentum_score_threshold', 1.0),
-    )
-    fast_momentum_strict_mode = _as_bool(
-        trial.params.get('momentum_strict_mode'),
-        default=getattr(config, 'momentum_strict_mode', True),
-    )
-    fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'off')))
-    fast_funding_filter_mode = str(trial.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'soft')))
-    guard_floor_trades = int(guards.get('min_total_trades', 5))
-    required_total_trades_floor = max(1, int(min_total_trades_gate or 0), guard_floor_trades)
-    early_trade_feasibility_mode = _normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)
-    early_trade_projection_min_folds = max(1, int(early_trade_feasibility_min_folds or 1))
-    early_trade_feasibility_grace_trials = max(0, int(early_trade_feasibility_grace_trials or 0))
-    early_trade_feasibility_penalty_scale = max(0.0, float(early_trade_feasibility_penalty_scale or 0.0))
+    config = Config(**{
+        **seed_config.__dict__,
+        'max_positions': 1,
+        'leverage': 4,
+        'min_signal_edge': 0.0,
+        'enforce_pruned_features': bool(pruned_only),
+        'min_train_samples': 100,
+        'signal_threshold': 0.50,
+    })
 
-    fold_results, total_trades = [], 0
-    stressed_fold_results = []
-    blended_fold_sharpes = []
-    cumulative_trade_frequency_penalty = 0.0
-    fold_skip_reasons = {}
-    w_normal = float(fee_blend_normal_weight)
-    w_stress = float(fee_blend_stressed_weight)
-    if w_normal <= 0 and w_stress <= 0:
-        w_normal, w_stress = 1.0, 0.0
-    w_total = w_normal + w_stress
-    w_normal, w_stress = w_normal / w_total, w_stress / w_total
+    features = optim_data[target_sym]['features']
+    ohlcv = optim_data[target_sym]['ohlcv']
+    fold_scores = []
 
     for fold in cv_splits:
-        fold_diag = {}
-        r = fast_evaluate_fold(
-            features,
-            ohlcv_data,
-            fold,
-            profile,
-            config,
-            target_sym,
-            fee_multiplier=1.0,
-            pruned_only=pruned_only,
-            diagnostics=fold_diag,
-            strategy_family_name=strategy_family,
-            momentum_score_threshold=fast_momentum_score_threshold,
-            momentum_strict_mode=fast_momentum_strict_mode,
-            trend_filter_mode=fast_trend_filter_mode,
-            funding_filter_mode=fast_funding_filter_mode,
-        )
-        if r is not None:
-            fold_results.append(r)
-            total_trades += r['n_trades']
-
-            fold_trade_counts = [int(fr.get('n_trades', 0) or 0) for fr in fold_results]
-            observed_tpy = float(np.mean([float(fr.get('trades_per_year', 0.0) or 0.0) for fr in fold_results]))
-            trial.set_user_attr('fold_trade_counts', fold_trade_counts)
-            trial.set_user_attr('projected_trades_per_year_partial', round(observed_tpy, 3))
-            trial.set_user_attr('projected_trades_per_year_threshold', round(min_feasible_tpy, 3))
-
-            folds_observed = len(fold_results)
-            freq_attrs = _trade_frequency_attrs(
-                folds_observed=folds_observed,
-                observed_tpy=observed_tpy,
-                min_feasible_tpy=min_feasible_tpy,
-                target_tpy=target_tpy,
-                target_trades_per_week=float(target_trades_per_week),
-                min_trade_frequency_ratio=min_trade_frequency_ratio,
-                strategy_family=strategy_family,
-                trade_freq_bucket=trade_freq_bucket,
-                fold_trade_counts=fold_trade_counts,
-                coin_name=coin_name,
-            )
-            for key, value in freq_attrs.items():
-                trial.set_user_attr(key, value)
-
-            completed_study_trials = sum(
-                1
-                for t in trial.study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-            )
-            in_discovery_grace = completed_study_trials < early_trade_feasibility_grace_trials
-
-            if folds_observed >= early_trade_projection_min_folds and observed_tpy < min_feasible_tpy:
-                shortfall_penalty = _trade_frequency_penalty(
-                    observed_tpy=observed_tpy,
-                    min_feasible_tpy=min_feasible_tpy,
-                    penalty_scale=early_trade_feasibility_penalty_scale,
-                )
-                reason_text = (
-                    f'unlikely_trade_frequency:{observed_tpy:.2f}'
-                    f'<{min_feasible_tpy:.2f}'
-                )
-
-                if in_discovery_grace or early_trade_feasibility_mode == 'penalize':
-                    cumulative_trade_frequency_penalty += float(shortfall_penalty)
-                    trial.set_user_attr('early_trade_feasibility_action', 'penalized')
-                    trial.set_user_attr('early_trade_feasibility_penalty', float(cumulative_trade_frequency_penalty))
-                    trial.set_user_attr('early_trade_feasibility_in_grace', bool(in_discovery_grace))
-                    trial.set_user_attr('early_trade_feasibility_mode', str(early_trade_feasibility_mode))
-                elif early_trade_feasibility_mode == 'off':
-                    trial.set_user_attr('early_trade_feasibility_action', 'off')
-                    trial.set_user_attr('early_trade_feasibility_in_grace', bool(in_discovery_grace))
-                    trial.set_user_attr('early_trade_feasibility_mode', str(early_trade_feasibility_mode))
-                else:
-                    return _reject_trial(
-                        trial,
-                        code=ReasonCode.UNLIKELY_TRADE_FREQUENCY,
-                        reason=reason_text,
-                        stage='early_feasibility',
-                        observed=observed_tpy,
-                        threshold=min_feasible_tpy,
-                        fold_results=fold_results,
-                        stressed_fold_results=stressed_fold_results,
-                        extra_attrs={**freq_attrs, 'early_trade_feasibility_mode': str(early_trade_feasibility_mode), 'early_trade_feasibility_in_grace': bool(in_discovery_grace)},
-                    )
-
-            if enable_fee_stress:
-                stressed_r = fast_evaluate_fold(
-                    features,
-                    ohlcv_data,
-                    fold,
-                    profile,
-                    config,
-                    target_sym,
-                    fee_multiplier=fee_stress_multiplier,
-                    pruned_only=pruned_only,
-                    strategy_family_name=strategy_family,
-                    momentum_score_threshold=fast_momentum_score_threshold,
-                    momentum_strict_mode=fast_momentum_strict_mode,
-                    trend_filter_mode=fast_trend_filter_mode,
-                    funding_filter_mode=fast_funding_filter_mode,
-                )
-                if stressed_r is None:
-                    return _reject_trial(
-                        trial,
-                        code=ReasonCode.MISSING_STRESSED_FOLD,
-                        reason='missing_stressed_fold',
-                        stage='fee_stress',
-                        fold_results=fold_results,
-                        stressed_fold_results=stressed_fold_results,
-                    )
-            else:
-                stressed_r = dict(r)
-
-            stressed_fold_results.append(stressed_r)
-            blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
-
-        else:
-            skip_reason = fold_diag.get('skip_reason', 'unknown_fold_skip')
-            fold_skip_reasons[skip_reason] = int(fold_skip_reasons.get(skip_reason, 0)) + 1
+        result = proxy_evaluate_fold(features, ohlcv, fold, profile, config, target_sym, pruned_only=pruned_only)
+        if result is not None:
+            fold_scores.append(result)
 
     min_required_folds = max(1, len(cv_splits) // 3)
-    if len(fold_results) < min_required_folds:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.TOO_FEW_FOLDS,
-            reason=f'too_few_folds:{len(fold_results)}/{len(cv_splits)}',
-            stage='fold_eval',
-            observed=len(fold_results),
-            threshold=min_required_folds,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            extra_attrs={'fold_skip_reasons': fold_skip_reasons},
-        )
-    if min_internal_oos_trades > 0 and any(int(r.get('n_trades', 0) or 0) < min_internal_oos_trades for r in fold_results):
-        worst_internal_trades = min(int(r.get('n_trades', 0) or 0) for r in fold_results)
-        return _reject_trial(
-            trial,
-            code=ReasonCode.TOO_FEW_INTERNAL_OOS_TRADES,
-            reason=f'too_few_internal_oos_trades:{min_internal_oos_trades}',
-            stage='fold_eval',
-            observed=worst_internal_trades,
-            threshold=min_internal_oos_trades,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-        )
-    if total_trades < 4:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.TOO_FEW_TRADES,
-            reason=f'too_few_trades:{total_trades}',
-            stage='fold_eval',
-            observed=total_trades,
-            threshold=4,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-        )
+    if len(fold_scores) < min_required_folds:
+        trial.set_user_attr('reject_code', str(ReasonCode.TOO_FEW_FOLDS))
+        trial.set_user_attr('reject_reason', f'too_few_folds:{len(fold_scores)}/{len(cv_splits)}')
+        trial.set_user_attr('n_folds', int(len(fold_scores)))
+        return -1.0
 
-    sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in fold_results]
-    stressed_sharpes = [r['sharpe'] if r['sharpe'] > -90 else 0.0 for r in stressed_fold_results]
-    cv_psr_threshold = float(min_psr_cv) if min_psr_cv is not None else float(min_psr)
-    psr = compute_psr_from_samples(
-        sharpes,
-        benchmark_sharpe=0.0,
-        effective_observations=len(sharpes),
-    )
-    mean_sr, min_sr = np.mean(sharpes), np.min(sharpes)
-    mean_stressed_sr = np.mean(stressed_sharpes) if stressed_sharpes else mean_sr
-    mean_blended_sr = np.mean(blended_fold_sharpes) if blended_fold_sharpes else mean_sr
-    std_sr = np.std(sharpes) if len(sharpes) > 1 else 0.0
-    mean_wr = np.mean([r['win_rate'] for r in fold_results])
-    mean_dd = np.mean([r['max_drawdown'] for r in fold_results])
-    mean_pf = np.mean([r['profit_factor'] for r in fold_results])
-    mean_ret = np.mean([r['total_return'] for r in fold_results])
-    mean_fee_edge = np.mean([r.get('fee_edge_ratio', 1.0) for r in fold_results])
-    mean_expectancy = np.mean([r.get('avg_pnl', 0.0) for r in fold_results])
-    mean_raw_expectancy = np.mean([r.get('avg_raw_pnl', 0.0) for r in fold_results])
-    stressed_expectancy = np.mean([r.get('avg_pnl', 0.0) for r in stressed_fold_results]) if stressed_fold_results else mean_expectancy
-    stressed_fee_edge_ratio = np.mean([r.get('fee_edge_ratio', 1.0) for r in stressed_fold_results]) if stressed_fold_results else mean_fee_edge
-    exp_std = np.std([r.get('avg_pnl', 0.0) for r in fold_results]) if len(fold_results) > 1 else 0.0
-    tpy = np.mean([r.get('trades_per_year', 0.0) for r in fold_results])
+    model_q = float(np.mean([f['model_quality']['score'] for f in fold_scores]))
+    signal_d = float(np.mean([f['signal_density']['score'] for f in fold_scores]))
+    label_q = float(np.mean([f['label_quality']['score'] for f in fold_scores]))
+    mean_auc = float(np.mean([f['model_quality']['auc'] for f in fold_scores]))
+    consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores])
 
-    guard_min_trades = required_total_trades_floor
-    guard_min_avg_tc = float(guards.get('min_avg_trades_per_fold', 1.0))
-    guard_min_exp = float(guards.get('min_expectancy', 0.0))
-    avg_tc = np.mean([r['n_trades'] for r in fold_results])
+    combined = (0.40 * model_q + 0.30 * signal_d + 0.15 * label_q + 0.15 * consistency['score'])
+    estimated_tpy = float(np.mean([f['signal_density']['estimated_tpy'] for f in fold_scores]))
 
-    fold_metrics = [
-        {
-            'fold_idx': i,
-            'n_trades': int(r.get('n_trades', 0) or 0),
-            'sharpe': round(float(r.get('sharpe', 0.0) or 0.0), 6),
-            'win_rate': round(float(r.get('win_rate', 0.0) or 0.0), 6),
-            'profit_factor': round(float(r.get('profit_factor', 0.0) or 0.0), 6),
-            'max_drawdown': round(float(r.get('max_drawdown', 0.0) or 0.0), 6),
-            'total_return': round(float(r.get('total_return', 0.0) or 0.0), 6),
-        }
-        for i, r in enumerate(fold_results)
-    ]
+    trial.set_user_attr('n_folds', int(len(fold_scores)))
+    trial.set_user_attr('mean_auc', round(mean_auc, 4))
+    trial.set_user_attr('signal_density', round(signal_d, 4))
+    trial.set_user_attr('estimated_tpy', round(estimated_tpy, 1))
+    trial.set_user_attr('n_trades', int(round(estimated_tpy)))
+    trial.set_user_attr('mean_sharpe', round(combined, 6))
+    trial.set_user_attr('min_sharpe', round(combined, 6))
+    trial.set_user_attr('win_rate', round(max(0.0, min(1.0, model_q + 0.5)), 4))
+    trial.set_user_attr('max_drawdown', round(max(0.0, 1.0 - signal_d), 4))
 
-    if min_sr < min_fold_sharpe_hard:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.LOW_MIN_FOLD_SHARPE,
-            reason=f'guard_min_fold_sharpe:{min_sr:.3f}<{min_fold_sharpe_hard:.3f}',
-            stage='post_cv_gates',
-            observed=min_sr,
-            threshold=min_fold_sharpe_hard,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
+    return float(combined)
 
-    low_wr_folds = [
-        f for f in fold_metrics
-        if f['n_trades'] >= min_fold_win_rate_trades and f['win_rate'] < min_fold_win_rate
-    ]
-    if low_wr_folds:
-        worst_fold = min(low_wr_folds, key=lambda f: f['win_rate'])
-        return _reject_trial(
-            trial,
-            code=ReasonCode.LOW_FOLD_WIN_RATE,
-            reason=(
-                f"guard_min_fold_win_rate:fold{worst_fold['fold_idx']}="
-                f"{worst_fold['win_rate']:.3f}<{min_fold_win_rate:.2f}"
-                f"@trades>={min_fold_win_rate_trades}"
-            ),
-            stage='post_cv_gates',
-            observed=worst_fold['win_rate'],
-            threshold=min_fold_win_rate,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-
-    if total_trades < guard_min_trades:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.GUARD_TOTAL_TRADES,
-            reason=f'guard_total_trades:{total_trades}<{guard_min_trades}',
-            stage='post_cv_gates',
-            observed=total_trades,
-            threshold=guard_min_trades,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-    if avg_tc < guard_min_avg_tc:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.GUARD_AVG_FOLD_TRADES,
-            reason=f'guard_avg_fold_trades:{avg_tc:.2f}<{guard_min_avg_tc:.2f}',
-            stage='post_cv_gates',
-            observed=avg_tc,
-            threshold=guard_min_avg_tc,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-    if mean_expectancy < guard_min_exp:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.GUARD_EXPECTANCY,
-            reason=f'guard_expectancy:{mean_expectancy:.6f}<{guard_min_exp:.6f}',
-            stage='post_cv_gates',
-            observed=mean_expectancy,
-            threshold=guard_min_exp,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-    if mean_raw_expectancy < float(min_raw_expectancy):
-        return _reject_trial(
-            trial,
-            code=ReasonCode.RAW_EXPECTANCY_NONPOSITIVE,
-            reason=f'raw_expectancy_below_min:{mean_raw_expectancy:.6f}<{float(min_raw_expectancy):.6f}',
-            stage='post_cv_gates',
-            observed=mean_raw_expectancy,
-            threshold=float(min_raw_expectancy),
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-    if enable_fee_stress and mean_stressed_sr < 0:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.NEG_STRESSED_SR,
-            reason=f'negative_stressed_sharpe:{mean_stressed_sr:.6f}',
-            stage='fee_stress',
-            observed=mean_stressed_sr,
-            threshold=0.0,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-    if enable_fee_stress and stressed_expectancy < float(min_stressed_expectancy):
-        return _reject_trial(
-            trial,
-            code=ReasonCode.NONPOSITIVE_STRESSED_EXPECTANCY,
-            reason=f'stressed_expectancy_below_min:{stressed_expectancy:.6f}<{float(min_stressed_expectancy):.6f}',
-            stage='fee_stress',
-            observed=stressed_expectancy,
-            threshold=float(min_stressed_expectancy),
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-    significance_gates = evaluate_significance_gates(
-        psr_cv=psr,
-        min_psr_cv=cv_psr_threshold,
-    )
-    if not significance_gates['psr_cv']['passed']:
-        return _reject_trial(
-            trial,
-            code=ReasonCode.LOW_PSR,
-            reason=f'low_psr:{psr.get("psr", 0.0):.3f}<{cv_psr_threshold:.3f}',
-            stage='psr',
-            observed=psr.get('psr', 0.0),
-            threshold=cv_psr_threshold,
-            fold_results=fold_results,
-            stressed_fold_results=stressed_fold_results,
-            psr=psr,
-        )
-
-    robust_score = mean_blended_sr
-    if cumulative_trade_frequency_penalty > 0:
-        robust_score -= float(cumulative_trade_frequency_penalty)
-        trial.set_user_attr('trade_frequency_penalty_applied', float(cumulative_trade_frequency_penalty))
-    if std_sr < 0.3 and len(sharpes) >= 2: robust_score += 0.15
-    elif std_sr > 0.8: robust_score -= 0.25
-    if min_sr > 0: robust_score += 0.10
-    elif min_sr < -0.5: robust_score -= 0.30
-    if min(max(0, mean_pf), 5.0) > 1.2: robust_score += min(0.2, (mean_pf - 1.0) * 0.15)
-    if mean_dd > 0.25: robust_score -= (mean_dd - 0.25) * 2.0
-    if avg_tc < 5: robust_score -= 0.5
-    elif avg_tc < 8: robust_score -= 0.2
-    if mean_wr > 0.75 and total_trades < 40: robust_score -= 0.3
-    if mean_fee_edge > 0.35: robust_score -= min(0.35, (mean_fee_edge - 0.35) * 0.8)
-    if exp_std > 0.01: robust_score -= min(0.30, (exp_std - 0.01) * 12)
-    if psr.get('valid'):
-        if psr['psr'] >= 0.80:
-            robust_score += 0.20
-        elif psr['psr'] < 0.60:
-            robust_score -= 0.20
-
-    target_tpy = max(
-        1.0,
-        float(target_trades_per_year)
-        if target_trades_per_year is not None
-        else float(target_trades_per_week) * 52.0,
-    )
-    freq_ratio = (tpy / target_tpy) if target_tpy > 0 else 1.0
-    frequency_bonus = _compute_frequency_bonus(freq_ratio)
-    frequency_rank_adjustment = (frequency_bonus - 1.0) * 0.30
-    score = robust_score + frequency_rank_adjustment
-
-    trial.set_user_attr('n_trades', total_trades)
-    trial.set_user_attr('n_folds', len(fold_results))
-    trial.set_user_attr('mean_sharpe', round(mean_sr, 3))
-    trial.set_user_attr('min_sharpe', round(min_sr, 3))
-    trial.set_user_attr('std_sharpe', round(std_sr, 3))
-    trial.set_user_attr('blended_sharpe', round(mean_blended_sr, 3))
-    trial.set_user_attr('raw_sharpe_score', round(float(mean_blended_sr), 6))
-    trial.set_user_attr('mean_return', round(mean_ret, 4))
-    trial.set_user_attr('win_rate', round(mean_wr, 3))
-    trial.set_user_attr('profit_factor', round(min(mean_pf, 5), 3))
-    trial.set_user_attr('max_drawdown', round(mean_dd, 4))
-    trial.set_user_attr('sharpe', round(mean_sr, 3))
-    trial.set_user_attr('oos_sharpe', round(mean_sr, 3))
-    trial.set_user_attr('mean_oos_sharpe', round(mean_sr, 3))
-    trial.set_user_attr('min_oos_sharpe', round(min_sr, 3))
-    trial.set_user_attr('std_oos_sharpe', round(std_sr, 3))
-    trial.set_user_attr('oos_return', round(mean_ret, 4))
-    trial.set_user_attr('oos_trades', total_trades)
-    trial.set_user_attr('psr', round(float(psr.get('psr', 0.0)), 4))
-    trial.set_user_attr('psr_z', round(float(psr.get('z_score', 0.0)), 4))
-    trial.set_user_attr('psr_meta', {
-        'observations': int(psr.get('observations', 0) or 0),
-        'benchmark_sharpe': float(psr.get('benchmark_sharpe', 0.0) or 0.0),
-        'sharpe_estimate': float(psr.get('sharpe_estimate', 0.0) or 0.0),
-        'skewness': float(psr.get('skewness', 0.0) or 0.0),
-        'kurtosis': float(psr.get('kurtosis', 3.0) or 3.0),
-        'fallback_moments_used': bool(psr.get('fallback_moments_used', False)),
-        'sample_count': int(psr.get('sample_count', 0) or 0),
-    })
-    trial.set_user_attr('fee_edge_ratio', round(float(mean_fee_edge), 4))
-    trial.set_user_attr('stressed_sharpe', round(float(mean_stressed_sr), 4))
-    trial.set_user_attr('stressed_fee_edge_ratio', round(float(stressed_fee_edge_ratio), 4))
-    trial.set_user_attr('stressed_expectancy', round(float(stressed_expectancy), 6))
-    trial.set_user_attr('expectancy', round(float(mean_expectancy), 6))
-    trial.set_user_attr('raw_expectancy', round(float(mean_raw_expectancy), 6))
-    trial.set_user_attr('expectancy_std', round(float(exp_std), 6))
-    trial.set_user_attr('trades_per_month', round(tpy / 12.0, 1))
-    trial.set_user_attr('trades_per_year', round(tpy, 1))
-    trial.set_user_attr('target_trades_per_week', round(float(target_trades_per_week), 2))
-    trial.set_user_attr('target_trades_per_year', round(float(target_tpy), 2))
-    trial.set_user_attr('frequency_ratio', round(float(freq_ratio), 3))
-    trial.set_user_attr('frequency_bonus', round(float(frequency_bonus), 3))
-    trial.set_user_attr('projected_trades_per_year', round(float(tpy), 3))
-    trial.set_user_attr('raw_robust_score', round(float(robust_score), 6))
-    trial.set_user_attr('frequency_adjusted_score', round(float(score), 6))
-    trial.set_user_attr('fold_metrics', fold_metrics)
-    trial.set_user_attr('fold_skip_reasons', fold_skip_reasons)
-    trial.set_user_attr('stressed_fold_metrics', [
-        {
-            'fold_idx': i,
-            'n_trades': int(r.get('n_trades', 0) or 0),
-            'sharpe': round(float(r.get('sharpe', 0.0) or 0.0), 6),
-            'win_rate': round(float(r.get('win_rate', 0.0) or 0.0), 6),
-            'profit_factor': round(float(r.get('profit_factor', 0.0) or 0.0), 6),
-            'max_drawdown': round(float(r.get('max_drawdown', 0.0) or 0.0), 6),
-            'total_return': round(float(r.get('total_return', 0.0) or 0.0), 6),
-        }
-        for i, r in enumerate(stressed_fold_results)
-    ])
-    trial.set_user_attr('fold_constraints', {
-        'min_fold_sharpe_hard': float(min_fold_sharpe_hard),
-        'min_fold_win_rate': float(min_fold_win_rate),
-        'min_fold_win_rate_trades': int(min_fold_win_rate_trades),
-        'min_psr': float(min_psr),
-        'min_psr_cv': float(cv_psr_threshold),
-        'min_raw_expectancy': float(min_raw_expectancy),
-        'min_stressed_expectancy': float(min_stressed_expectancy),
-    })
-    tunable_params = dict(trial.params)
-    tunable_params['cooldown_hours'] = tunable_params.get('cooldown_hours', build_effective_params(trial.params, coin_name)['cooldown_hours'])
-    trial.set_user_attr('fold_trade_counts', [int(r.get('n_trades', 0) or 0) for r in fold_results])
-    trial.set_user_attr('prune_reason', trial.user_attrs.get('reject_code', ''))
-    trial.set_user_attr('tunable_params', tunable_params)
-    trial.set_user_attr('effective_params', build_effective_params(trial.params, coin_name))
-    ann_ret = np.mean([r['ann_return'] for r in fold_results])
-    trial.set_user_attr('ann_return', round(ann_ret, 4))
-    trial.set_user_attr('calmar', round(min(ann_ret / mean_dd if mean_dd > 0.01 else 0, 10.0), 3))
-
-    if DEBUG_TRIALS:
-        print(
-            f"  T{trial.number}: raw_sharpe={mean_blended_sr:.3f} robust={robust_score:.3f} freq_adj={score:.3f} "
-            f"freq_bonus={frequency_bonus:.3f} freq_rank_adj={frequency_rank_adjustment:.3f} "
-            f"SR={mean_sr:.3f}±{std_sr:.3f} "
-            f"min={min_sr:.3f} trades={total_trades} folds={len(fold_results)}"
-        )
-    logger.debug(
-        "Trial %s scoring: raw_sharpe=%.4f robust_score=%.4f frequency_bonus=%.4f frequency_rank_adjustment=%.4f frequency_adjusted_score=%.4f "
-        "tpy=%.2f target_tpy=%.2f",
-        trial.number,
-        mean_blended_sr,
-        robust_score,
-        frequency_bonus,
-        frequency_rank_adjustment,
-        score,
-        tpy,
-        target_tpy,
-    )
-    return score
-
-class PlateauStopper:
-    def __init__(
-        self,
-        patience=60,
-        min_delta=0.02,
-        warmup_trials=30,
-        min_completed_trials=0,
-        flatline_window=50,
-        flatline_reject_ratio=0.70,
-    ):
-        self.patience = max(1, patience)
-        self.min_delta = max(0, min_delta)
-        self.warmup_trials = max(0, warmup_trials)
-        self.min_completed_trials = max(0, min_completed_trials)
-        self.flatline_window = max(10, int(flatline_window))
-        self.flatline_reject_ratio = min(1.0, max(0.0, float(flatline_reject_ratio)))
-        self.best_value = self.best_trial_number = None
-        self._flatline_announced = False
-
-    def __call__(self, study, trial):
-        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
-        min_trials_required = max(self.warmup_trials, self.min_completed_trials)
-        if len(completed) < min_trials_required:
-            return
-
-        recent = completed[-self.flatline_window:]
-        reject_counts = {}
-        for t in recent:
-            code = t.user_attrs.get('reject_code')
-            if code:
-                reject_counts[code] = int(reject_counts.get(code, 0)) + 1
-        if reject_counts:
-            top_code, top_count = max(reject_counts.items(), key=lambda kv: kv[1])
-            top_ratio = float(top_count) / float(max(1, len(recent)))
-            if top_ratio >= self.flatline_reject_ratio and not self._flatline_announced:
-                print(
-                    f"\n⚠️ Flatline detector: {top_ratio:.0%} recent rejects are {top_code} "
-                    f"(window={len(recent)}, best={study.best_value:.4f})."
-                )
-                self._flatline_announced = True
-
-        if self.best_value is None:
-            self.best_value = study.best_value
-            self.best_trial_number = study.best_trial.number
-            return
-        if study.best_value > self.best_value + self.min_delta:
-            self.best_value = study.best_value
-            self.best_trial_number = study.best_trial.number
-            return
-        if sum(1 for t in completed if t.number > (self.best_trial_number or 0)) >= self.patience:
-            print(
-                f"\n🛑 Plateau: {self.patience} trials w/o improvement "
-                f"(best={self.best_value:.4f}, completed={len(completed)}, "
-                f"min_completed={min_trials_required})"
-            )
-            study.stop()
 
 def _select_best_trial(study, min_trades=6):
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
