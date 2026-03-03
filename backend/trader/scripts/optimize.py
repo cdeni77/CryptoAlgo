@@ -1111,8 +1111,7 @@ def objective(
     fast_trend_filter_mode = str(trial.params.get('trend_filter_mode', getattr(config, 'trend_filter_mode', 'off')))
     fast_funding_filter_mode = str(trial.params.get('funding_filter_mode', getattr(config, 'funding_filter_mode', 'soft')))
     guard_floor_trades = int(guards.get('min_total_trades', 5))
-    required_total_trades_floor = max(4, int(min_total_trades_gate or 0), guard_floor_trades)
-    early_trade_reject_tolerance = 0.10
+    required_total_trades_floor = max(1, int(min_total_trades_gate or 0), guard_floor_trades)
     early_trade_feasibility_mode = _normalize_early_trade_feasibility_mode(early_trade_feasibility_mode)
     early_trade_projection_min_folds = max(1, int(early_trade_feasibility_min_folds or 1))
     early_trade_feasibility_grace_trials = max(0, int(early_trade_feasibility_grace_trials or 0))
@@ -1246,35 +1245,6 @@ def objective(
             stressed_fold_results.append(stressed_r)
             blended_fold_sharpes.append((w_normal * (r['sharpe'] if r['sharpe'] > -90 else 0.0)) + (w_stress * (stressed_r['sharpe'] if stressed_r['sharpe'] > -90 else 0.0)))
 
-            folds_observed = len(fold_results)
-            if folds_observed >= early_trade_projection_min_folds:
-                observed_avg_trades_per_fold = float(total_trades) / float(folds_observed)
-                projected_total = observed_avg_trades_per_fold * float(len(cv_splits))
-                projected_floor_with_tolerance = float(required_total_trades_floor) * (1.0 - early_trade_reject_tolerance)
-                if projected_total < projected_floor_with_tolerance and not in_discovery_grace:
-                    return _reject_trial(
-                        trial,
-                        code=ReasonCode.EARLY_TRADE_STARVATION,
-                        reason=(
-                            f'early_trade_starvation:{projected_total:.2f}'
-                            f'<{projected_floor_with_tolerance:.2f}'
-                        ),
-                        stage='fold_eval',
-                        observed=projected_total,
-                        threshold=required_total_trades_floor,
-                        fold_results=fold_results,
-                        stressed_fold_results=stressed_fold_results,
-                        extra_attrs={
-                            'observed_avg_trades_per_fold': round(observed_avg_trades_per_fold, 6),
-                            'observed_trades_so_far': int(total_trades),
-                            'observed_folds': int(folds_observed),
-                            'projected_total_trades': round(projected_total, 6),
-                            'projected_floor_with_tolerance': round(projected_floor_with_tolerance, 6),
-                            'required_total_trades_floor': int(required_total_trades_floor),
-                            'early_trade_reject_tolerance': float(early_trade_reject_tolerance),
-                            'prune_reason': str(ReasonCode.EARLY_TRADE_STARVATION),
-                        },
-                    )
         else:
             skip_reason = fold_diag.get('skip_reason', 'unknown_fold_skip')
             fold_skip_reasons[skip_reason] = int(fold_skip_reasons.get(skip_reason, 0)) + 1
