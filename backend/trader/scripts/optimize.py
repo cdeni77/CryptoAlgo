@@ -792,9 +792,6 @@ FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
     'min_val_auc': 0.48,
-    'min_vol_24h': 0.006,
-    'max_vol_24h': 0.08,
-    'min_momentum_magnitude': 0.04,
 }
 
 COIN_OPTIMIZATION_PRIORS = {
@@ -947,7 +944,7 @@ def create_trial_profile(trial, coin_name):
     if min_vol_bounds:
         min_vol_24h = trial.suggest_float('min_vol_24h', min_vol_bounds[0], min_vol_bounds[1], step=0.001)
     else:
-        min_vol_24h = FIXED_RISK['min_vol_24h']
+        min_vol_24h = float(bp.min_vol_24h) if bp else 0.004
 
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
@@ -991,9 +988,9 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
         # Tuned cadence + risk gates
         'cooldown_hours': params.get('cooldown_hours', base_cooldown),
-        'min_vol_24h': params.get('min_vol_24h', FIXED_RISK['min_vol_24h']),
-        'max_vol_24h': params.get('max_vol_24h', FIXED_RISK['max_vol_24h']),
-        'min_momentum_magnitude': params.get('min_momentum_magnitude', FIXED_RISK['min_momentum_magnitude']),
+        'min_vol_24h': params.get('min_vol_24h', bp.min_vol_24h if bp else 0.004),
+        'max_vol_24h': params.get('max_vol_24h', bp.max_vol_24h if bp else 0.09),
+        'min_momentum_magnitude': params.get('min_momentum_magnitude', bp.min_momentum_magnitude if bp else 0.02),
         'max_ensemble_std': params.get('max_ensemble_std', bp.max_ensemble_std if bp else np.mean(priors.get('max_ensemble_std', (0.08, 0.13)))),
         'min_directional_agreement': params.get('min_directional_agreement', bp.min_directional_agreement if bp else np.mean(priors.get('min_directional_agreement', (0.60, 0.78)))),
         'meta_probability_threshold': params.get('meta_probability_threshold', bp.meta_probability_threshold if bp else np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
