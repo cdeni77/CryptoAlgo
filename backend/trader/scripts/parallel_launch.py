@@ -34,11 +34,20 @@ class OptimizationConfig:
     gate_mode: str = "initial_paper_qualification"
 
 
+def _resolve_coin_prefix(coin: str) -> str:
+    """Return the canonical CDE prefix for a configured coin."""
+    coin_key = coin.upper()
+    if coin_key not in PREFIX_FOR_COIN:
+        raise ValueError(f"Unsupported coin '{coin}' for CDE prefix mapping")
+    return PREFIX_FOR_COIN[coin_key]
+
+
 def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) -> tuple[str, dict[str, Any] | None]:
     all_data, coin, config, run_id = args
+    coin_prefix = _resolve_coin_prefix(coin)
     result = optimize_coin_multiseed(
         all_data,
-        coin_prefix=PREFIX_FOR_COIN.get(coin, coin),
+        coin_prefix=coin_prefix,
         coin_name=coin,
         n_trials=config.trials,
         n_jobs=config.jobs,
@@ -65,7 +74,7 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
 
 def run_optimization(coins: list[str], config: OptimizationConfig, workers: int) -> dict[str, dict[str, Any] | None]:
     all_data = load_data(days=2200)
-    run_id = datetime.utcnow().strftime("run_%Y%m%dT%H%M%SZ")
+    run_id = datetime.utcnow().strftime("run_%Y%m%dT%H%M%S%fZ")
     work_items = [(all_data, coin, config, run_id) for coin in coins]
 
     if workers <= 1 or len(work_items) == 1:
