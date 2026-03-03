@@ -1111,14 +1111,11 @@ if __name__ == "__main__":
                 "--preset", "none",  # already applied
                 "--gate-mode", args.gate_mode,
             ]
-            if args.min_internal_oos_trades:
-                cmd.extend(["--min-internal-oos-trades", str(args.min_internal_oos_trades)])
+            cmd.extend(["--min-internal-oos-trades", str(args.min_internal_oos_trades)])
             if args.require_holdout_pass:
                 cmd.append("--require-holdout-pass")
-            if args.min_total_trades:
-                cmd.extend(["--min-total-trades", str(args.min_total_trades)])
-            if args.sampler_seeds:
-                cmd.extend(["--sampler-seeds", args.sampler_seeds])
+            cmd.extend(["--min-total-trades", str(args.min_total_trades)])
+            cmd.extend(["--sampler-seeds", str(args.sampler_seeds)])
             if args.min_psr_cv is not None:
                 cmd.extend(["--min-psr-cv", str(args.min_psr_cv)])
             if args.min_psr_holdout is not None:
@@ -1150,6 +1147,7 @@ if __name__ == "__main__":
                 stdout_target = log_file
 
             print(f"   🚀 Launching {coin} ({n_workers} workers)", flush=True)
+            print(f"      Command: {' '.join(cmd)}", flush=True)
             proc = subprocess.Popen(
                 cmd, cwd=str(trader_root),
                 stdout=stdout_target, stderr=subprocess.STDOUT if log_file else None,
