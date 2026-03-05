@@ -712,9 +712,9 @@ def objective(
 
     estimated_tpy = float(np.mean([f['signal_density']['estimated_tpy'] for f in fold_scores]))
 
-    if mean_auc < 0.515:
+    if mean_auc < 0.505:
         trial.set_user_attr('reject_code', 'AUC_BELOW_FLOOR')
-        trial.set_user_attr('reject_reason', f'mean_auc={mean_auc:.4f}<0.515')
+        trial.set_user_attr('reject_reason', f'mean_auc={mean_auc:.4f}<0.505')
         trial.set_user_attr('n_folds', int(len(fold_scores)))
         trial.set_user_attr('mean_auc', round(mean_auc, 4))
         trial.set_user_attr('estimated_tpy', round(estimated_tpy, 1))
@@ -1351,7 +1351,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
     print("   Proxy score weights: model_quality=0.55, signal_density=0.15, label_quality=0.15, fold_consistency=0.15")
-    print("   AUC floor: 0.515 | Signal density TPY cap: 100")
+    print("   AUC floor: 0.505 | Signal density TPY cap: 100")
     phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
     print(
         f"   Phase: {phase_label} | target_tpw={float(target_trades_per_week):.2f} "
