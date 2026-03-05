@@ -219,7 +219,7 @@ def check_parameter_sensitivity_fast(all_data, best_params, coin_name, coin_pref
     from scripts.train_model import Config
     from scripts.optimize import (
         profile_from_params, resolve_target_symbol,
-        create_cv_splits, fast_evaluate_fold,
+        create_cv_splits, proxy_evaluate_fold,
     )
 
     target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
@@ -245,21 +245,23 @@ def check_parameter_sensitivity_fast(all_data, best_params, coin_name, coin_pref
                     max_ensemble_std=0.10, train_embargo_hours=24)
 
     def _mean_fold_sharpe(profile):
-        fold_sharpes = []
-        for train_end, test_start, test_end in cv_splits:
-            result = fast_evaluate_fold(
-                features, ohlcv, train_end, test_start, test_end,
-                profile, config, target_sym, fee_multiplier=1.0,
+        fold_scores = []
+        for fold in cv_splits:
+            result = proxy_evaluate_fold(
+                features,
+                ohlcv,
+                fold,
+                profile,
+                config,
+                target_sym,
+                pruned_only=False,
             )
             if not result:
                 continue
-            s = float(result.get('sharpe', 0) or 0)
-            if s <= -90:
-                s = 0.0
-            fold_sharpes.append(s)
-        if not fold_sharpes:
+            fold_scores.append(float(result.get('model_quality', {}).get('score', 0.0) or 0.0))
+        if not fold_scores:
             return None
-        return float(np.mean(fold_sharpes))
+        return float(np.mean(fold_scores))
 
     baseline_profile = profile_from_params(best_params, coin_name)
     baseline_sharpe = _mean_fold_sharpe(baseline_profile)

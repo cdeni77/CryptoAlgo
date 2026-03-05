@@ -4,8 +4,8 @@ optimize.py — Per-coin Optuna parameter optimization (v11.1: Fast CV).
 
 v11.1: CRITICAL PERFORMANCE FIX
   v11.0 called run_backtest() 3x per trial (~30 min/trial = 50h for 100 trials).
-  v11.3 uses fast_evaluate_fold() which trains ONE model per fold and simulates
-  trading directly (~2s/fold). run_backtest() only used for final holdout.
+  v11.3 uses proxy_evaluate_fold() to score fold-level model quality and signal viability
+  without full trade simulation. run_backtest() only used for final holdout.
   Expected: 100 trials in ~30-60 minutes instead of 50 hours.
 
 Usage:
@@ -34,13 +34,10 @@ from optuna.samplers import TPESampler
 
 from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
-    get_contract_spec, calculate_pnl_exact,
-    _build_strategy_context, _resolve_filter_policy,
 )
-from core.meta_labeling import calibrator_predict, primary_recall_threshold
+from core.meta_labeling import calibrator_predict
 from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
 from core.preprocessing_cv import fit_transform_fold
-from core.strategies import get_strategy_family
 from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
@@ -68,13 +65,6 @@ logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEBUG_TRIALS = False
-EARLY_TRADE_FEASIBILITY_MODES = ('reject', 'penalize', 'off')
-DEFAULT_EARLY_TRADE_FEASIBILITY_MODE = 'penalize'
-DEFAULT_EARLY_TRADE_FEASIBILITY_MIN_FOLDS = 3
-DEFAULT_EARLY_TRADE_FEASIBILITY_GRACE_TRIALS = 40
-DEFAULT_EARLY_TRADE_FEASIBILITY_PENALTY_SCALE = 3.0
-
-
 class PlateauStopper:
     """Stop an Optuna study when completed trials stop improving.
 
@@ -232,89 +222,6 @@ def _build_cost_config(cost_assumptions: ExchangeCostAssumptions | None) -> tupl
     return config, cost_assumptions.to_metadata()
 
 
-def _compute_frequency_bonus(freq_ratio: float) -> float:
-    """Return a bounded soft bonus from trade-frequency ratio.
-
-    This keeps the bonus informative for ranking while avoiding hard-veto behavior.
-    """
-    ratio = max(0.0, float(freq_ratio))
-    floor_bonus = 0.40
-    cap_bonus = 1.10
-    slope = 2.0
-    center = 1.0
-    bonus = floor_bonus + (cap_bonus - floor_bonus) / (1.0 + math.exp(-slope * (ratio - center)))
-    return float(min(cap_bonus, max(floor_bonus, bonus)))
-
-
-def _set_partial_reject_attrs(trial, *, fold_results, stressed_fold_results=None, psr=None):
-    stressed_fold_results = stressed_fold_results or []
-    fold_trade_counts = [int(r.get('n_trades', 0) or 0) for r in (fold_results or [])]
-    sharpes = [float(r.get('sharpe', 0.0) or 0.0) for r in (fold_results or [])]
-    stressed_sharpes = [float(r.get('sharpe', 0.0) or 0.0) for r in stressed_fold_results]
-    total_trades_partial = int(sum(fold_trade_counts))
-    trial.set_user_attr('n_folds_evaluated', len(fold_trade_counts))
-    trial.set_user_attr('total_trades_partial', total_trades_partial)
-    trial.set_user_attr('fold_trade_counts', fold_trade_counts)
-    if sharpes:
-        trial.set_user_attr('mean_sr_partial', round(float(np.mean(sharpes)), 6))
-        trial.set_user_attr('min_sr_partial', round(float(np.min(sharpes)), 6))
-    if psr is not None:
-        trial.set_user_attr('psr_partial', round(float(psr.get('psr', 0.0) or 0.0), 6))
-    if stressed_sharpes:
-        trial.set_user_attr('stressed_sr_partial', round(float(np.mean(stressed_sharpes)), 6))
-
-
-def _reject_trial(
-    trial,
-    *,
-    code,
-    reason,
-    stage,
-    observed=None,
-    threshold=None,
-    base=-6.0,
-    scale=8.0,
-    fold_results=None,
-    stressed_fold_results=None,
-    psr=None,
-    extra_attrs=None,
-):
-    _set_partial_reject_attrs(
-        trial,
-        fold_results=fold_results or [],
-        stressed_fold_results=stressed_fold_results or [],
-        psr=psr,
-    )
-    penalty = _reject_score(observed, threshold, base=base, scale=scale)
-    trial.set_user_attr('reject_code', str(code))
-    trial.set_user_attr('reject_reason', str(reason))
-    trial.set_user_attr('reject_stage', str(stage))
-    trial.set_user_attr('prune_reason', str(code))
-    trial.set_user_attr('reject_observed', observed if observed is None else float(observed))
-    trial.set_user_attr('reject_threshold', threshold if threshold is None else float(threshold))
-    trial.set_user_attr('reject_penalty', float(penalty))
-    if isinstance(extra_attrs, dict):
-        for key, value in extra_attrs.items():
-            trial.set_user_attr(str(key), value)
-    _emit_event({
-        'event_type': 'reject',
-        'coin': trial.study.user_attrs.get('coin_name'),
-        'study_name': trial.study.study_name,
-        'trial_number': int(trial.number),
-        'stage': str(stage),
-        'reason_code': str(code),
-        'reason': str(reason),
-        'metrics': {
-            'n_folds_evaluated': int(len(fold_results or [])),
-            'total_trades_partial': int(sum(int(r.get('n_trades', 0) or 0) for r in (fold_results or []))),
-            'fold_trade_counts': [int(r.get('n_trades', 0) or 0) for r in (fold_results or [])],
-            'observed': observed,
-            'threshold': threshold,
-        },
-    })
-    return penalty
-
-
 def estimate_holdout_trade_budget(holdout_days: int, target_trades_per_week: float, holdout_min_trades: int) -> tuple[float, int]:
     estimated_holdout_trades = max(0.0, float(target_trades_per_week)) * (max(0, int(holdout_days)) / 7.0)
     effective_holdout_floor = max(
@@ -345,120 +252,14 @@ def _reject_score(observed: float | None = None, threshold: float | None = None,
     return base - penalty
 
 
-def _normalize_early_trade_feasibility_mode(mode: str | None) -> str:
-    normalized = str(mode or DEFAULT_EARLY_TRADE_FEASIBILITY_MODE).strip().lower()
-    return normalized if normalized in EARLY_TRADE_FEASIBILITY_MODES else DEFAULT_EARLY_TRADE_FEASIBILITY_MODE
-
-
-def _trade_frequency_attrs(*, folds_observed: int, observed_tpy: float, min_feasible_tpy: float, target_tpy: float,
-                           target_trades_per_week: float, min_trade_frequency_ratio: float,
-                           strategy_family: str, trade_freq_bucket: str, fold_trade_counts: List[int],
-                           coin_name: str | None = None) -> Dict[str, object]:
-    attrs: Dict[str, object] = {
-        'observed_folds': int(folds_observed),
-        'projected_trades_per_year_partial': round(float(observed_tpy), 6),
-        'projected_trades_per_year_threshold': round(float(min_feasible_tpy), 6),
-        'target_trades_per_year': round(float(target_tpy), 6),
-        'target_trades_per_week': round(float(target_trades_per_week), 6),
-        'min_trade_frequency_ratio': float(min_trade_frequency_ratio),
-        'strategy_family': str(strategy_family),
-        'trade_freq_bucket': str(trade_freq_bucket),
-        'fold_trade_counts': [int(x) for x in (fold_trade_counts or [])],
-    }
-    if coin_name:
-        attrs['coin_name'] = str(coin_name)
-    return attrs
-
-
-def _trade_frequency_penalty(*, observed_tpy: float, min_feasible_tpy: float, penalty_scale: float) -> float:
-    ratio = float(observed_tpy) / float(max(1e-9, min_feasible_tpy))
-    shortfall = max(0.0, 1.0 - ratio)
-    return float(shortfall * max(0.0, float(penalty_scale)))
-
-
-def build_trade_frequency_diagnostics(completed_trials, *, recent_limit: int = 40) -> Dict[str, object]:
-    freq_trials = []
-    family_counts: Dict[str, int] = {}
-    bucket_counts: Dict[str, int] = {}
-    for trial in reversed(list(completed_trials or [])):
-        if trial.user_attrs.get('reject_code') != str(ReasonCode.UNLIKELY_TRADE_FREQUENCY):
-            continue
-        freq_trials.append(trial)
-        fam = str(trial.user_attrs.get('strategy_family', 'unknown'))
-        bucket = str(trial.user_attrs.get('trade_freq_bucket', 'unknown'))
-        family_counts[fam] = int(family_counts.get(fam, 0)) + 1
-        bucket_counts[bucket] = int(bucket_counts.get(bucket, 0)) + 1
-        if len(freq_trials) >= int(max(1, recent_limit)):
-            break
-
-    projected_vals = [_as_number(t.user_attrs.get('projected_trades_per_year_partial'), None) for t in freq_trials]
-    projected_vals = [float(v) for v in projected_vals if v is not None and np.isfinite(v)]
-    threshold_vals = [_as_number(t.user_attrs.get('projected_trades_per_year_threshold'), None) for t in freq_trials]
-    threshold_vals = [float(v) for v in threshold_vals if v is not None and np.isfinite(v)]
-
-    def _stats(values: List[float]) -> Dict[str, float] | None:
-        if not values:
-            return None
-        arr = np.asarray(values, dtype=float)
-        return {
-            'mean': float(np.mean(arr)),
-            'median': float(np.median(arr)),
-            'min': float(np.min(arr)),
-            'max': float(np.max(arr)),
-        }
-
-    return {
-        'early_reject_count': int(sum(1 for t in (completed_trials or []) if t.user_attrs.get('reject_code') == str(ReasonCode.UNLIKELY_TRADE_FREQUENCY))),
-        'recent_projected_tpy_stats': _stats(projected_vals),
-        'recent_threshold_stats': _stats(threshold_vals),
-        'dominant_strategy_families': dict(sorted(family_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]),
-        'dominant_trade_freq_buckets': dict(sorted(bucket_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]),
-    }
-
-
-def format_trade_frequency_diagnostics_line(diag: Dict[str, object]) -> str:
-    stats = diag.get('recent_projected_tpy_stats') if isinstance(diag, dict) else None
-    threshold_stats = diag.get('recent_threshold_stats') if isinstance(diag, dict) else None
-    if not isinstance(stats, dict):
-        return ""
-    median = _as_number(stats.get('median'), None)
-    lo = _as_number(stats.get('min'), None)
-    hi = _as_number(stats.get('max'), None)
-    threshold_median = _as_number((threshold_stats or {}).get('median') if isinstance(threshold_stats, dict) else None, None)
-    if median is None:
-        return ""
-    out = f"proj_tpy={median:.1f}"
-    if lo is not None and hi is not None:
-        out += f"[{lo:.1f},{hi:.1f}]"
-    if threshold_median is not None:
-        out += f" thr≈{threshold_median:.1f}"
-    return out
-
-def compute_deflated_sharpe(observed_sharpe, n_trades, n_trials=200, skewness=0.0, kurtosis=3.0):
-    """Backward-compatible wrapper around canonical DSR helper."""
-    return compute_deflated_sharpe_metric(
-        observed_sharpe=observed_sharpe,
-        observations=n_trades,
-        effective_test_count=n_trials,
-        skewness=skewness,
-        kurtosis=kurtosis,
-    )
-
-
-def compute_probabilistic_sharpe(sharpes: List[float], benchmark_sr: float = 0.0) -> dict:
-    """Backward-compatible wrapper around canonical PSR helper."""
-    return compute_psr_from_samples(sharpes, benchmark_sharpe=benchmark_sr)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA SPLITTING
-# ═══════════════════════════════════════════════════════════════════════════
-
 def resolve_target_symbol(all_data, coin_prefix, coin_name):
     for sym in all_data:
         parts = sym.upper().split('-')
-        if parts[0] in (coin_prefix.upper(), coin_name.upper()): return sym
+        if parts[0] in (coin_prefix.upper(), coin_name.upper()):
+            return sym
     for sym in all_data:
-        if coin_name.upper() in sym.upper() or coin_prefix.upper() in sym.upper(): return sym
+        if coin_name.upper() in sym.upper() or coin_prefix.upper() in sym.upper():
+            return sym
     return None
 
 def split_data_temporal(all_data, holdout_days=180):
@@ -508,336 +309,6 @@ def create_cv_splits(
     return create_walk_forward_splits(index, n_folds=n_folds, min_train_days=min_train_days, purge_days=purge_days)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# v11.1: FAST LIGHTWEIGHT EVALUATOR (~2s per fold instead of ~10min)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fast_evaluate_fold(
-    features,
-    ohlcv,
-    fold: CVFold,
-    profile,
-    config,
-    symbol,
-    fee_multiplier=1.0,
-    pruned_only=True,
-    diagnostics=None,
-    strategy_family_name=None,
-    momentum_score_threshold=None,
-    momentum_strict_mode=None,
-    trend_filter_mode=None,
-    funding_filter_mode=None,
-):
-    """Train one model on train fold and simulate trading on the corresponding test fold."""
-    def _set_diag(reason):
-        if isinstance(diagnostics, dict):
-            diagnostics['skip_reason'] = str(reason)
-
-    system = MLSystem(config)
-    feature_candidates = profile.resolve_feature_columns(
-        use_pruned_features=bool(pruned_only),
-        strict_pruned=bool(pruned_only),
-    )
-    cols = system.get_feature_columns(features.columns, feature_candidates)
-    if not cols or len(cols) < 4:
-        _set_diag('insufficient_features')
-        return None
-
-    train_feat = features.loc[fold.train_idx.intersection(features.index)]
-    if len(train_feat) < config.min_train_samples:
-        _set_diag('train_feat_too_small')
-        return None
-
-    y = system.create_labels(ohlcv, train_feat, profile=profile)
-    valid_idx = y.dropna().index
-    X_all = train_feat.loc[valid_idx, cols]
-    y_all = y.loc[valid_idx]
-    X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
-    if len(X_all) < config.min_train_samples:
-        _set_diag('labeled_samples_too_small')
-        return None
-
-    split_idx = int(len(X_all) * (1 - config.val_fraction))
-    if split_idx <= 0 or split_idx >= len(X_all):
-        _set_diag('invalid_train_val_split')
-        return None
-
-    y_train = y_all.iloc[:split_idx]
-    y_val = y_all.iloc[split_idx:]
-    x_train_fold, x_val_fold, _ = fit_transform_fold(X_all.iloc[:split_idx], X_all.iloc[split_idx:], y_train)
-    if y_train.nunique() < 2 or y_val.nunique() < 2:
-        _set_diag('single_class_split')
-        return None
-
-    result = system.train(
-        x_train_fold,
-        y_train,
-        x_val_fold,
-        y_val,
-        profile=profile,
-        symbol=symbol,
-    )
-    if not result:
-        _set_diag('model_training_failed')
-        return {
-            'n_trades': 0,
-            'sharpe': 0.0,
-            'win_rate': 0.0,
-            'profit_factor': 0.0,
-            'max_drawdown': 0.0,
-            'ann_return': 0.0,
-            'total_return': 0.0,
-            'trades_per_year': 0.0,
-            'avg_pnl': 0.0,
-            'avg_raw_pnl': 0.0,
-            'gross_total_return': 0.0,
-            'net_total_return': 0.0,
-            'fee_edge_ratio': 0.0,
-        }
-    model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
-
-    # --- SIMULATE TRADING ---
-    test_feat = features.loc[fold.test_idx.intersection(features.index)]
-    test_ohlcv = ohlcv.loc[fold.test_idx.intersection(ohlcv.index)]
-    if len(test_feat) < 50:
-        _set_diag('test_window_too_small')
-        return None
-
-    completed_trades = []
-    active_pos = None
-    last_exit = None
-    equity = 100_000.0
-    peak_equity = equity
-    fee_multiplier = max(0.0, float(fee_multiplier))
-    stressed_config = config
-    if abs(fee_multiplier - 1.0) > 1e-9:
-        stressed_config = Config(**{**config.__dict__,
-                                    'fee_pct_per_side': config.fee_pct_per_side * fee_multiplier,
-                                    'min_fee_per_contract': config.min_fee_per_contract * fee_multiplier})
-
-    contract_spec = get_contract_spec(symbol)
-    units_per_contract = float(contract_spec.get('units', 1.0) or 1.0)
-    strategy_family = get_strategy_family(strategy_family_name or getattr(config, 'strategy_family', 'momentum_trend'))
-    effective_score_threshold = float(
-        momentum_score_threshold
-        if momentum_score_threshold is not None
-        else getattr(config, 'momentum_score_threshold', 1.0)
-    )
-    effective_strict_mode = _as_bool(
-        momentum_strict_mode,
-        default=getattr(config, 'momentum_strict_mode', True),
-    )
-    effective_trend_mode = str(trend_filter_mode or getattr(config, 'trend_filter_mode', 'off'))
-    effective_funding_mode = str(funding_filter_mode or getattr(config, 'funding_filter_mode', 'soft'))
-
-    for ts in test_feat.index:
-        if ts not in test_ohlcv.index: continue
-        price = test_ohlcv.loc[ts, 'close']
-        sma_200 = test_ohlcv.loc[ts, 'sma_200'] if 'sma_200' in test_ohlcv.columns else np.nan
-
-        # CHECK EXITS
-        if active_pos is not None:
-            row = test_feat.loc[ts]
-            funding_hourly_bps = row.get('funding_rate_bps', 0.0)
-            if pd.isna(funding_hourly_bps):
-                funding_hourly_bps = 0.0
-            active_pos['accum_funding'] += -(funding_hourly_bps / 10000.0) * active_pos['dir']
-            d = active_pos['dir']
-            exit_price = exit_reason = None
-            if d == 1:
-                if price >= active_pos['tp']: exit_price, exit_reason = price, 'take_profit'
-                elif price <= active_pos['sl']: exit_price, exit_reason = price, 'stop_loss'
-            else:
-                if price <= active_pos['tp']: exit_price, exit_reason = price, 'take_profit'
-                elif price >= active_pos['sl']: exit_price, exit_reason = price, 'stop_loss'
-            hours_held = (ts - active_pos['time']).total_seconds() / 3600
-            if hours_held >= profile.max_hold_hours and not exit_price:
-                exit_price, exit_reason = price, 'max_hold'
-            if exit_price:
-                pos_size_multiplier = max(0.0, float(active_pos.get('size_multiplier', 1.0) or 1.0))
-                notional = equity * profile.position_size * config.leverage * pos_size_multiplier
-                notional_per_contract = max(units_per_contract * active_pos['entry'], 1e-9)
-                n_contracts = max(1, int(notional / notional_per_contract))
-                net, raw, _, _, _, _, pnl_d, _ = calculate_pnl_exact(
-                    active_pos['entry'], exit_price, d,
-                    active_pos['accum_funding'], n_contracts, symbol, stressed_config
-                )
-                raw_pnl_dollars = raw * notional
-                completed_trades.append({'raw_pnl': raw, 'net_pnl': net, 'pnl_dollars': pnl_d, 'raw_pnl_dollars': raw_pnl_dollars, 'exit_reason': exit_reason})
-                equity += pnl_d
-                peak_equity = max(peak_equity, equity)
-                last_exit = ts
-                active_pos = None
-
-        # CHECK ENTRIES
-        if active_pos is None and equity > config.min_equity:
-            if last_exit and (ts - last_exit).total_seconds() < profile.cooldown_hours * 3600: continue
-            row = test_feat.loc[ts]
-            ts_loc = test_ohlcv.index.get_loc(ts)
-            if ts_loc < 24: continue
-
-            ret_24h = price / test_ohlcv['close'].iloc[max(0, ts_loc-24)] - 1
-            ret_72h = (price / test_ohlcv['close'].iloc[max(0, ts_loc-72)] - 1) if ts_loc >= 72 else 0
-            sma_50 = test_ohlcv['close'].iloc[max(0,ts_loc-50):ts_loc].mean()
-            vol_24h = test_ohlcv['close'].pct_change().rolling(24).std().get(ts, None)
-            if vol_24h is None or pd.isna(vol_24h): continue
-
-            strategy_context = _build_strategy_context(
-                row,
-                price,
-                sma_200,
-                ret_24h,
-                ret_72h,
-                sma_50,
-                vol_24h=vol_24h,
-            )
-            strategy_decision = strategy_family.evaluate(
-                strategy_context,
-                min_momentum_magnitude=float(profile.min_momentum_magnitude),
-                score_threshold=effective_score_threshold,
-                strict_mode=effective_strict_mode,
-            )
-            direction = strategy_decision.direction
-            if direction == 0:
-                continue
-
-            if pd.isna(sma_200):
-                continue
-
-            candidate_rank_penalty = 0.0
-            candidate_size_multiplier = 1.0
-
-            trend_violated = (direction == 1 and price < sma_200) or (direction == -1 and price > sma_200)
-            trend_effect = _resolve_filter_policy(
-                effective_trend_mode,
-                trend_violated,
-                rank_penalty=0.30,
-                size_multiplier=0.70,
-            )
-            if trend_effect.reject:
-                continue
-            candidate_rank_penalty += float(trend_effect.rank_penalty)
-            candidate_size_multiplier *= float(trend_effect.size_multiplier)
-
-            if vol_24h < profile.min_vol_24h or vol_24h > profile.max_vol_24h: continue
-            if abs(ret_72h) < profile.min_momentum_magnitude: continue
-            x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0)
-            raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
-            prob = float(calibrator_predict(iso, np.array([raw_prob]))[0])
-            # Match production: apply recall-oriented primary threshold.
-            primary_cutoff = primary_recall_threshold(profile.signal_threshold, config.min_signal_edge)
-            if prob < primary_cutoff: continue
-
-            # Match production: funding filter policy
-            f_z = row.get('funding_rate_zscore', 0)
-            if pd.isna(f_z): f_z = 0
-            funding_violated = (direction == 1 and f_z > 2.5) or (direction == -1 and f_z < -2.5)
-            funding_effect = _resolve_filter_policy(
-                effective_funding_mode,
-                funding_violated,
-                rank_penalty=0.25,
-                size_multiplier=0.75,
-            )
-            if funding_effect.reject:
-                continue
-            candidate_rank_penalty += float(funding_effect.rank_penalty)
-            candidate_size_multiplier *= float(funding_effect.size_multiplier)
-
-            if candidate_rank_penalty > 0.0 and (prob - candidate_rank_penalty) < primary_cutoff:
-                continue
-
-            vol = vol_24h if vol_24h > 0 else 0.02
-            active_pos = {
-                'time': ts, 'entry': price, 'dir': direction, 'vol': vol,
-                'tp': price * (1 + profile.vol_mult_tp * vol * direction),
-                'sl': price * (1 - profile.vol_mult_sl * vol * direction),
-                'accum_funding': 0.0,
-                'size_multiplier': max(0.1, candidate_size_multiplier),
-            }
-
-    # METRICS
-    n = len(completed_trades)
-    if n == 0:
-        test_days = max((fold.test_end - fold.test_start).days, 1)
-        return {
-            'n_trades': 0,
-            'sharpe': 0.0,
-            'win_rate': 0.0,
-            'profit_factor': 0.0,
-            'max_drawdown': 0.0,
-            'ann_return': 0.0,
-            'total_return': 0.0,
-            'trades_per_year': 0.0,
-            'avg_pnl': 0.0,
-            'avg_raw_pnl': 0.0,
-            'gross_total_return': 0.0,
-            'net_total_return': 0.0,
-            'fee_edge_ratio': 0.0,
-        }
-    if n < 3:
-        pnls = [t['net_pnl'] for t in completed_trades]
-        raw_pnls = [t['raw_pnl'] for t in completed_trades]
-        raw_pnl_d = [t.get('raw_pnl_dollars', 0.0) for t in completed_trades]
-        wins = [p for p in pnls if p > 0]
-        wr = len(wins) / max(len(pnls), 1)
-        avg = float(np.mean(pnls))
-        total_ret = equity / 100000 - 1
-        gross_total_return = float(np.sum(raw_pnl_d) / 100000.0)
-        test_days = max((fold.test_end - fold.test_start).days, 1)
-        return {
-            'n_trades': n,
-            'sharpe': 0.0,
-            'win_rate': round(wr, 4),
-            'profit_factor': 0.0,
-            'max_drawdown': 0.0,
-            'ann_return': 0.0,
-            'total_return': round(total_ret, 4),
-            'trades_per_year': round(n * 365.0 / test_days, 1),
-            'avg_pnl': round(avg, 6),
-            'avg_raw_pnl': round(float(np.mean(raw_pnls)), 6),
-            'gross_total_return': round(gross_total_return, 4),
-            'net_total_return': round(total_ret, 4),
-            'fee_edge_ratio': 0.0,
-        }
-
-
-    pnls = [t['net_pnl'] for t in completed_trades]
-    raw_pnls = [t['raw_pnl'] for t in completed_trades]
-    pnl_d = [t['pnl_dollars'] for t in completed_trades]
-    raw_pnl_d = [t.get('raw_pnl_dollars', 0.0) for t in completed_trades]
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    wr = len(wins) / len(pnls)
-    avg, std = np.mean(pnls), np.std(pnls)
-    sr = avg / std if std > 0 else 0.0
-    gw = sum(wins) if wins else 0
-    gl = abs(sum(losses)) if losses else 0.001
-    pf = gw / gl if gl > 0 else 0.0
-
-    eq_curve = 100000 + np.cumsum(pnl_d)
-    peak = np.maximum.accumulate(eq_curve)
-    dd = float(np.max((peak - eq_curve) / np.maximum(peak, 1.0)))
-    total_ret = equity / 100000 - 1
-    test_days = max((fold.test_end - fold.test_start).days, 1)
-    ann_f = 365.0 / test_days
-    ann_ret = (1 + total_ret) ** ann_f - 1 if total_ret > -1 else -1.0
-    tpy = n * ann_f
-    tpd = n / test_days
-    ann_sr = sr * np.sqrt(tpd * 252) if tpd > 0 else 0.0
-
-    avg_raw = float(np.mean(raw_pnls)) if raw_pnls else 0.0
-    fee_edge_ratio = abs((avg_raw - avg) / avg_raw) if abs(avg_raw) > 1e-9 else 1.0
-
-    return {'n_trades': n, 'sharpe': round(ann_sr, 4), 'win_rate': round(wr, 4),
-            'profit_factor': round(min(pf, 5.0), 4), 'max_drawdown': round(dd, 4),
-            'ann_return': round(ann_ret, 4), 'total_return': round(total_ret, 4),
-            'trades_per_year': round(tpy, 1), 'avg_pnl': round(avg, 6),
-            'avg_raw_pnl': round(avg_raw, 6), 'fee_edge_ratio': round(float(fee_edge_ratio), 4)}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TRIAL PROFILE (6 tunable params)
-# ═══════════════════════════════════════════════════════════════════════════
-
 FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
 FIXED_RISK = {
     'position_size': 0.12,
@@ -846,75 +317,11 @@ FIXED_RISK = {
 }
 
 COIN_OPTIMIZATION_PRIORS = {
-    # target_trades_per_year ~= at least weekly cadence while preserving quality
-    'BTC': {
-        'target_trades_per_year': 40.0,
-        'cooldown_min': 6.0,
-        'cooldown_max': 36.0,
-        'min_momentum_magnitude': (0.010, 0.050),
-        'max_vol_24h': (0.045, 0.110),
-        'max_ensemble_std': (0.10, 0.20),
-        'min_directional_agreement': (0.50, 0.72),
-        'meta_probability_threshold': (0.48, 0.62),
-        'min_vol_24h': (0.001, 0.007),
-        'min_trade_frequency_ratio': 0.40,
-    },
-    'ETH': {
-        'target_trades_per_year': 40.0,
-        'cooldown_min': 4.0,
-        'cooldown_max': 30.0,
-        'min_momentum_magnitude': (0.010, 0.050),
-        'max_vol_24h': (0.050, 0.100),
-        'max_ensemble_std': (0.10, 0.20),
-        'min_directional_agreement': (0.50, 0.72),
-        'meta_probability_threshold': (0.48, 0.62),
-        'min_vol_24h': (0.002, 0.008),
-        'min_trade_frequency_ratio': 0.40,
-    },
-    'SOL': {
-        'target_trades_per_year': 48.0,
-        'cooldown_min': 3.0,
-        'cooldown_max': 24.0,
-        'min_momentum_magnitude': (0.010, 0.055),
-        'max_vol_24h': (0.055, 0.130),
-        'max_ensemble_std': (0.10, 0.20),
-        'min_directional_agreement': (0.50, 0.72),
-        'meta_probability_threshold': (0.48, 0.62),
-        'min_vol_24h': (0.002, 0.010),
-        'min_trade_frequency_ratio': 0.40,
-    },
-    'XRP': {
-        'target_trades_per_year': 44.0,
-        'cooldown_min': 4.0,
-        'cooldown_max': 30.0,
-        'min_momentum_magnitude': (0.010, 0.055),
-        'max_vol_24h': (0.050, 0.110),
-        'max_ensemble_std': (0.10, 0.20),
-        'min_directional_agreement': (0.50, 0.72),
-        'meta_probability_threshold': (0.48, 0.62),
-        'min_vol_24h': (0.002, 0.008),
-        'min_trade_frequency_ratio': 0.40,
-    },
-    'DOGE': {
-        'target_trades_per_year': 44.0,
-        'cooldown_min': 4.0,
-        'cooldown_max': 30.0,
-        'min_momentum_magnitude': (0.010, 0.060),
-        'max_vol_24h': (0.060, 0.150),
-        'max_ensemble_std': (0.10, 0.20),
-        'min_directional_agreement': (0.50, 0.72),
-        'meta_probability_threshold': (0.48, 0.62),
-        'min_vol_24h': (0.002, 0.010),
-        'min_trade_frequency_ratio': 0.40,
-    },
-}
-
-COIN_OBJECTIVE_GUARDS = {
-    'BTC': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
-    'ETH': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
-    'SOL': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
-    'XRP': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
-    'DOGE': {'min_total_trades': 3, 'min_avg_trades_per_fold': 0.5, 'min_expectancy': 0.0},
+    'BTC': {'target_trades_per_year': 40.0, 'cooldown_min': 6.0, 'cooldown_max': 36.0, 'min_momentum_magnitude': (0.010, 0.050), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
+    'ETH': {'target_trades_per_year': 40.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.050), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'SOL': {'target_trades_per_year': 48.0, 'cooldown_min': 3.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.010, 0.055), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    'XRP': {'target_trades_per_year': 44.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.055), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'DOGE': {'target_trades_per_year': 44.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.060), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -944,6 +351,7 @@ def _resolve_strategy_and_bucket(params: Dict | None) -> tuple[str, str]:
         trade_freq_bucket = 'balanced'
     return strategy_family, trade_freq_bucket
 
+
 def create_trial_profile(trial, coin_name):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
     default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0})
@@ -970,37 +378,20 @@ def create_trial_profile(trial, coin_name):
         max(0.010, mm_high * family_prior['min_momentum_multiplier']),
         step=0.001,
     )
-    max_vol_24h = trial.suggest_float(
-        'max_vol_24h',
-        *priors.get('max_vol_24h', (0.05, 0.09)),
-        step=0.001,
-    )
-    max_ensemble_std = trial.suggest_float(
-        'max_ensemble_std',
-        *priors.get('max_ensemble_std', (0.08, 0.13)),
-        step=0.001,
-    )
-    min_directional_agreement = trial.suggest_float(
-        'min_directional_agreement',
-        *priors.get('min_directional_agreement', (0.60, 0.78)),
-        step=0.01,
-    )
-    meta_probability_threshold = trial.suggest_float(
-        'meta_probability_threshold',
-        *priors.get('meta_probability_threshold', (0.50, 0.65)),
-        step=0.01,
-    )
+    max_vol_24h = trial.suggest_float('max_vol_24h', *priors.get('max_vol_24h', (0.05, 0.09)), step=0.001)
+    max_ensemble_std = trial.suggest_float('max_ensemble_std', *priors.get('max_ensemble_std', (0.08, 0.13)), step=0.001)
+    min_directional_agreement = trial.suggest_float('min_directional_agreement', *priors.get('min_directional_agreement', (0.60, 0.78)), step=0.01)
+    meta_probability_threshold = trial.suggest_float('meta_probability_threshold', *priors.get('meta_probability_threshold', (0.50, 0.65)), step=0.01)
 
     min_vol_bounds = priors.get('min_vol_24h')
     if min_vol_bounds:
         min_vol_24h = trial.suggest_float('min_vol_24h', min_vol_bounds[0], min_vol_bounds[1], step=0.001)
     else:
-        min_vol_24h = float(bp.min_vol_24h) if bp else 0.004
+        min_vol_24h = bp.min_vol_24h if bp else 0.004
 
     return CoinProfile(
-        name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
-        extra_features=get_extra_features(coin_name),
-        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.15, 0.50, 0.75), clamp(base_threshold + 0.10, 0.62, 0.82), step=0.01),
+        name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
+        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.08, 0.50, 0.72), clamp(base_threshold + 0.10, 0.62, 0.82), step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
         min_momentum_magnitude=min_momentum_magnitude,
@@ -1037,7 +428,6 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'vol_mult_tp': params.get('vol_mult_tp', bp.vol_mult_tp if bp else 5.0),
         'vol_mult_sl': params.get('vol_mult_sl', bp.vol_mult_sl if bp else 3.0),
         'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
-        # Tuned cadence + risk gates
         'cooldown_hours': params.get('cooldown_hours', base_cooldown),
         'min_vol_24h': params.get('min_vol_24h', bp.min_vol_24h if bp else 0.004),
         'max_vol_24h': params.get('max_vol_24h', bp.max_vol_24h if bp else 0.09),
@@ -1047,7 +437,6 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'meta_probability_threshold': params.get('meta_probability_threshold', bp.meta_probability_threshold if bp else np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
         'strategy_family': strategy_family,
         'trade_freq_bucket': trade_freq_bucket,
-        # Fixed risk/ML knobs
         'min_val_auc': FIXED_RISK['min_val_auc'],
         'position_size': FIXED_RISK['position_size'],
         'vol_sizing_target': FIXED_RISK['vol_sizing_target'],
@@ -1095,7 +484,8 @@ def _score_model_quality(probs: np.ndarray, y_test: pd.Series) -> dict:
     brier = float(brier_score_loss(y_test, probs))
     prob_std = float(np.std(probs))
     prob_range = float(np.percentile(probs, 95) - np.percentile(probs, 5))
-    score = float((auc - 0.5) * 2.0 - brier)
+    spread_bonus = min(0.1, prob_range * 0.5)
+    score = float((auc - 0.5) * 2.0 - brier + spread_bonus)
     return {'auc': auc, 'brier': brier, 'prob_std': prob_std, 'prob_range': prob_range, 'score': score}
 
 
@@ -1117,7 +507,8 @@ def _score_signal_density(probs: np.ndarray, ohlcv_test: pd.DataFrame, profile: 
     joint_rate = max(signal_rate * momentum_rate * vol_rate, 1e-6)
     hours_per_trade = max(float(profile.cooldown_hours), 1.0 / joint_rate)
     estimated_tpy = float(8760.0 / hours_per_trade)
-    score = float(np.log1p(estimated_tpy) / np.log1p(52.0))
+    capped_tpy = min(estimated_tpy, 100.0)
+    score = float(min(1.0, np.log1p(capped_tpy) / np.log1p(100.0)))
 
     return {
         'signal_rate': signal_rate,
@@ -1282,8 +673,23 @@ def objective(
     mean_auc = float(np.mean([f['model_quality']['auc'] for f in fold_scores]))
     consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores])
 
-    combined = (0.40 * model_q + 0.30 * signal_d + 0.15 * label_q + 0.15 * consistency['score'])
     estimated_tpy = float(np.mean([f['signal_density']['estimated_tpy'] for f in fold_scores]))
+
+    if mean_auc < 0.515:
+        trial.set_user_attr('reject_code', 'AUC_BELOW_FLOOR')
+        trial.set_user_attr('reject_reason', f'mean_auc={mean_auc:.4f}<0.515')
+        trial.set_user_attr('n_folds', int(len(fold_scores)))
+        trial.set_user_attr('mean_auc', round(mean_auc, 4))
+        trial.set_user_attr('estimated_tpy', round(estimated_tpy, 1))
+        return -1.0
+
+    signal_floor_ok = 1.0 if estimated_tpy >= 20.0 else (estimated_tpy / 20.0)
+    combined = (
+        0.55 * model_q +
+        0.15 * signal_d +
+        0.15 * label_q +
+        0.15 * consistency['score']
+    ) * signal_floor_ok
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
@@ -1447,7 +853,6 @@ def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days,
         print(f"  ❌ Holdout error ({eval_days}d): {e}")
         return None
     if not result:
-        _set_diag('model_training_failed')
         return None
     oos_sr = _finite_metric(result.get('oos_sharpe', 0))
     return {
@@ -1908,7 +1313,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}, cv_mode={cv_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
-    print("   Proxy score weights: model_quality=0.40, signal_density=0.30, label_quality=0.15, fold_consistency=0.15")
+    print("   Proxy score weights: model_quality=0.55, signal_density=0.15, label_quality=0.15, fold_consistency=0.15")
+    print("   AUC floor: 0.515 | Signal density TPY cap: 100")
     phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
     print(
         f"   Phase: {phase_label} | target_tpw={float(target_trades_per_week):.2f} "
@@ -2186,12 +1592,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         if not reject_reason and not reject_code:
             accepted_trials += 1
 
-    trade_frequency_diagnostics = build_trade_frequency_diagnostics(completed_trials)
-    top_reject = max(reject_code_counts.items(), key=lambda kv: kv[1])[0] if reject_code_counts else None
-    if top_reject == str(ReasonCode.UNLIKELY_TRADE_FREQUENCY):
-        freq_line = format_trade_frequency_diagnostics_line(trade_frequency_diagnostics)
-        if freq_line:
-            print(f"  🔎 Top reject diagnostics ({ReasonCode.UNLIKELY_TRADE_FREQUENCY}): {freq_line}")
+    trade_frequency_diagnostics = {}
 
     effective_best_params = build_effective_params(best.params, coin_name)
     tunable_best_params = dict(best.params)
@@ -2567,11 +1968,11 @@ def resolve_gate_mode(mode_name: str) -> Dict[str, object]:
 
 def apply_runtime_preset(args):
     presets = {
-        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 8, 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'early_trade_feasibility_mode': 'reject', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 40, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
-        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 6, 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'early_trade_feasibility_mode': 'reject', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 40, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
-        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 0, 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'early_trade_feasibility_mode': 'off', 'early_trade_feasibility_min_folds': 2, 'early_trade_feasibility_grace_trials': 30, 'early_trade_feasibility_penalty_scale': 2.0, 'disable_fee_stress': True, 'min_fold_sharpe_hard': -0.5, 'min_fold_win_rate': 0.30, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'min_raw_expectancy': -0.0010, 'min_stressed_expectancy': -0.0010, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
-        'discovery': {'plateau_patience': 70, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_internal_oos_trades': 2, 'min_total_trades': 10, 'n_cv_folds': 4, 'holdout_candidates': 2, 'holdout_min_trades': 10, 'holdout_min_sharpe': -0.05, 'holdout_min_return': -0.03, 'require_holdout_pass': False, 'target_trades_per_week': 0.6, 'early_trade_feasibility_mode': 'penalize', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 50, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.55, 'seed_stability_max_param_dispersion': 0.90, 'seed_stability_max_oos_sharpe_dispersion': 0.60, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
-        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_internal_oos_trades': 10, 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'early_trade_feasibility_mode': 'reject', 'early_trade_feasibility_min_folds': 3, 'early_trade_feasibility_grace_trials': 40, 'early_trade_feasibility_penalty_scale': 3.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
+        'discovery': {'plateau_patience': 70, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 10, 'n_cv_folds': 4, 'holdout_candidates': 2, 'holdout_min_trades': 10, 'holdout_min_sharpe': -0.05, 'holdout_min_return': -0.03, 'require_holdout_pass': False, 'target_trades_per_week': 0.6, 'seed_stability_min_pass_rate': 0.55, 'seed_stability_max_param_dispersion': 0.90, 'seed_stability_max_oos_sharpe_dispersion': 0.60, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -2584,7 +1985,6 @@ def apply_runtime_preset(args):
             'plateau_min_completed': '--plateau-min-completed',
             'holdout_days': '--holdout-days',
             'holdout_mode': '--holdout-mode',
-            'min_internal_oos_trades': '--min-internal-oos-trades',
             'min_total_trades': '--min-total-trades',
             'n_cv_folds': '--n-cv-folds',
             'cv_mode': '--cv-mode',
@@ -2600,33 +2000,14 @@ def apply_runtime_preset(args):
             'require_holdout_pass': '--require-holdout-pass',
             'target_trades_per_week': '--target-trades-per-week',
             'target_trades_per_year': '--target-trades-per-year',
-            'early_trade_feasibility_mode': '--early-trade-feasibility-mode',
-            'early_trade_feasibility_min_folds': '--early-trade-feasibility-min-folds',
-            'early_trade_feasibility_grace_trials': '--early-trade-feasibility-grace-trials',
-            'early_trade_feasibility_penalty_scale': '--early-trade-feasibility-penalty-scale',
-            'disable_fee_stress': '--disable-fee-stress',
-            'min_fold_sharpe_hard': '--min-fold-sharpe-hard',
-            'min_fold_win_rate': '--min-fold-win-rate',
             'min_psr': '--min-psr',
             'min_psr_cv': '--min-psr-cv',
             'min_psr_holdout': '--min-psr-holdout',
             'min_dsr': '--min-dsr',
-            'min_raw_expectancy': '--min-raw-expectancy',
-            'min_stressed_expectancy': '--min-stressed-expectancy',
             'seed_stability_min_pass_rate': '--seed-stability-min-pass-rate',
             'seed_stability_max_param_dispersion': '--seed-stability-max-param-dispersion',
             'seed_stability_max_oos_sharpe_dispersion': '--seed-stability-max-oos-sharpe-dispersion',
             'cost_config_path': '--cost-config-path',
-            'enable_pbo_diagnostic': '--enable-pbo-diagnostic',
-            'enable_study_significance': '--enable-study-significance',
-            'study_significance_bootstrap_iterations': '--study-significance-bootstrap-iterations',
-            'study_significance_seed': '--study-significance-seed',
-            'study_significance_score_source': '--study-significance-score-source',
-            'enable_cost_stress_diagnostics': '--enable-cost-stress-diagnostics',
-            'cost_stress_finalists': '--cost-stress-finalists',
-            'cost_stress_fee_multiplier': '--cost-stress-fee-multiplier',
-            'cost_stress_slippage_multiplier': '--cost-stress-slippage-multiplier',
-            'cost_stress_funding_bps_per_trade': '--cost-stress-funding-bps-per-trade',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
