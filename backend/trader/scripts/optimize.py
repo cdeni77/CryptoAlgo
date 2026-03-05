@@ -1383,6 +1383,13 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     sampler = TPESampler(seed=sampler_seed, n_startup_trials=min(10, n_trials // 3))
     study = None
     storage_url = _sqlite_url(_db_path())
+    storage = optuna.storages.RDBStorage(
+        url=storage_url,
+        engine_kwargs={
+            "connect_args": {"timeout": 30},
+            "pool_pre_ping": True,
+        },
+    )
     for attempt in range(10):
         try:
             with _study_storage_lock(_db_path()):
@@ -1390,7 +1397,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                     direction='maximize',
                     sampler=sampler,
                     study_name=study_name,
-                    storage=storage_url,
+                    storage=storage,
                     load_if_exists=bool(resume_study),
                 )
             break
@@ -1399,7 +1406,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
                 if resume_study:
                     with _study_storage_lock(_db_path()):
-                        study = optuna.load_study(study_name=study_name, storage=storage_url, sampler=sampler)
+                        study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler)
                     break
                 raise RuntimeError(
                     f"Study '{study_name}' already exists but --resume was not set. "
@@ -1450,13 +1457,39 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             },
         })
 
-    try: study.optimize(obj, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=sys.stderr.isatty(),
-                        callbacks=[PlateauStopper(
-                            plateau_patience,
-                            plateau_min_delta,
-                            plateau_warmup,
-                            min_completed_trials,
-                        ), _prune_event_callback])
+    callbacks = [
+        PlateauStopper(
+            plateau_patience,
+            plateau_min_delta,
+            plateau_warmup,
+            min_completed_trials,
+        ),
+        _prune_event_callback,
+    ]
+    optimize_jobs = max(1, int(n_jobs or 1))
+    if optimize_jobs > 1:
+        print(f"⚠️  Optuna SQLite storage is lock-prone with n_jobs>1; forcing n_jobs=1 for {coin_name}.")
+        optimize_jobs = 1
+
+    try:
+        for attempt in range(5):
+            try:
+                study.optimize(
+                    obj,
+                    n_trials=n_trials,
+                    n_jobs=optimize_jobs,
+                    show_progress_bar=sys.stderr.isatty(),
+                    callbacks=callbacks,
+                )
+                break
+            except optuna.exceptions.StorageInternalError as e:
+                err = str(e).lower()
+                if "database is locked" in err and attempt < 4:
+                    wait_s = 0.5 * (attempt + 1)
+                    print(f"⚠️  SQLite busy during optimize ({coin_name}), retrying in {wait_s:.1f}s...")
+                    time.sleep(wait_s)
+                    continue
+                raise
     except KeyboardInterrupt: print("\n🛑 Stopped.")
     except Exception as e: print(f"\n❌ {e}"); traceback.print_exc(); return None
     if not study.trials: print("No trials."); return None
@@ -1470,7 +1503,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
           f"| WR={_fmt_pct(best.user_attrs.get('win_rate'))} | DD={_fmt_pct(best.user_attrs.get('max_drawdown'),2)}")
 
     nc = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None])
-    dsr = compute_deflated_sharpe(_finite_metric(best.user_attrs.get('mean_sharpe', 0)), int(best.user_attrs.get('n_trades', 0) or 0), nc)
+    dsr = compute_deflated_sharpe_metric(
+        _finite_metric(best.user_attrs.get('mean_sharpe', 0)),
+        int(best.user_attrs.get('n_trades', 0) or 0),
+        nc,
+    )
     run_id = f"{study_name}_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
     ledger_path = append_trial_ledger_entry(
         coin_name=coin_name,
