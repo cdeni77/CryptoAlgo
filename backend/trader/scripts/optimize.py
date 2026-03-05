@@ -162,6 +162,43 @@ def get_extra_features(coin_name):
         'DOGE': DOGE_EXTRA_FEATURES,
     }.get(coin_name, [])
 
+
+def resolve_target_symbol(all_data, coin_prefix, coin_name):
+    """Resolve the symbol key to optimize for a given coin.
+
+    Preference order:
+      1) symbol names starting with the Coinbase CDE prefix (e.g. BIP, ETP)
+      2) symbol names starting with the canonical coin ticker (e.g. BTC, ETH)
+    Within each group, prefer the symbol with the most recent OHLCV timestamp.
+    """
+    if not all_data:
+        return None
+
+    prefix = str(coin_prefix or "").upper()
+    ticker = str(coin_name or "").upper()
+    symbols = list(all_data.keys())
+
+    epoch_utc = pd.Timestamp(0, tz='UTC')
+
+    def _latest_ts(sym):
+        try:
+            ohlcv = all_data[sym].get('ohlcv')
+            if ohlcv is None or ohlcv.empty:
+                return epoch_utc
+            idx = ohlcv.index
+            return idx.max() if len(idx) else epoch_utc
+        except Exception:
+            return epoch_utc
+
+    for token in (prefix, ticker):
+        if not token:
+            continue
+        candidates = [sym for sym in symbols if str(sym).upper().startswith(token)]
+        if candidates:
+            return max(candidates, key=_latest_ts)
+
+    return None
+
 def _as_number(value, default=None):
     if value is None: return default
     if isinstance(value, (int, float)): return float(value)
