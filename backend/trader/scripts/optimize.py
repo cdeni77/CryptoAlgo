@@ -14,10 +14,10 @@ Usage:
     python optimize.py --show
 """
 import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import fcntl
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -206,21 +206,6 @@ def _as_number(value, default=None):
     except: return default
 
 
-def _as_bool(value, default=False):
-    if value is None:
-        return bool(default)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {'1', 'true', 'yes', 'y', 'on'}:
-            return True
-        if normalized in {'0', 'false', 'no', 'n', 'off'}:
-            return False
-    return bool(default)
-
 def _finite_metric(value, default=0.0):
     n = _as_number(value, default=default)
     return default if (n is None or not np.isfinite(n)) else float(n)
@@ -268,36 +253,6 @@ def estimate_holdout_trade_budget(holdout_days: int, target_trades_per_week: flo
     return estimated_holdout_trades, effective_holdout_floor
 
 
-def _reject_score(observed: float | None = None, threshold: float | None = None, *, base: float = -6.0, scale: float = 8.0) -> float:
-    """Return a strong but non-degenerate penalty for rejected trials.
-
-    We intentionally avoid a flat sentinel like -99 so Optuna can still rank
-    rejected trials by *how far* they are from meeting hard constraints.
-    """
-    if observed is None or threshold is None:
-        return base - scale
-    try:
-        obs = float(observed)
-        th = float(threshold)
-    except (TypeError, ValueError):
-        return base - scale
-    if not np.isfinite(obs) or not np.isfinite(th):
-        return base - scale
-    gap = max(0.0, th - obs)
-    norm = max(abs(th), 1e-6)
-    penalty = scale * min(3.0, gap / norm)
-    return base - penalty
-
-
-def resolve_target_symbol(all_data, coin_prefix, coin_name):
-    for sym in all_data:
-        parts = sym.upper().split('-')
-        if parts[0] in (coin_prefix.upper(), coin_name.upper()):
-            return sym
-    for sym in all_data:
-        if coin_name.upper() in sym.upper() or coin_prefix.upper() in sym.upper():
-            return sym
-    return None
 
 def split_data_temporal(all_data, holdout_days=180):
     all_ends = [d['ohlcv'].index.max() for d in all_data.values() if len(d['ohlcv']) > 0]
@@ -634,33 +589,6 @@ def proxy_evaluate_fold(features, ohlcv, fold: CVFold, profile: CoinProfile, con
     }
 
 
-def validate_candidates(candidate_trials, coin_name, coin_prefix, holdout_data, holdout_days, holdout_mode, n_top=10, pruned_only=True, base_config=None):
-    results = []
-    for cand in list(candidate_trials)[: max(1, int(n_top))]:
-        metrics = evaluate_holdout(
-            holdout_data,
-            cand.params,
-            coin_name,
-            coin_prefix,
-            holdout_days,
-            pruned_only=pruned_only,
-            holdout_mode=holdout_mode,
-            base_config=base_config,
-        )
-        if not metrics:
-            continue
-        results.append({
-            'trial_number': int(cand.number),
-            'params': cand.params,
-            'proxy_score': float(cand.value if cand.value is not None else -1.0),
-            'trades': int(metrics.get('holdout_trades', 0) or 0),
-            'sharpe': float(metrics.get('holdout_sharpe', 0.0) or 0.0),
-            'return': float(metrics.get('holdout_return', 0.0) or 0.0),
-            'win_rate': float(metrics.get('full_pf', 0.0) or 0.0),
-            'metrics': metrics,
-        })
-    return sorted(results, key=lambda row: row['sharpe'], reverse=True)
-
 # ═══════════════════════════════════════════════════════════════════════════
 # OBJECTIVE + STOPPER + SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -964,33 +892,6 @@ def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days,
     top_level['holdout_mode'] = holdout_mode
     top_level['holdout_slices'] = holdout_slices
     return top_level
-
-
-def _proxy_fidelity_thresholds(
-    sharpe_delta_max=0.35,
-    trade_count_delta_max=8,
-    return_delta_max=0.03,
-    max_drawdown_delta_max=0.04,
-):
-    return {
-        'sharpe_delta_max': float(max(0.0, sharpe_delta_max)),
-        'trade_count_delta_max': int(max(0, trade_count_delta_max)),
-        'return_delta_max': float(max(0.0, return_delta_max)),
-        'max_drawdown_delta_max': float(max(0.0, max_drawdown_delta_max)),
-    }
-
-
-def _degrade_confidence_tier(tier: str) -> str:
-    rank = ['REJECT', 'RESEARCH_ONLY', 'PAPER_READY', 'PROMOTION_READY']
-    if tier not in rank:
-        return tier
-    idx = rank.index(tier)
-    return rank[max(0, idx - 1)]
-
-
-def calibrate_proxy_fidelity(**_kwargs):
-    """Deprecated after proxy objective refactor; retained as disabled metadata hook."""
-    return {'enabled': False, 'reason': 'deprecated_proxy_objective'}
 
 
 def assess_result_quality(rd):

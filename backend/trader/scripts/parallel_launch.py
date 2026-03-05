@@ -12,6 +12,41 @@ from scripts.optimize import PREFIX_FOR_COIN, load_data, optimize_coin_multiseed
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
 
+def _parse_sampler_seeds(raw: str) -> list[int]:
+    values = [item.strip() for item in str(raw or '').split(',') if item.strip()]
+    return [int(item) for item in values]
+
+
+def build_run_manifest(script_dir, args, target_coins: list[str], run_id: str) -> dict[str, Any]:
+    """Build a reproducibility manifest for a parallel optimization run."""
+    generated_at = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    sampler_seeds_raw = getattr(args, 'sampler_seeds', '')
+    manifest = {
+        'run_id': str(run_id),
+        'generated_at': generated_at,
+        'script_dir': str(script_dir),
+        'preset': getattr(args, 'preset', None),
+        'target_coins': [str(coin).upper() for coin in (target_coins or [])],
+        'seed_policy': {
+            'sampler_seeds_raw': sampler_seeds_raw,
+            'sampler_seeds': _parse_sampler_seeds(sampler_seeds_raw),
+        },
+        'optimizer_flags': {
+            'holdout_mode': getattr(args, 'holdout_mode', None),
+            'holdout_candidates': getattr(args, 'holdout_candidates', None),
+            'require_holdout_pass': bool(getattr(args, 'require_holdout_pass', False)),
+            'gate_mode': getattr(args, 'gate_mode', None),
+            'min_psr': getattr(args, 'min_psr', None),
+            'min_psr_cv': getattr(args, 'min_psr_cv', None),
+            'min_psr_holdout': getattr(args, 'min_psr_holdout', None),
+            'min_dsr': getattr(args, 'min_dsr', None),
+            'proxy_fidelity_candidates': getattr(args, 'proxy_fidelity_candidates', None),
+            'proxy_fidelity_eval_days': getattr(args, 'proxy_fidelity_eval_days', None),
+        },
+    }
+    return manifest
+
+
 @dataclass
 class OptimizationConfig:
     trials: int = 300
