@@ -289,6 +289,16 @@ def _reject_score(observed: float | None = None, threshold: float | None = None,
     return base - penalty
 
 
+def resolve_target_symbol(all_data, coin_prefix, coin_name):
+    for sym in all_data:
+        parts = sym.upper().split('-')
+        if parts[0] in (coin_prefix.upper(), coin_name.upper()):
+            return sym
+    for sym in all_data:
+        if coin_name.upper() in sym.upper() or coin_prefix.upper() in sym.upper():
+            return sym
+    return None
+
 def split_data_temporal(all_data, holdout_days=180):
     all_ends = [d['ohlcv'].index.max() for d in all_data.values() if len(d['ohlcv']) > 0]
     if not all_ends or holdout_days <= 0: return all_data, {}
@@ -334,6 +344,171 @@ def create_cv_splits(
             embargo_frac=embargo_frac,
         )
     return create_walk_forward_splits(index, n_folds=n_folds, min_train_days=min_train_days, purge_days=purge_days)
+
+
+FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
+FIXED_RISK = {
+    'position_size': 0.12,
+    'vol_sizing_target': 0.025,
+    'min_val_auc': 0.48,
+}
+
+COIN_OPTIMIZATION_PRIORS = {
+    'BTC': {'target_trades_per_year': 40.0, 'cooldown_min': 6.0, 'cooldown_max': 36.0, 'min_momentum_magnitude': (0.010, 0.050), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
+    'ETH': {'target_trades_per_year': 40.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.050), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'SOL': {'target_trades_per_year': 48.0, 'cooldown_min': 3.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.010, 0.055), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    'XRP': {'target_trades_per_year': 44.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.055), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'DOGE': {'target_trades_per_year': 44.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.060), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+}
+
+STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
+TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
+
+STRATEGY_FAMILY_PRIORS = {
+    'momentum_trend': {'min_momentum_multiplier': 1.00, 'cooldown_multiplier': 1.00, 'min_trade_frequency_ratio_delta': 0.00},
+    'breakout': {'min_momentum_multiplier': 0.90, 'cooldown_multiplier': 0.85, 'min_trade_frequency_ratio_delta': 0.03},
+    'mean_reversion': {'min_momentum_multiplier': 0.80, 'cooldown_multiplier': 0.95, 'min_trade_frequency_ratio_delta': -0.02},
+    'vol_overlay': {'min_momentum_multiplier': 0.95, 'cooldown_multiplier': 1.10, 'min_trade_frequency_ratio_delta': -0.01},
+}
+
+TRADE_FREQ_BUCKET_PRIORS = {
+    'conservative': {'cooldown_scale': 1.25, 'min_trade_frequency_ratio_delta': -0.06},
+    'balanced': {'cooldown_scale': 1.00, 'min_trade_frequency_ratio_delta': 0.00},
+    'aggressive': {'cooldown_scale': 0.80, 'min_trade_frequency_ratio_delta': 0.08},
+}
+
+
+def _resolve_strategy_and_bucket(params: Dict | None) -> tuple[str, str]:
+    params = params or {}
+    strategy_family = str(params.get('strategy_family') or 'momentum_trend')
+    trade_freq_bucket = str(params.get('trade_freq_bucket') or 'balanced')
+    if strategy_family not in STRATEGY_FAMILIES:
+        strategy_family = 'momentum_trend'
+    if trade_freq_bucket not in TRADE_FREQ_BUCKETS:
+        trade_freq_bucket = 'balanced'
+    return strategy_family, trade_freq_bucket
+
+
+def create_trial_profile(trial, coin_name):
+    bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0})
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
+
+    def clamp(v, low, high):
+        return max(low, min(high, v))
+
+    base_threshold = bp.signal_threshold if bp else 0.75
+    base_fwd = bp.label_forward_hours if bp else 24
+    base_label_vol = bp.label_vol_target if bp else 1.8
+    base_tp = bp.vol_mult_tp if bp else 5.0
+    base_sl = bp.vol_mult_sl if bp else 3.0
+    base_hold = bp.max_hold_hours if bp else 72
+    strategy_family = trial.suggest_categorical('strategy_family', STRATEGY_FAMILIES)
+    trade_freq_bucket = trial.suggest_categorical('trade_freq_bucket', TRADE_FREQ_BUCKETS)
+    family_prior = STRATEGY_FAMILY_PRIORS.get(strategy_family, STRATEGY_FAMILY_PRIORS['momentum_trend'])
+    bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(trade_freq_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
+
+    mm_low, mm_high = priors.get('min_momentum_magnitude', (0.03, 0.07))
+    min_momentum_magnitude = trial.suggest_float(
+        'min_momentum_magnitude',
+        max(0.005, mm_low * family_prior['min_momentum_multiplier']),
+        max(0.010, mm_high * family_prior['min_momentum_multiplier']),
+        step=0.001,
+    )
+    max_vol_24h = trial.suggest_float('max_vol_24h', *priors.get('max_vol_24h', (0.05, 0.09)), step=0.001)
+    max_ensemble_std = trial.suggest_float('max_ensemble_std', *priors.get('max_ensemble_std', (0.08, 0.13)), step=0.001)
+    min_directional_agreement = trial.suggest_float('min_directional_agreement', *priors.get('min_directional_agreement', (0.60, 0.78)), step=0.01)
+    meta_probability_threshold = trial.suggest_float('meta_probability_threshold', *priors.get('meta_probability_threshold', (0.50, 0.65)), step=0.01)
+
+    min_vol_bounds = priors.get('min_vol_24h')
+    if min_vol_bounds:
+        min_vol_24h = trial.suggest_float('min_vol_24h', min_vol_bounds[0], min_vol_bounds[1], step=0.001)
+    else:
+        min_vol_24h = bp.min_vol_24h if bp else 0.004
+
+    return CoinProfile(
+        name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
+        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.08, 0.50, 0.72), clamp(base_threshold + 0.10, 0.62, 0.82), step=0.01),
+        label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
+        label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
+        min_momentum_magnitude=min_momentum_magnitude,
+        vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 2.0, 2.0, 8.0), clamp(base_tp + 2.0, 3.0, 9.0), step=0.5),
+        vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 1.5, 5.0), clamp(base_sl + 1.0, 2.0, 5.5), step=0.5),
+        max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
+        min_vol_24h=min_vol_24h,
+        max_vol_24h=max_vol_24h,
+        max_ensemble_std=max_ensemble_std,
+        min_directional_agreement=min_directional_agreement,
+        meta_probability_threshold=meta_probability_threshold,
+        cooldown_hours=trial.suggest_float(
+            'cooldown_hours',
+            priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
+            priors['cooldown_max'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
+        ),
+        position_size=FIXED_RISK['position_size'],
+        vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
+        n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
+        learning_rate=FIXED_ML['learning_rate'], min_child_samples=FIXED_ML['min_child_samples'],
+    )
+
+
+def build_effective_params(params: Dict, coin_name: str) -> Dict:
+    bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {})
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
+    strategy_family, trade_freq_bucket = _resolve_strategy_and_bucket(params)
+    base_cooldown = bp.cooldown_hours if bp and getattr(bp, 'cooldown_hours', None) is not None else 24.0
+    return {
+        'signal_threshold': params.get('signal_threshold', bp.signal_threshold if bp else 0.75),
+        'label_forward_hours': params.get('label_forward_hours', bp.label_forward_hours if bp else 24),
+        'label_vol_target': params.get('label_vol_target', bp.label_vol_target if bp else 1.8),
+        'vol_mult_tp': params.get('vol_mult_tp', bp.vol_mult_tp if bp else 5.0),
+        'vol_mult_sl': params.get('vol_mult_sl', bp.vol_mult_sl if bp else 3.0),
+        'max_hold_hours': params.get('max_hold_hours', bp.max_hold_hours if bp else 72),
+        'cooldown_hours': params.get('cooldown_hours', base_cooldown),
+        'min_vol_24h': params.get('min_vol_24h', bp.min_vol_24h if bp else 0.004),
+        'max_vol_24h': params.get('max_vol_24h', bp.max_vol_24h if bp else 0.09),
+        'min_momentum_magnitude': params.get('min_momentum_magnitude', bp.min_momentum_magnitude if bp else 0.02),
+        'max_ensemble_std': params.get('max_ensemble_std', bp.max_ensemble_std if bp else np.mean(priors.get('max_ensemble_std', (0.08, 0.13)))),
+        'min_directional_agreement': params.get('min_directional_agreement', bp.min_directional_agreement if bp else np.mean(priors.get('min_directional_agreement', (0.60, 0.78)))),
+        'meta_probability_threshold': params.get('meta_probability_threshold', bp.meta_probability_threshold if bp else np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
+        'strategy_family': strategy_family,
+        'trade_freq_bucket': trade_freq_bucket,
+        'min_val_auc': FIXED_RISK['min_val_auc'],
+        'position_size': FIXED_RISK['position_size'],
+        'vol_sizing_target': FIXED_RISK['vol_sizing_target'],
+        'n_estimators': FIXED_ML['n_estimators'],
+        'max_depth': FIXED_ML['max_depth'],
+        'learning_rate': FIXED_ML['learning_rate'],
+        'min_child_samples': FIXED_ML['min_child_samples'],
+    }
+
+
+def profile_from_params(params, coin_name):
+    bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
+    effective_params = build_effective_params(params, coin_name)
+    return CoinProfile(
+        name=coin_name, prefixes=bp.prefixes if bp else [coin_name],
+        extra_features=get_extra_features(coin_name),
+        signal_threshold=effective_params['signal_threshold'],
+        min_val_auc=effective_params['min_val_auc'],
+        label_forward_hours=effective_params['label_forward_hours'],
+        label_vol_target=effective_params['label_vol_target'],
+        min_momentum_magnitude=effective_params['min_momentum_magnitude'],
+        vol_mult_tp=effective_params['vol_mult_tp'], vol_mult_sl=effective_params['vol_mult_sl'],
+        max_hold_hours=effective_params['max_hold_hours'],
+        cooldown_hours=effective_params['cooldown_hours'],
+        min_vol_24h=effective_params['min_vol_24h'], max_vol_24h=effective_params['max_vol_24h'],
+        max_ensemble_std=effective_params['max_ensemble_std'],
+        min_directional_agreement=effective_params['min_directional_agreement'],
+        meta_probability_threshold=effective_params['meta_probability_threshold'],
+        position_size=effective_params['position_size'],
+        vol_sizing_target=effective_params['vol_sizing_target'],
+        n_estimators=effective_params['n_estimators'],
+        max_depth=effective_params['max_depth'],
+        learning_rate=effective_params['learning_rate'],
+        min_child_samples=effective_params['min_child_samples'],
+    )
 
 
 def _score_model_quality(probs: np.ndarray, y_test: pd.Series) -> dict:
@@ -715,7 +890,6 @@ def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days,
         print(f"  ❌ Holdout error ({eval_days}d): {e}")
         return None
     if not result:
-        _set_diag('model_training_failed')
         return None
     oos_sr = _finite_metric(result.get('oos_sharpe', 0))
     return {
