@@ -1075,6 +1075,14 @@ def validate_all_symbol_configs(all_data: Dict, config: Config,
         validate_label_execution_config(sym, profile, config)
 
 
+def resolve_paper_profile_overrides_path() -> Path:
+    """Resolve paper profile override path (env override > default data/paper_candidates)."""
+    env_path = os.getenv('PAPER_PROFILE_OVERRIDES_PATH')
+    if env_path:
+        return Path(env_path)
+    return Path('data') / 'paper_candidates'
+
+
 def load_data():
     data = {}
     print("⏳ Loading data from features and database...")
@@ -2420,13 +2428,14 @@ if __name__ == "__main__":
     )
     data = load_data()
 
-    paper_profile_overrides_path = os.getenv('PAPER_PROFILE_OVERRIDES_PATH')
-    profile_overrides = load_paper_profile_overrides(paper_profile_overrides_path)
+    paper_profile_overrides_path = resolve_paper_profile_overrides_path()
+    print(f"🧪 Paper profile overrides path: {paper_profile_overrides_path}")
+    profile_overrides = load_paper_profile_overrides(str(paper_profile_overrides_path))
     if profile_overrides:
         print(
             "🧪 Loaded paper profile overrides: "
             + ", ".join(sorted(profile_overrides.keys()))
-            + (f" (source={paper_profile_overrides_path})" if paper_profile_overrides_path else "")
+            + f" (source={paper_profile_overrides_path})"
         )
 
     gate_artifact_dir = Path(args.gate_report_dir) if args.gate_report_json else None

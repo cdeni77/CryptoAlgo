@@ -14,7 +14,7 @@ Usage:
     python optimize.py --show
 """
 import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math, tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -36,7 +36,8 @@ from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
     _build_strategy_context, _calibrator_predict, _resolve_filter_policy,
     calculate_n_contracts, get_strategy_family, primary_recall_threshold,
-    resolve_label_horizon, resolve_param, GATE_REASON_CODES,
+    resolve_label_horizon, resolve_param, resolve_categorical_param,
+    build_ensemble_member_specs, GATE_REASON_CODES,
 )
 from core.meta_labeling import calibrator_predict
 from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
@@ -312,11 +313,13 @@ FIXED_RISK = {
 }
 
 COIN_OPTIMIZATION_PRIORS = {
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
-    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
-    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.065), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    # Search priors are intentionally a bit wider than deployment defaults. This broadens
+    # discovery while leaving holdout/promotion gates unchanged.
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
+    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.065), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -636,65 +639,111 @@ def _aggregate_slice_gate_summaries(holdout_slices: Dict[str, dict]) -> Dict[str
 
 def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
     system = MLSystem(config)
-    strategy_family = get_strategy_family(config.strategy_family)
+    resolved_family = resolve_categorical_param('strategy_family', profile, config, Config.strategy_family)
+    resolved_bucket = resolve_categorical_param('trade_freq_bucket', profile, config, Config.trade_freq_bucket)
+    config.strategy_family = resolved_family
+    config.trade_freq_bucket = resolved_bucket
+    strategy_family = get_strategy_family(resolved_family)
+
     feature_candidates = profile.resolve_feature_columns(
         use_pruned_features=bool(pruned_only),
         strict_pruned=bool(pruned_only),
     )
-    cols = system.get_feature_columns(features.columns, feature_candidates)
-    if not cols or len(cols) < 4:
+    base_cols = system.get_feature_columns(features.columns, feature_candidates)
+    if not base_cols or len(base_cols) < 4:
         return None
 
     train_feat = features.loc[fold.train_idx.intersection(features.index)]
     test_feat = features.loc[fold.test_idx.intersection(features.index)]
-    test_ohlcv = ohlcv.loc[fold.test_idx.intersection(ohlcv.index)]
     if len(train_feat) < config.min_train_samples or len(test_feat) < 24:
         return None
 
-    y = system.create_labels(ohlcv, train_feat, profile=profile)
-    valid_idx = y.dropna().index
-    X_all = train_feat.loc[valid_idx, cols]
-    y_all = y.loc[valid_idx]
-    X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
-    if len(X_all) < config.min_train_samples or y_all.nunique() < 2:
+    member_models = []
+    for member_spec in build_ensemble_member_specs():
+        if train_feat.empty:
+            continue
+        cutoff_ts = train_feat.index.max() - timedelta(days=int(member_spec.train_window_days))
+        member_train_feat = train_feat.loc[train_feat.index >= cutoff_ts]
+        if len(member_train_feat) < config.min_train_samples:
+            continue
+
+        member_cols = system.build_member_features(symbol, base_cols, member_spec)
+        if len(member_cols) < 4:
+            continue
+
+        y = system.create_labels(ohlcv, member_train_feat, profile=profile)
+        valid_idx = y.dropna().index
+        X_all = member_train_feat.loc[valid_idx, member_cols]
+        y_all = y.loc[valid_idx]
+        X_all, y_all = system.prepare_binary_training_set(X_all, y_all)
+        if len(X_all) < config.min_train_samples or y_all.nunique() < 2:
+            continue
+
+        split_idx = int(len(X_all) * (1 - config.val_fraction))
+        if split_idx <= 0 or split_idx >= len(X_all):
+            continue
+
+        y_train = y_all.iloc[:split_idx]
+        y_val = y_all.iloc[split_idx:]
+        x_train_fold, x_val_fold, _ = fit_transform_fold(X_all.iloc[:split_idx], X_all.iloc[split_idx:], y_train)
+        if y_train.nunique() < 2 or y_val.nunique() < 2:
+            continue
+
+        result = system.train(
+            x_train_fold,
+            y_train,
+            x_val_fold,
+            y_val,
+            profile=profile,
+            symbol=symbol,
+            member_spec=member_spec,
+            member_features=member_cols,
+        )
+        if not result:
+            continue
+
+        model, scaler, iso, auc, meta_artifacts, *_ = result
+        member_models.append({
+            'model': model,
+            'scaler': scaler,
+            'calibrator': iso,
+            'meta': meta_artifacts,
+            'cols': member_cols,
+            'auc': float(auc),
+        })
+
+    if len(member_models) < 2:
         return None
 
-    split_idx = int(len(X_all) * (1 - config.val_fraction))
-    if split_idx <= 0 or split_idx >= len(X_all):
-        return None
-
-    y_train = y_all.iloc[:split_idx]
-    y_val = y_all.iloc[split_idx:]
-    x_train_fold, x_val_fold, _ = fit_transform_fold(X_all.iloc[:split_idx], X_all.iloc[split_idx:], y_train)
-    if y_train.nunique() < 2 or y_val.nunique() < 2:
-        return None
-
-    result = system.train(x_train_fold, y_train, x_val_fold, y_val, profile=profile, symbol=symbol)
-    if not result:
-        return None
-
-    model, scaler, iso, *_ = result
     y_test_raw = system.create_labels(ohlcv, test_feat, profile=profile).dropna()
-    X_test_raw = test_feat.loc[y_test_raw.index, cols]
-    X_test, y_test = system.prepare_binary_training_set(X_test_raw, y_test_raw)
-    if len(y_test) < 20 or y_test.nunique() < 2:
+    if len(y_test_raw) < 20 or y_test_raw.nunique() < 2:
         return None
-    raw_probs = model.predict_proba(scaler.transform(X_test))[:, 1]
-    probs = calibrator_predict(iso, raw_probs)
 
-    model_quality = _score_model_quality(probs, y_test)
-    label_quality = _score_label_quality(y_train, y_test)
+    ensemble_probs = []
+    y_test = []
+    for ts, yv in y_test_raw.items():
+        row = test_feat.loc[ts]
+        probs = []
+        for m in member_models:
+            x_in = np.nan_to_num(np.array([row.get(c, 0.0) for c in m['cols']], dtype=float).reshape(1, -1), nan=0.0)
+            raw_prob = m['model'].predict_proba(m['scaler'].transform(x_in))[0, 1]
+            probs.append(float(_calibrator_predict(m['calibrator'], np.array([raw_prob]))[0]))
+        if probs:
+            ensemble_probs.append(float(np.mean(probs)))
+            y_test.append(int(yv))
 
-    test_idx = test_feat.index.intersection(ohlcv.index)
-    if len(test_idx) < 24:
+    if len(ensemble_probs) < 20 or len(set(y_test)) < 2:
         return None
+
+    model_quality = _score_model_quality(np.array(ensemble_probs, dtype=float), pd.Series(y_test))
+    label_quality = _score_label_quality(pd.Series(y_test), pd.Series(y_test))
 
     gate_counts: Dict[str, int] = {}
-
     def _gate(reason: str):
         gate_counts[reason] = gate_counts.get(reason, 0) + 1
 
-    cooldown_hours = max(float(profile.cooldown_hours), 0.0)
+    bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(resolved_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
+    cooldown_hours = max(float(profile.cooldown_hours) * float(bucket_prior.get('cooldown_scale', 1.0)), 0.0)
     last_entry_ts = None
     label_horizon = max(1, int(resolve_label_horizon(profile, config)))
     effective_threshold = resolve_param('signal_threshold', profile, config, Config.signal_threshold, mode='direct')
@@ -704,8 +753,10 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     effective_max_ensemble_std = resolve_param('max_ensemble_std', profile, config, Config.max_ensemble_std, mode='direct')
     effective_momentum = resolve_param('min_momentum_magnitude', profile, config, Config.min_momentum_magnitude, mode='direct')
 
-    ohlcv_ts = ohlcv
     trade_returns: List[float] = []
+    agreement_values: List[float] = []
+    std_values: List[float] = []
+    test_idx = test_feat.index.intersection(ohlcv.index)
 
     for ts in test_idx:
         if last_entry_ts is not None and cooldown_hours > 0:
@@ -714,14 +765,14 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
                 continue
 
         row = features.loc[ts]
-        ohlcv_row = ohlcv_ts.loc[ts]
+        ohlcv_row = ohlcv.loc[ts]
         price = float(ohlcv_row.get('close', np.nan))
         sma_200 = ohlcv_row.get('sma_200', np.nan)
         if pd.isna(price) or pd.isna(sma_200):
             _gate('missing_sma200')
             continue
 
-        vol_24h = ohlcv_ts['close'].pct_change().rolling(24).std().get(ts, None)
+        vol_24h = ohlcv['close'].pct_change().rolling(24).std().get(ts, None)
         if vol_24h is None or pd.isna(vol_24h) or float(vol_24h) < profile.min_vol_24h:
             _gate('vol_regime_low')
             continue
@@ -729,18 +780,18 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             _gate('vol_regime_high')
             continue
 
-        ts_loc = ohlcv_ts.index.get_loc(ts)
+        ts_loc = ohlcv.index.get_loc(ts)
         if ts_loc < 72:
             _gate('momentum_magnitude')
             continue
 
-        ret_24h = (price / ohlcv_ts['close'].iloc[ts_loc - 24] - 1)
-        ret_72h = (price / ohlcv_ts['close'].iloc[ts_loc - 72] - 1)
+        ret_24h = (price / ohlcv['close'].iloc[ts_loc - 24] - 1)
+        ret_72h = (price / ohlcv['close'].iloc[ts_loc - 72] - 1)
         if abs(ret_72h) < effective_momentum:
             _gate('momentum_magnitude')
             continue
 
-        sma_50 = ohlcv_ts['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
+        sma_50 = ohlcv['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
         strategy_context = _build_strategy_context(row, price, sma_200, ret_24h, ret_72h, sma_50, vol_24h=float(vol_24h))
         strategy_decision = strategy_family.evaluate(
             strategy_context,
@@ -770,57 +821,60 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             continue
         size_multiplier *= float(funding_effect.size_multiplier)
 
-        x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0)
-        raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
-        cal_prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
-        directional_votes = [1 if (cal_prob >= 0.5 and direction == 1) or (cal_prob < 0.5 and direction == -1) else 0]
-        probs = [cal_prob]
+        probs: List[float] = []
+        directional_votes: List[int] = []
+        meta_probs: List[float] = []
+        for m in member_models:
+            x_in = np.nan_to_num(np.array([row.get(c, 0.0) for c in m['cols']], dtype=float).reshape(1, -1), nan=0.0)
+            raw_prob = m['model'].predict_proba(m['scaler'].transform(x_in))[0, 1]
+            cal_prob = float(_calibrator_predict(m['calibrator'], np.array([raw_prob]))[0])
+            probs.append(cal_prob)
+            directional_votes.append(1 if (cal_prob >= 0.5 and direction == 1) or (cal_prob < 0.5 and direction == -1) else 0)
+            meta_artifacts = m['meta']
+            if cal_prob >= primary_cutoff and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
+                meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
+                if meta_artifacts.calibrator is not None:
+                    meta_probs.append(float(calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0]))
+                else:
+                    meta_probs.append(float(meta_raw))
 
-        agreement = float(np.mean(directional_votes))
+        if not probs:
+            continue
+        agreement = float(np.mean(directional_votes)) if directional_votes else 0.0
+        prob = float(np.mean(probs))
+        prob_std = float(np.std(probs))
+        agreement_values.append(agreement)
+        std_values.append(prob_std)
+
         if agreement < effective_directional_agreement:
             _gate('ensemble_agreement')
             continue
 
-        prob = float(np.mean(probs))
-        prob_std = float(np.std(probs))
         if agreement < 0.999:
             prob = min(prob, config.disagreement_confidence_cap)
         if prob < primary_cutoff or prob_std > effective_max_ensemble_std:
             _gate('primary_threshold' if prob < primary_cutoff else 'ensemble_std')
             continue
 
-        if meta_artifacts.model is None or meta_artifacts.scaler is None:
+        if not meta_probs:
             _gate('meta_threshold')
             continue
-        meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
-        if meta_artifacts.calibrator is not None:
-            meta_prob = float(calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0])
-        else:
-            meta_prob = float(meta_raw)
-        if meta_prob < effective_meta_threshold:
+        if float(np.mean(meta_probs)) < effective_meta_threshold:
             _gate('meta_threshold')
             continue
 
-        n_contracts = calculate_n_contracts(
-            100_000,
-            price,
-            symbol,
-            config,
-            vol_24h=float(vol_24h),
-            profile=profile,
-        )
+        n_contracts = calculate_n_contracts(100_000, price, symbol, config, vol_24h=float(vol_24h), profile=profile)
         n_contracts = int(np.floor(n_contracts * size_multiplier))
         if n_contracts < 1:
             _gate('no_contract_size')
             continue
 
         exit_loc = ts_loc + label_horizon
-        if exit_loc >= len(ohlcv_ts):
+        if exit_loc >= len(ohlcv):
             continue
 
-        exit_price = float(ohlcv_ts['close'].iloc[exit_loc])
-        trade_ret = float(((exit_price / price) - 1.0) * direction)
-        trade_returns.append(trade_ret)
+        exit_price = float(ohlcv['close'].iloc[exit_loc])
+        trade_returns.append(float(((exit_price / price) - 1.0) * direction))
         last_entry_ts = ts
 
     fold_trades = int(len(trade_returns))
@@ -842,6 +896,8 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             'sharpe': sharpe,
             'return': fold_return,
             'expectancy': expectancy,
+            'ensemble_agreement_mean': float(np.mean(agreement_values)) if agreement_values else 0.0,
+            'ensemble_std_mean': float(np.mean(std_values)) if std_values else 0.0,
         },
         'gate_counters': _summarize_fold_gate_counters(gate_counts, total_checks=len(test_idx)),
     }
@@ -873,6 +929,8 @@ def objective(
         'min_train_samples': 100,
         'signal_threshold': 0.50,
     })
+    config.strategy_family = profile.strategy_family
+    config.trade_freq_bucket = profile.trade_freq_bucket
 
     features = optim_data[target_sym]['features']
     ohlcv = optim_data[target_sym]['ohlcv']
@@ -2053,23 +2111,6 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         },
     }
 
-    if holdout_passed:
-        paper_candidate_payload = {
-            'coin': coin_name,
-            'evaluated_params': effective_best_params,
-            'holdout_metrics': holdout_result or {},
-            'holdout_passed': True,
-            'holdout_gate_result': 'pass',
-            'run_id': run_id,
-            'study_name': study_name,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'research_confidence_tier': research_confidence_tier,
-            'gate_profile': gate_profile,
-        }
-        paper_candidate_path = _persist_paper_candidate_json(coin_name, paper_candidate_payload)
-        if paper_candidate_path:
-            print(f"  📄 Paper candidate artifact: {paper_candidate_path}")
-
     completed_trials_for_diag = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
@@ -2359,6 +2400,35 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
     p = _persist_result_json(coin_name, best_seed_result)
     if p:
         print(f"  💾 Consensus result saved to {p}")
+
+    final_tier = str(best_seed_result.get('research_confidence_tier') or '')
+    if (
+        not bool(best_seed_result.get('deployment_blocked', False))
+        and _passes_holdout_gate(
+            best_seed_result.get('holdout_metrics', {}),
+            min_trades=holdout_min_trades,
+            min_sharpe=holdout_min_sharpe,
+            min_return=holdout_min_return,
+            min_psr_holdout=min_psr_holdout,
+            min_dsr=min_dsr,
+        )
+        and final_tier in {'PAPER_QUALIFIED', 'PROMOTION_READY'}
+    ):
+        paper_candidate_payload = {
+            'coin': coin_name,
+            'evaluated_params': best_seed_result['params'],
+            'holdout_metrics': best_seed_result['holdout_metrics'],
+            'holdout_passed': True,
+            'holdout_gate_result': 'pass',
+            'run_id': best_seed_result.get('run_id'),
+            'study_name': best_seed_result.get('meta', {}).get('study_name') or best_seed_result.get('study_name'),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'research_confidence_tier': final_tier,
+            'gate_profile': best_seed_result.get('gate_profile', {}),
+        }
+        paper_candidate_path = _persist_paper_candidate_json(coin_name, paper_candidate_payload)
+        if paper_candidate_path:
+            print(f"  📄 Final paper candidate artifact: {paper_candidate_path}")
 
     return best_seed_result
 
