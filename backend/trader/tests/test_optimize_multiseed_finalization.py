@@ -142,3 +142,33 @@ def test_multiseed_artifact_requires_pass_not_blocked_and_min_tier(monkeypatch):
 
     assert result is not None
     assert artifact_payloads == []
+
+
+def test_aggregate_multiseed_respects_emit_artifacts_flag(monkeypatch):
+    seed_result = {
+        "coin": "BTC",
+        "optim_score": 1.0,
+        "params": {"signal_threshold": 0.7},
+        "holdout_metrics": {"holdout_sharpe": 0.4, "holdout_trades": 20, "holdout_return": 0.02},
+        "deployment_blocked": False,
+        "selection_meta": {},
+        "research_confidence_tier": "PAPER_QUALIFIED",
+    }
+
+    persisted = {"result": 0, "paper": 0}
+    monkeypatch.setattr(optimize, "_persist_result_json", lambda *_args, **_kwargs: persisted.__setitem__("result", persisted["result"] + 1))
+    monkeypatch.setattr(optimize, "_persist_paper_candidate_json", lambda *_args, **_kwargs: persisted.__setitem__("paper", persisted["paper"] + 1))
+
+    out = optimize.aggregate_multiseed_results(
+        coin_name="BTC",
+        seeds=[1],
+        run_results=[seed_result],
+        holdout_min_trades=8,
+        holdout_min_sharpe=-0.1,
+        holdout_min_return=-0.05,
+        emit_artifacts=False,
+    )
+
+    assert out is not None
+    assert persisted["result"] == 0
+    assert persisted["paper"] == 0
