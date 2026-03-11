@@ -715,6 +715,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     if len(member_models) < 2:
         return None
 
+    y_train_label_quality = system.create_labels(ohlcv, train_feat, profile=profile).dropna()
     y_test_raw = system.create_labels(ohlcv, test_feat, profile=profile).dropna()
     if len(y_test_raw) < 20 or y_test_raw.nunique() < 2:
         return None
@@ -735,8 +736,9 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     if len(ensemble_probs) < 20 or len(set(y_test)) < 2:
         return None
 
-    model_quality = _score_model_quality(np.array(ensemble_probs, dtype=float), pd.Series(y_test))
-    label_quality = _score_label_quality(pd.Series(y_test), pd.Series(y_test))
+    y_test_series = pd.Series(y_test)
+    model_quality = _score_model_quality(np.array(ensemble_probs, dtype=float), y_test_series)
+    label_quality = _score_label_quality(y_train_label_quality, y_test_series)
 
     gate_counts: Dict[str, int] = {}
     def _gate(reason: str):
