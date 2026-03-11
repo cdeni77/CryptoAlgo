@@ -817,7 +817,18 @@ def objective(
 
     fold_metrics = [f.get('fold_metrics', {}) for f in fold_scores]
     fold_gate_counters = [f.get('gate_counters', {}) for f in fold_scores]
+    fold_metrics_with_gates = [
+        {
+            'trades': int((metric or {}).get('trades', 0) or 0),
+            'sharpe': _finite_metric((metric or {}).get('sharpe'), 0.0),
+            'return': _finite_metric((metric or {}).get('return'), 0.0),
+            'expectancy': _finite_metric((metric or {}).get('expectancy'), 0.0),
+            'gate_counters': gate if isinstance(gate, dict) else {},
+        }
+        for metric, gate in zip(fold_metrics, fold_gate_counters)
+    ]
     fold_trade_counts = [int(m.get('trades', 0) or 0) for m in fold_metrics]
+    fold_sharpes = [_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]
 
     realized_sharpe = float(np.mean([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]))
     realized_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in fold_metrics]))
@@ -846,9 +857,29 @@ def objective(
     trial.set_user_attr('std_sharpe', round(float(np.std([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics])) if fold_metrics else 0.0, 6))
     trial.set_user_attr('win_rate', round(float(np.mean([1.0 if _finite_metric(m.get('expectancy'), 0.0) > 0 else 0.0 for m in fold_metrics])) if fold_metrics else 0.0, 4))
     trial.set_user_attr('max_drawdown', round(max(0.0, 1.0 - max(realized_return, -1.0)), 4))
-    trial.set_user_attr('fold_metrics', _to_json_safe(fold_metrics))
+    psr_meta = compute_psr_from_samples(
+        fold_sharpes,
+        benchmark_sharpe=0.0,
+        effective_observations=len(fold_sharpes),
+    )
+    if not psr_meta.get('valid', False) and psr_meta.get('reason') is None:
+        psr_meta['reason'] = 'insufficient_observations'
+
+    dsr_cv_meta = compute_deflated_sharpe_metric(
+        observed_sharpe=float(np.mean(fold_sharpes)) if fold_sharpes else 0.0,
+        observations=len(fold_sharpes),
+        effective_test_count=max(len(cv_splits), len(fold_sharpes), 1),
+    )
+    if not dsr_cv_meta.get('valid', False) and dsr_cv_meta.get('reason') is None:
+        dsr_cv_meta['reason'] = 'insufficient_observations'
+
+    trial.set_user_attr('fold_metrics', _to_json_safe(fold_metrics_with_gates))
     trial.set_user_attr('fold_gate_counters', _to_json_safe(fold_gate_counters))
     trial.set_user_attr('fold_trade_counts', _to_json_safe(fold_trade_counts))
+    trial.set_user_attr('psr_meta', _to_json_safe(psr_meta))
+    trial.set_user_attr('psr', float(psr_meta['psr']) if psr_meta.get('valid', False) else None)
+    trial.set_user_attr('dsr_cv_meta', _to_json_safe(dsr_cv_meta))
+    trial.set_user_attr('dsr_cv', float(dsr_cv_meta['dsr']) if dsr_cv_meta.get('valid', False) else None)
     trial.set_user_attr('realized_return', round(realized_return, 6))
     trial.set_user_attr('realized_expectancy', round(realized_expectancy, 6))
     trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
@@ -1806,15 +1837,21 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         min_psr_holdout=min_psr_holdout,
         min_dsr=min_dsr,
     ) if holdout_result else False
-    cv_psr_metric = {
-        'valid': bool(best.user_attrs.get('psr_meta')),
-        'psr': _as_number(best.user_attrs.get('psr'), 0.0) or 0.0,
+    cv_psr_metric = best.user_attrs.get('psr_meta') if isinstance(best.user_attrs.get('psr_meta'), dict) else {
+        'valid': False,
+        'psr': None,
+        'reason': 'insufficient_observations',
+    }
+    cv_dsr_metric = best.user_attrs.get('dsr_cv_meta') if isinstance(best.user_attrs.get('dsr_cv_meta'), dict) else {
+        'valid': False,
+        'dsr': None,
+        'reason': 'insufficient_observations',
     }
     holdout_psr_metric = (holdout_result or {}).get('psr_holdout') if isinstance(holdout_result, dict) else None
     significance_gates = evaluate_significance_gates(
         psr_cv=cv_psr_metric,
         psr_holdout=holdout_psr_metric if isinstance(holdout_psr_metric, dict) else None,
-        dsr=dsr,
+        dsr=cv_dsr_metric,
         min_psr_cv=min_psr_cv if min_psr_cv is not None else min_psr,
         min_psr_holdout=min_psr_holdout,
         min_dsr=min_dsr,
@@ -1960,7 +1997,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'embargo_bars': None if embargo_bars is None else int(embargo_bars),
             'embargo_frac': float(embargo_frac or 0.0),
         },
-        'deflated_sharpe': dsr, 'psr_cv': cv_psr_metric, 'psr_holdout': holdout_psr_metric or {},
+        'deflated_sharpe': dsr, 'dsr_cv': cv_dsr_metric, 'psr_cv': cv_psr_metric, 'psr_holdout': holdout_psr_metric or {},
         'significance_gates': significance_gates, 'version': 'v11.3', 'timestamp': datetime.now().isoformat(),
         'cost_model': cost_model_metadata,
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
