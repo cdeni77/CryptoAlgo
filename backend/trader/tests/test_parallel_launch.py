@@ -1,6 +1,8 @@
 from argparse import Namespace
+import inspect
 import json
 
+from scripts import optimize
 from scripts import parallel_launch
 
 
@@ -89,6 +91,13 @@ def test_optimize_single_forwards_flags(monkeypatch) -> None:
     assert captured["proxy_fidelity_eval_days"] == 21
 
 
+
+
+def test_optimize_coin_signature_supports_parallel_forwarded_proxy_args() -> None:
+    signature = inspect.signature(optimize.optimize_coin)
+    assert "proxy_fidelity_candidates" in signature.parameters
+    assert "proxy_fidelity_eval_days" in signature.parameters
+
 def test_worker_failure_isolation(monkeypatch) -> None:
     def _fake_optimize_coin_multiseed(_all_data, **kwargs):
         if kwargs.get("coin_name") == "ETH":
@@ -105,6 +114,51 @@ def test_worker_failure_isolation(monkeypatch) -> None:
     assert eth["success"] is False
     assert "RuntimeError" in eth["error"]
 
+
+
+
+def test_parallel_optimize_forwarded_kwargs_are_supported_downstream() -> None:
+    config_to_optimize = {
+        "trials": "n_trials",
+        "jobs": "n_jobs",
+        "n_cv_folds": "n_cv_folds",
+        "holdout_mode": "holdout_mode",
+        "holdout_days": "holdout_days",
+        "plateau_patience": "plateau_patience",
+        "plateau_min_delta": "plateau_min_delta",
+        "plateau_warmup": "plateau_warmup",
+        "plateau_min_completed": "plateau_min_completed",
+        "min_total_trades": "min_total_trades",
+        "holdout_min_trades": "holdout_min_trades",
+        "holdout_min_sharpe": "holdout_min_sharpe",
+        "holdout_min_return": "holdout_min_return",
+        "target_trades_per_week": "target_trades_per_week",
+        "target_trades_per_year": "target_trades_per_year",
+        "require_holdout_pass": "require_holdout_pass",
+        "gate_mode": "gate_mode",
+        "resume_study": "resume_study",
+        "min_psr": "min_psr",
+        "min_psr_cv": "min_psr_cv",
+        "min_psr_holdout": "min_psr_holdout",
+        "min_dsr": "min_dsr",
+        "seed_stability_min_pass_rate": "seed_stability_min_pass_rate",
+        "seed_stability_max_param_dispersion": "seed_stability_max_param_dispersion",
+        "seed_stability_max_oos_sharpe_dispersion": "seed_stability_max_oos_sharpe_dispersion",
+        "cv_mode": "cv_mode",
+        "purge_days": "purge_days",
+        "purge_bars": "purge_bars",
+        "embargo_days": "embargo_days",
+        "embargo_bars": "embargo_bars",
+        "embargo_frac": "embargo_frac",
+        "pruned_only": "pruned_only",
+        "preset_name": "preset_name",
+        "cost_config_path": "cost_config_path",
+        "proxy_fidelity_candidates": "proxy_fidelity_candidates",
+        "proxy_fidelity_eval_days": "proxy_fidelity_eval_days",
+    }
+    optimize_params = set(inspect.signature(optimize.optimize_coin).parameters.keys())
+    for expected_param in config_to_optimize.values():
+        assert expected_param in optimize_params
 
 def test_manifest_writing(tmp_path) -> None:
     args = Namespace(
