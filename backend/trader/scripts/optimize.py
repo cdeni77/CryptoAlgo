@@ -407,6 +407,8 @@ def create_trial_profile(trial, coin_name):
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
         learning_rate=FIXED_ML['learning_rate'], min_child_samples=FIXED_ML['min_child_samples'],
+        strategy_family=strategy_family,
+        trade_freq_bucket=trade_freq_bucket,
     )
 
 
@@ -466,6 +468,8 @@ def profile_from_params(params, coin_name):
         max_depth=effective_params['max_depth'],
         learning_rate=effective_params['learning_rate'],
         min_child_samples=effective_params['min_child_samples'],
+        strategy_family=effective_params['strategy_family'],
+        trade_freq_bucket=effective_params['trade_freq_bucket'],
     )
 
 
