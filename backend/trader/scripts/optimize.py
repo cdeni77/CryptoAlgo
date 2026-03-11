@@ -798,10 +798,37 @@ def objective(
     ohlcv = optim_data[target_sym]['ohlcv']
     fold_scores = []
 
-    for fold in cv_splits:
+    for fold_idx, fold in enumerate(cv_splits):
         result = evaluate_fold_with_execution_gates(features, ohlcv, fold, profile, config, target_sym, pruned_only=pruned_only)
         if result is not None:
             fold_scores.append(result)
+            partial_model_q = float(np.mean([f['model_quality']['score'] for f in fold_scores]))
+            partial_label_q = float(np.mean([f['label_quality']['score'] for f in fold_scores]))
+            partial_consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores])
+            partial_metrics = [f.get('fold_metrics', {}) for f in fold_scores]
+            partial_sharpe = float(np.mean([_finite_metric(m.get('sharpe'), 0.0) for m in partial_metrics]))
+            partial_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in partial_metrics]))
+            partial_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in partial_metrics]))
+
+            partial_combined = (
+                0.25 * partial_model_q +
+                0.20 * partial_label_q +
+                0.15 * partial_consistency['score'] +
+                0.25 * partial_sharpe +
+                0.10 * partial_expectancy +
+                0.05 * np.tanh(partial_return * 5.0)
+            )
+            trial.report(float(partial_combined), step=int(fold_idx))
+
+            if trial.should_prune():
+                trial.set_user_attr('reject_stage', 'cv_fold')
+                trial.set_user_attr('reject_code', str(ReasonCode.PRUNED.value))
+                trial.set_user_attr('reject_reason', f'optuna_pruner:fold_{fold_idx}')
+                trial.set_user_attr('prune_source', 'optuna_pruner')
+                trial.set_user_attr('prune_fold_idx', int(fold_idx))
+                trial.set_user_attr('n_folds', int(len(fold_scores)))
+                trial.set_user_attr('prune_intermediate_value', round(float(partial_combined), 6))
+                raise optuna.TrialPruned(f'pruned_at_fold_{fold_idx}')
 
     min_required_folds = max(1, len(cv_splits) // 3)
     if len(fold_scores) < min_required_folds:
@@ -1509,6 +1536,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
 
     study_name = f"optimize_{coin_name}{'_' + study_suffix if study_suffix else ''}"
     sampler = TPESampler(seed=sampler_seed, n_startup_trials=min(10, n_trials // 3))
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=max(8, min(30, n_trials // 5)),
+        n_warmup_steps=1,
+        interval_steps=1,
+    )
     study = None
     storage_url = _sqlite_url(_db_path())
     storage = optuna.storages.RDBStorage(
@@ -1524,6 +1556,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 study = optuna.create_study(
                     direction='maximize',
                     sampler=sampler,
+                    pruner=pruner,
                     study_name=study_name,
                     storage=storage,
                     load_if_exists=bool(resume_study),
@@ -1534,7 +1567,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
                 if resume_study:
                     with _study_storage_lock(_db_path()):
-                        study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler)
+                        study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler, pruner=pruner)
                     break
                 raise RuntimeError(
                     f"Study '{study_name}' already exists but --resume was not set. "
