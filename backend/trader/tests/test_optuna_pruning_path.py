@@ -115,3 +115,67 @@ def test_objective_keeps_significance_invalid_when_observations_are_missing(monk
     assert trial.user_attrs["psr_meta"]["reason"] == "insufficient_observations"
     assert trial.user_attrs["dsr_cv_meta"]["valid"] is False
     assert trial.user_attrs["dsr_cv_meta"]["reason"] == "insufficient_observations"
+
+
+def _objective_value_for_fold_metrics(monkeypatch, fold_metrics):
+    trial = _TrialStub(should_prune_after_report=False)
+    idx = pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC")
+    optim_data = {"SYM": {"features": pd.DataFrame(index=idx), "ohlcv": pd.DataFrame(index=idx)}}
+
+    monkeypatch.setattr(
+        optimize,
+        "evaluate_fold_with_execution_gates",
+        lambda *_a, **_k: {
+            "model_quality": {"score": 0.2, "auc": 0.58},
+            "label_quality": {"score": 0.1},
+            "fold_metrics": dict(fold_metrics),
+            "gate_counters": {},
+        },
+    )
+
+    value = optimize.objective(
+        trial,
+        optim_data=optim_data,
+        coin_prefix="BIP",
+        coin_name="BTC",
+        cv_splits=[_dummy_fold(), _dummy_fold()],
+        target_sym="SYM",
+    )
+    return float(value), trial.user_attrs
+
+
+def test_objective_bounds_absurd_low_trade_sharpe(monkeypatch):
+    value, attrs = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"raw_sharpe": 171_691_641.0, "sharpe": 0.0, "return": 0.01, "expectancy": 0.01, "trades": 1},
+    )
+
+    assert abs(value) < 1.0
+    assert attrs["n_trades"] == 2
+    assert attrs["realized_sharpe_term"] <= 1.0
+
+
+def test_tiny_trade_count_trial_does_not_dominate_stable_trial(monkeypatch):
+    tiny_value, _ = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"raw_sharpe": 171_691_641.0, "sharpe": 0.0, "return": 0.01, "expectancy": 0.01, "trades": 1},
+    )
+    stable_value, _ = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"sharpe": 1.2, "return": 0.02, "expectancy": 0.015, "trades": 8},
+    )
+
+    assert stable_value > tiny_value
+
+
+def test_normal_trials_remain_rankable_after_sharpe_bounding(monkeypatch):
+    weak_value, _ = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"sharpe": 0.2, "return": 0.01, "expectancy": 0.005, "trades": 8},
+    )
+    strong_value, _ = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"sharpe": 1.0, "return": 0.02, "expectancy": 0.012, "trades": 8},
+    )
+
+    assert strong_value > weak_value

@@ -214,6 +214,10 @@ def _finite_metric(value, default=0.0):
     n = _as_number(value, default=default)
     return default if (n is None or not np.isfinite(n)) else float(n)
 
+
+def _bounded_sharpe_term(sharpe_value: float, scale: float = 2.0) -> float:
+    return float(np.tanh(_finite_metric(sharpe_value, 0.0) / max(float(scale), 1e-9)))
+
 def _fmt_pct(v, d=1, fb="?"): n = _as_number(v); return f"{n:.{d}%}" if n is not None else fb
 def _fmt_float(v, d=3, fb="?"): n = _as_number(v); return f"{n:.{d}f}" if n is not None else fb
 
@@ -901,10 +905,15 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         arr = np.array(trade_returns, dtype=float)
         fold_return = float(np.prod(1.0 + arr) - 1.0)
         expectancy = float(np.mean(arr))
-        sharpe = float((np.mean(arr) / max(np.std(arr), 1e-9)) * np.sqrt(fold_trades))
+        raw_sharpe = float((np.mean(arr) / max(np.std(arr), 1e-9)) * np.sqrt(fold_trades))
+        if fold_trades < 3:
+            sharpe = 0.0
+        else:
+            sharpe = float(np.clip(raw_sharpe, -3.0, 3.0))
     else:
         fold_return = 0.0
         expectancy = 0.0
+        raw_sharpe = 0.0
         sharpe = 0.0
 
     return {
@@ -912,6 +921,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         'label_quality': label_quality,
         'fold_metrics': {
             'trades': fold_trades,
+            'raw_sharpe': raw_sharpe,
             'sharpe': sharpe,
             'return': fold_return,
             'expectancy': expectancy,
@@ -964,6 +974,7 @@ def objective(
             partial_consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores])
             partial_metrics = [f.get('fold_metrics', {}) for f in fold_scores]
             partial_sharpe = float(np.mean([_finite_metric(m.get('sharpe'), 0.0) for m in partial_metrics]))
+            partial_sharpe_term = _bounded_sharpe_term(partial_sharpe)
             partial_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in partial_metrics]))
             partial_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in partial_metrics]))
 
@@ -971,7 +982,7 @@ def objective(
                 0.25 * partial_model_q +
                 0.20 * partial_label_q +
                 0.15 * partial_consistency['score'] +
-                0.25 * partial_sharpe +
+                0.25 * partial_sharpe_term +
                 0.10 * partial_expectancy +
                 0.05 * np.tanh(partial_return * 5.0)
             )
@@ -1004,6 +1015,7 @@ def objective(
     fold_metrics_with_gates = [
         {
             'trades': int((metric or {}).get('trades', 0) or 0),
+            'raw_sharpe': _finite_metric((metric or {}).get('raw_sharpe', (metric or {}).get('sharpe')), 0.0),
             'sharpe': _finite_metric((metric or {}).get('sharpe'), 0.0),
             'return': _finite_metric((metric or {}).get('return'), 0.0),
             'expectancy': _finite_metric((metric or {}).get('expectancy'), 0.0),
@@ -1013,8 +1025,11 @@ def objective(
     ]
     fold_trade_counts = [int(m.get('trades', 0) or 0) for m in fold_metrics]
     fold_sharpes = [_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]
+    fold_raw_sharpes = [_finite_metric(m.get('raw_sharpe', m.get('sharpe')), 0.0) for m in fold_metrics]
 
     realized_sharpe = float(np.mean([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]))
+    realized_sharpe_raw = float(np.mean(fold_raw_sharpes)) if fold_raw_sharpes else 0.0
+    realized_sharpe_term = _bounded_sharpe_term(realized_sharpe)
     realized_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in fold_metrics]))
     realized_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in fold_metrics]))
     realized_trades = int(sum(fold_trade_counts))
@@ -1023,7 +1038,7 @@ def objective(
         0.25 * model_q +
         0.20 * label_q +
         0.15 * consistency['score'] +
-        0.25 * realized_sharpe +
+        0.25 * realized_sharpe_term +
         0.10 * realized_expectancy +
         0.05 * np.tanh(realized_return * 5.0)
     )
@@ -1037,6 +1052,8 @@ def objective(
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
     trial.set_user_attr('n_trades', int(realized_trades))
     trial.set_user_attr('mean_sharpe', round(realized_sharpe, 6))
+    trial.set_user_attr('mean_sharpe_raw', round(realized_sharpe_raw, 6))
+    trial.set_user_attr('realized_sharpe_term', round(realized_sharpe_term, 6))
     trial.set_user_attr('min_sharpe', round(float(min([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics] or [0.0])), 6))
     trial.set_user_attr('std_sharpe', round(float(np.std([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics])) if fold_metrics else 0.0, 6))
     trial.set_user_attr('win_rate', round(float(np.mean([1.0 if _finite_metric(m.get('expectancy'), 0.0) > 0 else 0.0 for m in fold_metrics])) if fold_metrics else 0.0, 4))
