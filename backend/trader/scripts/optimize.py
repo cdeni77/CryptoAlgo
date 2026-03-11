@@ -537,6 +537,21 @@ def _score_label_quality(y_train: pd.Series, y_test: pd.Series) -> dict:
     }
 
 
+def _normalize_triple_barrier_labels(labels: pd.Series) -> pd.Series:
+    """Normalize triple-barrier labels {-1, 0, 1} into binary {0, 1}.
+
+    Neutral labels (0) are removed and direction labels are remapped
+    from {-1, 1} to {0, 1}. If the input does not contain short-class
+    labels (-1), values are returned unchanged apart from NaN dropping.
+    """
+    clean = labels.dropna()
+    if clean.empty:
+        return clean
+    if (clean == -1).any():
+        return clean.loc[clean != 0].map({-1: 0, 1: 1}).dropna().astype(int)
+    return clean.astype(int)
+
+
 def _score_fold_consistency(fold_aucs: list[float]) -> dict:
     if len(fold_aucs) < 2:
         return {'score': 0.5}
@@ -715,14 +730,16 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     if len(member_models) < 2:
         return None
 
-    y_train_label_quality = system.create_labels(ohlcv, train_feat, profile=profile).dropna()
+    y_train_label_quality_raw = system.create_labels(ohlcv, train_feat, profile=profile).dropna()
+    y_train_label_quality = _normalize_triple_barrier_labels(y_train_label_quality_raw)
     y_test_raw = system.create_labels(ohlcv, test_feat, profile=profile).dropna()
     if len(y_test_raw) < 20 or y_test_raw.nunique() < 2:
         return None
+    y_test_binary = _normalize_triple_barrier_labels(y_test_raw)
 
     ensemble_probs = []
     y_test = []
-    for ts, yv in y_test_raw.items():
+    for ts, yv in y_test_binary.items():
         row = test_feat.loc[ts]
         probs = []
         for m in member_models:
