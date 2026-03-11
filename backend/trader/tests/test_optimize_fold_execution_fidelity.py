@@ -128,3 +128,53 @@ def test_fold_evaluator_uses_profile_categoricals_and_nontrivial_ensemble(monkey
     breakout_metrics = breakout_result["fold_metrics"]
     assert breakout_metrics["ensemble_agreement_mean"] < 1.0
     assert "ensemble_std_mean" in breakout_metrics
+
+
+class _FakeMLSystemTernary(_FakeMLSystem):
+    def create_labels(self, _ohlcv, feat, profile=None):
+        pattern = np.array([-1, 0, 1], dtype=int)
+        y = np.resize(pattern, len(feat))
+        return pd.Series(y, index=feat.index)
+
+    def prepare_binary_training_set(self, x, y):
+        y_bin = y.loc[y != 0].map({-1: 0, 1: 1})
+        x_bin = x.loc[y_bin.index]
+        return x_bin, y_bin.astype(int)
+
+
+def test_fold_evaluator_normalizes_ternary_labels_before_auc(monkeypatch):
+    features, ohlcv = _make_market_data()
+    idx = features.index
+    fold = optimize.CVFold(
+        train_idx=idx[:150],
+        test_idx=idx[150:],
+        train_end=idx[149],
+        test_start=idx[150],
+        test_end=idx[-1],
+        purge_bars=0,
+        embargo_bars=0,
+    )
+
+    monkeypatch.setattr(optimize, "MLSystem", _FakeMLSystemTernary)
+    monkeypatch.setattr(optimize, "fit_transform_fold", lambda x_tr, x_val, _y: (x_tr, x_val, None))
+    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m2")])
+    monkeypatch.setattr(optimize, "get_strategy_family", lambda family_name: _FakeStrategyFamily(family_name))
+    monkeypatch.setattr(optimize, "calculate_n_contracts", lambda *_a, **_k: 2)
+
+    captured = {}
+
+    original_score_model_quality = optimize._score_model_quality
+
+    def _capturing_score_model_quality(probs, y_test):
+        captured["labels"] = sorted(set(int(v) for v in y_test.tolist()))
+        return original_score_model_quality(probs, y_test)
+
+    monkeypatch.setattr(optimize, "_score_model_quality", _capturing_score_model_quality)
+
+    profile = COIN_PROFILES["BTC"]
+    cfg = optimize.Config(min_train_samples=50, val_fraction=0.2, trend_filter_mode="hard", funding_filter_mode="off")
+
+    result = optimize.evaluate_fold_with_execution_gates(features, ohlcv, fold, profile, cfg, "BIP-20DEC30-CDE", pruned_only=False)
+
+    assert result is not None
+    assert captured["labels"] == [0, 1]
