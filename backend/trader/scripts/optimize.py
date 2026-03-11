@@ -1444,6 +1444,17 @@ def _persist_result_json(coin_name, data):
         except: continue
     return None
 
+
+def _persist_paper_candidate_json(coin_name: str, payload: Dict) -> Optional[Path]:
+    target_dir = Path("data") / "paper_candidates"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / f"{coin_name.lower()}.json"
+        target_path.write_text(json.dumps(_to_json_safe(payload), indent=2), encoding='utf-8')
+        return target_path
+    except Exception:
+        return None
+
 def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
                   plateau_min_completed=0,
@@ -1921,6 +1932,38 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'max_oos_sharpe_dispersion': float(seed_stability_max_oos_sharpe_dispersion),
     }
 
+    gate_profile = {
+        'mode': gate_mode,
+        'screen_threshold': float(resolve_gate_mode(gate_mode).get('screen_threshold', 38.0)),
+        'holdout_min_trades': int(holdout_min_trades),
+        'holdout_min_sharpe': float(holdout_min_sharpe),
+        'holdout_min_return': float(holdout_min_return),
+        'min_psr_cv': float(min_psr_cv) if min_psr_cv is not None else float(min_psr),
+        'min_psr_holdout': None if min_psr_holdout is None else float(min_psr_holdout),
+        'min_dsr': None if min_dsr is None else float(min_dsr),
+        'escalation_policy': {
+            'window_days': '14-28',
+            'action': 'Tighten thresholds and switch to production_promotion after stable paper evidence.',
+        },
+    }
+
+    if holdout_passed:
+        paper_candidate_payload = {
+            'coin': coin_name,
+            'evaluated_params': effective_best_params,
+            'holdout_metrics': holdout_result or {},
+            'holdout_passed': True,
+            'holdout_gate_result': 'pass',
+            'run_id': run_id,
+            'study_name': study_name,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'research_confidence_tier': research_confidence_tier,
+            'gate_profile': gate_profile,
+        }
+        paper_candidate_path = _persist_paper_candidate_json(coin_name, paper_candidate_payload)
+        if paper_candidate_path:
+            print(f"  📄 Paper candidate artifact: {paper_candidate_path}")
+
     completed_trials_for_diag = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
@@ -2045,20 +2088,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'seed_stability': seed_stability,
         'research_confidence_tier': research_confidence_tier,
         'gate_mode': gate_mode,
-        'gate_profile': {
-            'mode': gate_mode,
-            'screen_threshold': float(resolve_gate_mode(gate_mode).get('screen_threshold', 38.0)),
-            'holdout_min_trades': int(holdout_min_trades),
-            'holdout_min_sharpe': float(holdout_min_sharpe),
-            'holdout_min_return': float(holdout_min_return),
-            'min_psr_cv': float(min_psr_cv) if min_psr_cv is not None else float(min_psr),
-            'min_psr_holdout': None if min_psr_holdout is None else float(min_psr_holdout),
-            'min_dsr': None if min_dsr is None else float(min_dsr),
-            'escalation_policy': {
-                'window_days': '14-28',
-                'action': 'Tighten thresholds and switch to production_promotion after stable paper evidence.',
-            },
-        },
+        'gate_profile': gate_profile,
         'pruned_only': bool(pruned_only),
         'run_id': run_id,
         'trial_ledger': {

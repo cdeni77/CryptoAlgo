@@ -53,6 +53,7 @@ from core.meta_labeling import (
     calibrator_params as meta_calibrator_params,
 )
 from core.strategies import StrategyContext, get_strategy_family
+from core.paper_profile_overrides import load_paper_profile_overrides
 
 warnings.filterwarnings('ignore')
 
@@ -1144,9 +1145,15 @@ def check_correlation(sym: str, direction: int, active_positions: Dict,
 # BACKTEST — v8 PER-COIN PROFILES
 def _get_profile(symbol: str, profile_overrides: Optional[Dict[str, CoinProfile]] = None) -> CoinProfile:
     if profile_overrides:
-        prefix = symbol.split('-')[0].upper()
+        resolved = get_coin_profile(symbol)
+        if resolved.name in profile_overrides:
+            return profile_overrides[resolved.name]
+
+        symbol_token = str(symbol or '').upper()
+        symbol_prefix = symbol_token.split('-')[0]
         for profile in profile_overrides.values():
-            if prefix in profile.prefixes:
+            normalized_prefixes = {str(prefix).upper() for prefix in profile.prefixes}
+            if symbol_token in normalized_prefixes or symbol_prefix in normalized_prefixes:
                 return profile
     return get_coin_profile(symbol)
 
@@ -1846,7 +1853,7 @@ def run_backtest(all_data: Dict, config: Config,
             best = max(ensemble_list, key=lambda x: x[4])
             model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta = best
             importance_summary = summarize_feature_importance(model, cols)
-            profile = get_coin_profile(sym)
+            profile = _get_profile(sym, profile_overrides)
             resolved_family = resolve_categorical_param('strategy_family', profile, config, Config.strategy_family)
             resolved_bucket = resolve_categorical_param('trade_freq_bucket', profile, config, Config.trade_freq_bucket)
             save_model(
@@ -1916,16 +1923,17 @@ def run_backtest(all_data: Dict, config: Config,
     }
 
 
-def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = None, train_window_days: int = 90) -> Dict:
+def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = None, train_window_days: int = 90,
+                   profile_overrides: Optional[Dict[str, CoinProfile]] = None) -> Dict:
     system = MLSystem(config)
-    validate_all_symbol_configs(all_data, config)
+    validate_all_symbol_configs(all_data, config, profile_overrides=profile_overrides)
     metrics = {}
     symbols_trained = 0
     train_end_global = pd.Timestamp.now(tz='UTC')
     train_start_global = train_end_global - pd.Timedelta(days=train_window_days)
 
     for sym, d in all_data.items():
-        profile = get_coin_profile(sym)
+        profile = _get_profile(sym, profile_overrides)
         feat, ohlc = d['features'], d['ohlcv']
         coin_feature_list = profile.resolve_feature_columns(
             use_pruned_features=config.enforce_pruned_features,
@@ -2014,15 +2022,16 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
 
 
 # LIVE SIGNALS — v8
-def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifact_dir: Optional[Path] = None):
+def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifact_dir: Optional[Path] = None,
+                profile_overrides: Optional[Dict[str, CoinProfile]] = None):
     system = MLSystem(config)
-    validate_all_symbol_configs(all_data, config)
+    validate_all_symbol_configs(all_data, config, profile_overrides=profile_overrides)
     print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
     print("   Strategy family: resolved per symbol/profile")
     gate_counters = _new_gate_counters()
 
     for sym, d in all_data.items():
-        profile = get_coin_profile(sym)
+        profile = _get_profile(sym, profile_overrides)
         feat, ohlc = d['features'], d['ohlcv']
         coin_feature_list = profile.resolve_feature_columns(
             use_pruned_features=config.enforce_pruned_features,
@@ -2411,11 +2420,20 @@ if __name__ == "__main__":
     )
     data = load_data()
 
+    paper_profile_overrides_path = os.getenv('PAPER_PROFILE_OVERRIDES_PATH')
+    profile_overrides = load_paper_profile_overrides(paper_profile_overrides_path)
+    if profile_overrides:
+        print(
+            "🧪 Loaded paper profile overrides: "
+            + ", ".join(sorted(profile_overrides.keys()))
+            + (f" (source={paper_profile_overrides_path})" if paper_profile_overrides_path else "")
+        )
+
     gate_artifact_dir = Path(args.gate_report_dir) if args.gate_report_json else None
 
     if args.backtest:
-        run_backtest(data, config, gate_artifact_dir=gate_artifact_dir)
+        run_backtest(data, config, profile_overrides=profile_overrides, gate_artifact_dir=gate_artifact_dir)
     elif args.signals or args.debug:
-        run_signals(data, config, debug=args.debug, gate_artifact_dir=gate_artifact_dir)
+        run_signals(data, config, debug=args.debug, gate_artifact_dir=gate_artifact_dir, profile_overrides=profile_overrides)
     else:
         parser.print_help()
