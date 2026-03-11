@@ -13,7 +13,7 @@ Usage:
     python optimize.py --all --trials 100 --jobs 16
     python optimize.py --show
 """
-import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math
+import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math, tempfile
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,7 +36,7 @@ from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
     _build_strategy_context, _calibrator_predict, _resolve_filter_policy,
     calculate_n_contracts, get_strategy_family, primary_recall_threshold,
-    resolve_label_horizon, resolve_param,
+    resolve_label_horizon, resolve_param, GATE_REASON_CODES,
 )
 from core.meta_labeling import calibrator_predict
 from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
@@ -541,17 +541,97 @@ def _score_fold_consistency(fold_aucs: list[float]) -> dict:
     return {'score': float(1.0 / (1.0 + cv))}
 
 
-def _summarize_fold_gate_counters(gate_counts: Dict[str, int], total_checks: int) -> Dict[str, object]:
-    gate_counts_clean = {str(k): int(v) for k, v in sorted(gate_counts.items()) if int(v) > 0}
-    gate_rates = {
-        reason: float(count / max(total_checks, 1))
-        for reason, count in gate_counts_clean.items()
+def _normalize_gate_reason_code(reason: str) -> Optional[str]:
+    token = str(reason or '').strip()
+    if not token:
+        return None
+    if token in GATE_REASON_CODES:
+        return token
+    lowered = token.lower()
+    if lowered in GATE_REASON_CODES:
+        return lowered
+    return None
+
+
+def _summarize_gate_counters_by_reason(gate_counts: Dict[str, int], total_checks: int) -> Dict[str, object]:
+    normalized_counts = {reason: 0 for reason in GATE_REASON_CODES}
+    for reason, count in (gate_counts or {}).items():
+        normalized = _normalize_gate_reason_code(reason)
+        if normalized is None:
+            continue
+        normalized_counts[normalized] += int(count or 0)
+
+    checks = max(int(total_checks or 0), 0)
+    rates = {
+        reason: float(count / max(checks, 1))
+        for reason, count in normalized_counts.items()
     }
     return {
-        'total_checks': int(total_checks),
-        'gate_counts': gate_counts_clean,
-        'gate_rates': gate_rates,
+        'total_checks': checks,
+        'gate_counts': normalized_counts,
+        'gate_rates': rates,
     }
+
+
+def _derive_main_blockers(gate_summary: Dict[str, object], *, top_n: int = 3) -> List[Dict[str, object]]:
+    counts = (gate_summary or {}).get('gate_counts', {}) if isinstance(gate_summary, dict) else {}
+    rates = (gate_summary or {}).get('gate_rates', {}) if isinstance(gate_summary, dict) else {}
+    ranked = sorted(
+        [
+            (reason, int(counts.get(reason, 0) or 0), float(rates.get(reason, 0.0) or 0.0))
+            for reason in GATE_REASON_CODES
+        ],
+        key=lambda row: (row[1], row[2]),
+        reverse=True,
+    )
+    return [
+        {'reason_code': reason, 'count': count, 'rate': rate}
+        for reason, count, rate in ranked
+        if count > 0
+    ][:max(1, int(top_n or 1))]
+
+
+def _summarize_fold_gate_counters(gate_counts: Dict[str, int], total_checks: int) -> Dict[str, object]:
+    return _summarize_gate_counters_by_reason(gate_counts, total_checks)
+
+
+def _extract_gate_summary_from_artifact(artifact_dir: Path, symbol: str) -> Dict[str, object]:
+    files = sorted(artifact_dir.glob('gate_counters_backtest_*.json'))
+    if not files:
+        return _summarize_gate_counters_by_reason({}, 0)
+
+    payload = json.loads(files[-1].read_text(encoding='utf-8'))
+    symbols = payload.get('symbols', []) if isinstance(payload, dict) else []
+    selected = None
+    for item in symbols:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('symbol')) == str(symbol):
+            selected = item
+            break
+    if selected is None and symbols:
+        selected = next((item for item in symbols if isinstance(item, dict)), None)
+
+    if not selected:
+        return _summarize_gate_counters_by_reason({}, 0)
+
+    total_checks = int(selected.get('total_candidate_checks', 0) or 0)
+    gate_counts = selected.get('gate_counts', {}) if isinstance(selected.get('gate_counts', {}), dict) else {}
+    return _summarize_gate_counters_by_reason(gate_counts, total_checks)
+
+
+def _aggregate_slice_gate_summaries(holdout_slices: Dict[str, dict]) -> Dict[str, object]:
+    aggregate_counts = {reason: 0 for reason in GATE_REASON_CODES}
+    total_checks = 0
+    for metrics in (holdout_slices or {}).values():
+        if not isinstance(metrics, dict):
+            continue
+        gate_summary = metrics.get('gate_counters', {}) if isinstance(metrics.get('gate_counters', {}), dict) else {}
+        total_checks += int(gate_summary.get('total_checks', 0) or 0)
+        counts = gate_summary.get('gate_counts', {}) if isinstance(gate_summary.get('gate_counts', {}), dict) else {}
+        for reason in GATE_REASON_CODES:
+            aggregate_counts[reason] += int(counts.get(reason, 0) or 0)
+    return _summarize_gate_counters_by_reason(aggregate_counts, total_checks)
 
 
 def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
@@ -1058,14 +1138,23 @@ def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days,
                     'max_ensemble_std': 0.10, 'train_embargo_hours': 24, 'oos_eval_days': int(eval_days),
                     'enforce_pruned_features': bool(pruned_only)})
     try:
-        result = run_backtest({target_sym: holdout_data[target_sym]}, config, profile_overrides={coin_name: profile})
+        with tempfile.TemporaryDirectory(prefix='holdout_gate_counters_') as gate_tmp:
+            gate_dir = Path(gate_tmp)
+            result = run_backtest(
+                {target_sym: holdout_data[target_sym]},
+                config,
+                profile_overrides={coin_name: profile},
+                gate_artifact_dir=gate_dir,
+            )
+            gate_summary = _extract_gate_summary_from_artifact(gate_dir, target_sym)
     except Exception as e:
         print(f"  ❌ Holdout error ({eval_days}d): {e}")
         return None
     if not result:
         return None
+
     oos_sr = _finite_metric(result.get('oos_sharpe', 0))
-    return {
+    holdout_payload = {
         'holdout_sharpe': oos_sr if oos_sr > -90 else 0,
         'holdout_return': _finite_metric(result.get('oos_return', 0)),
         'holdout_trades': int(result.get('oos_trades', 0) or 0),
@@ -1073,7 +1162,11 @@ def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days,
         'full_pf': _finite_metric(result.get('profit_factor', 0)),
         'full_dd': _finite_metric(result.get('max_drawdown', 1), 1),
         'full_trades': int(result.get('n_trades', 0) or 0),
+        'gate_counters': gate_summary,
     }
+    if holdout_payload['holdout_trades'] == 0:
+        holdout_payload['main_blockers'] = _derive_main_blockers(gate_summary)
+    return holdout_payload
 
 
 def _derive_top_level_holdout(holdout_slices, holdout_mode):
@@ -1083,6 +1176,9 @@ def _derive_top_level_holdout(holdout_slices, holdout_mode):
     if holdout_mode == 'single90' and isinstance(recent, dict):
         selected = dict(recent)
         selected['selected_slice'] = 'recent90'
+        selected['gate_counters'] = _aggregate_slice_gate_summaries({'recent90': recent})
+        if int(selected.get('holdout_trades', 0) or 0) == 0:
+            selected['main_blockers'] = _derive_main_blockers(selected['gate_counters'])
         return selected
 
     values = [m for m in holdout_slices.values() if isinstance(m, dict)]
@@ -1097,7 +1193,10 @@ def _derive_top_level_holdout(holdout_slices, holdout_mode):
         'full_dd': float(np.median([_as_number(m.get('full_dd'), 1.0) or 1.0 for m in values])),
         'full_trades': int(min(int(m.get('full_trades', 0) or 0) for m in values)),
         'selected_slice': 'median_composite',
+        'gate_counters': _aggregate_slice_gate_summaries(holdout_slices),
     }
+    if int(selected.get('holdout_trades', 0) or 0) == 0:
+        selected['main_blockers'] = _derive_main_blockers(selected['gate_counters'])
     return selected
 
 
@@ -1827,7 +1926,14 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                         'holdout_sharpe': round(float(m.get('holdout_sharpe', 0.0) or 0.0), 6),
                         'holdout_return': round(float(m.get('holdout_return', 0.0) or 0.0), 6),
                         'holdout_trades': int(m.get('holdout_trades', 0) or 0),
+                        'gate_counters': m.get('gate_counters', {}),
+                        'main_blockers': m.get('main_blockers', []),
                         'holdout_slices': m.get('holdout_slices', {}),
+                        'slice_gate_counters': {
+                            k: v.get('gate_counters', {})
+                            for k, v in m.get('holdout_slices', {}).items()
+                            if isinstance(v, dict)
+                        },
                         'passes_gate': _passes_holdout_gate(
                             m,
                             min_trades=effective_holdout_min_trades,
