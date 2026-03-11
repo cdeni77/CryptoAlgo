@@ -263,6 +263,22 @@ def resolve_param(
     return resolved
 
 
+def resolve_categorical_param(
+    field_name: str,
+    profile: Optional[CoinProfile],
+    config: Config,
+    default: str,
+) -> str:
+    """Resolve categorical parameter values with deterministic precedence."""
+    if field_name in config.cli_overrides:
+        resolved = getattr(config, field_name)
+    elif profile is not None and hasattr(profile, field_name):
+        resolved = getattr(profile, field_name)
+    else:
+        resolved = default
+    return str(resolved or default)
+
+
 @dataclass
 class FilterPolicyEffect:
     reject: bool = False
@@ -1242,15 +1258,17 @@ def run_backtest(all_data: Dict, config: Config,
     current_date = min(all_ts) + timedelta(days=config.train_lookback_days)
     end_date = max(all_ts)
 
-    strategy_family = get_strategy_family(config.strategy_family)
     print(f"\n⏩ STARTING BACKTEST (v8 — Per-Coin Profiles)")
     print(f"   Period: {current_date.date()} to {end_date.date()}")
-    print(f"   Strategy family: {strategy_family.name} | trade_freq_bucket={config.trade_freq_bucket}")
+    print("   Strategy family: resolved per symbol/profile")
     print(f"   Leverage: {config.leverage}x | Fee: 0.10%/side (0.20% round-trip)")
     print(f"   Coin profiles:")
     for sym in all_data:
         p = _get_profile(sym, profile_overrides)
-        print(f"     {sym}: {p.name} ({strategy_family.name}) | thresh={p.signal_threshold} | "
+        resolved_family = resolve_categorical_param('strategy_family', p, config, Config.strategy_family)
+        resolved_bucket = resolve_categorical_param('trade_freq_bucket', p, config, Config.trade_freq_bucket)
+        strategy_family_name = get_strategy_family(resolved_family).name
+        print(f"     {sym}: {p.name} ({strategy_family_name}) | bucket={resolved_bucket} | thresh={p.signal_threshold} | "
               f"TP={p.vol_mult_tp}x SL={p.vol_mult_sl}x | hold={p.max_hold_hours}h")
 
     equity = 100_000.0
@@ -1526,6 +1544,13 @@ def run_backtest(all_data: Dict, config: Config,
                         sma_50,
                         vol_24h=vol_24h,
                     )
+                    resolved_family = resolve_categorical_param(
+                        'strategy_family',
+                        profile,
+                        config,
+                        Config.strategy_family,
+                    )
+                    strategy_family = get_strategy_family(resolved_family)
                     strategy_decision = strategy_family.evaluate(
                         strategy_context,
                         min_momentum_magnitude=effective_momentum,
@@ -1822,6 +1847,8 @@ def run_backtest(all_data: Dict, config: Config,
             model, scaler, cols, iso, auc, meta_artifacts, stage_metrics, member_meta = best
             importance_summary = summarize_feature_importance(model, cols)
             profile = get_coin_profile(sym)
+            resolved_family = resolve_categorical_param('strategy_family', profile, config, Config.strategy_family)
+            resolved_bucket = resolve_categorical_param('trade_freq_bucket', profile, config, Config.trade_freq_bucket)
             save_model(
                 symbol=sym,
                 model=model,
@@ -1832,8 +1859,8 @@ def run_backtest(all_data: Dict, config: Config,
                 profile_name=profile.name,
                 extra_meta={
                     'strategy': 'momentum',
-                    'strategy_family': config.strategy_family or 'momentum_trend',
-                    'trade_freq_bucket': config.trade_freq_bucket or 'balanced',
+                    'strategy_family': resolved_family,
+                    'trade_freq_bucket': resolved_bucket,
                     'signal_threshold': profile.signal_threshold,
                     'n_ensemble': len(ensemble_list),
                     'backtest_trades': len(df[df['symbol'] == sym]) if sym in df['symbol'].values else 0,
@@ -1941,6 +1968,8 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
             'final_trade_precision': float(stage_metrics.get('final_trade_precision', 0.0)),
             'cost_aware_importance_share': float(importance_summary.get('cost_aware_block', {}).get('share', 0.0)),
         }
+        resolved_family = resolve_categorical_param('strategy_family', profile, config, Config.strategy_family)
+        resolved_bucket = resolve_categorical_param('trade_freq_bucket', profile, config, Config.trade_freq_bucket)
         save_model(
             symbol=sym,
             model=model,
@@ -1952,8 +1981,8 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
             target_dir=target_dir,
             extra_meta={
                 'strategy': 'momentum',
-                'strategy_family': config.strategy_family or 'momentum_trend',
-                'trade_freq_bucket': config.trade_freq_bucket or 'balanced',
+                'strategy_family': resolved_family,
+                'trade_freq_bucket': resolved_bucket,
                 'signal_threshold': profile.signal_threshold,
                 'train_start': symbol_train_start.isoformat() if symbol_train_start is not None else None,
                 'train_end': symbol_train_end.isoformat() if symbol_train_end is not None else None,
@@ -1988,9 +2017,8 @@ def retrain_models(all_data: Dict, config: Config, target_dir: Optional[Path] = 
 def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifact_dir: Optional[Path] = None):
     system = MLSystem(config)
     validate_all_symbol_configs(all_data, config)
-    strategy_family = get_strategy_family(config.strategy_family)
     print(f"\n🔍 ANALYZING LIVE MARKETS (v8 — Per-Coin Profiles)...")
-    print(f"   Strategy family: {strategy_family.name} | trade_freq_bucket={config.trade_freq_bucket}")
+    print("   Strategy family: resolved per symbol/profile")
     gate_counters = _new_gate_counters()
 
     for sym, d in all_data.items():
@@ -2038,6 +2066,8 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
 
         model, scaler, iso, auc, meta_artifacts, stage_metrics, member_meta = result
         importance_summary = summarize_feature_importance(model, cols)
+        resolved_family = resolve_categorical_param('strategy_family', profile, config, Config.strategy_family)
+        resolved_bucket = resolve_categorical_param('trade_freq_bucket', profile, config, Config.trade_freq_bucket)
 
         save_model(
             symbol=sym,
@@ -2049,8 +2079,8 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             profile_name=profile.name,
             extra_meta={
                 'strategy': 'momentum',
-                'strategy_family': config.strategy_family or 'momentum_trend',
-                'trade_freq_bucket': config.trade_freq_bucket or 'balanced',
+                'strategy_family': resolved_family,
+                'trade_freq_bucket': resolved_bucket,
                 'signal_threshold': profile.signal_threshold,
                 'train_samples': len(X_all),
                 'stage_metrics': stage_metrics,
@@ -2089,6 +2119,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             ret_72h,
             sma_50,
         )
+        strategy_family = get_strategy_family(resolved_family)
         strategy_decision = strategy_family.evaluate(
             strategy_context,
             min_momentum_magnitude=resolve_param(

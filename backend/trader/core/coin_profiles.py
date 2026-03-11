@@ -175,6 +175,10 @@ class CoinProfile:
     learning_rate: float = 0.05
     min_child_samples: int = 20
 
+    # Categorical strategy knobs
+    strategy_family: str = 'momentum_trend'
+    trade_freq_bucket: str = 'balanced'
+
     def load_pruned_features(self, features_dir: Optional[Path] = None) -> Optional[List[str]]:
         """Load persisted pruned feature list for this coin if available."""
         artifact_dir = features_dir or PRUNED_FEATURES_DIR
@@ -225,6 +229,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_momentum_magnitude=0.02,
         min_vol_24h=0.004,
         max_vol_24h=0.09,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
     ),
     
     # ── XRP: momentum (balanced confidence to avoid over-filtering) ──
@@ -240,6 +246,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_momentum_magnitude=0.02,
         min_vol_24h=0.004,
         max_vol_24h=0.10,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
     ),
     
     # ── BTC: strict momentum (mean-reversion failed at 25% WR) ──
@@ -267,6 +275,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         n_estimators=150,
         max_depth=4,
         min_child_samples=30,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
     ),
     
     # ── SOL: momentum with tuned exits for higher vol ──
@@ -290,6 +300,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         max_vol_24h=0.12,
         position_size=0.12,
         vol_sizing_target=0.025,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
     ),
     
     # ── DOGE: strict momentum (mean-reversion produced 0 trades) ──
@@ -316,6 +328,8 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         n_estimators=80,                # Fewer trees — don't overfit noise
         max_depth=3,
         min_child_samples=25,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
     ),
 }
 
