@@ -2298,32 +2298,32 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     return result_data
 
 
-def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None, **kwargs):
-    seeds = [int(s) for s in (sampler_seeds or [42])]
-    if len(seeds) <= 1:
-        return optimize_coin(all_data, coin_prefix, coin_name, sampler_seed=seeds[0], **kwargs)
-
-    print(f"\n🌱 Multi-seed optimization for {coin_name}: seeds={seeds}")
-    run_results = []
-    base_suffix = kwargs.get('study_suffix', '')
-    for seed in seeds:
-        seed_kwargs = dict(kwargs)
-        seed_kwargs['study_suffix'] = f"{base_suffix}_s{seed}" if base_suffix else f"s{seed}"
-        r = optimize_coin(all_data, coin_prefix, coin_name, sampler_seed=seed, **seed_kwargs)
-        if r:
-            run_results.append(r)
-
+def aggregate_multiseed_results(
+    coin_name,
+    seeds,
+    run_results,
+    *,
+    holdout_min_trades=15,
+    holdout_min_sharpe=0.0,
+    holdout_min_return=0.0,
+    min_psr_holdout=None,
+    min_dsr=None,
+    min_seed_pass_rate=0.67,
+    max_seed_param_dispersion=0.60,
+    max_seed_oos_sharpe_dispersion=0.35,
+    failed_seeds=None,
+    emit_artifacts=True,
+):
     if not run_results:
         return None
 
-    holdout_min_trades = int(kwargs.get('holdout_min_trades', 15) or 15)
-    holdout_min_sharpe = float(kwargs.get('holdout_min_sharpe', 0.0) or 0.0)
-    holdout_min_return = float(kwargs.get('holdout_min_return', 0.0) or 0.0)
-    min_psr_holdout = kwargs.get('min_psr_holdout', None)
-    min_dsr = kwargs.get('min_dsr', None)
-    min_seed_pass_rate = float(kwargs.get('seed_stability_min_pass_rate', 0.67) or 0.67)
-    max_seed_param_dispersion = float(kwargs.get('seed_stability_max_param_dispersion', 0.60) or 0.60)
-    max_seed_oos_sharpe_dispersion = float(kwargs.get('seed_stability_max_oos_sharpe_dispersion', 0.35) or 0.35)
+    holdout_min_trades = int(holdout_min_trades or 15)
+    holdout_min_sharpe = float(holdout_min_sharpe or 0.0)
+    holdout_min_return = float(holdout_min_return or 0.0)
+    min_seed_pass_rate = float(min_seed_pass_rate or 0.67)
+    max_seed_param_dispersion = float(max_seed_param_dispersion or 0.60)
+    max_seed_oos_sharpe_dispersion = float(max_seed_oos_sharpe_dispersion or 0.35)
+    failed_seeds = [int(seed) for seed in (failed_seeds or [])]
 
     seed_stability = _compute_seed_stability(
         run_results,
@@ -2400,6 +2400,7 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
         'seeds': seeds,
         'qualified_runs': len(qualified),
         'total_runs': len(run_results),
+        'failed_seeds': failed_seeds,
     }
     best_seed_result['consensus_params'] = consensus_params
     best_seed_result['consensus_revalidated'] = False
@@ -2418,12 +2419,13 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
         raise ValueError("Selected-seed holdout metrics missing; refusing to persist inconsistent result.")
 
     best_seed_result['quality'] = assess_result_quality(best_seed_result)
-    p = _persist_result_json(coin_name, best_seed_result)
-    if p:
-        print(f"  💾 Consensus result saved to {p}")
+    if emit_artifacts:
+        p = _persist_result_json(coin_name, best_seed_result)
+        if p:
+            print(f"  💾 Consensus result saved to {p}")
 
     final_tier = str(best_seed_result.get('research_confidence_tier') or '')
-    if (
+    if emit_artifacts and (
         not bool(best_seed_result.get('deployment_blocked', False))
         and _passes_holdout_gate(
             best_seed_result.get('holdout_metrics', {}),
@@ -2452,6 +2454,41 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
             print(f"  📄 Final paper candidate artifact: {paper_candidate_path}")
 
     return best_seed_result
+
+
+def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None, **kwargs):
+    seeds = [int(s) for s in (sampler_seeds or [42])]
+    if len(seeds) <= 1:
+        return optimize_coin(all_data, coin_prefix, coin_name, sampler_seed=seeds[0], **kwargs)
+
+    print(f"\n🌱 Multi-seed optimization for {coin_name}: seeds={seeds}")
+    run_results = []
+    base_suffix = kwargs.get('study_suffix', '')
+    failed_seeds = []
+    for seed in seeds:
+        seed_kwargs = dict(kwargs)
+        seed_kwargs['study_suffix'] = f"{base_suffix}_s{seed}" if base_suffix else f"s{seed}"
+        r = optimize_coin(all_data, coin_prefix, coin_name, sampler_seed=seed, **seed_kwargs)
+        if r:
+            run_results.append(r)
+        else:
+            failed_seeds.append(int(seed))
+
+    return aggregate_multiseed_results(
+        coin_name,
+        seeds,
+        run_results,
+        holdout_min_trades=kwargs.get('holdout_min_trades', 15),
+        holdout_min_sharpe=kwargs.get('holdout_min_sharpe', 0.0),
+        holdout_min_return=kwargs.get('holdout_min_return', 0.0),
+        min_psr_holdout=kwargs.get('min_psr_holdout', None),
+        min_dsr=kwargs.get('min_dsr', None),
+        min_seed_pass_rate=kwargs.get('seed_stability_min_pass_rate', 0.67),
+        max_seed_param_dispersion=kwargs.get('seed_stability_max_param_dispersion', 0.60),
+        max_seed_oos_sharpe_dispersion=kwargs.get('seed_stability_max_oos_sharpe_dispersion', 0.35),
+        failed_seeds=failed_seeds,
+        emit_artifacts=True,
+    )
 
 def show_results():
     results = []

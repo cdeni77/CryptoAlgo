@@ -9,7 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from scripts.optimize import PREFIX_FOR_COIN, apply_runtime_preset, load_data, optimize_coin_multiseed
+from scripts.optimize import (
+    PREFIX_FOR_COIN,
+    aggregate_multiseed_results,
+    apply_runtime_preset,
+    load_data,
+    optimize_coin,
+    optimize_coin_multiseed,
+)
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 MANIFEST_DIR = Path("optimization_results/manifests")
@@ -20,8 +27,8 @@ def _parse_sampler_seeds(raw: str) -> list[int]:
     return [int(item) for item in values]
 
 
-def resolve_workers(worker_arg: str | int, num_coins: int, cpu_count: int | None = None) -> int:
-    selected = max(1, int(num_coins or 1))
+def resolve_workers(worker_arg: str | int, task_count: int, cpu_count: int | None = None) -> int:
+    selected = max(1, int(task_count or 1))
     detected_cpu = int(cpu_count or mp.cpu_count() or 1)
     if str(worker_arg).lower() == "auto":
         resolved = min(selected, max(1, detected_cpu // 4))
@@ -37,6 +44,32 @@ def _build_coin_study_suffix(base_suffix: str, coin: str, run_id: str) -> str:
     return f"{run_id}_{coin_key}"
 
 
+def _build_coin_seed_study_suffix(base_suffix: str, coin: str, seed: int, run_id: str) -> str:
+    coin_key = str(coin).upper()
+    if base_suffix:
+        return f"{base_suffix}_{coin_key}_seed{int(seed)}_{run_id}"
+    return f"{run_id}_{coin_key}_seed{int(seed)}"
+
+
+def _iter_study_suffix_examples(
+    target_coins: list[str],
+    seeds: list[int],
+    run_id: str,
+    study_suffix: str,
+    parallel_mode: str,
+) -> dict[str, list[str]]:
+    examples: dict[str, list[str]] = {}
+    for coin in target_coins or []:
+        if parallel_mode == "coin-seed":
+            examples[coin] = [
+                _build_coin_seed_study_suffix(study_suffix, coin, seed, run_id)
+                for seed in seeds
+            ]
+        else:
+            examples[coin] = [_build_coin_study_suffix(study_suffix, coin, run_id)]
+    return examples
+
+
 def build_run_manifest(
     script_dir,
     args,
@@ -44,19 +77,32 @@ def build_run_manifest(
     run_id: str,
     workers: int | None = None,
     cpu_count: int | None = None,
+    total_tasks: int | None = None,
 ) -> dict[str, Any]:
     """Build a reproducibility manifest for a parallel optimization run."""
     generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     sampler_seeds_raw = getattr(args, "sampler_seeds", "")
     seeds = _parse_sampler_seeds(sampler_seeds_raw)
     study_suffix = str(getattr(args, "study_suffix", "") or "")
+    parallel_mode = str(getattr(args, "parallel_mode", "coin") or "coin")
     resolved_cpu_count = int(cpu_count or mp.cpu_count() or 1)
-    resolved_workers = int(workers or resolve_workers(getattr(args, "workers", "auto"), len(target_coins), resolved_cpu_count))
+    computed_total_tasks = int(total_tasks or (len(target_coins) * len(seeds) if parallel_mode == "coin-seed" else len(target_coins)))
+    resolved_workers = int(
+        workers
+        or resolve_workers(
+            getattr(args, "workers", "auto"),
+            computed_total_tasks,
+            resolved_cpu_count,
+        )
+    )
     return {
         "run_id": str(run_id),
         "generated_at": generated_at,
         "script_dir": str(script_dir),
         "cpu_count": resolved_cpu_count,
+        "parallel_mode": parallel_mode,
+        "total_tasks": computed_total_tasks,
+        "aggregation_serial_after_tasks": True,
         "workers": resolved_workers,
         "jobs": int(getattr(args, "jobs", 1)),
         "preset": getattr(args, "preset", None),
@@ -64,11 +110,8 @@ def build_run_manifest(
         "target_coins": [str(coin).upper() for coin in (target_coins or [])],
         "study_suffix_strategy": {
             "provided_suffix": study_suffix,
-            "mode": "user_suffix_plus_coin_plus_run" if study_suffix else "run_plus_coin",
-            "examples": {
-                coin: _build_coin_study_suffix(study_suffix, coin, run_id)
-                for coin in (target_coins or [])
-            },
+            "mode": "user_suffix_plus_coin_plus_seed_plus_run" if parallel_mode == "coin-seed" else ("user_suffix_plus_coin_plus_run" if study_suffix else "run_plus_coin"),
+            "examples": _iter_study_suffix_examples(target_coins, seeds, run_id, study_suffix, parallel_mode),
         },
         "seed_policy": {
             "sampler_seeds_raw": sampler_seeds_raw,
@@ -216,11 +259,158 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
         }
 
 
-def run_optimization(coins: list[str], config: OptimizationConfig, workers: int) -> dict[str, dict[str, Any]]:
+def _optimize_seed_worker(args: tuple[dict[str, Any], str, int, OptimizationConfig, str]) -> dict[str, Any]:
+    all_data, coin, seed, config, run_id = args
+    study_suffix = _build_coin_seed_study_suffix(config.study_suffix, coin, seed, run_id)
+    try:
+        coin_prefix = _resolve_coin_prefix(coin)
+        result = optimize_coin(
+            all_data,
+            coin_prefix,
+            coin,
+            n_trials=config.trials,
+            n_jobs=config.jobs,
+            sampler_seed=int(seed),
+            n_cv_folds=config.n_cv_folds,
+            holdout_days=config.holdout_days,
+            holdout_mode=config.holdout_mode,
+            holdout_candidates=config.top_candidates,
+            plateau_patience=config.plateau_patience,
+            plateau_min_delta=config.plateau_min_delta,
+            plateau_warmup=config.plateau_warmup,
+            plateau_min_completed=config.plateau_min_completed,
+            min_total_trades=config.min_total_trades,
+            holdout_min_trades=config.holdout_min_trades,
+            holdout_min_sharpe=config.holdout_min_sharpe,
+            holdout_min_return=config.holdout_min_return,
+            target_trades_per_week=config.target_trades_per_week,
+            target_trades_per_year=config.target_trades_per_year,
+            require_holdout_pass=config.require_holdout_pass,
+            gate_mode=config.gate_mode,
+            study_suffix=study_suffix,
+            resume_study=config.resume_study,
+            min_psr=config.min_psr,
+            min_psr_cv=config.min_psr_cv,
+            min_psr_holdout=config.min_psr_holdout,
+            min_dsr=config.min_dsr,
+            seed_stability_min_pass_rate=config.seed_stability_min_pass_rate,
+            seed_stability_max_param_dispersion=config.seed_stability_max_param_dispersion,
+            seed_stability_max_oos_sharpe_dispersion=config.seed_stability_max_oos_sharpe_dispersion,
+            cv_mode=config.cv_mode,
+            purge_days=config.purge_days,
+            purge_bars=config.purge_bars,
+            embargo_days=config.embargo_days,
+            embargo_bars=config.embargo_bars,
+            embargo_frac=config.embargo_frac,
+            pruned_only=config.pruned_only,
+            preset_name=config.preset_name,
+            cost_config_path=config.cost_config_path,
+            proxy_fidelity_candidates=config.proxy_fidelity_candidates,
+            proxy_fidelity_eval_days=config.proxy_fidelity_eval_days,
+        )
+        return {
+            "coin": coin,
+            "seed": int(seed),
+            "success": bool(result),
+            "result": result,
+            "error": None,
+            "study_suffix": study_suffix,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "coin": coin,
+            "seed": int(seed),
+            "success": False,
+            "result": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "study_suffix": study_suffix,
+        }
+
+
+def _aggregate_seed_payloads(coin: str, seeds: list[int], payloads: list[dict[str, Any]], config: OptimizationConfig) -> dict[str, Any]:
+    successful = [item for item in payloads if item.get("success") and item.get("result")]
+    failed = [item for item in payloads if not item.get("success")]
+    failed_seed_ids = [int(item.get("seed")) for item in failed if item.get("seed") is not None]
+    run_results = [item["result"] for item in successful]
+
+    if not run_results:
+        err = "; ".join(item.get("error") or f"seed {item.get('seed')} failed" for item in failed) or "no usable seed results"
+        return {
+            "coin": coin,
+            "success": False,
+            "result": None,
+            "error": err,
+            "seed_results": payloads,
+            "successful_seeds": [int(item.get("seed")) for item in successful],
+            "failed_seeds": failed_seed_ids,
+        }
+
+    try:
+        aggregated = aggregate_multiseed_results(
+            coin_name=coin,
+            seeds=seeds,
+            run_results=run_results,
+            holdout_min_trades=config.holdout_min_trades,
+            holdout_min_sharpe=config.holdout_min_sharpe,
+            holdout_min_return=config.holdout_min_return,
+            min_psr_holdout=config.min_psr_holdout,
+            min_dsr=config.min_dsr,
+            min_seed_pass_rate=config.seed_stability_min_pass_rate,
+            max_seed_param_dispersion=config.seed_stability_max_param_dispersion,
+            max_seed_oos_sharpe_dispersion=config.seed_stability_max_oos_sharpe_dispersion,
+            failed_seeds=failed_seed_ids,
+            emit_artifacts=True,
+        )
+        return {
+            "coin": coin,
+            "success": bool(aggregated),
+            "result": aggregated,
+            "error": None if aggregated else "aggregation returned no result",
+            "seed_results": payloads,
+            "successful_seeds": [int(item.get("seed")) for item in successful],
+            "failed_seeds": failed_seed_ids,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "coin": coin,
+            "success": False,
+            "result": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "seed_results": payloads,
+            "successful_seeds": [int(item.get("seed")) for item in successful],
+            "failed_seeds": failed_seed_ids,
+        }
+
+
+def run_optimization(coins: list[str], config: OptimizationConfig, workers: int, parallel_mode: str = "coin") -> dict[str, Any]:
     all_data = load_data()
     run_id = datetime.utcnow().strftime("run_%Y%m%dT%H%M%S%fZ")
-    work_items = [(all_data, coin, config, run_id) for coin in coins]
 
+    if parallel_mode == "coin-seed":
+        work_items = [(all_data, coin, int(seed), config, run_id) for coin in coins for seed in config.seeds]
+        if workers <= 1 or len(work_items) == 1:
+            seed_outputs = [_optimize_seed_worker(item) for item in work_items]
+        else:
+            with mp.Pool(processes=min(workers, len(work_items))) as pool:
+                seed_outputs = pool.map(_optimize_seed_worker, work_items)
+
+        grouped: dict[str, list[dict[str, Any]]] = {coin: [] for coin in coins}
+        for payload in seed_outputs:
+            grouped.setdefault(str(payload["coin"]), []).append(payload)
+
+        aggregated_results = {
+            coin: _aggregate_seed_payloads(coin, [int(seed) for seed in config.seeds], grouped.get(coin, []), config)
+            for coin in coins
+        }
+        return {
+            "run_id": run_id,
+            "parallel_mode": parallel_mode,
+            "total_tasks": len(work_items),
+            "seed_outputs": seed_outputs,
+            "results": aggregated_results,
+        }
+
+    work_items = [(all_data, coin, config, run_id) for coin in coins]
     if workers <= 1 or len(work_items) == 1:
         outputs = [_optimize_single(item) for item in work_items]
     else:
@@ -229,6 +419,8 @@ def run_optimization(coins: list[str], config: OptimizationConfig, workers: int)
 
     return {
         "run_id": run_id,
+        "parallel_mode": parallel_mode,
+        "total_tasks": len(work_items),
         "results": {str(item["coin"]): item for item in outputs},
     }
 
@@ -236,6 +428,7 @@ def run_optimization(coins: list[str], config: OptimizationConfig, workers: int)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Direct parallel launcher for optimization")
     parser.add_argument("--coins", type=str, default=",".join(COINS))
+    parser.add_argument("--parallel-mode", choices=["coin", "coin-seed"], default="coin")
     parser.add_argument("--trials", type=int, default=300)
     parser.add_argument("--workers", type=str, default="auto", help="Worker count or 'auto'")
     parser.add_argument("--jobs", type=int, default=1)
@@ -291,14 +484,17 @@ def main() -> None:
     selected_coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     seeds = [int(item.strip()) for item in args.sampler_seeds.split(",") if item.strip()]
     cpu_count = int(mp.cpu_count() or 1)
-    resolved_workers = resolve_workers(args.workers, len(selected_coins), cpu_count=cpu_count)
+    total_tasks = len(selected_coins) * len(seeds) if args.parallel_mode == "coin-seed" else len(selected_coins)
+    resolved_workers = resolve_workers(args.workers, total_tasks, cpu_count=cpu_count)
 
     print("\n=== Parallel Optimization Launch ===")
     print(f"CPU count detected: {cpu_count}")
     print(f"Selected coins: {', '.join(selected_coins)}")
+    print(f"Sampler seeds: {seeds}")
+    print(f"Parallel mode: {args.parallel_mode}")
+    print(f"Total tasks: {total_tasks}")
     print(f"Workers: {resolved_workers}")
-    print(f"Jobs per coin optimization: {args.jobs}")
-    print("Concurrency model: coin-level parallelism with single-job inner optimization.")
+    print(f"Jobs per optimization: {args.jobs}")
 
     config = OptimizationConfig(
         trials=args.trials,
@@ -342,11 +538,19 @@ def main() -> None:
         proxy_fidelity_eval_days=args.proxy_fidelity_eval_days,
     )
 
-    run_outputs = run_optimization(selected_coins, config, workers=resolved_workers)
+    run_outputs = run_optimization(selected_coins, config, workers=resolved_workers, parallel_mode=args.parallel_mode)
     run_id = run_outputs["run_id"]
     per_coin = run_outputs["results"]
 
-    manifest = build_run_manifest(Path(__file__).resolve().parent, args, selected_coins, run_id, resolved_workers, cpu_count)
+    manifest = build_run_manifest(
+        Path(__file__).resolve().parent,
+        args,
+        selected_coins,
+        run_id,
+        resolved_workers,
+        cpu_count,
+        total_tasks=total_tasks,
+    )
     manifest["config"] = asdict(config)
     manifest_path = save_run_manifest(manifest)
 
@@ -356,7 +560,12 @@ def main() -> None:
         payload = per_coin.get(coin)
         if not payload or not payload.get("success"):
             err = payload.get("error") if payload else "missing result payload"
-            print(f"{coin}: FAILED | error={err}")
+            failed = payload.get("failed_seeds") if payload else []
+            success = payload.get("successful_seeds") if payload else []
+            if args.parallel_mode == "coin-seed":
+                print(f"{coin}: FAILED | success_seeds={len(success)} failed_seeds={len(failed)} error={err}")
+            else:
+                print(f"{coin}: FAILED | error={err}")
             continue
         result = payload.get("result") or {}
         score = float(result.get("optim_score", 0.0) or 0.0)
@@ -364,10 +573,18 @@ def main() -> None:
         holdout_sr = float(holdout.get("holdout_sharpe", 0.0) or 0.0)
         holdout_trades = int(holdout.get("holdout_trades", 0) or 0)
         result_path = result.get("result_json_path") or result.get("result_path") or "n/a"
-        print(
-            f"{coin}: SUCCESS | score={score:.4f} holdout_sr={holdout_sr:.3f} "
-            f"holdout_trades={holdout_trades} result={result_path}"
-        )
+        if args.parallel_mode == "coin-seed":
+            failed = payload.get("failed_seeds") or []
+            success = payload.get("successful_seeds") or []
+            print(
+                f"{coin}: SUCCESS | success_seeds={len(success)} failed_seeds={len(failed)} "
+                f"score={score:.4f} holdout_sr={holdout_sr:.3f} holdout_trades={holdout_trades} result={result_path}"
+            )
+        else:
+            print(
+                f"{coin}: SUCCESS | score={score:.4f} holdout_sr={holdout_sr:.3f} "
+                f"holdout_trades={holdout_trades} result={result_path}"
+            )
 
 
 if __name__ == "__main__":
