@@ -107,9 +107,11 @@ def test_fold_evaluator_uses_profile_categoricals_and_nontrivial_ensemble(monkey
 
     monkeypatch.setattr(optimize, "MLSystem", _FakeMLSystem)
     monkeypatch.setattr(optimize, "fit_transform_fold", lambda x_tr, x_val, _y: (x_tr, x_val, None))
-    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m2")])
+    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m1")])
     monkeypatch.setattr(optimize, "get_strategy_family", lambda family_name: _FakeStrategyFamily(family_name))
     monkeypatch.setattr(optimize, "calculate_n_contracts", lambda *_a, **_k: 2)
+    monkeypatch.setattr(optimize, "resolve_label_horizon", lambda *_a, **_k: 1)
+    monkeypatch.setattr(optimize, "resolve_label_horizon", lambda *_a, **_k: 1)
 
     profile = COIN_PROFILES["BTC"]
     profile_breakout = profile.__class__(**{**profile.__dict__, "strategy_family": "breakout", "trade_freq_bucket": "aggressive", "cooldown_hours": 1.0})
@@ -157,9 +159,10 @@ def test_fold_evaluator_normalizes_ternary_labels_before_auc(monkeypatch):
 
     monkeypatch.setattr(optimize, "MLSystem", _FakeMLSystemTernary)
     monkeypatch.setattr(optimize, "fit_transform_fold", lambda x_tr, x_val, _y: (x_tr, x_val, None))
-    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m2")])
+    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m1")])
     monkeypatch.setattr(optimize, "get_strategy_family", lambda family_name: _FakeStrategyFamily(family_name))
     monkeypatch.setattr(optimize, "calculate_n_contracts", lambda *_a, **_k: 2)
+    monkeypatch.setattr(optimize, "resolve_label_horizon", lambda *_a, **_k: 1)
 
     captured = {}
 
@@ -178,3 +181,38 @@ def test_fold_evaluator_normalizes_ternary_labels_before_auc(monkeypatch):
 
     assert result is not None
     assert captured["labels"] == [0, 1]
+
+
+def test_fold_evaluator_low_trade_sharpe_is_zeroed_and_raw_retained(monkeypatch):
+    features, ohlcv = _make_market_data()
+    idx = features.index
+    fold = optimize.CVFold(
+        train_idx=idx[:150],
+        test_idx=idx[150:],
+        train_end=idx[149],
+        test_start=idx[150],
+        test_end=idx[-1],
+        purge_bars=0,
+        embargo_bars=0,
+    )
+
+    monkeypatch.setattr(optimize, "MLSystem", _FakeMLSystem)
+    monkeypatch.setattr(optimize, "fit_transform_fold", lambda x_tr, x_val, _y: (x_tr, x_val, None))
+    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m1")])
+    monkeypatch.setattr(optimize, "get_strategy_family", lambda family_name: _FakeStrategyFamily(family_name))
+    monkeypatch.setattr(optimize, "calculate_n_contracts", lambda *_a, **_k: 2)
+    monkeypatch.setattr(optimize, "resolve_label_horizon", lambda *_a, **_k: 1)
+
+    profile = COIN_PROFILES["BTC"]
+    one_trade_profile = profile.__class__(
+        **{**profile.__dict__, "strategy_family": "breakout", "trade_freq_bucket": "aggressive", "cooldown_hours": 10_000.0, "min_vol_24h": 0.0, "max_vol_24h": 1.0}
+    )
+    cfg = optimize.Config(min_train_samples=50, val_fraction=0.2, trend_filter_mode="hard", funding_filter_mode="off")
+
+    result = optimize.evaluate_fold_with_execution_gates(features, ohlcv, fold, one_trade_profile, cfg, "BIP-20DEC30-CDE", pruned_only=False)
+
+    assert result is not None
+    metrics = result["fold_metrics"]
+    assert metrics["trades"] == 1
+    assert metrics["raw_sharpe"] > 100_000
+    assert metrics["sharpe"] == 0.0
