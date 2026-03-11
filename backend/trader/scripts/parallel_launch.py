@@ -37,18 +37,27 @@ def _build_coin_study_suffix(base_suffix: str, coin: str, run_id: str) -> str:
     return f"{run_id}_{coin_key}"
 
 
-def build_run_manifest(script_dir, args, target_coins: list[str], run_id: str, workers: int, cpu_count: int) -> dict[str, Any]:
+def build_run_manifest(
+    script_dir,
+    args,
+    target_coins: list[str],
+    run_id: str,
+    workers: int | None = None,
+    cpu_count: int | None = None,
+) -> dict[str, Any]:
     """Build a reproducibility manifest for a parallel optimization run."""
     generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     sampler_seeds_raw = getattr(args, "sampler_seeds", "")
     seeds = _parse_sampler_seeds(sampler_seeds_raw)
     study_suffix = str(getattr(args, "study_suffix", "") or "")
+    resolved_cpu_count = int(cpu_count or mp.cpu_count() or 1)
+    resolved_workers = int(workers or resolve_workers(getattr(args, "workers", "auto"), len(target_coins), resolved_cpu_count))
     return {
         "run_id": str(run_id),
         "generated_at": generated_at,
         "script_dir": str(script_dir),
-        "cpu_count": int(cpu_count),
-        "workers": int(workers),
+        "cpu_count": resolved_cpu_count,
+        "workers": resolved_workers,
         "jobs": int(getattr(args, "jobs", 1)),
         "preset": getattr(args, "preset", None),
         "pruned_only": bool(getattr(args, "pruned_only", False)),
