@@ -139,7 +139,6 @@ def compute_psr_from_samples(
 
 
 def compute_deflated_sharpe(
-    *,
     observed_sharpe: float,
     observations: int,
     effective_test_count: int,

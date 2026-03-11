@@ -309,11 +309,11 @@ FIXED_RISK = {
 }
 
 COIN_OPTIMIZATION_PRIORS = {
-    'BTC': {'target_trades_per_year': 40.0, 'cooldown_min': 6.0, 'cooldown_max': 36.0, 'min_momentum_magnitude': (0.010, 0.050), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
-    'ETH': {'target_trades_per_year': 40.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.050), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'SOL': {'target_trades_per_year': 48.0, 'cooldown_min': 3.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.010, 0.055), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
-    'XRP': {'target_trades_per_year': 44.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.055), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'DOGE': {'target_trades_per_year': 44.0, 'cooldown_min': 4.0, 'cooldown_max': 30.0, 'min_momentum_magnitude': (0.010, 0.060), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.10, 0.20), 'min_directional_agreement': (0.50, 0.72), 'meta_probability_threshold': (0.48, 0.62), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
+    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.065), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.15), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.52, 0.65), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -383,13 +383,13 @@ def create_trial_profile(trial, coin_name):
 
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
-        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.08, 0.50, 0.72), clamp(base_threshold + 0.10, 0.62, 0.82), step=0.01),
+        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.04, 0.58, 0.75), clamp(base_threshold + 0.12, 0.65, 0.85), step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
         min_momentum_magnitude=min_momentum_magnitude,
-        vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 2.0, 2.0, 8.0), clamp(base_tp + 2.0, 3.0, 9.0), step=0.5),
-        vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 1.5, 5.0), clamp(base_sl + 1.0, 2.0, 5.5), step=0.5),
-        max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 24, 120)), int(clamp(base_hold + 24, 36, 132)), step=12),
+        vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 1.5, 3.5, 8.0), clamp(base_tp + 2.5, 5.0, 10.0), step=0.5),
+        vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 2.0, 5.0), clamp(base_sl + 1.0, 2.5, 5.5), step=0.5),
+        max_hold_hours=trial.suggest_int('max_hold_hours', int(clamp(base_hold - 24, 48, 120)), int(clamp(base_hold + 36, 72, 168)), step=12),
         min_vol_24h=min_vol_24h,
         max_vol_24h=max_vol_24h,
         max_ensemble_std=max_ensemble_std,
@@ -477,7 +477,8 @@ def _score_model_quality(probs: np.ndarray, y_test: pd.Series) -> dict:
     prob_std = float(np.std(probs))
     prob_range = float(np.percentile(probs, 95) - np.percentile(probs, 5))
     spread_bonus = min(0.1, prob_range * 0.5)
-    score = float((auc - 0.5) * 2.0 - brier + spread_bonus)
+    baseline_brier = 0.25
+    score = float((auc - 0.5) * 2.0 - (brier - baseline_brier) + spread_bonus)
     return {'auc': auc, 'brier': brier, 'prob_std': prob_std, 'prob_range': prob_range, 'score': score}
 
 
@@ -499,8 +500,10 @@ def _score_signal_density(probs: np.ndarray, ohlcv_test: pd.DataFrame, profile: 
     joint_rate = max(signal_rate * momentum_rate * vol_rate, 1e-6)
     hours_per_trade = max(float(profile.cooldown_hours), 1.0 / joint_rate)
     estimated_tpy = float(8760.0 / hours_per_trade)
+    filter_health = (signal_rate + momentum_rate + vol_rate) / 3.0
     capped_tpy = min(estimated_tpy, 100.0)
-    score = float(min(1.0, np.log1p(capped_tpy) / np.log1p(100.0)))
+    tpy_score = float(min(1.0, np.log1p(capped_tpy) / np.log1p(100.0)))
+    score = 0.5 * filter_health + 0.5 * tpy_score
 
     return {
         'signal_rate': signal_rate,
@@ -640,21 +643,13 @@ def objective(
 
     estimated_tpy = float(np.mean([f['signal_density']['estimated_tpy'] for f in fold_scores]))
 
-    if mean_auc < 0.505:
-        trial.set_user_attr('reject_code', 'AUC_BELOW_FLOOR')
-        trial.set_user_attr('reject_reason', f'mean_auc={mean_auc:.4f}<0.505')
-        trial.set_user_attr('n_folds', int(len(fold_scores)))
-        trial.set_user_attr('mean_auc', round(mean_auc, 4))
-        trial.set_user_attr('estimated_tpy', round(estimated_tpy, 1))
-        return -1.0
-
-    signal_floor_ok = 1.0 if estimated_tpy >= 20.0 else (estimated_tpy / 20.0)
+    signal_penalty = 0.0 if estimated_tpy >= 10.0 else -0.10 * (1.0 - estimated_tpy / 10.0)
     combined = (
-        0.55 * model_q +
-        0.15 * signal_d +
-        0.15 * label_q +
-        0.15 * consistency['score']
-    ) * signal_floor_ok
+        0.30 * model_q +
+        0.30 * signal_d +
+        0.20 * label_q +
+        0.20 * consistency['score']
+    ) + signal_penalty
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
@@ -1251,8 +1246,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}, cv_mode={cv_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
-    print("   Proxy score weights: model_quality=0.55, signal_density=0.15, label_quality=0.15, fold_consistency=0.15")
-    print("   AUC floor: 0.505 | Signal density TPY cap: 100")
+    print("   Proxy score weights: model_quality=0.30, signal_density=0.30, label_quality=0.20, fold_consistency=0.20")
+    print("   High-conviction mode: raised thresholds + longer cooldowns + wider TP")
     phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
     print(
         f"   Phase: {phase_label} | target_tpw={float(target_trades_per_week):.2f} "
