@@ -1648,7 +1648,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   seed_stability_max_oos_sharpe_dispersion=0.35,
                   cv_mode='walk_forward', purge_days=None, purge_bars=None, embargo_days=None,
                   embargo_bars=None, embargo_frac=0.0,
-                  cost_config_path=None):
+                  cost_config_path=None,
+                  proxy_fidelity_candidates=0,
+                  proxy_fidelity_eval_days=0):
     enable_pbo_diagnostic = False
     enable_study_significance = False
     study_significance_bootstrap_iterations = 500
