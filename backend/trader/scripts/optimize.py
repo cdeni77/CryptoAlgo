@@ -1224,6 +1224,15 @@ def _derive_confidence_tier(
         return 'PROMOTION_READY'
     return 'PAPER_QUALIFIED'
 
+
+def _is_paper_facing_run(preset_name: str, gate_mode: str) -> bool:
+    preset = str(preset_name or '').lower()
+    gate = str(gate_mode or '').lower()
+    return preset in {'paper_ready', 'robust120', 'robust180'} or gate in {
+        'initial_paper_qualification',
+        'production_promotion',
+    }
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PATHS / PERSISTENCE / MAIN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1610,6 +1619,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     selection_meta = {}
     deployment_blocked = False
     blocked_reasons = []
+    paper_facing_run = _is_paper_facing_run(preset_name, gate_mode)
+    effective_require_holdout_pass = bool(require_holdout_pass or paper_facing_run)
+    exploratory_best_trial = int(best.number)
+    exploratory_best_score = round(float(best.value), 6) if best.value is not None else None
+    promoted_paper_candidate = None
     est_ho_trades, effective_holdout_min_trades = estimate_holdout_trade_budget(
         holdout_days=holdout_days,
         target_trades_per_week=max(
@@ -1674,15 +1688,33 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                     min_dsr=min_dsr,
                 )
             ]
-            selected_pool = passing_candidates if require_holdout_pass else ranked_candidates
-            selected_trial, holdout_result, selected_score = selected_pool[0] if selected_pool else (None, None, None)
-            if require_holdout_pass and not passing_candidates:
+            selected_trial = None
+            selected_score = None
+            exploratory_trial, exploratory_holdout, exploratory_score = ranked_candidates[0]
+            paper_candidate = passing_candidates[0] if passing_candidates else None
+
+            if not passing_candidates:
                 deployment_blocked = True
-                blocked_reasons.append(
-                    f"holdout_gate_failed:trades>={effective_holdout_min_trades},sr>={holdout_min_sharpe},ret>={holdout_min_return},psr>={min_psr_holdout},dsr>={min_dsr}"
-                )
-                print("  🛑 Holdout gate failed for all candidates. Blocking deployment for this coin.")
-                selected_trial, holdout_result, selected_score = ranked_candidates[0]
+                blocked_reasons.extend([
+                    'NO_HOLDOUT_CANDIDATE_PASSED_GATE',
+                    (
+                        f"holdout_gate_failed:trades>={effective_holdout_min_trades},sr>={holdout_min_sharpe},"
+                        f"ret>={holdout_min_return},psr>={min_psr_holdout},dsr>={min_dsr}"
+                    ),
+                ])
+                if effective_require_holdout_pass:
+                    blocked_reasons.append('REQUIRE_HOLDOUT_PASS_ACTIVE')
+                print("  🛑 Holdout gate failed for all candidates. Deployment remains blocked.")
+
+            if paper_candidate:
+                selected_trial, holdout_result, selected_score = paper_candidate
+                promoted_paper_candidate = {
+                    'trial': int(selected_trial.number),
+                    'selection_score': round(float(selected_score), 6),
+                }
+            else:
+                selected_trial, holdout_result, selected_score = exploratory_trial, exploratory_holdout, exploratory_score
+
             if selected_trial.number != best.number:
                 print(
                     f"  🧭 Holdout-guided selection: #{selected_trial.number} "
@@ -1696,7 +1728,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 'selected_trial': int(best.number),
                 'selected_score': round(float(selected_score), 6),
                 'holdout_mode': holdout_mode,
-                'require_holdout_pass': bool(require_holdout_pass),
+                'require_holdout_pass_input': bool(require_holdout_pass),
+                'paper_facing_run': bool(paper_facing_run),
+                'require_holdout_pass_effective': bool(effective_require_holdout_pass),
                 'holdout_gate': {
                     'min_trades': int(holdout_min_trades),
                     'effective_min_trades': int(effective_holdout_min_trades),
@@ -1706,6 +1740,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                     'min_dsr': None if min_dsr is None else float(min_dsr),
                 },
                 'deployment_blocked': bool(deployment_blocked),
+                'best_exploratory_trial': {
+                    'trial': int(exploratory_trial.number),
+                    'selection_score': round(float(exploratory_score), 6),
+                },
+                'paper_eligible_promoted_candidate': promoted_paper_candidate,
                 'candidates': [
                     {
                         'trial': int(c.number),
@@ -1800,6 +1839,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         max_seed_param_dispersion=seed_stability_max_param_dispersion,
         max_seed_oos_sharpe_dispersion=seed_stability_max_oos_sharpe_dispersion,
     )
+    if deployment_blocked:
+        research_confidence_tier = 'SCREENED'
     selection_meta = dict(selection_meta)
     selection_meta['research_confidence_tier'] = research_confidence_tier
 
@@ -1924,6 +1965,11 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         'cost_model': cost_model_metadata,
         'selection_meta': selection_meta, 'deployment_blocked': deployment_blocked,
         'deployment_block_reasons': blocked_reasons,
+        'best_exploratory_trial': {
+            'trial': exploratory_best_trial,
+            'optim_score': exploratory_best_score,
+        },
+        'paper_eligible_promoted_candidate': promoted_paper_candidate,
         'robustness_diagnostics': robustness_diagnostics,
         'study_significance': study_significance,
         'seed_stability': seed_stability,
