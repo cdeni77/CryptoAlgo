@@ -116,7 +116,7 @@ def test_failed_holdout_blocks_deployment_and_emits_no_promotion_artifact(monkey
     assert artifacts == []
 
 
-def test_passing_holdout_emits_promotion_artifact_with_required_fields(monkeypatch):
+def test_passing_holdout_does_not_emit_single_seed_promotion_artifact(monkeypatch):
     result, artifacts = _run_optimize_coin_with_holdout(
         monkeypatch,
         holdout_metrics={"holdout_sharpe": 0.3, "holdout_return": 0.04, "holdout_trades": 25},
@@ -124,13 +124,7 @@ def test_passing_holdout_emits_promotion_artifact_with_required_fields(monkeypat
 
     assert result is not None
     assert result["deployment_blocked"] is False
-    assert len(artifacts) == 1
-    artifact = artifacts[0]
-    assert artifact["holdout_passed"] is True
-    assert artifact["holdout_gate_result"] == "pass"
-    assert artifact["evaluated_params"] == result["params"]
-    for key in ("coin", "holdout_metrics", "run_id", "study_name", "timestamp", "gate_profile"):
-        assert key in artifact
+    assert artifacts == []
 
 from core.coin_profiles import COIN_PROFILES
 from core.paper_profile_overrides import load_paper_profile_overrides

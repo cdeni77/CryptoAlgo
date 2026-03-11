@@ -12,6 +12,10 @@ def test_multiseed_keeps_selected_seed_params_and_metrics(monkeypatch):
             "holdout_metrics": {"holdout_sharpe": 0.41, "holdout_trades": 20, "holdout_return": 0.06},
             "deployment_blocked": False,
             "selection_meta": {},
+            "research_confidence_tier": "PAPER_QUALIFIED",
+            "gate_profile": {"mode": "initial_paper_qualification"},
+            "meta": {"study_name": "s1"},
+            "run_id": "run-1",
         },
         202: {
             "coin": "BTC",
@@ -20,6 +24,10 @@ def test_multiseed_keeps_selected_seed_params_and_metrics(monkeypatch):
             "holdout_metrics": {"holdout_sharpe": 0.15, "holdout_trades": 16, "holdout_return": 0.01},
             "deployment_blocked": False,
             "selection_meta": {},
+            "research_confidence_tier": "PAPER_QUALIFIED",
+            "gate_profile": {"mode": "initial_paper_qualification"},
+            "meta": {"study_name": "s2"},
+            "run_id": "run-2",
         },
     }
 
@@ -28,6 +36,12 @@ def test_multiseed_keeps_selected_seed_params_and_metrics(monkeypatch):
 
     monkeypatch.setattr(optimize, "optimize_coin", fake_optimize_coin)
     monkeypatch.setattr(optimize, "_persist_result_json", lambda *_args, **_kwargs: None)
+    artifact_payloads = []
+    monkeypatch.setattr(
+        optimize,
+        "_persist_paper_candidate_json",
+        lambda _coin, payload: artifact_payloads.append(payload) or "artifact.json",
+    )
 
     result = optimize.optimize_coin_multiseed(
         all_data={},
@@ -37,15 +51,17 @@ def test_multiseed_keeps_selected_seed_params_and_metrics(monkeypatch):
     )
 
     assert result is not None
-    # Top-level params/metrics must remain tied to the selected seed evaluation.
     assert result["params"] == seed_results[101]["params"]
     assert result["holdout_metrics"] == seed_results[101]["holdout_metrics"]
-
-    # Consensus must be explicit metadata and not silently replace evaluated params.
     assert result["consensus_params"] != result["params"]
     assert result["consensus_params"] == {"signal_threshold": 0.795, "max_depth": 6}
     assert result["consensus_revalidated"] is False
     assert result["evaluated_params_source"] == "selected_seed"
+
+    assert len(artifact_payloads) == 1
+    artifact = artifact_payloads[0]
+    assert artifact["evaluated_params"] == result["params"]
+    assert artifact["holdout_metrics"] == result["holdout_metrics"]
 
 
 def test_multiseed_records_consensus_metadata_when_no_consensus(monkeypatch):
@@ -74,7 +90,6 @@ def test_multiseed_records_consensus_metadata_when_no_consensus(monkeypatch):
     monkeypatch.setattr(optimize, "optimize_coin", fake_optimize_coin)
     monkeypatch.setattr(optimize, "_persist_result_json", lambda *_args, **_kwargs: None)
 
-    # Empty selected-seed params should be rejected by the guardrail.
     try:
         optimize.optimize_coin_multiseed(
             all_data={},
@@ -86,3 +101,44 @@ def test_multiseed_records_consensus_metadata_when_no_consensus(monkeypatch):
         assert "params missing" in str(exc)
     else:
         raise AssertionError("Expected guardrail to reject empty selected-seed params")
+
+
+def test_multiseed_artifact_requires_pass_not_blocked_and_min_tier(monkeypatch):
+    seed_results = {
+        1: {
+            "coin": "BTC",
+            "optim_score": 2.0,
+            "params": {"signal_threshold": 0.72},
+            "holdout_metrics": {"holdout_sharpe": 0.4, "holdout_trades": 2, "holdout_return": 0.05},
+            "deployment_blocked": False,
+            "selection_meta": {},
+            "research_confidence_tier": "SCREENED",
+        },
+        2: {
+            "coin": "BTC",
+            "optim_score": 1.0,
+            "params": {"signal_threshold": 0.70},
+            "holdout_metrics": {"holdout_sharpe": 0.2, "holdout_trades": 2, "holdout_return": 0.01},
+            "deployment_blocked": False,
+            "selection_meta": {},
+            "research_confidence_tier": "SCREENED",
+        },
+    }
+
+    monkeypatch.setattr(
+        optimize,
+        "optimize_coin",
+        lambda _all_data, _coin_prefix, _coin_name, sampler_seed, **_kwargs: deepcopy(seed_results[sampler_seed]),
+    )
+    monkeypatch.setattr(optimize, "_persist_result_json", lambda *_args, **_kwargs: None)
+    artifact_payloads = []
+    monkeypatch.setattr(
+        optimize,
+        "_persist_paper_candidate_json",
+        lambda _coin, payload: artifact_payloads.append(payload) or "artifact.json",
+    )
+
+    result = optimize.optimize_coin_multiseed({}, "BIP", "BTC", sampler_seeds=[1, 2])
+
+    assert result is not None
+    assert artifact_payloads == []

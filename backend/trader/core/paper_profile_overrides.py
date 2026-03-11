@@ -107,6 +107,11 @@ def load_paper_profile_overrides(path: Optional[str]) -> Dict[str, CoinProfile]:
             logger.info("Skipping non-passing holdout artifact for %s (%s)", coin_name, artifact_path)
             continue
 
+        tier = str(payload.get('research_confidence_tier') or '').upper()
+        if tier and tier not in {'PAPER_QUALIFIED', 'PROMOTION_READY'}:
+            logger.info("Skipping artifact below paper-qualified tier for %s: %s", coin_name, tier)
+            continue
+
         evaluated_params = payload.get('evaluated_params')
         if not isinstance(evaluated_params, dict):
             logger.warning("Skipping artifact missing evaluated_params: %s", artifact_path)
