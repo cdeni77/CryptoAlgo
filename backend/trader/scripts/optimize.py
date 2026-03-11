@@ -2165,13 +2165,27 @@ def optimize_coin_multiseed(all_data, coin_prefix, coin_name, sampler_seeds=None
         f"tier={research_confidence_tier}"
     )
 
-    if consensus_params:
-        best_seed_result['params'] = consensus_params
-        best_seed_result.setdefault('meta', {})['seed_consensus'] = {
-            'seeds': seeds,
-            'qualified_runs': len(qualified),
-            'total_runs': len(run_results),
-        }
+    best_seed_result.setdefault('meta', {})['seed_consensus'] = {
+        'seeds': seeds,
+        'qualified_runs': len(qualified),
+        'total_runs': len(run_results),
+    }
+    best_seed_result['consensus_params'] = consensus_params
+    best_seed_result['consensus_revalidated'] = False
+    best_seed_result['evaluated_params_source'] = 'selected_seed'
+
+    # Guardrail: top-level params must always correspond to top-level holdout_metrics.
+    if best_seed_result.get('evaluated_params_source') != 'selected_seed':
+        raise ValueError("Top-level params must come from selected seed unless holdout is revalidated.")
+
+    seed_params = best_seed_result.get('params')
+    if not isinstance(seed_params, dict) or not seed_params:
+        raise ValueError("Selected-seed params missing; refusing to persist inconsistent result.")
+
+    holdout_metrics = best_seed_result.get('holdout_metrics')
+    if not isinstance(holdout_metrics, dict) or not holdout_metrics:
+        raise ValueError("Selected-seed holdout metrics missing; refusing to persist inconsistent result.")
+
     best_seed_result['quality'] = assess_result_quality(best_seed_result)
     p = _persist_result_json(coin_name, best_seed_result)
     if p:
