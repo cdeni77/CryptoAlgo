@@ -4,8 +4,8 @@ optimize.py — Per-coin Optuna parameter optimization (v11.1: Fast CV).
 
 v11.1: CRITICAL PERFORMANCE FIX
   v11.0 called run_backtest() 3x per trial (~30 min/trial = 50h for 100 trials).
-  v11.3 uses proxy_evaluate_fold() to score fold-level model quality and signal viability
-  without full trade simulation. run_backtest() only used for final holdout.
+  v11.4 evaluates folds through execution gates aligned with train_model.py logic
+  and uses realized fold outcomes for objective scoring. run_backtest() only used for final holdout.
   Expected: 100 trials in ~30-60 minutes instead of 50 hours.
 
 Usage:
@@ -34,6 +34,9 @@ from optuna.samplers import TPESampler
 
 from scripts.train_model import (
     Config, load_data, run_backtest, MLSystem,
+    _build_strategy_context, _calibrator_predict, _resolve_filter_policy,
+    calculate_n_contracts, get_strategy_family, primary_recall_threshold,
+    resolve_label_horizon, resolve_param,
 )
 from core.meta_labeling import calibrator_predict
 from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
@@ -534,8 +537,22 @@ def _score_fold_consistency(fold_aucs: list[float]) -> dict:
     return {'score': float(1.0 / (1.0 + cv))}
 
 
-def proxy_evaluate_fold(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
+def _summarize_fold_gate_counters(gate_counts: Dict[str, int], total_checks: int) -> Dict[str, object]:
+    gate_counts_clean = {str(k): int(v) for k, v in sorted(gate_counts.items()) if int(v) > 0}
+    gate_rates = {
+        reason: float(count / max(total_checks, 1))
+        for reason, count in gate_counts_clean.items()
+    }
+    return {
+        'total_checks': int(total_checks),
+        'gate_counts': gate_counts_clean,
+        'gate_rates': gate_rates,
+    }
+
+
+def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
     system = MLSystem(config)
+    strategy_family = get_strategy_family(config.strategy_family)
     feature_candidates = profile.resolve_feature_columns(
         use_pruned_features=bool(pruned_only),
         strict_pruned=bool(pruned_only),
@@ -582,13 +599,167 @@ def proxy_evaluate_fold(features, ohlcv, fold: CVFold, profile: CoinProfile, con
     probs = calibrator_predict(iso, raw_probs)
 
     model_quality = _score_model_quality(probs, y_test)
-    signal_density = _score_signal_density(probs, test_ohlcv.loc[y_test.index], profile)
     label_quality = _score_label_quality(y_train, y_test)
+
+    test_idx = test_feat.index.intersection(ohlcv.index)
+    if len(test_idx) < 24:
+        return None
+
+    gate_counts: Dict[str, int] = {}
+
+    def _gate(reason: str):
+        gate_counts[reason] = gate_counts.get(reason, 0) + 1
+
+    cooldown_hours = max(float(profile.cooldown_hours), 0.0)
+    last_entry_ts = None
+    label_horizon = max(1, int(resolve_label_horizon(profile, config)))
+    effective_threshold = resolve_param('signal_threshold', profile, config, Config.signal_threshold, mode='direct')
+    primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
+    effective_meta_threshold = resolve_param('meta_probability_threshold', profile, config, Config.meta_probability_threshold, mode='direct')
+    effective_directional_agreement = resolve_param('min_directional_agreement', profile, config, Config.min_directional_agreement, mode='direct')
+    effective_max_ensemble_std = resolve_param('max_ensemble_std', profile, config, Config.max_ensemble_std, mode='direct')
+    effective_momentum = resolve_param('min_momentum_magnitude', profile, config, Config.min_momentum_magnitude, mode='direct')
+
+    ohlcv_ts = ohlcv
+    trade_returns: List[float] = []
+
+    for ts in test_idx:
+        if last_entry_ts is not None and cooldown_hours > 0:
+            if (ts - last_entry_ts).total_seconds() < cooldown_hours * 3600:
+                _gate('cooldown')
+                continue
+
+        row = features.loc[ts]
+        ohlcv_row = ohlcv_ts.loc[ts]
+        price = float(ohlcv_row.get('close', np.nan))
+        sma_200 = ohlcv_row.get('sma_200', np.nan)
+        if pd.isna(price) or pd.isna(sma_200):
+            _gate('missing_sma200')
+            continue
+
+        vol_24h = ohlcv_ts['close'].pct_change().rolling(24).std().get(ts, None)
+        if vol_24h is None or pd.isna(vol_24h) or float(vol_24h) < profile.min_vol_24h:
+            _gate('vol_regime_low')
+            continue
+        if float(vol_24h) > profile.max_vol_24h:
+            _gate('vol_regime_high')
+            continue
+
+        ts_loc = ohlcv_ts.index.get_loc(ts)
+        if ts_loc < 72:
+            _gate('momentum_magnitude')
+            continue
+
+        ret_24h = (price / ohlcv_ts['close'].iloc[ts_loc - 24] - 1)
+        ret_72h = (price / ohlcv_ts['close'].iloc[ts_loc - 72] - 1)
+        if abs(ret_72h) < effective_momentum:
+            _gate('momentum_magnitude')
+            continue
+
+        sma_50 = ohlcv_ts['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
+        strategy_context = _build_strategy_context(row, price, sma_200, ret_24h, ret_72h, sma_50, vol_24h=float(vol_24h))
+        strategy_decision = strategy_family.evaluate(
+            strategy_context,
+            min_momentum_magnitude=effective_momentum,
+            score_threshold=config.momentum_score_threshold,
+            strict_mode=config.momentum_strict_mode,
+        )
+        direction = int(strategy_decision.direction)
+        if not strategy_decision.gate_contributions.get('momentum_dir_agreement', direction != 0):
+            _gate('momentum_dir_agreement')
+            continue
+
+        trend_violated = (direction == 1 and price < sma_200) or (direction == -1 and price > sma_200)
+        trend_effect = _resolve_filter_policy(config.trend_filter_mode, trend_violated, rank_penalty=0.30, size_multiplier=0.70)
+        if trend_effect.reject:
+            _gate('trend_filter')
+            continue
+        size_multiplier = float(trend_effect.size_multiplier)
+
+        f_z = row.get('funding_rate_zscore', 0)
+        if pd.isna(f_z):
+            f_z = 0
+        funding_violated = (direction == 1 and f_z > 2.5) or (direction == -1 and f_z < -2.5)
+        funding_effect = _resolve_filter_policy(config.funding_filter_mode, funding_violated, rank_penalty=0.25, size_multiplier=0.75)
+        if funding_effect.reject:
+            _gate('funding_filter')
+            continue
+        size_multiplier *= float(funding_effect.size_multiplier)
+
+        x_in = np.nan_to_num(np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0)
+        raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
+        cal_prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
+        directional_votes = [1 if (cal_prob >= 0.5 and direction == 1) or (cal_prob < 0.5 and direction == -1) else 0]
+        probs = [cal_prob]
+
+        agreement = float(np.mean(directional_votes))
+        if agreement < effective_directional_agreement:
+            _gate('ensemble_agreement')
+            continue
+
+        prob = float(np.mean(probs))
+        prob_std = float(np.std(probs))
+        if agreement < 0.999:
+            prob = min(prob, config.disagreement_confidence_cap)
+        if prob < primary_cutoff or prob_std > effective_max_ensemble_std:
+            _gate('primary_threshold' if prob < primary_cutoff else 'ensemble_std')
+            continue
+
+        if meta_artifacts.model is None or meta_artifacts.scaler is None:
+            _gate('meta_threshold')
+            continue
+        meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
+        if meta_artifacts.calibrator is not None:
+            meta_prob = float(calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0])
+        else:
+            meta_prob = float(meta_raw)
+        if meta_prob < effective_meta_threshold:
+            _gate('meta_threshold')
+            continue
+
+        n_contracts = calculate_n_contracts(
+            100_000,
+            price,
+            symbol,
+            config,
+            vol_24h=float(vol_24h),
+            profile=profile,
+        )
+        n_contracts = int(np.floor(n_contracts * size_multiplier))
+        if n_contracts < 1:
+            _gate('no_contract_size')
+            continue
+
+        exit_loc = ts_loc + label_horizon
+        if exit_loc >= len(ohlcv_ts):
+            continue
+
+        exit_price = float(ohlcv_ts['close'].iloc[exit_loc])
+        trade_ret = float(((exit_price / price) - 1.0) * direction)
+        trade_returns.append(trade_ret)
+        last_entry_ts = ts
+
+    fold_trades = int(len(trade_returns))
+    if fold_trades:
+        arr = np.array(trade_returns, dtype=float)
+        fold_return = float(np.prod(1.0 + arr) - 1.0)
+        expectancy = float(np.mean(arr))
+        sharpe = float((np.mean(arr) / max(np.std(arr), 1e-9)) * np.sqrt(fold_trades))
+    else:
+        fold_return = 0.0
+        expectancy = 0.0
+        sharpe = 0.0
 
     return {
         'model_quality': model_quality,
-        'signal_density': signal_density,
         'label_quality': label_quality,
+        'fold_metrics': {
+            'trades': fold_trades,
+            'sharpe': sharpe,
+            'return': fold_return,
+            'expectancy': expectancy,
+        },
+        'gate_counters': _summarize_fold_gate_counters(gate_counts, total_checks=len(test_idx)),
     }
 
 
@@ -624,7 +795,7 @@ def objective(
     fold_scores = []
 
     for fold in cv_splits:
-        result = proxy_evaluate_fold(features, ohlcv, fold, profile, config, target_sym, pruned_only=pruned_only)
+        result = evaluate_fold_with_execution_gates(features, ohlcv, fold, profile, config, target_sym, pruned_only=pruned_only)
         if result is not None:
             fold_scores.append(result)
 
@@ -636,30 +807,47 @@ def objective(
         return -1.0
 
     model_q = float(np.mean([f['model_quality']['score'] for f in fold_scores]))
-    signal_d = float(np.mean([f['signal_density']['score'] for f in fold_scores]))
     label_q = float(np.mean([f['label_quality']['score'] for f in fold_scores]))
     mean_auc = float(np.mean([f['model_quality']['auc'] for f in fold_scores]))
     consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores])
 
-    estimated_tpy = float(np.mean([f['signal_density']['estimated_tpy'] for f in fold_scores]))
+    fold_metrics = [f.get('fold_metrics', {}) for f in fold_scores]
+    fold_gate_counters = [f.get('gate_counters', {}) for f in fold_scores]
+    fold_trade_counts = [int(m.get('trades', 0) or 0) for m in fold_metrics]
 
-    signal_penalty = 0.0 if estimated_tpy >= 10.0 else -0.10 * (1.0 - estimated_tpy / 10.0)
+    realized_sharpe = float(np.mean([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]))
+    realized_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in fold_metrics]))
+    realized_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in fold_metrics]))
+    realized_trades = int(sum(fold_trade_counts))
+
     combined = (
-        0.30 * model_q +
-        0.30 * signal_d +
+        0.25 * model_q +
         0.20 * label_q +
-        0.20 * consistency['score']
-    ) + signal_penalty
+        0.15 * consistency['score'] +
+        0.25 * realized_sharpe +
+        0.10 * realized_expectancy +
+        0.05 * np.tanh(realized_return * 5.0)
+    )
+
+    trade_floor_penalty = 0.0
+    if realized_trades < max(3, len(cv_splits)):
+        trade_floor_penalty = -0.20 * (1.0 - realized_trades / max(float(len(cv_splits)), 1.0))
+        combined += trade_floor_penalty
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
-    trial.set_user_attr('signal_density', round(signal_d, 4))
-    trial.set_user_attr('estimated_tpy', round(estimated_tpy, 1))
-    trial.set_user_attr('n_trades', int(round(estimated_tpy)))
-    trial.set_user_attr('mean_sharpe', round(combined, 6))
-    trial.set_user_attr('min_sharpe', round(combined, 6))
-    trial.set_user_attr('win_rate', round(max(0.0, min(1.0, model_q + 0.5)), 4))
-    trial.set_user_attr('max_drawdown', round(max(0.0, 1.0 - signal_d), 4))
+    trial.set_user_attr('n_trades', int(realized_trades))
+    trial.set_user_attr('mean_sharpe', round(realized_sharpe, 6))
+    trial.set_user_attr('min_sharpe', round(float(min([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics] or [0.0])), 6))
+    trial.set_user_attr('std_sharpe', round(float(np.std([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics])) if fold_metrics else 0.0, 6))
+    trial.set_user_attr('win_rate', round(float(np.mean([1.0 if _finite_metric(m.get('expectancy'), 0.0) > 0 else 0.0 for m in fold_metrics])) if fold_metrics else 0.0, 4))
+    trial.set_user_attr('max_drawdown', round(max(0.0, 1.0 - max(realized_return, -1.0)), 4))
+    trial.set_user_attr('fold_metrics', _to_json_safe(fold_metrics))
+    trial.set_user_attr('fold_gate_counters', _to_json_safe(fold_gate_counters))
+    trial.set_user_attr('fold_trade_counts', _to_json_safe(fold_trade_counts))
+    trial.set_user_attr('realized_return', round(realized_return, 6))
+    trial.set_user_attr('realized_expectancy', round(realized_expectancy, 6))
+    trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
 
     return float(combined)
 
@@ -1246,7 +1434,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}, cv_mode={cv_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
-    print("   Proxy score weights: model_quality=0.30, signal_density=0.30, label_quality=0.20, fold_consistency=0.20")
+    print("   Objective weights: model_quality=0.25, label_quality=0.20, fold_consistency=0.15, realized_sharpe=0.25, expectancy=0.10, return_term=0.05")
     print("   High-conviction mode: raised thresholds + longer cooldowns + wider TP")
     phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
     print(
