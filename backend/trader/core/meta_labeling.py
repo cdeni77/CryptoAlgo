@@ -53,7 +53,13 @@ def build_meta_dataset(
 def fit_calibrator(strategy: str, scores: np.ndarray, labels: pd.Series, isotonic_min_samples: int = 200):
     mode = (strategy or 'platt').lower()
     x = np.clip(np.asarray(scores, dtype=float), 1e-6, 1 - 1e-6)
-    y = np.asarray(labels, dtype=int)
+    y_series = pd.Series(labels)
+    valid_mask = np.isfinite(x) & y_series.notna().to_numpy()
+    x = x[valid_mask]
+    y = y_series.loc[valid_mask].to_numpy(dtype=int)
+
+    if len(y) < 2 or np.unique(y).size < 2:
+        return None, 'none_single_class_fallback'
 
     if mode == 'isotonic' and len(x) >= isotonic_min_samples:
         calibrator = IsotonicRegression(y_min=0, y_max=1, out_of_bounds='clip')
@@ -72,6 +78,8 @@ def fit_calibrator(strategy: str, scores: np.ndarray, labels: pd.Series, isotoni
 
 def calibrator_predict(calibrator, scores: np.ndarray) -> np.ndarray:
     x = np.clip(np.asarray(scores, dtype=float), 1e-6, 1 - 1e-6)
+    if calibrator is None:
+        return x
     if isinstance(calibrator, LogisticRegression):
         return calibrator.predict_proba(x.reshape(-1, 1))[:, 1]
     if BetaCalibration is not None and isinstance(calibrator, BetaCalibration):
@@ -197,7 +205,11 @@ def train_meta_classifier(
     fit_scores = raw_meta_val[:-holdout_size] if holdout_size > 0 else raw_meta_val
     fit_labels = y_meta_val.iloc[:-holdout_size] if holdout_size > 0 else y_meta_val
 
-    calibrator, calibrator_type = fit_calibrator(calibration_strategy, fit_scores, fit_labels)
+    if len(fit_scores) < 2 or fit_labels.nunique() < 2:
+        calibrator = None
+        calibrator_type = 'none_single_class_fallback'
+    else:
+        calibrator, calibrator_type = fit_calibrator(calibration_strategy, fit_scores, fit_labels)
     cal_meta_val = calibrator_predict(calibrator, raw_meta_val)
 
     metrics_report = {
