@@ -319,7 +319,7 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # Search priors are intentionally a bit wider than deployment defaults. This broadens
     # discovery while leaving holdout/promotion gates unchanged.
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.010, 0.045), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.58, 0.76), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.0005, 0.0045), 'min_trade_frequency_ratio': 0.40},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.010, 0.045), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.57, 0.76), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.0005, 0.0045), 'min_trade_frequency_ratio': 0.40},
     'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.009, 0.045), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.57, 0.75), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
     'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.012, 0.052), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.55, 0.74), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.0015, 0.0085), 'min_trade_frequency_ratio': 0.40},
     'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.59, 0.77), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
@@ -675,6 +675,47 @@ def _aggregate_slice_gate_summaries(holdout_slices: Dict[str, dict]) -> Dict[str
         for reason in GATE_REASON_CODES:
             aggregate_counts[reason] += int(counts.get(reason, 0) or 0)
     return _summarize_gate_counters_by_reason(aggregate_counts, total_checks)
+
+def _finalize_holdout_payload(metrics: Dict[str, object]) -> Dict[str, object]:
+    payload = dict(metrics or {})
+    gate_summary = payload.get('gate_counters', {}) if isinstance(payload.get('gate_counters', {}), dict) else {}
+    payload['gate_counters'] = _summarize_gate_counters_by_reason(
+        gate_summary.get('gate_counts', {}) if isinstance(gate_summary.get('gate_counts', {}), dict) else {},
+        int(gate_summary.get('total_checks', 0) or 0),
+    )
+    payload['starvation_signature'] = _derive_starvation_signature(payload['gate_counters'])
+
+    if int(payload.get('holdout_trades', 0) or 0) == 0:
+        payload['main_blockers'] = _derive_main_blockers(payload['gate_counters'])
+    else:
+        payload.pop('main_blockers', None)
+    return payload
+
+
+def _select_median_composite_slice(holdout_slices: Dict[str, dict]) -> tuple[str, Dict[str, object]] | tuple[None, None]:
+    slice_items = [(name, metrics) for name, metrics in (holdout_slices or {}).items() if isinstance(metrics, dict)]
+    if not slice_items:
+        return None, None
+
+    sr_median = float(np.median([_as_number(metrics.get('holdout_sharpe'), 0.0) or 0.0 for _, metrics in slice_items]))
+    ret_median = float(np.median([_as_number(metrics.get('holdout_return'), 0.0) or 0.0 for _, metrics in slice_items]))
+    trades_median = float(np.median([int(metrics.get('holdout_trades', 0) or 0) for _, metrics in slice_items]))
+
+    def _dist(item):
+        _name, metrics = item
+        sr = _as_number(metrics.get('holdout_sharpe'), 0.0) or 0.0
+        ret = _as_number(metrics.get('holdout_return'), 0.0) or 0.0
+        trades = float(int(metrics.get('holdout_trades', 0) or 0))
+        return (
+            abs(sr - sr_median),
+            abs(ret - ret_median),
+            abs(trades - trades_median),
+            -trades,
+        )
+
+    selected_name, selected_metrics = min(slice_items, key=_dist)
+    return selected_name, dict(selected_metrics)
+
 
 
 def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
@@ -1230,7 +1271,15 @@ def _passes_holdout_gate(
 def _compute_holdout_significance(holdout_metrics, *, completed_trials: int):
     if not holdout_metrics:
         return holdout_metrics
-    hm = dict(holdout_metrics)
+    hm = _finalize_holdout_payload(dict(holdout_metrics))
+    slices = hm.get('holdout_slices', {}) if isinstance(hm.get('holdout_slices', {}), dict) else {}
+    if slices:
+        hm['holdout_slices'] = {
+            name: _finalize_holdout_payload(metrics)
+            for name, metrics in slices.items()
+            if isinstance(metrics, dict)
+        }
+
     ho_sr = _as_number(hm.get('holdout_sharpe'), 0.0) or 0.0
     ho_trades = int(hm.get('holdout_trades', 0) or 0)
     psr_holdout = compute_psr_from_samples([ho_sr], benchmark_sharpe=0.0, effective_observations=max(ho_trades, 1))
@@ -1242,6 +1291,46 @@ def _compute_holdout_significance(holdout_metrics, *, completed_trials: int):
     hm['psr_holdout'] = psr_holdout
     hm['dsr_holdout'] = dsr_holdout
     return hm
+
+
+def _candidate_holdout_summary(
+    candidate_trial,
+    holdout_metrics: Dict[str, object],
+    selection_score: float,
+    *,
+    min_trades: int,
+    min_sharpe: float,
+    min_return: float,
+    min_psr_holdout=None,
+    min_dsr=None,
+) -> Dict[str, object]:
+    finalized = _finalize_holdout_payload(holdout_metrics if isinstance(holdout_metrics, dict) else {})
+    summary = {
+        'trial': int(candidate_trial.number),
+        'selection_score': round(float(selection_score), 6),
+        'holdout_sharpe': round(float(finalized.get('holdout_sharpe', 0.0) or 0.0), 6),
+        'holdout_return': round(float(finalized.get('holdout_return', 0.0) or 0.0), 6),
+        'holdout_trades': int(finalized.get('holdout_trades', 0) or 0),
+        'gate_counters': finalized.get('gate_counters', {}),
+        'starvation_signature': finalized.get('starvation_signature', _derive_starvation_signature(finalized.get('gate_counters', {}))),
+        'holdout_slices': finalized.get('holdout_slices', {}),
+        'slice_gate_counters': {
+            k: _finalize_holdout_payload(v).get('gate_counters', {})
+            for k, v in finalized.get('holdout_slices', {}).items()
+            if isinstance(v, dict)
+        },
+        'passes_gate': _passes_holdout_gate(
+            finalized,
+            min_trades=min_trades,
+            min_sharpe=min_sharpe,
+            min_return=min_return,
+            min_psr_holdout=min_psr_holdout,
+            min_dsr=min_dsr,
+        ),
+    }
+    if int(summary['holdout_trades']) == 0:
+        summary['main_blockers'] = finalized.get('main_blockers', _derive_main_blockers(summary['gate_counters']))
+    return summary
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HOLDOUT (full run_backtest — called ONCE at the end)
@@ -1278,11 +1367,8 @@ def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days,
         'full_dd': _finite_metric(result.get('max_drawdown', 1), 1),
         'full_trades': int(result.get('n_trades', 0) or 0),
         'gate_counters': gate_summary,
-        'starvation_signature': _derive_starvation_signature(gate_summary),
     }
-    if holdout_payload['holdout_trades'] == 0:
-        holdout_payload['main_blockers'] = _derive_main_blockers(gate_summary)
-    return holdout_payload
+    return _finalize_holdout_payload(holdout_payload)
 
 
 def _derive_top_level_holdout(holdout_slices, holdout_mode):
@@ -1292,30 +1378,16 @@ def _derive_top_level_holdout(holdout_slices, holdout_mode):
     if holdout_mode == 'single90' and isinstance(recent, dict):
         selected = dict(recent)
         selected['selected_slice'] = 'recent90'
-        selected['gate_counters'] = _aggregate_slice_gate_summaries({'recent90': recent})
-        selected['starvation_signature'] = _derive_starvation_signature(selected['gate_counters'])
-        if int(selected.get('holdout_trades', 0) or 0) == 0:
-            selected['main_blockers'] = _derive_main_blockers(selected['gate_counters'])
-        return selected
+        return _finalize_holdout_payload(selected)
 
-    values = [m for m in holdout_slices.values() if isinstance(m, dict)]
-    if not values:
+    selected_slice, selected_metrics = _select_median_composite_slice(holdout_slices)
+    if not selected_metrics:
         return {}
-    selected = {
-        'holdout_sharpe': float(np.median([_as_number(m.get('holdout_sharpe'), 0.0) or 0.0 for m in values])),
-        'holdout_return': float(np.median([_as_number(m.get('holdout_return'), 0.0) or 0.0 for m in values])),
-        'holdout_trades': int(min(int(m.get('holdout_trades', 0) or 0) for m in values)),
-        'full_sharpe': float(np.median([_as_number(m.get('full_sharpe'), 0.0) or 0.0 for m in values])),
-        'full_pf': float(np.median([_as_number(m.get('full_pf'), 0.0) or 0.0 for m in values])),
-        'full_dd': float(np.median([_as_number(m.get('full_dd'), 1.0) or 1.0 for m in values])),
-        'full_trades': int(min(int(m.get('full_trades', 0) or 0) for m in values)),
-        'selected_slice': 'median_composite',
-        'gate_counters': _aggregate_slice_gate_summaries(holdout_slices),
-    }
-    selected['starvation_signature'] = _derive_starvation_signature(selected['gate_counters'])
-    if int(selected.get('holdout_trades', 0) or 0) == 0:
-        selected['main_blockers'] = _derive_main_blockers(selected['gate_counters'])
-    return selected
+
+    selected = dict(selected_metrics)
+    selected['selected_slice'] = 'median_composite'
+    selected['selected_slice_source'] = selected_slice
+    return _finalize_holdout_payload(selected)
 
 
 def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days, pruned_only=True, holdout_mode='single90', base_config=None):
@@ -2040,30 +2112,16 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                 },
                 'paper_eligible_promoted_candidate': promoted_paper_candidate,
                 'candidates': [
-                    {
-                        'trial': int(c.number),
-                        'selection_score': round(float(sc), 6),
-                        'holdout_sharpe': round(float(m.get('holdout_sharpe', 0.0) or 0.0), 6),
-                        'holdout_return': round(float(m.get('holdout_return', 0.0) or 0.0), 6),
-                        'holdout_trades': int(m.get('holdout_trades', 0) or 0),
-                        'gate_counters': m.get('gate_counters', {}),
-                        'main_blockers': m.get('main_blockers', []),
-                        'starvation_signature': m.get('starvation_signature', _derive_starvation_signature(m.get('gate_counters', {}))),
-                        'holdout_slices': m.get('holdout_slices', {}),
-                        'slice_gate_counters': {
-                            k: v.get('gate_counters', {})
-                            for k, v in m.get('holdout_slices', {}).items()
-                            if isinstance(v, dict)
-                        },
-                        'passes_gate': _passes_holdout_gate(
-                            m,
-                            min_trades=effective_holdout_min_trades,
-                            min_sharpe=holdout_min_sharpe,
-                            min_return=holdout_min_return,
-                            min_psr_holdout=min_psr_holdout,
-                            min_dsr=min_dsr,
-                        ),
-                    }
+                    _candidate_holdout_summary(
+                        c,
+                        m,
+                        sc,
+                        min_trades=effective_holdout_min_trades,
+                        min_sharpe=holdout_min_sharpe,
+                        min_return=holdout_min_return,
+                        min_psr_holdout=min_psr_holdout,
+                        min_dsr=min_dsr,
+                    )
                     for c, m, sc in ranked_candidates
                 ],
             }
