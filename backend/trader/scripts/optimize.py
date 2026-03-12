@@ -319,11 +319,11 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # Search priors are intentionally a bit wider than deployment defaults. This broadens
     # discovery while leaving holdout/promotion gates unchanged.
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.001, 0.007), 'min_trade_frequency_ratio': 0.40},
-    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.055), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
-    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.060), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.015, 0.065), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.60, 0.78), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.010), 'min_trade_frequency_ratio': 0.40},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.010, 0.045), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.58, 0.76), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.0005, 0.0045), 'min_trade_frequency_ratio': 0.40},
+    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.009, 0.045), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.57, 0.75), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.012, 0.052), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.55, 0.74), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.0015, 0.0085), 'min_trade_frequency_ratio': 0.40},
+    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.59, 0.77), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
+    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.011, 0.052), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.55, 0.74), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.001, 0.0075), 'min_trade_frequency_ratio': 0.40},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -611,6 +611,27 @@ def _derive_main_blockers(gate_summary: Dict[str, object], *, top_n: int = 3) ->
         for reason, count, rate in ranked
         if count > 0
     ][:max(1, int(top_n or 1))]
+
+
+def _derive_starvation_signature(gate_summary: Dict[str, object]) -> Dict[str, object]:
+    rates = (gate_summary or {}).get('gate_rates', {}) if isinstance(gate_summary, dict) else {}
+    momentum_starve = float(rates.get('momentum_magnitude', 0.0) or 0.0) + float(rates.get('momentum_dir_agreement', 0.0) or 0.0)
+    vol_starve = float(rates.get('vol_regime_low', 0.0) or 0.0)
+    confidence_starve = float(rates.get('primary_threshold', 0.0) or 0.0) + float(rates.get('ensemble_agreement', 0.0) or 0.0)
+    total = momentum_starve + vol_starve + confidence_starve
+    if total <= 0.0:
+        return {'label': 'insufficient_signal', 'shares': {}}
+
+    shares = {
+        'momentum_starved': float(momentum_starve / total),
+        'vol_starved': float(vol_starve / total),
+        'confidence_starved': float(confidence_starve / total),
+    }
+    label = max(shares, key=shares.get)
+    return {
+        'label': label,
+        'shares': shares,
+    }
 
 
 def _summarize_fold_gate_counters(gate_counts: Dict[str, int], total_checks: int) -> Dict[str, object]:
@@ -1257,6 +1278,7 @@ def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days,
         'full_dd': _finite_metric(result.get('max_drawdown', 1), 1),
         'full_trades': int(result.get('n_trades', 0) or 0),
         'gate_counters': gate_summary,
+        'starvation_signature': _derive_starvation_signature(gate_summary),
     }
     if holdout_payload['holdout_trades'] == 0:
         holdout_payload['main_blockers'] = _derive_main_blockers(gate_summary)
@@ -1271,6 +1293,7 @@ def _derive_top_level_holdout(holdout_slices, holdout_mode):
         selected = dict(recent)
         selected['selected_slice'] = 'recent90'
         selected['gate_counters'] = _aggregate_slice_gate_summaries({'recent90': recent})
+        selected['starvation_signature'] = _derive_starvation_signature(selected['gate_counters'])
         if int(selected.get('holdout_trades', 0) or 0) == 0:
             selected['main_blockers'] = _derive_main_blockers(selected['gate_counters'])
         return selected
@@ -1289,6 +1312,7 @@ def _derive_top_level_holdout(holdout_slices, holdout_mode):
         'selected_slice': 'median_composite',
         'gate_counters': _aggregate_slice_gate_summaries(holdout_slices),
     }
+    selected['starvation_signature'] = _derive_starvation_signature(selected['gate_counters'])
     if int(selected.get('holdout_trades', 0) or 0) == 0:
         selected['main_blockers'] = _derive_main_blockers(selected['gate_counters'])
     return selected
@@ -2024,6 +2048,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                         'holdout_trades': int(m.get('holdout_trades', 0) or 0),
                         'gate_counters': m.get('gate_counters', {}),
                         'main_blockers': m.get('main_blockers', []),
+                        'starvation_signature': m.get('starvation_signature', _derive_starvation_signature(m.get('gate_counters', {}))),
                         'holdout_slices': m.get('holdout_slices', {}),
                         'slice_gate_counters': {
                             k: v.get('gate_counters', {})
