@@ -319,11 +319,11 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # Search priors are intentionally a bit wider than deployment defaults. This broadens
     # discovery while leaving holdout/promotion gates unchanged.
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 18.0, 'cooldown_max': 72.0, 'min_momentum_magnitude': (0.010, 0.045), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.57, 0.76), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.0005, 0.0045), 'min_trade_frequency_ratio': 0.40},
-    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.009, 0.045), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.57, 0.75), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 12.0, 'cooldown_max': 48.0, 'min_momentum_magnitude': (0.012, 0.052), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.55, 0.74), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.0015, 0.0085), 'min_trade_frequency_ratio': 0.40},
-    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.59, 0.77), 'meta_probability_threshold': (0.48, 0.68), 'min_vol_24h': (0.002, 0.008), 'min_trade_frequency_ratio': 0.40},
-    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 14.0, 'cooldown_max': 60.0, 'min_momentum_magnitude': (0.011, 0.052), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.55, 0.74), 'meta_probability_threshold': (0.47, 0.67), 'min_vol_24h': (0.001, 0.0075), 'min_trade_frequency_ratio': 0.40},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 10.0, 'cooldown_max': 40.0, 'min_momentum_magnitude': (0.007, 0.036), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.53, 0.72), 'meta_probability_threshold': (0.45, 0.65), 'min_vol_24h': (0.0002, 0.0035), 'min_trade_frequency_ratio': 0.45},
+    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 8.0, 'cooldown_max': 34.0, 'min_momentum_magnitude': (0.005, 0.034), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.50, 0.70), 'meta_probability_threshold': (0.44, 0.64), 'min_vol_24h': (0.0008, 0.006), 'min_trade_frequency_ratio': 0.45},
+    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 6.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.44, 0.64), 'min_vol_24h': (0.0005, 0.0065), 'min_trade_frequency_ratio': 0.48},
+    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 8.0, 'cooldown_max': 32.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.54, 0.73), 'meta_probability_threshold': (0.45, 0.65), 'min_vol_24h': (0.0008, 0.006), 'min_trade_frequency_ratio': 0.48},
+    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 4.0, 'cooldown_max': 20.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.44, 0.64), 'min_vol_24h': (0.0004, 0.0055), 'min_trade_frequency_ratio': 0.50},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -391,9 +391,12 @@ def create_trial_profile(trial, coin_name):
     else:
         min_vol_24h = bp.min_vol_24h if bp else 0.004
 
+    signal_lo = clamp(base_threshold - 0.07, 0.54, 0.73)
+    signal_hi = clamp(base_threshold + 0.08, 0.62, 0.82)
+
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
-        signal_threshold=trial.suggest_float('signal_threshold', clamp(base_threshold - 0.04, 0.58, 0.75), clamp(base_threshold + 0.12, 0.65, 0.85), step=0.01),
+        signal_threshold=trial.suggest_float('signal_threshold', signal_lo, signal_hi, step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
         label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
         min_momentum_magnitude=min_momentum_magnitude,
@@ -407,8 +410,8 @@ def create_trial_profile(trial, coin_name):
         meta_probability_threshold=meta_probability_threshold,
         cooldown_hours=trial.suggest_float(
             'cooldown_hours',
-            priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
-            priors['cooldown_max'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale'],
+            max(2.0, priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
+            max(6.0, priors['cooldown_max'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
         ),
         position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
@@ -1096,23 +1099,46 @@ def objective(
     realized_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in fold_metrics]))
     realized_trades = int(sum(fold_trade_counts))
 
+    default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {})
+    priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
+    family_prior = STRATEGY_FAMILY_PRIORS.get(profile.strategy_family, STRATEGY_FAMILY_PRIORS['momentum_trend'])
+    bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(profile.trade_freq_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
+    base_trade_frequency_ratio = float(priors.get('min_trade_frequency_ratio', 0.40) or 0.40)
+    strategy_delta = float(family_prior.get('min_trade_frequency_ratio_delta', 0.0))
+    bucket_delta = float(bucket_prior.get('min_trade_frequency_ratio_delta', 0.0))
+    min_trade_frequency_ratio = float(np.clip(base_trade_frequency_ratio + strategy_delta + bucket_delta, 0.20, 0.90))
+    target_trades_floor = max(1.0, float(len(cv_splits)) * min_trade_frequency_ratio)
+    trade_density = float(realized_trades) / max(float(len(cv_splits)), 1.0)
+    trade_density_ratio = float(realized_trades) / target_trades_floor
+
     combined = (
         0.25 * model_q +
         0.20 * label_q +
         0.15 * consistency['score'] +
         0.25 * realized_sharpe_term +
         0.10 * realized_expectancy +
-        0.05 * np.tanh(realized_return * 5.0)
+        0.05 * np.tanh(realized_return * 5.0) +
+        0.08 * min(1.0, trade_density_ratio)
     )
 
     trade_floor_penalty = 0.0
-    if realized_trades < max(3, len(cv_splits)):
-        trade_floor_penalty = -0.20 * (1.0 - realized_trades / max(float(len(cv_splits)), 1.0))
+    if realized_trades < target_trades_floor:
+        shortfall_ratio = 1.0 - (float(realized_trades) / target_trades_floor)
+        trade_floor_penalty = -0.35 * (shortfall_ratio ** 1.35)
+        if realized_trades < max(3, int(math.ceil(target_trades_floor * 0.45))):
+            trade_floor_penalty -= 0.18
         combined += trade_floor_penalty
+
+    activity_regime = 'active' if trade_density_ratio >= 1.0 else ('thin' if trade_density_ratio >= 0.65 else 'starved')
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
     trial.set_user_attr('n_trades', int(realized_trades))
+    trial.set_user_attr('cv_trade_density', round(trade_density, 6))
+    trial.set_user_attr('cv_trade_density_ratio', round(trade_density_ratio, 6))
+    trial.set_user_attr('target_trades_floor', round(target_trades_floor, 6))
+    trial.set_user_attr('min_trade_frequency_ratio', round(min_trade_frequency_ratio, 6))
+    trial.set_user_attr('activity_regime', activity_regime)
     trial.set_user_attr('mean_sharpe', round(realized_sharpe, 6))
     trial.set_user_attr('mean_sharpe_raw', round(realized_sharpe_raw, 6))
     trial.set_user_attr('realized_sharpe_term', round(realized_sharpe_term, 6))
@@ -1193,11 +1219,15 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         accepted = completed
 
     def _rank_key(t):
+        cv_trades = int(t.user_attrs.get('n_trades', 0) or 0)
+        cv_density_ratio = _as_number(t.user_attrs.get('cv_trade_density_ratio'), None)
+        if cv_density_ratio is None:
+            cv_density_ratio = float(cv_trades) / max(float(min_trades), 1.0)
         psr = _as_number(t.user_attrs.get('psr'), 0.0) or 0.0
         mean_sr = _as_number(t.user_attrs.get('mean_sharpe', t.user_attrs.get('sharpe')), -9.0) or -9.0
         std_s = _as_number(t.user_attrs.get('std_sharpe'), 9.0) or 9.0
         dd = _as_number(t.user_attrs.get('max_drawdown'), 1.0) or 1.0
-        return (float(t.value or -99), psr, mean_sr, -std_s, -dd)
+        return (min(2.5, float(cv_density_ratio)), cv_trades, float(t.value or -99), psr, mean_sr, -std_s, -dd)
 
     accepted_sorted = sorted(accepted, key=_rank_key, reverse=True)
     cap = max(1, int(max_candidates or 1))
@@ -1222,7 +1252,8 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
 
     median_sr = float(np.median(sharpe_vals)) if sharpe_vals else 0.0
     median_ret = float(np.median(return_vals)) if return_vals else 0.0
-    median_trade_term = min(1.0, (float(np.median(trade_vals)) if trade_vals else 0.0) / 25.0)
+    median_trades = float(np.median(trade_vals)) if trade_vals else 0.0
+    median_trade_term = min(1.0, median_trades / 25.0)
     dispersion_penalty = 0.35 * (float(np.std(sharpe_vals)) if len(sharpe_vals) > 1 else 0.0)
 
     trade_min_penalty = 0.0
@@ -1230,14 +1261,18 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
         ho_sr = _as_number(metrics.get('holdout_sharpe'), 0.0) or 0.0
         ho_ret = _as_number(metrics.get('holdout_return'), 0.0) or 0.0
         ho_trades = int(metrics.get('holdout_trades', 0) or 0)
-        if ho_trades < 10:
-            trade_min_penalty += 0.20
+        if ho_trades < 6:
+            trade_min_penalty += 0.35
+        elif ho_trades < 10:
+            trade_min_penalty += 0.25
+        elif ho_trades < 15:
+            trade_min_penalty += 0.12
         if ho_sr <= 0:
             trade_min_penalty += 0.20
         if ho_ret <= 0:
             trade_min_penalty += 0.15
 
-    score = (0.60 * median_sr) + (0.25 * median_ret * 5.0) + (0.15 * median_trade_term)
+    score = (0.50 * median_sr) + (0.20 * median_ret * 5.0) + (0.30 * median_trade_term)
     score -= (trade_min_penalty + dispersion_penalty)
     return score + 0.10 * (_as_number(cv_score, 0.0) or 0.0)
 
@@ -1305,9 +1340,14 @@ def _candidate_holdout_summary(
     min_dsr=None,
 ) -> Dict[str, object]:
     finalized = _finalize_holdout_payload(holdout_metrics if isinstance(holdout_metrics, dict) else {})
+    trial_attrs = candidate_trial.user_attrs if isinstance(getattr(candidate_trial, 'user_attrs', None), dict) else {}
     summary = {
         'trial': int(candidate_trial.number),
         'selection_score': round(float(selection_score), 6),
+        'cv_n_trades': int(trial_attrs.get('n_trades', 0) or 0),
+        'cv_trade_density': _finite_metric(trial_attrs.get('cv_trade_density'), 0.0),
+        'cv_trade_density_ratio': _finite_metric(trial_attrs.get('cv_trade_density_ratio'), 0.0),
+        'activity_regime': str(trial_attrs.get('activity_regime') or 'unknown'),
         'holdout_sharpe': round(float(finalized.get('holdout_sharpe', 0.0) or 0.0), 6),
         'holdout_return': round(float(finalized.get('holdout_return', 0.0) or 0.0), 6),
         'holdout_trades': int(finalized.get('holdout_trades', 0) or 0),
@@ -2153,7 +2193,17 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         if not reject_reason and not reject_code:
             accepted_trials += 1
 
-    trade_frequency_diagnostics = {}
+    trade_frequency_diagnostics = {
+        'best_cv_n_trades': int(best.user_attrs.get('n_trades', 0) or 0),
+        'best_cv_trade_density': _finite_metric(best.user_attrs.get('cv_trade_density'), 0.0),
+        'best_cv_trade_density_ratio': _finite_metric(best.user_attrs.get('cv_trade_density_ratio'), 0.0),
+        'best_activity_regime': str(best.user_attrs.get('activity_regime') or 'unknown'),
+        'target_trades_floor': _finite_metric(best.user_attrs.get('target_trades_floor'), 0.0),
+        'min_trade_frequency_ratio': _finite_metric(best.user_attrs.get('min_trade_frequency_ratio'), 0.0),
+        'holdout_trades': int((holdout_result or {}).get('holdout_trades', 0) or 0),
+        'starvation_signature': (holdout_result or {}).get('starvation_signature', {}),
+        'top_blockers': (holdout_result or {}).get('main_blockers', []),
+    }
 
     effective_best_params = build_effective_params(best.params, coin_name)
     tunable_best_params = dict(best.params)
