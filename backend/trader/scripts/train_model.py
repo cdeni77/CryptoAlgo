@@ -37,6 +37,7 @@ from core.coin_profiles import (
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
 from core.trading_costs import get_contract_spec
+from core.execution_sim import compute_trade_execution_pnl
 from core.costs import compute_cost_breakdown
 from core.labeling import (
     TripleBarrierSpec,
@@ -487,24 +488,35 @@ def calculate_execution_costs(n_contracts: int, entry_price: float, exit_price: 
 def calculate_pnl_exact(entry_price: float, exit_price: float, direction: int,
                          accum_funding: float, n_contracts: int, symbol: str,
                          config: Config) -> Tuple[float, float, float, float, float, float, float, float]:
-    spec = get_contract_spec(symbol)
-    notional_per_contract = spec['units'] * entry_price
-    total_notional = n_contracts * notional_per_contract
-    if total_notional == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    raw_pnl_pct = (exit_price - entry_price) / entry_price * direction
-    raw_pnl_dollars = total_notional * raw_pnl_pct
-    total_fee_dollars, pct_fee_component, min_fee_component, slippage_component = calculate_execution_costs(
-        n_contracts, entry_price, exit_price, symbol, config
+    breakdown = compute_trade_execution_pnl(
+        entry_price=entry_price,
+        exit_price=exit_price,
+        direction=direction,
+        accum_funding=accum_funding,
+        n_contracts=n_contracts,
+        symbol=symbol,
+        fee_pct_per_side=config.fee_pct_per_side,
+        min_fee_per_contract=config.min_fee_per_contract,
+        slippage_bps=config.slippage_bps,
+        apply_funding=config.apply_funding,
+        apply_slippage=config.apply_slippage,
+        apply_impact=config.apply_impact,
+        impact_bps_per_contract=config.impact_bps_per_contract,
+        impact_max_bps_per_side=config.impact_max_bps_per_side,
     )
-    total_fee_pct = total_fee_dollars / total_notional
-    pct_fee_pnl = -(pct_fee_component / total_notional)
-    min_fee_pnl = -(min_fee_component / total_notional)
-    slippage_pnl = -(slippage_component / total_notional)
-    funding_dollars = (accum_funding * total_notional) if config.apply_funding else 0.0
-    net_pnl_dollars = raw_pnl_dollars - total_fee_dollars + funding_dollars
-    net_pnl_pct = net_pnl_dollars / total_notional
-    return net_pnl_pct, raw_pnl_pct, -total_fee_pct, pct_fee_pnl, min_fee_pnl, slippage_pnl, net_pnl_dollars, total_notional
+    if breakdown.notional == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    return (
+        breakdown.net_pnl_pct,
+        breakdown.raw_pnl_pct,
+        breakdown.fee_pnl_pct,
+        breakdown.fee_pct_component_pct,
+        breakdown.min_fee_component_pct,
+        breakdown.slippage_component_pct,
+        breakdown.pnl_dollars,
+        breakdown.notional,
+    )
 
 
 def calculate_n_contracts(equity: float, price: float, symbol: str,
