@@ -1231,7 +1231,10 @@ def objective(
     **_kwargs,
 ):
     profile = create_trial_profile(trial, coin_name)
-    param_fingerprint = _trial_param_fingerprint(trial.params)
+    trial_params = getattr(trial, 'params', {})
+    if not isinstance(trial_params, dict):
+        trial_params = {}
+    param_fingerprint = _trial_param_fingerprint(trial_params)
     prior_same_params = _find_prior_trial_with_fingerprint(trial, param_fingerprint)
     seed_config = base_config or Config()
     config = Config(**{
