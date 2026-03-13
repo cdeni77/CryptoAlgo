@@ -319,11 +319,11 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # Search priors are intentionally a bit wider than deployment defaults. This broadens
     # discovery while leaving holdout/promotion gates unchanged.
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 10.0, 'cooldown_max': 40.0, 'min_momentum_magnitude': (0.007, 0.036), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.53, 0.72), 'meta_probability_threshold': (0.45, 0.65), 'min_vol_24h': (0.0002, 0.0035), 'min_trade_frequency_ratio': 0.45},
-    'ETH': {'target_trades_per_year': 25.0, 'cooldown_min': 8.0, 'cooldown_max': 34.0, 'min_momentum_magnitude': (0.005, 0.034), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.50, 0.70), 'meta_probability_threshold': (0.44, 0.64), 'min_vol_24h': (0.0008, 0.006), 'min_trade_frequency_ratio': 0.45},
-    'SOL': {'target_trades_per_year': 30.0, 'cooldown_min': 6.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.44, 0.64), 'min_vol_24h': (0.0005, 0.0065), 'min_trade_frequency_ratio': 0.48},
-    'XRP': {'target_trades_per_year': 25.0, 'cooldown_min': 8.0, 'cooldown_max': 32.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.54, 0.73), 'meta_probability_threshold': (0.45, 0.65), 'min_vol_24h': (0.0008, 0.006), 'min_trade_frequency_ratio': 0.48},
-    'DOGE': {'target_trades_per_year': 25.0, 'cooldown_min': 4.0, 'cooldown_max': 20.0, 'min_momentum_magnitude': (0.006, 0.040), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.44, 0.64), 'min_vol_24h': (0.0004, 0.0055), 'min_trade_frequency_ratio': 0.50},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 6.0, 'cooldown_max': 28.0, 'min_momentum_magnitude': (0.005, 0.030), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.49, 0.69), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0001, 0.0030), 'min_trade_frequency_ratio': 0.55},
+    'ETH': {'target_trades_per_year': 27.0, 'cooldown_min': 5.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.003, 0.028), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.46, 0.66), 'meta_probability_threshold': (0.41, 0.61), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.55},
+    'SOL': {'target_trades_per_year': 33.0, 'cooldown_min': 3.0, 'cooldown_max': 16.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'XRP': {'target_trades_per_year': 28.0, 'cooldown_min': 4.0, 'cooldown_max': 20.0, 'min_momentum_magnitude': (0.002, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'DOGE': {'target_trades_per_year': 30.0, 'cooldown_min': 2.0, 'cooldown_max': 12.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.0045), 'min_trade_frequency_ratio': 0.60},
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -337,10 +337,49 @@ STRATEGY_FAMILY_PRIORS = {
 }
 
 TRADE_FREQ_BUCKET_PRIORS = {
-    'conservative': {'cooldown_scale': 1.25, 'min_trade_frequency_ratio_delta': -0.06},
+    'conservative': {'cooldown_scale': 1.15, 'min_trade_frequency_ratio_delta': -0.06},
     'balanced': {'cooldown_scale': 1.00, 'min_trade_frequency_ratio_delta': 0.00},
-    'aggressive': {'cooldown_scale': 0.80, 'min_trade_frequency_ratio_delta': 0.08},
+    'aggressive': {'cooldown_scale': 0.70, 'min_trade_frequency_ratio_delta': 0.08},
 }
+
+
+def _compute_cv_oos_days(cv_splits: list[CVFold]) -> float:
+    if not cv_splits:
+        return 0.0
+    total_days = 0.0
+    for fold in cv_splits:
+        start = pd.Timestamp(fold.test_start)
+        end = pd.Timestamp(fold.test_end)
+        span_days = max((end - start).total_seconds() / 86400.0, 0.0)
+        total_days += span_days
+    return float(total_days)
+
+
+def _classify_activity_regime(trade_density_ratio: float, realized_trades: int) -> str:
+    if realized_trades <= 0:
+        return 'dead'
+    if trade_density_ratio < 0.30 or realized_trades <= 5:
+        return 'starved'
+    if trade_density_ratio < 0.80 or realized_trades <= 12:
+        return 'thin'
+    return 'active'
+
+
+def _trade_starvation_penalty(realized_trades: int, target_trades_floor: float) -> float:
+    floor = max(float(target_trades_floor), 1.0)
+    trades = int(realized_trades)
+    ratio = float(trades) / floor
+    shortfall = max(0.0, 1.0 - ratio)
+    penalty = -0.40 * (shortfall ** 1.2)
+    if trades == 0:
+        return penalty - 1.00
+    if trades <= 3:
+        return penalty - 0.75
+    if trades <= 5:
+        return penalty - 0.50
+    if trades <= 12:
+        return penalty - 0.22
+    return penalty
 
 
 def _resolve_strategy_and_bucket(params: Dict | None) -> tuple[str, str]:
@@ -831,15 +870,19 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         gate_counts[reason] = gate_counts.get(reason, 0) + 1
 
     bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(resolved_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
-    cooldown_hours = max(float(profile.cooldown_hours) * float(bucket_prior.get('cooldown_scale', 1.0)), 0.0)
+    cooldown_hours = max(float(profile.cooldown_hours) * float(bucket_prior.get('cooldown_scale', 1.0)) * 0.65, 0.0)
     last_entry_ts = None
     label_horizon = max(1, int(resolve_label_horizon(profile, config)))
     effective_threshold = resolve_param('signal_threshold', profile, config, Config.signal_threshold, mode='direct')
-    primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
+    primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge * 0.5)
+    primary_cutoff = max(0.45, primary_cutoff - 0.02)
     effective_meta_threshold = resolve_param('meta_probability_threshold', profile, config, Config.meta_probability_threshold, mode='direct')
+    effective_meta_threshold = max(0.35, float(effective_meta_threshold) - 0.03)
     effective_directional_agreement = resolve_param('min_directional_agreement', profile, config, Config.min_directional_agreement, mode='direct')
+    effective_directional_agreement = max(0.40, float(effective_directional_agreement) - 0.04)
     effective_max_ensemble_std = resolve_param('max_ensemble_std', profile, config, Config.max_ensemble_std, mode='direct')
     effective_momentum = resolve_param('min_momentum_magnitude', profile, config, Config.min_momentum_magnitude, mode='direct')
+    effective_momentum = max(0.0015, float(effective_momentum) * 0.75)
 
     trade_returns: List[float] = []
     agreement_values: List[float] = []
@@ -884,8 +927,8 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         strategy_decision = strategy_family.evaluate(
             strategy_context,
             min_momentum_magnitude=effective_momentum,
-            score_threshold=config.momentum_score_threshold,
-            strict_mode=config.momentum_strict_mode,
+            score_threshold=max(0.65, float(config.momentum_score_threshold) * 0.75),
+            strict_mode=False,
         )
         direction = int(strategy_decision.direction)
         if not strategy_decision.gate_contributions.get('momentum_dir_agreement', direction != 0):
@@ -939,17 +982,21 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             continue
 
         if agreement < 0.999:
-            prob = min(prob, config.disagreement_confidence_cap)
+            relaxed_disagreement_cap = min(0.98, max(float(config.disagreement_confidence_cap), primary_cutoff + 0.08))
+            prob = min(prob, relaxed_disagreement_cap)
         if prob < primary_cutoff or prob_std > effective_max_ensemble_std:
             _gate('primary_threshold' if prob < primary_cutoff else 'ensemble_std')
             continue
 
         if not meta_probs:
-            _gate('meta_threshold')
-            continue
-        if float(np.mean(meta_probs)) < effective_meta_threshold:
-            _gate('meta_threshold')
-            continue
+            if prob < (primary_cutoff + 0.035):
+                _gate('meta_threshold')
+                continue
+        elif float(np.mean(meta_probs)) < effective_meta_threshold:
+            soft_meta_floor = effective_meta_threshold - 0.04
+            if prob < max(primary_cutoff + 0.02, soft_meta_floor):
+                _gate('meta_threshold')
+                continue
 
         n_contracts = calculate_n_contracts(100_000, price, symbol, config, vol_24h=float(vol_24h), profile=profile)
         n_contracts = int(np.floor(n_contracts * size_multiplier))
@@ -1107,38 +1154,45 @@ def objective(
     strategy_delta = float(family_prior.get('min_trade_frequency_ratio_delta', 0.0))
     bucket_delta = float(bucket_prior.get('min_trade_frequency_ratio_delta', 0.0))
     min_trade_frequency_ratio = float(np.clip(base_trade_frequency_ratio + strategy_delta + bucket_delta, 0.20, 0.90))
-    target_trades_floor = max(1.0, float(len(cv_splits)) * min_trade_frequency_ratio)
-    trade_density = float(realized_trades) / max(float(len(cv_splits)), 1.0)
+    cv_oos_days = _compute_cv_oos_days(cv_splits)
+    cv_oos_years = max(cv_oos_days / 365.25, 1e-6)
+    target_trades_per_year = float(priors.get('target_trades_per_year', 25.0) or 25.0)
+    target_trades_floor = max(1.0, target_trades_per_year * cv_oos_years * min_trade_frequency_ratio)
+    trade_density = float(realized_trades) / max(cv_oos_years, 1e-6)
     trade_density_ratio = float(realized_trades) / target_trades_floor
 
+    activity_bonus = 0.20 * min(1.5, trade_density_ratio)
+    if realized_trades >= max(20, int(math.ceil(target_trades_floor * 0.90))):
+        activity_bonus += 0.08
+
     combined = (
-        0.25 * model_q +
-        0.20 * label_q +
-        0.15 * consistency['score'] +
-        0.25 * realized_sharpe_term +
-        0.10 * realized_expectancy +
-        0.05 * np.tanh(realized_return * 5.0) +
-        0.08 * min(1.0, trade_density_ratio)
+        0.18 * model_q +
+        0.14 * label_q +
+        0.12 * consistency['score'] +
+        0.20 * realized_sharpe_term +
+        0.08 * realized_expectancy +
+        0.04 * np.tanh(realized_return * 5.0) +
+        activity_bonus
     )
 
-    trade_floor_penalty = 0.0
-    if realized_trades < target_trades_floor:
-        shortfall_ratio = 1.0 - (float(realized_trades) / target_trades_floor)
-        trade_floor_penalty = -0.35 * (shortfall_ratio ** 1.35)
-        if realized_trades < max(3, int(math.ceil(target_trades_floor * 0.45))):
-            trade_floor_penalty -= 0.18
-        combined += trade_floor_penalty
+    trade_floor_penalty = _trade_starvation_penalty(realized_trades, target_trades_floor)
+    combined += trade_floor_penalty
 
-    activity_regime = 'active' if trade_density_ratio >= 1.0 else ('thin' if trade_density_ratio >= 0.65 else 'starved')
+    activity_regime = _classify_activity_regime(trade_density_ratio, realized_trades)
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
     trial.set_user_attr('n_trades', int(realized_trades))
     trial.set_user_attr('cv_trade_density', round(trade_density, 6))
+    trial.set_user_attr('cv_oos_days', round(cv_oos_days, 4))
+    trial.set_user_attr('cv_oos_years', round(cv_oos_years, 6))
+    trial.set_user_attr('realized_trades', int(realized_trades))
+    trial.set_user_attr('realized_trades_per_year', round(trade_density, 6))
     trial.set_user_attr('cv_trade_density_ratio', round(trade_density_ratio, 6))
     trial.set_user_attr('target_trades_floor', round(target_trades_floor, 6))
     trial.set_user_attr('min_trade_frequency_ratio', round(min_trade_frequency_ratio, 6))
     trial.set_user_attr('activity_regime', activity_regime)
+    trial.set_user_attr('trade_density_ratio', round(trade_density_ratio, 6))
     trial.set_user_attr('mean_sharpe', round(realized_sharpe, 6))
     trial.set_user_attr('mean_sharpe_raw', round(realized_sharpe_raw, 6))
     trial.set_user_attr('realized_sharpe_term', round(realized_sharpe_term, 6))
@@ -1165,6 +1219,20 @@ def objective(
     trial.set_user_attr('fold_metrics', _to_json_safe(fold_metrics_with_gates))
     trial.set_user_attr('fold_gate_counters', _to_json_safe(fold_gate_counters))
     trial.set_user_attr('fold_trade_counts', _to_json_safe(fold_trade_counts))
+    aggregate_cv_gate_counters = _aggregate_slice_gate_summaries({
+        f'fold_{idx}': {'gate_counters': gate_summary}
+        for idx, gate_summary in enumerate(fold_gate_counters)
+    })
+    trial.set_user_attr('aggregated_gate_counters', _to_json_safe(aggregate_cv_gate_counters))
+    trial.set_user_attr('main_blockers', _to_json_safe(_derive_main_blockers(aggregate_cv_gate_counters)))
+    trial.set_user_attr('starvation_signature', _to_json_safe(_derive_starvation_signature(aggregate_cv_gate_counters)))
+    trial.set_user_attr('fold_blocker_summary', _to_json_safe([
+        {
+            'fold': int(idx),
+            'main_blockers': _derive_main_blockers(gate_summary, top_n=2),
+        }
+        for idx, gate_summary in enumerate(fold_gate_counters)
+    ]))
     trial.set_user_attr('psr_meta', _to_json_safe(psr_meta))
     trial.set_user_attr('psr', float(psr_meta['psr']) if psr_meta.get('valid', False) else None)
     trial.set_user_attr('dsr_cv_meta', _to_json_safe(dsr_cv_meta))
@@ -1223,11 +1291,15 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         cv_density_ratio = _as_number(t.user_attrs.get('cv_trade_density_ratio'), None)
         if cv_density_ratio is None:
             cv_density_ratio = float(cv_trades) / max(float(min_trades), 1.0)
+        activity_regime = str(t.user_attrs.get('activity_regime') or _classify_activity_regime(float(cv_density_ratio), cv_trades))
+        regime_rank = {'dead': 0, 'starved': 1, 'thin': 2, 'active': 3}.get(activity_regime, 0)
         psr = _as_number(t.user_attrs.get('psr'), 0.0) or 0.0
         mean_sr = _as_number(t.user_attrs.get('mean_sharpe', t.user_attrs.get('sharpe')), -9.0) or -9.0
+        realized_return = _as_number(t.user_attrs.get('realized_return'), -9.0) or -9.0
         std_s = _as_number(t.user_attrs.get('std_sharpe'), 9.0) or 9.0
         dd = _as_number(t.user_attrs.get('max_drawdown'), 1.0) or 1.0
-        return (min(2.5, float(cv_density_ratio)), cv_trades, float(t.value or -99), psr, mean_sr, -std_s, -dd)
+        activity_score = min(3.0, float(cv_density_ratio)) + (0.06 * cv_trades)
+        return (regime_rank, activity_score, float(mean_sr >= 0.0), float(realized_return >= 0.0), psr, mean_sr, float(t.value or -99), -std_s, -dd)
 
     accepted_sorted = sorted(accepted, key=_rank_key, reverse=True)
     cap = max(1, int(max_candidates or 1))
@@ -1253,28 +1325,30 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
     median_sr = float(np.median(sharpe_vals)) if sharpe_vals else 0.0
     median_ret = float(np.median(return_vals)) if return_vals else 0.0
     median_trades = float(np.median(trade_vals)) if trade_vals else 0.0
-    median_trade_term = min(1.0, median_trades / 25.0)
-    dispersion_penalty = 0.35 * (float(np.std(sharpe_vals)) if len(sharpe_vals) > 1 else 0.0)
+    median_trade_term = min(1.8, median_trades / 18.0)
+    dispersion_penalty = 0.30 * (float(np.std(sharpe_vals)) if len(sharpe_vals) > 1 else 0.0)
 
     trade_min_penalty = 0.0
     for _, metrics in slice_items:
         ho_sr = _as_number(metrics.get('holdout_sharpe'), 0.0) or 0.0
         ho_ret = _as_number(metrics.get('holdout_return'), 0.0) or 0.0
         ho_trades = int(metrics.get('holdout_trades', 0) or 0)
-        if ho_trades < 6:
-            trade_min_penalty += 0.35
-        elif ho_trades < 10:
+        if ho_trades <= 0:
+            trade_min_penalty += 1.00
+        elif ho_trades <= 3:
+            trade_min_penalty += 0.75
+        elif ho_trades <= 6:
+            trade_min_penalty += 0.50
+        elif ho_trades < 12:
             trade_min_penalty += 0.25
-        elif ho_trades < 15:
-            trade_min_penalty += 0.12
-        if ho_sr <= 0:
+        if ho_sr < 0:
+            trade_min_penalty += 0.25
+        if ho_ret < 0:
             trade_min_penalty += 0.20
-        if ho_ret <= 0:
-            trade_min_penalty += 0.15
 
-    score = (0.50 * median_sr) + (0.20 * median_ret * 5.0) + (0.30 * median_trade_term)
+    score = (0.40 * median_sr) + (0.18 * median_ret * 5.0) + (0.42 * median_trade_term)
     score -= (trade_min_penalty + dispersion_penalty)
-    return score + 0.10 * (_as_number(cv_score, 0.0) or 0.0)
+    return score + 0.08 * (_as_number(cv_score, 0.0) or 0.0)
 
 
 def _passes_holdout_gate(

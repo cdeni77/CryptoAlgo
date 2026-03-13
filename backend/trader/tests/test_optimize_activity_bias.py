@@ -5,6 +5,7 @@ from scripts.optimize import (
     _candidate_holdout_summary,
     _candidate_trials_for_holdout,
     _holdout_selection_score,
+    _classify_activity_regime,
 )
 
 
@@ -68,3 +69,11 @@ def test_candidate_summary_emits_cv_activity_fields() -> None:
     assert summary["cv_trade_density"] == 6.0
     assert summary["cv_trade_density_ratio"] == 1.2
     assert summary["activity_regime"] == "active"
+
+
+
+def test_activity_regime_classification() -> None:
+    assert _classify_activity_regime(0.0, 0) == "dead"
+    assert _classify_activity_regime(0.2, 2) == "starved"
+    assert _classify_activity_regime(0.7, 9) == "thin"
+    assert _classify_activity_regime(1.1, 20) == "active"

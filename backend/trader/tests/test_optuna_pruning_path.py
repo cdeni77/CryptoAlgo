@@ -179,3 +179,99 @@ def test_normal_trials_remain_rankable_after_sharpe_bounding(monkeypatch):
     )
 
     assert strong_value > weak_value
+
+
+def _fold_with_span(start: str, days: int) -> CVFold:
+    train_idx = pd.date_range(start, periods=72, freq="h", tz="UTC")
+    test_start = train_idx[-1] + pd.Timedelta(hours=1)
+    test_idx = pd.date_range(test_start, periods=max(24, int(days * 24)), freq="h", tz="UTC")
+    return CVFold(
+        train_idx=train_idx,
+        test_idx=test_idx,
+        train_end=train_idx[-1],
+        test_start=test_idx[0],
+        test_end=test_idx[-1],
+        purge_bars=0,
+        embargo_bars=0,
+    )
+
+
+def test_objective_trade_floor_scales_with_oos_years(monkeypatch):
+    trial = _TrialStub(should_prune_after_report=False)
+    idx = pd.date_range("2024-01-01", periods=12, freq="h", tz="UTC")
+    optim_data = {"SYM": {"features": pd.DataFrame(index=idx), "ohlcv": pd.DataFrame(index=idx)}}
+
+    monkeypatch.setattr(
+        optimize,
+        "evaluate_fold_with_execution_gates",
+        lambda *_a, **_k: {
+            "model_quality": {"score": 0.2, "auc": 0.58},
+            "label_quality": {"score": 0.1},
+            "fold_metrics": {"sharpe": 0.1, "return": 0.0, "expectancy": 0.0, "trades": 4},
+            "gate_counters": {},
+        },
+    )
+
+    folds = [_fold_with_span("2024-01-01", 365), _fold_with_span("2025-01-01", 365)]
+    optimize.objective(
+        trial,
+        optim_data=optim_data,
+        coin_prefix="BIP",
+        coin_name="BTC",
+        cv_splits=folds,
+        target_sym="SYM",
+    )
+
+    assert trial.user_attrs["cv_oos_years"] >= 1.9
+    assert trial.user_attrs["target_trades_floor"] > len(folds)
+
+
+def test_objective_activity_regime_and_starvation_penalty(monkeypatch):
+    tiny_value, tiny_attrs = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"raw_sharpe": 10.0, "sharpe": 0.8, "return": 0.02, "expectancy": 0.01, "trades": 1},
+    )
+    active_value, active_attrs = _objective_value_for_fold_metrics(
+        monkeypatch,
+        {"raw_sharpe": 1.2, "sharpe": 0.9, "return": 0.02, "expectancy": 0.01, "trades": 16},
+    )
+
+    assert tiny_attrs["activity_regime"] in {"dead", "starved"}
+    assert active_attrs["activity_regime"] in {"thin", "active"}
+    assert tiny_attrs["trade_floor_penalty"] < -0.4
+    assert active_value > tiny_value
+
+
+def test_objective_persists_gate_blocker_diagnostics(monkeypatch):
+    trial = _TrialStub(should_prune_after_report=False)
+    idx = pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC")
+    optim_data = {"SYM": {"features": pd.DataFrame(index=idx), "ohlcv": pd.DataFrame(index=idx)}}
+
+    monkeypatch.setattr(
+        optimize,
+        "evaluate_fold_with_execution_gates",
+        lambda *_a, **_k: {
+            "model_quality": {"score": 0.1, "auc": 0.55},
+            "label_quality": {"score": 0.1},
+            "fold_metrics": {"sharpe": 0.0, "return": 0.0, "expectancy": 0.0, "trades": 0},
+            "gate_counters": {
+                "total_checks": 10,
+                "gate_counts": {"primary_threshold": 4, "momentum_magnitude": 3},
+                "gate_rates": {"primary_threshold": 0.4, "momentum_magnitude": 0.3},
+            },
+        },
+    )
+
+    optimize.objective(
+        trial,
+        optim_data=optim_data,
+        coin_prefix="BIP",
+        coin_name="BTC",
+        cv_splits=[_dummy_fold()],
+        target_sym="SYM",
+    )
+
+    assert "aggregated_gate_counters" in trial.user_attrs
+    assert "main_blockers" in trial.user_attrs
+    assert "starvation_signature" in trial.user_attrs
+    assert "fold_blocker_summary" in trial.user_attrs
