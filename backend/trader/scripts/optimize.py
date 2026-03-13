@@ -13,7 +13,7 @@ Usage:
     python optimize.py --all --trials 100 --jobs 16
     python optimize.py --show
 """
-import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math, tempfile
+import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math, tempfile, hashlib
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,6 +38,7 @@ from scripts.train_model import (
     calculate_n_contracts, get_strategy_family, primary_recall_threshold,
     resolve_label_horizon, resolve_param, resolve_categorical_param,
     build_ensemble_member_specs, GATE_REASON_CODES,
+    calculate_pnl_exact,
 )
 from core.meta_labeling import calibrator_predict
 from core.cv_splitters import CVFold, create_purged_embargo_splits, create_walk_forward_splits
@@ -250,6 +251,39 @@ def _build_cost_config(cost_assumptions: ExchangeCostAssumptions | None) -> tupl
     config.cost_config_path = cost_assumptions.source_path
     config.cost_config_version = cost_assumptions.version
     return config, cost_assumptions.to_metadata()
+
+
+def _trial_param_fingerprint(params: Dict[str, object]) -> str:
+    payload = json.dumps(_to_json_safe(params or {}), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode('utf-8')).hexdigest()[:12]
+
+
+def _find_prior_trial_with_fingerprint(trial, fingerprint: str):
+    try:
+        for past in trial.study.trials:
+            if past.number == trial.number:
+                continue
+            if past.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            if past.user_attrs.get('param_fingerprint') == fingerprint:
+                return past
+    except Exception:
+        return None
+    return None
+
+
+def _is_absurd_cv_metrics(realized_return: float, realized_expectancy: float, realized_trades: int) -> tuple[bool, str]:
+    if not np.isfinite(realized_return) or not np.isfinite(realized_expectancy):
+        return True, 'non_finite_cv_metrics'
+    if realized_return <= -1.0:
+        return True, 'equity_wipeout_or_lower'
+    if realized_trades <= 0:
+        return False, ''
+    if realized_return > 12.0:
+        return True, 'cv_return_implausibly_high'
+    if abs(realized_expectancy) > 0.25:
+        return True, 'cv_expectancy_implausibly_high'
+    return False, ''
 
 
 def estimate_holdout_trade_budget(holdout_days: int, target_trades_per_week: float, holdout_min_trades: int) -> tuple[float, int]:
@@ -884,7 +918,16 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     effective_momentum = resolve_param('min_momentum_magnitude', profile, config, Config.min_momentum_magnitude, mode='direct')
     effective_momentum = max(0.0015, float(effective_momentum) * 0.75)
 
-    trade_returns: List[float] = []
+    start_equity = 100_000.0
+    equity = float(start_equity)
+    trade_equity_returns: List[float] = []
+    trade_net_notional_returns: List[float] = []
+    trade_gross_notional_returns: List[float] = []
+    fee_pnls: List[float] = []
+    funding_pnls: List[float] = []
+    trade_notionals: List[float] = []
+    total_fees = 0.0
+    total_funding = 0.0
     agreement_values: List[float] = []
     std_values: List[float] = []
     test_idx = test_feat.index.intersection(ohlcv.index)
@@ -998,7 +1041,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
                 _gate('meta_threshold')
                 continue
 
-        n_contracts = calculate_n_contracts(100_000, price, symbol, config, vol_24h=float(vol_24h), profile=profile)
+        n_contracts = calculate_n_contracts(max(equity, config.min_equity), price, symbol, config, vol_24h=float(vol_24h), profile=profile)
         n_contracts = int(np.floor(n_contracts * size_multiplier))
         if n_contracts < 1:
             _gate('no_contract_size')
@@ -1009,13 +1052,44 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             continue
 
         exit_price = float(ohlcv['close'].iloc[exit_loc])
-        trade_returns.append(float(((exit_price / price) - 1.0) * direction))
+        accum_funding = 0.0
+        if config.apply_funding and 'funding_rate_bps' in features.columns:
+            funding_window = features['funding_rate_bps'].iloc[ts_loc:exit_loc]
+            if not funding_window.empty:
+                funding_sum_bps = float(np.nan_to_num(funding_window, nan=0.0).sum())
+                accum_funding = -(funding_sum_bps / 10000.0) * float(direction)
+
+        net_pnl, raw_pnl, fee_pnl, _fee_pct_component, _min_fee_component, _slippage_component, pnl_dollars, notional = calculate_pnl_exact(
+            price,
+            exit_price,
+            direction,
+            accum_funding,
+            n_contracts,
+            symbol,
+            config,
+        )
+        pnl_dollars = float(max(pnl_dollars, -notional))
+        if notional <= 0:
+            continue
+
+        prev_equity = float(max(equity, 1e-9))
+        equity += pnl_dollars
+        trade_equity_returns.append(float(pnl_dollars / prev_equity))
+        trade_net_notional_returns.append(float(net_pnl))
+        trade_gross_notional_returns.append(float(raw_pnl))
+        fee_pnls.append(float(fee_pnl))
+        funding_pnls.append(float(accum_funding if config.apply_funding else 0.0))
+        trade_notionals.append(float(notional))
+        total_fees += float(-fee_pnl * notional)
+        total_funding += float((accum_funding if config.apply_funding else 0.0) * notional)
         last_entry_ts = ts
 
-    fold_trades = int(len(trade_returns))
+    fold_trades = int(len(trade_equity_returns))
     if fold_trades:
-        arr = np.array(trade_returns, dtype=float)
-        fold_return = float(np.prod(1.0 + arr) - 1.0)
+        arr = np.array(trade_equity_returns, dtype=float)
+        fold_return = float((equity / start_equity) - 1.0)
+        gross_return = float(np.sum(trade_gross_notional_returns))
+        net_notional_return = float(np.mean(trade_net_notional_returns))
         expectancy = float(np.mean(arr))
         raw_sharpe = float((np.mean(arr) / max(np.std(arr), 1e-9)) * np.sqrt(fold_trades))
         if fold_trades < 3:
@@ -1023,7 +1097,10 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         else:
             sharpe = float(np.clip(raw_sharpe, -3.0, 3.0))
     else:
+        equity = float(start_equity)
         fold_return = 0.0
+        gross_return = 0.0
+        net_notional_return = 0.0
         expectancy = 0.0
         raw_sharpe = 0.0
         sharpe = 0.0
@@ -1037,6 +1114,15 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             'sharpe': sharpe,
             'return': fold_return,
             'expectancy': expectancy,
+            'gross_return': gross_return,
+            'net_notional_return': net_notional_return,
+            'equity_start': float(start_equity),
+            'equity_end': float(equity),
+            'total_fees': float(total_fees),
+            'total_funding': float(total_funding),
+            'avg_notional': float(np.mean(trade_notionals)) if trade_notionals else 0.0,
+            'avg_fee_pnl': float(np.mean(fee_pnls)) if fee_pnls else 0.0,
+            'avg_funding_pnl': float(np.mean(funding_pnls)) if funding_pnls else 0.0,
             'ensemble_agreement_mean': float(np.mean(agreement_values)) if agreement_values else 0.0,
             'ensemble_std_mean': float(np.mean(std_values)) if std_values else 0.0,
         },
@@ -1060,6 +1146,8 @@ def objective(
     **_kwargs,
 ):
     profile = create_trial_profile(trial, coin_name)
+    param_fingerprint = _trial_param_fingerprint(trial.params)
+    prior_same_params = _find_prior_trial_with_fingerprint(trial, param_fingerprint)
     seed_config = base_config or Config()
     config = Config(**{
         **seed_config.__dict__,
@@ -1130,7 +1218,13 @@ def objective(
             'raw_sharpe': _finite_metric((metric or {}).get('raw_sharpe', (metric or {}).get('sharpe')), 0.0),
             'sharpe': _finite_metric((metric or {}).get('sharpe'), 0.0),
             'return': _finite_metric((metric or {}).get('return'), 0.0),
+            'gross_return': _finite_metric((metric or {}).get('gross_return'), 0.0),
             'expectancy': _finite_metric((metric or {}).get('expectancy'), 0.0),
+            'equity_start': _finite_metric((metric or {}).get('equity_start'), 0.0),
+            'equity_end': _finite_metric((metric or {}).get('equity_end'), 0.0),
+            'total_fees': _finite_metric((metric or {}).get('total_fees'), 0.0),
+            'total_funding': _finite_metric((metric or {}).get('total_funding'), 0.0),
+            'avg_notional': _finite_metric((metric or {}).get('avg_notional'), 0.0),
             'gate_counters': gate if isinstance(gate, dict) else {},
         }
         for metric, gate in zip(fold_metrics, fold_gate_counters)
@@ -1143,8 +1237,29 @@ def objective(
     realized_sharpe_raw = float(np.mean(fold_raw_sharpes)) if fold_raw_sharpes else 0.0
     realized_sharpe_term = _bounded_sharpe_term(realized_sharpe)
     realized_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in fold_metrics]))
+    realized_gross_return = float(np.mean([_finite_metric(m.get('gross_return'), 0.0) for m in fold_metrics]))
     realized_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in fold_metrics]))
     realized_trades = int(sum(fold_trade_counts))
+    cv_total_fees = float(np.sum([_finite_metric(m.get('total_fees'), 0.0) for m in fold_metrics]))
+    cv_total_funding = float(np.sum([_finite_metric(m.get('total_funding'), 0.0) for m in fold_metrics]))
+    cv_avg_notional = float(np.mean([_finite_metric(m.get('avg_notional'), 0.0) for m in fold_metrics])) if fold_metrics else 0.0
+    cv_equity_start = float(np.sum([_finite_metric(m.get('equity_start'), 0.0) for m in fold_metrics]))
+    cv_equity_end = float(np.sum([_finite_metric(m.get('equity_end'), 0.0) for m in fold_metrics]))
+
+    absurd_metrics, absurd_reason = _is_absurd_cv_metrics(realized_return, realized_expectancy, realized_trades)
+    if absurd_metrics:
+        logger.error(
+            "Rejecting trial %s due to absurd CV economics: reason=%s return=%.4f expectancy=%.4f trades=%s",
+            trial.number,
+            absurd_reason,
+            realized_return,
+            realized_expectancy,
+            realized_trades,
+        )
+        trial.set_user_attr('reject_code', str(ReasonCode.ABSURD_CV_METRICS.value))
+        trial.set_user_attr('reject_reason', f'absurd_cv_metrics:{absurd_reason}')
+        trial.set_user_attr('param_fingerprint', param_fingerprint)
+        return -1.0
 
     default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {})
     priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
@@ -1181,6 +1296,13 @@ def objective(
     activity_regime = _classify_activity_regime(trade_density_ratio, realized_trades)
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
+    trial.set_user_attr('param_fingerprint', param_fingerprint)
+    trial.set_user_attr('duplicate_of_trial', int(prior_same_params.number) if prior_same_params is not None else None)
+    trial.set_user_attr('duplicate_has_identical_params', bool(prior_same_params is not None))
+    trial.set_user_attr(
+        'duplicate_has_identical_value',
+        bool(prior_same_params is not None and prior_same_params.value is not None and np.isfinite(prior_same_params.value) and abs(float(prior_same_params.value) - float(combined)) < 1e-9),
+    )
     trial.set_user_attr('mean_auc', round(mean_auc, 4))
     trial.set_user_attr('n_trades', int(realized_trades))
     trial.set_user_attr('cv_trade_density', round(trade_density, 6))
@@ -1239,6 +1361,13 @@ def objective(
     trial.set_user_attr('dsr_cv', float(dsr_cv_meta['dsr']) if dsr_cv_meta.get('valid', False) else None)
     trial.set_user_attr('realized_return', round(realized_return, 6))
     trial.set_user_attr('realized_expectancy', round(realized_expectancy, 6))
+    trial.set_user_attr('cv_net_return', round(realized_return, 6))
+    trial.set_user_attr('cv_gross_return', round(realized_gross_return, 6))
+    trial.set_user_attr('cv_total_fees', round(cv_total_fees, 6))
+    trial.set_user_attr('cv_total_funding', round(cv_total_funding, 6))
+    trial.set_user_attr('cv_avg_notional', round(cv_avg_notional, 6))
+    trial.set_user_attr('cv_equity_start', round(cv_equity_start, 6))
+    trial.set_user_attr('cv_equity_end', round(cv_equity_end, 6))
     trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
 
     return float(combined)
