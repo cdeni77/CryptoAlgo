@@ -793,6 +793,57 @@ def _select_median_composite_slice(holdout_slices: Dict[str, dict]) -> tuple[str
     return selected_name, dict(selected_metrics)
 
 
+def _close_active_position(
+    active_position: dict,
+    *,
+    equity: float,
+    config: Config,
+    symbol: str,
+    features: pd.DataFrame,
+):
+    entry_price = float(active_position['entry_price'])
+    exit_price = float(active_position['exit_price'])
+    direction = int(active_position['direction'])
+    n_contracts = int(active_position['n_contracts'])
+    ts_loc = int(active_position['ts_loc'])
+    exit_loc = int(active_position['exit_loc'])
+
+    accum_funding = 0.0
+    if config.apply_funding and 'funding_rate_bps' in features.columns:
+        funding_window = features['funding_rate_bps'].iloc[ts_loc:exit_loc]
+        if not funding_window.empty:
+            funding_sum_bps = float(np.nan_to_num(funding_window, nan=0.0).sum())
+            accum_funding = -(funding_sum_bps / 10000.0) * float(direction)
+
+    net_pnl, raw_pnl, fee_pnl, _fee_pct_component, _min_fee_component, _slippage_component, pnl_dollars, notional = calculate_pnl_exact(
+        entry_price,
+        exit_price,
+        direction,
+        accum_funding,
+        n_contracts,
+        symbol,
+        config,
+    )
+    pnl_dollars = float(max(pnl_dollars, -notional))
+    if notional <= 0:
+        return None
+
+    prev_equity = float(max(equity, 1e-9))
+    updated_equity = float(equity + pnl_dollars)
+    return {
+        'equity': updated_equity,
+        'equity_return': float(pnl_dollars / prev_equity),
+        'net_notional_return': float(net_pnl),
+        'gross_notional_return': float(raw_pnl),
+        'fee_pnl': float(fee_pnl),
+        'funding_pnl': float(accum_funding if config.apply_funding else 0.0),
+        'notional': float(notional),
+        'total_fees': float(-fee_pnl * notional),
+        'total_funding': float((accum_funding if config.apply_funding else 0.0) * notional),
+        'exit_ts': active_position['exit_ts'],
+    }
+
+
 
 def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: CoinProfile, config: Config, symbol: str, pruned_only: bool = True):
     system = MLSystem(config)
@@ -905,7 +956,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
 
     bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(resolved_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
     cooldown_hours = max(float(profile.cooldown_hours) * float(bucket_prior.get('cooldown_scale', 1.0)) * 0.65, 0.0)
-    last_entry_ts = None
+    last_exit_ts = None
     label_horizon = max(1, int(resolve_label_horizon(profile, config)))
     effective_threshold = resolve_param('signal_threshold', profile, config, Config.signal_threshold, mode='direct')
     primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge * 0.5)
@@ -932,9 +983,36 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     std_values: List[float] = []
     test_idx = test_feat.index.intersection(ohlcv.index)
 
+    active_position = None
+
     for ts in test_idx:
-        if last_entry_ts is not None and cooldown_hours > 0:
-            if (ts - last_entry_ts).total_seconds() < cooldown_hours * 3600:
+        if active_position is not None and ts >= active_position['exit_ts']:
+            close_result = _close_active_position(
+                active_position,
+                equity=equity,
+                config=config,
+                symbol=symbol,
+                features=features,
+            )
+            active_position = None
+            if close_result is not None:
+                equity = float(close_result['equity'])
+                trade_equity_returns.append(float(close_result['equity_return']))
+                trade_net_notional_returns.append(float(close_result['net_notional_return']))
+                trade_gross_notional_returns.append(float(close_result['gross_notional_return']))
+                fee_pnls.append(float(close_result['fee_pnl']))
+                funding_pnls.append(float(close_result['funding_pnl']))
+                trade_notionals.append(float(close_result['notional']))
+                total_fees += float(close_result['total_fees'])
+                total_funding += float(close_result['total_funding'])
+                last_exit_ts = close_result['exit_ts']
+
+        if config.max_positions <= 1 and active_position is not None:
+            _gate('cooldown')
+            continue
+
+        if last_exit_ts is not None and cooldown_hours > 0:
+            if (ts - last_exit_ts).total_seconds() < cooldown_hours * 3600:
                 _gate('cooldown')
                 continue
 
@@ -1051,38 +1129,45 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         if exit_loc >= len(ohlcv):
             continue
 
-        exit_price = float(ohlcv['close'].iloc[exit_loc])
-        accum_funding = 0.0
-        if config.apply_funding and 'funding_rate_bps' in features.columns:
-            funding_window = features['funding_rate_bps'].iloc[ts_loc:exit_loc]
-            if not funding_window.empty:
-                funding_sum_bps = float(np.nan_to_num(funding_window, nan=0.0).sum())
-                accum_funding = -(funding_sum_bps / 10000.0) * float(direction)
-
-        net_pnl, raw_pnl, fee_pnl, _fee_pct_component, _min_fee_component, _slippage_component, pnl_dollars, notional = calculate_pnl_exact(
-            price,
-            exit_price,
-            direction,
-            accum_funding,
-            n_contracts,
-            symbol,
-            config,
-        )
-        pnl_dollars = float(max(pnl_dollars, -notional))
-        if notional <= 0:
+        exit_ts = ohlcv.index[exit_loc]
+        if exit_ts > fold.test_end:
             continue
 
-        prev_equity = float(max(equity, 1e-9))
-        equity += pnl_dollars
-        trade_equity_returns.append(float(pnl_dollars / prev_equity))
-        trade_net_notional_returns.append(float(net_pnl))
-        trade_gross_notional_returns.append(float(raw_pnl))
-        fee_pnls.append(float(fee_pnl))
-        funding_pnls.append(float(accum_funding if config.apply_funding else 0.0))
-        trade_notionals.append(float(notional))
-        total_fees += float(-fee_pnl * notional)
-        total_funding += float((accum_funding if config.apply_funding else 0.0) * notional)
-        last_entry_ts = ts
+        if config.max_positions <= 1 and active_position is not None:
+            _gate('cooldown')
+            continue
+
+        exit_price = float(ohlcv['close'].iloc[exit_loc])
+
+        active_position = {
+            'entry_ts': ts,
+            'exit_ts': exit_ts,
+            'ts_loc': ts_loc,
+            'exit_loc': exit_loc,
+            'entry_price': price,
+            'exit_price': exit_price,
+            'direction': direction,
+            'n_contracts': n_contracts,
+        }
+
+    if active_position is not None and active_position['exit_ts'] <= fold.test_end:
+        close_result = _close_active_position(
+            active_position,
+            equity=equity,
+            config=config,
+            symbol=symbol,
+            features=features,
+        )
+        if close_result is not None:
+            equity = float(close_result['equity'])
+            trade_equity_returns.append(float(close_result['equity_return']))
+            trade_net_notional_returns.append(float(close_result['net_notional_return']))
+            trade_gross_notional_returns.append(float(close_result['gross_notional_return']))
+            fee_pnls.append(float(close_result['fee_pnl']))
+            funding_pnls.append(float(close_result['funding_pnl']))
+            trade_notionals.append(float(close_result['notional']))
+            total_fees += float(close_result['total_fees'])
+            total_funding += float(close_result['total_funding'])
 
     fold_trades = int(len(trade_equity_returns))
     if fold_trades:
