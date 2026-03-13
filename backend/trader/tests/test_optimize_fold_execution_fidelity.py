@@ -216,3 +216,39 @@ def test_fold_evaluator_low_trade_sharpe_is_zeroed_and_raw_retained(monkeypatch)
     assert metrics["trades"] == 1
     assert metrics["raw_sharpe"] > 100_000
     assert metrics["sharpe"] == 0.0
+
+
+class _FakeMLSystemNoMeta(_FakeMLSystem):
+    def train(self, *_args, member_spec=None, **_kwargs):
+        offset = 0.1 if member_spec.name == "m1" else -0.1
+        meta = SimpleNamespace(model=None, scaler=None, calibrator=None)
+        return (_FakeModel(offset), _IdentityScaler(), _IdentityCalibrator(), 0.6, meta, {}, {})
+
+
+def test_fold_evaluator_no_meta_can_still_enter_on_strong_primary(monkeypatch):
+    features, ohlcv = _make_market_data()
+    idx = features.index
+    fold = optimize.CVFold(
+        train_idx=idx[:150],
+        test_idx=idx[150:],
+        train_end=idx[149],
+        test_start=idx[150],
+        test_end=idx[-1],
+        purge_bars=0,
+        embargo_bars=0,
+    )
+
+    monkeypatch.setattr(optimize, "MLSystem", _FakeMLSystemNoMeta)
+    monkeypatch.setattr(optimize, "fit_transform_fold", lambda x_tr, x_val, _y: (x_tr, x_val, None))
+    monkeypatch.setattr(optimize, "build_ensemble_member_specs", lambda: [_Member("m1"), _Member("m1")])
+    monkeypatch.setattr(optimize, "get_strategy_family", lambda family_name: _FakeStrategyFamily(family_name))
+    monkeypatch.setattr(optimize, "calculate_n_contracts", lambda *_a, **_k: 2)
+    monkeypatch.setattr(optimize, "resolve_label_horizon", lambda *_a, **_k: 1)
+
+    profile = COIN_PROFILES["BTC"].__class__(**{**COIN_PROFILES["BTC"].__dict__, "cooldown_hours": 1.0, "signal_threshold": 0.50, "min_vol_24h": 0.0, "max_vol_24h": 1.0})
+    cfg = optimize.Config(min_train_samples=50, val_fraction=0.2, trend_filter_mode="hard", funding_filter_mode="off")
+
+    result = optimize.evaluate_fold_with_execution_gates(features, ohlcv, fold, profile, cfg, "BIP-20DEC30-CDE", pruned_only=False)
+
+    assert result is not None
+    assert result["fold_metrics"]["trades"] > 0
