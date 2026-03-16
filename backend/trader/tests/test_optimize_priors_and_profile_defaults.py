@@ -9,7 +9,7 @@ def test_coin_optimization_priors_are_ordered_and_nontrivial() -> None:
             "min_vol_24h": (0.0001, 0.003),
             "min_directional_agreement": (0.49, 0.69),
             "meta_probability_threshold": (0.42, 0.62),
-            "cooldown": (6.0, 28.0),
+            "cooldown": (3.5, 16.0),
             "min_trade_frequency_ratio": 0.55,
         },
         "ETH": {
@@ -25,7 +25,7 @@ def test_coin_optimization_priors_are_ordered_and_nontrivial() -> None:
             "min_vol_24h": (0.0002, 0.005),
             "min_directional_agreement": (0.44, 0.64),
             "meta_probability_threshold": (0.40, 0.60),
-            "cooldown": (3.0, 16.0),
+            "cooldown": (1.0, 8.0),
             "min_trade_frequency_ratio": 0.58,
         },
         "XRP": {
@@ -33,7 +33,7 @@ def test_coin_optimization_priors_are_ordered_and_nontrivial() -> None:
             "min_vol_24h": (0.0004, 0.005),
             "min_directional_agreement": (0.48, 0.68),
             "meta_probability_threshold": (0.42, 0.62),
-            "cooldown": (4.0, 20.0),
+            "cooldown": (2.0, 10.0),
             "min_trade_frequency_ratio": 0.58,
         },
         "DOGE": {
@@ -41,7 +41,7 @@ def test_coin_optimization_priors_are_ordered_and_nontrivial() -> None:
             "min_vol_24h": (0.0002, 0.0045),
             "min_directional_agreement": (0.44, 0.64),
             "meta_probability_threshold": (0.40, 0.60),
-            "cooldown": (2.0, 12.0),
+            "cooldown": (1.5, 9.0),
             "min_trade_frequency_ratio": 0.60,
         },
     }
@@ -62,7 +62,7 @@ def test_profile_defaults_shifted_for_trade_starvation_issues() -> None:
     assert COIN_PROFILES["BTC"].min_momentum_magnitude == 0.007
     assert COIN_PROFILES["BTC"].min_directional_agreement == 0.50
     assert COIN_PROFILES["BTC"].meta_probability_threshold == 0.45
-    assert COIN_PROFILES["BTC"].cooldown_hours == 6.0
+    assert COIN_PROFILES["BTC"].cooldown_hours == 4.0
 
     assert COIN_PROFILES["ETH"].signal_threshold == 0.53
     assert COIN_PROFILES["ETH"].min_momentum_magnitude == 0.006
@@ -74,21 +74,21 @@ def test_profile_defaults_shifted_for_trade_starvation_issues() -> None:
     assert COIN_PROFILES["XRP"].min_momentum_magnitude == 0.004
     assert COIN_PROFILES["XRP"].min_directional_agreement == 0.50
     assert COIN_PROFILES["XRP"].meta_probability_threshold == 0.45
-    assert COIN_PROFILES["XRP"].cooldown_hours == 5.0
+    assert COIN_PROFILES["XRP"].cooldown_hours == 3.0
 
     assert COIN_PROFILES["SOL"].signal_threshold == 0.53
     assert COIN_PROFILES["SOL"].min_momentum_magnitude == 0.007
     assert COIN_PROFILES["SOL"].min_directional_agreement == 0.45
     assert COIN_PROFILES["SOL"].meta_probability_threshold == 0.44
     assert COIN_PROFILES["SOL"].min_vol_24h == 0.0008
-    assert COIN_PROFILES["SOL"].cooldown_hours == 3.0
+    assert COIN_PROFILES["SOL"].cooldown_hours == 1.5
 
     assert COIN_PROFILES["DOGE"].signal_threshold == 0.52
     assert COIN_PROFILES["DOGE"].min_momentum_magnitude == 0.007
     assert COIN_PROFILES["DOGE"].min_directional_agreement == 0.45
     assert COIN_PROFILES["DOGE"].meta_probability_threshold == 0.44
     assert COIN_PROFILES["DOGE"].min_vol_24h == 0.0007
-    assert COIN_PROFILES["DOGE"].cooldown_hours == 2.5
+    assert COIN_PROFILES["DOGE"].cooldown_hours == 2.0
 
 
 def test_profile_from_params_still_builds_valid_profile_with_new_ranges() -> None:
