@@ -6,6 +6,9 @@ from scripts.optimize import (
     _candidate_trials_for_holdout,
     _holdout_selection_score,
     _classify_activity_regime,
+    _cooldown_dominance_penalty,
+    _fold_balance_penalties,
+    _top_level_reporting_fields,
 )
 
 
@@ -77,3 +80,58 @@ def test_activity_regime_classification() -> None:
     assert _classify_activity_regime(0.2, 2) == "starved"
     assert _classify_activity_regime(0.7, 9) == "thin"
     assert _classify_activity_regime(1.1, 20) == "active"
+
+
+def test_cooldown_dominance_penalty_triggers_when_cooldown_overwhelms_gate_mix() -> None:
+    gate_summary = {
+        "gate_rates": {
+            "cooldown": 0.74,
+            "primary_threshold": 0.11,
+            "ensemble_agreement": 0.08,
+        }
+    }
+
+    penalty = _cooldown_dominance_penalty(gate_summary)
+
+    assert penalty["cooldown_rate"] == 0.74
+    assert penalty["max_other_rate"] == 0.11
+    assert penalty["penalty"] > 0.0
+
+
+def test_fold_balance_penalties_penalize_zero_trade_fold() -> None:
+    penalties = _fold_balance_penalties([18, 0, 16], [0.25, -0.22, 0.20])
+
+    assert penalties["zero_trade_penalty"] >= 0.45
+    assert penalties["total_penalty"] >= penalties["zero_trade_penalty"]
+
+
+def test_top_level_reporting_fields_copies_selection_meta_and_holdout_summary() -> None:
+    payload = {
+        "selection_meta": {
+            "research_confidence_tier": "PAPER_QUALIFIED",
+            "n_candidates": 4,
+            "n_passing_candidates": 1,
+            "paper_eligible_promoted_candidate": {"trial": 7, "selection_score": 0.91},
+        },
+        "holdout_metrics": {
+            "holdout_trades": 19,
+            "holdout_sharpe": 0.33,
+            "holdout_return": 0.07,
+            "selected_slice": "recent90",
+        },
+        "deployment_blocked": True,
+        "deployment_block_reasons": ["NO_HOLDOUT_CANDIDATE_PASSED_GATE"],
+    }
+
+    flattened = _top_level_reporting_fields(payload)
+
+    assert flattened["tier"] == "PAPER_QUALIFIED"
+    assert flattened["blocked"] is True
+    assert flattened["block_reasons"] == ["NO_HOLDOUT_CANDIDATE_PASSED_GATE"]
+    assert flattened["holdout_trades"] == 19
+    assert flattened["holdout_sharpe"] == 0.33
+    assert flattened["holdout_return"] == 0.07
+    assert flattened["selected_slice"] == "recent90"
+    assert flattened["n_candidates"] == 4
+    assert flattened["n_passing_candidates"] == 1
+    assert flattened["paper_eligible_promoted_candidate"] == {"trial": 7, "selection_score": 0.91}

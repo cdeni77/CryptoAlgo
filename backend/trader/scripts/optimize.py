@@ -353,11 +353,17 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # Search priors are intentionally a bit wider than deployment defaults. This broadens
     # discovery while leaving holdout/promotion gates unchanged.
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 6.0, 'cooldown_max': 28.0, 'min_momentum_magnitude': (0.005, 0.030), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.49, 0.69), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0001, 0.0030), 'min_trade_frequency_ratio': 0.55},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 4.5, 'cooldown_max': 22.0, 'min_momentum_magnitude': (0.005, 0.030), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.49, 0.69), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0001, 0.0030), 'min_trade_frequency_ratio': 0.55},
     'ETH': {'target_trades_per_year': 27.0, 'cooldown_min': 5.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.003, 0.028), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.46, 0.66), 'meta_probability_threshold': (0.41, 0.61), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.55},
-    'SOL': {'target_trades_per_year': 33.0, 'cooldown_min': 3.0, 'cooldown_max': 16.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
-    'XRP': {'target_trades_per_year': 28.0, 'cooldown_min': 4.0, 'cooldown_max': 20.0, 'min_momentum_magnitude': (0.002, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.58},
-    'DOGE': {'target_trades_per_year': 30.0, 'cooldown_min': 2.0, 'cooldown_max': 12.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.0045), 'min_trade_frequency_ratio': 0.60},
+    'SOL': {'target_trades_per_year': 33.0, 'cooldown_min': 2.0, 'cooldown_max': 12.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'XRP': {'target_trades_per_year': 28.0, 'cooldown_min': 3.0, 'cooldown_max': 16.0, 'min_momentum_magnitude': (0.002, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'DOGE': {'target_trades_per_year': 30.0, 'cooldown_min': 1.5, 'cooldown_max': 9.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.0045), 'min_trade_frequency_ratio': 0.60},
+}
+
+ETH_GATE_RELAXATION = {
+    'primary_cutoff': 0.015,
+    'meta_probability_threshold': 0.015,
+    'ensemble_agreement': 0.020,
 }
 
 STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
@@ -414,6 +420,88 @@ def _trade_starvation_penalty(realized_trades: int, target_trades_floor: float) 
     if trades <= 12:
         return penalty - 0.22
     return penalty
+
+
+def _cooldown_dominance_penalty(gate_summary: Dict[str, object]) -> Dict[str, float]:
+    rates = (gate_summary or {}).get('gate_rates', {}) if isinstance(gate_summary, dict) else {}
+    cooldown_rate = float(rates.get('cooldown', 0.0) or 0.0)
+    other_rates = [float(rates.get(reason, 0.0) or 0.0) for reason in GATE_REASON_CODES if reason != 'cooldown']
+    max_other_rate = max(other_rates) if other_rates else 0.0
+    dominance_margin = max(0.0, cooldown_rate - max_other_rate)
+
+    penalty = 0.0
+    if cooldown_rate >= 0.60:
+        penalty += 0.12 * ((cooldown_rate - 0.60) / 0.40)
+    if dominance_margin >= 0.20:
+        penalty += 0.08 * ((dominance_margin - 0.20) / 0.50)
+
+    return {
+        'cooldown_rate': float(cooldown_rate),
+        'max_other_rate': float(max_other_rate),
+        'dominance_margin': float(dominance_margin),
+        'penalty': float(max(0.0, penalty)),
+    }
+
+
+def _fold_balance_penalties(fold_trade_counts: List[int], fold_sharpes: List[float]) -> Dict[str, float]:
+    trades = [max(0, int(t or 0)) for t in (fold_trade_counts or [])]
+    sharpes = [_finite_metric(v, 0.0) for v in (fold_sharpes or [])]
+    if not trades:
+        return {'zero_trade_penalty': 0.0, 'trade_imbalance_penalty': 0.0, 'weak_fold_penalty': 0.0, 'total_penalty': 0.0}
+
+    zero_trade_folds = sum(1 for t in trades if t <= 0)
+    zero_trade_penalty = 0.45 * float(zero_trade_folds)
+
+    mean_trades = float(np.mean(trades))
+    trade_cv = float(np.std(trades) / max(mean_trades, 1.0)) if len(trades) > 1 else 0.0
+    trade_imbalance_penalty = 0.20 * max(0.0, trade_cv - 0.35)
+
+    weak_fold_penalty = 0.0
+    if len(sharpes) >= 3:
+        positive_folds = sum(1 for s in sharpes if s > 0.10)
+        weak_folds = sum(1 for s in sharpes if s < -0.10)
+        if positive_folds >= 2 and weak_folds >= 1:
+            weak_fold_penalty += 0.16
+        downside_gap = max(0.0, float(np.mean(sharpes)) - min(sharpes))
+        if downside_gap > 0.45:
+            weak_fold_penalty += 0.10 * min(1.0, (downside_gap - 0.45) / 0.60)
+
+    total_penalty = zero_trade_penalty + trade_imbalance_penalty + weak_fold_penalty
+    return {
+        'zero_trade_penalty': float(zero_trade_penalty),
+        'trade_imbalance_penalty': float(trade_imbalance_penalty),
+        'weak_fold_penalty': float(weak_fold_penalty),
+        'total_penalty': float(total_penalty),
+    }
+
+
+def _fold_cooldown_dominance_stats(fold_gate_counters: List[Dict[str, object]]) -> Dict[str, float]:
+    fold_count = max(1, len(fold_gate_counters or []))
+    cooldown_dominant_folds = 0
+    cooldown_rates: List[float] = []
+    for gate_summary in (fold_gate_counters or []):
+        summary = _summarize_gate_counters_by_reason(
+            gate_summary.get('gate_counts', {}) if isinstance(gate_summary, dict) else {},
+            int(gate_summary.get('total_checks', 0) or 0) if isinstance(gate_summary, dict) else 0,
+        )
+        rates = summary.get('gate_rates', {}) if isinstance(summary, dict) else {}
+        cooldown_rate = float(rates.get('cooldown', 0.0) or 0.0)
+        max_other = max([float(rates.get(reason, 0.0) or 0.0) for reason in GATE_REASON_CODES if reason != 'cooldown'] or [0.0])
+        cooldown_rates.append(cooldown_rate)
+        if cooldown_rate > 0.45 and cooldown_rate >= (max_other + 0.08):
+            cooldown_dominant_folds += 1
+
+    dominant_share = float(cooldown_dominant_folds / fold_count)
+    penalty = 0.0
+    if dominant_share >= 0.60:
+        penalty = 0.20 * ((dominant_share - 0.60) / 0.40)
+    return {
+        'cooldown_dominant_folds': float(cooldown_dominant_folds),
+        'fold_count': float(fold_count),
+        'dominant_share': float(dominant_share),
+        'mean_cooldown_rate': float(np.mean(cooldown_rates) if cooldown_rates else 0.0),
+        'penalty': float(max(0.0, penalty)),
+    }
 
 
 def _resolve_strategy_and_bucket(params: Dict | None) -> tuple[str, str]:
@@ -965,6 +1053,11 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     effective_meta_threshold = max(0.35, float(effective_meta_threshold) - 0.03)
     effective_directional_agreement = resolve_param('min_directional_agreement', profile, config, Config.min_directional_agreement, mode='direct')
     effective_directional_agreement = max(0.40, float(effective_directional_agreement) - 0.04)
+
+    if str(profile.name).upper() == 'ETH':
+        primary_cutoff = max(0.43, primary_cutoff - float(ETH_GATE_RELAXATION['primary_cutoff']))
+        effective_meta_threshold = max(0.33, effective_meta_threshold - float(ETH_GATE_RELAXATION['meta_probability_threshold']))
+        effective_directional_agreement = max(0.38, effective_directional_agreement - float(ETH_GATE_RELAXATION['ensemble_agreement']))
     effective_max_ensemble_std = resolve_param('max_ensemble_std', profile, config, Config.max_ensemble_std, mode='direct')
     effective_momentum = resolve_param('min_momentum_magnitude', profile, config, Config.min_momentum_magnitude, mode='direct')
     effective_momentum = max(0.0015, float(effective_momentum) * 0.75)
@@ -1381,6 +1474,15 @@ def objective(
     trade_floor_penalty = _trade_starvation_penalty(realized_trades, target_trades_floor)
     combined += trade_floor_penalty
 
+    aggregate_cv_gate_counters = _aggregate_slice_gate_summaries({
+        f'fold_{idx}': {'gate_counters': gate_summary}
+        for idx, gate_summary in enumerate(fold_gate_counters)
+    })
+    cooldown_penalty_meta = _cooldown_dominance_penalty(aggregate_cv_gate_counters)
+    fold_balance_penalty_meta = _fold_balance_penalties(fold_trade_counts, fold_sharpes)
+    combined -= cooldown_penalty_meta['penalty']
+    combined -= fold_balance_penalty_meta['total_penalty']
+
     activity_regime = _classify_activity_regime(trade_density_ratio, realized_trades)
 
     trial.set_user_attr('n_folds', int(len(fold_scores)))
@@ -1429,10 +1531,6 @@ def objective(
     trial.set_user_attr('fold_metrics', _to_json_safe(fold_metrics_with_gates))
     trial.set_user_attr('fold_gate_counters', _to_json_safe(fold_gate_counters))
     trial.set_user_attr('fold_trade_counts', _to_json_safe(fold_trade_counts))
-    aggregate_cv_gate_counters = _aggregate_slice_gate_summaries({
-        f'fold_{idx}': {'gate_counters': gate_summary}
-        for idx, gate_summary in enumerate(fold_gate_counters)
-    })
     trial.set_user_attr('aggregated_gate_counters', _to_json_safe(aggregate_cv_gate_counters))
     trial.set_user_attr('main_blockers', _to_json_safe(_derive_main_blockers(aggregate_cv_gate_counters)))
     trial.set_user_attr('starvation_signature', _to_json_safe(_derive_starvation_signature(aggregate_cv_gate_counters)))
@@ -1457,6 +1555,12 @@ def objective(
     trial.set_user_attr('cv_equity_start', round(cv_equity_start, 6))
     trial.set_user_attr('cv_equity_end', round(cv_equity_end, 6))
     trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
+    trial.set_user_attr('cooldown_dominance_penalty', round(float(cooldown_penalty_meta['penalty']), 6))
+    trial.set_user_attr('cooldown_dominance_rate', round(float(cooldown_penalty_meta['cooldown_rate']), 6))
+    trial.set_user_attr('fold_balance_penalty', round(float(fold_balance_penalty_meta['total_penalty']), 6))
+    trial.set_user_attr('zero_trade_fold_penalty', round(float(fold_balance_penalty_meta['zero_trade_penalty']), 6))
+    trial.set_user_attr('trade_imbalance_penalty', round(float(fold_balance_penalty_meta['trade_imbalance_penalty']), 6))
+    trial.set_user_attr('weak_fold_penalty', round(float(fold_balance_penalty_meta['weak_fold_penalty']), 6))
 
     return float(combined)
 
@@ -1516,7 +1620,12 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         std_s = _as_number(t.user_attrs.get('std_sharpe'), 9.0) or 9.0
         dd = _as_number(t.user_attrs.get('max_drawdown'), 1.0) or 1.0
         activity_score = min(3.0, float(cv_density_ratio)) + (0.06 * cv_trades)
-        return (regime_rank, activity_score, float(mean_sr >= 0.0), float(realized_return >= 0.0), psr, mean_sr, float(t.value or -99), -std_s, -dd)
+        ranking_penalty = 0.0
+        ranking_penalty += float(_as_number(t.user_attrs.get('cooldown_dominance_penalty'), 0.0) or 0.0)
+        ranking_penalty += float(_as_number(t.user_attrs.get('fold_balance_penalty'), 0.0) or 0.0)
+        cooldown_fold_meta = _fold_cooldown_dominance_stats(t.user_attrs.get('fold_gate_counters', []))
+        ranking_penalty += float(cooldown_fold_meta.get('penalty', 0.0) or 0.0)
+        return (regime_rank, activity_score - ranking_penalty, float(mean_sr >= 0.0), float(realized_return >= 0.0), psr, mean_sr, float(t.value or -99), -std_s, -dd)
 
     accepted_sorted = sorted(accepted, key=_rank_key, reverse=True)
     cap = max(1, int(max_candidates or 1))
@@ -1544,6 +1653,13 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
     median_trades = float(np.median(trade_vals)) if trade_vals else 0.0
     median_trade_term = min(1.8, median_trades / 18.0)
     dispersion_penalty = 0.30 * (float(np.std(sharpe_vals)) if len(sharpe_vals) > 1 else 0.0)
+    fold_balance_penalty = _fold_balance_penalties(trade_vals, sharpe_vals)
+
+    aggregate_holdout_gate_summary = _aggregate_slice_gate_summaries({
+        str(name): {'gate_counters': (metrics.get('gate_counters', {}) if isinstance(metrics, dict) else {})}
+        for name, metrics in slice_items
+    })
+    cooldown_penalty_meta = _cooldown_dominance_penalty(aggregate_holdout_gate_summary)
 
     trade_min_penalty = 0.0
     for _, metrics in slice_items:
@@ -1565,6 +1681,8 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
 
     score = (0.40 * median_sr) + (0.18 * median_ret * 5.0) + (0.42 * median_trade_term)
     score -= (trade_min_penalty + dispersion_penalty)
+    score -= float(fold_balance_penalty.get('total_penalty', 0.0) or 0.0)
+    score -= float(cooldown_penalty_meta.get('penalty', 0.0) or 0.0)
     return score + 0.08 * (_as_number(cv_score, 0.0) or 0.0)
 
 
@@ -2057,6 +2175,36 @@ def _study_storage_lock(db_path: Path):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+
+def _top_level_reporting_fields(payload: Dict[str, object]) -> Dict[str, object]:
+    data = payload if isinstance(payload, dict) else {}
+    selection_meta = data.get('selection_meta', {}) if isinstance(data.get('selection_meta', {}), dict) else {}
+    holdout_metrics = data.get('holdout_metrics', {}) if isinstance(data.get('holdout_metrics', {}), dict) else {}
+
+    paper_candidate = selection_meta.get('paper_eligible_promoted_candidate')
+    if paper_candidate is None:
+        paper_candidate = data.get('paper_eligible_promoted_candidate')
+
+    return {
+        'tier': str(selection_meta.get('research_confidence_tier') or data.get('research_confidence_tier') or ''),
+        'blocked': bool(data.get('deployment_blocked', False)),
+        'block_reasons': list(data.get('deployment_block_reasons', []) or []),
+        'holdout_trades': int(holdout_metrics.get('holdout_trades', 0) or 0),
+        'holdout_sharpe': _finite_metric(holdout_metrics.get('holdout_sharpe'), 0.0),
+        'holdout_return': _finite_metric(holdout_metrics.get('holdout_return'), 0.0),
+        'selected_slice': holdout_metrics.get('selected_slice'),
+        'n_candidates': int(selection_meta.get('n_candidates', 0) or 0),
+        'n_passing_candidates': int(selection_meta.get('n_passing_candidates', 0) or 0),
+        'paper_eligible_promoted_candidate': paper_candidate,
+    }
+
+
+def _apply_top_level_reporting_fields(payload: Dict[str, object]) -> Dict[str, object]:
+    merged = dict(payload or {})
+    merged.update(_top_level_reporting_fields(merged))
+    return merged
 
 def _persist_result_json(coin_name, data):
     for d in _candidate_results_dirs():
@@ -2719,6 +2867,7 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
             'study_significance_enabled': bool(enable_study_significance),
         },
         'trade_frequency_diagnostics': trade_frequency_diagnostics}
+    result_data = _apply_top_level_reporting_fields(result_data)
     result_data['quality'] = assess_result_quality(result_data)
     print(f"  🧪 Quality: {result_data['quality']['rating']}")
     print(
@@ -2859,6 +3008,7 @@ def aggregate_multiseed_results(
     if not isinstance(holdout_metrics, dict) or not holdout_metrics:
         raise ValueError("Selected-seed holdout metrics missing; refusing to persist inconsistent result.")
 
+    best_seed_result = _apply_top_level_reporting_fields(best_seed_result)
     best_seed_result['quality'] = assess_result_quality(best_seed_result)
     if emit_artifacts:
         p = _persist_result_json(coin_name, best_seed_result)
