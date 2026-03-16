@@ -353,10 +353,10 @@ FIXED_RISK = {
 COIN_OPTIMIZATION_PRIORS = {
     # Search priors are intentionally a bit wider than deployment defaults. This broadens
     # discovery while leaving holdout/promotion gates unchanged.
-    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 4.5, 'cooldown_max': 22.0, 'min_momentum_magnitude': (0.005, 0.030), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.49, 0.69), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0001, 0.0030), 'min_trade_frequency_ratio': 0.55},
+    'BTC': {'target_trades_per_year': 25.0, 'cooldown_min': 3.5, 'cooldown_max': 16.0, 'min_momentum_magnitude': (0.005, 0.030), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.49, 0.69), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0001, 0.0030), 'min_trade_frequency_ratio': 0.55},
     'ETH': {'target_trades_per_year': 27.0, 'cooldown_min': 5.0, 'cooldown_max': 24.0, 'min_momentum_magnitude': (0.003, 0.028), 'max_vol_24h': (0.050, 0.100), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.46, 0.66), 'meta_probability_threshold': (0.41, 0.61), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.55},
-    'SOL': {'target_trades_per_year': 33.0, 'cooldown_min': 2.0, 'cooldown_max': 12.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
-    'XRP': {'target_trades_per_year': 28.0, 'cooldown_min': 3.0, 'cooldown_max': 16.0, 'min_momentum_magnitude': (0.002, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'SOL': {'target_trades_per_year': 33.0, 'cooldown_min': 1.0, 'cooldown_max': 8.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'XRP': {'target_trades_per_year': 28.0, 'cooldown_min': 2.0, 'cooldown_max': 10.0, 'min_momentum_magnitude': (0.002, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.58},
     'DOGE': {'target_trades_per_year': 30.0, 'cooldown_min': 1.5, 'cooldown_max': 9.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.0045), 'min_trade_frequency_ratio': 0.60},
 }
 
@@ -422,23 +422,36 @@ def _trade_starvation_penalty(realized_trades: int, target_trades_floor: float) 
     return penalty
 
 
-def _cooldown_dominance_penalty(gate_summary: Dict[str, object]) -> Dict[str, float]:
+def _cooldown_dominance_penalty(gate_summary: Dict[str, object], fold_dominant_share: float = 0.0) -> Dict[str, float]:
     rates = (gate_summary or {}).get('gate_rates', {}) if isinstance(gate_summary, dict) else {}
     cooldown_rate = float(rates.get('cooldown', 0.0) or 0.0)
     other_rates = [float(rates.get(reason, 0.0) or 0.0) for reason in GATE_REASON_CODES if reason != 'cooldown']
     max_other_rate = max(other_rates) if other_rates else 0.0
     dominance_margin = max(0.0, cooldown_rate - max_other_rate)
+    dominant_share = max(0.0, min(1.0, float(fold_dominant_share or 0.0)))
 
     penalty = 0.0
-    if cooldown_rate >= 0.60:
-        penalty += 0.12 * ((cooldown_rate - 0.60) / 0.40)
-    if dominance_margin >= 0.20:
-        penalty += 0.08 * ((dominance_margin - 0.20) / 0.50)
+    if cooldown_rate >= 0.55:
+        penalty += 0.15 * ((cooldown_rate - 0.55) / 0.45)
+    if cooldown_rate > 0.65:
+        penalty += 0.22 * ((cooldown_rate - 0.65) / 0.35)
+    if dominance_margin >= 0.16:
+        penalty += 0.12 * ((dominance_margin - 0.16) / 0.54)
+    if dominant_share >= 0.60:
+        penalty += 0.24 * ((dominant_share - 0.60) / 0.40)
+
+    cooldown_regime = 'normal'
+    if cooldown_rate > 0.75 or dominant_share >= 0.80:
+        cooldown_regime = 'severe'
+    elif cooldown_rate > 0.65 or dominant_share >= 0.60:
+        cooldown_regime = 'elevated'
 
     return {
         'cooldown_rate': float(cooldown_rate),
         'max_other_rate': float(max_other_rate),
         'dominance_margin': float(dominance_margin),
+        'dominant_fold_share': float(dominant_share),
+        'cooldown_regime': cooldown_regime,
         'penalty': float(max(0.0, penalty)),
     }
 
@@ -450,21 +463,23 @@ def _fold_balance_penalties(fold_trade_counts: List[int], fold_sharpes: List[flo
         return {'zero_trade_penalty': 0.0, 'trade_imbalance_penalty': 0.0, 'weak_fold_penalty': 0.0, 'total_penalty': 0.0}
 
     zero_trade_folds = sum(1 for t in trades if t <= 0)
-    zero_trade_penalty = 0.45 * float(zero_trade_folds)
+    zero_trade_penalty = 0.65 * float(zero_trade_folds)
+    if zero_trade_folds >= max(2, len(trades) - 1):
+        zero_trade_penalty += 0.25
 
     mean_trades = float(np.mean(trades))
     trade_cv = float(np.std(trades) / max(mean_trades, 1.0)) if len(trades) > 1 else 0.0
-    trade_imbalance_penalty = 0.20 * max(0.0, trade_cv - 0.35)
+    trade_imbalance_penalty = 0.30 * max(0.0, trade_cv - 0.25)
 
     weak_fold_penalty = 0.0
     if len(sharpes) >= 3:
         positive_folds = sum(1 for s in sharpes if s > 0.10)
         weak_folds = sum(1 for s in sharpes if s < -0.10)
         if positive_folds >= 2 and weak_folds >= 1:
-            weak_fold_penalty += 0.16
+            weak_fold_penalty += 0.22
         downside_gap = max(0.0, float(np.mean(sharpes)) - min(sharpes))
-        if downside_gap > 0.45:
-            weak_fold_penalty += 0.10 * min(1.0, (downside_gap - 0.45) / 0.60)
+        if downside_gap > 0.35:
+            weak_fold_penalty += 0.18 * min(1.0, (downside_gap - 0.35) / 0.55)
 
     total_penalty = zero_trade_penalty + trade_imbalance_penalty + weak_fold_penalty
     return {
@@ -493,8 +508,8 @@ def _fold_cooldown_dominance_stats(fold_gate_counters: List[Dict[str, object]]) 
 
     dominant_share = float(cooldown_dominant_folds / fold_count)
     penalty = 0.0
-    if dominant_share >= 0.60:
-        penalty = 0.20 * ((dominant_share - 0.60) / 0.40)
+    if dominant_share >= 0.55:
+        penalty = 0.24 * ((dominant_share - 0.55) / 0.45)
     return {
         'cooldown_dominant_folds': float(cooldown_dominant_folds),
         'fold_count': float(fold_count),
@@ -571,7 +586,7 @@ def create_trial_profile(trial, coin_name):
         meta_probability_threshold=meta_probability_threshold,
         cooldown_hours=trial.suggest_float(
             'cooldown_hours',
-            max(2.0, priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
+            max(1.0 if coin_name in {'BTC', 'SOL', 'XRP'} else 2.0, priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
             max(6.0, priors['cooldown_max'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
         ),
         position_size=FIXED_RISK['position_size'],
@@ -1478,7 +1493,11 @@ def objective(
         f'fold_{idx}': {'gate_counters': gate_summary}
         for idx, gate_summary in enumerate(fold_gate_counters)
     })
-    cooldown_penalty_meta = _cooldown_dominance_penalty(aggregate_cv_gate_counters)
+    fold_cooldown_meta = _fold_cooldown_dominance_stats(fold_gate_counters)
+    cooldown_penalty_meta = _cooldown_dominance_penalty(
+        aggregate_cv_gate_counters,
+        fold_dominant_share=float(fold_cooldown_meta.get('dominant_share', 0.0) or 0.0),
+    )
     fold_balance_penalty_meta = _fold_balance_penalties(fold_trade_counts, fold_sharpes)
     combined -= cooldown_penalty_meta['penalty']
     combined -= fold_balance_penalty_meta['total_penalty']
@@ -1557,6 +1576,8 @@ def objective(
     trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
     trial.set_user_attr('cooldown_dominance_penalty', round(float(cooldown_penalty_meta['penalty']), 6))
     trial.set_user_attr('cooldown_dominance_rate', round(float(cooldown_penalty_meta['cooldown_rate']), 6))
+    trial.set_user_attr('cooldown_dominance_regime', str(cooldown_penalty_meta.get('cooldown_regime', 'normal')))
+    trial.set_user_attr('cooldown_dominant_fold_share', round(float(cooldown_penalty_meta.get('dominant_fold_share', 0.0)), 6))
     trial.set_user_attr('fold_balance_penalty', round(float(fold_balance_penalty_meta['total_penalty']), 6))
     trial.set_user_attr('zero_trade_fold_penalty', round(float(fold_balance_penalty_meta['zero_trade_penalty']), 6))
     trial.set_user_attr('trade_imbalance_penalty', round(float(fold_balance_penalty_meta['trade_imbalance_penalty']), 6))
@@ -1619,13 +1640,15 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         realized_return = _as_number(t.user_attrs.get('realized_return'), -9.0) or -9.0
         std_s = _as_number(t.user_attrs.get('std_sharpe'), 9.0) or 9.0
         dd = _as_number(t.user_attrs.get('max_drawdown'), 1.0) or 1.0
-        activity_score = min(3.0, float(cv_density_ratio)) + (0.06 * cv_trades)
+        activity_score = min(2.4, float(cv_density_ratio)) + (0.03 * cv_trades)
         ranking_penalty = 0.0
         ranking_penalty += float(_as_number(t.user_attrs.get('cooldown_dominance_penalty'), 0.0) or 0.0)
         ranking_penalty += float(_as_number(t.user_attrs.get('fold_balance_penalty'), 0.0) or 0.0)
         cooldown_fold_meta = _fold_cooldown_dominance_stats(t.user_attrs.get('fold_gate_counters', []))
-        ranking_penalty += float(cooldown_fold_meta.get('penalty', 0.0) or 0.0)
-        return (regime_rank, activity_score - ranking_penalty, float(mean_sr >= 0.0), float(realized_return >= 0.0), psr, mean_sr, float(t.value or -99), -std_s, -dd)
+        ranking_penalty += 1.25 * float(cooldown_fold_meta.get('penalty', 0.0) or 0.0)
+        zero_trade_fold_penalty = float(_as_number(t.user_attrs.get('zero_trade_fold_penalty'), 0.0) or 0.0)
+        positive_perf_score = float(mean_sr > 0.0) + float(realized_return > 0.0) + float((_as_number(t.user_attrs.get('realized_expectancy'), 0.0) or 0.0) > 0.0)
+        return (regime_rank, positive_perf_score, activity_score - ranking_penalty - (0.50 * zero_trade_fold_penalty), psr, mean_sr, float(t.value or -99), -std_s, -dd)
 
     accepted_sorted = sorted(accepted, key=_rank_key, reverse=True)
     cap = max(1, int(max_candidates or 1))
@@ -1659,7 +1682,11 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
         str(name): {'gate_counters': (metrics.get('gate_counters', {}) if isinstance(metrics, dict) else {})}
         for name, metrics in slice_items
     })
-    cooldown_penalty_meta = _cooldown_dominance_penalty(aggregate_holdout_gate_summary)
+    fold_cooldown_meta = _fold_cooldown_dominance_stats([
+        (m.get('gate_counters', {}) if isinstance(m, dict) else {})
+        for _, m in slice_items
+    ])
+    cooldown_penalty_meta = _cooldown_dominance_penalty(aggregate_holdout_gate_summary, fold_dominant_share=float(fold_cooldown_meta.get('dominant_share', 0.0) or 0.0))
 
     trade_min_penalty = 0.0
     for _, metrics in slice_items:
@@ -1679,10 +1706,19 @@ def _holdout_selection_score(holdout_metrics, cv_score=0.0):
         if ho_ret < 0:
             trade_min_penalty += 0.20
 
-    score = (0.40 * median_sr) + (0.18 * median_ret * 5.0) + (0.42 * median_trade_term)
+    median_expectancy = float(np.median([_as_number(m.get('holdout_expectancy'), 0.0) or 0.0 for _, m in slice_items])) if slice_items else 0.0
+    positive_perf_bonus = 0.0
+    if median_sr > 0.0:
+        positive_perf_bonus += 0.16
+    if median_ret > 0.0:
+        positive_perf_bonus += 0.12
+    if median_expectancy > 0.0:
+        positive_perf_bonus += 0.10
+
+    score = (0.46 * median_sr) + (0.24 * median_ret * 5.0) + (0.24 * median_trade_term) + positive_perf_bonus
     score -= (trade_min_penalty + dispersion_penalty)
     score -= float(fold_balance_penalty.get('total_penalty', 0.0) or 0.0)
-    score -= float(cooldown_penalty_meta.get('penalty', 0.0) or 0.0)
+    score -= 1.20 * float(cooldown_penalty_meta.get('penalty', 0.0) or 0.0)
     return score + 0.08 * (_as_number(cv_score, 0.0) or 0.0)
 
 

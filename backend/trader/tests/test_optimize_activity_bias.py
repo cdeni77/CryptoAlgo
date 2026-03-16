@@ -12,7 +12,19 @@ from scripts.optimize import (
 )
 
 
-def _trial(number: int, value: float, n_trades: int, cv_ratio: float, mean_sharpe: float = 0.4):
+def _trial(
+    number: int,
+    value: float,
+    n_trades: int,
+    cv_ratio: float,
+    mean_sharpe: float = 0.4,
+    realized_return: float = 0.04,
+    realized_expectancy: float = 0.02,
+    cooldown_penalty: float = 0.0,
+    fold_balance_penalty: float = 0.0,
+    zero_trade_fold_penalty: float = 0.0,
+    fold_gate_counters=None,
+):
     return SimpleNamespace(
         number=number,
         value=value,
@@ -21,6 +33,12 @@ def _trial(number: int, value: float, n_trades: int, cv_ratio: float, mean_sharp
             "n_trades": n_trades,
             "cv_trade_density_ratio": cv_ratio,
             "mean_sharpe": mean_sharpe,
+            "realized_return": realized_return,
+            "realized_expectancy": realized_expectancy,
+            "cooldown_dominance_penalty": cooldown_penalty,
+            "fold_balance_penalty": fold_balance_penalty,
+            "zero_trade_fold_penalty": zero_trade_fold_penalty,
+            "fold_gate_counters": fold_gate_counters or [],
             "std_sharpe": 0.05,
             "min_sharpe": 0.0,
             "max_drawdown": 0.1,
@@ -29,10 +47,30 @@ def _trial(number: int, value: float, n_trades: int, cv_ratio: float, mean_sharp
     )
 
 
-def test_candidate_trials_for_holdout_prefers_activity_first() -> None:
-    inactive_but_higher_objective = _trial(1, value=1.30, n_trades=10, cv_ratio=0.40, mean_sharpe=0.8)
-    active_trial = _trial(2, value=1.10, n_trades=35, cv_ratio=1.35, mean_sharpe=0.35)
-    study = SimpleNamespace(trials=[inactive_but_higher_objective, active_trial])
+def test_candidate_trials_for_holdout_prefers_balanced_lower_cooldown_candidates() -> None:
+    cooldown_heavy = _trial(
+        1,
+        value=1.30,
+        n_trades=28,
+        cv_ratio=1.30,
+        mean_sharpe=0.55,
+        cooldown_penalty=0.40,
+        fold_balance_penalty=0.35,
+        zero_trade_fold_penalty=0.65,
+        fold_gate_counters=[{"total_checks": 100, "gate_counts": {"cooldown": 76, "primary_threshold": 8}}] * 3,
+    )
+    balanced = _trial(
+        2,
+        value=1.10,
+        n_trades=22,
+        cv_ratio=1.05,
+        mean_sharpe=0.40,
+        cooldown_penalty=0.02,
+        fold_balance_penalty=0.01,
+        zero_trade_fold_penalty=0.0,
+        fold_gate_counters=[{"total_checks": 100, "gate_counts": {"cooldown": 20, "primary_threshold": 18}}] * 3,
+    )
+    study = SimpleNamespace(trials=[cooldown_heavy, balanced])
 
     ranked = _candidate_trials_for_holdout(study, max_candidates=2, min_trades=6)
 
@@ -82,7 +120,7 @@ def test_activity_regime_classification() -> None:
     assert _classify_activity_regime(1.1, 20) == "active"
 
 
-def test_cooldown_dominance_penalty_triggers_when_cooldown_overwhelms_gate_mix() -> None:
+def test_cooldown_dominance_penalty_stronger_for_high_rate_and_fold_dominance() -> None:
     gate_summary = {
         "gate_rates": {
             "cooldown": 0.74,
@@ -91,17 +129,19 @@ def test_cooldown_dominance_penalty_triggers_when_cooldown_overwhelms_gate_mix()
         }
     }
 
-    penalty = _cooldown_dominance_penalty(gate_summary)
+    baseline = _cooldown_dominance_penalty(gate_summary, fold_dominant_share=0.10)
+    dominated = _cooldown_dominance_penalty(gate_summary, fold_dominant_share=0.85)
 
-    assert penalty["cooldown_rate"] == 0.74
-    assert penalty["max_other_rate"] == 0.11
-    assert penalty["penalty"] > 0.0
+    assert dominated["cooldown_rate"] == 0.74
+    assert dominated["max_other_rate"] == 0.11
+    assert dominated["cooldown_regime"] in {"elevated", "severe"}
+    assert dominated["penalty"] > baseline["penalty"]
 
 
-def test_fold_balance_penalties_penalize_zero_trade_fold() -> None:
+def test_fold_balance_penalties_penalize_zero_trade_fold_more_strongly() -> None:
     penalties = _fold_balance_penalties([18, 0, 16], [0.25, -0.22, 0.20])
 
-    assert penalties["zero_trade_penalty"] >= 0.45
+    assert penalties["zero_trade_penalty"] >= 0.65
     assert penalties["total_penalty"] >= penalties["zero_trade_penalty"]
 
 
