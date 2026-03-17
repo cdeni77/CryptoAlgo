@@ -6,7 +6,7 @@ from .base import StrategyContext, StrategyDecision
 class MomentumTrendStrategy:
     name = 'momentum_trend'
 
-    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool) -> StrategyDecision:
+    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool, family_params=None) -> StrategyDecision:
         if strict_mode and context.ret_24h * context.ret_72h < 0:
             return StrategyDecision(direction=0, rank_modifier=0.0, gate_contributions={'momentum_dir_agreement': False})
 

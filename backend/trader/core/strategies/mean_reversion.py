@@ -6,7 +6,7 @@ from .base import StrategyContext, StrategyDecision
 class MeanReversionStrategy:
     name = 'mean_reversion'
 
-    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool) -> StrategyDecision:
+    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool, family_params=None) -> StrategyDecision:
         zscore = context.feature('zscore_72h', context.feature('zscore_48h', 0.0))
         rsi = context.feature('rsi_14', 50.0)
 

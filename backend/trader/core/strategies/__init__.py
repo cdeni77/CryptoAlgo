@@ -3,12 +3,16 @@ from .momentum import MomentumTrendStrategy
 from .breakout import BreakoutStrategy
 from .mean_reversion import MeanReversionStrategy
 from .vol_overlay import VolatilityOverlayStrategy
+from .trend_pullback import TrendPullbackStrategy
+from .breakout_expansion import BreakoutExpansionStrategy
 
 STRATEGY_FAMILY_REGISTRY = {
     MomentumTrendStrategy.name: MomentumTrendStrategy(),
     BreakoutStrategy.name: BreakoutStrategy(),
     MeanReversionStrategy.name: MeanReversionStrategy(),
     VolatilityOverlayStrategy.name: VolatilityOverlayStrategy(),
+    TrendPullbackStrategy.name: TrendPullbackStrategy(),
+    BreakoutExpansionStrategy.name: BreakoutExpansionStrategy(),
 }
 
 

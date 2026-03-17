@@ -35,5 +35,13 @@ class StrategyDecision:
 class StrategyFamily(Protocol):
     name: str
 
-    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool) -> StrategyDecision:
+    def evaluate(
+        self,
+        context: StrategyContext,
+        *,
+        min_momentum_magnitude: float,
+        score_threshold: float,
+        strict_mode: bool,
+        family_params: Optional[Dict[str, float]] = None,
+    ) -> StrategyDecision:
         """Return direction plus rank/gating contributions for candidate selection."""

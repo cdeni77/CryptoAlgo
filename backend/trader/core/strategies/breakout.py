@@ -6,7 +6,7 @@ from .base import StrategyContext, StrategyDecision
 class BreakoutStrategy:
     name = 'breakout'
 
-    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool) -> StrategyDecision:
+    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool, family_params=None) -> StrategyDecision:
         breakout_strength = context.feature('breakout_strength_24h', 0.0)
         range_position = context.feature('range_position_72h', 0.5)
         raw_impulse = breakout_strength + context.ret_24h
