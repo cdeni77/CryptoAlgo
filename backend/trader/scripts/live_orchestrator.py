@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any, List
 
 from core.coin_profiles import MODELS_DIR
+from core.paper_profile_overrides import load_paper_profile_overrides
 from core.pg_writer import PgWriter
-from scripts.train_model import Config, load_data, retrain_models
+from scripts.train_model import Config, load_data, resolve_paper_profile_overrides_path, retrain_models
 
 LOGGER = logging.getLogger("live_orchestrator")
 STOP_REQUESTED = False
@@ -266,7 +267,11 @@ def _run_retrain(train_window_days: int, retrain_every_days: int, writer: PgWrit
         )
 
     try:
-        result = retrain_models(data, config, target_dir=staged_dir, train_window_days=train_window_days)
+        paper_profile_path = resolve_paper_profile_overrides_path()
+        profile_overrides = load_paper_profile_overrides(str(paper_profile_path))
+        if profile_overrides:
+            LOGGER.info("Retrain: loaded %d paper profile override(s) from %s", len(profile_overrides), paper_profile_path)
+        result = retrain_models(data, config, target_dir=staged_dir, train_window_days=train_window_days, profile_overrides=profile_overrides)
         if result.get("symbols_trained", 0) == 0:
             raise RuntimeError("No models trained successfully; refusing promotion")
 

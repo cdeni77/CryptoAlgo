@@ -2342,9 +2342,18 @@ def _apply_top_level_reporting_fields(payload: Dict[str, object]) -> Dict[str, o
     return merged
 
 def _persist_result_json(coin_name, data):
-    for d in _candidate_results_dirs():
-        try: d.mkdir(parents=True, exist_ok=True); p = d / f"{coin_name}_optimization.json"; open(p,'w').write(json.dumps(_to_json_safe(data), indent=2)); return p
-        except: continue
+    dirs = _candidate_results_dirs()
+    for d in dirs:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / f"{coin_name}_optimization.json"
+            p.write_text(json.dumps(_to_json_safe(data), indent=2), encoding='utf-8')
+            logger.info("Persisted %s result to %s", coin_name, p)
+            return p
+        except Exception as exc:
+            logger.warning("Failed to persist %s result to %s: %s", coin_name, d, exc)
+            continue
+    logger.error("Could not persist %s result to any directory (tried: %s)", coin_name, [str(d) for d in dirs])
     return None
 
 
@@ -2354,8 +2363,10 @@ def _persist_paper_candidate_json(coin_name: str, payload: Dict) -> Optional[Pat
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = target_dir / f"{coin_name.lower()}.json"
         target_path.write_text(json.dumps(_to_json_safe(payload), indent=2), encoding='utf-8')
+        logger.info("Persisted paper candidate for %s to %s", coin_name, target_path)
         return target_path
-    except Exception:
+    except Exception as exc:
+        logger.error("Failed to persist paper candidate for %s: %s", coin_name, exc)
         return None
 
 def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
@@ -3140,8 +3151,15 @@ def aggregate_multiseed_results(
         raise ValueError("Selected-seed params missing; refusing to persist inconsistent result.")
 
     holdout_metrics = best_seed_result.get('holdout_metrics')
-    if not isinstance(holdout_metrics, dict) or not holdout_metrics:
+    is_deployment_blocked = bool(best_seed_result.get('deployment_blocked', False))
+    if not isinstance(holdout_metrics, dict) or (not holdout_metrics and not is_deployment_blocked):
         raise ValueError("Selected-seed holdout metrics missing; refusing to persist inconsistent result.")
+    if not holdout_metrics and is_deployment_blocked:
+        logger.warning(
+            "%s: all seeds blocked (no holdout candidate passed). "
+            "Result will still be saved for diagnostic review.",
+            coin_name,
+        )
 
     best_seed_result = _apply_top_level_reporting_fields(best_seed_result)
     best_seed_result['quality'] = assess_result_quality(best_seed_result)

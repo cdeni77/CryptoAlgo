@@ -307,5 +307,5 @@ def test_summary_mixed_success_failure(monkeypatch, capsys, tmp_path) -> None:
     parallel_launch.main()
 
     out = capsys.readouterr().out
-    assert "BTC: SUCCESS | success_seeds=1 failed_seeds=1" in out
+    assert "BTC: SUCCESS |" in out and "success_seeds=1 failed_seeds=1" in out
     assert "ETH: FAILED | success_seeds=0 failed_seeds=2" in out

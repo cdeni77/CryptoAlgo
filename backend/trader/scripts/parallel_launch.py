@@ -552,6 +552,31 @@ def main() -> None:
         total_tasks=total_tasks,
     )
     manifest["config"] = asdict(config)
+
+    # Attach per-coin outcome summary to manifest for post-run debugging
+    coin_summaries: dict[str, Any] = {}
+    for coin in selected_coins:
+        payload = per_coin.get(coin) or {}
+        result = payload.get("result") or {}
+        holdout = result.get("holdout_metrics") or {}
+        seed_stability = result.get("seed_stability") or {}
+        coin_summaries[coin] = {
+            "success": bool(payload.get("success")),
+            "error": payload.get("error"),
+            "research_confidence_tier": result.get("research_confidence_tier"),
+            "deployment_blocked": bool(result.get("deployment_blocked", False)),
+            "block_reasons": result.get("deployment_block_reasons") or [],
+            "optim_score": result.get("optim_score"),
+            "holdout_sharpe": holdout.get("holdout_sharpe"),
+            "holdout_trades": holdout.get("holdout_trades"),
+            "holdout_return": holdout.get("holdout_return"),
+            "seed_pass_rate": seed_stability.get("pass_rate"),
+            "seeds_passed": seed_stability.get("seeds_passed_holdout"),
+            "seeds_total": seed_stability.get("seeds_total"),
+            "successful_seeds": payload.get("successful_seeds") or [],
+            "failed_seeds": payload.get("failed_seeds") or [],
+        }
+    manifest["coin_results"] = coin_summaries
     manifest_path = save_run_manifest(manifest)
 
     print("\n=== Optimization Summary ===")
@@ -562,27 +587,31 @@ def main() -> None:
             err = payload.get("error") if payload else "missing result payload"
             failed = payload.get("failed_seeds") if payload else []
             success = payload.get("successful_seeds") if payload else []
+            result = (payload or {}).get("result") or {}
+            block_reasons = result.get("deployment_block_reasons") or []
             if args.parallel_mode == "coin-seed":
-                print(f"{coin}: FAILED | success_seeds={len(success)} failed_seeds={len(failed)} error={err}")
+                print(f"{coin}: FAILED | success_seeds={len(success or [])} failed_seeds={len(failed or [])} error={err}"
+                      + (f" | blocked_by={block_reasons}" if block_reasons else ""))
             else:
-                print(f"{coin}: FAILED | error={err}")
+                print(f"{coin}: FAILED | error={err}" + (f" | blocked_by={block_reasons}" if block_reasons else ""))
             continue
         result = payload.get("result") or {}
         score = float(result.get("optim_score", 0.0) or 0.0)
         holdout = result.get("holdout_metrics", {}) or {}
         holdout_sr = float(holdout.get("holdout_sharpe", 0.0) or 0.0)
         holdout_trades = int(holdout.get("holdout_trades", 0) or 0)
+        tier = result.get("research_confidence_tier", "?")
         result_path = result.get("result_json_path") or result.get("result_path") or "n/a"
         if args.parallel_mode == "coin-seed":
             failed = payload.get("failed_seeds") or []
             success = payload.get("successful_seeds") or []
             print(
-                f"{coin}: SUCCESS | success_seeds={len(success)} failed_seeds={len(failed)} "
+                f"{coin}: SUCCESS | tier={tier} success_seeds={len(success)} failed_seeds={len(failed)} "
                 f"score={score:.4f} holdout_sr={holdout_sr:.3f} holdout_trades={holdout_trades} result={result_path}"
             )
         else:
             print(
-                f"{coin}: SUCCESS | score={score:.4f} holdout_sr={holdout_sr:.3f} "
+                f"{coin}: SUCCESS | tier={tier} score={score:.4f} holdout_sr={holdout_sr:.3f} "
                 f"holdout_trades={holdout_trades} result={result_path}"
             )
 
