@@ -50,6 +50,9 @@ docker-compose.yml  Orchestrates all services
   - `optimize.py` — Per-coin Optuna optimization with true holdout evaluation, deflated Sharpe tracking, TPE sampler
   - `parallel_launch.py` — Process-level multi-coin optimization launcher with integrated robustness validation
   - `validate_robustness.py` — Post-optimization robustness validation producing paper-trade readiness scores
+  - `paper_engine.py` — Paper trading execution engine (simulates live trading against generated signals)
+  - `prune_features.py` — Feature pruning utility (removes low-importance features from coin profiles)
+  - `preflight_check.py` — Preflight system check (validates exchange connectivity, DB paths, env vars)
 - **ML stack**: LightGBM, scikit-learn, Optuna
 - **Data**: SQLite for pipeline DB, CSV for feature artifacts, joblib for model artifacts
 
@@ -61,7 +64,7 @@ docker-compose.yml  Orchestrates all services
   - `TradingTerminalPage.tsx` (`/`) — Spot/CDE price cards, price charting, trades table, signals table, wallet summary. Auto-refreshes prices (3s), trades (10s), signals (15s).
   - `StrategyLabPage.tsx` (`/strategy`) — Model health KPIs, coin strategy scoreboard, experiment timeline, explainability-lite (feature importance + signal distribution), paper trading tabs (positions, equity, performance, fills).
 - **Components** (in `src/components/`): `PriceCard`, `PriceChart`, `TradesTable`, `SignalsTable`, `WalletInfo`, `PaperPositionsTable`, `PaperEquityTable`, `PaperPerformancePanel`, `PaperFillsTable`
-- **API layer** (`src/api/`): `coinsApi.ts`, `tradesApi.ts`, `signalsApi.ts`, `paperApi.ts`, `researchApi.ts`
+- **API layer** (`src/api/`): `coinsApi.ts`, `tradesApi.ts`, `signalsApi.ts`, `walletApi.ts`, `paperApi.ts`, `researchApi.ts`
 - **Types**: `src/types.ts` — shared TypeScript interfaces
 - **Routing**: Custom history-based routing in `App.tsx` (no react-router)
 - **Config**: `VITE_API_BASE_URL` env var (defaults to `http://localhost:8000`)
@@ -142,4 +145,6 @@ cd backend/api && pip install -r requirements.txt && uvicorn app:app --reload
 - The orchestrator (`live_orchestrator.py`) manages model versioning with a staging directory pattern — new models are trained into `.staging/{version}/` then atomically promoted to the models directory.
 - Feature engineering is coin-specific. BTC uses mean-reversion extras (z-scores, RSI extremes), SOL uses momentum acceleration features, DOGE uses sentiment-proxy features. The base feature set is shared.
 - The research endpoints read from model artifacts and trade history to produce health KPIs, not from a separate research database.
-- Tests are minimal — `pytest` is listed in requirements but test coverage is sparse. New features should include tests where practical.
+- Tests are comprehensive — 27 test files under `backend/trader/tests/` cover CV consistency, optimization fidelity, overfitting diagnostics, model promotion, economic metrics, parallel launch integrity, meta-labeling, and more. New features should include tests where practical.
+- Strategy families available for `--strategy-family`: `momentum_trend` (default), `breakout`, `mean_reversion`, `vol_overlay`, `trend_pullback`, `breakout_expansion`. Each is implemented as a class in `core/strategies/`. All families implement the `StrategyFamily` protocol defined in `core/strategies/base.py`.
+- `core/` contains more than just `coin_profiles.py` and `pg_writer.py` — it also includes `cv_splitters.py`, `labeling.py`, `meta_labeling.py`, `execution_sim.py`, `reason_codes.py`, `trading_costs.py`, `overfit_diagnostics.py`, `metrics_significance.py`, `study_significance.py`, `run_manifest.py`, and `paper_profile_overrides.py`.

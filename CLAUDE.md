@@ -46,6 +46,10 @@ python -m scripts.compute_features
 python -m scripts.train_model
 python -m scripts.optimize --coin BTC --trials 100 --jobs 1
 python -m scripts.parallel_launch --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
+python -m scripts.validate_robustness
+python -m scripts.paper_engine
+python -m scripts.prune_features
+python -m scripts.preflight_check
 
 # Frontend checks
 cd frontend && npm run typecheck && npm run lint
@@ -63,7 +67,8 @@ cd frontend && npm run typecheck && npm run lint
 
 - **Python**: Type hints throughout, dataclasses for config, `logging` module, `os.getenv()` with defaults. Scripts run as `python -m scripts.<name>`.
 - **TypeScript/React**: Functional components + hooks only, no class components. Fetch-based API layer (no axios). `recharts` for charts.
-- **Tests**: `pytest` for trader. New features should include tests where practical.
+- **Tests**: `pytest` for trader — 27 test files covering CV, optimization, diagnostics, and more. New features should include tests where practical.
+- **Strategy families**: `momentum_trend` (default), `breakout`, `mean_reversion`, `vol_overlay`, `trend_pullback`, `breakout_expansion` — each a class in `core/strategies/`.
 
 ## Environment Variables
 

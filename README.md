@@ -28,6 +28,10 @@ Core trader scripts:
 - `scripts/live_orchestrator.py` — scheduled cycle runner (pipeline → features → signals)
 - `scripts/optimize.py` — single-coin Optuna optimization with true holdout evaluation
 - `scripts/parallel_launch.py` — process-level multi-coin optimization launcher
+- `scripts/validate_robustness.py` — post-optimization robustness validation
+- `scripts/paper_engine.py` — paper trading execution engine
+- `scripts/prune_features.py` — feature pruning utility
+- `scripts/preflight_check.py` — preflight system validation
 
 ---
 
@@ -149,6 +153,35 @@ Current optimization defaults are tuned for stronger robustness:
 docker compose run --rm trader \
   python -m scripts.optimize --coin BTC --trials 100 --jobs 1
 ```
+
+### Strategy families
+
+`train_model.py` and `optimize.py` support the `--strategy-family` flag:
+
+| Family | Description |
+|---|---|
+| `momentum_trend` | Default — trades in direction of recent momentum |
+| `breakout` | Triggers on price breakouts beyond a rolling range |
+| `mean_reversion` | Fades extended moves back toward equilibrium |
+| `vol_overlay` | Volatility-weighted directional bias |
+| `trend_pullback` | Enters on pullbacks within an established trend |
+| `breakout_expansion` | Combines breakout strength with range-expansion confirmation |
+
+### Preflight check
+
+```bash
+docker compose run --rm trader python -m scripts.preflight_check
+```
+
+Validates exchange connectivity, DB paths, and required env vars before a live run.
+
+### Paper trading engine
+
+```bash
+docker compose run --rm trader python -m scripts.paper_engine
+```
+
+Runs the paper trading simulation loop against live signals.
 
 ---
 
