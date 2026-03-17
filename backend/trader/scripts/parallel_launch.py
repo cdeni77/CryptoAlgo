@@ -5,7 +5,7 @@ import argparse
 import json
 import multiprocessing as mp
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +80,7 @@ def build_run_manifest(
     total_tasks: int | None = None,
 ) -> dict[str, Any]:
     """Build a reproducibility manifest for a parallel optimization run."""
-    generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace('+00:00', 'Z')
     sampler_seeds_raw = getattr(args, "sampler_seeds", "")
     seeds = _parse_sampler_seeds(sampler_seeds_raw)
     study_suffix = str(getattr(args, "study_suffix", "") or "")
@@ -384,7 +384,7 @@ def _aggregate_seed_payloads(coin: str, seeds: list[int], payloads: list[dict[st
 
 def run_optimization(coins: list[str], config: OptimizationConfig, workers: int, parallel_mode: str = "coin") -> dict[str, Any]:
     all_data = load_data()
-    run_id = datetime.utcnow().strftime("run_%Y%m%dT%H%M%S%fZ")
+    run_id = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S%fZ")
 
     if parallel_mode == "coin-seed":
         work_items = [(all_data, coin, int(seed), config, run_id) for coin in coins for seed in config.seeds]

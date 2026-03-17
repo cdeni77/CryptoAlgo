@@ -19,7 +19,7 @@ import json
 import hashlib
 import joblib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
@@ -410,7 +410,7 @@ def save_model(
     payload['meta'] = {
         'feature_set_hash': feature_set_hash,
         'feature_schema_version': FEATURE_SCHEMA_VERSION,
-        'model_version': datetime.utcnow().isoformat() + 'Z',
+        'model_version': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         **(extra_meta or {}),
     }
 

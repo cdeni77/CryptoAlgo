@@ -167,7 +167,8 @@ def train_meta_classifier(
         })
 
     scaler = RobustScaler()
-    X_tr_scaled = scaler.fit_transform(X_meta_tr)
+    _feat_names = list(X_meta_tr.columns)
+    X_tr_scaled = pd.DataFrame(scaler.fit_transform(X_meta_tr), columns=_feat_names)
 
     model = lgb.LGBMClassifier(
         n_estimators=n_estimators,
@@ -200,7 +201,7 @@ def train_meta_classifier(
             'final_trade_precision': 0.0,
         })
 
-    raw_meta_val = model.predict_proba(scaler.transform(X_meta_val))[:, 1]
+    raw_meta_val = model.predict_proba(pd.DataFrame(scaler.transform(X_meta_val), columns=_feat_names))[:, 1]
     holdout_size = max(10, int(len(raw_meta_val) * 0.25)) if len(raw_meta_val) >= 60 else 0
     fit_scores = raw_meta_val[:-holdout_size] if holdout_size > 0 else raw_meta_val
     fit_labels = y_meta_val.iloc[:-holdout_size] if holdout_size > 0 else y_meta_val
