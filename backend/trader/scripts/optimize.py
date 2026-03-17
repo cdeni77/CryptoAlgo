@@ -366,7 +366,7 @@ ETH_GATE_RELAXATION = {
     'ensemble_agreement': 0.020,
 }
 
-STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
+STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay', 'trend_pullback', 'breakout_expansion')
 TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
 
 STRATEGY_FAMILY_PRIORS = {
@@ -374,6 +374,8 @@ STRATEGY_FAMILY_PRIORS = {
     'breakout': {'min_momentum_multiplier': 0.90, 'cooldown_multiplier': 0.85, 'min_trade_frequency_ratio_delta': 0.03},
     'mean_reversion': {'min_momentum_multiplier': 0.80, 'cooldown_multiplier': 0.95, 'min_trade_frequency_ratio_delta': -0.02},
     'vol_overlay': {'min_momentum_multiplier': 0.95, 'cooldown_multiplier': 1.10, 'min_trade_frequency_ratio_delta': -0.01},
+    'trend_pullback': {'min_momentum_multiplier': 0.75, 'cooldown_multiplier': 0.85, 'min_trade_frequency_ratio_delta': 0.04},
+    'breakout_expansion': {'min_momentum_multiplier': 0.85, 'cooldown_multiplier': 0.90, 'min_trade_frequency_ratio_delta': 0.05},
 }
 
 TRADE_FREQ_BUCKET_PRIORS = {
@@ -382,6 +384,40 @@ TRADE_FREQ_BUCKET_PRIORS = {
     'aggressive': {'cooldown_scale': 0.70, 'min_trade_frequency_ratio_delta': 0.08},
 }
 
+
+
+
+def _family_param_keys(strategy_family: str) -> tuple[str, ...]:
+    if strategy_family == 'trend_pullback':
+        return (
+            'pullback_depth_threshold',
+            'rebound_confirmation_threshold',
+            'trend_strength_min',
+            'pullback_lookback',
+            'cooldown_hours',
+            'max_hold_hours',
+            'vol_mult_tp',
+            'vol_mult_sl',
+        )
+    if strategy_family == 'breakout_expansion':
+        return (
+            'breakout_lookback',
+            'breakout_buffer',
+            'expansion_confirm_threshold',
+            'cooldown_hours',
+            'max_hold_hours',
+            'vol_mult_tp',
+            'vol_mult_sl',
+        )
+    return ('cooldown_hours', 'max_hold_hours', 'vol_mult_tp', 'vol_mult_sl', 'min_momentum_magnitude')
+
+
+def _extract_family_params(params: Dict[str, object], strategy_family: str) -> Dict[str, object]:
+    return {k: params[k] for k in _family_param_keys(strategy_family) if k in params}
+
+
+def _family_param_fingerprint(params: Dict[str, object], strategy_family: str) -> str:
+    return _trial_param_fingerprint({'strategy_family': strategy_family, **_extract_family_params(params, strategy_family)})
 
 def _compute_cv_oos_days(cv_splits: list[CVFold]) -> float:
     if not cv_splits:
@@ -570,6 +606,24 @@ def create_trial_profile(trial, coin_name):
     signal_lo = clamp(base_threshold - 0.07, 0.54, 0.73)
     signal_hi = clamp(base_threshold + 0.08, 0.62, 0.82)
 
+    pullback_depth_threshold = bp.pullback_depth_threshold if bp else 0.02
+    rebound_confirmation_threshold = bp.rebound_confirmation_threshold if bp else 0.004
+    trend_strength_min = bp.trend_strength_min if bp else 0.002
+    pullback_lookback = bp.pullback_lookback if bp else 24
+    breakout_lookback = bp.breakout_lookback if bp else 48
+    breakout_buffer = bp.breakout_buffer if bp else 0.003
+    expansion_confirm_threshold = bp.expansion_confirm_threshold if bp else 0.004
+
+    if strategy_family == 'trend_pullback':
+        pullback_depth_threshold = trial.suggest_float('pullback_depth_threshold', 0.008, 0.045, step=0.001)
+        rebound_confirmation_threshold = trial.suggest_float('rebound_confirmation_threshold', 0.001, 0.020, step=0.001)
+        trend_strength_min = trial.suggest_float('trend_strength_min', 0.001, 0.025, step=0.001)
+        pullback_lookback = trial.suggest_int('pullback_lookback', 12, 96, step=12)
+    elif strategy_family == 'breakout_expansion':
+        breakout_lookback = trial.suggest_int('breakout_lookback', 12, 120, step=12)
+        breakout_buffer = trial.suggest_float('breakout_buffer', 0.001, 0.020, step=0.001)
+        expansion_confirm_threshold = trial.suggest_float('expansion_confirm_threshold', 0.001, 0.025, step=0.001)
+
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
         signal_threshold=trial.suggest_float('signal_threshold', signal_lo, signal_hi, step=0.01),
@@ -595,6 +649,13 @@ def create_trial_profile(trial, coin_name):
         learning_rate=FIXED_ML['learning_rate'], min_child_samples=FIXED_ML['min_child_samples'],
         strategy_family=strategy_family,
         trade_freq_bucket=trade_freq_bucket,
+        pullback_depth_threshold=pullback_depth_threshold,
+        rebound_confirmation_threshold=rebound_confirmation_threshold,
+        trend_strength_min=trend_strength_min,
+        pullback_lookback=pullback_lookback,
+        breakout_lookback=breakout_lookback,
+        breakout_buffer=breakout_buffer,
+        expansion_confirm_threshold=expansion_confirm_threshold,
     )
 
 
@@ -620,6 +681,13 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'meta_probability_threshold': params.get('meta_probability_threshold', bp.meta_probability_threshold if bp else np.mean(priors.get('meta_probability_threshold', (0.50, 0.65)))),
         'strategy_family': strategy_family,
         'trade_freq_bucket': trade_freq_bucket,
+        'pullback_depth_threshold': params.get('pullback_depth_threshold', bp.pullback_depth_threshold if bp else 0.02),
+        'rebound_confirmation_threshold': params.get('rebound_confirmation_threshold', bp.rebound_confirmation_threshold if bp else 0.004),
+        'trend_strength_min': params.get('trend_strength_min', bp.trend_strength_min if bp else 0.002),
+        'pullback_lookback': params.get('pullback_lookback', bp.pullback_lookback if bp else 24),
+        'breakout_lookback': params.get('breakout_lookback', bp.breakout_lookback if bp else 48),
+        'breakout_buffer': params.get('breakout_buffer', bp.breakout_buffer if bp else 0.003),
+        'expansion_confirm_threshold': params.get('expansion_confirm_threshold', bp.expansion_confirm_threshold if bp else 0.004),
         'min_val_auc': FIXED_RISK['min_val_auc'],
         'position_size': FIXED_RISK['position_size'],
         'vol_sizing_target': FIXED_RISK['vol_sizing_target'],
@@ -656,6 +724,13 @@ def profile_from_params(params, coin_name):
         min_child_samples=effective_params['min_child_samples'],
         strategy_family=effective_params['strategy_family'],
         trade_freq_bucket=effective_params['trade_freq_bucket'],
+        pullback_depth_threshold=effective_params['pullback_depth_threshold'],
+        rebound_confirmation_threshold=effective_params['rebound_confirmation_threshold'],
+        trend_strength_min=effective_params['trend_strength_min'],
+        pullback_lookback=effective_params['pullback_lookback'],
+        breakout_lookback=effective_params['breakout_lookback'],
+        breakout_buffer=effective_params['breakout_buffer'],
+        expansion_confirm_threshold=effective_params['expansion_confirm_threshold'],
     )
 
 
@@ -1158,6 +1233,15 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             min_momentum_magnitude=effective_momentum,
             score_threshold=max(0.65, float(config.momentum_score_threshold) * 0.75),
             strict_mode=False,
+            family_params={
+                'pullback_depth_threshold': float(getattr(profile, 'pullback_depth_threshold', 0.02)),
+                'rebound_confirmation_threshold': float(getattr(profile, 'rebound_confirmation_threshold', 0.004)),
+                'trend_strength_min': float(getattr(profile, 'trend_strength_min', 0.002)),
+                'pullback_lookback': int(getattr(profile, 'pullback_lookback', 24)),
+                'breakout_lookback': int(getattr(profile, 'breakout_lookback', 48)),
+                'breakout_buffer': float(getattr(profile, 'breakout_buffer', 0.003)),
+                'expansion_confirm_threshold': float(getattr(profile, 'expansion_confirm_threshold', 0.004)),
+            },
         )
         direction = int(strategy_decision.direction)
         if not strategy_decision.gate_contributions.get('momentum_dir_agreement', direction != 0):
@@ -1454,6 +1538,8 @@ def objective(
         )
         trial.set_user_attr('reject_code', str(ReasonCode.ABSURD_CV_METRICS.value))
         trial.set_user_attr('reject_reason', f'absurd_cv_metrics:{absurd_reason}')
+        trial.set_user_attr('strategy_family', profile.strategy_family)
+        trial.set_user_attr('family_param_fingerprint', _family_param_fingerprint(build_effective_params(trial_params, coin_name), profile.strategy_family))
         trial.set_user_attr('param_fingerprint', param_fingerprint)
         return -1.0
 
@@ -1504,7 +1590,20 @@ def objective(
 
     activity_regime = _classify_activity_regime(trade_density_ratio, realized_trades)
 
+    family_params = _extract_family_params(build_effective_params(trial_params, coin_name), profile.strategy_family)
+    family_param_fingerprint = _family_param_fingerprint(build_effective_params(trial_params, coin_name), profile.strategy_family)
+
     trial.set_user_attr('n_folds', int(len(fold_scores)))
+    trial.set_user_attr('strategy_family', profile.strategy_family)
+    trial.set_user_attr('trade_freq_bucket', profile.trade_freq_bucket)
+    trial.set_user_attr('family_params', _to_json_safe(family_params))
+    trial.set_user_attr('family_param_fingerprint', family_param_fingerprint)
+    trial.set_user_attr('family_regime_summary', _to_json_safe({
+        'strategy_family': profile.strategy_family,
+        'activity_regime': activity_regime,
+        'cooldown_hours': float(profile.cooldown_hours),
+        'max_hold_hours': int(profile.max_hold_hours),
+    }))
     trial.set_user_attr('param_fingerprint', param_fingerprint)
     trial.set_user_attr('duplicate_of_trial', int(prior_same_params.number) if prior_same_params is not None else None)
     trial.set_user_attr('duplicate_has_identical_params', bool(prior_same_params is not None))

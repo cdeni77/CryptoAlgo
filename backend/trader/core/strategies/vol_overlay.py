@@ -6,7 +6,7 @@ from .base import StrategyContext, StrategyDecision
 class VolatilityOverlayStrategy:
     name = 'vol_overlay'
 
-    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool) -> StrategyDecision:
+    def evaluate(self, context: StrategyContext, *, min_momentum_magnitude: float, score_threshold: float, strict_mode: bool, family_params=None) -> StrategyDecision:
         vol = context.vol_24h if context.vol_24h is not None else abs(context.feature('volatility_24h', 0.02))
         base_direction = 1 if context.ret_72h >= 0 else -1
         if strict_mode and context.ret_24h * context.ret_72h < 0:

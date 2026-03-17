@@ -175,6 +175,15 @@ class CoinProfile:
     learning_rate: float = 0.05
     min_child_samples: int = 20
 
+    # Family-specific knobs (kept broad so all families can coexist)
+    pullback_depth_threshold: float = 0.020
+    rebound_confirmation_threshold: float = 0.004
+    trend_strength_min: float = 0.002
+    pullback_lookback: int = 24
+    breakout_lookback: int = 48
+    breakout_buffer: float = 0.003
+    expansion_confirm_threshold: float = 0.004
+
     # Categorical strategy knobs
     strategy_family: str = 'momentum_trend'
     trade_freq_bucket: str = 'balanced'

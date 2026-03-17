@@ -228,6 +228,15 @@ class Config:
     strategy_family: str = 'momentum_trend'
     trade_freq_bucket: str = 'balanced'
 
+    # Family-specific strategy knobs
+    pullback_depth_threshold: float = 0.020
+    rebound_confirmation_threshold: float = 0.004
+    trend_strength_min: float = 0.002
+    pullback_lookback: int = 24
+    breakout_lookback: int = 48
+    breakout_buffer: float = 0.003
+    expansion_confirm_threshold: float = 0.004
+
     # Names of fields explicitly provided via CLI flags (not parser defaults).
     cli_overrides: Set[str] = field(default_factory=set)
 
@@ -352,6 +361,19 @@ def _build_strategy_context(
         features={str(k): float(v) for k, v in row.items() if isinstance(v, (int, float, np.floating, np.integer)) and not pd.isna(v)},
     )
 
+
+
+
+def build_family_params(profile: Optional[CoinProfile], config: Config) -> Dict[str, float]:
+    return {
+        'pullback_depth_threshold': float(resolve_param('pullback_depth_threshold', profile, config, Config.pullback_depth_threshold, mode='direct')),
+        'rebound_confirmation_threshold': float(resolve_param('rebound_confirmation_threshold', profile, config, Config.rebound_confirmation_threshold, mode='direct')),
+        'trend_strength_min': float(resolve_param('trend_strength_min', profile, config, Config.trend_strength_min, mode='direct')),
+        'pullback_lookback': int(resolve_param('pullback_lookback', profile, config, float(Config.pullback_lookback), mode='direct')),
+        'breakout_lookback': int(resolve_param('breakout_lookback', profile, config, float(Config.breakout_lookback), mode='direct')),
+        'breakout_buffer': float(resolve_param('breakout_buffer', profile, config, Config.breakout_buffer, mode='direct')),
+        'expansion_confirm_threshold': float(resolve_param('expansion_confirm_threshold', profile, config, Config.expansion_confirm_threshold, mode='direct')),
+    }
 
 def _calibrator_predict(calibrator, scores: np.ndarray) -> np.ndarray:
     x = np.clip(np.asarray(scores, dtype=float), 1e-6, 1 - 1e-6)
@@ -1583,6 +1605,7 @@ def run_backtest(all_data: Dict, config: Config,
                         min_momentum_magnitude=effective_momentum,
                         score_threshold=config.momentum_score_threshold,
                         strict_mode=config.momentum_strict_mode,
+                        family_params=build_family_params(profile, config),
                     )
                     direction = strategy_decision.direction
                     if not strategy_decision.gate_contributions.get('momentum_dir_agreement', direction != 0):
@@ -2160,6 +2183,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             ),
             score_threshold=config.momentum_score_threshold,
             strict_mode=config.momentum_strict_mode,
+            family_params=build_family_params(profile, config),
         )
         direction = strategy_decision.direction
         if direction == 0:
@@ -2362,7 +2386,7 @@ if __name__ == "__main__":
                         help="Trend filter policy: hard=reject, soft=penalize rank/size, off=ignore")
     parser.add_argument("--funding-filter-mode", choices=['hard', 'soft', 'off'], default='soft',
                         help="Funding filter policy: hard=reject, soft=penalize rank/size, off=ignore")
-    parser.add_argument("--strategy-family", choices=['momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay'],
+    parser.add_argument("--strategy-family", choices=['momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay', 'trend_pullback', 'breakout_expansion'],
                         default='momentum_trend', help="Strategy family used for direction + ranking")
     parser.add_argument("--trade-freq-bucket", choices=['conservative', 'balanced', 'aggressive'],
                         default='balanced', help="Trade frequency cadence bucket")
