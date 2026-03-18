@@ -14,6 +14,7 @@ import TradesTable from '../components/TradesTable';
 import WalletInfo from '../components/WalletInfo';
 import {
   CDESpecs,
+  ChartMarker,
   CoinSymbol,
   DataSource,
   HistoryEntry,
@@ -172,6 +173,42 @@ export default function TradingTerminalPage() {
     return { openTrades, closedTrades: closedTrades.length, winRate, realizedPnl };
   }, [trades]);
 
+  const chartMarkers = useMemo((): ChartMarker[] => {
+    if (mode === 'paper') {
+      return paperFills.map((f): ChartMarker => ({
+        coin: f.coin,
+        side: f.side,
+        price: f.fill_price,
+        timestamp: f.created_at,
+        contracts: f.contracts,
+        kind: 'entry',
+      }));
+    }
+    // Live mode: trade entries + exits
+    const markers: ChartMarker[] = [];
+    for (const t of trades) {
+      markers.push({
+        coin: t.coin,
+        side: t.side,
+        price: t.entry_price,
+        timestamp: t.datetime_open,
+        contracts: t.contracts,
+        kind: 'entry',
+      });
+      if (t.status === 'closed' && t.exit_price && t.datetime_close) {
+        markers.push({
+          coin: t.coin,
+          side: t.side,
+          price: t.exit_price,
+          timestamp: t.datetime_close,
+          contracts: t.contracts,
+          kind: 'exit',
+        });
+      }
+    }
+    return markers;
+  }, [mode, paperFills, trades]);
+
   const paperKpis = useMemo(() => {
     const latest = paperEquity[0];
     const first = paperEquity[paperEquity.length - 1];
@@ -264,7 +301,8 @@ export default function TradingTerminalPage() {
         {/* Chart — always visible */}
         <PriceChart
           data={history}
-          fills={[]}
+          markers={chartMarkers}
+          markerMode={mode}
           symbol={selectedCoin}
           loading={loadingHistory}
           timeRange={timeRange}

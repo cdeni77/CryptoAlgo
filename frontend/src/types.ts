@@ -150,6 +150,16 @@ export interface WalletData {
   >;
 }
 
+/** Unified marker for the price chart — works for both paper fills and live trades. */
+export interface ChartMarker {
+  coin: string;
+  side: 'long' | 'short';
+  price: number;
+  timestamp: string; // ISO string
+  contracts: number;
+  kind: 'entry' | 'exit';
+}
+
 export interface PaperFill {
   id: number;
   order_id: number;

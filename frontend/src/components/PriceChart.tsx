@@ -8,12 +8,13 @@ import {
   ResponsiveContainer,
   Scatter,
 } from 'recharts';
-import { HistoryEntry, CoinSymbol, DataSource, CDESpec, PaperFill } from '../types';
+import { ChartMarker, CoinSymbol, DataSource, CDESpec, HistoryEntry } from '../types';
 import DataSourceToggle from './DataSourceToggle';
 
 interface PriceChartProps {
   data: HistoryEntry[];
-  fills: PaperFill[];
+  markers: ChartMarker[];
+  markerMode: 'paper' | 'live';
   symbol: CoinSymbol;
   loading: boolean;
   timeRange: '1h' | '1d' | '1w' | '1m' | '1y';
@@ -24,7 +25,7 @@ interface PriceChartProps {
 }
 
 export default function PriceChart({
-  data, fills, symbol, loading, timeRange, setTimeRange,
+  data, markers, markerMode, symbol, loading, timeRange, setTimeRange,
   dataSource, onDataSourceChange, cdeSpec,
 }: PriceChartProps) {
   const ranges = ['1h', '1d', '1w', '1m', '1y'] as const;
@@ -102,20 +103,28 @@ export default function PriceChart({
 
   const chartStartMs = chartData[0].timestampMs;
   const chartEndMs = chartData[chartData.length - 1].timestampMs;
-  const fillMultiplier = (dataSource === 'cde' && cdeSpec) ? cdeSpec.units_per_contract : 1;
+  const priceMultiplier = (dataSource === 'cde' && cdeSpec) ? cdeSpec.units_per_contract : 1;
 
-  const fillMarkers = fills
-    .filter((fill) => fill.coin === symbol)
-    .map((fill) => ({
-      ...fill,
-      timestampMs: new Date(fill.created_at).getTime(),
-      plottedPrice: fill.fill_price * fillMultiplier,
+  const visibleMarkers = markers
+    .filter((m) => m.coin === symbol)
+    .map((m) => ({
+      ...m,
+      timestampMs: new Date(m.timestamp).getTime(),
+      plottedPrice: m.price * priceMultiplier,
     }))
-    .filter((fill) => fill.timestampMs >= chartStartMs && fill.timestampMs <= chartEndMs)
+    .filter((m) => m.timestampMs >= chartStartMs && m.timestampMs <= chartEndMs)
     .sort((a, b) => a.timestampMs - b.timestampMs);
 
-  const longFillMarkers = fillMarkers.filter((fill) => fill.side === 'long');
-  const shortFillMarkers = fillMarkers.filter((fill) => fill.side === 'short');
+  // Green ▲ = long entries + short exits (buys); Red ▼ = short entries + long exits (sells)
+  const greenMarkers = visibleMarkers.filter(
+    (m) => (m.side === 'long' && m.kind === 'entry') || (m.side === 'short' && m.kind === 'exit'),
+  );
+  const redMarkers = visibleMarkers.filter(
+    (m) => (m.side === 'short' && m.kind === 'entry') || (m.side === 'long' && m.kind === 'exit'),
+  );
+
+  const greenLabel = markerMode === 'paper' ? 'Paper long / buy' : 'Long entry / short exit';
+  const redLabel = markerMode === 'paper' ? 'Paper short / sell' : 'Short entry / long exit';
 
   return (
     <div className="glass-card rounded-xl overflow-hidden">
@@ -202,11 +211,13 @@ export default function PriceChart({
                 return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
               }}
               formatter={(value: number, _name, props) => {
-                if (props?.payload?.markerType === 'paper-fill') {
-                  const sideLabel = props.payload.side === 'long' ? 'Entry / Buy' : 'Exit / Sell';
-                  return [`${formatPrice(value)} (${props.payload.contracts} ctr)`, sideLabel];
+                if (props?.payload?.kind) {
+                  const { side, kind, contracts } = props.payload;
+                  const actionLabel = kind === 'entry'
+                    ? (side === 'long' ? 'Long entry' : 'Short entry')
+                    : (side === 'long' ? 'Long exit' : 'Short exit');
+                  return [`${formatPrice(value)} (${contracts} ctr)`, actionLabel];
                 }
-
                 return [formatPrice(value), dataSource === 'cde' ? 'Contract' : 'Price'];
               }}
             />
@@ -220,14 +231,14 @@ export default function PriceChart({
               activeDot={{ r: 4, stroke: strokeColor, strokeWidth: 2, fill: '#0a0e17' }}
             />
             <Scatter
-              data={longFillMarkers.map((fill) => ({ ...fill, markerType: 'paper-fill' }))}
+              data={greenMarkers}
               dataKey="plottedPrice"
               fill="#22c55e"
               shape="triangle"
               legendType="triangle"
             />
             <Scatter
-              data={shortFillMarkers.map((fill) => ({ ...fill, markerType: 'paper-fill' }))}
+              data={redMarkers}
               dataKey="plottedPrice"
               fill="#ef4444"
               shape="triangle"
@@ -235,17 +246,23 @@ export default function PriceChart({
             />
           </AreaChart>
         </ResponsiveContainer>
-        <div className="flex flex-wrap items-center gap-4 px-1 pt-3 text-[11px] text-[var(--text-muted)] font-mono-trade">
-          <span className="inline-flex items-center gap-1.5">
-            <span className="text-[#22c55e]">▲</span>
-            Paper buy/entry
-          </span>
-          <span className="inline-flex items-center gap-1.5">
-            <span className="text-[#ef4444]">▼</span>
-            Paper sell/exit
-          </span>
-          <span>{fillMarkers.length} fill{fillMarkers.length === 1 ? '' : 's'} in view</span>
-        </div>
+        {visibleMarkers.length > 0 && (
+          <div className="flex flex-wrap items-center gap-4 px-1 pt-3 text-[11px] text-[var(--text-muted)] font-mono-trade">
+            {greenMarkers.length > 0 && (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="text-[#22c55e]">▲</span>
+                {greenLabel}
+              </span>
+            )}
+            {redMarkers.length > 0 && (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="text-[#ef4444]">▼</span>
+                {redLabel}
+              </span>
+            )}
+            <span>{visibleMarkers.length} marker{visibleMarkers.length === 1 ? '' : 's'} in view</span>
+          </div>
+        )}
       </div>
     </div>
   );
