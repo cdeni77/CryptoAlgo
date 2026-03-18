@@ -97,7 +97,8 @@ services:
       - FEATURE_LOOKBACK_DAYS=365            # Use 1 year for feature computation (was 1095)
 
       # Scheduling
-      - CYCLE_INTERVAL_SECONDS=3600          # Run every 1 hour
+      - CYCLE_INTERVAL_SECONDS=3600          # Max cycle interval (fallback)
+      - CYCLE_ALIGN_MINUTE=3                 # Run at :03 past every hour (1:03, 2:03, ...)
       - INCREMENTAL_BACKFILL_HOURS=6         # Fetch last 6h of data each cycle
 
       # Logging

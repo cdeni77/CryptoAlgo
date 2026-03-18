@@ -55,6 +55,17 @@ def _handle_signal(signum, _frame):
     LOGGER.info("Received signal %s, shutting down after current step.", signum)
 
 
+def _sleep_until_next_aligned(align_minute: int, max_wait_seconds: int = 3600) -> None:
+    """Sleep until the next :align_minute past the hour, capped at max_wait_seconds."""
+    now = datetime.now(timezone.utc)
+    next_run = now.replace(minute=align_minute, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += timedelta(hours=1)
+    sleep_secs = min((next_run - now).total_seconds(), max_wait_seconds)
+    LOGGER.info("Sleeping until %s UTC (~%ds).", next_run.strftime("%H:%M"), int(sleep_secs))
+    time.sleep(sleep_secs)
+
+
 def _setup_logging(log_level: str, log_file: Path) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
@@ -342,6 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live trader orchestrator")
     parser.add_argument("--backfill-days", type=int, default=int(os.getenv("INITIAL_BACKFILL_DAYS", "30")))
     parser.add_argument("--cycle-interval-seconds", type=int, default=int(os.getenv("CYCLE_INTERVAL_SECONDS", "3600")))
+    parser.add_argument("--cycle-align-minute", type=int, default=int(os.getenv("CYCLE_ALIGN_MINUTE", "-1")))
     parser.add_argument("--incremental-backfill-hours", type=int, default=int(os.getenv("INCREMENTAL_BACKFILL_HOURS", "6")))
     parser.add_argument("--db-path", type=str, default=os.getenv("TRADER_DB_PATH", "/app/data/trading.db"))
     parser.add_argument("--retrain-every-days", type=int, default=int(os.getenv("RETRAIN_EVERY_DAYS", "7")))
@@ -383,8 +395,11 @@ def main() -> int:
             if args.run_once:
                 break
 
-            LOGGER.info("Sleeping for %s seconds before next cycle.", args.cycle_interval_seconds)
-            time.sleep(args.cycle_interval_seconds)
+            if 0 <= args.cycle_align_minute < 60:
+                _sleep_until_next_aligned(args.cycle_align_minute, args.cycle_interval_seconds)
+            else:
+                LOGGER.info("Sleeping for %s seconds before next cycle.", args.cycle_interval_seconds)
+                time.sleep(args.cycle_interval_seconds)
             if STOP_REQUESTED:
                 break
 

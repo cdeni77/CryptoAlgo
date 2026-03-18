@@ -353,7 +353,7 @@ export default function TradingTerminalPage() {
               ))}
             </div>
 
-            {paperTab === 'positions' && <PaperPositionsTable positions={paperPositions} loading={loadingPaper} />}
+            {paperTab === 'positions' && <PaperPositionsTable positions={paperPositions} loading={loadingPaper} prices={prices} cdeSpecs={cdeSpecs} />}
             {paperTab === 'equity' && <PaperEquityTable points={paperEquity} loading={loadingPaper} />}
             {paperTab === 'performance' && <PaperPerformancePanel equity={paperEquity} fills={paperFills} loading={loadingPaper} />}
             {paperTab === 'fills' && <PaperFillsTable fills={paperFills} loading={loadingPaper} />}
