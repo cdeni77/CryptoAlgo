@@ -219,8 +219,9 @@ def check_parameter_sensitivity_fast(all_data, best_params, coin_name, coin_pref
     from scripts.train_model import Config
     from scripts.optimize import (
         profile_from_params, resolve_target_symbol,
-        create_cv_splits, proxy_evaluate_fold,
+        create_cv_splits, evaluate_fold_with_execution_gates,
     )
+    proxy_evaluate_fold = evaluate_fold_with_execution_gates
 
     target_sym = resolve_target_symbol(all_data, coin_prefix, coin_name)
     if not target_sym:
@@ -581,8 +582,9 @@ def run_validation(
     from scripts.train_model import Config, run_backtest
     from scripts.optimize import (
         profile_from_params, resolve_target_symbol,
-        COIN_MAP, PREFIX_FOR_COIN, compute_deflated_sharpe,
+        COIN_MAP, PREFIX_FOR_COIN,
     )
+    from core.metrics_significance import compute_deflated_sharpe
 
     params = optimization_result.get('params', {})
     coin_prefix = optimization_result.get('prefix', PREFIX_FOR_COIN.get(coin_name, coin_name))

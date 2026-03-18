@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.coin_profiles import COIN_PROFILES, CoinProfile

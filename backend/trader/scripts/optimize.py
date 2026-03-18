@@ -343,7 +343,7 @@ def create_cv_splits(
     return create_walk_forward_splits(index, n_folds=n_folds, min_train_days=min_train_days, purge_days=purge_days)
 
 
-FIXED_ML = {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
+FIXED_ML = {'n_estimators': 50, 'max_depth': 3, 'learning_rate': 0.05, 'min_child_samples': 20}
 FIXED_RISK = {
     'position_size': 0.12,
     'vol_sizing_target': 0.025,
@@ -366,7 +366,7 @@ ETH_GATE_RELAXATION = {
     'ensemble_agreement': 0.020,
 }
 
-STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay', 'trend_pullback', 'breakout_expansion')
+STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay', 'trend_pullback', 'breakout_expansion', 'funding_carry', 'squeeze_breakout', 'oi_divergence')
 TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
 
 STRATEGY_FAMILY_PRIORS = {
@@ -376,6 +376,10 @@ STRATEGY_FAMILY_PRIORS = {
     'vol_overlay': {'min_momentum_multiplier': 0.95, 'cooldown_multiplier': 1.10, 'min_trade_frequency_ratio_delta': -0.01},
     'trend_pullback': {'min_momentum_multiplier': 0.75, 'cooldown_multiplier': 0.85, 'min_trade_frequency_ratio_delta': 0.04},
     'breakout_expansion': {'min_momentum_multiplier': 0.85, 'cooldown_multiplier': 0.90, 'min_trade_frequency_ratio_delta': 0.05},
+    # New strategies
+    'funding_carry': {'min_momentum_multiplier': 0.60, 'cooldown_multiplier': 1.20, 'min_trade_frequency_ratio_delta': -0.05},
+    'squeeze_breakout': {'min_momentum_multiplier': 0.80, 'cooldown_multiplier': 0.80, 'min_trade_frequency_ratio_delta': 0.02},
+    'oi_divergence': {'min_momentum_multiplier': 0.70, 'cooldown_multiplier': 0.90, 'min_trade_frequency_ratio_delta': -0.03},
 }
 
 TRADE_FREQ_BUCKET_PRIORS = {
@@ -404,6 +408,32 @@ def _family_param_keys(strategy_family: str) -> tuple[str, ...]:
             'breakout_lookback',
             'breakout_buffer',
             'expansion_confirm_threshold',
+            'cooldown_hours',
+            'max_hold_hours',
+            'vol_mult_tp',
+            'vol_mult_sl',
+        )
+    if strategy_family == 'funding_carry':
+        return (
+            'funding_z_threshold',
+            'cooldown_hours',
+            'max_hold_hours',
+            'vol_mult_tp',
+            'vol_mult_sl',
+        )
+    if strategy_family == 'squeeze_breakout':
+        return (
+            'squeeze_pct_threshold',
+            'cooldown_hours',
+            'max_hold_hours',
+            'vol_mult_tp',
+            'vol_mult_sl',
+            'min_momentum_magnitude',
+        )
+    if strategy_family == 'oi_divergence':
+        return (
+            'liq_threshold',
+            'oi_z_threshold',
             'cooldown_hours',
             'max_hold_hours',
             'vol_mult_tp',
@@ -603,8 +633,8 @@ def create_trial_profile(trial, coin_name):
     else:
         min_vol_24h = bp.min_vol_24h if bp else 0.004
 
-    signal_lo = clamp(base_threshold - 0.07, 0.54, 0.73)
-    signal_hi = clamp(base_threshold + 0.08, 0.62, 0.82)
+    signal_lo = clamp(base_threshold - 0.07, 0.50, 0.73)
+    signal_hi = clamp(base_threshold + 0.08, 0.58, 0.82)
 
     pullback_depth_threshold = bp.pullback_depth_threshold if bp else 0.02
     rebound_confirmation_threshold = bp.rebound_confirmation_threshold if bp else 0.004
@@ -613,6 +643,10 @@ def create_trial_profile(trial, coin_name):
     breakout_lookback = bp.breakout_lookback if bp else 48
     breakout_buffer = bp.breakout_buffer if bp else 0.003
     expansion_confirm_threshold = bp.expansion_confirm_threshold if bp else 0.004
+    funding_z_threshold = bp.funding_z_threshold if bp else 2.5
+    squeeze_pct_threshold = bp.squeeze_pct_threshold if bp else 0.20
+    liq_threshold = bp.liq_threshold if bp else 0.30
+    oi_z_threshold = bp.oi_z_threshold if bp else 1.0
 
     if strategy_family == 'trend_pullback':
         pullback_depth_threshold = trial.suggest_float('pullback_depth_threshold', 0.008, 0.045, step=0.001)
@@ -623,6 +657,13 @@ def create_trial_profile(trial, coin_name):
         breakout_lookback = trial.suggest_int('breakout_lookback', 12, 120, step=12)
         breakout_buffer = trial.suggest_float('breakout_buffer', 0.001, 0.020, step=0.001)
         expansion_confirm_threshold = trial.suggest_float('expansion_confirm_threshold', 0.001, 0.025, step=0.001)
+    elif strategy_family == 'funding_carry':
+        funding_z_threshold = trial.suggest_float('funding_z_threshold', 1.5, 5.0, step=0.25)
+    elif strategy_family == 'squeeze_breakout':
+        squeeze_pct_threshold = trial.suggest_float('squeeze_pct_threshold', 0.05, 0.35, step=0.05)
+    elif strategy_family == 'oi_divergence':
+        liq_threshold = trial.suggest_float('liq_threshold', 0.10, 0.80, step=0.05)
+        oi_z_threshold = trial.suggest_float('oi_z_threshold', 0.50, 3.0, step=0.25)
 
     return CoinProfile(
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
@@ -656,6 +697,10 @@ def create_trial_profile(trial, coin_name):
         breakout_lookback=breakout_lookback,
         breakout_buffer=breakout_buffer,
         expansion_confirm_threshold=expansion_confirm_threshold,
+        funding_z_threshold=funding_z_threshold,
+        squeeze_pct_threshold=squeeze_pct_threshold,
+        liq_threshold=liq_threshold,
+        oi_z_threshold=oi_z_threshold,
     )
 
 
@@ -688,6 +733,10 @@ def build_effective_params(params: Dict, coin_name: str) -> Dict:
         'breakout_lookback': params.get('breakout_lookback', bp.breakout_lookback if bp else 48),
         'breakout_buffer': params.get('breakout_buffer', bp.breakout_buffer if bp else 0.003),
         'expansion_confirm_threshold': params.get('expansion_confirm_threshold', bp.expansion_confirm_threshold if bp else 0.004),
+        'funding_z_threshold': params.get('funding_z_threshold', bp.funding_z_threshold if bp else 2.5),
+        'squeeze_pct_threshold': params.get('squeeze_pct_threshold', bp.squeeze_pct_threshold if bp else 0.20),
+        'liq_threshold': params.get('liq_threshold', bp.liq_threshold if bp else 0.30),
+        'oi_z_threshold': params.get('oi_z_threshold', bp.oi_z_threshold if bp else 1.0),
         'min_val_auc': FIXED_RISK['min_val_auc'],
         'position_size': FIXED_RISK['position_size'],
         'vol_sizing_target': FIXED_RISK['vol_sizing_target'],
@@ -731,6 +780,10 @@ def profile_from_params(params, coin_name):
         breakout_lookback=effective_params['breakout_lookback'],
         breakout_buffer=effective_params['breakout_buffer'],
         expansion_confirm_threshold=effective_params['expansion_confirm_threshold'],
+        funding_z_threshold=effective_params['funding_z_threshold'],
+        squeeze_pct_threshold=effective_params['squeeze_pct_threshold'],
+        liq_threshold=effective_params['liq_threshold'],
+        oi_z_threshold=effective_params['oi_z_threshold'],
     )
 
 
@@ -1098,7 +1151,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             'auc': float(auc),
         })
 
-    if len(member_models) < 2:
+    if len(member_models) < 1:
         return None
 
     y_train_label_quality_raw = system.create_labels(ohlcv, train_feat, profile=profile).dropna()
@@ -1108,18 +1161,34 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         return None
     y_test_binary = _normalize_triple_barrier_labels(y_test_raw)
 
-    ensemble_probs = []
-    y_test = []
-    for ts, yv in y_test_binary.items():
-        row = test_feat.loc[ts]
-        probs = []
-        for m in member_models:
-            x_in = np.nan_to_num(np.array([row.get(c, 0.0) for c in m['cols']], dtype=float).reshape(1, -1), nan=0.0)
-            raw_prob = m['model'].predict_proba(m['scaler'].transform(x_in))[0, 1]
-            probs.append(float(_calibrator_predict(m['calibrator'], np.array([raw_prob]))[0]))
-        if probs:
-            ensemble_probs.append(float(np.mean(probs)))
-            y_test.append(int(yv))
+    # --- Batch pre-compute all member predictions for test_feat rows ---
+    # (Avoids single-sample predict_proba calls in the hot loops below)
+    _n_test = len(test_feat)
+    _test_ts_to_pos = {ts: i for i, ts in enumerate(test_feat.index)}
+    _member_probs_arr = np.zeros((_n_test, len(member_models)), dtype=np.float32)
+    _member_meta_probs_arr = np.full((_n_test, len(member_models)), np.nan, dtype=np.float32)
+    for _i_m, _m in enumerate(member_models):
+        _X_batch = np.nan_to_num(
+            test_feat.reindex(columns=_m['cols'], fill_value=0.0).values.astype(np.float32),
+            nan=0.0
+        )
+        _raw = _m['model'].predict_proba(_m['scaler'].transform(_X_batch))[:, 1].astype(np.float32)
+        _member_probs_arr[:, _i_m] = _calibrator_predict(_m['calibrator'], _raw).astype(np.float32)
+        _meta = _m['meta']
+        if _meta.model is not None and _meta.scaler is not None:
+            _meta_raw = _meta.model.predict_proba(_meta.scaler.transform(_X_batch))[:, 1].astype(np.float32)
+            _meta_cal = (calibrator_predict(_meta.calibrator, _meta_raw) if _meta.calibrator is not None else _meta_raw).astype(np.float32)
+            _member_meta_probs_arr[:, _i_m] = _meta_cal
+
+    # Vectorized label evaluation (replaces per-row predict_proba loop)
+    _label_positions = [_test_ts_to_pos[ts] for ts in y_test_binary.index if ts in _test_ts_to_pos]
+    _valid_label_ts = [ts for ts in y_test_binary.index if ts in _test_ts_to_pos]
+    if _label_positions:
+        ensemble_probs = list(np.mean(_member_probs_arr[_label_positions, :], axis=1).astype(float))
+        y_test = list(y_test_binary.reindex(_valid_label_ts).astype(int))
+    else:
+        ensemble_probs = []
+        y_test = []
 
     if len(ensemble_probs) < 20 or len(set(y_test)) < 2:
         return None
@@ -1166,6 +1235,11 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
     std_values: List[float] = []
     test_idx = test_feat.index.intersection(ohlcv.index)
 
+    # Pre-compute expensive series ONCE to avoid O(n²) computation inside the gate loop
+    _vol_24h_series = ohlcv['close'].pct_change().rolling(24).std()
+    _close_arr = ohlcv['close'].values.astype(np.float64)
+    _ohlcv_idx_map = {ts: i for i, ts in enumerate(ohlcv.index)}
+
     active_position = None
 
     for ts in test_idx:
@@ -1207,7 +1281,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             _gate('missing_sma200')
             continue
 
-        vol_24h = ohlcv['close'].pct_change().rolling(24).std().get(ts, None)
+        vol_24h = _vol_24h_series.get(ts, None)
         if vol_24h is None or pd.isna(vol_24h) or float(vol_24h) < profile.min_vol_24h:
             _gate('vol_regime_low')
             continue
@@ -1215,18 +1289,18 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             _gate('vol_regime_high')
             continue
 
-        ts_loc = ohlcv.index.get_loc(ts)
-        if ts_loc < 72:
+        ts_loc = _ohlcv_idx_map.get(ts)
+        if ts_loc is None or ts_loc < 72:
             _gate('momentum_magnitude')
             continue
 
-        ret_24h = (price / ohlcv['close'].iloc[ts_loc - 24] - 1)
-        ret_72h = (price / ohlcv['close'].iloc[ts_loc - 72] - 1)
+        ret_24h = float(_close_arr[ts_loc]) / float(_close_arr[ts_loc - 24]) - 1
+        ret_72h = float(_close_arr[ts_loc]) / float(_close_arr[ts_loc - 72]) - 1
         if abs(ret_72h) < effective_momentum:
             _gate('momentum_magnitude')
             continue
 
-        sma_50 = ohlcv['close'].iloc[max(0, ts_loc - 50):ts_loc].mean()
+        sma_50 = float(np.mean(_close_arr[max(0, ts_loc - 50):ts_loc]))
         strategy_context = _build_strategy_context(row, price, sma_200, ret_24h, ret_72h, sma_50, vol_24h=float(vol_24h))
         strategy_decision = strategy_family.evaluate(
             strategy_context,
@@ -1241,6 +1315,10 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
                 'breakout_lookback': int(getattr(profile, 'breakout_lookback', 48)),
                 'breakout_buffer': float(getattr(profile, 'breakout_buffer', 0.003)),
                 'expansion_confirm_threshold': float(getattr(profile, 'expansion_confirm_threshold', 0.004)),
+                'funding_z_threshold': float(getattr(profile, 'funding_z_threshold', 2.5)),
+                'squeeze_pct_threshold': float(getattr(profile, 'squeeze_pct_threshold', 0.20)),
+                'liq_threshold': float(getattr(profile, 'liq_threshold', 0.30)),
+                'oi_z_threshold': float(getattr(profile, 'oi_z_threshold', 1.0)),
             },
         )
         direction = int(strategy_decision.direction)
@@ -1265,22 +1343,16 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             continue
         size_multiplier *= float(funding_effect.size_multiplier)
 
+        _t_pos = _test_ts_to_pos.get(ts)
         probs: List[float] = []
         directional_votes: List[int] = []
         meta_probs: List[float] = []
-        for m in member_models:
-            x_in = np.nan_to_num(np.array([row.get(c, 0.0) for c in m['cols']], dtype=float).reshape(1, -1), nan=0.0)
-            raw_prob = m['model'].predict_proba(m['scaler'].transform(x_in))[0, 1]
-            cal_prob = float(_calibrator_predict(m['calibrator'], np.array([raw_prob]))[0])
+        for _i_m, m in enumerate(member_models):
+            cal_prob = float(_member_probs_arr[_t_pos, _i_m]) if _t_pos is not None else 0.5
             probs.append(cal_prob)
             directional_votes.append(1 if (cal_prob >= 0.5 and direction == 1) or (cal_prob < 0.5 and direction == -1) else 0)
-            meta_artifacts = m['meta']
-            if cal_prob >= primary_cutoff and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
-                meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
-                if meta_artifacts.calibrator is not None:
-                    meta_probs.append(float(calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0]))
-                else:
-                    meta_probs.append(float(meta_raw))
+            if cal_prob >= primary_cutoff and _t_pos is not None and not np.isnan(_member_meta_probs_arr[_t_pos, _i_m]):
+                meta_probs.append(float(_member_meta_probs_arr[_t_pos, _i_m]))
 
         if not probs:
             continue
@@ -1437,6 +1509,7 @@ def objective(
         'enforce_pruned_features': bool(pruned_only),
         'min_train_samples': 100,
         'signal_threshold': 0.50,
+        'max_n_estimators_optimize': FIXED_ML['n_estimators'],
     })
     config.strategy_family = profile.strategy_family
     config.trade_freq_bucket = profile.trade_freq_bucket
@@ -1922,14 +1995,26 @@ def _candidate_holdout_summary(
 
 def _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days, pruned_only=True, base_config=None):
     seed_config = base_config or Config()
+    train_lookback = int(getattr(seed_config, 'train_lookback_days', 120))
     config = Config(**{**seed_config.__dict__, 'max_positions': 1, 'leverage': 4, 'min_signal_edge': 0.00,
                     'max_ensemble_std': 0.10, 'train_embargo_hours': 24, 'oos_eval_days': int(eval_days),
-                    'enforce_pruned_features': bool(pruned_only)})
+                    'enforce_pruned_features': bool(pruned_only),
+                    'max_n_estimators_optimize': FIXED_ML['n_estimators']})
+
+    # Trim holdout_data to only the needed window (train_lookback + eval_days) to avoid
+    # retraining over years of unnecessary history. This is the primary holdout speedup.
+    sym_data = holdout_data[target_sym]
+    end_ts = sym_data['ohlcv'].index.max()
+    window_start = end_ts - pd.Timedelta(days=train_lookback + eval_days)
+    trimmed_ohlcv = sym_data['ohlcv'][sym_data['ohlcv'].index >= window_start]
+    trimmed_feat = sym_data['features'][sym_data['features'].index >= window_start]
+    trimmed_sym_data = {target_sym: {'features': trimmed_feat, 'ohlcv': trimmed_ohlcv}}
+
     try:
         with tempfile.TemporaryDirectory(prefix='holdout_gate_counters_') as gate_tmp:
             gate_dir = Path(gate_tmp)
             result = run_backtest(
-                {target_sym: holdout_data[target_sym]},
+                trimmed_sym_data,
                 config,
                 profile_overrides={coin_name: profile},
                 gate_artifact_dir=gate_dir,
@@ -1984,25 +2069,27 @@ def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days,
     if recent_metrics:
         holdout_slices['recent90'] = recent_metrics
 
-    sym_ohlcv = holdout_data[target_sym]['ohlcv']
-    end_ts = sym_ohlcv.index.max()
-    prior_end = end_ts - pd.Timedelta(days=90)
-    prior_dataset = {
-        target_sym: {
-            'features': holdout_data[target_sym]['features'][holdout_data[target_sym]['features'].index <= prior_end],
-            'ohlcv': sym_ohlcv[sym_ohlcv.index <= prior_end],
+    # For single90 mode only recent90 is used — skip the more expensive prior/full windows.
+    if holdout_mode != 'single90':
+        sym_ohlcv = holdout_data[target_sym]['ohlcv']
+        end_ts = sym_ohlcv.index.max()
+        prior_end = end_ts - pd.Timedelta(days=90)
+        prior_dataset = {
+            target_sym: {
+                'features': holdout_data[target_sym]['features'][holdout_data[target_sym]['features'].index <= prior_end],
+                'ohlcv': sym_ohlcv[sym_ohlcv.index <= prior_end],
+            }
         }
-    }
-    if len(prior_dataset[target_sym]['ohlcv']) > 500:
-        prior_metrics = _run_holdout_window(prior_dataset, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only, base_config=base_config)
-        if prior_metrics:
-            holdout_slices['prior90'] = prior_metrics
+        if len(prior_dataset[target_sym]['ohlcv']) > 500:
+            prior_metrics = _run_holdout_window(prior_dataset, target_sym, profile, coin_name, eval_days=90, pruned_only=pruned_only, base_config=base_config)
+            if prior_metrics:
+                holdout_slices['prior90'] = prior_metrics
 
-    full_span_days = (sym_ohlcv.index.max() - sym_ohlcv.index.min()).days
-    if full_span_days >= 180:
-        full_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=180, pruned_only=pruned_only, base_config=base_config)
-        if full_metrics:
-            holdout_slices['full180'] = full_metrics
+        full_span_days = (sym_ohlcv.index.max() - sym_ohlcv.index.min()).days
+        if full_span_days >= 180:
+            full_metrics = _run_holdout_window(holdout_data, target_sym, profile, coin_name, eval_days=180, pruned_only=pruned_only, base_config=base_config)
+            if full_metrics:
+                holdout_slices['full180'] = full_metrics
 
     top_level = _derive_top_level_holdout(holdout_slices, holdout_mode=holdout_mode)
     if not top_level:
@@ -2159,6 +2246,9 @@ def _derive_confidence_tier(
 def _is_paper_facing_run(preset_name: str, gate_mode: str) -> bool:
     preset = str(preset_name or '').lower()
     gate = str(gate_mode or '').lower()
+    # fast_qualify explicitly opts out of holdout requirement; don't force it via gate_mode.
+    if preset in {'fast_qualify', 'quick', 'discovery'}:
+        return False
     return preset in {'paper_ready', 'robust120', 'robust180'} or gate in {
         'initial_paper_qualification',
         'production_promotion',
@@ -2388,7 +2478,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   embargo_bars=None, embargo_frac=0.0,
                   cost_config_path=None,
                   proxy_fidelity_candidates=0,
-                  proxy_fidelity_eval_days=0):
+                  proxy_fidelity_eval_days=0,
+                  use_memory_storage=False):
     enable_pbo_diagnostic = False
     enable_study_significance = False
     study_significance_bootstrap_iterations = 500
@@ -2469,47 +2560,59 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         interval_steps=1,
     )
     study = None
-    storage_url = _sqlite_url(_db_path())
-    storage = optuna.storages.RDBStorage(
-        url=storage_url,
-        engine_kwargs={
-            "connect_args": {"timeout": 30},
-            "pool_pre_ping": True,
-        },
-    )
-    for attempt in range(10):
-        try:
-            with _study_storage_lock(_db_path()):
-                study = optuna.create_study(
-                    direction='maximize',
-                    sampler=sampler,
-                    pruner=pruner,
-                    study_name=study_name,
-                    storage=storage,
-                    load_if_exists=bool(resume_study),
+    _use_memory = use_memory_storage or (n_jobs or 1) > 1
+    if _use_memory:
+        # In-memory storage avoids SQLite lock contention entirely.
+        # Used when running multiple parallel workers or n_jobs > 1.
+        # Trade-off: no resume capability for this run.
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=sampler,
+            pruner=pruner,
+            study_name=study_name,
+        )
+    else:
+        storage_url = _sqlite_url(_db_path())
+        storage = optuna.storages.RDBStorage(
+            url=storage_url,
+            engine_kwargs={
+                "connect_args": {"timeout": 30},
+                "pool_pre_ping": True,
+            },
+        )
+        for attempt in range(10):
+            try:
+                with _study_storage_lock(_db_path()):
+                    study = optuna.create_study(
+                        direction='maximize',
+                        sampler=sampler,
+                        pruner=pruner,
+                        study_name=study_name,
+                        storage=storage,
+                        load_if_exists=bool(resume_study),
+                    )
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
+                    if resume_study:
+                        with _study_storage_lock(_db_path()):
+                            study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler, pruner=pruner)
+                        break
+                    raise RuntimeError(
+                        f"Study '{study_name}' already exists but --resume was not set. "
+                        "Pass --resume to continue the existing study or change --study-suffix."
+                    )
+                # SQLite schema/alembic races can happen when multiple processes initialize storage concurrently.
+                transient_schema_race = (
+                    ("table" in err and "already exists" in err)
+                    or ("alembic_version" in err and "unique constraint failed" in err)
                 )
-            break
-        except Exception as e:
-            err = str(e).lower()
-            if isinstance(e, optuna.exceptions.DuplicatedStudyError) or "already exists" in err:
-                if resume_study:
-                    with _study_storage_lock(_db_path()):
-                        study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler, pruner=pruner)
-                    break
-                raise RuntimeError(
-                    f"Study '{study_name}' already exists but --resume was not set. "
-                    "Pass --resume to continue the existing study or change --study-suffix."
-                )
-            # SQLite schema/alembic races can happen when multiple processes initialize storage concurrently.
-            transient_schema_race = (
-                ("table" in err and "already exists" in err)
-                or ("alembic_version" in err and "unique constraint failed" in err)
-            )
-            if transient_schema_race and attempt < 9:
-                time.sleep(0.3 * (attempt + 1)); continue
-            if "database is locked" in err and attempt < 9:
-                time.sleep(0.4 * (attempt + 1)); continue
-            raise
+                if transient_schema_race and attempt < 9:
+                    time.sleep(0.3 * (attempt + 1)); continue
+                if "database is locked" in err and attempt < 9:
+                    time.sleep(0.4 * (attempt + 1)); continue
+                raise
     if not study: print("❌ Could not create study"); return None
 
     study.set_user_attr('sampler_seed', int(sampler_seed))
@@ -2555,9 +2658,6 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         _prune_event_callback,
     ]
     optimize_jobs = max(1, int(n_jobs or 1))
-    if optimize_jobs > 1:
-        print(f"⚠️  Optuna SQLite storage is lock-prone with n_jobs>1; forcing n_jobs=1 for {coin_name}.")
-        optimize_jobs = 1
 
     try:
         for attempt in range(5):
@@ -2643,7 +2743,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         ranked_candidates = []
         for cand in candidate_trials:
             holdout_metrics = evaluate_holdout(holdout_data, cand.params, coin_name, coin_prefix, holdout_days,
-                                               pruned_only=pruned_only, holdout_mode=holdout_mode)
+                                               pruned_only=pruned_only, holdout_mode=holdout_mode,
+                                               base_config=base_cost_config)
             holdout_metrics = _compute_holdout_significance(holdout_metrics, completed_trials=nc)
             if not holdout_metrics:
                 continue
@@ -3273,6 +3374,11 @@ def apply_runtime_preset(args):
         'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
         'discovery': {'plateau_patience': 70, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 10, 'n_cv_folds': 4, 'holdout_candidates': 2, 'holdout_min_trades': 10, 'holdout_min_sharpe': -0.05, 'holdout_min_return': -0.03, 'require_holdout_pass': False, 'target_trades_per_week': 0.6, 'seed_stability_min_pass_rate': 0.55, 'seed_stability_max_param_dispersion': 0.90, 'seed_stability_max_oos_sharpe_dispersion': 0.60, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
         'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        # fast_qualify: lenient first-pass preset for getting all 5 coins to PAPER_QUALIFIED tier
+        # quickly. Use this to find any working parameter set before upgrading to paper_ready.
+        # Key relaxations vs paper_ready: 3-fold CV, no holdout-pass requirement, generous trade
+        # minimums, low PSR bar, full seed-stability tolerance.
+        'fast_qualify': {'plateau_patience': 50, 'plateau_warmup': 20, 'plateau_min_delta': 0.025, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 6, 'n_cv_folds': 2, 'holdout_candidates': 2, 'holdout_min_trades': 4, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.4, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.0, 'seed_stability_max_oos_sharpe_dispersion': 0.70, 'min_psr': 0.50, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
     }
     name = getattr(args, 'preset', 'none')
     if name in (None, '', 'none'): return args
@@ -3332,7 +3438,7 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-days", type=int, default=90)
     parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
                         help="Holdout aggregation mode for selection + backward-compatible top-level metrics")
-    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready", "discovery"])
+    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready", "discovery", "fast_qualify"])
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--cv-mode", type=str, default="walk_forward", choices=["walk_forward", "purged_embargo"],

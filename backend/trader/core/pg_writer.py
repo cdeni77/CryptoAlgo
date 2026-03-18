@@ -206,20 +206,23 @@ class PgWriter:
                 if existing:
                     return existing.id
 
+            def _f(v):
+                return float(v) if v is not None else None
+
             sig = Signal(
                 coin=coin,
                 timestamp=timestamp,
                 direction=direction,
-                confidence=confidence,
-                raw_probability=raw_probability,
-                model_auc=model_auc,
-                price_at_signal=price_at_signal,
+                confidence=_f(confidence),
+                raw_probability=_f(raw_probability),
+                model_auc=_f(model_auc),
+                price_at_signal=_f(price_at_signal),
                 momentum_pass=momentum_pass,
                 trend_pass=trend_pass,
                 regime_pass=regime_pass,
                 ml_pass=ml_pass,
-                contracts_suggested=contracts_suggested,
-                notional_usd=notional_usd,
+                contracts_suggested=int(contracts_suggested) if contracts_suggested is not None else None,
+                notional_usd=_f(notional_usd),
                 acted_on=acted_on,
                 trade_id=trade_id,
                 passed_gates=passed_gates,

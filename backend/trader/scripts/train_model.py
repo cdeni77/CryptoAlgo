@@ -32,6 +32,7 @@ from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.preprocessing import RobustScaler
 import lightgbm as lgb
 
+
 from core.coin_profiles import (
     get_coin_profile, save_model, load_model, list_saved_models,
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
@@ -237,6 +238,9 @@ class Config:
     breakout_lookback: int = 48
     breakout_buffer: float = 0.003
     expansion_confirm_threshold: float = 0.004
+
+    # Optimization-mode cap: when > 0, member n_estimators are capped to this value to speed up trials.
+    max_n_estimators_optimize: int = 0
 
     # Names of fields explicitly provided via CLI flags (not parser defaults).
     cli_overrides: Set[str] = field(default_factory=set)
@@ -737,8 +741,12 @@ class MLSystem:
     ) -> Dict[str, float]:
         rng = np.random.default_rng(self._stable_seed(symbol, member.name, "hparams"))
         profile_lr = profile.learning_rate if profile else 0.05
+        n_est = int(rng.integers(member.n_estimators_range[0], member.n_estimators_range[1] + 1))
+        cap = self.config.max_n_estimators_optimize
+        if cap > 0:
+            n_est = min(n_est, cap)
         return {
-            'n_estimators': int(rng.integers(member.n_estimators_range[0], member.n_estimators_range[1] + 1)),
+            'n_estimators': n_est,
             'max_depth': int(rng.integers(member.max_depth_range[0], member.max_depth_range[1] + 1)),
             'num_leaves': int(rng.integers(member.num_leaves_range[0], member.num_leaves_range[1] + 1)),
             'min_child_samples': int(rng.integers(member.min_child_samples_range[0], member.min_child_samples_range[1] + 1)),
@@ -935,7 +943,7 @@ class MLSystem:
             reg_lambda=0.01,
             min_gain_to_split=0.0,
             min_child_weight=1e-3,
-            n_jobs=1
+            n_jobs=1,
         )
         base_model.fit(X_train_scaled, y_train, sample_weight=train_sample_weights)
 

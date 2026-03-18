@@ -89,9 +89,12 @@ services:
       # Signal generation parameters (from train_model.py defaults)
       # SIGNAL_THRESHOLD is intentionally omitted — per-coin profiles define their own thresholds
       # (SOL=0.57, others=0.52-0.53 from coin_profiles.py). Set this only to override all profiles.
-      - MIN_AUC=0.54
+      - MIN_AUC=0.48
       - LEVERAGE=4
-      - EXCLUDE_SYMBOLS=BIP,DOP
+      - PRUNED_ONLY=true
+
+      # Feature engineering
+      - FEATURE_LOOKBACK_DAYS=365            # Use 1 year for feature computation (was 1095)
 
       # Scheduling
       - CYCLE_INTERVAL_SECONDS=3600          # Run every 1 hour

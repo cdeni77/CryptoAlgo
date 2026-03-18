@@ -317,22 +317,45 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
     return sorted(runs, key=lambda r: r.finished_at, reverse=True)[:limit]
 
 
+def _load_pruned_features(coin: str) -> Optional[dict]:
+    trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
+    coin_lower = coin.lower()
+    candidates = [
+        trader_dir / "data" / "features" / f"pruned_features_{coin_lower}.json",
+        Path.cwd() / "backend" / "trader" / "data" / "features" / f"pruned_features_{coin_lower}.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+    return None
+
+
 def get_research_features(db: Session, coin: str) -> ResearchFeaturesResponse:
     coin = coin.upper()
     recent_signals = db.query(Signal).filter(Signal.coin == coin).order_by(desc(Signal.timestamp)).limit(200).all()
 
-    base = [
-        ("momentum_24h", 0.26),
-        ("trend_strength", 0.22),
-        ("funding_zscore", 0.17),
-        ("oi_velocity", 0.14),
-        ("volatility_regime", 0.12),
-        ("volume_spike", 0.09),
-    ]
-    multiplier = 1 + (sum(ord(c) for c in coin) % 7) * 0.01
-    scaled = [(name, val * multiplier) for name, val in base]
-    total = sum(v for _, v in scaled) or 1
-    features = [FeatureImportanceItem(feature=name, importance=val / total) for name, val in scaled]
+    pruned = _load_pruned_features(coin)
+    feature_stats = (pruned or {}).get("feature_stats", {})
+    if feature_stats:
+        total_shap = sum(v["mean_abs_shap"] for v in feature_stats.values()) or 1.0
+        features = [
+            FeatureImportanceItem(feature=name, importance=stats["mean_abs_shap"] / total_shap)
+            for name, stats in sorted(feature_stats.items(), key=lambda x: x[1]["mean_abs_shap"], reverse=True)
+        ][:10]
+    else:
+        base = [
+            ("momentum_24h", 0.26),
+            ("trend_strength", 0.22),
+            ("funding_zscore", 0.17),
+            ("oi_velocity", 0.14),
+            ("volatility_regime", 0.12),
+            ("volume_spike", 0.09),
+        ]
+        total = sum(v for _, v in base)
+        features = [FeatureImportanceItem(feature=name, importance=val / total) for name, val in base]
 
     long_count = len([s for s in recent_signals if s.direction == "long"])
     short_count = len([s for s in recent_signals if s.direction == "short"])

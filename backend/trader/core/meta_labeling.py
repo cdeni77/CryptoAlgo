@@ -17,6 +17,7 @@ except Exception:
     BetaCalibration = None
 
 
+
 @dataclass
 class MetaArtifacts:
     model: Optional[lgb.LGBMClassifier]

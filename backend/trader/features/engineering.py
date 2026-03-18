@@ -114,6 +114,20 @@ class PriceFeatures:
         atr24 = true_range.rolling(24).mean()
         features['atr_pct_24h'] = atr24 / df['close'].replace(0, np.nan)
 
+        # ----- BB-width percentile rank (squeeze detector, universal) -----
+        # Rolling 168-bar percentile rank of bb_width; near 0 = volatility compression
+        features['bb_width_pct_rank'] = features['bb_width'].rolling(168).rank(pct=True)
+
+        # ----- Universal price z-scores (used by mean_reversion for all coins) -----
+        # Previously only existed in BTCMeanReversionFeatures; now available for all
+        close = df['close']
+        for lb in [24, 48, 72, 168]:
+            ma = close.rolling(lb).mean()
+            std = close.rolling(lb).std()
+            col = f'zscore_{lb}h'
+            if col not in features.columns:
+                features[col] = (close - ma) / std.replace(0, np.nan)
+
         return features
 
 class VolumeVolatilityFeatures:

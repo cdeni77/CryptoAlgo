@@ -183,6 +183,13 @@ class CoinProfile:
     breakout_lookback: int = 48
     breakout_buffer: float = 0.003
     expansion_confirm_threshold: float = 0.004
+    # funding_carry
+    funding_z_threshold: float = 2.5
+    # squeeze_breakout
+    squeeze_pct_threshold: float = 0.20
+    # oi_divergence
+    liq_threshold: float = 0.30
+    oi_z_threshold: float = 1.0
 
     # Categorical strategy knobs
     strategy_family: str = 'momentum_trend'

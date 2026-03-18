@@ -16,6 +16,7 @@ import warnings
 import sqlite3
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -33,7 +34,7 @@ from core.coin_profiles import FEATURE_SCHEMA_VERSION, get_coin_profile, CoinPro
 from core.labeling import (
     TripleBarrierSpec,
     assert_label_path_consistency,
-    compute_labels_from_ohlcv_iteration,
+    compute_labels_from_feature_index,
     momentum_direction_series,
     resolve_profile_label_horizon,
 )
@@ -177,10 +178,12 @@ def resolve_label_horizon(profile: CoinProfile) -> int:
 
 def compute_profile_target(
     ohlcv: pd.DataFrame,
+    feature_index: pd.DatetimeIndex,
     profile: CoinProfile,
-    score_threshold: int = 1,
+    direction: pd.Series,
+    spec: TripleBarrierSpec,
 ) -> pd.Series:
-    """Momentum-direction triple-barrier labels aligned with train_model execution.
+    """Momentum-direction triple-barrier labels using the fast numpy path.
 
     Label values:
       1  -> take-profit first touch (long/short aware)
@@ -188,14 +191,9 @@ def compute_profile_target(
       0  -> timeout/no touch within horizon
 
     Neutral direction entries (no momentum consensus) are not labeled (NaN).
+    Only computes labels for rows in feature_index (skips the full OHLCV range).
     """
-    spec = TripleBarrierSpec(
-        horizon_hours=resolve_label_horizon(profile),
-        tp_mult=profile.vol_mult_tp,
-        sl_mult=profile.vol_mult_sl,
-    )
-    direction = momentum_direction_series(ohlcv, score_threshold=score_threshold)
-    return compute_labels_from_ohlcv_iteration(ohlcv, spec, direction)
+    return compute_labels_from_feature_index(ohlcv, feature_index, spec, direction)
 
 # 3. MAIN SCRIPT
 
@@ -289,16 +287,19 @@ def main():
     for f, c in sorted_corr:
         print(f"    {'📈' if c>0 else '📉'} {f:<35} IC: {c:+.4f}")
 
-    # --- 4. Export & Prep ML Data ---
+    # --- 4. Export & Prep ML Data (parallel per symbol) ---
     print("\n4️⃣  EXPORTING DATA (All Symbols)")
     print("-" * 50)
-    
-    for symbol in symbols:
-        if symbol not in all_features: continue
-        
+
+    def _process_symbol(symbol: str) -> list[str]:
+        """Returns log lines; all file writes happen inside. Thread-safe (separate files)."""
+        lines: list[str] = []
+        if symbol not in all_features:
+            return lines
+
         feats = all_features[symbol]
         ohlcv = ohlcv_data[symbol]
-        
+
         profile = get_coin_profile(symbol)
         spec = TripleBarrierSpec(
             horizon_hours=resolve_label_horizon(profile),
@@ -310,8 +311,8 @@ def main():
         # 1. Feature integrity + collinearity diagnostics
         is_valid, missing_features = validate_profile_feature_mapping(symbol, feats, profile)
         if not is_valid:
-            print(f"  ❌ {symbol}: Missing profile features ({len(missing_features)}): {missing_features[:8]}")
-            continue
+            lines.append(f"  ❌ {symbol}: Missing profile features ({len(missing_features)}): {missing_features[:8]}")
+            return lines
 
         post_count = count_high_correlation_pairs(feats, profile.feature_columns, threshold=0.80)
         pre_count = count_high_correlation_pairs(
@@ -319,7 +320,7 @@ def main():
             profile.feature_columns + [c for c in REMOVED_REDUNDANT_FEATURES if c in feats.columns],
             threshold=0.80,
         )
-        print(
+        lines.append(
             f"  📊 {symbol}: Collinearity pairs | pre={pre_count} post={post_count} "
             f"(corr>|0.80|, delta={post_count - pre_count:+d})"
         )
@@ -331,36 +332,45 @@ def main():
         export_feature_metadata(meta_path, symbol, profile, feats)
 
         assert_label_path_consistency(ohlcv, feats.index, spec, direction, sample_size=200)
-        target = compute_profile_target(ohlcv, profile, score_threshold=1)
+        target = compute_profile_target(ohlcv, feats.index, profile, direction, spec)
         total_bars = len(ohlcv)
         labeled_bars = int(target.notna().sum())
         neutral_bars = int(target.isna().sum())
-        print(
+        lines.append(
             f"  🧪 {symbol}: Label diagnostics | total={total_bars} labeled={labeled_bars} neutral={neutral_bars}"
         )
-        
+
         # Ensure UTC match
-        if target.index.tz is None: target.index = target.index.tz_localize('UTC')
-        
+        if target.index.tz is None:
+            target.index = target.index.tz_localize('UTC')
+
         # Robust Cleaning
         X_final, y_final = prepare_robust_dataset(feats, target)
-        
+
         if len(X_final) > 0:
             ml_df = X_final.copy()
             ml_df['target_tb'] = y_final
             ml_path = EXPORT_DIR / f"{symbol.replace('-', '_')}_ml_dataset.csv"
             ml_df.to_csv(ml_path)
-            
+
             tp_rate = (y_final == 1).mean()
             sl_rate = (y_final == -1).mean()
             timeout_rate = (y_final == 0).mean()
-            print(
+            lines.append(
                 f"  ✅ {symbol}: Saved {len(ml_df)} rows | "
                 f"TP={tp_rate:.1%} SL={sl_rate:.1%} Timeout={timeout_rate:.1%} "
                 f"(TP={profile.vol_mult_tp}x, SL={profile.vol_mult_sl}x, H={resolve_label_horizon(profile)}h)"
             )
         else:
-            print(f"  ❌ {symbol}: Failed to generate ML dataset (0 rows)")
+            lines.append(f"  ❌ {symbol}: Failed to generate ML dataset (0 rows)")
+        return lines
+
+    n_workers = min(len(symbols), os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_process_symbol, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            for line in future.result():
+                print(line)
 
     print("\n" + "=" * 70)
     print("✅ DONE. Pipeline Complete.")

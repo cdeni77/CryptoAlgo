@@ -5,6 +5,9 @@ from .mean_reversion import MeanReversionStrategy
 from .vol_overlay import VolatilityOverlayStrategy
 from .trend_pullback import TrendPullbackStrategy
 from .breakout_expansion import BreakoutExpansionStrategy
+from .funding_carry import FundingCarryStrategy
+from .squeeze_breakout import SqueezeBreakoutStrategy
+from .oi_divergence import OIDivergenceStrategy
 
 STRATEGY_FAMILY_REGISTRY = {
     MomentumTrendStrategy.name: MomentumTrendStrategy(),
@@ -13,6 +16,9 @@ STRATEGY_FAMILY_REGISTRY = {
     VolatilityOverlayStrategy.name: VolatilityOverlayStrategy(),
     TrendPullbackStrategy.name: TrendPullbackStrategy(),
     BreakoutExpansionStrategy.name: BreakoutExpansionStrategy(),
+    FundingCarryStrategy.name: FundingCarryStrategy(),
+    SqueezeBreakoutStrategy.name: SqueezeBreakoutStrategy(),
+    OIDivergenceStrategy.name: OIDivergenceStrategy(),
 }
 
 

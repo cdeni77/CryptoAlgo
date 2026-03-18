@@ -100,6 +100,7 @@ export default function SignalsTable({ signals, loading }: SignalsTableProps) {
                 <td className="px-4 py-3">
                   <div className="flex flex-wrap">
                     <GateBadge pass={s.momentum_pass} label="MOM" />
+                    <GateBadge pass={s.trend_pass} label="TRD" />
                     <GateBadge pass={s.regime_pass} label="REG" />
                     <GateBadge pass={s.ml_pass} label="ML" />
                   </div>
@@ -109,7 +110,7 @@ export default function SignalsTable({ signals, loading }: SignalsTableProps) {
                   {s.passed_gates ? (
                     s.acted_on ? (
                       <span className="inline-flex items-center gap-1 text-xs text-[var(--accent-emerald)]">
-                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" /> Filled #{s.trade_id}
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" /> {s.trade_id != null ? `Filled #${s.trade_id}` : 'Filled'}
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-1 text-xs text-[var(--accent-cyan)]">

@@ -69,6 +69,29 @@ def _label_for_barrier_path(future: pd.DataFrame, direction: int, tp_px: float, 
     return label
 
 
+def _label_for_barrier_path_fast(
+    future_high: np.ndarray, future_low: np.ndarray,
+    direction: int, tp_px: float, sl_px: float
+) -> float:
+    """Vectorized version of _label_for_barrier_path using numpy arrays."""
+    if direction == 1:
+        tp_hit = future_high >= tp_px
+        sl_hit = future_low <= sl_px
+    else:
+        tp_hit = future_low <= tp_px
+        sl_hit = future_high >= sl_px
+    n = len(tp_hit)
+    first_tp = int(np.argmax(tp_hit)) if tp_hit.any() else n
+    first_sl = int(np.argmax(sl_hit)) if sl_hit.any() else n
+    if first_tp < first_sl:
+        return 1.0
+    if first_sl < first_tp:
+        return -1.0
+    if first_tp == first_sl < n:
+        return -1.0  # simultaneous hit — SL wins
+    return 0.0  # timeout
+
+
 def compute_labels_from_ohlcv_iteration(
     ohlcv: pd.DataFrame,
     spec: TripleBarrierSpec,
@@ -113,23 +136,33 @@ def compute_labels_from_feature_index(
     target = pd.Series(index=feature_index, dtype=float)
     vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
 
+    # Pre-compute numpy arrays and index map for O(1) lookups (avoids per-row pandas overhead)
+    _close_arr = ohlcv['close'].values
+    _high_arr = ohlcv['high'].values
+    _low_arr = ohlcv['low'].values
+    _vol_arr = vol.values
+    _idx_map = {ts: i for i, ts in enumerate(ohlcv.index)}
+    _dir_arr = direction.reindex(ohlcv.index, fill_value=0.0).values
+    h = int(spec.horizon_hours)
+    n = len(ohlcv)
+
     for ts in feature_index:
-        if ts not in ohlcv.index or ts not in vol.index:
+        pos = _idx_map.get(ts)
+        if pos is None:
             continue
 
-        row_vol = vol.loc[ts]
-        if pd.isna(row_vol) or row_vol <= 0:
+        row_vol = _vol_arr[pos]
+        if np.isnan(row_vol) or row_vol <= 0:
             continue
 
-        side = int(direction.get(ts, 0.0))
+        side = int(_dir_arr[pos])
         if side == 0:
             continue
 
-        pos = ohlcv.index.get_loc(ts)
-        if pos + spec.horizon_hours >= len(ohlcv):
+        if pos + h >= n:
             continue
 
-        entry_px = ohlcv.loc[ts, 'close']
+        entry_px = _close_arr[pos]
         tp_move = spec.tp_mult * row_vol
         sl_move = spec.sl_mult * row_vol
 
@@ -140,8 +173,9 @@ def compute_labels_from_feature_index(
             tp_px = entry_px * (1 - tp_move)
             sl_px = entry_px * (1 + sl_move)
 
-        future = ohlcv.iloc[pos + 1: pos + 1 + spec.horizon_hours]
-        target.loc[ts] = _label_for_barrier_path(future, side, tp_px, sl_px)
+        future_high = _high_arr[pos + 1: pos + 1 + h]
+        future_low = _low_arr[pos + 1: pos + 1 + h]
+        target.loc[ts] = _label_for_barrier_path_fast(future_high, future_low, side, tp_px, sl_px)
 
     return target
 

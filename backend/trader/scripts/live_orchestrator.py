@@ -88,6 +88,7 @@ def _build_train_model_cmd(args: argparse.Namespace) -> List[str]:
     min_auc = os.getenv("MIN_AUC")
     leverage = os.getenv("LEVERAGE")
     exclude = os.getenv("EXCLUDE_SYMBOLS")
+    pruned_only = os.getenv("PRUNED_ONLY", "").lower() in ("1", "true", "yes")
 
     if threshold:
         cmd.extend(["--threshold", threshold])
@@ -97,6 +98,8 @@ def _build_train_model_cmd(args: argparse.Namespace) -> List[str]:
         cmd.extend(["--leverage", leverage])
     if exclude:
         cmd.extend(["--exclude", exclude])
+    if pruned_only:
+        cmd.append("--pruned-only")
     if args.debug:
         cmd.append("--debug")
 

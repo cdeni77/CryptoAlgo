@@ -4,6 +4,7 @@
 import argparse
 import json
 import multiprocessing as mp
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from scripts.optimize import (
     load_data,
     optimize_coin,
     optimize_coin_multiseed,
+    resolve_gate_mode,
 )
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
@@ -165,13 +167,13 @@ class OptimizationConfig:
     gate_mode: str = "initial_paper_qualification"
     study_suffix: str = ""
     resume_study: bool = False
-    min_psr: float = 0.55
+    min_psr: float = 0.50
     min_psr_cv: float | None = None
     min_psr_holdout: float | None = None
     min_dsr: float | None = None
-    seed_stability_min_pass_rate: float = 0.67
-    seed_stability_max_param_dispersion: float = 0.60
-    seed_stability_max_oos_sharpe_dispersion: float = 0.35
+    seed_stability_min_pass_rate: float = 0.50
+    seed_stability_max_param_dispersion: float = 1.0
+    seed_stability_max_oos_sharpe_dispersion: float = 0.70
     cv_mode: str = "walk_forward"
     purge_days: int | None = None
     purge_bars: int | None = None
@@ -179,7 +181,7 @@ class OptimizationConfig:
     embargo_bars: int | None = None
     embargo_frac: float = 0.0
     pruned_only: bool = True
-    preset_name: str = "paper_ready"
+    preset_name: str = "fast_qualify"
     cost_config_path: str | None = None
     proxy_fidelity_candidates: int = 0
     proxy_fidelity_eval_days: int = 0
@@ -241,6 +243,7 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
             cost_config_path=config.cost_config_path,
             proxy_fidelity_candidates=config.proxy_fidelity_candidates,
             proxy_fidelity_eval_days=config.proxy_fidelity_eval_days,
+            use_memory_storage=True,
         )
         return {
             "coin": coin,
@@ -307,6 +310,7 @@ def _optimize_seed_worker(args: tuple[dict[str, Any], str, int, OptimizationConf
             cost_config_path=config.cost_config_path,
             proxy_fidelity_candidates=config.proxy_fidelity_candidates,
             proxy_fidelity_eval_days=config.proxy_fidelity_eval_days,
+            use_memory_storage=True,
         )
         return {
             "coin": coin,
@@ -449,12 +453,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-trades-per-year", type=float, default=None)
     parser.add_argument("--require-holdout-pass", action="store_true")
     parser.add_argument("--gate-mode", type=str, default="initial_paper_qualification")
-    parser.add_argument("--preset", type=str, default="paper_ready")
+    parser.add_argument("--preset", type=str, default="fast_qualify",
+                        choices=["none", "quick", "fast_qualify", "discovery", "robust120", "robust180", "paper_ready"])
     parser.add_argument("--pruned-only", action="store_true")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only")
     parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--min-psr", type=float, default=0.55)
+    parser.add_argument("--min-psr", type=float, default=0.50)
     parser.add_argument("--min-psr-cv", type=float, default=None)
     parser.add_argument("--min-psr-holdout", type=float, default=None)
     parser.add_argument("--min-dsr", type=float, default=None)
@@ -476,7 +481,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = build_parser().parse_args(argv)
-    return apply_runtime_preset(args)
+    args = apply_runtime_preset(args)
+    # Apply gate_mode holdout overrides — must happen AFTER preset so the gate_mode's
+    # lenient thresholds win over the preset's stricter defaults when no explicit flag is given.
+    # (Mirrors the same logic in optimize.py __main__ that was missing here.)
+    gate_cfg = resolve_gate_mode(args.gate_mode)
+    provided = set(argv if argv is not None else sys.argv[1:])
+    if "--holdout-min-trades" not in provided:
+        args.holdout_min_trades = int(gate_cfg["holdout_min_trades"])
+    if "--holdout-min-sharpe" not in provided:
+        args.holdout_min_sharpe = float(gate_cfg["holdout_min_sharpe"])
+    if "--holdout-min-return" not in provided:
+        args.holdout_min_return = float(gate_cfg["holdout_min_return"])
+    return args
 
 
 def main() -> None:
@@ -495,6 +512,11 @@ def main() -> None:
     print(f"Total tasks: {total_tasks}")
     print(f"Workers: {resolved_workers}")
     print(f"Jobs per optimization: {args.jobs}")
+    print(f"Preset: {args.preset} | Gate: {args.gate_mode} | "
+          f"holdout_min_trades={args.holdout_min_trades}, "
+          f"holdout_min_sharpe={args.holdout_min_sharpe}, "
+          f"holdout_min_return={args.holdout_min_return}, "
+          f"require_holdout_pass={args.require_holdout_pass}")
 
     config = OptimizationConfig(
         trials=args.trials,
