@@ -29,7 +29,6 @@ const COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE'];
 const coinIcons: Record<CoinSymbol, string> = { BTC: '₿', ETH: 'Ξ', SOL: '◎', XRP: '✕', DOGE: 'Ð' };
 
 type TradingMode = 'live' | 'paper';
-type LiveTab = 'signals' | 'trades';
 type PaperTab = 'positions' | 'equity' | 'performance' | 'fills';
 
 const formatAgo = (d: Date | null) => {
@@ -59,12 +58,12 @@ export default function TradingTerminalPage() {
 
   // ── Live mode ────────────────────────────────────────────────────
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [signals, setSignals] = useState<Signal[]>([]);
   const [loadingTrades, setLoadingTrades] = useState(true);
-  const [loadingSignals, setLoadingSignals] = useState(true);
-  const [signalsUpdatedAt, setSignalsUpdatedAt] = useState<Date | null>(null);
   const [tradesUpdatedAt, setTradesUpdatedAt] = useState<Date | null>(null);
-  const [liveTab, setLiveTab] = useState<LiveTab>('signals');
+
+  // ── Signals (paper mode monitoring) ──────────────────────────────
+  const [signals, setSignals] = useState<Signal[]>([]);
+  const [loadingSignals, setLoadingSignals] = useState(true);
 
   // ── Paper mode ───────────────────────────────────────────────────
   const [paperPositions, setPaperPositions] = useState<PaperPosition[]>([]);
@@ -116,7 +115,6 @@ export default function TradingTerminalPage() {
       setLoadingSignals(true);
       try {
         setSignals(await getRecentSignals(200));
-        setSignalsUpdatedAt(new Date());
       } finally {
         setLoadingSignals(false);
       }
@@ -170,11 +168,9 @@ export default function TradingTerminalPage() {
     const closedTrades = trades.filter((t) => t.status === 'closed');
     const winners = closedTrades.filter((t) => (t.net_pnl ?? 0) > 0).length;
     const winRate = closedTrades.length > 0 ? (winners / closedTrades.length) * 100 : 0;
-    const actedSignals = signals.filter((s) => s.acted_on).length;
-    const actedRate = signals.length > 0 ? (actedSignals / signals.length) * 100 : 0;
     const realizedPnl = closedTrades.reduce((sum, t) => sum + (t.net_pnl ?? 0), 0);
-    return { openTrades, closedTrades: closedTrades.length, winRate, actedRate, realizedPnl };
-  }, [trades, signals]);
+    return { openTrades, closedTrades: closedTrades.length, winRate, realizedPnl };
+  }, [trades]);
 
   const paperKpis = useMemo(() => {
     const latest = paperEquity[0];
@@ -234,11 +230,10 @@ export default function TradingTerminalPage() {
 
         {/* KPI strip — switches between paper and live */}
         {mode === 'live' ? (
-          <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <section className="grid grid-cols-2 lg:grid-cols-3 gap-3">
             {[
               { label: 'Open Trades', value: liveKpis.openTrades.toString(), sub: `Closed ${liveKpis.closedTrades}` },
               { label: 'Win Rate', value: `${liveKpis.winRate.toFixed(1)}%`, sub: `Updated ${formatAgo(tradesUpdatedAt)}` },
-              { label: 'Signal Act Rate', value: `${liveKpis.actedRate.toFixed(1)}%`, sub: `Signals ${formatAgo(signalsUpdatedAt)}` },
               { label: 'Realized PNL', value: `${liveKpis.realizedPnl >= 0 ? '+' : '-'}$${Math.abs(liveKpis.realizedPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, sub: 'Closed trades only', valueClass: liveKpis.realizedPnl >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]' },
             ].map((k) => (
               <div key={k.label} className="glass-card rounded-xl p-3 text-center">
@@ -284,22 +279,8 @@ export default function TradingTerminalPage() {
           <>
             <WalletInfo loading={false} showPaperMetrics={false} showExternalMetrics showHoldingsBreakdown chartMode="portfolio" />
             <section>
-              <div className="flex flex-wrap gap-2 mb-4">
-                {[
-                  ['signals', `Signals (${signals.length})`],
-                  ['trades', `Trades (${trades.length})`],
-                ].map(([key, label]) => (
-                  <button
-                    key={key}
-                    onClick={() => setLiveTab(key as LiveTab)}
-                    className={`px-4 py-2 rounded-lg text-sm ${liveTab === key ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] border border-[var(--border-accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              {liveTab === 'signals' && <SignalsTable signals={signals} loading={loadingSignals} />}
-              {liveTab === 'trades' && <TradesTable trades={trades} loading={loadingTrades} />}
+              <h2 className="text-sm font-semibold mb-3">Live Trades ({trades.length})</h2>
+              <TradesTable trades={trades} loading={loadingTrades} />
             </section>
           </>
         ) : (
