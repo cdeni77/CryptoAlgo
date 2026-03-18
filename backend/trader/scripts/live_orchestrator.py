@@ -259,7 +259,8 @@ def _run_retrain(train_window_days: int, retrain_every_days: int, writer: PgWrit
     staged_dir = MODELS_DIR / ".staging" / version
     staged_dir.mkdir(parents=True, exist_ok=True)
 
-    config = Config(retrain_frequency_days=retrain_every_days)
+    pruned_only = os.getenv("PRUNED_ONLY", "").lower() in ("1", "true", "yes")
+    config = Config(retrain_frequency_days=retrain_every_days, enforce_pruned_features=pruned_only)
     data = load_data()
     run_id = None
     if writer:
