@@ -1,4 +1,4 @@
-import { PaperEquityPoint, PaperFill, PaperOrder, PaperPosition } from '../types';
+import { PaperEquityPoint, PaperFill, PaperPosition } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
@@ -17,10 +17,6 @@ export async function getPaperPositions(): Promise<PaperPosition[]> {
 
 export async function getPaperEquity(limit = 250): Promise<PaperEquityPoint[]> {
   return fetchWithError(`${API_BASE}/paper/equity?limit=${limit}`);
-}
-
-export async function getPaperOrders(limit = 100): Promise<PaperOrder[]> {
-  return fetchWithError(`${API_BASE}/paper/orders?limit=${limit}`);
 }
 
 export async function getPaperFills(limit = 100): Promise<PaperFill[]> {

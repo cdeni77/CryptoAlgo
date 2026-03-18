@@ -64,6 +64,8 @@ export interface Signal {
   notional_usd: number | null;
   acted_on: boolean;
   trade_id: number | null;
+  passed_gates: boolean;
+  gate_failure_reason: string | null;
   created_at: string | null;
 }
 
@@ -146,17 +148,6 @@ export interface WalletData {
       total_value_usd: number;
     }>
   >;
-}
-
-export interface PaperOrder {
-  id: number;
-  signal_id: number;
-  coin: string;
-  side: 'long' | 'short';
-  contracts: number;
-  target_price: number;
-  status: 'new' | 'filled' | 'canceled';
-  created_at: string;
 }
 
 export interface PaperFill {

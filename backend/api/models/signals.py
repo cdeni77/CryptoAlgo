@@ -27,6 +27,8 @@ class Signal(Base):
     notional_usd = Column(Float, nullable=True)
     acted_on = Column(Boolean, default=False)
     trade_id = Column(Integer, nullable=True)
+    passed_gates = Column(Boolean, nullable=False, default=True)
+    gate_failure_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     def __repr__(self):
@@ -50,6 +52,8 @@ class SignalResponse(BaseModel):
     notional_usd: Optional[float] = None
     acted_on: bool = False
     trade_id: Optional[int] = None
+    passed_gates: bool = True
+    gate_failure_reason: Optional[str] = None
     created_at: Optional[datetime] = None
 
     class Config:

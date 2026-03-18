@@ -20,7 +20,7 @@ import sqlite3
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -55,6 +55,7 @@ from core.meta_labeling import (
 )
 from core.strategies import StrategyContext, get_strategy_family
 from core.paper_profile_overrides import load_paper_profile_overrides
+from core.pg_writer import PgWriter as _PgWriter
 
 warnings.filterwarnings('ignore')
 
@@ -2073,6 +2074,13 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
     print("   Strategy family: resolved per symbol/profile")
     gate_counters = _new_gate_counters()
 
+    _pg: Optional[_PgWriter] = None
+    if os.environ.get("DATABASE_URL"):
+        try:
+            _pg = _PgWriter()
+        except Exception as _e:
+            print(f"   ⚠️  Failed to connect to DB for signal writing: {_e}")
+
     for sym, d in all_data.items():
         profile = _get_profile(sym, profile_overrides)
         feat, ohlc = d['features'], d['ohlcv']
@@ -2298,28 +2306,35 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
             print(f"  Policy penalties: rank={candidate_rank_penalty:.2f} | size_mult={candidate_size_multiplier:.2f}")
             print(f"  24h Vol: {vol_24h:.4f}" if not pd.isna(vol_24h) else "  24h Vol: N/A")
 
+        # ── Gate evaluation (collect result instead of early-exit so we can log all) ──
+        gate_failure_reason: str | None = None
         if not momentum_pass:
             _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
+            gate_failure_reason = 'momentum_magnitude'
             if debug:
                 print(f"  Skip reason: momentum_magnitude (family={strategy_family.name}, |72h|={abs(ret_72h):.4f}, min={effective_momentum:.4f})")
-            continue
-        if not regime_pass:
+        elif not regime_pass:
             _increment_gate_counter(gate_counters, sym, regime_reason)
+            gate_failure_reason = regime_reason
             if debug:
                 print(f"  Skip reason: {regime_reason}")
-            continue
-        if not ml_pass:
+        elif not ml_pass:
             _increment_gate_counter(gate_counters, sym, 'primary_threshold')
+            gate_failure_reason = 'primary_threshold'
             if debug:
                 print("  Skip reason: primary_threshold")
-            continue
-        if not meta_pass:
+        elif not meta_pass:
             _increment_gate_counter(gate_counters, sym, 'meta_threshold')
+            gate_failure_reason = 'meta_threshold'
             if debug:
                 print("  Skip reason: meta_threshold")
-            continue
 
-        if ml_pass and meta_pass and regime_pass and momentum_pass:
+        passed = gate_failure_reason is None
+        dir_str = 'LONG' if direction == 1 else 'SHORT'
+        n_contracts: int | None = None
+        notional: float | None = None
+
+        if passed:
             n_contracts = calculate_n_contracts(
                 100_000, price, sym, config,
                 vol_24h=vol_24h if not pd.isna(vol_24h) else 0.02,
@@ -2330,13 +2345,44 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
                 _increment_gate_counter(gate_counters, sym, 'no_contract_size')
                 if debug:
                     print(f"  Skip reason: no_contract_size")
-                continue
-            spec = get_contract_spec(sym)
-            dir_str = 'LONG' if direction == 1 else 'SHORT'
-            notional = n_contracts * spec['units'] * price
-            print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
-                  f"{n_contracts} contracts | ${notional:,.0f} notional | "
-                  f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")
+                gate_failure_reason = 'no_contract_size'
+                passed = False
+                n_contracts = None
+            else:
+                spec = get_contract_spec(sym)
+                notional = n_contracts * spec['units'] * price
+                print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
+                      f"{n_contracts} contracts | ${notional:,.0f} notional | "
+                      f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")
+
+        if _pg is not None:
+            try:
+                _pg.write_signal(
+                    coin=profile.name,
+                    timestamp=datetime.now(timezone.utc),
+                    direction="long" if direction == 1 else "short",
+                    confidence=prob,
+                    raw_probability=raw_prob,
+                    model_auc=auc,
+                    price_at_signal=price,
+                    momentum_pass=momentum_pass,
+                    regime_pass=regime_pass,
+                    ml_pass=ml_pass,
+                    contracts_suggested=n_contracts,
+                    notional_usd=float(notional) if notional is not None else None,
+                    passed_gates=passed,
+                    gate_failure_reason=gate_failure_reason,
+                    idempotency_key=f"{profile.name}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M')}_{dir_str}",
+                )
+                if passed:
+                    print(f"   ✅ Signal written to DB: {profile.name} {dir_str} conf={prob:.3f}")
+                else:
+                    print(f"   📝 Signal logged (rejected: {gate_failure_reason}): {profile.name} {dir_str} conf={prob:.3f}")
+            except Exception as _e:
+                print(f"   ⚠️  Failed to write signal to DB: {_e}")
+
+        if not passed:
+            continue
 
     if debug:
         _print_gate_counter_summary(

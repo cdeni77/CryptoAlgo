@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from coinbase.rest import RESTClient
 from database import get_db
-from models.trade import Trade, TradeSide, TradeStatus
+from models.trade import PaperEquityCurve, Trade, TradeSide, TradeStatus
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
 
@@ -632,7 +632,13 @@ def get_wallet(db: Session = Depends(get_db)):
     ledger_usd = _safe_float(ledger.get("value_usd"))
     portfolio_total = (spot_usd or 0.0) + (perps_usd or 0.0) + (ledger_usd or 0.0)
 
-    paper_balance = 10000.0
+    INITIAL_PAPER_EQUITY = 10_000.0
+    latest_equity_row = (
+        db.query(PaperEquityCurve).order_by(PaperEquityCurve.timestamp.desc()).first()
+    )
+    paper_balance = latest_equity_row.equity if latest_equity_row else INITIAL_PAPER_EQUITY
+    paper_cash = latest_equity_row.cash_balance if latest_equity_row else INITIAL_PAPER_EQUITY
+    paper_unrealized = latest_equity_row.unrealized_pnl if latest_equity_row else 0.0
 
     holdings = _combine_assets(spot.get("assets", []), ledger.get("assets", []))
     history_configs = {
@@ -661,8 +667,8 @@ def get_wallet(db: Session = Depends(get_db)):
         "wallets": {
             "paper_trading": {
                 "value_usd": round(paper_balance, 2),
-                "cash_usd": round(paper_balance, 2),
-                "unrealized_pnl": 0.0,
+                "cash_usd": round(paper_cash, 2),
+                "unrealized_pnl": round(paper_unrealized, 4),
                 "status": "ok",
             },
             "coinbase_spot": {"value_usd": spot.get("value_usd"), "status": spot.get("status")},

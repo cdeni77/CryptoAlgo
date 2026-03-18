@@ -1,14 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { getPaperEquity, getPaperFills, getPaperPositions } from '../api/paperApi';
 import { getResearchCoin, getResearchFeatures, getResearchJobLogs, getResearchJobs, getResearchRuns, getResearchScripts, getResearchSummary, launchResearchJob } from '../api/researchApi';
-import PaperEquityTable from '../components/PaperEquityTable';
-import PaperFillsTable from '../components/PaperFillsTable';
-import PaperPerformancePanel from '../components/PaperPerformancePanel';
-import PaperPositionsTable from '../components/PaperPositionsTable';
-import WalletInfo from '../components/WalletInfo';
-import { PaperEquityPoint, PaperFill, PaperPosition, ReadinessTier, ReadinessTierDisplayMeta, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchScriptInfo, ResearchSummary } from '../types';
-
-type PaperTab = 'positions' | 'equity' | 'performance' | 'fills';
+import { ReadinessTier, ReadinessTierDisplayMeta, ResearchCoinHealth, ResearchFeatures, ResearchJobLaunchResponse, ResearchRun, ResearchScriptInfo, ResearchSummary } from '../types';
 
 const READINESS_TIER_META: Record<ReadinessTier, ReadinessTierDisplayMeta> = {
   FULL: { label: 'Full', tone: 'emerald', description: 'Production-ready: normal position sizing is allowed.' },
@@ -47,15 +39,9 @@ export default function StrategyLabPage() {
   const [selectedCoin, setSelectedCoin] = useState('BTC');
   const [features, setFeatures] = useState<ResearchFeatures | null>(null);
   const [coinDetail, setCoinDetail] = useState<ResearchCoinHealth | null>(null);
-  const [paperPositions, setPaperPositions] = useState<PaperPosition[]>([]);
-  const [paperEquity, setPaperEquity] = useState<PaperEquityPoint[]>([]);
-  const [paperFills, setPaperFills] = useState<PaperFill[]>([]);
   const [loading, setLoading] = useState(true);
-  const [loadingPaper, setLoadingPaper] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [paperTab, setPaperTab] = useState<PaperTab>('positions');
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
-  const [paperUpdatedAt, setPaperUpdatedAt] = useState<Date | null>(null);
   const [scripts, setScripts] = useState<ResearchScriptInfo[]>([]);
   const [selectedScript, setSelectedScript] = useState('');
   const [cliArgs, setCliArgs] = useState('');
@@ -189,40 +175,18 @@ export default function StrategyLabPage() {
     }
   }, [cliArgs, selectedScript]);
 
-  const loadPaper = useCallback(async () => {
-    setLoadingPaper(true);
-    try {
-      const [positions, equity, fills] = await Promise.all([
-        getPaperPositions(),
-        getPaperEquity(250),
-        getPaperFills(250),
-      ]);
-      setPaperPositions(positions);
-      setPaperEquity(equity);
-      setPaperFills(fills);
-      setPaperUpdatedAt(new Date());
-    } finally {
-      setLoadingPaper(false);
-    }
-  }, []);
-
   useEffect(() => {
     loadResearch();
-    loadPaper();
     loadScripts();
     loadLaunchedJobs();
     const researchIv = setInterval(loadResearch, 45000);
-    const paperIv = setInterval(loadPaper, 20000);
-    return () => {
-      clearInterval(researchIv);
-      clearInterval(paperIv);
-    };
-  }, [loadLaunchedJobs, loadPaper, loadResearch, loadScripts]);
+    return () => clearInterval(researchIv);
+  }, [loadLaunchedJobs, loadResearch, loadScripts]);
 
   const staleData = useMemo(() => {
-    if (!updatedAt || !paperUpdatedAt) return false;
-    return Date.now() - updatedAt.getTime() > 120000 || Date.now() - paperUpdatedAt.getTime() > 40000;
-  }, [updatedAt, paperUpdatedAt]);
+    if (!updatedAt) return false;
+    return Date.now() - updatedAt.getTime() > 120000;
+  }, [updatedAt]);
 
   const kpiCards = useMemo(() => {
     const k = summary?.kpis;
@@ -246,8 +210,8 @@ export default function StrategyLabPage() {
             <p className="text-xs text-[var(--text-muted)]">Model lifecycle telemetry + paper trading workflow.</p>
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-xs font-mono-trade text-[var(--text-muted)]">Research: {formatAgo(updatedAt)} · Paper: {formatAgo(paperUpdatedAt)}</span>
-            <button onClick={() => { loadResearch(); loadPaper(); loadScripts(); loadLaunchedJobs(); }} className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)]">Refresh All</button>
+            <span className="text-xs font-mono-trade text-[var(--text-muted)]">Research: {formatAgo(updatedAt)}</span>
+            <button onClick={() => { loadResearch(); loadScripts(); loadLaunchedJobs(); }} className="px-3 py-2 rounded-lg text-xs border border-[var(--border-accent)] text-[var(--accent-cyan)]">Refresh All</button>
           </div>
         </div>
       </header>
@@ -471,30 +435,6 @@ export default function StrategyLabPage() {
           )}
         </section>
 
-        <section>
-          <h2 className="text-sm font-semibold mb-3">Paper Trading Wallet</h2>
-          <WalletInfo loading={false} showPaperMetrics showExternalMetrics={false} showHoldingsBreakdown={false} chartMode="paper" />
-        </section>
-
-        <section>
-          <div className="flex flex-wrap gap-2 mb-4 overflow-x-auto">
-            {[
-              ['positions', `Positions (${paperPositions.length})`],
-              ['equity', `Equity (${paperEquity.length})`],
-              ['performance', 'Performance'],
-              ['fills', `Fills (${paperFills.length})`],
-            ].map(([key, label]) => (
-              <button key={key} onClick={() => setPaperTab(key as PaperTab)} className={`px-4 py-2 rounded-lg text-sm ${paperTab === key ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] border border-[var(--border-accent)]' : 'text-[var(--text-muted)]'}`}>
-                {label}
-              </button>
-            ))}
-          </div>
-
-          {paperTab === 'positions' && <PaperPositionsTable positions={paperPositions} loading={loadingPaper} />}
-          {paperTab === 'equity' && <PaperEquityTable points={paperEquity} loading={loadingPaper} />}
-          {paperTab === 'performance' && <PaperPerformancePanel equity={paperEquity} fills={paperFills} loading={loadingPaper} />}
-          {paperTab === 'fills' && <PaperFillsTable fills={paperFills} loading={loadingPaper} />}
-        </section>
       </main>
     </>
   );

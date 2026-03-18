@@ -2,7 +2,7 @@
 
 import enum
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import create_engine
@@ -73,6 +73,8 @@ class Signal(Base):
     notional_usd = Column(Float, nullable=True)
     acted_on = Column(Boolean, default=False)
     trade_id = Column(Integer, nullable=True)
+    passed_gates = Column(Boolean, nullable=False, default=True)
+    gate_failure_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -185,14 +187,20 @@ class PgWriter:
         notional_usd: float | None = None,
         acted_on: bool = False,
         trade_id: int | None = None,
+        passed_gates: bool = True,
+        gate_failure_reason: str | None = None,
     ) -> int:
         """Insert one signal row. Returns the signal id (idempotent for coin+timestamp+direction)."""
         _ = mode
         with self._session() as db:
             if idempotency_key:
+                # Deduplicate by coin+direction within the same minute window
+                minute_start = timestamp.replace(second=0, microsecond=0)
+                minute_end = minute_start + timedelta(minutes=1)
                 existing = db.query(Signal).filter(
                     Signal.coin == coin,
-                    Signal.timestamp == timestamp,
+                    Signal.timestamp >= minute_start,
+                    Signal.timestamp < minute_end,
                     Signal.direction == direction,
                 ).first()
                 if existing:
@@ -214,6 +222,8 @@ class PgWriter:
                 notional_usd=notional_usd,
                 acted_on=acted_on,
                 trade_id=trade_id,
+                passed_gates=passed_gates,
+                gate_failure_reason=gate_failure_reason,
             )
             db.add(sig)
             db.commit()
@@ -459,7 +469,7 @@ class PgWriter:
         with self._session() as db:
             return (
                 db.query(Signal)
-                .filter(Signal.id > since_id)
+                .filter(Signal.id > since_id, Signal.acted_on.is_(False), Signal.passed_gates.is_(True))
                 .order_by(Signal.id.asc())
                 .all()
             )

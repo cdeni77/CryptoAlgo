@@ -15,8 +15,3 @@ export async function getRecentSignals(limit = 50): Promise<Signal[]> {
   return fetchWithError(`${API_BASE}/signals?limit=${limit}`);
 }
 
-export async function getSignalsByCoin(coin: string, hours?: number, limit = 100): Promise<Signal[]> {
-  const params = new URLSearchParams({ limit: String(limit) });
-  if (hours) params.set('hours', String(hours));
-  return fetchWithError(`${API_BASE}/signals/coin/${coin}?${params}`);
-}

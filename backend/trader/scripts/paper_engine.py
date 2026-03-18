@@ -30,11 +30,13 @@ class PaperTradingEngine:
         max_signal_age_minutes: float = 30.0,
         tier_map: dict[str, str] | None = None,
         tier_size_multipliers: dict[str, float] | None = None,
+        min_confidence: float = 0.0,
     ):
         self.poll_seconds = poll_seconds
         self.max_signal_age_minutes = max_signal_age_minutes
         self.writer = PgWriter()
         self.config = Config()
+        self.min_confidence = min_confidence
         self.state = EngineState()
         self.tier_map = {k.upper(): v.upper() for k, v in (tier_map or {}).items()}
         self.tier_size_multipliers = {"FULL": 1.0, "PILOT": 0.5, "SHADOW": 0.0}
@@ -74,13 +76,13 @@ class PaperTradingEngine:
             return
 
         confidence = float(signal.confidence or 0.0)
-        if confidence < self.config.signal_threshold:
+        if confidence < self.min_confidence:
             logger.info(
                 "skipping low-confidence signal id=%s coin=%s conf=%.3f<th=%.3f",
                 signal.id,
                 signal.coin,
                 confidence,
-                self.config.signal_threshold,
+                self.min_confidence,
             )
             self.writer.mark_signal_acted(signal.id)
             return
@@ -226,6 +228,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="paper trading engine")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--max-signal-age-minutes", type=float, default=30.0)
+    parser.add_argument("--min-confidence", type=float, default=0.0,
+                        help="Minimum signal confidence to act on (default 0.0 trusts train_model pre-filtering)")
     parser.add_argument(
         "--tier-map",
         type=str,
@@ -246,6 +250,7 @@ def main() -> None:
         max_signal_age_minutes=args.max_signal_age_minutes,
         tier_map=_parse_tier_map(args.tier_map),
         tier_size_multipliers=_parse_multipliers(args.tier_size_multipliers),
+        min_confidence=args.min_confidence,
     ).run_forever()
 
 

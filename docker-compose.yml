@@ -87,7 +87,8 @@ services:
       - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
 
       # Signal generation parameters (from train_model.py defaults)
-      - SIGNAL_THRESHOLD=0.74
+      # SIGNAL_THRESHOLD is intentionally omitted — per-coin profiles define their own thresholds
+      # (SOL=0.57, others=0.52-0.53 from coin_profiles.py). Set this only to override all profiles.
       - MIN_AUC=0.54
       - LEVERAGE=4
       - EXCLUDE_SYMBOLS=BIP,DOP
@@ -108,7 +109,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import os, psycopg2; psycopg2.connect(os.environ['DATABASE_URL']).close(); print('ok')\"",
+          "python -c \"import os, psycopg2; psycopg2.connect(os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://')).close(); print('ok')\"",
         ]
       interval: 30s
       timeout: 10s
@@ -122,12 +123,37 @@ services:
       # Mount source for development (remove in production)
       - ./backend/trader:/app
       - ./configs:/app/configs:ro
+      # Paper candidate overrides (optimizer results) — overlays the named volume subdir
+      - ./backend/trader/data/paper_candidates:/app/data/paper_candidates
     # The orchestrator: initial backfill (30d) then hourly cycles
     command: >
       -m scripts.live_orchestrator
         --backfill-days 30
         --include-oi
         --debug
+
+  # ===========================================================================
+  # Paper Engine — consumes signals from PostgreSQL and simulates fills
+  # ===========================================================================
+  paper-engine:
+    build:
+      context: ./backend/trader
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
+      - TZ=America/New_York
+    depends_on:
+      db:
+        condition: service_healthy
+      trader:
+        condition: service_started
+    volumes:
+      - ./backend/trader:/app
+    command: >
+      -m scripts.paper_engine
+        --poll-seconds 5
+        --max-signal-age-minutes 60
 
   # ===========================================================================
   # Trader — Backtest mode (run once, then exit)
