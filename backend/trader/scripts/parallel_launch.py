@@ -391,7 +391,9 @@ def run_optimization(coins: list[str], config: OptimizationConfig, workers: int,
     run_id = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S%fZ")
 
     if parallel_mode == "coin-seed":
-        work_items = [(all_data, coin, int(seed), config, run_id) for coin in coins for seed in config.seeds]
+        # Interleave by seed (seed-major) so all coins start immediately when workers < total tasks.
+        # coin-major order (old) starved last coins when workers < len(coins)*len(seeds).
+        work_items = [(all_data, coin, int(seed), config, run_id) for seed in config.seeds for coin in coins]
         if workers <= 1 or len(work_items) == 1:
             seed_outputs = [_optimize_seed_worker(item) for item in work_items]
         else:
