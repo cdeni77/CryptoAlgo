@@ -54,10 +54,18 @@ ASSET_TO_CODE_MAP = {
     "SOL": "SLP",
     "XRP": "XPP",
     "DOGE": "DOP",
+    # New coins — verified 20DEC30 CDE codes from Coinbase API
+    "AVAX": "AVP",
+    "ADA": "ADP",
+    "LINK": "LNP",
+    "LTC": "LCP",
 }
 
 DEFAULT_TIMEFRAMES = ["1h", "1d"]
-DEFAULT_SYMBOLS = ["BTC-PERP", "ETH-PERP", "SOL-PERP", "XRP-PERP", "DOGE-PERP"]
+DEFAULT_SYMBOLS = [
+    "BTC-PERP", "ETH-PERP", "SOL-PERP", "XRP-PERP", "DOGE-PERP",
+    "AVP-20DEC30-CDE", "ADP-20DEC30-CDE", "LNP-20DEC30-CDE", "LCP-20DEC30-CDE",
+]
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -491,28 +499,46 @@ async def backfill_open_interest(
 async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
     """
     Resolve active Coinbase Perpetual contract IDs.
-    
-    Returns list of product IDs like ["BIP-20DEC30-CDE", "ETP-20DEC30-CDE", ...]
+
+    Returns product IDs found on Coinbase (e.g. "BIP-20DEC30-CDE") PLUS
+    "-PERP" fallback symbols for any configured asset not covered by Coinbase,
+    so CCXT can backfill historical data for those.
     """
     logger.info("🔍 Resolving active Coinbase Perpetual contracts...")
-    
+
     try:
         client = CoinbaseRESTClient(api_key, api_secret)
         target_codes = list(ASSET_TO_CODE_MAP.values())
         products = await client.get_perpetual_products(target_codes=target_codes)
         await client.close()
-        
-        active_symbols = [p['product_id'] for p in products]
-        
-        if active_symbols:
-            logger.info(f"✅ Found {len(active_symbols)} active contracts:")
-            for s in active_symbols:
+
+        coinbase_symbols = [p['product_id'] for p in products]
+
+        if coinbase_symbols:
+            logger.info(f"✅ Found {len(coinbase_symbols)} Coinbase CDE contracts:")
+            for s in coinbase_symbols:
                 logger.info(f"   -> {s}")
         else:
             logger.warning("⚠️ No matching perpetuals found from Coinbase API")
-        
-        return active_symbols
-        
+
+        # Determine which assets were covered by Coinbase
+        covered_assets: set = set()
+        for sym in coinbase_symbols:
+            code = sym.split('-')[0].upper()
+            for asset, asset_code in ASSET_TO_CODE_MAP.items():
+                if code == asset_code.upper() or code == asset.upper():
+                    covered_assets.add(asset.upper())
+
+        # Add CCXT-fallback "-PERP" symbols for any asset not found on Coinbase
+        all_symbols = list(coinbase_symbols)
+        for asset in ASSET_TO_CODE_MAP:
+            if asset.upper() not in covered_assets:
+                fallback = f"{asset}-PERP"
+                all_symbols.append(fallback)
+                logger.info(f"   ⤷ {asset} not on Coinbase CDE — using CCXT fallback: {fallback}")
+
+        return all_symbols
+
     except Exception as e:
         logger.error(f"⚠️ Failed to resolve Coinbase symbols: {e}")
         return []

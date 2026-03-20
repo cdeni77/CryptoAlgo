@@ -590,10 +590,11 @@ class MLSystem:
             horizon_hours=resolve_label_horizon(profile, self.config),
             tp_mult=profile.vol_mult_tp if profile else self.config.vol_mult_tp,
             sl_mult=profile.vol_mult_sl if profile else self.config.vol_mult_sl,
+            fee_pct_per_side=self.config.fee_pct_per_side,
         )
         direction = momentum_direction_series(
             ohlcv,
-            score_threshold=int(round(self.config.momentum_score_threshold)),
+            score_threshold=profile.direction_score_threshold if profile else int(round(self.config.momentum_score_threshold)),
         )
         return compute_labels_from_feature_index(ohlcv, features.index, spec, direction)
 

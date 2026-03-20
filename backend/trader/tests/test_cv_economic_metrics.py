@@ -83,7 +83,7 @@ def test_funding_sign_affects_net_pnl():
 
 def test_objective_stores_economic_cv_user_attrs(monkeypatch):
     fold_metric = {
-        'trades': 2,
+        'trades': 10,
         'raw_sharpe': 1.0,
         'sharpe': 0.8,
         'return': 0.12,

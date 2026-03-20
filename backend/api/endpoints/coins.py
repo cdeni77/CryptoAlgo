@@ -28,6 +28,10 @@ COINBASE_PRODUCTS = {
     "SOL": "SOL-USD",
     "XRP": "XRP-USD",
     "DOGE": "DOGE-USD",
+    "AVAX": "AVAX-USD",
+    "ADA": "ADA-USD",
+    "LINK": "LINK-USD",
+    "LTC": "LTC-USD",
 }
 
 # CDE (Contract for Difference / Perpetual) product mappings
@@ -67,6 +71,34 @@ CDE_PRODUCTS = {
         "units_per_contract": 5000,
         "approx_contract_value": 458.35,
         "fee_pct": 0.00100,  # 0.100% per side
+    },
+    "AVAX": {
+        "symbol": "AVP-20DEC30-CDE",
+        "code": "AVP",
+        "units_per_contract": 5,
+        "approx_contract_value": 47.50,
+        "fee_pct": 0.00100,
+    },
+    "ADA": {
+        "symbol": "ADP-20DEC30-CDE",
+        "code": "ADP",
+        "units_per_contract": 1000,
+        "approx_contract_value": 267.80,
+        "fee_pct": 0.00100,
+    },
+    "LINK": {
+        "symbol": "LNP-20DEC30-CDE",
+        "code": "LNP",
+        "units_per_contract": 10,
+        "approx_contract_value": 90.64,
+        "fee_pct": 0.00100,
+    },
+    "LTC": {
+        "symbol": "LCP-20DEC30-CDE",
+        "code": "LCP",
+        "units_per_contract": 1,
+        "approx_contract_value": 55.69,
+        "fee_pct": 0.00100,
     },
 }
 

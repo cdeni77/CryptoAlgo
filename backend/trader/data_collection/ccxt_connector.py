@@ -35,12 +35,21 @@ class CCXTConnector:
     
     # Symbol mapping between exchanges
     SYMBOL_MAPPING = {
-        # Coinbase symbol -> CCXT unified symbol
+        # Coinbase CDE code -> CCXT unified perpetual symbol
         "BIP": "BTC/USDT:USDT",
         "ETP": "ETH/USDT:USDT",
         "SLP": "SOL/USDT:USDT",
         "XPP": "XRP/USDT:USDT",
         "DOP": "DOGE/USDT:USDT",
+        # New coins — verified CDE codes (20DEC30 contracts)
+        "AVP": "AVAX/USDT:USDT",
+        "AVAX": "AVAX/USDT:USDT",
+        "ADP": "ADA/USDT:USDT",
+        "ADA": "ADA/USDT:USDT",
+        "LNP": "LINK/USDT:USDT",
+        "LINK": "LINK/USDT:USDT",
+        "LCP": "LTC/USDT:USDT",
+        "LTC": "LTC/USDT:USDT",
     }
     
     # Alternative exchanges that may work in restricted regions

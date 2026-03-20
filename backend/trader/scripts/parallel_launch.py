@@ -20,7 +20,7 @@ from scripts.optimize import (
     resolve_gate_mode,
 )
 
-COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "AVAX", "ADA", "LINK", "LTC"]
 MANIFEST_DIR = Path("optimization_results/manifests")
 
 
@@ -152,18 +152,18 @@ class OptimizationConfig:
     n_cv_folds: int = 5
     top_candidates: int = 10
     holdout_mode: str = "multi_slice"
-    holdout_days: int = 90
-    plateau_patience: int = 120
-    plateau_min_delta: float = 0.012
-    plateau_warmup: int = 60
+    holdout_days: int = 365
+    plateau_patience: int = 90
+    plateau_min_delta: float = 0.015
+    plateau_warmup: int = 45
     plateau_min_completed: int = 0
-    min_total_trades: int = 8
+    min_total_trades: int = 15
     holdout_min_trades: int = 8
     holdout_min_sharpe: float = 0.0
     holdout_min_return: float = -0.05
     target_trades_per_week: float = 1.0
     target_trades_per_year: float | None = None
-    require_holdout_pass: bool = False
+    require_holdout_pass: bool = True
     gate_mode: str = "initial_paper_qualification"
     study_suffix: str = ""
     resume_study: bool = False
@@ -171,9 +171,9 @@ class OptimizationConfig:
     min_psr_cv: float | None = None
     min_psr_holdout: float | None = None
     min_dsr: float | None = None
-    seed_stability_min_pass_rate: float = 0.50
-    seed_stability_max_param_dispersion: float = 1.0
-    seed_stability_max_oos_sharpe_dispersion: float = 0.70
+    seed_stability_min_pass_rate: float = 0.60
+    seed_stability_max_param_dispersion: float = 0.70
+    seed_stability_max_oos_sharpe_dispersion: float = 0.40
     cv_mode: str = "walk_forward"
     purge_days: int | None = None
     purge_bars: int | None = None
@@ -181,10 +181,12 @@ class OptimizationConfig:
     embargo_bars: int | None = None
     embargo_frac: float = 0.0
     pruned_only: bool = True
-    preset_name: str = "fast_qualify"
+    preset_name: str = "robust_annual"
     cost_config_path: str | None = None
     proxy_fidelity_candidates: int = 0
     proxy_fidelity_eval_days: int = 0
+    family_screen_trials: int = 30
+    family_screen_top_n: int = 2
 
 
 def _resolve_coin_prefix(coin: str) -> str:
@@ -243,6 +245,8 @@ def _optimize_single(args: tuple[dict[str, Any], str, OptimizationConfig, str]) 
             cost_config_path=config.cost_config_path,
             proxy_fidelity_candidates=config.proxy_fidelity_candidates,
             proxy_fidelity_eval_days=config.proxy_fidelity_eval_days,
+            family_screen_trials=config.family_screen_trials,
+            family_screen_top_n=config.family_screen_top_n,
             use_memory_storage=True,
         )
         return {
@@ -310,6 +314,8 @@ def _optimize_seed_worker(args: tuple[dict[str, Any], str, int, OptimizationConf
             cost_config_path=config.cost_config_path,
             proxy_fidelity_candidates=config.proxy_fidelity_candidates,
             proxy_fidelity_eval_days=config.proxy_fidelity_eval_days,
+            family_screen_trials=config.family_screen_trials,
+            family_screen_top_n=config.family_screen_top_n,
             use_memory_storage=True,
         )
         return {
@@ -442,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-cv-folds", type=int, default=5)
     parser.add_argument("--holdout-candidates", type=int, default=10)
     parser.add_argument("--holdout-mode", type=str, default="multi_slice")
-    parser.add_argument("--holdout-days", type=int, default=90)
+    parser.add_argument("--holdout-days", type=int, default=365)
     parser.add_argument("--plateau-patience", type=int, default=120)
     parser.add_argument("--plateau-min-delta", type=float, default=0.012)
     parser.add_argument("--plateau-warmup", type=int, default=60)
@@ -455,8 +461,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-trades-per-year", type=float, default=None)
     parser.add_argument("--require-holdout-pass", action="store_true")
     parser.add_argument("--gate-mode", type=str, default="initial_paper_qualification")
-    parser.add_argument("--preset", type=str, default="fast_qualify",
-                        choices=["none", "quick", "fast_qualify", "discovery", "robust120", "robust180", "paper_ready"])
+    parser.add_argument("--preset", type=str, default="robust_annual",
+                        choices=["none", "quick", "fast_qualify", "discovery", "robust120", "robust180", "robust_annual", "paper_ready"])
     parser.add_argument("--pruned-only", action="store_true")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only")
     parser.add_argument("--study-suffix", type=str, default="")
@@ -477,6 +483,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cost-config-path", type=str, default=None)
     parser.add_argument("--proxy-fidelity-candidates", type=int, default=0)
     parser.add_argument("--proxy-fidelity-eval-days", type=int, default=0)
+    parser.add_argument("--family-screen-trials", type=int, default=30,
+                        help="Trials per family in pre-screen phase (0 = skip, use all families)")
+    parser.add_argument("--family-screen-top-n", type=int, default=2,
+                        help="Number of top families to keep after pre-screen")
     parser.set_defaults(pruned_only=True)
     return parser
 
@@ -560,6 +570,8 @@ def main() -> None:
         cost_config_path=args.cost_config_path,
         proxy_fidelity_candidates=args.proxy_fidelity_candidates,
         proxy_fidelity_eval_days=args.proxy_fidelity_eval_days,
+        family_screen_trials=args.family_screen_trials,
+        family_screen_top_n=args.family_screen_top_n,
     )
 
     run_outputs = run_optimization(selected_coins, config, workers=resolved_workers, parallel_mode=args.parallel_mode)

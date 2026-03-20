@@ -41,7 +41,7 @@ from core.labeling import (
 
 DB_PATH = "./data/trading.db"
 EXPORT_DIR = Path("./data/features")
-LOOKBACK_DAYS = int(os.getenv("FEATURE_LOOKBACK_DAYS", "1095"))
+LOOKBACK_DAYS = int(os.getenv("FEATURE_LOOKBACK_DAYS", "1825"))  # 5 years default
 
 
 # 1. ROBUST LOADERS (UTC Enforced)
@@ -305,8 +305,9 @@ def main():
             horizon_hours=resolve_label_horizon(profile),
             tp_mult=profile.vol_mult_tp,
             sl_mult=profile.vol_mult_sl,
+            fee_pct_per_side=0.0010,  # Coinbase taker fee; TP label only when gross move covers round-trip cost
         )
-        direction = momentum_direction_series(ohlcv, score_threshold=1)
+        direction = momentum_direction_series(ohlcv, score_threshold=profile.direction_score_threshold)
 
         # 1. Feature integrity + collinearity diagnostics
         is_valid, missing_features = validate_profile_feature_mapping(symbol, feats, profile)

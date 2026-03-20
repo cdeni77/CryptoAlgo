@@ -2,17 +2,27 @@ from typing import Dict
 
 # Shared Coinbase CDE-like fee/contract specs
 CONTRACT_SPECS: Dict[str, Dict[str, float | str]] = {
-    'BIP': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
-    'ETP': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
-    'XPP': {'units': 500,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
-    'SLP': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
-    'DOP': {'units': 5000,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
-    'BTC': {'units': 0.01,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
-    'ETH': {'units': 0.10,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
-    'XRP': {'units': 500,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
-    'SOL': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
-    'DOGE': {'units': 5000, 'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
-    'DEFAULT': {'units': 1, 'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'UNKNOWN'},
+    'BIP': {'units': 0.01,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
+    'ETP': {'units': 0.10,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
+    'XPP': {'units': 500,    'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
+    'SLP': {'units': 5,      'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
+    'DOP': {'units': 5000,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
+    # New coins — verified CDE codes from Coinbase API
+    'AVP': {'units': 5,      'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'AVAX'},
+    'AVAX': {'units': 5,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'AVAX'},
+    'ADP': {'units': 1000,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ADA'},
+    'ADA': {'units': 1000,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ADA'},
+    'LNP': {'units': 10,     'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'LINK'},
+    'LINK': {'units': 10,    'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'LINK'},
+    'LCP': {'units': 1,      'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'LTC'},
+    'LTC': {'units': 1,      'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'LTC'},
+    # Tickers (alias entries for legacy symbol resolution)
+    'BTC': {'units': 0.01,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'BTC'},
+    'ETH': {'units': 0.10,   'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'ETH'},
+    'XRP': {'units': 500,    'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'XRP'},
+    'SOL': {'units': 5,      'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'SOL'},
+    'DOGE': {'units': 5000,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'DOGE'},
+    'DEFAULT': {'units': 1,  'min_fee_usd': 0.20, 'fee_pct': 0.0010, 'base': 'UNKNOWN'},
 }
 
 

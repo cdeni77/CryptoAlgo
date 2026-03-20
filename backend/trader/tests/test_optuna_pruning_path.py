@@ -145,13 +145,14 @@ def _objective_value_for_fold_metrics(monkeypatch, fold_metrics):
 
 
 def test_objective_bounds_absurd_low_trade_sharpe(monkeypatch):
+    # Use enough trades to pass the hard gate; sharpe=0.0 is the post-execution-gate bounded value
     value, attrs = _objective_value_for_fold_metrics(
         monkeypatch,
-        {"raw_sharpe": 171_691_641.0, "sharpe": 0.0, "return": 0.01, "expectancy": 0.01, "trades": 1},
+        {"raw_sharpe": 171_691_641.0, "sharpe": 0.0, "return": 0.01, "expectancy": 0.01, "trades": 5},
     )
 
     assert abs(value) < 1.0
-    assert attrs["n_trades"] == 2
+    assert attrs["n_trades"] == 10
     assert attrs["realized_sharpe_term"] <= 1.0
 
 

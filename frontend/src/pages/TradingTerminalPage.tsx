@@ -355,7 +355,7 @@ export default function TradingTerminalPage() {
 
             {paperTab === 'positions' && <PaperPositionsTable positions={paperPositions} loading={loadingPaper} prices={prices} cdeSpecs={cdeSpecs} />}
             {paperTab === 'equity' && <PaperEquityTable points={paperEquity} loading={loadingPaper} />}
-            {paperTab === 'performance' && <PaperPerformancePanel equity={paperEquity} fills={paperFills} loading={loadingPaper} />}
+            {paperTab === 'performance' && <PaperPerformancePanel equity={paperEquity} fills={paperFills} loading={loadingPaper} positions={paperPositions} prices={prices} cdeSpecs={cdeSpecs} />}
             {paperTab === 'fills' && <PaperFillsTable fills={paperFills} loading={loadingPaper} />}
 
             {/* Signals always visible in paper mode for monitoring */}

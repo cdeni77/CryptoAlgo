@@ -132,6 +132,28 @@ SOL_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
 XRP_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
 DOGE_EXTRA_FEATURES += BTC_RELATIVE_FEATURES
 
+# ── New altcoins ──────────────────────────────────────────────────────────────
+
+# AVAX reuses SOL momentum-breakout feature set (same generic names, different data)
+AVAX_EXTRA_FEATURES = list(SOL_EXTRA_FEATURES)  # already includes BTC_RELATIVE_FEATURES
+
+# ADA: compression-breakout pattern similar to XRP
+ADA_EXTRA_FEATURES = [
+    'ada_compression_ratio', 'ada_breakout_distance', 'ada_whipsaw_score',
+    'ada_body_efficiency', 'ada_volume_breakout_confirm', 'ada_reversal_pressure',
+] + BTC_RELATIVE_FEATURES
+
+# LINK: trend-persistence features similar to ETH
+LINK_EXTRA_FEATURES = [
+    'link_trend_spread_12h', 'link_trend_spread_24h',
+    'link_trend_spread_72h', 'link_trend_spread_168h',
+    'link_impulse_12h', 'link_impulse_24h', 'link_impulse_48h',
+    'link_volume_support', 'link_pullback_depth_72h', 'link_breakout_pressure',
+] + BTC_RELATIVE_FEATURES
+
+# LTC: BTC mean-reversion pattern (store-of-value narrative, halving cycles)
+LTC_EXTRA_FEATURES = list(BTC_EXTRA_FEATURES) + BTC_RELATIVE_FEATURES
+
 
 @dataclass
 class CoinProfile:
@@ -154,6 +176,10 @@ class CoinProfile:
     label_forward_hours: int = 24
     label_vol_target: float = 1.8
     min_momentum_magnitude: float = 0.02
+    # Direction filter strictness: 2 = all 3 momentum signals must agree (default),
+    # 1 = any 2-of-3 agree. Use 1 for noisy/high-vol coins (DOGE, SOL) to generate
+    # more labeled bars in sideways markets without sacrificing directional bias.
+    direction_score_threshold: int = 2
     
     # Exits
     vol_mult_tp: float = 5.5
@@ -232,27 +258,27 @@ class CoinProfile:
 
 
 COIN_PROFILES: Dict[str, CoinProfile] = {
-    # ── ETH: momentum (strong baseline, calibrated confidence floor) ──
+    # ── ETH: vol_overlay baseline (optimized params: threshold=0.50, holdout SR=0.245) ──
     'ETH': CoinProfile(
         name='ETH',
         prefixes=['ETP', 'ETH'],
         extra_features=ETH_EXTRA_FEATURES,
-        signal_threshold=0.53,
-        min_val_auc=0.50,
-        vol_mult_tp=4.5,
-        vol_mult_sl=3.0,
-        max_hold_hours=72,
-        min_momentum_magnitude=0.006,
-        min_directional_agreement=0.47,
-        meta_probability_threshold=0.44,
-        cooldown_hours=5.0,
-        min_vol_24h=0.001,
-        max_vol_24h=0.09,
-        strategy_family='momentum_trend',
+        signal_threshold=0.53,          # Baseline for optimizer search range ~0.46-0.61
+        min_val_auc=0.48,
+        vol_mult_tp=5.0,
+        vol_mult_sl=4.0,
+        max_hold_hours=48,
+        min_momentum_magnitude=0.022,
+        min_directional_agreement=0.48,
+        meta_probability_threshold=0.49,
+        cooldown_hours=20.0,             # Long cooldown from best candidate — reduces overtrading
+        min_vol_24h=0.0034,
+        max_vol_24h=0.069,
+        strategy_family='vol_overlay',   # Best known family for ETH
         trade_freq_bucket='balanced',
     ),
-    
-    # ── XRP: momentum (balanced confidence to avoid over-filtering) ──
+
+    # ── XRP: baseline for optimizer search ──
     'XRP': CoinProfile(
         name='XRP',
         prefixes=['XPP', 'XRP'],
@@ -264,37 +290,33 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         max_hold_hours=108,
         min_momentum_magnitude=0.004,
         min_directional_agreement=0.50,
-        meta_probability_threshold=0.45,
+        meta_probability_threshold=0.47,
         cooldown_hours=3.0,
         min_vol_24h=0.001,
         max_vol_24h=0.10,
         strategy_family='momentum_trend',
         trade_freq_bucket='balanced',
     ),
-    
-    # ── BTC: strict momentum (mean-reversion failed at 25% WR) ──
-    # v7 momentum was never tested on BTC (it was excluded).
-    # BTC is macro-driven — hourly RSI extremes don't predict bounces.
-    # Use same momentum approach as ETH but with very strict filters:
-    # balanced threshold/AUC bar, small position, long cooldown.
+
+    # ── BTC: macro-driven, longer horizon ──
     'BTC': CoinProfile(
         name='BTC',
         prefixes=['BIP', 'BTC'],
         extra_features=BTC_EXTRA_FEATURES,
-        signal_threshold=0.53,          # Lower bar so calibrated probabilities can trigger
+        signal_threshold=0.54,
         min_val_auc=0.50,
-        label_forward_hours=36,         # Longer horizon for BTC trend persistence
-        label_vol_target=1.8,           # Standard barriers
-        min_momentum_magnitude=0.007,    # Allow smaller moves to trigger
-        vol_mult_tp=4.0,               # Push for larger winners
-        vol_mult_sl=3.0,               # Tighter risk control
+        label_forward_hours=36,
+        label_vol_target=1.8,
+        min_momentum_magnitude=0.007,
+        vol_mult_tp=4.0,
+        vol_mult_sl=3.0,
         max_hold_hours=72,
         min_directional_agreement=0.50,
-        meta_probability_threshold=0.45,
+        meta_probability_threshold=0.47,
         cooldown_hours=4.0,
-        min_vol_24h=0.0005,             # BTC has lower vol than alts
+        min_vol_24h=0.0005,
         max_vol_24h=0.09,
-        position_size=0.10,            # Smaller position — less confident edge
+        position_size=0.10,
         vol_sizing_target=0.020,
         n_estimators=150,
         max_depth=4,
@@ -302,60 +324,155 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         strategy_family='momentum_trend',
         trade_freq_bucket='balanced',
     ),
-    
-    # ── SOL: momentum with tuned exits for higher vol ──
-    # SOL momentum works (41% WR) but fees eat the edge.
-    # Problem: TP=5.5x is too wide for SOL — price spikes then reverses.
-    # Solution: tighter TP to capture breakouts, wider SL for SOL's chop.
+
+    # ── SOL: high vol, breakout family showed promise ──
     'SOL': CoinProfile(
         name='SOL',
         prefixes=['SLP', 'SOL'],
         extra_features=SOL_EXTRA_FEATURES,
         signal_threshold=0.53,
         min_val_auc=0.50,
-        label_forward_hours=24,         # Slightly longer horizon to capture full moves
-        label_vol_target=1.6,           # Tighter barriers
+        label_forward_hours=24,
+        label_vol_target=1.6,
         min_momentum_magnitude=0.007,
-        min_directional_agreement=0.45,
-        meta_probability_threshold=0.44,
-        vol_mult_tp=4.5,               # Require larger move vs fees
-        vol_mult_sl=3.0,               # Wider SL — avoid stop-hunting in SOL chop
-        max_hold_hours=96,              # Let winners work when trend extends
+        min_directional_agreement=0.47,
+        meta_probability_threshold=0.46,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=96,
         cooldown_hours=1.5,
-        min_vol_24h=0.0008,             # SOL has higher base vol
+        min_vol_24h=0.0008,
         max_vol_24h=0.12,
         position_size=0.12,
         vol_sizing_target=0.025,
-        strategy_family='momentum_trend',
+        strategy_family='breakout',      # breakout showed 0.114 holdout SR in prior run
         trade_freq_bucket='balanced',
+        direction_score_threshold=1,     # SOL is noisy — allow 2-of-3 momentum signal
     ),
-    
-    # ── DOGE: strict momentum (mean-reversion produced 0 trades) ──
-    # DOGE trends hard when it trends (Elon tweets, retail FOMO).
-    # MR failed because hourly RSI rarely hits 25/75 on DOGE.
-    # Use momentum with strict filters and small position sizes.
+
+    # ── DOGE: trend-following, fast moves ──
     'DOGE': CoinProfile(
         name='DOGE',
         prefixes=['DOP', 'DOGE'],
         extra_features=DOGE_EXTRA_FEATURES,
         signal_threshold=0.52,
         min_val_auc=0.50,
-        label_forward_hours=12,          # Short horizon — DOGE moves fast
-        label_vol_target=1.4,            # Tight barriers — high vol
+        label_forward_hours=12,
+        label_vol_target=1.4,
         min_momentum_magnitude=0.007,
-        min_directional_agreement=0.45,
-        meta_probability_threshold=0.44,
-        vol_mult_tp=5.5,                # Larger TP target to beat fees
-        vol_mult_sl=3.0,                # Avoid noise stop-outs
-        max_hold_hours=72,               # Give trends time to materialize
+        min_directional_agreement=0.47,
+        meta_probability_threshold=0.46,
+        vol_mult_tp=5.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=72,
         cooldown_hours=2.0,
-        min_vol_24h=0.0007,              # DOGE always volatile
-        max_vol_24h=0.14,               # Allow high vol
-        position_size=0.08,             # Small positions — high risk
+        min_vol_24h=0.0007,
+        max_vol_24h=0.14,
+        position_size=0.08,
         vol_sizing_target=0.020,
-        n_estimators=80,                # Fewer trees — don't overfit noise
+        n_estimators=80,
         max_depth=3,
         min_child_samples=25,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
+        direction_score_threshold=1,     # DOGE is noisy/memecoin — allow 2-of-3 momentum
+    ),
+
+    # ── AVAX: high-beta DeFi ecosystem, breakout-driven ──
+    'AVAX': CoinProfile(
+        name='AVAX',
+        prefixes=['AVP', 'AVAX'],
+        extra_features=AVAX_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=24,
+        label_vol_target=1.6,
+        min_momentum_magnitude=0.008,
+        min_directional_agreement=0.47,
+        meta_probability_threshold=0.46,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=96,
+        cooldown_hours=2.0,
+        min_vol_24h=0.0008,
+        max_vol_24h=0.14,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='breakout',
+        trade_freq_bucket='balanced',
+    ),
+
+    # ── ADA: compression-breakout, fundamental-driven ──
+    'ADA': CoinProfile(
+        name='ADA',
+        prefixes=['ADP', 'ADA'],
+        extra_features=ADA_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=24,
+        label_vol_target=1.6,
+        min_momentum_magnitude=0.004,
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.47,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=96,
+        cooldown_hours=3.0,
+        min_vol_24h=0.0008,
+        max_vol_24h=0.12,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
+    ),
+
+    # ── LINK: oracle token, trend-persistent, institutional-grade ──
+    'LINK': CoinProfile(
+        name='LINK',
+        prefixes=['LNP', 'LINK'],
+        extra_features=LINK_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.48,
+        label_forward_hours=24,
+        label_vol_target=1.8,
+        min_momentum_magnitude=0.006,
+        min_directional_agreement=0.48,
+        meta_probability_threshold=0.49,
+        vol_mult_tp=5.0,
+        vol_mult_sl=4.0,
+        max_hold_hours=48,
+        cooldown_hours=6.0,
+        min_vol_24h=0.0030,
+        max_vol_24h=0.10,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='vol_overlay',
+        trade_freq_bucket='balanced',
+    ),
+
+    # ── LTC: BTC-correlated, mean-reversion + halving cycles ──
+    'LTC': CoinProfile(
+        name='LTC',
+        prefixes=['LCP', 'LTC'],
+        extra_features=LTC_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=36,
+        label_vol_target=1.8,
+        min_momentum_magnitude=0.005,
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.47,
+        vol_mult_tp=4.0,
+        vol_mult_sl=3.0,
+        max_hold_hours=72,
+        cooldown_hours=4.0,
+        min_vol_24h=0.0005,
+        max_vol_24h=0.10,
+        n_estimators=150,
+        max_depth=4,
+        min_child_samples=30,
+        position_size=0.10,
+        vol_sizing_target=0.020,
         strategy_family='momentum_trend',
         trade_freq_bucket='balanced',
     ),

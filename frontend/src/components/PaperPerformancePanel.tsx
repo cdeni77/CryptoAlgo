@@ -9,19 +9,37 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { PaperEquityPoint, PaperFill } from '../types';
+import { PaperEquityPoint, PaperFill, PaperPosition, PriceData, CDESpecs, CoinSymbol } from '../types';
 
 const fmt = (v: number) => `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const pct = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
+
+function calcLiveUnrealized(positions: PaperPosition[], prices: PriceData | null, cdeSpecs: CDESpecs | null): number {
+  if (!prices || !cdeSpecs) return 0;
+  return positions.filter(p => p.is_open).reduce((sum, p) => {
+    const coin = p.coin as CoinSymbol;
+    const livePrice = prices[coin]?.price ?? null;
+    const spec = cdeSpecs[coin] ?? null;
+    if (livePrice === null || !spec) return sum;
+    const sign = p.side === 'long' ? 1 : -1;
+    return sum + p.contracts * spec.units_per_contract * (livePrice - p.entry_price) * sign;
+  }, 0);
+}
 
 export default function PaperPerformancePanel({
   equity,
   fills,
   loading,
+  positions = [],
+  prices = null,
+  cdeSpecs = null,
 }: {
   equity: PaperEquityPoint[];
   fills: PaperFill[];
   loading: boolean;
+  positions?: PaperPosition[];
+  prices?: PriceData | null;
+  cdeSpecs?: CDESpecs | null;
 }) {
   if (loading) return <div className="glass-card rounded-xl p-6 text-sm text-[var(--text-muted)]">Loading performance...</div>;
 
@@ -63,11 +81,14 @@ export default function PaperPerformancePanel({
 
   const initialEquity = first?.equity ?? 0;
 
+  const liveUnrealized = calcLiveUnrealized(positions, prices, cdeSpecs);
+  const hasLivePrices = prices !== null && cdeSpecs !== null;
+
   const stats = [
     { label: 'Paper Return', value: pct(returnPct), color: returnPct >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]' },
     { label: 'Latest Equity', value: latest ? fmt(latest.equity) : '—', color: 'text-[var(--text-primary)]' },
     { label: 'Realized PNL', value: latest ? `${latest.realized_pnl >= 0 ? '+' : ''}${fmt(latest.realized_pnl)}` : '—', color: latest && latest.realized_pnl >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]' },
-    { label: 'Unrealized PNL', value: latest ? `${latest.unrealized_pnl >= 0 ? '+' : ''}${fmt(latest.unrealized_pnl)}` : '—', color: latest && latest.unrealized_pnl >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]' },
+    { label: 'Unrealized PNL', value: hasLivePrices ? `${liveUnrealized >= 0 ? '+' : ''}${fmt(liveUnrealized)}` : (latest ? `${latest.unrealized_pnl >= 0 ? '+' : ''}${fmt(latest.unrealized_pnl)}` : '—'), color: (hasLivePrices ? liveUnrealized : (latest?.unrealized_pnl ?? 0)) >= 0 ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]' },
     { label: 'Filled Notional', value: fmt(totalNotional), color: 'text-[var(--text-primary)]' },
     { label: 'Total Fees', value: fmt(totalFees), color: 'text-[var(--accent-amber)]' },
     { label: 'Trades', value: String(tradeCount), color: 'text-[var(--text-primary)]' },

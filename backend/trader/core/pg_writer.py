@@ -403,27 +403,10 @@ class PgWriter:
             )
 
     def upsert_paper_position(self, coin: str, side: str, contracts: int, entry_price: float, mark_price: float, notional: float, realized_pnl: float, unrealized_pnl: float, fees_paid: float, is_open: bool = True) -> int:
+        # Always INSERT a new position row. The old position must be explicitly closed via
+        # close_paper_position() before this is called. Overwriting in-place would cause
+        # "re-entry without close" — the side/entry_price would silently flip on the same row.
         with self._session() as db:
-            position = (
-                db.query(PaperPosition)
-                .filter(PaperPosition.coin == coin, PaperPosition.is_open.is_(True))
-                .order_by(PaperPosition.id.desc())
-                .first()
-            )
-            if position:
-                position.side = side
-                position.contracts = contracts
-                position.entry_price = entry_price
-                position.mark_price = mark_price
-                position.notional = notional
-                position.realized_pnl = realized_pnl
-                position.unrealized_pnl = unrealized_pnl
-                position.fees_paid = fees_paid
-                position.is_open = is_open
-                db.commit()
-                db.refresh(position)
-                return position.id
-
             position = PaperPosition(
                 coin=coin,
                 side=side,

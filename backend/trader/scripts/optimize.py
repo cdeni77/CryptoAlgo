@@ -14,6 +14,7 @@ Usage:
     python optimize.py --show
 """
 import argparse, json, warnings, sys, os, logging, sqlite3, functools, traceback, time, math, tempfile, hashlib
+from scipy.stats import spearmanr as _spearmanr
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +48,7 @@ from core.coin_profiles import (
     CoinProfile, COIN_PROFILES, get_coin_profile,
     BTC_EXTRA_FEATURES, ETH_EXTRA_FEATURES, XRP_EXTRA_FEATURES,
     SOL_EXTRA_FEATURES, DOGE_EXTRA_FEATURES,
+    AVAX_EXTRA_FEATURES, ADA_EXTRA_FEATURES, LINK_EXTRA_FEATURES, LTC_EXTRA_FEATURES,
 )
 from core.reason_codes import ReasonCode
 from core.metrics_significance import (
@@ -165,6 +167,10 @@ def get_extra_features(coin_name):
         'XRP': XRP_EXTRA_FEATURES,
         'SOL': SOL_EXTRA_FEATURES,
         'DOGE': DOGE_EXTRA_FEATURES,
+        'AVAX': AVAX_EXTRA_FEATURES,
+        'ADA': ADA_EXTRA_FEATURES,
+        'LINK': LINK_EXTRA_FEATURES,
+        'LTC': LTC_EXTRA_FEATURES,
     }.get(coin_name, [])
 
 
@@ -358,6 +364,11 @@ COIN_OPTIMIZATION_PRIORS = {
     'SOL': {'target_trades_per_year': 33.0, 'cooldown_min': 1.0, 'cooldown_max': 8.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.055, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
     'XRP': {'target_trades_per_year': 28.0, 'cooldown_min': 2.0, 'cooldown_max': 10.0, 'min_momentum_magnitude': (0.002, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.58},
     'DOGE': {'target_trades_per_year': 30.0, 'cooldown_min': 1.5, 'cooldown_max': 9.0, 'min_momentum_magnitude': (0.003, 0.032), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.0045), 'min_trade_frequency_ratio': 0.60},
+    # New coins — priors set from nearest archetype
+    'AVAX': {'target_trades_per_year': 33.0, 'cooldown_min': 1.0, 'cooldown_max': 10.0, 'min_momentum_magnitude': (0.004, 0.035), 'max_vol_24h': (0.060, 0.150), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.44, 0.64), 'meta_probability_threshold': (0.40, 0.60), 'min_vol_24h': (0.0002, 0.005), 'min_trade_frequency_ratio': 0.58},
+    'ADA':  {'target_trades_per_year': 28.0, 'cooldown_min': 2.0, 'cooldown_max': 12.0, 'min_momentum_magnitude': (0.002, 0.025), 'max_vol_24h': (0.050, 0.130), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.47, 0.67), 'meta_probability_threshold': (0.41, 0.61), 'min_vol_24h': (0.0003, 0.005), 'min_trade_frequency_ratio': 0.56},
+    'LINK': {'target_trades_per_year': 27.0, 'cooldown_min': 4.0, 'cooldown_max': 20.0, 'min_momentum_magnitude': (0.003, 0.028), 'max_vol_24h': (0.050, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.46, 0.66), 'meta_probability_threshold': (0.41, 0.61), 'min_vol_24h': (0.0004, 0.005), 'min_trade_frequency_ratio': 0.55},
+    'LTC':  {'target_trades_per_year': 25.0, 'cooldown_min': 3.0, 'cooldown_max': 16.0, 'min_momentum_magnitude': (0.004, 0.028), 'max_vol_24h': (0.045, 0.110), 'max_ensemble_std': (0.08, 0.20), 'min_directional_agreement': (0.48, 0.68), 'meta_probability_threshold': (0.42, 0.62), 'min_vol_24h': (0.0002, 0.003), 'min_trade_frequency_ratio': 0.55},
 }
 
 ETH_GATE_RELAXATION = {
@@ -366,7 +377,17 @@ ETH_GATE_RELAXATION = {
     'ensemble_agreement': 0.020,
 }
 
-STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay', 'trend_pullback', 'breakout_expansion', 'funding_carry', 'squeeze_breakout', 'oi_divergence')
+# Reduced to 4 economically motivated families — fewer categorical choices gives
+# Optuna's TPE ~50 trials per family (vs ~22 with 9 families at 200 trials).
+# Removed: trend_pullback, breakout_expansion, squeeze_breakout, oi_divergence (strategy-specific
+# params add DOF without clear economic justification), funding_carry (negatively selects
+# in exactly the market conditions where you want exposure).
+STRATEGY_FAMILIES = ('momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay')
+# Full set of known families — used for playback/profile_from_params, not Optuna search
+_ALL_KNOWN_STRATEGY_FAMILIES = (
+    'momentum_trend', 'breakout', 'mean_reversion', 'vol_overlay',
+    'trend_pullback', 'breakout_expansion', 'funding_carry', 'squeeze_breakout', 'oi_divergence',
+)
 TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
 
 STRATEGY_FAMILY_PRIORS = {
@@ -538,14 +559,22 @@ def _fold_balance_penalties(fold_trade_counts: List[int], fold_sharpes: List[flo
     trade_imbalance_penalty = 0.30 * max(0.0, trade_cv - 0.25)
 
     weak_fold_penalty = 0.0
-    if len(sharpes) >= 3:
-        positive_folds = sum(1 for s in sharpes if s > 0.10)
+    if len(sharpes) >= 2:
+        # Any negative-Sharpe fold is a robustness failure — tighter threshold than before
+        negative_folds = sum(1 for s in sharpes if s < 0.0)
         weak_folds = sum(1 for s in sharpes if s < -0.10)
-        if positive_folds >= 2 and weak_folds >= 1:
-            weak_fold_penalty += 0.22
+        if negative_folds >= 1:
+            weak_fold_penalty += 0.30 * negative_folds  # 0.30 per negative fold
+        if weak_folds >= 1:
+            weak_fold_penalty += 0.20 * weak_folds       # extra hit for severely negative
+        # Penalise large gap between best and worst fold — regime-specific strategies
         downside_gap = max(0.0, float(np.mean(sharpes)) - min(sharpes))
-        if downside_gap > 0.35:
-            weak_fold_penalty += 0.18 * min(1.0, (downside_gap - 0.35) / 0.55)
+        if downside_gap > 0.25:
+            weak_fold_penalty += 0.25 * min(1.5, (downside_gap - 0.25) / 0.40)
+        # Penalise high Sharpe std-dev — inconsistent performance across regimes
+        sharpe_std = float(np.std(sharpes)) if len(sharpes) > 1 else 0.0
+        if sharpe_std > 0.30:
+            weak_fold_penalty += 0.20 * min(1.5, (sharpe_std - 0.30) / 0.40)
 
     total_penalty = zero_trade_penalty + trade_imbalance_penalty + weak_fold_penalty
     return {
@@ -585,18 +614,21 @@ def _fold_cooldown_dominance_stats(fold_gate_counters: List[Dict[str, object]]) 
     }
 
 
-def _resolve_strategy_and_bucket(params: Dict | None) -> tuple[str, str]:
+def _resolve_strategy_and_bucket(params: Dict | None, strict: bool = False) -> tuple[str, str]:
     params = params or {}
     strategy_family = str(params.get('strategy_family') or 'momentum_trend')
     trade_freq_bucket = str(params.get('trade_freq_bucket') or 'balanced')
-    if strategy_family not in STRATEGY_FAMILIES:
+    # strict=True: only allow families in current Optuna search (create_trial_profile)
+    # strict=False: allow any known family (profile_from_params / holdout replay)
+    allowed = STRATEGY_FAMILIES if strict else _ALL_KNOWN_STRATEGY_FAMILIES
+    if strategy_family not in allowed:
         strategy_family = 'momentum_trend'
     if trade_freq_bucket not in TRADE_FREQ_BUCKETS:
         trade_freq_bucket = 'balanced'
     return strategy_family, trade_freq_bucket
 
 
-def create_trial_profile(trial, coin_name):
+def create_trial_profile(trial, coin_name, allowed_families=None):
     bp = COIN_PROFILES.get(coin_name, COIN_PROFILES.get('ETH'))
     default_priors = COIN_OPTIMIZATION_PRIORS.get('ETH', {'target_trades_per_year': 60.0, 'cooldown_min': 8.0, 'cooldown_max': 36.0})
     priors = COIN_OPTIMIZATION_PRIORS.get(coin_name, default_priors)
@@ -610,22 +642,26 @@ def create_trial_profile(trial, coin_name):
     base_tp = bp.vol_mult_tp if bp else 5.0
     base_sl = bp.vol_mult_sl if bp else 3.0
     base_hold = bp.max_hold_hours if bp else 72
-    strategy_family = trial.suggest_categorical('strategy_family', STRATEGY_FAMILIES)
-    trade_freq_bucket = trial.suggest_categorical('trade_freq_bucket', TRADE_FREQ_BUCKETS)
+    _families = tuple(allowed_families) if allowed_families else STRATEGY_FAMILIES
+    strategy_family = trial.suggest_categorical('strategy_family', _families)
+    # trade_freq_bucket fixed at 'balanced' — searching over frequency buckets adds noise
+    # to the categorical search without strong economic justification.
+    trade_freq_bucket = 'balanced'
     family_prior = STRATEGY_FAMILY_PRIORS.get(strategy_family, STRATEGY_FAMILY_PRIORS['momentum_trend'])
     bucket_prior = TRADE_FREQ_BUCKET_PRIORS.get(trade_freq_bucket, TRADE_FREQ_BUCKET_PRIORS['balanced'])
 
-    mm_low, mm_high = priors.get('min_momentum_magnitude', (0.03, 0.07))
-    min_momentum_magnitude = trial.suggest_float(
-        'min_momentum_magnitude',
-        max(0.005, mm_low * family_prior['min_momentum_multiplier']),
-        max(0.010, mm_high * family_prior['min_momentum_multiplier']),
-        step=0.001,
-    )
+    # Fixed at profile midpoint — min_momentum_magnitude is a weak gate that interacts
+    # with regime in unpredictable ways; optimizing it adds DOF without reliable edge.
+    mm_low, mm_high = priors.get('min_momentum_magnitude', (0.003, 0.020))
+    min_momentum_magnitude = (mm_low + mm_high) / 2.0
+
     max_vol_24h = trial.suggest_float('max_vol_24h', *priors.get('max_vol_24h', (0.05, 0.09)), step=0.001)
-    max_ensemble_std = trial.suggest_float('max_ensemble_std', *priors.get('max_ensemble_std', (0.08, 0.13)), step=0.001)
-    min_directional_agreement = trial.suggest_float('min_directional_agreement', *priors.get('min_directional_agreement', (0.60, 0.78)), step=0.01)
-    meta_probability_threshold = trial.suggest_float('meta_probability_threshold', *priors.get('meta_probability_threshold', (0.50, 0.65)), step=0.01)
+
+    # Fixed at profile defaults — these gates are binary filters that Optuna overfits
+    # when tuned; fixing them at sensible defaults removes 3 DOF.
+    max_ensemble_std = bp.max_ensemble_std if bp else 0.15
+    min_directional_agreement = bp.min_directional_agreement if bp else 0.50
+    meta_probability_threshold = bp.meta_probability_threshold if bp else 0.50
 
     min_vol_bounds = priors.get('min_vol_24h')
     if min_vol_bounds:
@@ -669,7 +705,9 @@ def create_trial_profile(trial, coin_name):
         name=coin_name, prefixes=bp.prefixes if bp else [coin_name], extra_features=get_extra_features(coin_name),
         signal_threshold=trial.suggest_float('signal_threshold', signal_lo, signal_hi, step=0.01),
         label_forward_hours=trial.suggest_int('label_forward_hours', int(clamp(base_fwd - 12, 12, 48)), int(clamp(base_fwd + 12, 12, 48)), step=12),
-        label_vol_target=trial.suggest_float('label_vol_target', clamp(base_label_vol - 0.6, 1.0, 2.4), clamp(base_label_vol + 0.6, 1.2, 2.6), step=0.2),
+        # label_vol_target fixed at profile default — optimizing this adds DOF without
+        # clear benefit; the 48-bar vol estimate is already more stable than before.
+        label_vol_target=base_label_vol,
         min_momentum_magnitude=min_momentum_magnitude,
         vol_mult_tp=trial.suggest_float('vol_mult_tp', clamp(base_tp - 1.5, 3.5, 8.0), clamp(base_tp + 2.5, 5.0, 10.0), step=0.5),
         vol_mult_sl=trial.suggest_float('vol_mult_sl', clamp(base_sl - 1.0, 2.0, 5.0), clamp(base_sl + 1.0, 2.5, 5.5), step=0.5),
@@ -679,11 +717,9 @@ def create_trial_profile(trial, coin_name):
         max_ensemble_std=max_ensemble_std,
         min_directional_agreement=min_directional_agreement,
         meta_probability_threshold=meta_probability_threshold,
-        cooldown_hours=trial.suggest_float(
-            'cooldown_hours',
-            max(1.0 if coin_name in {'BTC', 'SOL', 'XRP'} else 2.0, priors['cooldown_min'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
-            max(6.0, priors['cooldown_max'] * family_prior['cooldown_multiplier'] * bucket_prior['cooldown_scale']),
-        ),
+        # cooldown_hours fixed at profile default — in-sample optimal cooldown shifts
+        # nonlinearly with regime; tuning it is a primary source of overfit.
+        cooldown_hours=float(bp.cooldown_hours if bp else 6.0),
         position_size=FIXED_RISK['position_size'],
         vol_sizing_target=FIXED_RISK['vol_sizing_target'], min_val_auc=FIXED_RISK['min_val_auc'],
         n_estimators=FIXED_ML['n_estimators'], max_depth=FIXED_ML['max_depth'],
@@ -863,11 +899,40 @@ def _normalize_triple_barrier_labels(labels: pd.Series) -> pd.Series:
     return clean.astype(int)
 
 
-def _score_fold_consistency(fold_aucs: list[float]) -> dict:
+def _score_fold_consistency(fold_aucs: list[float], fold_sharpes: list[float] | None = None) -> dict:
     if len(fold_aucs) < 2:
         return {'score': 0.5}
-    cv = float(np.std(fold_aucs) / max(abs(np.mean(fold_aucs)), 0.01))
-    return {'score': float(1.0 / (1.0 + cv))}
+    auc_cv = float(np.std(fold_aucs) / max(abs(np.mean(fold_aucs)), 0.01))
+    auc_score = float(1.0 / (1.0 + auc_cv))
+    if fold_sharpes and len(fold_sharpes) >= 2:
+        # Sharpe consistency: penalise high variance across regime folds
+        sharpe_std = float(np.std(fold_sharpes))
+        sharpe_score = float(1.0 / (1.0 + sharpe_std))
+        return {'score': 0.40 * auc_score + 0.60 * sharpe_score}
+    return {'score': auc_score}
+
+
+def _compute_importance_stability(fold_importances: list[dict]) -> float | None:
+    """Compute mean pairwise Spearman rank correlation of feature importance vectors across folds.
+
+    Returns None when fewer than 2 folds have importances or fewer than 4 common features.
+    A value close to 1.0 means the same features drive predictions across all folds.
+    A value close to 0 or negative indicates the top features are fold-specific (overfitting signal).
+    """
+    filled = [fi for fi in fold_importances if fi]
+    if len(filled) < 2:
+        return None
+    common = sorted(set.intersection(*[set(fi.keys()) for fi in filled]))
+    if len(common) < 4:
+        return None
+    vecs = [[fi[k] for k in common] for fi in filled]
+    correlations = []
+    for i in range(len(vecs)):
+        for j in range(i + 1, len(vecs)):
+            corr, _ = _spearmanr(vecs[i], vecs[j])
+            if np.isfinite(corr):
+                correlations.append(float(corr))
+    return float(np.mean(correlations)) if correlations else None
 
 
 def _normalize_gate_reason_code(reason: str) -> Optional[str]:
@@ -1454,6 +1519,15 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
         raw_sharpe = 0.0
         sharpe = 0.0
 
+    # Collect feature importances from the primary ensemble member for stability tracking.
+    fold_importance: dict[str, float] = {}
+    if member_models:
+        _m0 = member_models[0]
+        _imps = getattr(_m0['model'], 'feature_importances_', None)
+        if _imps is not None and len(_imps) == len(_m0['cols']):
+            _total = float(np.sum(np.abs(_imps))) or 1.0
+            fold_importance = {col: float(imp) / _total for col, imp in zip(_m0['cols'], _imps)}
+
     return {
         'model_quality': model_quality,
         'label_quality': label_quality,
@@ -1476,6 +1550,7 @@ def evaluate_fold_with_execution_gates(features, ohlcv, fold: CVFold, profile: C
             'ensemble_std_mean': float(np.mean(std_values)) if std_values else 0.0,
         },
         'gate_counters': _summarize_fold_gate_counters(gate_counts, total_checks=len(test_idx)),
+        'feature_importances': fold_importance,
     }
 
 
@@ -1492,9 +1567,10 @@ def objective(
     target_sym,
     pruned_only=True,
     base_config=None,
+    allowed_families=None,
     **_kwargs,
 ):
-    profile = create_trial_profile(trial, coin_name)
+    profile = create_trial_profile(trial, coin_name, allowed_families=allowed_families)
     trial_params = getattr(trial, 'params', {})
     if not isinstance(trial_params, dict):
         trial_params = {}
@@ -1561,9 +1637,9 @@ def objective(
     model_q = float(np.mean([f['model_quality']['score'] for f in fold_scores]))
     label_q = float(np.mean([f['label_quality']['score'] for f in fold_scores]))
     mean_auc = float(np.mean([f['model_quality']['auc'] for f in fold_scores]))
-    consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores])
-
     fold_metrics = [f.get('fold_metrics', {}) for f in fold_scores]
+    _early_fold_sharpes = [_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]
+    consistency = _score_fold_consistency([f['model_quality']['auc'] for f in fold_scores], _early_fold_sharpes)
     fold_gate_counters = [f.get('gate_counters', {}) for f in fold_scores]
     fold_metrics_with_gates = [
         {
@@ -1588,7 +1664,10 @@ def objective(
 
     realized_sharpe = float(np.mean([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics]))
     realized_sharpe_raw = float(np.mean(fold_raw_sharpes)) if fold_raw_sharpes else 0.0
-    realized_sharpe_term = _bounded_sharpe_term(realized_sharpe)
+    # Robust Sharpe: weight min-fold 40% — penalises regime-specific strategies heavily
+    min_fold_sharpe = float(min(fold_sharpes)) if fold_sharpes else realized_sharpe
+    robust_sharpe = 0.60 * realized_sharpe + 0.40 * min_fold_sharpe
+    realized_sharpe_term = _bounded_sharpe_term(robust_sharpe)
     realized_return = float(np.mean([_finite_metric(m.get('return'), 0.0) for m in fold_metrics]))
     realized_gross_return = float(np.mean([_finite_metric(m.get('gross_return'), 0.0) for m in fold_metrics]))
     realized_expectancy = float(np.mean([_finite_metric(m.get('expectancy'), 0.0) for m in fold_metrics]))
@@ -1631,23 +1710,28 @@ def objective(
     trade_density = float(realized_trades) / max(cv_oos_years, 1e-6)
     trade_density_ratio = float(realized_trades) / target_trades_floor
 
-    activity_bonus = 0.20 * min(1.5, trade_density_ratio)
-    if realized_trades >= max(20, int(math.ceil(target_trades_floor * 0.90))):
-        activity_bonus += 0.08
+    # -----------------------------------------------------------------------
+    # Simplified objective (v12): fold-mean Sharpe as primary signal.
+    #
+    # Research rationale: composite objectives with many penalty terms create
+    # non-convex landscapes that Bayesian optimisers navigate poorly — they find
+    # penalty-avoidance configurations rather than alpha. With fewer tunable
+    # parameters (cooldown/thresholds now fixed), the search space is cleaner
+    # and a simpler objective is both sufficient and more transparent.
+    #
+    # Structure:
+    #   primary   = robust_sharpe (0.60*mean + 0.40*min_fold) — same blend as before
+    #   bonus     = small consistency term (cross-fold Sharpe std)
+    #   hard gate = if too few trades in ANY fold → hard -2.0 rejection
+    #
+    # Removed: activity_bonus, cooldown_penalty, fold_balance_penalty,
+    #          model_q/label_q/expectancy/return terms from the objective.
+    #          Those are diagnostics, not optimisation targets.
+    # -----------------------------------------------------------------------
 
-    combined = (
-        0.18 * model_q +
-        0.14 * label_q +
-        0.12 * consistency['score'] +
-        0.20 * realized_sharpe_term +
-        0.08 * realized_expectancy +
-        0.04 * np.tanh(realized_return * 5.0) +
-        activity_bonus
-    )
-
+    # Compute diagnostics before hard gates so they're available for rejected trials.
     trade_floor_penalty = _trade_starvation_penalty(realized_trades, target_trades_floor)
-    combined += trade_floor_penalty
-
+    activity_regime = _classify_activity_regime(trade_density_ratio, realized_trades)
     aggregate_cv_gate_counters = _aggregate_slice_gate_summaries({
         f'fold_{idx}': {'gate_counters': gate_summary}
         for idx, gate_summary in enumerate(fold_gate_counters)
@@ -1658,10 +1742,87 @@ def objective(
         fold_dominant_share=float(fold_cooldown_meta.get('dominant_share', 0.0) or 0.0),
     )
     fold_balance_penalty_meta = _fold_balance_penalties(fold_trade_counts, fold_sharpes)
-    combined -= cooldown_penalty_meta['penalty']
-    combined -= fold_balance_penalty_meta['total_penalty']
+    psr_meta = compute_psr_from_samples(
+        fold_sharpes,
+        benchmark_sharpe=0.0,
+        effective_observations=len(fold_sharpes),
+    )
+    if not psr_meta.get('valid', False) and psr_meta.get('reason') is None:
+        psr_meta['reason'] = 'insufficient_observations'
+    dsr_cv_meta = compute_deflated_sharpe_metric(
+        observed_sharpe=float(np.mean(fold_sharpes)) if fold_sharpes else 0.0,
+        observations=len(fold_sharpes),
+        effective_test_count=max(len(cv_splits), len(fold_sharpes), 1),
+    )
+    if not dsr_cv_meta.get('valid', False) and dsr_cv_meta.get('reason') is None:
+        dsr_cv_meta['reason'] = 'insufficient_observations'
 
-    activity_regime = _classify_activity_regime(trade_density_ratio, realized_trades)
+    def _set_pre_gate_diagnostics():
+        trial.set_user_attr('cv_oos_days', round(cv_oos_days, 4))
+        trial.set_user_attr('cv_oos_years', round(cv_oos_years, 6))
+        trial.set_user_attr('target_trades_floor', round(target_trades_floor, 6))
+        trial.set_user_attr('min_trade_frequency_ratio', round(min_trade_frequency_ratio, 6))
+        trial.set_user_attr('activity_regime', activity_regime)
+        trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
+        trial.set_user_attr('aggregated_gate_counters', _to_json_safe(aggregate_cv_gate_counters))
+        trial.set_user_attr('main_blockers', _to_json_safe(_derive_main_blockers(aggregate_cv_gate_counters)))
+        trial.set_user_attr('starvation_signature', _to_json_safe(_derive_starvation_signature(aggregate_cv_gate_counters)))
+        trial.set_user_attr('fold_blocker_summary', _to_json_safe([
+            {'fold': int(idx), 'main_blockers': _derive_main_blockers(gate_summary, top_n=2)}
+            for idx, gate_summary in enumerate(fold_gate_counters)
+        ]))
+        trial.set_user_attr('psr_meta', _to_json_safe(psr_meta))
+        trial.set_user_attr('dsr_cv_meta', _to_json_safe(dsr_cv_meta))
+
+    # Hard gate: any fold with 0 trades is a hard rejection — the strategy
+    # cannot be evaluated in that regime.
+    zero_trade_folds = sum(1 for t in fold_trade_counts if t == 0)
+    if zero_trade_folds > 0:
+        _set_pre_gate_diagnostics()
+        trial.set_user_attr('reject_reason', f'zero_trade_fold:count={zero_trade_folds}')
+        return -2.0
+
+    # Hard gate: total trades must reach minimum floor (same threshold as before)
+    if realized_trades < max(5, int(target_trades_floor * 0.35)):
+        _set_pre_gate_diagnostics()
+        trial.set_user_attr('reject_reason', f'insufficient_trades:{realized_trades}<floor_35pct={int(target_trades_floor*0.35)}')
+        return -2.0
+
+    # Primary: robust Sharpe (already computed above)
+    combined = realized_sharpe_term  # tanh-bounded robust_sharpe
+
+    # Small consistency bonus (max 0.15): reward strategies that work across folds
+    # without creating an optimisation target that dominates the Sharpe signal.
+    if fold_sharpes and len(fold_sharpes) > 1:
+        sharpe_std = float(np.std(fold_sharpes))
+        consistency_bonus = 0.15 * float(1.0 / (1.0 + sharpe_std))
+        combined += consistency_bonus
+
+    # Retain trade starvation penalty (softer version) — prevents trivially
+    # good Sharpe from strategies with only 1-2 lucky trades
+    combined += trade_floor_penalty
+
+    # DSR soft penalty: if Deflated SR is valid but below 0.50 the apparent
+    # edge is likely a multiple-testing artefact. Apply a linear penalty capped
+    # at -0.10 to steer the sampler away without causing a hard rejection
+    # (DSR is often invalid at low fold counts, in which case we skip this term).
+    dsr_penalty = 0.0
+    if dsr_cv_meta.get('valid', False):
+        dsr_val = float(dsr_cv_meta.get('dsr', 0.0) or 0.0)
+        if dsr_val < 0.50:
+            dsr_penalty = -0.10 * (0.50 - dsr_val) / 0.50
+    combined += dsr_penalty
+
+    # Feature importance stability: compute mean pairwise Spearman correlation
+    # of per-fold importance vectors. A low score indicates the model is
+    # latching onto different features in different regimes — a sign of
+    # overfitting. Apply a small penalty when stability < 0.30.
+    fold_importances = [f.get('feature_importances', {}) for f in fold_scores]
+    importance_stability = _compute_importance_stability(fold_importances)
+    importance_instability_penalty = 0.0
+    if importance_stability is not None and importance_stability < 0.30:
+        importance_instability_penalty = -0.05 * (0.30 - importance_stability) / 0.30
+        combined += importance_instability_penalty
 
     family_params = _extract_family_params(build_effective_params(trial_params, coin_name), profile.strategy_family)
     family_param_fingerprint = _family_param_fingerprint(build_effective_params(trial_params, coin_name), profile.strategy_family)
@@ -1703,22 +1864,6 @@ def objective(
     trial.set_user_attr('std_sharpe', round(float(np.std([_finite_metric(m.get('sharpe'), 0.0) for m in fold_metrics])) if fold_metrics else 0.0, 6))
     trial.set_user_attr('win_rate', round(float(np.mean([1.0 if _finite_metric(m.get('expectancy'), 0.0) > 0 else 0.0 for m in fold_metrics])) if fold_metrics else 0.0, 4))
     trial.set_user_attr('max_drawdown', round(max(0.0, 1.0 - max(realized_return, -1.0)), 4))
-    psr_meta = compute_psr_from_samples(
-        fold_sharpes,
-        benchmark_sharpe=0.0,
-        effective_observations=len(fold_sharpes),
-    )
-    if not psr_meta.get('valid', False) and psr_meta.get('reason') is None:
-        psr_meta['reason'] = 'insufficient_observations'
-
-    dsr_cv_meta = compute_deflated_sharpe_metric(
-        observed_sharpe=float(np.mean(fold_sharpes)) if fold_sharpes else 0.0,
-        observations=len(fold_sharpes),
-        effective_test_count=max(len(cv_splits), len(fold_sharpes), 1),
-    )
-    if not dsr_cv_meta.get('valid', False) and dsr_cv_meta.get('reason') is None:
-        dsr_cv_meta['reason'] = 'insufficient_observations'
-
     trial.set_user_attr('fold_metrics', _to_json_safe(fold_metrics_with_gates))
     trial.set_user_attr('fold_gate_counters', _to_json_safe(fold_gate_counters))
     trial.set_user_attr('fold_trade_counts', _to_json_safe(fold_trade_counts))
@@ -1746,6 +1891,9 @@ def objective(
     trial.set_user_attr('cv_equity_start', round(cv_equity_start, 6))
     trial.set_user_attr('cv_equity_end', round(cv_equity_end, 6))
     trial.set_user_attr('trade_floor_penalty', round(trade_floor_penalty, 6))
+    trial.set_user_attr('dsr_penalty', round(dsr_penalty, 6))
+    trial.set_user_attr('fold_importance_stability', round(importance_stability, 4) if importance_stability is not None else None)
+    trial.set_user_attr('importance_instability_penalty', round(importance_instability_penalty, 6))
     trial.set_user_attr('cooldown_dominance_penalty', round(float(cooldown_penalty_meta['penalty']), 6))
     trial.set_user_attr('cooldown_dominance_rate', round(float(cooldown_penalty_meta['cooldown_rate']), 6))
     trial.set_user_attr('cooldown_dominance_regime', str(cooldown_penalty_meta.get('cooldown_regime', 'normal')))
@@ -1793,7 +1941,8 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         dd = _as_number(t.user_attrs.get('max_drawdown'), 1.0) or 1.0
         std_s = _as_number(t.user_attrs.get('std_sharpe'), 9.0) or 9.0
         min_s = _as_number(t.user_attrs.get('min_sharpe'), -9.0)
-        if dd > 0.40 or std_s > 1.2 or (min_s is not None and min_s < -0.8):
+        # Tighter filters: require consistent cross-regime performance
+        if dd > 0.35 or std_s > 0.80 or (min_s is not None and min_s < -0.30):
             continue
         accepted.append(t)
 
@@ -1808,6 +1957,7 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         activity_regime = str(t.user_attrs.get('activity_regime') or _classify_activity_regime(float(cv_density_ratio), cv_trades))
         regime_rank = {'dead': 0, 'starved': 1, 'thin': 2, 'active': 3}.get(activity_regime, 0)
         psr = _as_number(t.user_attrs.get('psr'), 0.0) or 0.0
+        dsr_cv = _as_number(t.user_attrs.get('dsr_cv'), 0.0) or 0.0
         mean_sr = _as_number(t.user_attrs.get('mean_sharpe', t.user_attrs.get('sharpe')), -9.0) or -9.0
         realized_return = _as_number(t.user_attrs.get('realized_return'), -9.0) or -9.0
         std_s = _as_number(t.user_attrs.get('std_sharpe'), 9.0) or 9.0
@@ -1820,7 +1970,7 @@ def _candidate_trials_for_holdout(study, max_candidates=3, min_trades=20):
         ranking_penalty += 1.25 * float(cooldown_fold_meta.get('penalty', 0.0) or 0.0)
         zero_trade_fold_penalty = float(_as_number(t.user_attrs.get('zero_trade_fold_penalty'), 0.0) or 0.0)
         positive_perf_score = float(mean_sr > 0.0) + float(realized_return > 0.0) + float((_as_number(t.user_attrs.get('realized_expectancy'), 0.0) or 0.0) > 0.0)
-        return (regime_rank, positive_perf_score, activity_score - ranking_penalty - (0.50 * zero_trade_fold_penalty), psr, mean_sr, float(t.value or -99), -std_s, -dd)
+        return (regime_rank, positive_perf_score, activity_score - ranking_penalty - (0.50 * zero_trade_fold_penalty), psr, dsr_cv, mean_sr, float(t.value or -99), -std_s, -dd)
 
     accepted_sorted = sorted(accepted, key=_rank_key, reverse=True)
     cap = max(1, int(max_candidates or 1))
@@ -2091,6 +2241,22 @@ def evaluate_holdout(holdout_data, params, coin_name, coin_prefix, holdout_days,
             if full_metrics:
                 holdout_slices['full180'] = full_metrics
 
+        # prior180: evaluate 180d window ending ~180d before holdout end — covers a different
+        # market regime (e.g. correction/consolidation period before the bull run).
+        # Only meaningful when the holdout pool is deep enough (≥360d).
+        if full_span_days >= 360:
+            prior180_end = end_ts - pd.Timedelta(days=180)
+            prior180_dataset = {
+                target_sym: {
+                    'features': holdout_data[target_sym]['features'][holdout_data[target_sym]['features'].index <= prior180_end],
+                    'ohlcv': sym_ohlcv[sym_ohlcv.index <= prior180_end],
+                }
+            }
+            if len(prior180_dataset[target_sym]['ohlcv']) > 500:
+                prior180_metrics = _run_holdout_window(prior180_dataset, target_sym, profile, coin_name, eval_days=180, pruned_only=pruned_only, base_config=base_config)
+                if prior180_metrics:
+                    holdout_slices['prior180'] = prior180_metrics
+
     top_level = _derive_top_level_holdout(holdout_slices, holdout_mode=holdout_mode)
     if not top_level:
         return None
@@ -2249,7 +2415,7 @@ def _is_paper_facing_run(preset_name: str, gate_mode: str) -> bool:
     # fast_qualify explicitly opts out of holdout requirement; don't force it via gate_mode.
     if preset in {'fast_qualify', 'quick', 'discovery'}:
         return False
-    return preset in {'paper_ready', 'robust120', 'robust180'} or gate in {
+    return preset in {'paper_ready', 'robust120', 'robust180', 'robust_annual'} or gate in {
         'initial_paper_qualification',
         'production_promotion',
     }
@@ -2459,6 +2625,73 @@ def _persist_paper_candidate_json(coin_name: str, payload: Dict) -> Optional[Pat
         logger.error("Failed to persist paper candidate for %s: %s", coin_name, exc)
         return None
 
+def _screen_strategy_families(
+    optim_data,
+    coin_prefix,
+    coin_name,
+    cv_splits,
+    target_sym,
+    base_config,
+    screen_trials: int = 30,
+    top_n: int = 2,
+) -> tuple[str, ...]:
+    """Run a cheap per-family screen and return the top `top_n` families by mean CV Sharpe.
+
+    Each family is evaluated with `screen_trials` Optuna trials with the family fixed
+    (no categorical search). This separates family selection (coarse, cheap) from
+    hyperparameter tuning (fine, expensive), giving TPE a cleaner search space for the
+    main study.
+    """
+    families = list(STRATEGY_FAMILIES)
+    if len(families) <= top_n:
+        return tuple(families)
+
+    family_scores: dict[str, float] = {}
+    print(f"\n🔍 Family pre-screen ({coin_name}): {screen_trials} trials × {len(families)} families")
+
+    for family in families:
+        screen_study = optuna.create_study(
+            direction='maximize',
+            sampler=TPESampler(seed=42, n_startup_trials=min(10, screen_trials // 3)),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+        )
+        screen_obj = functools.partial(
+            objective,
+            optim_data=optim_data,
+            coin_prefix=coin_prefix,
+            coin_name=coin_name,
+            cv_splits=cv_splits,
+            target_sym=target_sym,
+            pruned_only=True,
+            base_config=base_config,
+            allowed_families=[family],
+        )
+        try:
+            screen_study.optimize(screen_obj, n_trials=screen_trials, show_progress_bar=False)
+        except Exception as e:
+            logger.warning("Family screen failed for %s/%s: %s", coin_name, family, e)
+            family_scores[family] = -9.0
+            continue
+
+        completed = [
+            t for t in screen_study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        if completed:
+            mean_sr = float(np.mean([
+                float(t.user_attrs.get('mean_sharpe', 0.0) or 0.0) for t in completed
+            ]))
+        else:
+            mean_sr = -9.0
+        family_scores[family] = mean_sr
+        print(f"   {family}: mean_sharpe={mean_sr:.3f} ({len(completed)} completed)")
+
+    ranked = sorted(family_scores, key=lambda f: family_scores[f], reverse=True)
+    selected = tuple(ranked[:top_n])
+    print(f"   → Top {top_n} families: {selected}")
+    return selected
+
+
 def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   plateau_patience=60, plateau_min_delta=0.02, plateau_warmup=30,
                   plateau_min_completed=0,
@@ -2479,7 +2712,9 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
                   cost_config_path=None,
                   proxy_fidelity_candidates=0,
                   proxy_fidelity_eval_days=0,
-                  use_memory_storage=False):
+                  use_memory_storage=False,
+                  family_screen_trials=30,
+                  family_screen_top_n=2):
     enable_pbo_diagnostic = False
     enable_study_significance = False
     study_significance_bootstrap_iterations = 500
@@ -2518,12 +2753,31 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
         embargo_frac=embargo_frac,
     )
 
+    # Strategy family pre-screen: run cheap trials per family, keep top N.
+    # Only skip when resuming (families already selected) or only 1 family exists.
+    screen_trials = int(family_screen_trials or 0)
+    top_n = int(family_screen_top_n or 2)
+    if screen_trials > 0 and not resume_study and len(STRATEGY_FAMILIES) > top_n:
+        allowed_families = _screen_strategy_families(
+            optim_data=optim_data,
+            coin_prefix=coin_prefix,
+            coin_name=coin_name,
+            cv_splits=cv_splits,
+            target_sym=target_sym,
+            base_config=base_cost_config,
+            screen_trials=screen_trials,
+            top_n=top_n,
+        )
+    else:
+        allowed_families = STRATEGY_FAMILIES
+
     print(f"\n{'='*60}")
     print(f"🚀 OPTIMIZING {coin_name} — v11.3 FAST CV")
     print(f"   Selected config: n_cv_folds={n_cv_folds}, holdout_days={holdout_days}, holdout_mode={holdout_mode}, cv_mode={cv_mode}")
     print(f"   Optim: {optim_start.date()} → {optim_end.date()} | Holdout: last {holdout_days}d (→{holdout_end.date()})")
     print(f"   CV folds: {len(cv_splits)} | Purge: {purge_days}d (max_hold={active_profile.max_hold_hours}h) | Params: 6 tunable | Trials: {n_trials} | Jobs: {n_jobs}")
-    print("   Objective weights: model_quality=0.25, label_quality=0.20, fold_consistency=0.15, realized_sharpe=0.25, expectancy=0.10, return_term=0.05")
+    print(f"   Families (post-screen): {allowed_families}")
+    print("   Objective (v12): robust_sharpe(mean+min blend, tanh-bounded) + consistency_bonus(max=0.15) | hard gate: 0-trade folds → -2.0")
     print("   High-conviction mode: raised thresholds + longer cooldowns + wider TP")
     phase_label = 'discovery' if str(preset_name).lower() in {'discovery', 'paper_discovery'} else 'qualification'
     print(
@@ -2628,7 +2882,8 @@ def optimize_coin(all_data, coin_prefix, coin_name, n_trials=100, n_jobs=1,
     obj = functools.partial(objective, optim_data=optim_data, coin_prefix=coin_prefix,
                             coin_name=coin_name, cv_splits=cv_splits, target_sym=target_sym,
                             pruned_only=pruned_only,
-                            base_config=base_cost_config)
+                            base_config=base_cost_config,
+                            allowed_families=allowed_families)
     min_completed_trials = max(int(plateau_min_completed or 0), int(max(1, n_trials) * 0.40))
 
     def _prune_event_callback(study, frozen_trial):
@@ -3371,6 +3626,10 @@ def apply_runtime_preset(args):
     presets = {
         'robust180': {'plateau_patience': 120, 'plateau_warmup': 60, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 20, 'n_cv_folds': 5, 'holdout_candidates': 3, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.67, 'seed_stability_max_param_dispersion': 0.60, 'seed_stability_max_oos_sharpe_dispersion': 0.35, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
         'robust120': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 15, 'n_cv_folds': 5, 'holdout_candidates': 2, 'holdout_min_trades': 12, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
+        # Annual holdout: splits last 365 days as holdout, evaluates across 4 slices
+        # (prior180, prior90, recent90, full180) spanning correction + bull-ramp + bull-peak.
+        # Training window shrinks to ~19 months but holdout covers multiple distinct regimes.
+        'robust_annual': {'plateau_patience': 90, 'plateau_warmup': 45, 'plateau_min_delta': 0.015, 'plateau_min_completed': 0, 'holdout_days': 365, 'holdout_mode': 'multi_slice', 'min_total_trades': 15, 'n_cv_folds': 5, 'cv_mode': 'purged_embargo', 'holdout_candidates': 3, 'holdout_min_trades': 8, 'holdout_min_sharpe': 0.0, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.60, 'seed_stability_max_param_dispersion': 0.70, 'seed_stability_max_oos_sharpe_dispersion': 0.40, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None, 'family_screen_trials': 30, 'family_screen_top_n': 2},
         'quick':     {'plateau_patience': 45, 'plateau_warmup': 20, 'plateau_min_delta': 0.03, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 8, 'n_cv_folds': 2, 'holdout_candidates': 1, 'holdout_min_trades': 8, 'holdout_min_sharpe': -0.1, 'holdout_min_return': -0.05, 'require_holdout_pass': False, 'target_trades_per_week': 0.8, 'min_psr': 0.05, 'min_psr_cv': 0.05, 'min_psr_holdout': None, 'min_dsr': None, 'seed_stability_min_pass_rate': 0.50, 'seed_stability_max_param_dispersion': 1.00, 'seed_stability_max_oos_sharpe_dispersion': 0.80},
         'discovery': {'plateau_patience': 70, 'plateau_warmup': 30, 'plateau_min_delta': 0.02, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'single90', 'min_total_trades': 10, 'n_cv_folds': 4, 'holdout_candidates': 2, 'holdout_min_trades': 10, 'holdout_min_sharpe': -0.05, 'holdout_min_return': -0.03, 'require_holdout_pass': False, 'target_trades_per_week': 0.6, 'seed_stability_min_pass_rate': 0.55, 'seed_stability_max_param_dispersion': 0.90, 'seed_stability_max_oos_sharpe_dispersion': 0.60, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
         'paper_ready': {'plateau_patience': 150, 'plateau_warmup': 80, 'plateau_min_delta': 0.012, 'plateau_min_completed': 0, 'holdout_days': 90, 'holdout_mode': 'multi_slice', 'min_total_trades': 28, 'n_cv_folds': 5, 'holdout_candidates': 4, 'holdout_min_trades': 15, 'holdout_min_sharpe': 0.05, 'holdout_min_return': 0.0, 'require_holdout_pass': True, 'target_trades_per_week': 1.0, 'seed_stability_min_pass_rate': 0.75, 'seed_stability_max_param_dispersion': 0.50, 'seed_stability_max_oos_sharpe_dispersion': 0.30, 'min_psr_cv': None, 'min_psr_holdout': None, 'min_dsr': None},
@@ -3414,6 +3673,8 @@ def apply_runtime_preset(args):
             'seed_stability_max_param_dispersion': '--seed-stability-max-param-dispersion',
             'seed_stability_max_oos_sharpe_dispersion': '--seed-stability-max-oos-sharpe-dispersion',
             'cost_config_path': '--cost-config-path',
+            'family_screen_trials': '--family-screen-trials',
+            'family_screen_top_n': '--family-screen-top-n',
         }
         provided = set(sys.argv[1:])
         for k, v in cfg.items():
@@ -3425,7 +3686,10 @@ def apply_runtime_preset(args):
     return args
 
 COIN_MAP = {'BIP':'BTC','BTC':'BTC','ETP':'ETH','ETH':'ETH','XPP':'XRP','XRP':'XRP','SLP':'SOL','SOL':'SOL','DOP':'DOGE','DOGE':'DOGE'}
-PREFIX_FOR_COIN = {'BTC':'BIP','ETH':'ETP','XRP':'XPP','SOL':'SLP','DOGE':'DOP'}
+PREFIX_FOR_COIN = {
+    'BTC': 'BIP', 'ETH': 'ETP', 'XRP': 'XPP', 'SOL': 'SLP', 'DOGE': 'DOP',
+    'AVAX': 'AVP', 'ADA': 'ADP', 'LINK': 'LNP', 'LTC': 'LCP',
+}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="v11.3 Fast CV Optimization")
@@ -3438,7 +3702,7 @@ if __name__ == "__main__":
     parser.add_argument("--holdout-days", type=int, default=90)
     parser.add_argument("--holdout-mode", type=str, default="single90", choices=["single90", "multi_slice"],
                         help="Holdout aggregation mode for selection + backward-compatible top-level metrics")
-    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","quick", "paper_ready", "discovery", "fast_qualify"])
+    parser.add_argument("--preset", type=str, default="paper_ready", choices=["none","robust120","robust180","robust_annual","quick", "paper_ready", "discovery", "fast_qualify"])
     parser.add_argument("--min-total-trades", type=int, default=0)
     parser.add_argument("--n-cv-folds", type=int, default=5); parser.add_argument("--study-suffix", type=str, default="")
     parser.add_argument("--cv-mode", type=str, default="walk_forward", choices=["walk_forward", "purged_embargo"],
@@ -3488,6 +3752,10 @@ if __name__ == "__main__":
                         help="Require pruned feature artifacts during optimization and holdout")
     parser.add_argument("--allow-unpruned", action="store_false", dest="pruned_only",
                         help="Allow fallback to unpruned profile features if artifacts are missing")
+    parser.add_argument("--family-screen-trials", type=int, default=30,
+                        help="Trials per family in pre-screen phase (0 = skip pre-screen, use all families)")
+    parser.add_argument("--family-screen-top-n", type=int, default=2,
+                        help="Number of top families to keep after pre-screen")
     parser.add_argument("--sampler-seeds", type=str, default="")
     parser.add_argument("--resume", action="store_true"); parser.add_argument("--debug-trials", action="store_true")
     parser.set_defaults(pruned_only=True)
@@ -3559,4 +3827,6 @@ if __name__ == "__main__":
             preset_name=args.preset,
             gate_mode=args.gate_mode,
             cost_config_path=args.cost_config_path,
+            family_screen_trials=args.family_screen_trials,
+            family_screen_top_n=args.family_screen_top_n,
         )

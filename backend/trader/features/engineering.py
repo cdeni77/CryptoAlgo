@@ -596,6 +596,82 @@ class DOGESentimentFeatures:
         return features
 
 
+class ADABreakoutFeatures:
+    """
+    ADA-specific: compression-breakout and flow microstructure features.
+
+    ADA often alternates between low-volatility compression and abrupt directional bursts,
+    similar to XRP but with slower, more fundamental-driven pace.
+    """
+
+    @classmethod
+    def compute(cls, df: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        close = df['close']
+        returns = close.pct_change()
+
+        range_24 = (df['high'].rolling(24).max() - df['low'].rolling(24).min()).replace(0, np.nan)
+        range_168 = (df['high'].rolling(168).max() - df['low'].rolling(168).min()).replace(0, np.nan)
+        features['ada_compression_ratio'] = range_24 / range_168
+
+        features['ada_breakout_distance'] = (
+            (close - close.rolling(72).mean()) / close.rolling(72).std().replace(0, np.nan)
+        )
+        features['ada_whipsaw_score'] = (
+            (returns.abs() > returns.rolling(168).std() * 1.7).rolling(24).mean()
+        )
+
+        body = (df['close'] - df['open']).abs()
+        full = (df['high'] - df['low']).replace(0, np.nan)
+        features['ada_body_efficiency'] = (body / full).rolling(12).mean()
+
+        vol_ratio = df['volume'] / df['volume'].rolling(168).mean().replace(0, np.nan)
+        features['ada_volume_breakout_confirm'] = (
+            (close > close.rolling(48).max().shift(1)).astype(int) * vol_ratio
+        ).rolling(12).mean()
+        features['ada_reversal_pressure'] = (
+            (close - close.rolling(24).mean()) / close.rolling(24).std().replace(0, np.nan)
+        ).diff(6)
+
+        return features
+
+
+class LINKTrendFeatures:
+    """
+    LINK-specific: trend-persistence and oracle-catalyst momentum features.
+
+    Chainlink tends to exhibit sharp trend impulses driven by oracle integrations,
+    partnership announcements, and DeFi TVL cycles — followed by measured pullbacks.
+    """
+
+    @classmethod
+    def compute(cls, df: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        close = df['close']
+        returns = close.pct_change()
+
+        for lb in [12, 24, 72, 168]:
+            ema_fast = close.ewm(span=max(4, lb // 3), adjust=False).mean()
+            ema_slow = close.ewm(span=lb, adjust=False).mean()
+            features[f'link_trend_spread_{lb}h'] = (ema_fast - ema_slow) / ema_slow.replace(0, np.nan)
+
+        vol_base = returns.rolling(168).std().replace(0, np.nan)
+        for lb in [12, 24, 48]:
+            impulse = returns.rolling(lb).sum()
+            features[f'link_impulse_{lb}h'] = impulse / (vol_base * np.sqrt(lb / 24.0))
+
+        vol_ratio = df['volume'] / df['volume'].rolling(168).mean().replace(0, np.nan)
+        features['link_volume_support'] = (vol_ratio * returns.clip(lower=0)).rolling(12).mean()
+        features['link_pullback_depth_72h'] = (
+            close / close.rolling(72).max().replace(0, np.nan)
+        ) - 1.0
+        features['link_breakout_pressure'] = (
+            (close - close.rolling(48).max().shift(1)) / close.rolling(48).std().replace(0, np.nan)
+        )
+
+        return features
+
+
 # Coin-Specific Feature Labels
 
 # Map symbol prefixes to their coin-specific feature class
@@ -610,6 +686,15 @@ COIN_FEATURE_MAP = {
     'SOL': SOLEcosystemFeatures,
     'DOP': DOGESentimentFeatures,         # DOGE
     'DOGE': DOGESentimentFeatures,
+    # New coins
+    'AVP': SOLEcosystemFeatures,          # AVAX — same momentum-breakout features as SOL
+    'AVAX': SOLEcosystemFeatures,
+    'ADP': ADABreakoutFeatures,           # ADA
+    'ADA': ADABreakoutFeatures,
+    'LNP': LINKTrendFeatures,             # LINK
+    'LINK': LINKTrendFeatures,
+    'LCP': BTCMeanReversionFeatures,      # LTC — BTC-like mean-reversion
+    'LTC': BTCMeanReversionFeatures,
 }
 
 

@@ -520,8 +520,8 @@ def compute_readiness_score(mc_shuffle, mc_resample, sensitivity, dsr,
 
     psr = float(optim_metrics.get('psr', 0.0) or 0.0)
     checks.append(ReadinessCheck(
-        'psr_confident', psr >= 0.60, 10.0,
-        f"PSR={psr:.2f} (need >=0.60)"))
+        'psr_confident', psr >= 0.75, 10.0,
+        f"PSR={psr:.2f} (need >=0.75)"))
 
     ho_sharpe = holdout_metrics.get('holdout_sharpe', 0)
     ho_trades = holdout_metrics.get('holdout_trades', 0)

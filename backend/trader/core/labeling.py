@@ -18,11 +18,15 @@ class TripleBarrierSpec:
 
     Neutral-direction entries (no momentum consensus) are left as NaN and are excluded
     from model training before SL/TP are binary-mapped to 0/1.
+
+    fee_pct_per_side: round-trip fee (2×this) is added to the TP barrier so that
+    label=1 only when the gross move covers execution costs.
     """
 
     horizon_hours: int
     tp_mult: float
     sl_mult: float
+    fee_pct_per_side: float = 0.0
 
 
 def resolve_profile_label_horizon(max_hold_hours: int, label_forward_hours: int) -> int:
@@ -98,7 +102,8 @@ def compute_labels_from_ohlcv_iteration(
     direction: pd.Series,
 ) -> pd.Series:
     target = pd.Series(index=ohlcv.index, dtype=float)
-    vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
+    # Use 48-bar rolling std shifted 1 bar — more stable estimate, no lookahead
+    vol = ohlcv['close'].pct_change().rolling(48).std().shift(1).ffill()
 
     for idx in range(len(ohlcv) - spec.horizon_hours):
         ts = ohlcv.index[idx]
@@ -113,12 +118,13 @@ def compute_labels_from_ohlcv_iteration(
         entry_px = ohlcv['close'].iloc[idx]
         tp_move = spec.tp_mult * row_vol
         sl_move = spec.sl_mult * row_vol
+        rt_fee = 2.0 * spec.fee_pct_per_side  # round-trip: entry + exit
 
         if side == 1:
-            tp_px = entry_px * (1 + tp_move)
+            tp_px = entry_px * (1 + tp_move + rt_fee)
             sl_px = entry_px * (1 - sl_move)
         else:
-            tp_px = entry_px * (1 - tp_move)
+            tp_px = entry_px * (1 - tp_move - rt_fee)
             sl_px = entry_px * (1 + sl_move)
 
         future = ohlcv.iloc[idx + 1: idx + 1 + spec.horizon_hours]
@@ -134,7 +140,8 @@ def compute_labels_from_feature_index(
     direction: pd.Series,
 ) -> pd.Series:
     target = pd.Series(index=feature_index, dtype=float)
-    vol = ohlcv['close'].pct_change().rolling(24).std().ffill()
+    # Use 48-bar rolling std shifted 1 bar — more stable estimate, no lookahead
+    vol = ohlcv['close'].pct_change().rolling(48).std().shift(1).ffill()
 
     # Pre-compute numpy arrays and index map for O(1) lookups (avoids per-row pandas overhead)
     _close_arr = ohlcv['close'].values
@@ -165,12 +172,13 @@ def compute_labels_from_feature_index(
         entry_px = _close_arr[pos]
         tp_move = spec.tp_mult * row_vol
         sl_move = spec.sl_mult * row_vol
+        rt_fee = 2.0 * spec.fee_pct_per_side  # round-trip: entry + exit
 
         if side == 1:
-            tp_px = entry_px * (1 + tp_move)
+            tp_px = entry_px * (1 + tp_move + rt_fee)
             sl_px = entry_px * (1 - sl_move)
         else:
-            tp_px = entry_px * (1 - tp_move)
+            tp_px = entry_px * (1 - tp_move - rt_fee)
             sl_px = entry_px * (1 + sl_move)
 
         future_high = _high_arr[pos + 1: pos + 1 + h]

@@ -96,6 +96,7 @@ class PaperTradingEngine:
         open_positions = self.writer.count_open_positions()
         if open_positions >= self.config.max_positions:
             logger.info("max open positions reached (%s), skipping signal id=%s", open_positions, signal.id)
+            self.writer.mark_signal_acted(signal.id)
             return
 
         open_position = self.writer.get_open_paper_position(signal.coin)
