@@ -1,40 +1,48 @@
 import { PaperFill } from '../types';
 
-const sideClass = (side: string) =>
-  side === 'long' ? 'text-[var(--accent-emerald)]' : 'text-[var(--accent-rose)]';
+function fmt(v: number) {
+  return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 
-export default function PaperFillsTable({ fills, loading }: { fills: PaperFill[]; loading: boolean }) {
-  if (loading) return <div className="glass-card rounded-xl p-6 text-sm text-[var(--text-muted)]">Fetching paper trading state...</div>;
+interface Props { fills: PaperFill[]; limit?: number }
+
+export default function PaperFillsTable({ fills, limit = 20 }: Props) {
+  const rows = fills.slice(0, limit);
 
   return (
-    <div className="glass-card rounded-xl overflow-hidden">
-      <div className="overflow-x-auto max-h-[560px]">
-        <table className="min-w-full">
-          <thead className="sticky top-0 z-10 bg-[var(--bg-card)]/95">
-            <tr className="border-b border-[var(--border-subtle)]">
-              {['Time', 'Coin', 'Side', 'Contracts', 'Fill Price', 'Notional', 'Fee', 'Slippage (bps)'].map((h) => (
-                <th key={h} className="px-4 py-3 text-left text-[10px] uppercase text-[var(--text-muted)]">{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {fills.length === 0 ? (
-              <tr><td colSpan={8} className="px-4 py-8 text-center text-[var(--text-muted)]">No paper fills yet.</td></tr>
-            ) : fills.map((f) => (
-              <tr key={f.id} className="border-b border-[var(--border-subtle)] hover:bg-[var(--bg-elevated)]/30">
-                <td className="px-4 py-2 text-xs text-[var(--text-muted)]">{new Date(f.created_at).toLocaleString()}</td>
-                <td className="px-4 py-2 font-semibold">{f.coin}</td>
-                <td className={`px-4 py-2 font-semibold uppercase text-xs ${sideClass(f.side)}`}>{f.side}</td>
-                <td className="px-4 py-2">{f.contracts}</td>
-                <td className="px-4 py-2">${f.fill_price.toFixed(2)}</td>
-                <td className="px-4 py-2">${f.notional.toFixed(2)}</td>
-                <td className="px-4 py-2">${f.fee.toFixed(4)}</td>
-                <td className="px-4 py-2">{f.slippage_bps.toFixed(2)}</td>
-              </tr>
+    <div className="overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-[rgba(56,189,248,0.08)]">
+            {['Time', 'Coin', 'Side', 'Qty', 'Price', 'Notional', 'Fee', 'Slip'].map(h => (
+              <th key={h} className="text-left px-2 py-2 text-tx-muted font-medium tracking-wider uppercase text-[10px]">{h}</th>
             ))}
-          </tbody>
-        </table>
-      </div>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr><td colSpan={8} className="px-2 py-6 text-center text-tx-muted">No fills yet</td></tr>
+          )}
+          {rows.map(f => (
+            <tr key={f.id} className="border-b border-[rgba(56,189,248,0.04)] hover:bg-[rgba(56,189,248,0.03)]">
+              <td className="px-2 py-1.5 font-mono text-tx-muted whitespace-nowrap">
+                {new Date(f.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}
+              </td>
+              <td className="px-2 py-1.5 font-medium text-tx-secondary">{f.coin}</td>
+              <td className="px-2 py-1.5">
+                <span className={`font-mono text-[11px] font-semibold ${f.side === 'long' ? 'text-accent-emerald' : 'text-accent-rose'}`}>
+                  {f.side.toUpperCase()}
+                </span>
+              </td>
+              <td className="px-2 py-1.5 font-mono text-tx-secondary">{f.contracts}</td>
+              <td className="px-2 py-1.5 font-mono text-tx-secondary">${fmt(f.fill_price)}</td>
+              <td className="px-2 py-1.5 font-mono text-tx-secondary">${fmt(f.notional)}</td>
+              <td className="px-2 py-1.5 font-mono text-accent-rose">${fmt(f.fee)}</td>
+              <td className="px-2 py-1.5 font-mono text-tx-muted">{f.slippage_bps?.toFixed(1)}bps</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

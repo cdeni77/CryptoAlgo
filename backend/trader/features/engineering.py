@@ -695,6 +695,21 @@ COIN_FEATURE_MAP = {
     'LINK': LINKTrendFeatures,
     'LCP': BTCMeanReversionFeatures,      # LTC — BTC-like mean-reversion
     'LTC': BTCMeanReversionFeatures,
+    # ── New 20DEC30-CDE additions ──────────────────────────────────────────
+    'NER': SOLEcosystemFeatures,          # NEAR  — Layer-1, ecosystem momentum like SOL
+    'NEAR': SOLEcosystemFeatures,
+    'SUP': SOLEcosystemFeatures,          # SUI   — Layer-1, parallel execution like SOL
+    'SUI': SOLEcosystemFeatures,
+    'BCP': BTCMeanReversionFeatures,      # BCH   — BTC-lite, same mean-reversion pattern
+    'BCH': BTCMeanReversionFeatures,
+    'XLP': XRPFlowMicrostructureFeatures, # XLM   — compression-breakout like XRP
+    'XLM': XRPFlowMicrostructureFeatures,
+    'POP': BTCMeanReversionFeatures,      # DOT   — parachain, BTC-like support/resistance
+    'DOT': BTCMeanReversionFeatures,
+    'SHP': DOGESentimentFeatures,         # 1000SHIB — meme coin, btc_lead like DOGE
+    'SHIB': DOGESentimentFeatures,
+    'PEP': DOGESentimentFeatures,         # 1000PEPE — meme coin, btc_lead like DOGE
+    'PEPE': DOGESentimentFeatures,
 }
 
 

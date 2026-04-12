@@ -36,9 +36,11 @@ class TrendPullbackStrategy:
         trend_gate = abs(trend_strength) >= trend_strength_min
         pullback_gate = long_pullback or short_pullback
 
+        norm_trend = abs(trend_strength) / max(trend_strength_min, 1e-6)
+        norm_rebound = abs(rebound_signal) / max(rebound_threshold, 1e-6)
         return StrategyDecision(
             direction=direction,
-            rank_modifier=0.20 * abs(trend_strength) + 0.10 * abs(rebound_signal),
+            rank_modifier=0.18 * min(2.0, norm_trend) + 0.07 * min(1.0, norm_rebound),
             gate_contributions={
                 'momentum_magnitude': trend_gate and rebound_pass,
                 'momentum_dir_agreement': direction != 0 and pullback_gate,

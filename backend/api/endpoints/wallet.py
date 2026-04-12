@@ -632,7 +632,7 @@ def get_wallet(db: Session = Depends(get_db)):
     ledger_usd = _safe_float(ledger.get("value_usd"))
     portfolio_total = (spot_usd or 0.0) + (perps_usd or 0.0) + (ledger_usd or 0.0)
 
-    INITIAL_PAPER_EQUITY = 10_000.0
+    INITIAL_PAPER_EQUITY = 100_000.0
     latest_equity_row = (
         db.query(PaperEquityCurve).order_by(PaperEquityCurve.timestamp.desc()).first()
     )

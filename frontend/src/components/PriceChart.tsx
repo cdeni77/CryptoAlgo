@@ -1,269 +1,92 @@
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  Scatter,
-} from 'recharts';
-import { ChartMarker, CoinSymbol, DataSource, CDESpec, HistoryEntry } from '../types';
-import DataSourceToggle from './DataSourceToggle';
+import { useMemo } from 'react';
+import { ComposedChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
+import { HistoryEntry, PaperFill } from '../types';
 
-interface PriceChartProps {
+interface Props {
   data: HistoryEntry[];
-  markers: ChartMarker[];
-  markerMode: 'paper' | 'live';
-  symbol: CoinSymbol;
-  loading: boolean;
-  timeRange: '1h' | '1d' | '1w' | '1m' | '1y';
-  setTimeRange: (range: '1h' | '1d' | '1w' | '1m' | '1y') => void;
-  dataSource: DataSource;
-  onDataSourceChange: (source: DataSource) => void;
-  cdeSpec?: CDESpec;
+  fills?: PaperFill[];
+  coin: string;
+  mode?: 'candle' | 'line';
 }
 
-export default function PriceChart({
-  data, markers, markerMode, symbol, loading, timeRange, setTimeRange,
-  dataSource, onDataSourceChange, cdeSpec,
-}: PriceChartProps) {
-  const ranges = ['1h', '1d', '1w', '1m', '1y'] as const;
-
-  const rangeLabels: Record<typeof timeRange, string> = {
-    '1h': '1H',
-    '1d': '24H',
-    '1w': '7D',
-    '1m': '30D',
-    '1y': '1Y',
-  };
-
-  if (loading) {
-    return (
-      <div className="glass-card rounded-xl p-8 flex items-center justify-center h-[400px]">
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-10 h-10 border-2 border-[var(--accent-cyan)] border-t-transparent rounded-full animate-spin" />
-          <span className="text-sm text-[var(--text-muted)]">Loading chart...</span>
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function CustomTooltip({ active, payload }: any) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload as HistoryEntry;
+  if (!d) return null;
+  const chg = ((d.close - d.open) / d.open) * 100;
+  const up = d.close >= d.open;
+  return (
+    <div className="glass-card rounded-lg p-3 text-xs font-mono min-w-[140px]">
+      <div className="text-tx-muted mb-1.5">
+        {new Date(d.timestamp).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}
+      </div>
+      {[['O', d.open], ['H', d.high], ['L', d.low], ['C', d.close]].map(([k, v]) => (
+        <div key={String(k)} className="flex justify-between gap-3">
+          <span className="text-tx-muted">{k}</span>
+          <span className="text-tx-primary">${Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 })}</span>
         </div>
-      </div>
-    );
-  }
-
-  if (data.length === 0) {
-    return (
-      <div className="glass-card rounded-xl p-8 text-center h-[400px] flex items-center justify-center">
-        <span className="text-[var(--text-muted)]">No data for this period</span>
-      </div>
-    );
-  }
-
-  // Transform data: if CDE mode, multiply close prices by units_per_contract
-  const chartData = data.map(d => {
-    const multiplier = (dataSource === 'cde' && cdeSpec) ? cdeSpec.units_per_contract : 1;
-    return {
-      ...d,
-      timestampMs: new Date(d.timestamp).getTime(),
-      close: d.close * multiplier,
-    };
-  });
-
-  const prices = chartData.map(d => d.close);
-  const minPrice = Math.min(...prices);
-  const maxPrice = Math.max(...prices);
-  const pad = (maxPrice - minPrice) * 0.06;
-  const isPositive = chartData.length >= 2 && chartData[chartData.length - 1].close >= chartData[0].close;
-  const strokeColor = isPositive ? '#34d399' : '#fb7185';
-  const fillId = isPositive ? 'gradientGreen' : 'gradientRed';
-
-  const formatXAxis = (timestamp: string) => {
-    const date = new Date(timestamp);
-    switch (timeRange) {
-      case '1h':
-      case '1d':
-        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      case '1w':
-        return date.toLocaleDateString([], { weekday: 'short', day: 'numeric' });
-      case '1m':
-      case '1y':
-        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-      default:
-        return date.toLocaleDateString();
-    }
-  };
-
-  const formatPrice = (value: number) => {
-    if (value >= 10000) return `$${(value / 1000).toFixed(1)}k`;
-    if (value >= 1) return `$${value.toFixed(2)}`;
-    return `$${value.toFixed(4)}`;
-  };
-
-  const sourceLabel = dataSource === 'cde' && cdeSpec
-    ? `${cdeSpec.code} Contract Value`
-    : `${symbol}/USD Spot`;
-
-  const chartStartMs = chartData[0].timestampMs;
-  const chartEndMs = chartData[chartData.length - 1].timestampMs;
-  const priceMultiplier = (dataSource === 'cde' && cdeSpec) ? cdeSpec.units_per_contract : 1;
-
-  const visibleMarkers = markers
-    .filter((m) => m.coin === symbol)
-    .map((m) => ({
-      ...m,
-      timestampMs: new Date(m.timestamp).getTime(),
-      plottedPrice: m.price * priceMultiplier,
-    }))
-    .filter((m) => m.timestampMs >= chartStartMs && m.timestampMs <= chartEndMs)
-    .sort((a, b) => a.timestampMs - b.timestampMs);
-
-  // Green ▲ = long entries + short exits (buys); Red ▼ = short entries + long exits (sells)
-  const greenMarkers = visibleMarkers.filter(
-    (m) => (m.side === 'long' && m.kind === 'entry') || (m.side === 'short' && m.kind === 'exit'),
+      ))}
+      <div className={`mt-1 ${up ? 'text-accent-emerald' : 'text-accent-rose'}`}>{up ? '+' : ''}{chg.toFixed(2)}%</div>
+    </div>
   );
-  const redMarkers = visibleMarkers.filter(
-    (m) => (m.side === 'short' && m.kind === 'entry') || (m.side === 'long' && m.kind === 'exit'),
+}
+
+export default function PriceChart({ data, fills = [], coin, mode = 'candle' }: Props) {
+  const chartData = useMemo(() => data.map(d => ({
+    ...d,
+    upBody:   d.close >= d.open ? [d.open, d.close] : [null, null],
+    downBody: d.close <  d.open ? [d.close, d.open] : [null, null],
+  })), [data]);
+
+  const fillPrices = useMemo(() =>
+    fills.filter(f => f.coin === coin).map(f => f.fill_price),
+    [fills, coin]
   );
 
-  const greenLabel = markerMode === 'paper' ? 'Paper long / buy' : 'Long entry / short exit';
-  const redLabel = markerMode === 'paper' ? 'Paper short / sell' : 'Short entry / long exit';
+  // Determine overall trend color for line mode
+  const lineColor = useMemo(() => {
+    if (!data.length) return '#38bdf8';
+    const chg = data[data.length - 1].close - data[0].open;
+    return chg >= 0 ? '#34d399' : '#fb7185';
+  }, [data]);
+
+  if (!data.length) {
+    return <div className="flex items-center justify-center h-full text-tx-muted text-sm">Loading chart…</div>;
+  }
 
   return (
-    <div className="glass-card rounded-xl overflow-hidden">
-      {/* Chart header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-5 pb-0 gap-3">
-        <div className="flex items-center gap-4">
-          <div>
-            <h3 className="text-lg font-bold text-[var(--text-primary)]">{symbol} Price</h3>
-            <p
-              className={`text-xs font-mono-trade mt-0.5 ${
-                dataSource === 'cde' ? 'text-[var(--accent-cyan)]' : 'text-[var(--text-muted)]'
-              }`}
-            >
-              {sourceLabel}
-            </p>
-          </div>
-          <DataSourceToggle source={dataSource} onChange={onDataSourceChange} compact />
-        </div>
-        <div className="flex gap-1 p-0.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)]">
-          {ranges.map((r) => (
-            <button
-              key={r}
-              onClick={() => setTimeRange(r)}
-              className={`
-                px-3 py-1 rounded-md text-xs font-mono-trade font-medium transition-all duration-200
-                ${timeRange === r
-                  ? 'bg-[var(--bg-elevated)] text-[var(--accent-cyan)] shadow-sm'
-                  : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
-                }
-              `}
-            >
-              {rangeLabels[r]}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Chart body */}
-      <div className="p-4 pt-2">
-        <ResponsiveContainer width="100%" height={340}>
-          <AreaChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="gradientGreen" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#34d399" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#34d399" stopOpacity={0} />
-              </linearGradient>
-              <linearGradient id="gradientRed" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#fb7185" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#fb7185" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(56, 189, 248, 0.04)" vertical={false} />
-            <XAxis
-              dataKey="timestampMs"
-              type="number"
-              domain={[chartStartMs, chartEndMs]}
-              scale="time"
-              tickFormatter={(ts) => formatXAxis(new Date(ts).toISOString())}
-              tick={{ fill: '#64748b', fontSize: 11, fontFamily: 'JetBrains Mono' }}
-              axisLine={{ stroke: 'rgba(56, 189, 248, 0.06)' }}
-              tickLine={false}
-              minTickGap={40}
-            />
-            <YAxis
-              domain={[minPrice - pad, maxPrice + pad]}
-              tickFormatter={formatPrice}
-              tick={{ fill: '#64748b', fontSize: 11, fontFamily: 'JetBrains Mono' }}
-              axisLine={false}
-              tickLine={false}
-              width={70}
-            />
-            <Tooltip
-              contentStyle={{
-                backgroundColor: '#131927',
-                border: '1px solid rgba(56, 189, 248, 0.15)',
-                borderRadius: '8px',
-                boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
-                fontFamily: 'JetBrains Mono',
-                fontSize: '12px',
-                color: '#e2e8f0',
-              }}
-              labelFormatter={(label) => {
-                const d = new Date(label);
-                return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-              }}
-              formatter={(value: number, _name, props) => {
-                if (props?.payload?.kind) {
-                  const { side, kind, contracts } = props.payload;
-                  const actionLabel = kind === 'entry'
-                    ? (side === 'long' ? 'Long entry' : 'Short entry')
-                    : (side === 'long' ? 'Long exit' : 'Short exit');
-                  return [`${formatPrice(value)} (${contracts} ctr)`, actionLabel];
-                }
-                return [formatPrice(value), dataSource === 'cde' ? 'Contract' : 'Price'];
-              }}
-            />
-            <Area
-              type="monotone"
-              dataKey="close"
-              stroke={strokeColor}
-              strokeWidth={2}
-              fill={`url(#${fillId})`}
-              dot={false}
-              activeDot={{ r: 4, stroke: strokeColor, strokeWidth: 2, fill: '#0a0e17' }}
-            />
-            <Scatter
-              data={greenMarkers}
-              dataKey="plottedPrice"
-              fill="#22c55e"
-              shape="triangle"
-              legendType="triangle"
-            />
-            <Scatter
-              data={redMarkers}
-              dataKey="plottedPrice"
-              fill="#ef4444"
-              shape="triangle"
-              legendType="triangle"
-            />
-          </AreaChart>
-        </ResponsiveContainer>
-        {visibleMarkers.length > 0 && (
-          <div className="flex flex-wrap items-center gap-4 px-1 pt-3 text-[11px] text-[var(--text-muted)] font-mono-trade">
-            {greenMarkers.length > 0 && (
-              <span className="inline-flex items-center gap-1.5">
-                <span className="text-[#22c55e]">▲</span>
-                {greenLabel}
-              </span>
-            )}
-            {redMarkers.length > 0 && (
-              <span className="inline-flex items-center gap-1.5">
-                <span className="text-[#ef4444]">▼</span>
-                {redLabel}
-              </span>
-            )}
-            <span>{visibleMarkers.length} marker{visibleMarkers.length === 1 ? '' : 's'} in view</span>
-          </div>
+    <ResponsiveContainer width="100%" height="100%">
+      <ComposedChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+        <XAxis
+          dataKey="timestamp"
+          tickFormatter={v => {
+            const d = new Date(v);
+            return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+          }}
+          tick={{ fill: '#64748b', fontSize: 10, fontFamily: 'JetBrains Mono' }}
+          axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={90}
+        />
+        <YAxis
+          domain={['auto', 'auto']}
+          tickFormatter={v => v >= 1000 ? `$${(v/1000).toFixed(1)}k` : `$${v.toFixed(2)}`}
+          tick={{ fill: '#64748b', fontSize: 10, fontFamily: 'JetBrains Mono' }}
+          axisLine={false} tickLine={false} width={56} orientation="right"
+        />
+        <Tooltip content={<CustomTooltip />} />
+        {fillPrices.map((p, i) => (
+          <ReferenceLine key={i} y={p} stroke="rgba(56,189,248,0.4)" strokeDasharray="3 4" />
+        ))}
+        {mode === 'candle' ? (
+          <>
+            <Bar dataKey="upBody"   fill="#34d399" opacity={0.85} radius={[1,1,0,0]} />
+            <Bar dataKey="downBody" fill="#fb7185" opacity={0.85} radius={[1,1,0,0]} />
+            <Line dataKey="close" stroke="rgba(148,163,184,0.15)" dot={false} strokeWidth={0.5} />
+          </>
+        ) : (
+          <Line dataKey="close" stroke={lineColor} dot={false} strokeWidth={1.5} />
         )}
-      </div>
-    </div>
+      </ComposedChart>
+    </ResponsiveContainer>
   );
 }

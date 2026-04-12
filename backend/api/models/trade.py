@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, JSON, String, Text
 from sqlalchemy.sql import func
 
 from models.base import Base
@@ -91,6 +91,10 @@ class PaperPosition(Base):
     opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     is_open = Column(Boolean, nullable=False, default=True)
+    tp_price = Column(Float, nullable=True)
+    sl_price = Column(Float, nullable=True)
+    max_hold_until = Column(DateTime(timezone=True), nullable=True)
+    exit_reason = Column(String, nullable=True)
 
 
 class PaperEquityCurve(Base):
@@ -103,6 +107,31 @@ class PaperEquityCurve(Base):
     unrealized_pnl = Column(Float, nullable=False)
     realized_pnl = Column(Float, nullable=False)
     open_positions = Column(Integer, nullable=False, default=0)
+
+
+class ModelRun(Base):
+    __tablename__ = "model_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_started_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    run_finished_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String, nullable=False, index=True)
+    retrain_window_days = Column(Integer, nullable=False, default=90)
+    symbols_total = Column(Integer, nullable=False, default=0)
+    symbols_trained = Column(Integer, nullable=False, default=0)
+    artifacts_version = Column(String, nullable=True)
+    metrics = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PaperEngineConfig(Base):
+    __tablename__ = "paper_engine_config"
+
+    id = Column(Integer, primary_key=True, default=1)
+    active_coins = Column(JSON, nullable=False, default=list)
+    tier_map = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class TradeBase(BaseModel):
@@ -175,6 +204,10 @@ class PaperPositionResponse(BaseModel):
     opened_at: datetime
     updated_at: Optional[datetime] = None
     is_open: bool
+    tp_price: Optional[float] = None
+    sl_price: Optional[float] = None
+    max_hold_until: Optional[datetime] = None
+    exit_reason: Optional[str] = None
 
     class Config:
         from_attributes = True

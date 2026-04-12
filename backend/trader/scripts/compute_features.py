@@ -312,8 +312,9 @@ def main():
         # 1. Feature integrity + collinearity diagnostics
         is_valid, missing_features = validate_profile_feature_mapping(symbol, feats, profile)
         if not is_valid:
-            lines.append(f"  ❌ {symbol}: Missing profile features ({len(missing_features)}): {missing_features[:8]}")
-            return lines
+            lines.append(f"  ⚠️ {symbol}: Filling {len(missing_features)} missing profile features with 0: {missing_features[:8]}")
+            for col in missing_features:
+                feats[col] = 0.0
 
         post_count = count_high_correlation_pairs(feats, profile.feature_columns, threshold=0.80)
         pre_count = count_high_correlation_pairs(

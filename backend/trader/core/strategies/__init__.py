@@ -8,6 +8,8 @@ from .breakout_expansion import BreakoutExpansionStrategy
 from .funding_carry import FundingCarryStrategy
 from .squeeze_breakout import SqueezeBreakoutStrategy
 from .oi_divergence import OIDivergenceStrategy
+from .btc_lead import BtcLeadStrategy
+from .autocorr_regime import AutocorrRegimeStrategy
 
 STRATEGY_FAMILY_REGISTRY = {
     MomentumTrendStrategy.name: MomentumTrendStrategy(),
@@ -19,6 +21,8 @@ STRATEGY_FAMILY_REGISTRY = {
     FundingCarryStrategy.name: FundingCarryStrategy(),
     SqueezeBreakoutStrategy.name: SqueezeBreakoutStrategy(),
     OIDivergenceStrategy.name: OIDivergenceStrategy(),
+    BtcLeadStrategy.name: BtcLeadStrategy(),
+    AutocorrRegimeStrategy.name: AutocorrRegimeStrategy(),
 }
 
 

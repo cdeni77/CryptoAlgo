@@ -30,7 +30,7 @@ class ValidationConfig:
     
     # Price validation
     max_price_change_pct: float = 10.0  # Max % change in 1 minute
-    min_price: float = 0.0001  # Minimum valid price
+    min_price: float = 1e-12  # Minimum valid price (supports micro-cap tokens like SHIB, PEPE)
     max_price: float = 1_000_000_000  # Maximum valid price (1 billion)
     
     # Volume validation

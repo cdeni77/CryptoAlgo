@@ -154,6 +154,32 @@ LINK_EXTRA_FEATURES = [
 # LTC: BTC mean-reversion pattern (store-of-value narrative, halving cycles)
 LTC_EXTRA_FEATURES = list(BTC_EXTRA_FEATURES) + BTC_RELATIVE_FEATURES
 
+# ── New 20DEC30-CDE coins ──────────────────────────────────────────────────────
+
+# NEAR: Layer-1 ecosystem momentum — reuse SOL feature set
+NEAR_EXTRA_FEATURES = list(SOL_EXTRA_FEATURES)  # already includes BTC_RELATIVE_FEATURES
+
+# SUI: Layer-1 parallel execution — reuse SOL feature set
+SUI_EXTRA_FEATURES = list(SOL_EXTRA_FEATURES)   # already includes BTC_RELATIVE_FEATURES
+
+# BCH: BTC-lite — reuse LTC feature set (same BTC mean-reversion + BTC relative)
+BCH_EXTRA_FEATURES = list(LTC_EXTRA_FEATURES)
+
+# XLM: compression-breakout like XRP
+XLM_EXTRA_FEATURES = [
+    'xlm_compression_ratio', 'xlm_breakout_distance', 'xlm_whipsaw_score',
+    'xlm_body_efficiency', 'xlm_volume_breakout_confirm', 'xlm_reversal_pressure',
+] + BTC_RELATIVE_FEATURES
+
+# DOT: parachain ecosystem, BTC-like support/resistance — reuse BTC mean-reversion
+DOT_EXTRA_FEATURES = list(BTC_EXTRA_FEATURES) + BTC_RELATIVE_FEATURES
+
+# SHIB (1000SHIB): meme coin sentiment — reuse DOGE feature set
+SHIB_EXTRA_FEATURES = list(DOGE_EXTRA_FEATURES)  # already includes BTC_RELATIVE_FEATURES
+
+# PEPE (1000PEPE): meme coin — reuse DOGE feature set
+PEPE_EXTRA_FEATURES = list(DOGE_EXTRA_FEATURES)  # already includes BTC_RELATIVE_FEATURES
+
 
 @dataclass
 class CoinProfile:
@@ -221,6 +247,11 @@ class CoinProfile:
     strategy_family: str = 'momentum_trend'
     trade_freq_bucket: str = 'balanced'
 
+    # Kelly Criterion sizing calibration (populated from backtest results)
+    # kelly_win_rate = 0.0 means not calibrated; sizing falls back to vol-scaled fixed fraction
+    kelly_win_rate: float = 0.0
+    kelly_payoff_ratio: float = 0.0   # avg_win_net_pnl / avg_loss_net_pnl from backtest trades
+
     def load_pruned_features(self, features_dir: Optional[Path] = None) -> Optional[List[str]]:
         """Load persisted pruned feature list for this coin if available."""
         artifact_dir = features_dir or PRUNED_FEATURES_DIR
@@ -258,27 +289,34 @@ class CoinProfile:
 
 
 COIN_PROFILES: Dict[str, CoinProfile] = {
-    # ── ETH: vol_overlay baseline (optimized params: threshold=0.50, holdout SR=0.245) ──
+    # ── ETH: comprehensive_search v2 2026-04-05: mean_reversion/24h/0.025, tp=5.0/sl=3.5
+    #         Verified SR=+0.601, WR=50.8%, 27.2/yr ──
     'ETH': CoinProfile(
         name='ETH',
         prefixes=['ETP', 'ETH'],
         extra_features=ETH_EXTRA_FEATURES,
-        signal_threshold=0.53,          # Baseline for optimizer search range ~0.46-0.61
+        signal_threshold=0.51,
         min_val_auc=0.48,
-        vol_mult_tp=5.0,
-        vol_mult_sl=4.0,
-        max_hold_hours=48,
-        min_momentum_magnitude=0.022,
-        min_directional_agreement=0.48,
-        meta_probability_threshold=0.49,
-        cooldown_hours=20.0,             # Long cooldown from best candidate — reduces overtrading
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
+        max_hold_hours=72,
+        label_forward_hours=24,
+        min_momentum_magnitude=0.025,   # comprehensive_search v2 winner: mean_reversion/24h/0.025
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        cooldown_hours=24.0,            # comprehensive_search v2 winner: 24h, 27.2/yr
         min_vol_24h=0.0034,
         max_vol_24h=0.069,
-        strategy_family='vol_overlay',   # Best known family for ETH
+        position_size=0.12,
+        vol_sizing_target=0.025,
+        strategy_family='mean_reversion',  # comprehensive_search v2 winner
         trade_freq_bucket='balanced',
+        kelly_win_rate=0.508,           # from verified backtest WR=50.8%
+        kelly_payoff_ratio=1.383,       # approx (tp/sl) × (1-WR)/WR = 1.429 × 0.968
     ),
 
     # ── XRP: baseline for optimizer search ──
+    # iter6: raised thresholds to match priors floors — prevents overtrading in full backtest
     'XRP': CoinProfile(
         name='XRP',
         prefixes=['XPP', 'XRP'],
@@ -288,44 +326,42 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         vol_mult_tp=4.5,
         vol_mult_sl=3.0,
         max_hold_hours=108,
-        min_momentum_magnitude=0.004,
-        min_directional_agreement=0.50,
-        meta_probability_threshold=0.47,
-        cooldown_hours=3.0,
+        min_momentum_magnitude=0.0125,  # iter8: lowered → priors midpoint (0.005,0.020); blocked momentum_trend+vol_overlay, try breakout/mean_reversion
+        min_directional_agreement=0.48, # iter8: priors lower bound
+        meta_probability_threshold=0.46, # iter8: priors lower bound
+        cooldown_hours=16.0,
         min_vol_24h=0.001,
         max_vol_24h=0.10,
         strategy_family='momentum_trend',
         trade_freq_bucket='balanced',
     ),
 
-    # ── BTC: macro-driven, longer horizon ──
+    # ── BTC: optimizer 2026-03-31: breakout/72h/0.020 → PROMOTION_READY (holdout SR=-0.046) ──
     'BTC': CoinProfile(
         name='BTC',
         prefixes=['BIP', 'BTC'],
         extra_features=BTC_EXTRA_FEATURES,
-        signal_threshold=0.54,
-        min_val_auc=0.50,
+        signal_threshold=0.53,          # optimizer
+        min_val_auc=0.48,
         label_forward_hours=36,
         label_vol_target=1.8,
-        min_momentum_magnitude=0.007,
-        vol_mult_tp=4.0,
-        vol_mult_sl=3.0,
-        max_hold_hours=72,
+        min_momentum_magnitude=0.020,   # screen: mean_reversion/72h/0.020, kept by optimizer
+        vol_mult_tp=4.5,                # optimizer
+        vol_mult_sl=5.0,                # optimizer
+        max_hold_hours=60,              # optimizer
         min_directional_agreement=0.50,
-        meta_probability_threshold=0.47,
-        cooldown_hours=4.0,
-        min_vol_24h=0.0005,
-        max_vol_24h=0.09,
-        position_size=0.10,
-        vol_sizing_target=0.020,
-        n_estimators=150,
-        max_depth=4,
-        min_child_samples=30,
-        strategy_family='momentum_trend',
+        meta_probability_threshold=0.48,
+        cooldown_hours=72,              # screen winner: 72h cooldown
+        min_vol_24h=0.0021,
+        max_vol_24h=0.084,
+        position_size=0.12,
+        vol_sizing_target=0.025,
+        strategy_family='breakout',     # optimizer switched from mean_reversion
         trade_freq_bucket='balanced',
     ),
 
-    # ── SOL: high vol, breakout family showed promise ──
+    # ── SOL: comprehensive_search 2026-04-01: momentum_trend/36h/0.030, tp=5.0/sl=3.5
+    #         Verified SR=+0.323, WR=50.5%, 21.2/yr, PF=1.193, PnL=+$27,336 ──
     'SOL': CoinProfile(
         name='SOL',
         prefixes=['SLP', 'SOL'],
@@ -334,23 +370,26 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_val_auc=0.50,
         label_forward_hours=24,
         label_vol_target=1.6,
-        min_momentum_magnitude=0.007,
-        min_directional_agreement=0.47,
-        meta_probability_threshold=0.46,
-        vol_mult_tp=4.5,
-        vol_mult_sl=3.0,
+        min_momentum_magnitude=0.030,   # comprehensive_search winner: momentum_trend/36h/0.030
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
         max_hold_hours=96,
-        cooldown_hours=1.5,
+        cooldown_hours=36.0,            # comprehensive_search winner: 36h, 21.2/yr
         min_vol_24h=0.0008,
         max_vol_24h=0.12,
         position_size=0.12,
         vol_sizing_target=0.025,
-        strategy_family='breakout',      # breakout showed 0.114 holdout SR in prior run
+        strategy_family='momentum_trend',
         trade_freq_bucket='balanced',
         direction_score_threshold=1,     # SOL is noisy — allow 2-of-3 momentum signal
+        kelly_win_rate=0.505,           # from verified backtest WR=50.5%
+        kelly_payoff_ratio=1.169,       # PF=1.193 × (1-0.505)/0.505
     ),
 
-    # ── DOGE: trend-following, fast moves ──
+    # ── DOGE: comprehensive_search v2 2026-04-05: btc_lead/6h/0.010, tp=5.0/sl=3.5
+    #         Verified SR=+0.314, WR=49.6%, 30.1/yr ──
     'DOGE': CoinProfile(
         name='DOGE',
         prefixes=['DOP', 'DOGE'],
@@ -359,13 +398,13 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_val_auc=0.50,
         label_forward_hours=12,
         label_vol_target=1.4,
-        min_momentum_magnitude=0.007,
-        min_directional_agreement=0.47,
-        meta_probability_threshold=0.46,
-        vol_mult_tp=5.5,
-        vol_mult_sl=3.0,
+        min_momentum_magnitude=0.010,   # comprehensive_search v2 winner: btc_lead/6h/0.010
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
         max_hold_hours=72,
-        cooldown_hours=2.0,
+        cooldown_hours=6.0,             # comprehensive_search v2 winner: 6h, 30.1/yr
         min_vol_24h=0.0007,
         max_vol_24h=0.14,
         position_size=0.08,
@@ -373,12 +412,15 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         n_estimators=80,
         max_depth=3,
         min_child_samples=25,
-        strategy_family='momentum_trend',
+        strategy_family='btc_lead',     # BTC lead-lag catch-up
         trade_freq_bucket='balanced',
         direction_score_threshold=1,     # DOGE is noisy/memecoin — allow 2-of-3 momentum
+        kelly_win_rate=0.496,           # from verified backtest WR=49.6%
+        kelly_payoff_ratio=1.451,       # approx (tp/sl) × (1-WR)/WR = 1.429 × 1.016
     ),
 
-    # ── AVAX: high-beta DeFi ecosystem, breakout-driven ──
+    # ── AVAX: comprehensive_search v2 2026-04-05: breakout/8h/0.015, tp=4.5/sl=3.0
+    #         Verified SR=+0.658, WR=49.3%, 29.4/yr ──
     'AVAX': CoinProfile(
         name='AVAX',
         prefixes=['AVP', 'AVAX'],
@@ -387,22 +429,25 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_val_auc=0.50,
         label_forward_hours=24,
         label_vol_target=1.6,
-        min_momentum_magnitude=0.008,
-        min_directional_agreement=0.47,
-        meta_probability_threshold=0.46,
-        vol_mult_tp=4.5,
+        min_momentum_magnitude=0.015,   # comprehensive_search v2 winner: breakout/8h/0.015
+        min_directional_agreement=0.52,
+        meta_probability_threshold=0.50,
+        vol_mult_tp=4.5,                # tp > sl: tp=4.5, sl=3.0
         vol_mult_sl=3.0,
         max_hold_hours=96,
-        cooldown_hours=2.0,
+        cooldown_hours=8.0,             # comprehensive_search v2 winner: 8h, 29.4/yr
         min_vol_24h=0.0008,
         max_vol_24h=0.14,
         position_size=0.10,
         vol_sizing_target=0.025,
         strategy_family='breakout',
         trade_freq_bucket='balanced',
+        kelly_win_rate=0.493,           # from verified backtest WR=49.3%
+        kelly_payoff_ratio=1.542,       # approx (tp/sl) × (1-WR)/WR = 1.500 × 1.028
     ),
 
-    # ── ADA: compression-breakout, fundamental-driven ──
+    # ── ADA: comprehensive_search 2026-04-01: breakout/36h/0.018, tp=5.0/sl=3.5
+    #         Verified SR=+0.498, WR=47.3%, 28.1/yr, PF=1.137, PnL=+$22,138 ──
     'ADA': CoinProfile(
         name='ADA',
         prefixes=['ADP', 'ADA'],
@@ -411,46 +456,51 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_val_auc=0.50,
         label_forward_hours=24,
         label_vol_target=1.6,
-        min_momentum_magnitude=0.004,
+        min_momentum_magnitude=0.018,   # comprehensive_search winner: breakout/36h/0.018
         min_directional_agreement=0.50,
-        meta_probability_threshold=0.47,
-        vol_mult_tp=4.5,
-        vol_mult_sl=3.0,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
         max_hold_hours=96,
-        cooldown_hours=3.0,
+        cooldown_hours=36.0,            # comprehensive_search winner: 36h, 28.1/yr
         min_vol_24h=0.0008,
         max_vol_24h=0.12,
         position_size=0.10,
         vol_sizing_target=0.025,
-        strategy_family='momentum_trend',
+        strategy_family='breakout',
         trade_freq_bucket='balanced',
+        kelly_win_rate=0.473,           # from verified backtest WR=47.3%
+        kelly_payoff_ratio=1.267,       # PF=1.137 × (1-0.473)/0.473
     ),
 
-    # ── LINK: oracle token, trend-persistent, institutional-grade ──
+    # ── LINK: comprehensive_search 2026-04-03: btc_lead/24h/0.030, tp=5.0/sl=3.5
+    #         Verified SR=+1.568, WR=73.3%, 23.9/yr, PnL=+$14,870 ──
     'LINK': CoinProfile(
         name='LINK',
         prefixes=['LNP', 'LINK'],
         extra_features=LINK_EXTRA_FEATURES,
         signal_threshold=0.53,
         min_val_auc=0.48,
-        label_forward_hours=24,
+        label_forward_hours=12,
         label_vol_target=1.8,
-        min_momentum_magnitude=0.006,
-        min_directional_agreement=0.48,
-        meta_probability_threshold=0.49,
-        vol_mult_tp=5.0,
-        vol_mult_sl=4.0,
-        max_hold_hours=48,
-        cooldown_hours=6.0,
-        min_vol_24h=0.0030,
-        max_vol_24h=0.10,
-        position_size=0.10,
+        min_momentum_magnitude=0.030,   # comprehensive_search winner: btc_lead/24h/0.030
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
+        max_hold_hours=72,
+        cooldown_hours=24.0,            # comprehensive_search winner: 24h, 23.9/yr
+        min_vol_24h=0.0004,
+        max_vol_24h=0.094,
+        position_size=0.12,
         vol_sizing_target=0.025,
-        strategy_family='vol_overlay',
+        strategy_family='btc_lead',     # comprehensive_search winner
         trade_freq_bucket='balanced',
+        kelly_win_rate=0.733,           # from verified backtest WR=73.3%
+        kelly_payoff_ratio=0.534,       # approx (tp/sl) × (1-WR)/WR = 1.429 × 0.364
     ),
 
-    # ── LTC: BTC-correlated, mean-reversion + halving cycles ──
+    # ── LTC: accurate screen 2026-03-31: momentum_trend/36h/0.012 → Sharpe=0.761, 20.6/yr ──
     'LTC': CoinProfile(
         name='LTC',
         prefixes=['LCP', 'LTC'],
@@ -459,22 +509,210 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
         min_val_auc=0.50,
         label_forward_hours=36,
         label_vol_target=1.8,
-        min_momentum_magnitude=0.005,
-        min_directional_agreement=0.50,
-        meta_probability_threshold=0.47,
+        min_momentum_magnitude=0.012,   # accurate screen winner: momentum_trend/36h/0.012
+        min_directional_agreement=0.52,
+        meta_probability_threshold=0.50,
         vol_mult_tp=4.0,
         vol_mult_sl=3.0,
         max_hold_hours=72,
-        cooldown_hours=4.0,
-        min_vol_24h=0.0005,
+        cooldown_hours=36.0,            # accurate screen winner: 36h cooldown, 20.6/yr
+        min_vol_24h=0.0004,
         max_vol_24h=0.10,
         n_estimators=150,
         max_depth=4,
         min_child_samples=30,
         position_size=0.10,
         vol_sizing_target=0.020,
+        strategy_family='momentum_trend',  # accurate screen winner
+        trade_freq_bucket='balanced',
+    ),
+
+    # ── New 20DEC30-CDE coins — baseline profiles pending strategy search ────
+
+    # NEAR: Layer-1 ecosystem, high BTC correlation, fast momentum
+    'NEAR': CoinProfile(
+        name='NEAR',
+        prefixes=['NER', 'NEAR'],
+        extra_features=NEAR_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=24,
+        label_vol_target=1.6,
+        min_momentum_magnitude=0.030,
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=96,
+        cooldown_hours=24.0,
+        min_vol_24h=0.0008,
+        max_vol_24h=0.14,
+        position_size=0.10,
+        vol_sizing_target=0.025,
         strategy_family='momentum_trend',
         trade_freq_bucket='balanced',
+    ),
+
+    # SUI: Layer-1 parallel execution, high-beta ecosystem like SOL
+    'SUI': CoinProfile(
+        name='SUI',
+        prefixes=['SUP', 'SUI'],
+        extra_features=SUI_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=24,
+        label_vol_target=1.6,
+        min_momentum_magnitude=0.030,
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=96,
+        cooldown_hours=24.0,
+        min_vol_24h=0.0008,
+        max_vol_24h=0.16,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='momentum_trend',
+        trade_freq_bucket='balanced',
+        direction_score_threshold=1,    # high-vol Layer-1 — allow 2-of-3 momentum
+    ),
+
+    # BCH: BTC-lite, halving cycles, mean-reversion at support/resistance
+    'BCH': CoinProfile(
+        name='BCH',
+        prefixes=['BCP', 'BCH'],
+        extra_features=BCH_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=36,
+        label_vol_target=1.8,
+        min_momentum_magnitude=0.020,
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=72,
+        cooldown_hours=48.0,
+        min_vol_24h=0.0004,
+        max_vol_24h=0.10,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='breakout',
+        trade_freq_bucket='balanced',
+    ),
+
+    # XLM: compression-breakout like XRP, low volatility
+    'XLM': CoinProfile(
+        name='XLM',
+        prefixes=['XLP', 'XLM'],
+        extra_features=XLM_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=24,
+        label_vol_target=1.6,
+        min_momentum_magnitude=0.018,
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=4.5,
+        vol_mult_sl=3.0,
+        max_hold_hours=96,
+        cooldown_hours=18.0,
+        min_vol_24h=0.0006,
+        max_vol_24h=0.12,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='breakout',
+        trade_freq_bucket='balanced',
+    ),
+
+    # ── DOT: comprehensive_search 2026-04-03: mean_reversion/48h/0.065, tp=5.0/sl=3.5
+    #         Verified SR=+1.510, WR=69.2%, ~19-25/yr ──
+    'DOT': CoinProfile(
+        name='DOT',
+        prefixes=['POP', 'DOT'],
+        extra_features=DOT_EXTRA_FEATURES,
+        signal_threshold=0.53,
+        min_val_auc=0.50,
+        label_forward_hours=36,
+        label_vol_target=1.8,
+        min_momentum_magnitude=0.065,   # comprehensive_search winner: mean_reversion/48h/0.065
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
+        max_hold_hours=72,
+        cooldown_hours=48.0,            # comprehensive_search winner: 48h cooldown
+        min_vol_24h=0.0005,
+        max_vol_24h=0.12,
+        position_size=0.10,
+        vol_sizing_target=0.025,
+        strategy_family='mean_reversion',  # comprehensive_search winner
+        trade_freq_bucket='balanced',
+        kelly_win_rate=0.692,           # from verified backtest WR=69.2%
+        kelly_payoff_ratio=1.400,       # approx tp/sl ratio (5.0/3.5); recalibrate after 90d live
+    ),
+
+    # ── SHIB: comprehensive_search 2026-04-03 round 2: mean_reversion/24h/0.050, tp=5.0/sl=3.5
+    #         Verified SR=+1.242, WR=60.0%, 29.9/yr, PnL=+$6,644 ──
+    'SHIB': CoinProfile(
+        name='SHIB',
+        prefixes=['SHP', 'SHIB'],
+        extra_features=SHIB_EXTRA_FEATURES,
+        signal_threshold=0.52,
+        min_val_auc=0.50,
+        label_forward_hours=12,
+        label_vol_target=1.4,
+        min_momentum_magnitude=0.050,   # comprehensive_search winner: mean_reversion/24h/0.050
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
+        max_hold_hours=72,
+        cooldown_hours=24.0,            # comprehensive_search winner: 24h cooldown, 29.9/yr
+        min_vol_24h=0.0007,
+        max_vol_24h=0.16,
+        position_size=0.08,
+        vol_sizing_target=0.020,
+        n_estimators=80,
+        max_depth=3,
+        min_child_samples=25,
+        strategy_family='mean_reversion',  # comprehensive_search winner (switched from btc_lead)
+        trade_freq_bucket='balanced',
+        direction_score_threshold=1,    # noisy/memecoin — allow 2-of-3 momentum
+        kelly_win_rate=0.600,           # from verified backtest WR=60.0%
+        kelly_payoff_ratio=1.400,       # approx tp/sl ratio; recalibrate after 90d live
+    ),
+
+    # ── PEPE: comprehensive_search 2026-04-03: momentum_trend/18h/0.065, tp=5.0/sl=3.5
+    #         Verified SR=+0.371, WR=40.0%, ~22-37/yr  ⚠️ only ~2.3yr data — monitor closely ──
+    'PEPE': CoinProfile(
+        name='PEPE',
+        prefixes=['PEP', 'PEPE'],
+        extra_features=PEPE_EXTRA_FEATURES,
+        signal_threshold=0.52,
+        min_val_auc=0.50,
+        label_forward_hours=12,
+        label_vol_target=1.4,
+        min_momentum_magnitude=0.065,   # comprehensive_search winner: momentum_trend/18h/0.065
+        min_directional_agreement=0.50,
+        meta_probability_threshold=0.48,
+        vol_mult_tp=5.0,                # tp > sl: tp=5.0, sl=3.5
+        vol_mult_sl=3.5,
+        max_hold_hours=72,
+        cooldown_hours=18.0,            # comprehensive_search winner: 18h cooldown
+        min_vol_24h=0.0007,
+        max_vol_24h=0.18,
+        position_size=0.07,             # reduced: marginal SR, limited data history
+        vol_sizing_target=0.020,
+        n_estimators=80,
+        max_depth=3,
+        min_child_samples=25,
+        strategy_family='momentum_trend',  # comprehensive_search winner (switched from btc_lead)
+        trade_freq_bucket='balanced',
+        direction_score_threshold=1,    # noisy/memecoin — allow 2-of-3 momentum
+        kelly_win_rate=0.400,           # from verified backtest WR=40.0%
+        kelly_payoff_ratio=1.500,       # estimated; recalibrate after 90d live
     ),
 }
 

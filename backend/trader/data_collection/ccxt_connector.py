@@ -50,6 +50,21 @@ class CCXTConnector:
         "LINK": "LINK/USDT:USDT",
         "LCP": "LTC/USDT:USDT",
         "LTC": "LTC/USDT:USDT",
+        # Batch 3 — new 20DEC30-CDE additions 2026-04-03
+        "NER": "NEAR/USDT:USDT",
+        "NEAR": "NEAR/USDT:USDT",
+        "SUP": "SUI/USDT:USDT",
+        "SUI": "SUI/USDT:USDT",
+        "BCP": "BCH/USDT:USDT",
+        "BCH": "BCH/USDT:USDT",
+        "XLP": "XLM/USDT:USDT",
+        "XLM": "XLM/USDT:USDT",
+        "POP": "DOT/USDT:USDT",
+        "DOT": "DOT/USDT:USDT",
+        "SHP": "SHIB/USDT:USDT",
+        "SHIB": "SHIB/USDT:USDT",
+        "PEP": "PEPE/USDT:USDT",
+        "PEPE": "PEPE/USDT:USDT",
     }
     
     # Alternative exchanges that may work in restricted regions
@@ -160,10 +175,6 @@ class CCXTConnector:
                 
                 self._exchanges[exchange_id] = exchange
                 logger.info(f"✓ Initialized {exchange_id} with {len(exchange.markets)} markets")
-                
-                # If we have at least one working exchange, we're good
-                if len(self._exchanges) >= 1 and exchange_id in self.exchange_ids:
-                    break
                     
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout initializing {exchange_id}")
@@ -213,22 +224,15 @@ class CCXTConnector:
             base = coinbase_symbol.replace("-PERP", "")
             base_symbol = f"{base}/USDT:USDT"
         
-        # Verify symbol exists on exchange
+        # Verify symbol exists on exchange as a swap/perpetual market
         exchange = self._exchanges.get(exchange_id)
         if exchange and base_symbol in exchange.symbols:
-            return base_symbol
-        
-        # Try alternative formats
-        alternatives = [
-            f"{coinbase_symbol.replace('-PERP', '')}/USDT",
-            f"{coinbase_symbol.replace('-PERP', '')}USDT",
-        ]
-        
-        if exchange:
-            for alt in alternatives:
-                if alt in exchange.symbols:
-                    return alt
-        
+            market = exchange.markets.get(base_symbol, {})
+            if market.get('swap') or market.get('type') in ('swap', 'future'):
+                return base_symbol
+
+        # Only fall back to non-perpetual alternatives as a last resort
+        # (spot market data is generally not useful for perp backtesting)
         return base_symbol
     
     async def fetch_ohlcv(
@@ -261,18 +265,32 @@ class CCXTConnector:
                 logger.error(f"Exchange {exchange_id} not available")
                 return []
         else:
-            # Use first available exchange
+            # Try exchanges in order, picking the first one that has the symbol as a swap
             if not self._exchanges:
                 logger.error("No exchanges available")
                 return []
-            exchange_id = list(self._exchanges.keys())[0]
-            exchange = self._exchanges[exchange_id]
-        
-        ccxt_symbol = self._get_ccxt_symbol(symbol, exchange_id)
+            exchange_id = None
+            ccxt_symbol = None
+            for eid, exch in self._exchanges.items():
+                candidate = self._get_ccxt_symbol(symbol, eid)
+                if candidate and candidate in exch.symbols:
+                    market = exch.markets.get(candidate, {})
+                    if market.get('swap') or market.get('type') in ('swap', 'future'):
+                        exchange_id = eid
+                        ccxt_symbol = candidate
+                        exchange = exch
+                        break
+            if not exchange_id:
+                # Fall back to first exchange regardless
+                exchange_id = list(self._exchanges.keys())[0]
+                exchange = self._exchanges[exchange_id]
+
+        if ccxt_symbol is None:
+            ccxt_symbol = self._get_ccxt_symbol(symbol, exchange_id)
         if not ccxt_symbol:
             logger.error(f"Could not map symbol {symbol} for {exchange_id}")
             return []
-        
+
         logger.info(
             f"Fetching {symbol} ({ccxt_symbol}) {timeframe} from {exchange_id} "
             f"({start} to {end})"

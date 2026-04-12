@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from database import engine
 from endpoints.coins import router as coins_router
@@ -16,6 +17,16 @@ from models import trade as _trade_models
 from models import wallet as _wallet_models  
 
 Base.metadata.create_all(bind=engine)
+
+# Idempotent column migrations for schema additions that post-date create_all().
+with engine.begin() as _conn:
+    for _stmt in (
+        "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS tp_price DOUBLE PRECISION",
+        "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS sl_price DOUBLE PRECISION",
+        "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS max_hold_until TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS exit_reason VARCHAR",
+    ):
+        _conn.execute(text(_stmt))
 
 app = FastAPI(
     title="Trading History & Market API",

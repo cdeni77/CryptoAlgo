@@ -1,0 +1,151 @@
+{
+  "run_at": "20260331T191756Z",
+  "coins_screened": [
+    "ETH",
+    "LINK",
+    "BTC",
+    "SOL",
+    "XRP",
+    "DOGE",
+    "ADA",
+    "LTC"
+  ],
+  "winner_sharpe_threshold": 0.3,
+  "min_trades_threshold": 20,
+  "per_coin": {
+    "ETH": {
+      "status": "WINNER",
+      "pass_found": 1,
+      "strategy_family": "vol_overlay",
+      "cooldown_hours": 60,
+      "min_momentum_magnitude": 0.05,
+      "sharpe_annual": 0.8097,
+      "win_rate": 0.6375,
+      "profit_factor": 1.352,
+      "trades_per_year": 34.3,
+      "total_pnl": 74964.05,
+      "kelly_fraction": 0.1685,
+      "avg_win_pnl": 0.024305,
+      "avg_loss_pnl": 0.031445
+    },
+    "LINK": {
+      "status": "WINNER",
+      "pass_found": 1,
+      "strategy_family": "vol_overlay",
+      "cooldown_hours": 72,
+      "min_momentum_magnitude": 0.048,
+      "sharpe_annual": 1.0468,
+      "win_rate": 0.5876,
+      "profit_factor": 1.553,
+      "trades_per_year": 20.8,
+      "total_pnl": 60827.41,
+      "kelly_fraction": 0.2405,
+      "avg_win_pnl": 0.0401,
+      "avg_loss_pnl": 0.03376
+    },
+    "BTC": {
+      "status": "NEAR_MISS",
+      "pass_found": 3,
+      "strategy_family": "mean_reversion",
+      "cooldown_hours": 72,
+      "min_momentum_magnitude": 0.02,
+      "sharpe_annual": 0.1814,
+      "win_rate": 0.5818,
+      "profit_factor": 1.011,
+      "trades_per_year": 35.4,
+      "total_pnl": 1063.73,
+      "kelly_fraction": 0.039,
+      "avg_win_pnl": 0.017288,
+      "avg_loss_pnl": 0.022441
+    },
+    "SOL": {
+      "status": "NO_EDGE",
+      "pass_found": 1,
+      "strategy_family": "momentum_trend",
+      "cooldown_hours": 24,
+      "min_momentum_magnitude": 0.033,
+      "sharpe_annual": -0.5019,
+      "win_rate": 0.3684,
+      "profit_factor": 0.785,
+      "trades_per_year": 20.4,
+      "total_pnl": -27728.75,
+      "kelly_fraction": 0.0,
+      "avg_win_pnl": 0.045776,
+      "avg_loss_pnl": 0.034425
+    },
+    "XRP": {
+      "status": "NO_EDGE",
+      "pass_found": 1,
+      "strategy_family": "",
+      "cooldown_hours": 0,
+      "min_momentum_magnitude": 0,
+      "sharpe_annual": -99,
+      "win_rate": 0,
+      "profit_factor": 0,
+      "trades_per_year": 0,
+      "total_pnl": 0,
+      "kelly_fraction": 0,
+      "avg_win_pnl": 0,
+      "avg_loss_pnl": 0
+    },
+    "DOGE": {
+      "status": "NO_EDGE",
+      "pass_found": 1,
+      "strategy_family": "",
+      "cooldown_hours": 0,
+      "min_momentum_magnitude": 0,
+      "sharpe_annual": -99,
+      "win_rate": 0,
+      "profit_factor": 0,
+      "trades_per_year": 0,
+      "total_pnl": 0,
+      "kelly_fraction": 0,
+      "avg_win_pnl": 0,
+      "avg_loss_pnl": 0
+    },
+    "ADA": {
+      "status": "WINNER",
+      "pass_found": 1,
+      "strategy_family": "mean_reversion",
+      "cooldown_hours": 24,
+      "min_momentum_magnitude": 0.027,
+      "sharpe_annual": 0.6702,
+      "win_rate": 0.4958,
+      "profit_factor": 1.345,
+      "trades_per_year": 25.5,
+      "total_pnl": 39022.02,
+      "kelly_fraction": 0.1271,
+      "avg_win_pnl": 0.040094,
+      "avg_loss_pnl": 0.029319
+    },
+    "LTC": {
+      "status": "WINNER",
+      "pass_found": 1,
+      "strategy_family": "momentum_trend",
+      "cooldown_hours": 36,
+      "min_momentum_magnitude": 0.012,
+      "sharpe_annual": 0.7607,
+      "win_rate": 0.5417,
+      "profit_factor": 1.384,
+      "trades_per_year": 20.6,
+      "total_pnl": 29131.2,
+      "kelly_fraction": 0.1723,
+      "avg_win_pnl": 0.030816,
+      "avg_loss_pnl": 0.024832
+    }
+  },
+  "winners": [
+    "ETH",
+    "LINK",
+    "ADA",
+    "LTC"
+  ],
+  "near_misses": [
+    "BTC"
+  ],
+  "no_edge": [
+    "SOL",
+    "XRP",
+    "DOGE"
+  ]
+}

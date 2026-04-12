@@ -21,6 +21,10 @@ PREFIX_FOR_COIN = {
     "SOL": "SLP",
     "XRP": "XPP",
     "DOGE": "DOP",
+    "AVAX": "AVP",
+    "ADA": "ADP",
+    "LINK": "LNP",
+    "LTC": "LCP",
 }
 
 
@@ -42,7 +46,7 @@ class CoinPreflight:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Preflight QA checks for trader pipeline")
-    parser.add_argument("--coins", type=str, default="BTC,ETH,SOL,XRP,DOGE")
+    parser.add_argument("--coins", type=str, default="BTC,ETH,SOL,XRP,DOGE,AVAX,ADA,LINK,LTC")
     parser.add_argument("--db-path", type=str, default="./data/trading.db")
     parser.add_argument("--features-dir", type=str, default="./data/features")
     parser.add_argument("--output", type=str, default="./scripts/optimization_results/preflight_report.json")

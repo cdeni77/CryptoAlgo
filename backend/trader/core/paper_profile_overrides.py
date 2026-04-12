@@ -64,6 +64,8 @@ def _build_override_profile(base_profile: CoinProfile, params: Dict[str, object]
         'meta_probability_threshold',
         'strategy_family',
         'trade_freq_bucket',
+        'kelly_win_rate',
+        'kelly_payoff_ratio',
         'position_size',
         'vol_sizing_target',
         'min_val_auc',

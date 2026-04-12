@@ -169,7 +169,7 @@ class Config:
 
     # Fees — EXACT COINBASE US CDE
     fee_pct_per_side: float = 0.0010
-    min_fee_per_contract: float = 0.20
+    min_fee_per_contract: float = 0.0   # Coinbase CDE: pure 0.1% of notional, no per-contract floor
     slippage_bps: float = 2.0
     apply_funding: bool = True
     apply_slippage: bool = True
@@ -555,6 +555,20 @@ def calculate_n_contracts(equity: float, price: float, symbol: str,
         return 0
     pos_size = profile.position_size if profile else config.position_size
     vol_target = profile.vol_sizing_target if profile else config.vol_sizing_target
+
+    # Kelly Criterion gate and scaling
+    # If the profile has calibrated Kelly stats, use half-Kelly as the position fraction.
+    # A negative Kelly fraction means no edge — skip the trade entirely.
+    # half_kelly is a direct fraction of equity; capped at 1.5x the profile's base pos_size.
+    if profile and profile.kelly_win_rate > 0 and profile.kelly_payoff_ratio > 0:
+        p = profile.kelly_win_rate
+        b = profile.kelly_payoff_ratio
+        kelly_f = (b * p - (1.0 - p)) / b
+        if kelly_f <= 0:
+            return 0
+        half_kelly = kelly_f * 0.5
+        pos_size = min(half_kelly, pos_size * 1.5)  # Kelly directly sets fraction; cap at 1.5x base
+
     if vol_24h > 0 and vol_target > 0:
         vol_ratio = vol_target / vol_24h
         vol_ratio = min(vol_ratio, 1.5)
@@ -1160,7 +1174,7 @@ def load_data():
         spec = get_contract_spec(sym)
         price = data[sym]['ohlcv']['close'].iloc[-1]
         notional = spec['units'] * price
-        eff_fee = max(0.20, notional * 0.0010) / notional * 100
+        eff_fee = 0.10  # Coinbase CDE: 0.1% of notional per side, no per-contract floor
         profile = get_coin_profile(sym)
         print(f"  {sym}: {spec['units']} units/contract, "
               f"~${notional:.2f}/contract, "
@@ -1826,6 +1840,11 @@ def run_backtest(all_data: Dict, config: Config,
     avg_raw = df['raw_pnl'].mean()
     avg_funding = df['funding_pnl'].mean()
 
+    wins = df[df['net_pnl'] > 0]['net_pnl']
+    losses = df[df['net_pnl'] < 0]['net_pnl']
+    avg_win_net_pnl = float(wins.mean()) if len(wins) > 0 else 0.0
+    avg_loss_net_pnl = float(abs(losses.mean())) if len(losses) > 0 else 0.0
+
     print(f"\n{'=' * 70}")
     print(f"📊 BACKTEST RESULTS (v8 — Per-Coin Profiles)")
     print(f"{'=' * 70}")
@@ -1968,6 +1987,8 @@ def run_backtest(all_data: Dict, config: Config,
         'avg_fee_pct_component': avg_fee_pct,
         'avg_min_fee_component': avg_min_fee,
         'avg_slippage_component': avg_slippage,
+        'avg_win_net_pnl': avg_win_net_pnl,
+        'avg_loss_net_pnl': avg_loss_net_pnl,
         'final_equity': equity,
         'oos_trades': int(len(oos_df)),
         'oos_sharpe': oos_sharpe,
@@ -2406,12 +2427,316 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
     )
 
 
+def run_inference(all_data: Dict, config: Config, debug: bool = False, gate_artifact_dir: Optional[Path] = None,
+                  profile_overrides: Optional[Dict[str, CoinProfile]] = None):
+    """Generate signals using existing saved models WITHOUT retraining.
+
+    This is the hourly inference path that matches backtest behaviour: models are trained
+    once per week (via _run_retrain in the orchestrator) and the same model is reused for
+    every hourly signal cycle within that week.  If no saved model is found for a symbol
+    it is skipped and counted as a gate failure so the orchestrator can log the gap.
+    """
+    system = MLSystem(config)
+    print(f"\n🔍 INFERENCE MODE — Using saved models (no retraining)...")
+    print("   Models must have been promoted by the weekly retrain step.")
+    gate_counters = _new_gate_counters()
+
+    _pg: Optional[_PgWriter] = None
+    if os.environ.get("DATABASE_URL"):
+        try:
+            _pg = _PgWriter()
+        except Exception as _e:
+            print(f"   ⚠️  Failed to connect to DB for signal writing: {_e}")
+
+    for sym, d in all_data.items():
+        profile = _get_profile(sym, profile_overrides)
+        feat, ohlc = d['features'], d['ohlcv']
+
+        # ── Load existing saved model (no training) ──────────────────────────
+        payload = load_model(sym)
+        if payload is None:
+            print(f"[{sym}] ⏩ No saved model found — skipping (run weekly retrain first)")
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
+            continue
+
+        model = payload['model']
+        scaler = payload['scaler']
+        iso = payload['calibrator']
+        saved_cols = payload['feature_columns']
+        auc = float(payload.get('auc', 0.0))
+        _meta = payload.get('meta', {})
+
+        # Filter saved feature columns to those present in current data
+        cols = [c for c in saved_cols if c in feat.columns]
+        print(f"[{sym}] Loaded model — AUC={auc:.3f} | features={len(cols)}/{len(saved_cols)} available")
+        if len(cols) < 4:
+            print(f"[{sym}] ❌ Too few features available ({len(cols)} < 4) [primary_threshold]")
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
+            continue
+
+        # Reconstruct meta_artifacts from saved secondary model components
+        meta_artifacts = MetaArtifacts(
+            model=payload.get('secondary_model'),
+            scaler=payload.get('secondary_scaler'),
+            calibrator=payload.get('secondary_calibrator'),
+            calibrator_type=_meta.get('secondary_calibration', {}).get('strategy_used', 'isotonic'),
+            calibration_metrics=_meta.get('secondary_calibration', {}).get('metrics', {}),
+            primary_threshold=resolve_param('signal_threshold', profile, config, Config.signal_threshold, mode='direct'),
+            meta_threshold=resolve_param('meta_probability_threshold', profile, config, Config.meta_probability_threshold, mode='direct'),
+            metrics={},
+        )
+
+        # Use strategy family / bucket baked into the saved model's metadata
+        resolved_family = _meta.get('strategy_family') or resolve_categorical_param('strategy_family', profile, config, Config.strategy_family)
+        resolved_bucket = _meta.get('trade_freq_bucket') or resolve_categorical_param('trade_freq_bucket', profile, config, Config.trade_freq_bucket)
+
+        # ── Signal generation (identical to run_signals after training) ──────
+        row = feat.iloc[-1]
+        price = ohlc.iloc[-1]['close']
+        sma_200 = ohlc.iloc[-1]['sma_200']
+
+        f_z = row.get('funding_rate_zscore', 0)
+        if pd.isna(f_z):
+            f_z = 0
+
+        ts_loc = len(ohlc) - 1
+
+        ret_24h = (price / ohlc['close'].iloc[ts_loc - 24] - 1) if ts_loc >= 24 else 0
+        ret_72h = (price / ohlc['close'].iloc[ts_loc - 72] - 1) if ts_loc >= 72 else 0
+        sma_50 = ohlc['close'].iloc[max(0, ts_loc - 50):ts_loc].mean() if ts_loc >= 10 else price
+        strategy_context = _build_strategy_context(
+            row,
+            price,
+            sma_200,
+            ret_24h,
+            ret_72h,
+            sma_50,
+        )
+        strategy_family = get_strategy_family(resolved_family)
+        strategy_decision = strategy_family.evaluate(
+            strategy_context,
+            min_momentum_magnitude=resolve_param(
+                'min_momentum_magnitude',
+                profile,
+                config,
+                Config.min_momentum_magnitude,
+                mode='direct',
+            ),
+            score_threshold=config.momentum_score_threshold,
+            strict_mode=config.momentum_strict_mode,
+            family_params=build_family_params(profile, config),
+        )
+        direction = strategy_decision.direction
+        if direction == 0:
+            _increment_gate_counter(gate_counters, sym, 'momentum_dir_agreement')
+            if debug:
+                strict_msg = "strict disagreement filter enabled" if config.momentum_strict_mode else "score below threshold"
+                print(f"\n[{sym}] ⏸️  No momentum consensus ({strict_msg}; threshold={config.momentum_score_threshold:.2f}) [momentum_dir_agreement]")
+            continue
+
+        if pd.isna(sma_200):
+            _increment_gate_counter(gate_counters, sym, 'missing_sma200')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Missing SMA200 [missing_sma200]")
+            continue
+
+        candidate_rank_penalty = 0.0
+        candidate_size_multiplier = 1.0
+
+        trend_violated = (direction == 1 and price < sma_200) or (direction == -1 and price > sma_200)
+        trend_effect = _resolve_filter_policy(
+            config.trend_filter_mode,
+            trend_violated,
+            rank_penalty=0.30,
+            size_multiplier=0.70,
+        )
+        if trend_effect.reject:
+            _increment_gate_counter(gate_counters, sym, 'trend_filter')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Rejected by trend filter policy=hard [trend_filter]")
+            continue
+        candidate_rank_penalty += trend_effect.rank_penalty
+        candidate_size_multiplier *= trend_effect.size_multiplier
+
+        funding_violated = (direction == 1 and f_z > 2.5) or (direction == -1 and f_z < -2.5)
+        funding_effect = _resolve_filter_policy(
+            config.funding_filter_mode,
+            funding_violated,
+            rank_penalty=0.25,
+            size_multiplier=0.75,
+        )
+        if funding_effect.reject:
+            _increment_gate_counter(gate_counters, sym, 'funding_filter')
+            if debug:
+                print(f"\n[{sym}] ⏸️  Rejected by funding filter policy=hard [funding_filter]")
+            continue
+        candidate_rank_penalty += funding_effect.rank_penalty
+        candidate_size_multiplier *= funding_effect.size_multiplier
+
+        x_in = np.nan_to_num(
+            np.array([row.get(c, 0) for c in cols]).reshape(1, -1), nan=0.0
+        )
+        raw_prob = model.predict_proba(scaler.transform(x_in))[0, 1]
+        prob = float(_calibrator_predict(iso, np.array([raw_prob]))[0])
+        effective_threshold = resolve_param(
+            'signal_threshold',
+            profile,
+            config,
+            Config.signal_threshold,
+            mode='direct',
+        )
+        primary_cutoff = primary_recall_threshold(effective_threshold, config.min_signal_edge)
+        ml_pass = prob >= primary_cutoff
+        meta_prob = 0.0
+        meta_pass = False
+        effective_meta_threshold = resolve_param(
+            'meta_probability_threshold',
+            profile,
+            config,
+            Config.meta_probability_threshold,
+            mode='direct',
+        )
+        if ml_pass and meta_artifacts.model is not None and meta_artifacts.scaler is not None:
+            meta_raw = meta_artifacts.model.predict_proba(meta_artifacts.scaler.transform(x_in))[0, 1]
+            if meta_artifacts.calibrator is not None:
+                meta_prob = float(meta_calibrator_predict(meta_artifacts.calibrator, np.array([meta_raw]))[0])
+            else:
+                meta_prob = float(meta_raw)
+            meta_pass = meta_prob >= effective_meta_threshold
+
+        vol_24h = ohlc['close'].pct_change().rolling(24).std().iloc[-1]
+        if pd.isna(vol_24h):
+            regime_pass = False
+            regime_reason = 'vol_regime_low'
+        elif vol_24h < profile.min_vol_24h:
+            regime_pass = False
+            regime_reason = 'vol_regime_low'
+        elif vol_24h > profile.max_vol_24h:
+            regime_pass = False
+            regime_reason = 'vol_regime_high'
+        else:
+            regime_pass = True
+            regime_reason = ''
+
+        effective_momentum = resolve_param(
+            'min_momentum_magnitude',
+            profile,
+            config,
+            Config.min_momentum_magnitude,
+            mode='direct',
+        )
+        momentum_pass = bool(strategy_decision.gate_contributions.get('momentum_magnitude', abs(ret_72h) >= effective_momentum))
+
+        if debug:
+            dir_str = 'LONG' if direction == 1 else 'SHORT'
+            print(f"\n[{sym}] ({profile.name})")
+            print(f"  Price: ${price:,.2f} | SMA200: ${sma_200:,.2f}" if not pd.isna(sma_200) else f"  Price: ${price:,.2f}")
+            print(f"  Direction: {dir_str}")
+            print(f"  Primary prob: {raw_prob:.3f} → Calibrated: {prob:.3f} (thresh: {primary_cutoff:.3f})")
+            print(f"  AUC: {auc:.3f}")
+            print(f"  Gates: Primary={'✅' if ml_pass else '❌'} | Meta={'✅' if meta_pass else '❌'} | Regime={'✅' if regime_pass else '❌'} | Mom={'✅' if momentum_pass else '❌'}")
+            print(f"  Funding z-score: {f_z:.2f}")
+            print(f"  Policy penalties: rank={candidate_rank_penalty:.2f} | size_mult={candidate_size_multiplier:.2f}")
+            print(f"  24h Vol: {vol_24h:.4f}" if not pd.isna(vol_24h) else "  24h Vol: N/A")
+
+        gate_failure_reason: str | None = None
+        if not momentum_pass:
+            _increment_gate_counter(gate_counters, sym, 'momentum_magnitude')
+            gate_failure_reason = 'momentum_magnitude'
+            if debug:
+                print(f"  Skip reason: momentum_magnitude (family={strategy_family.name}, |72h|={abs(ret_72h):.4f}, min={effective_momentum:.4f})")
+        elif not regime_pass:
+            _increment_gate_counter(gate_counters, sym, regime_reason)
+            gate_failure_reason = regime_reason
+            if debug:
+                print(f"  Skip reason: {regime_reason}")
+        elif not ml_pass:
+            _increment_gate_counter(gate_counters, sym, 'primary_threshold')
+            gate_failure_reason = 'primary_threshold'
+            if debug:
+                print("  Skip reason: primary_threshold")
+        elif not meta_pass:
+            _increment_gate_counter(gate_counters, sym, 'meta_threshold')
+            gate_failure_reason = 'meta_threshold'
+            if debug:
+                print("  Skip reason: meta_threshold")
+
+        passed = gate_failure_reason is None
+        dir_str = 'LONG' if direction == 1 else 'SHORT'
+        n_contracts: int | None = None
+        notional: float | None = None
+
+        if passed:
+            n_contracts = calculate_n_contracts(
+                100_000, price, sym, config,
+                vol_24h=vol_24h if not pd.isna(vol_24h) else 0.02,
+                profile=profile
+            )
+            n_contracts = int(np.floor(n_contracts * candidate_size_multiplier))
+            if n_contracts < 1:
+                _increment_gate_counter(gate_counters, sym, 'no_contract_size')
+                if debug:
+                    print(f"  Skip reason: no_contract_size")
+                gate_failure_reason = 'no_contract_size'
+                passed = False
+                n_contracts = None
+            else:
+                spec = get_contract_spec(sym)
+                notional = n_contracts * spec['units'] * price
+                print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
+                      f"{n_contracts} contracts | ${notional:,.0f} notional | "
+                      f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")
+
+        if _pg is not None:
+            try:
+                _pg.write_signal(
+                    coin=profile.name,
+                    timestamp=datetime.now(timezone.utc),
+                    direction="long" if direction == 1 else "short",
+                    confidence=prob,
+                    raw_probability=raw_prob,
+                    model_auc=auc,
+                    price_at_signal=price,
+                    momentum_pass=momentum_pass,
+                    regime_pass=regime_pass,
+                    ml_pass=ml_pass,
+                    contracts_suggested=n_contracts,
+                    notional_usd=float(notional) if notional is not None else None,
+                    passed_gates=passed,
+                    gate_failure_reason=gate_failure_reason,
+                    idempotency_key=f"{profile.name}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M')}_{dir_str}",
+                )
+                if passed:
+                    print(f"   ✅ Signal written to DB: {profile.name} {dir_str} conf={prob:.3f}")
+                else:
+                    print(f"   📝 Signal logged (rejected: {gate_failure_reason}): {profile.name} {dir_str} conf={prob:.3f}")
+            except Exception as _e:
+                print(f"   ⚠️  Failed to write signal to DB: {_e}")
+
+        if not passed:
+            continue
+
+    if debug:
+        _print_gate_counter_summary(
+            gate_counters,
+            title="📉 Candidate Gate Failure Reasons (Inference Debug)",
+            top_n=6,
+        )
+    _write_gate_counter_artifact(
+        gate_counters,
+        run_type='inference',
+        artifact_dir=gate_artifact_dir,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Crypto ML Trading System v8 — Per-Coin Profiles"
     )
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--signals", action="store_true")
+    parser.add_argument("--inference", action="store_true",
+                        help="Generate signals using existing saved models WITHOUT retraining (matches backtest weekly-retrain cadence)")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--threshold", type=float, default=None,
                         help="CLI override for signal threshold. Precedence: CLI override > profile value > global default.")
@@ -2533,6 +2858,8 @@ if __name__ == "__main__":
 
     if args.backtest:
         run_backtest(data, config, profile_overrides=profile_overrides, gate_artifact_dir=gate_artifact_dir)
+    elif args.inference:
+        run_inference(data, config, debug=args.debug, gate_artifact_dir=gate_artifact_dir, profile_overrides=profile_overrides)
     elif args.signals or args.debug:
         run_signals(data, config, debug=args.debug, gate_artifact_dir=gate_artifact_dir, profile_overrides=profile_overrides)
     else:

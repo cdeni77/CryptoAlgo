@@ -93,7 +93,7 @@ def _run_step(name: str, command: List[str]) -> None:
 
 
 def _build_train_model_cmd(args: argparse.Namespace) -> List[str]:
-    cmd = [sys.executable, "-m", "scripts.train_model", "--signals"]
+    cmd = [sys.executable, "-m", "scripts.train_model", "--inference"]
 
     threshold = os.getenv("SIGNAL_THRESHOLD")
     min_auc = os.getenv("MIN_AUC")

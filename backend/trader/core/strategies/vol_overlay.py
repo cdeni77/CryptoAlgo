@@ -15,11 +15,16 @@ class VolatilityOverlayStrategy:
         momentum_gate = abs(context.ret_72h) >= min_momentum_magnitude * 0.8
         vol_gate = 0.004 <= vol <= 0.12
         gate_pass = momentum_gate and vol_gate
-        vol_bonus = 0.0 if vol <= 0 else min(0.3, 0.05 / vol)
+        # Normalized momentum strength: 0.20 at gate threshold, scales up to 0.40
+        norm_mom = abs(context.ret_72h) / max(min_momentum_magnitude * 0.8, 1e-6)
+        mom_rank = 0.20 * min(2.0, norm_mom)
+        # Vol quality: peaks when vol is in the ideal 0.01–0.04 range, tapers at extremes
+        vol_quality = max(0.0, 1.0 - abs(vol - 0.025) / 0.10)
+        vol_rank = 0.10 * vol_quality
 
         return StrategyDecision(
             direction=base_direction if gate_pass else 0,
-            rank_modifier=0.12 * abs(context.ret_72h) + vol_bonus,
+            rank_modifier=mom_rank + vol_rank,
             gate_contributions={
                 'momentum_magnitude': momentum_gate,
                 'momentum_dir_agreement': gate_pass,

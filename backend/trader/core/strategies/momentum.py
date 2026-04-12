@@ -24,9 +24,10 @@ class MomentumTrendStrategy:
             direction = 0
 
         momentum_pass = abs(context.ret_72h) >= min_momentum_magnitude
+        norm_mom = abs(context.ret_72h) / max(min_momentum_magnitude, 1e-6)
         return StrategyDecision(
             direction=direction,
-            rank_modifier=0.2 * abs(context.ret_72h),
+            rank_modifier=0.20 * min(2.0, norm_mom),
             gate_contributions={
                 'momentum_magnitude': momentum_pass,
                 'momentum_dir_agreement': direction != 0,

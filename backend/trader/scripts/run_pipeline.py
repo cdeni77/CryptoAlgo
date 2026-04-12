@@ -54,17 +54,28 @@ ASSET_TO_CODE_MAP = {
     "SOL": "SLP",
     "XRP": "XPP",
     "DOGE": "DOP",
-    # New coins — verified 20DEC30 CDE codes from Coinbase API
+    # Batch 2 — verified 20DEC30 CDE codes from Coinbase API
     "AVAX": "AVP",
     "ADA": "ADP",
     "LINK": "LNP",
     "LTC": "LCP",
+    # Batch 3 — new 20DEC30-CDE additions 2026-04-03
+    "NEAR": "NER",
+    "SUI": "SUP",
+    "BCH": "BCP",
+    "XLM": "XLP",
+    "DOT": "POP",
+    "SHIB": "SHP",
+    "PEPE": "PEP",
 }
 
 DEFAULT_TIMEFRAMES = ["1h", "1d"]
 DEFAULT_SYMBOLS = [
     "BTC-PERP", "ETH-PERP", "SOL-PERP", "XRP-PERP", "DOGE-PERP",
     "AVP-20DEC30-CDE", "ADP-20DEC30-CDE", "LNP-20DEC30-CDE", "LCP-20DEC30-CDE",
+    # Batch 3
+    "NER-20DEC30-CDE", "SUP-20DEC30-CDE", "BCP-20DEC30-CDE",
+    "XLP-20DEC30-CDE", "POP-20DEC30-CDE", "SHP-20DEC30-CDE", "PEP-20DEC30-CDE",
 ]
 
 logging.basicConfig(

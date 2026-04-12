@@ -3,7 +3,8 @@ export interface PriceInfo {
   change24h: number | null;
 }
 
-export type CoinSymbol = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE';
+export type CoinSymbol = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'AVAX' | 'ADA' | 'LINK' | 'LTC';
+export const ALL_COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC'];
 
 export type PriceData = Record<CoinSymbol, PriceInfo>;
 
@@ -26,7 +27,7 @@ export interface CDESpec {
   fee_pct: number;
 }
 
-export type CDESpecs = Record<CoinSymbol, CDESpec>;
+export type CDESpecs = Record<string, CDESpec>;
 
 export interface Trade {
   id: number;
@@ -69,95 +70,18 @@ export interface Signal {
   created_at: string | null;
 }
 
-export interface WalletData {
-  balance: number;
+export interface PaperSummary {
+  total_return_pct: number;
   realized_pnl: number;
   unrealized_pnl: number;
-  total_pnl: number;
-  wallets?: {
-    paper_trading?: {
-      value_usd: number;
-      cash_usd: number | null;
-      unrealized_pnl: number | null;
-      status: string;
-    };
-    coinbase_spot?: { value_usd: number | null; status: string };
-    coinbase_perps?: { value_usd: number | null; status: string };
-    ledger?: {
-      value_usd: number | null;
-      status: string;
-      address_count: number;
-    };
-  };
-  coinbase?: {
-    spot?: {
-      value_usd: number | null;
-      status: string;
-      error?: string;
-      assets?: Array<{
-        asset: string;
-        amount: number;
-        price_usd: number;
-        value_usd: number;
-      }>;
-    };
-    perps?: {
-      value_usd: number | null;
-      status: string;
-      error?: string;
-      positions?: Array<{
-        symbol: string;
-        contracts: number | null;
-        mark_price: number | null;
-        notional_usd: number | null;
-        unrealized_pnl_usd: number | null;
-      }>;
-    };
-    total_value_usd: number | null;
-  };
-  ledger?: {
-    status: string;
-    value_usd: number | null;
-    entries: Array<{
-      coin: string;
-      address: string;
-      amount: number | null;
-      price_usd: number | null;
-      value_usd: number | null;
-    }>;
-    assets?: Array<{
-      asset: string;
-      amount: number;
-      price_usd: number | null;
-      value_usd: number | null;
-    }>;
-    updated_at?: string;
-  };
-  portfolio_history?: Array<{
-    timestamp: string;
-    paper_equity_usd: number;
-    external_usd: number;
-    total_value_usd: number;
-  }>;
-  portfolio_history_by_range?: Record<
-    '1h' | '1d' | '1w' | '1m' | '1y',
-    Array<{
-      timestamp: string;
-      paper_equity_usd: number;
-      external_usd: number;
-      total_value_usd: number;
-    }>
-  >;
-}
-
-/** Unified marker for the price chart — works for both paper fills and live trades. */
-export interface ChartMarker {
-  coin: string;
-  side: 'long' | 'short';
-  price: number;
-  timestamp: string; // ISO string
-  contracts: number;
-  kind: 'entry' | 'exit';
+  equity: number;
+  cash_balance: number;
+  max_drawdown_pct: number;
+  win_rate: number;
+  fill_count: number;
+  open_positions: number;
+  sharpe_ratio: number | null;
+  profit_factor: number | null;
 }
 
 export interface PaperFill {
@@ -198,6 +122,15 @@ export interface PaperEquityPoint {
   unrealized_pnl: number;
   realized_pnl: number;
   open_positions: number;
+}
+
+export interface ChartMarker {
+  coin: string;
+  side: 'long' | 'short';
+  price: number;
+  timestamp: string;
+  contracts: number;
+  kind: 'entry' | 'exit';
 }
 
 export type ReadinessTier = 'FULL' | 'PILOT' | 'SHADOW' | 'REJECT' | 'UNKNOWN';
@@ -280,7 +213,6 @@ export interface ResearchFeatures {
   signal_distribution: SignalDistributionItem[];
 }
 
-
 export interface ResearchScriptInfo {
   name: string;
   module: string;
@@ -316,4 +248,58 @@ export interface ResearchJobLogResponse {
   launched_at: string;
   log_path: string;
   logs: string[];
+}
+
+export type ModelCoinStatus = 'active' | 'gate_rejected' | 'stale' | 'auc_rejected';
+
+export interface ModelCoinInfo {
+  coin: string;
+  last_signal_at: string | null;
+  model_auc: number | null;
+  gate_failure_reason: string | null;
+  passed_gates: boolean;
+  status: ModelCoinStatus;
+  hours_since_signal: number | null;
+}
+
+export interface ModelStatusData {
+  coins: ModelCoinInfo[];
+  last_retrain: {
+    started_at: string | null;
+    finished_at: string | null;
+    status: string;
+    symbols_trained: number;
+    symbols_total: number;
+    version: string | null;
+    error: string | null;
+  } | null;
+  next_retrain_at: string | null;
+  retrain_every_days: number;
+}
+
+export interface WalletAsset {
+  asset: string;
+  amount: number;
+  price_usd: number;
+  value_usd: number;
+}
+
+export interface WalletData {
+  balance: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  total_pnl: number;
+  wallets?: Record<string, { value_usd: number; cash_usd?: number; unrealized_pnl?: number; status: string }>;
+  coinbase?: {
+    spot?: { value_usd: number | null; status: string; assets?: WalletAsset[] };
+    perps?: { value_usd: number | null; status: string; positions?: Array<{ symbol: string; contracts: number | null; mark_price: number | null; notional_usd: number | null; unrealized_pnl_usd: number | null }> };
+    total_value_usd: number | null;
+  };
+  ledger?: {
+    status: string;
+    assets?: WalletAsset[];
+    value_usd: number;
+    updated_at?: string;
+  };
+  portfolio_history_by_range?: Record<string, Array<{ timestamp: string; paper_equity_usd: number; external_usd: number; total_value_usd: number }>>;
 }

@@ -1,58 +1,62 @@
-import { useEffect, useState } from 'react';
-import StrategyLabPage from './pages/StrategyLabPage';
-import TradingTerminalPage from './pages/TradingTerminalPage';
+import { useState, useEffect } from 'react';
+import Sidebar from './components/Sidebar';
+import DashboardPage from './pages/DashboardPage';
+import TradingPage from './pages/TradingPage';
+import ResearchPage from './pages/ResearchPage';
+import { getPaperConfig } from './api/paperApi';
 
-type RoutePath = '/' | '/strategy';
+export type RoutePath = '/' | '/trading' | '/research';
 
-function normalizePath(pathname: string): RoutePath {
-  return pathname.startsWith('/strategy') ? '/strategy' : '/';
+function getInitialRoute(): RoutePath {
+  const p = window.location.pathname as RoutePath;
+  return ['/', '/trading', '/research'].includes(p) ? p : '/';
 }
 
-function NavButton({ href, active, label, onNavigate }: { href: RoutePath; active: boolean; label: string; onNavigate: (path: RoutePath) => void }) {
-  return (
-    <button
-      onClick={() => onNavigate(href)}
-      className={`px-3 py-1.5 rounded-lg text-sm border transition-colors ${
-        active
-          ? 'border-[var(--border-accent)] text-[var(--accent-cyan)] bg-[var(--bg-elevated)]'
-          : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-function TopNavigation({ current, onNavigate }: { current: RoutePath; onNavigate: (path: RoutePath) => void }) {
-  return (
-    <div className="max-w-[1400px] mx-auto px-5 pt-4 pb-1 flex items-center gap-2">
-      <NavButton href="/" active={current === '/'} label="Trading Terminal" onNavigate={onNavigate} />
-      <NavButton href="/strategy" active={current === '/strategy'} label="Strategy Lab" onNavigate={onNavigate} />
-    </div>
-  );
-}
-
-function App() {
-  const [route, setRoute] = useState<RoutePath>(normalizePath(window.location.pathname));
+export default function App() {
+  const [route, setRoute] = useState<RoutePath>(getInitialRoute);
+  const [utc, setUtc] = useState('');
+  const [activeCoins, setActiveCoins] = useState<string[]>([]);
 
   useEffect(() => {
-    const updateRoute = () => setRoute(normalizePath(window.location.pathname));
-    window.addEventListener('popstate', updateRoute);
-    return () => window.removeEventListener('popstate', updateRoute);
+    const load = () => getPaperConfig().then(cfg => setActiveCoins(cfg.active_coins)).catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
   }, []);
 
-  const navigate = (path: RoutePath) => {
-    if (route === path) return;
-    window.history.pushState({}, '', path);
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      setUtc(`${now.toUTCString().slice(17, 25)} UTC`);
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  function navigate(path: RoutePath) {
+    window.history.pushState(null, '', path);
     setRoute(path);
-  };
+  }
+
+  const pageTitle = route === '/' ? 'Dashboard' : route === '/trading' ? 'Trading' : 'Research Lab';
 
   return (
-    <div className="min-h-screen bg-grid font-sans antialiased">
-      <TopNavigation current={route} onNavigate={navigate} />
-      {route === '/' ? <TradingTerminalPage /> : <StrategyLabPage />}
+    <div className="flex h-screen overflow-hidden bg-[#080c14] font-sans antialiased">
+      <Sidebar route={route} navigate={navigate} activeCoins={activeCoins} />
+
+      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+        <header className="flex-shrink-0 flex items-center justify-between px-6 py-3.5 border-b border-[rgba(56,189,248,0.08)] bg-[#0c1120]">
+          <span className="text-tx-secondary text-sm font-medium tracking-widest uppercase">{pageTitle}</span>
+          <span className="font-mono text-tx-muted text-xs">{utc}</span>
+        </header>
+
+        <main className="flex-1 overflow-y-auto bg-grid">
+          {route === '/'        && <DashboardPage />}
+          {route === '/trading' && <TradingPage />}
+          {route === '/research'&& <ResearchPage />}
+        </main>
+      </div>
     </div>
   );
 }
-
-export default App;

@@ -11,7 +11,7 @@ from typing import Any
 class FeeAssumptions:
     maker_bps: float = 10.0
     taker_bps: float = 10.0
-    min_fee_per_contract: float = 0.20
+    min_fee_per_contract: float = 0.0   # Coinbase CDE: pure % of notional, no per-contract floor
     use_taker: bool = True
 
     @property

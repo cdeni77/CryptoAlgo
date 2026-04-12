@@ -1,0 +1,237 @@
+{
+  "aggregation_serial_after_tasks": true,
+  "coin_results": {
+    "ADA": {
+      "block_reasons": [
+        "NO_HOLDOUT_CANDIDATE_PASSED_GATE",
+        "holdout_gate_failed:trades>=5,sr>=0.0,ret>=-0.05,psr>=None,dsr>=None",
+        "REQUIRE_HOLDOUT_PASS_ACTIVE"
+      ],
+      "deployment_blocked": true,
+      "error": null,
+      "failed_seeds": [],
+      "holdout_return": -1.0,
+      "holdout_sharpe": 0,
+      "holdout_trades": 4,
+      "optim_score": -2.0,
+      "research_confidence_tier": "SCREENED",
+      "seed_pass_rate": 0.0,
+      "seeds_passed": 0,
+      "seeds_total": 3,
+      "success": true,
+      "successful_seeds": []
+    },
+    "BTC": {
+      "block_reasons": [
+        "NO_HOLDOUT_CANDIDATE_PASSED_GATE",
+        "holdout_gate_failed:trades>=15,sr>=0.0,ret>=-0.05,psr>=None,dsr>=None",
+        "REQUIRE_HOLDOUT_PASS_ACTIVE"
+      ],
+      "deployment_blocked": true,
+      "error": null,
+      "failed_seeds": [],
+      "holdout_return": -1.0,
+      "holdout_sharpe": 0,
+      "holdout_trades": 1,
+      "optim_score": -2.0,
+      "research_confidence_tier": "SCREENED",
+      "seed_pass_rate": 0.0,
+      "seeds_passed": 0,
+      "seeds_total": 3,
+      "success": true,
+      "successful_seeds": []
+    },
+    "DOGE": {
+      "block_reasons": [
+        "NO_HOLDOUT_CANDIDATE_PASSED_GATE",
+        "holdout_gate_failed:trades>=15,sr>=0.0,ret>=-0.05,psr>=None,dsr>=None",
+        "REQUIRE_HOLDOUT_PASS_ACTIVE"
+      ],
+      "deployment_blocked": true,
+      "error": null,
+      "failed_seeds": [],
+      "holdout_return": -0.23483240497124871,
+      "holdout_sharpe": -0.2682830659864791,
+      "holdout_trades": 39,
+      "optim_score": 0.11933560213472062,
+      "research_confidence_tier": "SCREENED",
+      "seed_pass_rate": 0.0,
+      "seeds_passed": 0,
+      "seeds_total": 3,
+      "success": true,
+      "successful_seeds": []
+    },
+    "LTC": {
+      "block_reasons": [
+        "NO_HOLDOUT_CANDIDATE_PASSED_GATE",
+        "holdout_gate_failed:trades>=5,sr>=0.0,ret>=-0.05,psr>=None,dsr>=None",
+        "REQUIRE_HOLDOUT_PASS_ACTIVE"
+      ],
+      "deployment_blocked": true,
+      "error": null,
+      "failed_seeds": [],
+      "holdout_return": 0.0,
+      "holdout_sharpe": 0.0,
+      "holdout_trades": 0,
+      "optim_score": -2.0,
+      "research_confidence_tier": "SCREENED",
+      "seed_pass_rate": 0.0,
+      "seeds_passed": 0,
+      "seeds_total": 3,
+      "success": true,
+      "successful_seeds": []
+    },
+    "SOL": {
+      "block_reasons": [
+        "NO_HOLDOUT_CANDIDATE_PASSED_GATE",
+        "holdout_gate_failed:trades>=15,sr>=0.0,ret>=-0.05,psr>=None,dsr>=None",
+        "REQUIRE_HOLDOUT_PASS_ACTIVE"
+      ],
+      "deployment_blocked": true,
+      "error": null,
+      "failed_seeds": [],
+      "holdout_return": -0.04896410613521396,
+      "holdout_sharpe": -0.07314388011472835,
+      "holdout_trades": 18,
+      "optim_score": -0.4882609133046568,
+      "research_confidence_tier": "SCREENED",
+      "seed_pass_rate": 0.0,
+      "seeds_passed": 0,
+      "seeds_total": 3,
+      "success": true,
+      "successful_seeds": []
+    },
+    "XRP": {
+      "block_reasons": [
+        "NO_HOLDOUT_CANDIDATE_PASSED_GATE",
+        "holdout_gate_failed:trades>=15,sr>=0.0,ret>=-0.05,psr>=None,dsr>=None",
+        "REQUIRE_HOLDOUT_PASS_ACTIVE"
+      ],
+      "deployment_blocked": true,
+      "error": null,
+      "failed_seeds": [],
+      "holdout_return": -0.18647449953713868,
+      "holdout_sharpe": -0.22212470807070178,
+      "holdout_trades": 37,
+      "optim_score": -2.0,
+      "research_confidence_tier": "SCREENED",
+      "seed_pass_rate": 0.3333333333333333,
+      "seeds_passed": 1,
+      "seeds_total": 3,
+      "success": true,
+      "successful_seeds": []
+    }
+  },
+  "config": {
+    "cost_config_path": null,
+    "cv_mode": "purged_embargo",
+    "embargo_bars": null,
+    "embargo_days": null,
+    "embargo_frac": 0.0,
+    "family_screen_top_n": 2,
+    "family_screen_trials": 30,
+    "gate_mode": "initial_paper_qualification",
+    "holdout_days": 180,
+    "holdout_min_return": -0.05,
+    "holdout_min_sharpe": 0.0,
+    "holdout_min_trades": 5,
+    "holdout_mode": "multi_slice",
+    "jobs": 2,
+    "min_dsr": null,
+    "min_psr": 0.5,
+    "min_psr_cv": null,
+    "min_psr_holdout": null,
+    "min_total_trades": 8,
+    "n_cv_folds": 5,
+    "plateau_min_completed": 0,
+    "plateau_min_delta": 0.015,
+    "plateau_patience": 90,
+    "plateau_warmup": 45,
+    "preset_name": "robust_annual",
+    "proxy_fidelity_candidates": 0,
+    "proxy_fidelity_eval_days": 0,
+    "pruned_only": true,
+    "purge_bars": null,
+    "purge_days": null,
+    "require_holdout_pass": true,
+    "resume_study": false,
+    "seed_stability_max_oos_sharpe_dispersion": 0.4,
+    "seed_stability_max_param_dispersion": 0.7,
+    "seed_stability_min_pass_rate": 0.6,
+    "seeds": [
+      42,
+      1337,
+      7
+    ],
+    "study_suffix": "",
+    "target_trades_per_week": 1.0,
+    "target_trades_per_year": null,
+    "top_candidates": 3,
+    "trials": 150
+  },
+  "cpu_count": 20,
+  "generated_at": "2026-03-28T07:45:44Z",
+  "jobs": 2,
+  "optimizer_flags": {
+    "gate_mode": "initial_paper_qualification",
+    "holdout_candidates": 3,
+    "holdout_days": 180,
+    "holdout_mode": "multi_slice",
+    "min_dsr": null,
+    "min_psr": 0.5,
+    "min_psr_cv": null,
+    "min_psr_holdout": null,
+    "proxy_fidelity_candidates": 0,
+    "proxy_fidelity_eval_days": 0,
+    "require_holdout_pass": true,
+    "target_trades_per_week": 1.0,
+    "target_trades_per_year": null
+  },
+  "parallel_mode": "coin",
+  "preset": "robust_annual",
+  "pruned_only": true,
+  "run_id": "run_20260328T042626146101Z",
+  "script_dir": "/home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/backend/trader/scripts",
+  "seed_policy": {
+    "sampler_seeds": [
+      42,
+      1337,
+      7
+    ],
+    "sampler_seeds_raw": "42,1337,7"
+  },
+  "study_suffix_strategy": {
+    "examples": {
+      "ADA": [
+        "run_20260328T042626146101Z_ADA"
+      ],
+      "BTC": [
+        "run_20260328T042626146101Z_BTC"
+      ],
+      "DOGE": [
+        "run_20260328T042626146101Z_DOGE"
+      ],
+      "LTC": [
+        "run_20260328T042626146101Z_LTC"
+      ],
+      "SOL": [
+        "run_20260328T042626146101Z_SOL"
+      ],
+      "XRP": [
+        "run_20260328T042626146101Z_XRP"
+      ]
+    },
+    "mode": "run_plus_coin",
+    "provided_suffix": ""
+  },
+  "target_coins": [
+    "BTC",
+    "SOL",
+    "XRP",
+    "DOGE",
+    "ADA",
+    "LTC"
+  ],
+  "total_tasks": 6,
+  "workers": 6
+}

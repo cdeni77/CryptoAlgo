@@ -28,9 +28,11 @@ class BreakoutExpansionStrategy:
             direction = 0
 
         passed = breakout_gate and expansion_gate and trend_gate and volume_gate and direction != 0
+        norm_impulse = abs(impulse) / max(min_momentum_magnitude * 0.7, 1e-6)
+        vol_confirm_rank = min(1.0, max(0.0, volume_confirm - 1.0))  # 0 at 1x vol, 1 at 2x vol
         return StrategyDecision(
             direction=direction if passed else 0,
-            rank_modifier=0.22 * abs(impulse) + 0.08 * max(0.0, volume_confirm - 1.0),
+            rank_modifier=0.20 * min(2.0, norm_impulse) + 0.05 * vol_confirm_rank,
             gate_contributions={
                 'momentum_magnitude': breakout_gate and expansion_gate,
                 'momentum_dir_agreement': trend_gate and volume_gate and direction != 0,

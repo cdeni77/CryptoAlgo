@@ -146,6 +146,23 @@ def get_current_prices():
         raise HTTPException(status_code=503, detail=str(e))
 
 
+@router.get("/cde-prices", response_model=Dict[str, dict])
+def get_cde_prices():
+    """Get current mark prices for all CDE perpetual contracts."""
+    client = get_coinbase_client()
+    result = {}
+    for symbol, spec in CDE_PRODUCTS.items():
+        try:
+            prod = client.get_public_product(spec["symbol"])
+            result[symbol] = {
+                "price": float(prod.price) if prod.price else None,
+                "change24h": float(prod.price_percentage_change_24h) if getattr(prod, "price_percentage_change_24h", None) else None,
+            }
+        except Exception:
+            result[symbol] = {"price": None, "change24h": None}
+    return result
+
+
 @router.get("/cde-specs", response_model=Dict[str, dict])
 def get_cde_specs():
     """Return CDE contract specifications for all coins."""

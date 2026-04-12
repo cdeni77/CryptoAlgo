@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 
 # ── Inline model definitions (mirror of the API models) ────────────
@@ -142,6 +142,11 @@ class PaperPosition(Base):
     opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     is_open = Column(Boolean, nullable=False, default=True)
+    # Exit parameters frozen at open time — paper engine uses these to close positions
+    tp_price = Column(Float, nullable=True)
+    sl_price = Column(Float, nullable=True)
+    max_hold_until = Column(DateTime(timezone=True), nullable=True)
+    exit_reason = Column(String, nullable=True)
 
 
 class PaperEquityCurve(Base):
@@ -155,6 +160,15 @@ class PaperEquityCurve(Base):
     open_positions = Column(Integer, nullable=False, default=0)
 
 
+class PaperEngineConfig(Base):
+    """Single-row table written by the paper engine on startup to expose its runtime config."""
+    __tablename__ = "paper_engine_config"
+    id = Column(Integer, primary_key=True, default=1)
+    active_coins = Column(JSON, nullable=False, default=list)
+    tier_map = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class PgWriter:
     def __init__(self, database_url: Optional[str] = None):
         url = database_url or os.environ.get("DATABASE_URL")
@@ -163,6 +177,19 @@ class PgWriter:
         self.engine = create_engine(url)
         self.SessionLocal = sessionmaker(bind=self.engine)
         Base.metadata.create_all(self.engine)
+        self._run_pg_migrations()
+
+    def _run_pg_migrations(self) -> None:
+        """Add columns that post-date create_all(). Idempotent — safe on every startup."""
+        stmts = [
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS tp_price DOUBLE PRECISION",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS sl_price DOUBLE PRECISION",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS max_hold_until TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS exit_reason VARCHAR",
+        ]
+        with self.engine.begin() as conn:
+            for stmt in stmts:
+                conn.execute(text(stmt))
 
     def _session(self) -> Session:
         return self.SessionLocal()
@@ -402,11 +429,60 @@ class PgWriter:
                 .first()
             )
 
-    def upsert_paper_position(self, coin: str, side: str, contracts: int, entry_price: float, mark_price: float, notional: float, realized_pnl: float, unrealized_pnl: float, fees_paid: float, is_open: bool = True) -> int:
+    def get_all_open_paper_positions_for_coin(self, coin: str) -> list[PaperPosition]:
+        with self._session() as db:
+            return (
+                db.query(PaperPosition)
+                .filter(PaperPosition.coin == coin, PaperPosition.is_open.is_(True))
+                .order_by(PaperPosition.id.asc())
+                .all()
+            )
+
+    def get_all_open_paper_positions(self) -> list[PaperPosition]:
+        with self._session() as db:
+            return (
+                db.query(PaperPosition)
+                .filter(PaperPosition.is_open.is_(True))
+                .order_by(PaperPosition.id.asc())
+                .all()
+            )
+
+    def update_paper_position_mark(self, position_id: int, mark_price: float, unrealized_pnl: float) -> None:
+        with self._session() as db:
+            position = db.query(PaperPosition).filter(PaperPosition.id == position_id).first()
+            if position:
+                position.mark_price = mark_price
+                position.unrealized_pnl = unrealized_pnl
+                db.commit()
+
+    def get_latest_signal_price(self, coin: str) -> Optional[float]:
+        with self._session() as db:
+            sig = (
+                db.query(Signal.price_at_signal)
+                .filter(Signal.coin == coin, Signal.price_at_signal.isnot(None))
+                .order_by(Signal.id.desc())
+                .first()
+            )
+            return float(sig.price_at_signal) if sig else None
+
+    def upsert_paper_position(self, coin: str, side: str, contracts: int, entry_price: float, mark_price: float, notional: float, realized_pnl: float, unrealized_pnl: float, fees_paid: float, is_open: bool = True, tp_price: float | None = None, sl_price: float | None = None, max_hold_until: datetime | None = None) -> int:
         # Always INSERT a new position row. The old position must be explicitly closed via
         # close_paper_position() before this is called. Overwriting in-place would cause
         # "re-entry without close" — the side/entry_price would silently flip on the same row.
+        import logging as _logging
+        _log = _logging.getLogger("pg_writer")
         with self._session() as db:
+            existing = (
+                db.query(PaperPosition)
+                .filter(PaperPosition.coin == coin, PaperPosition.side == side, PaperPosition.is_open.is_(True))
+                .first()
+            )
+            if existing:
+                _log.warning(
+                    "upsert_paper_position: same-side open position already exists for %s %s (id=%s) — skipping insert",
+                    coin, side, existing.id,
+                )
+                return existing.id
             position = PaperPosition(
                 coin=coin,
                 side=side,
@@ -418,13 +494,16 @@ class PgWriter:
                 unrealized_pnl=unrealized_pnl,
                 fees_paid=fees_paid,
                 is_open=is_open,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                max_hold_until=max_hold_until,
             )
             db.add(position)
             db.commit()
             db.refresh(position)
             return position.id
 
-    def close_paper_position(self, position_id: int, mark_price: float, realized_pnl: float, fees_paid: float) -> None:
+    def close_paper_position(self, position_id: int, mark_price: float, realized_pnl: float, fees_paid: float, exit_reason: str | None = None) -> None:
         with self._session() as db:
             position = db.query(PaperPosition).filter(PaperPosition.id == position_id).first()
             if not position:
@@ -434,7 +513,21 @@ class PgWriter:
             position.unrealized_pnl = 0.0
             position.fees_paid = fees_paid
             position.is_open = False
+            if exit_reason:
+                position.exit_reason = exit_reason
             db.commit()
+
+    def get_recent_signal_prices_for_coin(self, coin: str, limit: int = 48) -> list[tuple[datetime, float]]:
+        """Return the last `limit` (timestamp, price_at_signal) pairs for a coin, oldest first."""
+        with self._session() as db:
+            rows = (
+                db.query(Signal.timestamp, Signal.price_at_signal)
+                .filter(Signal.coin == coin, Signal.price_at_signal.isnot(None))
+                .order_by(Signal.id.desc())
+                .limit(limit)
+                .all()
+            )
+        return [(r.timestamp, float(r.price_at_signal)) for r in reversed(rows)]
 
     def write_paper_equity_point(self, equity: float, cash_balance: float, unrealized_pnl: float, realized_pnl: float, open_positions: int, timestamp: Optional[datetime] = None) -> int:
         with self._session() as db:
@@ -488,3 +581,38 @@ class PgWriter:
                 .order_by(PaperEquityCurve.timestamp.asc())
                 .all()
             )
+
+    def upsert_paper_engine_config(self, active_coins: list[str], tier_map: dict[str, str]) -> None:
+        """Write (or overwrite) the single paper_engine_config row so the API can expose it."""
+        with self._session() as db:
+            row = db.query(PaperEngineConfig).filter(PaperEngineConfig.id == 1).first()
+            if row:
+                row.active_coins = sorted(active_coins)
+                row.tier_map = tier_map
+            else:
+                db.add(PaperEngineConfig(id=1, active_coins=sorted(active_coins), tier_map=tier_map))
+            db.commit()
+
+    def compute_paper_state_from_history(self, initial_equity: float = 10_000.0) -> dict:
+        """Reconstruct correct cash_balance/realized/unrealized from fill + position history.
+
+        This is used on engine startup to avoid the reset-to-10000 bug after container restarts.
+        Formula: cash = initial - sum(open_fees_from_fills) + sum(realized_pnl_from_closed_positions)
+        """
+        with self._session() as db:
+            total_open_fees = db.query(func.sum(PaperFill.fee)).scalar() or 0.0
+            total_realized = (
+                db.query(func.sum(PaperPosition.realized_pnl))
+                .filter(PaperPosition.is_open.is_(False))
+                .scalar()
+            ) or 0.0
+            open_positions = (
+                db.query(PaperPosition).filter(PaperPosition.is_open.is_(True)).all()
+            )
+            total_unrealized = sum(float(p.unrealized_pnl or 0) for p in open_positions)
+        cash = initial_equity - float(total_open_fees) + float(total_realized)
+        return {
+            "cash_balance": cash,
+            "realized_pnl": float(total_realized),
+            "unrealized_pnl": total_unrealized,
+        }

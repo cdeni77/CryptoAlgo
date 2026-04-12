@@ -1,0 +1,3003 @@
+{
+  "coin": "ETH",
+  "prefix": "ETP",
+  "optim_score": -0.4065011124721451,
+  "optim_metrics": {
+    "n_folds": 5,
+    "strategy_family": "momentum_trend",
+    "trade_freq_bucket": "balanced",
+    "family_params": {
+      "cooldown_hours": 60,
+      "max_hold_hours": 72,
+      "vol_mult_tp": 3.5,
+      "vol_mult_sl": 5.0,
+      "min_momentum_magnitude": 0.05
+    },
+    "family_param_fingerprint": "d2c42c52c276",
+    "family_regime_summary": {
+      "strategy_family": "momentum_trend",
+      "activity_regime": "active",
+      "cooldown_hours": 60.0,
+      "max_hold_hours": 72
+    },
+    "param_fingerprint": "a1972970f7d5",
+    "duplicate_of_trial": null,
+    "duplicate_has_identical_params": false,
+    "duplicate_has_identical_value": false,
+    "mean_auc": 0.5113,
+    "n_trades": 181,
+    "cv_trade_density": 43.504318,
+    "cv_oos_days": 1519.625,
+    "cv_oos_years": 4.160507,
+    "realized_trades": 181,
+    "realized_trades_per_year": 43.504318,
+    "cv_trade_density_ratio": 3.655825,
+    "target_trades_floor": 49.510027,
+    "min_trade_frequency_ratio": 0.35,
+    "activity_regime": "active",
+    "trade_density_ratio": 3.655825,
+    "mean_sharpe": 0.079659,
+    "mean_sharpe_raw": 0.079659,
+    "realized_sharpe_term": -0.158435,
+    "min_sharpe": -0.918394,
+    "std_sharpe": 0.649476,
+    "win_rate": 0.6,
+    "max_drawdown": 0.9947,
+    "fold_metrics": [
+      {
+        "trades": 46,
+        "raw_sharpe": 0.5379676598493852,
+        "sharpe": 0.5379676598493852,
+        "return": 0.13407147421882204,
+        "gross_return": 0.38744932861751313,
+        "expectancy": 0.003957677237848375,
+        "equity_start": 100000.0,
+        "equity_end": 113407.1474218822,
+        "total_fees": 10181.635729200001,
+        "total_funding": -1580.4578489177695,
+        "avg_notional": 92105.45228260869,
+        "gate_counters": {
+          "total_checks": 7272,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 0,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 715,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 0,
+            "meta_threshold": 0,
+            "ensemble_agreement": 484,
+            "ensemble_std": 0,
+            "cooldown": 6026,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.09832233223322333,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.06655665566556655,
+            "ensemble_std": 0.0,
+            "cooldown": 0.8286578657865786,
+            "no_contract_size": 0.0
+          }
+        }
+      },
+      {
+        "trades": 44,
+        "raw_sharpe": -0.918393969856875,
+        "sharpe": -0.918393969856875,
+        "return": -0.306898549966127,
+        "gross_return": -0.43482867740560255,
+        "expectancy": -0.007029380688676887,
+        "equity_start": 100000.0,
+        "equity_end": 69310.1450033873,
+        "total_fees": 5516.306143199999,
+        "total_funding": -533.1388534126576,
+        "avg_notional": 52517.75222727273,
+        "gate_counters": {
+          "total_checks": 7273,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 41,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 1114,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 0,
+            "meta_threshold": 0,
+            "ensemble_agreement": 329,
+            "ensemble_std": 0,
+            "cooldown": 5745,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.005637288601677437,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.15316925615289426,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.04523580365736285,
+            "ensemble_std": 0.0,
+            "cooldown": 0.7899078784545579,
+            "no_contract_size": 0.0
+          }
+        }
+      },
+      {
+        "trades": 31,
+        "raw_sharpe": 0.7123467060510191,
+        "sharpe": 0.7123467060510191,
+        "return": 0.1163145204736773,
+        "gross_return": 0.2774191250473372,
+        "expectancy": 0.004051007605213008,
+        "equity_start": 100000.0,
+        "equity_end": 111631.45204736774,
+        "total_fees": 5430.568975199999,
+        "total_funding": -1942.3589774322888,
+        "avg_notional": 72684.99622580646,
+        "gate_counters": {
+          "total_checks": 7273,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 240,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 2577,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 0,
+            "meta_threshold": 0,
+            "ensemble_agreement": 407,
+            "ensemble_std": 0,
+            "cooldown": 4018,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.03299876254640451,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.3543242128420184,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.055960401484944314,
+            "ensemble_std": 0.0,
+            "cooldown": 0.5524542829643888,
+            "no_contract_size": 0.0
+          }
+        }
+      },
+      {
+        "trades": 17,
+        "raw_sharpe": -0.46597449456206713,
+        "sharpe": -0.46597449456206713,
+        "return": -0.05354536521466302,
+        "gross_return": -0.024156624937778884,
+        "expectancy": -0.0028986260588527496,
+        "equity_start": 100000.0,
+        "equity_end": 94645.4634785337,
+        "total_fees": 2845.6773900000007,
+        "total_funding": -273.61213146627495,
+        "avg_notional": 69986.61517647059,
+        "gate_counters": {
+          "total_checks": 7273,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 0,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 2908,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 966,
+            "meta_threshold": 0,
+            "ensemble_agreement": 1155,
+            "ensemble_std": 0,
+            "cooldown": 2227,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.39983500618726797,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.13282001924927817,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.1588065447545717,
+            "ensemble_std": 0.0,
+            "cooldown": 0.3062010174618452,
+            "no_contract_size": 0.0
+          }
+        }
+      },
+      {
+        "trades": 43,
+        "raw_sharpe": 0.5323489173440431,
+        "sharpe": 0.5323489173440431,
+        "return": 0.13644233237555348,
+        "gross_return": 0.3815976930727572,
+        "expectancy": 0.004241385992445956,
+        "equity_start": 100000.0,
+        "equity_end": 113644.23323755534,
+        "total_fees": 7146.106116000001,
+        "total_funding": -2041.1566464445832,
+        "avg_notional": 68979.73179069768,
+        "gate_counters": {
+          "total_checks": 7369,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 0,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 1135,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 0,
+            "meta_threshold": 0,
+            "ensemble_agreement": 563,
+            "ensemble_std": 0,
+            "cooldown": 5628,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.1540236124304519,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.07640113991043561,
+            "ensemble_std": 0.0,
+            "cooldown": 0.7637399918577826,
+            "no_contract_size": 0.0
+          }
+        }
+      }
+    ],
+    "fold_gate_counters": [
+      {
+        "total_checks": 7272,
+        "gate_counts": {
+          "missing_sma200": 0,
+          "vol_regime_low": 0,
+          "vol_regime_high": 0,
+          "momentum_magnitude": 715,
+          "momentum_dir_agreement": 0,
+          "trend_filter": 0,
+          "funding_filter": 0,
+          "primary_threshold": 0,
+          "meta_threshold": 0,
+          "ensemble_agreement": 484,
+          "ensemble_std": 0,
+          "cooldown": 6026,
+          "no_contract_size": 0
+        },
+        "gate_rates": {
+          "missing_sma200": 0.0,
+          "vol_regime_low": 0.0,
+          "vol_regime_high": 0.0,
+          "momentum_magnitude": 0.09832233223322333,
+          "momentum_dir_agreement": 0.0,
+          "trend_filter": 0.0,
+          "funding_filter": 0.0,
+          "primary_threshold": 0.0,
+          "meta_threshold": 0.0,
+          "ensemble_agreement": 0.06655665566556655,
+          "ensemble_std": 0.0,
+          "cooldown": 0.8286578657865786,
+          "no_contract_size": 0.0
+        }
+      },
+      {
+        "total_checks": 7273,
+        "gate_counts": {
+          "missing_sma200": 0,
+          "vol_regime_low": 41,
+          "vol_regime_high": 0,
+          "momentum_magnitude": 1114,
+          "momentum_dir_agreement": 0,
+          "trend_filter": 0,
+          "funding_filter": 0,
+          "primary_threshold": 0,
+          "meta_threshold": 0,
+          "ensemble_agreement": 329,
+          "ensemble_std": 0,
+          "cooldown": 5745,
+          "no_contract_size": 0
+        },
+        "gate_rates": {
+          "missing_sma200": 0.0,
+          "vol_regime_low": 0.005637288601677437,
+          "vol_regime_high": 0.0,
+          "momentum_magnitude": 0.15316925615289426,
+          "momentum_dir_agreement": 0.0,
+          "trend_filter": 0.0,
+          "funding_filter": 0.0,
+          "primary_threshold": 0.0,
+          "meta_threshold": 0.0,
+          "ensemble_agreement": 0.04523580365736285,
+          "ensemble_std": 0.0,
+          "cooldown": 0.7899078784545579,
+          "no_contract_size": 0.0
+        }
+      },
+      {
+        "total_checks": 7273,
+        "gate_counts": {
+          "missing_sma200": 0,
+          "vol_regime_low": 240,
+          "vol_regime_high": 0,
+          "momentum_magnitude": 2577,
+          "momentum_dir_agreement": 0,
+          "trend_filter": 0,
+          "funding_filter": 0,
+          "primary_threshold": 0,
+          "meta_threshold": 0,
+          "ensemble_agreement": 407,
+          "ensemble_std": 0,
+          "cooldown": 4018,
+          "no_contract_size": 0
+        },
+        "gate_rates": {
+          "missing_sma200": 0.0,
+          "vol_regime_low": 0.03299876254640451,
+          "vol_regime_high": 0.0,
+          "momentum_magnitude": 0.3543242128420184,
+          "momentum_dir_agreement": 0.0,
+          "trend_filter": 0.0,
+          "funding_filter": 0.0,
+          "primary_threshold": 0.0,
+          "meta_threshold": 0.0,
+          "ensemble_agreement": 0.055960401484944314,
+          "ensemble_std": 0.0,
+          "cooldown": 0.5524542829643888,
+          "no_contract_size": 0.0
+        }
+      },
+      {
+        "total_checks": 7273,
+        "gate_counts": {
+          "missing_sma200": 0,
+          "vol_regime_low": 0,
+          "vol_regime_high": 0,
+          "momentum_magnitude": 2908,
+          "momentum_dir_agreement": 0,
+          "trend_filter": 0,
+          "funding_filter": 0,
+          "primary_threshold": 966,
+          "meta_threshold": 0,
+          "ensemble_agreement": 1155,
+          "ensemble_std": 0,
+          "cooldown": 2227,
+          "no_contract_size": 0
+        },
+        "gate_rates": {
+          "missing_sma200": 0.0,
+          "vol_regime_low": 0.0,
+          "vol_regime_high": 0.0,
+          "momentum_magnitude": 0.39983500618726797,
+          "momentum_dir_agreement": 0.0,
+          "trend_filter": 0.0,
+          "funding_filter": 0.0,
+          "primary_threshold": 0.13282001924927817,
+          "meta_threshold": 0.0,
+          "ensemble_agreement": 0.1588065447545717,
+          "ensemble_std": 0.0,
+          "cooldown": 0.3062010174618452,
+          "no_contract_size": 0.0
+        }
+      },
+      {
+        "total_checks": 7369,
+        "gate_counts": {
+          "missing_sma200": 0,
+          "vol_regime_low": 0,
+          "vol_regime_high": 0,
+          "momentum_magnitude": 1135,
+          "momentum_dir_agreement": 0,
+          "trend_filter": 0,
+          "funding_filter": 0,
+          "primary_threshold": 0,
+          "meta_threshold": 0,
+          "ensemble_agreement": 563,
+          "ensemble_std": 0,
+          "cooldown": 5628,
+          "no_contract_size": 0
+        },
+        "gate_rates": {
+          "missing_sma200": 0.0,
+          "vol_regime_low": 0.0,
+          "vol_regime_high": 0.0,
+          "momentum_magnitude": 0.1540236124304519,
+          "momentum_dir_agreement": 0.0,
+          "trend_filter": 0.0,
+          "funding_filter": 0.0,
+          "primary_threshold": 0.0,
+          "meta_threshold": 0.0,
+          "ensemble_agreement": 0.07640113991043561,
+          "ensemble_std": 0.0,
+          "cooldown": 0.7637399918577826,
+          "no_contract_size": 0.0
+        }
+      }
+    ],
+    "fold_trade_counts": [
+      46,
+      44,
+      31,
+      17,
+      43
+    ],
+    "aggregated_gate_counters": {
+      "total_checks": 36460,
+      "gate_counts": {
+        "missing_sma200": 0,
+        "vol_regime_low": 281,
+        "vol_regime_high": 0,
+        "momentum_magnitude": 8449,
+        "momentum_dir_agreement": 0,
+        "trend_filter": 0,
+        "funding_filter": 0,
+        "primary_threshold": 966,
+        "meta_threshold": 0,
+        "ensemble_agreement": 2938,
+        "ensemble_std": 0,
+        "cooldown": 23644,
+        "no_contract_size": 0
+      },
+      "gate_rates": {
+        "missing_sma200": 0.0,
+        "vol_regime_low": 0.007707076247942951,
+        "vol_regime_high": 0.0,
+        "momentum_magnitude": 0.23173340647284696,
+        "momentum_dir_agreement": 0.0,
+        "trend_filter": 0.0,
+        "funding_filter": 0.0,
+        "primary_threshold": 0.026494788809654415,
+        "meta_threshold": 0.0,
+        "ensemble_agreement": 0.08058145913329676,
+        "ensemble_std": 0.0,
+        "cooldown": 0.6484914975315414,
+        "no_contract_size": 0.0
+      }
+    },
+    "main_blockers": [
+      {
+        "reason_code": "cooldown",
+        "count": 23644,
+        "rate": 0.6484914975315414
+      },
+      {
+        "reason_code": "momentum_magnitude",
+        "count": 8449,
+        "rate": 0.23173340647284696
+      },
+      {
+        "reason_code": "ensemble_agreement",
+        "count": 2938,
+        "rate": 0.08058145913329676
+      }
+    ],
+    "starvation_signature": {
+      "label": "momentum_starved",
+      "shares": {
+        "momentum_starved": 0.6687509893936995,
+        "vol_starved": 0.02224157036567991,
+        "confidence_starved": 0.3090074402406205
+      }
+    },
+    "fold_blocker_summary": [
+      {
+        "fold": 0,
+        "main_blockers": [
+          {
+            "reason_code": "cooldown",
+            "count": 6026,
+            "rate": 0.8286578657865786
+          },
+          {
+            "reason_code": "momentum_magnitude",
+            "count": 715,
+            "rate": 0.09832233223322333
+          }
+        ]
+      },
+      {
+        "fold": 1,
+        "main_blockers": [
+          {
+            "reason_code": "cooldown",
+            "count": 5745,
+            "rate": 0.7899078784545579
+          },
+          {
+            "reason_code": "momentum_magnitude",
+            "count": 1114,
+            "rate": 0.15316925615289426
+          }
+        ]
+      },
+      {
+        "fold": 2,
+        "main_blockers": [
+          {
+            "reason_code": "cooldown",
+            "count": 4018,
+            "rate": 0.5524542829643888
+          },
+          {
+            "reason_code": "momentum_magnitude",
+            "count": 2577,
+            "rate": 0.3543242128420184
+          }
+        ]
+      },
+      {
+        "fold": 3,
+        "main_blockers": [
+          {
+            "reason_code": "momentum_magnitude",
+            "count": 2908,
+            "rate": 0.39983500618726797
+          },
+          {
+            "reason_code": "cooldown",
+            "count": 2227,
+            "rate": 0.3062010174618452
+          }
+        ]
+      },
+      {
+        "fold": 4,
+        "main_blockers": [
+          {
+            "reason_code": "cooldown",
+            "count": 5628,
+            "rate": 0.7637399918577826
+          },
+          {
+            "reason_code": "momentum_magnitude",
+            "count": 1135,
+            "rate": 0.1540236124304519
+          }
+        ]
+      }
+    ],
+    "psr_meta": {
+      "valid": true,
+      "psr": 0.5620032346162442,
+      "z_score": 0.15605010006106854,
+      "observations": 5,
+      "benchmark_sharpe": 0.0,
+      "sharpe_estimate": 0.07965896376510105,
+      "skewness": -0.5214736858869509,
+      "kurtosis": 1.4918348638925312,
+      "fallback_moments_used": false,
+      "sample_count": 5,
+      "sample_sharpes": [
+        0.537968,
+        -0.918394,
+        0.712347,
+        -0.465974,
+        0.532349
+      ]
+    },
+    "psr": 0.5620032346162442,
+    "dsr_cv_meta": {
+      "valid": true,
+      "dsr": -1.0128656180175992,
+      "p_value": 0.8444378235362169,
+      "expected_max_sr": 0.5333442511650874,
+      "significant_10pct": false,
+      "observations": 5,
+      "effective_test_count": 5,
+      "observed_sharpe": 0.07965896376510105,
+      "skewness": 0.0,
+      "kurtosis": 3.0,
+      "fallback_moments_used": true
+    },
+    "dsr_cv": -1.0128656180175992,
+    "realized_return": 0.005277,
+    "realized_expectancy": 0.000464,
+    "cv_net_return": 0.005277,
+    "cv_gross_return": 0.117496,
+    "cv_total_fees": 31120.294354,
+    "cv_total_funding": -6370.724458,
+    "cv_avg_notional": 71254.909541,
+    "cv_equity_start": 500000.0,
+    "cv_equity_end": 502638.441189,
+    "trade_floor_penalty": -0.0,
+    "dsr_penalty": -0.302573,
+    "fold_importance_stability": 0.0814,
+    "importance_instability_penalty": -0.036431,
+    "cooldown_dominance_penalty": 0.209888,
+    "cooldown_dominance_rate": 0.648491,
+    "cooldown_dominance_regime": "severe",
+    "cooldown_dominant_fold_share": 0.8,
+    "fold_balance_penalty": 1.56543,
+    "zero_trade_fold_penalty": 0.0,
+    "trade_imbalance_penalty": 0.015692,
+    "weak_fold_penalty": 1.549738
+  },
+  "holdout_metrics": {
+    "holdout_sharpe": -0.04792625539403314,
+    "holdout_return": -0.018198637637047495,
+    "holdout_trades": 13,
+    "full_sharpe": -0.3481120297168677,
+    "full_pf": 0.8631059273404817,
+    "full_dd": 0.09440728160691948,
+    "full_trades": 13,
+    "gate_counters": {
+      "total_checks": 1592,
+      "gate_counts": {
+        "missing_sma200": 0,
+        "vol_regime_low": 6,
+        "vol_regime_high": 0,
+        "momentum_magnitude": 679,
+        "momentum_dir_agreement": 0,
+        "trend_filter": 0,
+        "funding_filter": 0,
+        "primary_threshold": 0,
+        "meta_threshold": 0,
+        "ensemble_agreement": 170,
+        "ensemble_std": 0,
+        "cooldown": 737,
+        "no_contract_size": 0
+      },
+      "gate_rates": {
+        "missing_sma200": 0.0,
+        "vol_regime_low": 0.0037688442211055275,
+        "vol_regime_high": 0.0,
+        "momentum_magnitude": 0.4265075376884422,
+        "momentum_dir_agreement": 0.0,
+        "trend_filter": 0.0,
+        "funding_filter": 0.0,
+        "primary_threshold": 0.0,
+        "meta_threshold": 0.0,
+        "ensemble_agreement": 0.10678391959798995,
+        "ensemble_std": 0.0,
+        "cooldown": 0.4629396984924623,
+        "no_contract_size": 0.0
+      }
+    },
+    "starvation_signature": {
+      "label": "momentum_starved",
+      "shares": {
+        "momentum_starved": 0.7941520467836257,
+        "vol_starved": 0.007017543859649122,
+        "confidence_starved": 0.19883040935672516
+      }
+    },
+    "selected_slice": "median_composite",
+    "selected_slice_source": "recent90",
+    "holdout_mode": "multi_slice",
+    "holdout_slices": {
+      "recent90": {
+        "holdout_sharpe": -0.04792625539403314,
+        "holdout_return": -0.018198637637047495,
+        "holdout_trades": 13,
+        "full_sharpe": -0.3481120297168677,
+        "full_pf": 0.8631059273404817,
+        "full_dd": 0.09440728160691948,
+        "full_trades": 13,
+        "gate_counters": {
+          "total_checks": 1592,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 6,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 679,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 0,
+            "meta_threshold": 0,
+            "ensemble_agreement": 170,
+            "ensemble_std": 0,
+            "cooldown": 737,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0037688442211055275,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.4265075376884422,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.10678391959798995,
+            "ensemble_std": 0.0,
+            "cooldown": 0.4629396984924623,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.7941520467836257,
+            "vol_starved": 0.007017543859649122,
+            "confidence_starved": 0.19883040935672516
+          }
+        }
+      },
+      "prior90": {
+        "holdout_sharpe": -0.1447298706346361,
+        "holdout_return": -0.043213789960468804,
+        "holdout_trades": 11,
+        "full_sharpe": -0.9670042305433201,
+        "full_pf": 0.7066964860486069,
+        "full_dd": 0.0685522199407895,
+        "full_trades": 11,
+        "gate_counters": {
+          "total_checks": 1510,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 0,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 482,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 133,
+            "meta_threshold": 0,
+            "ensemble_agreement": 273,
+            "ensemble_std": 0,
+            "cooldown": 622,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.31920529801324504,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0880794701986755,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.18079470198675496,
+            "ensemble_std": 0.0,
+            "cooldown": 0.4119205298013245,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.5427927927927927,
+            "vol_starved": 0.0,
+            "confidence_starved": 0.45720720720720714
+          }
+        }
+      },
+      "full180": {
+        "holdout_sharpe": -0.15927909971602322,
+        "holdout_return": -0.08832784613834874,
+        "holdout_trades": 24,
+        "full_sharpe": -1.1115353342242849,
+        "full_pf": 0.6954765133501458,
+        "full_dd": 0.14556822969497127,
+        "full_trades": 24,
+        "gate_counters": {
+          "total_checks": 3254,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 6,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 1177,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 144,
+            "meta_threshold": 0,
+            "ensemble_agreement": 497,
+            "ensemble_std": 0,
+            "cooldown": 1430,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0018438844499078057,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.36170866625691456,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.044253226797787336,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.15273509526736326,
+            "ensemble_std": 0.0,
+            "cooldown": 0.43945912722802705,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.6452850877192983,
+            "vol_starved": 0.003289473684210526,
+            "confidence_starved": 0.3514254385964913
+          }
+        }
+      },
+      "prior180": {
+        "holdout_sharpe": -0.008026814783562052,
+        "holdout_return": 0.0037695333819457414,
+        "holdout_trades": 20,
+        "full_sharpe": -0.05113486332109127,
+        "full_pf": 1.0212414383359123,
+        "full_dd": 0.09454676442843149,
+        "full_trades": 20,
+        "gate_counters": {
+          "total_checks": 3136,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 0,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 1350,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 203,
+            "meta_threshold": 0,
+            "ensemble_agreement": 388,
+            "ensemble_std": 0,
+            "cooldown": 1195,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.430484693877551,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.06473214285714286,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.12372448979591837,
+            "ensemble_std": 0.0,
+            "cooldown": 0.38105867346938777,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.695517774343122,
+            "vol_starved": 0.0,
+            "confidence_starved": 0.3044822256568779
+          }
+        }
+      }
+    },
+    "psr_holdout": {
+      "valid": true,
+      "psr": 0.43410752770201877,
+      "z_score": -0.1659261660292867,
+      "observations": 13,
+      "benchmark_sharpe": 0.0,
+      "sharpe_estimate": -0.04792625539403314,
+      "skewness": 0.0,
+      "kurtosis": 3.0,
+      "fallback_moments_used": false,
+      "sample_count": 1,
+      "sample_sharpes": [
+        -0.047926
+      ]
+    },
+    "dsr_holdout": {
+      "valid": true,
+      "dsr": -2.6178230692101185,
+      "p_value": 0.9955753662195426,
+      "expected_max_sr": 0.6785440328303076,
+      "significant_10pct": false,
+      "observations": 13,
+      "effective_test_count": 79,
+      "observed_sharpe": -0.04792625539403314,
+      "skewness": 0.0,
+      "kurtosis": 3.0,
+      "fallback_moments_used": true
+    }
+  },
+  "params": {
+    "signal_threshold": 0.51,
+    "label_forward_hours": 36,
+    "label_vol_target": 1.8,
+    "vol_mult_tp": 3.5,
+    "vol_mult_sl": 5.0,
+    "max_hold_hours": 72,
+    "cooldown_hours": 60,
+    "min_vol_24h": 0.0014,
+    "max_vol_24h": 0.062,
+    "min_momentum_magnitude": 0.05,
+    "max_ensemble_std": 0.18,
+    "min_directional_agreement": 0.5,
+    "meta_probability_threshold": 0.48,
+    "strategy_family": "momentum_trend",
+    "trade_freq_bucket": "balanced",
+    "pullback_depth_threshold": 0.02,
+    "rebound_confirmation_threshold": 0.004,
+    "trend_strength_min": 0.002,
+    "pullback_lookback": 24,
+    "breakout_lookback": 48,
+    "breakout_buffer": 0.003,
+    "expansion_confirm_threshold": 0.004,
+    "funding_z_threshold": 2.5,
+    "squeeze_pct_threshold": 0.2,
+    "liq_threshold": 0.3,
+    "oi_z_threshold": 1.0,
+    "min_val_auc": 0.48,
+    "position_size": 0.12,
+    "vol_sizing_target": 0.025,
+    "n_estimators": 50,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "min_child_samples": 20
+  },
+  "tunable_params": {
+    "strategy_family": "momentum_trend",
+    "max_vol_24h": 0.062,
+    "min_vol_24h": 0.0014,
+    "signal_threshold": 0.51,
+    "label_forward_hours": 36,
+    "vol_mult_tp": 3.5,
+    "vol_mult_sl": 5.0,
+    "max_hold_hours": 72,
+    "cooldown_hours": 60
+  },
+  "n_trials": 200,
+  "n_cv_folds": 5,
+  "holdout_days": 180,
+  "holdout_mode": "multi_slice",
+  "cv_mode": "walk_forward",
+  "cv_controls": {
+    "purge_days": 5,
+    "purge_bars": null,
+    "embargo_days": null,
+    "embargo_bars": null,
+    "embargo_frac": 0.0
+  },
+  "deflated_sharpe": {
+    "valid": true,
+    "dsr": -1.372647236978075,
+    "p_value": 0.9150689803004407,
+    "expected_max_sr": 0.1818487936387621,
+    "significant_10pct": false,
+    "observations": 181,
+    "effective_test_count": 79,
+    "observed_sharpe": 0.079659,
+    "skewness": 0.0,
+    "kurtosis": 3.0,
+    "fallback_moments_used": true
+  },
+  "dsr_cv": {
+    "valid": true,
+    "dsr": -1.0128656180175992,
+    "p_value": 0.8444378235362169,
+    "expected_max_sr": 0.5333442511650874,
+    "significant_10pct": false,
+    "observations": 5,
+    "effective_test_count": 5,
+    "observed_sharpe": 0.07965896376510105,
+    "skewness": 0.0,
+    "kurtosis": 3.0,
+    "fallback_moments_used": true
+  },
+  "psr_cv": {
+    "valid": true,
+    "psr": 0.5620032346162442,
+    "z_score": 0.15605010006106854,
+    "observations": 5,
+    "benchmark_sharpe": 0.0,
+    "sharpe_estimate": 0.07965896376510105,
+    "skewness": -0.5214736858869509,
+    "kurtosis": 1.4918348638925312,
+    "fallback_moments_used": false,
+    "sample_count": 5,
+    "sample_sharpes": [
+      0.537968,
+      -0.918394,
+      0.712347,
+      -0.465974,
+      0.532349
+    ]
+  },
+  "psr_holdout": {
+    "valid": true,
+    "psr": 0.43410752770201877,
+    "z_score": -0.1659261660292867,
+    "observations": 13,
+    "benchmark_sharpe": 0.0,
+    "sharpe_estimate": -0.04792625539403314,
+    "skewness": 0.0,
+    "kurtosis": 3.0,
+    "fallback_moments_used": false,
+    "sample_count": 1,
+    "sample_sharpes": [
+      -0.047926
+    ]
+  },
+  "significance_gates": {
+    "psr_cv": {
+      "enabled": true,
+      "threshold": 0.5,
+      "observed": 0.5620032346162442,
+      "valid": true,
+      "passed": true,
+      "reason": null
+    },
+    "psr_holdout": {
+      "enabled": false,
+      "threshold": null,
+      "observed": 0.43410752770201877,
+      "valid": true,
+      "passed": true,
+      "reason": null
+    },
+    "dsr": {
+      "enabled": false,
+      "threshold": null,
+      "observed": -1.0128656180175992,
+      "valid": true,
+      "passed": true,
+      "reason": null
+    },
+    "all_passed": true
+  },
+  "version": "v11.3",
+  "timestamp": "2026-03-31T17:50:52.169374",
+  "cost_model": {
+    "version": "legacy_default",
+    "cost_config_id": "legacy_default",
+    "source_path": null,
+    "execution_fee_mode": "bps",
+    "exchange_fee_mode": "per_contract_usd",
+    "funding_interval_hours": 1,
+    "assumption_profile": "legacy",
+    "applied": {
+      "funding": true,
+      "slippage": true,
+      "impact": false
+    }
+  },
+  "selection_meta": {
+    "mode": "holdout_guided",
+    "n_candidates": 4,
+    "n_passing_candidates": 1,
+    "selected_trial": 19,
+    "selected_score": -3.380362,
+    "holdout_mode": "multi_slice",
+    "require_holdout_pass_input": true,
+    "paper_facing_run": true,
+    "require_holdout_pass_effective": true,
+    "holdout_gate": {
+      "min_trades": 8,
+      "effective_min_trades": 8,
+      "min_sharpe": -0.1,
+      "min_return": -0.05,
+      "min_psr_holdout": null,
+      "min_dsr": null
+    },
+    "deployment_blocked": false,
+    "best_exploratory_trial": {
+      "trial": 19,
+      "selection_score": -3.380362
+    },
+    "paper_eligible_promoted_candidate": {
+      "trial": 19,
+      "selection_score": -3.380362
+    },
+    "candidates": [
+      {
+        "trial": 19,
+        "selection_score": -3.380362,
+        "cv_n_trades": 181,
+        "cv_trade_density": 43.504318,
+        "cv_trade_density_ratio": 3.655825,
+        "activity_regime": "active",
+        "holdout_sharpe": -0.047926,
+        "holdout_return": -0.018199,
+        "holdout_trades": 13,
+        "gate_counters": {
+          "total_checks": 1592,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 6,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 679,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 0,
+            "meta_threshold": 0,
+            "ensemble_agreement": 170,
+            "ensemble_std": 0,
+            "cooldown": 737,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0037688442211055275,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.4265075376884422,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.10678391959798995,
+            "ensemble_std": 0.0,
+            "cooldown": 0.4629396984924623,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.7941520467836257,
+            "vol_starved": 0.007017543859649122,
+            "confidence_starved": 0.19883040935672516
+          }
+        },
+        "holdout_slices": {
+          "recent90": {
+            "holdout_sharpe": -0.04792625539403314,
+            "holdout_return": -0.018198637637047495,
+            "holdout_trades": 13,
+            "full_sharpe": -0.3481120297168677,
+            "full_pf": 0.8631059273404817,
+            "full_dd": 0.09440728160691948,
+            "full_trades": 13,
+            "gate_counters": {
+              "total_checks": 1592,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 6,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 679,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 0,
+                "meta_threshold": 0,
+                "ensemble_agreement": 170,
+                "ensemble_std": 0,
+                "cooldown": 737,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0037688442211055275,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.4265075376884422,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.0,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.10678391959798995,
+                "ensemble_std": 0.0,
+                "cooldown": 0.4629396984924623,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.7941520467836257,
+                "vol_starved": 0.007017543859649122,
+                "confidence_starved": 0.19883040935672516
+              }
+            }
+          },
+          "prior90": {
+            "holdout_sharpe": -0.1447298706346361,
+            "holdout_return": -0.043213789960468804,
+            "holdout_trades": 11,
+            "full_sharpe": -0.9670042305433201,
+            "full_pf": 0.7066964860486069,
+            "full_dd": 0.0685522199407895,
+            "full_trades": 11,
+            "gate_counters": {
+              "total_checks": 1510,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 0,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 482,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 133,
+                "meta_threshold": 0,
+                "ensemble_agreement": 273,
+                "ensemble_std": 0,
+                "cooldown": 622,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.31920529801324504,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.0880794701986755,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.18079470198675496,
+                "ensemble_std": 0.0,
+                "cooldown": 0.4119205298013245,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5427927927927927,
+                "vol_starved": 0.0,
+                "confidence_starved": 0.45720720720720714
+              }
+            }
+          },
+          "full180": {
+            "holdout_sharpe": -0.15927909971602322,
+            "holdout_return": -0.08832784613834874,
+            "holdout_trades": 24,
+            "full_sharpe": -1.1115353342242849,
+            "full_pf": 0.6954765133501458,
+            "full_dd": 0.14556822969497127,
+            "full_trades": 24,
+            "gate_counters": {
+              "total_checks": 3254,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 6,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1177,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 144,
+                "meta_threshold": 0,
+                "ensemble_agreement": 497,
+                "ensemble_std": 0,
+                "cooldown": 1430,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0018438844499078057,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.36170866625691456,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.044253226797787336,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.15273509526736326,
+                "ensemble_std": 0.0,
+                "cooldown": 0.43945912722802705,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.6452850877192983,
+                "vol_starved": 0.003289473684210526,
+                "confidence_starved": 0.3514254385964913
+              }
+            }
+          },
+          "prior180": {
+            "holdout_sharpe": -0.008026814783562052,
+            "holdout_return": 0.0037695333819457414,
+            "holdout_trades": 20,
+            "full_sharpe": -0.05113486332109127,
+            "full_pf": 1.0212414383359123,
+            "full_dd": 0.09454676442843149,
+            "full_trades": 20,
+            "gate_counters": {
+              "total_checks": 3136,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 0,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1350,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 203,
+                "meta_threshold": 0,
+                "ensemble_agreement": 388,
+                "ensemble_std": 0,
+                "cooldown": 1195,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.430484693877551,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.06473214285714286,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.12372448979591837,
+                "ensemble_std": 0.0,
+                "cooldown": 0.38105867346938777,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.695517774343122,
+                "vol_starved": 0.0,
+                "confidence_starved": 0.3044822256568779
+              }
+            }
+          }
+        },
+        "slice_gate_counters": {
+          "recent90": {
+            "total_checks": 1592,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 6,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 679,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 0,
+              "meta_threshold": 0,
+              "ensemble_agreement": 170,
+              "ensemble_std": 0,
+              "cooldown": 737,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0037688442211055275,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.4265075376884422,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.0,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.10678391959798995,
+              "ensemble_std": 0.0,
+              "cooldown": 0.4629396984924623,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior90": {
+            "total_checks": 1510,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 0,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 482,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 133,
+              "meta_threshold": 0,
+              "ensemble_agreement": 273,
+              "ensemble_std": 0,
+              "cooldown": 622,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.31920529801324504,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.0880794701986755,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.18079470198675496,
+              "ensemble_std": 0.0,
+              "cooldown": 0.4119205298013245,
+              "no_contract_size": 0.0
+            }
+          },
+          "full180": {
+            "total_checks": 3254,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 6,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1177,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 144,
+              "meta_threshold": 0,
+              "ensemble_agreement": 497,
+              "ensemble_std": 0,
+              "cooldown": 1430,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0018438844499078057,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.36170866625691456,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.044253226797787336,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.15273509526736326,
+              "ensemble_std": 0.0,
+              "cooldown": 0.43945912722802705,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior180": {
+            "total_checks": 3136,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 0,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1350,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 203,
+              "meta_threshold": 0,
+              "ensemble_agreement": 388,
+              "ensemble_std": 0,
+              "cooldown": 1195,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.430484693877551,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.06473214285714286,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.12372448979591837,
+              "ensemble_std": 0.0,
+              "cooldown": 0.38105867346938777,
+              "no_contract_size": 0.0
+            }
+          }
+        },
+        "passes_gate": true
+      },
+      {
+        "trial": 3,
+        "selection_score": -4.138257,
+        "cv_n_trades": 0,
+        "cv_trade_density": 0.0,
+        "cv_trade_density_ratio": 0.0,
+        "activity_regime": "active",
+        "holdout_sharpe": 0.0,
+        "holdout_return": -1.0,
+        "holdout_trades": 3,
+        "gate_counters": {
+          "total_checks": 1917,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 137,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 1011,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 352,
+            "meta_threshold": 0,
+            "ensemble_agreement": 238,
+            "ensemble_std": 0,
+            "cooldown": 179,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0714658320292123,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.5273865414710485,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.18362023995826812,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.12415232133541992,
+            "ensemble_std": 0.0,
+            "cooldown": 0.09337506520605113,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.5817031070195627,
+            "vol_starved": 0.07882623705408516,
+            "confidence_starved": 0.3394706559263521
+          }
+        },
+        "holdout_slices": {
+          "recent90": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 3,
+            "full_sharpe": -1.540367161262946,
+            "full_pf": 0.3403566145913716,
+            "full_dd": 0.03763087077591576,
+            "full_trades": 3,
+            "gate_counters": {
+              "total_checks": 1917,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 137,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1011,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 352,
+                "meta_threshold": 0,
+                "ensemble_agreement": 238,
+                "ensemble_std": 0,
+                "cooldown": 179,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0714658320292123,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.5273865414710485,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.18362023995826812,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.12415232133541992,
+                "ensemble_std": 0.0,
+                "cooldown": 0.09337506520605113,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5817031070195627,
+                "vol_starved": 0.07882623705408516,
+                "confidence_starved": 0.3394706559263521
+              }
+            }
+          },
+          "prior90": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 3,
+            "full_sharpe": -24.140832734661494,
+            "full_pf": 0.0,
+            "full_dd": 0.04937661014033772,
+            "full_trades": 3,
+            "gate_counters": {
+              "total_checks": 1277,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 24,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 580,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 351,
+                "meta_threshold": 0,
+                "ensemble_agreement": 143,
+                "ensemble_std": 0,
+                "cooldown": 179,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.018794048551292093,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.45418950665622554,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.2748629600626468,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.11198120595144871,
+                "ensemble_std": 0.0,
+                "cooldown": 0.14017227877838684,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5282331511839709,
+                "vol_starved": 0.02185792349726776,
+                "confidence_starved": 0.44990892531876137
+              }
+            }
+          },
+          "full180": {
+            "holdout_sharpe": -0.23089093631193422,
+            "holdout_return": -0.03181762295545196,
+            "holdout_trades": 7,
+            "full_sharpe": -0.8701913554444138,
+            "full_pf": 0.5855116546378138,
+            "full_dd": 0.06433030887826856,
+            "full_trades": 7,
+            "gate_counters": {
+              "total_checks": 3390,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 178,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1655,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 711,
+                "meta_threshold": 0,
+                "ensemble_agreement": 429,
+                "ensemble_std": 0,
+                "cooldown": 417,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.052507374631268436,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.4882005899705015,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.2097345132743363,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.12654867256637167,
+                "ensemble_std": 0.0,
+                "cooldown": 0.12300884955752213,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5566767574840229,
+                "vol_starved": 0.059872182980154724,
+                "confidence_starved": 0.38345105953582237
+              }
+            }
+          },
+          "prior180": {
+            "holdout_sharpe": 0.017638352870103954,
+            "holdout_return": 0.001765038253658065,
+            "holdout_trades": 7,
+            "full_sharpe": 0.06647615725853542,
+            "full_pf": 1.0273857414399157,
+            "full_dd": 0.024453971704770955,
+            "full_trades": 7,
+            "gate_counters": {
+              "total_checks": 3352,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 47,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1923,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 393,
+                "meta_threshold": 0,
+                "ensemble_agreement": 572,
+                "ensemble_std": 0,
+                "cooldown": 417,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.014021479713603818,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.5736873508353222,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.11724343675417662,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.17064439140811455,
+                "ensemble_std": 0.0,
+                "cooldown": 0.12440334128878282,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.6551959114139694,
+                "vol_starved": 0.016013628620102215,
+                "confidence_starved": 0.3287904599659285
+              }
+            }
+          }
+        },
+        "slice_gate_counters": {
+          "recent90": {
+            "total_checks": 1917,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 137,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1011,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 352,
+              "meta_threshold": 0,
+              "ensemble_agreement": 238,
+              "ensemble_std": 0,
+              "cooldown": 179,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0714658320292123,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.5273865414710485,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.18362023995826812,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.12415232133541992,
+              "ensemble_std": 0.0,
+              "cooldown": 0.09337506520605113,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior90": {
+            "total_checks": 1277,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 24,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 580,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 351,
+              "meta_threshold": 0,
+              "ensemble_agreement": 143,
+              "ensemble_std": 0,
+              "cooldown": 179,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.018794048551292093,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.45418950665622554,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.2748629600626468,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.11198120595144871,
+              "ensemble_std": 0.0,
+              "cooldown": 0.14017227877838684,
+              "no_contract_size": 0.0
+            }
+          },
+          "full180": {
+            "total_checks": 3390,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 178,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1655,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 711,
+              "meta_threshold": 0,
+              "ensemble_agreement": 429,
+              "ensemble_std": 0,
+              "cooldown": 417,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.052507374631268436,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.4882005899705015,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.2097345132743363,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.12654867256637167,
+              "ensemble_std": 0.0,
+              "cooldown": 0.12300884955752213,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior180": {
+            "total_checks": 3352,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 47,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1923,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 393,
+              "meta_threshold": 0,
+              "ensemble_agreement": 572,
+              "ensemble_std": 0,
+              "cooldown": 417,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.014021479713603818,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.5736873508353222,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.11724343675417662,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.17064439140811455,
+              "ensemble_std": 0.0,
+              "cooldown": 0.12440334128878282,
+              "no_contract_size": 0.0
+            }
+          }
+        },
+        "passes_gate": false
+      },
+      {
+        "trial": 1,
+        "selection_score": -4.614871,
+        "cv_n_trades": 0,
+        "cv_trade_density": 0.0,
+        "cv_trade_density_ratio": 0.0,
+        "activity_regime": "active",
+        "holdout_sharpe": 0.0,
+        "holdout_return": -1.0,
+        "holdout_trades": 4,
+        "gate_counters": {
+          "total_checks": 3395,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 6,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 1934,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 229,
+            "meta_threshold": 0,
+            "ensemble_agreement": 987,
+            "ensemble_std": 0,
+            "cooldown": 239,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0017673048600883653,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.569661266568483,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.0674521354933726,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.2907216494845361,
+            "ensemble_std": 0.0,
+            "cooldown": 0.07039764359351988,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.6128010139416983,
+            "vol_starved": 0.0019011406844106464,
+            "confidence_starved": 0.385297845373891
+          }
+        },
+        "holdout_slices": {
+          "recent90": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 2,
+            "full_sharpe": -9.470394493099654,
+            "full_pf": 0.0,
+            "full_dd": 0.04892168907001833,
+            "full_trades": 2,
+            "gate_counters": {
+              "total_checks": 1948,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 6,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1207,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 79,
+                "meta_threshold": 0,
+                "ensemble_agreement": 537,
+                "ensemble_std": 0,
+                "cooldown": 119,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.003080082135523614,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.6196098562628337,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.04055441478439425,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.27566735112936347,
+                "ensemble_std": 0.0,
+                "cooldown": 0.061088295687885014,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.6599234554401312,
+                "vol_starved": 0.0032804811372334607,
+                "confidence_starved": 0.33679606342263535
+              }
+            }
+          },
+          "prior90": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 3,
+            "full_sharpe": -1.900665468095128,
+            "full_pf": 0.2687458464734014,
+            "full_dd": 0.03117144551381498,
+            "full_trades": 3,
+            "gate_counters": {
+              "total_checks": 1394,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 0,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 646,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 138,
+                "meta_threshold": 0,
+                "ensemble_agreement": 430,
+                "ensemble_std": 0,
+                "cooldown": 180,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.4634146341463415,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.09899569583931134,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.3084648493543759,
+                "ensemble_std": 0.0,
+                "cooldown": 0.1291248206599713,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5321252059308073,
+                "vol_starved": 0.0,
+                "confidence_starved": 0.4678747940691928
+              }
+            }
+          },
+          "full180": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 4,
+            "full_sharpe": -2.3663109397940993,
+            "full_pf": 0.15975794290954984,
+            "full_dd": 0.06025211733687145,
+            "full_trades": 4,
+            "gate_counters": {
+              "total_checks": 3395,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 6,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1934,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 229,
+                "meta_threshold": 0,
+                "ensemble_agreement": 987,
+                "ensemble_std": 0,
+                "cooldown": 239,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0017673048600883653,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.569661266568483,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.0674521354933726,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.2907216494845361,
+                "ensemble_std": 0.0,
+                "cooldown": 0.07039764359351988,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.6128010139416983,
+                "vol_starved": 0.0019011406844106464,
+                "confidence_starved": 0.385297845373891
+              }
+            }
+          },
+          "prior180": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 4,
+            "full_sharpe": 4.550938068880777,
+            "full_pf": 0.0,
+            "full_dd": 0.0,
+            "full_trades": 4,
+            "gate_counters": {
+              "total_checks": 2884,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 0,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1721,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 83,
+                "meta_threshold": 0,
+                "ensemble_agreement": 841,
+                "ensemble_std": 0,
+                "cooldown": 239,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.5967406380027739,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.028779472954230237,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.29160887656033285,
+                "ensemble_std": 0.0,
+                "cooldown": 0.08287101248266297,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.6506616257088846,
+                "vol_starved": 0.0,
+                "confidence_starved": 0.3493383742911153
+              }
+            }
+          }
+        },
+        "slice_gate_counters": {
+          "recent90": {
+            "total_checks": 1948,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 6,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1207,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 79,
+              "meta_threshold": 0,
+              "ensemble_agreement": 537,
+              "ensemble_std": 0,
+              "cooldown": 119,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.003080082135523614,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.6196098562628337,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.04055441478439425,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.27566735112936347,
+              "ensemble_std": 0.0,
+              "cooldown": 0.061088295687885014,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior90": {
+            "total_checks": 1394,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 0,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 646,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 138,
+              "meta_threshold": 0,
+              "ensemble_agreement": 430,
+              "ensemble_std": 0,
+              "cooldown": 180,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.4634146341463415,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.09899569583931134,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.3084648493543759,
+              "ensemble_std": 0.0,
+              "cooldown": 0.1291248206599713,
+              "no_contract_size": 0.0
+            }
+          },
+          "full180": {
+            "total_checks": 3395,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 6,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1934,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 229,
+              "meta_threshold": 0,
+              "ensemble_agreement": 987,
+              "ensemble_std": 0,
+              "cooldown": 239,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0017673048600883653,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.569661266568483,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.0674521354933726,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.2907216494845361,
+              "ensemble_std": 0.0,
+              "cooldown": 0.07039764359351988,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior180": {
+            "total_checks": 2884,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 0,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1721,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 83,
+              "meta_threshold": 0,
+              "ensemble_agreement": 841,
+              "ensemble_std": 0,
+              "cooldown": 239,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.5967406380027739,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.028779472954230237,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.29160887656033285,
+              "ensemble_std": 0.0,
+              "cooldown": 0.08287101248266297,
+              "no_contract_size": 0.0
+            }
+          }
+        },
+        "passes_gate": false
+      },
+      {
+        "trial": 0,
+        "selection_score": -5.52394,
+        "cv_n_trades": 0,
+        "cv_trade_density": 0.0,
+        "cv_trade_density_ratio": 0.0,
+        "activity_regime": "active",
+        "holdout_sharpe": 0.0,
+        "holdout_return": -1.0,
+        "holdout_trades": 4,
+        "gate_counters": {
+          "total_checks": 3146,
+          "gate_counts": {
+            "missing_sma200": 0,
+            "vol_regime_low": 0,
+            "vol_regime_high": 0,
+            "momentum_magnitude": 2017,
+            "momentum_dir_agreement": 0,
+            "trend_filter": 0,
+            "funding_filter": 0,
+            "primary_threshold": 123,
+            "meta_threshold": 0,
+            "ensemble_agreement": 767,
+            "ensemble_std": 0,
+            "cooldown": 239,
+            "no_contract_size": 0
+          },
+          "gate_rates": {
+            "missing_sma200": 0.0,
+            "vol_regime_low": 0.0,
+            "vol_regime_high": 0.0,
+            "momentum_magnitude": 0.6411315956770502,
+            "momentum_dir_agreement": 0.0,
+            "trend_filter": 0.0,
+            "funding_filter": 0.0,
+            "primary_threshold": 0.039097266369993645,
+            "meta_threshold": 0.0,
+            "ensemble_agreement": 0.24380165289256198,
+            "ensemble_std": 0.0,
+            "cooldown": 0.07596948506039415,
+            "no_contract_size": 0.0
+          }
+        },
+        "starvation_signature": {
+          "label": "momentum_starved",
+          "shares": {
+            "momentum_starved": 0.693842449260406,
+            "vol_starved": 0.0,
+            "confidence_starved": 0.30615755073959405
+          }
+        },
+        "holdout_slices": {
+          "recent90": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 1,
+            "full_sharpe": 0.0,
+            "full_pf": 0.0,
+            "full_dd": 0.021719615921565565,
+            "full_trades": 1,
+            "gate_counters": {
+              "total_checks": 2114,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 6,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 1308,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 110,
+                "meta_threshold": 0,
+                "ensemble_agreement": 630,
+                "ensemble_std": 0,
+                "cooldown": 60,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.002838221381267739,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.618732261116367,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.05203405865657521,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.2980132450331126,
+                "ensemble_std": 0.0,
+                "cooldown": 0.02838221381267739,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.6368062317429405,
+                "vol_starved": 0.0029211295034079843,
+                "confidence_starved": 0.36027263875365145
+              }
+            }
+          },
+          "prior90": {
+            "holdout_sharpe": -0.31796757630922673,
+            "holdout_return": -0.03651382278082931,
+            "holdout_trades": 5,
+            "full_sharpe": -1.432325409043374,
+            "full_pf": 0.48826517776902234,
+            "full_dd": 0.036513822780829215,
+            "full_trades": 5,
+            "gate_counters": {
+              "total_checks": 1609,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 0,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 668,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 161,
+                "meta_threshold": 0,
+                "ensemble_agreement": 480,
+                "ensemble_std": 0,
+                "cooldown": 300,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.4151646985705407,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.10006215040397763,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.2983219390926041,
+                "ensemble_std": 0.0,
+                "cooldown": 0.18645121193287756,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5103132161955691,
+                "vol_starved": 0.0,
+                "confidence_starved": 0.48968678380443087
+              }
+            }
+          },
+          "full180": {
+            "holdout_sharpe": -0.5025301652607675,
+            "holdout_return": -0.06881863578802531,
+            "holdout_trades": 6,
+            "full_sharpe": -1.7534630601152252,
+            "full_pf": 0.33609803834859886,
+            "full_dd": 0.06881863578802527,
+            "full_trades": 6,
+            "gate_counters": {
+              "total_checks": 3730,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 6,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 2008,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 302,
+                "meta_threshold": 0,
+                "ensemble_agreement": 1055,
+                "ensemble_std": 0,
+                "cooldown": 359,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0016085790884718498,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.5383378016085791,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.08096514745308311,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.2828418230563003,
+                "ensemble_std": 0.0,
+                "cooldown": 0.09624664879356569,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.5956689409670721,
+                "vol_starved": 0.001779887273805992,
+                "confidence_starved": 0.40255117175912186
+              }
+            }
+          },
+          "prior180": {
+            "holdout_sharpe": 0,
+            "holdout_return": -1.0,
+            "holdout_trades": 4,
+            "full_sharpe": 2.583159354698425,
+            "full_pf": 7.499710526101895,
+            "full_dd": 0.008794734067227599,
+            "full_trades": 4,
+            "gate_counters": {
+              "total_checks": 3146,
+              "gate_counts": {
+                "missing_sma200": 0,
+                "vol_regime_low": 0,
+                "vol_regime_high": 0,
+                "momentum_magnitude": 2017,
+                "momentum_dir_agreement": 0,
+                "trend_filter": 0,
+                "funding_filter": 0,
+                "primary_threshold": 123,
+                "meta_threshold": 0,
+                "ensemble_agreement": 767,
+                "ensemble_std": 0,
+                "cooldown": 239,
+                "no_contract_size": 0
+              },
+              "gate_rates": {
+                "missing_sma200": 0.0,
+                "vol_regime_low": 0.0,
+                "vol_regime_high": 0.0,
+                "momentum_magnitude": 0.6411315956770502,
+                "momentum_dir_agreement": 0.0,
+                "trend_filter": 0.0,
+                "funding_filter": 0.0,
+                "primary_threshold": 0.039097266369993645,
+                "meta_threshold": 0.0,
+                "ensemble_agreement": 0.24380165289256198,
+                "ensemble_std": 0.0,
+                "cooldown": 0.07596948506039415,
+                "no_contract_size": 0.0
+              }
+            },
+            "starvation_signature": {
+              "label": "momentum_starved",
+              "shares": {
+                "momentum_starved": 0.693842449260406,
+                "vol_starved": 0.0,
+                "confidence_starved": 0.30615755073959405
+              }
+            }
+          }
+        },
+        "slice_gate_counters": {
+          "recent90": {
+            "total_checks": 2114,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 6,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 1308,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 110,
+              "meta_threshold": 0,
+              "ensemble_agreement": 630,
+              "ensemble_std": 0,
+              "cooldown": 60,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.002838221381267739,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.618732261116367,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.05203405865657521,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.2980132450331126,
+              "ensemble_std": 0.0,
+              "cooldown": 0.02838221381267739,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior90": {
+            "total_checks": 1609,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 0,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 668,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 161,
+              "meta_threshold": 0,
+              "ensemble_agreement": 480,
+              "ensemble_std": 0,
+              "cooldown": 300,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.4151646985705407,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.10006215040397763,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.2983219390926041,
+              "ensemble_std": 0.0,
+              "cooldown": 0.18645121193287756,
+              "no_contract_size": 0.0
+            }
+          },
+          "full180": {
+            "total_checks": 3730,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 6,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 2008,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 302,
+              "meta_threshold": 0,
+              "ensemble_agreement": 1055,
+              "ensemble_std": 0,
+              "cooldown": 359,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0016085790884718498,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.5383378016085791,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.08096514745308311,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.2828418230563003,
+              "ensemble_std": 0.0,
+              "cooldown": 0.09624664879356569,
+              "no_contract_size": 0.0
+            }
+          },
+          "prior180": {
+            "total_checks": 3146,
+            "gate_counts": {
+              "missing_sma200": 0,
+              "vol_regime_low": 0,
+              "vol_regime_high": 0,
+              "momentum_magnitude": 2017,
+              "momentum_dir_agreement": 0,
+              "trend_filter": 0,
+              "funding_filter": 0,
+              "primary_threshold": 123,
+              "meta_threshold": 0,
+              "ensemble_agreement": 767,
+              "ensemble_std": 0,
+              "cooldown": 239,
+              "no_contract_size": 0
+            },
+            "gate_rates": {
+              "missing_sma200": 0.0,
+              "vol_regime_low": 0.0,
+              "vol_regime_high": 0.0,
+              "momentum_magnitude": 0.6411315956770502,
+              "momentum_dir_agreement": 0.0,
+              "trend_filter": 0.0,
+              "funding_filter": 0.0,
+              "primary_threshold": 0.039097266369993645,
+              "meta_threshold": 0.0,
+              "ensemble_agreement": 0.24380165289256198,
+              "ensemble_std": 0.0,
+              "cooldown": 0.07596948506039415,
+              "no_contract_size": 0.0
+            }
+          }
+        },
+        "passes_gate": false
+      }
+    ],
+    "research_confidence_tier": "PAPER_QUALIFIED",
+    "seed_stability": {
+      "seeds_total": 2,
+      "seeds_passed_holdout": 2,
+      "pass_rate": 1.0,
+      "parameter_dispersion": {
+        "max_vol_24h": {
+          "count": 2,
+          "iqr": 0.0030000000000000027,
+          "std": 0.0030000000000000027,
+          "median": 0.065,
+          "mean": 0.065,
+          "iqr_over_median_abs": 0.04615384615384619,
+          "std_over_median_abs": 0.04615384615384619
+        },
+        "min_vol_24h": {
+          "count": 2,
+          "iqr": 0.0015000000000000005,
+          "std": 0.0015000000000000002,
+          "median": 0.0029000000000000002,
+          "mean": 0.0029000000000000002,
+          "iqr_over_median_abs": 0.517241379310345,
+          "std_over_median_abs": 0.5172413793103449
+        },
+        "signal_threshold": {
+          "count": 2,
+          "iqr": 0.014999999999999902,
+          "std": 0.015000000000000013,
+          "median": 0.525,
+          "mean": 0.525,
+          "iqr_over_median_abs": 0.028571428571428383,
+          "std_over_median_abs": 0.028571428571428595
+        },
+        "label_forward_hours": {
+          "count": 2,
+          "iqr": 6.0,
+          "std": 6.0,
+          "median": 42.0,
+          "mean": 42.0,
+          "iqr_over_median_abs": 0.14285714285714285,
+          "std_over_median_abs": 0.14285714285714285
+        },
+        "vol_mult_tp": {
+          "count": 2,
+          "iqr": 0.0,
+          "std": 0.0,
+          "median": 3.5,
+          "mean": 3.5,
+          "iqr_over_median_abs": 0.0,
+          "std_over_median_abs": 0.0
+        },
+        "vol_mult_sl": {
+          "count": 2,
+          "iqr": 1.0,
+          "std": 1.0,
+          "median": 4.0,
+          "mean": 4.0,
+          "iqr_over_median_abs": 0.25,
+          "std_over_median_abs": 0.25
+        },
+        "max_hold_hours": {
+          "count": 2,
+          "iqr": 6.0,
+          "std": 6.0,
+          "median": 66.0,
+          "mean": 66.0,
+          "iqr_over_median_abs": 0.09090909090909091,
+          "std_over_median_abs": 0.09090909090909091
+        },
+        "cooldown_hours": {
+          "count": 2,
+          "iqr": 0.0,
+          "std": 0.0,
+          "median": 60.0,
+          "mean": 60.0,
+          "iqr_over_median_abs": 0.0,
+          "std_over_median_abs": 0.0
+        }
+      },
+      "oos_sharpe_dispersion": {
+        "count": 2,
+        "std": 0.05983640504224768,
+        "iqr": 0.05983640504224767,
+        "median": 0.01191014964821454,
+        "mean": 0.01191014964821454
+      }
+    },
+    "seed_stability_thresholds": {
+      "min_pass_rate": 0.75,
+      "max_param_dispersion": 0.5,
+      "max_oos_sharpe_dispersion": 0.3
+    }
+  },
+  "deployment_blocked": false,
+  "deployment_block_reasons": [],
+  "best_exploratory_trial": {
+    "trial": 19,
+    "optim_score": -0.406501
+  },
+  "paper_eligible_promoted_candidate": {
+    "trial": 19,
+    "selection_score": -3.380362
+  },
+  "robustness_diagnostics": {
+    "enabled": false,
+    "pbo": null,
+    "stress_costs": null
+  },
+  "study_significance": {
+    "enabled": false,
+    "p_value": null,
+    "spa_like_p_value": null,
+    "bootstrap": null,
+    "methodology": {
+      "style": "white_rc_spa_like_recentered_bootstrap",
+      "reason": "disabled",
+      "score_source": "fold_sharpe"
+    }
+  },
+  "seed_stability": {
+    "seeds_total": 2,
+    "seeds_passed_holdout": 2,
+    "pass_rate": 1.0,
+    "parameter_dispersion": {
+      "max_vol_24h": {
+        "count": 2,
+        "iqr": 0.0030000000000000027,
+        "std": 0.0030000000000000027,
+        "median": 0.065,
+        "mean": 0.065,
+        "iqr_over_median_abs": 0.04615384615384619,
+        "std_over_median_abs": 0.04615384615384619
+      },
+      "min_vol_24h": {
+        "count": 2,
+        "iqr": 0.0015000000000000005,
+        "std": 0.0015000000000000002,
+        "median": 0.0029000000000000002,
+        "mean": 0.0029000000000000002,
+        "iqr_over_median_abs": 0.517241379310345,
+        "std_over_median_abs": 0.5172413793103449
+      },
+      "signal_threshold": {
+        "count": 2,
+        "iqr": 0.014999999999999902,
+        "std": 0.015000000000000013,
+        "median": 0.525,
+        "mean": 0.525,
+        "iqr_over_median_abs": 0.028571428571428383,
+        "std_over_median_abs": 0.028571428571428595
+      },
+      "label_forward_hours": {
+        "count": 2,
+        "iqr": 6.0,
+        "std": 6.0,
+        "median": 42.0,
+        "mean": 42.0,
+        "iqr_over_median_abs": 0.14285714285714285,
+        "std_over_median_abs": 0.14285714285714285
+      },
+      "vol_mult_tp": {
+        "count": 2,
+        "iqr": 0.0,
+        "std": 0.0,
+        "median": 3.5,
+        "mean": 3.5,
+        "iqr_over_median_abs": 0.0,
+        "std_over_median_abs": 0.0
+      },
+      "vol_mult_sl": {
+        "count": 2,
+        "iqr": 1.0,
+        "std": 1.0,
+        "median": 4.0,
+        "mean": 4.0,
+        "iqr_over_median_abs": 0.25,
+        "std_over_median_abs": 0.25
+      },
+      "max_hold_hours": {
+        "count": 2,
+        "iqr": 6.0,
+        "std": 6.0,
+        "median": 66.0,
+        "mean": 66.0,
+        "iqr_over_median_abs": 0.09090909090909091,
+        "std_over_median_abs": 0.09090909090909091
+      },
+      "cooldown_hours": {
+        "count": 2,
+        "iqr": 0.0,
+        "std": 0.0,
+        "median": 60.0,
+        "mean": 60.0,
+        "iqr_over_median_abs": 0.0,
+        "std_over_median_abs": 0.0
+      }
+    },
+    "oos_sharpe_dispersion": {
+      "count": 2,
+      "std": 0.05983640504224768,
+      "iqr": 0.05983640504224767,
+      "median": 0.01191014964821454,
+      "mean": 0.01191014964821454
+    }
+  },
+  "research_confidence_tier": "PAPER_QUALIFIED",
+  "gate_mode": "initial_paper_qualification",
+  "gate_profile": {
+    "mode": "initial_paper_qualification",
+    "screen_threshold": 38.0,
+    "holdout_min_trades": 8,
+    "holdout_min_sharpe": -0.1,
+    "holdout_min_return": -0.05,
+    "min_psr_cv": 0.5,
+    "min_psr_holdout": null,
+    "min_dsr": null,
+    "escalation_policy": {
+      "window_days": "14-28",
+      "action": "Tighten thresholds and switch to production_promotion after stable paper evidence."
+    }
+  },
+  "pruned_only": true,
+  "run_id": "optimize_ETH_run_20260331T195406141987Z_ETH_s1337_20260331T174657",
+  "trial_ledger": {
+    "ledger_path": "/home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/backend/trader/scripts/optimization_results/trial_ledger.jsonl",
+    "ledger_timestamp": "2026-03-31T17:46:57.980118",
+    "coin_cumulative_trials": 521,
+    "global_cumulative_trials": 6946,
+    "completed_trials_this_run": 79,
+    "preset": "paper_ready"
+  },
+  "optimization_diagnostics": {
+    "completed_trials": 79,
+    "failed_trials": 0,
+    "pruned_trials": 121,
+    "accepted_trials": 1,
+    "reject_reason_counts": {
+      "zero_trade_fold:count=3": 42,
+      "zero_trade_fold:count=4": 2,
+      "zero_trade_fold:count=1": 21,
+      "zero_trade_fold:count=2": 13
+    },
+    "reject_code_counts": {},
+    "reject_prune_log_path": "/home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/backend/trader/scripts/optimization_results/ETH_reject_prune_run_20260331T195406141987Z_ETH_s1337.jsonl",
+    "study_significance_enabled": false
+  },
+  "trade_frequency_diagnostics": {
+    "best_cv_n_trades": 181,
+    "best_cv_trade_density": 43.504318,
+    "best_cv_trade_density_ratio": 3.655825,
+    "best_activity_regime": "active",
+    "target_trades_floor": 49.510027,
+    "min_trade_frequency_ratio": 0.35,
+    "holdout_trades": 13,
+    "starvation_signature": {
+      "label": "momentum_starved",
+      "shares": {
+        "momentum_starved": 0.7941520467836257,
+        "vol_starved": 0.007017543859649122,
+        "confidence_starved": 0.19883040935672516
+      }
+    },
+    "top_blockers": []
+  },
+  "tier": "PAPER_QUALIFIED",
+  "blocked": false,
+  "block_reasons": [],
+  "holdout_trades": 13,
+  "holdout_sharpe": -0.04792625539403314,
+  "holdout_return": -0.018198637637047495,
+  "selected_slice": "median_composite",
+  "n_candidates": 4,
+  "n_passing_candidates": 1,
+  "quality": {
+    "rating": "POOR",
+    "issues": [
+      "high_dd:99.5%",
+      "holdout_too_few_trades:13",
+      "bad_holdout_sharpe:-0.048",
+      "bad_holdout_return:-1.820%"
+    ],
+    "warnings": []
+  },
+  "meta": {
+    "seed_consensus": {
+      "seeds": [
+        42,
+        1337
+      ],
+      "qualified_runs": 2,
+      "total_runs": 2,
+      "failed_seeds": []
+    }
+  },
+  "consensus_params": {
+    "min_vol_24h": 0.0029,
+    "breakout_lookback": 48,
+    "max_ensemble_std": 0.18,
+    "min_directional_agreement": 0.5,
+    "max_vol_24h": 0.065,
+    "cooldown_hours": 60,
+    "vol_mult_sl": 4.0,
+    "label_forward_hours": 42,
+    "squeeze_pct_threshold": 0.2,
+    "n_estimators": 50,
+    "min_val_auc": 0.48,
+    "liq_threshold": 0.3,
+    "oi_z_threshold": 1.0,
+    "label_vol_target": 1.8,
+    "strategy_family": "momentum_trend",
+    "signal_threshold": 0.525,
+    "position_size": 0.12,
+    "pullback_lookback": 24,
+    "max_hold_hours": 66,
+    "learning_rate": 0.05,
+    "min_child_samples": 20,
+    "rebound_confirmation_threshold": 0.004,
+    "max_depth": 3,
+    "funding_z_threshold": 2.5,
+    "vol_sizing_target": 0.025,
+    "meta_probability_threshold": 0.48,
+    "trend_strength_min": 0.002,
+    "vol_mult_tp": 3.5,
+    "pullback_depth_threshold": 0.02,
+    "min_momentum_magnitude": 0.05,
+    "trade_freq_bucket": "balanced",
+    "breakout_buffer": 0.003,
+    "expansion_confirm_threshold": 0.004
+  },
+  "consensus_revalidated": false,
+  "evaluated_params_source": "selected_seed"
+}
