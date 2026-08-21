@@ -8,7 +8,17 @@ export interface PriceInfo {
 // and two pages had already grown their own private copies, in different
 // orders, which is how a coin ends up tradeable on one screen and absent from
 // the other.
-export const ALL_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC'] as const;
+//
+// All sixteen the trader models (`core/profiles.py`), not the nine the API used
+// to serve. The nine were mistaken for the traded universe when writing the
+// spot scrape, which would have left seven instruments with no cross-venue
+// features and no row on any screen.
+// `test_orm_parity.py::test_the_api_serves_every_instrument_the_trader_models`
+// keeps the three lists in step.
+export const ALL_COINS = [
+  'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC',
+  'BCH', 'DOT', 'NEAR', 'SUI', 'XLM', 'PEPE', 'SHIB',
+] as const;
 export type CoinSymbol = (typeof ALL_COINS)[number];
 
 export type PriceData = Record<CoinSymbol, PriceInfo>;

@@ -245,20 +245,13 @@ export default function TradingPage() {
           (v): v is number => v !== null,
         );
         const total = measured.reduce((a, b) => a + b, 0);
+        // Nothing measured and nothing broken is the only case with nothing to
+        // say. One section failing must never blank the others: with a perps
+        // error and a genuinely empty spot book this used to replace the whole
+        // panel with "Holdings unavailable — Coinbase perps: error", hiding a
+        // spot section that had answered fine. Every failure is now a line
+        // inside the panel, beside whatever did report.
         if (!measured.length && !failed.length) return null;
-        if (failed.length && total <= 0) {
-          return (
-            <div className="glass-card rounded-xl p-5">
-              <div className="text-tx-muted text-[11px] uppercase tracking-wider mb-2">
-                Real portfolio
-              </div>
-              <div className="text-accent-rose text-sm">
-                Holdings unavailable — {failed.join('; ')}
-              </div>
-            </div>
-          );
-        }
-        if (total <= 0 && !failed.length) return null;
         const spotAssets  = (held.coinbase?.spot?.assets  ?? []).filter(a => a.value_usd >= 0.01);
         const ledgerAssets = (held.ledger?.assets ?? []).filter(a => a.value_usd >= 0.01);
         return (
@@ -267,6 +260,15 @@ export default function TradingPage() {
               <span className="text-tx-secondary text-xs font-medium tracking-widest uppercase">Real Portfolio</span>
               <span className="font-mono text-tx-primary text-sm font-semibold">{fmt(total)} external</span>
             </div>
+            {failed.length > 0 && (
+              <div className="mb-4 space-y-1">
+                {failed.map((problem) => (
+                  <div key={problem} className="text-accent-rose text-xs">
+                    {problem}
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               {spotVal !== null && spotVal > 0 && (
                 <div>
@@ -298,6 +300,11 @@ export default function TradingPage() {
                       </span>
                     </div>
                   ))}
+                </div>
+              )}
+              {spotVal === 0 && (
+                <div className="text-tx-muted text-xs">
+                  Coinbase spot reported no holdings.
                 </div>
               )}
               {ledgerVal !== null && ledgerVal > 0 && (

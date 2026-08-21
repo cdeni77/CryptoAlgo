@@ -327,16 +327,43 @@ def test_the_api_contract_sizes_match_the_cost_model():
 
 
 def test_every_api_product_is_known_to_the_cost_model():
-    """A product the cost model has never heard of gets a default contract size."""
-    from core.costs import CONTRACT_UNITS
+    """A product the cost model has never heard of gets a default contract size.
+
+    Asserted through `get_contract_spec`, which is what production calls, rather
+    than through set membership in `CONTRACT_UNITS`. The two differ: the meme
+    contracts are keyed `1000PEPE` / `1000SHIB` there while the API and
+    `core/profiles.py` call them `PEPE` / `SHIB`, and `resolve_base` bridges that
+    with an alias. The literal version flagged both as unknown when they price
+    correctly — a false alarm on a naming convention, which is worse than no
+    check because it trains you to ignore it.
+    """
+    from core.costs import DEFAULT_UNITS, get_contract_spec
 
     api_products = _load_api_module('endpoints.coins').CDE_PRODUCTS
-    unknown = sorted(set(api_products) - set(CONTRACT_UNITS))
 
-    assert not unknown, (
-        f'served by the API with no entry in CONTRACT_UNITS, so they would be '
-        f'priced at the fallback: {unknown}'
+    # `base == 'UNKNOWN'` is the fallback, not `units == DEFAULT_UNITS`: BCH is
+    # genuinely one unit per contract (confirmed against the venue's own
+    # `contract_size`), so a units-based check condemns a correct entry forever.
+    unpriced = [
+        name for name, detail in api_products.items()
+        # Resolve from the product id the API serves, since that is what a
+        # caller passes back in.
+        if get_contract_spec(detail.get('symbol') or name).base == 'UNKNOWN'
+    ]
+    assert not unpriced, (
+        f'served by the API but unresolvable by get_contract_spec, so priced at '
+        f'the {DEFAULT_UNITS} fallback: {sorted(unpriced)}'
     )
+
+    # And the size the API advertises must be the size the cost model uses.
+    mismatches = [
+        f"{name}: api={detail['units_per_contract']:g} "
+        f"cost_model={get_contract_spec(detail['symbol']).units:g}"
+        for name, detail in api_products.items()
+        if float(detail['units_per_contract'])
+        != get_contract_spec(detail['symbol']).units
+    ]
+    assert not mismatches, 'contract size differs from the cost model:\n  ' + '\n  '.join(mismatches)
 
 
 def test_no_table_is_declared_without_a_writer(schemas):
@@ -417,3 +444,61 @@ def test_the_venue_schedule_agrees_with_the_contract_units_table():
           'wrong. Contract size multiplies into notional, fees, margin, '
           'liquidation price and PnL, so this is not a cosmetic difference.'
     )
+
+
+def test_the_api_serves_every_instrument_the_trader_models():
+    """One universe, or an explicit reason why not.
+
+    The trader modelled sixteen contracts (`core/profiles.py`) while the API and
+    frontend served nine. Nothing was wrong with either list on its own, and that
+    is the problem: the nine got mistaken for the traded universe when writing
+    the spot scrape, which would have left seven instruments with no cross-venue
+    features and no dashboard row.
+
+    The API cannot import the trader (separate containers), so the tables are
+    duplicated on purpose and this is the mechanism — the same one
+    `test_the_api_contract_sizes_match_the_cost_model` applies to sizes.
+    """
+    from core.costs import SPOT_PRODUCTS, resolve_base
+    from core.profiles import COIN_PROFILES
+
+    coins = _load_api_module('endpoints.coins')
+    modelled = {resolve_base(name) for name in COIN_PROFILES}
+
+    served_cde = {resolve_base(name) for name in coins.CDE_PRODUCTS}
+    missing = sorted(b for b in modelled - served_cde if b)
+    assert not missing, (
+        f'the trader models these but the API serves no CDE product for them: '
+        f'{missing}. They will have no dashboard row and no /coins/cde-specs '
+        f'entry, so the frontend falls back for their contract size.'
+    )
+
+    served_spot = {resolve_base(name) for name in coins.COINBASE_PRODUCTS}
+    missing_spot = sorted(b for b in modelled - served_spot if b)
+    assert not missing_spot, (
+        f'no spot product served for {missing_spot}; spot is the reference venue '
+        f'the cross-venue features use'
+    )
+
+    # And the trader's own spot table has to cover the same set, since that is
+    # what `--spot-universe` scrapes from.
+    uncovered = sorted(b for b in modelled if b and b not in SPOT_PRODUCTS)
+    assert not uncovered, f'SPOT_PRODUCTS has no entry for {uncovered}'
+
+
+def test_the_spot_universe_covers_every_contract_once():
+    """`--spot-universe` is what stops the list being hand-typed. It has to be
+    complete and free of duplicates, or a silently short scrape is back."""
+    from core.costs import spot_universe
+    from core.profiles import COIN_PROFILES
+
+    products = spot_universe(sorted(COIN_PROFILES))
+
+    assert len(products) == len(COIN_PROFILES), (
+        f'{len(products)} spot products for {len(COIN_PROFILES)} contracts'
+    )
+    assert len(set(products)) == len(products), 'a spot product appears twice'
+    assert all(p.endswith('-USD') for p in products), products
+    # The meme contracts are keyed 1000PEPE/1000SHIB but spot is plain.
+    assert 'PEPE-USD' in products and 'SHIB-USD' in products
+    assert not any('1000' in p for p in products), products

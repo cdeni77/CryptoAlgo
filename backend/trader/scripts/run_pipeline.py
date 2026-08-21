@@ -157,6 +157,7 @@ async def backfill_ohlcv(
     timeframes: List[str],
     start_time: datetime,
     end_time: datetime,
+    cross_venue_prehistory: bool = False,
 ):
     """
     Hybrid OHLCV backfill: Coinbase Native -> CCXT fallback.
@@ -193,18 +194,48 @@ async def backfill_ohlcv(
                     first_bar_time = df.index.min()
                     if hasattr(first_bar_time, 'to_pydatetime'):
                         first_bar_time = first_bar_time.to_pydatetime()
-                    
+
                     gap = first_bar_time - start_time
                     if gap > timedelta(hours=12):
-                        logger.info(f"   ⚠️ Gap detected: Coinbase data starts {first_bar_time.date()} (missing {gap.days} days)")
-                        logger.info(f"      Backfilling pre-history gap via CCXT...")
-                        await pipeline.backfill(
-                            start=start_time,
-                            end=first_bar_time,
-                            symbols=[symbol],
-                            timeframes=[tf],
-                            use_ccxt=True
-                        )
+                        # Coinbase answered, and its earliest bar is where the
+                        # contract's history begins — BIP was listed 2025-07-18,
+                        # so a request for 400 days "misses" everything before
+                        # that. Nothing is missing: the instrument did not exist.
+                        #
+                        # Filling it from CCXT substitutes a different
+                        # instrument. `BTC/USDT:USDT` on OKX is another exchange,
+                        # another quote currency, another contract size, its own
+                        # funding and its own participants. Those rows are
+                        # stamped with the serving venue, so a `venue='coinbase'`
+                        # read never sees them — but they cost API calls, they
+                        # grow with each newer contract (the Batch-3 listings are
+                        # months younger), and they put one instrument's prices in
+                        # the store under another's symbol, which is confusing
+                        # even when it is inert.
+                        #
+                        # Off by default for that reason. `--cross-venue-prehistory`
+                        # turns it back on for the case it was written for: a
+                        # deliberate cross-venue reference series, where you want
+                        # the other venue's bars and will point
+                        # `--reference-venue` at them.
+                        if not cross_venue_prehistory:
+                            logger.info(
+                                "   %s history starts %s; the %d day(s) requested "
+                                "before that pre-date the contract, so nothing is "
+                                "missing. Pass --cross-venue-prehistory to fill "
+                                "them from another exchange instead.",
+                                symbol, first_bar_time.date(), gap.days,
+                            )
+                        else:
+                            logger.info(f"   ⚠️ Gap detected: Coinbase data starts {first_bar_time.date()} (missing {gap.days} days)")
+                            logger.info("      Backfilling pre-history gap via CCXT (a different instrument)...")
+                            await pipeline.backfill(
+                                start=start_time,
+                                end=first_bar_time,
+                                symbols=[symbol],
+                                timeframes=[tf],
+                                use_ccxt=True
+                            )
                 
                 # Final count
                 df = pipeline.get_ohlcv(symbol, tf, start_time, end_time)
@@ -614,6 +645,17 @@ Examples:
     parser.add_argument("--include-oi", action="store_true", help="Also fetch open interest data")
     
     # Paths
+    parser.add_argument("--spot-universe", action="store_true",
+                        help="Scrape the Coinbase spot product for every "
+                             "instrument the trader models, instead of naming "
+                             "symbols. Implies --venue-label coinbase_spot. Use "
+                             "this rather than typing --symbols: the hand-written "
+                             "list was nine products against sixteen contracts.")
+    parser.add_argument("--cross-venue-prehistory", action="store_true",
+                        help="Fill the span before a contract was listed with "
+                             "another exchange's bars for the same underlying. "
+                             "Off by default: nothing is missing there, and the "
+                             "substitute is a different instrument.")
     parser.add_argument("--venue-label", type=str, default=None,
                         help="Store Coinbase-native rows under this venue label "
                              "instead of 'coinbase'. Use 'coinbase_spot' when "
@@ -668,7 +710,20 @@ Examples:
     print()
     
     # Step 1: Resolve Symbols
-    if args.symbols:
+    if args.spot_universe:
+        from core.costs import spot_universe
+        from core.profiles import COIN_PROFILES
+
+        symbols = spot_universe(sorted(COIN_PROFILES))
+        if not args.venue_label:
+            # Spot and the perp resolve to the same base, so sharing a venue
+            # label would make the cross-venue basis a comparison with itself.
+            args.venue_label = 'coinbase_spot'
+        logger.info(
+            "spot universe: %d products for %d modelled contracts, venue label %r",
+            len(symbols), len(COIN_PROFILES), args.venue_label,
+        )
+    elif args.symbols:
         # User-specified symbols
         symbols = [s.strip() for s in args.symbols.split(",")]
         logger.info(f"Using user-specified symbols: {symbols}")
@@ -720,7 +775,10 @@ Examples:
                 pipeline.on_ticker(on_ticker_update)
                 pipeline.on_funding(on_funding_rate)
                 
-                await backfill_ohlcv(pipeline, symbols, timeframes, start_time, end_time)
+                await backfill_ohlcv(
+                    pipeline, symbols, timeframes, start_time, end_time,
+                    cross_venue_prehistory=args.cross_venue_prehistory,
+                )
             else:
                 # An empty price history is not a successful scrape. This used to
                 # warn and return 0, so `live_orchestrator._run_step` — which

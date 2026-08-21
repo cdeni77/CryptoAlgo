@@ -34,6 +34,13 @@ COINBASE_PRODUCTS = {
     "ADA": "ADA-USD",
     "LINK": "LINK-USD",
     "LTC": "LTC-USD",
+    "BCH": "BCH-USD",
+    "DOT": "DOT-USD",
+    "NEAR": "NEAR-USD",
+    "SUI": "SUI-USD",
+    "XLM": "XLM-USD",
+    "PEPE": "PEPE-USD",
+    "SHIB": "SHIB-USD",
 }
 
 # CDE (Contract for Difference / Perpetual) product mappings
@@ -108,6 +115,69 @@ CDE_PRODUCTS = {
         "code": "LCP",
         "units_per_contract": 5,
         "approx_contract_value": 55.69,
+        "fee_pct": 0.00100,
+    },
+    "BCH": {
+        "symbol": "BCP-20DEC30-CDE",
+        "code": "BCP",
+        "units_per_contract": 1,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "DOT": {
+        "symbol": "POP-20DEC30-CDE",
+        "code": "POP",
+        "units_per_contract": 100,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "NEAR": {
+        "symbol": "NER-20DEC30-CDE",
+        "code": "NER",
+        "units_per_contract": 500,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "SUI": {
+        "symbol": "SUP-20DEC30-CDE",
+        "code": "SUP",
+        "units_per_contract": 500,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "XLM": {
+        "symbol": "XLP-20DEC30-CDE",
+        "code": "XLP",
+        "units_per_contract": 5000,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "PEPE": {
+        "symbol": "PEP-20DEC30-CDE",
+        "code": "PEP",
+        "units_per_contract": 100000,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "SHIB": {
+        "symbol": "SHP-20DEC30-CDE",
+        "code": "SHP",
+        "units_per_contract": 10000,
+        # Notional moves with price; the frontend prefers the live
+        # figure and only falls back to this.
+        "approx_contract_value": None,
         "fee_pct": 0.00100,
     },
 }

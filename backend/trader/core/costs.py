@@ -143,6 +143,62 @@ _MONTH_NAMES = {
 }
 
 
+# The Coinbase *spot* product quoting each traded underlying. Spot is the
+# reference venue this account can actually reach — the offshore perp venues are
+# 451 from a US IP — and it is the market the perp's index is built from, so its
+# basis is what drives funding.
+#
+# Explicit rather than derived: the meme contracts are keyed `1000PEPE` and
+# `1000SHIB` here because that is how their contract units are quoted, while
+# spot is plain `PEPE-USD` / `SHIB-USD`. A `.replace('1000', '')` would work
+# today and break on the first asset with 1000 in its real ticker.
+SPOT_PRODUCTS: dict[str, str] = {
+    'BTC': 'BTC-USD',
+    'ETH': 'ETH-USD',
+    'SOL': 'SOL-USD',
+    'XRP': 'XRP-USD',
+    'DOGE': 'DOGE-USD',
+    'AVAX': 'AVAX-USD',
+    'ADA': 'ADA-USD',
+    'LINK': 'LINK-USD',
+    'LTC': 'LTC-USD',
+    'BCH': 'BCH-USD',
+    'DOT': 'DOT-USD',
+    'NEAR': 'NEAR-USD',
+    'SUI': 'SUI-USD',
+    'XLM': 'XLM-USD',
+    '1000PEPE': 'PEPE-USD',
+    '1000SHIB': 'SHIB-USD',
+}
+
+
+def spot_product(symbol: str) -> Optional[str]:
+    """The Coinbase spot product for whatever spelling names an instrument.
+
+    Takes a CDE product id, a contract code or a bare base — anything
+    `resolve_base` understands — and returns the spot product id, or None for an
+    underlying with no spot listing.
+    """
+    base = resolve_base(symbol)
+    return SPOT_PRODUCTS.get(base) if base else None
+
+
+def spot_universe(symbols: Iterable[str]) -> list[str]:
+    """Spot products for a set of instruments, deduplicated and ordered.
+
+    This exists so the spot scrape is never hand-typed. Written by hand once, it
+    listed nine products against the sixteen the trader models — the API and
+    frontend serve nine, and that list got mistaken for the traded universe — so
+    seven instruments would have silently had no cross-venue features.
+    """
+    out: list[str] = []
+    for symbol in symbols:
+        product = spot_product(symbol)
+        if product and product not in out:
+            out.append(product)
+    return out
+
+
 def psf_symbol(product_id: str) -> Optional[str]:
     """Convert a CDE product id to the Perp Style Futures symbol.
 
