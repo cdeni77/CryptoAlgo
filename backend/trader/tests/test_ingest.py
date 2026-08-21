@@ -480,3 +480,50 @@ def test_the_funding_snapshot_is_taken_outside_the_gap_loop():
         'a window comparison against event_time is back; funding_time can sit '
         'after the end of the backfill range'
     )
+
+
+def test_spot_symbols_get_no_funding_product():
+    """Funding is a perpetual cash flow. Spot has none, so it must not be mapped.
+
+    `_extract_coin_code('BTC-USD')` resolves to 'BIP', so the funding product map
+    happily pointed every spot symbol at the corresponding CDE perp. A spot
+    scrape then fetched the *perp's* funding rate and filed it under the spot
+    symbol — the right number under a key that has no such thing, once per
+    settlement, indistinguishable in the store from a real observation.
+
+    Confirmed in a live store: `BTC-USD`, `ETH-USD` and sixteen others each
+    carried a funding row alongside their CDE counterparts.
+    """
+    from scripts.run_pipeline import SPOT_QUOTES, _extract_coin_code
+
+    for spot in ('BTC-USD', 'ETH-USD', 'PEPE-USD', 'SOL-USDC', 'XRP-USDT'):
+        assert SPOT_QUOTES.search(spot), f'{spot} not recognised as spot'
+        # The trap: the code resolves, which is why the guard has to be explicit.
+        assert _extract_coin_code(spot), (
+            f'{spot} resolves to a perp code, so skipping it cannot rely on '
+            f'resolution failing'
+        )
+
+    for perp in ('BIP-20DEC30-CDE', 'HYP-20DEC30-CDE', 'BTC-PERP'):
+        assert not SPOT_QUOTES.search(perp), f'{perp} wrongly treated as spot'
+
+
+def test_the_funding_snapshot_is_filed_under_the_run_venue():
+    """A hardcoded venue misfiles funding on any run with a venue label.
+
+    The snapshot insert passed `venue='coinbase'` literally, so a spot run's rows
+    landed on the perp venue. Combined with the mapping bug above, that put
+    perp funding under a spot symbol on the perp venue — two wrongs in one row.
+    """
+    import inspect
+
+    from scripts import run_pipeline
+
+    source = inspect.getsource(run_pipeline.backfill_funding_rates)
+    assert 'venue_label' in inspect.signature(
+        run_pipeline.backfill_funding_rates
+    ).parameters, 'the funding backfill no longer takes a venue label'
+    assert "ingest_funding(\n                        [current], venue=venue_label" in source \
+        or 'venue=venue_label' in source, (
+        'the snapshot is not filed under the run venue'
+    )

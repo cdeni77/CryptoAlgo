@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import asyncio
+import re
 import logging
 import os
 import sys
@@ -73,6 +74,10 @@ ASSET_TO_CODE_MAP = {
     "HYPE": "HYP",
     "ONDO": "OND",
 }
+
+# Spot spellings: an instrument quoted directly in fiat or a stablecoin. Funding
+# is a perpetual-contract cash flow, so these never have one.
+SPOT_QUOTES = re.compile(r'-(USD|USDC|USDT)$', re.IGNORECASE)
 
 DEFAULT_TIMEFRAMES = ["1h", "1d"]
 DEFAULT_SYMBOLS = [
@@ -285,6 +290,12 @@ async def resolve_coinbase_funding_product_map(
 
         mapping: Dict[str, str] = {}
         for symbol in symbols:
+            # Spot pays no funding. `_extract_coin_code('BTC-USD')` resolves to
+            # 'BIP', so without this a spot run fetched the *perp's* funding rate
+            # and filed it under the spot symbol — the right number under a key
+            # that has no such thing, once per settlement.
+            if SPOT_QUOTES.search(symbol):
+                continue
             code = _extract_coin_code(symbol)
             if code and code in code_to_product:
                 mapping[symbol] = code_to_product[code]
@@ -303,6 +314,7 @@ async def backfill_funding_rates(
     proxy: Optional[str] = None,
     api_key: Optional[str] = None,
     api_secret: Optional[str] = None,
+    venue_label: Optional[str] = None,
 ):
     """
     Backfill funding rates with Coinbase-native hourly history as primary source.
@@ -416,7 +428,9 @@ async def backfill_funding_rates(
                 if current is not None:
                     current.symbol = symbol
                     current.funding_source = 'coinbase'
-                    outcome = ingestor.ingest_funding([current], venue='coinbase')
+                    outcome = ingestor.ingest_funding(
+                        [current], venue=venue_label or 'coinbase'
+                    )
                     symbol_inserted += outcome.inserted
                     source_metrics[symbol]['coinbase'] += outcome.inserted
                     logger.info(
@@ -827,7 +841,8 @@ Examples:
         # Funding Rate Backfill
         if not args.ohlcv_only:
             funding_rows = await backfill_funding_rates(
-                symbols, start_time, end_time, db, proxy, api_key, api_secret
+                symbols, start_time, end_time, db, proxy, api_key, api_secret,
+                venue_label=args.venue_label,
             )
             # Zero funding is not a partial success. Carry is the edge this
             # system is built to capture — 2bp/hour is 48bp/day against a
