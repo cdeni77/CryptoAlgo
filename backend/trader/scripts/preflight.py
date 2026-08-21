@@ -37,7 +37,6 @@ from core.costs import symbols_missing_fee_schedule
 from core.cv import average_uniqueness, effective_sample_size
 from core.datastore import ResearchStore
 from core.features import feature_columns
-from core.model import train_forecast_model
 from scripts._common import add_data_arguments, build_config, configure_logging, load
 
 # A pooled panel model needs enough resolved rows that the effective sample is
@@ -266,9 +265,9 @@ def _effective_sample(dataset, config: Config) -> Check:
             f'{horizon_needed}h (--horizon {horizon_needed})\n'
         )
     fix += (
-        f'Anything trained below the threshold is not wrong, but every statistic '
-        f'downstream — Sharpe, PBO, the gates — has error bars far wider than it '
-        f'looks, and the gates are calibrated for that.'
+        'Anything trained below the threshold is not wrong, but every statistic '
+        'downstream — Sharpe, PBO, the gates — has error bars far wider than it '
+        'looks, and the gates are calibrated for that.'
     )
 
     return Check('effective sample', False, detail, fix)
@@ -288,6 +287,22 @@ def _universe_wide_enough(dataset) -> Check:
 
 
 def _model_trains(dataset, config: Config, as_of: Optional[str]) -> Check:
+    # Imported here, not at module scope. This is the one check that needs
+    # LightGBM, and LightGBM needs a native library — on macOS an absent
+    # `libomp.dylib` raises OSError from dlopen at import time. That took down
+    # the whole report, including the sample-size numbers this script exists to
+    # produce and which need nothing but pandas. "Can I train?" should not be
+    # unanswerable because the trainer will not load.
+    try:
+        from core.model import train_forecast_model
+    except (ImportError, OSError) as exc:
+        first = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        return Check(
+            'model fit', False, f'LightGBM unavailable: {first}',
+            'every other check above still holds. On macOS this is usually a '
+            'missing OpenMP runtime: `brew install libomp`',
+        )
+
     model = train_forecast_model(
         dataset.features, dataset.targets, config=config, data_as_of=as_of,
         horizon_bars=dataset.horizon_bars,
