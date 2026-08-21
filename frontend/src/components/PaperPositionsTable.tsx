@@ -20,9 +20,11 @@ const money = (v: number, digits = 2) =>
 interface Props {
   positions: PaperPosition[];
   prices?: PriceData | null;
-  /** Contract size per instrument. Defaults to 1 when the specs have not loaded,
-   *  which shows the stored mark rather than a wrong live one. */
-  unitsFor?: (coin: string) => number;
+  /** Contract size per instrument, or null for an instrument the specs do not
+   *  cover. Either way the row falls back to the stored mark rather than
+   *  marking against an invented size — `?? 1` here would be a 100x error on
+   *  XRP and a 5000x one on DOGE. */
+  unitsFor?: (coin: string) => number | null;
 }
 
 export default function PaperPositionsTable({ positions, prices, unitsFor }: Props) {
@@ -36,10 +38,10 @@ export default function PaperPositionsTable({ positions, prices, unitsFor }: Pro
     <div className="space-y-2">
       {open.map((p) => {
         const live = prices?.[p.coin as keyof typeof prices]?.price ?? null;
-        const units = unitsFor?.(p.coin) ?? 1;
+        const units = unitsFor?.(p.coin) ?? null;
         const sign = p.side === 'long' ? 1 : -1;
         const unrealised =
-          live != null && unitsFor
+          live != null && units !== null
             ? p.contracts * units * (live - p.entry_price) * sign
             : p.unrealized_pnl;
         const mark = live ?? p.mark_price;

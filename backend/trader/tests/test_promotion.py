@@ -349,6 +349,7 @@ def test_a_missing_cost_config_does_not_silently_pass(tmp_path):
     assert find_cost_config('no_such_venue_v1999.json') is None
 
 
+@pytest.mark.slow
 def test_a_full_evaluation_measures_every_gate(config):
     """No gate may be structurally unmeasurable, or nothing can ever promote.
 
@@ -390,6 +391,7 @@ def test_a_full_evaluation_measures_every_gate(config):
     )
 
 
+@pytest.mark.slow
 def test_a_quick_evaluation_cannot_promote(config):
     """`--quick` skips the slow simulations, and a skipped gate must fail."""
     from core.dataset import Dataset

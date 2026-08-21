@@ -102,7 +102,9 @@ class Config:
     # --- Risk / sizing ---
     max_positions: int = 5
     position_size: float = 0.15
-    leverage: int = 4
+    # Float, not int: `--leverage 1.5` is a reasonable thing for an operator to
+    # want, and `execution.py` already casts to float at both use sites.
+    leverage: float = 4.0
     vol_sizing_target: float = 0.025
     min_equity: float = 1000.0
 

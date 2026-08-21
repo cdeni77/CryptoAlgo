@@ -82,7 +82,7 @@ cannot express carry separately from price cannot find it.
 
 ```bash
 cp .env.example .env      # POSTGRES_PASSWORD is required
-docker compose up --build db backend frontend trader
+docker compose up --build db backend frontend trader paper-engine
 ```
 
 Postgres and the API bind to loopback. `POST /research/launch` needs `API_TOKEN`

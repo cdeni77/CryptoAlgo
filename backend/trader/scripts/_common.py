@@ -48,6 +48,9 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                         help='Refuse a candidate whose trailing return correlation '
                              'with an open position exceeds this. 0 disables the '
                              'cap (default: the Config value).')
+    parser.add_argument('--leverage', type=float, default=None,
+                        help='Notional multiple on the sized position, and the '
+                             'divisor for margin (default: the Config value).')
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
     return parser
 
@@ -102,6 +105,17 @@ def _with_recency(config: Config, args: argparse.Namespace) -> Config:
         symbols = [s.strip().upper() for s in excluded.split(',') if s.strip()]
         config = replace(config, excluded_symbols=symbols)
         logging.info('excluding %s', ', '.join(symbols))
+
+    # `LEVERAGE=4` sat in docker-compose.yml read by nothing, which is the
+    # dangerous shape for this particular knob: an operator lowering it saw the
+    # book keep trading at 4x. It multiplies target notional in
+    # `execution.size_from_forecast` and divides margin, so it is money.
+    leverage = getattr(args, 'leverage', None)
+    if leverage is not None:
+        if leverage <= 0:
+            raise SystemExit('--leverage must be positive')
+        config = replace(config, leverage=float(leverage))
+        logging.info('leverage %.2fx', float(leverage))
 
     correlation = getattr(args, 'max_correlation', None)
     if correlation is not None:

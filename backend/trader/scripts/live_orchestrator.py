@@ -355,6 +355,7 @@ def _write_signals(args: argparse.Namespace) -> None:
         sys.executable, '-m', 'scripts.signals',
         '--model', str(MODELS_DIR / 'forecast.joblib'),
         '--equity', str(args.equity),
+        '--leverage', str(args.leverage),
         *_data_arguments(args),
     ]
     _run_step('signals', command)
@@ -390,6 +391,7 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
         '--models-dir', str(MODELS_DIR),
         '--periods', str(args.walk_forward_periods),
         '--equity', str(args.equity),
+        '--leverage', str(args.leverage),
         *_data_arguments(args),
         *_training_arguments(args),
     ]
@@ -518,6 +520,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--walk-forward-periods', type=int,
                         default=int(os.getenv('WALK_FORWARD_PERIODS', '6')))
     parser.add_argument('--equity', type=float, default=float(os.getenv('EQUITY', '100000')))
+    parser.add_argument('--leverage', type=float, default=float(os.getenv('LEVERAGE', '4')))
 
     # Modes.
     parser.add_argument('--run-once', action='store_true', help='One cycle, then exit')

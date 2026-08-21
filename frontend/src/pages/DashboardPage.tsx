@@ -21,20 +21,6 @@ import { usePolling } from '../hooks/usePolling';
 import { ALL_COINS, PaperEquityPoint } from '../types';
 
 
-/**
- * Fallback contract sizes, used only until `/coins/cde-specs` answers.
- *
- * This table used to be the *only* source, with a comment reading "Must match
- * trading_costs.py" — a file that has since been deleted, so nothing was
- * checking the claim. Contract size multiplies straight into unrealised PnL: a
- * wrong entry here misreports the position's value by that factor, silently.
- * The API now serves the real specs, and these are the last resort.
- */
-const FALLBACK_UNITS: Record<string, number> = {
-  BTC: 0.01, ETH: 0.1, SOL: 5, XRP: 500, DOGE: 5000,
-  AVAX: 10, ADA: 1000, LINK: 50, LTC: 5,
-};
-
 const STARTING_BALANCE = 100_000;
 
 const money = (v: number, prefix = '$') =>
@@ -83,12 +69,18 @@ export default function DashboardPage() {
   const prices = priceSource === 'cde' ? cde.data : spot.data;
   const priceState = priceSource === 'cde' ? cde : spot;
 
+  // Contract size, from `/coins/cde-specs` or not at all. There used to be a
+  // local fallback table here, carried over from a deleted cost module that had
+  // stopped checking it: AVAX read 10 against the schedule's 5, LINK 50 against
+  // 10, LTC 5 against 1, and an unknown coin silently got 1. Contract size
+  // multiplies straight into unrealised PnL, so every one of those misreported
+  // the position by that factor on the first render — and the whole point of
+  // serving the real specs was to stop guessing.
   const unitsFor = useMemo(() => {
     const contracts = specs.data?.contracts ?? {};
-    return (coin: string): number => {
-      const key = coin.toUpperCase();
-      const fromApi = contracts[key]?.units_per_contract;
-      return typeof fromApi === 'number' && fromApi > 0 ? fromApi : (FALLBACK_UNITS[key] ?? 1);
+    return (coin: string): number | null => {
+      const fromApi = contracts[coin.toUpperCase()]?.units_per_contract;
+      return typeof fromApi === 'number' && fromApi > 0 ? fromApi : null;
     };
   }, [specs.data]);
 
@@ -102,9 +94,12 @@ export default function DashboardPage() {
     if (!openPositions.length || !prices) return null;
     return openPositions.reduce((sum, p) => {
       const px = prices[p.coin as keyof typeof prices]?.price;
-      if (!px) return sum + p.unrealized_pnl;
+      const units = unitsFor(p.coin);
+      // No live price or no contract size means no live mark. The stored value
+      // is stale, but it was computed against the real spec.
+      if (!px || units === null) return sum + p.unrealized_pnl;
       const sign = p.side === 'long' ? 1 : -1;
-      return sum + p.contracts * unitsFor(p.coin) * (px - p.entry_price) * sign;
+      return sum + p.contracts * units * (px - p.entry_price) * sign;
     }, 0);
   }, [openPositions, prices, unitsFor]);
 

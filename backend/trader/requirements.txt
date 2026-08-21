@@ -16,6 +16,9 @@ coinbase-advanced-py
 
 # Testing
 pytest>=7.0.0
+# Parallel test execution; pytest.ini sets `-n auto`, so this is required
+# rather than optional — without it pytest exits on an unrecognised argument.
+pytest-xdist>=3.5.0
 
 # Development
 black>=23.0.0

@@ -1,8 +1,23 @@
 # Research Pipeline Rebuild
 
 Design spec for the feature + training + validation rebuild. Scope: everything
-between the scraper and the signal writer. The scraper (`data_collection/`),
-the API, and the frontend keep their current contracts.
+between the scraper and the signal writer.
+
+> **Read this as the design intent, not as the current state.** It was written
+> before the rebuild and the build diverged from it in five places that matter.
+> Where they disagree, the code wins, and `AGENTS.md` describes what landed.
+>
+> | This spec says | What landed |
+> |---|---|
+> | §3.3 triple-barrier labels + meta-labelling | `core/targets.py` regresses **net return**, decomposed into price/carry/cost. No labeller, no `TripleBarrierSpec`, no meta-labelling stage. Only average-uniqueness weighting survived. |
+> | §3.4 instrument identity as a feature | `core/model.py` sets `USE_SYMBOL_IDENTITY = False` — identity alone scored IC +0.54 on random walks. `identity_ceiling_ic` reports that ceiling instead. |
+> | §3.4 a GRU/TCN second ensemble member | Three LightGBM heads (`price`, `carry`, `dispersion`). No neural member; no torch dependency. |
+> | §4.5 spread taken from persisted book snapshots | Still an assumption (`config.spread_bps`, default 4.0). `OrderBookSnapshot` exists and the WebSocket builds them, but nothing persists one, so §3.1's "book snapshots persisted for slippage calibration" is also unlanded. |
+> | §5 `CPCV median/p05 Sharpe` gates, and a "paper/CPCV agreement" gate | The gates are `walk_forward_median_sharpe` / `walk_forward_p05_sharpe`, measured across walk-forward sub-periods. CPCV is implemented and tested but off the promotion path by choice: 66 fits against this loop's 6. Paper/CPCV agreement is monitoring, not a gate. `README.md` lists the ten real gates. |
+>
+> The scraper (`data_collection/`) did *not* keep its contract: venue-scoped
+> watermarks, gap detection and a single naive-UTC time helper were added. The
+> API and frontend did not either — see `AGENTS.md`.
 
 Instrument context: **Coinbase US perpetual-style futures (CDE)**, hourly
 funding (`funding.method = coinbase_us_perps_hourly`), per-contract commission
@@ -36,14 +51,14 @@ Round-trip cost, modelled vs actual:
 | LCP (LTC)  | $475   | 20.0 bp |  4.2 bp | 0.21x |
 
 The error is not a constant bias — it runs in **both directions**. ETH was
-backtested at 40% of its real cost; DOGE at 17x. Fee-aware labels
-(`TripleBarrierSpec.fee_pct_per_side`) inherit the same error, so the labels
-themselves are wrong. Any ranking of coins or strategies built on this is
+backtested at 40% of its real cost; DOGE at 17x. The old system's fee-aware
+labels (`TripleBarrierSpec.fee_pct_per_side`, since deleted along with the
+labeller) inherited the same error, so the labels themselves were wrong. Any ranking of coins or strategies built on this is
 uninterpretable.
 
 ### 1.2 Contract sizes contradict between code and config
 
-`core/trading_costs.py` and the exchange config disagree for three instruments:
+`core/trading_costs.py` (since deleted) and the exchange config disagreed for three instruments:
 
 | Contract | Config | Code table | Factor |
 |----------|-------:|-----------:|-------:|
@@ -154,10 +169,12 @@ XLM has been training on 7 of its 13 intended features.
 Seven layers, each one module with one job.
 
 ```
-data      →  features  →  labels  →  model  →  simulation  →  decision  →  execution
-(venue-    (mechanism-   (triple-  (pooled  (CPCV, MC,      (one         (fills,
- keyed,     grouped)      barrier,  panel)   bootstrap)      decide())     funding,
- PIT)                     fee-aware)                                       margin)
+data      →  features  →  targets  →  model  →  simulation  →  decision  →  execution
+(venue-    (mechanism-   (net      (pooled  (bootstrap,     (one         (fills,
+ keyed,     grouped)      return:   panel,   regime sim,      decide())     funding,
+ PIT)                     price +   3 heads) cost stress)                   margin)
+                          carry -
+                          cost)
 ```
 
 ### 3.1 Data
@@ -166,8 +183,9 @@ data      →  features  →  labels  →  model  →  simulation  →  decision
 enough that a full-history feature build is a coffee break rather than an
 afternoon. Partitioned `dataset/venue=…/symbol=…/month=…`.
 
-**Serving store: PostgreSQL, unchanged.** `signals`, `trades`, `paper_*`,
-`wallet`, `model_runs` keep their schemas so the API and frontend are untouched.
+**Serving store: PostgreSQL.** `signals`, `paper_*`, `wallet`, `model_runs`.
+(The `trades` table named here was deleted — nothing ever wrote a row to it. See
+`AGENTS.md`.)
 
 Changes to what's collected:
 
@@ -176,7 +194,9 @@ Changes to what's collected:
 - **Coinbase-native funding and OI** for the traded instrument. Binance funding
   stays, as a *cross-venue* feature rather than a substitute.
 - **Book snapshots** from the existing WebSocket handler, persisted for slippage
-  calibration. Without depth data, every slippage number is a guess.
+  calibration. Without depth data, every slippage number is a guess. **Not
+  landed:** the snapshots are built and dropped — nothing writes them — so the
+  spread is still the assumption §4.5 describes.
 - **Feature matrices materialised as Parquet with a content hash**, so a model
   artifact names exactly the feature set it was trained on.
 
@@ -223,7 +243,15 @@ z-score across the universe). This is what makes the pooled model in 3.4
 coherent, and it removes the per-coin scaling that the current archetypes
 hand-encode.
 
-### 3.3 Labels
+### 3.3 Labels — **superseded, see the header table**
+
+There is no labeller. `core/targets.py` regresses net return, decomposed into
+`price`, `carry` and `cost`, because triple-barrier classification could not
+express carry — the most plausible edge on hourly-funding perps, where 2bp/hour
+is 48bp/day against a 5-54bp round trip. Of the paragraph below, only the
+average-uniqueness weighting survived (`core/cv.py:average_uniqueness`); there
+is no meta-labelling stage, and `Config.meta_probability_threshold` is orphaned.
+The original text:
 
 Keep what is already correct: triple-barrier with the round-trip fee added to
 the take-profit barrier, neutral-direction rows excluded, average-uniqueness
@@ -231,7 +259,13 @@ sample weights, and meta-labelling as a second stage. The one change is that the
 fee input becomes the real per-contract schedule, which moves the barriers
 materially (1.1).
 
-### 3.4 Model
+### 3.4 Model — **two departures, see the header table**
+
+Pooling landed. The two things that did not: instrument identity is *excluded*
+(`USE_SYMBOL_IDENTITY = False`, because identity alone scored IC +0.54 on random
+walks — `identity_ceiling_ic` reports that ceiling instead), and there is no
+neural second member. The ensemble is three LightGBM heads: `price`, `carry`,
+`dispersion`. The original text:
 
 **One pooled panel model** over all instruments, with instrument identity as a
 feature (embedding or dummies) rather than fifteen separate fits. At 30-50
@@ -315,8 +349,12 @@ into it, so this measures **robustness and sizing**, never edge.
 
 The static 2 bps assumption is replaced with a model calibrated to the venue:
 
-- Participation-rate slippage — order size against bar volume, with the spread
-  crossing taken from persisted book snapshots rather than assumed.
+- Participation-rate slippage — order size against bar volume. **The spread
+  crossing is still an assumption** (`config.spread_bps`, default 4.0), not a
+  measurement: `OrderBookSnapshot` exists and the WebSocket handler builds them,
+  but `storage.py` has no insert for one and `ingest.py` never persists one, so
+  the calibration input does not exist yet. `execution.py:book_depth_bps` is the
+  hook that will replace the assumption when it does.
 - The real fee schedule, per-contract, per instrument group (1.1).
 - Latency: signal at bar close, fill at next bar open plus a delay.
 - **Hourly funding accrued at actual settlement timestamps** — at 4x leverage
@@ -354,22 +392,33 @@ what makes 4.2 computable.
 A configuration reaches paper trading only by clearing all of these. They are
 hard gates, not a score to be traded off.
 
-| Gate | Threshold | From |
+The gate names below are the *design* names. What `core/metrics.py:DEFAULT_GATES`
+actually contains is the ten-row table in `README.md`; two differences matter.
+
+The `cpcv_*` gates were renamed `walk_forward_*` because they were measured
+across walk-forward sub-periods, not CPCV paths — the old names promised a
+stronger guarantee than the loop delivered. CPCV is implemented and tested
+(`core/cv.py`), and is off the promotion path by choice: 66 model fits against
+this loop's 6.
+
+Paper/CPCV agreement is **not** a gate. It cannot be: it needs 30 days of paper
+trading that only happens after promotion. It is the orchestrator's monitoring
+job (`live_orchestrator:_monitoring_thresholds`), and a breach quarantines the
+live model rather than blocking a candidate. `max_exit_participation <= 0.20`
+*is* a gate and is missing from the table below.
+
+| Gate (design name) | Threshold | From |
 |------|-----------|------|
-| CPCV median Sharpe | >= 0.5 | 4.1 |
-| CPCV 5th percentile Sharpe | > 0 | 4.1 |
+| CPCV median Sharpe → `walk_forward_median_sharpe` | >= 0.5 | 4.1 |
+| CPCV 5th percentile Sharpe → `walk_forward_p05_sharpe` | > 0 | 4.1 |
 | Probability of backtest overfitting | <= 0.30 | 4.1 |
 | Deflated Sharpe Ratio | > 0 at true trial count | 4.2 |
 | Bootstrap P(Sharpe > 0) | >= 0.90 | 4.3 |
 | Synthetic panels with positive Sharpe | >= 60% | 4.4 |
-| Cost stress: 2x fees, 3x slippage | median Sharpe still > 0 | 4.5 |
+| Cost stress: 2x fees, 3x spread | median Sharpe still > 0 | 4.5 |
 | Parameter plateau | >= 60% of +/-1-step neighbours keep >= 70% of Sharpe | 4.6 |
 | OOS trade count | >= 100 | — |
-| Paper/CPCV agreement | paper Sharpe inside the 90% band after 30 days | — |
-
-The last gate is the one that closes the loop. If paper falls outside the band
-the model is not "unlucky" — the simulation is wrong, and it gets fixed before
-anything else ships.
+| Paper/CPCV agreement | *monitoring, not a gate* — see above | — |
 
 ---
 
@@ -389,10 +438,11 @@ Each phase leaves the system working and is independently verifiable.
    matrices content-hashed.
 5. **Feature layer.** The mechanism groups in 3.2, cross-sectionally
    standardised.
-6. **Pooled model.** Panel LightGBM with instrument identity; purged CV;
-   uniqueness weights; meta-labelling.
-7. **Simulation layer.** CPCV first (it changes every number you look at), then
-   the bootstrap, then execution simulation, then synthetic panels.
+6. **Pooled model.** Panel LightGBM, purged CV, uniqueness weights. Landed
+   without instrument identity and without meta-labelling — see §3.3 and §3.4.
+7. **Simulation layer.** CPCV, the bootstrap, execution simulation, synthetic
+   panels. CPCV landed but sits off the promotion path (§5); the walk-forward
+   distribution is what the gates read.
 8. **Search collapse.** One campaign runner over the ledger, replacing the five
    scripts.
 9. **Gates wired into promotion.** No path to paper except through section 5.
@@ -610,10 +660,21 @@ On 92 days of hourly data across five instruments:
 | 96h (the profile default) | 18 from 1,768 timestamps | far too few |
 | 8h | 232 from 1,856 timestamps | enough to start |
 
-The two ways out are quantifiable, and `scripts/preflight.py` now states both:
-keep the horizon and scrape about `200 x horizon / 24` days, or keep the history
-and shorten the horizon to about `timestamps / 200` hours. At the 96h default,
-200 effective observations needs roughly 2.2 years of hourly history.
+There are **three** levers, not two, and `scripts/preflight.py` reports which
+one binds:
+
+1. **Raise the recency half-life.** Weights sum to about `24 x H / ln 2`
+   bar-equivalents however far back the store goes, so the weighted effective
+   sample saturates at `24H/ln2/h` regardless of history. When that is already
+   below 200, preflight says so and suppresses the scrape advice — more history
+   genuinely cannot help until the half-life is raised. This is usually the
+   binding constraint.
+2. **Shorten the horizon.** Sized off the weighted budget when a decay is
+   active, not the raw timestamp count — computing it the naive way produced
+   advice to *lengthen* the horizon to 219h at five years of hourly data, which
+   is the opposite of the fix.
+3. **Scrape more**, about `200 x horizon / 24` days — which only helps once
+   lever 1 is not the binding one.
 
 This is much cheaper to learn before an overnight scrape than after.
 
@@ -691,7 +752,11 @@ heads that are `LGBMRegressor` instances, whose attributes are
 - `PaperPositionsTable` carried its own contract-size table with a comment
   reading "Must match trading_costs.py", a file deleted in this rebuild. Contract
   size multiplies into unrealised PnL, so a stale entry there misreports a
-  position silently. It comes from the API now.
+  position silently. It comes from the API now — and the same table survived one
+  more round in `DashboardPage.tsx` as a "fallback until the specs load", where
+  three of its nine entries had already drifted against the real schedule (AVAX
+  10 against 5, LINK 50 against 10, LTC 5 against 1). There is no fallback now:
+  a position whose contract size is unknown shows the stored mark.
 
 ### 10.4 `frontend/node_modules` was committed
 

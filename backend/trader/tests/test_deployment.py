@@ -259,3 +259,75 @@ def test_the_paper_engine_reads_the_same_store_the_trader_writes(compose):
     assert data_volume('trader') == data_volume('paper-engine'), (
         'different /app/data sources: the engine would read an empty store'
     )
+
+
+# ---------------------------------------------------------------------------
+# The environment the container runs with
+# ---------------------------------------------------------------------------
+
+# Variables the runtime reads, not this codebase: the base image, the driver,
+# the Postgres entrypoint, or a Vite build. Each is a deliberate exemption.
+_RUNTIME_ENV = {
+    'TZ',                       # glibc / the base image
+    'PYTHONUNBUFFERED',         # CPython
+    'PYTHONPATH',               # CPython
+    'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
+    'POSTGRES_USER', 'POSTGRES_PASSWORD', 'POSTGRES_DB',   # postgres entrypoint
+    'PGDATA',
+    'NODE_ENV',                 # vite / node
+    'CHOKIDAR_USEPOLLING',      # vite file watcher in a container
+}
+
+
+def _declared_env(service: dict) -> set[str]:
+    """Variable names a compose service sets, from either env syntax."""
+    env = service.get('environment') or {}
+    if isinstance(env, dict):
+        return {str(k) for k in env}
+    names = set()
+    for entry in env:
+        text = str(entry)
+        # Skip a bare `- NAME` pass-through, which sets nothing here.
+        if '=' in text:
+            names.add(text.split('=', 1)[0].strip())
+    return names
+
+
+def test_every_environment_variable_compose_sets_is_read_by_something(compose):
+    """A knob nothing reads is worse than a missing one.
+
+    `LEVERAGE=4` sat in the trader service, documented in AGENTS.md with a
+    default, and read by no code at all — so an operator lowering it watched the
+    book keep sizing at 4x. It multiplies target notional in
+    `execution.size_from_forecast` and divides margin, so the silence was
+    expensive. It is wired now, and this test is what stops the next one.
+
+    The check is deliberately loose about *where* the read happens (trader, API,
+    or the frontend's `import.meta.env`) — the failure mode is a variable read
+    nowhere, not one read in the wrong package.
+    """
+    sources: list[str] = []
+    for root in (REPO_ROOT / 'backend', REPO_ROOT / 'frontend' / 'src'):
+        if not root.exists():
+            continue
+        for path in root.rglob('*'):
+            if path.suffix in {'.py', '.ts', '.tsx'} and '__pycache__' not in path.parts:
+                sources.append(path.read_text(errors='ignore'))
+    haystack = '\n'.join(sources)
+    assert haystack, 'found no source to search, so this test proves nothing'
+
+    unread: dict[str, list[str]] = {}
+    for name, service in compose.get('services', {}).items():
+        for variable in sorted(_declared_env(service)):
+            if variable in _RUNTIME_ENV:
+                continue
+            # VITE_* reach the browser through import.meta.env, not os.getenv.
+            if variable not in haystack:
+                unread.setdefault(variable, []).append(name)
+
+    assert not unread, (
+        'compose sets variables no code reads:\n  '
+        + '\n  '.join(f'{k} (in {", ".join(v)})' for k, v in sorted(unread.items()))
+        + '\n\nEither wire it or delete it. A knob that silently does nothing is '
+          'how LEVERAGE=4 stayed authoritative while an operator lowered it.'
+    )

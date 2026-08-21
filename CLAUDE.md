@@ -19,20 +19,28 @@ AGENTS.md           Detailed architecture and coding conventions
 ## Running Tests
 
 ```bash
-# All trader tests
+# All trader tests. `pytest.ini` sets `-n auto`, so this is already parallel:
+# ~5m50 across four cores against ~9m50 serially. The tail is one 209s
+# promotion evaluation, so more workers buy little.
 cd backend/trader && pytest
 
-# Single file
-cd backend/trader && pytest tests/test_<name>.py -v
+# The fast loop — everything except the model-training end-to-ends. 33s.
+cd backend/trader && pytest -m "not slow"
+
+# Serial, when a traceback or a debugger matters
+cd backend/trader && pytest -n 0 tests/test_<name>.py -v
+
+# API tests (serial; they share one SQLite fixture)
+cd backend/api && pytest
 ```
 
-Tests live in `backend/trader/tests/` (9 files). No frontend tests exist.
+Tests live in `backend/trader/tests/` (16 files) and `backend/api/tests/` (5). No frontend tests exist — `package.json` has no test script and no runner.
 
 ## Key Commands
 
 ```bash
 # Start full stack
-docker compose up --build db backend frontend trader
+docker compose up --build db backend frontend trader paper-engine
 
 # Frontend dev (hot-reload)
 cd frontend && npm ci && npm run dev
@@ -40,8 +48,12 @@ cd frontend && npm ci && npm run dev
 # API dev (hot-reload)
 cd backend/api && pip install -r requirements.txt && uvicorn app:app --reload
 
-# Trader scripts (run from backend/trader/). Every script takes the same data
-# arguments — see scripts/_common.py — so they cannot disagree about the dataset.
+# Trader scripts (run from backend/trader/). The seven research scripts —
+# train, backtest, promote, search, signals, preflight, build_features — share
+# scripts/_common.py:add_data_arguments, so they cannot disagree about the
+# dataset. The four operational ones below (run_pipeline,
+# migrate_to_research_store, paper_engine, live_orchestrator) hand-roll their
+# own argparse and take a different set.
 python -m scripts.run_pipeline                 # scrape into SQLite
 python -m scripts.migrate_to_research_store    # sync SQLite -> Parquet store
 python -m scripts.build_features               # assemble the feature panel
@@ -53,7 +65,13 @@ python -m scripts.promote --history            # what has been tried, and why no
 python -m scripts.search                       # one campaign runner, append-only ledger
 python -m scripts.signals                      # decide() on the latest bar
 python -m scripts.paper_engine                 # act on signals, account honestly
-python -m scripts.live_orchestrator            # the loop that runs all of the above
+python -m scripts.live_orchestrator            # the hourly loop: scrape -> sync ->
+                                               # features -> signals, plus a
+                                               # promotion attempt on its own
+                                               # cadence. It does not run search,
+                                               # train, backtest or the paper
+                                               # engine — paper_engine is its own
+                                               # compose service.
 
 # Frontend checks
 cd frontend && npm run typecheck && npm run lint && npm run build
@@ -171,9 +189,9 @@ and both are useful.
 ## Critical Architecture Notes
 
 - **`core/profiles.py` is the single source of truth** for per-coin feature sets, thresholds, and ML hyperparameters. Coins are described by a feature *archetype* (`mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`) plus tuned deltas. Changes cascade into training, search, and signal generation.
-- **`core/costs.py` is the single source of truth for money** — contract specs, exchange fee assumptions, round-trip costs, trade PnL, and position sizing. Load a venue's real schedule with `Config.with_cost_assumptions(find_cost_config())` — `configs/` lives under `backend/trader/` so the Docker build context includes it; the hardcoded defaults are 10bps/side, which is wrong for Coinbase CDE by 0.06x-2.5x depending on the contract.
+- **`core/costs.py` is the single source of truth for the money *inputs*** — contract specs, exchange fee assumptions, and the per-contract fee floor. Trade PnL and sizing are deliberately elsewhere and the module's closing comment says where: round-trip cost in `core/targets.py`, entry fee and Kelly/risk-budget sizing in `core/execution.py`. Load a venue's real schedule with `Config.with_cost_assumptions(find_cost_config())` — `configs/` lives under `backend/trader/` so the Docker build context includes it; the hardcoded defaults are 10bps/side, which is wrong for Coinbase CDE by 0.06x-2.5x depending on the contract.
 - **Duplicated ORM models**: `backend/trader/core/pg_writer.py` duplicates the API ORM models for container isolation. `backend/trader/tests/test_orm_parity.py` fails when they diverge in columns, types, nullability, defaults, or migration lists — a note in a doc was not enough; `wallet.balance` had already drifted 10,000 against 100,000, so whichever container created the row decided the paper account's starting balance.
-- **No react-router**: Frontend routing is manual via `window.history.pushState` in `App.tsx`. Add a page by adding an entry to `ROUTES` and a case in the render — the `RoutePath` type derives from `ROUTES`, so a missing case is a type error.
+- **No react-router**: Frontend routing is manual via `window.history.pushState` in `App.tsx`. Add a page by adding an entry to `ROUTES` (path → label) **and** to `PAGES` (path → component). `RoutePath` derives from `ROUTES`; `PAGES` is a `Record<RoutePath, ComponentType>`, which is what makes a route with no component a `tsc` error. The render used to be a chain of `route === '/x' && <XPage />`, and this file used to claim that was exhaustive — it was not.
 - **Frontend HTTP goes through `src/api/client.ts`**: one base URL, one error type, one place the `X-API-Token` header is set. Poll with `usePolling`, which pauses on hidden tabs and surfaces failures. Five copies of `fetchWithError` had already drifted in how they reported errors, and every `.catch(() => {})` made a dead backend look like a quiet market.
 - **The API serves measurements, never substitutes.** A missing value is null with a reason. The research surface used to report `pr_auc` as `holdout_auc - 0.06`, `precision_at_threshold` as `holdout_auc - 0.04`, and — when the artifact it wanted was absent, which was always — a hardcoded table of six feature importances. All of it rendered identically to real data.
 - **Promotion is the gate**: `core/promotion.py` stages into `models/.staging/{version}/`, then atomically renames into place — but only after every gate in `core/metrics.py:DEFAULT_GATES` passed. `--force` needs a reason and records it. `live_orchestrator.py` decides *when* to ask; it never decides the answer.
@@ -188,4 +206,4 @@ and both are useful.
 
 ## Environment Variables
 
-See `AGENTS.md` for the full table. Minimum required for live workflows: `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DATABASE_URL`.
+See `AGENTS.md` for the full table. Minimum required for live workflows: `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DATABASE_URL`, `POSTGRES_PASSWORD` (compose refuses to start without it), `COST_CONFIG` (unset misprices every contract by 0.06x–2.5x), and `API_TOKEN` + `VITE_API_TOKEN` if you want the dashboard's script runner.
