@@ -57,6 +57,42 @@ def _trim(payload: Any, depth: int = 0) -> Any:
     return payload
 
 
+async def historical_funding(client, products: list[str], path: str,
+                             symbol_param: str, extra: dict[str, str]) -> None:
+    """Try the Coinbase Derivatives historical-funding endpoint with PSF symbols.
+
+    The endpoint keys on the Perp Style Futures spelling (`BIPZ30`), not the
+    Advanced Trade product id (`BIP-20DEC30-CDE`) — different naming for the same
+    contract, and the long form is a standard futures id which has no funding at
+    all. `core.costs.psf_symbol` does the conversion.
+
+    `--funding-path` is a parameter rather than a constant because the path is
+    not guessed here: paste it from the API reference and this reports what the
+    account actually gets back, which is what decides the implementation.
+    """
+    from core.costs import psf_symbol
+
+    print('=' * 72)
+    print(f'HISTORICAL FUNDING — {path}')
+    print('=' * 72)
+    for product in products:
+        psf = psf_symbol(product)
+        if psf is None:
+            print(f'{product:22} no PSF symbol derived, skipped')
+            continue
+        params = {symbol_param: psf, **extra}
+        try:
+            status, data = await client._request(
+                'GET', path, params=params, authenticated=True
+            )
+        except Exception as exc:                          # noqa: BLE001
+            print(f'{product:22} ({psf:8}) raised {type(exc).__name__}: {exc}')
+            continue
+        summary = json.dumps(_trim(data), default=str)
+        print(f'{product:22} ({psf:8}) HTTP {status}  {summary[:280]}')
+    print()
+
+
 async def contract_sizes(client, products: list[str]) -> None:
     """Ask the venue for `contract_size`, which settles a 5x open question.
 
@@ -98,6 +134,14 @@ async def main() -> int:
     parser.add_argument('--product', default='BIP-20DEC30-CDE')
     parser.add_argument('--sizes-only', action='store_true',
                         help='Skip the endpoint probe, just dump contract sizes')
+    parser.add_argument('--funding-path', default=None,
+                        help='Path of the historical-funding endpoint, from the '
+                             'API reference. Given this, the probe queries it '
+                             'with PSF symbols (BIPZ30) for every product.')
+    parser.add_argument('--funding-symbol-param', default='symbol',
+                        help='Name of its symbol query parameter')
+    parser.add_argument('--funding-params', default='',
+                        help='Extra query params as k=v,k=v (start/end/limit)')
     parser.add_argument(
         '--products',
         default=('BIP-20DEC30-CDE,ETP-20DEC30-CDE,SLP-20DEC30-CDE,XPP-20DEC30-CDE,'
@@ -116,9 +160,19 @@ async def main() -> int:
 
     client = CoinbaseRESTClient(key, secret)
     try:
-        await contract_sizes(
-            client, [p.strip() for p in args.products.split(',') if p.strip()]
-        )
+        products = [p.strip() for p in args.products.split(',') if p.strip()]
+
+        if args.funding_path:
+            extra = dict(
+                pair.split('=', 1) for pair in args.funding_params.split(',') if '=' in pair
+            )
+            await historical_funding(
+                client, products, args.funding_path,
+                args.funding_symbol_param, extra,
+            )
+            return 0
+
+        await contract_sizes(client, products)
         if args.sizes_only:
             return 0
         for path_template, params_template, why in PROBES:

@@ -125,6 +125,45 @@ def resolve_base(symbol: str) -> Optional[str]:
 _resolve_base = resolve_base  # historical name
 
 
+# CME-style futures month codes, which CDE follows. Not a lookup anyone should
+# reinvent inline: getting one letter wrong resolves to a contract that exists
+# and is the wrong month.
+FUTURES_MONTH_CODES = {
+    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z',
+}
+
+_CDE_PRODUCT = re.compile(
+    r'^(?P<code>[A-Z0-9]+)-(?P<day>\d{1,2})(?P<month>[A-Z]{3})(?P<year>\d{2})-CDE$',
+    re.IGNORECASE,
+)
+_MONTH_NAMES = {
+    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+    'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+}
+
+
+def psf_symbol(product_id: str) -> Optional[str]:
+    """Convert a CDE product id to the Perp Style Futures symbol.
+
+    `BIP-20DEC30-CDE` -> `BIPZ30`. The two name the same instrument, but the
+    Coinbase Derivatives historical-funding endpoint keys on the PSF form while
+    the Advanced Trade product and candle endpoints key on the long form — so
+    the scraper needs both spellings for one contract.
+
+    Returns None for anything that is not a decorated CDE product id, including
+    the bare codes and `*-PERP` spellings, because there is nothing to derive an
+    expiry from.
+    """
+    match = _CDE_PRODUCT.match((product_id or '').strip().upper())
+    if match is None:
+        return None
+    month = _MONTH_NAMES.get(match.group('month').upper())
+    if month is None:
+        return None
+    return f"{match.group('code')}{FUTURES_MONTH_CODES[month]}{match.group('year')}"
+
+
 def contract_size_disagreements(
     declared: dict[str, float] | None,
 ) -> dict[str, tuple[float, float]]:

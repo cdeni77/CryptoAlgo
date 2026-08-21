@@ -181,3 +181,75 @@ def test_the_market_symbol_is_resolvable():
     from core.costs import _resolve_base
 
     assert _resolve_base(MARKET_SYMBOL) is not None
+
+
+# ---------------------------------------------------------------------------
+# Perp Style Futures symbols
+# ---------------------------------------------------------------------------
+
+
+def test_cde_product_ids_convert_to_psf_symbols():
+    """One contract, two spellings, and the endpoints disagree about which.
+
+    The Advanced Trade product and candle endpoints key on the long form
+    (`BIP-20DEC30-CDE`); Coinbase Derivatives' historical-funding endpoint keys
+    on the Perp Style Futures form (`BIPZ30`). `Z` is the CME-style month code
+    for December, which CDE follows.
+    """
+    from core.costs import psf_symbol
+
+    assert psf_symbol('BIP-20DEC30-CDE') == 'BIPZ30'
+    assert psf_symbol('ETP-20DEC30-CDE') == 'ETPZ30'
+    assert psf_symbol('PEP-20DEC30-CDE') == 'PEPZ30'
+    # Case is not the caller's problem.
+    assert psf_symbol('bip-20dec30-cde') == 'BIPZ30'
+
+
+def test_every_month_gets_its_own_code():
+    """A wrong letter resolves to a contract that exists and is the wrong month.
+
+    That is the dangerous failure here — not an error, a different instrument —
+    so the whole table is checked rather than the one month we happen to trade.
+    """
+    from core.costs import FUTURES_MONTH_CODES, psf_symbol
+
+    expected = 'FGHJKMNQUVXZ'
+    assert ''.join(FUTURES_MONTH_CODES[m] for m in range(1, 13)) == expected
+    assert len(set(FUTURES_MONTH_CODES.values())) == 12
+
+    names = ('JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+             'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC')
+    for month, (name, code) in enumerate(zip(names, expected), start=1):
+        assert psf_symbol(f'ABC-15{name}27-CDE') == f'ABC{code}27', (
+            f'month {month} ({name}) should map to {code}'
+        )
+
+
+def test_spellings_with_no_expiry_are_not_guessed():
+    """`BTC-PERP` and a bare code carry no expiry, so there is nothing to derive.
+
+    Returning None matters: inventing an expiry would produce a symbol that
+    resolves to a real contract and silently query the wrong one.
+    """
+    from core.costs import psf_symbol
+
+    for spelling in ('BTC-PERP', 'BIP', '', 'BIP-20DEC30', 'BIP-20XXX30-CDE'):
+        assert psf_symbol(spelling) is None, spelling
+
+
+def test_every_scraped_cde_product_has_a_psf_symbol():
+    """The 16 contracts the scraper resolves must all convert, or funding for the
+    ones that do not is silently uncollectable."""
+    from core.costs import psf_symbol
+
+    products = [
+        'BIP-20DEC30-CDE', 'ETP-20DEC30-CDE', 'BCP-20DEC30-CDE', 'SLP-20DEC30-CDE',
+        'LCP-20DEC30-CDE', 'XPP-20DEC30-CDE', 'LNP-20DEC30-CDE', 'AVP-20DEC30-CDE',
+        'POP-20DEC30-CDE', 'NER-20DEC30-CDE', 'SUP-20DEC30-CDE', 'ADP-20DEC30-CDE',
+        'XLP-20DEC30-CDE', 'DOP-20DEC30-CDE', 'SHP-20DEC30-CDE', 'PEP-20DEC30-CDE',
+    ]
+    mapped = {p: psf_symbol(p) for p in products}
+    missing = [p for p, v in mapped.items() if v is None]
+    assert not missing, f'no PSF symbol derived for {missing}'
+    assert len(set(mapped.values())) == len(products), 'two products collided'
+    assert all(v.endswith('Z30') for v in mapped.values()), mapped
