@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import MISSING, dataclass, fields, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
@@ -81,6 +81,9 @@ class Config:
     # --- Execution costs (see core.costs; satisfies its CostParams protocol) ---
     fee_pct_per_side: float = 0.0010
     min_fee_per_contract: float = 0.0
+    # Per-symbol overrides of the per-contract floor. Empty means the scalar
+    # above applies everywhere; a loaded venue config fills this in.
+    min_fee_per_contract_by_symbol: dict[str, float] = field(default_factory=dict)
     slippage_bps: float = 2.0
     apply_funding: bool = True
     apply_slippage: bool = True
@@ -191,6 +194,7 @@ class Config:
             self,
             fee_pct_per_side=a.effective_fee_pct_per_side(),
             min_fee_per_contract=a.effective_min_fee_per_contract(),
+            min_fee_per_contract_by_symbol=dict(a.exchange_fee.symbol_overrides or {}),
             slippage_bps=a.slippage.bps_per_side,
             apply_slippage=a.slippage.enabled,
             apply_impact=a.impact.enabled,
