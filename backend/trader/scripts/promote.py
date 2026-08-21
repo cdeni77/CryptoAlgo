@@ -29,6 +29,7 @@ from core.promotion import (
     load_records,
     promote,
     report,
+    trials_to_date,
 )
 from scripts._common import add_data_arguments, build_config, configure_logging, load, require_data
 
@@ -94,6 +95,10 @@ def main() -> int:
         n_periods=args.periods, initial_equity=args.equity,
         spread_bps=args.spread_bps, synthetic_paths=args.synthetic_paths,
         full=not args.quick, data_as_of=args.as_of,
+        # Every candidate ever evaluated counts, including this one. The deflated
+        # Sharpe discounts by this number, which is the whole reason rejections
+        # stay in the ledger.
+        trials=trials_to_date(models_dir) + 1,
     )
 
     if model is None:

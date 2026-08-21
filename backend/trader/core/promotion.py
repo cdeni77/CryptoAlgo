@@ -32,17 +32,33 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
+
 from core.config import Config
 from core.dataset import Dataset
-from core.metrics import Gate, evaluate_gates, gate_report, sharpe_ratio, summarise_paths
+from core.metrics import (
+    Gate,
+    deflated_sharpe,
+    evaluate_gates,
+    gate_report,
+    probability_of_backtest_overfitting,
+    sharpe_ratio,
+    summarise_paths,
+)
 from core.model import ForecastModel, train_forecast_model
-from core.simulation import SimulationReport, bootstrap_trades, cost_stress, synthetic_panel
+from core.simulation import (
+    SimulationReport,
+    SurfaceResult,
+    bootstrap_trades,
+    cost_stress,
+    synthetic_panel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +70,14 @@ STAGING_DIRNAME = '.staging'
 # Resamples for the trade bootstrap. Two thousand is enough for a stable p05 on a
 # few hundred trades and cheap enough to run on every candidate.
 BOOTSTRAP_RESAMPLES = 2_000
+
+# The thresholds `core.signal.decide` actually trades on. Perturbing these is what
+# distinguishes a plateau from a spike, and re-running them also yields the
+# candidates x splits matrix the PBO estimate needs — so two gates come from one
+# set of runs rather than two.
+SURFACE_PARAMETERS = ('min_edge_over_cost', 'vol_mult_tp', 'vol_mult_sl')
+SURFACE_STEP = 0.2
+SURFACE_KEEP_FRACTION = 0.7
 
 
 def _now() -> str:
@@ -182,6 +206,7 @@ def evaluate_candidate(
     synthetic_paths: int = 20,
     full: bool = True,
     data_as_of: Optional[str] = None,
+    trials: int = 1,
 ) -> tuple[Optional[ForecastModel], PromotionRecord]:
     """Train a candidate and build the whole case for or against it.
 
@@ -189,9 +214,14 @@ def evaluate_candidate(
     gates block it, because a blocked candidate is still worth inspecting — but
     `promote` will refuse to install it, which is the separation that matters.
 
-    Set `full=False` to skip synthetic panels and cost stress. That is for a fast
-    development loop only: both are gated, and a skipped gate fails, so a
-    `full=False` evaluation can never promote.
+    `trials` is how many configurations have been evaluated in total, including
+    this one — the ledger's count. The deflated Sharpe discounts by it, and
+    under-reporting it is the most common way a backtest passes a significance
+    test it should fail.
+
+    Set `full=False` to skip the synthetic panels, cost stress, parameter surface
+    and PBO. That is for a fast development loop only: all four are gated, and a
+    skipped gate fails, so a `full=False` evaluation can never promote.
     """
     from core.backtest import walk_forward_backtest
 
@@ -228,45 +258,97 @@ def evaluate_candidate(
         max_exit_participation=result.max_exit_participation,
     )
 
+    def period_sharpes_of(outcome, periods) -> list[float]:
+        """Sharpe per walk-forward period. Each is an independent OOS stretch."""
+        out: list[float] = []
+        for start, end in periods:
+            window = outcome.equity_curve.loc[
+                (outcome.equity_curve.index >= start) & (outcome.equity_curve.index <= end)
+            ]
+            out.append(sharpe_ratio(window.pct_change().dropna()) if len(window) > 2 else 0.0)
+        return out
+
+    def run_with(candidate_config: Config, bars=None):
+        outcome, produced = walk_forward_backtest(
+            dataset.features, dataset.targets,
+            bars_by_symbol=bars if bars is not None else dataset.bars,
+            funding_by_symbol=dataset.funding,
+            config=candidate_config, profiles=dataset.profiles,
+            n_periods=n_periods, initial_equity=initial_equity,
+            spread_bps=spread_bps, horizon_bars=dataset.horizon_bars,
+        )
+        return outcome, produced
+
     if result.trades:
         returns = result.trades_frame()['net_return'].to_numpy()
         report.bootstrap = bootstrap_trades(returns, n_resamples=BOOTSTRAP_RESAMPLES)
 
-        # Each walk-forward period is an independent out-of-sample stretch, so the
-        # spread of their Sharpes stands in for the CPCV path distribution.
-        period_sharpes = []
-        for start, end in generated.periods:
-            window = result.equity_curve.loc[
-                (result.equity_curve.index >= start) & (result.equity_curve.index <= end)
-            ]
-            if len(window) > 2:
-                period_sharpes.append(sharpe_ratio(window.pct_change().dropna()))
-        if period_sharpes:
-            report.cpcv = summarise_paths(period_sharpes)
+        centre_paths = period_sharpes_of(result, generated.periods)
+        if centre_paths:
+            report.cpcv = summarise_paths(centre_paths)
+
+        # The deflated Sharpe needs the number of configurations tried, not the
+        # number kept. `trials` is the ledger's count, which is why rejections are
+        # never deleted: under-reporting it is the most common way a backtest
+        # passes a significance test it should fail.
+        significance = deflated_sharpe(
+            sharpe=result.sharpe,
+            observations=max(len(centre_paths), result.n_trades, 1),
+            trials=max(int(trials), 1),
+        )
+        # `statistic` is the z-score of the observed Sharpe against the expected
+        # best of `trials` worthless strategies. Positive means it beat that
+        # benchmark, which is what the gate's `>= 0` threshold asks.
+        report.deflated_sharpe = (
+            significance.statistic if significance.valid else None
+        )
 
         if full:
-            def run_with(candidate_config: Config) -> float:
-                outcome, _ = walk_forward_backtest(
-                    dataset.features, dataset.targets,
-                    bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
-                    config=candidate_config, profiles=dataset.profiles,
-                    n_periods=n_periods, initial_equity=initial_equity,
-                    spread_bps=spread_bps, horizon_bars=dataset.horizon_bars,
-                )
-                return outcome.sharpe
+            report.stress = cost_stress(lambda cfg: run_with(cfg)[0].sharpe, config)
 
-            report.stress = cost_stress(run_with, config)
+            # Perturbing the thresholds `decide()` actually uses gives two gates
+            # from one set of runs: the surface's retention, and a
+            # (candidates x splits) matrix for PBO. A real edge is insensitive to
+            # small parameter changes because it comes from something about the
+            # market; an overfit sits on a spike because it comes from something
+            # about the sample.
+            centre_parameters = {
+                name: float(getattr(config, name)) for name in SURFACE_PARAMETERS
+            }
+            surface_scores: dict[str, float] = {}
+            score_matrix: list[list[float]] = [centre_paths]
+
+            for name, value in centre_parameters.items():
+                for factor, label in ((1 + SURFACE_STEP, 'up'), (1 - SURFACE_STEP, 'down')):
+                    candidate = replace(config, **{name: type(value)(value * factor)})
+                    outcome, produced = run_with(candidate)
+                    surface_scores[f'{name}_{label}'] = outcome.sharpe
+                    paths = period_sharpes_of(outcome, produced.periods)
+                    if len(paths) == len(centre_paths):
+                        score_matrix.append(paths)
+
+            kept = sum(
+                1 for score in surface_scores.values()
+                if score >= SURFACE_KEEP_FRACTION * result.sharpe
+            )
+            report.surface = SurfaceResult(
+                centre=result.sharpe,
+                neighbours=surface_scores,
+                # Retention is meaningless when the centre itself loses money:
+                # "neighbours at least 70% as good as a negative Sharpe" would
+                # reward being uniformly bad. Report zero instead.
+                retention=(kept / len(surface_scores))
+                if surface_scores and result.sharpe > 0 else 0.0,
+            )
+
+            if len(score_matrix) >= 2 and len(centre_paths) >= 2:
+                report.pbo = probability_of_backtest_overfitting(
+                    np.asarray(score_matrix, dtype=float)
+                ).pbo
 
             synthetic_sharpes = []
             for seed in range(synthetic_paths):
-                outcome, _ = walk_forward_backtest(
-                    dataset.features, dataset.targets,
-                    bars_by_symbol=synthetic_panel(dataset.bars, seed=seed),
-                    funding_by_symbol=dataset.funding,
-                    config=config, profiles=dataset.profiles,
-                    n_periods=n_periods, initial_equity=initial_equity,
-                    spread_bps=spread_bps, horizon_bars=dataset.horizon_bars,
-                )
+                outcome, _ = run_with(config, bars=synthetic_panel(dataset.bars, seed=seed))
                 synthetic_sharpes.append(outcome.sharpe)
             report.synthetic = summarise_paths(synthetic_sharpes)
 

@@ -1,137 +1,166 @@
 import { ModelCoinInfo, ModelStatusData } from '../types';
 
-const STATUS_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
-  active:       { label: 'Active',        dot: 'bg-accent-emerald', text: 'text-accent-emerald' },
-  gate_rejected:{ label: 'Gate Rejected', dot: 'bg-amber-400',      text: 'text-amber-400' },
-  stale:        { label: 'Stale',         dot: 'bg-amber-400',      text: 'text-amber-400' },
-  auc_rejected: { label: 'AUC Rejected',  dot: 'bg-accent-rose',    text: 'text-accent-rose' },
-};
+/**
+ * Per-instrument model state, from the most recent signal each one produced.
+ *
+ * The AUC column is gone: it was a classification metric on a model that
+ * regresses net return, so it read "AUC —" on every row. What each instrument
+ * has instead is the edge the model forecast and the round trip that edge has to
+ * clear, which is the pair that decides whether a trade happens.
+ *
+ * The layout is a grid rather than a flex row with fixed widths. The old one
+ * pinned a `w-20` time column beside a `flex-1` reason and let both overflow, so
+ * "volatility regime" and "3.1h ago" printed on top of each other.
+ */
 
-function fmtRelTime(isoStr: string | null): string {
-  if (!isoStr) return '—';
-  const diff = (Date.now() - new Date(isoStr).getTime()) / 1000;
-  if (diff < 90) return 'just now';
-  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-  if (diff < 86400) return `${(diff / 3600).toFixed(1)}h ago`;
-  return `${Math.round(diff / 86400)}d ago`;
+const STATUS = {
+  active: { label: 'Active', dot: 'bg-accent-emerald', text: 'text-accent-emerald' },
+  gate_rejected: { label: 'Blocked', dot: 'bg-accent-amber', text: 'text-accent-amber' },
+  stale: { label: 'Stale', dot: 'bg-accent-amber', text: 'text-accent-amber' },
+  no_signal: { label: 'No signal', dot: 'bg-tx-muted', text: 'text-tx-muted' },
+} as const;
+
+function relative(iso: string | null): string {
+  if (!iso) return '—';
+  const seconds = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (seconds < 90) return 'now';
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`;
+  return `${Math.round(seconds / 86400)}d`;
 }
 
-function fmtAbsTime(isoStr: string | null): string {
-  if (!isoStr) return '—';
-  const d = new Date(isoStr);
-  return d.toLocaleString('en-US', {
-    month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit', timeZone: 'UTC', timeZoneName: 'short',
+function absolute(iso: string | null): string {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString('en-GB', {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    timeZone: 'UTC', hour12: false,
   });
 }
 
-function timeUntil(isoStr: string | null): string {
-  if (!isoStr) return '—';
-  const diff = (new Date(isoStr).getTime() - Date.now()) / 1000;
-  if (diff <= 0) return 'due now';
-  const h = Math.floor(diff / 3600);
-  const d = Math.floor(h / 24);
-  if (d >= 1) return `in ${d}d ${h % 24}h`;
-  return `in ${h}h ${Math.floor((diff % 3600) / 60)}m`;
+function until(iso: string | null): string {
+  if (!iso) return '—';
+  const seconds = (new Date(iso).getTime() - Date.now()) / 1000;
+  if (seconds <= 0) return 'due now';
+  const hours = Math.floor(seconds / 3600);
+  const days = Math.floor(hours / 24);
+  return days >= 1 ? `in ${days}d ${hours % 24}h` : `in ${hours}h`;
 }
 
 function CoinRow({ c }: { c: ModelCoinInfo }) {
-  const cfg = STATUS_CONFIG[c.status] ?? STATUS_CONFIG.stale;
-  const gateLabel = c.gate_failure_reason
-    ? c.gate_failure_reason.replace(/_/g, ' ')
-    : c.status === 'auc_rejected' ? 'no signal written' : null;
+  const style = STATUS[c.status] ?? STATUS.no_signal;
+  const detail = c.gate_failure_reason?.replace(/_/g, ' ') ?? null;
+  const net = c.expected_net_bps;
 
   return (
-    <div className="flex items-center gap-3 py-2 border-b border-[rgba(56,189,248,0.06)] last:border-0">
-      {/* Coin */}
-      <span className="font-mono text-xs font-semibold text-tx-primary w-12 flex-shrink-0">{c.coin}</span>
+    <div className="grid grid-cols-[2.6rem_1fr_4.2rem_2.4rem] items-center gap-2 border-b border-[rgba(56,189,248,0.06)] py-2 last:border-0">
+      <span className="font-mono text-xs font-semibold text-tx-primary">{c.coin}</span>
 
-      {/* Status badge */}
-      <div className="flex items-center gap-1.5 w-28 flex-shrink-0">
-        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${cfg.dot} ${c.status === 'active' ? 'animate-pulse' : ''}`} />
-        <span className={`text-[10px] font-medium ${cfg.text}`}>{cfg.label}</span>
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span
+            className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${style.dot} ${
+              c.status === 'active' ? 'animate-pulse' : ''
+            }`}
+            aria-hidden
+          />
+          <span className={`text-[10px] font-medium ${style.text}`}>{style.label}</span>
+        </div>
+        {detail && (
+          <div className="truncate font-mono text-[10px] text-tx-muted" title={detail}>
+            {detail}
+          </div>
+        )}
       </div>
 
-      {/* AUC */}
-      <span className="font-mono text-xs text-tx-muted w-16 flex-shrink-0">
-        {c.model_auc != null ? `AUC ${c.model_auc.toFixed(3)}` : 'AUC —'}
-      </span>
-
-      {/* Gate failure / last signal */}
-      <div className="flex-1 min-w-0">
-        {gateLabel ? (
-          <span className="text-[10px] text-tx-muted font-mono truncate">{gateLabel}</span>
-        ) : null}
+      {/* Net edge against the cost it has to clear. Shown together because a
+          +12bp forecast is a trade on DOGE at 5bp and a loss on ETH at 54bp. */}
+      <div className="text-right">
+        <div
+          className={`font-mono text-[11px] tabular-nums ${
+            net === null ? 'text-tx-muted' : net > 0 ? 'text-accent-emerald' : 'text-accent-rose'
+          }`}
+        >
+          {net === null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(1)}`}
+        </div>
+        <div className="font-mono text-[9px] text-tx-muted tabular-nums">
+          {c.cost_bps === null ? '' : `/ ${c.cost_bps.toFixed(1)}bp`}
+        </div>
       </div>
 
-      {/* Time */}
-      <span className="text-[10px] font-mono text-tx-muted flex-shrink-0 text-right w-20">
-        {fmtRelTime(c.last_signal_at)}
+      <span className="text-right font-mono text-[10px] text-tx-muted tabular-nums">
+        {relative(c.last_signal_at)}
       </span>
     </div>
   );
 }
 
-interface Props {
-  data: ModelStatusData | null;
-}
-
-export default function ModelStatusPanel({ data }: Props) {
-  if (!data) {
-    return (
-      <div className="glass-card rounded-xl p-5">
-        <div className="text-tx-secondary text-xs font-medium tracking-widest uppercase mb-4">ML Model Status</div>
-        <div className="text-tx-muted text-xs">Loading…</div>
-      </div>
-    );
-  }
-
+export default function ModelStatusPanel({ data }: { data: ModelStatusData }) {
   const retrain = data.last_retrain;
-  const retrainStatusColor = !retrain ? 'text-tx-muted'
-    : retrain.status === 'success' ? 'text-accent-emerald'
-    : 'text-accent-rose';
+  const tone = !retrain
+    ? 'text-tx-muted'
+    : retrain.status === 'success'
+      ? 'text-accent-emerald'
+      : 'text-accent-rose';
 
   return (
     <div className="glass-card rounded-xl p-5">
-      <div className="flex items-center justify-between mb-4">
-        <span className="text-tx-secondary text-xs font-medium tracking-widest uppercase">ML Model Status</span>
-        <span className="text-tx-muted text-[10px] font-mono">inference mode · retrain every {data.retrain_every_days}d</span>
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <span className="text-xs font-medium uppercase tracking-widest text-tx-secondary">
+          Signal status
+        </span>
+        <span className="font-mono text-[10px] text-tx-muted">
+          retrain every {data.retrain_every_days}d
+        </span>
       </div>
+      <p className="mb-3 text-[10px] leading-snug text-tx-muted">
+        Latest signal per instrument: expected net edge over the round trip it has
+        to clear.
+      </p>
 
-      {/* Per-coin rows */}
       {data.coins.length === 0 ? (
-        <div className="text-tx-muted text-xs">No active coins configured.</div>
+        <div className="py-6 text-center text-xs text-tx-muted">
+          No active instruments configured.
+        </div>
       ) : (
         <div className="mb-4">
-          {data.coins.map(c => <CoinRow key={c.coin} c={c} />)}
+          {data.coins.map((c) => (
+            <CoinRow key={c.coin} c={c} />
+          ))}
         </div>
       )}
 
-      {/* Retrain info footer */}
-      <div className="pt-3 border-t border-[rgba(56,189,248,0.08)] grid grid-cols-2 gap-x-4 gap-y-1">
-        <div>
-          <div className="text-tx-muted text-[9px] tracking-widest uppercase mb-0.5">Last Retrain</div>
-          <div className={`text-[10px] font-mono ${retrainStatusColor}`}>
-            {retrain ? `${retrain.status} · ${retrain.symbols_trained}/${retrain.symbols_total} coins` : '—'}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-[rgba(56,189,248,0.08)] pt-3">
+        <div className="min-w-0">
+          <div className="mb-0.5 text-[9px] uppercase tracking-widest text-tx-muted">
+            Last retrain
           </div>
-          {retrain?.started_at && (
-            <div className="text-tx-muted text-[9px] font-mono">{fmtAbsTime(retrain.started_at)}</div>
-          )}
+          <div className={`font-mono text-[10px] ${tone}`}>
+            {retrain
+              ? `${retrain.status} · ${retrain.symbols_trained}/${retrain.symbols_total}`
+              : '—'}
+          </div>
+          <div className="font-mono text-[9px] text-tx-muted">
+            {absolute(retrain?.started_at ?? null)}
+          </div>
           {retrain?.error && (
-            <div className="text-accent-rose text-[9px] font-mono truncate mt-0.5" title={retrain.error}>
-              {retrain.error.slice(0, 60)}…
+            <div
+              className="mt-0.5 truncate font-mono text-[9px] text-accent-rose"
+              title={retrain.error}
+            >
+              {retrain.error}
             </div>
           )}
         </div>
-        <div>
-          <div className="text-tx-muted text-[9px] tracking-widest uppercase mb-0.5">Next Retrain</div>
-          <div className="text-tx-primary text-[10px] font-mono">{timeUntil(data.next_retrain_at)}</div>
-          {data.next_retrain_at && (
-            <div className="text-tx-muted text-[9px] font-mono">{fmtAbsTime(data.next_retrain_at)}</div>
-          )}
-          {!data.next_retrain_at && (
-            <div className="text-amber-400 text-[9px] font-mono">no successful retrain yet</div>
-          )}
+        <div className="min-w-0">
+          <div className="mb-0.5 text-[9px] uppercase tracking-widest text-tx-muted">
+            Next retrain
+          </div>
+          <div className="font-mono text-[10px] text-tx-primary">
+            {until(data.next_retrain_at)}
+          </div>
+          <div className="font-mono text-[9px] text-tx-muted">
+            {data.next_retrain_at ? absolute(data.next_retrain_at) : 'no successful retrain yet'}
+          </div>
         </div>
       </div>
     </div>

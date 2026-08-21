@@ -142,9 +142,16 @@ export interface PaperPosition {
   realized_pnl: number;
   unrealized_pnl: number;
   fees_paid: number;
+  /** Funding accrued so far. On hourly-funding perps a long hold can pay more in
+   *  funding than in commission, so it is reported separately from fees. */
+  funding_paid: number;
   opened_at: string;
   updated_at: string | null;
   is_open: boolean;
+  tp_price?: number | null;
+  sl_price?: number | null;
+  max_hold_until?: string | null;
+  exit_reason?: string | null;
 }
 
 export interface PaperEquityPoint {
@@ -450,12 +457,15 @@ export interface ResearchJobLogResponse {
   logs: string[];
 }
 
-export type ModelCoinStatus = 'active' | 'gate_rejected' | 'stale' | 'auc_rejected';
+export type ModelCoinStatus = 'active' | 'gate_rejected' | 'stale' | 'no_signal';
 
 export interface ModelCoinInfo {
   coin: string;
   last_signal_at: string | null;
-  model_auc: number | null;
+  /** The forecast and the round trip it has to clear. `model_auc` used to be
+   *  here and is null on every row the current signal writer creates. */
+  expected_net_bps: number | null;
+  cost_bps: number | null;
   gate_failure_reason: string | null;
   passed_gates: boolean;
   status: ModelCoinStatus;

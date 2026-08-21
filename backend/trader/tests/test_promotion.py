@@ -286,3 +286,66 @@ def test_a_missing_cost_config_does_not_silently_pass(tmp_path):
     from core.config import find_cost_config
 
     assert find_cost_config('no_such_venue_v1999.json') is None
+
+
+def test_a_full_evaluation_measures_every_gate(config):
+    """No gate may be structurally unmeasurable, or nothing can ever promote.
+
+    `pbo`, `deflated_sharpe` and `parameter_plateau` were in `DEFAULT_GATES` but
+    nothing computed them, so every candidate came back with three gates reading
+    "not measured" — which fails by design. The effect was that `--force` was the
+    only route to live, which defeats the entire point of having gates.
+
+    This does not check that the values are *good* — on synthetic data they should
+    not be. It checks that they are numbers.
+    """
+    from core.dataset import Dataset
+    from core.metrics import DEFAULT_GATES
+    from core.promotion import evaluate_candidate
+    from tests.test_backtest import _features_targets
+
+    features, targets, bars_by, funding_by, profiles = _features_targets(
+        config, 3, drift=0.0004, funding_mean=2e-5
+    )
+    dataset = Dataset(
+        features=features, targets=targets, bars=bars_by, funding=funding_by,
+        profiles=profiles, venue='synthetic', reference_venue=None,
+        as_of=None, horizon_bars=48,
+    )
+
+    _, record = evaluate_candidate(
+        dataset, config, n_periods=3, full=True, synthetic_paths=2, trials=4,
+    )
+
+    unmeasured = [
+        name for name, value in record.measurements.items() if value is None
+    ]
+    assert not unmeasured, (
+        f'gates with no measurement, which fail by construction: {unmeasured}. '
+        f'A gate nothing computes makes --force the only route to live.'
+    )
+    assert set(record.measurements) == set(DEFAULT_GATES), (
+        'the report and the gate table describe different sets'
+    )
+
+
+def test_a_quick_evaluation_cannot_promote(config):
+    """`--quick` skips the slow simulations, and a skipped gate must fail."""
+    from core.dataset import Dataset
+    from core.promotion import evaluate_candidate
+    from tests.test_backtest import _features_targets
+
+    features, targets, bars_by, funding_by, profiles = _features_targets(
+        config, 3, drift=0.0004, funding_mean=2e-5
+    )
+    dataset = Dataset(
+        features=features, targets=targets, bars=bars_by, funding=funding_by,
+        profiles=profiles, venue='synthetic', reference_venue=None,
+        as_of=None, horizon_bars=48,
+    )
+
+    _, record = evaluate_candidate(dataset, config, n_periods=3, full=False, trials=2)
+
+    assert not record.promoted
+    assert 'synthetic_positive_fraction' in record.failed_gates
+    assert 'parameter_plateau' in record.failed_gates

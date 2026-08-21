@@ -147,3 +147,7 @@ backend/trader/data/research/
 
 # Vite/tsc build cache
 *.tsbuildinfo
+
+# Node dependencies and the Vite dev-server cache
+node_modules/
+.vite/

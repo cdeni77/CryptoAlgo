@@ -17,19 +17,25 @@ import { Signal } from '../types';
 interface Props {
   signals: Signal[];
   limit?: number;
+  /** Drop the price/carry split. Nine columns in a third-width card clipped the
+   *  result column, which is the one that says whether anything was traded. */
+  compact?: boolean;
 }
 
 const bps = (v: number | null) => (v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}`);
 
-export default function SignalsTable({ signals, limit = 20 }: Props) {
+export default function SignalsTable({ signals, limit = 20, compact = false }: Props) {
   const rows = signals.slice(0, limit);
+  const headers = compact
+    ? ['Time', 'Coin', 'Dir', 'Net', 'Cost', 'Result']
+    : ['Time', 'Coin', 'Dir', 'Net', 'Price', 'Carry', 'Cost', 'E/R', 'Result'];
 
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-xs">
         <thead>
           <tr className="border-b border-[rgba(56,189,248,0.08)]">
-            {['Time', 'Coin', 'Dir', 'Net', 'Price', 'Carry', 'Cost', 'E/R', 'Result'].map((h) => (
+            {headers.map((h) => (
               <th
                 key={h}
                 className="px-2 py-2 text-left text-[10px] font-medium uppercase tracking-wider text-tx-muted"
@@ -42,7 +48,7 @@ export default function SignalsTable({ signals, limit = 20 }: Props) {
         <tbody>
           {rows.length === 0 && (
             <tr>
-              <td colSpan={9} className="px-2 py-6 text-center text-tx-muted">
+              <td colSpan={headers.length} className="px-2 py-6 text-center text-tx-muted">
                 No signals yet
               </td>
             </tr>
@@ -80,18 +86,24 @@ export default function SignalsTable({ signals, limit = 20 }: Props) {
               >
                 {bps(s.expected_net_bps)}
               </td>
-              <td className="px-2 py-1.5 font-mono text-tx-muted tabular-nums">
-                {bps(s.expected_price_bps)}
-              </td>
-              <td className="px-2 py-1.5 font-mono text-tx-muted tabular-nums">
-                {bps(s.expected_carry_bps)}
-              </td>
+              {!compact && (
+                <>
+                  <td className="px-2 py-1.5 font-mono text-tx-muted tabular-nums">
+                    {bps(s.expected_price_bps)}
+                  </td>
+                  <td className="px-2 py-1.5 font-mono text-tx-muted tabular-nums">
+                    {bps(s.expected_carry_bps)}
+                  </td>
+                </>
+              )}
               <td className="px-2 py-1.5 font-mono text-tx-muted tabular-nums">
                 {s.cost_bps === null ? '—' : s.cost_bps.toFixed(1)}
               </td>
-              <td className="px-2 py-1.5 font-mono text-tx-secondary tabular-nums">
-                {s.edge_to_risk === null ? '—' : s.edge_to_risk.toFixed(2)}
-              </td>
+              {!compact && (
+                <td className="px-2 py-1.5 font-mono text-tx-secondary tabular-nums">
+                  {s.edge_to_risk === null ? '—' : s.edge_to_risk.toFixed(2)}
+                </td>
+              )}
               <td className="px-2 py-1.5">
                 {s.passed_gates ? (
                   <span className="text-[10px] text-accent-cyan">

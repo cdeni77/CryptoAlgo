@@ -234,7 +234,13 @@ export default function DashboardPage() {
             emptyMessage="Nothing open."
             loadingLabel="Loading positions"
           >
-            {(rows) => <PaperPositionsTable positions={rows} prices={prices ?? null} />}
+            {(rows) => (
+              <PaperPositionsTable
+                positions={rows}
+                prices={prices ?? null}
+                unitsFor={specs.data ? unitsFor : undefined}
+              />
+            )}
           </Panel>
         </div>
       </div>
@@ -309,7 +315,7 @@ export default function DashboardPage() {
             emptyHint="Run scripts.signals after building the feature panel."
             loadingLabel="Loading signals"
           >
-            {() => <SignalsTable signals={shownSignals} limit={15} />}
+            {() => <SignalsTable signals={shownSignals} limit={15} compact />}
           </Panel>
         </div>
 

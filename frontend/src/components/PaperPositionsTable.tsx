@@ -1,76 +1,93 @@
 import { PaperPosition, PriceData } from '../types';
 
-// Must match trading_costs.py CONTRACT_SPECS
-const UNITS: Record<string, number> = {
-  BTC: 0.01, ETH: 0.10, SOL: 5, XRP: 500, DOGE: 5000,
-  AVAX: 10, ADA: 1000, LINK: 50, LTC: 5,
-};
+/**
+ * Open positions, marked to the live price where there is one.
+ *
+ * Two things changed. The contract-size table that used to live here carried a
+ * comment reading "Must match trading_costs.py" — a file that has since been
+ * deleted, so nothing was checking the claim, and contract size multiplies
+ * straight into unrealised PnL. It now comes from the caller, which reads
+ * `/coins/cde-specs`.
+ *
+ * And the layout is a compact row rather than an eight-column table. This panel
+ * sits in a third-width card, where eight columns silently clipped the unrealised
+ * PnL — the one number the panel exists to show.
+ */
 
-function fmt(v: number) {
-  return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
+const money = (v: number, digits = 2) =>
+  v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 
 interface Props {
   positions: PaperPosition[];
   prices?: PriceData | null;
+  /** Contract size per instrument. Defaults to 1 when the specs have not loaded,
+   *  which shows the stored mark rather than a wrong live one. */
+  unitsFor?: (coin: string) => number;
 }
 
-export default function PaperPositionsTable({ positions, prices }: Props) {
-  const open = positions.filter(p => p.is_open);
+export default function PaperPositionsTable({ positions, prices, unitsFor }: Props) {
+  const open = positions.filter((p) => p.is_open);
 
   if (!open.length) {
-    return <div className="px-4 py-8 text-center text-tx-muted text-sm">No open positions</div>;
+    return <div className="px-4 py-8 text-center text-sm text-tx-muted">No open positions</div>;
   }
 
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="border-b border-[rgba(56,189,248,0.08)]">
-            {['Coin', 'Side', 'Qty', 'Entry', 'Mark', 'Unrealized', 'Fees', 'Opened'].map(h => (
-              <th key={h} className="text-left px-3 py-2 text-tx-muted font-medium tracking-wider uppercase text-[10px]">{h}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {open.map(p => {
-            const livePrice = prices?.[p.coin as keyof typeof prices]?.price ?? null;
-            const units = UNITS[p.coin.toUpperCase()] ?? 1;
-            const sign = p.side === 'long' ? 1 : -1;
-            const liveUnrealized = livePrice != null
-              ? p.contracts * units * (livePrice - p.entry_price) * sign
-              : p.unrealized_pnl;
-            const markDisplay = livePrice ?? p.mark_price;
-            const isLive = livePrice != null;
+    <div className="space-y-2">
+      {open.map((p) => {
+        const live = prices?.[p.coin as keyof typeof prices]?.price ?? null;
+        const units = unitsFor?.(p.coin) ?? 1;
+        const sign = p.side === 'long' ? 1 : -1;
+        const unrealised =
+          live != null && unitsFor
+            ? p.contracts * units * (live - p.entry_price) * sign
+            : p.unrealized_pnl;
+        const mark = live ?? p.mark_price;
 
-            return (
-              <tr key={p.id} className="border-b border-[rgba(56,189,248,0.04)] hover:bg-[rgba(56,189,248,0.03)]">
-                <td className="px-3 py-2.5 font-medium text-tx-primary">{p.coin}</td>
-                <td className="px-3 py-2.5">
-                  <span className={`font-mono text-[11px] font-semibold px-1.5 py-0.5 rounded ${
-                    p.side === 'long' ? 'text-accent-emerald bg-accent-emerald/10' : 'text-accent-rose bg-accent-rose/10'
-                  }`}>
-                    {p.side.toUpperCase()}
-                  </span>
-                </td>
-                <td className="px-3 py-2.5 font-mono text-tx-secondary">{p.contracts}</td>
-                <td className="px-3 py-2.5 font-mono text-tx-secondary">${fmt(p.entry_price)}</td>
-                <td className="px-3 py-2.5 font-mono text-tx-secondary">
-                  ${fmt(markDisplay)}
-                  {isLive && <span className="ml-1 text-[9px] text-accent-cyan opacity-60">live</span>}
-                </td>
-                <td className={`px-3 py-2.5 font-mono font-semibold ${liveUnrealized >= 0 ? 'text-accent-emerald' : 'text-accent-rose'}`}>
-                  {liveUnrealized >= 0 ? '+' : ''}${fmt(liveUnrealized)}
-                </td>
-                <td className="px-3 py-2.5 font-mono text-tx-muted">${fmt(p.fees_paid)}</td>
-                <td className="px-3 py-2.5 font-mono text-tx-muted whitespace-nowrap">
-                  {new Date(p.opened_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+        return (
+          <div
+            key={p.id}
+            className="rounded-lg border border-[rgba(56,189,248,0.08)] bg-surface-2/40 px-3 py-2.5"
+          >
+            <div className="flex items-baseline justify-between gap-2">
+              <div className="flex items-baseline gap-2">
+                <span className="text-sm font-semibold text-tx-primary">{p.coin}</span>
+                <span
+                  className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+                    p.side === 'long'
+                      ? 'bg-accent-emerald/10 text-accent-emerald'
+                      : 'bg-accent-rose/10 text-accent-rose'
+                  }`}
+                >
+                  {p.side.toUpperCase()}
+                </span>
+                <span className="font-mono text-[11px] text-tx-muted">{p.contracts}c</span>
+              </div>
+              <span
+                className={`font-mono text-sm font-semibold tabular-nums ${
+                  unrealised >= 0 ? 'text-accent-emerald' : 'text-accent-rose'
+                }`}
+              >
+                {unrealised >= 0 ? '+' : '-'}${money(Math.abs(unrealised))}
+              </span>
+            </div>
+
+            <div className="mt-1.5 flex items-baseline justify-between gap-2 font-mono text-[10px] text-tx-muted tabular-nums">
+              <span>
+                {money(p.entry_price, p.entry_price > 100 ? 2 : 4)}
+                <span className="mx-1 opacity-50">→</span>
+                {money(mark, mark > 100 ? 2 : 4)}
+                {live != null && <span className="ml-1 text-accent-cyan opacity-70">live</span>}
+              </span>
+              {/* Fees and funding kept apart: on hourly-funding perps, a long
+                  hold can pay more in funding than in commission. */}
+              <span>
+                fee ${money(p.fees_paid)} · fund ${money(p.funding_paid ?? 0)}
+              </span>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

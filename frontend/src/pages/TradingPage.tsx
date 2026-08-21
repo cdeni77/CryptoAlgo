@@ -120,7 +120,7 @@ export default function TradingPage() {
         {/* Price display. A missing price used to render as nothing at all, so a
             dead price feed and a market with no quote looked the same. */}
         {!coinPrice && priceState.error && (
-          <div className="ml-auto max-w-md">
+          <div className="ml-auto min-w-0 max-w-sm">
             <ErrorBlock error={priceState.error} onRetry={priceState.refresh} compact />
           </div>
         )}
@@ -190,12 +190,20 @@ export default function TradingPage() {
               <Freshness lastUpdated={history.lastUpdated} refreshing />
             </div>
           )}
-          {history.error && bars.length === 0 ? (
-            <ErrorBlock error={history.error} onRetry={history.refresh} />
-          ) : history.loading && bars.length === 0 ? (
-            <Spinner label={`Loading ${coin} history`} />
-          ) : bars.length === 0 ? (
-            <Empty message={`No ${range} history for ${coin}.`} />
+          {bars.length === 0 ? (
+            // Centred rather than pinned to the top: a chart's worth of empty
+            // space below a one-line message reads as a half-loaded page.
+            <div className="flex h-full items-center justify-center px-6">
+              <div className="w-full max-w-2xl">
+                {history.error ? (
+                  <ErrorBlock error={history.error} onRetry={history.refresh} />
+                ) : history.loading ? (
+                  <Spinner label={`Loading ${coin} history`} />
+                ) : (
+                  <Empty message={`No ${range} history for ${coin}.`} />
+                )}
+              </div>
+            </div>
           ) : (
             <PriceChart data={bars} fills={coinFills} coin={coin} mode={chartMode} />
           )}

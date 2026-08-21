@@ -84,14 +84,17 @@ def model_status(db: Session = Depends(get_db)) -> Dict[str, Any]:
     for coin in active_coins:
         sig = latest_by_coin.get(coin)
         if sig is None:
-            # No signal in the last 48h — most likely AUC rejection prevented writing
+            # No signal at all in the window. Previously labelled "auc_rejected",
+            # which named a classifier threshold the model no longer has; the
+            # honest status is that nothing was written.
             coins.append({
                 "coin": coin,
                 "last_signal_at": None,
-                "model_auc": None,
+                "expected_net_bps": None,
+                "cost_bps": None,
                 "gate_failure_reason": None,
                 "passed_gates": False,
-                "status": "auc_rejected",
+                "status": "no_signal",
                 "hours_since_signal": None,
             })
         else:
@@ -108,7 +111,11 @@ def model_status(db: Session = Depends(get_db)) -> Dict[str, Any]:
             coins.append({
                 "coin": coin,
                 "last_signal_at": ts.isoformat(),
-                "model_auc": sig.model_auc,
+                # The forecast and the hurdle it has to clear, which is what the
+                # model actually produces. `model_auc` was here, and it is null
+                # for every row the current signal writer creates.
+                "expected_net_bps": sig.expected_net_bps,
+                "cost_bps": sig.cost_bps,
                 "gate_failure_reason": sig.gate_failure_reason,
                 "passed_gates": bool(sig.passed_gates),
                 "status": status,

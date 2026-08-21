@@ -318,9 +318,26 @@ def get_feature_importance(head: str = 'price') -> FeatureImportanceResponse:
             unavailable_reason=f'no "{head}" head on this model (heads: {available})',
         )
 
+    # The heads are LightGBM's sklearn estimators (`LGBMRegressor`), whose
+    # attributes are `feature_importances_` and `feature_name_`. The Booster API
+    # — `feature_importance(importance_type=...)` — is a different object, and
+    # calling it here produced "no attribute 'feature_importance'" on every
+    # request. Both are handled, because either can end up in a saved artifact.
     try:
-        gains = booster.feature_importance(importance_type='gain')
-        names = list(booster.feature_name())
+        if hasattr(booster, 'feature_importances_'):
+            gains = list(booster.feature_importances_)
+            names = list(
+                getattr(booster, 'feature_name_', None)
+                or getattr(booster, 'feature_names_in_', None)
+                or [f'f{i}' for i in range(len(gains))]
+            )
+        elif hasattr(booster, 'booster_'):
+            inner = booster.booster_
+            gains = list(inner.feature_importance(importance_type='gain'))
+            names = list(inner.feature_name())
+        else:
+            gains = list(booster.feature_importance(importance_type='gain'))
+            names = list(booster.feature_name())
     except Exception as exc:  # noqa: BLE001
         return FeatureImportanceResponse(
             generated_at=generated_at, version=version,
