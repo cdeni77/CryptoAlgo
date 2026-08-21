@@ -269,6 +269,25 @@ export default function TradingPage() {
                 ))}
               </div>
             )}
+            {/* A section that answered zero says zero. Only one that never
+                answered stays silent — otherwise an empty futures account and a
+                broken futures call look identical, which is the whole failure
+                mode this panel keeps reproducing. */}
+            {measured.length > 0 && (
+              <div className="mb-4 space-y-1">
+                {([
+                  ['Coinbase spot', spotVal],
+                  ['Coinbase perps', perpsVal],
+                  ['Ledger', ledgerVal],
+                ] as const)
+                  .filter(([, v]) => v === 0)
+                  .map(([label]) => (
+                    <div key={label} className="text-tx-muted text-xs">
+                      {label} reported no holdings.
+                    </div>
+                  ))}
+              </div>
+            )}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               {spotVal !== null && spotVal > 0 && (
                 <div>
@@ -300,11 +319,6 @@ export default function TradingPage() {
                       </span>
                     </div>
                   ))}
-                </div>
-              )}
-              {spotVal === 0 && (
-                <div className="text-tx-muted text-xs">
-                  Coinbase spot reported no holdings.
                 </div>
               )}
               {ledgerVal !== null && ledgerVal > 0 && (
