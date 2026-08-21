@@ -114,7 +114,8 @@ Persistent volumes: `postgres_data`, `trader_data`, `trader_models`, `trader_log
 | `EXCLUDE_SYMBOLS`           | `BIP,DOP`               | trader    |
 | `CYCLE_INTERVAL_SECONDS`    | `3600`                  | trader    |
 | `INCREMENTAL_BACKFILL_HOURS`| `6`                     | trader    |
-| `TRAIN_WINDOW_DAYS`         | `90`                    | trader    |
+| `TRAIN_WINDOW_DAYS`         | `0` (all history)       | trader    |
+| `RECENCY_HALF_LIFE_DAYS`    | unset (`Config`: `50`)  | trader    |
 | `RETRAIN_EVERY_DAYS`        | `7`                     | trader    |
 | `FEATURE_LOOKBACK_DAYS`     | `2190`                  | trader    |
 | `VITE_API_BASE_URL`         | `http://localhost:8000` | frontend  |

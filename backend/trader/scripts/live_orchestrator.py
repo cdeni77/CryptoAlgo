@@ -286,6 +286,20 @@ def _data_arguments(args: argparse.Namespace) -> list[str]:
     return flags
 
 
+def _training_arguments(args: argparse.Namespace) -> list[str]:
+    """Controls that only the training step needs.
+
+    Deliberately separate from `_data_arguments`: a training window passed to the
+    signal writer would truncate the panel it has to score the latest bar from.
+    """
+    flags: list[str] = []
+    if args.train_window_days:
+        flags += ['--train-window-days', str(args.train_window_days)]
+    if args.recency_half_life_days is not None:
+        flags += ['--recency-half-life-days', str(args.recency_half_life_days)]
+    return flags
+
+
 def _scrape(args: argparse.Namespace, backfill_days: int) -> None:
     command = [
         sys.executable, '-m', 'scripts.run_pipeline',
@@ -342,7 +356,7 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
     run_id = None
     if writer:
         run_id = writer.create_model_run(
-            retrain_window_days=args.train_window_days,
+            retrain_window_days=int(args.train_window_days),
             symbols_total=0,
             artifacts_version=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'),
         )
@@ -353,6 +367,7 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
         '--periods', str(args.walk_forward_periods),
         '--equity', str(args.equity),
         *_data_arguments(args),
+        *_training_arguments(args),
     ]
     try:
         code = _run_step('promote', command, allow_codes=(0, 2))
@@ -462,8 +477,16 @@ def parse_args() -> argparse.Namespace:
                         default=int(os.getenv('CYCLE_ALIGN_MINUTE', '-1')))
     parser.add_argument('--retrain-every-days', type=int,
                         default=int(os.getenv('RETRAIN_EVERY_DAYS', str(DEFAULT_RETRAIN_DAYS))))
-    parser.add_argument('--train-window-days', type=int,
-                        default=int(os.getenv('TRAIN_WINDOW_DAYS', '90')))
+    parser.add_argument('--train-window-days', type=float,
+                        default=float(os.getenv('TRAIN_WINDOW_DAYS', '0')),
+                        help='Fit on the most recent N days only. 0 (the default) '
+                             'uses all history and lets the recency half-life do '
+                             'the weighting.')
+    parser.add_argument('--recency-half-life-days', type=float,
+                        default=(float(os.environ['RECENCY_HALF_LIFE_DAYS'])
+                                 if os.getenv('RECENCY_HALF_LIFE_DAYS') else None),
+                        help='Decay on training weights, in days. Governs how much '
+                             'of a long history reaches the model at all.')
     parser.add_argument('--walk-forward-periods', type=int,
                         default=int(os.getenv('WALK_FORWARD_PERIODS', '6')))
     parser.add_argument('--equity', type=float, default=float(os.getenv('EQUITY', '100000')))

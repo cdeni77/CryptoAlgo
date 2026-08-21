@@ -67,7 +67,6 @@ class Config:
     """Global run settings. Per-coin values live in `core.profiles.CoinProfile`."""
 
     # --- Walk-forward windows ---
-    train_lookback_days: int = 120
     retrain_frequency_days: int = 7
     min_train_samples: int = 400
     train_embargo_hours: int = 24
@@ -398,7 +397,6 @@ CLI_PARAMS: tuple[CliParam, ...] = (
     CliParam('--cooldown', 'cooldown_hours', float, 'Hours to wait after an exit'),
     CliParam('--min-edge', 'min_signal_edge', float, 'Require prob >= threshold + edge'),
     CliParam('--min-train-samples', 'min_train_samples', int, 'Minimum training rows per fold'),
-    CliParam('--train-lookback-days', 'train_lookback_days', int, 'Training window in days'),
     CliParam('--momentum-score-threshold', 'momentum_score_threshold', float,
              'Directional consensus score needed to trade'),
     CliParam('--recency-half-life-days', 'recency_half_life_days', float,
@@ -425,7 +423,6 @@ ENV_PARAMS: tuple[tuple[str, str, Callable[[str], Any]], ...] = (
     ('SIGNAL_THRESHOLD', 'signal_threshold', float),
     ('MIN_AUC', 'min_val_auc', float),
     ('LEVERAGE', 'leverage', int),
-    ('TRAIN_WINDOW_DAYS', 'train_lookback_days', int),
     ('RETRAIN_EVERY_DAYS', 'retrain_frequency_days', int),
     ('PRUNED_ONLY', 'enforce_pruned_features', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
 )

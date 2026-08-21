@@ -24,6 +24,7 @@ nobody wrote down.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from dataclasses import dataclass
 from typing import Optional
@@ -33,7 +34,7 @@ import pandas as pd
 
 from core.config import Config
 from core.costs import symbols_missing_fee_schedule
-from core.cv import effective_sample_size
+from core.cv import average_uniqueness, effective_sample_size
 from core.datastore import ResearchStore
 from core.features import feature_columns
 from core.model import train_forecast_model
@@ -171,7 +172,27 @@ def _targets_resolve(dataset) -> Check:
     return Check('targets', True, detail)
 
 
-def _effective_sample(dataset) -> Check:
+def _weighted_effective(index: pd.DatetimeIndex, horizon_bars: int,
+                        half_life_days: float) -> float:
+    """Effective observations after the recency decay training actually applies.
+
+    `effective_sample_size` answers "how many independent labels are in this
+    span". Training then multiplies each by `0.5 ** (age / H)`, and the product
+    is what the model is fitted on. The two numbers diverge sharply: the weights
+    sum to about `24 * H / ln 2` bar-equivalents no matter how far back the store
+    goes, so at H=50d and a 96h horizon the answer is ~18 whether you hold one
+    year of history or five. Reporting only the unweighted count is how a scrape
+    gets recommended that cannot change the fit.
+    """
+    if half_life_days <= 0:
+        return effective_sample_size(index, horizon_bars)
+    uniqueness = average_uniqueness(index, horizon_bars)
+    age_days = (index.max() - index).total_seconds() / 86_400.0
+    decay = np.power(0.5, np.asarray(age_days) / float(half_life_days))
+    return float((uniqueness * decay).sum())
+
+
+def _effective_sample(dataset, config: Config) -> Check:
     """Overlapping labels are not independent observations.
 
     A million hourly rows with a 24-hour horizon carry nowhere near a million
@@ -184,12 +205,18 @@ def _effective_sample(dataset) -> Check:
     if len(index) < 2:
         return Check('effective sample', False, 'fewer than two resolved timestamps')
 
-    effective = effective_sample_size(index, dataset.horizon_bars)
+    unweighted = effective_sample_size(index, dataset.horizon_bars)
+    half_life = config.recency_half_life_days
+    effective = _weighted_effective(index, dataset.horizon_bars, half_life)
     horizon = max(dataset.horizon_bars, 1)
+
     detail = (
         f'{effective:.0f} effective observations from {len(index):,} timestamps '
-        f'(uniqueness {effective / len(index):.1%}, horizon {horizon}h)'
+        f'(uniqueness {unweighted:.0f}, horizon {horizon}h'
     )
+    detail += (f', half-life {half_life:.0f}d)' if half_life > 0
+               else ', no recency decay)')
+
     if effective >= MIN_EFFECTIVE_OBSERVATIONS:
         return Check('effective sample', True, detail)
 
@@ -199,23 +226,52 @@ def _effective_sample(dataset) -> Check:
     # overlaps its h-1 neighbours.
     days_needed = MIN_EFFECTIVE_OBSERVATIONS * horizon / 24.0
     have_days = len(index) / 24.0
-    horizon_needed = max(int(len(index) / MIN_EFFECTIVE_OBSERVATIONS), 1)
 
-    return Check(
-        'effective sample', False, detail,
+    # Three levers, not two. Which one binds depends on the half-life: a decay
+    # caps the weighted sample at ~24H/ln2 bar-equivalents regardless of span,
+    # so when that cap is the binding constraint, scraping more history is
+    # wasted effort and has to be named as such.
+    saturated = 24.0 * half_life / math.log(2) / horizon if half_life > 0 else float('inf')
+
+    # The shorter-horizon suggestion has to be solved against whichever budget
+    # actually applies. Sizing it off the raw timestamp count while a decay is
+    # active produced advice to *lengthen* the horizon — 219h at five years of
+    # hourly data — which is the opposite of the fix.
+    budget = (24.0 * half_life / math.log(2)) if half_life > 0 else float(len(index))
+    horizon_needed = max(int(budget / MIN_EFFECTIVE_OBSERVATIONS), 1)
+    fix = (
         f'need at least {MIN_EFFECTIVE_OBSERVATIONS}. A label spanning {horizon} '
         f'bars overlaps its {horizon - 1} neighbours, so they are not independent '
-        f'observations and more rows over the same span will not help. Two ways '
-        f'out:\n'
-        f'  - keep the {horizon}h horizon and scrape about '
-        f'{days_needed:,.0f} days ({days_needed / 365:.1f} years); '
-        f'you have {have_days:,.0f}\n'
-        f'  - keep this history and shorten the horizon to about '
-        f'{horizon_needed}h (--horizon {horizon_needed})\n'
+        f'observations and more rows over the same span will not help. Ways out:\n'
+    )
+    if saturated < MIN_EFFECTIVE_OBSERVATIONS:
+        half_life_needed = MIN_EFFECTIVE_OBSERVATIONS * horizon * math.log(2) / 24.0
+        fix += (
+            f'  - the {half_life:.0f}d recency half-life is the binding limit here: '
+            f'it caps this horizon at ~{saturated:.0f} effective observations no '
+            f'matter how much history you hold, so more history will not help '
+            f'until it is raised. Lengthen it to about {half_life_needed:,.0f}d '
+            f'(--recency-half-life-days {half_life_needed:.0f}) or disable it '
+            f'(--recency-half-life-days 0)\n'
+        )
+    else:
+        fix += (
+            f'  - keep the {horizon}h horizon and scrape about '
+            f'{days_needed:,.0f} days ({days_needed / 365:.1f} years); '
+            f'you have {have_days:,.0f}\n'
+        )
+    if horizon_needed < horizon:
+        fix += (
+            f'  - keep this history and shorten the horizon to about '
+            f'{horizon_needed}h (--horizon {horizon_needed})\n'
+        )
+    fix += (
         f'Anything trained below the threshold is not wrong, but every statistic '
         f'downstream — Sharpe, PBO, the gates — has error bars far wider than it '
-        f'looks, and the gates are calibrated for that.',
+        f'looks, and the gates are calibrated for that.'
     )
+
+    return Check('effective sample', False, detail, fix)
 
 
 def _universe_wide_enough(dataset) -> Check:
@@ -276,7 +332,7 @@ def main() -> int:
         checks.append(_panel_builds(dataset))
         if checks[-1].passed:
             checks.append(_targets_resolve(dataset))
-            checks.append(_effective_sample(dataset))
+            checks.append(_effective_sample(dataset, config))
             checks.append(_universe_wide_enough(dataset))
             if not args.skip_fit and checks[-3].passed:
                 checks.append(_model_trains(dataset, config, args.as_of))

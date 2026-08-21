@@ -13,7 +13,7 @@ stood then, not as it was later revised.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -29,6 +29,17 @@ from core.targets import build_target_panel, summarise_targets
 logger = logging.getLogger(__name__)
 
 MARKET_SYMBOL = 'BIP'
+
+
+def _since(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Rows at or after `cutoff`, tolerating the empty frames the loader stores.
+
+    A symbol with no funding on either venue is held as an empty DataFrame,
+    which carries a RangeIndex; comparing that to a Timestamp raises.
+    """
+    if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return frame
+    return frame[frame.index >= cutoff]
 
 
 @dataclass
@@ -73,6 +84,41 @@ class Dataset:
             'mean_cost_bps': round(target_summary.mean_cost_bps, 2),
             'warnings': self.warnings,
         }
+
+    def trailing(self, days: float) -> "Dataset":
+        """The same dataset restricted to the most recent `days` of event time.
+
+        A training window and a recency half-life are different instruments and
+        both are useful: the window bounds what is loaded and fitted, the
+        half-life shapes what matters inside it. The window is applied after the
+        features are built, so a feature that needed 200 bars of history still
+        saw them — only the rows offered to the model are cut.
+        """
+        if days is None or days <= 0 or self.features.empty:
+            return self
+
+        times = pd.DatetimeIndex(self.features.index.get_level_values('event_time'))
+        cutoff = times.max() - pd.Timedelta(days=float(days))
+        if cutoff <= times.min():
+            return self
+
+        keep = times >= cutoff
+        features = self.features[keep]
+        target_times = pd.DatetimeIndex(self.targets.index.get_level_values('event_time'))
+        targets = self.targets[target_times >= cutoff]
+
+        return replace(
+            self,
+            features=features,
+            targets=targets,
+            bars={s: _since(f, cutoff) for s, f in self.bars.items()},
+            funding={s: _since(f, cutoff) for s, f in self.funding.items()},
+            warnings=[
+                *self.warnings,
+                f'training window: kept the last {float(days):,.0f} days '
+                f'({len(features):,} of {len(self.features):,} rows)',
+            ],
+        )
 
     def __str__(self) -> str:
         return (

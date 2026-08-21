@@ -116,15 +116,57 @@ Measured on 92 days of hourly data across five instruments:
 | 96h (the profile default) | 18 from 1,768 timestamps | far too few |
 | 8h | 232 from 1,856 timestamps | enough to start |
 
-So the horizon and the history length trade off directly. `scripts/preflight.py`
-computes both numbers and states the two ways out — scrape roughly
-`200 x horizon / 24` days, or shorten the horizon to about
-`timestamps / 200` hours. **Run it before a long scrape**, not after.
+### The recency half-life is usually the binding constraint, not the history
+
+Uniqueness is only half the calculation. Training then multiplies each row by
+`0.5 ** (age_days / H)` where `H` is `Config.recency_half_life_days`, and the
+product is what the model is fitted on. Those weights sum to about
+`24 x H / ln 2` bar-equivalents **no matter how far back the store goes**, so the
+weighted sample saturates at roughly `24 x H / ln 2 / h` and more history stops
+helping past about `3H`.
+
+Measured against `core/cv.py`, at the default `H = 50` days:
+
+| history | horizon | uniqueness says | training sees |
+|---------|---------|-----------------|---------------|
+| 1 year  | 96h | 91  | 17 |
+| 2.2 years | 96h | 200 | 18 |
+| 5 years | 96h | 456 | **18** |
+| 5 years | 24h | 1,825 | 72 |
+| 5 years | 8h  | 5,475 | 216 |
+
+So at the profile default horizon, five years of history buys one effective
+observation over one year. Scraping more data is the wrong lever there; the
+half-life is. Same five years, varying `H` instead:
+
+| horizon | H=50d | H=180d | H=365d | H=730d | off |
+|---------|-------|--------|--------|--------|-----|
+| 96h | 18 | 64 | 127 | 216 | 456 |
+| 24h | 72 | 259 | **510** | 867 | 1,825 |
+| 8h  | 216 | 778 | 1,530 | 2,601 | 5,475 |
+
+24h with `H = 365d` is the combination the cost schedule also argues for: hours
+of funding carry needed to cover a round trip are 2.8h (XRP), 2.9h (DOGE), 3.1h
+(SOL), 9.9h (BTC), 24.1h (ETH), so a 24h hold pays for itself on carry alone on
+four of five contracts. At 96h you must set `H` near 730d to clear the gate,
+which nearly disables the decay and defeats its purpose.
+
+`scripts/preflight.py` reports both numbers and names whichever lever binds —
+including telling you plainly when more history cannot help. **Run it before a
+long scrape**, not after.
 
 ```bash
-python -m scripts.preflight                 # profile default horizon
-python -m scripts.preflight --horizon 8     # what a shorter hold buys
+python -m scripts.preflight                                        # profile default
+python -m scripts.preflight --horizon 24 --recency-half-life-days 365
+python -m scripts.preflight --horizon 8                             # a shorter hold
 ```
+
+Both controls are on every research script (`scripts/_common.py`), and
+`live_orchestrator` forwards them to the training step only — a window passed to
+the signal writer would truncate the panel it has to score the latest bar from.
+`--train-window-days` is a hard cut applied by `Dataset.trailing()`;
+`--recency-half-life-days` is the soft weighting. They are different instruments
+and both are useful.
 
 ## Critical Architecture Notes
 

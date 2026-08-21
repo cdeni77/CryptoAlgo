@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +35,11 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument('--cost-config', default=DEFAULT_COST_CONFIG_NAME,
                         help="Venue fee schedule: a path, or a filename looked up "
                              "in configs/exchange. 'none' to use the hardcoded default.")
+    parser.add_argument('--train-window-days', type=float, default=None,
+                        help='Fit on the most recent N days only (default: all history)')
+    parser.add_argument('--recency-half-life-days', type=float, default=None,
+                        help='Exponential decay on training weights, in days. '
+                             '0 disables it (default: the Config value)')
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
     return parser
 
@@ -64,8 +71,35 @@ def build_config(args: argparse.Namespace) -> Config:
             args.cost_config,
             ', '.join(str(d) for d in COST_CONFIG_SEARCH_PATHS),
         )
-        return config
-    return config.with_cost_assumptions(path)
+        return _with_recency(config, args)
+    return _with_recency(config.with_cost_assumptions(path), args)
+
+
+def _with_recency(config: Config, args: argparse.Namespace) -> Config:
+    """Apply --recency-half-life-days, and say what the weighting will do.
+
+    The half-life decides how much of a long history actually reaches the model:
+    weights sum to about `24 * H / ln 2` bar-equivalents however far back the
+    store goes, so past roughly 3H the extra history changes the fit very little.
+    That is the intended behaviour of a decay, but it has to be visible, because
+    it is easy to scrape two more years and wonder why nothing moved.
+    """
+    half_life = getattr(args, 'recency_half_life_days', None)
+    if half_life is not None:
+        config = replace(config, recency_half_life_days=float(half_life))
+
+    if config.recency_half_life_days > 0:
+        saturation_days = config.recency_half_life_days / math.log(2)
+        logging.info(
+            'recency half-life %.0fd: the weighted sample saturates near %.0f '
+            'days of full-weight data, so history much beyond %.0fd mostly '
+            'informs the folds rather than the fit',
+            config.recency_half_life_days, saturation_days,
+            3 * config.recency_half_life_days,
+        )
+    else:
+        logging.info('recency weighting off: every row weighted by uniqueness alone')
+    return config
 
 
 def load(args: argparse.Namespace, config: Config) -> Dataset:
@@ -81,6 +115,9 @@ def load(args: argparse.Namespace, config: Config) -> Dataset:
         min_quality=None if args.min_quality == 'all' else args.min_quality,
         horizon_bars=args.horizon,
     )
+    window = getattr(args, 'train_window_days', None)
+    if window:
+        dataset = dataset.trailing(window)
     report_warnings(dataset)
     return dataset
 
