@@ -614,6 +614,12 @@ Examples:
     parser.add_argument("--include-oi", action="store_true", help="Also fetch open interest data")
     
     # Paths
+    parser.add_argument("--venue-label", type=str, default=None,
+                        help="Store Coinbase-native rows under this venue label "
+                             "instead of 'coinbase'. Use 'coinbase_spot' when "
+                             "scraping {COIN}-USD spot: the perp and its spot "
+                             "index resolve to the same base, so one label makes "
+                             "the cross-venue basis a comparison with itself.")
     parser.add_argument("--db-path", type=str, default="./data/trading.db", help="Database path")
     
     # Network
@@ -657,6 +663,7 @@ Examples:
     )
     print(f"Timeframes: {timeframes}")
     print(f"Database: {args.db_path}")
+    print(f"Venue label: {args.venue_label or 'coinbase'}")
     print(f"Proxy: {proxy or 'None'}")
     print()
     
@@ -704,6 +711,7 @@ Examples:
                     proxy=proxy,
                     ccxt_exchanges=["okx", "binance", "bybit"],
                     ccxt_use_fallbacks=True,
+                    venue_label=args.venue_label,
                 )
                 pipeline = await create_pipeline(config)
                 
@@ -821,6 +829,7 @@ Examples:
             proxy=proxy,
             ccxt_exchanges=["okx", "binance", "bybit"],
             ccxt_use_fallbacks=True,
+            venue_label=args.venue_label,
         )
         pipeline = await create_pipeline(config)
         pipeline.on_ohlcv(on_new_candle)

@@ -47,6 +47,13 @@ class PipelineConfig:
     db_type: str = "sqlite"
     db_path: str = "./data/trading.db"
     queue_type: str = "memory"
+    # Label written to the `venue` column for Coinbase-native fetches, instead
+    # of the default 'coinbase'. Needed because the CDE perp and its Coinbase
+    # spot index are both "coinbase" and both resolve to the same base — so
+    # storing them under one label makes a cross-venue basis a comparison
+    # between an instrument and itself, which is identically zero and looks like
+    # a working feature. Scrape spot with `--venue-label coinbase_spot`.
+    venue_label: Optional[str] = None
     ohlcv_poll_interval: int = 60
     funding_poll_interval: int = 300
     backfill_days: int = 30
@@ -213,7 +220,7 @@ class DataPipeline:
         basis and lead-lag feature was empty.
         """
         if not use_ccxt:
-            return 'coinbase'
+            return self.config.venue_label or 'coinbase'
         served = self._ccxt_connector.last_ohlcv_exchange if self._ccxt_connector else None
         if served:
             return served

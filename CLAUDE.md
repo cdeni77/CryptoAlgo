@@ -250,6 +250,68 @@ real observation is 22x lower. Collect the distribution before sizing anything o
 it. `scripts/preflight.py` reports sample size; it cannot tell you the edge is
 real.
 
+### Use Coinbase spot as the reference venue, not Binance
+
+The cross-venue group (basis, lead-lag) needs a deeper venue quoting the same
+underlying. Binance, OKX and Bybit are all 451 from a US IP — but Coinbase's own
+spot book is deeper than the nano perp, reachable, and is the market the perp's
+index is built from, which makes its basis the thing that actually drives
+funding. It is the better reference for this account, not a fallback.
+
+Two things make it work:
+
+1. **Scrape spot under its own venue label.** The perp and its spot index both
+   resolve to the same base (`BIP-20DEC30-CDE` and `BTC-USD` both -> `BTC`), so
+   storing them under one label makes the basis a comparison between an
+   instrument and itself — identically zero, and a column full of a plausible
+   number that measures nothing. `run_pipeline --venue-label coinbase_spot`.
+2. **Reference symbols resolve separately.** `load_dataset` used to look up the
+   *trade* spelling on the reference venue, which only worked by accident: the
+   CCXT path stores Binance bars under the Coinbase product id. Coinbase spot
+   calls it `BTC-USD`, so the direct lookup found nothing and the whole group
+   came back empty. It now resolves against the reference venue's own spellings.
+
+```bash
+# Perps
+python -m scripts.run_pipeline --backfill-only --backfill-days 400 --timeframes 1h
+
+# Spot, under its own label, for the basis
+python -m scripts.run_pipeline --backfill-only --backfill-days 1100 --timeframes 1h \
+  --venue-label coinbase_spot \
+  --symbols BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD,AVAX-USD,ADA-USD,LINK-USD,LTC-USD
+
+python -m scripts.migrate_to_research_store --venue coinbase
+python -m scripts.preflight --horizon 24 --recency-half-life-days 365 \
+  --reference-venue coinbase_spot
+```
+
+Note the panel needs at least three instruments for the relative groups to
+standardise (`min_universe=3`); below that they are legitimately NaN.
+
+### Historical funding needs credentials this account does not have
+
+`GET /rest/funding-rate` on `https://api.exchange.fairx.net` does serve
+historical CDE funding, keyed on the Perp Style Futures symbol (`BIPZ30`, see
+`core.costs.psf_symbol`) with an optional `trading_session_date`. It is not
+reachable with a CDP key:
+
+| | the CDP key this repo uses | what that endpoint needs |
+|---|---|---|
+| host | `api.coinbase.com` | `api.exchange.fairx.net` |
+| auth | JWT / ES256 | HMAC-SHA256 |
+| credentials | key name + EC private key PEM | access key + secret + **passphrase** |
+| issued by | CDP portal | Derivatives Command Center (`dcc.coinbase.com`) |
+
+Confirmed not public — an unauthenticated request returns
+`{"error":"missing request header: CB-ACCESS-KEY"}`. The DCC is the exchange's
+member portal, so eligibility is the blocker rather than configuration. If
+credentials do turn up, `probe_funding --funding-path /rest/funding-rate` tests
+it and the host would need adding to the connector.
+
+Until then carry accumulates forward only, and the basis above is the material
+from which it could later be *reconstructed* — validated against the forward
+actuals, labelled, and gated, never assumed.
+
 ### Do not backfill carry from another venue
 
 The tempting shortcut, given that CDE has no funding history, is to take

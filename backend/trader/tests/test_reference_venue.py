@@ -170,3 +170,75 @@ def test_no_reference_venue_requested_is_not_a_warning(tmp_path):
         store, venue='coinbase', reference_venue=None, min_quality='valid')
 
     assert not [w for w in dataset.warnings if 'cross-venue' in w], dataset.warnings
+
+
+# ---------------------------------------------------------------------------
+# Coinbase spot as the reference venue
+# ---------------------------------------------------------------------------
+
+
+def test_coinbase_spot_can_serve_as_the_reference_venue(tmp_path):
+    """The fix for a geo-blocked reference venue, without leaving the exchange.
+
+    Binance, OKX and Bybit all answer 451 to a US IP, which empties the
+    cross-venue group. Coinbase's own spot book is deeper than the nano perp,
+    quotes the same underlying, and is reachable — and it is the market the
+    perp's index is built from, so its basis is the thing that actually drives
+    funding.
+
+    `resolve_base` already maps both spellings to the same base
+    (`BTC-USD` -> BTC, `BIP-20DEC30-CDE` -> BTC), so the only requirement is that
+    spot is stored under its own venue label.
+    """
+    store = ResearchStore(tmp_path / 'research')
+    # Three instruments, not two: the relative groups are cross-sectionally
+    # standardised with `min_universe=3`, so a smaller panel legitimately yields
+    # NaN and would make this test fail for the wrong reason.
+    perps = ('BIP-20DEC30-CDE', 'ETP-20DEC30-CDE', 'SLP-20DEC30-CDE')
+    spot = ('BTC-USD', 'ETH-USD', 'SOL-USD')
+    _write(store, perps, venue='coinbase')
+    _write(store, spot, venue='coinbase_spot', seed=7)
+
+    dataset = load_dataset(
+        store, venue='coinbase', reference_venue='coinbase_spot',
+        min_quality='valid',
+    )
+
+    assert not dataset.features.empty
+    populated = [c for c in CROSS_VENUE_COLUMNS if dataset.features[c].notna().any()]
+    assert populated == list(CROSS_VENUE_COLUMNS), (
+        f'spot is in the store but these stayed empty: '
+        f'{sorted(set(CROSS_VENUE_COLUMNS) - set(populated))}'
+    )
+    assert not [w for w in dataset.warnings if 'cross-venue' in w], dataset.warnings
+
+    # The basis has to be a real number, not a constant.
+    basis = dataset.features['basis_bps'].dropna()
+    assert len(basis) > 100
+    assert basis.std() > 0, 'basis is constant, so it is not measuring two markets'
+
+
+def test_one_venue_label_for_both_makes_the_basis_meaningless(tmp_path):
+    """Why `--venue-label` exists. This is the trap it prevents.
+
+    Store the perp and its spot index under the same venue and they resolve to
+    the same base, so the reference lookup can return the instrument itself. A
+    basis against itself is identically zero — a column full of a plausible
+    number that measures nothing.
+    """
+    store = ResearchStore(tmp_path / 'research')
+    _write(store, ('BIP-20DEC30-CDE',), venue='coinbase')
+    _write(store, ('BTC-USD',), venue='coinbase', seed=7)
+
+    dataset = load_dataset(
+        store, venue='coinbase', reference_venue='coinbase',
+        min_quality='valid',
+    )
+
+    basis = dataset.features['basis_bps'].dropna() if not dataset.features.empty else None
+    if basis is not None and len(basis):
+        assert (basis.abs() < 1e-9).all() or basis.std() == 0, (
+            'expected a degenerate basis when both legs share a venue label; if '
+            'this now measures something real, the resolution changed and the '
+            '--venue-label guidance in CLAUDE.md should be revisited'
+        )

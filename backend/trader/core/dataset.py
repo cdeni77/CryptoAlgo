@@ -294,6 +294,18 @@ def load_dataset(
         if asked_name.upper() != stored_name:
             warnings.append(f'{asked_name} resolved to {stored_name}')
 
+    # The same translation, against the reference venue. Keyed by the *stored*
+    # trade spelling, because that is what the loop below iterates over.
+    reference_spellings: dict[str, str] = {}
+    if reference_venue:
+        reference_map, _ = resolve_store_symbols(
+            store, requested, venue=reference_venue
+        )
+        reference_spellings = {
+            symbol: reference_map[symbol]
+            for symbol in requested if symbol in reference_map
+        }
+
     # Profiles are keyed by the stored spelling, since that is what every
     # downstream lookup uses.
     # One profile per symbol, chosen deterministically. A dict comprehension over
@@ -363,9 +375,19 @@ def load_dataset(
         if not open_interest.empty and resolved_oi_venue != venue:
             oi_venues_used.add(resolved_oi_venue)
 
+        # Resolved separately against the reference venue's own spellings. The
+        # same symbol string existing on both venues is only true by accident:
+        # the CCXT path stores Binance bars under the *Coinbase* product id, so
+        # `BIP-20DEC30-CDE` matched there. Coinbase spot calls the same
+        # underlying `BTC-USD`, so a direct lookup finds nothing and the whole
+        # cross-venue group comes back empty — which is the configuration a US
+        # operator most wants, since the offshore venues are geo-blocked and
+        # spot is the market the perp's index is built from.
+        reference_symbol = reference_spellings.get(symbol) if reference_venue else None
         reference_bars = (
-            _frame_for(store, 'bars', symbol, reference_venue, as_of=as_of, min_quality=min_quality)
-            if reference_venue else pd.DataFrame()
+            _frame_for(store, 'bars', reference_symbol, reference_venue,
+                       as_of=as_of, min_quality=min_quality)
+            if reference_symbol else pd.DataFrame()
         )
         if reference_venue:
             (symbols_with_reference if not reference_bars.empty
