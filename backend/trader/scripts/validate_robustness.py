@@ -584,7 +584,7 @@ def run_validation(
         profile_from_params, resolve_target_symbol,
         COIN_MAP, PREFIX_FOR_COIN,
     )
-    from core.metrics_significance import compute_deflated_sharpe
+    from core.metrics import deflated_sharpe
 
     params = optimization_result.get('params', {})
     coin_prefix = optimization_result.get('prefix', PREFIX_FOR_COIN.get(coin_name, coin_name))
@@ -672,10 +672,17 @@ def run_validation(
         dsr_meta['fallback_to_single_run'] = False
 
     oos_sr = float(optim_metrics.get('mean_oos_sharpe', optim_metrics.get('oos_sharpe', sharpe)) or 0)
-    dsr = compute_deflated_sharpe(oos_sr, n_trades, n_trials_for_dsr)
-    if dsr.get('valid'):
+    dsr_result = deflated_sharpe(
+        sharpe=oos_sr, observations=n_trades, trials=n_trials_for_dsr
+    )
+    dsr = {
+        'valid': dsr_result.valid,
+        'dsr': dsr_result.statistic,
+        **dsr_result.detail,
+    }
+    if dsr_result.valid:
         print(
-            f"     DSR: {dsr['dsr']:.3f} (p={dsr['p_value']:.3f}) "
+            f"     DSR: {dsr_result.statistic:.3f} (p={dsr_result.detail['p_value']:.3f}) "
             f"| trials={n_trials_for_dsr} ({dsr_meta['scope']})"
         )
 

@@ -91,9 +91,10 @@ structural cause of "training didn't align to paper trading."
 
 ### 1.5 The statistics don't support the conclusions
 
-- 120-day windows at 1h bars = 2,880 rows, with 60-108h barrier horizons, giving
-  roughly **30-50 effectively independent label events per fold** against 73
-  features.
+- 120-day windows at 1h bars = 2,880 rows. Computed with
+  `core.cv.effective_sample_size`, the 72-hour barrier horizon leaves **40.0
+  independent observations** — not an estimate, the concurrency-weighted count.
+  At a 108-hour horizon it is 26.7. Against 77 features.
 - A single walk-forward path yields **one** Sharpe estimate with no confidence
   interval.
 - ~200 Optuna trials x 15 coins of selection pressure sits on top of that, with
@@ -256,14 +257,23 @@ compose into one verdict; each rules out a specific failure mode.
 
 ### 4.1 Combinatorial purged cross-validation (CPCV)
 
-Split the timeline into N=12 contiguous groups, take k=2 as test:
-C(12,2) = 66 train/test splits, which recombine into **11 distinct backtest
-paths** instead of one. Every path is purged and embargoed.
+*Implemented in `core/cv.py`.* Split the timeline into N=12 contiguous groups,
+take k=2 as test: C(12,2) = 66 train/test splits, which recombine into **11
+distinct backtest paths** instead of one. Every path is purged and embargoed, and
+`assert_no_leakage` fails a fold whose purge is shorter than the label horizon.
 
 *Output:* a distribution of Sharpe, drawdown and hit rate.
 *Rules out:* a strategy that only works on the one train/test cut you chose.
-*Also yields:* PBO — the fraction of trials where the in-sample-best
+*Also yields:* PBO — the fraction of splits where the in-sample-best
 configuration lands below the out-of-sample median.
+
+**What it does not buy.** The 11 paths reuse the same history, so they are 11
+correlated views of one sample rather than 11 samples. The spread across them
+measures sensitivity to how the data was cut — worth knowing, and the thing a
+single walk-forward hides — but it adds no evidence. Measured on a 120-day hourly
+window: the whole sample carries **40.0 independent observations** at a 72-hour
+horizon, and an individual CPCV test block carries about **7**. Widening the
+sample means more instruments, not more folds.
 
 ### 4.2 Deflated Sharpe Ratio
 

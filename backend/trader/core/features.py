@@ -568,6 +568,15 @@ def build_panel(
     panel = pd.concat(frames, names=['symbol', 'event_time'])
     panel = panel.reorder_levels(['event_time', 'symbol']).sort_index()
 
+    # Force the canonical column order. Without this, the panel's schema depends
+    # on which symbol happened to be built first: a group can be legitimately
+    # empty for one instrument — BTC has no beta to BTC — and `concat` unions
+    # columns in first-seen order, so the same universe in a different order
+    # produces a differently-shaped matrix. A model saved against one ordering
+    # would then score against another.
+    canonical = feature_columns(groups)
+    panel = panel.reindex(columns=canonical)
+
     if standardize:
         panel = cross_sectional_standardize(
             panel, groups=groups, min_universe=min_universe
