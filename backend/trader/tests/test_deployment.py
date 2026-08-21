@@ -537,3 +537,29 @@ def test_the_launcher_container_can_import_what_it_launches():
             f'the API container launches trader scripts but does not declare '
             f'{package}, so `POST /research/launch` fails at import'
         )
+
+
+def test_the_scrape_and_the_migration_agree_about_the_timeframe():
+    """Collecting a timeframe the migration filters out is collecting nothing.
+
+    The research store's `bars` dataset has no timeframe column, so `from_sqlite`
+    selects one — `WHERE timeframe = ?`, defaulting to '1h' — and
+    migrate_to_research_store defaults to the same. Anything the scrape collects
+    at another timeframe stays in SQLite and never reaches a panel.
+
+    The default used to be ["1h", "1d"], so every run fetched 400 days of daily
+    bars per contract that nothing anywhere consumed: the store filters them out,
+    and no module under backend/api reads the ohlcv table at all (the dashboard's
+    '1d' is a range of `days=1`, not a granularity).
+    """
+    import inspect
+
+    from core import datastore
+    from scripts import run_pipeline
+
+    migrated = inspect.signature(datastore.from_sqlite).parameters['timeframe'].default
+
+    assert run_pipeline.DEFAULT_TIMEFRAMES == [migrated], (
+        f'the scrape defaults to {run_pipeline.DEFAULT_TIMEFRAMES} but the store '
+        f'only ingests {migrated!r} — the difference is fetched and discarded'
+    )
