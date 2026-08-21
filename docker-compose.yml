@@ -64,17 +64,25 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      # Build arguments, not runtime environment: Vite inlines VITE_* at build
+      # time, so a runtime value on a static nginx image reaches nothing.
+      args:
+        # Default to the relative path nginx already proxies to the backend,
+        # which makes the bundle host-agnostic.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_API_TOKEN: ${API_TOKEN:-}
     ports:
       - "127.0.0.1:3000:80"
     depends_on:
       - backend
-    environment:
-      # The browser makes these requests, not the container, so this has to be
-      # an address the browser can reach. `http://backend:8000` is the
-      # Docker-internal hostname and resolves nowhere outside the compose
-      # network — every API call from the built frontend failed.
-      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000}
-      - VITE_API_TOKEN=${API_TOKEN:-}
+    # No runtime environment. Vite inlines `import.meta.env.VITE_*` at BUILD
+    # time, so values set here on an nginx image serving a finished bundle are
+    # silently ignored — what actually got baked in was the committed
+    # `frontend/.env`, which is why every deployment pointed at localhost:8000
+    # and the API token was always absent. They are `build.args` above now.
+    # The default `/api` is a relative path that `nginx.conf` already proxies to
+    # the backend, so the bundle no longer hardcodes a host at all.
+    # `frontend/.env` still applies to `npm run dev`.
 
   # ===========================================================================
   # Trader — the research pipeline (scrape → features → signals), plus retraining

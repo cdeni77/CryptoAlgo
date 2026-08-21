@@ -149,10 +149,32 @@ Measured on 92 days of hourly data across five instruments:
 | 96h | 18 from 1,768 timestamps | far too few |
 | 8h  | 232 from 1,856 timestamps | enough to start |
 
-The horizon and the history length trade off directly, and `scripts/preflight.py`
-quantifies both ways out: scrape about `200 x horizon / 24` days, or shorten the
-horizon to about `timestamps / 200` hours. It is much cheaper to learn this
-before an overnight scrape than after.
+Uniqueness is only half of it. Training also weights each row by
+`0.5 ** (age_days / H)`, where `H` is `Config.recency_half_life_days`, and those
+weights sum to about `24 x H / ln 2` bar-equivalents **however far back the store
+goes**. So the weighted sample saturates near `24 x H / ln 2 / h`, and at the
+default `H = 50` days a 96h horizon tops out around 18 effective observations
+whether you hold one year of history or five — while uniqueness alone reports 456
+at five years.
+
+That makes the half-life, not the history, usually the binding constraint:
+
+| horizon | H=50d | H=180d | H=365d | H=730d | off |
+|---------|-------|--------|--------|--------|-----|
+| 96h | 18 | 64 | 127 | 216 | 456 |
+| 24h | 72 | 259 | **510** | 867 | 1,825 |
+| 8h  | 216 | 778 | 1,530 | 2,601 | 5,475 |
+
+`scripts/preflight.py` reports both numbers and names whichever lever binds,
+including saying plainly when more history cannot help. There are three ways out,
+not two: raise the half-life, shorten the horizon, or scrape more — and only the
+last one costs a night.
+
+```bash
+python -m scripts.preflight --horizon 24 --recency-half-life-days 365
+```
+
+It is much cheaper to learn this before an overnight scrape than after.
 
 ---
 
@@ -164,8 +186,8 @@ of safety.
 
 | gate | threshold | what it protects against |
 |------|-----------|--------------------------|
-| `cpcv_median_sharpe` | ≥ 0.5 | picking the best path instead of the middle |
-| `cpcv_p05_sharpe` | ≥ 0.0 | a strategy whose bad paths lose money |
+| `walk_forward_median_sharpe` | ≥ 0.5 | picking the best path instead of the middle |
+| `walk_forward_p05_sharpe` | ≥ 0.0 | a strategy whose bad paths lose money |
 | `pbo` | ≤ 0.30 | the in-sample winner losing out-of-sample |
 | `deflated_sharpe` | ≥ 0.0 | the best of fifty random strategies looking good |
 | `bootstrap_positive_fraction` | ≥ 0.90 | one lucky ordering of trades |

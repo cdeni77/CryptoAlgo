@@ -131,7 +131,7 @@ def test_flag_and_value_patterns_agree_with_the_examples_in_the_docstring():
     assert not FLAG.match('--Venue')
     assert not FLAG.match('-v')
     assert VALUE.match('BIP,ETP')
-    assert VALUE.match('2026-06-01T00:00:00Z') is None or True  # colons allowed
+    assert VALUE.match('2026-06-01T00:00:00Z'), 'colons must survive the value pattern'
     assert not VALUE.match('-leading-dash')
 
 
@@ -164,3 +164,47 @@ def test_unset_origins_default_to_local_development(monkeypatch):
     assert '*' not in origins
     assert all(o.startswith('http://localhost') or o.startswith('http://127.0.0.1')
                for o in origins)
+
+
+# ---------------------------------------------------------------------------
+# The comparison itself
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_ascii_token_is_rejected_not_a_server_error(monkeypatch):
+    """`hmac.compare_digest` raises TypeError on non-ASCII strings.
+
+    Starlette decodes headers as latin-1, so a crafted header reached the compare
+    as a str with characters outside ASCII and turned the auth check into an
+    unhandled 500 rather than a 401. Comparing bytes fixes both directions — a
+    non-ASCII `API_TOKEN` previously broke every request, authorised or not.
+    """
+    from fastapi import HTTPException
+
+    from security import require_token
+
+    monkeypatch.setenv('API_TOKEN', 'correct-horse')
+
+    with pytest.raises(HTTPException) as raised:
+        require_token(x_api_token='wrong-ÿ-token')
+
+    assert raised.value.status_code == 401
+
+
+def test_a_non_ascii_configured_token_still_authorises(monkeypatch):
+    from security import require_token
+
+    monkeypatch.setenv('API_TOKEN', 'sécret-ключ')
+
+    require_token(x_api_token='sécret-ключ')  # must not raise
+
+
+def test_the_comparison_is_constant_time_on_bytes():
+    """Guard the mechanism, not just the outcome."""
+    import inspect
+
+    import security
+
+    source = inspect.getsource(security.require_token)
+    assert 'compare_digest' in source, 'auth must not use =='
+    assert 'encode(' in source, 'compare_digest must be given bytes, not str'

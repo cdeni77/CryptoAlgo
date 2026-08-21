@@ -1,0 +1,12 @@
+# Host artefacts must not enter the build. `COPY . .` runs after `npm ci`, so a
+# host node_modules would overwrite the alpine-installed one — and esbuild,
+# rollup and lightningcss ship platform-specific native binaries, so the build
+# that follows would run against the wrong ones.
+node_modules
+dist
+.env
+.env.*
+*.tsbuildinfo
+.git
+.DS_Store
+npm-debug.log*

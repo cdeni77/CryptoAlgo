@@ -104,7 +104,7 @@ def _simulation(payload: Any) -> SimulationSummary:
         probability_positive=bootstrap.get('probability_positive'),
         risk_of_ruin=bootstrap.get('risk_of_ruin'),
         block_length=bootstrap.get('block_length'),
-        per_period_sharpe=_distribution(payload.get('cpcv')),
+        per_period_sharpe=_distribution(payload.get('per_period')),
         synthetic_sharpe=_distribution(payload.get('synthetic')),
         stressed_worst_sharpe=stress.get('worst'),
         parameter_plateau=surface.get('retention'),

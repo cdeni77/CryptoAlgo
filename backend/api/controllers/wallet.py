@@ -21,7 +21,22 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from coinbase.rest import RESTClient
-from models.trade import PaperEquityCurve, Trade, TradeSide, TradeStatus
+from endpoints.coins import CDE_PRODUCTS
+from models.trade import PaperEquityCurve, PaperPosition, Trade, TradeSide, TradeStatus
+
+
+def _units_per_contract(coin: str) -> float:
+    """Base units per CDE contract, for marking a position to market.
+
+    Sourced from the same table the specs endpoint serves, which a parity test in
+    the trader suite pins against `core/costs.py` — the single source of truth for
+    money. Three entries had drifted by 2x-5x, and contract size multiplies
+    straight into notional, margin, liquidation price and PnL.
+    """
+    for asset, product in CDE_PRODUCTS.items():
+        if coin in (asset, product.get("code"), product.get("symbol")):
+            return float(product["units_per_contract"])
+    return 1.0
 
 # Coinbase client (credentials optional; endpoint degrades gracefully without them)
 api_key = os.getenv("COINBASE_API_KEY")
@@ -34,6 +49,8 @@ ONDO_SOL_MINT = "A3eMEJQqN3EAx2FQwPDhJGFH3M9x4W8M7mWUPR8iY5Wg"
 ETH_RPC_URL = "https://ethereum-rpc.publicnode.com"
 
 _ETHPLORER_CACHE: Dict[str, Dict[str, Any]] = {}
+# Bounded, because it is module-level and lives for the life of the worker.
+_ETHPLORER_CACHE_MAX = 256
 
 # Matches the paper engine's own starting equity. It is stated in both places
 # because neither process can import the other; `test_orm_parity.py` guards the
@@ -244,19 +261,44 @@ def get_ledger_wallets_from_env() -> Dict[str, Any]:
 
 
 def _get_ethplorer_address_info(address: str) -> Dict[str, Any]:
+    """Cached address info, but never a cached failure.
+
+    `_fetch_json` returns `{}` on any error, and caching that with no TTL meant a
+    single blip made an address permanently unavailable for the life of the
+    worker. The cache is also bounded now: it was an unbounded module-level dict.
+    """
     normalized = address.lower()
     if normalized in _ETHPLORER_CACHE:
         return _ETHPLORER_CACHE[normalized]
+
     payload = _fetch_json(f"https://api.ethplorer.io/getAddressInfo/{address}?apiKey=freekey")
+    if not payload:
+        return {}  # retry next request rather than remembering the failure
+
+    if len(_ETHPLORER_CACHE) >= _ETHPLORER_CACHE_MAX:
+        _ETHPLORER_CACHE.clear()
     _ETHPLORER_CACHE[normalized] = payload
     return payload
 
 
 def _get_btc_balance(address: str) -> Optional[float]:
+    """Confirmed balance, or None when the provider could not be reached.
+
+    `_fetch_json` returns `{}` on any HTTP, JSON or timeout failure, so
+    `funded - spent` came out 0.0 and this returned a confident "you hold 0 BTC"
+    during an outage — which `get_ledger_portfolio` then reported with
+    `status: "ok"`. The ETH and SOL paths already returned None in the same
+    situation, so this was an outlier rather than a policy.
+    """
     payload = _fetch_json(f"https://blockstream.info/api/address/{address}")
     chain_stats = _to_dict(payload.get("chain_stats"))
-    funded = _safe_float(chain_stats.get("funded_txo_sum")) or 0.0
-    spent = _safe_float(chain_stats.get("spent_txo_sum")) or 0.0
+    if not chain_stats:
+        return None
+
+    funded = _safe_float(chain_stats.get("funded_txo_sum"))
+    spent = _safe_float(chain_stats.get("spent_txo_sum"))
+    if funded is None or spent is None:
+        return None
     return (funded - spent) / 1e8
 
 
@@ -591,6 +633,7 @@ def get_coinbase_perps_portfolio() -> Dict[str, Any]:
             summary = _to_dict(summary_response)
             value_usd = _safe_float(summary.get("equity_usd") or summary.get("portfolio_value_usd"))
 
+        positions_error: Optional[str] = None
         if hasattr(client, "get_perps_positions"):
             try:
                 positions_response = client.get_perps_positions()
@@ -613,41 +656,82 @@ def get_coinbase_perps_portfolio() -> Dict[str, Any]:
                                 else None,
                             }
                         )
-            except Exception:
+            except Exception as exc:
+                # A failed positions call used to leave `positions = []` while
+                # `status` stayed "ok", so "the request broke" rendered as "no
+                # open perps". Say which it was.
                 positions = []
+                positions_error = str(exc)
 
         positions.sort(key=lambda item: abs(item.get("notional_usd") or 0.0), reverse=True)
 
         return {
             "value_usd": round(value_usd, 2) if value_usd is not None else None,
             "positions": positions,
+            "positions_unavailable_reason": positions_error,
             "status": "ok" if value_usd is not None else "unavailable",
         }
     except Exception as exc:
         return {
             "value_usd": None,
             "positions": [],
+            "positions_unavailable_reason": str(exc),
             "status": "error",
             "error": str(exc),
         }
 
 
-def build_wallet(db: Session) -> Dict[str, Any]:
-    """Assemble the wallet response: local PnL plus every external holding."""
-    realized_pnl = (
-        db.query(sa.func.sum(Trade.net_pnl))
-        .filter(Trade.status == TradeStatus.CLOSED)
+def _paper_pnl(db: Session) -> Dict[str, Any]:
+    """Realised and unrealised PnL, from the table that actually has rows.
+
+    Two defects met here. The realised figure summed `trades.net_pnl`, but
+    `open_trade`/`close_trade` in the trader's `pg_writer` have no callers
+    anywhere — nothing writes that table, so the answer was structurally 0.0 and
+    served under `or 0.0` as though it were measured. The real paper PnL is in
+    `paper_positions`, which the paper engine does write.
+
+    The unrealised figure passed a bare symbol (`"BTC"`) to `get_current_price`,
+    which needs a product id (`"BTC-USD"`); every other call site in this module
+    formats it correctly. The 404 was swallowed and the position skipped, so the
+    total was permanently 0.0.
+    """
+    realised = (
+        db.query(sa.func.sum(PaperPosition.realized_pnl))
+        .filter(PaperPosition.is_open.is_(False))
         .scalar()
-        or 0.0
     )
 
-    unrealized_pnl = 0.0
-    for trade in db.query(Trade).filter(Trade.status == TradeStatus.OPEN).all():
-        current_price = get_current_price(trade.coin)
-        if current_price is None:
+    unrealised = 0.0
+    priced = 0
+    unpriced: List[str] = []
+    for position in db.query(PaperPosition).filter(PaperPosition.is_open.is_(True)).all():
+        price = get_current_price(f"{position.coin}-USD")
+        if price is None:
+            unpriced.append(position.coin)
             continue
-        multiplier = 1 if trade.side == TradeSide.LONG else -1
-        unrealized_pnl += (current_price - trade.entry_price) * multiplier * trade.contracts
+        direction = 1 if str(position.side).upper().endswith("LONG") else -1
+        units = _units_per_contract(position.coin)
+        unrealised += (price - position.entry_price) * direction * position.contracts * units
+        priced += 1
+
+    return {
+        # A missing measurement stays missing: no closed positions is not zero PnL.
+        "realized_pnl": float(realised) if realised is not None else None,
+        # Partial marks are worse than none: a total that silently omits the
+        # positions it could not price is not the portfolio's unrealised PnL.
+        "unrealized_pnl": round(unrealised, 4) if not unpriced else None,
+        "unrealized_unavailable_reason": (
+            f"no current price for {', '.join(sorted(set(unpriced)))}" if unpriced else None
+        ),
+        "marked_positions": priced,
+    }
+
+
+def build_wallet(db: Session) -> Dict[str, Any]:
+    """Assemble the wallet response: local PnL plus every external holding."""
+    pnl = _paper_pnl(db)
+    realized_pnl = pnl["realized_pnl"]
+    unrealized_pnl = pnl["unrealized_pnl"]
 
     spot = get_coinbase_spot_portfolio()
     perps = get_coinbase_perps_portfolio()
@@ -656,29 +740,33 @@ def build_wallet(db: Session) -> Dict[str, Any]:
     spot_usd = _safe_float(spot.get("value_usd"))
     perps_usd = _safe_float(perps.get("value_usd"))
     ledger_usd = _safe_float(ledger.get("value_usd"))
-    portfolio_total = (spot_usd or 0.0) + (perps_usd or 0.0) + (ledger_usd or 0.0)
+    # Summing `x or 0.0` reported a smaller portfolio as a confident total when a
+    # provider was down. Only sum what was actually measured, and say how much of
+    # the picture that is.
+    measured = [v for v in (spot_usd, perps_usd, ledger_usd) if v is not None]
+    portfolio_total = sum(measured) if measured else None
+    missing_sections = [
+        name for name, value in (
+            ('coinbase_spot', spot_usd), ('coinbase_perps', perps_usd), ('ledger', ledger_usd)
+        ) if value is None
+    ]
 
     latest = db.query(PaperEquityCurve).order_by(PaperEquityCurve.timestamp.desc()).first()
     paper_balance = latest.equity if latest else INITIAL_PAPER_EQUITY
     paper_cash = latest.cash_balance if latest else INITIAL_PAPER_EQUITY
     paper_unrealized = latest.unrealized_pnl if latest else 0.0
 
-    holdings = _combine_assets(spot.get("assets", []), ledger.get("assets", []))
-    history_by_range = {
-        key: _build_holdings_portfolio_history(
-            holdings=holdings,
-            perps_usd=perps_usd or 0.0,
-            lookback=spec["lookback"],
-            granularity_seconds=spec["granularity_seconds"],
-        )
-        for key, spec in HISTORY_RANGES.items()
-    }
-
     return {
         "balance": paper_balance,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
-        "total_pnl": realized_pnl + unrealized_pnl,
+        "unrealized_unavailable_reason": pnl["unrealized_unavailable_reason"],
+        # Null unless both halves were measured: a sum with a missing term is not
+        # a total.
+        "total_pnl": (
+            realized_pnl + unrealized_pnl
+            if realized_pnl is not None and unrealized_pnl is not None else None
+        ),
         "wallets": {
             "paper_trading": {
                 "value_usd": round(paper_balance, 2),
@@ -697,11 +785,22 @@ def build_wallet(db: Session) -> Dict[str, Any]:
         "coinbase": {
             "spot": spot,
             "perps": perps,
-            "total_value_usd": round(portfolio_total, 2)
-            if (spot_usd is not None or perps_usd is not None or ledger_usd is not None)
-            else None,
+            "total_value_usd": round(portfolio_total, 2) if portfolio_total is not None else None,
+            "total_incomplete_sections": missing_sections or None,
         },
         "ledger": ledger,
-        "portfolio_history": history_by_range["1d"],
-        "portfolio_history_by_range": history_by_range,
+        # There is no portfolio history. What used to be served here was current
+        # holdings priced at past closes — a history that never happened — and it
+        # was a flat line besides, because the timestamp grid was built from
+        # `now - lookback` while Coinbase keys candles on buckets aligned to
+        # `epoch % granularity == 0`, so no lookup ever hit. It also cost four
+        # ranges x N assets of serial candle fetches per request, which is why
+        # this endpoint could not answer inside the frontend's 20s timeout.
+        # Recording real portfolio snapshots over time is the only honest way to
+        # produce this, and nothing does that yet.
+        "portfolio_history": None,
+        "portfolio_history_unavailable_reason": (
+            "no portfolio snapshots are recorded; current holdings priced at past "
+            "closes would be a history that never happened"
+        ),
     }

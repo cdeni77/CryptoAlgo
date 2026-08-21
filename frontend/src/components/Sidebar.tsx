@@ -37,10 +37,11 @@ const NAV_ITEMS: { path: RoutePath; label: string; icon: JSX.Element }[] = [
 interface Props {
   route: RoutePath;
   navigate: (path: RoutePath) => void;
-  activeCoins?: string[];
+  activeCoins: string[] | null;
+  activeCoinsError?: string | null;
 }
 
-export default function Sidebar({ route, navigate, activeCoins }: Props) {
+export default function Sidebar({ route, navigate, activeCoins, activeCoinsError }: Props) {
   return (
     <aside className="w-52 flex-shrink-0 flex flex-col bg-[#0c1120] border-r border-[rgba(56,189,248,0.08)]">
       {/* Brand */}
@@ -77,14 +78,33 @@ export default function Sidebar({ route, navigate, activeCoins }: Props) {
         })}
       </nav>
 
-      {/* Footer status */}
+      {/* Footer status. The dot reflects whether the engine's config could be
+          read — it used to be a hardcoded pulsing green "Live" that stayed green
+          while the API was down and while the kill switch said quarantined. */}
       <div className="px-4 py-4 border-t border-[rgba(56,189,248,0.08)]">
         <div className="flex items-center gap-2 mb-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-accent-emerald animate-pulse" />
-          <span className="text-tx-muted text-[11px]">Live</span>
+          <span
+            className={
+              'w-1.5 h-1.5 rounded-full ' +
+              (activeCoinsError
+                ? 'bg-accent-rose'
+                : activeCoins
+                  ? 'bg-accent-emerald animate-pulse'
+                  : 'bg-tx-muted')
+            }
+          />
+          <span className="text-tx-muted text-[11px]">
+            {activeCoinsError ? 'Engine unreachable' : activeCoins ? 'Engine reachable' : 'Checking…'}
+          </span>
         </div>
         <div className="text-tx-muted text-[10px] leading-relaxed">
-          {activeCoins && activeCoins.length > 0 ? activeCoins.join(' · ') + ' active' : 'Loading…'}
+          {activeCoinsError
+            ? activeCoinsError
+            : activeCoins === null
+              ? 'Checking…'
+              : activeCoins.length > 0
+                ? activeCoins.join(' · ') + ' active'
+                : 'no active coins configured'}
         </div>
       </div>
     </aside>

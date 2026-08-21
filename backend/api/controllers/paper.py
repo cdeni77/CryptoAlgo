@@ -62,8 +62,48 @@ def _compute_true_equity(db: Session) -> Dict[str, float]:
     }
 
 
+def _has_activity(db: Session) -> bool:
+    """Has this account traded at all?
+
+    Without this the endpoint reported a complete, confident account on an empty
+    database: `equity` and `cash_balance` were the hardcoded `INITIAL_EQUITY`,
+    `total_return_pct` was derived from it, and `max_drawdown_pct` was seeded 0.0
+    and stayed there. A never-started account was indistinguishable from one that
+    had traded and broken even at zero drawdown. `win_rate` already returned null
+    in the same payload, which is the pattern the rest should follow.
+    """
+    return bool(
+        db.query(func.count(PaperFill.id)).scalar()
+        or db.query(func.count(PaperPosition.id)).scalar()
+        or db.query(func.count(PaperEquityCurve.id)).scalar()
+    )
+
+
 def get_paper_summary(db: Session) -> Dict[str, Any]:
     """Aggregate paper trading performance stats."""
+    if not _has_activity(db):
+        return {
+            "initial_equity": INITIAL_EQUITY,
+            "equity": None,
+            "cash_balance": None,
+            "realized_pnl": None,
+            "unrealized_pnl": None,
+            "total_return_pct": None,
+            "max_drawdown_pct": None,
+            "win_rate": None,
+            "sharpe_ratio": None,
+            "profit_factor": None,
+            "open_positions": 0,
+            "closed_positions": 0,
+            "fill_count": 0,
+            "total_fees": None,
+            "total_notional": None,
+            "unavailable_reason": (
+                "no paper fills, positions or equity points; the account has not "
+                "started trading"
+            ),
+        }
+
     true_state = _compute_true_equity(db)
     latest_equity = true_state["equity"]
     realized_pnl = true_state["realized_pnl"]
@@ -82,8 +122,11 @@ def get_paper_summary(db: Session) -> Dict[str, Any]:
         .order_by(asc(PaperEquityCurve.timestamp))
         .all()
     )
-    max_drawdown_pct = 0.0
+    # None rather than 0.0 with no curve: "we never observed a drawdown" and
+    # "the drawdown was zero" are different claims.
+    max_drawdown_pct = None
     if equity_rows:
+        max_drawdown_pct = 0.0
         peak = INITIAL_EQUITY
         for (eq,) in equity_rows:
             if eq > peak:
@@ -110,7 +153,7 @@ def get_paper_summary(db: Session) -> Dict[str, Any]:
         "fill_count": fill_count,
         "total_fees": round(total_fees, 4),
         "total_notional": round(total_notional, 2),
-        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "max_drawdown_pct": round(max_drawdown_pct, 2) if max_drawdown_pct is not None else None,
         # win_rate as 0-1 fraction (frontend multiplies by 100 for display)
         "win_rate": round(win_rate / 100.0, 4) if win_rate is not None else None,
         "closed_positions": len(closed_positions),

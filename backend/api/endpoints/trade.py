@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List
 from models.trade import TradeResponse
@@ -13,8 +13,10 @@ router = APIRouter(prefix="/trades", tags=["trades"])
 
 @router.get("/", response_model=List[TradeResponse])
 def list_trades(
-    skip: int = 0,
-    limit: int = 100,
+    # Bounded like every other router: `?limit=99999999` returned 200 and read
+    # the whole table.
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db)
 ):
     return get_all_trades(db, skip=skip, limit=limit)

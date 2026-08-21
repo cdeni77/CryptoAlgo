@@ -299,7 +299,7 @@ def test_path_distribution_exposes_the_bad_tail():
 
 def test_unmeasured_gates_fail_rather_than_pass():
     """"We did not run that test" is not evidence of safety."""
-    promoted, gates = evaluate_gates({'cpcv_median_sharpe': 0.9})
+    promoted, gates = evaluate_gates({'walk_forward_median_sharpe': 0.9})
 
     assert not promoted
     unmeasured = [g for g in gates if g.value is None]
@@ -309,7 +309,7 @@ def test_unmeasured_gates_fail_rather_than_pass():
 
 def test_all_gates_passing_promotes():
     measurements = {
-        'cpcv_median_sharpe': 0.8, 'cpcv_p05_sharpe': 0.1, 'pbo': 0.15,
+        'walk_forward_median_sharpe': 0.8, 'walk_forward_p05_sharpe': 0.1, 'pbo': 0.15,
         'deflated_sharpe': 1.9, 'bootstrap_positive_fraction': 0.95,
         'synthetic_positive_fraction': 0.7, 'stressed_median_sharpe': 0.2,
         'parameter_plateau': 0.8, 'oos_trades': 250,
@@ -325,7 +325,7 @@ def test_all_gates_passing_promotes():
 
 def test_one_failing_gate_blocks():
     measurements = {
-        'cpcv_median_sharpe': 0.8, 'cpcv_p05_sharpe': -0.2,      # fails
+        'walk_forward_median_sharpe': 0.8, 'walk_forward_p05_sharpe': -0.2,      # fails
         'pbo': 0.15, 'deflated_sharpe': 1.9,
         'bootstrap_positive_fraction': 0.95, 'synthetic_positive_fraction': 0.7,
         'stressed_median_sharpe': 0.2, 'parameter_plateau': 0.8, 'oos_trades': 250,

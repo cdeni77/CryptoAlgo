@@ -209,6 +209,24 @@ def _realised_volatility(close: pd.Series) -> pd.Series:
     return close.pct_change().rolling(VOL_WINDOW_BARS).std().shift(1)
 
 
+def _hold_bars(
+    config: Config, profile: Optional[CoinProfile], horizon_bars: Optional[int]
+) -> int:
+    """Maximum hold, never longer than the forecast it was opened on.
+
+    The profile's hold and the dataset's horizon disagreed for four of five
+    traded instruments, and holding past the horizon realises a return the
+    forecast never described. Capping is the conservative direction: barriers
+    already exit earlier than the maximum, so shortening a hold changes when a
+    position closes, while lengthening it past the horizon makes the target
+    meaningless.
+    """
+    hold = config.label_horizon_hours(profile)
+    if horizon_bars is None:
+        return hold
+    return max(1, min(int(hold), int(horizon_bars)))
+
+
 def run_backtest(
     *,
     forecasts: pd.DataFrame,
@@ -217,16 +235,29 @@ def run_backtest(
     config: Optional[Config] = None,
     profiles: Optional[dict[str, CoinProfile]] = None,
     initial_equity: float = 100_000.0,
-    spread_bps: float = 4.0,
+    spread_bps: Optional[float] = None,
+    horizon_bars: Optional[int] = None,
 ) -> BacktestResult:
     """Walk the panel forward, deciding at each close and filling at the next open.
 
     `forecasts` is the output of `ForecastModel.predict`, MultiIndexed by
     (event_time, symbol). Bars and funding are per instrument.
+
+    `horizon_bars` is the span the forecasts describe, and it caps how long a
+    position may stay open. Without it the hold came from the per-coin profile
+    while the targets came from the dataset's single horizon, so the model
+    forecast one thing and the backtest waited for another — BTC held 60h against
+    a 96h forecast, XRP 108h. `Config.label_horizon_hours` already documents the
+    invariant ("labels must span at least as long as a position can stay open");
+    this is what enforces it.
     """
     config = config or Config()
     profiles = profiles or {}
     funding_by_symbol = funding_by_symbol or {}
+    # The spread lives on Config so `cost_stress` can move it; an explicit
+    # argument still wins for callers that want to sweep it directly.
+    spread = float(config.spread_bps if spread_bps is None else spread_bps)
+    horizon = int(horizon_bars) if horizon_bars else None
 
     timestamps = pd.DatetimeIndex(
         forecasts.index.get_level_values('event_time').unique()
@@ -275,8 +306,8 @@ def run_backtest(
                 volatility=float(vol),
                 tp_mult=float(config.resolve('vol_mult_tp', profiles.get(decision.symbol))),
                 sl_mult=float(config.resolve('vol_mult_sl', profiles.get(decision.symbol))),
-                hold_bars=config.label_horizon_hours(profiles.get(decision.symbol)),
-                spread_bps=spread_bps,
+                hold_bars=_hold_bars(config, profiles.get(decision.symbol), horizon),
+                spread_bps=spread,
                 participation_limit=MAX_PARTICIPATION,
                 liquidity=decision.sizing_liquidity,
             )
@@ -306,7 +337,7 @@ def run_backtest(
                 trade, fill = close_position(
                     position, bar=bar, timestamp=timestamp,
                     exit_price=outcome.exit_price, reason=outcome.reason,
-                    config=config, spread_bps=spread_bps,
+                    config=config, spread_bps=spread,
                     entry_participation=entry_participation.get(symbol, 0.0),
                 )
                 # Funding was charged to equity as it accrued, so only the price
@@ -374,7 +405,7 @@ def run_backtest(
         bar = bars.loc[final]
         trade, fill = close_position(
             position, bar=bar, timestamp=final, exit_price=float(bar['close']),
-            reason=ExitReason.END_OF_DATA, config=config, spread_bps=spread_bps,
+            reason=ExitReason.END_OF_DATA, config=config, spread_bps=spread,
             entry_participation=entry_participation.get(symbol, 0.0),
         )
         equity += trade.price_pnl - fill.fee
@@ -396,7 +427,7 @@ def backtest_from_model(
     config: Optional[Config] = None,
     profiles: Optional[dict[str, CoinProfile]] = None,
     initial_equity: float = 100_000.0,
-    spread_bps: float = 4.0,
+    spread_bps: Optional[float] = None,
     allow_in_sample: bool = False,
 ) -> BacktestResult:
     """Score a feature panel with one model, then backtest the result.
@@ -429,6 +460,7 @@ def backtest_from_model(
         profiles=profiles,
         initial_equity=initial_equity,
         spread_bps=spread_bps,
+        horizon_bars=model.horizon_bars,
     )
 
 
@@ -444,6 +476,9 @@ class WalkForwardForecasts:
     forecasts: pd.DataFrame
     models: list[ForecastModel] = field(default_factory=list)
     periods: list[tuple[pd.Timestamp, pd.Timestamp]] = field(default_factory=list)
+    # The span these forecasts describe. Carried rather than re-derived so the
+    # backtest cannot hold a position longer than the forecast it opened on.
+    horizon_bars: Optional[int] = None
 
     @property
     def coverage(self) -> int:
@@ -500,7 +535,7 @@ def generate_walk_forward_forecasts(
 
     start = int(len(unique) * min_train_fraction)
     if start >= len(unique) - n_periods:
-        return WalkForwardForecasts(pd.DataFrame())
+        return WalkForwardForecasts(pd.DataFrame(), horizon_bars=horizon)
 
     edges = np.linspace(start, len(unique), n_periods + 1).astype(int)
     pieces: list[pd.DataFrame] = []
@@ -518,6 +553,22 @@ def generate_walk_forward_forecasts(
         train_mask = times < train_cutoff
         if train_mask.sum() < 500:
             continue
+
+        # Assert it rather than trust the line above. `core.cv.assert_no_leakage`
+        # guards the CV folds, but this split — the one every promotion gate is
+        # computed from — had no equivalent check, and no test: removing the
+        # purge entirely left the whole suite green, because the nearest guard
+        # asserts `model.train_end < period_start` and the purge sits *inside*
+        # that boundary. A label spanning `horizon` bars from the last training
+        # row must resolve strictly before the first bar being forecast.
+        if train_mask.any():
+            last_train = times[train_mask].max()
+            if last_train + pd.Timedelta(hours=horizon) > period_start:
+                raise AssertionError(
+                    f'walk-forward leak: last training bar {last_train} plus a '
+                    f'{horizon}h label resolves at or after the forecast period '
+                    f'start {period_start}'
+                )
 
         model = train_forecast_model(
             x[train_mask], y[train_mask], config=config,
@@ -537,10 +588,11 @@ def generate_walk_forward_forecasts(
         periods.append((period_start, period_end))
 
     if not pieces:
-        return WalkForwardForecasts(pd.DataFrame())
+        return WalkForwardForecasts(pd.DataFrame(), horizon_bars=horizon)
 
     return WalkForwardForecasts(
-        forecasts=pd.concat(pieces).sort_index(), models=models, periods=periods
+        forecasts=pd.concat(pieces).sort_index(), models=models, periods=periods,
+        horizon_bars=horizon,
     )
 
 
@@ -554,7 +606,7 @@ def walk_forward_backtest(
     profiles: Optional[dict[str, CoinProfile]] = None,
     n_periods: int = 6,
     initial_equity: float = 100_000.0,
-    spread_bps: float = 4.0,
+    spread_bps: Optional[float] = None,
     horizon_bars: Optional[int] = None,
 ) -> tuple[BacktestResult, WalkForwardForecasts]:
     """The only honest backtest: retrain forward, trade only what was forecastable.
@@ -577,5 +629,7 @@ def walk_forward_backtest(
         profiles=profiles,
         initial_equity=initial_equity,
         spread_bps=spread_bps,
+        # The models were fitted at this horizon, so a position may not outlive it.
+        horizon_bars=generated.horizon_bars,
     )
     return result, generated

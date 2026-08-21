@@ -400,8 +400,8 @@ class Gate:
 # edges are noise, and a gate set that keeps confirming strategies is not
 # measuring anything.
 DEFAULT_GATES: dict[str, tuple[float, str]] = {
-    'cpcv_median_sharpe': (0.5, 'min'),
-    'cpcv_p05_sharpe': (0.0, 'min'),
+    'walk_forward_median_sharpe': (0.5, 'min'),
+    'walk_forward_p05_sharpe': (0.0, 'min'),
     'pbo': (0.30, 'max'),
     'deflated_sharpe': (0.0, 'min'),
     'bootstrap_positive_fraction': (0.90, 'min'),

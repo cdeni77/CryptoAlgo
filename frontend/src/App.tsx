@@ -28,7 +28,8 @@ function currentRoute(): RoutePath {
 export default function App() {
   const [route, setRoute] = useState<RoutePath>(currentRoute);
   const [utc, setUtc] = useState('');
-  const [activeCoins, setActiveCoins] = useState<string[]>([]);
+  const [activeCoins, setActiveCoins] = useState<string[] | null>(null);
+  const [activeCoinsError, setActiveCoinsError] = useState<string | null>(null);
 
   const navigate = useCallback((path: RoutePath) => {
     if (path === window.location.pathname) return;
@@ -48,22 +49,52 @@ export default function App() {
     document.title = `${ROUTES[route]} · CryptoAlgo`;
   }, [route]);
 
-  // The engine's active-coin list, for the sidebar. Failing quietly is right
-  // here and only here: it is a label, and the pages that matter report their
-  // own errors.
+  // The engine's active-coin list, for the sidebar. The previous version
+  // swallowed the error on the grounds that it is "just a label" — but the label
+  // renders "Loading…" whenever the fetch fails, in the persistent chrome of
+  // every page, so a dead backend was indistinguishable from a slow one forever.
+  // It also bypassed usePolling and so kept polling a hidden tab.
   useEffect(() => {
     let cancelled = false;
     const load = () =>
       getPaperConfig()
         .then((cfg) => {
-          if (!cancelled) setActiveCoins(cfg.active_coins);
+          if (cancelled) return;
+          setActiveCoins(cfg.active_coins);
+          setActiveCoinsError(null);
         })
-        .catch(() => {});
+        .catch((caught: unknown) => {
+          if (cancelled) return;
+          setActiveCoins(null);
+          setActiveCoinsError(caught instanceof Error ? caught.message : String(caught));
+        });
+
+    let id: number | undefined;
+    const start = () => {
+      if (id === undefined) id = window.setInterval(load, 60_000);
+    };
+    const stop = () => {
+      if (id !== undefined) {
+        window.clearInterval(id);
+        id = undefined;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        void load();
+        start();
+      }
+    };
+
     load();
-    const id = window.setInterval(load, 60_000);
+    if (!document.hidden) start();
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      stop();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, []);
 
@@ -100,7 +131,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#080c14] font-sans antialiased">
-      <Sidebar route={route} navigate={navigate} activeCoins={activeCoins} />
+      <Sidebar route={route} navigate={navigate} activeCoins={activeCoins} activeCoinsError={activeCoinsError} />
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex flex-shrink-0 items-center justify-between border-b border-[rgba(56,189,248,0.08)] bg-[#0c1120] px-6 py-3.5">

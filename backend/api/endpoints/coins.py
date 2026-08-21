@@ -3,7 +3,7 @@ import os
 from pathlib import Path as FilePath
 
 from fastapi import APIRouter, HTTPException, Path, Query
-from typing import Dict, List
+from typing import Literal, Dict, List
 from datetime import datetime, timezone
 from coinbase.rest import RESTClient
 from dotenv import load_dotenv
@@ -38,6 +38,14 @@ COINBASE_PRODUCTS = {
 
 # CDE (Contract for Difference / Perpetual) product mappings
 # These are the nano perpetual futures on Coinbase CDE
+# `Query(..., enum=[...])` only annotates the OpenAPI schema — FastAPI does not
+# validate against it, so `?granularity=NONSENSE` returned 200 and the value
+# reached the Coinbase SDK raw while `gran_seconds.get(granularity, 3600)`
+# silently substituted an hour for the chunk arithmetic. A Literal is enforced.
+GRANULARITY = Literal[
+    "ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "ONE_HOUR", "SIX_HOUR", "ONE_DAY"
+]
+
 CDE_PRODUCTS = {
     "BTC": {
         "symbol": "BIP-20DEC30-CDE",
@@ -77,7 +85,7 @@ CDE_PRODUCTS = {
     "AVAX": {
         "symbol": "AVP-20DEC30-CDE",
         "code": "AVP",
-        "units_per_contract": 5,
+        "units_per_contract": 10,
         "approx_contract_value": 47.50,
         "fee_pct": 0.00100,
     },
@@ -91,14 +99,14 @@ CDE_PRODUCTS = {
     "LINK": {
         "symbol": "LNP-20DEC30-CDE",
         "code": "LNP",
-        "units_per_contract": 10,
+        "units_per_contract": 50,
         "approx_contract_value": 90.64,
         "fee_pct": 0.00100,
     },
     "LTC": {
         "symbol": "LCP-20DEC30-CDE",
         "code": "LCP",
-        "units_per_contract": 1,
+        "units_per_contract": 5,
         "approx_contract_value": 55.69,
         "fee_pct": 0.00100,
     },
@@ -228,10 +236,11 @@ def get_historical_prices(
     symbol: str = Path(..., enum=VALID_SYMBOLS),
     days: int | None = Query(None, ge=1, le=730, description="Number of days (for ranges ≥1d)"),
     hours: int | None = Query(None, ge=1, le=24, description="Number of hours (for 1h range)"),
-    granularity: str = Query(
+    granularity: GRANULARITY | None = Query(
         None,
-        enum=["ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "ONE_HOUR", "SIX_HOUR", "ONE_DAY"]
-    )
+        description="Candle granularity. Validated, unlike `enum=`, which only "
+                    "annotates the OpenAPI schema.",
+    ),
 ):
     """Get historical spot OHLCV data from Coinbase."""
     if symbol not in COINBASE_PRODUCTS:

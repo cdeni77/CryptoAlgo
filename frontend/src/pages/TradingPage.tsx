@@ -216,10 +216,36 @@ export default function TradingPage() {
       )}
       {wallet.data && (() => {
         const held = wallet.data;
-        const spotVal   = held.coinbase?.spot?.value_usd ?? 0;
-        const ledgerVal = held.ledger?.value_usd ?? 0;
-        const total = spotVal + ledgerVal;
-        if (total <= 0) return null;
+        const spotVal   = held.coinbase?.spot?.value_usd ?? null;
+        const ledgerVal = held.ledger?.value_usd ?? null;
+        // `?? 0` then `total <= 0 -> return null` made a broken exchange
+        // connection look exactly like holding nothing: the backend answers 200
+        // with `value_usd: null` and a `status` this page never read, so the
+        // whole panel silently disappeared for a user with real holdings.
+        const spotStatus = held.coinbase?.spot?.status;
+        const ledgerStatus = held.ledger?.status;
+        const failed = [
+          spotStatus && spotStatus !== 'ok' ? `Coinbase spot: ${spotStatus}` : null,
+          ledgerStatus && !['ok', 'configured', 'unconfigured'].includes(ledgerStatus)
+            ? `Ledger: ${ledgerStatus}`
+            : null,
+        ].filter(Boolean) as string[];
+        const measured = [spotVal, ledgerVal].filter((v): v is number => v !== null);
+        const total = measured.reduce((a, b) => a + b, 0);
+        if (!measured.length && !failed.length) return null;
+        if (failed.length && total <= 0) {
+          return (
+            <div className="glass-card rounded-xl p-5">
+              <div className="text-tx-muted text-[11px] uppercase tracking-wider mb-2">
+                Real portfolio
+              </div>
+              <div className="text-accent-rose text-sm">
+                Holdings unavailable — {failed.join('; ')}
+              </div>
+            </div>
+          );
+        }
+        if (total <= 0 && !failed.length) return null;
         const spotAssets  = (held.coinbase?.spot?.assets  ?? []).filter(a => a.value_usd >= 0.01);
         const ledgerAssets = (held.ledger?.assets ?? []).filter(a => a.value_usd >= 0.01);
         return (
@@ -229,7 +255,7 @@ export default function TradingPage() {
               <span className="font-mono text-tx-primary text-sm font-semibold">{fmt(total)} external</span>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-              {spotVal > 0 && (
+              {spotVal !== null && spotVal > 0 && (
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-tx-muted text-[10px] uppercase tracking-widest">Coinbase Spot</span>
@@ -238,7 +264,7 @@ export default function TradingPage() {
                   {spotAssets.map(a => <AssetRow key={a.asset} a={a} />)}
                 </div>
               )}
-              {ledgerVal > 0 && (
+              {ledgerVal !== null && ledgerVal > 0 && (
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-tx-muted text-[10px] uppercase tracking-widest">Ledger</span>

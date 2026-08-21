@@ -50,26 +50,36 @@ export function usePolling<T>(
 
   const mounted = useRef(true);
   const inFlight = useRef(false);
+  // Which set of `deps` the in-flight request belongs to. Without this, changing
+  // the selection left the previous subject's response to land under the new
+  // subject's label: the effect re-ran, `void load()` hit the in-flight guard
+  // and returned, then the old request resolved and called setData — so the
+  // Trading page plotted the previous coin's candles under "{coin} / USD", and
+  // computed its range change from them, until the next interval tick.
+  const generation = useRef(0);
+  const firstRun = useRef(true);
 
   const load = useCallback(async () => {
     // Skip if a request is already out. A slow endpoint on a short interval
     // otherwise stacks requests until one of them wins arbitrarily, and the
     // value that lands is whichever finished last, not whichever is newest.
     if (inFlight.current) return;
+    const requested = generation.current;
     inFlight.current = true;
     setRefreshing(true);
     try {
       const next = await fetcherRef.current();
-      if (!mounted.current) return;
+      // Stale if the dependencies moved on while this was in flight.
+      if (!mounted.current || generation.current !== requested) return;
       setData(next);
       setError(null);
       setLastUpdated(new Date());
     } catch (caught) {
-      if (!mounted.current) return;
+      if (!mounted.current || generation.current !== requested) return;
       setError(caught instanceof Error ? caught : new Error(String(caught)));
     } finally {
-      inFlight.current = false;
-      if (mounted.current) {
+      if (generation.current === requested) inFlight.current = false;
+      if (mounted.current && generation.current === requested) {
         setLoading(false);
         setRefreshing(false);
       }
@@ -78,6 +88,22 @@ export function usePolling<T>(
 
   useEffect(() => {
     mounted.current = true;
+    // A new generation invalidates any in-flight response and frees the guard so
+    // the new subject is fetched immediately rather than at the next tick.
+    generation.current += 1;
+    inFlight.current = false;
+
+    if (firstRun.current) {
+      firstRun.current = false;
+    } else {
+      // The previous value describes a different subject. Showing "no data yet"
+      // is honest; showing the last subject's numbers is not.
+      setData(null);
+      setError(null);
+      setLoading(true);
+      setLastUpdated(null);
+    }
+
     let timer: number | undefined;
 
     const start = () => {

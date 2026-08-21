@@ -53,7 +53,7 @@ def model() -> ForecastModel:
 def _record(*, promoted: bool, version: str | None = None) -> PromotionRecord:
     gates = [
         {'name': 'pbo', 'value': 0.1, 'threshold': 0.3, 'comparison': 'max', 'passed': True},
-        {'name': 'cpcv_median_sharpe', 'value': 0.9 if promoted else -0.4,
+        {'name': 'walk_forward_median_sharpe', 'value': 0.9 if promoted else -0.4,
          'threshold': 0.5, 'comparison': 'min', 'passed': promoted},
     ]
     return PromotionRecord(
@@ -76,7 +76,7 @@ def test_a_blocked_candidate_is_not_installed(tmp_path, model):
     assert not installed
     assert not (tmp_path / MODEL_FILENAME).exists(), 'a blocked model was installed'
     assert current_record(tmp_path) is None, 'a blocked model became the live pointer'
-    assert record.failed_gates == ['cpcv_median_sharpe']
+    assert record.failed_gates == ['walk_forward_median_sharpe']
 
 
 def test_a_passing_candidate_is_installed_and_becomes_current(tmp_path, model):
@@ -126,7 +126,7 @@ def test_a_forced_model_is_visibly_forced(tmp_path, model):
     assert installed
     assert record.forced
     assert 'DOGE' in (record.force_reason or '')
-    assert record.failed_gates == ['cpcv_median_sharpe'], (
+    assert record.failed_gates == ['walk_forward_median_sharpe'], (
         'forcing must not rewrite which gates failed'
     )
 
@@ -209,29 +209,40 @@ def test_promotion_replaces_the_previous_model(tmp_path, model):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow
-def test_driftless_random_walks_do_not_promote(config):
-    """A candidate fitted to noise must be blocked, whatever its backtest says.
-
-    This is the end-to-end version of the guard: not "does promote() refuse a
-    record marked failed", but "does the evaluation that produces the record
-    reach the right verdict on data with nothing in it".
-    """
+def _dataset_for(config, seed, *, drift, funding_mean):
     from core.dataset import Dataset
-    from core.promotion import evaluate_candidate
     from tests.test_backtest import _features_targets
 
     features, targets, bars_by, funding_by, profiles = _features_targets(
-        config, 0, drift=0.0, funding_mean=0.0
+        config, seed, drift=drift, funding_mean=funding_mean
     )
-    dataset = Dataset(
+    return Dataset(
         features=features, targets=targets, bars=bars_by, funding=funding_by,
         profiles=profiles, venue='synthetic', reference_venue=None,
         as_of=None, horizon_bars=48,
     )
 
+
+@pytest.mark.slow
+def test_driftless_random_walks_do_not_promote(config):
+    """A candidate fitted to noise must be blocked on the merits.
+
+    The version of this test that shipped could not fail. It called
+    `evaluate_candidate(..., full=False)`, which skips the synthetic panels, so
+    `synthetic_positive_fraction` was never measured — and an unmeasured gate
+    fails by construction. The verdict was therefore structural and completely
+    independent of the data: replacing the driftless walks with 0.4% drift per
+    bar and 50bp/hour of carry, an enormous exploitable edge, still passed.
+
+    So this now runs the full evaluation and asserts on the gates that actually
+    reflect the data.
+    """
+    from core.promotion import evaluate_candidate
+
+    dataset = _dataset_for(config, 0, drift=0.0, funding_mean=0.0)
+
     model, record = evaluate_candidate(
-        dataset, config, n_periods=3, full=False, synthetic_paths=2,
+        dataset, config, n_periods=3, full=True, synthetic_paths=2, trials=1,
     )
 
     assert model is not None, 'the candidate should train; it just should not promote'
@@ -239,9 +250,50 @@ def test_driftless_random_walks_do_not_promote(config):
         f'driftless random walks cleared the gates: '
         f'{json.dumps(record.measurements, default=str)}'
     )
-    # A skipped simulation is a failed gate, not a passed one: "we did not run
-    # that test" is not evidence of safety.
-    assert 'synthetic_positive_fraction' in record.failed_gates
+    # Every gate was measured, so the rejection cannot be an artefact of a
+    # skipped simulation.
+    unmeasured = [k for k, v in record.measurements.items() if v is None]
+    assert not unmeasured, f'gates not measured, so the verdict is structural: {unmeasured}'
+
+    # And the rejection has to rest on a gate that reads the data, not on
+    # bookkeeping. These are the ones noise should fail.
+    data_dependent = {
+        'walk_forward_median_sharpe', 'walk_forward_p05_sharpe',
+        'deflated_sharpe', 'bootstrap_p05_sharpe', 'probability_positive',
+        'synthetic_positive_fraction',
+    }
+    assert data_dependent & set(record.failed_gates), (
+        f'blocked, but only by bookkeeping gates: {record.failed_gates}'
+    )
+
+
+@pytest.mark.slow
+def test_a_real_edge_scores_better_than_noise(config):
+    """The differential the previous test lacked.
+
+    A test that only ever sees noise cannot distinguish "the gates work" from
+    "the gates always fail". Running the same evaluation on data with a genuine
+    drift-and-carry edge must move the measurements in the right direction, or
+    the gate arithmetic is not reading the data at all.
+    """
+    from core.promotion import evaluate_candidate
+
+    _, noise = evaluate_candidate(
+        _dataset_for(config, 3, drift=0.0, funding_mean=0.0),
+        config, n_periods=3, full=True, synthetic_paths=2, trials=1,
+    )
+    _, edge = evaluate_candidate(
+        _dataset_for(config, 3, drift=0.004, funding_mean=5e-4),
+        config, n_periods=3, full=True, synthetic_paths=2, trials=1,
+    )
+
+    noisy = noise.measurements.get('walk_forward_median_sharpe')
+    real = edge.measurements.get('walk_forward_median_sharpe')
+    assert noisy is not None and real is not None
+    assert real > noisy, (
+        f'a 0.4%/bar drift with 50bp/hour carry scored no better than noise '
+        f'({real:.3f} vs {noisy:.3f}) — the gates are not reading the data'
+    )
 
 
 # ---------------------------------------------------------------------------

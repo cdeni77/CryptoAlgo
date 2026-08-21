@@ -67,7 +67,12 @@ def require_token(x_api_token: Optional[str] = Header(default=None)) -> None:
                 f'same value in the {TOKEN_HEADER} header.'
             ),
         )
-    if not x_api_token or not hmac.compare_digest(x_api_token.strip(), expected):
+    # Compare bytes, not str: `hmac.compare_digest` raises TypeError on strings
+    # with non-ASCII characters, and Starlette decodes headers as latin-1, so a
+    # crafted header turned the auth check into an unhandled 500 — and a
+    # non-ASCII API_TOKEN broke every request.
+    supplied = (x_api_token or '').strip().encode('utf-8')
+    if not supplied or not hmac.compare_digest(supplied, expected.encode('utf-8')):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f'Missing or invalid {TOKEN_HEADER}',

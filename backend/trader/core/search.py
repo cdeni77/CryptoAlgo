@@ -24,6 +24,7 @@ version and feature-set hash, and `trial_count` is a query.
 from __future__ import annotations
 
 import itertools
+import math
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ import pandas as pd
 
 from core.config import Config
 from core.metrics import (
+    HOURS_PER_YEAR,
     Gate,
     deflated_sharpe,
     evaluate_gates,
@@ -330,13 +332,20 @@ def run_campaign(
     pbo_result = probability_of_backtest_overfitting(matrix) if matrix.size else None
 
     best = max(
-        (t.metrics.get('cpcv_median_sharpe', float('-inf')) for t in trials),
+        (t.metrics.get('walk_forward_median_sharpe', float('-inf')) for t in trials),
         default=float('-inf'),
     )
     dsr = None
     if np.isfinite(best) and observations > 1 and total > 0:
+        # `best` is an annualised Sharpe and `observations` is a count of paths,
+        # so the two are at different frequencies and both terms of the
+        # correction scale as 1/sqrt(n). De-annualise to the observation
+        # frequency before comparing them, or the statistic reads several times
+        # too confident and the gate cannot reject a lucky winner.
         dsr = deflated_sharpe(
-            sharpe=best, observations=observations, trials=total
+            sharpe=best / math.sqrt(HOURS_PER_YEAR / max(observations, 1)),
+            observations=observations,
+            trials=total,
         ).statistic
 
     return CampaignResult(

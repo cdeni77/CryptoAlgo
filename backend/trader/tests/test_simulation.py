@@ -276,7 +276,7 @@ def test_report_flattens_into_gate_measurements():
             np.random.default_rng(0).normal(0.01, 0.02, 200), n_resamples=200
         ),
         synthetic=summarise_paths([0.8, 0.9, 1.1, -0.2, 0.5]),
-        cpcv=summarise_paths([0.7, 0.8, 0.6, 0.9]),
+        per_period=summarise_paths([0.7, 0.8, 0.6, 0.9]),
         pbo=0.2,
         deflated_sharpe=1.4,
         oos_trades=180,

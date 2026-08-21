@@ -258,17 +258,21 @@ export default function ModelPage() {
                       label="Net PnL"
                       value={money(data.live.backtest.net_pnl)}
                       tone={
-                        (data.live.backtest.net_pnl ?? 0) >= 0 ? 'good' : 'bad'
+                        data.live.backtest.net_pnl == null
+                          ? 'neutral'
+                          : data.live.backtest.net_pnl >= 0 ? 'good' : 'bad'
                       }
                       hint={`price ${money(data.live.backtest.price_pnl)} · funding ${money(
                         data.live.backtest.funding_pnl,
-                      )} · fees ${money(data.live.backtest.fees ? -data.live.backtest.fees : null)}`}
+                      )} · fees ${money(data.live.backtest.fees != null ? -data.live.backtest.fees : null)}`}
                     />
                     <Metric
                       label="Max drawdown"
                       value={pct(data.live.backtest.max_drawdown)}
                       tone={
-                        (data.live.backtest.max_drawdown ?? 0) > 0.25 ? 'bad' : 'neutral'
+                        data.live.backtest.max_drawdown == null
+                          ? 'neutral'
+                          : data.live.backtest.max_drawdown > 0.25 ? 'bad' : 'neutral'
                       }
                     />
                     <Metric
@@ -375,13 +379,19 @@ export default function ModelPage() {
               label="P(positive)"
               value={pct(record.simulation.probability_positive)}
               tone={
-                (record.simulation.probability_positive ?? 0) >= 0.9 ? 'good' : 'warn'
+                record.simulation.probability_positive == null
+                  ? 'neutral'
+                  : record.simulation.probability_positive >= 0.9 ? 'good' : 'warn'
               }
             />
             <Metric
               label="Risk of ruin"
               value={pct(record.simulation.risk_of_ruin)}
-              tone={(record.simulation.risk_of_ruin ?? 0) > 0.05 ? 'bad' : 'good'}
+              tone={
+                record.simulation.risk_of_ruin == null
+                  ? 'neutral'
+                  : record.simulation.risk_of_ruin > 0.05 ? 'bad' : 'good'
+              }
               hint="paths hitting a 50% drawdown"
             />
             <Metric
@@ -440,7 +450,7 @@ export default function ModelPage() {
                     <span className="flex-shrink-0 text-right">
                       <span
                         className={`block font-mono text-xs tabular-nums ${
-                          (r.backtest.sharpe ?? 0) >= 0
+                          r.backtest.sharpe != null && r.backtest.sharpe >= 0
                             ? 'text-accent-emerald'
                             : 'text-accent-rose'
                         }`}
@@ -514,14 +524,18 @@ export default function ModelPage() {
                 <Metric
                   label="Win rate"
                   value={pct(live.data.kill_switch.win_rate)}
-                  hint={`${live.data.kill_switch.trades ?? 0} trades / ${
+                  hint={`${live.data.kill_switch.trades ?? '—'} trades / ${
                     live.data.kill_switch.window_days ?? '—'
                   }d`}
                 />
                 <Metric
                   label="Drawdown"
                   value={pct(live.data.kill_switch.drawdown)}
-                  tone={(live.data.kill_switch.drawdown ?? 0) > 0.12 ? 'bad' : 'neutral'}
+                  tone={
+                    live.data.kill_switch.drawdown == null
+                      ? 'neutral'
+                      : live.data.kill_switch.drawdown > 0.12 ? 'bad' : 'neutral'
+                  }
                 />
               </div>
               {live.data.kill_switch.reasons.length > 0 && (

@@ -115,6 +115,11 @@ export interface PaperSummary {
   open_positions: number;
   sharpe_ratio: number | null;
   profit_factor: number | null;
+  initial_equity?: number;
+  total_fees?: number | null;
+  total_notional?: number | null;
+  closed_positions?: number;
+  unavailable_reason?: string | null;
 }
 
 export interface PaperFill {

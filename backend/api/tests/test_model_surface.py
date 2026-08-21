@@ -27,7 +27,7 @@ def _record(version: str, *, promoted: bool, forced: bool = False) -> dict:
         'gates': [
             {'name': 'pbo', 'value': 0.12, 'threshold': 0.30,
              'comparison': 'max', 'passed': True},
-            {'name': 'cpcv_median_sharpe', 'value': 0.9 if promoted else -0.3,
+            {'name': 'walk_forward_median_sharpe', 'value': 0.9 if promoted else -0.3,
              'threshold': 0.5, 'comparison': 'min', 'passed': promoted},
         ],
         'provenance': {
@@ -52,7 +52,7 @@ def _record(version: str, *, promoted: bool, forced: bool = False) -> dict:
                 'risk_of_ruin': 0.01,
                 'block_length': 3.2,
             },
-            'cpcv': {'n': 6, 'median': 0.9, 'p05': 0.1, 'p95': 1.8},
+            'per_period': {'n': 6, 'median': 0.9, 'p05': 0.1, 'p95': 1.8},
         },
         'measurements': {'pbo': 0.12},
         'error': None,
@@ -152,8 +152,8 @@ def test_failed_gates_are_named(client, empty_models_dir):
 
     record = client.get('/model/promotions').json()['records'][0]
 
-    assert record['failed_gates'] == ['cpcv_median_sharpe']
-    gate = [g for g in record['gates'] if g['name'] == 'cpcv_median_sharpe'][0]
+    assert record['failed_gates'] == ['walk_forward_median_sharpe']
+    gate = [g for g in record['gates'] if g['name'] == 'walk_forward_median_sharpe'][0]
     assert gate['passed'] is False
     assert gate['value'] == -0.3
     assert gate['threshold'] == 0.5
@@ -169,7 +169,7 @@ def test_a_forced_promotion_stays_visibly_forced(client, empty_models_dir):
 
     assert body['live']['forced'] is True
     assert body['live']['force_reason'] == 'operator override'
-    assert body['live']['failed_gates'] == ['cpcv_median_sharpe']
+    assert body['live']['failed_gates'] == ['walk_forward_median_sharpe']
 
 
 def test_provenance_and_decomposition_survive_the_round_trip(client, empty_models_dir):
@@ -289,8 +289,22 @@ def test_research_runs_merges_naive_and_aware_timestamps(client, empty_models_di
 
 
 def test_research_runs_reports_no_attempts_as_empty(client, empty_models_dir):
-    """No ledger and no run rows is a normal state, not an error."""
+    """No ledger and no run rows is a normal state, not an error.
+
+    `isinstance(..., list)` is true of any 200 response, and the session-scoped
+    database fixture carries rows written by the preceding test, so this passed
+    without ever exercising the empty path. Clearing the table makes the
+    assertion mean what the name says, and removes the order dependency.
+    """
+    from database import SessionLocal
+    from models.trade import ModelRun
+
+    db = SessionLocal()
+    db.query(ModelRun).delete()
+    db.commit()
+    db.close()
+
     response = client.get('/research/runs')
 
     assert response.status_code == 200
-    assert isinstance(response.json(), list)
+    assert response.json() == []

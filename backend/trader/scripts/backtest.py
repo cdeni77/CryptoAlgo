@@ -82,8 +82,8 @@ def main() -> int:
             from core.metrics import sharpe_ratio
             period_sharpes.append(sharpe_ratio(window.pct_change().dropna()))
     if period_sharpes:
-        report.cpcv = summarise_paths(period_sharpes)
-        print(f'per-period Sharpe: {report.cpcv.as_dict()}')
+        report.per_period = summarise_paths(period_sharpes)
+        print(f'per-period Sharpe: {report.per_period.as_dict()}')
 
     if args.full:
         def run_with(cfg) -> float:

@@ -160,28 +160,47 @@ export default function DashboardPage() {
         <StatCard
           label="Portfolio value"
           value={summary.data ? money(portfolio) : '—'}
-          sub={`started at ${money(STARTING_BALANCE)}`}
+          sub={
+            summary.data?.initial_equity != null
+              ? `started at ${money(summary.data.initial_equity)}`
+              : 'starting balance not reported'
+          }
         />
         <StatCard
           label="Total return"
           value={summary.data ? `${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}%` : '—'}
-          sub={`${money(summary.data?.realized_pnl ?? 0)} realised`}
-          color={totalReturn >= 0 ? 'text-accent-emerald' : 'text-accent-rose'}
+          sub={
+            summary.data?.realized_pnl != null
+              ? `${money(summary.data.realized_pnl)} realised`
+              : 'realised P&L not measured'
+          }
+          color={
+            summary.data?.total_return_pct == null
+              ? undefined
+              : totalReturn >= 0 ? 'text-accent-emerald' : 'text-accent-rose'
+          }
         />
         <StatCard
           label="Unrealised P&L"
           value={summary.data ? `${unrealized >= 0 ? '+' : ''}${money(unrealized)}` : '—'}
-          sub={`${summary.data?.open_positions ?? 0} open${
-            liveUnrealized !== null ? ' · marked live' : ''
-          }`}
-          color={unrealized >= 0 ? 'text-accent-emerald' : 'text-accent-rose'}
+          sub={
+            summary.data
+              ? `${summary.data.open_positions} open${
+                  liveUnrealized !== null ? ' · marked live' : ''
+                }`
+              : 'not measured'
+          }
+          color={
+            !summary.data ? undefined
+              : unrealized >= 0 ? 'text-accent-emerald' : 'text-accent-rose'
+          }
         />
         <StatCard
           label="Win rate"
           value={
             summary.data?.win_rate != null ? `${(summary.data.win_rate * 100).toFixed(1)}%` : '—'
           }
-          sub={`${summary.data?.fill_count ?? 0} fills`}
+          sub={summary.data ? `${summary.data.fill_count} fills` : 'not measured'}
         />
       </div>
 

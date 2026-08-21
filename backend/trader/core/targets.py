@@ -91,6 +91,34 @@ def round_trip_cost(symbol: str, price: float, config: Config, *, contracts: int
     return 2.0 * (fee_per_side + slippage)
 
 
+def round_trip_cost_series(
+    symbol: str, close: pd.Series, config: Config, *, contracts: int = 1
+) -> pd.Series:
+    """Round-trip cost as a fraction of notional, per bar.
+
+    A per-contract commission is a fixed number of dollars, so as a fraction of
+    notional it moves inversely with price — for BTC ranging 30k to 100k that is
+    a 3.3x swing in the cost of the same trade. Pricing every row off one
+    reference price got this wrong twice: the cost was constant when it should
+    vary, and the reference used was the *last* close in the loaded history, which
+    put end-of-sample information into every training row's target and into the
+    hurdle `decide()` compares against. `features.cost_features` was already
+    per-bar, so the feature and the target disagreed.
+    """
+    spec = get_contract_spec(symbol)
+    price = pd.to_numeric(close, errors='coerce')
+    notional = price * spec.units * float(contracts)
+
+    pct_fee = float(config.fee_pct_per_side)
+    floor_dollars = fee_floor(symbol, config) * float(contracts)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        floor_fraction = np.where(notional > 0, floor_dollars / notional, np.nan)
+
+    fee_per_side = np.maximum(pct_fee, floor_fraction)
+    slippage = config.slippage_bps / 10_000.0 if config.apply_slippage else 0.0
+    return pd.Series(2.0 * (fee_per_side + slippage), index=price.index)
+
+
 def target_spec_for(
     symbol: str,
     *,
@@ -155,7 +183,8 @@ def build_targets(
     spec: TargetSpec,
     *,
     funding: Optional[pd.DataFrame] = None,
-    index: Optional[pd.DatetimeIndex] = None,
+    index: Optional[d.DatetimeIndex] = None,
+    cost: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """Target frame for one instrument.
 
@@ -176,7 +205,12 @@ def build_targets(
     out = pd.DataFrame(index=frame.index)
     out['price'] = price
     out['carry'] = carry
-    out['cost'] = spec.round_trip_cost
+    # Per bar when supplied, so the cost of a trade reflects the price at the
+    # bar it would open at rather than one reference price for the whole sample.
+    out['cost'] = (
+        pd.to_numeric(cost, errors='coerce').reindex(frame.index)
+        if cost is not None else spec.round_trip_cost
+    )
     out['net_long'] = out['price'] + out['carry'] - out['cost']
     out['net_short'] = -out['price'] - out['carry'] - out['cost']
 
@@ -225,8 +259,10 @@ def build_target_panel(
             symbol,
             profile=profiles.get(symbol),
             config=config,
-            reference_price=float(bars['close'].iloc[-1]),
+            # Only the horizon is taken from the spec now; the cost is per bar.
+            reference_price=float(bars['close'].iloc[0]),
         )
+        cost = round_trip_cost_series(symbol, bars['close'], config)
         if horizon_bars is not None:
             spec = TargetSpec(horizon_bars=horizon_bars, round_trip_cost=spec.round_trip_cost)
 
@@ -234,6 +270,7 @@ def build_target_panel(
             bars, spec,
             funding=funding_by_symbol.get(symbol),
             index=(index_by_symbol or {}).get(symbol),
+            cost=cost,
         )
         if targets['price'].notna().any():
             pieces[symbol] = targets

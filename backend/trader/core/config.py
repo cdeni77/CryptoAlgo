@@ -127,6 +127,10 @@ class Config:
     # above applies everywhere; a loaded venue config fills this in.
     min_fee_per_contract_by_symbol: dict[str, float] = field(default_factory=dict)
     slippage_bps: float = 2.0
+    # Half-spread crossed on entry and exit. Threaded through the backtest as an
+    # argument before, which meant `cost_stress`'s "3x slippage" scenario had
+    # nothing to multiply — `core/execution.py` reads this, never `slippage_bps`.
+    spread_bps: float = 4.0
     apply_funding: bool = True
     apply_slippage: bool = True
     apply_impact: bool = False

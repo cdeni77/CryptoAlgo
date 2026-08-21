@@ -63,7 +63,7 @@ def main() -> int:
         print(frame.groupby('campaign').agg(
             trials=('trial_id', 'count'), passed=('passed', 'sum')
         ).to_string())
-        best = ledger.best('cpcv_median_sharpe')
+        best = ledger.best('walk_forward_median_sharpe')
         if best is not None:
             print(f'\nbest passing trial: {best["trial_id"]} ({best["campaign"]})')
             print(f'  parameters: {best["parameters"]}')
@@ -119,8 +119,8 @@ def main() -> int:
         )
         return (
             {
-                'cpcv_median_sharpe': distribution.median,
-                'cpcv_p05_sharpe': distribution.p05,
+                'walk_forward_median_sharpe': distribution.median,
+                'walk_forward_p05_sharpe': distribution.p05,
                 'bootstrap_positive_fraction': bootstrap.probability_positive,
                 'oos_trades': float(result.n_trades),
                 'max_drawdown': result.drawdown.max_drawdown,

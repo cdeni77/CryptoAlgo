@@ -39,6 +39,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
+from scipy import stats
 
 from core.config import Config
 from core.dataset import Dataset
@@ -52,6 +53,7 @@ from core.metrics import (
     summarise_paths,
 )
 from core.model import ForecastModel, train_forecast_model
+from core.targets import build_target_panel
 from core.simulation import (
     SimulationReport,
     SurfaceResult,
@@ -269,9 +271,28 @@ def evaluate_candidate(
         return out
 
     def run_with(candidate_config: Config, bars=None):
+        panel_bars = bars if bars is not None else dataset.bars
+        # `decide()` reads its cost hurdle from the target frame, so reusing the
+        # baseline targets left the hurdle unstressed in every cost scenario:
+        # the fills got more expensive while the decision to trade did not, which
+        # is not what raising costs does. Rebuilding them under the candidate
+        # config is also what makes the synthetic-panel gate coherent, since a
+        # synthetic price path implies different costs per bar.
+        targets = dataset.targets
+        if candidate_config is not config or bars is not None:
+            targets = build_target_panel(
+                panel_bars,
+                funding_by_symbol=dataset.funding,
+                profiles=dataset.profiles,
+                config=candidate_config,
+                horizon_bars=dataset.horizon_bars,
+                index_by_symbol={
+                    s: b.index for s, b in panel_bars.items()
+                },
+            )
         outcome, produced = walk_forward_backtest(
-            dataset.features, dataset.targets,
-            bars_by_symbol=bars if bars is not None else dataset.bars,
+            dataset.features, targets,
+            bars_by_symbol=panel_bars,
             funding_by_symbol=dataset.funding,
             config=candidate_config, profiles=dataset.profiles,
             n_periods=n_periods, initial_equity=initial_equity,
@@ -283,18 +304,42 @@ def evaluate_candidate(
         returns = result.trades_frame()['net_return'].to_numpy()
         report.bootstrap = bootstrap_trades(returns, n_resamples=BOOTSTRAP_RESAMPLES)
 
+        # Sharpe of each walk-forward sub-period: dispersion across TIME within
+        # one out-of-sample path. These gates were named `cpcv_*`, which promised
+        # something else — combinatorial purged CV recombines held-out groups into
+        # many complete alternative histories, and 11 such paths carry far more
+        # information than 6 consecutive slices of one. That machinery exists and
+        # is tested (`core.cv.combinatorial_purged_splits`, `assemble_paths`), but
+        # it costs 66 model fits against this loop's 6, so it is not on the
+        # promotion path by choice. The name now says what is measured.
         centre_paths = period_sharpes_of(result, generated.periods)
         if centre_paths:
-            report.cpcv = summarise_paths(centre_paths)
+            report.per_period = summarise_paths(centre_paths)
 
         # The deflated Sharpe needs the number of configurations tried, not the
         # number kept. `trials` is the ledger's count, which is why rejections are
         # never deleted: under-reporting it is the most common way a backtest
         # passes a significance test it should fail.
+        #
+        # It also needs the Sharpe and the observation count at the SAME
+        # frequency, because both terms of the correction scale as 1/sqrt(n).
+        # Passing the annualised Sharpe against a per-trade count inflated the
+        # statistic by roughly sqrt(HOURS_PER_YEAR / holding period): an
+        # annualised 1.0 over 150 trades scored +8.1 at 50 trials and still
+        # +6.4 at a hundred thousand, so the one gate whose job is to discount
+        # for the size of the search could not reject anything. The per-trade
+        # ratio over the trade count is the pairing the function documents.
+        per_trade_sharpe = float(
+            np.mean(returns) / np.std(returns, ddof=1)
+        ) if returns.size > 1 and np.std(returns, ddof=1) > 0 else 0.0
         significance = deflated_sharpe(
-            sharpe=result.sharpe,
-            observations=max(len(centre_paths), result.n_trades, 1),
+            sharpe=per_trade_sharpe,
+            observations=max(int(returns.size), 2),
             trials=max(int(trials), 1),
+            # Trade returns are neither symmetric nor thin-tailed; supplying the
+            # moments stops the estimate assuming they are.
+            skewness=float(stats.skew(returns)) if returns.size > 2 else None,
+            kurtosis=float(stats.kurtosis(returns, fisher=False)) if returns.size > 3 else None,
         )
         # `statistic` is the z-score of the observed Sharpe against the expected
         # best of `trials` worthless strategies. Positive means it beat that
@@ -320,7 +365,19 @@ def evaluate_candidate(
 
             for name, value in centre_parameters.items():
                 for factor, label in ((1 + SURFACE_STEP, 'up'), (1 - SURFACE_STEP, 'down')):
-                    candidate = replace(config, **{name: type(value)(value * factor)})
+                    # `cli_overrides` is what makes the perturbation survive
+                    # `Config.resolve`, which otherwise prefers the per-coin
+                    # profile's value and hands back the unperturbed number.
+                    # Without it every surface run was a byte-identical re-run of
+                    # the centre, so retention was pinned at 1.0 and this gate
+                    # could not fail for any candidate with a positive Sharpe.
+                    # The duplicate rows also went into the PBO score matrix.
+                    # `core/search.py:configure` had this right; this did not.
+                    candidate = replace(
+                        config,
+                        **{name: type(value)(value * factor)},
+                        cli_overrides=frozenset(set(config.cli_overrides) | {name}),
+                    )
                     outcome, produced = run_with(candidate)
                     surface_scores[f'{name}_{label}'] = outcome.sharpe
                     paths = period_sharpes_of(outcome, produced.periods)

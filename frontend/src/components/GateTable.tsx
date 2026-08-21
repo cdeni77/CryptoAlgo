@@ -15,9 +15,9 @@ import { GateResult } from '../types';
 
 /** Plain-language notes on what each gate is protecting against. */
 const EXPLANATIONS: Record<string, string> = {
-  cpcv_median_sharpe:
+  walk_forward_median_sharpe:
     'Median Sharpe across the out-of-sample paths. The middle of the distribution, not the best path.',
-  cpcv_p05_sharpe:
+  walk_forward_p05_sharpe:
     'Fifth-percentile path. A strategy whose bad paths lose money is a strategy that will, eventually.',
   pbo: 'Probability of backtest overfitting. How often the configuration that won in-sample loses out-of-sample.',
   deflated_sharpe:

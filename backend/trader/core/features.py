@@ -468,7 +468,7 @@ def cost_features(inputs: SymbolInputs, config: Optional[Config] = None) -> pd.D
     # instrument, so a tree splits on it to recover instrument identity with a
     # continuous variable — more expressive, and more overfittable, than the
     # symbol category the pooled model already has. The model does not size
-    # positions either; `core.costs.size_position` does.
+    # positions either; `core.execution.size_from_forecast` does.
     out['fee_hurdle_bps'] = hurdle * 10_000
 
     vol_24h = bars['close'].pct_change().rolling(24, min_periods=6).std()

@@ -87,11 +87,20 @@ def test_omitting_the_flag_keeps_the_config_default():
     assert build_config(args).recency_half_life_days == Config().recency_half_life_days
 
 
-@pytest.mark.parametrize('param', [p for p in CLI_PARAMS if p.field == 'recency_half_life_days'])
-def test_the_declared_flag_name_matches_the_wired_one(param):
-    """Two spellings of the same control would be worse than one."""
-    args = _parser().parse_args([param.flag, '180'])
-    assert build_config(args).recency_half_life_days == 180.0
+def test_the_declared_flag_name_matches_the_wired_one():
+    """Two spellings of the same control would be worse than one.
+
+    Parametrising over `CLI_PARAMS` looked tidier but deleted its own guard: if
+    the field ever leaves that tuple the comprehension yields nothing and pytest
+    reports `1 skipped`, not a failure — silently, in exactly the scenario this
+    file exists to catch.
+    """
+    declared = [p for p in CLI_PARAMS if p.field == 'recency_half_life_days']
+    assert declared, 'recency_half_life_days is no longer declared in CLI_PARAMS'
+
+    for param in declared:
+        args = _parser().parse_args([param.flag, '180'])
+        assert build_config(args).recency_half_life_days == 180.0
 
 
 # ---------------------------------------------------------------------------

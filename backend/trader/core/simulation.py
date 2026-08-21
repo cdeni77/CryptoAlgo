@@ -430,10 +430,16 @@ def cost_stress(
     cost multiple does it stop working". A strategy that dies at 2x fees was
     never a strategy.
     """
+    # `spread_bps`, not `slippage_bps`: `core/execution.py` prices fills from the
+    # spread and never reads `slippage_bps`, so the old "3x slippage" scenario
+    # multiplied a field nothing consumed and re-ran the baseline unchanged.
     scenarios = scenarios or {
         'fees_2x': {'fee_pct_per_side': 2.0, 'min_fee_per_contract': 2.0},
-        'slippage_3x': {'slippage_bps': 3.0},
-        'both': {'fee_pct_per_side': 2.0, 'min_fee_per_contract': 2.0, 'slippage_bps': 3.0},
+        'spread_3x': {'spread_bps': 3.0, 'slippage_bps': 3.0},
+        'both': {
+            'fee_pct_per_side': 2.0, 'min_fee_per_contract': 2.0,
+            'spread_bps': 3.0, 'slippage_bps': 3.0,
+        },
     }
 
     baseline = float(run(config))
@@ -556,7 +562,7 @@ class SimulationReport:
     stress: Optional[StressResult] = None
     surface: Optional[SurfaceResult] = None
     capacity: Optional[CapacityResult] = None
-    cpcv: Optional[PathDistribution] = None
+    per_period: Optional[PathDistribution] = None
     pbo: Optional[float] = None
     deflated_sharpe: Optional[float] = None
     oos_trades: int = 0
@@ -574,8 +580,8 @@ class SimulationReport:
         of safety.
         """
         return {
-            'cpcv_median_sharpe': self.cpcv.median if self.cpcv else None,
-            'cpcv_p05_sharpe': self.cpcv.p05 if self.cpcv else None,
+            'walk_forward_median_sharpe': self.per_period.median if self.per_period else None,
+            'walk_forward_p05_sharpe': self.per_period.p05 if self.per_period else None,
             'pbo': self.pbo,
             'deflated_sharpe': self.deflated_sharpe,
             'bootstrap_positive_fraction': (
@@ -597,7 +603,7 @@ class SimulationReport:
             'stress': self.stress.as_dict() if self.stress else None,
             'surface': self.surface.as_dict() if self.surface else None,
             'capacity': self.capacity.as_dict() if self.capacity else None,
-            'cpcv': self.cpcv.as_dict() if self.cpcv else None,
+            'per_period': self.per_period.as_dict() if self.per_period else None,
             'pbo': self.pbo,
             'deflated_sharpe': self.deflated_sharpe,
             'oos_trades': self.oos_trades,

@@ -49,6 +49,24 @@ def _load_api_models() -> Any:
             sys.path.remove(inserted)
 
 
+def _load_api_module(dotted: str) -> Any:
+    """Import an API module with the API root on `sys.path`, then restore it.
+
+    Same mechanism as `_load_api_models`: the API package uses bare imports, so
+    its root has to lead the path for the duration and be removed afterwards.
+    """
+    if not API_ROOT.exists():
+        pytest.skip(f'API package not present at {API_ROOT}')
+
+    inserted = str(API_ROOT)
+    sys.path.insert(0, inserted)
+    try:
+        return importlib.import_module(dotted)
+    finally:
+        if inserted in sys.path:
+            sys.path.remove(inserted)
+
+
 def _tables(base: Any) -> dict[str, Any]:
     return dict(base.metadata.tables)
 
@@ -164,4 +182,58 @@ def test_the_migration_lists_match(schemas):
         f'migration lists differ — only in trader: '
         f'{sorted(trader_columns - api_columns)}; '
         f'only in api: {sorted(api_columns - trader_columns)}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Contract sizes
+# ---------------------------------------------------------------------------
+
+
+def test_the_api_contract_sizes_match_the_cost_model():
+    """Contract size is money, and it had drifted 2x-5x in three places.
+
+    `core/costs.py` is the single source of truth for money (CLAUDE.md), but the
+    API serves its own `CDE_PRODUCTS` table to the frontend, which prefers the
+    API value over its own fallback. AVAX read 5 against 10, LINK 10 against 50,
+    LTC 1 against 5 — and contract size multiplies straight into notional, fee as
+    a fraction of notional, margin, liquidation price, participation rate and
+    PnL. The five instruments actually traded happened to agree, which is why
+    nothing surfaced it.
+
+    Duplication here is deliberate (the containers do not import each other), so
+    the guard is the same one `test_orm_parity` applies to the ORMs: compare them
+    and fail on divergence.
+    """
+    from core.costs import CONTRACT_UNITS
+
+    api_products = _load_api_module('endpoints.coins').CDE_PRODUCTS
+
+    mismatches = []
+    for asset, product in api_products.items():
+        expected = CONTRACT_UNITS.get(asset)
+        if expected is None:
+            continue
+        actual = float(product['units_per_contract'])
+        if abs(actual - float(expected)) > 1e-9:
+            mismatches.append(
+                f'{asset} ({product.get("code")}): API {actual} vs core/costs.py {expected}'
+            )
+
+    assert not mismatches, (
+        'contract sizes disagree, so notional and PnL differ between the '
+        'services:\n  ' + '\n  '.join(mismatches)
+    )
+
+
+def test_every_api_product_is_known_to_the_cost_model():
+    """A product the cost model has never heard of gets a default contract size."""
+    from core.costs import CONTRACT_UNITS
+
+    api_products = _load_api_module('endpoints.coins').CDE_PRODUCTS
+    unknown = sorted(set(api_products) - set(CONTRACT_UNITS))
+
+    assert not unknown, (
+        f'served by the API with no entry in CONTRACT_UNITS, so they would be '
+        f'priced at the fallback: {unknown}'
     )

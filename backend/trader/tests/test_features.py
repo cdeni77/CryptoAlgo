@@ -229,7 +229,7 @@ def test_notional_per_contract_is_not_a_feature(config):
     expressive, and more overfittable, than the symbol category the pooled model
     deliberately does without (see `core.model.USE_SYMBOL_IDENTITY`). It also has
     no predictive story: the model does not size positions,
-    `core.costs.size_position` does.
+    `core.execution.size_from_forecast` does.
     """
     inputs = _inputs('SLP', 150, seed=31)
     features = cost_features(inputs, config=config)
