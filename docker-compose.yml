@@ -199,6 +199,11 @@ services:
       # hardcoded 10bp/side — the two failures its own docstring exists to fix.
       - RESEARCH_STORE=/app/data/research
       - COST_CONFIG=coinbase_us_perps_cde_v202602.json
+      # Must match the trader's LEVERAGE. This engine reads config.leverage for
+      # the margin it reserves and for the `cash * leverage` cap that clips a
+      # signal's contract count, so a mismatch means the book sizes positions
+      # differently from the signal writer that produced them.
+      - LEVERAGE=4
       - LOG_LEVEL=INFO
     depends_on:
       db:

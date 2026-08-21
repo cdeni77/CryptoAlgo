@@ -15,10 +15,13 @@ Three layers, in dependency order:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Protocol
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from core.profiles import CoinProfile
@@ -120,6 +123,32 @@ def resolve_base(symbol: str) -> Optional[str]:
 
 
 _resolve_base = resolve_base  # historical name
+
+
+def contract_size_disagreements(
+    declared: dict[str, float] | None,
+) -> dict[str, tuple[float, float]]:
+    """Where a venue schedule's contract sizes differ from `CONTRACT_UNITS`.
+
+    Returns {base: (schedule_size, contract_units_size)}.
+
+    `ExchangeCostAssumptions.contract_sizes` is parsed out of every venue file
+    and read by nothing — `get_contract_spec` always uses `CONTRACT_UNITS` — so
+    a schedule that disagreed had no way to say so. Three instruments do
+    disagree in the shipped CDE file (AVAX 2x, LINK 5x, LTC 5x), and contract
+    size multiplies into notional, fees, margin, liquidation price and PnL.
+    Which side is right is a question for Coinbase's published specs; this
+    function exists so the question gets asked.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    for key, size in (declared or {}).items():
+        base = resolve_base(key)
+        if base is None or base not in CONTRACT_UNITS:
+            continue
+        ours = float(CONTRACT_UNITS[base])
+        if ours != float(size):
+            out[base] = (float(size), ours)
+    return out
 
 
 def get_contract_spec(symbol: str) -> ContractSpec:
@@ -334,7 +363,23 @@ class ExchangeCostAssumptions:
 def load_exchange_cost_assumptions(path: str | Path) -> ExchangeCostAssumptions:
     p = Path(path)
     with p.open("r", encoding="utf-8") as f:
-        return ExchangeCostAssumptions.from_dict(json.load(f), source_path=str(p))
+        assumptions = ExchangeCostAssumptions.from_dict(json.load(f), source_path=str(p))
+
+    disagreements = contract_size_disagreements(assumptions.contract_sizes)
+    if disagreements:
+        logger.warning(
+            "%s declares contract sizes that disagree with core.costs "
+            "CONTRACT_UNITS, which is what actually sizes every position: %s. "
+            "Contract size multiplies into notional, fees, margin, liquidation "
+            "price and PnL — check Coinbase's published specs and fix whichever "
+            "is wrong",
+            p.name,
+            ", ".join(
+                f"{base} schedule={theirs:g} used={ours:g} ({ours / theirs:.3g}x)"
+                for base, (theirs, ours) in sorted(disagreements.items())
+            ),
+        )
+    return assumptions
 
 
 # ---------------------------------------------------------------------------

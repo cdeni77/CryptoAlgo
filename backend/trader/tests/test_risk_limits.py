@@ -189,3 +189,60 @@ def test_the_floor_is_read_by_the_backtest():
 
     source = inspect.getsource(backtest.run_backtest)
     assert 'min_equity' in source, 'the equity floor is not enforced'
+
+
+# ---------------------------------------------------------------------------
+# The per-trade risk bound has to survive leverage
+# ---------------------------------------------------------------------------
+
+
+def _loss_at_stop(leverage: float, *, stop_multiple: float = 3.0) -> float:
+    """Fraction of equity lost if a freshly sized position hits its stop."""
+    from dataclasses import replace
+
+    from core.config import Config
+    from core.costs import get_contract_spec
+    from core.execution import size_from_forecast
+
+    equity, price, sigma = 100_000.0, 60_000.0, 0.02
+    config = replace(Config(), leverage=leverage)
+    contracts = size_from_forecast(
+        equity=equity, price=price, symbol='BIP', expected_return=0.05,
+        sigma=sigma, config=config, stop_multiple=stop_multiple, stop_sigma=sigma,
+    )
+    notional = contracts * get_contract_spec('BIP').units * price
+    return notional * stop_multiple * sigma / equity
+
+
+def test_max_risk_per_trade_is_a_bound_at_every_leverage():
+    """`MAX_RISK_PER_TRADE` must mean what its docstring says it means.
+
+    `risk_budget_fraction` solves for the notional whose stop-out costs at most
+    `max_risk` of equity — then `size_from_forecast` multiplied that fraction by
+    `config.leverage`, so the realised bound was `max_risk * leverage`. At the
+    compose default of 4x a declared 1% became a measured 4.00%, and raising the
+    knob raised the loss with it. The function had a `leverage` parameter,
+    declared and referenced nowhere, which is what it was for.
+    """
+    from core.execution import MAX_RISK_PER_TRADE
+
+    for leverage in (1.0, 2.0, 4.0, 10.0, 25.0):
+        loss = _loss_at_stop(leverage)
+        assert loss <= MAX_RISK_PER_TRADE + 1e-9, (
+            f'at {leverage}x leverage a stop-out costs {loss:.2%} of equity '
+            f'against a declared limit of {MAX_RISK_PER_TRADE:.2%}'
+        )
+
+
+def test_raising_leverage_past_the_risk_budget_stops_adding_size():
+    """Once the risk budget binds, leverage is not a way around it.
+
+    Below the budget, leverage does what an operator expects and scales the
+    position. Above it, the bound holds instead — that ordering is the whole
+    point of `min(conviction, budget)`.
+    """
+    small, large = _loss_at_stop(1.0), _loss_at_stop(4.0)
+    assert large > small, 'leverage should still scale size while the budget is slack'
+    assert _loss_at_stop(25.0) == pytest.approx(_loss_at_stop(10.0), rel=1e-6), (
+        'past the budget, more leverage must not buy more risk'
+    )

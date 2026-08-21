@@ -204,6 +204,31 @@ and both are useful.
 - **TypeScript/React**: Functional components + hooks only, no class components. Fetch-based API layer (no axios). `recharts` for charts.
 - **Tests**: `pytest` for trader. The suite's job is to catch the failure modes that produced fake edge before: lookahead (`test_backtest.py`), symbol-identity memorisation (`test_model.py`), leaked fold statistics (`test_cv_and_metrics.py`), the cost identity (`test_targets.py`), and blocked candidates reaching live (`test_promotion.py`). Mark anything over ~10s `@pytest.mark.slow`.
 
+## Open: contract sizes disagree by up to 5x
+
+`configs/exchange/coinbase_us_perps_cde_v202602.json` and
+`core/costs.py:CONTRACT_UNITS` do not agree on three instruments:
+
+| asset | venue schedule | CONTRACT_UNITS (what actually sizes positions) |
+|-------|---------------:|-----------------------------------------------:|
+| AVAX  | 5  | 10 |
+| LINK  | 10 | 50 |
+| LTC   | 1  | 5  |
+
+The schedule's `contract_sizes` are read by nothing — `get_contract_spec` always
+uses `CONTRACT_UNITS` — so the disagreement had no way to surface. Contract size
+multiplies into notional, fee-as-a-fraction-of-notional, margin, liquidation
+price, participation rate and PnL, so this is a silent multiplier on everything
+those three instruments produce.
+
+**Resolving it needs Coinbase's published contract specs**, not a code change;
+picking a side in code would be guessing at money.
+`load_exchange_cost_assumptions` warns on every run that reads the file, and
+`test_orm_parity.py::test_the_venue_schedule_agrees_with_the_contract_units_table`
+is a `strict=True` xfail — it fails the moment the data is fixed without the
+marker being removed. Until then, exclude AVAX, LINK and LTC (`--exclude
+AVAX,LINK,LTC`) or accept that their sizing is uncertain to 2x-5x.
+
 ## The reference venue needs a proxy from a US IP
 
 Coinbase data — the instrument actually traded — is authenticated and US-legal,

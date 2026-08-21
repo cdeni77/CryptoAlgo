@@ -66,6 +66,12 @@ def build_config(args: argparse.Namespace) -> Config:
     every Coinbase contract, and the previous system never loaded the file at all.
     """
     config = Config()
+    # Every return below goes through `_with_recency`, which is where
+    # --leverage, --exclude, --max-correlation and --recency-half-life-days are
+    # applied. Two of these branches used to `return config` directly, so
+    # `--cost-config none` silently discarded all four — including the half-life,
+    # the lever preflight reports on. Four flags that parsed, stored, and reached
+    # nothing, which is the exact class of bug they were added to remove.
     if not args.cost_config or args.cost_config.lower() == 'none':
         logging.warning(
             'no cost config: pricing every contract at the hardcoded %.1fbp/side '
@@ -73,7 +79,7 @@ def build_config(args: argparse.Namespace) -> Config:
             'contract by 0.06x to 2.5x',
             config.fee_pct_per_side * 10_000,
         )
-        return config
+        return _with_recency(config, args)
 
     path = find_cost_config(args.cost_config)
     if path is None:

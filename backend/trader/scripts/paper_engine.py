@@ -39,7 +39,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -168,11 +168,12 @@ class PaperTradingEngine:
         active_coins: Optional[list[str]] = None,
         cost_config: Optional[str] = None,
         store: Optional[str] = None,
+        leverage: Optional[float] = None,
     ) -> None:
         self.poll_seconds = poll_seconds
         self.max_signal_age_minutes = max_signal_age_minutes
         self.writer = PgWriter()
-        self.config = _build_config(cost_config)
+        self.config = _build_config(cost_config, leverage)
         self.min_edge_to_risk = min_edge_to_risk
         self.state = EngineState()
         self.funding = FundingSource(store)
@@ -576,17 +577,34 @@ class PaperTradingEngine:
             time.sleep(self.poll_seconds)
 
 
-def _build_config(cost_config: Optional[str]) -> Config:
+def _build_config(cost_config: Optional[str], leverage: Optional[float] = None) -> Config:
     """A Config with the venue's real fee schedule loaded unless refused.
 
     Loud on failure. Paper trading exists to tell you what the strategy earns,
     and a paper book priced at the wrong commission answers a different question
     than the one being asked.
+
+    `leverage` is threaded in because this engine reads `config.leverage` in two
+    money places — the margin it reserves on a rehydrated position, and the
+    `cash * leverage` cap that clips a signal's contract count. It used to take
+    the `Config` default of 4 regardless of what the deployment set, so
+    `LEVERAGE=1` lowered signal sizing while the book still reserved a quarter
+    of the margin a 1x position needs, and `LEVERAGE=10` left the engine
+    clipping the signal's own size at 4x.
     """
     config = Config()
+    if leverage is not None:
+        if leverage <= 0:
+            raise SystemExit('--leverage must be positive')
+        config = replace(config, leverage=float(leverage))
+
     if cost_config and cost_config.lower() == 'none':
+        # `config.taker_bps` does not exist — this line raised AttributeError on
+        # the one path it guards, so `--cost-config none` crashed the engine
+        # instead of warning it.
         logger.warning('running on the hardcoded %.1fbp/side default, which is '
-                       'wrong for every Coinbase CDE contract', config.taker_bps)
+                       'wrong for every Coinbase CDE contract',
+                       config.fee_pct_per_side * 10_000)
         return config
 
     path = find_cost_config(cost_config or DEFAULT_COST_CONFIG_NAME)
@@ -625,6 +643,10 @@ def main() -> None:
                         help='Comma-separated coins to trade. Empty means all.')
     parser.add_argument('--cost-config', default=os.getenv('COST_CONFIG') or None,
                         help="Venue fee schedule. 'none' to use the hardcoded default.")
+    parser.add_argument('--leverage', type=float,
+                        default=float(os.getenv('LEVERAGE', '4')),
+                        help='Margin divisor and notional cap. Must match what '
+                             'the signal writer sized with.')
     parser.add_argument('--store', default=os.getenv('RESEARCH_STORE') or None,
                         help='Research store root, for funding rates')
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
@@ -641,6 +663,7 @@ def main() -> None:
         min_edge_to_risk=args.min_edge_to_risk,
         active_coins=[c.strip().upper() for c in args.active_coins.split(',') if c.strip()] or None,
         cost_config=args.cost_config,
+        leverage=args.leverage,
         store=args.store,
     ).run_forever()
 

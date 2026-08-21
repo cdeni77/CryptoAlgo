@@ -20,7 +20,18 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"],
-  "exclude": ["node_modules", "dist"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  // `vite.config.ts` is checked separately, by tsconfig.node.json. It used to be
+  // in this project's `include` AND behind a `references` entry, which made
+  // `npm run typecheck` — plain `tsc --noEmit`, no `-b` — resolve the referenced
+  // project's declaration output from disk:
+  //
+  //   error TS6305: Output file 'vite.config.d.ts' has not been built from
+  //   source file 'vite.config.ts'.
+  //
+  // That output was a stale checked-in build artifact. Untracking it, which was
+  // right, broke `npm run typecheck` on every clean clone — the first step of
+  // the command chain CLAUDE.md documents. Both projects are checked now; see
+  // the `typecheck` script.
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "dist"]
 }

@@ -331,3 +331,35 @@ def test_every_environment_variable_compose_sets_is_read_by_something(compose):
         + '\n\nEither wire it or delete it. A knob that silently does nothing is '
           'how LEVERAGE=4 stayed authoritative while an operator lowered it.'
     )
+
+
+def test_the_trader_and_paper_engine_agree_on_leverage(compose):
+    """Two services size the same book. They cannot disagree about leverage.
+
+    `scripts.signals` sizes a position with `config.leverage`; the paper engine
+    then reserves margin as `notional / leverage` and caps contracts at
+    `cash * leverage`. If the two read different values the engine either
+    reserves the wrong margin or clips the signal writer's own size — and the
+    engine used to read no value at all, taking the `Config` default of 4
+    whatever the deployment set.
+    """
+    services = compose.get('services', {})
+    values = {}
+    for name in ('trader', 'paper-engine'):
+        service = services.get(name)
+        if service is None:
+            pytest.skip(f'no {name} service in compose')
+        declared = {
+            entry.split('=', 1)[0].strip(): entry.split('=', 1)[1].strip()
+            for entry in (service.get('environment') or [])
+            if isinstance(entry, str) and '=' in entry
+        }
+        assert 'LEVERAGE' in declared, (
+            f'{name} does not set LEVERAGE, so it falls back to the Config '
+            f'default regardless of the deployment'
+        )
+        values[name] = declared['LEVERAGE']
+
+    assert len(set(values.values())) == 1, (
+        f'the services disagree about leverage: {values}'
+    )

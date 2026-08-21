@@ -402,11 +402,17 @@ def risk_budget_fraction(
 
     This is what keeps a run of bad forecasts survivable. Sizing on Kelly alone,
     a strategy trading noise lost 92% of the account over 110 trades.
+
+    `leverage` divides the budget because the caller multiplies the fraction it
+    returns by `config.leverage` when it converts to notional. Without the
+    division the bound scaled with leverage: at the compose default of 4x, a
+    declared 1% `MAX_RISK_PER_TRADE` allowed a 4% loss at the stop. The parameter
+    was already declared here and referenced nowhere, which is what it was for.
     """
     loss_per_unit = max(stop_multiple, 1e-9) * max(sigma, 1e-9)
     if loss_per_unit <= 0:
         return 0.0
-    return float(max(max_risk / loss_per_unit, 0.0))
+    return float(max(max_risk / loss_per_unit / max(leverage, 1e-9), 0.0))
 
 
 def size_from_forecast(
@@ -460,6 +466,7 @@ def size_from_forecast(
     budget = risk_budget_fraction(
         sigma if stop_sigma is None else stop_sigma,
         stop_multiple=stop_multiple, max_risk=max_risk,
+        leverage=float(config.leverage),
     )
     fraction = min(conviction, budget)
 

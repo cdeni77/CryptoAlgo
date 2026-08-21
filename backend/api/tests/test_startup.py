@@ -18,16 +18,48 @@ import pytest
 from sqlalchemy import inspect
 
 
-def _fresh_app(url: str):
-    """Import `app` against `url`, evicting anything that cached an engine."""
-    for module in ('app', 'database'):
-        sys.modules.pop(module, None)
-    import os
-    os.environ['DATABASE_URL'] = url
-    return importlib.import_module('app')
+@pytest.fixture
+def fresh_app(monkeypatch):
+    """Import `app` against a given URL, then put the session back as it was.
+
+    Two things have to be undone or the rest of the suite inherits them: the
+    `DATABASE_URL` this points at a deliberately dead host, and the evicted
+    `app`/`database` modules that every other test's `client` fixture imports.
+    Setting the variable with bare `os.environ` and leaving the modules popped
+    made the whole API suite order-dependent — it passed only because this file
+    sorts last, and adding `-n auto` (xdist does not preserve file grouping) or
+    renaming the file broke five tests in other files with
+    `OperationalError: port 1 failed`.
+    """
+    # Evicting `app` and `database` alone is not enough. Every controller and
+    # endpoint module did `from database import get_db`, capturing a function
+    # closed over that module's `SessionLocal` — so a cached controller keeps
+    # using the engine it was first imported with, and restoring two entries
+    # leaves the dead one reachable through all of them.
+    roots = ('app', 'database', 'security')
+    packages = ('models', 'controllers', 'endpoints')
+
+    def _owned(name: str) -> bool:
+        return name in roots or name.split('.')[0] in packages
+
+    original = {name: module for name, module in sys.modules.items() if _owned(name)}
+
+    def _load(url: str):
+        for name in list(sys.modules):
+            if _owned(name):
+                del sys.modules[name]
+        monkeypatch.setenv('DATABASE_URL', url)
+        return importlib.import_module('app')
+
+    yield _load
+
+    for name in list(sys.modules):
+        if _owned(name):
+            del sys.modules[name]
+    sys.modules.update(original)
 
 
-def test_importing_the_app_does_not_connect(tmp_path, monkeypatch):
+def test_importing_the_app_does_not_connect(tmp_path, monkeypatch, fresh_app):
     """A `DATABASE_URL` nothing is listening on must still import cleanly.
 
     `create_engine` is lazy, so this passes as long as no top-level statement
@@ -35,7 +67,7 @@ def test_importing_the_app_does_not_connect(tmp_path, monkeypatch):
     back to module scope.
     """
     monkeypatch.setenv('API_TOKEN', 'x')
-    module = _fresh_app('postgresql://nobody:nothing@127.0.0.1:1/absent')
+    module = fresh_app('postgresql://nobody:nothing@127.0.0.1:1/absent')
     assert module.app is not None
 
     with pytest.raises(Exception):
@@ -45,10 +77,10 @@ def test_importing_the_app_does_not_connect(tmp_path, monkeypatch):
         inspect(module.engine).get_table_names()
 
 
-def test_startup_creates_the_tables(tmp_path, monkeypatch):
+def test_startup_creates_the_tables(tmp_path, monkeypatch, fresh_app):
     monkeypatch.setenv('API_TOKEN', 'x')
     database = tmp_path / 'startup.db'
-    module = _fresh_app(f'sqlite:///{database}')
+    module = fresh_app(f'sqlite:///{database}')
 
     assert inspect(module.engine).get_table_names() == [], (
         'tables exist before startup, so something created them at import'
@@ -64,11 +96,11 @@ def test_startup_creates_the_tables(tmp_path, monkeypatch):
         assert expected in tables, f'{expected} missing after startup: {sorted(tables)}'
 
 
-def test_bootstrap_is_idempotent(tmp_path, monkeypatch):
+def test_bootstrap_is_idempotent(tmp_path, monkeypatch, fresh_app):
     """Every worker runs it. Running it twice must be a no-op, not an error."""
     monkeypatch.setenv('API_TOKEN', 'x')
     database = tmp_path / 'twice.db'
-    module = _fresh_app(f'sqlite:///{database}')
+    module = fresh_app(f'sqlite:///{database}')
 
     module.bootstrap_schema()
     first = set(inspect(module.engine).get_table_names())

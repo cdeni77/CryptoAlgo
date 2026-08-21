@@ -1,11 +1,18 @@
 {
+  // Checks `vite.config.ts`, which needs Node globals and a different module
+  // interop than the browser sources. Deliberately NOT `composite`: it was, and
+  // the root project referenced it, which made plain `tsc --noEmit` demand a
+  // built `vite.config.d.ts` on disk (TS6305) and broke typecheck on a clean
+  // clone. It is now a standalone project that `npm run typecheck` checks
+  // alongside the app.
   "compilerOptions": {
-    "composite": true,
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
-    "strict": true
+    "strict": true,
+    "noEmit": true,
+    "types": ["node"]
   },
   "include": ["vite.config.ts"]
 }

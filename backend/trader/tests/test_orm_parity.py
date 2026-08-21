@@ -355,3 +355,73 @@ def test_no_table_is_declared_without_a_writer(schemas):
         'the `trades` table is back. Nothing wrote it before; if something '
         'writes it now, delete this test and say what.'
     )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        'KNOWN OPEN: the shipped CDE schedule and CONTRACT_UNITS disagree on '
+        'AVAX (5 vs 10), LINK (10 vs 50) and LTC (1 vs 5). Resolving it needs '
+        "Coinbase's published contract specs, not a code change — picking a "
+        'side here would be guessing at a multiplier on notional, fees, margin '
+        'and PnL. `load_exchange_cost_assumptions` warns on every run that '
+        'reads the file. strict=True so this fails the moment someone fixes the '
+        'data without removing this marker.'
+    ),
+)
+def test_the_venue_schedule_agrees_with_the_contract_units_table():
+    """Three sources declare contract size. All three have to say the same thing.
+
+    Contract size multiplies straight into notional, fee-as-a-fraction-of-
+    notional, margin, liquidation price, participation rate and PnL — so a
+    disagreement is a silent multiplier on every number the system produces.
+
+    `test_the_api_contract_sizes_match_the_cost_model` above compares two of the
+    three: the API's `CDE_PRODUCTS` against `core/costs.py:CONTRACT_UNITS`. It
+    passed while the file both are meant to derive from — the venue fee schedule
+    in `configs/exchange/` — disagreed on three instruments:
+
+        AVAX   CONTRACT_UNITS 10   schedule 5    (2x)
+        LINK   CONTRACT_UNITS 50   schedule 10   (5x)
+        LTC    CONTRACT_UNITS  5   schedule 1    (5x)
+
+    `ExchangeCostAssumptions.contract_sizes` is parsed out of that file and read
+    by nothing — `get_contract_spec` always uses `CONTRACT_UNITS` — so the
+    schedule's sizes were dead data and the disagreement had no way to surface.
+
+    Which of the two is correct is a question for Coinbase's published specs, not
+    for this test. What this test does is refuse to let them differ silently.
+    """
+    import json
+
+    from core.costs import CONTRACT_UNITS, resolve_base
+
+    schedule_path = (
+        TRADER_ROOT / 'configs' / 'exchange' / 'coinbase_us_perps_cde_v202602.json'
+    )
+    if not schedule_path.exists():
+        pytest.skip(f'no venue schedule at {schedule_path}')
+
+    declared = json.loads(schedule_path.read_text()).get('contract_sizes') or {}
+    assert declared, 'the venue schedule declares no contract sizes'
+
+    mismatches = []
+    for key, size in sorted(declared.items()):
+        # The schedule keys on both the asset (AVAX) and the contract code (AVP);
+        # both resolve to the same base, which is what CONTRACT_UNITS keys on.
+        base = resolve_base(key)
+        if base is None or base not in CONTRACT_UNITS:
+            continue
+        if float(CONTRACT_UNITS[base]) != float(size):
+            mismatches.append(
+                f'{key} (base {base}): schedule={size} CONTRACT_UNITS={CONTRACT_UNITS[base]} '
+                f'({float(CONTRACT_UNITS[base]) / float(size):.3g}x)'
+            )
+
+    assert not mismatches, (
+        'contract sizes disagree between the venue schedule and the money '
+        'module:\n  ' + '\n  '.join(mismatches)
+        + '\n\nCheck Coinbase\'s published contract specs and fix whichever is '
+          'wrong. Contract size multiplies into notional, fees, margin, '
+          'liquidation price and PnL, so this is not a cosmetic difference.'
+    )
