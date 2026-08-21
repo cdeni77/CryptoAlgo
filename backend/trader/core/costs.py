@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from core.profiles import CoinProfile
@@ -344,6 +344,10 @@ class CostParams(Protocol):
 
     fee_pct_per_side: float
     min_fee_per_contract: float
+    # Optional per-symbol overrides of the floor. Coinbase CDE bills $0.75 per
+    # contract on BTC and ETH but $0.10 on everything else, so a single scalar
+    # silently charges every instrument the most expensive rate.
+    min_fee_per_contract_by_symbol: dict[str, float]
     slippage_bps: float
     impact_bps_per_contract: float
     impact_max_bps_per_side: float
@@ -351,6 +355,50 @@ class CostParams(Protocol):
     apply_impact: bool
     apply_funding: bool
     leverage: float
+
+
+def fee_floor(symbol: str, params: CostParams) -> float:
+    """Per-contract commission for `symbol`, falling back to the flat default.
+
+    The venue's schedule is keyed by a mix of CDE product codes and plain
+    tickers, so try the symbol as given, then its prefix, then the underlying
+    ticker, then any product code for that underlying.
+    """
+    overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
+    if not overrides:
+        return float(params.min_fee_per_contract)
+
+    token = symbol.upper().strip()
+    base = _resolve_base(token)
+    candidates = [token, token.split('-')[0]]
+    if base:
+        candidates.append(base)
+        candidates.extend(code for code, mapped in CDE_CODE_TO_BASE.items() if mapped == base)
+
+    for candidate in candidates:
+        if candidate in overrides:
+            return float(overrides[candidate])
+    return float(params.min_fee_per_contract)
+
+
+def symbols_missing_fee_schedule(
+    symbols: Iterable[str],
+    params: CostParams,
+) -> list[str]:
+    """Symbols with no explicit entry in the loaded per-contract fee schedule.
+
+    Those fall back to the flat default, which for Coinbase CDE is the expensive
+    BTC/ETH rate. That errs toward understating profitability rather than
+    overstating it, but it is a data gap and callers should say so rather than
+    let it pass silently. Resolve it against the venue's published schedule.
+    """
+    overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
+    if not overrides:
+        return []
+    default = float(params.min_fee_per_contract)
+    return sorted(
+        {s for s in symbols if fee_floor(s, params) == default and s.upper() not in overrides}
+    )
 
 
 @dataclass(frozen=True)
@@ -446,7 +494,7 @@ def entry_fee(n_contracts: int, price: float, symbol: str, params: CostParams) -
     """One-side fee in dollars: percentage of notional, floored per contract."""
     spec = get_contract_spec(symbol)
     pct_fee = spec.notional(n_contracts, price) * params.fee_pct_per_side
-    floor = n_contracts * params.min_fee_per_contract
+    floor = n_contracts * fee_floor(symbol, params)
     return float(max(pct_fee, floor))
 
 
@@ -464,7 +512,7 @@ def round_trip_costs(
         exit_notional=spec.notional(n_contracts, exit_price),
         n_contracts=int(n_contracts),
         fee_pct_per_side=params.fee_pct_per_side,
-        min_fee_per_contract=params.min_fee_per_contract,
+        min_fee_per_contract=fee_floor(symbol, params),
         slippage_bps_per_side=params.slippage_bps,
         impact_bps_per_contract=params.impact_bps_per_contract,
         impact_max_bps_per_side=params.impact_max_bps_per_side,
