@@ -530,9 +530,14 @@ def test_every_modelled_contract_has_an_explicit_fee_floor():
         pytest.skip('no cost config on the search path')
     config = Config().with_cost_assumptions(path)
 
-    # Every spelling a profile answers to, since that is what callers pass.
+    # Every spelling a profile answers to, *and* the decorated product ids the
+    # store actually holds — `BIP-20DEC30-CDE`, not `BIP`. Testing bare codes
+    # alone missed a false positive on the decorated form: the check compared
+    # the resolved fee against the default, so BIP and ETP at an explicit $0.75
+    # were reported as uncovered while pricing correctly.
     codes = sorted({p for profile in COIN_PROFILES.values() for p in profile.prefixes})
-    missing = symbols_missing_fee_schedule(codes, config)
+    decorated = [f'{c}-20DEC30-CDE' for c in codes]
+    missing = symbols_missing_fee_schedule(codes + decorated, config)
 
     assert not missing, (
         f'no explicit per-contract fee for {missing}. They fall back to '

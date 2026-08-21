@@ -506,16 +506,22 @@ class CostParams(Protocol):
     leverage: float
 
 
-def fee_floor(symbol: str, params: CostParams) -> float:
-    """Per-contract commission for `symbol`, falling back to the flat default.
+def fee_schedule_key(symbol: str, overrides: dict[str, float]) -> Optional[str]:
+    """The schedule key covering `symbol`, or None if the schedule has no entry.
 
     The venue's schedule is keyed by a mix of CDE product codes and plain
     tickers, so try the symbol as given, then its prefix, then the underlying
     ticker, then any product code for that underlying.
+
+    Separated from `fee_floor` so that "did the schedule cover this?" is asked
+    directly. Comparing the returned *fee* against the default cannot answer it:
+    BIP and ETP are explicitly $0.75 and the default is also $0.75, so an
+    equality test reported both as uncovered while they were pricing correctly.
+    The same shape as using `units == DEFAULT_UNITS` to detect an unresolved
+    contract, which condemned BCH for genuinely being one unit per contract.
     """
-    overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
     if not overrides:
-        return float(params.min_fee_per_contract)
+        return None
 
     token = symbol.upper().strip()
     base = resolve_base(token)
@@ -524,10 +530,14 @@ def fee_floor(symbol: str, params: CostParams) -> float:
         candidates.append(base)
         candidates.extend(code for code, mapped in CDE_CODE_TO_BASE.items() if mapped == base)
 
-    for candidate in candidates:
-        if candidate in overrides:
-            return float(overrides[candidate])
-    return float(params.min_fee_per_contract)
+    return next((c for c in candidates if c in overrides), None)
+
+
+def fee_floor(symbol: str, params: CostParams) -> float:
+    """Per-contract commission for `symbol`, falling back to the flat default."""
+    overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
+    key = fee_schedule_key(symbol, overrides)
+    return float(overrides[key]) if key else float(params.min_fee_per_contract)
 
 
 def symbols_missing_fee_schedule(
@@ -544,10 +554,7 @@ def symbols_missing_fee_schedule(
     overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
     if not overrides:
         return []
-    default = float(params.min_fee_per_contract)
-    return sorted(
-        {s for s in symbols if fee_floor(s, params) == default and s.upper() not in overrides}
-    )
+    return sorted({s for s in symbols if fee_schedule_key(s, overrides) is None})
 
 
 # ---------------------------------------------------------------------------
