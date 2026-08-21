@@ -289,3 +289,48 @@ def test_report_flattens_into_gate_measurements():
     assert measurements['oos_trades'] == 180.0
     # Still blocked: stress and surface were not run.
     assert not evaluate_gates(measurements)[0]
+
+
+def test_synthetic_panel_keeps_every_instrument_its_own_span():
+    """A ragged panel must not be truncated to its shortest member.
+
+    Joint generation needs a rectangular array, and the first attempt at that was
+    `n = min(lengths)`. It worked and cost most of the evidence: on a store holding
+    398 days across 18 CDE contracts the shortest was HYP at 75 days, so every
+    synthetic panel, bootstrap and cost-stress figure was computed on 54 of 398
+    days — and those 54 were a single directional quarter, the worst possible
+    window to conclude from.
+
+    Generating over the union span and restricting each instrument to its own
+    listed window gives the ragged shape the real panel already has, so nothing
+    downstream changes.
+    """
+    index = pd.date_range('2026-01-01', periods=2_000, freq='1h', tz='UTC')
+    bars = {}
+    for i, (symbol, start) in enumerate((('LONG', 0), ('MID', 1_200), ('SHORT', 1_900))):
+        window = index[start:]
+        rng = np.random.default_rng(i)
+        close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, len(window))))
+        opens = np.concatenate([[close[0]], close[:-1]])
+        bars[symbol] = pd.DataFrame(
+            {'open': opens, 'high': np.maximum(opens, close) * 1.002,
+             'low': np.minimum(opens, close) * 0.998, 'close': close,
+             'volume': 1_000.0},
+            index=window,
+        )
+
+    synthetic = synthetic_panel(bars, seed=11)
+
+    for symbol, real in bars.items():
+        assert synthetic[symbol].index.equals(real.index), (
+            f'{symbol} was reindexed; the shortest common span would give '
+            f'{min(len(b) for b in bars.values())} bars for all three'
+        )
+        assert np.isfinite(synthetic[symbol]['close']).all()
+        # Compounding through months the contract did not exist would hand it a
+        # drift it never had, so the path must start from the real first close.
+        assert synthetic[symbol]['close'].iloc[0] == pytest.approx(
+            float(real['close'].iloc[0]), rel=0.05)
+
+    assert len(synthetic['LONG']) == 2_000
+    assert len(synthetic['SHORT']) == 100

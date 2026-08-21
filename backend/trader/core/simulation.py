@@ -337,27 +337,48 @@ def synthetic_panel(
         return {}
 
     # A ragged panel is the normal state of a store where one instrument listed
-    # later than another, and taking `n` from the first symbol then applying it to
-    # all of them raised `ValueError: operands could not be broadcast together`
-    # for either ordering — turning the whole synthetic gate into an exception
-    # rather than a measurement. Simulate the shortest common span.
+    # later than another. Joint generation needs a rectangular array, and taking
+    # `n` from the first symbol then applying it to all of them raised
+    # `ValueError: operands could not be broadcast together` — turning the whole
+    # synthetic gate into an exception rather than a measurement.
+    #
+    # The fix for that was `n = min(lengths)`, which worked and cost most of the
+    # evidence: on a store holding 398 days across 18 CDE contracts, the shortest
+    # was HYP at 75 days (listed 2026-06-05), so every synthetic panel, bootstrap
+    # and cost-stress number was computed on 54 of 398 days — and those 54 were
+    # one directional quarter, which is the worst possible window to draw a
+    # conclusion from.
+    #
+    # Generate over the UNION span instead, then restrict each instrument to the
+    # window it actually traded in. That is the ragged shape the real panel
+    # already has, so nothing downstream has to change, and the correlation is
+    # estimated pairwise-complete rather than from the shortest overlap.
+    index = pd.DatetimeIndex(
+        sorted(set().union(*(bars.index for bars in bars_by_symbol.values())))
+    )
+    n = len(index)
     lengths = {symbol: len(bars) for symbol, bars in bars_by_symbol.items()}
-    n = min(lengths.values())
     if len(set(lengths.values())) > 1:
         logger.info(
-            'ragged panel: simulating the shortest common span of %d bars '
-            '(longest %d)', n, max(lengths.values())
+            'ragged panel: simulating the union span of %d bars '
+            '(shortest instrument %d, longest %d); each instrument is restricted '
+            'to its own listed window',
+            n, min(lengths.values()), max(lengths.values()),
         )
-    reference = bars_by_symbol[symbols[0]].iloc[-n:]
 
     returns_frame = pd.DataFrame({
-        symbol: bars['close'].iloc[-n:].pct_change() for symbol, bars in bars_by_symbol.items()
-    }).dropna()
+        symbol: bars['close'].reindex(index).pct_change()
+        for symbol, bars in bars_by_symbol.items()
+    })
     if correlation is None:
+        # Pairwise-complete: `DataFrame.corr` already ignores rows where either
+        # leg is missing, so a late listing contributes to every pair it overlaps
+        # instead of truncating all of them to its own length.
         correlation = returns_frame.corr().to_numpy()
 
     parameters = {
-        symbol: fit_regime_parameters(returns_frame[symbol]) for symbol in symbols
+        symbol: fit_regime_parameters(returns_frame[symbol].dropna())
+        for symbol in symbols
     }
 
     # Regime paths give each instrument its own volatility clustering; the
@@ -390,12 +411,16 @@ def synthetic_panel(
     coupled = coupled * independent.std(0) + independent.mean(0)
 
     out: dict[str, pd.DataFrame] = {}
+    positions = {t: i for i, t in enumerate(index)}
     for i, symbol in enumerate(symbols):
-        # The same shortest common span the simulation was generated over, so the
-        # real intrabar ratios line up with the simulated closes.
-        bars = bars_by_symbol[symbol].iloc[-n:]
+        # Restrict to the instrument's own listed window, and accumulate only over
+        # that window — compounding through months when the contract did not exist
+        # would hand it a drift it never had.
+        bars = bars_by_symbol[symbol]
+        rows = np.fromiter((positions[t] for t in bars.index), dtype=int, count=len(bars))
+        steps = coupled[rows, i]
         start = float(bars['close'].iloc[0])
-        close = start * np.exp(np.cumsum(coupled[:, i]))
+        close = start * np.exp(np.cumsum(steps))
         open_ = np.concatenate([[close[0]], close[:-1]])
         # Reuse the real intrabar range as a fraction, so highs and lows keep a
         # realistic relationship to the close rather than being invented.
