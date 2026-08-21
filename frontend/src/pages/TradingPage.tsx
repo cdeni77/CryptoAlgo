@@ -89,7 +89,7 @@ export default function TradingPage() {
   const priceColor = coinChange == null ? 'text-tx-primary' : coinChange >= 0 ? 'text-accent-emerald' : 'text-accent-rose';
 
   return (
-    <div className="p-6 space-y-5 max-w-[1600px]">
+    <div className="w-full space-y-5 p-6">
       {/* Coin selector */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="flex gap-0.5 p-0.5 rounded bg-[rgba(56,189,248,0.05)] border border-[rgba(56,189,248,0.08)] flex-shrink-0">

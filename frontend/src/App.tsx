@@ -154,7 +154,7 @@ export default function App() {
           <span className="font-mono text-xs text-tx-muted">{utc}</span>
         </header>
 
-        <main className="bg-grid flex-1 overflow-y-auto" id="main">
+        <main className="bg-grid min-h-0 flex-1 overflow-y-auto" id="main">
           <Page />
         </main>
       </div>

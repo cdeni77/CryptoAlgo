@@ -157,7 +157,7 @@ export default function ResearchPage() {
   const kpis = summary.data?.kpis;
 
   return (
-    <div className="max-w-[1600px] space-y-5 p-6">
+    <div className="w-full space-y-5 p-6">
       {/* ---- universe calibration ---------------------------------------- */}
       <div className={CARD}>
         <div className="mb-1 flex items-center justify-between">

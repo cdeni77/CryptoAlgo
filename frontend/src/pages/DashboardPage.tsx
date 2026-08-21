@@ -148,7 +148,7 @@ export default function DashboardPage() {
   }, [signals.data, activeCoins]);
 
   return (
-    <div className="max-w-[1600px] space-y-5 p-6">
+    <div className="w-full space-y-5 p-6">
       {/* A failure on the summary is worth a banner: every number below is
           derived from it, so a stale one is a stale screen. */}
       {summary.error && (

@@ -181,7 +181,7 @@ export default function ModelPage() {
     selected !== null && selectedRecord === null && !history.loading;
 
   return (
-    <div className="max-w-[1600px] space-y-5 p-6">
+    <div className="w-full space-y-5 p-6">
       {/* ---- what is live ------------------------------------------------ */}
       <div className={CARD}>
         <div className="mb-4 flex items-center justify-between">
