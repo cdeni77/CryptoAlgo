@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import signal
 import subprocess
@@ -282,6 +281,23 @@ def _run_step(name: str, command: Sequence[str], *, allow_codes: Sequence[int] =
     return code
 
 
+def _int_env(name: str) -> int | None:
+    """An optional integer from the environment. Unset and empty both mean None.
+
+    `int(os.getenv(name, '0'))` would make 0 indistinguishable from unset, and
+    for the horizon those mean different things: unset falls back to the coin
+    profile, 0 is invalid.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.warning('%s=%r is not an integer, ignoring', name, raw)
+        return None
+
+
 def _data_arguments(args: argparse.Namespace) -> list[str]:
     """The `scripts._common` argument surface, one place.
 
@@ -299,6 +315,20 @@ def _data_arguments(args: argparse.Namespace) -> list[str]:
         flags += ['--symbols', args.symbols]
     if args.cost_config:
         flags += ['--cost-config', args.cost_config]
+    # Horizon belongs in the *shared* set, not the training-only one. It sets the
+    # purge width between train and test, is recorded in the model's provenance,
+    # and drives `effective_observations` — so the feature build, the training
+    # step and the signal writer all have to agree about it or a model purged at
+    # one horizon scores a panel targeted at another. It was unreachable from
+    # here entirely, which pinned every containerised run to the profile default
+    # of 96h: 70 effective observations against the ~200 the gates need, on the
+    # 398 days of CDE history that exist.
+    horizon = getattr(args, 'horizon', None)
+    if horizon:
+        flags += ['--horizon', str(horizon)]
+    leverage = getattr(args, 'leverage', None)
+    if leverage:
+        flags += ['--leverage', str(leverage)]
     flags += ['--log-level', args.log_level]
     return flags
 
@@ -355,7 +385,6 @@ def _write_signals(args: argparse.Namespace) -> None:
         sys.executable, '-m', 'scripts.signals',
         '--model', str(MODELS_DIR / 'forecast.joblib'),
         '--equity', str(args.equity),
-        '--leverage', str(args.leverage),
         *_data_arguments(args),
     ]
     _run_step('signals', command)
@@ -391,7 +420,6 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
         '--models-dir', str(MODELS_DIR),
         '--periods', str(args.walk_forward_periods),
         '--equity', str(args.equity),
-        '--leverage', str(args.leverage),
         *_data_arguments(args),
         *_training_arguments(args),
     ]
@@ -521,6 +549,10 @@ def parse_args() -> argparse.Namespace:
                         default=int(os.getenv('WALK_FORWARD_PERIODS', '6')))
     parser.add_argument('--equity', type=float, default=float(os.getenv('EQUITY', '100000')))
     parser.add_argument('--leverage', type=float, default=float(os.getenv('LEVERAGE', '4')))
+    parser.add_argument('--horizon', type=int, default=_int_env('HORIZON_HOURS'),
+                        help='Forecast horizon in hours. Unset uses the profile '
+                             'hold, which is 96h — far too long for the amount '
+                             'of CDE history that exists. See CLAUDE.md.')
 
     # Modes.
     parser.add_argument('--run-once', action='store_true', help='One cycle, then exit')

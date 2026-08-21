@@ -134,6 +134,14 @@ services:
       - LEVERAGE=4
       - EQUITY=100000
 
+      # Forecast horizon. Unset falls back to the coin profile's 96h hold, which
+      # carries ~70 effective observations against the ~200 the gates need on the
+      # ~400 days of CDE history that exist — so the loop could never train a
+      # promotable model. 24h with RECENCY_HALF_LIFE_DAYS=365 gives ~280, and is
+      # what the cost schedule argues for independently.
+      - HORIZON_HOURS=24
+      - RECENCY_HALF_LIFE_DAYS=365
+
       # Scheduling
       - CYCLE_INTERVAL_SECONDS=3600          # Max cycle interval (fallback)
       - CYCLE_ALIGN_MINUTE=3                 # Run at :03 past every hour (1:03, 2:03, ...)

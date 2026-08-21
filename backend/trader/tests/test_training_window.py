@@ -193,6 +193,12 @@ def test_the_training_controls_stay_out_of_the_data_arguments():
 
     A training window leaking into `_data_arguments` would truncate the features
     that `scripts.signals` needs to decide on the most recent timestamp.
+
+    Horizon and leverage are deliberately in the shared set and are asserted
+    present: the horizon sets the purge width and is recorded in provenance, and
+    leverage sizes the position, so a step that saw a different value would score
+    a model against a panel it was not trained for, or size against a different
+    book. Only the *window* has to stay out.
     """
     from scripts.live_orchestrator import _data_arguments
 
@@ -200,11 +206,13 @@ def test_the_training_controls_stay_out_of_the_data_arguments():
         venue='coinbase', min_quality='valid', store=None, reference_venue='binance',
         symbols=None, cost_config=None, log_level='INFO',
         train_window_days=730.0, recency_half_life_days=365.0,
+        horizon=24, leverage=2.0,
     )
     flags = _data_arguments(args)
 
     assert '--train-window-days' not in flags
     assert '--recency-half-life-days' not in flags
+    assert '--horizon' in flags and '--leverage' in flags
 
 
 def test_the_orchestrator_defaults_to_all_history():

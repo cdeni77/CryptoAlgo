@@ -363,3 +363,43 @@ def test_the_trader_and_paper_engine_agree_on_leverage(compose):
     assert len(set(values.values())) == 1, (
         f'the services disagree about leverage: {values}'
     )
+
+
+def test_the_orchestrator_forwards_the_horizon_and_leverage_to_every_step():
+    """Both have to be identical across the feature build, training and signals.
+
+    The horizon sets the purge width between train and test, is recorded in the
+    model's provenance, and drives `effective_observations`. It was unreachable
+    from `live_orchestrator` entirely — no flag, no env var — which pinned every
+    containerised run to the profile default of 96h. On the 398 days of CDE
+    history that exist, 96h carries about 70 effective observations against the
+    ~200 the gates need, so the loop could not train a promotable model at all.
+
+    Leverage moved into the same shared set for the same reason: it sizes the
+    position in `scripts.signals` and bounds the risk budget in both, so a step
+    that saw a different value would size against a different book.
+    """
+    import sys as _sys
+
+    import scripts.live_orchestrator as orchestrator
+
+    original = _sys.argv
+    try:
+        _sys.argv = ['live_orchestrator', '--horizon', '24', '--leverage', '2']
+        args = orchestrator.parse_args()
+    finally:
+        _sys.argv = original
+
+    forwarded = orchestrator._data_arguments(args)
+    assert '--horizon' in forwarded and forwarded[forwarded.index('--horizon') + 1] == '24'
+    assert '--leverage' in forwarded and forwarded[forwarded.index('--leverage') + 1] == '2.0'
+
+    # Unset must stay unset rather than becoming a number: the profile hold is
+    # the documented fallback, and 0 is not a valid horizon.
+    try:
+        _sys.argv = ['live_orchestrator']
+        bare = orchestrator.parse_args()
+    finally:
+        _sys.argv = original
+    assert bare.horizon is None
+    assert '--horizon' not in orchestrator._data_arguments(bare)
