@@ -52,6 +52,8 @@ CONTRACT_UNITS: dict[str, float] = {
     'DOT': 100,
     '1000SHIB': 10000,
     '1000PEPE': 100000,
+    'HYPE': 10,
+    'ONDO': 1000,
 }
 
 # Coinbase CDE product codes -> underlying ticker.
@@ -72,6 +74,8 @@ CDE_CODE_TO_BASE: dict[str, str] = {
     'POP': 'DOT',
     'SHP': '1000SHIB',
     'PEP': '1000PEPE',
+    'HYP': 'HYPE',
+    'OND': 'ONDO',
 }
 
 # Short aliases people actually type for the 1000x meme contracts.
@@ -169,6 +173,8 @@ SPOT_PRODUCTS: dict[str, str] = {
     'XLM': 'XLM-USD',
     '1000PEPE': 'PEPE-USD',
     '1000SHIB': 'SHIB-USD',
+    'HYPE': 'HYPE-USD',
+    'ONDO': 'ONDO-USD',
 }
 
 

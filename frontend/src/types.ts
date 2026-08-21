@@ -17,7 +17,7 @@ export interface PriceInfo {
 // keeps the three lists in step.
 export const ALL_COINS = [
   'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC',
-  'BCH', 'DOT', 'NEAR', 'SUI', 'XLM', 'PEPE', 'SHIB',
+  'BCH', 'DOT', 'NEAR', 'SUI', 'XLM', 'PEPE', 'SHIB', 'HYPE', 'ONDO',
 ] as const;
 export type CoinSymbol = (typeof ALL_COINS)[number];
 

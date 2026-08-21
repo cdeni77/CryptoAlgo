@@ -386,6 +386,23 @@ COIN_PROFILES: Dict[str, CoinProfile] = {
                min_momentum_magnitude=0.03, vol_mult_tp=4.5, cooldown_hours=24.0,
                min_vol_24h=0.0008, max_vol_24h=0.14, position_size=0.10),
 
+    # Both listed after the original sixteen, so they carry less history than
+    # the rest of the panel. Started from the NEAR/SUI settings — same
+    # archetype, same liquidity tier — rather than inventing thresholds: every
+    # distinct configuration is a trial the deflated Sharpe discounts by, and
+    # these two have the least evidence behind them.
+    'HYPE': _p('HYPE', ('HYP', 'HYPE'), 'momentum_breakout',
+               signal_threshold=0.53, min_directional_agreement=0.50,
+               meta_probability_threshold=0.48, label_vol_target=1.6,
+               min_momentum_magnitude=0.03, vol_mult_tp=4.5, cooldown_hours=24.0,
+               min_vol_24h=0.0008, max_vol_24h=0.18, position_size=0.08),
+
+    'ONDO': _p('ONDO', ('OND', 'ONDO'), 'momentum_breakout',
+               signal_threshold=0.53, min_directional_agreement=0.50,
+               meta_probability_threshold=0.48, label_vol_target=1.6,
+               min_momentum_magnitude=0.03, vol_mult_tp=4.5, cooldown_hours=24.0,
+               min_vol_24h=0.0008, max_vol_24h=0.16, position_size=0.08),
+
     'SUI': _p('SUI', ('SUP', 'SUI'), 'momentum_breakout',
               signal_threshold=0.53, min_directional_agreement=0.50,
               meta_probability_threshold=0.48, label_vol_target=1.6,

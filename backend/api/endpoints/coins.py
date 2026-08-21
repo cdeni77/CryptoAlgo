@@ -41,6 +41,8 @@ COINBASE_PRODUCTS = {
     "XLM": "XLM-USD",
     "PEPE": "PEPE-USD",
     "SHIB": "SHIB-USD",
+    "HYPE": "HYPE-USD",
+    "ONDO": "ONDO-USD",
 }
 
 # CDE (Contract for Difference / Perpetual) product mappings
@@ -177,6 +179,20 @@ CDE_PRODUCTS = {
         "units_per_contract": 10000,
         # Notional moves with price; the frontend prefers the live
         # figure and only falls back to this.
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "HYPE": {
+        "symbol": "HYP-20DEC30-CDE",
+        "code": "HYP",
+        "units_per_contract": 10,
+        "approx_contract_value": None,
+        "fee_pct": 0.00100,
+    },
+    "ONDO": {
+        "symbol": "OND-20DEC30-CDE",
+        "code": "OND",
+        "units_per_contract": 1000,
         "approx_contract_value": None,
         "fee_pct": 0.00100,
     },

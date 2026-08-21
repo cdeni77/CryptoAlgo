@@ -69,6 +69,9 @@ ASSET_TO_CODE_MAP = {
     "DOT": "POP",
     "SHIB": "SHP",
     "PEPE": "PEP",
+    # Listed after the rest, so they carry less history than the panel.
+    "HYPE": "HYP",
+    "ONDO": "OND",
 }
 
 DEFAULT_TIMEFRAMES = ["1h", "1d"]
@@ -78,6 +81,7 @@ DEFAULT_SYMBOLS = [
     # Batch 3
     "NER-20DEC30-CDE", "SUP-20DEC30-CDE", "BCP-20DEC30-CDE",
     "XLP-20DEC30-CDE", "POP-20DEC30-CDE", "SHP-20DEC30-CDE", "PEP-20DEC30-CDE",
+    "HYP-20DEC30-CDE", "OND-20DEC30-CDE",
 ]
 
 logging.basicConfig(
