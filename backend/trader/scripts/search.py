@@ -133,6 +133,7 @@ def main() -> int:
     outcome = run_campaign(
         space, evaluate, base_config=config, ledger=ledger,
         data_as_of=args.as_of, observations=observations,
+        horizon_bars=dataset.horizon_bars,
     )
     print(f'\n{outcome}')
     print(json.dumps(outcome.summary(), indent=2, default=str))

@@ -96,7 +96,7 @@ class ContractSpec:
         return float(n_contracts) * self.units * float(price)
 
 
-def _resolve_base(symbol: str) -> Optional[str]:
+def resolve_base(symbol: str) -> Optional[str]:
     """Map any symbol spelling to an underlying ticker, or None if unknown."""
     token = symbol.upper().strip()
 
@@ -119,9 +119,12 @@ def _resolve_base(symbol: str) -> Optional[str]:
     return None
 
 
+_resolve_base = resolve_base  # historical name
+
+
 def get_contract_spec(symbol: str) -> ContractSpec:
     """Resolve a symbol (CDE code, ticker, or decorated product id) to its spec."""
-    base = _resolve_base(symbol)
+    base = resolve_base(symbol)
     if base is None:
         return ContractSpec(symbol=symbol, base='UNKNOWN', units=DEFAULT_UNITS)
     return ContractSpec(symbol=symbol, base=base, units=float(CONTRACT_UNITS[base]))
@@ -369,7 +372,7 @@ def fee_floor(symbol: str, params: CostParams) -> float:
         return float(params.min_fee_per_contract)
 
     token = symbol.upper().strip()
-    base = _resolve_base(token)
+    base = resolve_base(token)
     candidates = [token, token.split('-')[0]]
     if base:
         candidates.append(base)

@@ -22,10 +22,10 @@ from sqlalchemy.orm import Session
 
 from coinbase.rest import RESTClient
 from endpoints.coins import CDE_PRODUCTS
-from models.trade import PaperEquityCurve, PaperPosition, Trade, TradeSide, TradeStatus
+from models.trade import PaperEquityCurve, PaperPosition
 
 
-def _units_per_contract(coin: str) -> float:
+def _units_per_contract(coin: str) -> Optional[float]:
     """Base units per CDE contract, for marking a position to market.
 
     Sourced from the same table the specs endpoint serves, which a parity test in
@@ -33,10 +33,16 @@ def _units_per_contract(coin: str) -> float:
     money. Three entries had drifted by 2x-5x, and contract size multiplies
     straight into notional, margin, liquidation price and PnL.
     """
+    token = (coin or '').strip().upper()
     for asset, product in CDE_PRODUCTS.items():
-        if coin in (asset, product.get("code"), product.get("symbol")):
+        if token in (asset.upper(), str(product.get("code", "")).upper(),
+                     str(product.get("symbol", "")).upper()):
             return float(product["units_per_contract"])
-    return 1.0
+    # None, not 1.0. Returning a default invented a contract size and multiplied
+    # it into a PnL figure served as measured — the same class of substitution
+    # this module was cleaned up to remove, in the one field the docstring calls
+    # money. An unknown contract is an unmarkable position.
+    return None
 
 # Coinbase client (credentials optional; endpoint degrades gracefully without them)
 api_key = os.getenv("COINBASE_API_KEY")
@@ -59,12 +65,6 @@ INITIAL_PAPER_EQUITY = 100_000.0
 
 # Windows the dashboard's range selector offers, with a granularity that keeps
 # each series to a few hundred points.
-HISTORY_RANGES = {
-    "1h": {"lookback": timedelta(hours=1), "granularity_seconds": 60},
-    "1d": {"lookback": timedelta(days=1), "granularity_seconds": 900},
-    "1w": {"lookback": timedelta(days=7), "granularity_seconds": 3600},
-    "1y": {"lookback": timedelta(days=365), "granularity_seconds": 86400},
-}
 
 
 def _to_dict(payload: Any) -> Dict[str, Any]:
@@ -116,106 +116,7 @@ def _fetch_json(url: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str,
 
 
 
-def _fetch_json_list(url: str) -> List[Any]:
-    try:
-        req = request.Request(url, headers={"accept": "application/json"})
-        with request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8")
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, list) else []
-    except (error.HTTPError, error.URLError, json.JSONDecodeError, TimeoutError, ValueError):
-        return []
 
-
-def _combine_assets(*asset_groups: List[Dict[str, Any]]) -> Dict[str, float]:
-    combined: Dict[str, float] = {}
-    for group in asset_groups:
-        for asset in group or []:
-            symbol = str(asset.get("asset") or "").upper()
-            amount = _safe_float(asset.get("amount")) or 0.0
-            if not symbol or amount <= 0:
-                continue
-            combined[symbol] = combined.get(symbol, 0.0) + amount
-    return combined
-
-
-def _get_historical_closes(
-    asset: str,
-    start: datetime,
-    end: datetime,
-    granularity_seconds: int,
-) -> Dict[int, float]:
-    if asset in STABLE_COINS:
-        closes: Dict[int, float] = {}
-        cursor = int(start.timestamp())
-        end_ts = int(end.timestamp())
-        while cursor <= end_ts:
-            closes[cursor] = 1.0
-            cursor += granularity_seconds
-        return closes
-
-    product = f"{asset}-USD"
-    params = parse.urlencode(
-        {
-            "granularity": granularity_seconds,
-            "start": start.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
-            "end": end.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-    )
-    candles = _fetch_json_list(f"https://api.exchange.coinbase.com/products/{product}/candles?{params}")
-    closes: Dict[int, float] = {}
-    for candle in candles:
-        if not isinstance(candle, list) or len(candle) < 5:
-            continue
-        ts = _safe_float(candle[0])
-        close = _safe_float(candle[4])
-        if ts is None or close is None:
-            continue
-        closes[int(ts)] = close
-    return closes
-
-
-def _build_holdings_portfolio_history(
-    holdings: Dict[str, float],
-    perps_usd: float,
-    lookback: timedelta,
-    granularity_seconds: int,
-) -> List[Dict[str, Any]]:
-    now = datetime.now(timezone.utc)
-    start = now - lookback
-
-    historical_prices: Dict[str, Dict[int, float]] = {}
-    for asset in holdings:
-        historical_prices[asset] = _get_historical_closes(asset, start, now, granularity_seconds)
-
-    history: List[Dict[str, Any]] = []
-    last_price_by_asset: Dict[str, float] = {}
-    cursor_ts = int(start.timestamp())
-    end_ts = int(now.timestamp())
-    while cursor_ts <= end_ts:
-        external_total = perps_usd
-        for asset, amount in holdings.items():
-            prices = historical_prices.get(asset, {})
-            px = prices.get(cursor_ts)
-            if px is None:
-                px = last_price_by_asset.get(asset)
-            if px is None:
-                continue
-            last_price_by_asset[asset] = px
-            external_total += amount * px
-
-        history.append(
-            {
-                "timestamp": datetime.fromtimestamp(cursor_ts, tz=timezone.utc).isoformat(),
-                "paper_equity_usd": 0.0,
-                "external_usd": round(external_total, 2),
-                "total_value_usd": round(external_total, 2),
-                "source": "holdings_price_backfill",
-            }
-        )
-        cursor_ts += granularity_seconds
-
-    return history
 
 def get_current_price(spot_id: str) -> Optional[float]:
     try:
@@ -709,8 +610,11 @@ def _paper_pnl(db: Session) -> Dict[str, Any]:
         if price is None:
             unpriced.append(position.coin)
             continue
-        direction = 1 if str(position.side).upper().endswith("LONG") else -1
         units = _units_per_contract(position.coin)
+        if units is None:
+            unpriced.append(f'{position.coin} (unknown contract size)')
+            continue
+        direction = 1 if str(position.side).upper().endswith("LONG") else -1
         unrealised += (price - position.entry_price) * direction * position.contracts * units
         priced += 1
 
@@ -751,10 +655,14 @@ def build_wallet(db: Session) -> Dict[str, Any]:
         ) if value is None
     ]
 
+    # No equity curve means the account has not traded. Substituting the starting
+    # balance reported a funded 100k account with `status: ok` — the same
+    # fabrication that was removed from `/paper/summary`, in the other endpoint
+    # that had it.
     latest = db.query(PaperEquityCurve).order_by(PaperEquityCurve.timestamp.desc()).first()
-    paper_balance = latest.equity if latest else INITIAL_PAPER_EQUITY
-    paper_cash = latest.cash_balance if latest else INITIAL_PAPER_EQUITY
-    paper_unrealized = latest.unrealized_pnl if latest else 0.0
+    paper_balance = latest.equity if latest else None
+    paper_cash = latest.cash_balance if latest else None
+    paper_unrealized = latest.unrealized_pnl if latest else None
 
     return {
         "balance": paper_balance,
@@ -769,10 +677,12 @@ def build_wallet(db: Session) -> Dict[str, Any]:
         ),
         "wallets": {
             "paper_trading": {
-                "value_usd": round(paper_balance, 2),
-                "cash_usd": round(paper_cash, 2),
-                "unrealized_pnl": round(paper_unrealized, 4),
-                "status": "ok",
+                "value_usd": round(paper_balance, 2) if paper_balance is not None else None,
+                "cash_usd": round(paper_cash, 2) if paper_cash is not None else None,
+                "unrealized_pnl": (
+                    round(paper_unrealized, 4) if paper_unrealized is not None else None
+                ),
+                "status": "ok" if latest is not None else "no_activity",
             },
             "coinbase_spot": {"value_usd": spot.get("value_usd"), "status": spot.get("status")},
             "coinbase_perps": {"value_usd": perps.get("value_usd"), "status": perps.get("status")},

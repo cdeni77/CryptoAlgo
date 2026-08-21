@@ -204,7 +204,9 @@ def evaluate_candidate(
     version: Optional[str] = None,
     n_periods: int = 6,
     initial_equity: float = 100_000.0,
-    spread_bps: float = 4.0,
+    # None so `Config.spread_bps` governs and `cost_stress` can move it. An
+    # explicit 4.0 here silently beat the config and left the fill unstressed.
+    spread_bps: Optional[float] = None,
     synthetic_paths: int = 20,
     full: bool = True,
     data_as_of: Optional[str] = None,

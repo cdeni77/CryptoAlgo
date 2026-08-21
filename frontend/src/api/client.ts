@@ -102,6 +102,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
+// Paths that target a router's root route MUST carry the trailing slash.
+// FastAPI's `redirect_slashes` answers `/signals` with a 307 whose Location is
+// absolute and built from the *proxied* path, so behind nginx's
+// `proxy_pass http://backend:8000/` (which strips `/api/`) the browser is sent
+// to `/signals/` with no prefix — where the SPA fallback returns index.html with
+// HTTP 200 and `response.json()` throws a parse error attributed to the backend.
+// It also doubled every polled request even when an absolute base made the
+// redirect resolve.
 export function get<T>(path: string): Promise<T> {
   return request<T>(path);
 }

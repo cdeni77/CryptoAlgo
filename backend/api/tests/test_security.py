@@ -191,12 +191,34 @@ def test_a_non_ascii_token_is_rejected_not_a_server_error(monkeypatch):
     assert raised.value.status_code == 401
 
 
-def test_a_non_ascii_configured_token_still_authorises(monkeypatch):
+def test_a_non_ascii_configured_token_is_refused_with_a_reason(monkeypatch):
+    """A token no client can transmit must not fail every request mysteriously.
+
+    HTTP header values are octets, and httpx refuses non-ASCII outright — so a
+    non-ASCII `API_TOKEN` cannot be sent at all. It used to 500 inside
+    `hmac.compare_digest`; then it 401'd, which is honest about the outcome but
+    silent about the cause. 503 with the reason is the same treatment an unset
+    token gets.
+    """
+    from fastapi import HTTPException
+
     from security import require_token
 
-    monkeypatch.setenv('API_TOKEN', 'sécret-ключ')
+    monkeypatch.setenv('API_TOKEN', 'sécret-ključ')
 
-    require_token(x_api_token='sécret-ключ')  # must not raise
+    with pytest.raises(HTTPException) as raised:
+        require_token(x_api_token='anything')
+
+    assert raised.value.status_code == 503
+    assert 'non-ASCII' in raised.value.detail
+
+
+def test_an_ascii_token_still_authorises(monkeypatch):
+    from security import require_token
+
+    monkeypatch.setenv('API_TOKEN', 'correct-horse-battery-staple')
+
+    require_token(x_api_token='correct-horse-battery-staple')  # must not raise
 
 
 def test_the_comparison_is_constant_time_on_bytes():

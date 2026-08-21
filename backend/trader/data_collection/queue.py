@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass
 
+from .timeutil import utc_now
+
 logger = logging.getLogger(__name__)
 
 

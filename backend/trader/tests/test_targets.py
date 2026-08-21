@@ -32,6 +32,16 @@ def config(repo_root) -> Config:
     return Config().with_cost_assumptions(repo_root / CDE_CONFIG)
 
 
+@pytest.fixture(scope='module')
+def cde_config():
+    """The real venue schedule: per-contract commission, no percentage fee."""
+    from core.config import Config, find_cost_config
+    path = find_cost_config()
+    if path is None:
+        pytest.skip('no cost config on the search path')
+    return Config().with_cost_assumptions(path)
+
+
 def _flat(n: int = 12, price: float = 100.0) -> pd.DataFrame:
     index = pd.date_range('2026-01-01', periods=n, freq='1h', tz='UTC')
     close = pd.Series(price, index=index, dtype=float)
@@ -253,3 +263,124 @@ def test_summary_reports_the_carry_share(config):
 
     assert summary.carry_share == pytest.approx(1.0)
     assert summary.mean_carry_bps < 0        # a long pays positive funding
+
+
+# ---------------------------------------------------------------------------
+# Per-bar cost
+# ---------------------------------------------------------------------------
+
+
+def _rising_bars(start: float, end: float, periods: int = 500) -> pd.DataFrame:
+    index = pd.date_range('2026-01-01', periods=periods, freq='h', tz='UTC')
+    close = pd.Series(np.linspace(start, end, periods), index=index)
+    return pd.DataFrame({'open': close, 'high': close * 1.001, 'low': close * 0.999,
+                         'close': close, 'volume': 1000.0}, index=index)
+
+
+def test_cost_moves_inversely_with_price(cde_config):
+    """A per-contract commission is a fixed number of dollars.
+
+    As a fraction of notional it therefore *falls* as price rises. Pricing every
+    row off one reference price got this wrong twice: the value was constant, and
+    the reference used was the last close in the loaded history — end-of-sample
+    information in every training row's target and in the hurdle `decide()`
+    compares against.
+    """
+    from core.targets import round_trip_cost_series
+
+    close = _rising_bars(30_000, 100_000)['close']
+    cost = round_trip_cost_series('BIP-20DEC30-CDE', close, cde_config)
+
+    assert cost.iloc[0] > cost.iloc[-1], 'cost must fall as price rises'
+    assert cost.nunique() > 100, f'cost is near-constant across the sample ({cost.nunique()} values)'
+    # The measured swing over a 30k-100k range, which one reference price reported
+    # as a single number.
+    assert 2.5 < cost.iloc[0] / cost.iloc[-1] < 3.2
+
+
+def test_the_panel_cost_is_per_bar_not_one_number(cde_config):
+    from core.targets import build_target_panel
+
+    bars = _rising_bars(30_000, 100_000)
+    panel = build_target_panel(
+        {'BIP-20DEC30-CDE': bars}, config=cde_config, horizon_bars=24)
+    resolved = panel.dropna(subset=['price'])
+
+    assert resolved['cost'].nunique() > 100, 'the panel carries a single cost value'
+
+
+def test_the_panel_cost_does_not_depend_on_later_bars(cde_config):
+    """The leak, stated as a property.
+
+    Truncating the history must not change the cost recorded for the rows that
+    remain. With the reference price taken from `close.iloc[-1]`, every row's cost
+    moved when a later bar arrived.
+    """
+    from core.targets import build_target_panel
+
+    bars = _rising_bars(30_000, 100_000)
+    full = build_target_panel({'BIP-20DEC30-CDE': bars}, config=cde_config, horizon_bars=24)
+    truncated = build_target_panel(
+        {'BIP-20DEC30-CDE': bars.iloc[:300]}, config=cde_config, horizon_bars=24)
+
+    # The truncated panel's last `horizon` rows are unresolvable and therefore
+    # NaN throughout, which is correct — compare only where both resolved.
+    shared = full.index.intersection(truncated.dropna(subset=['cost']).index)
+    assert len(shared) > 100
+    pd.testing.assert_series_equal(
+        full.loc[shared, 'cost'], truncated.loc[shared, 'cost'], check_names=False,
+    )
+
+
+def test_the_fee_floor_dominates_the_percentage_where_it_should(cde_config):
+    """`max(pct, floor)`, not `min`.
+
+    Flipping that comparison zeroes the commission entirely under the CDE
+    schedule, whose `fee_pct_per_side` is 0 — the panel's mean cost falls from
+    ~22bp to the slippage term alone — and every existing test still passed,
+    because the only cost assertions were the sign identity and the scalar helper.
+    """
+    from core.targets import round_trip_cost_series
+
+    assert cde_config.fee_pct_per_side == 0.0, 'CDE prices per contract, not per cent'
+
+    close = _rising_bars(60_000, 60_000, periods=10)['close']
+    cost = round_trip_cost_series('BIP-20DEC30-CDE', close, cde_config)
+
+    slippage_only = 2.0 * (cde_config.slippage_bps / 10_000.0)
+    assert (cost > slippage_only * 1.5).all(), (
+        'the per-contract floor is not reaching the cost: a min/max flip would '
+        'leave only slippage'
+    )
+
+
+def test_the_identity_holds_with_a_per_bar_cost(cde_config):
+    """`net_long + net_short == -2 * cost` must survive a varying cost."""
+    from core.targets import build_target_panel
+
+    bars = _rising_bars(30_000, 100_000)
+    panel = build_target_panel(
+        {'BIP-20DEC30-CDE': bars}, config=cde_config, horizon_bars=24)
+    resolved = panel.dropna(subset=['price'])
+
+    residual = (resolved['net_long'] + resolved['net_short'] + 2 * resolved['cost']).abs().max()
+    assert residual < 1e-15, residual
+
+
+def test_a_row_with_an_unresolvable_cost_is_dropped(cde_config):
+    """A NaN cost beside a resolvable price used to survive as a short.
+
+    NaN comparisons are False in both directions, so `best_side` fell through to
+    -1 and `best_net` stayed NaN — a row that looked like a decided trade with an
+    unknown outcome.
+    """
+    from core.targets import TargetSpec, build_targets
+
+    bars = _rising_bars(60_000, 60_000, periods=200)
+    cost = pd.Series(0.001, index=bars.index)
+    cost.iloc[50] = np.nan
+
+    out = build_targets(bars, TargetSpec(horizon_bars=24), cost=cost)
+
+    assert out['best_side'].iloc[50] != -1.0
+    assert pd.isna(out.loc[out.index[50], 'price'])

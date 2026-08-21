@@ -183,7 +183,7 @@ def build_targets(
     spec: TargetSpec,
     *,
     funding: Optional[pd.DataFrame] = None,
-    index: Optional[d.DatetimeIndex] = None,
+    index: Optional[pd.DatetimeIndex] = None,
     cost: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """Target frame for one instrument.
@@ -221,8 +221,11 @@ def build_targets(
     stand_aside = out['best_net'] <= 0
     out.loc[stand_aside, 'best_side'] = 0.0
 
-    # Unresolvable rows carry nothing.
-    resolvable = out['price'].notna()
+    # Unresolvable rows carry nothing. `cost` is in the mask because a NaN cost
+    # with a resolvable price left `best_net` NaN while `best_side` fell through
+    # to -1 (NaN comparisons are False both ways), so the row looked like a
+    # short with an unknown outcome.
+    resolvable = out['price'].notna() & out['cost'].notna()
     out.loc[~resolvable, :] = np.nan
 
     return out.reindex(target_index)

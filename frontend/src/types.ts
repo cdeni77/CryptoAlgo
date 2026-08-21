@@ -104,13 +104,17 @@ export interface Signal {
 }
 
 export interface PaperSummary {
-  total_return_pct: number;
-  realized_pnl: number;
-  unrealized_pnl: number;
-  equity: number;
-  cash_balance: number;
-  max_drawdown_pct: number;
-  win_rate: number;
+  // All nullable: `/paper/summary` returns nulls plus `unavailable_reason` when
+  // the account has not traded. Declaring them non-nullable is what let
+  // `summary.data.equity - 0` evaluate to 0 and render a fresh install as a
+  // $0.00 portfolio that had lost 100%, with tsc unable to see it.
+  total_return_pct: number | null;
+  realized_pnl: number | null;
+  unrealized_pnl: number | null;
+  equity: number | null;
+  cash_balance: number | null;
+  max_drawdown_pct: number | null;
+  win_rate: number | null;
   fill_count: number;
   open_positions: number;
   sharpe_ratio: number | null;
@@ -500,10 +504,11 @@ export interface WalletAsset {
 }
 
 export interface WalletData {
-  balance: number;
-  realized_pnl: number;
-  unrealized_pnl: number;
-  total_pnl: number;
+  balance: number | null;
+  realized_pnl: number | null;
+  unrealized_pnl: number | null;
+  unrealized_unavailable_reason?: string | null;
+  total_pnl: number | null;
   wallets?: Record<string, { value_usd: number; cash_usd?: number; unrealized_pnl?: number; status: string }>;
   coinbase?: {
     spot?: { value_usd: number | null; status: string; assets?: WalletAsset[] };

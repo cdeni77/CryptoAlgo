@@ -118,7 +118,7 @@ export default function DashboardPage() {
     // Base off the summary's equity, not the last curve point: a restarted engine
     // rewrites cash_balance, and the curve keeps the pre-restart value.
     const base =
-      summary.data != null
+      summary.data?.equity != null
         ? summary.data.equity - (summary.data.unrealized_pnl ?? 0)
         : latest.equity - latest.unrealized_pnl;
     const livePoint: PaperEquityPoint = {
@@ -131,13 +131,18 @@ export default function DashboardPage() {
     return [livePoint, ...points];
   }, [equity.data, liveUnrealized, summary.data]);
 
-  const totalReturn = summary.data?.total_return_pct ?? 0;
+  // Null, not zero. `/paper/summary` returns nulls with an `unavailable_reason`
+  // for an account that has not traded, and `null - 0` is 0 in JavaScript — so
+  // the previous arithmetic rendered a fresh install as a $0.00 portfolio under
+  // "started at $100,000.00", a confident 100% loss. The API was fixed to stop
+  // fabricating this; the fabrication simply moved here.
+  const totalReturn = summary.data?.total_return_pct ?? null;
   const cash =
-    summary.data != null
+    summary.data?.equity != null
       ? summary.data.equity - (summary.data.unrealized_pnl ?? 0)
-      : STARTING_BALANCE;
-  const unrealized = liveUnrealized ?? summary.data?.unrealized_pnl ?? 0;
-  const portfolio = cash + unrealized;
+      : null;
+  const unrealized = liveUnrealized ?? summary.data?.unrealized_pnl ?? null;
+  const portfolio = cash != null ? cash + (unrealized ?? 0) : null;
 
   const activeCoins = useMemo(
     () => new Set((config.data?.active_coins ?? []).map((c) => c.toUpperCase())),
@@ -159,7 +164,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
         <StatCard
           label="Portfolio value"
-          value={summary.data ? money(portfolio) : '—'}
+          value={portfolio != null ? money(portfolio) : '—'}
           sub={
             summary.data?.initial_equity != null
               ? `started at ${money(summary.data.initial_equity)}`
@@ -168,21 +173,27 @@ export default function DashboardPage() {
         />
         <StatCard
           label="Total return"
-          value={summary.data ? `${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}%` : '—'}
+          value={
+            totalReturn != null
+              ? `${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}%`
+              : '—'
+          }
           sub={
             summary.data?.realized_pnl != null
               ? `${money(summary.data.realized_pnl)} realised`
               : 'realised P&L not measured'
           }
           color={
-            summary.data?.total_return_pct == null
+            totalReturn == null
               ? undefined
               : totalReturn >= 0 ? 'text-accent-emerald' : 'text-accent-rose'
           }
         />
         <StatCard
           label="Unrealised P&L"
-          value={summary.data ? `${unrealized >= 0 ? '+' : ''}${money(unrealized)}` : '—'}
+          value={
+            unrealized != null ? `${unrealized >= 0 ? '+' : ''}${money(unrealized)}` : '—'
+          }
           sub={
             summary.data
               ? `${summary.data.open_positions} open${
@@ -191,7 +202,7 @@ export default function DashboardPage() {
               : 'not measured'
           }
           color={
-            !summary.data ? undefined
+            unrealized == null ? undefined
               : unrealized >= 0 ? 'text-accent-emerald' : 'text-accent-rose'
           }
         />

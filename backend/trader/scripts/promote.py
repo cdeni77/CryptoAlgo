@@ -65,7 +65,8 @@ def main() -> int:
     parser.add_argument('--models-dir', default=str(MODELS_DIR))
     parser.add_argument('--periods', type=int, default=6, help='Walk-forward retrains')
     parser.add_argument('--equity', type=float, default=100_000.0)
-    parser.add_argument('--spread-bps', type=float, default=4.0)
+    parser.add_argument('--spread-bps', type=float, default=None,
+                        help='Half-spread in bp. Default: the Config value, so the cost-stress scenarios can move it.')
     parser.add_argument('--synthetic-paths', type=int, default=20)
     parser.add_argument('--quick', action='store_true',
                         help='Skip synthetic panels and cost stress. Cannot promote: '

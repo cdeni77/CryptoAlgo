@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import Config
+from core.costs import resolve_base
 from core.costs import symbols_missing_fee_schedule
 from core.datastore import ResearchStore
 from core.features import SymbolInputs, build_panel
@@ -178,6 +179,61 @@ def _resolve_oi_venue(
     return str(available.iloc[0]['venue']) if not available.empty else None
 
 
+def resolve_store_symbols(
+    store: ResearchStore,
+    requested: Sequence[str],
+    *,
+    venue: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Map requested symbols onto the spellings the store actually holds.
+
+    The scraper and the readers disagreed about what a symbol is. `run_pipeline`
+    stores whatever the venue calls the product — `BTC-PERP`, or
+    `AVP-20DEC30-CDE` — while `load_dataset` asked for the bare profile prefix
+    (`BIP`, `ETP`). `ResearchStore._prepare` only upper-cases, so the two never
+    met: on a store built by the documented scrape command, every lookup missed
+    and the panel came back empty with one "no bars" warning per instrument. It
+    looked like a data problem and was a naming problem.
+
+    Resolution goes through `costs._resolve_base`, which already maps every
+    spelling — CDE code, ticker, or decorated product id — onto an underlying,
+    and is the same function that prices the contract. Returns
+    `{requested: stored}` plus the requested symbols nothing in the store matches.
+    """
+    coverage = store.coverage('bars')
+    if coverage.empty:
+        return {}, list(requested)
+
+    available = [str(s) for s in coverage.loc[coverage['venue'] == venue, 'symbol'].unique()]
+    if not available:
+        available = [str(s) for s in coverage['symbol'].unique()]
+
+    by_base: dict[str, list[str]] = {}
+    for stored in available:
+        base = resolve_base(stored)
+        if base:
+            by_base.setdefault(base, []).append(stored)
+
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for symbol in requested:
+        upper = symbol.upper()
+        if upper in available:          # already the stored spelling
+            resolved[symbol] = upper
+            continue
+        base = resolve_base(symbol)
+        candidates = by_base.get(base or '', [])
+        if candidates:
+            # Deterministic when a base has several contracts: prefer an exact
+            # prefix match, then the longest name, so the choice never depends on
+            # scrape order.
+            exact = [c for c in candidates if c.split('-')[0] == upper]
+            resolved[symbol] = sorted(exact or candidates, key=lambda s: (-len(s), s))[0]
+        else:
+            missing.append(symbol)
+    return resolved, missing
+
+
 def load_dataset(
     store: ResearchStore,
     *,
@@ -200,22 +256,46 @@ def load_dataset(
     config = config or Config()
     warnings: list[str] = []
 
-    requested = list(symbols) if symbols else [
+    asked = list(symbols) if symbols else [
         profile.prefixes[0] for profile in COIN_PROFILES.values()
     ]
-    profiles = {
-        symbol: profile
-        for symbol in requested
-        for profile in COIN_PROFILES.values()
-        if symbol in profile.prefixes
-    }
+    # Translate to the spellings the store holds before anything reads it.
+    mapping, unresolved = resolve_store_symbols(store, asked, venue=venue)
+    for symbol in unresolved:
+        warnings.append(f'{symbol}: nothing in the store resolves to it on {venue}')
+    requested = [mapping[s] for s in asked if s in mapping]
+    for asked_name, stored_name in mapping.items():
+        if asked_name.upper() != stored_name:
+            warnings.append(f'{asked_name} resolved to {stored_name}')
 
+    # Profiles are keyed by the stored spelling, since that is what every
+    # downstream lookup uses.
+    # One profile per symbol, chosen deterministically. A dict comprehension over
+    # two loops silently keeps whichever match comes last in COIN_PROFILES order,
+    # which is not a decision anyone made.
+    profiles: dict[str, CoinProfile] = {}
+    for symbol in asked:
+        stored = mapping.get(symbol)
+        if stored is None:
+            continue
+        exact = [p for p in COIN_PROFILES.values() if symbol in p.prefixes]
+        by_base = [p for p in COIN_PROFILES.values() if resolve_base(symbol) == p.name]
+        candidates = exact or by_base
+        if len(candidates) > 1:
+            warnings.append(
+                f'{symbol} matches {len(candidates)} profiles '
+                f'({", ".join(p.name for p in candidates)}); using the first'
+            )
+        if candidates:
+            profiles[stored] = candidates[0]
+
+    market_symbol = mapping.get(MARKET_SYMBOL) or MARKET_SYMBOL
     market = _frame_for(
-        store, 'bars', MARKET_SYMBOL, venue, as_of=as_of, min_quality=min_quality
+        store, 'bars', market_symbol, venue, as_of=as_of, min_quality=min_quality
     )
     if market.empty:
         warnings.append(
-            f'{MARKET_SYMBOL} has no bars on {venue}: the market_factor features '
+            f'{market_symbol} has no bars on {venue}: the market_factor features '
             f'will be empty, so nothing can be expressed relative to the market'
         )
 

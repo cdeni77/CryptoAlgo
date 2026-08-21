@@ -494,7 +494,20 @@ def assert_no_leakage(fold: CVFold, *, horizon_bars: int) -> None:
         return
     horizon = step * max(1, int(horizon_bars))
 
-    test_blocks = _contiguous_blocks(np.arange(len(fold.test_idx)))
+    # Blocks derived from gaps in the test index itself. `np.arange` is
+    # contiguous by construction, so `_contiguous_blocks` on it always returned a
+    # single block spanning the whole set — meaning only the FIRST block's start
+    # was ever checked. `combinatorial_purged_splits` is the splitter that
+    # produces multi-block test sets, so that is exactly the case this guard
+    # exists for: a fold purged around block 1 but not block 2 passed.
+    gaps = pd.Series(fold.test_idx).diff()
+    boundaries = [0, *np.flatnonzero((gaps > step * 1.5).to_numpy()[1:]) + 1,
+                  len(fold.test_idx)]
+    test_blocks = [
+        (boundaries[i], boundaries[i + 1] - 1)
+        for i in range(len(boundaries) - 1)
+        if boundaries[i + 1] > boundaries[i]
+    ]
     for start, stop in test_blocks:
         block_start = fold.test_idx[start]
         block_end = fold.test_idx[stop]

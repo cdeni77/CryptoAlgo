@@ -32,7 +32,8 @@ def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(description=__doc__))
     parser.add_argument('--periods', type=int, default=6, help='Walk-forward retrains')
     parser.add_argument('--equity', type=float, default=100_000.0)
-    parser.add_argument('--spread-bps', type=float, default=4.0)
+    parser.add_argument('--spread-bps', type=float, default=None,
+                        help='Half-spread in bp. Default: the Config value.')
     parser.add_argument('--full', action='store_true',
                         help='Also run synthetic panels and cost stress (slow)')
     parser.add_argument('--synthetic-paths', type=int, default=20)

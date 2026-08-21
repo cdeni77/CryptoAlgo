@@ -246,6 +246,15 @@ class RegimeParameters:
         return float(quiet_exit / total) if total > 0 else 0.5
 
 
+def _finite_or(value: Any, fallback: float) -> float:
+    """`float(x or default)` is wrong for NaN: NaN is truthy, so it survives."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return number if np.isfinite(number) and number > 0 else float(fallback)
+
+
 def fit_regime_parameters(returns: Sequence[float], *, quantile: float = 0.75) -> RegimeParameters:
     """Fit two volatility states by thresholding realised volatility.
 
@@ -277,8 +286,12 @@ def fit_regime_parameters(returns: Sequence[float], *, quantile: float = 0.75) -
     tail_df = float(np.clip(4.0 + 6.0 / excess, 3.0, 30.0)) if excess > 0.1 else 30.0
 
     return RegimeParameters(
-        quiet_vol=float(quiet_returns.std() or 0.01),
-        violent_vol=float(violent_returns.std() or 0.03),
+        quiet_vol=_finite_or(quiet_returns.std(), 0.01),
+        # `Series.std()` of a single observation is NaN, and `NaN or 0.03` is NaN
+        # because NaN is truthy — so a series with one violent bar (or a constant
+        # series, whose split leaves one side empty) produced a NaN volatility
+        # that propagated through every simulated path silently.
+        violent_vol=_finite_or(violent_returns.std(), 0.03),
         stay_quiet=float(1.0 - quiet_exits / max(quiet_count, 1)),
         stay_violent=float(1.0 - violent_exits / max(violent_count, 1)),
         drift=float(series.mean()),
@@ -323,11 +336,22 @@ def synthetic_panel(
     if not symbols:
         return {}
 
-    reference = bars_by_symbol[symbols[0]]
-    n = len(reference)
+    # A ragged panel is the normal state of a store where one instrument listed
+    # later than another, and taking `n` from the first symbol then applying it to
+    # all of them raised `ValueError: operands could not be broadcast together`
+    # for either ordering — turning the whole synthetic gate into an exception
+    # rather than a measurement. Simulate the shortest common span.
+    lengths = {symbol: len(bars) for symbol, bars in bars_by_symbol.items()}
+    n = min(lengths.values())
+    if len(set(lengths.values())) > 1:
+        logger.info(
+            'ragged panel: simulating the shortest common span of %d bars '
+            '(longest %d)', n, max(lengths.values())
+        )
+    reference = bars_by_symbol[symbols[0]].iloc[-n:]
 
     returns_frame = pd.DataFrame({
-        symbol: bars['close'].pct_change() for symbol, bars in bars_by_symbol.items()
+        symbol: bars['close'].iloc[-n:].pct_change() for symbol, bars in bars_by_symbol.items()
     }).dropna()
     if correlation is None:
         correlation = returns_frame.corr().to_numpy()
@@ -341,9 +365,23 @@ def synthetic_panel(
     independent = np.column_stack([
         simulate_regime_path(parameters[symbol], n, rng) for symbol in symbols
     ])
-    try:
-        chol = np.linalg.cholesky(_nearest_positive_definite(correlation))
-    except np.linalg.LinAlgError:
+    # A non-finite correlation is the realistic failure — a constant close gives a
+    # NaN row — and `np.linalg.cholesky` on a NaN matrix RETURNS NaN rather than
+    # raising, so the guarded branch never fired for the case it was written for
+    # and every simulated close came out NaN with no warning. Check first, and say
+    # so: falling back to the identity removes all cross-instrument correlation,
+    # which flatters any strategy that survives by being diversified.
+    chol = None
+    if np.isfinite(correlation).all():
+        candidate = np.linalg.cholesky(_nearest_positive_definite(correlation))
+        if np.isfinite(candidate).all():
+            chol = candidate
+    if chol is None:
+        logger.warning(
+            'correlation matrix is not usable (non-finite entries, usually a '
+            'constant price series): simulating with ZERO cross-instrument '
+            'correlation, which flatters a diversified strategy'
+        )
         chol = np.eye(len(symbols))
     standardised = (independent - independent.mean(0)) / np.where(
         independent.std(0) > 0, independent.std(0), 1.0
@@ -353,7 +391,9 @@ def synthetic_panel(
 
     out: dict[str, pd.DataFrame] = {}
     for i, symbol in enumerate(symbols):
-        bars = bars_by_symbol[symbol]
+        # The same shortest common span the simulation was generated over, so the
+        # real intrabar ratios line up with the simulated closes.
+        bars = bars_by_symbol[symbol].iloc[-n:]
         start = float(bars['close'].iloc[0])
         close = start * np.exp(np.cumsum(coupled[:, i]))
         open_ = np.concatenate([[close[0]], close[:-1]])
@@ -592,7 +632,7 @@ class SimulationReport:
             ),
             'stressed_median_sharpe': self.stress.worst if self.stress else None,
             'parameter_plateau': self.surface.retention if self.surface else None,
-            'oos_trades': float(self.oos_trades) if self.oos_trades else None,
+            'oos_trades': float(self.oos_trades) if self.oos_trades is not None else None,  # zero trades is a measurement
             'max_exit_participation': self.max_exit_participation,
         }
 

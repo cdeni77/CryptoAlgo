@@ -58,6 +58,19 @@ def require_token(x_api_token: Optional[str] = Header(default=None)) -> None:
     not leak its correct prefix through response timing.
     """
     expected = os.getenv(TOKEN_ENV, '').strip()
+    if expected and not expected.isascii():
+        # No conforming client can send this. HTTP header values are octets and
+        # httpx (among others) refuses non-ASCII outright, so a non-ASCII token
+        # locks out its own holder — previously with a 500 from
+        # `hmac.compare_digest`, then with a 401 that gave no clue why. Say what
+        # is wrong instead of failing every request mysteriously.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f'{TOKEN_ENV} contains non-ASCII characters and cannot be sent '
+                f'in an HTTP header. Set it to an ASCII value.'
+            ),
+        )
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -69,10 +82,19 @@ def require_token(x_api_token: Optional[str] = Header(default=None)) -> None:
         )
     # Compare bytes, not str: `hmac.compare_digest` raises TypeError on strings
     # with non-ASCII characters, and Starlette decodes headers as latin-1, so a
-    # crafted header turned the auth check into an unhandled 500 — and a
-    # non-ASCII API_TOKEN broke every request.
-    supplied = (x_api_token or '').strip().encode('utf-8')
-    if not supplied or not hmac.compare_digest(supplied, expected.encode('utf-8')):
+    # crafted header turned the auth check into an unhandled 500.
+    #
+    # The header must be re-encoded with latin-1, the codec it was decoded with,
+    # to recover the bytes the client actually sent. Encoding it as UTF-8 instead
+    # produced mojibake, so a non-ASCII `API_TOKEN` still rejected its own
+    # correct token — 500 became 401, which is better but still wrong.
+    # Compare bytes, not str: `hmac.compare_digest` raises TypeError on strings
+    # with non-ASCII characters, and Starlette decodes headers as latin-1, so a
+    # crafted header turned the auth check into an unhandled 500 rather than a
+    # 401. latin-1 round-trips every byte a header can carry.
+    header = (x_api_token or '').strip()
+    supplied = header.encode('latin-1', errors='replace')
+    if not header or not hmac.compare_digest(supplied, expected.encode('latin-1')):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f'Missing or invalid {TOKEN_HEADER}',

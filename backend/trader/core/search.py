@@ -284,6 +284,7 @@ def run_campaign(
     feature_set_hash: str = '',
     data_as_of: Optional[str] = None,
     observations: int = 0,
+    horizon_bars: int = 0,
 ) -> CampaignResult:
     """Evaluate every combination, gate it, and record all of it.
 
@@ -336,14 +337,20 @@ def run_campaign(
         default=float('-inf'),
     )
     dsr = None
-    if np.isfinite(best) and observations > 1 and total > 0:
-        # `best` is an annualised Sharpe and `observations` is a count of paths,
-        # so the two are at different frequencies and both terms of the
-        # correction scale as 1/sqrt(n). De-annualise to the observation
-        # frequency before comparing them, or the statistic reads several times
-        # too confident and the gate cannot reject a lucky winner.
+    if np.isfinite(best) and observations > 1 and total > 0 and horizon_bars:
+        # `best` is annualised by `HOURS_PER_YEAR`, and `deflated_sharpe` needs a
+        # ratio at the same frequency as `observations`, because both terms of the
+        # correction scale as 1/sqrt(n).
+        #
+        # De-annualising divides by `sqrt(HOURS_PER_YEAR / h)` where **h is the
+        # holding period in hours** — the span one observation covers. An earlier
+        # version of this used `observations` (a count, ~18-232) in h's place,
+        # which is a different quantity entirely: at the 8h horizon CLAUDE.md
+        # recommends it read 5.4x too confident and flipped the verdict from
+        # BLOCK to pass on every case tested.
+        per_observation = best / math.sqrt(HOURS_PER_YEAR / max(int(horizon_bars), 1))
         dsr = deflated_sharpe(
-            sharpe=best / math.sqrt(HOURS_PER_YEAR / max(observations, 1)),
+            sharpe=per_observation,
             observations=observations,
             trials=total,
         ).statistic

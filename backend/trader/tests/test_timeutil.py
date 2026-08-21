@@ -196,12 +196,55 @@ def test_no_connector_decodes_an_epoch_without_a_zone(eastern_tz):
     )
 
 
-def test_the_connectors_import_the_shared_helper(eastern_tz):
-    """Cheap guard that the modules actually took the dependency."""
-    for name in ('ccxt_connector', 'coinbase_connector', 'pipeline'):
-        module = importlib.import_module(f'data_collection.{name}')
-        source = importlib.import_module('data_collection.timeutil')
-        assert any(
-            getattr(module, attr, None) is getattr(source, attr)
-            for attr in source.__all__
-        ), f'{name} does not use data_collection.timeutil'
+def test_every_module_that_uses_a_helper_imports_it(eastern_tz):
+    """A name used without an import is a NameError at call time, not import time.
+
+    The narrower version of this test hardcoded three modules, and the sweep that
+    replaced `datetime.utcnow()` with `utc_now()` touched a fourth —
+    `data_collection/queue.py` — without adding the import. Nothing failed on
+    import; `InMemoryQueue.publish` raised `NameError` on every call, and the
+    callers wrap it in `except Exception`, so real-time collection logged an error
+    per tick and collected nothing.
+
+    So the property is derived from the source rather than a list: any module
+    naming one of these helpers must be able to resolve it.
+    """
+    from pathlib import Path
+
+    helpers = importlib.import_module('data_collection.timeutil')
+    root = Path(__file__).resolve().parents[1]
+
+    problems = []
+    for path in [
+        *(root / 'data_collection').glob('*.py'),
+        *(root / 'scripts').glob('*.py'),
+    ]:
+        if path.name in ('timeutil.py', '__init__.py'):
+            continue
+        text = path.read_text()
+        used = [name for name in helpers.__all__ if f'{name}(' in text]
+        if not used:
+            continue
+
+        package = 'data_collection' if path.parent.name == 'data_collection' else 'scripts'
+        module = importlib.import_module(f'{package}.{path.stem}')
+        for name in used:
+            if getattr(module, name, None) is None:
+                problems.append(f'{path.parent.name}/{path.name} calls {name}() without importing it')
+
+    assert not problems, '\n'.join(problems)
+
+
+def test_the_in_memory_queue_can_publish(eastern_tz):
+    """The concrete call the missing import broke.
+
+    `publish` stamps a message with the current time, so it exercises the helper
+    that was unresolvable. Its callers in `pipeline` swallow every exception, so
+    only calling it proves anything.
+    """
+    import asyncio
+
+    from data_collection.queue import InMemoryQueue
+
+    queue = InMemoryQueue()
+    asyncio.run(queue.publish('test-channel', {'value': 1}))

@@ -253,7 +253,16 @@ class Config:
             self,
             fee_pct_per_side=a.effective_fee_pct_per_side(),
             min_fee_per_contract=a.effective_min_fee_per_contract(),
-            min_fee_per_contract_by_symbol=dict(a.exchange_fee.symbol_overrides or {}),
+            # Only when the exchange fee is actually enabled. `fee_floor` prefers
+            # this dict whenever it is non-empty, which bypassed
+            # `effective_min_fee_per_contract`'s own `enabled` check — so loading
+            # the retail schedule (10bp/side, exchange_fee disabled) still charged
+            # the CDE $0.75/contract commission and produced an identical
+            # round-trip to CDE from a completely different fee model.
+            min_fee_per_contract_by_symbol=(
+                dict(a.exchange_fee.symbol_overrides or {})
+                if a.exchange_fee.enabled else {}
+            ),
             slippage_bps=a.slippage.bps_per_side,
             apply_slippage=a.slippage.enabled,
             apply_impact=a.impact.enabled,
