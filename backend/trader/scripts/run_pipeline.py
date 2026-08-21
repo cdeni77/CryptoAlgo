@@ -374,29 +374,6 @@ async def backfill_funding_rates(
                     except Exception as e:
                         logger.warning(f"Coinbase funding fetch failed for {symbol}: {e}")
 
-                # CDE has no historical funding endpoint, only the current rate
-                # (see CoinbaseRESTClient.get_funding_rate_history). So the only
-                # way the store ever accumulates carry is by taking the snapshot
-                # every run and letting the hourly cycle build the series. The
-                # window this lands in is the *next* settlement, which is what
-                # `funding_time` reports, so repeated runs inside one hour
-                # upsert rather than duplicate.
-                if not rates and coinbase_client and coinbase_product:
-                    try:
-                        current = await coinbase_client.get_funding_rate(coinbase_product)
-                    except Exception as e:
-                        logger.warning(f"Coinbase current funding failed for {symbol}: {e}")
-                        current = None
-                    if current is not None and win_start <= current.event_time <= win_end:
-                        current.symbol = symbol
-                        current.funding_source = "coinbase"
-                        rates = [current]
-                        logger.info(
-                            "%s: current funding %.4f bp/hour at %s (snapshot — CDE "
-                            "publishes no history)",
-                            symbol, current.rate * 10_000, current.event_time,
-                        )
-
                 source_used = "coinbase"
                 if not rates:
                     rates = await connector.fetch_funding_rates(symbol=symbol, start=win_start, end=win_end)
@@ -414,6 +391,39 @@ async def backfill_funding_rates(
                     logger.info(f"  ✓ Inserted {inserted} normalized hourly funding rates via {source_used}")
                 else:
                     logger.warning(f"  ⚠️ No funding rates found for {symbol} in {win_start.date()}->{win_end.date()}")
+
+            # The current rate, once per symbol, outside the gap loop and with
+            # no window test. CDE publishes no funding history, so this snapshot
+            # is the only way the series ever grows — and treating it as a gap
+            # fill broke that twice over. `funding_time` is the settlement the
+            # rate applies to, which can sit *after* `end` (the backfill runs up
+            # to "now", the next settlement is later that hour), so the window
+            # test dropped it; and being inside the loop meant a range with no
+            # gaps collected nothing at all, which is the steady state once an
+            # hour has a row. Collection would have been silently intermittent
+            # on exactly the data that cannot be re-fetched.
+            #
+            # Unconditional is safe: the store is keyed on
+            # (venue, symbol, event_time), so repeated runs inside one
+            # settlement hour upsert rather than duplicate.
+            coinbase_product = funding_product_map.get(symbol)
+            if coinbase_client and coinbase_product:
+                try:
+                    current = await coinbase_client.get_funding_rate(coinbase_product)
+                except Exception as exc:                      # noqa: BLE001
+                    logger.warning('current funding failed for %s: %s', symbol, exc)
+                    current = None
+                if current is not None:
+                    current.symbol = symbol
+                    current.funding_source = 'coinbase'
+                    outcome = ingestor.ingest_funding([current], venue='coinbase')
+                    symbol_inserted += outcome.inserted
+                    source_metrics[symbol]['coinbase'] += outcome.inserted
+                    logger.info(
+                        '%s: current funding %.4f bp/hour at %s (snapshot — CDE '
+                        'publishes no history)',
+                        symbol, current.rate * 10_000, current.event_time,
+                    )
 
             total_inserted += symbol_inserted
             progress.task_complete(symbol, count=symbol_inserted)

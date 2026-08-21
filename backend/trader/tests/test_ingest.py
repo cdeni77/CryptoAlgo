@@ -408,3 +408,75 @@ def test_the_ingestor_stamps_the_venue_on_open_interest(database):
         }
 
     assert 'unknown' not in venues and len(venues) == 2, venues
+
+
+# ---------------------------------------------------------------------------
+# The funding snapshot is not a gap fill
+# ---------------------------------------------------------------------------
+
+
+def test_the_funding_snapshot_is_taken_outside_the_gap_loop():
+    """CDE publishes no funding history, so the snapshot is the whole series.
+
+    It was fetched inside `for win_start, win_end in windows` and stored only if
+    `win_start <= event_time <= win_end`. Both halves broke collection:
+
+    * `funding_time` is the settlement the rate applies to, and the backfill
+      window ends at "now" — so a next-hour settlement fell outside every window
+      and was dropped.
+    * With no gaps in the range, the loop body never runs. That is the steady
+      state once an hour has a row, so the series would stop growing.
+
+    Either way the failure is silent, on data that cannot be re-fetched later.
+    Checked against the parse tree rather than the text: an indentation heuristic
+    measured the `try`/`if` nesting around the call instead of the loop it needed
+    to be outside of, and passed or failed for the wrong reason.
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(
+        (Path(__file__).resolve().parents[1] / 'scripts' / 'run_pipeline.py').read_text()
+    )
+    func = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'backfill_funding_rates'
+    )
+
+    def calls_current_funding(node) -> bool:
+        return any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == 'get_funding_rate'
+            for n in ast.walk(node)
+        )
+
+    window_loops = [
+        node for node in ast.walk(func)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Tuple)
+        and {getattr(e, 'id', '') for e in node.target.elts} == {'win_start', 'win_end'}
+    ]
+    assert window_loops, 'the per-window loop is gone; this test needs rewriting'
+
+    for loop in window_loops:
+        assert not calls_current_funding(loop), (
+            'the current-funding snapshot is inside the per-window loop again. '
+            'It must run once per symbol: funding_time can fall outside every '
+            'window, and a range with no gaps never enters the loop at all.'
+        )
+
+    assert calls_current_funding(func), (
+        'nothing fetches the current funding rate, so the series cannot grow'
+    )
+
+    # And no window test may guard it anywhere in the function.
+    compares = [
+        n for n in ast.walk(func)
+        if isinstance(n, ast.Compare)
+        and 'win_start' in ast.dump(n) and 'event_time' in ast.dump(n)
+    ]
+    assert not compares, (
+        'a window comparison against event_time is back; funding_time can sit '
+        'after the end of the backfill range'
+    )
