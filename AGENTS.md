@@ -120,12 +120,13 @@ Persistent volumes: `postgres_data`, `trader_data`, `trader_models`, `trader_log
 | `CORS_ALLOW_ORIGINS`        | comma-separated; `*` is filtered out | backend |
 | `LEDGER_WALLETS_JSON`       | `[]`                    | backend   |
 | `VITE_API_BASE_URL`         | `http://localhost:8000` | frontend  |
-| `TRADER_DB_PATH`            | `/app/data/trading.db`  | trader    |
+| `TRADER_DB_PATH`            | `/app/data/trading.db` in compose; `backend/trader/data/trading.db` when a script is run on a host | trader |
 | `RESEARCH_STORE`            | `/app/data/research`    | trader, paper-engine |
+| `TRADER_DATA_MOUNT`         | `trader_data` (a named volume). Read by compose, not by code: set it to `./backend/trader/data` to run the containers against a store scraped on the host, which the named volume otherwise masks | compose |
 | `COST_CONFIG`               | `coinbase_us_perps_cde_v202602.json` — unset misprices every contract by 0.06x–2.5x | trader, paper-engine |
 | `TRADE_VENUE`               | `coinbase`              | trader    |
-| `REFERENCE_VENUE`           | `binance`               | trader    |
-| `HTTPS_PROXY` / `HTTP_PROXY` | unset — **required from a US IP** for reference-venue and open-interest data (Binance, OKX and Bybit all answer 451) | trader |
+| `REFERENCE_VENUE`           | `coinbase_spot` — Binance/OKX/Bybit are 451 from a US IP, so the old `binance` default resolved to seven all-NaN columns | trader |
+| `HTTPS_PROXY` / `HTTP_PROXY` | unset — **required from a US IP** for open-interest data and for any offshore reference venue (Binance, OKX and Bybit all answer 451). Not needed for the `coinbase_spot` default | trader |
 | `SYMBOLS`                   | unset (the whole profile universe) | trader |
 | `EQUITY`                    | `100000`                | trader    |
 | `LEVERAGE`                  | `4`                     | trader    |

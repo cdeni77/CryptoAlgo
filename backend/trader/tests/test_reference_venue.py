@@ -12,10 +12,13 @@ fit without them cannot be told apart from the artifact.
 
 It is also the likely case for a US operator, which is what makes it worth a
 test rather than a comment. Binance, OKX and Bybit all answer HTTP 451 to a US
-IP, so the default `--reference-venue binance` yields nothing unless the scrape
-went through a proxy — and if the scraper's fallback served a different exchange
-instead, the bars are stamped with *that* venue's name and `binance` still
-matches nothing.
+IP, so `--reference-venue binance` — which used to be the default — yields
+nothing unless the scrape went through a proxy, and if the scraper's fallback
+served a different exchange instead, the bars are stamped with *that* venue's
+name and `binance` still matches nothing. The default is `coinbase_spot` now:
+reachable, deeper than the nano perp, and the market the perp's index is built
+from. `binance` stays in the tests below because it is what a stale config or an
+explicit flag still asks for.
 """
 
 from __future__ import annotations
@@ -242,3 +245,124 @@ def test_one_venue_label_for_both_makes_the_basis_meaningless(tmp_path):
             'this now measures something real, the resolution changed and the '
             '--venue-label guidance in CLAUDE.md should be revisited'
         )
+
+
+# ---------------------------------------------------------------------------
+# The live loop has to keep the reference venue current
+# ---------------------------------------------------------------------------
+
+
+def test_the_cycle_refreshes_the_reference_venue():
+    """A frozen reference does not go missing — it gets forward-filled.
+
+    `cross_venue_features` reindexes the reference series onto the panel index
+    and `ffill()`s it, so a spot series that stops updating has its last close
+    carried forward indefinitely. The basis then drifts with the perp against a
+    frozen number: a live feature that looks alive and measures nothing.
+
+    `_scrape` auto-resolves the perp contracts and never touches spot, so
+    without a second step the reference would have gone stale from the first
+    hour the loop ran.
+    """
+    import argparse
+    import inspect
+    from unittest import mock
+
+    from scripts import live_orchestrator as orchestrator
+
+    cycle = inspect.getsource(orchestrator._run_cycle)
+    assert '_scrape_reference(' in cycle, (
+        'the cycle no longer refreshes the reference venue, so the basis will '
+        'be computed against a forward-filled stale price'
+    )
+    assert cycle.index('_scrape_reference(') < cycle.index('_sync_store('), (
+        'the refresh must run before the store sync, or the new bars are not '
+        'in the panel this cycle builds'
+    )
+
+
+def test_the_refresh_only_applies_to_coinbase_spot():
+    """`--spot-universe` scrapes Coinbase products. Other venues come via CCXT
+    on the perp scrape's own fallback path and must not trigger it."""
+    import argparse
+    from unittest import mock
+
+    from scripts import live_orchestrator as orchestrator
+
+    for reference, expected in (
+        ('coinbase_spot', True), ('COINBASE_SPOT', True),
+        ('binance', False), ('', False), (None, False),
+    ):
+        args = argparse.Namespace(reference_venue=reference, db_path='x.db')
+        with mock.patch.object(orchestrator, '_run_step') as step:
+            orchestrator._scrape_reference(args, 6)
+        assert step.called is expected, f'reference_venue={reference!r}'
+        if expected:
+            command = step.call_args[0][1]
+            assert '--spot-universe' in command
+            assert '--backfill-hours' in command
+
+
+# ---------------------------------------------------------------------------
+# A spot-only scrape collects no funding, and that is not a failure
+# ---------------------------------------------------------------------------
+
+
+def test_spot_has_no_funding_to_collect():
+    """One predicate decides both who gets a funding lookup and who is owed one.
+
+    `resolve_coinbase_funding_product_map` skips spot spellings because
+    `_extract_coin_code('BTC-USD')` resolves to 'BIP' and would otherwise file
+    the perp's rate under a spot key. The exit code has to use the same rule or
+    the two disagree.
+    """
+    from core.costs import spot_universe
+    from core.profiles import COIN_PROFILES
+    from scripts.run_pipeline import perpetual_symbols
+
+    spot = spot_universe(sorted(COIN_PROFILES))
+    assert spot, 'no spot spellings to test against'
+    assert perpetual_symbols(spot) == [], (
+        f'spot symbols treated as perpetuals: {perpetual_symbols(spot)}'
+    )
+
+    perps = ['BIP-20DEC30-CDE', 'ETP-26MAR26-CDE', 'DOP-26JUN26-CDE']
+    assert perpetual_symbols(perps) == perps
+    assert perpetual_symbols(perps + spot) == perps
+
+
+def test_a_spot_only_scrape_exits_clean():
+    """Zero funding is a failure only when something in the run should have had it.
+
+    `run_pipeline` exits 1 when it collected no funding, which is right for a
+    perp scrape — a price-only dataset cannot test the carry hypothesis at all.
+    On the reference venue it was wrong twice over: spot has no funding by
+    definition, so a completely correct run exited 1, and
+    `live_orchestrator._run_step` raises on a non-zero exit — aborting the cycle
+    before the store sync, every hour, forever.
+    """
+    import ast
+    import inspect
+
+    from scripts import run_pipeline
+
+    tree = ast.parse(inspect.getsource(run_pipeline))
+
+    guards = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        # The innermost guard only: `if not args.ohlcv_only:` encloses this one
+        # and would match a subtree search.
+        direct = [statement for statement in node.body
+                  if isinstance(statement, ast.Expr)
+                  and 'funding: 0 rates collected' in ast.dump(statement)]
+        if not direct:
+            continue
+        guards.append({n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)})
+
+    assert len(guards) == 1, f'expected one funding-failure guard, found {len(guards)}'
+    assert 'perp_symbols' in guards[0], (
+        'the funding failure is not conditioned on the run containing perpetuals, '
+        'so a spot-only reference scrape exits 1 and aborts the live cycle'
+    )

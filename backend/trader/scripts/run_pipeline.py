@@ -35,7 +35,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
-from typing import List, Dict, Optional, Any
+from typing import Any, Dict, Iterable, List, Optional
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -78,6 +78,18 @@ ASSET_TO_CODE_MAP = {
 # Spot spellings: an instrument quoted directly in fiat or a stablecoin. Funding
 # is a perpetual-contract cash flow, so these never have one.
 SPOT_QUOTES = re.compile(r'-(USD|USDC|USDT)$', re.IGNORECASE)
+
+
+def perpetual_symbols(symbols: Iterable[str]) -> List[str]:
+    """The symbols that can carry funding at all.
+
+    One predicate, two callers: the funding product map skips spot so it cannot
+    file a perp's rate under a spot key, and the scrape's exit code demands
+    funding only when something in the run was supposed to have it. Those two had
+    to agree — a spot-only run collecting zero funding is a correct run, and
+    treating it as a failure aborted the orchestrator's reference-venue cycle.
+    """
+    return [symbol for symbol in symbols if not SPOT_QUOTES.search(symbol)]
 
 DEFAULT_TIMEFRAMES = ["1h", "1d"]
 DEFAULT_SYMBOLS = [
@@ -294,7 +306,7 @@ async def resolve_coinbase_funding_product_map(
             # 'BIP', so without this a spot run fetched the *perp's* funding rate
             # and filed it under the spot symbol — the right number under a key
             # that has no such thing, once per settlement.
-            if SPOT_QUOTES.search(symbol):
+            if not perpetual_symbols([symbol]):
                 continue
             code = _extract_coin_code(symbol)
             if code and code in code_to_product:
@@ -845,16 +857,22 @@ Examples:
                 venue_label=args.venue_label,
             )
             # Zero funding is not a partial success. Carry is the edge this
-            # system is built to capture — 2bp/hour is 48bp/day against a
-            # 5-54bp round trip — so a price-only scrape cannot test the
-            # hypothesis, and `core/targets.py` decomposes net return into
-            # price AND carry. The run used to exit 0 on this, which made a
-            # scrape that collected nothing usable look successful.
-            if not funding_rows:
+            # system is built to capture, and `core/targets.py` decomposes net
+            # return into price AND carry, so a price-only scrape cannot test the
+            # hypothesis. The run used to exit 0 on this, which made a scrape that
+            # collected nothing usable look successful.
+            #
+            # But only where funding exists to collect. A spot run has none by
+            # definition — `SPOT_QUOTES` is why the funding map skips those
+            # symbols in the first place — so demanding it here made the reference
+            # scrape exit 1 on a completely correct run, which
+            # `live_orchestrator._run_step` turns into an aborted cycle.
+            perp_symbols = perpetual_symbols(symbols)
+            if not funding_rows and perp_symbols:
                 failures.append(
                     "funding: 0 rates collected for all "
-                    f"{len(symbols)} symbols — the carry features and the carry "
-                    "component of every target will be empty"
+                    f"{len(perp_symbols)} perpetual symbols — the carry features "
+                    "and the carry component of every target will be empty"
                 )
         
         # Open Interest Backfill (optional)

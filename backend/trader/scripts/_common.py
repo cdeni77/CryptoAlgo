@@ -23,7 +23,13 @@ from core.datastore import ResearchStore
 def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument('--store', default=None, help='Research store root')
     parser.add_argument('--venue', default='coinbase', help='Venue supplying the traded price')
-    parser.add_argument('--reference-venue', default='binance',
+    # Coinbase spot, not Binance. Binance, OKX and Bybit all answer HTTP 451 to a
+    # US IP, so the old default resolved to nothing and the cross_venue group came
+    # back as seven all-NaN columns — which build_panel reindexes into the
+    # canonical 76 and therefore looks healthy. Coinbase's own spot book is
+    # deeper than the nano perp, reachable, and is the market the perp's index is
+    # built from, which makes its basis the thing that actually drives funding.
+    parser.add_argument('--reference-venue', default=os.getenv('REFERENCE_VENUE', 'coinbase_spot'),
                         help='Deeper venue for basis and lead-lag; empty to disable')
     parser.add_argument('--symbols', default=None, help='Comma-separated CDE codes')
     parser.add_argument('--as-of', default=None,

@@ -121,8 +121,18 @@ services:
 
       # Venue. Coinbase supplies the traded price; the reference venue is a
       # deeper market used only for basis and lead-lag features.
+      #
+      # Coinbase spot, not Binance. Binance, OKX and Bybit all answer HTTP 451 to
+      # a US IP, so `binance` here resolved to no bars at all and the seven
+      # cross_venue features arrived as all-NaN columns — which build_panel
+      # reindexes into the canonical 76, so the panel keeps its shape and the
+      # feature_set_hash is identical to a populated one. Coinbase's own spot book
+      # is deeper than the nano perp, reachable without a proxy, and is the market
+      # the perp's index is built from, which makes its basis the thing that
+      # actually drives funding. The orchestrator refreshes it each cycle
+      # (`_scrape_reference`) only when this is `coinbase_spot`.
       - TRADE_VENUE=coinbase
-      - REFERENCE_VENUE=binance
+      - REFERENCE_VENUE=coinbase_spot
 
       # The real CDE fee schedule, resolved by name out of configs/exchange.
       # Without it every contract is priced at the hardcoded 10bp/side, which is
@@ -168,9 +178,20 @@ services:
       retries: 3
       start_period: 20s
     volumes:
-      # Persist the SQLite DB, trained models, feature CSVs, and logs across restarts
-      - trader_data:/app/data
-      - trader_models:/app/models
+      # Persist the SQLite DB, trained models, feature CSVs, and logs across restarts.
+      #
+      # These are named volumes, and they are mounted *deeper* than the
+      # `./backend/trader:/app` bind below — so Docker layers them on top, and the
+      # container never sees a `backend/trader/data` scraped on the host. A store
+      # built by hand is invisible here and the loop backfills from scratch into a
+      # second, hidden copy. Point TRADER_DATA_MOUNT at the host directory to use
+      # it instead (`TRADER_DATA_MOUNT=./backend/trader/data`); the named volume
+      # stays the default because `data/` is gitignored, so a bind default would
+      # be a path Docker creates empty on a clean clone. Whatever you set, both
+      # this service and paper-engine read it — test_deployment.py asserts they
+      # cannot diverge.
+      - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
+      - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
       - trader_logs:/app/logs
       # Mount source for development (remove in production)
       - ./backend/trader:/app
@@ -219,8 +240,9 @@ services:
       trader:
         condition: service_started
     volumes:
-      # The store the orchestrator writes is the store this reads.
-      - trader_data:/app/data
+      # The store the orchestrator writes is the store this reads — same default,
+      # same override, or funding is accrued from a store nothing collected into.
+      - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ./backend/trader:/app
     command: >
       -m scripts.paper_engine

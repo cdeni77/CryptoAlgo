@@ -50,7 +50,16 @@ from core.promotion import current_record
 
 LOGGER = logging.getLogger('live_orchestrator')
 STOP_REQUESTED = False
-STATE_FILE = Path(os.getenv('ORCHESTRATOR_STATE_FILE', './data/orchestrator_state.json'))
+
+# Every default path below hangs off the package root rather than off `/app`.
+# The container's WORKDIR happens to be /app, so absolute container paths worked
+# there and were an unwritable `PermissionError: '/app'` the moment anyone ran
+# the loop on a host — the one place a long-running scrape is most likely to be
+# started by hand. Compose still wins: TRADER_DB_PATH and ORCHESTRATOR_LOG_FILE
+# are read first, and the container sets them.
+TRADER_ROOT = Path(__file__).resolve().parents[1]
+STATE_FILE = Path(os.getenv('ORCHESTRATOR_STATE_FILE')
+                  or TRADER_ROOT / 'data' / 'orchestrator_state.json')
 
 # The promotion gates cannot be re-run cheaply enough to sit in the hot loop, so
 # a retrain is scheduled rather than triggered. This is how long a promoted model
@@ -358,6 +367,30 @@ def _scrape(args: argparse.Namespace, window_hours: float) -> None:
     _run_step('scrape', command)
 
 
+def _scrape_reference(args: argparse.Namespace, window_hours: float) -> None:
+    """Keep the reference venue current too, or the basis rots silently.
+
+    `cross_venue_features` reindexes the reference series onto the panel's index
+    and forward-fills it. A spot series that stops updating therefore does not go
+    missing — its last close is carried forward indefinitely, and the basis drifts
+    with the perp against a frozen number. A live feature that looks alive and
+    measures nothing, which is the failure mode this system keeps producing.
+
+    Only for Coinbase spot: `--spot-universe` scrapes Coinbase products under the
+    `coinbase_spot` label. A reference venue pointing anywhere else arrives via
+    the perp scrape's own CCXT fallback and is not this step's business.
+    """
+    if (args.reference_venue or '').strip().lower() != 'coinbase_spot':
+        return
+
+    command = [
+        sys.executable, '-m', 'scripts.run_pipeline',
+        '--backfill-only', '--backfill-hours', str(window_hours),
+        '--db-path', args.db_path, '--spot-universe',
+    ]
+    _run_step('scrape-reference', command)
+
+
 def _sync_store(args: argparse.Namespace) -> None:
     """Move what the scraper wrote into the research store.
 
@@ -463,6 +496,7 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
 
 def _run_cycle(args: argparse.Namespace, window_hours: float, *, quarantined: bool) -> None:
     _scrape(args, window_hours)
+    _scrape_reference(args, window_hours)
     _sync_store(args)
     _build_features(args)
 
@@ -515,10 +549,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
     # Data surface, matching scripts/_common.py so every step sees one dataset.
-    parser.add_argument('--db-path', default=os.getenv('TRADER_DB_PATH', '/app/data/trading.db'))
+    parser.add_argument('--db-path',
+                        default=os.getenv('TRADER_DB_PATH')
+                        or str(TRADER_ROOT / 'data' / 'trading.db'))
     parser.add_argument('--store', default=os.getenv('RESEARCH_STORE') or None)
     parser.add_argument('--venue', default=os.getenv('TRADE_VENUE', 'coinbase'))
-    parser.add_argument('--reference-venue', default=os.getenv('REFERENCE_VENUE', 'binance'))
+    parser.add_argument('--reference-venue',
+                        default=os.getenv('REFERENCE_VENUE', 'coinbase_spot'))
     parser.add_argument('--symbols', default=os.getenv('SYMBOLS') or None)
     parser.add_argument('--min-quality', default='valid',
                         choices=['valid', 'suspicious', 'unvalidated', 'all'])
@@ -561,8 +598,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--include-oi', action='store_true')
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
     parser.add_argument('--log-file',
-                        default=os.getenv('ORCHESTRATOR_LOG_FILE',
-                                          '/app/logs/live_orchestrator.log'))
+                        default=os.getenv('ORCHESTRATOR_LOG_FILE')
+                        or str(TRADER_ROOT / 'logs' / 'live_orchestrator.log'))
     return parser.parse_args()
 
 

@@ -54,6 +54,48 @@ def _trader_services(compose: dict) -> dict[str, dict]:
     }
 
 
+INTERPOLATION = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}')
+
+
+def _mount(volume: str) -> tuple[str, str, str]:
+    """(source, target, mode) for one compose volume entry.
+
+    Splitting on ':' left-to-right is wrong the moment a source uses shell
+    interpolation: `${TRADER_DATA_MOUNT:-trader_data}:/app/data` yields
+    `-trader_data}` as the target, and every mount assertion below quietly stops
+    applying to it. The interpolation is masked out first, then the fields are
+    taken from the right, which is where the fixed ones are.
+    """
+    masked = INTERPOLATION.sub(lambda m: '\x00' * len(m.group(0)), volume)
+    if ':' not in masked:
+        return '', volume, ''      # anonymous volume: a target and nothing else
+    fields = []
+    start = len(masked)
+    while len(fields) < 2 and ':' in masked[:start]:
+        cut = masked.rindex(':', 0, start)
+        fields.insert(0, volume[cut + 1:start])
+        start = cut
+    source = volume[:start]
+    target = fields[0] if fields else ''
+    mode = fields[1] if len(fields) > 1 else ''
+    return source, target, mode
+
+
+def _mount_sources(volume: str) -> set[str]:
+    """Every host path this mount can resolve to, defaults included.
+
+    A `${VAR:-./some/path}` source is still a bind mount when VAR is unset, so
+    the "does the host path exist" check has to see through the interpolation —
+    otherwise moving a mount behind a variable is how it stops being checked.
+    """
+    source, _, _ = _mount(volume)
+    match = INTERPOLATION.fullmatch(source)
+    if match is None:
+        return {source}
+    default = match.group(2)
+    return {default} if default else set()
+
+
 def _module_and_flags(command: str) -> tuple[str, list[str]]:
     tokens = str(command).split()
     module = tokens[tokens.index('-m') + 1]
@@ -202,17 +244,18 @@ def test_no_mount_shadows_the_cost_config(compose):
         for volume in service.get('volumes', []) or []:
             if not isinstance(volume, str) or ':' not in volume:
                 continue
-            source, target = volume.split(':')[:2]
+            source, target, _ = _mount(volume)
             if target.rstrip('/').endswith('/configs'):
                 pytest.fail(
                     f'{name} mounts {source} at {target}, masking the fee schedule '
                     f'that the build context already provides'
                 )
-            if source.startswith('./') and not (REPO_ROOT / source[2:]).exists():
-                pytest.fail(
-                    f'{name} mounts {source}, which does not exist — Docker will '
-                    f'create it empty and mount it over {target}'
-                )
+            for candidate in _mount_sources(volume):
+                if candidate.startswith('./') and not (REPO_ROOT / candidate[2:]).exists():
+                    pytest.fail(
+                        f'{name} mounts {candidate}, which does not exist — Docker '
+                        f'will create it empty and mount it over {target}'
+                    )
 
 
 def test_the_paper_engine_can_reach_the_store_and_the_fee_schedule(compose):
@@ -237,7 +280,7 @@ def test_the_paper_engine_can_reach_the_store_and_the_fee_schedule(compose):
 
     data_mounts = [
         v for v in service.get('volumes', []) or []
-        if isinstance(v, str) and v.split(':')[1:2] == ['/app/data']
+        if isinstance(v, str) and _mount(v)[1] == '/app/data'
     ]
     assert data_mounts, 'no /app/data volume, so RESEARCH_STORE points at nothing'
 
@@ -253,8 +296,8 @@ def test_the_paper_engine_reads_the_same_store_the_trader_writes(compose):
     assert trader.get('RESEARCH_STORE') == engine.get('RESEARCH_STORE')
 
     def data_volume(name):
-        return {v.split(':')[0] for v in services[name].get('volumes', [])
-                if isinstance(v, str) and v.split(':')[1:2] == ['/app/data']}
+        return {_mount(v)[0] for v in services[name].get('volumes', [])
+                if isinstance(v, str) and _mount(v)[1] == '/app/data'}
 
     assert data_volume('trader') == data_volume('paper-engine'), (
         'different /app/data sources: the engine would read an empty store'
@@ -403,3 +446,63 @@ def test_the_orchestrator_forwards_the_horizon_and_leverage_to_every_step():
         _sys.argv = original
     assert bare.horizon is None
     assert '--horizon' not in orchestrator._data_arguments(bare)
+
+
+# ---------------------------------------------------------------------------
+# The same script has to run on a host, not only inside the container
+# ---------------------------------------------------------------------------
+
+
+def test_the_orchestrator_defaults_are_writable_outside_the_container():
+    """`/app` is the container's WORKDIR and nothing else's.
+
+    `--db-path` and `--log-file` defaulted to `/app/data/trading.db` and
+    `/app/logs/live_orchestrator.log`. Inside the image those are correct and
+    compose sets `TRADER_DB_PATH` anyway; run the same module on a host and the
+    first thing it does is `log_file.parent.mkdir(parents=True)` under `/`, which
+    is `PermissionError: [Errno 13] Permission denied: '/app'` before a single
+    step runs. The defaults hang off the package root now, so the loop writes
+    beside the code it was started from.
+    """
+    import os
+    import sys
+    from unittest import mock
+
+    orchestrator = importlib.import_module('scripts.live_orchestrator')
+
+    shed = ('TRADER_DB_PATH', 'ORCHESTRATOR_LOG_FILE', 'ORCHESTRATOR_STATE_FILE')
+    with mock.patch.dict(os.environ, clear=False):
+        for key in shed:
+            os.environ.pop(key, None)
+        with mock.patch.object(sys, 'argv', ['live_orchestrator']):
+            args = orchestrator.parse_args()
+
+    for label, value in (('--db-path', args.db_path), ('--log-file', args.log_file)):
+        path = Path(value)
+        assert not path.is_absolute() or TRADER_ROOT in path.parents, (
+            f'{label} defaults to {value}, which is outside {TRADER_ROOT} — a host '
+            f'run cannot create it'
+        )
+
+    assert TRADER_ROOT in orchestrator.STATE_FILE.parents, (
+        f'the state file defaults to {orchestrator.STATE_FILE}'
+    )
+
+
+def test_compose_still_overrides_those_defaults():
+    """The container keeps its own paths, so this fix cannot move the volumes.
+
+    `TRADER_DB_PATH` is what the trader service sets, and `/app/data` is the
+    mount the paper engine reads. If the default ever became authoritative in the
+    container, the two services would stop sharing a store.
+    """
+    compose_file = yaml.safe_load(COMPOSE.read_text())
+    environment = {
+        entry.split('=')[0]: entry.split('=', 1)[1]
+        for entry in compose_file['services']['trader'].get('environment', [])
+        if '=' in entry
+    }
+    assert environment.get('TRADER_DB_PATH', '').startswith('/app/data/'), (
+        'the container no longer names its own database path, so it would fall '
+        'back to a package-relative default that is not on the data volume'
+    )
