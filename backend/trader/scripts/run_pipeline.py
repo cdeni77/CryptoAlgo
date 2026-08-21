@@ -383,6 +383,7 @@ async def backfill_funding_rates(
             print(f"  {symbol}: coinbase={m['coinbase']}, binance_proxy={m['binance_proxy']} ({coverage_start} -> {coverage_end})")
 
         print(f"\nTotal funding rates inserted: {total_inserted}")
+        return total_inserted
 
     finally:
         await connector.close()
@@ -701,7 +702,21 @@ Examples:
         
         # Funding Rate Backfill
         if not args.ohlcv_only:
-            await backfill_funding_rates(symbols, start_time, end_time, db, proxy, api_key, api_secret)
+            funding_rows = await backfill_funding_rates(
+                symbols, start_time, end_time, db, proxy, api_key, api_secret
+            )
+            # Zero funding is not a partial success. Carry is the edge this
+            # system is built to capture — 2bp/hour is 48bp/day against a
+            # 5-54bp round trip — so a price-only scrape cannot test the
+            # hypothesis, and `core/targets.py` decomposes net return into
+            # price AND carry. The run used to exit 0 on this, which made a
+            # scrape that collected nothing usable look successful.
+            if not funding_rows:
+                failures.append(
+                    "funding: 0 rates collected for all "
+                    f"{len(symbols)} symbols — the carry features and the carry "
+                    "component of every target will be empty"
+                )
         
         # Open Interest Backfill (optional)
         if args.include_oi and not args.ohlcv_only:
