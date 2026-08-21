@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { ComponentType, useCallback, useEffect, useState } from 'react';
 
 import { getPaperConfig } from './api/paperApi';
 import Sidebar from './components/Sidebar';
@@ -15,6 +15,17 @@ export const ROUTES = {
 } as const;
 
 export type RoutePath = keyof typeof ROUTES;
+
+// `Record<RoutePath, ...>` is what makes adding a route to ROUTES without
+// rendering it a compile error. The render used to be a chain of
+// `route === '/x' && <XPage />`, which is exhaustive only by inspection: a new
+// entry in ROUTES got a sidebar link, a title and a blank page.
+const PAGES: Record<RoutePath, ComponentType> = {
+  '/': DashboardPage,
+  '/trading': TradingPage,
+  '/research': ResearchPage,
+  '/model': ModelPage,
+};
 
 function isRoute(path: string): path is RoutePath {
   return path in ROUTES;
@@ -129,6 +140,8 @@ export default function App() {
     };
   }, []);
 
+  const Page = PAGES[route];
+
   return (
     <div className="flex h-screen overflow-hidden bg-[#080c14] font-sans antialiased">
       <Sidebar route={route} navigate={navigate} activeCoins={activeCoins} activeCoinsError={activeCoinsError} />
@@ -141,11 +154,8 @@ export default function App() {
           <span className="font-mono text-xs text-tx-muted">{utc}</span>
         </header>
 
-        <main className="bg-grid flex-1 overflow-y-auto">
-          {route === '/' && <DashboardPage />}
-          {route === '/trading' && <TradingPage />}
-          {route === '/research' && <ResearchPage />}
-          {route === '/model' && <ModelPage />}
+        <main className="bg-grid flex-1 overflow-y-auto" id="main">
+          <Page />
         </main>
       </div>
     </div>

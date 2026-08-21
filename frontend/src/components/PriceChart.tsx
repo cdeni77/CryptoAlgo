@@ -32,15 +32,65 @@ function CustomTooltip({ active, payload }: any) {
   );
 }
 
+/** One candle: the high-low wick and the open-close body, drawn to scale.
+ *
+ * The bar's `dataKey` is the full `[low, high]` range, so recharts hands this
+ * shape a rectangle spanning exactly that range in pixels — which is enough to
+ * recover the price-to-pixel scale locally and place the body inside it. The
+ * previous version drew two bars covering open-to-close only: the tooltip
+ * reported H and L that appeared nowhere on the chart, so every bar looked like
+ * its entire range was the body, and recharts also allocated a category slot to
+ * each of the two bars, offsetting every candle from its own timestamp.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function Candle({ x, y, width, height, payload }: any) {
+  const d = payload as HistoryEntry;
+  if (
+    typeof x !== 'number' || typeof y !== 'number' ||
+    typeof width !== 'number' || typeof height !== 'number' ||
+    !d
+  ) return null;
+
+  const span = d.high - d.low;
+  // A bar that never moved has no scale to recover. Draw it as a hairline at
+  // its single price rather than dividing by zero.
+  const priceToY = (price: number) =>
+    span > 0 ? y + ((d.high - price) / span) * height : y + height / 2;
+
+  const up = d.close >= d.open;
+  const colour = up ? '#34d399' : '#fb7185';
+  const bodyTop = priceToY(Math.max(d.open, d.close));
+  const bodyBottom = priceToY(Math.min(d.open, d.close));
+  const centre = x + width / 2;
+
+  return (
+    <g opacity={0.85}>
+      <line
+        x1={centre} x2={centre}
+        y1={priceToY(d.high)} y2={priceToY(d.low)}
+        stroke={colour} strokeWidth={1}
+      />
+      <rect
+        x={x} width={Math.max(width, 1)}
+        y={bodyTop}
+        // A doji has zero body height and would render as nothing.
+        height={Math.max(bodyBottom - bodyTop, 1)}
+        fill={colour}
+      />
+    </g>
+  );
+}
+
 export default function PriceChart({ data, fills = [], coin, mode = 'candle' }: Props) {
   const chartData = useMemo(() => data.map(d => ({
     ...d,
-    upBody:   d.close >= d.open ? [d.open, d.close] : [null, null],
-    downBody: d.close <  d.open ? [d.close, d.open] : [null, null],
+    range: [d.low, d.high],
   })), [data]);
 
-  const fillPrices = useMemo(() =>
-    fills.filter(f => f.coin === coin).map(f => f.fill_price),
+  // Keyed by fill id, not array index: the list is filtered and repolled, so an
+  // index key reuses one fill's DOM node for another fill's price.
+  const coinFills = useMemo(() =>
+    fills.filter(f => f.coin === coin),
     [fills, coin]
   );
 
@@ -74,15 +124,14 @@ export default function PriceChart({ data, fills = [], coin, mode = 'candle' }: 
           axisLine={false} tickLine={false} width={56} orientation="right"
         />
         <Tooltip content={<CustomTooltip />} />
-        {fillPrices.map((p, i) => (
-          <ReferenceLine key={i} y={p} stroke="rgba(56,189,248,0.4)" strokeDasharray="3 4" />
+        {coinFills.map(f => (
+          <ReferenceLine
+            key={f.id} y={f.fill_price}
+            stroke="rgba(56,189,248,0.4)" strokeDasharray="3 4"
+          />
         ))}
         {mode === 'candle' ? (
-          <>
-            <Bar dataKey="upBody"   fill="#34d399" opacity={0.85} radius={[1,1,0,0]} />
-            <Bar dataKey="downBody" fill="#fb7185" opacity={0.85} radius={[1,1,0,0]} />
-            <Line dataKey="close" stroke="rgba(148,163,184,0.15)" dot={false} strokeWidth={0.5} />
-          </>
+          <Bar dataKey="range" shape={<Candle />} isAnimationActive={false} />
         ) : (
           <Line dataKey="close" stroke={lineColor} dot={false} strokeWidth={1.5} />
         )}

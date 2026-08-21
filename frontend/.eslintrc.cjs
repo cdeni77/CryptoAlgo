@@ -14,10 +14,13 @@ module.exports = {
   extends: [
     'eslint:recommended',
     'plugin:@typescript-eslint/recommended',
+    'plugin:react/recommended',
+    'plugin:react/jsx-runtime',
+    'plugin:jsx-a11y/recommended',
   ],
   parser: '@typescript-eslint/parser',
   parserOptions: { ecmaVersion: 'latest', sourceType: 'module' },
-  plugins: ['@typescript-eslint', 'react-hooks', 'react-refresh'],
+  plugins: ['@typescript-eslint', 'react', 'react-hooks', 'react-refresh', 'jsx-a11y'],
   ignorePatterns: ['dist', 'node_modules', '*.cjs', 'vite.config.ts'],
   settings: { react: { version: '18.3' } },
   rules: {
@@ -45,6 +48,12 @@ module.exports = {
 
     eqeqeq: ['error', 'always', { null: 'ignore' }],
     'no-console': ['warn', { allow: ['warn', 'error'] }],
+
+    // `settings.react.version` was already set here while the plugin that reads
+    // it was not installed, so none of these rules had ever run. `jsx-key` is
+    // the one with teeth in a dashboard built almost entirely from mapped lists.
+    'react/jsx-key': 'error',
+    'react/prop-types': 'off',   // TypeScript already checks props.
   },
   overrides: [
     {

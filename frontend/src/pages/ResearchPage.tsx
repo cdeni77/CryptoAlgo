@@ -251,7 +251,7 @@ export default function ResearchPage() {
         {kpis && kpis.kill_switch_status === 'quarantined' && (
           <div className="mt-4 rounded-lg border border-accent-rose/25 bg-accent-rose/5 px-3 py-2 text-[11px] leading-snug text-accent-rose">
             The live model is quarantined: realised paper results have breached the
-            monitor's thresholds, and the orchestrator has stopped writing signals.
+            monitor’s thresholds, and the orchestrator has stopped writing signals.
           </div>
         )}
       </div>
@@ -462,7 +462,7 @@ export default function ResearchPage() {
           <Freshness lastUpdated={runs.lastUpdated} refreshing={runs.refreshing} error={runs.error} />
         </div>
         <p className="mb-4 text-[11px] leading-relaxed text-tx-muted">
-          Real attempts, from the orchestrator's run table joined to the promotion
+          Real attempts, from the orchestrator’s run table joined to the promotion
           ledger. This table used to invent three runs per signal — a train, an
           optimize and a validate, with fabricated durations and a status hardcoded
           to success — none of which had happened.

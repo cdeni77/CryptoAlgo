@@ -58,12 +58,16 @@ export default function Sidebar({ route, navigate, activeCoins, activeCoinsError
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 px-3 py-4 space-y-1">
+      <nav className="flex-1 px-3 py-4 space-y-1" aria-label="Main">
         {NAV_ITEMS.map(({ path, label, icon }) => {
           const active = route === path;
           return (
             <button
               key={path}
+              // The active item was distinguished by colour alone, so a screen
+              // reader announced four identical buttons with no indication of
+              // where the user already was.
+              aria-current={active ? 'page' : undefined}
               onClick={() => navigate(path)}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all duration-150 ${
                 active
@@ -71,7 +75,7 @@ export default function Sidebar({ route, navigate, activeCoins, activeCoinsError
                   : 'text-tx-secondary hover:text-tx-primary hover:bg-[rgba(56,189,248,0.05)] border border-transparent'
               }`}
             >
-              <span className={active ? 'text-accent-cyan' : 'text-tx-muted'}>{icon}</span>
+              <span aria-hidden="true" className={active ? 'text-accent-cyan' : 'text-tx-muted'}>{icon}</span>
               {label}
             </button>
           );

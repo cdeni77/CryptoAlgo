@@ -9,7 +9,7 @@ import PriceChart from '../components/PriceChart';
 import SignalsTable from '../components/SignalsTable';
 import { Empty, ErrorBlock, Freshness, Panel, Spinner } from '../components/StateBlock';
 import { usePolling } from '../hooks/usePolling';
-import { CoinSymbol, WalletAsset } from '../types';
+import { ALL_COINS, CoinSymbol, WalletAsset } from '../types';
 
 function fmt(v: number) {
   return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -34,14 +34,20 @@ function AssetRow({ a }: { a: WalletAsset }) {
   );
 }
 
-const COINS: CoinSymbol[] = ['ETH','BTC','AVAX','SOL','XRP','DOGE','ADA','LINK','LTC'];
+// The universe comes from types.ts; only the ordering is local, because this
+// page defaults to ETH and puts it first.
+const DEFAULT_COIN: CoinSymbol = 'ETH';
+const COINS: CoinSymbol[] = [
+  DEFAULT_COIN,
+  ...ALL_COINS.filter((c) => c !== DEFAULT_COIN),
+];
 const RANGES = ['1h','1d','1w','1m','1y'] as const;
 type Range = typeof RANGES[number];
 type ChartMode = 'candle' | 'line';
 
 
 export default function TradingPage() {
-  const [coin, setCoin] = useState<CoinSymbol>('ETH');
+  const [coin, setCoin] = useState<CoinSymbol>(DEFAULT_COIN);
   const [range, setRange] = useState<Range>('1d');
   const [chartMode, setChartMode] = useState<ChartMode>('candle');
   const [priceSource, setPriceSource] = useState<'spot' | 'cde'>('spot');

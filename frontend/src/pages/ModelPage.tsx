@@ -168,10 +168,17 @@ export default function ModelPage() {
     }
   }
 
-  const record =
-    (selected && history.data?.records.find((r) => r.version === selected)) ||
-    live.data?.live ||
-    null;
+  // A selected version that is not in the ledger is a missing record, not the
+  // live model. The `||` chain fell through to `live.data.live`, so the gate
+  // table showed the live model's results while the ledger row for the
+  // selection stayed highlighted and the header — which printed the version
+  // only when `!record.is_live` — printed nothing.
+  const selectedRecord = selected
+    ? (history.data?.records.find((r) => r.version === selected) ?? null)
+    : null;
+  const record = selected ? selectedRecord : (live.data?.live ?? null);
+  const selectionMissing =
+    selected !== null && selectedRecord === null && !history.loading;
 
   return (
     <div className="max-w-[1600px] space-y-5 p-6">
@@ -304,9 +311,9 @@ export default function ModelPage() {
           <div className="mb-4 flex items-center justify-between">
             <span className={LABEL}>
               Promotion gates
-              {selected && record && !record.is_live && (
+              {selected && (
                 <span className="ml-2 font-mono normal-case tracking-normal text-accent-cyan">
-                  {record.version}
+                  {selected}
                 </span>
               )}
             </span>
@@ -320,7 +327,12 @@ export default function ModelPage() {
             )}
           </div>
 
-          {record ? (
+          {selectionMissing ? (
+            <Empty
+              message={`No ledger record for ${selected}.`}
+              hint="The promotion ledger no longer carries this version. Use “back to live” to return to what is installed."
+            />
+          ) : record ? (
             <GateTable gates={record.gates} />
           ) : live.loading ? (
             <Spinner label="Reading gate results" />

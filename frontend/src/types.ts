@@ -3,8 +3,13 @@ export interface PriceInfo {
   change24h: number | null;
 }
 
-export type CoinSymbol = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'AVAX' | 'ADA' | 'LINK' | 'LTC';
-export const ALL_COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC'];
+// The universe, once. `CoinSymbol` is derived from the array rather than
+// declared alongside it, so a coin added here cannot be missing from the type —
+// and two pages had already grown their own private copies, in different
+// orders, which is how a coin ends up tradeable on one screen and absent from
+// the other.
+export const ALL_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC'] as const;
+export type CoinSymbol = (typeof ALL_COINS)[number];
 
 export type PriceData = Record<CoinSymbol, PriceInfo>;
 

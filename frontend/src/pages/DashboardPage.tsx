@@ -18,9 +18,8 @@ import PriceCard from '../components/PriceCard';
 import SignalsTable from '../components/SignalsTable';
 import { Empty, ErrorBlock, Freshness, Panel } from '../components/StateBlock';
 import { usePolling } from '../hooks/usePolling';
-import { PaperEquityPoint } from '../types';
+import { ALL_COINS, PaperEquityPoint } from '../types';
 
-const ALL_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'ADA', 'LINK', 'LTC'] as const;
 
 /**
  * Fallback contract sizes, used only until `/coins/cde-specs` answers.
