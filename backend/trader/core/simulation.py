@@ -611,6 +611,10 @@ class SimulationReport:
     # routinely take a fifth of a bar did not trade the market the backtest
     # priced, and its fills are fiction at the size it claims.
     max_exit_participation: Optional[float] = None
+    # Symbols whose carry was trained on another venue's funding, from
+    # `Dataset.proxy_funding_symbols`. `None` means the question was not asked,
+    # which fails the gate — the same direction as every other measurement here.
+    proxy_funding_symbols: Optional[tuple[str, ...]] = None
 
     def measurements(self) -> dict[str, Optional[float]]:
         """Flat mapping for `core.metrics.evaluate_gates`.
@@ -634,6 +638,12 @@ class SimulationReport:
             'parameter_plateau': self.surface.retention if self.surface else None,
             'oos_trades': float(self.oos_trades) if self.oos_trades is not None else None,  # zero trades is a measurement
             'max_exit_participation': self.max_exit_participation,
+            # A count, not a ratio. Zero is the only passing value; None means we
+            # did not look, which fails, which is the intended direction.
+            'proxy_funding_symbols': (
+                float(len(self.proxy_funding_symbols))
+                if self.proxy_funding_symbols is not None else None
+            ),
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -648,4 +658,8 @@ class SimulationReport:
             'deflated_sharpe': self.deflated_sharpe,
             'oos_trades': self.oos_trades,
             'max_exit_participation': self.max_exit_participation,
+            'proxy_funding_symbols': (
+                list(self.proxy_funding_symbols)
+                if self.proxy_funding_symbols is not None else None
+            ),
         }

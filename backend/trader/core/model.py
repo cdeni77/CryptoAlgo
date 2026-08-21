@@ -348,6 +348,11 @@ class ForecastModel:
     # without it are indistinguishable — the likely case for a US operator, whose
     # reference venue answers 451.
     empty_features: tuple[str, ...] = ()
+    # Symbols whose funding came from a venue other than the traded one, from
+    # `Dataset.proxy_funding_symbols`. Funding feeds the `carry` component of the
+    # target, so this is the difference between a carry edge measured on the cash
+    # flow this account receives and one measured on somebody else's.
+    proxy_funding_symbols: tuple[str, ...] = ()
     train_start: Optional[pd.Timestamp] = None
     train_end: Optional[pd.Timestamp] = None
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -456,6 +461,7 @@ class ForecastModel:
             'validation_purged': self.validation_purged,
             'n_features_populated': len(self.feature_columns) - len(self.empty_features),
             'empty_features': list(self.empty_features),
+            'proxy_funding_symbols': list(self.proxy_funding_symbols),
             'train_start': str(self.train_start) if self.train_start is not None else None,
             'train_end': str(self.train_end) if self.train_end is not None else None,
             'symbols': list(self.symbol_categories),
@@ -514,6 +520,7 @@ def train_forecast_model(
     validation_fraction: float = 0.2,
     data_as_of: Optional[str] = None,
     horizon_bars: Optional[int] = None,
+    proxy_funding_symbols: Sequence[str] = (),
 ) -> Optional[ForecastModel]:
     """Fit the three heads on a (event_time, symbol) panel.
 
@@ -631,6 +638,14 @@ def train_forecast_model(
         column for column in x.columns
         if column != SYMBOL_COLUMN and x[column].isna().all()
     )
+    if proxy_funding_symbols:
+        logger.warning(
+            'carry trained on proxy funding for %d symbol(s): %s. Funding feeds '
+            'the carry component of the target, so this measures a cash flow the '
+            'traded venue does not pay',
+            len(proxy_funding_symbols), ', '.join(sorted(proxy_funding_symbols)),
+        )
+
     if empty:
         logger.warning(
             'trained on %d of %d declared features: %s carried no data at all. '
@@ -652,6 +667,7 @@ def train_forecast_model(
         effective_observations=_panel_effective_observations(x.index[train_mask], horizon),
         validation_purged=not purge_disabled,
         empty_features=empty,
+        proxy_funding_symbols=tuple(proxy_funding_symbols),
         train_start=pd.Timestamp(times[train_mask].min()) if train_mask.any() else None,
         train_end=pd.Timestamp(times[train_mask].max()) if train_mask.any() else None,
         metrics=metrics,

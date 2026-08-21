@@ -258,6 +258,7 @@ def evaluate_candidate(
     model = train_forecast_model(
         dataset.features, dataset.targets, config=config, data_as_of=data_as_of,
         horizon_bars=dataset.horizon_bars,
+        proxy_funding_symbols=dataset.proxy_funding_symbols,
     )
     if model is None:
         record.error = 'not enough resolved rows to train'
@@ -283,6 +284,9 @@ def evaluate_candidate(
     report = SimulationReport(
         oos_trades=result.n_trades,
         max_exit_participation=result.max_exit_participation,
+        # A tuple, possibly empty, rather than None: the question was asked. The
+        # gate then reads its length, and zero passes.
+        proxy_funding_symbols=tuple(dataset.proxy_funding_symbols),
     )
 
     def period_sharpes_of(outcome, periods) -> list[float]:

@@ -505,3 +505,68 @@ def test_the_hold_never_outlives_the_forecast(config):
 
     # And with no horizon the profile still governs, so the sweep is meaningful.
     assert _hold_bars(config, COIN_PROFILES['XRP'], None) == 108
+
+
+# ---------------------------------------------------------------------------
+# Carry from the wrong venue
+# ---------------------------------------------------------------------------
+
+
+def test_proxy_funding_blocks_promotion():
+    """Borrowed funding is research, not a candidate for live.
+
+    Coinbase CDE publishes no historical funding — only the current rate — so
+    borrowing a deeper venue's history is the obvious way to get a backfill. It
+    also trains the carry head on a cash flow this account will never receive:
+    funding feeds the `carry` component of the net-return target directly, so
+    the resulting edge is measured against someone else's settlement.
+
+    Nothing stopped it before. `load_dataset` logged a warning, and the warning
+    did not reach the model artifact or the gates — so a proxy-funded candidate
+    could clear all ten and install, indistinguishable from a clean one.
+    """
+    from core.metrics import DEFAULT_GATES, evaluate_gates
+
+    assert 'proxy_funding_symbols' in DEFAULT_GATES
+
+    # Everything else passing, so the proxy count is the only thing under test.
+    clean = {}
+    for name, (threshold, comparison) in DEFAULT_GATES.items():
+        clean[name] = threshold + 1.0 if comparison == 'min' else max(threshold - 0.01, 0.0)
+    clean['proxy_funding_symbols'] = 0.0
+    promoted, _ = evaluate_gates(clean)
+    assert promoted, 'the control case must pass, or this test proves nothing'
+
+    borrowed = dict(clean, proxy_funding_symbols=1.0)
+    promoted, gates = evaluate_gates(borrowed)
+    assert not promoted, 'a single proxy-funded symbol must block promotion'
+    gate = next(g for g in gates if g.name == 'proxy_funding_symbols')
+    assert not gate.passed
+
+    # And "we did not check" is not a pass, same as every other gate here.
+    unmeasured = dict(clean, proxy_funding_symbols=None)
+    promoted, _ = evaluate_gates(unmeasured)
+    assert not promoted
+
+
+def test_the_model_artifact_records_proxy_funding():
+    """The gate reads a count; the artifact has to name the symbols.
+
+    A rejected candidate is only useful if the ledger says why, and `--force`
+    exists — so a forced install must still carry the evidence.
+    """
+    from core.model import ForecastModel
+
+    model = ForecastModel(
+        heads={}, feature_columns=('a',), symbol_categories=('BIP',),
+        feature_set_hash='deadbeef', horizon_bars=24,
+        proxy_funding_symbols=('BIP', 'ETP'),
+    )
+    provenance = model.provenance()
+    assert provenance['proxy_funding_symbols'] == ['BIP', 'ETP']
+
+    # Default is empty, not None: most runs are clean and should say so.
+    assert ForecastModel(
+        heads={}, feature_columns=('a',), symbol_categories=('BIP',),
+        feature_set_hash='deadbeef', horizon_bars=24,
+    ).provenance()['proxy_funding_symbols'] == []

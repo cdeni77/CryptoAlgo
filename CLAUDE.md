@@ -250,6 +250,36 @@ real observation is 22x lower. Collect the distribution before sizing anything o
 it. `scripts/preflight.py` reports sample size; it cannot tell you the edge is
 real.
 
+### Do not backfill carry from another venue
+
+The tempting shortcut, given that CDE has no funding history, is to take
+Binance's. Don't — and the gates now refuse it.
+
+Funding feeds the `carry` component of the net-return target directly
+(`core/targets.py`), so a proxy series trains the carry head on a cash flow this
+account will never receive. It is not a small approximation: each venue sets
+funding from its own basis and its own formula, on its own interval (CDE hourly,
+most offshore perps 8h), in books of very different depth — BIP turns ~1.5M
+contracts a day against Binance's BTC perp. And the failure is invisible: the
+backtest would credit carry from one venue while the paper engine accrues it from
+another, and both numbers look plausible.
+
+`load_dataset` already warned. The warning did not reach the artifact or the
+gates, so a proxy-funded candidate could clear all ten and install
+indistinguishably from a clean one. Now:
+
+- `Dataset.proxy_funding_symbols` records it structurally, not just as a string.
+- `ForecastModel.provenance()` carries it, so a forced install keeps the evidence.
+- `proxy_funding_symbols` is a promotion gate with a threshold of zero, and
+  "not measured" fails like every other gate here.
+
+Research on proxy funding is fine and sometimes useful — measuring whether
+funding mean-reverts at all, say. Promotion is what is blocked. `--force` with a
+reason remains the escape hatch, and records itself.
+
+The legitimate use of another venue's funding is as a *cross-venue feature*
+(basis, lead-lag), which is what the `cross_venue` group already is.
+
 ## Contract sizes: settled against the venue
 
 `configs/exchange/coinbase_us_perps_cde_v202602.json` disagreed with

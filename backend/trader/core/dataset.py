@@ -56,6 +56,14 @@ class Dataset:
     as_of: Optional[str]
     horizon_bars: int
     warnings: list[str] = field(default_factory=list)
+    # Symbols whose funding came from the reference venue instead of the traded
+    # one. Structured, not just a warning string, because it has to survive into
+    # the model artifact and the promotion gates: funding feeds the `carry`
+    # component of the net-return target directly, so a proxy series trains the
+    # carry head on a cash flow this account will never receive. Coinbase CDE
+    # publishes no historical funding, which makes borrowing it the obvious
+    # shortcut and this the guard against taking it silently.
+    proxy_funding_symbols: list[str] = field(default_factory=list)
 
     @property
     def symbols(self) -> list[str]:
@@ -72,6 +80,7 @@ class Dataset:
         return {
             'venue': self.venue,
             'reference_venue': self.reference_venue,
+            'proxy_funding_symbols': list(self.proxy_funding_symbols),
             'as_of': self.as_of,
             'symbols': self.symbols,
             'rows': int(len(self.features)),
@@ -320,6 +329,7 @@ def load_dataset(
     bars: dict[str, pd.DataFrame] = {}
     funding: dict[str, pd.DataFrame] = {}
     oi_venues_used: set[str] = set()
+    proxy_funding_symbols: list[str] = []
     symbols_with_reference: list[str] = []
     symbols_without_reference: list[str] = []
 
@@ -335,6 +345,7 @@ def load_dataset(
                 store, 'funding', symbol, reference_venue, as_of=as_of, min_quality=min_quality
             )
             if not symbol_funding.empty:
+                proxy_funding_symbols.append(symbol)
                 warnings.append(
                     f'{symbol}: funding taken from {reference_venue}, not {venue} — '
                     f'the carry features describe a different venue than the trade'
@@ -375,6 +386,7 @@ def load_dataset(
         return Dataset(
             pd.DataFrame(), pd.DataFrame(), {}, {}, profiles,
             venue, reference_venue, as_of, 0, warnings,
+            proxy_funding_symbols=sorted(proxy_funding_symbols),
         )
 
     features = build_panel(inputs, config=config)
@@ -440,6 +452,7 @@ def load_dataset(
         as_of=as_of,
         horizon_bars=resolved_horizon,
         warnings=warnings,
+        proxy_funding_symbols=sorted(proxy_funding_symbols),
     )
 
 

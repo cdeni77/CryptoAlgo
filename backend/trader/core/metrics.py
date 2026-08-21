@@ -414,6 +414,14 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # lands in; if that routinely swallows a fifth of the volume, the strategy
     # has a capacity ceiling the backtest is not honouring.
     'max_exit_participation': (0.20, 'max'),
+    # Count of symbols whose carry was trained on another venue's funding. Zero
+    # is the only passing value. Coinbase CDE publishes no historical funding
+    # (only the current rate), which makes borrowing a deeper venue's history the
+    # obvious shortcut — and it trains the carry head on a cash flow this account
+    # will never receive, then reports the resulting edge as if it were real.
+    # Research on proxy funding is legitimate; promoting it is not, so this is a
+    # gate rather than a warning. `--force` with a reason remains the escape.
+    'proxy_funding_symbols': (0.0, 'max'),
 }
 
 
