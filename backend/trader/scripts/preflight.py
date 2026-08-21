@@ -185,18 +185,37 @@ def _effective_sample(dataset) -> Check:
         return Check('effective sample', False, 'fewer than two resolved timestamps')
 
     effective = effective_sample_size(index, dataset.horizon_bars)
+    horizon = max(dataset.horizon_bars, 1)
     detail = (
         f'{effective:.0f} effective observations from {len(index):,} timestamps '
-        f'(uniqueness {effective / len(index):.1%})'
+        f'(uniqueness {effective / len(index):.1%}, horizon {horizon}h)'
     )
-    if effective < MIN_EFFECTIVE_OBSERVATIONS:
-        return Check(
-            'effective sample', False, detail,
-            f'need at least {MIN_EFFECTIVE_OBSERVATIONS}. Overlapping labels '
-            f'share information, so more rows at the same span will not help — '
-            f'a longer history will.',
-        )
-    return Check('effective sample', True, detail)
+    if effective >= MIN_EFFECTIVE_OBSERVATIONS:
+        return Check('effective sample', True, detail)
+
+    # Two ways out, and both are worth quantifying rather than gesturing at:
+    # more history at this horizon, or the same history at a shorter one. The
+    # relationship is roughly linear in both, because a label spanning h bars
+    # overlaps its h-1 neighbours.
+    days_needed = MIN_EFFECTIVE_OBSERVATIONS * horizon / 24.0
+    have_days = len(index) / 24.0
+    horizon_needed = max(int(len(index) / MIN_EFFECTIVE_OBSERVATIONS), 1)
+
+    return Check(
+        'effective sample', False, detail,
+        f'need at least {MIN_EFFECTIVE_OBSERVATIONS}. A label spanning {horizon} '
+        f'bars overlaps its {horizon - 1} neighbours, so they are not independent '
+        f'observations and more rows over the same span will not help. Two ways '
+        f'out:\n'
+        f'  - keep the {horizon}h horizon and scrape about '
+        f'{days_needed:,.0f} days ({days_needed / 365:.1f} years); '
+        f'you have {have_days:,.0f}\n'
+        f'  - keep this history and shorten the horizon to about '
+        f'{horizon_needed}h (--horizon {horizon_needed})\n'
+        f'Anything trained below the threshold is not wrong, but every statistic '
+        f'downstream — Sharpe, PBO, the gates — has error bars far wider than it '
+        f'looks, and the gates are calibrated for that.',
+    )
 
 
 def _universe_wide_enough(dataset) -> Check:

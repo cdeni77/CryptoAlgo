@@ -175,3 +175,187 @@ def test_research_store_excludes_flagged_data_by_default(ingestor, database, tmp
     assert len(clean) == 1, 'suspicious funding leaked into a default read'
     assert len(everything) == 2
     assert set(everything['quality']) == {'valid', 'suspicious'}
+
+
+# ---------------------------------------------------------------------------
+# Venue is part of the key
+# ---------------------------------------------------------------------------
+
+
+def test_two_venues_coexist_for_the_same_bar(tmp_path):
+    """Both venues' bars for the same hour must survive. Neither may replace the other.
+
+    The unique key was `(symbol, timeframe, event_time)` with venue outside it,
+    against `INSERT OR REPLACE`. So writing a Coinbase bar and then a Binance bar
+    for the same instrument and hour silently discarded the first — and the
+    cross-venue features (basis, lead-lag) need exactly that pair, so they would
+    have produced no rows at all while the venue column sat there looking correct.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from data_collection.models import DataQuality, OHLCVBar
+    from data_collection.storage import SQLiteDatabase
+
+    db = SQLiteDatabase(str(tmp_path / 'venues.db'))
+    db.initialize()
+
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def bar(venue: str, close: float) -> OHLCVBar:
+        return OHLCVBar(
+            symbol='BIP', timeframe='1h', venue=venue,
+            event_time=stamp, available_time=stamp + timedelta(hours=1),
+            open=close, high=close * 1.01, low=close * 0.99, close=close,
+            volume=1_000.0, quality=DataQuality.VALID,
+        )
+
+    assert db.insert_ohlcv(bar('coinbase', 60_000.0))
+    assert db.insert_ohlcv(bar('binance', 60_030.0))
+
+    rows = _bars_at(db, 'BIP', stamp)
+
+    assert len(rows) == 2, f'one venue overwrote the other: {rows}'
+    assert {r['venue'] for r in rows} == {'coinbase', 'binance'}
+    assert {round(r['close']) for r in rows} == {60_000, 60_030}
+
+
+def test_the_same_venue_still_deduplicates(tmp_path):
+    """Venue widens the key; it must not disable de-duplication within a venue.
+
+    Re-running a backfill re-writes the same bars, and each should update its row
+    rather than accumulate a duplicate.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from data_collection.models import DataQuality, OHLCVBar
+    from data_collection.storage import SQLiteDatabase
+
+    db = SQLiteDatabase(str(tmp_path / 'dedupe.db'))
+    db.initialize()
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    for close in (60_000.0, 60_500.0):
+        db.insert_ohlcv(OHLCVBar(
+            symbol='BIP', timeframe='1h', venue='coinbase',
+            event_time=stamp, available_time=stamp + timedelta(hours=1),
+            open=close, high=close, low=close, close=close,
+            volume=1_000.0, quality=DataQuality.VALID,
+        ))
+
+    rows = _bars_at(db, 'BIP', stamp)
+
+    assert len(rows) == 1
+    assert round(rows[0]['close']) == 60_500, 'the revision did not replace the original'
+
+
+def test_funding_and_open_interest_are_venue_keyed(tmp_path):
+    """Funding differs materially between venues, so a proxy must not overwrite it.
+
+    Funding is the mechanism this system is mostly betting on — 2bp/hour is
+    48bp/day against a 5-54bp round trip — so a Binance rate silently stored as
+    Coinbase's own is not a labelling nit.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from data_collection.models import DataQuality, FundingRate, OpenInterest
+    from data_collection.storage import SQLiteDatabase
+
+    db = SQLiteDatabase(str(tmp_path / 'venue_keys.db'))
+    db.initialize()
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    for venue, rate in (('coinbase', 2e-5), ('binance', 5e-5)):
+        db.insert_funding_rate(FundingRate(
+            symbol='BIP', event_time=stamp, available_time=stamp,
+            rate=rate, mark_price=60_000.0, index_price=60_000.0,
+            venue=venue, quality=DataQuality.VALID,
+        ))
+        db.insert_open_interest(OpenInterest(
+            symbol='BIP', event_time=stamp, available_time=stamp,
+            open_interest_contracts=1_000.0, venue=venue,
+            quality=DataQuality.VALID,
+        ))
+
+    with db._get_connection() as conn:
+        funding = conn.execute(
+            'SELECT venue, rate FROM funding_rates WHERE symbol = ?', ('BIP',)
+        ).fetchall()
+        oi = conn.execute(
+            'SELECT venue FROM open_interest WHERE symbol = ?', ('BIP',)
+        ).fetchall()
+
+    assert {r['venue'] for r in funding} == {'coinbase', 'binance'}, (
+        f'funding rates collapsed across venues: {[dict(r) for r in funding]}'
+    )
+    assert {r['venue'] for r in oi} == {'coinbase', 'binance'}
+
+
+def test_a_legacy_database_is_rebuilt_onto_the_venue_key(tmp_path):
+    """An existing database keyed without venue must be migrated, not left broken.
+
+    SQLite cannot alter a UNIQUE constraint, so `initialize()` rebuilds the table.
+    Rows already collapsed by the old key are unrecoverable — re-running the
+    backfill is the only way to get the second venue back — but from the rebuild
+    onward both venues coexist.
+    """
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from data_collection.models import DataQuality, OHLCVBar
+    from data_collection.storage import SQLiteDatabase
+
+    path = tmp_path / 'legacy.db'
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    # The old schema, verbatim in the part that matters.
+    con = sqlite3.connect(str(path))
+    con.execute("""
+        CREATE TABLE ohlcv (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+            venue TEXT DEFAULT 'unknown',
+            event_time TIMESTAMP NOT NULL, available_time TIMESTAMP NOT NULL,
+            open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+            close REAL NOT NULL, volume REAL NOT NULL,
+            quote_volume REAL, trade_count INTEGER,
+            quality TEXT DEFAULT 'valid', quality_notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, timeframe, event_time)
+        )
+    """)
+    con.execute(
+        "INSERT INTO ohlcv (symbol, timeframe, venue, event_time, available_time, "
+        "open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ('BIP', '1h', 'coinbase', stamp, stamp, 1.0, 1.0, 1.0, 60_000.0, 1.0),
+    )
+    con.commit()
+    con.close()
+
+    db = SQLiteDatabase(str(path))
+    db.initialize()
+
+    # The pre-existing row survived the rebuild.
+    rows = _bars_at(db, 'BIP', stamp)
+    assert len(rows) == 1 and rows[0]['venue'] == 'coinbase'
+
+    # And the second venue can now be written alongside it.
+    db.insert_ohlcv(OHLCVBar(
+        symbol='BIP', timeframe='1h', venue='binance',
+        event_time=stamp, available_time=stamp + timedelta(hours=1),
+        open=60_030.0, high=60_030.0, low=60_030.0, close=60_030.0,
+        volume=1.0, quality=DataQuality.VALID,
+    ))
+
+    rows = _bars_at(db, 'BIP', stamp)
+    assert {r['venue'] for r in rows} == {'coinbase', 'binance'}
+
+
+def _bars_at(db, symbol: str, stamp) -> list[dict]:
+    with db._get_connection() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                'SELECT venue, close FROM ohlcv WHERE symbol = ? AND event_time = ?',
+                (symbol, stamp),
+            ).fetchall()
+        ]

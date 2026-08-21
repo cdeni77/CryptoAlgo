@@ -6,6 +6,7 @@ All data is stored with bi-temporal timestamps for backtesting integrity.
 """
 
 import logging
+import re
 import sqlite3
 import pandas as pd
 
@@ -134,7 +135,12 @@ class SQLiteDatabase(DatabaseBase):
                     quality TEXT DEFAULT 'valid',
                     quality_notes TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, timeframe, event_time)
+                    -- Venue is part of the key. Without it, INSERT OR REPLACE
+                    -- makes each venue overwrite the other's bar for the same
+                    -- hour, so the two-venue design collapses to whichever
+                    -- provider wrote last -- and the cross-venue features
+                    -- (basis, lead-lag) get no rows at all, silently.
+                    UNIQUE(symbol, timeframe, venue, event_time)
                 )
             """)
             
@@ -162,8 +168,9 @@ class SQLiteDatabase(DatabaseBase):
                     quality TEXT DEFAULT 'valid',
                     source TEXT DEFAULT 'unknown',
                     funding_source TEXT DEFAULT 'unknown',
+                    venue TEXT DEFAULT 'unknown',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, event_time)
+                    UNIQUE(symbol, venue, event_time)
                 )
             """)
 
@@ -171,15 +178,13 @@ class SQLiteDatabase(DatabaseBase):
             # Pre-existing bars keep 'unknown': the backfill tried Coinbase first
             # and filled gaps from CCXT (which itself falls back across six
             # exchanges), so the true origin of historical rows is not recoverable.
-            cursor.execute("PRAGMA table_info(ohlcv)")
-            ohlcv_columns = {row[1] for row in cursor.fetchall()}
-            if "venue" not in ohlcv_columns:
-                cursor.execute("ALTER TABLE ohlcv ADD COLUMN venue TEXT DEFAULT 'unknown'")
-
-            cursor.execute("PRAGMA table_info(funding_rates)")
-            funding_columns = {row[1] for row in cursor.fetchall()}
-            if "funding_source" not in funding_columns:
-                cursor.execute("ALTER TABLE funding_rates ADD COLUMN funding_source TEXT DEFAULT 'unknown'")
+            self._add_missing_columns(cursor, "ohlcv", {
+                "venue": "TEXT DEFAULT 'unknown'",
+            })
+            self._add_missing_columns(cursor, "funding_rates", {
+                "funding_source": "TEXT DEFAULT 'unknown'",
+                "venue": "TEXT DEFAULT 'unknown'",
+            })
             
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_funding_symbol_event 
@@ -198,8 +203,9 @@ class SQLiteDatabase(DatabaseBase):
                     open_interest_usd REAL,
                     quality TEXT DEFAULT 'valid',
                     source TEXT DEFAULT 'unknown',
+                    venue TEXT DEFAULT 'unknown',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, event_time)
+                    UNIQUE(symbol, venue, event_time)
                 )
             """)
             
@@ -207,9 +213,87 @@ class SQLiteDatabase(DatabaseBase):
                 CREATE INDEX IF NOT EXISTS idx_oi_symbol_event 
                 ON open_interest(symbol, event_time)
             """)
-            
+
+            self._add_missing_columns(cursor, "open_interest", {
+                "venue": "TEXT DEFAULT 'unknown'",
+            })
+
+            # Databases created before venue was part of the key still carry the
+            # old constraint, and SQLite cannot alter one in place.
+            self._rebuild_for_venue_key(cursor, "ohlcv",
+                                        "UNIQUE(symbol, timeframe, venue, event_time)")
+            self._rebuild_for_venue_key(cursor, "funding_rates",
+                                        "UNIQUE(symbol, venue, event_time)")
+            self._rebuild_for_venue_key(cursor, "open_interest",
+                                        "UNIQUE(symbol, venue, event_time)")
+
             conn.commit()
             logger.info(f"Database initialized at {self.db_path}")
+
+    @staticmethod
+    def _add_missing_columns(cursor, table: str, columns: Dict[str, str]) -> None:
+        """Add any of `columns` the table does not have. Idempotent."""
+        cursor.execute(f"PRAGMA table_info({table})")
+        present = {row[1] for row in cursor.fetchall()}
+        for name, definition in columns.items():
+            if name not in present:
+                logger.info("adding %s.%s", table, name)
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _rebuild_for_venue_key(cursor, table: str, wanted_unique: str) -> None:
+        """Rebuild `table` if its unique key predates venue.
+
+        SQLite cannot alter a UNIQUE constraint, so the table is recreated with
+        the wanted key and the rows copied across. This has to happen: with venue
+        outside the key, `INSERT OR REPLACE` silently discarded one venue's row
+        for every (symbol, hour) the other also covered, which is exactly the
+        pair the cross-venue features need.
+
+        Rows that survived the old key keep whatever venue they recorded; the
+        history that was already overwritten is not recoverable, and re-running
+        the backfill is the only way to get the second venue back.
+        """
+        cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return
+        create_sql = row[0]
+        normalised = ' '.join(create_sql.split())
+        if wanted_unique.replace(' ', '') in normalised.replace(' ', ''):
+            return  # already keyed on venue
+
+        logger.warning(
+            "%s is keyed without venue, so one venue's rows have been overwriting "
+            "the other's. Rebuilding the table; re-run the backfill to recover the "
+            "missing venue.", table,
+        )
+
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = [r[1] for r in cursor.fetchall()]
+        column_list = ', '.join(columns)
+
+        # Swap the old unique clause for the wanted one, keeping every column
+        # definition exactly as it was.
+        rebuilt = re.sub(
+            r'UNIQUE\s*\([^)]*\)', wanted_unique, create_sql, count=1
+        ).replace(f'TABLE IF NOT EXISTS {table}', f'TABLE {table}__new', 1)
+        if f'{table}__new' not in rebuilt:
+            rebuilt = rebuilt.replace(f'TABLE {table}', f'TABLE {table}__new', 1)
+
+        cursor.execute(f"DROP TABLE IF EXISTS {table}__new")
+        cursor.execute(rebuilt)
+        # OR IGNORE, not OR REPLACE: where the old key already collapsed two
+        # venues into one row there is nothing to choose between, and keeping the
+        # first is at least deterministic.
+        cursor.execute(
+            f"INSERT OR IGNORE INTO {table}__new ({column_list}) "
+            f"SELECT {column_list} FROM {table}"
+        )
+        cursor.execute(f"DROP TABLE {table}")
+        cursor.execute(f"ALTER TABLE {table}__new RENAME TO {table}")
     
     def insert_ohlcv(self, bar: OHLCVBar) -> bool:
         """Insert single OHLCV bar."""
@@ -331,8 +415,9 @@ class SQLiteDatabase(DatabaseBase):
                 cursor.execute("""
                     INSERT OR REPLACE INTO funding_rates
                     (symbol, event_time, available_time, rate, 
-                     mark_price, index_price, is_settlement, quality, source, funding_source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mark_price, index_price, is_settlement, quality, source,
+                     funding_source, venue)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     funding.symbol,
                     funding.event_time,
@@ -342,8 +427,11 @@ class SQLiteDatabase(DatabaseBase):
                     funding.index_price,
                     1 if funding.is_settlement else 0,
                     funding.quality.value,
-                    "coinbase",
+                    # Was hardcoded "coinbase", which labelled a Binance proxy
+                    # rate as Coinbase's own.
+                    getattr(funding, 'venue', 'unknown'),
                     funding.funding_source,
+                    getattr(funding, 'venue', 'unknown'),
                 ))
                 conn.commit()
                 return True
@@ -364,9 +452,10 @@ class SQLiteDatabase(DatabaseBase):
                 try:
                     cursor.execute("""
                     INSERT OR REPLACE INTO funding_rates
-                    (symbol, event_time, available_time, rate, 
-                         mark_price, index_price, is_settlement, quality, source, funding_source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (symbol, event_time, available_time, rate,
+                         mark_price, index_price, is_settlement, quality, source,
+                         funding_source, venue)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         funding.symbol,
                         funding.event_time,
@@ -376,8 +465,12 @@ class SQLiteDatabase(DatabaseBase):
                         funding.index_price,
                         1 if funding.is_settlement else 0,
                         funding.quality.value,
-                        getattr(funding, 'source', 'ccxt'),
+                        # `source` defaulted to 'ccxt', which names the client
+                        # library rather than the exchange. The venue is the thing
+                        # the research store partitions on.
+                        getattr(funding, 'venue', 'unknown'),
                         getattr(funding, 'funding_source', 'unknown'),
+                        getattr(funding, 'venue', 'unknown'),
                     ))
                     inserted += 1
                 except Exception as e:
@@ -436,8 +529,8 @@ class SQLiteDatabase(DatabaseBase):
                 cursor.execute("""
                     INSERT OR REPLACE INTO open_interest
                     (symbol, event_time, available_time, open_interest_contracts,
-                     open_interest_base, open_interest_usd, quality, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     open_interest_base, open_interest_usd, quality, source, venue)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     oi.symbol,
                     oi.event_time,
@@ -446,7 +539,11 @@ class SQLiteDatabase(DatabaseBase):
                     oi.open_interest_base,
                     oi.open_interest_usd,
                     oi.quality.value,
-                    "ccxt",
+                    # Was hardcoded "ccxt", which is the client library, not the
+                    # exchange. Which proxy matters: Bybit and Binance report
+                    # open interest in different units.
+                    getattr(oi, 'venue', 'unknown'),
+                    getattr(oi, 'venue', 'unknown'),
                 ))
                 conn.commit()
                 return True
@@ -468,8 +565,8 @@ class SQLiteDatabase(DatabaseBase):
                     cursor.execute("""
                         INSERT OR REPLACE INTO open_interest
                         (symbol, event_time, available_time, open_interest_contracts,
-                         open_interest_base, open_interest_usd, quality, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         open_interest_base, open_interest_usd, quality, source, venue)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         oi.symbol,
                         oi.event_time,
@@ -478,6 +575,7 @@ class SQLiteDatabase(DatabaseBase):
                         oi.open_interest_base,
                         oi.open_interest_usd,
                         oi.quality.value,
+                        getattr(oi, 'venue', 'unknown'),
                         getattr(oi, 'venue', 'unknown'),
                     ))
                     inserted += 1

@@ -389,8 +389,27 @@ def from_sqlite(
     The scraper's schema already carries `event_time`/`available_time`; this
     preserves both rather than collapsing to one, so migrated history supports
     point-in-time reads too.
+
+    `venue` is the caller's label for rows that recorded none. Rows that did keep
+    theirs — which is what the venue column is for, now that it is part of the
+    scraper's unique key.
     """
     import sqlite3
+
+    def venue_expression(table: str, fallbacks: tuple[str, ...]) -> str:
+        """`venue` where the table has it, else the best legacy proxy.
+
+        Funding and open interest gained a venue column late. Before that,
+        funding's origin was inferred from `funding_source` and open interest's
+        from `source` — which held the *client library* ('ccxt'), not an exchange.
+        Older databases still read from those, so the fallback chain stays.
+        """
+        cursor = con.execute(f'PRAGMA table_info({table})')
+        present = {row[1] for row in cursor.fetchall()}
+        candidates = [c for c in ('venue', *fallbacks) if c in present]
+        if not candidates:
+            return "'unknown' AS row_venue"
+        return f"COALESCE({', '.join(candidates)}, 'unknown') AS row_venue"
 
     counts: dict[str, int] = {}
     con = sqlite3.connect(str(sqlite_path))
@@ -405,8 +424,8 @@ def from_sqlite(
         bars = pd.read_sql_query(
             "SELECT symbol, event_time, available_time, quality, open, high, low, "
             "close, volume, quote_volume, trade_count, "
-            "COALESCE(venue, 'unknown') AS row_venue FROM ohlcv "
-            f"WHERE timeframe = ?{filt}",
+            + venue_expression('ohlcv', ())
+            + f" FROM ohlcv WHERE timeframe = ?{filt}",
             con, params=params,
         )
         if not bars.empty:
@@ -421,7 +440,9 @@ def from_sqlite(
         funding = pd.read_sql_query(
             "SELECT symbol, event_time, available_time, quality, rate, mark_price, "
             "index_price, is_settlement, "
-            "COALESCE(funding_source, 'unknown') AS row_venue FROM funding_rates", con,
+            + venue_expression('funding_rates', ('funding_source',))
+            + " FROM funding_rates",
+            con,
         )
         if not funding.empty:
             funding['venue'] = funding['row_venue'].where(
@@ -435,7 +456,9 @@ def from_sqlite(
             "SELECT symbol, event_time, available_time, quality, "
             "open_interest_contracts AS oi_contracts, open_interest_base AS oi_base, "
             "open_interest_usd AS oi_usd, "
-            "COALESCE(source, 'unknown') AS row_venue FROM open_interest", con,
+            + venue_expression('open_interest', ('source',))
+            + " FROM open_interest",
+            con,
         )
         if not oi.empty:
             oi['venue'] = oi['row_venue'].where(oi['row_venue'] != 'unknown', venue)
