@@ -478,7 +478,7 @@ class SQLiteDatabase(DatabaseBase):
                         oi.open_interest_base,
                         oi.open_interest_usd,
                         oi.quality.value,
-                        "ccxt",
+                        getattr(oi, 'venue', 'unknown'),
                     ))
                     inserted += 1
                 except Exception as e:

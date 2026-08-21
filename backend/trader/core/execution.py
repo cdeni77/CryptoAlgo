@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 # additional unit walks further up a book that is refilling.
 PARTICIPATION_FLOOR = 0.01
 
+# Window and quantile for the pessimistic liquidity estimate used to size
+# entries. One day of hourly bars at the lower quartile: thin enough to respect
+# a quiet market, long enough not to be one outlier bar.
+LIQUIDITY_WINDOW_BARS = 24
+LIQUIDITY_QUANTILE = 0.25
+
 # Impact in basis points at 100% participation, used to scale the square-root
 # law. Deliberately conservative for a venue as thin as CDE.
 IMPACT_AT_FULL_PARTICIPATION_BPS = 250.0
@@ -87,6 +93,29 @@ def participation_rate(contracts: int, price: float, bar_volume: float, symbol: 
     if bar_contracts <= 0:
         return 1.0
     return float(min(max(contracts / bar_contracts, 0.0), 1.0))
+
+
+def liquidity_floor(
+    volume: pd.Series,
+    *,
+    window: int = LIQUIDITY_WINDOW_BARS,
+    quantile: float = LIQUIDITY_QUANTILE,
+) -> pd.Series:
+    """Pessimistic liquidity estimate: a trailing low quantile of volume.
+
+    Sizing against the *deciding* bar's volume is the mistake that lets a
+    backtest claim capacity it does not have. Entry size is a control, but the
+    exit is not: the barrier fires when it fires, into whatever bar happens to
+    be there, and that bar is often much thinner than the one the decision saw.
+    A run that capped entries at 10% of the deciding bar was still dumping 47%
+    of the exit bar.
+
+    So the cap is applied against liquidity that is usually available rather
+    than liquidity that happened to be available once — the same reasoning a
+    capacity study uses. The value at t is knowable at t: the window closes on
+    the previous bar.
+    """
+    return volume.rolling(window, min_periods=max(window // 4, 2)).quantile(quantile).shift(1)
 
 
 def slippage_bps(
@@ -320,26 +349,64 @@ def resolve_bar(
 # ---------------------------------------------------------------------------
 
 
+# Most a single position may lose if it runs to its stop, as a fraction of
+# equity. This is the binding constraint in practice, not Kelly: Kelly assumes
+# the expected return is known, and a forecast of 10bp against a 3% volatility
+# implies betting over 100% of capital, which is what it says and not what
+# anyone should do with an estimate.
+MAX_RISK_PER_TRADE = 0.01
+
+# Ceiling on notional exposure per position as a fraction of equity, before
+# leverage. Bounds the damage when the dispersion head understates risk.
+MAX_POSITION_FRACTION = 0.05
+
+
 def fractional_kelly(
     expected_return: float,
     sigma: float,
     *,
     fraction: float = 0.25,
-    cap: float = 0.25,
+    cap: float = MAX_POSITION_FRACTION,
 ) -> float:
-    """Fraction of equity to risk, from a forecast and its uncertainty.
+    """Fraction of equity to commit, from a forecast and its uncertainty.
 
     Full Kelly is mu / sigma-squared, and it is the wrong answer whenever mu is
-    estimated rather than known — which it always is here. Estimation error in mu
-    makes full Kelly systematically overbet, and the loss function is brutally
-    asymmetric: overbetting by 2x loses more growth than underbetting by 2x.
-    A quarter of Kelly is the usual compromise, and the cap bounds the damage
-    when the dispersion head underestimates risk.
+    estimated rather than known — which it always is here. Estimation error makes
+    full Kelly systematically overbet, and the loss function is asymmetric:
+    overbetting by 2x costs more growth than underbetting by 2x does.
+
+    Note how readily this saturates. A 10bp forecast against 3% volatility gives
+    a raw Kelly of 1.1 — commit 110% of capital — so the cap is doing the real
+    work almost always, and `risk_budget_fraction` is what actually sizes the
+    position.
     """
     if sigma <= 1e-9 or expected_return <= 0:
         return 0.0
     kelly = expected_return / (sigma ** 2)
     return float(min(max(kelly * fraction, 0.0), cap))
+
+
+def risk_budget_fraction(
+    sigma: float,
+    *,
+    stop_multiple: float,
+    max_risk: float = MAX_RISK_PER_TRADE,
+    leverage: float = 1.0,
+) -> float:
+    """Notional fraction whose stop-out costs at most `max_risk` of equity.
+
+    A stop sits `stop_multiple` volatilities away, so a position of notional N
+    loses about N * stop_multiple * sigma when it triggers. Solving for N bounds
+    the loss regardless of whether the forecast was any good — which is the point,
+    because the forecast usually is not.
+
+    This is what keeps a run of bad forecasts survivable. Sizing on Kelly alone,
+    a strategy trading noise lost 92% of the account over 110 trades.
+    """
+    loss_per_unit = max(stop_multiple, 1e-9) * max(sigma, 1e-9)
+    if loss_per_unit <= 0:
+        return 0.0
+    return float(max(max_risk / loss_per_unit, 0.0))
 
 
 def size_from_forecast(
@@ -350,25 +417,38 @@ def size_from_forecast(
     expected_return: float,
     sigma: float,
     config: Config,
+    stop_multiple: float = 3.0,
     kelly_fraction: float = 0.25,
-    max_fraction: float = 0.25,
+    max_fraction: float = MAX_POSITION_FRACTION,
+    max_risk: float = MAX_RISK_PER_TRADE,
 ) -> int:
-    """Contracts to trade, from the forecast, its risk, and the account.
+    """Contracts to trade: the smaller of what Kelly wants and what risk allows.
 
-    Returns zero when the position rounds below one contract — which for a small
+    Two independent limits, and the tighter one wins:
+
+    * Kelly, quartered and capped, sizes on conviction.
+    * The risk budget sizes on consequence — a stop-out must not cost more than
+      `max_risk` of equity, whatever the forecast claimed.
+
+    Returns zero when the result rounds below one contract, which for a small
     account on an expensive contract is a real constraint rather than an edge
-    case, and one the previous fixed-fraction sizing hid.
+    case.
     """
     spec = get_contract_spec(symbol)
     notional_per_contract = spec.units * float(price)
     if notional_per_contract <= 0 or equity <= 0:
         return 0
 
-    fraction = fractional_kelly(
+    conviction = fractional_kelly(
         expected_return, sigma, fraction=kelly_fraction, cap=max_fraction
     )
-    if fraction <= 0:
+    if conviction <= 0:
         return 0
+
+    budget = risk_budget_fraction(
+        sigma, stop_multiple=stop_multiple, max_risk=max_risk,
+    )
+    fraction = min(conviction, budget)
 
     target_notional = equity * fraction * float(config.leverage)
     return int(max(target_notional // notional_per_contract, 0))
@@ -403,6 +483,19 @@ class Fill:
     notional: float
 
 
+def max_contracts_at_participation(
+    price: float,
+    bar_volume: float,
+    symbol: str,
+    limit: float,
+) -> int:
+    """Largest order that stays within `limit` of the bar's volume."""
+    spec = get_contract_spec(symbol)
+    if bar_volume <= 0 or spec.units <= 0:
+        return 0
+    return int(max((float(bar_volume) / spec.units) * limit, 0.0))
+
+
 def open_position(
     *,
     symbol: str,
@@ -417,12 +510,40 @@ def open_position(
     hold_bars: int,
     spread_bps: float = 4.0,
     book_depth_bps: Optional[float] = None,
-) -> tuple[Position, Fill]:
+    participation_limit: Optional[float] = None,
+    liquidity: Optional[float] = None,
+) -> tuple[Optional[Position], Optional[Fill]]:
     """Enter at this bar's open, paying to cross.
 
     The reference price is the bar's open rather than the previous close, because
     a decision taken from the previous close cannot fill before this bar starts.
+
+    That gap is also why `participation_limit` is re-applied here. The decision
+    checked participation against the *deciding* bar's volume; the fill happens
+    on the next bar, which may be far thinner. Without a second check an order
+    passed the 10% gate and then took 100% of the bar it actually traded in.
+    Oversized orders are trimmed rather than dropped, which is what a broker
+    would do.
+
+    `liquidity` tightens what the limit is measured against. Callers with a
+    `liquidity_floor` should pass it: the size has to be one the position can
+    *leave* through, and the exit bar is not this one. It is a floor, not a
+    substitute — the limit binds against whichever is smaller, so the order both
+    stays exitable and never exceeds its share of the bar it actually trades in.
+    Slippage still uses the real volume, because the real fill is real.
     """
+    if participation_limit is not None:
+        bar_volume = float(bar.get('volume', 0.0))
+        reference_volume = (
+            bar_volume if liquidity is None else min(bar_volume, float(liquidity))
+        )
+        allowed = max_contracts_at_participation(
+            float(bar['open']), reference_volume, symbol, participation_limit
+        )
+        contracts = min(contracts, allowed)
+        if contracts < 1:
+            return None, None
+
     reference = float(bar['open'])
     slip = slippage_bps(
         contracts, reference, float(bar.get('volume', 0.0)), symbol,
@@ -482,7 +603,15 @@ class ClosedTrade:
     net_pnl: float
     notional: float
     bars_held: int
-    max_participation: float = 0.0
+    # Kept apart on purpose. The entry rate is a control — we chose the size, so
+    # a breach there is a bug. The exit rate is a consequence — the barrier fires
+    # into whatever bar is there — so a breach there is a capacity finding.
+    entry_participation: float = 0.0
+    exit_participation: float = 0.0
+
+    @property
+    def max_participation(self) -> float:
+        return max(self.entry_participation, self.exit_participation)
 
     @property
     def net_return(self) -> float:
@@ -539,17 +668,16 @@ def close_position(
         net_pnl=float(net),
         notional=float(position.notional(position.entry_price)),
         bars_held=int(position.bars_held),
-        max_participation=float(max(
-            entry_participation,
-            participation_rate(position.contracts, filled,
-                               float(bar.get('volume', 0.0)), position.symbol),
-        )),
+        entry_participation=float(entry_participation),
+        exit_participation=participation_rate(
+            position.contracts, filled, float(bar.get('volume', 0.0)), position.symbol
+        ),
     )
     fill = Fill(
         symbol=position.symbol, timestamp=timestamp, direction=-position.direction,
         contracts=position.contracts, reference_price=exit_price, fill_price=filled,
         fee=exit_fee, slippage_bps=slip,
-        participation=trade.max_participation,
+        participation=trade.exit_participation,
         notional=position.notional(filled),
     )
     return trade, fill

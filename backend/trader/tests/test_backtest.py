@@ -38,6 +38,20 @@ UNIVERSE = {'BIP': 60_000.0, 'ETP': 3_000.0, 'SLP': 150.0, 'XPP': 2.2, 'DOP': 0.
 PROFILE_FOR = {'BIP': 'BTC', 'ETP': 'ETH', 'SLP': 'SOL', 'XPP': 'XRP', 'DOP': 'DOGE'}
 N_BARS = 1_400
 
+# Enough independent draws for a t-statistic to mean something. The lookahead
+# this guards against produced t = +7, so six seeds separate it from noise with
+# room to spare while keeping the test inside a tolerable runtime.
+SEEDS_FOR_SIGNIFICANCE = 6
+
+
+def _t_statistic(values) -> float:
+    """One-sample t against zero. Returns 0 when the sample cannot support one."""
+    values = np.asarray(values, dtype=float)
+    if values.size < 2:
+        return 0.0
+    error = float(np.std(values, ddof=1)) / np.sqrt(values.size)
+    return float(np.mean(values) / error) if error > 0 else 0.0
+
 
 @pytest.fixture(scope='module')
 def config(repo_root) -> Config:
@@ -103,18 +117,21 @@ def _features_targets(config, seed_offset: int, **kwargs):
 
 
 @pytest.mark.slow
-def test_walk_forward_loses_money_on_driftless_random_walks(config):
+@pytest.mark.slow
+def test_walk_forward_finds_no_edge_in_driftless_random_walks(config):
     """There is nothing to find in a driftless random walk except the fee bill.
 
     Trading in-sample forecasts produced a mean price PnL of +95,000 with a
     t-statistic of +7 across six seeds — the model recognising bars it had been
-    shown. Walk-forward turned that into a loss, which is the correct answer.
-
-    Averaged over seeds because a single levered run has enormous variance; one
-    profitable seed is noise, a positive mean is a bug.
+    shown. This is the regression test for that, and the assertion has to be
+    stated as a significance test rather than a sign test: a driftless walk has
+    zero *expected* price PnL, not negative, so demanding a loss on the mean of
+    a few seeds fails whenever the walks happen to go the model's way. A single
+    levered run has enormous per-trade variance, and a t-statistic is the only
+    honest way to separate a lookahead from luck.
     """
     nets, prices = [], []
-    for seed in range(3):
+    for seed in range(SEEDS_FOR_SIGNIFICANCE):
         features, targets, bars_by, funding_by, profiles = _features_targets(
             config, seed, drift=0.0, funding_mean=0.0
         )
@@ -123,14 +140,22 @@ def test_walk_forward_loses_money_on_driftless_random_walks(config):
             config=config, profiles=profiles, n_periods=3,
         )
         assert generated.periods, 'walk-forward produced no periods'
+        # Costs are a certainty on every path, whatever the price did.
+        assert result.net_pnl < result.price_pnl, (
+            f'seed {seed}: net {result.net_pnl:+,.0f} exceeds gross price PnL '
+            f'{result.price_pnl:+,.0f} — costs are not being charged'
+        )
         nets.append(result.net_pnl)
         prices.append(result.price_pnl)
 
-    assert np.mean(prices) < 0, (
-        f'price PnL of {np.mean(prices):+,.0f} on driftless random walks '
-        f'indicates a lookahead'
+    assert _t_statistic(prices) < 2.0, (
+        f'price PnL t-statistic of {_t_statistic(prices):+.2f} on driftless '
+        f'random walks indicates a lookahead (mean {np.mean(prices):+,.0f})'
     )
-    assert np.mean(nets) < 0, f'net PnL of {np.mean(nets):+,.0f} without an edge'
+    assert _t_statistic(nets) < 2.0, (
+        f'net PnL t-statistic of {_t_statistic(nets):+.2f} — a strategy that '
+        f'profits from noise is a bug, not an edge'
+    )
 
 
 def test_backtesting_in_sample_rows_is_refused(config):

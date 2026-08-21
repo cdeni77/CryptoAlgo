@@ -242,6 +242,12 @@ class OpenInterest(BiTemporalMixin):
     open_interest_usd: Optional[float] = None
     
     # Quality
+    # Which exchange reported this. Coinbase exposes no open-interest endpoint,
+    # so this is always a proxy venue — and which proxy matters, because Bybit
+    # and Binance report materially different open interest for the same
+    # underlying. It was previously hardcoded to the string "ccxt" at insert
+    # time, which lost that distinction.
+    venue: str = 'unknown'
     quality: DataQuality = DataQuality.UNVALIDATED
     
     def to_dict(self) -> Dict[str, Any]:

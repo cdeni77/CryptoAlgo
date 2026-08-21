@@ -347,9 +347,16 @@ class PathDistribution:
 
 
 def summarise_paths(path_scores: Sequence[float]) -> PathDistribution:
-    """Reduce per-path scores to the distribution the gates evaluate."""
-    arr = np.asarray([float(x) for x in path_scores], dtype=float)
-    arr = arr[np.isfinite(arr)]
+    """Reduce per-path scores to the distribution the gates evaluate.
+
+    Non-finite scores are dropped before any percentile is taken. A fold whose
+    IC is undefined — too few rows, or a constant forecast — contributes nothing
+    rather than turning the whole distribution into NaN.
+    """
+    arr = np.asarray([
+        float(x) for x in path_scores
+        if x is not None and np.isfinite(float(x))
+    ], dtype=float)
     if arr.size == 0:
         return PathDistribution(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ())
 
@@ -402,6 +409,11 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     'stressed_median_sharpe': (0.0, 'min'),
     'parameter_plateau': (0.60, 'min'),
     'oos_trades': (100.0, 'min'),
+    # Twice the entry cap. Entries are sized against a pessimistic liquidity
+    # floor so they stay exitable, but the exit bar is whatever the barrier
+    # lands in; if that routinely swallows a fifth of the volume, the strategy
+    # has a capacity ceiling the backtest is not honouring.
+    'max_exit_participation': (0.20, 'max'),
 }
 
 

@@ -753,13 +753,14 @@ class CVReport:
         }
 
     def __str__(self) -> str:
+        warning = '  MEMORISATION SUSPECTED' if self.memorisation_suspected else ''
         return (
-            f"{len(self.folds)} folds | price IC {self.price_ic.median:+.4f} "
-            f"(xs {self.price_ic_xs.median:+.4f}, identity baseline "
-            f"{self.identity_ic.median:+.4f}, excess "
-            f"{self.price_ic_above_identity:+.4f}) | "
+            f"{len(self.folds)} folds | "
+            f"price IC {self.price_ic.median:+.4f} (xs {self.price_ic_xs.median:+.4f}) | "
             f"carry IC {self.carry_ic.median:+.4f} | net IC {self.net_ic.median:+.4f} | "
             f"carry share {self.carry_share_of_signal:.0%} | "
+            f"identity ceiling {self.identity_ceiling.median:+.4f} "
+            f"(ratio {self.identity_ratio:.2f}){warning} | "
             f"{self.total_effective_observations:.0f} effective obs"
         )
 

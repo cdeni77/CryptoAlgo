@@ -91,6 +91,10 @@ class Decision:
     price: float = 0.0
     notional: float = 0.0
     participation: float = 0.0
+    # The liquidity the size was measured against, carried forward so the fill
+    # can re-apply the same cap against the same number rather than against the
+    # fill bar, which the decision never saw.
+    sizing_liquidity: float = 0.0
 
     @property
     def tradeable(self) -> bool:
@@ -125,6 +129,7 @@ class Decision:
             'price': self.price,
             'notional': self.notional,
             'participation': self.participation,
+            'sizing_liquidity': self.sizing_liquidity,
         }
 
 
@@ -219,6 +224,7 @@ def decide(
             edge_to_risk=field_value('edge_to_risk'),
             volatility=float(context.volatility),
             price=float(context.price),
+            sizing_liquidity=float(context.bar_volume),
             **kwargs,
         )
         return counter.record(decision) if counter else decision
@@ -284,6 +290,9 @@ def decide(
         expected_return=expected_net,
         sigma=sigma,
         config=config,
+        # The risk budget needs to know where the stop will sit, or it cannot
+        # bound what a stop-out costs.
+        stop_multiple=float(config.resolve('vol_mult_sl', profile)),
     )
     if contracts < 1:
         return result(gate=Gate.SIZE_BELOW_ONE_CONTRACT, side=side)

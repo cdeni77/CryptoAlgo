@@ -37,13 +37,14 @@ from core.execution import (
     Position,
     accrue_funding,
     close_position,
+    liquidity_floor,
     open_position,
     resolve_bar,
 )
 from core.metrics import DrawdownProfile, drawdown_profile, sharpe_ratio
 from core.model import ForecastModel
 from core.profiles import CoinProfile
-from core.signal import Decision, DecisionContext, GateCounter, decide_panel
+from core.signal import MAX_PARTICIPATION, Decision, DecisionContext, GateCounter, decide_panel
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,21 @@ class BacktestResult:
         return float(abs(self.funding_pnl) / gross) if gross > 0 else 0.0
 
     @property
+    def max_entry_participation(self) -> float:
+        """Largest share of a bar an *entry* took. A breach here is a bug."""
+        return max((t.entry_participation for t in self.trades), default=0.0)
+
+    @property
+    def max_exit_participation(self) -> float:
+        """Largest share of a bar an *exit* took. A breach here is a capacity finding.
+
+        Exits are not optional: the barrier fires into whatever bar is there.
+        Entries are sized against `liquidity_floor` precisely to keep this number
+        down, but it cannot be capped, only reported.
+        """
+        return max((t.exit_participation for t in self.trades), default=0.0)
+
+    @property
     def max_participation(self) -> float:
         """Largest share of a bar's volume any single order took."""
         return max((t.max_participation for t in self.trades), default=0.0)
@@ -146,6 +162,8 @@ class BacktestResult:
             'price_pnl': t.price_pnl, 'funding_pnl': t.funding_pnl, 'fees': t.fees,
             'net_pnl': t.net_pnl, 'net_return': t.net_return,
             'notional': t.notional, 'bars_held': t.bars_held,
+            'entry_participation': t.entry_participation,
+            'exit_participation': t.exit_participation,
             'max_participation': t.max_participation,
         } for t in self.trades])
 
@@ -166,7 +184,8 @@ class BacktestResult:
             'time_to_recovery': drawdown.time_to_recovery,
             'win_rate': round(self.win_rate, 4),
             'liquidations': self.liquidations,
-            'max_participation': round(self.max_participation, 4),
+            'max_entry_participation': round(self.max_entry_participation, 4),
+            'max_exit_participation': round(self.max_exit_participation, 4),
             'gates': self.gates.summary(),
         }
 
@@ -216,6 +235,11 @@ def run_backtest(
         return BacktestResult(initial_equity=initial_equity)
 
     volatility = {s: _realised_volatility(b['close']) for s, b in bars_by_symbol.items()}
+    # Sizing liquidity, not fill liquidity: see `execution.liquidity_floor`.
+    liquidity = {
+        s: liquidity_floor(b['volume']) if 'volume' in b else pd.Series(dtype=float)
+        for s, b in bars_by_symbol.items()
+    }
     funding = {
         s: f['rate'].reindex(bars_by_symbol[s].index).ffill()
         for s, f in funding_by_symbol.items() if s in bars_by_symbol
@@ -253,7 +277,12 @@ def run_backtest(
                 sl_mult=float(config.resolve('vol_mult_sl', profiles.get(decision.symbol))),
                 hold_bars=config.label_horizon_hours(profiles.get(decision.symbol)),
                 spread_bps=spread_bps,
+                participation_limit=MAX_PARTICIPATION,
+                liquidity=decision.sizing_liquidity,
             )
+            if position is None:
+                # The fill bar was too thin to take the order at all.
+                continue
             open_positions[decision.symbol] = position
             entry_participation[decision.symbol] = fill.participation
             equity -= fill.fee
@@ -317,10 +346,11 @@ def run_backtest(
             since_exit = (
                 bar_number - last_exit_bar[symbol] if symbol in last_exit_bar else None
             )
+            floor = liquidity[symbol].get(timestamp, np.nan)
             contexts[symbol] = DecisionContext(
                 equity=equity,
                 volatility=float(volatility[symbol].get(timestamp, np.nan)),
-                bar_volume=float(bar.get('volume', 0.0)),
+                bar_volume=float(floor) if np.isfinite(floor) else float(bar.get('volume', 0.0)),
                 price=float(bar['close']),
                 open_positions=len(open_positions),
                 bars_since_exit=since_exit,

@@ -182,6 +182,7 @@ class Ingestor:
 
         keep: list[OpenInterest] = []
         for record in records:
+            record.venue = venue
             outcome = self.validator.validate_open_interest(record)
             self.tracker.record_validation(outcome)
             record.quality = outcome.quality
