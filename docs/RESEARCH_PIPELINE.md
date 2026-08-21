@@ -417,3 +417,85 @@ Worth stating plainly, because the failure mode here is believing the machinery.
 - **A corrected cost model may erase the current results entirely.** Given 1.1,
   the ETH and BTC strategies were backtested at a fraction of their real cost.
   Some of what looks like a working strategy today is a fee error.
+
+---
+
+## 8. Deferred: the app layer
+
+Out of scope for the pipeline rebuild, recorded here so it is not rediscovered.
+Audited but not changed. The frontend is 1,945 lines, well organised, and
+`tsc --noEmit` passes clean — this is a fix list, not a rewrite.
+
+### 8.1 Security
+
+Severity depends on exposure. `docker-compose.yml` publishes with Docker's
+default binding, which is all interfaces, so these are LAN-reachable as
+configured.
+
+- **Postgres on `0.0.0.0:5432` with the password `yourpassword`** hardcoded in
+  compose. Bind to localhost, move the credential to an env file.
+- **No authentication on any endpoint.** There is not one auth dependency in the
+  API.
+- **CORS admits every origin with credentials.** `allow_origins` lists three
+  localhost entries *and* `"*"`; the wildcard defeats the list. Verified against
+  Starlette: an arbitrary origin is echoed back into
+  `Access-Control-Allow-Origin` alongside `Access-Control-Allow-Credentials:
+  true`. With no auth, any page the operator visits can read trades and wallet
+  balances and start research jobs.
+- **`POST /launch/{job}` passes `args` through** with only whitespace filtering.
+  Not remote code execution — the job name is checked against a discovered
+  allowlist and `Popen` receives a list, so there is no shell — but arbitrary
+  flags reach the launched script.
+
+### 8.2 Duplicated ORM models
+
+`backend/api/models/` and `core/pg_writer.py` each define the same 9 tables:
+96 duplicated column definitions. One has already drifted:
+
+    wallet.balance   api = Column(Float, default=100000.0)
+                     pg  = Column(Float, default=10000.0)
+
+A 10x difference in starting balance, resolved by whichever process calls
+`create_all` first. The container-isolation reason for duplicating them is real,
+but a shared schema module installed into both images is a better answer than a
+comment asking people to remember.
+
+Both sides also run their own ad-hoc migrations — `app.py` executes
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` at import time, and
+`pg_writer._run_pg_migrations` does the same job separately. One migration path,
+whichever it is.
+
+### 8.3 Correctness and quality
+
+- **Back button is broken.** `App.tsx` calls `pushState` with no `popstate`
+  listener, so the URL changes without the view.
+- **No error or loading state in any page.** When the API is unreachable the
+  dashboard shows stale numbers with no indication. On a trading dashboard that
+  is the wrong failure mode.
+- **`npm run lint` has never run.** No ESLint config exists, despite the script
+  and three eslint plugins in `devDependencies`. It is documented in CLAUDE.md as
+  a check to run.
+- **Polling ignores tab visibility.** The dashboard holds 5s, 30s and 60s
+  intervals — roughly 17k requests a day per open tab, whether or not anyone is
+  looking.
+- **Business logic in routing layers.** `endpoints/wallet.py` is 692 lines and
+  includes a third-party Ethplorer integration; `controllers/research.py` is 631.
+
+### 8.4 What the app should gain from the rebuild
+
+The pipeline work creates capabilities the current UI has no way to reach, and
+this is the more interesting half of the deferred work:
+
+- **A model's provenance.** Every artifact records its feature-set hash, cost
+  config version, and data as-of timestamp. The UI should show which model is
+  live and exactly what it was trained on.
+- **The promotion gates as a screen.** Section 5 is a pass/fail table per
+  candidate. That is a UI, and it is the screen that decides what goes live.
+- **CPCV path distributions, not point estimates.** A Sharpe is a distribution
+  across 11 paths; showing the median and the 5th percentile is the difference
+  between a dashboard that informs and one that flatters.
+- **One promote action.** Train, gate, paper, and live are currently a sequence
+  of scripts launched by PID. With the pipeline unified behind one `decide()` and
+  one search ledger, promotion can be a single reviewable transition with an
+  audit trail — which is also what makes going from paper to real defensible
+  rather than nervous.
