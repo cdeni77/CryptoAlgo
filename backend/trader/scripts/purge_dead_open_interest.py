@@ -47,6 +47,13 @@ def parse_args() -> argparse.Namespace:
                              'which is rebuilt from SQLite by migrate_to_research_store')
     parser.add_argument('--venue', default=None,
                         help='Restrict to one venue label (e.g. okx)')
+    parser.add_argument('--contracts-only', action='store_true',
+                        help="Treat a series whose open_interest_contracts is "
+                             "identically zero as dead even when open_interest_usd "
+                             "carries values. `positioning_features` prefers "
+                             "contracts and only falls back to usd, so this is the "
+                             "right call when the usd column is itself derived "
+                             "junk — check the reported maxima before using it.")
     parser.add_argument('--apply', action='store_true',
                         help='Actually delete. Without this, nothing is written.')
     return parser.parse_args()
@@ -78,23 +85,42 @@ def main() -> int:
         print('No open interest rows at all — nothing to purge.')
         return 0
 
-    dead = [
-        s for s in series
-        if not s['max_contracts'] and not s['max_usd']
-        and (args.venue is None or s['venue'] == args.venue)
-    ]
-    live = [s for s in series if s not in dead]
+    def verdict(row) -> str:
+        """Why this series lives or dies, in the report rather than in my head.
+
+        The first version printed only `max ... contracts` and a keep/DEAD label,
+        so a series with zero contracts and a populated usd column read as
+        'keep ... max 0 contracts' — a verdict that contradicted the only number
+        shown. Both maxima are printed now and the reason is named.
+        """
+        if row['max_contracts']:
+            return 'live'
+        if row['max_usd'] and not args.contracts_only:
+            return 'usd-only'
+        return 'dead'
+
+    scoped = [s for s in series if args.venue is None or s['venue'] == args.venue]
+    verdicts = {id(s): verdict(s) for s in scoped}
+    dead = [s for s in scoped if verdicts[id(s)] == 'dead']
 
     print(f'\n{len(series)} open-interest series in {args.db_path}')
-    for s in live:
-        print(f'  keep  {s["symbol"]:22} @{s["venue"]:<14} {s["rows"]:6} rows, '
-              f'max {s["max_contracts"]:,.0f} contracts')
-    for s in dead:
-        print(f'  DEAD  {s["symbol"]:22} @{s["venue"]:<14} {s["rows"]:6} rows, '
-              f'never above zero ({s["first"]} -> {s["last"]})')
+    print(f'  {"":6}{"symbol":22} {"venue":<14} {"rows":>6} '
+          f'{"max contracts":>15} {"max usd":>15}')
+    for s in scoped:
+        label = {'live': 'keep', 'usd-only': 'KEEP?', 'dead': 'DEAD'}[verdicts[id(s)]]
+        print(f'  {label:6}{s["symbol"]:22} {s["venue"]:<14} {s["rows"]:6} '
+              f'{s["max_contracts"]:>15,.0f} {s["max_usd"]:>15,.0f}')
+
+    usd_only = [s for s in scoped if verdicts[id(s)] == 'usd-only']
+    if usd_only:
+        print(f'\n{len(usd_only)} series have zero contracts but a populated usd '
+              f'column. `positioning_features` prefers oi_contracts and only falls '
+              f'back to oi_usd, so these still produce features — from the usd '
+              f'column alone. If that column is derived junk rather than a '
+              f'measurement, re-run with --contracts-only to delete them too.')
 
     if not dead:
-        print('\nNothing dead. Every series carries at least one non-zero value.')
+        print('\nNothing unambiguously dead.')
         return 0
 
     total = sum(s['rows'] for s in dead)

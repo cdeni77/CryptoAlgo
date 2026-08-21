@@ -38,7 +38,13 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOT = Path(os.getenv('RESEARCH_STORE', 'data/research'))
+# Absolute, not cwd-relative. `data/research` resolved against whatever directory
+# the process happened to start in, so running a script from the repo root rather
+# than from backend/trader created a second, empty store and the first one simply
+# went unread — the same hidden-second-copy failure as the compose named volume
+# masking the host directory. RESEARCH_STORE still wins.
+_TRADER_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ROOT = Path(os.getenv('RESEARCH_STORE') or _TRADER_ROOT / 'data' / 'research')
 
 # Datasets and the columns they must carry. `event_time` and `available_time`
 # are required everywhere — they are what makes a point-in-time read possible.
