@@ -266,8 +266,8 @@ Two things make it work:
    instrument and itself — identically zero, and a column full of a plausible
    number that measures nothing. `run_pipeline --venue-label coinbase_spot`.
 2. **Reference symbols resolve separately.** `load_dataset` used to look up the
-   *trade* spelling on the reference venue, which only worked by accident: the
-   CCXT path stores Binance bars under the Coinbase product id. Coinbase spot
+   *trade* spelling on the reference venue, which only worked by accident — the
+   old CCXT path stored Binance bars under the Coinbase product id. Coinbase spot
    calls it `BTC-USD`, so the direct lookup found nothing and the whole group
    came back empty. It now resolves against the reference venue's own spellings.
 
@@ -365,21 +365,50 @@ Reproduce the venue's own table with:
 python -m scripts.probe_funding --sizes-only
 ```
 
-## The reference venue needs a proxy from a US IP
+## Every source is Coinbase now, and no proxy is needed
 
-Coinbase data — the instrument actually traded — is authenticated and US-legal,
-so it scrapes fine. The *reference* venue does not: Binance, OKX and Bybit all
-answer HTTP 451 to a US IP, and open interest has no Coinbase-native source at
-all (`run_pipeline.py:412`), so both come through CCXT.
+CCXT is gone — the connector, the dependency, all three call sites. It existed
+for perp bars, reference bars and open interest, and each turned out to be
+native:
 
-Without `HTTPS_PROXY` set you lose two feature groups:
-
-| group | features | source | blocked from a US IP |
-|-------|---------:|--------|----------------------|
-| `cross_venue` (basis, lead-lag) | 7 | reference venue via CCXT | yes |
-| `positioning` (OI) | 6 | CCXT, no Coinbase endpoint | yes (and `--include-oi` is opt-in) |
-| `carry` | 9 | Coinbase native funding | no |
+| group | features | source | needs a proxy |
+|-------|---------:|--------|---------------|
+| `cross_venue` (basis, lead-lag) | 7 | Coinbase spot, `--spot-universe` | no |
+| `positioning` (OI) | 6 | `future_product_details.open_interest` | no |
+| `carry` | 9 | `future_product_details.funding_rate` | no |
 | `market_factor` | 9 | Coinbase BTC bars | no |
+
+**Open interest was the last one found, and the way it was missed is the pattern
+worth remembering.** A comment read "Open interest has no Coinbase-native source:
+the REST client implements candles, tickers and /intx/funding-rates but no
+open-interest endpoint" — an accurate statement about *this client*, recorded as a
+fact about the *venue*, exactly like the INTX-vs-CDE confusion. It is on the
+product payload, on the contract actually traded. Compare the two books:
+
+| | contracts |
+|---|----------:|
+| `BIP-20DEC30-CDE` (Coinbase, what we trade) | 268,164 |
+| `BTC/USDT:USDT` (gate, what the six features described) | 21,579,279 |
+
+Funding and open interest ride **one** request now
+(`get_contract_snapshot`), so they cannot straddle a settlement. Both are
+snapshots: current value, no range parameters, no cursor. So **open interest
+cannot be backfilled either** — it accumulates forward one observation per
+contract per cycle, exactly like carry. Run the loop before you need it.
+
+The CCXT paths that are gone, and why each was a mistake rather than resilience:
+
+- **Funding fallback** wrote `binance_proxy` rates. Funding feeds the target's
+  carry component, so another venue's rate trains the carry head on money this
+  account never receives — and `proxy_funding_symbols` is a promotion gate with a
+  threshold of zero, so those rows could only ever *block* a candidate.
+- **OHLCV pre-history fill** filled the span before a contract was listed. BIP
+  began 2025-07-18, so a 400-day request legitimately misses 265 days; nothing
+  was missing, and the substitute was another exchange's contract stored under
+  this symbol's name.
+- **`-PERP` placeholder symbols** were appended for any modelled asset with no
+  CDE listing, putting instruments this account cannot trade into the universe.
+  Unlisted assets are now named and excluded.
 
 **This degrades quietly by construction.** `build_panel` reindexes to the
 canonical 76-column list so a saved model always scores against the same matrix,
@@ -393,9 +422,10 @@ yields no bars, naming the symbols and the consequence, and the model's
 provenance carries `empty_features` and `n_features_populated` alongside
 `n_features`. `tests/test_reference_venue.py` covers both.
 
-If the scraper's CCXT fallback served a different exchange, bars are stamped with
-*that* venue's name — point `--reference-venue` at whichever one it stored, or
-the reader asks for `binance` and matches nothing.
+`--reference-venue` defaults to `coinbase_spot`. It used to default to
+`binance`, which is 451 from a US IP, so it resolved to no bars and the seven
+cross-venue columns arrived all-NaN — with the identical `feature_set_hash` a
+populated panel would have.
 
 ## Environment Variables
 

@@ -21,7 +21,6 @@ from .storage import (
     create_database,
 )
 
-from .ccxt_connector import CCXTConnector
 
 __all__ = [
     # Models
@@ -42,5 +41,4 @@ __all__ = [
     "create_database",
     
     # Connectors
-    "CCXTConnector",
 ]

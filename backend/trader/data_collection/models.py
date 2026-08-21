@@ -249,11 +249,14 @@ class OpenInterest(BiTemporalMixin):
     open_interest_usd: Optional[float] = None
     
     # Quality
-    # Which exchange reported this. Coinbase exposes no open-interest endpoint,
-    # so this is always a proxy venue — and which proxy matters, because Bybit
-    # and Binance report materially different open interest for the same
-    # underlying. It was previously hardcoded to the string "ccxt" at insert
-    # time, which lost that distinction.
+    # Which venue reported this. 'coinbase' now: it is on the product payload
+    # under `future_product_details.open_interest`, on the contract actually
+    # traded. The comment here used to say Coinbase exposed no open-interest
+    # endpoint, which was a statement about this client promoted to a fact about
+    # the venue — and it sent six features to gate's BTC/USDT:USDT book
+    # (21,579,279 contracts) instead of BIP's (268,164). Still recorded per row,
+    # because a series whose venue is unknown cannot be reasoned about; it was
+    # once hardcoded to the string "ccxt", which is a library, not an exchange.
     venue: str = 'unknown'
     quality: DataQuality = DataQuality.UNVALIDATED
     

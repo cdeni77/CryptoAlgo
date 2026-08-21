@@ -443,11 +443,16 @@ def test_the_funding_snapshot_is_taken_outside_the_gap_loop():
         if isinstance(node, ast.AsyncFunctionDef) and node.name == 'backfill_funding_rates'
     )
 
+    # `get_contract_snapshot` is the accessor now: funding and open interest ride
+    # one product payload, so they cannot straddle a settlement. Both spellings
+    # count — the property under test is where the call sits, not its name.
+    SNAPSHOT_CALLS = {'get_contract_snapshot', 'get_funding_rate'}
+
     def calls_current_funding(node) -> bool:
         return any(
             isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
-            and n.func.attr == 'get_funding_rate'
+            and n.func.attr in SNAPSHOT_CALLS
             for n in ast.walk(node)
         )
 
@@ -527,3 +532,155 @@ def test_the_funding_snapshot_is_filed_under_the_run_venue():
         or 'venue=venue_label' in source, (
         'the snapshot is not filed under the run venue'
     )
+
+
+def test_open_interest_rides_the_funding_snapshot():
+    """One request, one instant, two records — and neither from another exchange.
+
+    Open interest used to come from CCXT, because this client had no method for
+    it and a comment recorded that absence as "Coinbase exposes no open-interest
+    endpoint". It is on the product payload, under
+    `future_product_details.open_interest`, on the contract actually traded:
+    268,164 for BIP-20DEC30-CDE against 21,579,279 for gate's BTC/USDT:USDT.
+
+    Fetching the two separately would double the request count and let the funding
+    row keyed to 22:00 be paired with open interest read after the 22:00 print.
+    """
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / 'scripts' / 'run_pipeline.py').read_text()
+    tree = ast.parse(source)
+    func = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'backfill_funding_rates'
+    )
+
+    attributes = {
+        n.func.attr for n in ast.walk(func)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    }
+    assert 'get_contract_snapshot' in attributes, (
+        'the snapshot no longer comes from one product request'
+    )
+    assert 'ingest_open_interest' in attributes, (
+        'the open interest half of the snapshot is fetched and then dropped'
+    )
+
+    # Nothing reaches for another exchange. Prose mentioning CCXT is fine and
+    # wanted — the comments explaining why it was removed are the record — so the
+    # check is on imports and calls, which is what test_no_module_imports_ccxt does.
+    assert 'CCXTConnector' not in {
+        n.func.id for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+
+
+def test_no_module_imports_ccxt():
+    """The dependency is gone, not merely unused.
+
+    CCXT served three purposes and every one is now native: perp bars and spot
+    bars come from Coinbase (`coinbase` and `coinbase_spot`), open interest comes
+    from the product endpoint, and cross-venue funding was never permissible —
+    `proxy_funding_symbols` is a promotion gate with a threshold of zero, so the
+    fallback could only ever write rows the gates then refused.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in root.rglob('*.py'):
+        if '__pycache__' in path.parts or path.name == Path(__file__).name:
+            continue
+        text = path.read_text()
+        if 'import ccxt' in text or 'CCXTConnector' in text:
+            offenders.append(str(path.relative_to(root)))
+    assert not offenders, f'CCXT survives in: {offenders}'
+
+    # Both requirement files. The API declared ccxt and never imported it, which
+    # is how a dependency outlives every use of it.
+    for requirements in (root / 'requirements.txt',
+                         root.parent / 'api' / 'requirements.txt'):
+        if not requirements.exists():
+            continue
+        declared = [
+            line.strip() for line in requirements.read_text().splitlines()
+            if line.strip().lower().startswith('ccxt')
+        ]
+        assert not declared, f'{requirements.name} still declares {declared}'
+
+
+def test_the_snapshot_stores_funding_and_open_interest_together():
+    """The glue, exercised rather than inspected.
+
+    The AST tests above pin *where* the snapshot call sits; this runs it. Both
+    halves of one product payload have to land, under the run's venue label, keyed
+    on the symbol the caller asked for rather than the Coinbase product id —
+    every one of those was a bug at some point today.
+    """
+    import asyncio
+    from unittest import mock
+
+    from data_collection.storage import SQLiteDatabase
+    from scripts import run_pipeline
+
+    payload = {
+        'product_id': 'BIP-20DEC30-CDE', 'price': '77105',
+        'future_product_details': {
+            'funding_rate': '0.000009', 'funding_interval': '3600s',
+            'funding_time': '2026-08-21T22:00:00Z',
+            'open_interest': '268164', 'index_price': '77118.16',
+        },
+    }
+
+    class FakeClient:
+        def __init__(self):
+            self.requests = 0
+
+        async def get_contract_snapshot(self, product_id):
+            self.requests += 1
+            from data_collection.coinbase_connector import CoinbaseRESTClient
+            parse = CoinbaseRESTClient.__dict__
+            unbound = object.__new__(CoinbaseRESTClient)
+            return (parse['_parse_funding'](unbound, product_id, payload),
+                    parse['_parse_open_interest'](unbound, product_id, payload))
+
+        async def get_funding_rate_history(self, *a, **k):
+            return []
+
+        async def close(self):
+            pass
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        database = SQLiteDatabase(f'{tmp}/trading.db')
+        database.initialize()
+        client = FakeClient()
+
+        with mock.patch.object(run_pipeline, 'CoinbaseRESTClient', lambda *a: client), \
+             mock.patch.object(run_pipeline, 'resolve_coinbase_funding_product_map',
+                               mock.AsyncMock(return_value={'BIP': 'BIP-20DEC30-CDE'})):
+            asyncio.run(run_pipeline.backfill_funding_rates(
+                ['BIP'], T0, T0 + timedelta(hours=1), database,
+                api_key='k', api_secret='s', venue_label='coinbase',
+            ))
+
+        with database._get_connection() as conn:
+            funding = [dict(r) for r in conn.cursor().execute(
+                'SELECT symbol, venue, rate FROM funding_rates')]
+            interest = [dict(r) for r in conn.cursor().execute(
+                'SELECT symbol, venue, open_interest_contracts FROM open_interest')]
+
+    assert client.requests == 1, f'{client.requests} product requests for one symbol'
+
+    assert len(funding) == 1, f'funding rows: {funding}'
+    assert funding[0]['symbol'] == 'BIP', 'stored under the product id, not the symbol'
+    assert funding[0]['venue'] == 'coinbase'
+    assert funding[0]['rate'] == pytest.approx(9e-6)
+
+    assert len(interest) == 1, (
+        f'open interest rows: {interest} — the snapshot half was dropped'
+    )
+    assert interest[0]['symbol'] == 'BIP'
+    assert interest[0]['venue'] == 'coinbase'
+    assert interest[0]['open_interest_contracts'] == pytest.approx(268164.0)

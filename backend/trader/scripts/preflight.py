@@ -152,9 +152,11 @@ def _carry_and_positioning(store: ResearchStore, venue: str, min_days: int) -> C
       accumulates forward, one observation per hourly settlement, so the series
       is exactly as long as the hourly loop has been running. Telling someone to
       `--backfill-days 90` for it is advice that cannot work.
-    * **Open interest.** Coinbase exposes none, so it comes through CCXT from a
-      proxy venue, and `--include-oi` is opt-in. From a US IP the usual sources
-      answer 451.
+    * **Open interest.** Also a snapshot, on the same product payload under
+      `future_product_details.open_interest`, so it accumulates forward exactly
+      like funding. It used to come through CCXT from another exchange because
+      this client had no method for it, which put gate's BTC/USDT:USDT book
+      (21,579,279 contracts) behind features describing BIP's (268,164).
 
     Both feed real feature groups (`carry` 9 features, `positioning` 6), so their
     absence is worth stating plainly — the panel keeps its full 76 columns either
@@ -169,8 +171,7 @@ def _carry_and_positioning(store: ResearchStore, venue: str, min_days: int) -> C
         if coverage is None or coverage.empty:
             notes.append(f'{dataset}: empty, so the {groups} features are all-NaN')
             continue
-        # Open interest legitimately lives on a proxy venue.
-        scoped = coverage if dataset == 'open_interest' else coverage[coverage['venue'] == venue]
+        scoped = coverage[coverage['venue'] == venue]
         if scoped.empty:
             notes.append(f'{dataset}: nothing on {venue}, so {groups} is all-NaN')
             continue
@@ -181,9 +182,10 @@ def _carry_and_positioning(store: ResearchStore, venue: str, min_days: int) -> C
 
     return Check(
         'carry & positioning', True, '; '.join(notes), advisory=True,
-        fix='funding cannot be backfilled on CDE — start `scripts.live_orchestrator` '
-            'and it accrues hourly. Open interest needs --include-oi and a '
-            'reachable CCXT venue (451 from a US IP without a proxy).',
+        fix='neither funding nor open interest can be backfilled on CDE — both '
+            'are snapshots on the product endpoint. Start '
+            '`scripts.live_orchestrator` and they accrue hourly, one observation '
+            'per contract per cycle.',
     )
 
 

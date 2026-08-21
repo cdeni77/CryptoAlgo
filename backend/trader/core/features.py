@@ -318,6 +318,22 @@ def positioning_features(inputs: SymbolInputs) -> pd.DataFrame:
     if oi is None:
         return out
 
+    # A series that never moves carries no positioning information, and bailing
+    # on absence alone was not enough. A scrape wrote 720 rows per contract of
+    # zero open interest — an entry with no usable field became `float(... or 0)`
+    # — and because the rows were *present*, this group ran. Five of its six
+    # columns went all-NaN, which `empty_features` reports. The sixth did not:
+    # `liquidation_cascade_24h` sums three booleans, and `NaN < -0.05` is False,
+    # not NaN, so it kept returning 0/1/2 from volume and volatility alone with
+    # its defining open-interest term silently disabled — fully populated, and
+    # measuring something other than its name.
+    #
+    # Constant, not just zero: a stuck feed repeating one real value is the same
+    # failure with a plausible number in it.
+    finite = oi.replace([np.inf, -np.inf], np.nan).dropna()
+    if finite.empty or finite.nunique() <= 1:
+        return out
+
     out['oi_change_1h'] = oi.pct_change()
     out['oi_change_24h'] = oi.pct_change(24)
     out['oi_z_168h'] = _rolling_z(oi, 168, min_periods=48)
@@ -627,7 +643,13 @@ def _stub_inputs() -> SymbolInputs:
         symbol='BIP',
         bars=bars,
         funding=pd.DataFrame({'rate': 0.00001}, index=index),
-        open_interest=pd.DataFrame({'oi_contracts': 1_000.0}, index=index),
+        # Varying, not a constant. `positioning_features` treats a series that
+        # never moves as absent — a constant carries no positioning
+        # information, and a scrape once wrote 720 rows per contract of zero.
+        # A constant stub therefore discovered no columns for the group, which
+        # silently shortened the canonical column list this function defines.
+        open_interest=pd.DataFrame(
+            {'oi_contracts': np.linspace(1_000.0, 1_200.0, len(index))}, index=index),
         reference_bars=bars.assign(close=price * 1.001),
         market_bars=market,
     )

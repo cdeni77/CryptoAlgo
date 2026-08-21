@@ -22,7 +22,10 @@ from .timeutil import (
     naive_utc_to_epoch_seconds,
     utc_now,
 )
-from .models import OHLCVBar, FundingRate, OrderBookSnapshot, OrderBookLevel, TickerUpdate, DataQuality
+from .models import (
+    OHLCVBar, FundingRate, OpenInterest, OrderBookSnapshot, OrderBookLevel,
+    TickerUpdate, DataQuality,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -404,6 +407,38 @@ class CoinbaseRESTClient:
         all_rates.sort(key=lambda x: x.event_time)
         return all_rates
 
+    async def _product(self, product_id: str) -> Optional[Dict[str, Any]]:
+        """The product payload, or None. One place that knows the path."""
+        if not self.auth:
+            logger.warning("Authentication required for product details")
+            return None
+        try:
+            status, data = await self._request(
+                "GET", f"/api/v3/brokerage/products/{product_id}", authenticated=True
+            )
+        except Exception as e:                                   # noqa: BLE001
+            logger.debug("product lookup for %s failed: %s", product_id, e)
+            return None
+        if status != 200:
+            logger.debug("product lookup for %s: HTTP %s", product_id, status)
+            return None
+        return data
+
+    async def get_contract_snapshot(
+        self, product_id: str
+    ) -> Tuple[Optional[FundingRate], Optional[OpenInterest]]:
+        """Funding rate and open interest from a single request.
+
+        Both live on the same payload, so fetching them separately doubled the
+        request count and let the two observations straddle a settlement — the
+        funding row keyed to 22:00 could be paired with open interest read after
+        the 22:00 print. One request, one instant, two records.
+        """
+        data = await self._product(product_id)
+        if data is None:
+            return None, None
+        return self._parse_funding(product_id, data), self._parse_open_interest(product_id, data)
+
     async def get_funding_rate(self, product_id: str) -> Optional[FundingRate]:
         """The current funding rate for a CDE contract.
 
@@ -426,16 +461,14 @@ class CoinbaseRESTClient:
         `funding_time` is the *next* settlement, so it is the timestamp this rate
         applies to, and it is what the bar is keyed on.
         """
-        if not self.auth:
-            logger.warning("Authentication required for funding rate")
+        data = await self._product(product_id)
+        if data is None:
             return None
-        try:
-            path = f"/api/v3/brokerage/products/{product_id}"
-            status, data = await self._request("GET", path, authenticated=True)
-            if status != 200:
-                logger.debug("funding lookup for %s: HTTP %s", product_id, status)
-                return None
+        return self._parse_funding(product_id, data)
 
+    def _parse_funding(self, product_id: str, data: Dict[str, Any]) -> Optional[FundingRate]:
+        """The funding half of a product payload. Pure, so it can be tested."""
+        try:
             details = data.get("future_product_details") or {}
             raw_rate = details.get("funding_rate")
             if raw_rate in (None, ""):
@@ -472,6 +505,75 @@ class CoinbaseRESTClient:
             logger.debug(f"Could not get funding rate for {product_id}: {e}")
             return None
     
+    # Where the venue puts open interest. Checked in order, and a miss is a miss:
+    # the previous implementation went to CCXT because this client had no
+    # open-interest method, and a comment recorded that absence as "Coinbase
+    # exposes no open-interest endpoint" — a statement about our code, promoted
+    # to a fact about the venue. It is on the product payload, on the contract we
+    # actually trade.
+    OPEN_INTEREST_PATHS: Tuple[Tuple[str, ...], ...] = (
+        ('future_product_details', 'open_interest'),
+        ('future_product_details', 'perpetual_details', 'open_interest'),
+        ('open_interest',),
+    )
+
+    async def get_open_interest(self, product_id: str) -> Optional[OpenInterest]:
+        """Current open interest for one contract, in contracts.
+
+        `/api/v3/brokerage/products/{id}` reports it under
+        `future_product_details.open_interest` — 268,164 for BIP-20DEC30-CDE
+        against 21,579,279 for gate's BTC/USDT:USDT, which is how far apart the
+        two books are. The units are contracts, matching the sibling `volume_24h`
+        (~1.46M/day for BIP).
+
+        Like funding, this is a snapshot: a current value with no range
+        parameters and no cursor, so open interest accumulates forward one
+        observation per run and cannot be backfilled.
+
+        Returns None when the venue reports nothing. It never substitutes a zero
+        — writing 0.0 for an absent field is what put 11,520 rows of fabricated
+        open interest into the store, where five features went all-NaN and
+        `liquidation_cascade_24h` quietly carried on with its OI term disabled.
+        """
+        data = await self._product(product_id)
+        if data is None:
+            return None
+        return self._parse_open_interest(product_id, data)
+
+    def _parse_open_interest(self, product_id: str, data: Dict[str, Any]) -> Optional[OpenInterest]:
+        """The open-interest half of a product payload. Pure, so it can be tested."""
+        try:
+            raw = None
+            for keys in self.OPEN_INTEREST_PATHS:
+                node: Any = data
+                for key in keys:
+                    node = (node or {}).get(key) if isinstance(node, dict) else None
+                if node not in (None, ""):
+                    raw = node
+                    break
+
+            if raw is None:
+                logger.debug("%s reports no open_interest", product_id)
+                return None
+
+            try:
+                contracts = float(raw)
+            except (TypeError, ValueError):
+                logger.warning("%s: uninterpretable open_interest %r", product_id, raw)
+                return None
+
+            now = utc_now()
+            return OpenInterest(
+                symbol=product_id,
+                event_time=now,
+                available_time=now,
+                open_interest_contracts=contracts,
+                venue="coinbase",
+            )
+        except Exception as e:                                   # noqa: BLE001
+            logger.debug(f"Could not get open interest for {product_id}: {e}")
+            return None
+
     async def _get_funding_rate_from_portfolio(self, product_id: str) -> Optional[FundingRate]:
         try:
             summary = await self.get_perpetuals_portfolio_summary()

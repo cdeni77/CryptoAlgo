@@ -506,3 +506,34 @@ def test_compose_still_overrides_those_defaults():
         'the container no longer names its own database path, so it would fall '
         'back to a package-relative default that is not on the data volume'
     )
+
+
+def test_the_launcher_container_can_import_what_it_launches():
+    """`POST /research/launch` runs trader modules with the API's interpreter.
+
+    `research.py` does `subprocess.Popen(command, cwd=trader_dir)` where command
+    is `python -m scripts.<module>` — the API container's python, not the
+    trader's. Every research script reaches `core/datastore.py` through
+    `scripts/_common.py`, and that imports duckdb at module scope, so a
+    dependency the API lacks is a ModuleNotFoundError on every launch.
+
+    This is the trader's original duckdb bug relocated: the deployed
+    configuration disagreed with the code and nothing compared them.
+    """
+    api_requirements = REPO_ROOT / 'backend' / 'api' / 'requirements.txt'
+    if not api_requirements.exists():
+        pytest.skip('no API requirements to check')
+
+    declared = {
+        re.split(r'[=<>!\[]', line.strip())[0].lower()
+        for line in api_requirements.read_text().splitlines()
+        if line.strip() and not line.strip().startswith('#')
+    }
+
+    # What core/datastore.py and core/model.py import at module scope, which is
+    # what any `python -m scripts.*` launch pulls in before doing any work.
+    for package in ('duckdb', 'pyarrow', 'pandas', 'numpy', 'lightgbm', 'joblib'):
+        assert package in declared, (
+            f'the API container launches trader scripts but does not declare '
+            f'{package}, so `POST /research/launch` fails at import'
+        )

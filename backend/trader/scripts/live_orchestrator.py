@@ -362,8 +362,6 @@ def _scrape(args: argparse.Namespace, window_hours: float) -> None:
         '--backfill-only', '--backfill-hours', str(window_hours),
         '--db-path', args.db_path,
     ]
-    if args.include_oi:
-        command.append('--include-oi')
     _run_step('scrape', command)
 
 
@@ -595,7 +593,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--run-once', action='store_true', help='One cycle, then exit')
     parser.add_argument('--retrain-only', action='store_true',
                         help='Evaluate a candidate and exit')
-    parser.add_argument('--include-oi', action='store_true')
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
     parser.add_argument('--log-file',
                         default=os.getenv('ORCHESTRATOR_LOG_FILE')

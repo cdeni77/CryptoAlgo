@@ -61,10 +61,14 @@ def _seed_store(root, *, quality: str = 'valid', identical_venues: bool = False)
             'rate': rng.normal(1e-5, 4e-5, BARS), 'mark_price': close,
             'index_price': close, 'interval_hours': 1, 'is_settlement': 0,
         }))
-        # Open interest only exists on a proxy venue: Coinbase exposes no
-        # open-interest endpoint, so the builder must fall back to find it.
+        # Coinbase-native, on the traded contract. This used to be seeded under
+        # 'binance' with a comment saying Coinbase exposes no open-interest
+        # endpoint — true of the client, not the venue: it is on the product
+        # payload under `future_product_details.open_interest`. Seeding it where
+        # it actually lands means this exercises the primary path rather than
+        # `load_dataset`'s venue fallback.
         store.write('open_interest', pd.DataFrame({
-            'venue': 'binance', 'symbol': symbol, 'event_time': index,
+            'venue': 'coinbase', 'symbol': symbol, 'event_time': index,
             'available_time': index, 'quality': quality,
             'oi_contracts': np.abs(np.cumsum(rng.normal(0, 50, BARS)) + 5e4),
             'oi_base': np.nan, 'oi_usd': np.nan,
@@ -122,12 +126,50 @@ def test_every_feature_populates_with_a_real_basis(store, config):
     assert empty.empty, f'features with no data: {list(empty.index)}'
 
 
-def test_open_interest_falls_back_to_the_proxy_venue(store, config):
-    """Coinbase has no open-interest endpoint, so it lives under another venue."""
+def test_open_interest_reaches_the_panel(store, config):
+    """A varying open-interest series produces all six positioning features.
+
+    Renamed from `..._falls_back_to_the_proxy_venue`, whose docstring said
+    "Coinbase has no open-interest endpoint, so it lives under another venue" —
+    true of our client, not of the venue. It is on the product payload under
+    `future_product_details.open_interest`, on the contract actually traded, and
+    the CCXT path that claim justified is gone.
+    """
     panel = _build(store, config)
 
     assert panel['oi_change_24h'].notna().any()
     assert panel['liquidation_cascade_24h'].notna().any()
+
+
+def test_a_dead_open_interest_series_populates_nothing(tmp_path, config):
+    """The failure this whole change exists to prevent.
+
+    720 rows per contract of zero open interest reached the store, and because
+    the rows were *present* the group ran. Five columns went all-NaN, which
+    `empty_features` reports. `liquidation_cascade_24h` did not: it sums three
+    booleans and `NaN < -0.05` is False rather than NaN, so it kept returning
+    0/1/2 from volume and volatility alone, fully populated, with its defining
+    open-interest term silently disabled.
+    """
+    import numpy as np
+
+    store = _seed_store(tmp_path / 'dead_oi')
+    frame = store.read('open_interest', min_quality=None)
+    frame['oi_contracts'] = 0.0
+    frame['oi_usd'] = 0.0
+    store.write('open_interest', frame, overwrite=True)
+
+    panel = _build(store, config)
+
+    positioning = ['oi_change_1h', 'oi_change_24h', 'oi_z_168h',
+                   'oi_price_divergence_24h', 'oi_return_interaction_24h',
+                   'liquidation_cascade_24h']
+    for column in positioning:
+        assert column in panel.columns, f'{column} left the canonical column list'
+        assert panel[column].isna().all(), (
+            f'{column} is populated from an open-interest series that is '
+            f'identically zero — {panel[column].notna().sum()} values'
+        )
 
 
 def test_identical_venues_collapse_the_basis(tmp_path, config):

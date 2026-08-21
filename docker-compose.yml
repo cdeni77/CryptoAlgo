@@ -209,7 +209,6 @@ services:
     command: >
       -m scripts.live_orchestrator
         --backfill-days 30
-        --include-oi
 
   # ===========================================================================
   # Paper Engine — consumes signals from PostgreSQL and simulates fills

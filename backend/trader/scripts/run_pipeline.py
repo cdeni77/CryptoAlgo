@@ -4,8 +4,8 @@ Unified Data Pipeline for Coinbase Perps Trading Bot
 
 This script combines:
 1. Dynamic resolution of Coinbase "Smart Perp" product IDs
-2. Hybrid OHLCV backfill (Coinbase Native -> CCXT fallback)
-3. Funding rate backfill preferring Coinbase native hourly history with CCXT fallback
+2. OHLCV backfill from Coinbase (perps, or spot under --spot-universe)
+3. Funding rate and open interest snapshots from the product endpoint
 4. Real-time data collection via WebSocket
 
 Usage:
@@ -22,7 +22,6 @@ Usage:
     python run_pipeline.py --skip-backfill
 
     # Include open interest data
-    python run_pipeline.py --backfill-days 365 --include-oi
 """
 
 import argparse
@@ -44,7 +43,6 @@ from data_collection.coinbase_connector import CoinbaseRESTClient
 from data_collection.pipeline import create_pipeline, PipelineConfig, ensure_naive_utc
 from data_collection.timeutil import epoch_millis_to_naive_utc, utc_now
 from data_collection.models import OHLCVBar, TickerUpdate, FundingRate, OpenInterest
-from data_collection.ccxt_connector import CCXTConnector
 from data_collection.ingest import Ingestor
 from data_collection.storage import SQLiteDatabase
 
@@ -178,13 +176,25 @@ async def backfill_ohlcv(
     timeframes: List[str],
     start_time: datetime,
     end_time: datetime,
-    cross_venue_prehistory: bool = False,
 ):
     """
-    Hybrid OHLCV backfill: Coinbase Native -> CCXT fallback.
+    OHLCV backfill from Coinbase. There is no longer a second venue.
+
+    This was a hybrid, falling through to CCXT whenever Coinbase returned
+    nothing. Every use of that fallback turned out to be a mistake dressed as
+    resilience: the "gap" it filled was the span before a contract was listed
+    (BIP began 2025-07-18, so a 400-day request legitimately misses 265 days),
+    and it filled it with `BTC/USDT:USDT` from another exchange — a different
+    quote currency, contract size, funding and participant set, stored under this
+    symbol's name.
+
+    Coinbase serves both venues this system reads: the CDE perps under
+    `coinbase`, and spot under `coinbase_spot` via `--spot-universe`. Neither
+    needs a proxy, and the reference venue is a real Coinbase market rather than
+    a geo-blocked stand-in.
     """
     print("\n" + "=" * 70)
-    print("📊 OHLCV BACKFILL (Hybrid: Coinbase + CCXT)")
+    print("📊 OHLCV BACKFILL (Coinbase)")
     print("=" * 70)
     print(f"Period: {start_time.date()} to {end_time.date()}")
     print(f"Symbols: {symbols}")
@@ -197,67 +207,36 @@ async def backfill_ohlcv(
         for tf in timeframes:
             progress.update(symbol, tf)
             try:
-                # 1. Try Coinbase Native First
-                logger.info(f"   Attempting Coinbase Native fetch for {symbol} {tf}...")
-                await pipeline.backfill(start_time, end_time, [symbol], [tf], use_ccxt=False)
-                
-                # Check what we got
+                logger.info(f"   Fetching {symbol} {tf} from Coinbase...")
+                await pipeline.backfill(start_time, end_time, [symbol], [tf])
+
                 df = pipeline.get_ohlcv(symbol, tf, start_time, end_time)
                 cb_count = len(df) if df is not None and not df.empty else 0
-                
-                # 2. Gap Filling Logic
+
+                # An empty result is a fact about the instrument or the request,
+                # and it is reported as one. It used to trigger a fetch from
+                # another exchange, which is how a symbol with no Coinbase
+                # history ended up holding another venue's prices.
                 if cb_count == 0:
-                    # No data from Coinbase -> Full CCXT fallback
-                    logger.warning(f"   ⚠️ Coinbase returned 0 bars for {symbol}. Fetching via CCXT...")
-                    await pipeline.backfill(start_time, end_time, [symbol], [tf], use_ccxt=True)
-                
-                elif cb_count > 0:
+                    logger.warning(
+                        "   %s %s: Coinbase returned no bars for %s -> %s",
+                        symbol, tf, start_time.date(), end_time.date(),
+                    )
+                else:
                     first_bar_time = df.index.min()
                     if hasattr(first_bar_time, 'to_pydatetime'):
                         first_bar_time = first_bar_time.to_pydatetime()
-
                     gap = first_bar_time - start_time
                     if gap > timedelta(hours=12):
-                        # Coinbase answered, and its earliest bar is where the
-                        # contract's history begins — BIP was listed 2025-07-18,
-                        # so a request for 400 days "misses" everything before
-                        # that. Nothing is missing: the instrument did not exist.
-                        #
-                        # Filling it from CCXT substitutes a different
-                        # instrument. `BTC/USDT:USDT` on OKX is another exchange,
-                        # another quote currency, another contract size, its own
-                        # funding and its own participants. Those rows are
-                        # stamped with the serving venue, so a `venue='coinbase'`
-                        # read never sees them — but they cost API calls, they
-                        # grow with each newer contract (the Batch-3 listings are
-                        # months younger), and they put one instrument's prices in
-                        # the store under another's symbol, which is confusing
-                        # even when it is inert.
-                        #
-                        # Off by default for that reason. `--cross-venue-prehistory`
-                        # turns it back on for the case it was written for: a
-                        # deliberate cross-venue reference series, where you want
-                        # the other venue's bars and will point
-                        # `--reference-venue` at them.
-                        if not cross_venue_prehistory:
-                            logger.info(
-                                "   %s history starts %s; the %d day(s) requested "
-                                "before that pre-date the contract, so nothing is "
-                                "missing. Pass --cross-venue-prehistory to fill "
-                                "them from another exchange instead.",
-                                symbol, first_bar_time.date(), gap.days,
-                            )
-                        else:
-                            logger.info(f"   ⚠️ Gap detected: Coinbase data starts {first_bar_time.date()} (missing {gap.days} days)")
-                            logger.info("      Backfilling pre-history gap via CCXT (a different instrument)...")
-                            await pipeline.backfill(
-                                start=start_time,
-                                end=first_bar_time,
-                                symbols=[symbol],
-                                timeframes=[tf],
-                                use_ccxt=True
-                            )
+                        # Not a gap: the instrument did not exist yet.
+                        logger.info(
+                            "   %s history starts %s; the %d day(s) requested "
+                            "before that pre-date the contract, so nothing is "
+                            "missing.",
+                            symbol, first_bar_time.date(), gap.days,
+                        )
                 
+                # 2. Gap Filling Logic
                 # Final count
                 df = pipeline.get_ohlcv(symbol, tf, start_time, end_time)
                 final_count = len(df) if df is not None and not df.empty else 0
@@ -323,7 +302,6 @@ async def backfill_funding_rates(
     start: datetime,
     end: datetime,
     db: SQLiteDatabase,
-    proxy: Optional[str] = None,
     api_key: Optional[str] = None,
     api_secret: Optional[str] = None,
     venue_label: Optional[str] = None,
@@ -331,7 +309,11 @@ async def backfill_funding_rates(
     """
     Backfill funding rates with Coinbase-native hourly history as primary source.
 
-    Falls back to CCXT (Binance/OKX/Bybit) only when Coinbase history is unavailable.
+    Coinbase-native only. There used to be a CCXT fallback writing
+    `binance_proxy` rates; funding feeds the target's carry component, so
+    another venue's rate is a cash flow this account never receives — and
+    `proxy_funding_symbols` is a promotion gate with a threshold of zero, so
+    those rows could only ever have blocked a candidate.
     All persisted rates are normalized to decimal/hour.
     """
     print("\n" + "=" * 70)
@@ -343,12 +325,6 @@ async def backfill_funding_rates(
 
     ingestor = Ingestor(db)
 
-    connector = CCXTConnector(
-        exchanges=["binance", "okx", "bybit"],
-        proxy=proxy,
-        use_fallbacks=True,
-    )
-
     coinbase_client = CoinbaseRESTClient(api_key, api_secret) if api_key and api_secret else None
     funding_product_map: Dict[str, str] = {}
     if coinbase_client:
@@ -359,15 +335,14 @@ async def backfill_funding_rates(
 
     source_metrics: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "coinbase": 0,
-        "binance_proxy": 0,
         "start": None,
         "end": None,
     })
 
     try:
-        await connector.initialize()
         progress = BackfillProgress(len(symbols), "Funding Rate Backfill")
         total_inserted = 0
+        oi_inserted = 0
 
         for symbol in symbols:
             logger.info(f"\n📊 Processing funding rates for {symbol}")
@@ -398,12 +373,14 @@ async def backfill_funding_rates(
                     except Exception as e:
                         logger.warning(f"Coinbase funding fetch failed for {symbol}: {e}")
 
+                # No cross-venue fallback. Funding feeds the `carry` component
+                # of the net-return target, so another venue's rate trains the
+                # carry head on a cash flow this account will never receive —
+                # which is why `proxy_funding_symbols` is a promotion gate with a
+                # threshold of zero. A fallback that writes data the gates then
+                # refuse is a trap, not a safety net, so it is gone; the gap loop
+                # stays for the day DCC credentials make CDE history reachable.
                 source_used = "coinbase"
-                if not rates:
-                    rates = await connector.fetch_funding_rates(symbol=symbol, start=win_start, end=win_end)
-                    for r in rates:
-                        r.funding_source = "binance_proxy"
-                    source_used = "binance_proxy"
 
                 if rates:
                     outcome = ingestor.ingest_funding(rates, venue=source_used)
@@ -433,10 +410,30 @@ async def backfill_funding_rates(
             coinbase_product = funding_product_map.get(symbol)
             if coinbase_client and coinbase_product:
                 try:
-                    current = await coinbase_client.get_funding_rate(coinbase_product)
+                    current, oi = await coinbase_client.get_contract_snapshot(
+                        coinbase_product
+                    )
                 except Exception as exc:                      # noqa: BLE001
                     logger.warning('current funding failed for %s: %s', symbol, exc)
-                    current = None
+                    current = oi = None
+
+                # Open interest rides the same payload as funding, on the
+                # contract actually traded. It used to come from CCXT because
+                # this client had no method for it, and a comment recorded that
+                # gap as "Coinbase exposes no open-interest endpoint" — so six
+                # features described gate's BTC/USDT book (21,579,279) instead of
+                # BIP's (268,164). A snapshot, like funding: forward-only.
+                if oi is not None:
+                    oi.symbol = symbol
+                    oi_outcome = ingestor.ingest_open_interest(
+                        [oi], venue=venue_label or 'coinbase'
+                    )
+                    oi_inserted += oi_outcome.inserted
+                    logger.info(
+                        '%s: open interest %.0f contracts (snapshot — no history '
+                        'endpoint)', symbol, oi.open_interest_contracts,
+                    )
+
                 if current is not None:
                     current.symbol = symbol
                     current.funding_source = 'coinbase'
@@ -467,128 +464,21 @@ async def backfill_funding_rates(
             coverage_start = m['start'].date().isoformat() if m['start'] else 'n/a'
             coverage_end = m['end'].date().isoformat() if m['end'] else 'n/a'
             logger.info(
-                "Funding coverage %s [%s -> %s] coinbase=%s fallback=%s",
+                "Funding coverage %s [%s -> %s] coinbase=%s",
                 symbol,
                 coverage_start,
                 coverage_end,
                 m['coinbase'],
-                m['binance_proxy'],
             )
-            print(f"  {symbol}: coinbase={m['coinbase']}, binance_proxy={m['binance_proxy']} ({coverage_start} -> {coverage_end})")
+            print(f"  {symbol}: coinbase={m['coinbase']} ({coverage_start} -> {coverage_end})")
 
         print(f"\nTotal funding rates inserted: {total_inserted}")
+        print(f"Total open interest snapshots inserted: {oi_inserted}")
         return total_inserted
 
     finally:
-        await connector.close()
         if coinbase_client:
             await coinbase_client.close()
-
-
-async def backfill_open_interest(
-    symbols: List[str],
-    start: datetime,
-    end: datetime,
-    db: SQLiteDatabase,
-    proxy: Optional[str] = None,
-):
-    """
-    Backfill historical open interest data from CCXT exchanges.
-    """
-    print("\n" + "=" * 70)
-    print("📊 OPEN INTEREST BACKFILL")
-    print("=" * 70)
-    print(f"Period: {start.date()} to {end.date()}")
-    print(f"Symbols: {symbols}")
-    print()
-    
-    ingestor = Ingestor(db)
-
-    # Open interest has no Coinbase-native source: the REST client implements
-    # candles, tickers and /intx/funding-rates but no open-interest endpoint.
-    # These figures therefore describe a different venue's book than the one we
-    # trade, which is why the venue is recorded rather than left implicit.
-    connector = CCXTConnector(
-        exchanges=["bybit", "okx", "binance"],
-        proxy=proxy,
-        use_fallbacks=True,
-    )
-    oi_venue = "ccxt_proxy"
-
-    try:
-        await connector.initialize()
-
-        available_exchanges = connector.get_available_exchanges()
-        if available_exchanges:
-            oi_venue = available_exchanges[0]
-        if not available_exchanges:
-            logger.error("No exchanges available for OI! Check network/proxy.")
-            return
-        
-        print(f"✓ Connected to exchanges: {available_exchanges}")
-        print()
-        
-        progress = BackfillProgress(len(symbols), "Open Interest Backfill")
-        total_inserted = 0
-        
-        for symbol in symbols:
-            logger.info(f"\n📊 Processing OI history for {symbol}")
-            
-            # Every missing window, interior holes included. Prepend/append from
-            # MIN and MAX left a hole between them bracketed forever.
-            windows = db.find_gaps(
-                'open_interest', symbol, start, end, step_seconds=3600,
-            )
-            all_history = []
-            if not windows:
-                logger.info("  ✓ OI data already complete for this range")
-            for win_start, win_end in windows:
-                logger.info(
-                    f"  📥 Fetching OI gap: {win_start:%Y-%m-%d %H:%M} to "
-                    f"{win_end:%Y-%m-%d %H:%M}"
-                )
-                history = await connector.fetch_open_interest_history(
-                    symbol=symbol, timeframe='1h',
-                    start=win_start, end=win_end, limit=200
-                )
-                if history:
-                    all_history.extend(history)
-            
-            if all_history:
-                # Parse dicts to OpenInterest objects
-                oi_list = []
-                for entry in all_history:
-                    try:
-                        event_time = epoch_millis_to_naive_utc(entry['timestamp'])
-                        contracts = float(entry.get('openInterestAmount') or entry.get('baseVolume') or 0)
-                        value = float(entry.get('openInterestValue') or entry.get('quoteVolume') or 0)
-                        # Quality is deliberately left at its UNVALIDATED
-                        # default; the ingestor sets it from the validator.
-                        oi = OpenInterest(
-                            symbol=symbol, event_time=event_time,
-                            available_time=event_time + timedelta(seconds=5),
-                            open_interest_contracts=contracts,
-                            open_interest_usd=value,
-                        )
-                        oi_list.append(oi)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse OI entry: {e}")
-                
-                if oi_list:
-                    try:
-                        outcome = ingestor.ingest_open_interest(oi_list, venue=oi_venue)
-                        total_inserted += outcome.inserted
-                        logger.info(f"  ✓ Open interest: {outcome}")
-                    except Exception as e:
-                        logger.error(f"Failed to insert OI batch: {e}")
-            
-            progress.task_complete(symbol, count=len(all_history))
-        
-        progress.summary()
-        print(f"\nTotal OI records inserted: {total_inserted}")
-        
-    finally:
-        await connector.close()
 
 
 # Symbol Resolution
@@ -599,7 +489,7 @@ async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
 
     Returns product IDs found on Coinbase (e.g. "BIP-20DEC30-CDE") PLUS
     "-PERP" fallback symbols for any configured asset not covered by Coinbase,
-    so CCXT can backfill historical data for those.
+    Assets with no CDE listing are named and excluded, not substituted.
     """
     logger.info("🔍 Resolving active Coinbase Perpetual contracts...")
 
@@ -639,23 +529,23 @@ async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
         else:
             logger.warning("⚠️ No matching perpetuals found from Coinbase API")
 
-        # Determine which assets were covered by Coinbase
-        covered_assets: set = set()
-        for sym in coinbase_symbols:
-            code = sym.split('-')[0].upper()
-            for asset, asset_code in ASSET_TO_CODE_MAP.items():
-                if code == asset_code.upper() or code == asset.upper():
-                    covered_assets.add(asset.upper())
+        # An asset in ASSET_TO_CODE_MAP with no CDE listing is simply not
+        # tradable here, and it is named rather than substituted. A `-PERP`
+        # placeholder used to be appended for each one so CCXT could serve it,
+        # which put another exchange's contract in the universe under a symbol
+        # this account cannot trade.
+        covered_codes = {sym.split('-')[0].upper() for sym in coinbase_symbols}
+        unlisted = sorted(
+            asset for asset, code in ASSET_TO_CODE_MAP.items()
+            if code.upper() not in covered_codes
+        )
+        if unlisted:
+            logger.warning(
+                "%d modelled asset(s) have no CDE contract and are excluded: %s",
+                len(unlisted), ', '.join(unlisted),
+            )
 
-        # Add CCXT-fallback "-PERP" symbols for any asset not found on Coinbase
-        all_symbols = list(coinbase_symbols)
-        for asset in ASSET_TO_CODE_MAP:
-            if asset.upper() not in covered_assets:
-                fallback = f"{asset}-PERP"
-                all_symbols.append(fallback)
-                logger.info(f"   ⤷ {asset} not on Coinbase CDE — using CCXT fallback: {fallback}")
-
-        return all_symbols
+        return coinbase_symbols
 
     except Exception as e:
         logger.error(f"⚠️ Failed to resolve Coinbase symbols: {e}")
@@ -679,7 +569,6 @@ Examples:
   python run_pipeline.py --backfill-days 365 --backfill-only
   python run_pipeline.py --funding-only --backfill-days 365
   python run_pipeline.py --skip-backfill
-  python run_pipeline.py --backfill-days 365 --include-oi
         """
     )
     
@@ -703,7 +592,6 @@ Examples:
     parser.add_argument("--backfill-only", action="store_true", help="Only backfill, don't start real-time")
     parser.add_argument("--funding-only", action="store_true", help="Only backfill funding rates")
     parser.add_argument("--ohlcv-only", action="store_true", help="Only backfill OHLCV data")
-    parser.add_argument("--include-oi", action="store_true", help="Also fetch open interest data")
     
     # Paths
     parser.add_argument("--spot-universe", action="store_true",
@@ -712,11 +600,6 @@ Examples:
                              "symbols. Implies --venue-label coinbase_spot. Use "
                              "this rather than typing --symbols: the hand-written "
                              "list was nine products against sixteen contracts.")
-    parser.add_argument("--cross-venue-prehistory", action="store_true",
-                        help="Fill the span before a contract was listed with "
-                             "another exchange's bars for the same underlying. "
-                             "Off by default: nothing is missing there, and the "
-                             "substitute is a different instrument.")
     parser.add_argument("--venue-label", type=str, default=None,
                         help="Store Coinbase-native rows under this venue label "
                              "instead of 'coinbase'. Use 'coinbase_spot' when "
@@ -726,7 +609,6 @@ Examples:
     parser.add_argument("--db-path", type=str, default="./data/trading.db", help="Database path")
     
     # Network
-    parser.add_argument("--proxy", type=str, help="HTTP proxy URL for CCXT exchanges")
     
     args = parser.parse_args()
     
@@ -749,7 +631,6 @@ Examples:
     end_time = ensure_naive_utc(end_time)
     
     timeframes = args.timeframes.split(",") if args.timeframes else DEFAULT_TIMEFRAMES
-    proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     
     # API credentials
     api_key = os.environ.get("COINBASE_API_KEY")
@@ -767,7 +648,6 @@ Examples:
     print(f"Timeframes: {timeframes}")
     print(f"Database: {args.db_path}")
     print(f"Venue label: {args.venue_label or 'coinbase'}")
-    print(f"Proxy: {proxy or 'None'}")
     print()
     
     # Step 1: Resolve Symbols
@@ -824,9 +704,6 @@ Examples:
                     coinbase_api_secret=api_secret,
                     db_path=args.db_path,
                     backfill_days=args.backfill_days,
-                    proxy=proxy,
-                    ccxt_exchanges=["okx", "binance", "bybit"],
-                    ccxt_use_fallbacks=True,
                     venue_label=args.venue_label,
                 )
                 pipeline = await create_pipeline(config)
@@ -838,7 +715,6 @@ Examples:
                 
                 await backfill_ohlcv(
                     pipeline, symbols, timeframes, start_time, end_time,
-                    cross_venue_prehistory=args.cross_venue_prehistory,
                 )
             else:
                 # An empty price history is not a successful scrape. This used to
@@ -853,7 +729,7 @@ Examples:
         # Funding Rate Backfill
         if not args.ohlcv_only:
             funding_rows = await backfill_funding_rates(
-                symbols, start_time, end_time, db, proxy, api_key, api_secret,
+                symbols, start_time, end_time, db, api_key, api_secret,
                 venue_label=args.venue_label,
             )
             # Zero funding is not a partial success. Carry is the edge this
@@ -875,9 +751,6 @@ Examples:
                     "and the carry component of every target will be empty"
                 )
         
-        # Open Interest Backfill (optional)
-        if args.include_oi and not args.ohlcv_only:
-            await backfill_open_interest(symbols, start_time, end_time, db, proxy)
     
     # Step 4: Summary
     print("\n" + "=" * 70)
@@ -913,22 +786,38 @@ Examples:
     else:
         print("  No funding rate data")
     
-    # OI summary
-    if args.include_oi:
-        print("\n📊 Open Interest:")
-        with db._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT symbol, COUNT(*) as count, AVG(open_interest_contracts) as avg_oi
-                FROM open_interest
-                GROUP BY symbol
-            """)
-            rows = cursor.fetchall()
-            if rows:
-                for row in rows:
-                    print(f"  {row['symbol']}: {row['count']} records, avg OI: {row['avg_oi']:,.0f} contracts")
-            else:
-                print("  No open interest data")
+    # OI summary. Unconditional now that it comes from the traded contract's own
+    # product payload rather than an opt-in trip to another exchange.
+    print("\n📊 Open Interest:")
+    with db._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT symbol, COUNT(*) as count, AVG(open_interest_contracts) as avg_oi,
+                   MAX(open_interest_contracts) as max_oi, venue
+            FROM open_interest
+            GROUP BY symbol, venue
+        """)
+        rows = cursor.fetchall()
+        if rows:
+            dead = []
+            for row in rows:
+                print(f"  {row['symbol']} @{row['venue']}: {row['count']} records, "
+                      f"avg OI: {row['avg_oi']:,.0f} contracts")
+                if not row['max_oi']:
+                    dead.append(f"{row['symbol']}@{row['venue']} ({row['count']} rows)")
+            # A series that never exceeds zero is not a statistic, it is a defect.
+            # 16 contracts x 720 hours of zeros printed as "avg OI: 0 contracts"
+            # and read as data: five features went all-NaN and
+            # `liquidation_cascade_24h` carried on with its OI term disabled.
+            if dead:
+                logger.error(
+                    "open interest is identically zero for %d series — these rows "
+                    "are not measurements and the positioning features built on "
+                    "them are not either: %s",
+                    len(dead), ', '.join(dead[:8]) + (' ...' if len(dead) > 8 else ''),
+                )
+        else:
+            print("  No open interest data")
     
     # Step 5: Real-time Collection
     if args.backfill_only:
@@ -952,9 +841,6 @@ Examples:
             coinbase_api_secret=api_secret,
             db_path=args.db_path,
             backfill_days=args.backfill_days,
-            proxy=proxy,
-            ccxt_exchanges=["okx", "binance", "bybit"],
-            ccxt_use_fallbacks=True,
             venue_label=args.venue_label,
         )
         pipeline = await create_pipeline(config)

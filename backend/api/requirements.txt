@@ -12,9 +12,16 @@ pandas>=2.0.0
 scikit-learn
 lightgbm
 aiohttp
-ccxt
 scipy
 joblib
+
+# The research store. `POST /research/launch` runs `python -m scripts.<module>`
+# with THIS container's interpreter, and every trader script reaches
+# core/datastore.py through scripts/_common.py, which imports duckdb at module
+# scope. Without these the dashboard's script runner dies on import — the same
+# defect the trader's own requirements once had.
+duckdb>=1.0.0
+pyarrow>=15.0.0
 
 # Optional Redis-backed queue for trader data pipeline
 redis>=5.0.0

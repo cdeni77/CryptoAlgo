@@ -5,7 +5,6 @@
 aiohttp>=3.8.0
 
 # Crypto exchange integration
-ccxt>=4.0.0
 
 # Data processing
 pandas>=2.0.0

@@ -27,7 +27,6 @@ from .queue import MessageQueueBase, InMemoryQueue, Channels, QueueMessage
 from .ingest import Ingestor
 from .storage import DatabaseBase, SQLiteDatabase, create_database
 from .coinbase_connector import CoinbaseRESTClient, CoinbaseWebSocketClient
-from .ccxt_connector import CCXTConnector
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +40,6 @@ class PipelineConfig:
     timeframes: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h"])
     coinbase_api_key: Optional[str] = None
     coinbase_api_secret: Optional[str] = None
-    proxy: Optional[str] = None
-    ccxt_exchanges: List[str] = field(default_factory=lambda: ["binance", "bybit"])
-    ccxt_use_fallbacks: bool = True
     db_type: str = "sqlite"
     db_path: str = "./data/trading.db"
     queue_type: str = "memory"
@@ -66,7 +62,6 @@ class DataPipeline:
         self.config = config
         self._rest_client: Optional[CoinbaseRESTClient] = None
         self._ws_client: Optional[CoinbaseWebSocketClient] = None
-        self._ccxt_connector: Optional[CCXTConnector] = None
         self._queue: Optional[MessageQueueBase] = None
         self._database: Optional[DatabaseBase] = None
         self._validator: DataValidator = DataValidator(config.validation_config)
@@ -110,14 +105,6 @@ class DataPipeline:
             on_error=self._handle_ws_error,
         )
         logger.info("WebSocket client initialized")
-
-        self._ccxt_connector = CCXTConnector(
-            exchanges=self.config.ccxt_exchanges,
-            proxy=self.config.proxy,
-            use_fallbacks=self.config.ccxt_use_fallbacks,
-        )
-        await self._ccxt_connector.initialize()
-        logger.info("CCXT connector initialized")
 
         await self._load_last_times()
         await self._load_first_times()
@@ -182,8 +169,6 @@ class DataPipeline:
             await self._ws_client.stop()
         if self._rest_client:
             await self._rest_client.close()
-        if self._ccxt_connector:
-            await self._ccxt_connector.close()
         if self._queue:
             await self._queue.close()
         if self._database:
@@ -205,33 +190,25 @@ class DataPipeline:
             )
         return self._ingestor
 
-    def _venue_name(self, use_ccxt: bool) -> str:
-        """Which exchange the last fetch actually came from.
+    def _venue_name(self) -> str:
+        """The label every bar from this run is stored under.
 
-        Recorded on every bar because the backfill deliberately blends venues:
-        Coinbase first, CCXT filling any pre-history gap. Without this the
-        boundary between the instrument we trade and a proxy for it is invisible
-        in the stored series.
-
-        This used to return `get_available_exchanges()[0]` — the first exchange
-        that *initialised* — while `fetch_ohlcv` selects per symbol from
-        ["okx","binance","bybit"]. So bars served by Binance were stamped 'okx',
-        and `REFERENCE_VENUE=binance` then matched nothing: every cross-venue
-        basis and lead-lag feature was empty.
+        One venue now. This used to pick between Coinbase and whichever CCXT
+        exchange served the request, because the backfill blended them — and it
+        returned `get_available_exchanges()[0]`, the first exchange that
+        *initialised*, while `fetch_ohlcv` chose per symbol from
+        ["okx","binance","bybit"]. Bars served by Binance were stamped 'okx', so
+        `REFERENCE_VENUE=binance` matched nothing and every cross-venue feature
+        was empty. Both venues this system reads are Coinbase now — the CDE perps
+        under 'coinbase', spot under 'coinbase_spot' — so the label is just the
+        run's own.
         """
-        if not use_ccxt:
-            return self.config.venue_label or 'coinbase'
-        served = self._ccxt_connector.last_ohlcv_exchange if self._ccxt_connector else None
-        if served:
-            return served
-        available = self._ccxt_connector.get_available_exchanges() if self._ccxt_connector else []
-        return available[0] if available else 'ccxt_proxy'
+        return self.config.venue_label or 'coinbase'
 
-    async def _fetch_bars(self, symbol, timeframe, start_dt, end_dt, use_ccxt):
-        if use_ccxt:
-            return await self._ccxt_connector.fetch_ohlcv(symbol=symbol, timeframe=timeframe, start=start_dt, end=end_dt)
-        else:
-            return await self._rest_client.get_candles_range(product_id=symbol, granularity=timeframe, start=start_dt, end=end_dt)
+    async def _fetch_bars(self, symbol, timeframe, start_dt, end_dt):
+        return await self._rest_client.get_candles_range(
+            product_id=symbol, granularity=timeframe, start=start_dt, end=end_dt
+        )
 
     def _process_and_insert_bars(self, bars, symbol, timeframe, venue: str = 'unknown'):
         if not bars:
@@ -253,7 +230,7 @@ class DataPipeline:
         return inserted
 
     async def backfill(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
-                       symbols: Optional[List[str]] = None, timeframes: Optional[List[str]] = None, use_ccxt: bool = True):
+                       symbols: Optional[List[str]] = None, timeframes: Optional[List[str]] = None):
         end = ensure_naive_utc(end) if end else utc_now()
         start = ensure_naive_utc(start) if start else (end - timedelta(days=self.config.backfill_days))
         symbols = symbols or self.config.symbols
@@ -265,43 +242,27 @@ class DataPipeline:
                 tf_seconds = self._granularity_to_seconds(timeframe)
                 tf_delta = timedelta(seconds=tf_seconds)
                 # Venue-scoped, and asked of the database rather than the
-                # in-memory cache. The cache is keyed symbol->timeframe with no
-                # venue dimension, so it answered "has ANYONE covered this range"
-                # — and once Coinbase filled a span the CCXT prepend below was
-                # skipped, so the reference-venue bars the cross-venue features
-                # need were never collected at all.
-                prepend_venue = self._venue_name(use_ccxt=True) if use_ccxt else None
-                first_time = ensure_naive_utc(
-                    self._database.get_earliest_ohlcv_time(
-                        symbol, timeframe, venue=prepend_venue)
-                ) if use_ccxt else None
+                # in-memory cache: the cache is keyed symbol->timeframe with no
+                # venue dimension, so it answered "has ANYONE covered this
+                # range", which conflated the perp series with the spot one.
+                venue = self._venue_name()
                 last_time = ensure_naive_utc(
                     self._database.get_latest_ohlcv_time(
-                        symbol, timeframe, venue='coinbase')
+                        symbol, timeframe, venue=venue)
                 )
                 fetched_any = False
-                if use_ccxt and (not first_time or first_time > start + tf_delta):
-                    prepend_end = first_time if first_time else end
-                    prepend_start = start
-                    if prepend_start < prepend_end:
-                        logger.info(f"Prepending {symbol} {timeframe} from {prepend_start} to {prepend_end}")
-                        try:
-                            bars = await self._fetch_bars(symbol, timeframe, prepend_start, prepend_end, use_ccxt)
-                            inserted = self._process_and_insert_bars(bars, symbol, timeframe, self._venue_name(use_ccxt))
-                            if inserted:
-                                fetched_any = True
-                        except Exception as e:
-                            logger.error(f"Error prepending {symbol} {timeframe}: {e}")
-                            import traceback
-                            traceback.print_exc()
+                # No prepend branch. It existed to fill the span before a
+                # contract was listed with another exchange's bars for the same
+                # underlying — a different quote currency, contract size, funding
+                # and participant set, stored under this symbol's name.
                 append_start = start
                 if last_time:
                     append_start = last_time + tf_delta
                 if append_start < end:
                     logger.info(f"Appending {symbol} {timeframe} from {append_start} to {end}")
                     try:
-                        bars = await self._fetch_bars(symbol, timeframe, append_start, end, use_ccxt)
-                        inserted = self._process_and_insert_bars(bars, symbol, timeframe, self._venue_name(use_ccxt))
+                        bars = await self._fetch_bars(symbol, timeframe, append_start, end)
+                        inserted = self._process_and_insert_bars(bars, symbol, timeframe, venue)
                         if inserted:
                             fetched_any = True
                     except Exception as e:
