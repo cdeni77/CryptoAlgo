@@ -204,6 +204,52 @@ and both are useful.
 - **TypeScript/React**: Functional components + hooks only, no class components. Fetch-based API layer (no axios). `recharts` for charts.
 - **Tests**: `pytest` for trader. The suite's job is to catch the failure modes that produced fake edge before: lookahead (`test_backtest.py`), symbol-identity memorisation (`test_model.py`), leaked fold statistics (`test_cv_and_metrics.py`), the cost identity (`test_targets.py`), and blocked candidates reaching live (`test_promotion.py`). Mark anything over ~10s `@pytest.mark.slow`.
 
+## Carry: CDE publishes no history, and the rate is far smaller than assumed
+
+Two things established by probing a live US account
+(`python -m scripts.probe_funding`), both of which change the plan:
+
+**1. There is no historical funding endpoint.** The current rate lives at
+`/api/v3/brokerage/products/{id}` under `future_product_details`:
+
+```
+"funding_interval": "3600s",
+"funding_rate": "0.000009",
+"funding_time": "2026-08-21T16:00:00Z",
+```
+
+`funding_time` is the *next* settlement, and there are no range parameters and
+no cursor. `/api/v3/brokerage/intx/funding-rates` — which the scraper used to
+call — is Coinbase *International* Exchange; `GET /api/v3/brokerage/portfolios`
+on a US account returns a single `DEFAULT` portfolio and no INTX one, so every
+`intx/` path is a 404 by design. (The old INTX implementation is kept as
+`_unreachable_intx_funding_history` for an account that has that venue.)
+
+So carry cannot be backfilled. It accumulates forward, one observation per
+hourly settlement, which `run_pipeline` now takes on every run. **The carry head
+can only ever be validated on history collected since collection started**, so
+start the hourly loop before you need it. Bars, by contrast, backfill fine.
+
+**2. The observed rate is ~22x smaller than the 2bp/hour these docs assumed.**
+`0.000009` per hour is **0.09 bp/hour**, or 2.16 bp/day. Hours of carry needed to
+cover a round trip, measured against the CDE fee schedule:
+
+| contract | round trip | at 0.09 bp/h (observed) | at 2 bp/h (assumed) |
+|----------|-----------:|------------------------:|--------------------:|
+| XPP (XRP)  |  5.7 bp |  63 h |  2.9 h |
+| DOP (DOGE) |  7.3 bp |  81 h |  3.6 h |
+| SLP (SOL)  |  8.7 bp |  97 h |  4.3 h |
+| BIP (BTC)  | 25.0 bp | 278 h | 12.5 h |
+| ETP (ETH)  | 48.1 bp | 534 h | 24.1 h |
+
+This is **one snapshot**, taken while BTC was +6.7% on the day, and funding is
+volatile and sometimes negative — so it is not a verdict on the carry thesis.
+But it does mean the "24h hold pays for itself on carry alone on four of five
+contracts" claim rests on an assumed number, not a measured one, and the first
+real observation is 22x lower. Collect the distribution before sizing anything on
+it. `scripts/preflight.py` reports sample size; it cannot tell you the edge is
+real.
+
 ## Open: contract sizes disagree by up to 5x
 
 `configs/exchange/coinbase_us_perps_cde_v202602.json` and
@@ -221,8 +267,10 @@ multiplies into notional, fee-as-a-fraction-of-notional, margin, liquidation
 price, participation rate and PnL, so this is a silent multiplier on everything
 those three instruments produce.
 
-**Resolving it needs Coinbase's published contract specs**, not a code change;
-picking a side in code would be guessing at money.
+**The venue answers this directly** — `future_product_details.contract_size` and
+`contract_root_unit` on the product endpoint, confirmed as `"0.01"` / `"BTC"` for
+BIP. Run `python -m scripts.probe_funding --sizes-only` for the whole universe
+and set `CONTRACT_UNITS` from that, rather than picking a side in code.
 `load_exchange_cost_assumptions` warns on every run that reads the file, and
 `test_orm_parity.py::test_the_venue_schedule_agrees_with_the_contract_units_table`
 is a `strict=True` xfail — it fails the moment the data is fixed without the

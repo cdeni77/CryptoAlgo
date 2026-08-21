@@ -57,9 +57,55 @@ def _trim(payload: Any, depth: int = 0) -> Any:
     return payload
 
 
+async def contract_sizes(client, products: list[str]) -> None:
+    """Ask the venue for `contract_size`, which settles a 5x open question.
+
+    `core/costs.py:CONTRACT_UNITS` and the shipped fee schedule disagree on
+    AVAX (10 vs 5), LINK (50 vs 10) and LTC (5 vs 1). The product endpoint
+    reports `future_product_details.contract_size` and `contract_root_unit`
+    directly — the venue's own answer, which beats both of ours.
+    """
+    print('=' * 72)
+    print('CONTRACT SIZES, as the venue reports them')
+    print('=' * 72)
+    print(f'{"product":22} {"code":6} {"unit":6} {"contract_size":>14}  vs CONTRACT_UNITS')
+    try:
+        from core.costs import CONTRACT_UNITS, resolve_base
+    except Exception:                                    # noqa: BLE001
+        CONTRACT_UNITS, resolve_base = {}, lambda _: None
+
+    for product in products:
+        status, data = await client._request(
+            'GET', f'/api/v3/brokerage/products/{product}', authenticated=True
+        )
+        if status != 200:
+            print(f'{product:22} HTTP {status}')
+            continue
+        d = data.get('future_product_details') or {}
+        size = d.get('contract_size')
+        base = resolve_base(product)
+        ours = CONTRACT_UNITS.get(base) if base else None
+        verdict = ''
+        if size is not None and ours is not None:
+            verdict = 'agree' if float(size) == float(ours) else f'DISAGREE (ours {ours:g})'
+        print(f'{product:22} {str(d.get("contract_code","")):6} '
+              f'{str(d.get("contract_root_unit","")):6} {str(size):>14}  {verdict}')
+    print()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--product', default='BIP-20DEC30-CDE')
+    parser.add_argument('--sizes-only', action='store_true',
+                        help='Skip the endpoint probe, just dump contract sizes')
+    parser.add_argument(
+        '--products',
+        default=('BIP-20DEC30-CDE,ETP-20DEC30-CDE,SLP-20DEC30-CDE,XPP-20DEC30-CDE,'
+                 'DOP-20DEC30-CDE,AVP-20DEC30-CDE,ADP-20DEC30-CDE,LNP-20DEC30-CDE,'
+                 'LCP-20DEC30-CDE,BCP-20DEC30-CDE,NER-20DEC30-CDE,SUP-20DEC30-CDE,'
+                 'XLP-20DEC30-CDE,POP-20DEC30-CDE,SHP-20DEC30-CDE,PEP-20DEC30-CDE'),
+        help='Comma-separated products for the contract-size table',
+    )
     args = parser.parse_args()
 
     key = os.environ.get('COINBASE_API_KEY')
@@ -70,6 +116,11 @@ async def main() -> int:
 
     client = CoinbaseRESTClient(key, secret)
     try:
+        await contract_sizes(
+            client, [p.strip() for p in args.products.split(',') if p.strip()]
+        )
+        if args.sizes_only:
+            return 0
         for path_template, params_template, why in PROBES:
             path = path_template.format(product=args.product)
             params = (

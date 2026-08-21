@@ -339,6 +339,29 @@ async def backfill_funding_rates(
                     except Exception as e:
                         logger.warning(f"Coinbase funding fetch failed for {symbol}: {e}")
 
+                # CDE has no historical funding endpoint, only the current rate
+                # (see CoinbaseRESTClient.get_funding_rate_history). So the only
+                # way the store ever accumulates carry is by taking the snapshot
+                # every run and letting the hourly cycle build the series. The
+                # window this lands in is the *next* settlement, which is what
+                # `funding_time` reports, so repeated runs inside one hour
+                # upsert rather than duplicate.
+                if not rates and coinbase_client and coinbase_product:
+                    try:
+                        current = await coinbase_client.get_funding_rate(coinbase_product)
+                    except Exception as e:
+                        logger.warning(f"Coinbase current funding failed for {symbol}: {e}")
+                        current = None
+                    if current is not None and win_start <= current.event_time <= win_end:
+                        current.symbol = symbol
+                        current.funding_source = "coinbase"
+                        rates = [current]
+                        logger.info(
+                            "%s: current funding %.4f bp/hour at %s (snapshot — CDE "
+                            "publishes no history)",
+                            symbol, current.rate * 10_000, current.event_time,
+                        )
+
                 source_used = "coinbase"
                 if not rates:
                     rates = await connector.fetch_funding_rates(symbol=symbol, start=win_start, end=win_end)

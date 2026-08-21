@@ -62,6 +62,27 @@ class CoinbaseAuth:
         return jwt_token
 
 
+def _funding_interval_hours(raw: Any) -> float:
+    """Parse `funding_interval` ("3600s") into hours. Defaults to 1.
+
+    Read rather than assumed: every rate is divided by this to reach
+    decimal/hour, so a venue that switches to 8h settlement would otherwise
+    inflate every carry feature eightfold with nothing to notice it.
+    """
+    if raw in (None, ""):
+        return 1.0
+    text = str(raw).strip().lower()
+    try:
+        if text.endswith("s"):
+            return max(float(text[:-1]) / 3600.0, 1e-9)
+        if text.endswith("h"):
+            return max(float(text[:-1]), 1e-9)
+        return max(float(text) / 3600.0, 1e-9)
+    except ValueError:
+        logger.warning("unparseable funding_interval %r, assuming hourly", raw)
+        return 1.0
+
+
 class CoinbaseRESTClient:
     BASE_URL = "https://api.coinbase.com"
     
@@ -254,10 +275,49 @@ class CoinbaseRESTClient:
         end: datetime,
         limit: int = 200,
     ) -> List[FundingRate]:
-        """
-        Fetch Coinbase International hourly funding history for a CDE product.
+        """Historical funding for a CDE product. There is no such endpoint.
 
-        Returned rates are normalized to decimal/hour for downstream consistency.
+        Established by probing a live US account (`scripts/probe_funding.py`):
+
+        - `/api/v3/brokerage/products/{id}` returns the **current** rate only,
+          under `future_product_details.funding_rate`, with `funding_time` being
+          the *next* settlement. No range parameters, no cursor.
+        - `/api/v3/brokerage/intx/funding-rates`, which is what this method used
+          to call, is Coinbase *International* Exchange. `GET
+          /api/v3/brokerage/portfolios` on a US account returns a single
+          `DEFAULT` portfolio and no INTX one, so every `intx/` path is a 404 by
+          design, not by misconfiguration.
+
+        So CDE funding cannot be backfilled: it has to be accumulated forward,
+        one observation per hourly settlement, by `get_funding_rate`. The
+        consequence is strategic rather than technical — the carry head can only
+        ever be validated on history collected since collection began, so start
+        collecting before you need it.
+
+        This returns empty rather than raising: a caller asking for history is
+        not making a mistake, the data simply does not exist. The scrape counts
+        the zero and now exits non-zero, which is where the loudness belongs.
+        """
+        logger.info(
+            "%s: CDE publishes no historical funding, only the current rate. "
+            "Funding must be accumulated forward — see the docstring",
+            product_id,
+        )
+        return []
+
+    async def _unreachable_intx_funding_history(
+        self,
+        product_id: str,
+        start: datetime,
+        end: datetime,
+        limit: int = 200,
+    ) -> List[FundingRate]:
+        """The former INTX implementation, kept for a venue that has the endpoint.
+
+        Unreferenced on the CDE path by design. Coinbase International does
+        expose paginated funding history at this path, so if this system is ever
+        pointed at an INTX account the parsing below is correct and only the
+        caller needs changing.
         """
         if not self.auth:
             logger.warning("Authentication required for funding rate history")
@@ -345,21 +405,68 @@ class CoinbaseRESTClient:
         return all_rates
 
     async def get_funding_rate(self, product_id: str) -> Optional[FundingRate]:
+        """The current funding rate for a CDE contract.
+
+        Read from `/api/v3/brokerage/products/{id}` under
+        `future_product_details`, which is where CDE actually publishes it:
+
+            "funding_interval": "3600s",
+            "funding_rate": "0.000009",
+            "funding_time": "2026-08-21T16:00:00Z",
+            "index_price": "77451.711238",
+            "settlement_price": "72675",
+
+        This used to ask `/api/v3/brokerage/intx/products/{id}`. INTX is
+        Coinbase *International* Exchange — a different venue from CDE — so a US
+        account, whose only portfolio is `DEFAULT`, got 404 on every call and the
+        scrape stored zero funding rates. Note also that the sibling
+        `perpetual_details` block exists but its `funding_rate` is an empty
+        string; the populated values are one level up.
+
+        `funding_time` is the *next* settlement, so it is the timestamp this rate
+        applies to, and it is what the bar is keyed on.
+        """
         if not self.auth:
             logger.warning("Authentication required for funding rate")
             return None
         try:
-            path = f"/api/v3/brokerage/intx/products/{product_id}"
+            path = f"/api/v3/brokerage/products/{product_id}"
             status, data = await self._request("GET", path, authenticated=True)
             if status != 200:
-                return await self._get_funding_rate_from_portfolio(product_id)
-            now = utc_now()
-            funding_rate = float(data.get("funding_rate", 0))
-            mark_price = float(data.get("mark_price", 0))
-            index_price = float(data.get("index_price", 0))
+                logger.debug("funding lookup for %s: HTTP %s", product_id, status)
+                return None
+
+            details = data.get("future_product_details") or {}
+            raw_rate = details.get("funding_rate")
+            if raw_rate in (None, ""):
+                logger.debug("%s reports no funding_rate", product_id)
+                return None
+
+            # Normalise to decimal/hour, matching the CCXT path. CDE settles
+            # hourly (`funding_interval: 3600s`), so the divisor is 1 there — but
+            # reading it rather than assuming it means a venue that changes the
+            # interval cannot silently rescale every carry feature.
+            interval_hours = _funding_interval_hours(details.get("funding_interval"))
+            rate = float(raw_rate) / max(interval_hours, 1e-9)
+
+            event_time = (
+                ensure_naive_utc(
+                    datetime.fromisoformat(
+                        str(details["funding_time"]).replace("Z", "+00:00")
+                    )
+                )
+                if details.get("funding_time")
+                else utc_now()
+            )
             return FundingRate(
-                symbol=product_id, event_time=now, available_time=now,
-                rate=funding_rate, mark_price=mark_price, index_price=index_price,
+                symbol=product_id,
+                event_time=event_time,
+                available_time=utc_now(),
+                rate=rate,
+                mark_price=float(data.get("price") or 0.0),
+                index_price=float(details.get("index_price") or 0.0),
+                funding_source="coinbase",
+                venue="coinbase",
             )
         except Exception as e:
             logger.debug(f"Could not get funding rate for {product_id}: {e}")
