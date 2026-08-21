@@ -89,7 +89,17 @@ def perpetual_symbols(symbols: Iterable[str]) -> List[str]:
     """
     return [symbol for symbol in symbols if not SPOT_QUOTES.search(symbol)]
 
-DEFAULT_TIMEFRAMES = ["1h", "1d"]
+# Hourly only. The daily bars were collected and then read by nothing: the
+# research store's `bars` dataset has no timeframe column, and `from_sqlite`
+# filters `WHERE timeframe = ?` defaulting to '1h' (as does
+# migrate_to_research_store), so daily rows never reached the panel. Nothing in
+# backend/api touches the ohlcv table either — the dashboard's '1d' is a *range*
+# (`days=1`), not a candle granularity. So they cost 400 days x 18 contracts of
+# requests on the first cycle to populate rows nothing consumes, and sat in SQLite
+# where a `--timeframe 1d` migration could silently mix granularities into one
+# venue/symbol/event_time key space. Ask for them explicitly if you ever need them;
+# hourly resamples to daily anyway.
+DEFAULT_TIMEFRAMES = ["1h"]
 DEFAULT_SYMBOLS = [
     "BTC-PERP", "ETH-PERP", "SOL-PERP", "XRP-PERP", "DOGE-PERP",
     "AVP-20DEC30-CDE", "ADP-20DEC30-CDE", "LNP-20DEC30-CDE", "LCP-20DEC30-CDE",
