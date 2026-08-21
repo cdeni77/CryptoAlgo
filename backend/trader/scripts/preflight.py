@@ -117,6 +117,19 @@ def _store_populated(store: ResearchStore, venue: str, min_days: int) -> Check:
         if days < min_days:
             shortfalls.append(f'{dataset}: longest series is {days:.0f}d < {min_days}d')
 
+        # Name the other venues in the store. The count above is scoped to the
+        # traded venue, which is right — but reporting only that number makes a
+        # collected reference venue invisible, and "18 series" reads like a
+        # total. It is the reference venue that decides whether the cross-venue
+        # group has anything to work with, so it belongs in the same line.
+        others = coverage[coverage['venue'] != venue]
+        if not others.empty:
+            summary = ', '.join(
+                f'{name} {len(group)} series/{float(group["days"].max()):.0f}d'
+                for name, group in sorted(others.groupby('venue'))
+            )
+            lines.append(f'other venues: {summary}')
+
     detail = '; '.join(lines) or 'nothing in the store'
     if shortfalls:
         return Check(
