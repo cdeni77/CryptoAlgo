@@ -147,6 +147,11 @@ class PaperPosition(Base):
     sl_price = Column(Float, nullable=True)
     max_hold_until = Column(DateTime(timezone=True), nullable=True)
     exit_reason = Column(String, nullable=True)
+    # Funding accrued so far, in account currency. On hourly-funding perps this
+    # is the largest cost after commission — over a day-long hold, 2bp/hour is
+    # 48bp against a 5-54bp round trip. It has to survive a restart, or a
+    # relaunched engine forgets what the position already cost.
+    funding_paid = Column(Float, nullable=False, default=0.0)
 
 
 class PaperEquityCurve(Base):
@@ -186,6 +191,8 @@ class PgWriter:
             "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS sl_price DOUBLE PRECISION",
             "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS max_hold_until TIMESTAMP WITH TIME ZONE",
             "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS exit_reason VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS funding_paid "
+            "DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         ]
         with self.engine.begin() as conn:
             for stmt in stmts:
@@ -454,6 +461,21 @@ class PgWriter:
                 position.mark_price = mark_price
                 position.unrealized_pnl = unrealized_pnl
                 db.commit()
+
+    def accrue_paper_position_funding(self, position_id: int, amount: float) -> float:
+        """Add funding to a position's running total and return the new total.
+
+        Persisted rather than held in memory so a restarted engine does not
+        forget what the position has already cost it — which, on a multi-day
+        hold, can exceed the whole round-trip commission.
+        """
+        with self._session() as db:
+            position = db.query(PaperPosition).filter(PaperPosition.id == position_id).first()
+            if not position:
+                return 0.0
+            position.funding_paid = float(position.funding_paid or 0.0) + float(amount)
+            db.commit()
+            return float(position.funding_paid)
 
     def get_latest_signal_price(self, coin: str) -> Optional[float]:
         with self._session() as db:

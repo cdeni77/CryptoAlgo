@@ -6,11 +6,16 @@ services:
     image: postgres:16
     restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: yourpassword
-      POSTGRES_DB: trades_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      # No default. A compose file with a working password in it is a password
+      # in version control, and this one is reachable from the network below.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-trades_db}
     ports:
-      - "5432:5432"
+      # Bound to the loopback interface. Without the 127.0.0.1 prefix Docker
+      # publishes on every interface and punches through the host firewall,
+      # which put the trade database on the local network.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -28,13 +33,22 @@ services:
       context: ./backend/api
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      # Loopback only: the API serves a local dashboard and has one endpoint
+      # that starts a process.
+      - "127.0.0.1:8000:8000"
     environment:
-      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
       - TRADER_DIR=/trader
       - LEDGER_WALLETS_JSON=${LEDGER_WALLETS_JSON:-'[]'}
+      # Shared secret for POST /research/launch, which starts a process in a
+      # container holding the exchange keys. Unset means that route returns 503
+      # — it fails closed rather than running unauthenticated.
+      - API_TOKEN=${API_TOKEN:-}
+      # Comma-separated. `*` is filtered out: it made every other entry
+      # decorative and let any open page call the API with credentials.
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
     depends_on:
       db:
         condition: service_healthy
@@ -51,22 +65,27 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     depends_on:
       - backend
     environment:
-      - VITE_API_BASE_URL=http://backend:8000
+      # The browser makes these requests, not the container, so this has to be
+      # an address the browser can reach. `http://backend:8000` is the
+      # Docker-internal hostname and resolves nowhere outside the compose
+      # network — every API call from the built frontend failed.
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000}
+      - VITE_API_TOKEN=${API_TOKEN:-}
 
   # ===========================================================================
-  # Trader — ML Pipeline (data collection → features → signals)
+  # Trader — the research pipeline (scrape → features → signals), plus retraining
   #
-  # Lifecycle:
-  #   1. On startup: backfill 30 days of OHLCV, funding rates, OI
-  #   2. Compute features from raw data
-  #   3. Every hour: incremental data fetch → recompute features → generate signals
+  # Each cycle, scripts.live_orchestrator runs:
+  #   run_pipeline  →  migrate_to_research_store  →  build_features  →  signals
   #
-  # The scripts.live_orchestrator module handles the full cycle:
-  #   scripts.run_pipeline  →  scripts.compute_features  →  scripts.train_model --signals
+  # Retraining is on its own cadence (RETRAIN_EVERY_DAYS) and goes through
+  # scripts.promote, which installs a candidate only if every promotion gate in
+  # core/metrics.py passes. A blocked candidate leaves the previous model live
+  # and records why in models/promotions/.
   #
   # Configurable via environment variables (see defaults below).
   # ===========================================================================
@@ -84,22 +103,32 @@ services:
 
       # Pipeline database (SQLite inside the container, persisted via volume)
       - TRADER_DB_PATH=/app/data/trading.db
-      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
 
-      # Signal generation parameters (from train_model.py defaults)
-      # SIGNAL_THRESHOLD is intentionally omitted — per-coin profiles define their own thresholds
-      # (SOL=0.57, others=0.52-0.53 from coin_profiles.py). Set this only to override all profiles.
-      - MIN_AUC=0.48
+      # Research store (Parquet + DuckDB), rebuilt from the scraper DB
+      - RESEARCH_STORE=/app/data/research
+
+      # Venue. Coinbase supplies the traded price; the reference venue is a
+      # deeper market used only for basis and lead-lag features.
+      - TRADE_VENUE=coinbase
+      - REFERENCE_VENUE=binance
+
+      # The real CDE fee schedule, resolved by name out of configs/exchange.
+      # Without it every contract is priced at the hardcoded 10bp/side, which is
+      # wrong by 0.06x-2.5x depending on the contract — in both directions, so it
+      # inverts the ranking between coins. `configs/` lives inside
+      # backend/trader precisely so the Docker build context includes it.
+      - COST_CONFIG=coinbase_us_perps_cde_v202602.json
+
       - LEVERAGE=4
-      - PRUNED_ONLY=true
-
-      # Feature engineering
-      - FEATURE_LOOKBACK_DAYS=365            # Use 1 year for feature computation (was 1095)
+      - EQUITY=100000
 
       # Scheduling
       - CYCLE_INTERVAL_SECONDS=3600          # Max cycle interval (fallback)
       - CYCLE_ALIGN_MINUTE=3                 # Run at :03 past every hour (1:03, 2:03, ...)
       - INCREMENTAL_BACKFILL_HOURS=6         # Fetch last 6h of data each cycle
+      - RETRAIN_EVERY_DAYS=7                 # How long a promoted model stays live
+      - WALK_FORWARD_PERIODS=6               # Out-of-sample stretches per evaluation
 
       # Logging
       - LOG_LEVEL=INFO
@@ -145,7 +174,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      - DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@db:5432/trades_db
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
       - TZ=America/New_York
     depends_on:
       db:
@@ -160,15 +189,20 @@ services:
         --max-signal-age-minutes 60
 
   # ===========================================================================
-  # Trader — Backtest mode (run once, then exit)
-  # Uncomment to run a backtest instead of live signals.
+  # Trader — one-off evaluation (runs once, then exits)
+  #
+  # Uncomment to walk-forward backtest a candidate, run the simulation stack and
+  # print the promotion gates without installing anything. Swap the command for
+  # `python -m scripts.promote` to install it if the gates pass, or
+  # `python -m scripts.preflight` to check whether the data can train at all.
   # ===========================================================================
-  # trader-backtest:
+  # trader-evaluate:
   #   build:
   #     context: ./backend/trader
   #     dockerfile: Dockerfile
   #   environment:
   #     - TRADER_DB_PATH=/app/data/trading.db
+  #     - RESEARCH_STORE=/app/data/research
   #     - LOG_LEVEL=INFO
   #   volumes:
   #     - trader_data:/app/data
@@ -176,12 +210,10 @@ services:
   #     - trader_logs:/app/logs
   #     - ./backend/trader:/app
   #   command: >
-  #     python -m scripts.train_model
-  #       --backtest
-  #       --threshold 0.74
-  #       --min-auc 0.54
-  #       --leverage 4
-  #       --exclude BIP,DOP
+  #     python -m scripts.backtest
+  #       --full
+  #       --venue coinbase
+  #       --cost-config coinbase_us_perps_cde_v202602.json
 
 volumes:
   postgres_data:

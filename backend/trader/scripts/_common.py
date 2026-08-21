@@ -8,12 +8,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from core.config import Config
+from core.config import (
+    COST_CONFIG_SEARCH_PATHS,
+    DEFAULT_COST_CONFIG_NAME,
+    Config,
+    find_cost_config,
+)
 from core.dataset import Dataset, load_dataset, report_warnings
 from core.datastore import ResearchStore
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_COST_CONFIG = REPO_ROOT / 'configs/exchange/coinbase_us_perps_cde_v202602.json'
 
 
 def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -28,8 +30,9 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                         choices=['valid', 'suspicious', 'unvalidated', 'all'])
     parser.add_argument('--horizon', type=int, default=None,
                         help='Forecast horizon in hours (default: the profile hold)')
-    parser.add_argument('--cost-config', default=str(DEFAULT_COST_CONFIG),
-                        help="Venue fee schedule. 'none' to use the hardcoded default.")
+    parser.add_argument('--cost-config', default=DEFAULT_COST_CONFIG_NAME,
+                        help="Venue fee schedule: a path, or a filename looked up "
+                             "in configs/exchange. 'none' to use the hardcoded default.")
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
     return parser
 
@@ -45,13 +48,24 @@ def build_config(args: argparse.Namespace) -> Config:
     every Coinbase contract, and the previous system never loaded the file at all.
     """
     config = Config()
-    if args.cost_config and args.cost_config.lower() != 'none':
-        path = Path(args.cost_config)
-        if path.exists():
-            config = config.with_cost_assumptions(path)
-        else:
-            logging.warning('cost config not found: %s', path)
-    return config
+    if not args.cost_config or args.cost_config.lower() == 'none':
+        logging.warning(
+            'no cost config: pricing every contract at the hardcoded %.1fbp/side, '
+            'which is wrong for every Coinbase CDE contract',
+            config.taker_bps,
+        )
+        return config
+
+    path = find_cost_config(args.cost_config)
+    if path is None:
+        logging.error(
+            'cost config not found: %s (searched %s). Falling back to the '
+            'hardcoded default, which misprices every contract.',
+            args.cost_config,
+            ', '.join(str(d) for d in COST_CONFIG_SEARCH_PATHS),
+        )
+        return config
+    return config.with_cost_assumptions(path)
 
 
 def load(args: argparse.Namespace, config: Config) -> Dataset:

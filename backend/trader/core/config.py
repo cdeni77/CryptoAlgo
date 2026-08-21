@@ -29,6 +29,39 @@ FILTER_MODES = ('hard', 'soft', 'off')
 TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
 
 
+# Where a venue fee schedule can be found. Searched in order, because the same
+# code runs from a repo checkout (cwd anywhere) and from the container image
+# (/app), and a single computed relative path got this wrong in the container:
+# `configs/` used to live above the build context, so it was never copied into
+# the image and every containerised run silently priced contracts at the
+# hardcoded 10bp/side.
+COST_CONFIG_SEARCH_PATHS: tuple[Path, ...] = (
+    Path(__file__).resolve().parent.parent / 'configs' / 'exchange',
+    Path('/app/configs/exchange'),
+    Path('configs/exchange'),
+)
+
+DEFAULT_COST_CONFIG_NAME = 'coinbase_us_perps_cde_v202602.json'
+
+
+def find_cost_config(name: str = DEFAULT_COST_CONFIG_NAME) -> Optional[Path]:
+    """Locate a fee schedule by name, or return None.
+
+    An absolute or already-valid relative path is used as given; a bare filename
+    is looked up in the search paths. Returning None rather than raising is
+    deliberate: the caller decides whether a missing schedule is fatal, and it
+    should say so loudly rather than fall through to a default nobody chose.
+    """
+    candidate = Path(name)
+    if candidate.is_absolute() or candidate.exists():
+        return candidate if candidate.exists() else None
+    for directory in COST_CONFIG_SEARCH_PATHS:
+        found = directory / candidate.name
+        if found.exists():
+            return found
+    return None
+
+
 @dataclass
 class Config:
     """Global run settings. Per-coin values live in `core.profiles.CoinProfile`."""

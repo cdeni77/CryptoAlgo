@@ -1,16 +1,5 @@
-"""Script entrypoints for the trader package.
+"""Script entrypoints.
 
-Keep this module side-effect free so `python -m scripts.<name>` only loads
-the target script instead of importing every script dependency.
+Side-effect free on purpose, so `python -m scripts.<name>` loads only what that
+script needs rather than every script's dependencies.
 """
-
-__all__ = [
-    "compute_features",
-    "live_orchestrator",
-    "optimize",
-    "paper_engine",
-    "parallel_launch",
-    "run_pipeline",
-    "train_model",
-    "validate_robustness",
-]

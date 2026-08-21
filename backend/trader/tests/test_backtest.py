@@ -117,7 +117,6 @@ def _features_targets(config, seed_offset: int, **kwargs):
 
 
 @pytest.mark.slow
-@pytest.mark.slow
 def test_walk_forward_finds_no_edge_in_driftless_random_walks(config):
     """There is nothing to find in a driftless random walk except the fee bill.
 
