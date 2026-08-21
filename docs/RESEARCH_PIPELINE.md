@@ -54,18 +54,32 @@ uninterpretable.
 Contract size scales notional linearly, so PnL for AVAX, LINK and LTC is off by
 2x-5x depending on which table the call path happened to read.
 
-### 1.3 Training data is from the wrong venue
+### 1.3 Venues are silently blended
 
-`run_pipeline.py` backfills through `CCXTConnector`, whose `SYMBOL_MAPPING`
-resolves CDE codes to **Binance/Bybit USDT perps** (`BIP -> BTC/USDT:USDT`,
-`defaultType: swap`). Price is a reasonable proxy for BTC/ETH. Funding rate and
-open interest are not — they are venue-specific, and four base features plus the
-entire carry premise are computed from Binance's book while execution happens on
-Coinbase.
+Corrected from an earlier draft of this document, which claimed training ran
+wholly on Binance data. It does not, and the real defect is subtler.
 
-`data_collection/coinbase_connector.py` already implements native candles,
-`/intx/funding-rates`, and a WebSocket order book handler. None of it feeds
-training.
+**Bars** are Coinbase-first: `run_pipeline.py:178` fetches native Coinbase
+candles, and only falls back to `CCXTConnector` when Coinbase returns nothing or
+when there is a pre-history gap of more than 12 hours (`:188`, `:204`). So a
+symbol's history is a *blend* — recent bars from the venue we trade, older bars
+from Binance/Bybit via a symbol map (`BIP -> BTC/USDT:USDT`).
+
+**Funding** is also Coinbase-first, falling back to a `binance_proxy` source,
+and it already records which in `funding_source`.
+
+**Open interest** is CCXT-only. There is no Coinbase-native alternative: the REST
+client implements candles, tickers and `/intx/funding-rates`, but no
+open-interest endpoint.
+
+The problem is that the `ohlcv` table had **no venue column**, so the boundary
+between the instrument and its proxy was unrecoverable. A model trained across
+that seam is trained on two different books' microstructure — different tick
+size, different liquidity, different funding mechanics — with no way to tell
+where one ends.
+
+*Fixed:* bars now carry `venue`, recorded per row from the fetch path that
+produced them, and the research store keys on it.
 
 ### 1.4 Three drifted copies of the signal decision
 
@@ -89,7 +103,28 @@ structural cause of "training didn't align to paper trading."
 Per-coin models cannot be rescued at this sample size. The fix is structural
 (see 3.4), not a better estimator.
 
-### 1.6 XLM trains on none of its intended features
+### 1.6 Two of three datasets skipped validation
+
+`DataValidator` implements `validate_ohlcv`, `validate_funding_rate` and
+`validate_open_interest`. Only the first was reachable: OHLCV went through the
+async `DataPipeline`, which validates, while `run_pipeline`'s
+`backfill_funding_rates` and `backfill_open_interest` inserted directly.
+
+`validate_open_interest` had **zero callers**, and open-interest records were
+constructed with `quality=DataQuality.VALID` written in by hand — the column
+asserted the data had been checked when nothing had checked it.
+
+Compounding it, `quality` defaulted to `VALID` on every record type, so an
+unvalidated row was indistinguishable from a verified one.
+
+*Fixed:* `data_collection/ingest.py` is now the only path into storage and the
+only place that sets `quality`; `UNVALIDATED` is the default, so a bypass is
+visible in the data (`SELECT COUNT(*) ... WHERE quality = 'unvalidated'`). The
+flag survives into the research store, whose reads exclude flagged rows unless
+asked — a 50%-per-hour funding rate is stored as suspicious rather than dropped,
+and it has no business reaching the carry features.
+
+### 1.7 XLM trains on none of its intended features
 
 `COIN_FEATURE_MAP` maps XLM to `XRPFlowMicrostructureFeatures`, which emits
 `xrp_*` column names, while the XLM profile asks for `xlm_*`. All six archetype

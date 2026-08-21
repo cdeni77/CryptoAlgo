@@ -41,8 +41,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data_collection.coinbase_connector import CoinbaseRESTClient
 from data_collection.pipeline import create_pipeline, PipelineConfig, ensure_naive_utc
-from data_collection.models import OHLCVBar, TickerUpdate, FundingRate, OpenInterest, DataQuality
+from data_collection.models import OHLCVBar, TickerUpdate, FundingRate, OpenInterest
 from data_collection.ccxt_connector import CCXTConnector
+from data_collection.ingest import Ingestor
 from data_collection.storage import SQLiteDatabase
 
 # Configuration
@@ -280,6 +281,8 @@ async def backfill_funding_rates(
     print(f"Symbols: {symbols}")
     print()
 
+    ingestor = Ingestor(db)
+
     connector = CCXTConnector(
         exchanges=["binance", "okx", "bybit"],
         proxy=proxy,
@@ -344,7 +347,8 @@ async def backfill_funding_rates(
                     source_used = "binance_proxy"
 
                 if rates:
-                    inserted = db.insert_funding_rate_batch(rates)
+                    outcome = ingestor.ingest_funding(rates, venue=source_used)
+                    inserted = outcome.inserted
                     symbol_inserted += inserted
                     source_metrics[symbol][source_used] += inserted
                     source_metrics[symbol]["start"] = win_start if source_metrics[symbol]["start"] is None else min(source_metrics[symbol]["start"], win_start)
@@ -403,17 +407,25 @@ async def backfill_open_interest(
     print(f"Symbols: {symbols}")
     print()
     
-    # Initialize CCXT connector
+    ingestor = Ingestor(db)
+
+    # Open interest has no Coinbase-native source: the REST client implements
+    # candles, tickers and /intx/funding-rates but no open-interest endpoint.
+    # These figures therefore describe a different venue's book than the one we
+    # trade, which is why the venue is recorded rather than left implicit.
     connector = CCXTConnector(
         exchanges=["bybit", "okx", "binance"],
         proxy=proxy,
         use_fallbacks=True,
     )
-    
+    oi_venue = "ccxt_proxy"
+
     try:
         await connector.initialize()
-        
+
         available_exchanges = connector.get_available_exchanges()
+        if available_exchanges:
+            oi_venue = available_exchanges[0]
         if not available_exchanges:
             logger.error("No exchanges available for OI! Check network/proxy.")
             return
@@ -477,12 +489,13 @@ async def backfill_open_interest(
                         event_time = datetime.fromtimestamp(entry['timestamp'] / 1000).replace(tzinfo=None)
                         contracts = float(entry.get('openInterestAmount') or entry.get('baseVolume') or 0)
                         value = float(entry.get('openInterestValue') or entry.get('quoteVolume') or 0)
+                        # Quality is deliberately left at its UNVALIDATED
+                        # default; the ingestor sets it from the validator.
                         oi = OpenInterest(
                             symbol=symbol, event_time=event_time,
                             available_time=event_time + timedelta(seconds=5),
                             open_interest_contracts=contracts,
                             open_interest_usd=value,
-                            quality=DataQuality.VALID,
                         )
                         oi_list.append(oi)
                     except Exception as e:
@@ -490,9 +503,9 @@ async def backfill_open_interest(
                 
                 if oi_list:
                     try:
-                        inserted = db.insert_open_interest_batch(oi_list)
-                        total_inserted += inserted
-                        logger.info(f"  ✓ Inserted {inserted} OI records")
+                        outcome = ingestor.ingest_open_interest(oi_list, venue=oi_venue)
+                        total_inserted += outcome.inserted
+                        logger.info(f"  ✓ Open interest: {outcome}")
                     except Exception as e:
                         logger.error(f"Failed to insert OI batch: {e}")
             

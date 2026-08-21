@@ -22,7 +22,15 @@ class Side(Enum):
 
 
 class DataQuality(Enum):
-    """Data quality flags."""
+    """Data quality flags.
+
+    UNVALIDATED is the default on every record so that data which skipped
+    validation stays distinguishable from data that was checked and passed.
+    Defaulting to VALID made the two identical, which is how open interest ended
+    up stamped 'valid' by a path that never validated it. Any row still marked
+    UNVALIDATED after ingest is a bypass, and can be found with a query.
+    """
+    UNVALIDATED = "unvalidated"  # Never checked — treat as unknown
     VALID = "valid"
     SUSPICIOUS = "suspicious"  # Flagged but usable
     INVALID = "invalid"  # Should be excluded
@@ -70,9 +78,14 @@ class OHLCVBar(BiTemporalMixin):
     
     # Number of trades in this bar
     trade_count: Optional[int] = None
+
+    # Which exchange produced this bar. The backfill tries Coinbase first and
+    # fills gaps from CCXT, so one symbol's history is a blend of venues with
+    # different microstructure. Without this, the boundary is invisible.
+    venue: str = 'unknown'
     
     # Data quality
-    quality: DataQuality = DataQuality.VALID
+    quality: DataQuality = DataQuality.UNVALIDATED
     quality_notes: Optional[str] = None
     
     # Unique identifier for deduplication
@@ -127,7 +140,7 @@ class Trade(BiTemporalMixin):
     side: Side
     
     # Quality
-    quality: DataQuality = DataQuality.VALID
+    quality: DataQuality = DataQuality.UNVALIDATED
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -170,7 +183,7 @@ class FundingRate(BiTemporalMixin):
     funding_source: str = "coinbase"  # coinbase | binance_proxy
 
     # Quality
-    quality: DataQuality = DataQuality.VALID
+    quality: DataQuality = DataQuality.UNVALIDATED
     
     @property
     def rate_bps(self) -> float:
@@ -229,7 +242,7 @@ class OpenInterest(BiTemporalMixin):
     open_interest_usd: Optional[float] = None
     
     # Quality
-    quality: DataQuality = DataQuality.VALID
+    quality: DataQuality = DataQuality.UNVALIDATED
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -269,7 +282,7 @@ class OrderBookSnapshot(BiTemporalMixin):
     asks: List[OrderBookLevel]
     
     # Quality
-    quality: DataQuality = DataQuality.VALID
+    quality: DataQuality = DataQuality.UNVALIDATED
     
     @property
     def best_bid(self) -> Optional[float]:

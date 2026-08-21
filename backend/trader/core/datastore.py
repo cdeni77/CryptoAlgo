@@ -44,22 +44,30 @@ DEFAULT_ROOT = Path(os.getenv('RESEARCH_STORE', 'data/research'))
 # are required everywhere — they are what makes a point-in-time read possible.
 SCHEMAS: dict[str, tuple[str, ...]] = {
     'bars': (
-        'venue', 'symbol', 'event_time', 'available_time',
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
     ),
     'funding': (
-        'venue', 'symbol', 'event_time', 'available_time',
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'rate', 'mark_price', 'index_price', 'interval_hours', 'is_settlement',
     ),
     'open_interest': (
-        'venue', 'symbol', 'event_time', 'available_time',
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'oi_contracts', 'oi_base', 'oi_usd',
     ),
     'book_snapshots': (
-        'venue', 'symbol', 'event_time', 'available_time',
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'bid', 'ask', 'bid_size', 'ask_size', 'depth_1pct_bid', 'depth_1pct_ask',
     ),
 }
+
+# Ordered worst to best. `data_collection.ingest` stamps these from the
+# validator; carrying them through means a feature build can exclude flagged
+# data instead of silently averaging it in. A 50%-per-hour funding rate is
+# stored as SUSPICIOUS rather than dropped, and it has no business reaching the
+# carry features.
+QUALITY_LEVELS = ('invalid', 'unvalidated', 'suspicious', 'valid')
+DEFAULT_MIN_QUALITY = 'valid'
 
 TIME_COLUMNS = ('event_time', 'available_time')
 
@@ -161,6 +169,11 @@ class ResearchStore:
         if 'available_time' not in out.columns:
             out['available_time'] = out['event_time']
 
+        # An unstamped row is unvalidated by definition, never valid by default.
+        if 'quality' not in out.columns:
+            out['quality'] = 'unvalidated'
+        out['quality'] = out['quality'].fillna('unvalidated').astype(str).str.lower()
+
         for col in columns:
             if col not in out.columns:
                 out[col] = pd.NA
@@ -198,6 +211,7 @@ class ResearchStore:
         end: pd.Timestamp | str | None = None,
         as_of: pd.Timestamp | str | None = None,
         columns: Sequence[str] | None = None,
+        min_quality: str | None = DEFAULT_MIN_QUALITY,
     ) -> pd.DataFrame:
         """Read a dataset as of a point in time.
 
@@ -207,6 +221,9 @@ class ResearchStore:
         which is right for feature research and never right for a backtest.
 
         One row per `(venue, symbol, event_time)` comes back either way.
+
+        `min_quality` defaults to 'valid', so flagged data is excluded unless
+        asked for. Pass a lower level to include it, or None for everything.
         """
         if dataset not in SCHEMAS:
             raise DataStoreError(f"Unknown dataset {dataset!r}")
@@ -235,6 +252,14 @@ class ResearchStore:
         if as_of is not None:
             clauses.append('available_time <= ?')
             params.append(pd.Timestamp(as_of, tz='UTC'))
+        if min_quality is not None:
+            if min_quality not in QUALITY_LEVELS:
+                raise DataStoreError(
+                    f"Unknown quality {min_quality!r}; expected one of {QUALITY_LEVELS}"
+                )
+            acceptable = QUALITY_LEVELS[QUALITY_LEVELS.index(min_quality):]
+            clauses.append(f"quality IN ({', '.join('?' for _ in acceptable)})")
+            params.extend(acceptable)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
         # Rank revisions per event and keep the newest one still visible at
@@ -261,6 +286,7 @@ class ResearchStore:
         start: pd.Timestamp | str | None = None,
         end: pd.Timestamp | str | None = None,
         as_of: pd.Timestamp | str | None = None,
+        min_quality: str | None = DEFAULT_MIN_QUALITY,
     ) -> pd.DataFrame:
         """One field for many symbols as a time x symbol frame.
 
@@ -269,7 +295,7 @@ class ResearchStore:
         """
         long = self.read(
             'bars', venue=venue, symbols=symbols, start=start, end=end, as_of=as_of,
-            columns=('symbol', 'event_time', field),
+            columns=('symbol', 'event_time', field), min_quality=min_quality,
         )
         if long.empty:
             return pd.DataFrame()
@@ -283,7 +309,9 @@ class ResearchStore:
         This is what answers "do I actually have Coinbase history for this
         contract, or have I been training on a proxy".
         """
-        frame = self.read(dataset, columns=('venue', 'symbol', 'event_time'))
+        frame = self.read(
+            dataset, columns=('venue', 'symbol', 'event_time'), min_quality=None
+        )
         if frame.empty:
             return pd.DataFrame(columns=['venue', 'symbol', 'rows', 'start', 'end', 'days'])
         grouped = frame.groupby(['venue', 'symbol'])['event_time']
@@ -375,31 +403,43 @@ def from_sqlite(
             params.extend(syms)
 
         bars = pd.read_sql_query(
-            "SELECT symbol, event_time, available_time, open, high, low, close, "
-            "volume, quote_volume, trade_count FROM ohlcv "
+            "SELECT symbol, event_time, available_time, quality, open, high, low, "
+            "close, volume, quote_volume, trade_count, "
+            "COALESCE(venue, 'unknown') AS row_venue FROM ohlcv "
             f"WHERE timeframe = ?{filt}",
             con, params=params,
         )
         if not bars.empty:
-            bars['venue'] = venue
+            # Prefer the venue recorded per row; fall back to the caller's label
+            # for rows written before the column existed.
+            bars['venue'] = bars['row_venue'].where(
+                bars['row_venue'] != 'unknown', venue
+            )
+            bars = bars.drop(columns=['row_venue'])
             counts['bars'] = store.write('bars', bars)
 
         funding = pd.read_sql_query(
-            "SELECT symbol, event_time, available_time, rate, mark_price, "
-            "index_price, is_settlement FROM funding_rates", con,
+            "SELECT symbol, event_time, available_time, quality, rate, mark_price, "
+            "index_price, is_settlement, "
+            "COALESCE(funding_source, 'unknown') AS row_venue FROM funding_rates", con,
         )
         if not funding.empty:
-            funding['venue'] = venue
+            funding['venue'] = funding['row_venue'].where(
+                funding['row_venue'] != 'unknown', venue
+            )
+            funding = funding.drop(columns=['row_venue'])
             funding['interval_hours'] = 1
             counts['funding'] = store.write('funding', funding)
 
         oi = pd.read_sql_query(
-            "SELECT symbol, event_time, available_time, "
+            "SELECT symbol, event_time, available_time, quality, "
             "open_interest_contracts AS oi_contracts, open_interest_base AS oi_base, "
-            "open_interest_usd AS oi_usd FROM open_interest", con,
+            "open_interest_usd AS oi_usd, "
+            "COALESCE(source, 'unknown') AS row_venue FROM open_interest", con,
         )
         if not oi.empty:
-            oi['venue'] = venue
+            oi['venue'] = oi['row_venue'].where(oi['row_venue'] != 'unknown', venue)
+            oi = oi.drop(columns=['row_venue'])
             counts['open_interest'] = store.write('open_interest', oi)
     finally:
         con.close()

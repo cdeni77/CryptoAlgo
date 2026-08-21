@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from .models import OHLCVBar, FundingRate, TickerUpdate, DataQuality, OrderBookSnapshot
 from .validator import DataValidator, ValidationConfig, DataQualityTracker
 from .queue import MessageQueueBase, InMemoryQueue, Channels, QueueMessage
+from .ingest import Ingestor
 from .storage import DatabaseBase, SQLiteDatabase, create_database
 from .coinbase_connector import CoinbaseRESTClient, CoinbaseWebSocketClient
 from .ccxt_connector import CCXTConnector
@@ -62,6 +63,9 @@ class DataPipeline:
         self._database: Optional[DatabaseBase] = None
         self._validator: DataValidator = DataValidator(config.validation_config)
         self._quality_tracker: DataQualityTracker = DataQualityTracker()
+        # Storage goes through the ingestor so validation and quality-stamping
+        # happen in exactly one place, shared with run_pipeline's backfills.
+        self._ingestor: Optional[Ingestor] = None
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self._last_ohlcv_times: Dict[str, Dict[str, datetime]] = {}
@@ -185,27 +189,42 @@ class DataPipeline:
         }
         return mapping.get(granularity.lower(), 3600)
 
+    def _ingest(self) -> Ingestor:
+        """The one door into storage, sharing this run's validator and tracker."""
+        if self._ingestor is None or self._ingestor.database is not self._database:
+            self._ingestor = Ingestor(
+                self._database, validator=self._validator, tracker=self._quality_tracker
+            )
+        return self._ingestor
+
+    def _venue_name(self, use_ccxt: bool) -> str:
+        """Which exchange a fetch will come from.
+
+        Recorded on every bar because the backfill deliberately blends venues:
+        Coinbase first, CCXT filling any pre-history gap. Without this the
+        boundary between the instrument we trade and a proxy for it is invisible
+        in the stored series.
+        """
+        if not use_ccxt:
+            return 'coinbase'
+        available = self._ccxt_connector.get_available_exchanges() if self._ccxt_connector else []
+        return available[0] if available else 'ccxt_proxy'
+
     async def _fetch_bars(self, symbol, timeframe, start_dt, end_dt, use_ccxt):
         if use_ccxt:
             return await self._ccxt_connector.fetch_ohlcv(symbol=symbol, timeframe=timeframe, start=start_dt, end=end_dt)
         else:
             return await self._rest_client.get_candles_range(product_id=symbol, granularity=timeframe, start=start_dt, end=end_dt)
 
-    def _process_and_insert_bars(self, bars, symbol, timeframe):
+    def _process_and_insert_bars(self, bars, symbol, timeframe, venue: str = 'unknown'):
         if not bars:
             return 0
-        valid_bars = []
-        prev_bar = None
-        for bar in bars:
-            result = self._validator.validate_ohlcv(bar, prev_bar)
-            self._quality_tracker.record_validation(result)
-            if result.is_valid or result.quality == DataQuality.SUSPICIOUS:
-                valid_bars.append(bar)
-            prev_bar = bar
+        outcome = self._ingest().ingest_bars(bars, venue=venue)
+        valid_bars = outcome.stored
         if not valid_bars:
             return 0
-        inserted = self._database.insert_ohlcv_batch(valid_bars)
-        logger.info(f"Backfilled {inserted}/{len(bars)} bars for {symbol} {timeframe}")
+        inserted = outcome.inserted
+        logger.info(f"Backfilled {inserted}/{len(bars)} bars for {symbol} {timeframe} from {venue}")
         first_event = ensure_naive_utc(valid_bars[0].event_time)
         last_event = ensure_naive_utc(valid_bars[-1].event_time)
         current_last = self._last_ohlcv_times.get(symbol, {}).get(timeframe)
@@ -242,7 +261,7 @@ class DataPipeline:
                         logger.info(f"Prepending {symbol} {timeframe} from {prepend_start} to {prepend_end}")
                         try:
                             bars = await self._fetch_bars(symbol, timeframe, prepend_start, prepend_end, use_ccxt)
-                            inserted = self._process_and_insert_bars(bars, symbol, timeframe)
+                            inserted = self._process_and_insert_bars(bars, symbol, timeframe, self._venue_name(use_ccxt))
                             if inserted:
                                 fetched_any = True
                         except Exception as e:
@@ -256,7 +275,7 @@ class DataPipeline:
                     logger.info(f"Appending {symbol} {timeframe} from {append_start} to {end}")
                     try:
                         bars = await self._fetch_bars(symbol, timeframe, append_start, end, use_ccxt)
-                        inserted = self._process_and_insert_bars(bars, symbol, timeframe)
+                        inserted = self._process_and_insert_bars(bars, symbol, timeframe, self._venue_name(use_ccxt))
                         if inserted:
                             fetched_any = True
                     except Exception as e:
@@ -351,10 +370,8 @@ class DataPipeline:
                 ohlcv_messages = await self._queue.get_batch(Channels.RAW_OHLCV, max_messages=100, timeout_ms=100)
                 for msg in ohlcv_messages:
                     bar = OHLCVBar.from_dict(msg.data)
-                    result = self._validator.validate_ohlcv(bar, None)
-                    self._quality_tracker.record_validation(result)
-                    if result.is_valid or result.quality == DataQuality.SUSPICIOUS:
-                        self._database.insert_ohlcv(bar)
+                    outcome = self._ingest().ingest_bars([bar], venue=bar.venue or 'unknown')
+                    if outcome.stored:
                         await self._queue.publish(Channels.VALIDATED_OHLCV, bar.to_dict())
                         self._last_ohlcv_times.setdefault(bar.symbol, {})[bar.timeframe] = ensure_naive_utc(bar.event_time)
                 funding_messages = await self._queue.get_batch(Channels.RAW_FUNDING, max_messages=100, timeout_ms=100)
@@ -367,9 +384,10 @@ class DataPipeline:
                         mark_price=float(msg.data["mark_price"]),
                         index_price=float(msg.data["index_price"]),
                     )
-                    result = self._validator.validate_funding_rate(funding)
-                    if result.is_valid or result.quality == DataQuality.SUSPICIOUS:
-                        self._database.insert_funding_rate(funding)
+                    outcome = self._ingest().ingest_funding(
+                        [funding], venue=getattr(funding, 'funding_source', 'coinbase')
+                    )
+                    if outcome.stored:
                         await self._queue.publish(Channels.VALIDATED_FUNDING, funding.to_dict())
                 await asyncio.sleep(0.01)
             except asyncio.CancelledError:

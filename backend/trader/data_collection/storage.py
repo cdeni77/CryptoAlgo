@@ -121,6 +121,7 @@ class SQLiteDatabase(DatabaseBase):
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
                     timeframe TEXT NOT NULL,
+                    venue TEXT DEFAULT 'unknown',
                     event_time TIMESTAMP NOT NULL,
                     available_time TIMESTAMP NOT NULL,
                     open REAL NOT NULL,
@@ -166,7 +167,15 @@ class SQLiteDatabase(DatabaseBase):
                 )
             """)
 
-            # Lightweight migration for existing DBs
+            # Lightweight migration for existing DBs.
+            # Pre-existing bars keep 'unknown': the backfill tried Coinbase first
+            # and filled gaps from CCXT (which itself falls back across six
+            # exchanges), so the true origin of historical rows is not recoverable.
+            cursor.execute("PRAGMA table_info(ohlcv)")
+            ohlcv_columns = {row[1] for row in cursor.fetchall()}
+            if "venue" not in ohlcv_columns:
+                cursor.execute("ALTER TABLE ohlcv ADD COLUMN venue TEXT DEFAULT 'unknown'")
+
             cursor.execute("PRAGMA table_info(funding_rates)")
             funding_columns = {row[1] for row in cursor.fetchall()}
             if "funding_source" not in funding_columns:
@@ -209,13 +218,14 @@ class SQLiteDatabase(DatabaseBase):
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT OR REPLACE INTO ohlcv 
-                    (symbol, timeframe, event_time, available_time, 
-                     open, high, low, close, volume, quote_volume, 
+                    (symbol, timeframe, venue, event_time, available_time,
+                     open, high, low, close, volume, quote_volume,
                      trade_count, quality, quality_notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     bar.symbol,
                     bar.timeframe,
+                    bar.venue,
                     bar.event_time,
                     bar.available_time,
                     bar.open,
@@ -247,13 +257,14 @@ class SQLiteDatabase(DatabaseBase):
                 try:
                     cursor.execute("""
                         INSERT OR REPLACE INTO ohlcv 
-                        (symbol, timeframe, event_time, available_time, 
-                         open, high, low, close, volume, quote_volume, 
+                        (symbol, timeframe, venue, event_time, available_time,
+                         open, high, low, close, volume, quote_volume,
                          trade_count, quality, quality_notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         bar.symbol,
                         bar.timeframe,
+                        bar.venue,
                         bar.event_time,
                         bar.available_time,
                         bar.open,
