@@ -380,3 +380,39 @@ def test_preprocessor_is_a_noop_without_factories():
 
     pd.testing.assert_frame_equal(scaled_train, train)
     pd.testing.assert_frame_equal(scaled_test, test)
+
+
+def test_the_reported_head_ic_is_a_holdout_measurement():
+    """A validation IC labelled "in-sample" inverts what it tells you.
+
+    `train_forecast_model` fits on `x_train` and measures every head's `ic` on
+    `x_val` — the chronological, horizon-purged holdout. preflight printed that as
+    "in-sample IC", so a price IC of +0.004 read as "the model cannot fit its own
+    training data, something is broken" rather than "this generalises to no
+    directional edge". The second is a finding; the first sends you looking for a
+    bug that is not there.
+
+    Pinned two ways: the metric must come from the holdout, and no surface may
+    call it in-sample.
+    """
+    import inspect
+    from pathlib import Path
+
+    from core import model as model_module
+
+    source = inspect.getsource(model_module.train_forecast_model)
+    # The forecast the IC is computed from must be predicted on the validation
+    # split, not the training one.
+    assert "model.predict(x_val)" in source, (
+        'the head IC is no longer measured on the holdout; any surface calling it '
+        'a holdout measurement is now lying'
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in list(root.rglob('*.py')) + list(root.rglob('*.md')):
+        if '__pycache__' in path.parts or path.name == Path(__file__).name:
+            continue
+        if 'in-sample IC' in path.read_text():
+            offenders.append(str(path.relative_to(root)))
+    assert not offenders, f'holdout IC described as in-sample in: {offenders}'

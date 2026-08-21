@@ -381,7 +381,14 @@ def _model_trains(dataset, config: Config, as_of: Optional[str]) -> Check:
     detail = (
         f'{len(model.heads)} heads on {model.train_rows:,} rows '
         f'({model.effective_observations:.0f} effective)'
-        + (f' | in-sample IC {heads}' if heads else '')
+        # Not in-sample. `train_forecast_model` measures every head's IC on
+        # `x_val` — the chronologically split, horizon-purged holdout — so calling
+        # it in-sample invites exactly the wrong conclusion: a price IC of +0.004
+        # reads as "the model cannot even fit its training data, something is
+        # broken" when it actually means "this generalises to no directional
+        # edge", which is a finding rather than a fault. The dispersion head on
+        # the same split reaches +0.26, which settles that the fit works.
+        + (f' | holdout IC {heads}' if heads else '')
     )
     if model.uses_symbol_identity:
         return Check(
