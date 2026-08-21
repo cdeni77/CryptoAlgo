@@ -502,3 +502,40 @@ def test_the_spot_universe_covers_every_contract_once():
     # The meme contracts are keyed 1000PEPE/1000SHIB but spot is plain.
     assert 'PEPE-USD' in products and 'SHIB-USD' in products
     assert not any('1000' in p for p in products), products
+
+
+def test_every_modelled_contract_has_an_explicit_fee_floor():
+    """A missing floor silently charges the BTC/ETH rate to everything.
+
+    `fee_floor` falls back to `config.min_fee_per_contract`, which the CDE
+    schedule sets to 0.75 — the group-A rate for BIP and ETP. Every other
+    contract is 0.10. Seven of the eighteen (BCP, NER, SUP, XLP, POP, SHP, PEP)
+    were never listed, so they were priced 7.5x too expensive.
+
+    That is not a rounding error. SHIB's round trip read 287bp instead of 42bp,
+    DOT 172 instead of 26, and the cost enters the *target* through
+    `core/targets.py` as well as the hurdle `decide()` compares against — so
+    those instruments looked untradeable, and the cross-sectional cost features
+    ranked them against the others on a fiction.
+
+    `load_dataset` warns about this, and a warning was not enough: it fires on a
+    run nobody is reading closely, and the number it protects is money.
+    """
+    from core.config import Config, find_cost_config
+    from core.costs import symbols_missing_fee_schedule
+    from core.profiles import COIN_PROFILES
+
+    path = find_cost_config()
+    if path is None:
+        pytest.skip('no cost config on the search path')
+    config = Config().with_cost_assumptions(path)
+
+    # Every spelling a profile answers to, since that is what callers pass.
+    codes = sorted({p for profile in COIN_PROFILES.values() for p in profile.prefixes})
+    missing = symbols_missing_fee_schedule(codes, config)
+
+    assert not missing, (
+        f'no explicit per-contract fee for {missing}. They fall back to '
+        f'${config.min_fee_per_contract:.2f}/contract, the group-A rate, which '
+        f'overstates their round trip several-fold.'
+    )
