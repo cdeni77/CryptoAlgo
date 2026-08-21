@@ -181,6 +181,8 @@ class CoinbaseRESTClient:
             end = end.replace(tzinfo=timezone.utc)
         all_bars = []
         current_start = start
+        retried_window = False
+        skipped_windows: List[tuple] = []
         tf_seconds = self._granularity_to_seconds(granularity)
         batch_duration = tf_seconds * 300
         while current_start < end:
@@ -192,10 +194,32 @@ class CoinbaseRESTClient:
                 all_bars.extend(bars)
                 last_time = bars[-1].event_time.replace(tzinfo=timezone.utc) if bars[-1].event_time.tzinfo is None else bars[-1].event_time
                 next_start = last_time + timedelta(seconds=tf_seconds)
+                retried_window = False
                 current_start = max(next_start, current_start + timedelta(seconds=tf_seconds))
             else:
+                # `get_candles` returns [] for both "no data in this window" and
+                # "the request failed", and advancing past a failure silently
+                # drops 300 bars. Retry once, then record the gap rather than
+                # stepping over it as though the market had been quiet.
+                if not retried_window:
+                    retried_window = True
+                    logger.warning(
+                        'empty candle batch for %s %s..%s: retrying once',
+                        product_id, current_start, batch_end,
+                    )
+                    continue
+                skipped_windows.append((current_start, batch_end))
+                retried_window = False
                 current_start = batch_end
             await asyncio.sleep(0.1)
+        if skipped_windows:
+            logger.error(
+                '%s %s: %d window(s) still empty after a retry and missing from '
+                'the history: %s',
+                product_id, granularity, len(skipped_windows),
+                ', '.join(f'{a:%Y-%m-%d %H:%M}..{b:%Y-%m-%d %H:%M}'
+                          for a, b in skipped_windows[:5]),
+            )
         unique = {b.event_time: b for b in all_bars}
         return sorted(unique.values(), key=lambda x: x.event_time)
     

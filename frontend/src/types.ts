@@ -8,7 +8,6 @@ export const ALL_COINS: CoinSymbol[] = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVA
 
 export type PriceData = Record<CoinSymbol, PriceInfo>;
 
-export type DataSource = 'spot' | 'cde';
 
 export interface HistoryEntry {
   timestamp: string;
@@ -45,24 +44,6 @@ export interface CDESpecs {
   fees: CDEFeeSchedule | Record<string, never>;
 }
 
-export interface Trade {
-  id: number;
-  coin: string;
-  datetime_open: string;
-  datetime_close: string | null;
-  side: 'long' | 'short';
-  contracts: number;
-  entry_price: number;
-  exit_price: number | null;
-  fee_open: number | null;
-  fee_close: number | null;
-  net_pnl: number | null;
-  margin_used: number | null;
-  leverage: number | null;
-  reason_entry: string | null;
-  reason_exit: string | null;
-  status: 'open' | 'closed';
-}
 
 export interface Signal {
   id: number;
@@ -173,14 +154,6 @@ export interface PaperEquityPoint {
   open_positions: number;
 }
 
-export interface ChartMarker {
-  coin: string;
-  side: 'long' | 'short';
-  price: number;
-  timestamp: string;
-  contracts: number;
-  kind: 'entry' | 'exit';
-}
 
 /**
  * Research types, rewritten to match what the model produces.
@@ -254,10 +227,6 @@ export interface ResearchSummary {
   coins: ResearchCoinHealth[];
 }
 
-export interface ResearchCoinDetail {
-  generated_at: string;
-  coin: ResearchCoinHealth;
-}
 
 export interface ResearchRun {
   id: string;
@@ -443,9 +412,6 @@ export interface ResearchScriptListResponse {
   scripts: ResearchScriptInfo[];
 }
 
-export interface ResearchJobLaunchRequest {
-  args: string[];
-}
 
 export interface ResearchJobLaunchResponse {
   job: string;

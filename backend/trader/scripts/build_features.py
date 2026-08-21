@@ -84,13 +84,19 @@ def main() -> int:
     from scripts._common import add_data_arguments, build_config, configure_logging, require_data
 
     parser = add_data_arguments(argparse.ArgumentParser(description=__doc__))
-    parser.add_argument('--groups', default=None,
-                        help=f"Comma-separated subset of: {', '.join(g.name for g in GROUPS)}")
     parser.add_argument('--name', default='panel', help='Feature matrix name')
     parser.add_argument('--list', action='store_true', help='Print the feature set and exit')
     parser.add_argument('--dry-run', action='store_true', help='Build and report without writing')
     args = parser.parse_args()
     configure_logging(args.log_level)
+
+    # `--groups` used to be declared here and never read, so a "restricted" build
+    # produced the full panel and recorded itself as complete. It is gone rather
+    # than wired: the panel comes from `core.dataset.load_dataset`, the one place
+    # that turns "which venue, which symbols, as of when" into features, and a
+    # subset panel built here would be a different feature set from the one
+    # training and signals expect. `--list` prints the groups; that is the use
+    # the flag was reaching for.
 
     if args.list:
         for group in GROUPS:

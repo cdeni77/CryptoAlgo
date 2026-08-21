@@ -12,7 +12,7 @@ import pandas as pd
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
@@ -622,94 +622,221 @@ class SQLiteDatabase(DatabaseBase):
             
             return df
     
-    def get_latest_ohlcv_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
-        """Get the most recent OHLCV event time for a symbol."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT MAX(event_time) as max_time
-                FROM ohlcv
-                WHERE symbol = ? AND timeframe = ?
-            """, (symbol, timeframe))
-            
-            result = cursor.fetchone()
-            if result and result["max_time"]:
-                return datetime.fromisoformat(result["max_time"])
-            return None
-    
-    def get_earliest_ohlcv_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
-        """Get the earliest OHLCV event time for a symbol."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT MIN(event_time) as min_time
-                FROM ohlcv
-                WHERE symbol = ? AND timeframe = ?
-            """, (symbol, timeframe))
-            
-            result = cursor.fetchone()
-            if result and result["min_time"]:
-                return datetime.fromisoformat(result["min_time"])
-            return None
-    
-    def get_latest_funding_time(self, symbol: str) -> Optional[datetime]:
-        """Get the most recent funding rate time for a symbol."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT MAX(event_time) as max_time
-                FROM funding_rates
-                WHERE symbol = ?
-            """, (symbol,))
-            
-            result = cursor.fetchone()
-            if result and result["max_time"]:
-                return datetime.fromisoformat(result["max_time"])
-            return None
-    
-    def get_earliest_funding_time(self, symbol: str) -> Optional[datetime]:
-        """Get the earliest funding rate time for a symbol."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT MIN(event_time) as min_time
-                FROM funding_rates
-                WHERE symbol = ?
-            """, (symbol,))
-            
-            result = cursor.fetchone()
-            if result and result["min_time"]:
-                return datetime.fromisoformat(result["min_time"])
-            return None
-        
-    def get_latest_oi_time(self, symbol: str) -> Optional[datetime]:
-        """Get the most recent open interest event time for a symbol."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT MAX(event_time) as max_time
-                FROM open_interest
-                WHERE symbol = ?
-            """, (symbol,))
-            result = cursor.fetchone()
-            if result and result["max_time"]:
-                return datetime.fromisoformat(result["max_time"])
-            return None
+    def find_gaps(
+        self,
+        table: str,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        step_seconds: int,
+        venue: Optional[str] = None,
+        timeframe: Optional[str] = None,
+    ) -> list[tuple[datetime, datetime]]:
+        """Windows inside [start, end) with no rows, including interior holes.
 
-    def get_earliest_oi_time(self, symbol: str) -> Optional[datetime]:
-        """Get the earliest open interest event time for a symbol."""
+        The backfill only ever built `(start, existing_start)` and
+        `(existing_end, end)` from MIN and MAX, so any hole between them was
+        permanently bracketed and invisible — a failed request mid-history stayed
+        a hole for the life of the store, and the features computed straight
+        across it.
+        """
+        allowed = {'ohlcv', 'funding_rates', 'open_interest'}
+        if table not in allowed:
+            raise ValueError(f'unknown table {table!r}')
+
+        sql = f"SELECT event_time FROM {table} WHERE symbol = ?"
+        params: list = [symbol]
+        if timeframe is not None and table == 'ohlcv':
+            sql += " AND timeframe = ?"
+            params.append(timeframe)
+        if venue is not None:
+            sql += " AND venue = ?"
+            params.append(venue)
+        sql += " AND event_time >= ? AND event_time < ? ORDER BY event_time"
+        # Bind the datetime, not an isoformat string: rows are stored through the
+        # sqlite3 adapter as 'YYYY-MM-DD HH:MM:SS', and comparing that text
+        # against an isoformat 'T' separator is a lexicographic mismatch that
+        # silently matches nothing. Every other bounded query here binds the
+        # object for the same reason.
+        params += [start, end]
+
+        with self._get_connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        step = timedelta(seconds=step_seconds)
+        # A gap opens when consecutive rows are more than one step apart.
+        tolerance = step * 1.5
+        gaps: list[tuple[datetime, datetime]] = []
+        cursor = start
+        for row in rows:
+            raw = row['event_time']
+            # SQLite hands back either a str or a datetime depending on the
+            # detect_types configuration; accept both.
+            moment = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+            if moment - cursor > tolerance:
+                gaps.append((cursor, moment))
+            cursor = max(cursor, moment + step)
+        if end - cursor > tolerance:
+            gaps.append((cursor, end))
+        return gaps
+
+    def get_latest_ohlcv_time(
+        self, symbol: str, timeframe: str, venue: Optional[str] = None
+    ) -> Optional[datetime]:
+        """MAX event_time for this instrument, optionally scoped to one venue.
+
+        `venue` is not optional in spirit. Without it the watermark answers "has
+        anyone covered this range" rather than "has THIS venue covered it", so
+        once Coinbase filled a span the CCXT prepend was skipped and the
+        reference-venue bars the cross-venue basis and lead-lag features need
+        were never collected at all.
+        """
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT MIN(event_time) as min_time
-                FROM open_interest
-                WHERE symbol = ?
-            """, (symbol,))
-            result = cursor.fetchone()
-            if result and result["min_time"]:
-                return datetime.fromisoformat(result["min_time"])
-            return None
-    
+            sql = (
+                "SELECT MAX(event_time) as max_time FROM ohlcv "
+                "WHERE symbol = ? AND timeframe = ?"
+            )
+            params: list = [symbol, timeframe]
+            if venue is not None:
+                sql += " AND venue = ?"
+                params.append(venue)
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            value = row["max_time"] if row else None
+            return datetime.fromisoformat(value) if value else None
+
+    def get_earliest_ohlcv_time(
+        self, symbol: str, timeframe: str, venue: Optional[str] = None
+    ) -> Optional[datetime]:
+        """MIN event_time for this instrument, optionally scoped to one venue.
+
+        `venue` is not optional in spirit. Without it the watermark answers "has
+        anyone covered this range" rather than "has THIS venue covered it", so
+        once Coinbase filled a span the CCXT prepend was skipped and the
+        reference-venue bars the cross-venue basis and lead-lag features need
+        were never collected at all.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            sql = (
+                "SELECT MIN(event_time) as min_time FROM ohlcv "
+                "WHERE symbol = ? AND timeframe = ?"
+            )
+            params: list = [symbol, timeframe]
+            if venue is not None:
+                sql += " AND venue = ?"
+                params.append(venue)
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            value = row["min_time"] if row else None
+            return datetime.fromisoformat(value) if value else None
+
+    def get_latest_funding_time(
+        self, symbol: str, venue: Optional[str] = None
+    ) -> Optional[datetime]:
+        """MAX event_time for this instrument, optionally scoped to one venue.
+
+        `venue` is not optional in spirit. Without it the watermark answers "has
+        anyone covered this range" rather than "has THIS venue covered it", so
+        once Coinbase filled a span the CCXT prepend was skipped and the
+        reference-venue bars the cross-venue basis and lead-lag features need
+        were never collected at all.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            sql = (
+                "SELECT MAX(event_time) as max_time FROM funding_rates "
+                "WHERE symbol = ?"
+            )
+            params: list = [symbol]
+            if venue is not None:
+                sql += " AND venue = ?"
+                params.append(venue)
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            value = row["max_time"] if row else None
+            return datetime.fromisoformat(value) if value else None
+
+    def get_earliest_funding_time(
+        self, symbol: str, venue: Optional[str] = None
+    ) -> Optional[datetime]:
+        """MIN event_time for this instrument, optionally scoped to one venue.
+
+        `venue` is not optional in spirit. Without it the watermark answers "has
+        anyone covered this range" rather than "has THIS venue covered it", so
+        once Coinbase filled a span the CCXT prepend was skipped and the
+        reference-venue bars the cross-venue basis and lead-lag features need
+        were never collected at all.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            sql = (
+                "SELECT MIN(event_time) as min_time FROM funding_rates "
+                "WHERE symbol = ?"
+            )
+            params: list = [symbol]
+            if venue is not None:
+                sql += " AND venue = ?"
+                params.append(venue)
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            value = row["min_time"] if row else None
+            return datetime.fromisoformat(value) if value else None
+
+    def get_latest_oi_time(
+        self, symbol: str, venue: Optional[str] = None
+    ) -> Optional[datetime]:
+        """MAX event_time for this instrument, optionally scoped to one venue.
+
+        `venue` is not optional in spirit. Without it the watermark answers "has
+        anyone covered this range" rather than "has THIS venue covered it", so
+        once Coinbase filled a span the CCXT prepend was skipped and the
+        reference-venue bars the cross-venue basis and lead-lag features need
+        were never collected at all.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            sql = (
+                "SELECT MAX(event_time) as max_time FROM open_interest "
+                "WHERE symbol = ?"
+            )
+            params: list = [symbol]
+            if venue is not None:
+                sql += " AND venue = ?"
+                params.append(venue)
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            value = row["max_time"] if row else None
+            return datetime.fromisoformat(value) if value else None
+
+    def get_earliest_oi_time(
+        self, symbol: str, venue: Optional[str] = None
+    ) -> Optional[datetime]:
+        """MIN event_time for this instrument, optionally scoped to one venue.
+
+        `venue` is not optional in spirit. Without it the watermark answers "has
+        anyone covered this range" rather than "has THIS venue covered it", so
+        once Coinbase filled a span the CCXT prepend was skipped and the
+        reference-venue bars the cross-venue basis and lead-lag features need
+        were never collected at all.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            sql = (
+                "SELECT MIN(event_time) as min_time FROM open_interest "
+                "WHERE symbol = ?"
+            )
+            params: list = [symbol]
+            if venue is not None:
+                sql += " AND venue = ?"
+                params.append(venue)
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            value = row["min_time"] if row else None
+            return datetime.fromisoformat(value) if value else None
+
     def get_funding_stats(self) -> Dict[str, Any]:
         """Get statistics about stored funding data."""
         with self._get_connection() as conn:

@@ -155,8 +155,10 @@ def _as_record(payload: dict[str, Any], *, is_live: bool = False) -> PromotionRe
         GateResult(
             name=g.get('name', '?'),
             value=g.get('value'),
-            threshold=g.get('threshold', 0.0),
-            comparison=g.get('comparison', 'min'),
+            # None, not 0.0. A missing threshold rendered as `>= 0.00`,
+            # indistinguishable from a real gate that happens to sit at zero.
+            threshold=g.get('threshold'),
+            comparison=g.get('comparison'),
             passed=bool(g.get('passed')),
             note=g.get('note'),
         )
@@ -323,35 +325,48 @@ def get_feature_importance(head: str = 'price') -> FeatureImportanceResponse:
     # — `feature_importance(importance_type=...)` — is a different object, and
     # calling it here produced "no attribute 'feature_importance'" on every
     # request. Both are handled, because either can end up in a saved artifact.
+    # `feature_importances_` on LightGBM's sklearn wrapper defaults to SPLIT
+    # COUNT, while the Booster API's `feature_importance` can be asked for gain.
+    # Both used to land in a list named `gains` and be served under one field, so
+    # the endpoint's documented "split gains" was true of one branch only. Prefer
+    # the inner Booster, which can be asked for gain explicitly, and record which
+    # measure was actually used.
+    importance_kind = 'gain'
     try:
-        if hasattr(booster, 'feature_importances_'):
+        if hasattr(booster, 'booster_'):
+            inner = booster.booster_
+            gains = list(inner.feature_importance(importance_type='gain'))
+            names = list(inner.feature_name())
+        elif hasattr(booster, 'feature_importance'):
+            gains = list(booster.feature_importance(importance_type='gain'))
+            names = list(booster.feature_name())
+        else:
+            # Only the sklearn attribute is available, which is split count.
+            importance_kind = 'split_count'
             gains = list(booster.feature_importances_)
             names = list(
                 getattr(booster, 'feature_name_', None)
                 or getattr(booster, 'feature_names_in_', None)
                 or [f'f{i}' for i in range(len(gains))]
             )
-        elif hasattr(booster, 'booster_'):
-            inner = booster.booster_
-            gains = list(inner.feature_importance(importance_type='gain'))
-            names = list(inner.feature_name())
-        else:
-            gains = list(booster.feature_importance(importance_type='gain'))
-            names = list(booster.feature_name())
     except Exception as exc:  # noqa: BLE001
         return FeatureImportanceResponse(
             generated_at=generated_at, version=version,
             unavailable_reason=f'head "{head}" exposes no importances: {exc}',
         )
 
-    total = float(sum(gains)) or 1.0
-    ranked = sorted(zip(names, gains), key=lambda pair: pair[1], reverse=True)
+    ranked_all = sorted(zip(names, gains), key=lambda pair: pair[1], reverse=True)
+    # Normalise over what is actually returned, not over every feature: dividing
+    # by the full sum while serving the top 25 meant the list never summed to one,
+    # which is what the endpoint documents.
+    kept = [pair for pair in ranked_all if pair[1] > 0][:TOP_FEATURES]
+    total = float(sum(value for _, value in kept)) or 1.0
     return FeatureImportanceResponse(
         generated_at=generated_at,
         version=version,
+        importance_kind=importance_kind,
         features=[
             FeatureImportanceEntry(feature=name, importance=float(gain) / total, head=head)
-            for name, gain in ranked[:TOP_FEATURES]
-            if gain > 0
+            for name, gain in kept
         ],
     )

@@ -218,19 +218,26 @@ export default function TradingPage() {
         const held = wallet.data;
         const spotVal   = held.coinbase?.spot?.value_usd ?? null;
         const ledgerVal = held.ledger?.value_usd ?? null;
+        // Perps were fetched and discarded, so "external" excluded the
+        // perpetual book entirely — a wrong number, not just a missing panel.
+        const perpsVal = held.coinbase?.perps?.value_usd ?? null;
         // `?? 0` then `total <= 0 -> return null` made a broken exchange
         // connection look exactly like holding nothing: the backend answers 200
         // with `value_usd: null` and a `status` this page never read, so the
         // whole panel silently disappeared for a user with real holdings.
         const spotStatus = held.coinbase?.spot?.status;
+        const perpsStatus = held.coinbase?.perps?.status;
         const ledgerStatus = held.ledger?.status;
         const failed = [
           spotStatus && spotStatus !== 'ok' ? `Coinbase spot: ${spotStatus}` : null,
           ledgerStatus && !['ok', 'configured', 'unconfigured'].includes(ledgerStatus)
             ? `Ledger: ${ledgerStatus}`
             : null,
+          perpsStatus && perpsStatus !== 'ok' ? `Coinbase perps: ${perpsStatus}` : null,
         ].filter(Boolean) as string[];
-        const measured = [spotVal, ledgerVal].filter((v): v is number => v !== null);
+        const measured = [spotVal, ledgerVal, perpsVal].filter(
+          (v): v is number => v !== null,
+        );
         const total = measured.reduce((a, b) => a + b, 0);
         if (!measured.length && !failed.length) return null;
         if (failed.length && total <= 0) {
@@ -262,6 +269,29 @@ export default function TradingPage() {
                     <span className="font-mono text-tx-primary text-sm font-semibold">{fmt(spotVal)}</span>
                   </div>
                   {spotAssets.map(a => <AssetRow key={a.asset} a={a} />)}
+                </div>
+              )}
+              {perpsVal !== null && perpsVal > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-tx-muted text-[10px] uppercase tracking-widest">Coinbase Perps</span>
+                    <span className="font-mono text-tx-primary text-sm font-semibold">{fmt(perpsVal)}</span>
+                  </div>
+                  {(held.coinbase?.perps?.positions ?? []).map((pos) => (
+                    <div key={pos.symbol} className="flex items-center justify-between py-1">
+                      <span className="text-tx-secondary text-xs">{pos.symbol}</span>
+                      <span className="font-mono text-tx-muted text-xs">
+                        {pos.contracts ?? '—'} ct
+                        {pos.unrealized_pnl_usd != null && (
+                          <span className={pos.unrealized_pnl_usd >= 0
+                            ? ' text-accent-emerald' : ' text-accent-rose'}>
+                            {' '}{pos.unrealized_pnl_usd >= 0 ? '+' : ''}
+                            {fmt(pos.unrealized_pnl_usd)}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               )}
               {ledgerVal !== null && ledgerVal > 0 && (

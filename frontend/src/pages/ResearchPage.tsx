@@ -459,7 +459,7 @@ export default function ResearchPage() {
       <div className={CARD}>
         <div className="mb-1 flex items-center justify-between">
           <span className={LABEL}>Retrain history</span>
-          <Freshness lastUpdated={runs.lastUpdated} refreshing={runs.refreshing} />
+          <Freshness lastUpdated={runs.lastUpdated} refreshing={runs.refreshing} error={runs.error} />
         </div>
         <p className="mb-4 text-[11px] leading-relaxed text-tx-muted">
           Real attempts, from the orchestrator's run table joined to the promotion

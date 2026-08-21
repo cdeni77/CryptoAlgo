@@ -51,6 +51,10 @@ class CoinHealthRow(BaseModel):
 
     # Signals — what the model proposed.
     signals_total: int = 0
+    # `signals_total` counts a capped window, not the universe. Named plainly
+    # so a saturated count is not read as a total.
+    signals_window: Optional[int] = None
+    signals_truncated: bool = False
     signals_passed_gates: int = 0
     gate_pass_rate: Optional[float] = None
     top_gate_reason: Optional[str] = None
@@ -81,6 +85,10 @@ class ResearchSummaryKpis(BaseModel):
     """
 
     signals_total: int = 0
+    # `signals_total` counts a capped window, not the universe. Named plainly
+    # so a saturated count is not read as a total.
+    signals_window: Optional[int] = None
+    signals_truncated: bool = False
     signals_passed_gates: int = 0
     gate_pass_rate: Optional[float] = None
     trades_closed: int = 0

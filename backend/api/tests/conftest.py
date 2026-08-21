@@ -49,12 +49,17 @@ def client(sqlite_database):
     Nothing is stubbed. `app.run_migrations` checks the dialect and skips its
     Postgres-only ALTERs on SQLite, which is why this works without patching the
     engine — the guard belongs in the app, not in the harness.
+
+    Entered as a context manager because schema creation moved from module
+    import into the lifespan hook, and `TestClient` only runs lifespan inside
+    `with`. Constructed bare, the tables would never exist.
     """
     from fastapi.testclient import TestClient
 
     import app as app_module
 
-    return TestClient(app_module.app)
+    with TestClient(app_module.app) as test_client:
+        yield test_client
 
 
 @pytest.fixture

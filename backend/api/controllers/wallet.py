@@ -12,6 +12,7 @@ and are still worth serving when Ethplorer is not answering.
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,8 @@ from sqlalchemy.orm import Session
 from coinbase.rest import RESTClient
 from endpoints.coins import CDE_PRODUCTS
 from models.trade import PaperEquityCurve, PaperPosition
+
+logger = logging.getLogger(__name__)
 
 
 def _units_per_contract(coin: str) -> Optional[float]:
@@ -143,8 +146,13 @@ def get_ledger_wallets_from_env() -> Dict[str, Any]:
                     address = str(item.get("address", "")).strip()
                     if coin and address:
                         entries.append({"coin": coin, "address": address})
-        except Exception:
-            pass
+        except Exception as exc:
+            # A typo in a real wallet list used to be indistinguishable from an
+            # unset variable, because the exception was swallowed and the status
+            # stayed 'unconfigured'.
+            logger.warning('LEDGER_WALLETS_JSON is set but unparseable: %s', exc)
+            return {'status': 'misconfigured', 'entries': [],
+                    'error': f'LEDGER_WALLETS_JSON could not be parsed: {exc}'}
 
     deduped: List[Dict[str, str]] = []
     seen = set()

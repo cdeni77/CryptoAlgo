@@ -90,5 +90,9 @@ def launch(job: str, request: ResearchJobLaunchRequest):
         return launch_research_job(job=job, args=validate_job_args(request.args))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # Already running. 409 rather than 500: the request is well formed and the
+        # server is healthy, the resource is just busy.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -408,7 +408,7 @@ export default function ModelPage() {
         <div className={CARD}>
           <div className="mb-4 flex items-center justify-between">
             <span className={LABEL}>Candidates</span>
-            <Freshness lastUpdated={history.lastUpdated} refreshing={history.refreshing} />
+            <Freshness lastUpdated={history.lastUpdated} refreshing={history.refreshing} error={history.error} />
           </div>
           <p className="mb-3 text-[11px] leading-relaxed text-tx-muted">
             Rejections are kept. The count of attempts is what the deflated Sharpe

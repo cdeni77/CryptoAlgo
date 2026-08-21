@@ -179,5 +179,9 @@ class FeatureImportanceResponse(BaseModel):
 
     generated_at: datetime
     version: Optional[str] = None
+    # Which measure the numbers are: LightGBM's sklearn attribute is split count,
+    # the Booster API can be asked for gain. Both used to be served under one
+    # field with the docstring claiming gain.
+    importance_kind: Optional[str] = None
     features: List[FeatureImportanceEntry] = Field(default_factory=list)
     unavailable_reason: Optional[str] = None

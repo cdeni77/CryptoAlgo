@@ -240,6 +240,11 @@ class CCXTConnector:
         # (spot market data is generally not useful for perp backtesting)
         return base_symbol
     
+    @property
+    def last_ohlcv_exchange(self) -> Optional[str]:
+        """Which exchange served the most recent `fetch_ohlcv`, or None."""
+        return getattr(self, '_last_ohlcv_exchange', None)
+
     async def fetch_ohlcv(
         self,
         symbol: str,
@@ -295,6 +300,14 @@ class CCXTConnector:
         if not ccxt_symbol:
             logger.error(f"Could not map symbol {symbol} for {exchange_id}")
             return []
+
+        # Remembered so the caller can label the bars with the exchange that
+        # served them. `get_available_exchanges()[0]` returns the first exchange
+        # that *initialised*, and the loop above picks per symbol, so the two
+        # disagree whenever the first exchange lacks the market — bars requested
+        # as ["okx","binance","bybit"] were stamped 'okx' while readers asked for
+        # 'binance', leaving the cross-venue features with no rows.
+        self._last_ohlcv_exchange = exchange_id
 
         logger.info(
             f"Fetching {symbol} ({ccxt_symbol}) {timeframe} from {exchange_id} "

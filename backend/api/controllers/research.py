@@ -19,7 +19,6 @@ measured", and the dashboard says so.
 
 import ast
 from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import shlex
@@ -28,7 +27,7 @@ import sys
 from collections import Counter
 from typing import Any, List, Optional, Sequence
 
-from sqlalchemy import desc, func
+from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from models.research import (
@@ -43,7 +42,7 @@ from models.research import (
     SignalDistributionItem,
 )
 from models.signals import Signal
-from models.trade import ModelRun, PaperPosition, Trade
+from models.trade import ModelRun, PaperPosition
 
 DEFAULT_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
@@ -171,6 +170,8 @@ def _coin_row(db: Session, coin: str) -> CoinHealthRow:
     return CoinHealthRow(
         coin=coin,
         signals_total=len(signals),
+        signals_window=SIGNAL_WINDOW,
+        signals_truncated=len(signals) >= SIGNAL_WINDOW,
         signals_passed_gates=len(passed),
         gate_pass_rate=(len(passed) / len(signals)) if signals else None,
         top_gate_reason=Counter(blocked).most_common(1)[0][0] if blocked else None,
@@ -203,6 +204,7 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
     rows = [_coin_row(db, coin) for coin in _coins(db)]
 
     signals_total = sum(r.signals_total for r in rows)
+    signals_truncated = any(r.signals_truncated for r in rows)
     signals_passed = sum(r.signals_passed_gates for r in rows)
     trades_closed = sum(r.trades_closed for r in rows)
 
@@ -239,6 +241,8 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
 
     kpis = ResearchSummaryKpis(
         signals_total=signals_total,
+        signals_window=SIGNAL_WINDOW,
+        signals_truncated=signals_truncated,
         signals_passed_gates=signals_passed,
         gate_pass_rate=(signals_passed / signals_total) if signals_total else None,
         trades_closed=trades_closed,
@@ -584,6 +588,18 @@ def launch_research_job(job: str, args: List[str] | None = None):
         allowed = ", ".join(sorted(script_modules.keys()))
         raise ValueError(f"Unknown research job '{job}'. Allowed jobs: {allowed}")
 
+    # One at a time per job. Nothing prevented N simultaneous
+    # `live_orchestrator` processes: auth answers who, `validate_job_args`
+    # answers what, and nothing answered how many. Two orchestrators scraping
+    # into one SQLite file and racing on promotion is not a state to debug later.
+    already = running_jobs(job_key)
+    if already:
+        pids = ', '.join(str(entry['pid']) for entry in already)
+        raise RuntimeError(
+            f"'{job_key}' is already running (pid {pids}). Wait for it to finish, "
+            f"or check its logs at /research/jobs/{already[0]['pid']}/logs."
+        )
+
     safe_args = [a for a in (args or []) if a and a.strip()]
     # Use unbuffered Python so script prints stream into the log file immediately
     # (especially important for long-running jobs launched from the frontend).
@@ -620,7 +636,12 @@ def launch_research_job(job: str, args: List[str] | None = None):
         "cwd": str(trader_dir),
         "launched_at": launched_at,
         "log_path": str(log_file),
+        # The handle, not just the pid. Discarding it left finished children as
+        # zombies, and `os.kill(pid, 0)` succeeds on a zombie — so `running` was
+        # reported True for completed jobs forever. `Popen.poll()` reaps.
+        "process": process,
     }
+    _reap_finished_jobs()
 
     from models.research import ResearchJobLaunchResponse
 
@@ -635,6 +656,27 @@ def launch_research_job(job: str, args: List[str] | None = None):
     )
 
 
+def _reap_finished_jobs() -> None:
+    """Poll every tracked child so finished ones are reaped, not left as zombies."""
+    for entry in _JOB_REGISTRY.values():
+        process = entry.get("process")
+        if process is not None and entry.get("returncode") is None:
+            code = process.poll()
+            if code is not None:
+                entry["returncode"] = code
+                entry["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def running_jobs(job_key: Optional[str] = None) -> list[dict]:
+    """Tracked jobs that have not exited, optionally for one job key."""
+    _reap_finished_jobs()
+    return [
+        entry for entry in _JOB_REGISTRY.values()
+        if entry.get("returncode") is None
+        and (job_key is None or entry.get("job") == job_key)
+    ]
+
+
 def get_research_job_logs(pid: int, lines: int = 200):
     if pid not in _JOB_REGISTRY:
         raise ValueError(f"No launched job found for pid {pid}")
@@ -647,11 +689,19 @@ def get_research_job_logs(pid: int, lines: int = 200):
     raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     tail_lines = raw_lines[-max(1, lines):]
 
-    running = True
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        running = False
+    # `os.kill(pid, 0)` succeeds on a zombie, so it reported a finished job as
+    # running forever — and after a pid was reused it could report an unrelated
+    # process as this job. Ask the child handle, which reaps as a side effect.
+    _reap_finished_jobs()
+    process = job.get("process")
+    if process is not None:
+        running = job.get("returncode") is None
+    else:  # a job from a previous worker or process; fall back to the pid probe
+        try:
+            os.kill(pid, 0)
+            running = True
+        except OSError:
+            running = False
 
     from models.research import ResearchJobLogResponse
 

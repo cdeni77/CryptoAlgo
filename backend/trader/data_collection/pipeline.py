@@ -199,15 +199,24 @@ class DataPipeline:
         return self._ingestor
 
     def _venue_name(self, use_ccxt: bool) -> str:
-        """Which exchange a fetch will come from.
+        """Which exchange the last fetch actually came from.
 
         Recorded on every bar because the backfill deliberately blends venues:
         Coinbase first, CCXT filling any pre-history gap. Without this the
         boundary between the instrument we trade and a proxy for it is invisible
         in the stored series.
+
+        This used to return `get_available_exchanges()[0]` — the first exchange
+        that *initialised* — while `fetch_ohlcv` selects per symbol from
+        ["okx","binance","bybit"]. So bars served by Binance were stamped 'okx',
+        and `REFERENCE_VENUE=binance` then matched nothing: every cross-venue
+        basis and lead-lag feature was empty.
         """
         if not use_ccxt:
             return 'coinbase'
+        served = self._ccxt_connector.last_ohlcv_exchange if self._ccxt_connector else None
+        if served:
+            return served
         available = self._ccxt_connector.get_available_exchanges() if self._ccxt_connector else []
         return available[0] if available else 'ccxt_proxy'
 
@@ -248,12 +257,21 @@ class DataPipeline:
             for timeframe in timeframes:
                 tf_seconds = self._granularity_to_seconds(timeframe)
                 tf_delta = timedelta(seconds=tf_seconds)
-                first_time = self._first_ohlcv_times.get(symbol, {}).get(timeframe)
-                last_time = self._last_ohlcv_times.get(symbol, {}).get(timeframe)
-                if first_time:
-                    first_time = ensure_naive_utc(first_time)
-                if last_time:
-                    last_time = ensure_naive_utc(last_time)
+                # Venue-scoped, and asked of the database rather than the
+                # in-memory cache. The cache is keyed symbol->timeframe with no
+                # venue dimension, so it answered "has ANYONE covered this range"
+                # — and once Coinbase filled a span the CCXT prepend below was
+                # skipped, so the reference-venue bars the cross-venue features
+                # need were never collected at all.
+                prepend_venue = self._venue_name(use_ccxt=True) if use_ccxt else None
+                first_time = ensure_naive_utc(
+                    self._database.get_earliest_ohlcv_time(
+                        symbol, timeframe, venue=prepend_venue)
+                ) if use_ccxt else None
+                last_time = ensure_naive_utc(
+                    self._database.get_latest_ohlcv_time(
+                        symbol, timeframe, venue='coinbase')
+                )
                 fetched_any = False
                 if use_ccxt and (not first_time or first_time > start + tf_delta):
                     prepend_end = first_time if first_time else end

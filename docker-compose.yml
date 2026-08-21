@@ -41,7 +41,10 @@ services:
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
       - TRADER_DIR=/trader
-      - LEDGER_WALLETS_JSON=${LEDGER_WALLETS_JSON:-'[]'}
+      # No quotes around the default: `json.loads("'[]'")` raises, and the
+      # exception is swallowed, so a quoted default was indistinguishable from
+      # "not configured" — as would be a typo in a real wallet list.
+      - LEDGER_WALLETS_JSON=${LEDGER_WALLETS_JSON:-[]}
       # Shared secret for POST /research/launch, which starts a process in a
       # container holding the exchange keys. Unset means that route returns 503
       # — it fails closed rather than running unauthenticated.

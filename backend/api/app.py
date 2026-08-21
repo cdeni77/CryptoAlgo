@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +12,6 @@ from endpoints.model import router as model_router
 from endpoints.paper import router as paper_router
 from endpoints.research import router as research_router
 from endpoints.signals import router as signals_router
-from endpoints.trade import router as trades_router
 from endpoints.wallet import router as wallet_router
 from models.base import Base
 
@@ -19,8 +19,6 @@ from models.base import Base
 from models import signals as _signals_models 
 from models import trade as _trade_models  
 from models import wallet as _wallet_models  
-
-Base.metadata.create_all(bind=engine)
 
 # Columns added after the tables were first created. `create_all` above only
 # creates missing *tables*, so a new column on an existing table needs this.
@@ -49,6 +47,12 @@ POSTGRES_MIGRATIONS = (
 )
 
 
+# An arbitrary but fixed key. Postgres advisory locks are global to the
+# database, so the only requirement is that nothing else in this deployment
+# picks the same number.
+_BOOTSTRAP_LOCK_KEY = 8_931_774_205_113
+
+
 def run_migrations() -> None:
     """Apply the additive column migrations. Postgres only, by construction.
 
@@ -64,16 +68,56 @@ def run_migrations() -> None:
         )
         return
     with engine.begin() as connection:
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"), {"key": _BOOTSTRAP_LOCK_KEY}
+        )
         for statement in POSTGRES_MIGRATIONS:
             connection.execute(text(statement))
 
 
-run_migrations()
+def bootstrap_schema() -> None:
+    """Create missing tables, then add the columns `create_all` will not.
+
+    This used to run at module import, which meant all four uvicorn workers
+    (see the Dockerfile CMD) ran it simultaneously against one database.
+    `create_all` checks for each table and then creates it, and those two steps
+    are not atomic: two workers both see a table missing, both issue CREATE
+    TABLE, and the loser dies with DuplicateTable — at import, before FastAPI
+    exists to log it, so the symptom is a worker that vanishes at boot.
+
+    Two changes fix that. It runs from the lifespan hook rather than at import,
+    so a failure is a startup error with a traceback in the right place and
+    importing this module no longer requires a reachable database. And on
+    Postgres it holds a transaction-scoped advisory lock, so the workers
+    serialise and the ones that lose the race find the work already done.
+    """
+    if engine.dialect.name != "postgresql":
+        Base.metadata.create_all(bind=engine)
+        run_migrations()
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"), {"key": _BOOTSTRAP_LOCK_KEY}
+        )
+        # Postgres DDL is transactional, so the create and the ALTERs land
+        # together or not at all, and the lock is released on commit.
+        Base.metadata.create_all(bind=connection)
+        for statement in POSTGRES_MIGRATIONS:
+            connection.execute(text(statement))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    bootstrap_schema()
+    yield
+
 
 app = FastAPI(
     title="Trading History & Market API",
-    description="API for trades, signals, and paper trading telemetry",
+    description="API for signals, paper trading telemetry, and research",
     version="0.3.0",
+    lifespan=lifespan,
 )
 
 # Origins come from CORS_ALLOW_ORIGINS, and `*` is filtered out. The previous
@@ -95,7 +139,6 @@ if not token_configured():
         TOKEN_ENV,
     )
 
-app.include_router(trades_router)
 app.include_router(coins_router)
 app.include_router(wallet_router)
 app.include_router(signals_router)

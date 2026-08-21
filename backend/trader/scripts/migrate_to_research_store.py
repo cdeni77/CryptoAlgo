@@ -33,9 +33,12 @@ def main() -> int:
     parser.add_argument('--db-path', default=DEFAULT_DB, help='Scraper SQLite database')
     parser.add_argument('--store', default=None, help='Research store root (default: data/research)')
     parser.add_argument(
-        '--venue', default='unknown',
+        '--venue', default='coinbase',
         help="Venue label for rows written before the venue column existed. "
-             "Rows that recorded their own venue keep it.",
+             "Rows that recorded their own venue keep it. Defaults to the traded "
+             "venue: 'unknown' filed legacy funding and open interest under a "
+             "label no reader asks for, so `build_features --venue coinbase` "
+             "found none of it.",
     )
     parser.add_argument('--timeframe', default='1h')
     parser.add_argument('--symbols', default=None, help='Comma-separated subset')

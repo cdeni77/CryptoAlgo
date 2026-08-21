@@ -314,16 +314,15 @@ async def backfill_funding_rates(
             logger.info(f"\n📊 Processing funding rates for {symbol}")
             symbol_inserted = 0
 
-            existing_start = db.get_earliest_funding_time(symbol)
-            existing_end = db.get_latest_funding_time(symbol)
-            windows = []
-            if existing_start and existing_end:
-                if start < existing_start:
-                    windows.append((start, existing_start))
-                if end > existing_end:
-                    windows.append((existing_end, end))
-            else:
-                windows.append((start, end))
+            # Every missing window, not just the ends. Building only
+            # (start, MIN) and (MAX, end) left any interior hole bracketed
+            # forever — a failed request mid-history stayed a hole and the
+            # features were computed straight across it.
+            windows = db.find_gaps(
+                'funding_rates', symbol, start, end, step_seconds=3600,
+            )
+            if not windows:
+                logger.info('%s: no funding gaps in the requested range', symbol)
 
             for win_start, win_end in windows:
                 if win_end <= win_start:
@@ -440,47 +439,25 @@ async def backfill_open_interest(
         for symbol in symbols:
             logger.info(f"\n📊 Processing OI history for {symbol}")
             
-            # Check existing data
-            existing_start = db.get_earliest_oi_time(symbol)
-            existing_end = db.get_latest_oi_time(symbol)
-            
-            if existing_start and existing_end:
-                logger.info(f"  Existing OI data: {existing_start.date()} to {existing_end.date()}")
-            else:
-                logger.info(f"  No existing OI data")
-            
+            # Every missing window, interior holes included. Prepend/append from
+            # MIN and MAX left a hole between them bracketed forever.
+            windows = db.find_gaps(
+                'open_interest', symbol, start, end, step_seconds=3600,
+            )
             all_history = []
-            
-            if existing_start and existing_end:
-                # Prepend if needed
-                if start < existing_start:
-                    logger.info(f"  📥 Fetching OI pre-history: {start.date()} to {existing_start.date()}")
-                    history = await connector.fetch_open_interest_history(
-                        symbol=symbol, timeframe='1h',
-                        start=start, end=existing_start, limit=200
-                    )
-                    if history:
-                        all_history.extend(history)
-                
-                # Append if needed
-                if end > existing_end:
-                    logger.info(f"  📥 Fetching new OI data: {existing_end.date()} to {end.date()}")
-                    history = await connector.fetch_open_interest_history(
-                        symbol=symbol, timeframe='1h',
-                        start=existing_end, end=end, limit=200
-                    )
-                    if history:
-                        all_history.extend(history)
-                
-                if not all_history:
-                    logger.info(f"  ✓ OI data already up to date")
-            else:
-                # Full range fetch
-                logger.info(f"  📥 Fetching full OI range: {start.date()} to {end.date()}")
-                all_history = await connector.fetch_open_interest_history(
-                    symbol=symbol, timeframe='1h',
-                    start=start, end=end, limit=200
+            if not windows:
+                logger.info("  ✓ OI data already complete for this range")
+            for win_start, win_end in windows:
+                logger.info(
+                    f"  📥 Fetching OI gap: {win_start:%Y-%m-%d %H:%M} to "
+                    f"{win_end:%Y-%m-%d %H:%M}"
                 )
+                history = await connector.fetch_open_interest_history(
+                    symbol=symbol, timeframe='1h',
+                    start=win_start, end=win_end, limit=200
+                )
+                if history:
+                    all_history.extend(history)
             
             if all_history:
                 # Parse dicts to OpenInterest objects
@@ -591,7 +568,13 @@ Examples:
     )
     
     # Time range
-    parser.add_argument("--backfill-days", type=int, default=365, help="Days of history to fetch")
+    parser.add_argument("--backfill-days", type=float, default=365,
+                        help="Days of history to fetch. Fractional is fine: the "
+                             "hourly cycle wants 0.25, not 1.")
+    parser.add_argument("--backfill-hours", type=float, default=None,
+                        help="Hours of history to fetch. Overrides --backfill-days. "
+                             "The incremental cycle used to be quantised up to a "
+                             "whole day, so 6h fetched 24h.")
     parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD), overrides --backfill-days")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     
@@ -623,7 +606,10 @@ Examples:
         end_time = utc_now()
     else:
         end_time = utc_now()
-        start_time = end_time - timedelta(days=args.backfill_days)
+        start_time = end_time - (
+            timedelta(hours=args.backfill_hours) if args.backfill_hours
+            else timedelta(days=args.backfill_days)
+        )
     
     # Ensure naive UTC
     start_time = ensure_naive_utc(start_time)
@@ -639,7 +625,12 @@ Examples:
     print("=" * 70)
     print("🚀 UNIFIED DATA PIPELINE - Coinbase Perps Trading")
     print("=" * 70)
-    print(f"Date Range: {start_time.date()} to {end_time.date()} ({args.backfill_days} days)")
+    span_hours = (end_time - start_time).total_seconds() / 3600.0
+    print(
+        f"Date Range: {start_time:%Y-%m-%d %H:%M} to {end_time:%Y-%m-%d %H:%M} "
+        f"({span_hours:,.1f}h). Computed from the resolved bounds, so --start/--end "
+        f"are reported honestly rather than echoing --backfill-days."
+    )
     print(f"Timeframes: {timeframes}")
     print(f"Database: {args.db_path}")
     print(f"Proxy: {proxy or 'None'}")

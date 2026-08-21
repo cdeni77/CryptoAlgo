@@ -186,7 +186,10 @@ def get_current_prices():
                     break
 
             if not found:
-                result[symbol] = {"price": None, "change24h": None}
+                result[symbol] = {
+                    "price": None, "change24h": None,
+                    "unavailable_reason": "no price on the product response",
+                }
 
         if all(r["price"] is None for r in result.values()):
             raise HTTPException(status_code=503, detail="Failed to fetch prices from Coinbase")
@@ -210,8 +213,12 @@ def get_cde_prices():
                 "price": float(prod.price) if prod.price else None,
                 "change24h": float(prod.price_percentage_change_24h) if getattr(prod, "price_percentage_change_24h", None) else None,
             }
-        except Exception:
-            result[symbol] = {"price": None, "change24h": None}
+        except Exception as exc:
+            # The reason, not just the absence: a dead upstream and a contract
+            # with no price rendered identically before.
+            result[symbol] = {
+                "price": None, "change24h": None, "unavailable_reason": str(exc)[:200],
+            }
     return result
 
 

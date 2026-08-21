@@ -39,6 +39,7 @@ import pandas as pd
 
 from core.config import Config
 from core.metrics import (
+    DEFAULT_GATES,
     HOURS_PER_YEAR,
     Gate,
     deflated_sharpe,
@@ -127,6 +128,9 @@ class Trial:
     failed_gates: list[str] = field(default_factory=list)
     feature_set_hash: str = ''
     cost_config_version: str = ''
+    # Gates the campaign did not measure, so a survivor is never mistaken for a
+    # candidate that cleared the full promotion set.
+    ungated: list[str] = field(default_factory=list)
     data_as_of: Optional[str] = None
     evaluated_at: str = ''
     error: Optional[str] = None
@@ -316,9 +320,21 @@ def run_campaign(
             trial.metrics = {k: float(v) for k, v in metrics.items()
                              if isinstance(v, (int, float)) and np.isfinite(float(v))}
             trial.fold_scores = [float(f) for f in folds if np.isfinite(float(f))]
-            promoted, gates = evaluate_gates(trial.metrics, thresholds=thresholds)
-            trial.passed = promoted
+            # Only the gates this campaign actually measures. `evaluate_gates`
+            # correctly fails a missing measurement, and a search evaluator
+            # supplies six of the eleven in DEFAULT_GATES — so passing the full
+            # set made `Trial.passed` False by construction and `survivors`
+            # permanently empty. That is the mirror image of a gate that cannot
+            # fail: a gate that cannot pass. Promotion still evaluates the full
+            # set; a search is a filter, not the final word.
+            measurable = {
+                name: threshold for name, threshold in (thresholds or DEFAULT_GATES).items()
+                if name in trial.metrics
+            }
+            promoted, gates = evaluate_gates(trial.metrics, thresholds=measurable)
+            trial.passed = promoted and bool(measurable)
             trial.failed_gates = [g.name for g in gates if not g.passed]
+            trial.ungated = sorted(set(thresholds or DEFAULT_GATES) - set(measurable))
         except Exception as exc:                      # a failed trial is data
             logger.warning('trial failed (%s): %s', parameters, exc)
             trial.error = str(exc)[:400]

@@ -1,6 +1,5 @@
 import { get, post } from './client';
 import {
-  ResearchCoinDetail,
   ResearchFeatures,
   ResearchJobLaunchResponse,
   ResearchJobLogResponse,
@@ -24,9 +23,6 @@ export async function getResearchSummary(): Promise<ResearchSummary> {
   return get('/research/summary');
 }
 
-export async function getResearchCoin(coin: string): Promise<ResearchCoinDetail> {
-  return get(`/research/coins/${coin}`);
-}
 
 export async function getResearchRuns(limit = 50): Promise<ResearchRun[]> {
   return get(`/research/runs?limit=${limit}`);

@@ -336,6 +336,10 @@ class ForecastModel:
     data_as_of: Optional[str] = None
     train_rows: int = 0
     effective_observations: float = 0.0
+    # False when the train/validation split could not be purged for want of
+    # history, which makes the recorded ic/r2 optimistic. Reported rather
+    # than assumed, because the fallback fires exactly when data is scarce.
+    validation_purged: bool = True
     train_start: Optional[pd.Timestamp] = None
     train_end: Optional[pd.Timestamp] = None
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -441,6 +445,7 @@ class ForecastModel:
             'data_as_of': self.data_as_of,
             'train_rows': self.train_rows,
             'effective_observations': round(self.effective_observations, 1),
+            'validation_purged': self.validation_purged,
             'train_start': str(self.train_start) if self.train_start is not None else None,
             'train_end': str(self.train_end) if self.train_end is not None else None,
             'symbols': list(self.symbol_categories),
@@ -534,8 +539,22 @@ def train_forecast_model(
     boundary = unique_times[int(len(unique_times) * (1 - validation_fraction))]
 
     purged = times < (boundary - pd.Timedelta(hours=horizon))
+    purge_disabled = False
     if purged.sum() < MIN_FOLD_ROWS:
-        purged = times < boundary          # too little history to purge as well
+        # Falling back to an unpurged split means training labels overlap the
+        # validation window, so the `ic` and `r2` reported below are optimistic.
+        # This used to happen silently — and it happens precisely when history is
+        # scarce, which is this system's normal condition, so the artifact carried
+        # leaked validation figures with nothing to distinguish them.
+        purge_disabled = True
+        logger.warning(
+            'purging %dh leaves only %d training rows (min %d): falling back to an '
+            'UNPURGED split. The validation ic/r2 below overlap the training '
+            'labels and are optimistic; recorded on the artifact as '
+            'validation_purged=False.',
+            horizon, int(purged.sum()), MIN_FOLD_ROWS,
+        )
+        purged = times < boundary
     train_mask, val_mask = purged, times >= boundary
 
     if train_mask.sum() < MIN_FOLD_ROWS or val_mask.sum() < 50:
@@ -609,6 +628,7 @@ def train_forecast_model(
         data_as_of=data_as_of,
         train_rows=int(train_mask.sum()),
         effective_observations=_panel_effective_observations(x.index[train_mask], horizon),
+        validation_purged=not purge_disabled,
         train_start=pd.Timestamp(times[train_mask].min()) if train_mask.any() else None,
         train_end=pd.Timestamp(times[train_mask].max()) if train_mask.any() else None,
         metrics=metrics,

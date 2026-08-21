@@ -82,15 +82,32 @@ class KillSwitchThresholds:
     min_samples: int
 
 
-def _monitoring_thresholds() -> KillSwitchThresholds:
-    return KillSwitchThresholds(
+def _monitoring_thresholds(lookback_days: int = 14) -> KillSwitchThresholds:
+    thresholds = KillSwitchThresholds(
         min_win_rate=float(os.getenv('PAPER_MONITOR_MIN_WIN_RATE', '0.42')),
         min_profit_factor=float(os.getenv('PAPER_MONITOR_MIN_PROFIT_FACTOR', '0.9')),
         max_drawdown=float(os.getenv('PAPER_MONITOR_MAX_DRAWDOWN', '0.12')),
-        min_trades_per_week=float(os.getenv('PAPER_MONITOR_MIN_TRADES_PER_WEEK', '2.0')),
+        min_trades_per_week=float(os.getenv('PAPER_MONITOR_MIN_TRADES_PER_WEEK', '4.5')),
         max_negative_expectancy_streak=int(os.getenv('PAPER_MONITOR_NEG_EXPECTANCY_STREAK', '2')),
         min_samples=int(os.getenv('PAPER_MONITOR_MIN_SAMPLES', '8')),
     )
+
+    # The velocity check is only reachable above the sample gate, and the sample
+    # gate already implies a floor: `min_samples` trades over `lookback_days`
+    # is `min_samples * 7 / lookback_days` per week. A threshold at or below that
+    # can never fire, which is what the old default of 2.0 against 8 trades over
+    # 14 days (a floor of 4.0/week) quietly was. Say so rather than shipping a
+    # knob that does nothing.
+    implied_floor = thresholds.min_samples * 7 / max(lookback_days, 1)
+    if thresholds.min_trades_per_week <= implied_floor:
+        LOGGER.warning(
+            'PAPER_MONITOR_MIN_TRADES_PER_WEEK=%.2f can never fire: passing the '
+            'sample gate (%d trades in %dd) already implies >= %.2f/week. Raise it '
+            'above %.2f, or rely on insufficient_samples to catch a quiet strategy.',
+            thresholds.min_trades_per_week, thresholds.min_samples, lookback_days,
+            implied_floor, implied_floor,
+        )
+    return thresholds
 
 
 def _as_float(value: Any) -> float:
@@ -300,10 +317,10 @@ def _training_arguments(args: argparse.Namespace) -> list[str]:
     return flags
 
 
-def _scrape(args: argparse.Namespace, backfill_days: int) -> None:
+def _scrape(args: argparse.Namespace, window_hours: float) -> None:
     command = [
         sys.executable, '-m', 'scripts.run_pipeline',
-        '--backfill-only', '--backfill-days', str(backfill_days),
+        '--backfill-only', '--backfill-hours', str(window_hours),
         '--db-path', args.db_path,
     ]
     if args.include_oi:
@@ -355,10 +372,17 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
 
     run_id = None
     if writer:
+        # All three of these used to describe something that did not happen:
+        # `retrain_window_days` recorded 0 whenever the window was unset (the
+        # default), `symbols_total` was a literal zero, and `artifacts_version`
+        # was minted here — before promote ran — while `promotion.new_version()`
+        # mints its own with a uuid suffix, so the recorded version could never
+        # match a directory in models/promotions/. The real version is written by
+        # `complete_model_run` from the promotion record.
         run_id = writer.create_model_run(
-            retrain_window_days=int(args.train_window_days),
-            symbols_total=0,
-            artifacts_version=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'),
+            retrain_window_days=int(args.train_window_days) or None,
+            symbols_total=len(args.symbols.split(',')) if args.symbols else 0,
+            artifacts_version=None,
         )
 
     command = [
@@ -393,18 +417,22 @@ def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> 
         )
 
     if writer and run_id:
+        symbols = live.provenance.get('symbols', []) if live else []
         writer.complete_model_run(
             run_id=run_id,
             success=installed,
-            symbols_trained=len(live.provenance.get('symbols', [])) if live and installed else 0,
+            symbols_trained=len(symbols) if installed else 0,
             metrics=live.as_dict() if live and installed else None,
             error=None if installed else 'blocked by promotion gates',
+            # The version promote actually produced, which is the one that names
+            # a directory in models/promotions/.
+            artifacts_version=live.version if live and installed else None,
         )
     return installed
 
 
-def _run_cycle(args: argparse.Namespace, backfill_days: int, *, quarantined: bool) -> None:
-    _scrape(args, backfill_days)
+def _run_cycle(args: argparse.Namespace, window_hours: float, *, quarantined: bool) -> None:
+    _scrape(args, window_hours)
     _sync_store(args)
     _build_features(args)
 
@@ -517,13 +545,16 @@ def main() -> int:
     if args.retrain_only:
         return 0 if _attempt_promotion(args, writer) else 2
 
-    incremental_days = max(1, math.ceil(args.incremental_backfill_hours / 24))
+    # Hours, not days. `ceil(hours/24)` made every value from 1 to 24 fetch a
+    # full day, so the documented "last 6h each cycle" fetched 24h — four times
+    # the API calls for the same data.
+    incremental_hours = max(1, int(args.incremental_backfill_hours))
     LOGGER.info('live orchestrator starting (venue=%s, retrain every %dd)',
                 args.venue, args.retrain_every_days)
 
     try:
         quarantined, _ = evaluate_live_model(writer)
-        _run_cycle(args, args.backfill_days, quarantined=quarantined)
+        _run_cycle(args, args.backfill_days * 24, quarantined=quarantined)
 
         cycle = 1
         while not STOP_REQUESTED:
@@ -544,7 +575,7 @@ def main() -> int:
             cycle += 1
             LOGGER.info('cycle #%d', cycle)
             quarantined, _ = evaluate_live_model(writer)
-            _run_cycle(args, incremental_days, quarantined=quarantined)
+            _run_cycle(args, incremental_hours, quarantined=quarantined)
 
     except Exception as exc:  # noqa: BLE001 - the loop reports and exits nonzero
         LOGGER.exception('orchestrator failed: %s', exc)

@@ -5,54 +5,24 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import (
+    JSON, Boolean, Column, DateTime, Enum, Float, Integer, String, Text,
+    create_engine, text,
+)
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.sql import func
 
 # ── Inline model definitions (mirror of the API models) ────────────
 # We duplicate the ORM classes here so the trader doesn't need to
 # import from the API codebase (they run in separate containers).
-from sqlalchemy import Boolean, Column, DateTime, Enum, Float, Integer, String, Text, create_engine, JSON
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.sql import func
 
 Base = declarative_base()
-
-
-class TradeSide(str, enum.Enum):
-    LONG = "long"
-    SHORT = "short"
-
-
-class TradeStatus(str, enum.Enum):
-    OPEN = "open"
-    CLOSED = "closed"
 
 
 class PaperOrderStatus(str, enum.Enum):
     NEW = "new"
     FILLED = "filled"
     CANCELED = "canceled"
-
-
-class Trade(Base):
-    __tablename__ = "trades"
-    id = Column(Integer, primary_key=True, index=True)
-    coin = Column(String, nullable=False, index=True)
-    datetime_open = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    datetime_close = Column(DateTime(timezone=True), nullable=True)
-    side = Column(Enum(TradeSide), nullable=False)
-    contracts = Column(Float, nullable=False)
-    entry_price = Column(Float, nullable=False)
-    exit_price = Column(Float, nullable=True)
-    fee_open = Column(Float, nullable=True, default=0.0)
-    fee_close = Column(Float, nullable=True, default=0.0)
-    net_pnl = Column(Float, nullable=True)
-    margin_used = Column(Float, nullable=True)
-    leverage = Column(Float, nullable=True)
-    reason_entry = Column(Text, nullable=True)
-    reason_exit = Column(Text, nullable=True)
-    status = Column(Enum(TradeStatus), default=TradeStatus.OPEN, nullable=False)
 
 
 class Signal(Base):
@@ -327,80 +297,6 @@ class PgWriter:
             db.refresh(sig)
             return sig.id
 
-    # ── Trades ──────────────────────────────────────────────────────
-    def open_trade(
-        self,
-        coin: str,
-        side: str,
-        contracts: float,
-        entry_price: float,
-        mode: str = "live",
-        idempotency_key: str | None = None,
-        fee_open: float = 0.0,
-        margin_used: float | None = None,
-        leverage: float | None = None,
-        reason_entry: str | None = None,
-    ) -> int:
-        """Insert an open trade. Returns trade id."""
-        _ = mode
-        with self._session() as db:
-            if idempotency_key:
-                existing = db.query(Trade).filter(
-                    Trade.coin == coin,
-                    Trade.reason_entry == f"idem:{idempotency_key}",
-                ).first()
-                if existing:
-                    return existing.id
-
-            t = Trade(
-                coin=coin,
-                side=TradeSide(side),
-                contracts=contracts,
-                entry_price=entry_price,
-                fee_open=fee_open,
-                margin_used=margin_used,
-                leverage=leverage,
-                reason_entry=f"idem:{idempotency_key}" if idempotency_key else reason_entry,
-                status=TradeStatus.OPEN,
-            )
-            db.add(t)
-            db.commit()
-            db.refresh(t)
-            return t.id
-
-    def close_trade(
-        self,
-        trade_id: int,
-        exit_price: float,
-        mode: str = "live",
-        idempotency_key: str | None = None,
-        fee_close: float = 0.0,
-        net_pnl: float | None = None,
-        reason_exit: str | None = None,
-    ) -> bool:
-        """Close an existing trade. Returns True on success."""
-        _ = mode
-        with self._session() as db:
-            if idempotency_key:
-                existing = db.query(Trade).filter(
-                    Trade.reason_exit == f"idem:{idempotency_key}",
-                    Trade.status == TradeStatus.CLOSED,
-                ).first()
-                if existing:
-                    return True
-
-            t = db.query(Trade).filter(Trade.id == trade_id).first()
-            if not t:
-                return False
-            t.exit_price = exit_price
-            t.fee_close = fee_close
-            t.net_pnl = net_pnl
-            t.reason_exit = f"idem:{idempotency_key}" if idempotency_key else reason_exit
-            t.datetime_close = datetime.now(timezone.utc)
-            t.status = TradeStatus.CLOSED
-            db.commit()
-            return True
-
     def update_balance(self, new_balance: float) -> None:
         with self._session() as db:
             w = db.query(Wallet).order_by(Wallet.id.desc()).first()
@@ -432,7 +328,16 @@ class PgWriter:
         symbols_trained: int,
         metrics: dict | None = None,
         error: str | None = None,
+        artifacts_version: str | None = None,
     ) -> bool:
+        """Close out a run row.
+
+        `artifacts_version` is written here rather than at creation because only
+        `core.promotion.new_version()` knows it — it carries a uuid suffix so two
+        runs in the same second cannot collide in the ledger. Minting a timestamp
+        up front produced a version that named no directory in
+        models/promotions/.
+        """
         with self._session() as db:
             run = db.query(ModelRun).filter(ModelRun.id == run_id).first()
             if not run:
@@ -442,6 +347,8 @@ class PgWriter:
             run.symbols_trained = symbols_trained
             run.metrics = metrics
             run.error = error
+            if artifacts_version:
+                run.artifacts_version = artifacts_version
             db.commit()
             return True
     def upsert_wallet_balance(self, new_balance: float) -> None:

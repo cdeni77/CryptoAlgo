@@ -72,16 +72,37 @@ def _tables(base: Any) -> dict[str, Any]:
 
 
 def _column_shape(column: Any) -> dict[str, Any]:
-    """The parts of a column definition that a divergence would actually break."""
+    """The parts of a column definition that a divergence would actually break.
+
+    Three earlier blind spots, each demonstrated by mutation:
+
+    - `server_default` was compared as a boolean, so `text('100000')` against
+      `text('10000')` produced identical shapes — the exact `wallet.balance`
+      drift this file exists to catch, expressed server-side instead.
+    - callable defaults collapsed to the string `'<callable>'`, so
+      `default=list` and `default=dict` were interchangeable.
+    - `index` was not compared at all, so an index on one side only passed.
+    """
     default = getattr(column.default, 'arg', None) if column.default is not None else None
     if callable(default):
-        default = '<callable>'
+        # The function's identity, not the fact that it is one. `list` and `dict`
+        # are both callables and produce very different columns.
+        default = f'<callable:{getattr(default, "__name__", repr(default))}>'
+
+    server_default = column.server_default
+    if server_default is not None:
+        # The value, not its presence.
+        arg = getattr(server_default, 'arg', server_default)
+        server_default = str(getattr(arg, 'text', arg))
+
     return {
         'type': str(column.type).upper(),
         'nullable': bool(column.nullable),
         'primary_key': bool(column.primary_key),
         'default': default,
-        'server_default': column.server_default is not None,
+        'server_default': server_default,
+        'index': bool(column.index),
+        'unique': bool(column.unique),
     }
 
 
@@ -173,7 +194,14 @@ def test_the_migration_lists_match(schemas):
     trader_source = (TRADER_ROOT / 'core' / 'pg_writer.py').read_text()
     api_source = (API_ROOT / 'app.py').read_text()
 
-    pattern = re.compile(r'ADD COLUMN IF NOT EXISTS (\w+)')
+    # Table, column AND type. Capturing only the column name meant
+    # `cost_bps VARCHAR` on one side against `DOUBLE PRECISION` on the other
+    # passed, as did the right column added to the wrong table — which is the
+    # drift class this check exists for.
+    pattern = re.compile(
+        r'ALTER TABLE\s+(\w+)\s+ADD COLUMN IF NOT EXISTS\s+(\w+)\s+([A-Za-z ]+)',
+        re.IGNORECASE,
+    )
     trader_columns = set(pattern.findall(trader_source))
     api_columns = set(pattern.findall(api_source))
 
@@ -236,4 +264,22 @@ def test_every_api_product_is_known_to_the_cost_model():
     assert not unknown, (
         f'served by the API with no entry in CONTRACT_UNITS, so they would be '
         f'priced at the fallback: {unknown}'
+    )
+
+
+def test_no_table_is_declared_without_a_writer(schemas):
+    """A table nothing writes is a surface that serves fabricated aggregates.
+
+    `trades` was declared on both sides, exposed at `/trades` with a
+    `/trades/stats` that computed win rate over an empty table and reported
+    `0.0` — indistinguishable from a measured 0% — while the only writers,
+    `PgWriter.open_trade` and `.close_trade`, had no callers. The paper engine
+    keeps its ledger in `paper_positions`. When live execution lands it should
+    extend those tables (which carry funding, exit reason and TP/SL) rather
+    than resurrect a parallel schema.
+    """
+    trader, api = schemas
+    assert 'trades' not in trader and 'trades' not in api, (
+        'the `trades` table is back. Nothing wrote it before; if something '
+        'writes it now, delete this test and say what.'
     )
