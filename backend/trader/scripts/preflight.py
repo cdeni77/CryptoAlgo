@@ -58,9 +58,15 @@ class Check:
     passed: bool
     detail: str
     fix: str = ''
+    # Reported, but not a reason to withhold the rest of the report. Funding is
+    # the case that forced this: CDE publishes no historical funding endpoint, so
+    # a thin funding series cannot be scraped away and blocking on it made
+    # preflight permanently unpassable — while suppressing the effective-sample
+    # numbers the script exists to produce.
+    advisory: bool = False
 
     def __str__(self) -> str:
-        mark = 'PASS' if self.passed else 'FAIL'
+        mark = 'NOTE' if self.advisory else ('PASS' if self.passed else 'FAIL')
         return f'[{mark}] {self.name}: {self.detail}'
 
 
@@ -88,7 +94,7 @@ def _store_populated(store: ResearchStore, venue: str, min_days: int) -> Check:
     lines: list[str] = []
     shortfalls: list[str] = []
 
-    for dataset in ('bars', 'funding', 'open_interest'):
+    for dataset in ('bars',):
         try:
             coverage = store.coverage(dataset)
         except Exception as exc:  # noqa: BLE001 - a missing dataset is the finding
@@ -98,9 +104,7 @@ def _store_populated(store: ResearchStore, venue: str, min_days: int) -> Check:
             shortfalls.append(f'{dataset}: empty')
             continue
 
-        # Open interest legitimately lives on a proxy venue: Coinbase exposes no
-        # open-interest endpoint, so it is not a shortfall to find it elsewhere.
-        scoped = coverage if dataset == 'open_interest' else coverage[coverage['venue'] == venue]
+        scoped = coverage[coverage['venue'] == venue]
         if scoped.empty:
             shortfalls.append(f'{dataset}: nothing on {venue}')
             continue
@@ -118,10 +122,56 @@ def _store_populated(store: ResearchStore, venue: str, min_days: int) -> Check:
         return Check(
             'research store', False, f'{detail} | {"; ".join(shortfalls)}',
             'scrape, then sync: python -m scripts.run_pipeline --backfill-only '
-            f'--backfill-days {min_days} && python -m scripts.migrate_to_research_store '
-            f'--venue {venue}',
+            f'--backfill-days {min_days} --timeframes 1h && '
+            f'python -m scripts.migrate_to_research_store --venue {venue}',
         )
     return Check('research store', True, detail)
+
+
+def _carry_and_positioning(store: ResearchStore, venue: str, min_days: int) -> Check:
+    """Funding and open-interest coverage, reported rather than gated.
+
+    Neither can be fixed by scraping harder, which is why blocking on them was
+    wrong:
+
+    * **Funding.** CDE publishes no historical endpoint — only the current rate
+      on the product, with `funding_time` being the *next* settlement. It
+      accumulates forward, one observation per hourly settlement, so the series
+      is exactly as long as the hourly loop has been running. Telling someone to
+      `--backfill-days 90` for it is advice that cannot work.
+    * **Open interest.** Coinbase exposes none, so it comes through CCXT from a
+      proxy venue, and `--include-oi` is opt-in. From a US IP the usual sources
+      answer 451.
+
+    Both feed real feature groups (`carry` 9 features, `positioning` 6), so their
+    absence is worth stating plainly — the panel keeps its full 76 columns either
+    way and the empty ones arrive as all-NaN.
+    """
+    notes: list[str] = []
+    for dataset, groups in (('funding', 'carry'), ('open_interest', 'positioning')):
+        try:
+            coverage = store.coverage(dataset)
+        except Exception:                                  # noqa: BLE001
+            coverage = None
+        if coverage is None or coverage.empty:
+            notes.append(f'{dataset}: empty, so the {groups} features are all-NaN')
+            continue
+        # Open interest legitimately lives on a proxy venue.
+        scoped = coverage if dataset == 'open_interest' else coverage[coverage['venue'] == venue]
+        if scoped.empty:
+            notes.append(f'{dataset}: nothing on {venue}, so {groups} is all-NaN')
+            continue
+        days = float(scoped['days'].max())
+        rows = int(scoped['rows'].sum())
+        suffix = '' if days >= min_days else f' — under {min_days}d, so {groups} is thin'
+        notes.append(f'{dataset}: {len(scoped)} series, {rows:,} rows, {days:.0f} days{suffix}')
+
+    return Check(
+        'carry & positioning', True, '; '.join(notes), advisory=True,
+        fix='funding cannot be backfilled on CDE — start `scripts.live_orchestrator` '
+            'and it accrues hourly. Open interest needs --include-oi and a '
+            'reachable CCXT venue (451 from a US IP without a proxy).',
+    )
 
 
 def _panel_builds(dataset) -> Check:
@@ -341,7 +391,8 @@ def main() -> int:
     store = ResearchStore(args.store) if args.store else ResearchStore()
 
     checks.append(_store_populated(store, args.venue, args.min_days))
-    if checks[-1].passed:
+    checks.append(_carry_and_positioning(store, args.venue, args.min_days))
+    if checks[0].passed:
         dataset = load(args, config)
         checks.append(_cost_schedule(config, dataset.symbols))
         checks.append(_panel_builds(dataset))
@@ -357,11 +408,11 @@ def main() -> int:
     print()
     for check in checks:
         print(check)
-        if not check.passed and check.fix:
+        if check.fix and (check.advisory or not check.passed):
             for line in check.fix.split('\n'):
                 print(f'       {line}')
 
-    failed = [c for c in checks if not c.passed]
+    failed = [c for c in checks if not c.passed and not c.advisory]
     print()
     if failed:
         print(f'NOT READY: {len(failed)} of {len(checks)} check(s) failed')
