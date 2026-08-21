@@ -186,6 +186,86 @@ the signal writer would truncate the panel it has to score the latest bar from.
 `--recency-half-life-days` is the soft weighting. They are different instruments
 and both are useful.
 
+## The target must start from a price you can still buy
+
+`price_return` measured `close(t+h) / close(t) - 1`. That is wrong here, and it
+invalidated every performance number this repo produced before 2026-08-21.
+
+A bar's `available_time` is the moment it closes, so a decision using bar `t` is
+made at `t+1` and the earliest price it can fill at is `open(t+1)`. But `close(t)`
+is the *last trade* in bar `t`, and on a thin nano perp that can be twenty minutes
+before the bar ends while Coinbase spot keeps moving. The basis computed from that
+stale print looks extreme, the next trade corrects it, and a close-anchored target
+books the correction as profit.
+
+Measured on 399 days, the 14 contracts with >= 231 days, three walk-forward
+quarters:
+
+| measurement | IC |
+|---|---:|
+| `basis_z_168h` vs the `close(t) -> open(t+1)` gap alone | **-0.50** |
+| `basis_z_168h` vs the old close-to-close target | -0.167 |
+| `basis_z_168h` vs `open(t+1) -> open(t+1+h)` | -0.0065 |
+| cross_venue+trend model, h=1h, close-to-close | **+0.114** |
+| the same model, same split, open-to-open | **+0.002** |
+
+**Ninety-eight percent of the apparent edge was unreachable.** That single fact
+explains the central puzzle: reported IC of 0.05-0.17 alongside backtests that
+lost money on every configuration. `core/simulation.py` always entered at the next
+open — correctly — and the metric it was scored against never did.
+
+Everything that looked like a finding dissolves into it. `cross_venue` "beating all
+61 features"; basis mean reversion at IC -0.167 stable across three quarters;
+shorter horizons scoring better (the gap is a larger share of a shorter horizon);
+the per-instrument table favouring the thinnest contracts (the thinnest have the
+stalest closes). All one artifact.
+
+`entry='next_open'` is the default. `entry='close'` exists only to reproduce an old
+artifact — nothing should train on it, and
+`tests/test_targets.py::test_the_target_cannot_be_filled_at_a_price_that_is_already_gone`
+fails if `build_targets` reaches for it.
+
+### What the data actually supports, on the honest target
+
+- **Direction: nothing.** Holdout price IC is -0.027 at h=2, and +0.002 walk-forward.
+- **Volatility: a lot.** The dispersion head scores **+0.34**, and it went *up* when
+  the target was fixed, because it never depended on the artifact. Returns are
+  near-unpredictable and volatility is very predictable, which is the textbook
+  result and not a disappointment.
+- **Carry: still untested.** 18 funding rows. It is the one part of the original
+  thesis that has never been evaluated, and it accumulates forward only.
+
+### The sample is one bear market and one reversal
+
+Do not read a backtest here as a general result. Equal-weight across all 18:
+
+| quarter | return | Sharpe |
+|---|---:|---:|
+| 2025 Q3 | +12.5% | +1.23 |
+| 2025 Q4 | -34.1% | -2.65 |
+| 2026 Q1 | -25.8% | -1.92 |
+| 2026 Q2 | -18.8% | -1.42 |
+| 2026 Q3 | +28.6% | +4.14 |
+
+Fourteen of eighteen contracts are down 14-55% with 48-76% drawdowns. An 80/20
+chronological split therefore trains on three down quarters and tests on a
+melt-up, which is why a model fit that way calls shorts into a rally and realises
+a 31% win rate. Use walk-forward quarters, not one split.
+
+### Contract history is ragged, and it truncates the simulation
+
+`core/simulation.py` runs on the shortest common span. With all 18 that is **54
+days** of 398, because HYP listed 2026-06-05. Only four contracts (BIP, ETP, SLP,
+XPP) have a year; ten have ~240 days; four have under 170.
+
+`--exclude HYPE,PEPE,NEAR,ONDO` leaves the 14 with >= 231 days — every one
+spanning three down quarters plus the rally — and takes the simulated span to 190
+days. Prefer that to `--symbols`, which also shrinks the training universe.
+
+Note that the four excluded are the four that *rose*, because they only exist
+during the rally. Selecting instruments on measured performance here selects for
+listing date.
+
 ## Critical Architecture Notes
 
 - **`core/profiles.py` is the single source of truth** for per-coin feature sets, thresholds, and ML hyperparameters. Coins are described by a feature *archetype* (`mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`) plus tuned deltas. Changes cascade into training, search, and signal generation.
