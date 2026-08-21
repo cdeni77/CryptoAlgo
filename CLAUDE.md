@@ -65,8 +65,15 @@ panels, execution simulation) with hard promotion gates. Read it before changing
 anything under `core/` or `features/`.
 
 Landed so far: `core/costs.py`, `core/config.py`, `core/profiles.py`,
-`core/datastore.py`. Still on the old path: `scripts/train_model.py`,
-`features/engineering.py`, and the five search scripts.
+`core/datastore.py`, `core/features.py`, `core/labels.py`, `core/cv.py`,
+`core/metrics.py`, plus `scripts/build_features.py` and
+`scripts/migrate_to_research_store.py`. Still on the old path:
+`scripts/train_model.py`, `features/engineering.py`, `core/labeling.py`,
+`core/meta_labeling.py`, and the five search scripts — all of which go with the
+model layer.
+
+Nothing in the new path is wired into training yet. `train_model.py` still
+consumes `features/engineering.py`.
 
 ## Critical Architecture Notes
 

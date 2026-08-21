@@ -115,7 +115,16 @@ class Config:
     strategy_family: str = 'momentum_trend'
     trade_freq_bucket: str = 'balanced'
 
+    # --- Labelling ---
+    # Directional consensus needed before a bar is labelled at all: 2 requires
+    # all three momentum components to agree, 1 accepts two of three.
+    direction_score_threshold: int = 2
+
     # --- Family-specific knobs (profiles override per coin) ---
+    # Every value a profile can override needs a default here, or `resolve`
+    # cannot complete the CLI > profile > default chain for it. The last four
+    # belong to the funding_carry, squeeze_breakout and oi_divergence families,
+    # which is why they were missing: those families were unreachable.
     pullback_depth_threshold: float = 0.020
     rebound_confirmation_threshold: float = 0.004
     trend_strength_min: float = 0.002
@@ -123,6 +132,10 @@ class Config:
     breakout_lookback: int = 48
     breakout_buffer: float = 0.003
     expansion_confirm_threshold: float = 0.004
+    funding_z_threshold: float = 2.5
+    squeeze_pct_threshold: float = 0.20
+    liq_threshold: float = 0.30
+    oi_z_threshold: float = 1.0
 
     # Fields the user explicitly set on the command line.
     cli_overrides: frozenset[str] = frozenset()
