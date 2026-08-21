@@ -626,3 +626,74 @@ correctly leaves the skipped simulation gates as failures, so a fast development
 run can never promote. The API reads the resulting ledger entry — blocked, with
 its ten named gates, correct horizon and effective-observation count — and reports
 "no promoted model" for feature importances rather than substituting anything.
+
+---
+
+## 10. What taking screenshots found
+
+Running the dashboard against a real evaluation, rather than against tests,
+surfaced a defect that no test had caught — because the tests only checked that
+bad candidates get *blocked*, which they did, for the wrong reason.
+
+### 10.1 Three gates were structurally unmeasurable
+
+`pbo`, `deflated_sharpe` and `parameter_plateau` were in `DEFAULT_GATES`, but
+`evaluate_candidate` never computed any of them. A gate with no measurement fails
+by design — that rule is correct, and §5 relies on it — so every candidate came
+back with three gates reading "not measured".
+
+The consequence: **`--force` was the only route to live.** A system whose entire
+premise is that nothing reaches live except through the gates had gates that
+nothing could pass. The tests passed throughout, because a blocked candidate is
+what they assert, and eight of ten failing gates looks the same as eleven.
+
+All three are now measured:
+
+- **`deflated_sharpe`** from the observed Sharpe against the expected maximum of
+  `trials` worthless strategies. `trials` is the ledger count, passed in by the
+  caller — which is what finally makes "rejections are kept" load-bearing rather
+  than merely tidy.
+- **`parameter_plateau`** from perturbing the three thresholds `decide()` trades
+  on — `min_edge_over_cost`, `vol_mult_tp`, `vol_mult_sl` — one step either way
+  and re-running the walk-forward. Retention reports zero when the centre itself
+  loses money, because "neighbours at least 70% as good as a negative Sharpe"
+  would reward being uniformly bad.
+- **`pbo`** from the per-period Sharpes of those same runs, which form exactly the
+  (candidates x splits) matrix the estimate needs. Two gates out of one set of
+  runs.
+
+`test_a_full_evaluation_measures_every_gate` now fails if any measurement comes
+back null, and asserts the report and the gate table describe the same set. A
+gate added without a measurement breaks the suite instead of silently blocking
+everything.
+
+Measured on the demo dataset, all ten now carry numbers: `pbo` 0.50,
+`deflated_sharpe` −11.93, `parameter_plateau` 0.00, against eight failures and
+two passes. Which is the correct verdict — but it is now a verdict rather than an
+absence.
+
+### 10.2 The dashboard was reading the wrong LightGBM API
+
+Feature importance called `Booster.feature_importance(importance_type='gain')` on
+heads that are `LGBMRegressor` instances, whose attributes are
+`feature_importances_` and `feature_name_`. Every request returned
+"no attribute 'feature_importance'". Both APIs are handled now.
+
+### 10.3 Three display defects only visible on screen
+
+- `ModelStatusPanel` still had an AUC column, null on every row the current
+  signal writer creates, and its fixed-width flex row let the gate reason and the
+  timestamp overprint each other. It shows expected net edge against the round
+  trip that edge has to clear.
+- The positions and signals tables packed eight and nine columns into a
+  third-width card and clipped the last one — the unrealised PnL and the gate
+  result, which are the two numbers those panels exist to show.
+- `PaperPositionsTable` carried its own contract-size table with a comment
+  reading "Must match trading_costs.py", a file deleted in this rebuild. Contract
+  size multiplies into unrealised PnL, so a stale entry there misreports a
+  position silently. It comes from the API now.
+
+### 10.4 `frontend/node_modules` was committed
+
+4,791 files, 55.8 MB, tracked since 072eb02. `package-lock.json` is tracked too,
+so `npm ci` reproduces it exactly — which is the point of a lockfile. Untracked.
