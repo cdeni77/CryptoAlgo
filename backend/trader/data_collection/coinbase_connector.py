@@ -562,10 +562,23 @@ class CoinbaseRESTClient:
                 logger.warning("%s: uninterpretable open_interest %r", product_id, raw)
                 return None
 
+            # Floored to the hour, not `utc_now()`. Three things broke on a
+            # microsecond stamp. The store is keyed on
+            # (symbol, venue, event_time), so every run minted a new key and a
+            # second run inside one hour appended 18 duplicate rows instead of
+            # upserting — unlike funding, which keys on the settlement hour.
+            # `_align` reindexes onto the hourly bar grid with method='ffill', so
+            # a 21:21:06 reading landed on the 22:00 bar rather than 21:00. And
+            # the two halves of one snapshot carried different timestamps, which
+            # is exactly what fetching them in a single request exists to prevent.
+            #
+            # The hour it was observed in is the honest event time: `available_time`
+            # stays at the real instant, so the pair still says "known at 21:21,
+            # describes hour 21".
             now = utc_now()
             return OpenInterest(
                 symbol=product_id,
-                event_time=now,
+                event_time=now.replace(minute=0, second=0, microsecond=0),
                 available_time=now,
                 open_interest_contracts=contracts,
                 venue="coinbase",

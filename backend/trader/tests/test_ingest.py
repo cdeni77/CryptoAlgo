@@ -684,3 +684,65 @@ def test_the_snapshot_stores_funding_and_open_interest_together():
     assert interest[0]['symbol'] == 'BIP'
     assert interest[0]['venue'] == 'coinbase'
     assert interest[0]['open_interest_contracts'] == pytest.approx(268164.0)
+
+
+def test_the_open_interest_snapshot_is_keyed_on_the_hour():
+    """A microsecond stamp broke dedup, alignment and the pairing with funding.
+
+    The store's key is (symbol, venue, event_time). `utc_now()` mints a new one
+    every call, so a second run inside one hour appended duplicate rows instead of
+    upserting — funding, keyed on the settlement hour, did not have that problem,
+    and the two halves of a single request disagreeing about their timestamp is
+    what fetching them together exists to prevent.
+
+    `_align` also reindexes onto the hourly bar grid with `method='ffill'`, so a
+    reading at 21:21:06 landed on the 22:00 bar rather than 21:00.
+    """
+    import asyncio
+    from unittest import mock
+
+    from data_collection.coinbase_connector import CoinbaseRESTClient
+
+    client = CoinbaseRESTClient('k', 's')
+    body = {'price': '77105', 'future_product_details': {
+        'funding_rate': '0.000009', 'funding_interval': '3600s',
+        'funding_time': '2026-08-21T22:00:00Z', 'open_interest': '268164'}}
+
+    with mock.patch.object(client, '_request', mock.AsyncMock(return_value=(200, body))):
+        first = asyncio.run(client.get_contract_snapshot('BIP-20DEC30-CDE'))
+        second = asyncio.run(client.get_contract_snapshot('BIP-20DEC30-CDE'))
+
+    for funding, interest in (first, second):
+        assert interest.event_time.minute == 0
+        assert interest.event_time.second == 0
+        assert interest.event_time.microsecond == 0
+        # available_time keeps the real instant: known at 21:21, describes hour 21.
+        assert interest.available_time >= interest.event_time
+        assert funding.event_time.minute == 0
+
+    # Two reads in the same hour must produce the same key, or they accumulate.
+    assert first[1].event_time == second[1].event_time, (
+        'repeat reads inside one hour produce different keys, so they duplicate '
+        'instead of upserting'
+    )
+
+
+def test_repeat_snapshots_in_one_hour_upsert(database):
+    """The consequence of the above, at the storage layer."""
+    from data_collection.models import OpenInterest
+
+    ingestor = Ingestor(database)
+    stamp = datetime(2026, 8, 21, 21, 0, 0)
+    for contracts in (268164.0, 268900.0, 269500.0):
+        ingestor.ingest_open_interest([OpenInterest(
+            symbol='BIP-20DEC30-CDE', event_time=stamp,
+            available_time=stamp + timedelta(minutes=21),
+            open_interest_contracts=contracts,
+        )], venue='coinbase')
+
+    with database._get_connection() as conn:
+        rows = [dict(r) for r in conn.cursor().execute(
+            'SELECT event_time, open_interest_contracts FROM open_interest')]
+
+    assert len(rows) == 1, f'three reads in one hour produced {len(rows)} rows'
+    assert rows[0]['open_interest_contracts'] == 269500.0, 'the latest read must win'
