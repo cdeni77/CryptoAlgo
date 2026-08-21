@@ -140,14 +140,68 @@ def target_spec_for(
 # ---------------------------------------------------------------------------
 
 
-def price_return(close: pd.Series, horizon_bars: int) -> pd.Series:
-    """Simple return over the horizon, from t to t+h.
+def price_return(
+    bars: pd.DataFrame | pd.Series,
+    horizon_bars: int,
+    *,
+    entry: str = 'next_open',
+) -> pd.Series:
+    """Simple return over the horizon, from the first price a decision can fill at.
 
     Simple rather than log so that subtracting a cost — itself a fraction of
     notional — is exact rather than approximate.
+
+    `entry='next_open'` measures `open(t+1+h) / open(t+1) - 1`. That is the
+    honest target: a bar's `available_time` is the moment it closes, so a decision
+    using bar `t` cannot be made until `t+1` has begun, and the earliest price it
+    can transact at is `open(t+1)`.
+
+    `entry='close'` measures `close(t+h) / close(t) - 1`, which is what this
+    function used to do unconditionally. On a liquid instrument the two agree,
+    because `close(t)` and `open(t+1)` are the same moment. On a thin one they do
+    not, and the difference is not small:
+
+    * `close(t)` is the *last trade* in bar `t`, which on a nano perp can be
+      twenty minutes before the bar ends while spot keeps moving.
+    * Measured on this repo's 399-day store, across 14 contracts and three
+      walk-forward quarters, `basis_z_168h` scored IC **-0.50** against the
+      `close(t) -> open(t+1)` gap alone. The gap *is* the perp's stale print
+      catching up.
+    * So a model trained on the close-to-close target learns to forecast that
+      catch-up. Its IC looks strong and none of it is reachable: the same
+      cross_venue+trend model scored **+0.114** close-to-close and **+0.002**
+      open-to-open at a 1h horizon. Ninety-eight percent of the apparent edge was
+      a price that no longer existed.
+
+    That gap is why every backtest in this repo lost money while the reported IC
+    looked healthy. The simulation always entered at the next open — correctly —
+    and the target it was scored against never did.
+
+    Keep `entry='close'` only for reproducing an old artifact. Nothing should
+    train on it.
     """
-    forward = close.shift(-int(horizon_bars))
-    return (forward / close.replace(0, np.nan)) - 1.0
+    horizon = int(horizon_bars)
+    if isinstance(bars, pd.Series):
+        # Legacy call shape: a bare close series can only support the close mode.
+        if entry != 'close':
+            raise TypeError(
+                "price_return needs the bars frame (for 'open') unless "
+                "entry='close'; pass the DataFrame"
+            )
+        close = bars
+        return (close.shift(-horizon) / close.replace(0, np.nan)) - 1.0
+
+    if entry == 'close':
+        close = bars['close']
+        return (close.shift(-horizon) / close.replace(0, np.nan)) - 1.0
+
+    if entry != 'next_open':
+        raise ValueError(f"entry must be 'next_open' or 'close', got {entry!r}")
+
+    opens = bars['open']
+    fill = opens.shift(-1)
+    exit_price = opens.shift(-(1 + horizon))
+    return (exit_price / fill.replace(0, np.nan)) - 1.0
 
 
 def carry_return(
@@ -199,7 +253,7 @@ def build_targets(
     if funding is not None and not funding.empty and 'rate' in funding.columns:
         rates = funding['rate']
 
-    price = price_return(frame['close'], spec.horizon_bars)
+    price = price_return(frame, spec.horizon_bars)
     carry = carry_return(rates, frame.index, spec.horizon_bars)
 
     out = pd.DataFrame(index=frame.index)

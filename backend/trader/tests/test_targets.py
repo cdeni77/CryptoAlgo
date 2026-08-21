@@ -70,11 +70,71 @@ def _funding(index: pd.DatetimeIndex, rate: float) -> pd.DataFrame:
 
 
 def test_price_return_is_exact():
+    """The default measures open(t+1+h) / open(t+1) - 1."""
     bars = _ramp()
-    returns = price_return(bars['close'], 3)
+    returns = price_return(bars, 3)
+
+    assert returns.iloc[0] == pytest.approx(bars['open'].iloc[4] / bars['open'].iloc[1] - 1)
+    assert returns.iloc[-4:].isna().all(), 'rows without a forward window must be NaN'
+
+
+def test_price_return_legacy_close_mode_still_works():
+    bars = _ramp()
+    returns = price_return(bars, 3, entry='close')
 
     assert returns.iloc[0] == pytest.approx(103 / 100 - 1)
-    assert returns.iloc[-3:].isna().all(), 'rows without a forward window must be NaN'
+    assert returns.iloc[-3:].isna().all()
+
+
+def test_the_target_cannot_be_filled_at_a_price_that_is_already_gone():
+    """The target must start from a price a decision at t could actually transact at.
+
+    A bar's `available_time` is the moment it closes, so a decision using bar t is
+    made at t+1 and the earliest fillable price is `open(t+1)`. `close(t)` is the
+    *last trade* in bar t, which on a thin nano perp can be twenty minutes earlier
+    while spot kept moving — so a target anchored there credits the stale print's
+    catch-up to the strategy.
+
+    That is not hypothetical. On this repo's 399-day store, across 14 contracts and
+    three walk-forward quarters, `basis_z_168h` scored IC -0.50 against the
+    close-to-open gap alone, and the same cross_venue+trend model scored +0.114
+    close-to-close against +0.002 open-to-open at a 1h horizon. Ninety-eight
+    percent of the measured edge was unreachable, which is why every backtest lost
+    money while the reported IC looked healthy: the simulation entered at the next
+    open and the metric never did.
+
+    Constructed so the two answers must differ: bar 0's close is stale at 100
+    while bar 1 opens at 110.
+    """
+    index = pd.date_range('2026-01-01', periods=6, freq='1h', tz='UTC')
+    bars = pd.DataFrame(
+        {'open': [100.0, 110.0, 111.0, 112.0, 113.0, 114.0],
+         'high': [100.0, 110.0, 111.0, 112.0, 113.0, 114.0],
+         'low': [100.0, 110.0, 111.0, 112.0, 113.0, 114.0],
+         'close': [100.0, 110.0, 111.0, 112.0, 113.0, 114.0],
+         'volume': 1_000.0},
+        index=index,
+    )
+
+    tradeable = price_return(bars, 1)
+    stale = price_return(bars, 1, entry='close')
+
+    # The close-anchored target books the whole 100 -> 110 jump, which happened
+    # before any order could exist.
+    assert stale.iloc[0] == pytest.approx(0.10)
+    # The honest one books open(2)/open(1) - 1 = 111/110 - 1.
+    assert tradeable.iloc[0] == pytest.approx(111 / 110 - 1)
+    assert tradeable.iloc[0] < stale.iloc[0] / 10
+
+    # And build_targets must use the honest one.
+    import inspect
+
+    from core import targets as targets_module
+
+    source = inspect.getsource(targets_module.build_targets)
+    assert "entry='close'" not in source, (
+        'build_targets is anchoring the target on a price that is already gone'
+    )
 
 
 def test_long_pays_positive_funding():
