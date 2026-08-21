@@ -43,7 +43,17 @@ class Config:
 
     # --- Entry filters (profiles override per coin) ---
     signal_threshold: float = 0.80
+    # Classification-era: a probability threshold plus this margin. The forecast
+    # is a return now, so the decision path uses `min_edge_over_cost` instead —
+    # reusing this as a return threshold demanded 200bp of expected net, which no
+    # hourly forecast will ever clear.
     min_signal_edge: float = 0.02
+    # Expected net return must exceed the round-trip cost by this multiple again.
+    # Expressed relative to cost rather than as an absolute, because cost ranges
+    # from ~5bp on the group-B contracts to ~54bp on ETH: an absolute floor would
+    # be trivially met on one and unreachable on the other. At 0.5, DOGE needs
+    # ~2.5bp of forecast edge and ETH needs ~27bp.
+    min_edge_over_cost: float = 0.5
     min_momentum_magnitude: float = 0.07
     momentum_score_threshold: float = 1.0
     momentum_strict_mode: bool = False

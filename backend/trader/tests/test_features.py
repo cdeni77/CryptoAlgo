@@ -221,10 +221,20 @@ def test_fee_hurdle_tracks_the_real_schedule(config):
     assert hurdles['DOP'] < hurdles['BIP']
 
 
-def test_contract_notional_matches_spec(config):
+def test_notional_per_contract_is_not_a_feature(config):
+    """It was, and it ranked fifth by gain, which is the problem.
+
+    Notional per contract is near-constant for an instrument, so a tree splits on
+    it to recover instrument identity with a continuous variable — more
+    expressive, and more overfittable, than the symbol category the pooled model
+    deliberately does without (see `core.model.USE_SYMBOL_IDENTITY`). It also has
+    no predictive story: the model does not size positions,
+    `core.costs.size_position` does.
+    """
     inputs = _inputs('SLP', 150, seed=31)
     features = cost_features(inputs, config=config)
-    expected = get_contract_spec('SLP').units * inputs.bars['close']
-    pd.testing.assert_series_equal(
-        features['contract_notional_usd'], expected, check_names=False
-    )
+
+    assert 'contract_notional_usd' not in features.columns
+    # The hurdle itself stays: it is the threshold a move has to clear, and it
+    # moves with price rather than being a fixed per-instrument label.
+    assert 'fee_hurdle_bps' in features.columns
