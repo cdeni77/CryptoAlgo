@@ -38,15 +38,32 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                         choices=['valid', 'suspicious', 'unvalidated', 'all'])
     parser.add_argument('--horizon', type=int, default=None,
                         help='Forecast horizon in hours (default: the profile hold)')
+    parser.add_argument('--min-history-days', type=float, default=0.0,
+                        help="Drop instruments with fewer than this many days of "
+                             "bars. A contract with too little history is not a "
+                             "small version of one with enough, it is a sample "
+                             "from a different period: CDE listings are spread "
+                             "across a year, so the youngest contracts exist only "
+                             "inside the most recent regime. On a 399-day store, "
+                             "231 keeps the 14 that span three falling quarters "
+                             "and the rally, and drops the four that only ever saw "
+                             "the rally. It also sets the shortest span the "
+                             "simulation can cover. Prefer this to --exclude: it "
+                             "is a rule that reproduces itself rather than a "
+                             "symbol list someone has to remember the reason for.")
     parser.add_argument('--feature-groups', default=None,
                         help="Comma-separated feature groups to build, e.g. "
-                             "'cross_venue,trend'. Default: all of them. Measured "
-                             "walk-forward on 399 days across three quarters, "
-                             "cross_venue+trend (25 features) beat all 61 that "
-                             "carried data, and the rest flip sign between a "
-                             "falling quarter and a rising one. Groups: carry, "
-                             "cross_venue, volatility, liquidity, positioning, "
-                             "trend, market_factor, seasonality, cost.")
+                             "'cross_venue'. Default: all of them. Measured "
+                             "walk-forward on 399 days across three quarters "
+                             "against the tradeable open-to-open target, "
+                             "cross_venue (7 features) is the only group positive "
+                             "in every quarter, at IC +0.012 at a 1h horizon "
+                             "against +0.000 for all 61 that carry data. That is "
+                             "an edge of under 1bp against a cheapest round trip "
+                             "of 6.1bp, so it selects a better model rather than a "
+                             "tradeable one. Groups: carry, cross_venue, "
+                             "volatility, liquidity, positioning, trend, "
+                             "market_factor, seasonality, cost.")
     parser.add_argument('--cost-config', default=DEFAULT_COST_CONFIG_NAME,
                         help="Venue fee schedule: a path, or a filename looked up "
                              "in configs/exchange. 'none' to use the hardcoded default.")
@@ -173,6 +190,7 @@ def load(args: argparse.Namespace, config: Config) -> Dataset:
         min_quality=None if args.min_quality == 'all' else args.min_quality,
         horizon_bars=args.horizon,
         feature_groups=_feature_groups(getattr(args, 'feature_groups', None)),
+        min_history_days=float(getattr(args, 'min_history_days', 0.0) or 0.0),
     )
     window = getattr(args, 'train_window_days', None)
     if window:

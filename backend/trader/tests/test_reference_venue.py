@@ -439,3 +439,56 @@ def test_reference_history_deeper_than_the_trade_venue_is_unused(tmp_path):
         f'{difference} — the reindex is no longer bounding it, so the scrape depth '
         f'on the reference leg now matters'
     )
+
+
+def test_min_history_days_excludes_instruments_that_only_saw_one_regime(tmp_path):
+    """A short listing is a sample from a different period, not a smaller sample.
+
+    CDE listings are spread across a year, so on a 399-day store four contracts
+    hold ~395 days, ten hold ~240, and four hold under 180. The youngest exist only
+    inside the most recent regime — which on this store is a +28.6 percent quarter
+    following three falling ones, so they are also the only contracts that rose.
+    Selecting instruments on measured performance therefore selects by listing
+    date, and the shortest one alone sets the span the simulation can cover.
+
+    `--exclude` could express this as a symbol list, but a threshold reproduces
+    itself and carries its own reason.
+    """
+    store = ResearchStore(tmp_path / 'ragged')
+    end = pd.Timestamp('2026-08-21 20:00', tz='UTC')
+    spans = {'BIP': 300 * 24, 'ETP': 300 * 24, 'SLP': 300 * 24, 'XPP': 40 * 24}
+    for i, (symbol, bars) in enumerate(spans.items()):
+        index = pd.date_range(end=end, periods=bars, freq='1h')
+        rng = np.random.default_rng(i)
+        close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, bars)))
+        opens = np.concatenate([[close[0]], close[:-1]])
+        for venue in ('coinbase', 'coinbase_spot'):
+            store.write('bars', pd.DataFrame({
+                'venue': venue, 'symbol': symbol, 'event_time': index,
+                'available_time': index + pd.Timedelta(hours=1), 'quality': 'valid',
+                'open': opens, 'high': np.maximum(opens, close) * 1.004,
+                'low': np.minimum(opens, close) * 0.996, 'close': close,
+                'volume': rng.lognormal(8, 0.6, bars),
+                'quote_volume': np.nan, 'trade_count': np.nan,
+            }))
+
+    everything = load_dataset(store, venue='coinbase', reference_venue='coinbase_spot',
+                             symbols=list(spans), min_quality='valid', horizon_bars=2)
+    filtered = load_dataset(store, venue='coinbase', reference_venue='coinbase_spot',
+                            symbols=list(spans), min_quality='valid', horizon_bars=2,
+                            min_history_days=100)
+
+    assert set(everything.features.index.get_level_values('symbol')) == set(spans)
+    kept = set(filtered.features.index.get_level_values('symbol'))
+    assert 'XPP' not in kept, 'the 40-day instrument survived a 100-day floor'
+    assert {'BIP', 'ETP', 'SLP'} <= kept
+
+    # Named, with its span, rather than silently dropped.
+    excluded = [w for w in filtered.warnings if 'under 100d of bars' in w]
+    assert excluded, f'no warning naming the exclusion: {filtered.warnings}'
+    assert 'XPP' in excluded[0] and '40d' in excluded[0]
+
+    # And recorded on the Dataset, because the symbol list alone does not show
+    # which regimes the universe spans.
+    assert filtered.min_history_days == 100
+    assert everything.min_history_days == 0

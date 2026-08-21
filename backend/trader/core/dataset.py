@@ -61,6 +61,10 @@ class Dataset:
     # `feature_set_hash` only distinguishes them because `feature_columns(groups)`
     # shortens the name list.
     feature_groups: Optional[tuple[str, ...]] = None
+    # Minimum bar span an instrument needed to be included, in days. Recorded
+    # because it changes which regimes the universe spans, which is not visible
+    # from the symbol list alone.
+    min_history_days: float = 0.0
     warnings: list[str] = field(default_factory=list)
     # Symbols whose funding came from the reference venue instead of the traded
     # one. Structured, not just a warning string, because it has to survive into
@@ -260,6 +264,7 @@ def load_dataset(
     min_quality: Optional[str] = 'valid',
     horizon_bars: Optional[int] = None,
     feature_groups: Optional[Sequence[str]] = None,
+    min_history_days: float = 0.0,
 ) -> Dataset:
     """Build features and targets for a universe.
 
@@ -352,11 +357,28 @@ def load_dataset(
     symbols_with_reference: list[str] = []
     symbols_without_reference: list[str] = []
 
+    thin_history: list[str] = []
     for symbol in requested:
         symbol_bars = _frame_for(store, 'bars', symbol, venue, as_of=as_of, min_quality=min_quality)
         if symbol_bars.empty:
             warnings.append(f'{symbol}: no bars on {venue}, skipped')
             continue
+
+        # A contract with too little history is not a small version of one with
+        # enough — it is a sample from a different period. CDE listings are spread
+        # across a year, so on a 399-day store four contracts have ~395 days, ten
+        # have ~240 and four have under 170. The four youngest exist only inside
+        # the most recent rally, which is why they are the only four that rose and
+        # why selecting instruments on measured performance here selects by listing
+        # date. They also set the shortest span the simulation can cover.
+        if min_history_days > 0:
+            span_days = (
+                (symbol_bars.index.max() - symbol_bars.index.min()).total_seconds()
+                / 86_400.0
+            )
+            if span_days < min_history_days:
+                thin_history.append(f'{symbol} ({span_days:.0f}d)')
+                continue
 
         symbol_funding = _frame_for(store, 'funding', symbol, venue, as_of=as_of, min_quality=min_quality)
         if symbol_funding.empty and reference_venue:
@@ -411,19 +433,27 @@ def load_dataset(
             market_bars=market if not market.empty else None,
         ))
 
+    if thin_history:
+        warnings.append(
+            f'excluded {len(thin_history)} instrument(s) with under '
+            f'{min_history_days:.0f}d of bars: {", ".join(sorted(thin_history))}'
+        )
+
     if not inputs:
         return Dataset(
             pd.DataFrame(), pd.DataFrame(), {}, {}, profiles,
-            venue, reference_venue, as_of, 0, warnings,
+            venue, reference_venue, as_of, 0, warnings=warnings,
             proxy_funding_symbols=sorted(proxy_funding_symbols),
         )
 
     # Group selection reaches build_panel, which also reindexes to
     # `feature_columns(groups)` — so a restricted panel has a genuinely shorter
     # canonical column list rather than the full 76 with the rest all-NaN. That
-    # matters: all-NaN columns still cost the model splits to rule out, and
-    # measured walk-forward, 25 features (cross_venue + trend) beat all 61 that
-    # carried data.
+    # matters: all-NaN columns still cost the model splits to rule out. Measured
+    # walk-forward against the tradeable target, cross_venue (7 features) is the
+    # only group positive in all three quarters — IC +0.012 at 1h against +0.000
+    # for all 61 that carry data — though under 1bp of edge against a 6.1bp
+    # cheapest round trip means it picks a better model, not a tradeable one.
     features = build_panel(inputs, config=config, groups=feature_groups)
     resolved_horizon = horizon_bars or config.label_horizon_hours()
     targets = build_target_panel(
@@ -487,6 +517,7 @@ def load_dataset(
         as_of=as_of,
         horizon_bars=resolved_horizon,
         feature_groups=tuple(feature_groups) if feature_groups else None,
+        min_history_days=float(min_history_days),
         warnings=warnings,
         proxy_funding_symbols=sorted(proxy_funding_symbols),
     )
