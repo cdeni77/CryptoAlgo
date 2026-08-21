@@ -116,11 +116,6 @@ class ResearchSummaryResponse(BaseModel):
     coins: List[CoinHealthRow]
 
 
-class ResearchCoinDetailResponse(BaseModel):
-    generated_at: datetime
-    coin: CoinHealthRow
-
-
 class ResearchRunResponse(BaseModel):
     """A real retrain attempt, from `model_runs` and the promotion ledger.
 

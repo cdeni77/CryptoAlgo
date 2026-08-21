@@ -14,7 +14,7 @@ and are still worth serving when Ethplorer is not answering.
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
 

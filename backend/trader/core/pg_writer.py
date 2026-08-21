@@ -119,7 +119,7 @@ class PaperFill(Base):
     fee = Column(Float, nullable=False)
     notional = Column(Float, nullable=False)
     slippage_bps = Column(Float, nullable=False, default=0.0)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
 class PaperPosition(Base):
@@ -134,9 +134,9 @@ class PaperPosition(Base):
     realized_pnl = Column(Float, nullable=False, default=0.0)
     unrealized_pnl = Column(Float, nullable=False, default=0.0)
     fees_paid = Column(Float, nullable=False, default=0.0)
-    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    is_open = Column(Boolean, nullable=False, default=True)
+    is_open = Column(Boolean, nullable=False, default=True, index=True)
     # Exit parameters frozen at open time — paper engine uses these to close positions
     tp_price = Column(Float, nullable=True)
     sl_price = Column(Float, nullable=True)
@@ -197,6 +197,17 @@ class PgWriter:
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS carry_share DOUBLE PRECISION",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS participation DOUBLE PRECISION",
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS model_version VARCHAR",
+            # Indexes, not columns. `create_all` only touches missing *tables*, so
+            # an index added to an existing model never reaches a database that
+            # already has the table. The names match what SQLAlchemy's
+            # `index=True` generates (ix_<table>_<column>), so a fresh create and
+            # an upgraded database end up with the same index rather than two.
+            "CREATE INDEX IF NOT EXISTS ix_paper_fills_created_at "
+            "ON paper_fills (created_at)",
+            "CREATE INDEX IF NOT EXISTS ix_paper_positions_is_open "
+            "ON paper_positions (is_open)",
+            "CREATE INDEX IF NOT EXISTS ix_paper_positions_opened_at "
+            "ON paper_positions (opened_at)",
         ]
         with self.engine.begin() as conn:
             for stmt in stmts:

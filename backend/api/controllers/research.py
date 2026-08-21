@@ -34,7 +34,6 @@ from models.research import (
     CoinHealthRow,
     EdgeCalibration,
     FeatureImportanceItem,
-    ResearchCoinDetailResponse,
     ResearchFeaturesResponse,
     ResearchRunResponse,
     ResearchSummaryKpis,
@@ -77,17 +76,42 @@ def _basis_points(pnl: Optional[float], notional: Optional[float]) -> Optional[f
 # ---------------------------------------------------------------------------
 
 
-def _closed_paper_positions(db: Session, coin: Optional[str] = None) -> list[PaperPosition]:
+def _closed_paper_positions(
+    db: Session,
+    coin: Optional[str] = None,
+    since: Optional[datetime] = None,
+) -> list[PaperPosition]:
     """Closed paper positions, which carry the notional a return needs.
 
-    `trades` holds live/manual trades and has no notional column, so it cannot
-    express a return in basis points. Paper positions can, and paper is what the
-    model is actually being evaluated on.
+    Paper positions are what the model is actually being evaluated on, and they
+    carry notional, so a return can be expressed in basis points.
+
+    `since` bounds the read to positions *opened* at or after a timestamp. It is
+    not an optimisation: the calibration below compares a mean forecast against a
+    mean outcome, and without it the forecast came from the last `SIGNAL_WINDOW`
+    signals while the outcome came from every position the account had ever
+    closed. Those are two different periods, and their difference drove the
+    health grade — so a retrained model looked "at_risk" on returns earned by
+    the model before it.
+
+    Entry time is the right filter because a signal produces an entry. A
+    position opened inside the window and still open is not counted, which
+    biases the window's outcomes slightly toward trades that closed quickly.
     """
     query = db.query(PaperPosition).filter(PaperPosition.is_open.is_(False))
     if coin:
         query = query.filter(PaperPosition.coin == coin)
+    if since is not None:
+        query = query.filter(PaperPosition.opened_at >= since)
     return query.all()
+
+
+def _window_start(signals: Sequence[Signal]) -> Optional[datetime]:
+    """The oldest timestamp in a signal window, or None if there are none.
+
+    Signals arrive ordered newest-first, so this is the last one.
+    """
+    return signals[-1].timestamp if signals else None
 
 
 def _calibration(signals: Sequence[Signal], closed: Sequence[PaperPosition]) -> EdgeCalibration:
@@ -97,6 +121,10 @@ def _calibration(signals: Sequence[Signal], closed: Sequence[PaperPosition]) -> 
     the id of the position it produced, so pairing them individually would mean
     guessing. Means over a common window answer the question that matters — is
     the model's stated edge systematically too large — without that guess.
+
+    Both arguments must describe the same period. Callers get that from
+    `_window_start`; the comment on `_closed_paper_positions` says what happened
+    when they did not.
     """
     acted = [s for s in signals if s.passed_gates and s.expected_net_bps is not None]
     expected = _mean([s.expected_net_bps for s in acted])
@@ -160,7 +188,7 @@ def _coin_row(db: Session, coin: str) -> CoinHealthRow:
     passed = [s for s in signals if s.passed_gates]
     blocked = [s.gate_failure_reason for s in signals if not s.passed_gates and s.gate_failure_reason]
 
-    closed = _closed_paper_positions(db, coin)
+    closed = _closed_paper_positions(db, coin, since=_window_start(signals))
     wins = len([p for p in closed if (p.realized_pnl or 0.0) > 0])
     net_pnl = sum(float(p.realized_pnl or 0.0) for p in closed) if closed else None
 
@@ -210,11 +238,11 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
 
     # Ratios are pooled, not averaged. Averaging per-coin win rates weights a
     # coin with two trades the same as one with two hundred.
-    all_closed = _closed_paper_positions(db)
-    wins = len([p for p in all_closed if (p.realized_pnl or 0.0) > 0])
     all_signals = (
         db.query(Signal).order_by(desc(Signal.timestamp)).limit(SIGNAL_WINDOW * 4).all()
     )
+    all_closed = _closed_paper_positions(db, since=_window_start(all_signals))
+    wins = len([p for p in all_closed if (p.realized_pnl or 0.0) > 0])
     calibration = _calibration(all_signals, all_closed)
 
     from controllers.model import get_live_model
@@ -266,12 +294,6 @@ def get_research_summary(db: Session) -> ResearchSummaryResponse:
 
     return ResearchSummaryResponse(
         generated_at=datetime.now(timezone.utc), kpis=kpis, coins=rows
-    )
-
-
-def get_research_coin(db: Session, coin: str) -> ResearchCoinDetailResponse:
-    return ResearchCoinDetailResponse(
-        generated_at=datetime.now(timezone.utc), coin=_coin_row(db, coin.upper())
     )
 
 

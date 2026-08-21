@@ -41,7 +41,7 @@ class PaperFill(Base):
     fee = Column(Float, nullable=False)
     notional = Column(Float, nullable=False)
     slippage_bps = Column(Float, nullable=False, default=0.0)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
 class PaperPosition(Base):
@@ -57,9 +57,9 @@ class PaperPosition(Base):
     realized_pnl = Column(Float, nullable=False, default=0.0)
     unrealized_pnl = Column(Float, nullable=False, default=0.0)
     fees_paid = Column(Float, nullable=False, default=0.0)
-    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    is_open = Column(Boolean, nullable=False, default=True)
+    is_open = Column(Boolean, nullable=False, default=True, index=True)
     tp_price = Column(Float, nullable=True)
     sl_price = Column(Float, nullable=True)
     max_hold_until = Column(DateTime(timezone=True), nullable=True)

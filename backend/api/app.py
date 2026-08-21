@@ -44,6 +44,17 @@ POSTGRES_MIGRATIONS = (
     "ALTER TABLE signals ADD COLUMN IF NOT EXISTS carry_share DOUBLE PRECISION",
     "ALTER TABLE signals ADD COLUMN IF NOT EXISTS participation DOUBLE PRECISION",
     "ALTER TABLE signals ADD COLUMN IF NOT EXISTS model_version VARCHAR",
+    # Indexes, not columns. `create_all` only touches missing *tables*, so
+    # an index added to an existing model never reaches a database that
+    # already has the table. The names match what SQLAlchemy's
+    # `index=True` generates (ix_<table>_<column>), so a fresh create and
+    # an upgraded database end up with the same index rather than two.
+    "CREATE INDEX IF NOT EXISTS ix_paper_fills_created_at "
+    "ON paper_fills (created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_paper_positions_is_open "
+    "ON paper_positions (is_open)",
+    "CREATE INDEX IF NOT EXISTS ix_paper_positions_opened_at "
+    "ON paper_positions (opened_at)",
 )
 
 

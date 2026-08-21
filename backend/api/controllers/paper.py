@@ -135,10 +135,23 @@ def get_paper_summary(db: Session) -> Dict[str, Any]:
             if dd > max_drawdown_pct:
                 max_drawdown_pct = dd
 
-    # Win rate from closed positions
-    closed_positions = db.query(PaperPosition).filter(PaperPosition.is_open.is_(False)).all()
-    wins = [p for p in closed_positions if (p.realized_pnl or 0) > 0]
-    win_rate = len(wins) / len(closed_positions) * 100 if closed_positions else None
+    # Win rate from closed positions. Counted in SQL: this endpoint is polled,
+    # and the closed book only grows, so materialising every closed position as
+    # an ORM object to count two integers made the cost of the poll a function
+    # of the account's whole history.
+    closed_count = (
+        db.query(func.count(PaperPosition.id))
+        .filter(PaperPosition.is_open.is_(False))
+        .scalar()
+        or 0
+    )
+    win_count = (
+        db.query(func.count(PaperPosition.id))
+        .filter(PaperPosition.is_open.is_(False), PaperPosition.realized_pnl > 0)
+        .scalar()
+        or 0
+    )
+    win_rate = win_count / closed_count * 100 if closed_count else None
 
     cash_balance = true_state["cash_balance"]
     return {
@@ -156,7 +169,7 @@ def get_paper_summary(db: Session) -> Dict[str, Any]:
         "max_drawdown_pct": round(max_drawdown_pct, 2) if max_drawdown_pct is not None else None,
         # win_rate as 0-1 fraction (frontend multiplies by 100 for display)
         "win_rate": round(win_rate / 100.0, 4) if win_rate is not None else None,
-        "closed_positions": len(closed_positions),
+        "closed_positions": closed_count,
         "sharpe_ratio": None,
         "profit_factor": None,
     }

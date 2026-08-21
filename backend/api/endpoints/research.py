@@ -4,7 +4,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from controllers.research import (
-    get_research_coin,
     get_research_features,
     get_research_runs,
     get_research_summary,
@@ -16,7 +15,6 @@ from controllers.research import (
 from database import get_db
 from security import require_token, validate_job_args
 from models.research import (
-    ResearchCoinDetailResponse,
     ResearchFeaturesResponse,
     ResearchJobLaunchRequest,
     ResearchJobLaunchResponse,
@@ -32,11 +30,6 @@ router = APIRouter(prefix="/research", tags=["research"])
 @router.get("/summary", response_model=ResearchSummaryResponse)
 def summary(db: Session = Depends(get_db)):
     return get_research_summary(db)
-
-
-@router.get("/coins/{coin}", response_model=ResearchCoinDetailResponse)
-def coin_detail(coin: str, db: Session = Depends(get_db)):
-    return get_research_coin(db, coin)
 
 
 @router.get("/runs", response_model=List[ResearchRunResponse])

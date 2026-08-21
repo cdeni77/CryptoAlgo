@@ -213,6 +213,78 @@ def test_the_migration_lists_match(schemas):
     )
 
 
+def test_the_index_migrations_match(schemas):
+    """Indexes drift the same way columns do, and are invisible to create_all.
+
+    `create_all` only creates missing *tables*, so `index=True` added to an
+    existing model never reaches a database that already has the table. Both
+    containers therefore carry explicit `CREATE INDEX IF NOT EXISTS`
+    statements, and the column check above cannot see them — its pattern
+    matches `ALTER TABLE` only.
+    """
+    import re
+
+    trader_source = (TRADER_ROOT / 'core' / 'pg_writer.py').read_text()
+    api_source = (API_ROOT / 'app.py').read_text()
+
+    # Statements are wrapped across string literals, so join them first.
+    def indexes(source: str) -> set[tuple[str, str, str]]:
+        flat = re.sub(r'"\s*\n\s*"', '', source)
+        return set(
+            re.findall(
+                r'CREATE INDEX IF NOT EXISTS\s+(\w+)\s+ON\s+(\w+)\s*\(([^)]*)\)',
+                flat,
+                re.IGNORECASE,
+            )
+        )
+
+    trader_indexes = indexes(trader_source)
+    api_indexes = indexes(api_source)
+
+    assert trader_indexes, 'no index migrations found in pg_writer.py'
+    assert trader_indexes == api_indexes, (
+        f'index migrations differ — only in trader: '
+        f'{sorted(trader_indexes - api_indexes)}; '
+        f'only in api: {sorted(api_indexes - trader_indexes)}'
+    )
+
+
+def test_every_index_migration_names_a_column_the_model_indexes(schemas):
+    """A migration index and a model index have to be the same index.
+
+    Two ways this goes wrong: the migration names a column the model does not
+    mark `index=True`, so a fresh database lacks the index an upgraded one has;
+    or the name does not follow SQLAlchemy's `ix_<table>_<column>` convention,
+    so `create_all` and the migration each create their own copy of it.
+    """
+    import re
+
+    trader, _ = schemas
+    flat = re.sub(r'"\s*\n\s*"', '', (TRADER_ROOT / 'core' / 'pg_writer.py').read_text())
+
+    problems: list[str] = []
+    for name, table, columns in re.findall(
+        r'CREATE INDEX IF NOT EXISTS\s+(\w+)\s+ON\s+(\w+)\s*\(([^)]*)\)', flat, re.IGNORECASE
+    ):
+        column = columns.strip()
+        if table not in trader:
+            problems.append(f'{name}: table {table} is not declared')
+            continue
+        if column not in trader[table].columns:
+            problems.append(f'{name}: {table}.{column} is not a column')
+            continue
+        if not trader[table].columns[column].index:
+            problems.append(
+                f'{name}: {table}.{column} is not index=True, so a fresh '
+                f'create_all would not build this index'
+            )
+        expected = f'ix_{table}_{column}'
+        if name != expected:
+            problems.append(f'{name}: SQLAlchemy would name this {expected}')
+
+    assert not problems, 'index migrations disagree with the models:\n  ' + '\n  '.join(problems)
+
+
 # ---------------------------------------------------------------------------
 # Contract sizes
 # ---------------------------------------------------------------------------
