@@ -234,6 +234,7 @@ def _universe_wide_enough(dataset) -> Check:
 def _model_trains(dataset, config: Config, as_of: Optional[str]) -> Check:
     model = train_forecast_model(
         dataset.features, dataset.targets, config=config, data_as_of=as_of,
+        horizon_bars=dataset.horizon_bars,
     )
     if model is None:
         return Check('model fit', False, 'training returned nothing',

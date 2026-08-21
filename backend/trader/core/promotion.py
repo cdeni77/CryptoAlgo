@@ -200,6 +200,7 @@ def evaluate_candidate(
 
     model = train_forecast_model(
         dataset.features, dataset.targets, config=config, data_as_of=data_as_of,
+        horizon_bars=dataset.horizon_bars,
     )
     if model is None:
         record.error = 'not enough resolved rows to train'
@@ -214,6 +215,7 @@ def evaluate_candidate(
         bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
         config=config, profiles=dataset.profiles,
         n_periods=n_periods, initial_equity=initial_equity, spread_bps=spread_bps,
+        horizon_bars=dataset.horizon_bars,
     )
     record.backtest = {
         **result.summary(),
@@ -249,7 +251,7 @@ def evaluate_candidate(
                     bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
                     config=candidate_config, profiles=dataset.profiles,
                     n_periods=n_periods, initial_equity=initial_equity,
-                    spread_bps=spread_bps,
+                    spread_bps=spread_bps, horizon_bars=dataset.horizon_bars,
                 )
                 return outcome.sharpe
 
@@ -263,7 +265,7 @@ def evaluate_candidate(
                     funding_by_symbol=dataset.funding,
                     config=config, profiles=dataset.profiles,
                     n_periods=n_periods, initial_equity=initial_equity,
-                    spread_bps=spread_bps,
+                    spread_bps=spread_bps, horizon_bars=dataset.horizon_bars,
                 )
                 synthetic_sharpes.append(outcome.sharpe)
             report.synthetic = summarise_paths(synthetic_sharpes)

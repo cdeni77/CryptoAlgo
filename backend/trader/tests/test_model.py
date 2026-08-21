@@ -374,3 +374,56 @@ def test_refuses_to_train_on_too_little_data(config):
     )
 
     assert train_forecast_model(features, targets, config=config) is None
+
+
+# ---------------------------------------------------------------------------
+# The horizon has to come from the data
+# ---------------------------------------------------------------------------
+
+
+def test_the_model_records_the_horizon_its_targets_were_built_at(panel, config):
+    """`--horizon` overrides the profile, and the model has to follow.
+
+    The horizon was read from the config unconditionally, so a run with
+    `--horizon 8` built targets at 8h while the model purged its validation split
+    at the profile's 96h and recorded 96h in its provenance. Too wide is merely
+    wasteful — it discards training rows — but the same bug with a horizon
+    *longer* than the profile's purges less than one label span, and that leaks.
+
+    The recorded value is not cosmetic: it drives `effective_observations`, which
+    is the number every significance claim downstream rests on. At 96 instead of 8
+    it understated the effective sample twelvefold.
+    """
+    features, targets = panel
+
+    eight = train_forecast_model(features, targets, config=config, horizon_bars=8)
+    default = train_forecast_model(features, targets, config=config)
+
+    assert eight is not None and default is not None
+    assert eight.horizon_bars == 8, 'the model ignored the horizon it was given'
+    assert default.horizon_bars == config.label_horizon_hours(None), (
+        'without an explicit horizon the config default should still apply'
+    )
+
+    # A shorter horizon means less overlap, so more independent observations from
+    # the same rows. Roughly proportional, and certainly not equal.
+    assert eight.effective_observations > default.effective_observations, (
+        f'a shorter horizon should raise the effective sample: '
+        f'{eight.effective_observations:.0f} vs {default.effective_observations:.0f}'
+    )
+
+
+def test_the_walk_forward_backtest_trains_at_the_dataset_horizon(panel, config):
+    """The retrain inside `walk_forward_backtest` must agree with the targets too."""
+    from core.backtest import generate_walk_forward_forecasts
+
+    features, targets = panel
+    generated = generate_walk_forward_forecasts(
+        features, targets, config=config, n_periods=2, horizon_bars=8,
+    )
+
+    assert generated.models, 'no models were fitted'
+    assert all(m.horizon_bars == 8 for m in generated.models), (
+        f'walk-forward models recorded '
+        f'{sorted({m.horizon_bars for m in generated.models})} instead of 8'
+    )

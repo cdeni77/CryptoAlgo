@@ -498,12 +498,20 @@ def train_forecast_model(
     head_specs: Optional[dict[str, HeadSpec]] = None,
     validation_fraction: float = 0.2,
     data_as_of: Optional[str] = None,
+    horizon_bars: Optional[int] = None,
 ) -> Optional[ForecastModel]:
     """Fit the three heads on a (event_time, symbol) panel.
 
     The validation split is chronological and purged by one horizon. A random
     split would place a row's overlapping neighbours on the other side and report
     scores that cannot survive contact with live data.
+
+    `horizon_bars` must be the horizon the *targets were built at*. It used to be
+    read from the config unconditionally, which silently disagreed with the data
+    whenever `--horizon` overrode the profile: the targets were built at 8h and
+    the model purged at 96h and recorded 96h. Too wide is merely wasteful, but the
+    same bug in the other direction — a horizon longer than the profile's — purges
+    less than one label span and leaks.
     """
     config = config or Config()
     head_specs = head_specs or default_head_specs()
@@ -519,7 +527,7 @@ def train_forecast_model(
         if SYMBOL_COLUMN in x.columns
         else tuple(sorted(map(str, x.index.get_level_values('symbol').unique())))
     )
-    horizon = config.label_horizon_hours(profile)
+    horizon = int(horizon_bars) if horizon_bars else config.label_horizon_hours(profile)
 
     times = pd.DatetimeIndex(x.index.get_level_values('event_time'))
     unique_times = times.unique().sort_values()
@@ -775,11 +783,16 @@ def cross_validate_forecast(
     folds: Optional[Sequence[CVFold]] = None,
     n_folds: int = 6,
     scale: bool = True,
+    horizon_bars: Optional[int] = None,
 ) -> CVReport:
     """Refit per fold and score out of sample, returning distributions.
 
     Each fold refits from scratch and scales inside the fold, so every number
     that comes back is out of sample by construction.
+
+    `horizon_bars` is the horizon the targets were built at, and it sets the purge
+    width. Getting it from the config instead would purge the profile's horizon
+    even when the targets used a different one.
     """
     config = config or Config()
     head_specs = head_specs or default_head_specs()
@@ -793,7 +806,7 @@ def cross_validate_forecast(
     categories = (
         x[SYMBOL_COLUMN].cat.categories if SYMBOL_COLUMN in x.columns else None
     )
-    horizon = config.label_horizon_hours(profile)
+    horizon = int(horizon_bars) if horizon_bars else config.label_horizon_hours(profile)
 
     times = pd.DatetimeIndex(x.index.get_level_values('event_time'))
     unique_times = times.unique().sort_values()

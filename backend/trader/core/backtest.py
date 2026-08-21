@@ -469,6 +469,7 @@ def generate_walk_forward_forecasts(
     profiles: Optional[dict[str, CoinProfile]] = None,
     n_periods: int = 6,
     min_train_fraction: float = 0.35,
+    horizon_bars: Optional[int] = None,
 ) -> WalkForwardForecasts:
     """Retrain periodically and forecast only forward.
 
@@ -491,7 +492,11 @@ def generate_walk_forward_forecasts(
 
     times = pd.DatetimeIndex(x.index.get_level_values('event_time'))
     unique = times.unique().sort_values()
-    horizon = config.label_horizon_hours()
+    # The horizon the *targets* were built at, which is not always the profile's:
+    # `--horizon` overrides it. This sets both the purge width between train and
+    # forecast period and what each refitted model records, so reading it from the
+    # config alone purged 96h for targets built at 8h.
+    horizon = int(horizon_bars) if horizon_bars else config.label_horizon_hours()
 
     start = int(len(unique) * min_train_fraction)
     if start >= len(unique) - n_periods:
@@ -517,6 +522,9 @@ def generate_walk_forward_forecasts(
         model = train_forecast_model(
             x[train_mask], y[train_mask], config=config,
             data_as_of=str(train_cutoff),
+            # The same horizon this loop purges by, so the model's own validation
+            # split and its recorded provenance agree with the targets it saw.
+            horizon_bars=horizon,
         )
         if model is None:
             continue
@@ -547,6 +555,7 @@ def walk_forward_backtest(
     n_periods: int = 6,
     initial_equity: float = 100_000.0,
     spread_bps: float = 4.0,
+    horizon_bars: Optional[int] = None,
 ) -> tuple[BacktestResult, WalkForwardForecasts]:
     """The only honest backtest: retrain forward, trade only what was forecastable.
 
@@ -555,6 +564,7 @@ def walk_forward_backtest(
     """
     generated = generate_walk_forward_forecasts(
         features, targets, config=config, profiles=profiles, n_periods=n_periods,
+        horizon_bars=horizon_bars,
     )
     if generated.forecasts.empty:
         return BacktestResult(initial_equity=initial_equity), generated

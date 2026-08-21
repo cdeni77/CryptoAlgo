@@ -101,6 +101,31 @@ walk-forward backtests, bootstraps, stresses and gates a candidate, then install
 it only if every gate passed. Rejections stay in `models/promotions/` because the
 trial count is what the deflated Sharpe discounts by.
 
+## Before You Train: the horizon governs the sample size
+
+Overlapping labels are not independent observations. A label spanning `h` bars
+overlaps its `h-1` neighbours, so the effective sample is roughly
+`timestamps / h`, not `timestamps`. Using the row count as the sample size is how
+a t-statistic ends up several times too confident, and it is what the promotion
+gates are calibrated against.
+
+Measured on 92 days of hourly data across five instruments:
+
+| horizon | effective observations | verdict |
+|---------|-----------------------|---------|
+| 96h (the profile default) | 18 from 1,768 timestamps | far too few |
+| 8h | 232 from 1,856 timestamps | enough to start |
+
+So the horizon and the history length trade off directly. `scripts/preflight.py`
+computes both numbers and states the two ways out — scrape roughly
+`200 x horizon / 24` days, or shorten the horizon to about
+`timestamps / 200` hours. **Run it before a long scrape**, not after.
+
+```bash
+python -m scripts.preflight                 # profile default horizon
+python -m scripts.preflight --horizon 8     # what a shorter hold buys
+```
+
 ## Critical Architecture Notes
 
 - **`core/profiles.py` is the single source of truth** for per-coin feature sets, thresholds, and ML hyperparameters. Coins are described by a feature *archetype* (`mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`) plus tuned deltas. Changes cascade into training, search, and signal generation.

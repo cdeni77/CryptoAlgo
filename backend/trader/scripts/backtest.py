@@ -50,7 +50,7 @@ def main() -> int:
         bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
         config=config, profiles=dataset.profiles,
         n_periods=args.periods, initial_equity=args.equity,
-        spread_bps=args.spread_bps,
+        spread_bps=args.spread_bps, horizon_bars=dataset.horizon_bars,
     )
 
     if not result.trades:
@@ -92,7 +92,7 @@ def main() -> int:
                 bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
                 config=cfg, profiles=dataset.profiles,
                 n_periods=args.periods, initial_equity=args.equity,
-                spread_bps=args.spread_bps,
+                spread_bps=args.spread_bps, horizon_bars=dataset.horizon_bars,
             )
             return outcome.sharpe
 
@@ -107,7 +107,7 @@ def main() -> int:
                 bars_by_symbol=bars, funding_by_symbol=dataset.funding,
                 config=config, profiles=dataset.profiles,
                 n_periods=args.periods, initial_equity=args.equity,
-                spread_bps=args.spread_bps,
+                spread_bps=args.spread_bps, horizon_bars=dataset.horizon_bars,
             )
             synthetic_sharpes.append(outcome.sharpe)
         report.synthetic = summarise_paths(synthetic_sharpes)

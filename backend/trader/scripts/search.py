@@ -97,6 +97,10 @@ def main() -> int:
             bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
             config=trial_config, profiles=dataset.profiles,
             n_periods=args.periods, initial_equity=args.equity,
+            # Every trial must be measured at the same horizon the targets were
+            # built at, or the campaign is comparing configurations across
+            # different problems.
+            horizon_bars=dataset.horizon_bars,
         )
         if not result.trades:
             return {'oos_trades': 0.0}, []

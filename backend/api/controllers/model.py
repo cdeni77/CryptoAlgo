@@ -60,6 +60,14 @@ def _models_dir() -> Path:
 
 
 def _read_json(path: Path) -> Optional[dict[str, Any]]:
+    """Parse a JSON file, or None.
+
+    An absent file is a normal state — nothing promoted yet — and warns nothing.
+    A file that exists but will not parse is a real problem and says so, once per
+    call rather than being swallowed.
+    """
+    if not path.exists():
+        return None
     try:
         return json.loads(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as exc:
@@ -183,6 +191,7 @@ def _ledger_files(models_dir: Path) -> list[Path]:
 
 
 def _current(models_dir: Path) -> Optional[dict[str, Any]]:
+    """The live pointer, or None when nothing has been promoted."""
     return _read_json(models_dir / PROMOTIONS_DIRNAME / CURRENT_FILENAME)
 
 

@@ -38,6 +38,7 @@ def main() -> int:
 
     model = train_forecast_model(
         dataset.features, dataset.targets, config=config, data_as_of=args.as_of,
+        horizon_bars=dataset.horizon_bars,
     )
     if model is None:
         print('\nnot enough resolved rows to train')
@@ -58,6 +59,7 @@ def main() -> int:
     if not args.skip_cv:
         report = cross_validate_forecast(
             dataset.features, dataset.targets, config=config, n_folds=args.cv_folds,
+            horizon_bars=dataset.horizon_bars,
         )
         print(f'\ncross-validation: {report}')
         print(json.dumps(report.as_dict(), indent=2, default=str))

@@ -94,7 +94,7 @@ structural cause of "training didn't align to paper trading."
 - 120-day windows at 1h bars = 2,880 rows. Computed with
   `core.cv.effective_sample_size`, the 72-hour barrier horizon leaves **40.0
   independent observations** — not an estimate, the concurrency-weighted count.
-  At a 108-hour horizon it is 26.7. Against 77 features.
+  At a 108-hour horizon it is 26.7. Against 76 features.
 - A single walk-forward path yields **one** Sharpe estimate with no confidence
   interval.
 - ~200 Optuna trials x 15 coins of selection pressure sits on top of that, with
@@ -549,3 +549,80 @@ All four landed, on the new `/model` route.
   is the thing that ran the gates. Rejections stay in the ledger: the trial count
   is what the deflated Sharpe discounts by. A forced promotion needs a reason and
   stays visibly forced for as long as it is live.
+
+---
+
+## 9. What the end-to-end rehearsal found
+
+The chain was run once on synthetic data seeded through the real storage layer —
+scrape schema, migration, features, targets, training, walk-forward, simulation,
+gates — rather than only through pytest's in-process calls. Three defects only a
+full run could surface.
+
+### 9.1 Venue was not in the scraper's unique keys
+
+`ohlcv` carried a `venue` column whose unique key stayed
+`(symbol, timeframe, event_time)`. Against `INSERT OR REPLACE`, that means a
+Binance bar silently replaces the Coinbase bar for the same instrument and hour:
+only one venue survives per bar, and the cross-venue features that need both at
+the same timestamp — basis, lead-lag — would have produced no rows at all while
+the column sat there looking correct.
+
+`funding_rates` and `open_interest` had no venue column, and their inserts wrote
+literals: funding recorded `source = "coinbase"` for every row including Binance
+proxy rates, and open interest recorded `"ccxt"`, which names the client library
+rather than an exchange.
+
+This is §1.3 one level down. The venue column was added; the key was not.
+
+Fixed, with a rebuild path for existing databases (SQLite cannot alter a UNIQUE
+constraint) and four tests. Rows the old key already collapsed are unrecoverable —
+re-running the backfill is the only way to get the second venue back.
+
+### 9.2 The horizon came from the config, not the data
+
+`train_forecast_model` read the horizon from `config.label_horizon_hours(profile)`
+regardless of what the targets were built at. With `--horizon 8`, the targets
+resolved at 8h while the model purged its validation split at the profile's 96h
+and recorded 96h in its provenance.
+
+Too wide is merely wasteful. The same bug with a horizon *longer* than the
+profile's purges less than one label span, which leaks. And the recorded value is
+not cosmetic — it drives `effective_observations`, the denominator under every
+significance claim. Measured on the rehearsal dataset: 72 effective observations
+reported, against 922 actual. A 12.8x understatement.
+
+`horizon_bars` is now a parameter on `train_forecast_model`,
+`cross_validate_forecast`, `generate_walk_forward_forecasts` and
+`walk_forward_backtest`, and every caller passes `dataset.horizon_bars`.
+
+### 9.3 The horizon is what governs whether there is enough data at all
+
+Not a defect — a constraint, and the most important practical output of the
+rehearsal. Overlapping labels are not independent observations: a label spanning
+`h` bars overlaps its `h-1` neighbours, so the effective sample is roughly
+`timestamps / h`.
+
+On 92 days of hourly data across five instruments:
+
+| horizon | effective observations | verdict |
+|---------|-----------------------|---------|
+| 96h (the profile default) | 18 from 1,768 timestamps | far too few |
+| 8h | 232 from 1,856 timestamps | enough to start |
+
+The two ways out are quantifiable, and `scripts/preflight.py` now states both:
+keep the horizon and scrape about `200 x horizon / 24` days, or keep the history
+and shorten the horizon to about `timestamps / 200` hours. At the 96h default,
+200 effective observations needs roughly 2.2 years of hourly history.
+
+This is much cheaper to learn before an overnight scrape than after.
+
+### 9.4 What the rehearsal confirmed works
+
+On a driftless-price panel with AR(1) funding, the suite reported what it should:
+the carry head found the funding (in-sample IC +0.49) while the price head found
+nothing (−0.04), and the gates blocked promotion with ten failures. `--quick`
+correctly leaves the skipped simulation gates as failures, so a fast development
+run can never promote. The API reads the resulting ledger entry — blocked, with
+its ten named gates, correct horizon and effective-observation count — and reports
+"no promoted model" for feature importances rather than substituting anything.
