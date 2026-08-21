@@ -55,6 +55,12 @@ class Dataset:
     reference_venue: Optional[str]
     as_of: Optional[str]
     horizon_bars: int
+    # Which feature groups were built. None means all of them. Recorded because
+    # the panel's shape is the model's input contract: a model fit on
+    # cross_venue+trend cannot score against a 76-column panel, and
+    # `feature_set_hash` only distinguishes them because `feature_columns(groups)`
+    # shortens the name list.
+    feature_groups: Optional[tuple[str, ...]] = None
     warnings: list[str] = field(default_factory=list)
     # Symbols whose funding came from the reference venue instead of the traded
     # one. Structured, not just a warning string, because it has to survive into
@@ -253,6 +259,7 @@ def load_dataset(
     as_of: Optional[str] = None,
     min_quality: Optional[str] = 'valid',
     horizon_bars: Optional[int] = None,
+    feature_groups: Optional[Sequence[str]] = None,
 ) -> Dataset:
     """Build features and targets for a universe.
 
@@ -411,7 +418,13 @@ def load_dataset(
             proxy_funding_symbols=sorted(proxy_funding_symbols),
         )
 
-    features = build_panel(inputs, config=config)
+    # Group selection reaches build_panel, which also reindexes to
+    # `feature_columns(groups)` — so a restricted panel has a genuinely shorter
+    # canonical column list rather than the full 76 with the rest all-NaN. That
+    # matters: all-NaN columns still cost the model splits to rule out, and
+    # measured walk-forward, 25 features (cross_venue + trend) beat all 61 that
+    # carried data.
+    features = build_panel(inputs, config=config, groups=feature_groups)
     resolved_horizon = horizon_bars or config.label_horizon_hours()
     targets = build_target_panel(
         bars, profiles=profiles, funding_by_symbol=funding, config=config,
@@ -473,6 +486,7 @@ def load_dataset(
         reference_venue=reference_venue,
         as_of=as_of,
         horizon_bars=resolved_horizon,
+        feature_groups=tuple(feature_groups) if feature_groups else None,
         warnings=warnings,
         proxy_funding_symbols=sorted(proxy_funding_symbols),
     )

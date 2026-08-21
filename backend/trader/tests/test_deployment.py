@@ -563,3 +563,29 @@ def test_the_scrape_and_the_migration_agree_about_the_timeframe():
         f'the scrape defaults to {run_pipeline.DEFAULT_TIMEFRAMES} but the store '
         f'only ingests {migrated!r} — the difference is fetched and discarded'
     )
+
+
+@pytest.mark.parametrize('module', [
+    'scripts.backtest', 'scripts.train', 'scripts.promote', 'scripts.signals',
+    'scripts.preflight', 'scripts.search', 'scripts.build_features',
+    'scripts.run_pipeline', 'scripts.live_orchestrator',
+])
+def test_help_does_not_crash(module):
+    """`--help` must work. argparse %-formats every help string.
+
+    A help text containing a literal percent sign — "-18.8% quarter" — makes
+    argparse raise `ValueError: unsupported format character` from
+    `_expand_help`, and because the offending argument lived in
+    `add_data_arguments`, one bad string took `--help` down for every research
+    script at once. Nothing else in the suite exercises the help path.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, '-m', module, '--help'],
+        cwd=TRADER_ROOT, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        f'{module} --help exited {result.returncode}:\n{result.stderr[-800:]}'
+    )
