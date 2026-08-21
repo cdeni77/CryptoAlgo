@@ -492,3 +492,50 @@ def test_min_history_days_excludes_instruments_that_only_saw_one_regime(tmp_path
     # which regimes the universe spans.
     assert filtered.min_history_days == 100
     assert everything.min_history_days == 0
+
+
+def test_preflight_flags_an_instrument_whose_fill_uncertainty_exceeds_its_fee():
+    """The check that would have caught this repo's worst measurement bug.
+
+    A bar's `close` is its last *trade*, not its final instant, so on a thin perp
+    it can be twenty minutes stale while the deep spot book moves. A decision from
+    bar t fills at `open(t+1)`, which makes that gap pure fill uncertainty: absent
+    from the fee schedule, symmetric, and unremovable by any model. `price_return`
+    used to anchor on `close(t)` and therefore contained it, which is how
+    `basis_z_168h` came to predict the gap alone at IC -0.50.
+
+    Two instruments, identical fees, built so one has a 100bp gap between every
+    close and the next open and the other has none.
+    """
+    from core.config import Config
+    from scripts.preflight import _prices_are_fresh
+
+    index = pd.date_range('2026-01-01', periods=1_000, freq='1h', tz='UTC')
+    rng = np.random.default_rng(3)
+    walk = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.005, len(index))))
+
+    def frame(stale: bool) -> pd.DataFrame:
+        close = walk.copy()
+        # A stale close prints 1% away from where the next bar opens.
+        opens = close * (1.01 if stale else 1.0)
+        opens = np.concatenate([[close[0]], opens[:-1]])
+        return pd.DataFrame(
+            {'open': opens, 'high': np.maximum(opens, close) * 1.001,
+             'low': np.minimum(opens, close) * 0.999, 'close': close,
+             'volume': 1_000.0},
+            index=index,
+        )
+
+    class _Dataset:
+        bars = {'BIP-20DEC30-CDE': frame(stale=False),
+                'XPP-20DEC30-CDE': frame(stale=True)}
+
+    check = _prices_are_fresh(_Dataset(), Config())
+
+    assert check.advisory, 'venue behaviour is reported, not gated on'
+    assert 'XPP' in check.detail and 'exceeds the fee' in check.detail, (
+        f'the stale instrument was not flagged: {check.detail}'
+    )
+    # And the clean one must not be in the flagged list.
+    flagged = check.detail.split('exceeds the fee on')[-1]
+    assert 'BIP' not in flagged, f'the clean instrument was flagged: {flagged}'

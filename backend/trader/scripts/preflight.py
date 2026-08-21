@@ -37,6 +37,7 @@ from core.costs import symbols_missing_fee_schedule
 from core.cv import average_uniqueness, effective_sample_size
 from core.datastore import ResearchStore
 from core.features import feature_columns
+from core.targets import round_trip_cost
 from scripts._common import add_data_arguments, build_config, configure_logging, load
 
 # A pooled panel model needs enough resolved rows that the effective sample is
@@ -139,6 +140,64 @@ def _store_populated(store: ResearchStore, venue: str, min_days: int) -> Check:
             f'python -m scripts.migrate_to_research_store --venue {venue}',
         )
     return Check('research store', True, detail)
+
+
+def _prices_are_fresh(dataset, config: Config) -> Check:
+    """How far the price moves between a decision and the first fill.
+
+    A bar's `close` is its *last trade*, not its final instant. On a thin nano
+    perp that trade can be twenty minutes before the bar ends while the deep spot
+    book keeps moving, so `close(t)` and `open(t+1)` differ by much more than the
+    same pair on a liquid instrument. A decision made from bar `t` fills at
+    `open(t+1)`, which makes that gap pure fill uncertainty: it is not in the fee
+    schedule, it is symmetric, and no signal removes it.
+
+    This is the check that would have caught this repo's worst measurement bug.
+    `price_return` used to anchor on `close(t)`, so the target contained the gap,
+    and `basis_z_168h` predicted the gap alone at IC -0.50 — 98 percent of every
+    reported edge was that catch-up, unreachable by construction.
+
+    Advisory, because it is a property of the venue rather than something to fix.
+    But an instrument whose median gap exceeds its own round-trip cost cannot be
+    traded on hourly bars whatever the model says: the price is more uncertain than
+    the fee is expensive.
+    """
+    lines: list[str] = []
+    unusable: list[str] = []
+    for symbol, bars in sorted(dataset.bars.items()):
+        if bars.empty or len(bars) < 500 or 'open' not in bars:
+            continue
+        frame = bars.sort_index()
+        gap = ((frame['open'].shift(-1) / frame['close']) - 1.0).abs()
+        median_gap = float(gap.median()) * 10_000
+        try:
+            round_trip = round_trip_cost(
+                symbol, float(frame['close'].iloc[-1]), config) * 10_000
+        except Exception:                                     # noqa: BLE001
+            round_trip = float('nan')
+        base = symbol.split('-')[0]
+        if round_trip == round_trip and round_trip > 0:
+            ratio = median_gap / round_trip
+            lines.append(f'{base} {median_gap:.0f}bp vs {round_trip:.0f}bp fee')
+            if ratio > 1.0:
+                unusable.append(f'{base} ({ratio:.1f}x)')
+
+    if not lines:
+        return Check('price freshness', True, 'no bars to measure', advisory=True)
+
+    detail = f'median close-to-next-open gap: {"; ".join(lines[:6])}'
+    if len(lines) > 6:
+        detail += f' ... ({len(lines)} instruments)'
+    if unusable:
+        detail += (
+            f' | fill uncertainty exceeds the fee on {len(unusable)}: '
+            f'{", ".join(unusable)}'
+        )
+    return Check('price freshness', True, detail, advisory=True,
+                 fix='an instrument whose median gap exceeds its round trip cannot '
+                     'be traded on hourly bars — the price moves more between the '
+                     'decision and the fill than the trade costs. Drop it, or trade '
+                     'a longer horizon so the gap is a smaller share of the move.')
 
 
 def _carry_and_positioning(store: ResearchStore, venue: str, min_days: int) -> Check:
@@ -422,6 +481,7 @@ def main() -> int:
             checks.append(_targets_resolve(dataset))
             checks.append(_effective_sample(dataset, config))
             checks.append(_universe_wide_enough(dataset))
+            checks.append(_prices_are_fresh(dataset, config))
             if not args.skip_fit and checks[-3].passed:
                 checks.append(_model_trains(dataset, config, args.as_of))
     else:

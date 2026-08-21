@@ -259,6 +259,41 @@ volatility forecast improves sizing and gates entries. It is not itself tradeabl
 **Carry: still untested.** 18 funding rows. It is the one part of the original
 thesis that has never been evaluated, and it accumulates forward only.
 
+### Fill uncertainty is a second cost, and it is not in the fee schedule
+
+`close(t)` is a bar's last *trade*, so the move between it and `open(t+1)` — the
+first price a decision can fill at — is pure fill uncertainty. It is absent from
+`core/costs.py`, symmetric, and no model removes it.
+`scripts/preflight.py:_prices_are_fresh` reports it per instrument.
+
+Measured on 399 days. Median close-to-next-open gap against each contract's own
+round trip:
+
+| | median gap | round trip | |
+|---|---:|---:|---|
+| **XPP** | 4.4bp | 6.9bp | fresh **and** cheap |
+| **SLP** | 4.6bp | 8.4bp | fresh **and** cheap |
+| BIP | 1.7bp | 23.4bp | pristine price, fee 3x the noise... and 3x XPP's fee |
+| ETP | 2.9bp | 65.4bp | pristine price, unaffordable |
+| ADP | 12.4bp | 13.1bp | marginal |
+| XLP | 17.1bp | 6.1bp | **2.8x** — cheapest fee in the book, and unusable |
+| LNP, SUP | 13-15bp | 7-9bp | 1.7x |
+| BCP, DOP, LCP | 13-16bp | 9-12bp | 1.2-1.5x |
+| PEP | 28.0bp | 9.2bp | 3.0x, worst in the universe |
+
+**Six of fourteen have median fill uncertainty larger than their own fee**, which
+makes them untradeable on hourly bars whatever a model says: the price moves more
+between the decision and the fill than the trade costs.
+
+And the trap is structural. The cheap contracts are cheap *because* they are thin,
+and thin means stale — XLP has the lowest fee in the book (6.1bp) and 2.8x fill
+uncertainty. The contracts with clean prices, BIP and ETP, carry the highest fees.
+Only **XPP and SLP** have both, which is the practical answer to "which of these
+can be traded at all".
+
+This is also why the per-instrument IC table from the close-anchored target ranked
+the thinnest contracts highest: staleness was the signal.
+
 ### The sample is one bear market and one reversal
 
 Do not read a backtest here as a general result. Equal-weight across all 18:
