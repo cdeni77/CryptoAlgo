@@ -11,6 +11,11 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
+from .timeutil import (
+    epoch_millis_to_naive_utc,
+    naive_utc_to_epoch_millis,
+    utc_now,
+)
 from .models import (
     OHLCVBar,
     FundingRate,
@@ -303,8 +308,8 @@ class CCXTConnector:
         end = end.replace(tzinfo=None) if end.tzinfo else end
         
         # CCXT returns timestamps in milliseconds
-        since_ms = int(start.timestamp() * 1000)
-        end_ms = int(end.timestamp() * 1000)
+        since_ms = naive_utc_to_epoch_millis(start)
+        end_ms = naive_utc_to_epoch_millis(end)
         
         try:
             while since_ms < end_ms:
@@ -323,7 +328,7 @@ class CCXTConnector:
                 # Convert to OHLCVBar objects
                 for candle in ohlcv:
                     # CCXT format: [timestamp, open, high, low, close, volume]
-                    event_time = datetime.fromtimestamp(candle[0] / 1000)
+                    event_time = epoch_millis_to_naive_utc(candle[0])
                     
                     # Skip if past end time
                     if event_time >= end:
@@ -405,8 +410,8 @@ class CCXTConnector:
             # Try to fetch funding rate history
             # Note: This is exchange-specific and may not work on all exchanges
             if hasattr(exchange, 'fetch_funding_rate_history'):
-                since_ms = int(start.timestamp() * 1000)
-                end_ms = int(end.timestamp() * 1000)
+                since_ms = naive_utc_to_epoch_millis(start)
+                end_ms = naive_utc_to_epoch_millis(end)
                 
                 while since_ms < end_ms:
                     history = await exchange.fetch_funding_rate_history(
@@ -419,7 +424,7 @@ class CCXTConnector:
                         break
                     
                     for entry in history:
-                        event_time = datetime.fromtimestamp(entry["timestamp"] / 1000)
+                        event_time = epoch_millis_to_naive_utc(entry["timestamp"])
                         
                         if event_time >= end:
                             break
@@ -483,7 +488,7 @@ class CCXTConnector:
                 open_interest_contracts = float(oi_data.get("openInterestAmount") or oi_data.get("openInterest") or 0)
                 open_interest_value = float(oi_data.get("openInterestValue") or oi_data.get("sumOpenInterestValue") or 0)
                 
-                now = datetime.utcnow().replace(tzinfo=None)  # naive
+                now = utc_now()
                 
                 return OpenInterest(
                     symbol=symbol,
@@ -559,16 +564,16 @@ class CCXTConnector:
             # Handle timestamps - ensure they're valid milliseconds
             if start:
                 start = start.replace(tzinfo=None) if start.tzinfo else start
-                since_ms = int(start.timestamp() * 1000)
+                since_ms = naive_utc_to_epoch_millis(start)
             else:
                 # Default to 365 days ago
-                since_ms = int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000)
+                since_ms = naive_utc_to_epoch_millis(utc_now() - timedelta(days=365))
             
             if end:
                 end = end.replace(tzinfo=None) if end.tzinfo else end
-                end_ms = int(end.timestamp() * 1000)
+                end_ms = naive_utc_to_epoch_millis(end)
             else:
-                end_ms = int(datetime.utcnow().timestamp() * 1000)
+                end_ms = naive_utc_to_epoch_millis(utc_now())
             
             # Calculate timeframe in milliseconds for proper pagination
             tf_ms = self._timeframe_to_ms(timeframe)
@@ -584,7 +589,7 @@ class CCXTConnector:
                 elif exch_id == 'binance':
                     # Binance only has last 30 days
                     # Warn user and fetch what we can
-                    thirty_days_ago_ms = int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)
+                    thirty_days_ago_ms = naive_utc_to_epoch_millis(utc_now() - timedelta(days=30))
                     if since_ms < thirty_days_ago_ms:
                         logger.warning(f"Binance OI history limited to last 30 days. Requested start is older.")
                         since_ms = thirty_days_ago_ms

@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data_collection.coinbase_connector import CoinbaseRESTClient
 from data_collection.pipeline import create_pipeline, PipelineConfig, ensure_naive_utc
+from data_collection.timeutil import epoch_millis_to_naive_utc, utc_now
 from data_collection.models import OHLCVBar, TickerUpdate, FundingRate, OpenInterest
 from data_collection.ccxt_connector import CCXTConnector
 from data_collection.ingest import Ingestor
@@ -132,7 +133,7 @@ def on_new_candle(bar: OHLCVBar):
 
 def on_ticker_update(ticker: TickerUpdate):
     """Callback for ticker updates (throttled)."""
-    now = datetime.utcnow()
+    now = utc_now()
     last_logged = _ticker_last_log[ticker.symbol]
     
     if now - last_logged >= TICKER_LOG_INTERVAL:
@@ -486,7 +487,7 @@ async def backfill_open_interest(
                 oi_list = []
                 for entry in all_history:
                     try:
-                        event_time = datetime.fromtimestamp(entry['timestamp'] / 1000).replace(tzinfo=None)
+                        event_time = epoch_millis_to_naive_utc(entry['timestamp'])
                         contracts = float(entry.get('openInterestAmount') or entry.get('baseVolume') or 0)
                         value = float(entry.get('openInterestValue') or entry.get('quoteVolume') or 0)
                         # Quality is deliberately left at its UNVALIDATED
@@ -614,9 +615,9 @@ Examples:
         end_time = datetime.strptime(args.end, "%Y-%m-%d")
     elif args.start:
         start_time = datetime.strptime(args.start, "%Y-%m-%d")
-        end_time = datetime.utcnow()
+        end_time = utc_now()
     else:
-        end_time = datetime.utcnow()
+        end_time = utc_now()
         start_time = end_time - timedelta(days=args.backfill_days)
     
     # Ensure naive UTC

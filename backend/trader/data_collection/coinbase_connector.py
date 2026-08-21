@@ -16,6 +16,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from coinbase import jwt_generator  
 
+from .timeutil import (
+    ensure_naive_utc,
+    epoch_seconds_to_naive_utc,
+    naive_utc_to_epoch_seconds,
+    utc_now,
+)
 from .models import OHLCVBar, FundingRate, OrderBookSnapshot, OrderBookLevel, TickerUpdate, DataQuality
 
 logger = logging.getLogger(__name__)
@@ -140,9 +146,9 @@ class CoinbaseRESTClient:
         api_granularity = granularity_map.get(granularity, "ONE_HOUR")
         params = {"granularity": api_granularity, "limit": min(limit, 300)}
         if start:
-            params["start"] = int(start.timestamp())
+            params["start"] = naive_utc_to_epoch_seconds(start)
         if end:
-            params["end"] = int(end.timestamp())
+            params["end"] = naive_utc_to_epoch_seconds(end)
         path = f"/api/v3/brokerage/market/products/{product_id}/candles"
         status, data = await self._request("GET", path, params=params, authenticated=False)
         if status != 200:
@@ -155,7 +161,7 @@ class CoinbaseRESTClient:
             try:
                 start_ts = int(c["start"])
                 event_time_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-                event_time = event_time_utc.replace(tzinfo=None)
+                event_time = epoch_seconds_to_naive_utc(start_ts)
                 available_time = (event_time_utc + timedelta(seconds=tf_seconds)).replace(tzinfo=None)
                 bar = OHLCVBar(
                     symbol=product_id, timeframe=granularity, event_time=event_time, available_time=available_time,
@@ -206,7 +212,7 @@ class CoinbaseRESTClient:
             if not trades:
                 return None
             latest = trades[0]
-            now = datetime.utcnow()
+            now = utc_now()
             return TickerUpdate(
                 symbol=product_id, event_time=now, available_time=now,
                 price=float(latest.get("price", 0)),
@@ -233,8 +239,8 @@ class CoinbaseRESTClient:
             logger.warning("Authentication required for funding rate history")
             return []
 
-        start = start.replace(tzinfo=None) if start.tzinfo else start
-        end = end.replace(tzinfo=None) if end.tzinfo else end
+        start = ensure_naive_utc(start)
+        end = ensure_naive_utc(end)
 
         path = "/api/v3/brokerage/intx/funding-rates"
         cursor = None
@@ -243,8 +249,8 @@ class CoinbaseRESTClient:
         while True:
             params = {
                 "product_id": product_id,
-                "start": int(start.timestamp()),
-                "end": int(end.timestamp()),
+                "start": naive_utc_to_epoch_seconds(start),
+                "end": naive_utc_to_epoch_seconds(end),
                 "limit": limit,
             }
             if cursor:
@@ -282,7 +288,7 @@ class CoinbaseRESTClient:
                     ts_num = float(ts)
                     if ts_num > 10_000_000_000:
                         ts_num /= 1000.0
-                    event_time = datetime.utcfromtimestamp(ts_num)
+                    event_time = epoch_seconds_to_naive_utc(ts_num)
 
                 if event_time < start or event_time >= end:
                     continue
@@ -323,7 +329,7 @@ class CoinbaseRESTClient:
             status, data = await self._request("GET", path, authenticated=True)
             if status != 200:
                 return await self._get_funding_rate_from_portfolio(product_id)
-            now = datetime.utcnow()
+            now = utc_now()
             funding_rate = float(data.get("funding_rate", 0))
             mark_price = float(data.get("mark_price", 0))
             index_price = float(data.get("index_price", 0))
@@ -343,7 +349,7 @@ class CoinbaseRESTClient:
             positions = summary.get("positions", [])
             for pos in positions:
                 if pos.get("product_id") == product_id:
-                    now = datetime.utcnow()
+                    now = utc_now()
                     return FundingRate(
                         symbol=product_id, event_time=now, available_time=now,
                         rate=float(pos.get("funding_rate", 0)),
@@ -483,7 +489,7 @@ class CoinbaseWebSocketClient:
             for event in events:
                 tickers = event.get("tickers", [])
                 for t in tickers:
-                    now = datetime.utcnow()
+                    now = utc_now()
                     ticker = TickerUpdate(
                         symbol=t.get("product_id", ""),
                         event_time=now,
@@ -503,7 +509,7 @@ class CoinbaseWebSocketClient:
             product_id = data.get("product_id")
             if not product_id:
                 return
-            now = datetime.utcnow()
+            now = utc_now()
             bids = [OrderBookLevel(price=float(b[0]), size=float(b[1])) for b in data.get("bids", [])]
             asks = [OrderBookLevel(price=float(a[0]), size=float(a[1])) for a in data.get("asks", [])]
             bids.sort(key=lambda x: x.price, reverse=True)
@@ -531,7 +537,7 @@ class CoinbaseWebSocketClient:
                         self._update_book_side(current.bids, price, size, descending=True)
                     else:
                         self._update_book_side(current.asks, price, size, descending=False)
-                now = datetime.utcnow()
+                now = utc_now()
                 current.event_time = now
                 current.available_time = now
                 if self.on_orderbook:

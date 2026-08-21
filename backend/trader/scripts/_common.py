@@ -57,9 +57,10 @@ def build_config(args: argparse.Namespace) -> Config:
     config = Config()
     if not args.cost_config or args.cost_config.lower() == 'none':
         logging.warning(
-            'no cost config: pricing every contract at the hardcoded %.1fbp/side, '
-            'which is wrong for every Coinbase CDE contract',
-            config.taker_bps,
+            'no cost config: pricing every contract at the hardcoded %.1fbp/side '
+            'with no per-contract floor, which is wrong for every Coinbase CDE '
+            'contract by 0.06x to 2.5x',
+            config.fee_pct_per_side * 10_000,
         )
         return config
 

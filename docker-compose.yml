@@ -155,7 +155,11 @@ services:
       - trader_logs:/app/logs
       # Mount source for development (remove in production)
       - ./backend/trader:/app
-      - ./configs:/app/configs:ro
+      # `configs/` already lives inside backend/trader, so the bind mount above
+      # brings it in. Mounting a repo-root `./configs` here created an empty
+      # host directory and masked the real one, which is exactly the bug the
+      # note above describes: find_cost_config() then found nothing and every
+      # contract was priced at the hardcoded default.
       # Paper candidate overrides (optimizer results) — overlays the named volume subdir
       - ./backend/trader/data/paper_candidates:/app/data/paper_candidates
     # The orchestrator: initial backfill (30d) then hourly cycles
@@ -163,7 +167,6 @@ services:
       -m scripts.live_orchestrator
         --backfill-days 30
         --include-oi
-        --debug
 
   # ===========================================================================
   # Paper Engine — consumes signals from PostgreSQL and simulates fills
@@ -176,12 +179,21 @@ services:
     environment:
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
       - TZ=America/New_York
+      # The paper engine accrues funding from the research store and prices
+      # fills from the venue fee schedule. With neither set it read an empty
+      # store (so funding was silently never accrued) and fell back to the
+      # hardcoded 10bp/side — the two failures its own docstring exists to fix.
+      - RESEARCH_STORE=/app/data/research
+      - COST_CONFIG=coinbase_us_perps_cde_v202602.json
+      - LOG_LEVEL=INFO
     depends_on:
       db:
         condition: service_healthy
       trader:
         condition: service_started
     volumes:
+      # The store the orchestrator writes is the store this reads.
+      - trader_data:/app/data
       - ./backend/trader:/app
     command: >
       -m scripts.paper_engine

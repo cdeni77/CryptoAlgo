@@ -15,6 +15,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
+from .timeutil import (
+    ensure_naive_utc,
+    epoch_seconds_to_naive_utc,
+    naive_utc_to_epoch_seconds,
+    utc_now,
+)
 from .models import OHLCVBar, FundingRate, TickerUpdate, DataQuality, OrderBookSnapshot
 from .validator import DataValidator, ValidationConfig, DataQualityTracker
 from .queue import MessageQueueBase, InMemoryQueue, Channels, QueueMessage
@@ -26,12 +32,7 @@ from .ccxt_connector import CCXTConnector
 logger = logging.getLogger(__name__)
 
 
-def ensure_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None:
-        return None
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+
 
 
 @dataclass
@@ -237,7 +238,7 @@ class DataPipeline:
 
     async def backfill(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
                        symbols: Optional[List[str]] = None, timeframes: Optional[List[str]] = None, use_ccxt: bool = True):
-        end = ensure_naive_utc(end) if end else datetime.utcnow()
+        end = ensure_naive_utc(end) if end else utc_now()
         start = ensure_naive_utc(start) if start else (end - timedelta(days=self.config.backfill_days))
         symbols = symbols or self.config.symbols
         timeframes = timeframes or self.config.timeframes
@@ -290,7 +291,7 @@ class DataPipeline:
     async def _ohlcv_poll_loop(self):
         while self._running:
             try:
-                now = datetime.utcnow()
+                now = utc_now()
                 for symbol in self.config.symbols:
                     for timeframe in self.config.timeframes:
                         tf_seconds = self._granularity_to_seconds(timeframe)
@@ -301,8 +302,8 @@ class DataPipeline:
                         if last_time:
                             next_expected = last_time + tf_delta
                         else:
-                            aligned = int(now.timestamp()) // tf_seconds * tf_seconds
-                            next_expected = datetime.utcfromtimestamp(aligned)
+                            aligned = naive_utc_to_epoch_seconds(now) // tf_seconds * tf_seconds
+                            next_expected = epoch_seconds_to_naive_utc(aligned)
                         if now >= next_expected - timedelta(seconds=30):
                             start_fetch = next_expected - tf_delta * 2
                             start_fetch = max(start_fetch, now - timedelta(days=1))

@@ -133,7 +133,7 @@ class InMemoryQueue(MessageQueueBase):
         queue_msg = QueueMessage(
             channel=channel,
             data=message,
-            timestamp=datetime.utcnow()
+            timestamp=utc_now()
         )
         
         async with self._get_lock(channel):
@@ -175,11 +175,11 @@ class InMemoryQueue(MessageQueueBase):
         if channel not in self._queues:
             return messages
         
-        start_time = datetime.utcnow()
+        start_time = utc_now()
         timeout = timeout_ms / 1000
         
         while len(messages) < max_messages:
-            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            elapsed = (utc_now() - start_time).total_seconds()
             if elapsed >= timeout:
                 break
             
@@ -266,7 +266,7 @@ class RedisQueue(MessageQueueBase):
             queue_msg = QueueMessage(
                 channel=channel,
                 data=message,
-                timestamp=datetime.utcnow()
+                timestamp=utc_now()
             )
             
             # Publish to pub/sub for real-time subscribers

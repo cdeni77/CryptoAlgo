@@ -145,6 +145,14 @@ class Ingestor:
 
         keep: list[FundingRate] = []
         for rate in rates:
+            # Both fields, and `venue` is the one that matters: it is in the
+            # unique key, so without it every venue's rate for an instrument-hour
+            # collided and `INSERT OR REPLACE` kept whichever arrived last. A
+            # Binance proxy rate would overwrite Coinbase's own and then be read
+            # back as Coinbase's, which is the one substitution the carry features
+            # cannot survive. Bars and open interest already did this correctly;
+            # funding was the outlier.
+            rate.venue = venue
             rate.funding_source = venue
             outcome = self.validator.validate_funding_rate(rate)
             self.tracker.record_validation(outcome)
