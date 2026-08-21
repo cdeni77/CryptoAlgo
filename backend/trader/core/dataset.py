@@ -246,7 +246,7 @@ def load_dataset(
     store: ResearchStore,
     *,
     venue: str = 'coinbase',
-    reference_venue: Optional[str] = 'binance',
+    reference_venue: Optional[str] = 'coinbase_spot',
     oi_venue: Optional[str] = None,
     symbols: Optional[Sequence[str]] = None,
     config: Optional[Config] = None,
