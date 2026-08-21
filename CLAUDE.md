@@ -250,32 +250,28 @@ real observation is 22x lower. Collect the distribution before sizing anything o
 it. `scripts/preflight.py` reports sample size; it cannot tell you the edge is
 real.
 
-## Open: contract sizes disagree by up to 5x
+## Contract sizes: settled against the venue
 
-`configs/exchange/coinbase_us_perps_cde_v202602.json` and
-`core/costs.py:CONTRACT_UNITS` do not agree on three instruments:
+`configs/exchange/coinbase_us_perps_cde_v202602.json` disagreed with
+`core/costs.py:CONTRACT_UNITS` on three instruments. The venue answered it:
+`future_product_details.contract_size` on the product endpoint reports **10, 50
+and 5** for AVAX, LINK and LTC — agreeing with `CONTRACT_UNITS` across all
+sixteen contracts. So the code was right and the schedule was wrong; the schedule
+is corrected.
 
-| asset | venue schedule | CONTRACT_UNITS (what actually sizes positions) |
-|-------|---------------:|-----------------------------------------------:|
-| AVAX  | 5  | 10 |
-| LINK  | 10 | 50 |
-| LTC   | 1  | 5  |
-
-The schedule's `contract_sizes` are read by nothing — `get_contract_spec` always
-uses `CONTRACT_UNITS` — so the disagreement had no way to surface. Contract size
-multiplies into notional, fee-as-a-fraction-of-notional, margin, liquidation
-price, participation rate and PnL, so this is a silent multiplier on everything
-those three instruments produce.
-
-**The venue answers this directly** — `future_product_details.contract_size` and
-`contract_root_unit` on the product endpoint, confirmed as `"0.01"` / `"BTC"` for
-BIP. Run `python -m scripts.probe_funding --sizes-only` for the whole universe
-and set `CONTRACT_UNITS` from that, rather than picking a side in code.
-`load_exchange_cost_assumptions` warns on every run that reads the file, and
+The edit changed no computed cost, because the schedule's `contract_sizes` are
+read by nothing — `get_contract_spec` always uses `CONTRACT_UNITS`. That is
+precisely why the discrepancy survived: dead data cannot be wrong in a way
+anything notices. Two mechanisms now watch it, both mutation-verified —
+`load_exchange_cost_assumptions` warns on any disagreement at load time, and
 `test_orm_parity.py::test_the_venue_schedule_agrees_with_the_contract_units_table`
-is a `strict=True` xfail — it fails the moment the data is fixed without the
-marker being removed. Until then, exclude AVAX, LINK and LTC (`--exclude
-AVAX,LINK,LTC`) or accept that their sizing is uncertain to 2x-5x.
+fails on it.
+
+Reproduce the venue's own table with:
+
+```bash
+python -m scripts.probe_funding --sizes-only
+```
 
 ## The reference venue needs a proxy from a US IP
 

@@ -357,18 +357,6 @@ def test_no_table_is_declared_without_a_writer(schemas):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        'KNOWN OPEN: the shipped CDE schedule and CONTRACT_UNITS disagree on '
-        'AVAX (5 vs 10), LINK (10 vs 50) and LTC (1 vs 5). Resolving it needs '
-        "Coinbase's published contract specs, not a code change — picking a "
-        'side here would be guessing at a multiplier on notional, fees, margin '
-        'and PnL. `load_exchange_cost_assumptions` warns on every run that '
-        'reads the file. strict=True so this fails the moment someone fixes the '
-        'data without removing this marker.'
-    ),
-)
 def test_the_venue_schedule_agrees_with_the_contract_units_table():
     """Three sources declare contract size. All three have to say the same thing.
 
@@ -389,8 +377,12 @@ def test_the_venue_schedule_agrees_with_the_contract_units_table():
     by nothing — `get_contract_spec` always uses `CONTRACT_UNITS` — so the
     schedule's sizes were dead data and the disagreement had no way to surface.
 
-    Which of the two is correct is a question for Coinbase's published specs, not
-    for this test. What this test does is refuse to let them differ silently.
+    Resolved by asking the venue: `future_product_details.contract_size` on the
+    product endpoint reports 10 / 50 / 5 for all three, agreeing with
+    `CONTRACT_UNITS` across all sixteen contracts — so the schedule was the wrong
+    one and is corrected. `probe_funding --sizes-only` reproduces that table.
+    The edit was inert (those sizes are read by nothing), which is exactly why
+    nothing caught it: this test and the loader's warning are the mechanism now.
     """
     import json
 
