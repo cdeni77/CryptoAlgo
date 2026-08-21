@@ -520,67 +520,90 @@ def get_coinbase_spot_portfolio() -> Dict[str, Any]:
         }
 
 
-def get_coinbase_perps_portfolio() -> Dict[str, Any]:
+def _futures_positions() -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Open CDE futures positions, or the reason they could not be read."""
+    positions: List[Dict[str, Any]] = []
     try:
-        balances_response = client.get_perps_portfolio_balances()
-        balances = _to_dict(balances_response)
-        positions: List[Dict[str, Any]] = []
+        raw = _to_dict(client.list_futures_positions())
+    except Exception as exc:                                  # noqa: BLE001
+        return [], str(exc)
 
-        candidates = [
-            balances.get("total_balance_usd"),
-            balances.get("portfolio_balance_usd"),
-            balances.get("equity_usd"),
-            balances.get("cash_equity_usd"),
-            _to_dict(balances.get("portfolio_balance")).get("value"),
-            _to_dict(balances.get("equity")).get("value"),
-        ]
+    for raw_position in raw.get("positions", []):
+        pos = _to_dict(raw_position)
+        symbol = pos.get("product_id") or pos.get("symbol")
+        contracts = _safe_float(
+            pos.get("number_of_contracts") or pos.get("contracts")
+        )
+        mark_price = _safe_float(pos.get("current_price") or pos.get("mark_price"))
+        notional = _safe_float(
+            pos.get("notional_value_usd")
+            or pos.get("current_notional_value")
+            or pos.get("notional_usd")
+        )
+        unrealized_pnl = _safe_float(
+            pos.get("unrealized_pnl") or pos.get("unrealized_pnl_usd")
+        )
+        if symbol and (contracts is not None or notional is not None):
+            positions.append({
+                "symbol": symbol,
+                "contracts": round(contracts, 8) if contracts is not None else None,
+                "mark_price": round(mark_price, 6) if mark_price is not None else None,
+                "notional_usd": round(notional, 2) if notional is not None else None,
+                "unrealized_pnl_usd": (
+                    round(unrealized_pnl, 2) if unrealized_pnl is not None else None
+                ),
+            })
 
-        value_usd = next((v for v in (_safe_float(c) for c in candidates) if v is not None), None)
+    positions.sort(key=lambda item: abs(item.get("notional_usd") or 0.0), reverse=True)
+    return positions, None
 
-        if value_usd is None:
-            summary_response = client.get_perps_portfolio_summary()
-            summary = _to_dict(summary_response)
-            value_usd = _safe_float(summary.get("equity_usd") or summary.get("portfolio_value_usd"))
 
-        positions_error: Optional[str] = None
-        if hasattr(client, "get_perps_positions"):
-            try:
-                positions_response = client.get_perps_positions()
-                for raw_position in _to_dict(positions_response).get("positions", []):
-                    pos = _to_dict(raw_position)
-                    symbol = pos.get("product_id") or pos.get("symbol")
-                    contracts = _safe_float(pos.get("number_of_contracts") or pos.get("contracts"))
-                    mark_price = _safe_float(pos.get("mark_price"))
-                    notional = _safe_float(pos.get("notional_value_usd") or pos.get("notional_usd"))
-                    unrealized_pnl = _safe_float(pos.get("unrealized_pnl") or pos.get("unrealized_pnl_usd"))
-                    if symbol and (contracts is not None or notional is not None):
-                        positions.append(
-                            {
-                                "symbol": symbol,
-                                "contracts": round(contracts, 8) if contracts is not None else None,
-                                "mark_price": round(mark_price, 6) if mark_price is not None else None,
-                                "notional_usd": round(notional, 2) if notional is not None else None,
-                                "unrealized_pnl_usd": round(unrealized_pnl, 2)
-                                if unrealized_pnl is not None
-                                else None,
-                            }
-                        )
-            except Exception as exc:
-                # A failed positions call used to leave `positions = []` while
-                # `status` stayed "ok", so "the request broke" rendered as "no
-                # open perps". Say which it was.
-                positions = []
-                positions_error = str(exc)
+def get_coinbase_perps_portfolio() -> Dict[str, Any]:
+    """The CDE futures account: its balance and any open positions.
 
-        positions.sort(key=lambda item: abs(item.get("notional_usd") or 0.0), reverse=True)
+    Reads the **futures** (FCM) endpoints, not the perpetuals ones. Those are two
+    different venues on one API: `get_perps_portfolio_balances` and
+    `list_perps_positions` belong to Coinbase International (INTX), which a US
+    account does not have — `GET /api/v3/brokerage/portfolios` returns a single
+    DEFAULT portfolio and no INTX one. The same distinction made every
+    `intx/funding-rates` call a 404.
+
+    The symptom was blunter here: `get_perps_portfolio_balances()` requires a
+    `portfolio_uuid` and was called with none, so the whole section returned
+    `TypeError: missing 1 required positional argument` as its status. Even
+    supplying one would have queried a venue this account has no portfolio on.
+
+    CDE contracts are FCM-margined futures, so the balance is a futures balance
+    summary and the money sits in the futures account rather than in spot — which
+    is why a spot read of $0 alongside real CDE activity is consistent, not a
+    contradiction.
+    """
+    try:
+        summary = _to_dict(client.get_futures_balance_summary())
+        # The response nests under `balance_summary`; older shapes are flat.
+        balance = _to_dict(summary.get("balance_summary")) or summary
+
+        candidates = (
+            _to_dict(balance.get("total_usd_balance")).get("value"),
+            _to_dict(balance.get("cbi_usd_balance")).get("value"),
+            _to_dict(balance.get("cfm_usd_balance")).get("value"),
+            _to_dict(balance.get("futures_buying_power")).get("value"),
+            balance.get("total_usd_balance"),
+        )
+        value_usd = next(
+            (v for v in (_safe_float(c) for c in candidates) if v is not None), None
+        )
+
+        positions, positions_error = _futures_positions()
 
         return {
             "value_usd": round(value_usd, 2) if value_usd is not None else None,
             "positions": positions,
             "positions_unavailable_reason": positions_error,
+            # A balance of 0 is a measurement; None is not.
             "status": "ok" if value_usd is not None else "unavailable",
         }
-    except Exception as exc:
+    except Exception as exc:                                  # noqa: BLE001
         return {
             "value_usd": None,
             "positions": [],
