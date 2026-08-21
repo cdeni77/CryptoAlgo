@@ -566,15 +566,36 @@ async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
     try:
         client = CoinbaseRESTClient(api_key, api_secret)
         target_codes = list(ASSET_TO_CODE_MAP.values())
+
+        # Ask for everything first, then filter. "Found 16 contracts" used to be
+        # the count of hardcoded codes that matched, not the count the venue
+        # lists — and `ASSET_TO_CODE_MAP` has exactly 16 entries, so the filter
+        # was fully binding and a newly-listed contract was invisible. Reporting
+        # what was skipped turns "add a coin" from a discovery problem into a
+        # one-line data change.
+        all_products = await client.get_perpetual_products()
         products = await client.get_perpetual_products(target_codes=target_codes)
         await client.close()
 
         coinbase_symbols = [p['product_id'] for p in products]
+        skipped = sorted(
+            p['product_id'] for p in all_products
+            if p.get('product_id') not in set(coinbase_symbols)
+        )
 
         if coinbase_symbols:
             logger.info(f"✅ Found {len(coinbase_symbols)} Coinbase CDE contracts:")
             for s in coinbase_symbols:
                 logger.info(f"   -> {s}")
+        if skipped:
+            logger.info(
+                "ℹ️  %d further contract(s) the venue lists and this system does "
+                "not model. Add the code to ASSET_TO_CODE_MAP, CONTRACT_UNITS, "
+                "COIN_PROFILES and SPOT_PRODUCTS to include one:",
+                len(skipped),
+            )
+            for s in skipped:
+                logger.info(f"   (skipped) {s}")
         else:
             logger.warning("⚠️ No matching perpetuals found from Coinbase API")
 

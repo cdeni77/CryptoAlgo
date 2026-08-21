@@ -93,6 +93,48 @@ async def historical_funding(client, products: list[str], path: str,
     print()
 
 
+async def list_all_contracts(client) -> None:
+    """Every futures product the venue lists, modelled or not.
+
+    `run_pipeline` filters the venue's product list to `ASSET_TO_CODE_MAP`, which
+    has exactly sixteen entries — so its "Found 16 contracts" was the count of
+    hardcoded codes that matched, not the count Coinbase offers. This asks
+    without a filter, which is the only way to answer "can I add ONDO?".
+    """
+    from core.costs import resolve_base
+
+    print('=' * 72)
+    print('EVERY CDE FUTURES PRODUCT THE VENUE LISTS')
+    print('=' * 72)
+    status, data = await client._request(
+        'GET', '/api/v3/brokerage/products',
+        params={'product_type': 'FUTURE'}, authenticated=True,
+    )
+    if status != 200:
+        print(f'HTTP {status}: {data}')
+        return
+
+    products = data.get('products', [])
+    print(f'{"product_id":24} {"code":6} {"unit":8} {"size":>10} {"funding":>10}  modelled')
+    modelled = skipped = 0
+    for raw in products:
+        d = raw.get('future_product_details') or {}
+        pid = raw.get('product_id', '')
+        # Only the perpetual-style ones have a funding interval.
+        funding = d.get('funding_interval') or ''
+        known = resolve_base(pid) is not None
+        modelled += known
+        skipped += (not known) and bool(funding)
+        print(f'{pid:24} {str(d.get("contract_code","")):6} '
+              f'{str(d.get("contract_root_unit","")):8} '
+              f'{str(d.get("contract_size","")):>10} {str(funding):>10}  '
+              f'{"yes" if known else "NO - addable"}')
+    print()
+    print(f'{len(products)} products listed; {modelled} modelled; '
+          f'{skipped} perpetual-style contract(s) not modelled')
+    print()
+
+
 async def contract_sizes(client, products: list[str]) -> None:
     """Ask the venue for `contract_size`, which settles a 5x open question.
 
@@ -132,6 +174,9 @@ async def contract_sizes(client, products: list[str]) -> None:
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--product', default='BIP-20DEC30-CDE')
+    parser.add_argument('--list-contracts', action='store_true',
+                        help='Every futures product the venue lists, with which '
+                             'ones this system models. Answers "can I add X?".')
     parser.add_argument('--sizes-only', action='store_true',
                         help='Skip the endpoint probe, just dump contract sizes')
     parser.add_argument('--funding-path', default=None,
@@ -161,6 +206,10 @@ async def main() -> int:
     client = CoinbaseRESTClient(key, secret)
     try:
         products = [p.strip() for p in args.products.split(',') if p.strip()]
+
+        if args.list_contracts:
+            await list_all_contracts(client)
+            return 0
 
         if args.funding_path:
             extra = dict(
