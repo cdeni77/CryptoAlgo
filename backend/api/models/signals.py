@@ -31,6 +31,27 @@ class Signal(Base):
     gate_failure_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # -- the decision, decomposed ------------------------------------------
+    # These replace the classification columns above, which no longer describe
+    # what the model produces. `confidence` and `raw_probability` were a
+    # probability and an AUC; the model regresses net return, so the honest
+    # record is the forecast broken into its parts and the cost it has to clear.
+    # The old columns stay nullable and unwritten rather than being dropped,
+    # because historical rows still hold real values from the previous system.
+    expected_net_bps = Column(Float, nullable=True)
+    expected_price_bps = Column(Float, nullable=True)
+    expected_carry_bps = Column(Float, nullable=True)
+    cost_bps = Column(Float, nullable=True)
+    sigma_bps = Column(Float, nullable=True)
+    edge_to_risk = Column(Float, nullable=True)
+    # Share of the expected edge that is carry rather than direction. A book
+    # whose edge is mostly carry is a different strategy with different risks.
+    carry_share = Column(Float, nullable=True)
+    participation = Column(Float, nullable=True)
+    # Which promoted model produced this. Without it, a signal cannot be
+    # attributed after a retrain, and calibration is measured across two models.
+    model_version = Column(String, nullable=True)
+
     def __repr__(self):
         return f"<Signal {self.id} | {self.coin} | {self.direction} | conf={self.confidence:.1%}>"
 
@@ -55,6 +76,15 @@ class SignalResponse(BaseModel):
     passed_gates: bool = True
     gate_failure_reason: Optional[str] = None
     created_at: Optional[datetime] = None
+    expected_net_bps: Optional[float] = None
+    expected_price_bps: Optional[float] = None
+    expected_carry_bps: Optional[float] = None
+    cost_bps: Optional[float] = None
+    sigma_bps: Optional[float] = None
+    edge_to_risk: Optional[float] = None
+    carry_share: Optional[float] = None
+    participation: Optional[float] = None
+    model_version: Optional[str] = None
 
     class Config:
         from_attributes = True

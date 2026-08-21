@@ -24,10 +24,26 @@ export interface CDESpec {
   code: string;
   units_per_contract: number;
   approx_contract_value: number;
+  /** Stale 10bp/side guess, kept only for compatibility. Coinbase CDE charges a
+   *  flat per-contract commission, not a percentage — use `CDESpecs.fees`. */
   fee_pct: number;
 }
 
-export type CDESpecs = Record<string, CDESpec>;
+/** The venue's actual commission schedule, read from the same config file the
+ *  research pipeline prices its targets with. */
+export interface CDEFeeSchedule {
+  version: string | null;
+  mode: string | null;
+  per_contract_usd_default: number | null;
+  per_contract_usd_by_code: Record<string, number>;
+  taker_fee_bps: number | null;
+  maker_fee_bps: number | null;
+}
+
+export interface CDESpecs {
+  contracts: Record<string, CDESpec>;
+  fees: CDEFeeSchedule | Record<string, never>;
+}
 
 export interface Trade {
   id: number;
@@ -53,14 +69,10 @@ export interface Signal {
   coin: string;
   timestamp: string;
   direction: 'long' | 'short' | 'neutral';
+  /** Edge-to-risk: expected net return over its own uncertainty. Named
+   *  `confidence` because the column is, but it is not a probability. */
   confidence: number;
-  raw_probability: number | null;
-  model_auc: number | null;
   price_at_signal: number | null;
-  momentum_pass: boolean | null;
-  trend_pass: boolean | null;
-  regime_pass: boolean | null;
-  ml_pass: boolean | null;
   contracts_suggested: number | null;
   notional_usd: number | null;
   acted_on: boolean;
@@ -68,6 +80,27 @@ export interface Signal {
   passed_gates: boolean;
   gate_failure_reason: string | null;
   created_at: string | null;
+
+  // The decision, decomposed. This is what `decide()` actually produced.
+  expected_net_bps: number | null;
+  expected_price_bps: number | null;
+  expected_carry_bps: number | null;
+  cost_bps: number | null;
+  sigma_bps: number | null;
+  edge_to_risk: number | null;
+  /** Share of the expected edge that is carry rather than direction. */
+  carry_share: number | null;
+  participation: number | null;
+  model_version: string | null;
+
+  // Classifier-era columns, left null by the current signal writer. Historical
+  // rows still carry real values, which is why they are not dropped.
+  raw_probability: number | null;
+  model_auc: number | null;
+  momentum_pass: boolean | null;
+  trend_pass: boolean | null;
+  regime_pass: boolean | null;
+  ml_pass: boolean | null;
 }
 
 export interface PaperSummary {
@@ -133,41 +166,70 @@ export interface ChartMarker {
   kind: 'entry' | 'exit';
 }
 
-export type ReadinessTier = 'FULL' | 'PILOT' | 'SHADOW' | 'REJECT' | 'UNKNOWN';
+/**
+ * Research types, rewritten to match what the model produces.
+ *
+ * The old shapes described a classifier: `holdout_auc`, `pr_auc`,
+ * `precision_at_threshold`, `readiness_tier`, `robustness_gate`. The model
+ * regresses net return, so AUC is undefined for it — the API now leaves it null
+ * — and the readiness tier was read from an artifact of a deleted pipeline, so it
+ * was "UNKNOWN" for everything. `pr_auc` and `precision_at_threshold` were the
+ * AUC with 0.06 and 0.04 subtracted: one number displayed three times.
+ *
+ * What replaces them is the comparison the model can be held to — the edge it
+ * claimed against the edge it earned — plus the promotion gates, which are the
+ * real readiness decision.
+ */
 
-export interface ReadinessTierDisplayMeta {
-  label: string;
-  tone: 'emerald' | 'amber' | 'slate' | 'rose';
-  description: string;
-}
+export type Health = 'healthy' | 'watch' | 'at_risk' | 'unknown';
 
-export interface ResearchSummaryKpis {
-  holdout_auc: number | null;
-  pr_auc: number | null;
-  precision_at_threshold: number | null;
-  win_rate_realized: number;
-  acted_signal_rate: number;
-  drift_delta: number;
-  readiness_tier?: ReadinessTier;
-  recommended_position_scale?: number;
-  readiness_tier_meta?: ReadinessTierDisplayMeta;
-  robustness_gate: boolean;
+export interface EdgeCalibration {
+  expected_net_bps: number | null;
+  realised_net_bps: number | null;
+  /** Realised minus expected. Persistently negative means the model overstates
+   *  its edge, which over-sizes every position clearing the conviction floor. */
+  delta_bps: number | null;
+  sample: number;
 }
 
 export interface ResearchCoinHealth {
   coin: string;
-  holdout_auc: number | null;
-  pr_auc: number | null;
-  precision_at_threshold: number | null;
-  win_rate_realized: number;
-  acted_signal_rate: number;
-  drift_delta: number;
-  readiness_tier?: ReadinessTier;
-  recommended_position_scale?: number;
-  robustness_gate: boolean;
-  optimization_freshness_hours: number | null;
-  last_optimized_at: string | null;
-  health: 'healthy' | 'watch' | 'at_risk';
+  signals_total: number;
+  signals_passed_gates: number;
+  gate_pass_rate: number | null;
+  top_gate_reason: string | null;
+  last_signal_at: string | null;
+  expected_net_bps: number | null;
+  expected_carry_share: number | null;
+  mean_cost_bps: number | null;
+  trades_closed: number;
+  win_rate_realized: number | null;
+  net_pnl: number | null;
+  realised_net_bps: number | null;
+  calibration: EdgeCalibration;
+  health: Health;
+  health_reason: string | null;
+}
+
+export interface ResearchSummaryKpis {
+  signals_total: number;
+  signals_passed_gates: number;
+  gate_pass_rate: number | null;
+  trades_closed: number;
+  win_rate_realized: number | null;
+  net_pnl: number | null;
+  expected_net_bps: number | null;
+  realised_net_bps: number | null;
+  calibration_delta_bps: number | null;
+  expected_carry_share: number | null;
+  model_version: string | null;
+  model_promoted: boolean;
+  model_forced: boolean;
+  model_age_hours: number | null;
+  gates_failed: string[];
+  kill_switch_status: string;
+  trials_to_date: number;
+  health: Health;
 }
 
 export interface ResearchSummary {
@@ -183,17 +245,21 @@ export interface ResearchCoinDetail {
 
 export interface ResearchRun {
   id: string;
-  coin: string;
-  run_type: 'train' | 'optimize' | 'validate';
+  run_type: string;
   status: string;
   started_at: string;
-  finished_at: string;
-  duration_seconds: number;
-  holdout_auc: number | null;
-  readiness_tier?: ReadinessTier;
-  recommended_position_scale?: number;
-  readiness_tier_meta?: ReadinessTierDisplayMeta;
-  robustness_gate: boolean;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  artifacts_version: string | null;
+  symbols_trained: number;
+  symbols_total: number;
+  retrain_window_days: number | null;
+  promoted: boolean | null;
+  forced: boolean;
+  failed_gates: string[];
+  sharpe: number | null;
+  trades: number | null;
+  error: string | null;
 }
 
 export interface FeatureImportanceItem {
@@ -211,6 +277,140 @@ export interface ResearchFeatures {
   generated_at: string;
   feature_importance: FeatureImportanceItem[];
   signal_distribution: SignalDistributionItem[];
+  /** Set when importances could not be read, so the client can say why rather
+   *  than render an empty chart that looks like a zero result. */
+  importance_unavailable_reason: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Model provenance and promotion gates
+// ---------------------------------------------------------------------------
+
+export interface GateResult {
+  name: string;
+  value: number | null;
+  threshold: number;
+  /** 'min' — value must be at least the threshold; 'max' — at most. */
+  comparison: 'min' | 'max' | string;
+  passed: boolean;
+  note: string | null;
+}
+
+export interface ModelProvenance {
+  version: string | null;
+  feature_set_hash: string | null;
+  n_features: number | null;
+  heads: string[];
+  uses_symbol_identity: boolean;
+  horizon_bars: number | null;
+  cost_config_version: string | null;
+  trained_at: string | null;
+  data_as_of: string | null;
+  train_rows: number | null;
+  /** Overlapping labels are not independent observations. Any significance claim
+   *  belongs to this number, not to train_rows. */
+  effective_observations: number | null;
+  train_start: string | null;
+  train_end: string | null;
+  symbols: string[];
+}
+
+export interface BacktestSummary {
+  trades: number | null;
+  net_pnl: number | null;
+  price_pnl: number | null;
+  funding_pnl: number | null;
+  fees: number | null;
+  carry_contribution: number | null;
+  return_pct: number | null;
+  sharpe: number | null;
+  max_drawdown: number | null;
+  win_rate: number | null;
+  liquidations: number | null;
+  max_entry_participation: number | null;
+  max_exit_participation: number | null;
+}
+
+export interface PathDistributionSummary {
+  n: number | null;
+  median: number | null;
+  mean: number | null;
+  p05: number | null;
+  p95: number | null;
+  positive_fraction: number | null;
+}
+
+export interface SimulationSummary {
+  bootstrap_sharpe: PathDistributionSummary | null;
+  bootstrap_max_drawdown: PathDistributionSummary | null;
+  probability_positive: number | null;
+  risk_of_ruin: number | null;
+  block_length: number | null;
+  per_period_sharpe: PathDistributionSummary | null;
+  synthetic_sharpe: PathDistributionSummary | null;
+  stressed_worst_sharpe: number | null;
+  parameter_plateau: number | null;
+}
+
+export interface PromotionRecord {
+  version: string;
+  created_at: string | null;
+  promoted: boolean;
+  forced: boolean;
+  force_reason: string | null;
+  is_live: boolean;
+  failed_gates: string[];
+  gates: GateResult[];
+  provenance: ModelProvenance;
+  backtest: BacktestSummary;
+  simulation: SimulationSummary;
+  error: string | null;
+}
+
+export interface KillSwitchStatus {
+  status: string;
+  version: string | null;
+  evaluated_at: string | null;
+  reasons: string[];
+  trades: number | null;
+  win_rate: number | null;
+  profit_factor: number | null;
+  drawdown: number | null;
+  expectancy: number | null;
+  trades_per_week: number | null;
+  window_days: number | null;
+}
+
+export interface LiveModel {
+  generated_at: string;
+  has_model: boolean;
+  artifact_path: string | null;
+  artifact_modified_at: string | null;
+  trials_to_date: number;
+  live: PromotionRecord | null;
+  kill_switch: KillSwitchStatus;
+  /** An artifact with no ledger entry: installed outside the gates. */
+  unrecorded_artifact: boolean;
+}
+
+export interface PromotionHistory {
+  generated_at: string;
+  trials_to_date: number;
+  live_version: string | null;
+  records: PromotionRecord[];
+}
+
+export interface FeatureImportanceEntry {
+  feature: string;
+  importance: number;
+  head: string;
+}
+
+export interface FeatureImportanceResponse {
+  generated_at: string;
+  version: string | null;
+  features: FeatureImportanceEntry[];
+  unavailable_reason: string | null;
 }
 
 export interface ResearchScriptInfo {

@@ -1,4 +1,6 @@
+import json
 import os
+from pathlib import Path as FilePath
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from typing import Dict, List
@@ -105,6 +107,48 @@ CDE_PRODUCTS = {
 VALID_SYMBOLS = list(COINBASE_PRODUCTS.keys())
 
 
+def _real_fee_schedule() -> Dict[str, dict]:
+    """The venue's actual fee schedule, from the trader's config directory.
+
+    `CDE_PRODUCTS` above carries a `fee_pct` of 0.001 — 10 basis points per side —
+    for every contract. That figure is wrong for all of them, and wrong in both
+    directions: Coinbase CDE charges no percentage fee and a flat per-contract
+    commission, $0.75 on BTC and ETH and $0.10 on the rest. On a $675 BTC contract
+    that is 11bp per side, not 10; on a $56 contract it is 18bp. The percentage
+    model cannot express either.
+
+    So the schedule is read from the same file the trader prices its targets with,
+    rather than kept as a third hardcoded copy that drifts from the other two.
+    Absent file, absent fees — the response says so rather than substituting the
+    guess.
+    """
+    trader_dir = FilePath(os.getenv("TRADER_DIR", "/trader"))
+    candidates = [
+        trader_dir / "configs" / "exchange" / "coinbase_us_perps_cde_v202602.json",
+        FilePath("/app/configs/exchange/coinbase_us_perps_cde_v202602.json"),
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        exchange_fee = payload.get("exchange_fee") or {}
+        overrides = exchange_fee.get("symbol_overrides") or {}
+        default = exchange_fee.get("per_contract_usd")
+        retail = payload.get("retail_execution_fee") or {}
+        return {
+            "version": payload.get("version"),
+            "mode": exchange_fee.get("mode"),
+            "per_contract_usd_default": default,
+            "per_contract_usd_by_code": overrides,
+            "taker_fee_bps": retail.get("taker_fee_bps") if retail.get("enabled") else 0.0,
+            "maker_fee_bps": retail.get("maker_fee_bps") if retail.get("enabled") else 0.0,
+        }
+    return {}
+
+
 @router.get("/prices", response_model=Dict[str, dict])
 def get_current_prices():
     """Get current spot prices for all tracked coins."""
@@ -165,8 +209,18 @@ def get_cde_prices():
 
 @router.get("/cde-specs", response_model=Dict[str, dict])
 def get_cde_specs():
-    """Return CDE contract specifications for all coins."""
-    return CDE_PRODUCTS
+    """CDE contract specifications, with the venue's real commission schedule.
+
+    `fees` comes from the trader's fee config — the same file the research
+    pipeline prices its targets with — so the API, the backtest and the paper
+    engine cannot disagree about what a trade costs. The per-contract `fee_pct`
+    on each product is left in place for compatibility but is a stale 10bp
+    guess; use `fees` instead.
+    """
+    return {
+        "contracts": CDE_PRODUCTS,
+        "fees": _real_fee_schedule(),
+    }
 
 
 @router.get("/history/{symbol}", response_model=List[Dict])

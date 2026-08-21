@@ -85,7 +85,22 @@ def main() -> int:
         from core.pg_writer import PgWriter
         writer = PgWriter()
 
+    # Which promoted version produced these, so a signal can still be attributed
+    # after the next retrain — and so calibration is never measured across two
+    # different models.
+    from core.promotion import current_record
+
+    live = current_record(model_path.parent)
+    model_version = live.version if live else None
+    if live is None:
+        logger.warning(
+            'no promotion record beside %s: this model was installed outside the '
+            'gates, and its signals cannot be attributed to a version',
+            model_path,
+        )
+
     print(f'\nbar {latest} | model {model.feature_set_hash} '
+          f'(version {model_version or "unrecorded"}) '
           f'trained through {model.train_end}')
 
     for (timestamp, symbol), row in forecasts.iterrows():
@@ -121,25 +136,37 @@ def main() -> int:
 
         if writer is not None:
             profile = dataset.profiles.get(symbol)
+            coin = profile.name if profile else symbol
+            side = 'long' if decision.side >= 0 else 'short'
+            # `confidence` is retained because the frontend and the paper engine
+            # read it, and edge-to-risk is the closest honest analogue: how large
+            # the expected edge is relative to its own uncertainty. Everything
+            # else goes into the columns that mean what they say. The classifier
+            # columns — raw_probability, model_auc, momentum_pass, ml_pass — are
+            # left null rather than filled with a stand-in, because a fabricated
+            # zero reads as a measurement.
             writer.write_signal(
-                coin=profile.name if profile else symbol,
+                coin=coin,
                 timestamp=datetime.now(timezone.utc),
-                direction='long' if decision.side >= 0 else 'short',
+                direction=side,
                 confidence=float(min(max(decision.edge_to_risk, 0.0), 1.0)),
-                raw_probability=float(decision.expected_net),
-                model_auc=0.0,
                 price_at_signal=decision.price,
-                momentum_pass=True,
                 regime_pass=decision.gate is None or decision.gate.value != 'volatility_regime',
-                ml_pass=decision.tradeable,
                 contracts_suggested=decision.contracts or None,
                 notional_usd=decision.notional or None,
                 passed_gates=decision.tradeable,
                 gate_failure_reason=decision.gate.value if decision.gate else None,
+                expected_net_bps=decision.expected_net * 10_000,
+                expected_price_bps=decision.expected_price * 10_000,
+                expected_carry_bps=decision.expected_carry * 10_000,
+                cost_bps=decision.cost * 10_000,
+                sigma_bps=decision.sigma * 10_000,
+                edge_to_risk=decision.edge_to_risk,
+                carry_share=decision.carry_share,
+                participation=decision.participation,
+                model_version=model_version,
                 idempotency_key=(
-                    f"{profile.name if profile else symbol}_"
-                    f"{timestamp.strftime('%Y%m%dT%H%M')}_"
-                    f"{'long' if decision.side >= 0 else 'short'}"
+                    f"{coin}_{timestamp.strftime('%Y%m%dT%H%M')}_{side}"
                 ),
             )
             written += 1

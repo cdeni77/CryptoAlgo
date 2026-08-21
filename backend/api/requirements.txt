@@ -24,3 +24,7 @@ betacal
 
 # Optional Redis-backed queue for trader data pipeline
 redis>=5.0.0
+
+# Tests. httpx backs fastapi.testclient.
+pytest>=7.0.0
+httpx>=0.27.0

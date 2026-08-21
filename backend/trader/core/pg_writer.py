@@ -77,11 +77,36 @@ class Signal(Base):
     gate_failure_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # -- the decision, decomposed ------------------------------------------
+    # These replace the classification columns above, which no longer describe
+    # what the model produces. `confidence` and `raw_probability` were a
+    # probability and an AUC; the model regresses net return, so the honest
+    # record is the forecast broken into its parts and the cost it has to clear.
+    # The old columns stay nullable and unwritten rather than being dropped,
+    # because historical rows still hold real values from the previous system.
+    expected_net_bps = Column(Float, nullable=True)
+    expected_price_bps = Column(Float, nullable=True)
+    expected_carry_bps = Column(Float, nullable=True)
+    cost_bps = Column(Float, nullable=True)
+    sigma_bps = Column(Float, nullable=True)
+    edge_to_risk = Column(Float, nullable=True)
+    # Share of the expected edge that is carry rather than direction. A book
+    # whose edge is mostly carry is a different strategy with different risks.
+    carry_share = Column(Float, nullable=True)
+    participation = Column(Float, nullable=True)
+    # Which promoted model produced this. Without it, a signal cannot be
+    # attributed after a retrain, and calibration is measured across two models.
+    model_version = Column(String, nullable=True)
+
 
 class Wallet(Base):
     __tablename__ = "wallet"
     id = Column(Integer, primary_key=True)
-    balance = Column(Float, default=10000.0)
+    # Matches backend/api/models/wallet.py. The two drifted — 10000 here against
+    # 100000 there — so whichever container created the row decided the starting
+    # balance, and the paper equity curve started from a different number than
+    # the dashboard reported.
+    balance = Column(Float, default=100000.0)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
@@ -193,6 +218,15 @@ class PgWriter:
             "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS exit_reason VARCHAR",
             "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS funding_paid "
             "DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_net_bps DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_price_bps DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_carry_bps DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS cost_bps DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS sigma_bps DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS edge_to_risk DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS carry_share DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS participation DOUBLE PRECISION",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS model_version VARCHAR",
         ]
         with self.engine.begin() as conn:
             for stmt in stmts:
@@ -223,8 +257,25 @@ class PgWriter:
         trade_id: int | None = None,
         passed_gates: bool = True,
         gate_failure_reason: str | None = None,
+        expected_net_bps: float | None = None,
+        expected_price_bps: float | None = None,
+        expected_carry_bps: float | None = None,
+        cost_bps: float | None = None,
+        sigma_bps: float | None = None,
+        edge_to_risk: float | None = None,
+        carry_share: float | None = None,
+        participation: float | None = None,
+        model_version: str | None = None,
     ) -> int:
-        """Insert one signal row. Returns the signal id (idempotent for coin+timestamp+direction)."""
+        """Insert one signal row. Returns the signal id (idempotent for coin+timestamp+direction).
+
+        The decomposition arguments are the real record of what `decide()` chose:
+        the forecast split into price and carry, the cost it has to clear, and the
+        uncertainty it is measured against. The older `confidence`, `raw_probability`
+        and `model_auc` arguments described a classifier and should be left unset —
+        writing a return into a column named "probability" is how the research
+        dashboard came to be displaying quantities that mean nothing.
+        """
         _ = mode
         with self._session() as db:
             if idempotency_key:
@@ -261,6 +312,15 @@ class PgWriter:
                 trade_id=trade_id,
                 passed_gates=passed_gates,
                 gate_failure_reason=gate_failure_reason,
+                expected_net_bps=_f(expected_net_bps),
+                expected_price_bps=_f(expected_price_bps),
+                expected_carry_bps=_f(expected_carry_bps),
+                cost_bps=_f(cost_bps),
+                sigma_bps=_f(sigma_bps),
+                edge_to_risk=_f(edge_to_risk),
+                carry_share=_f(carry_share),
+                participation=_f(participation),
+                model_version=model_version,
             )
             db.add(sig)
             db.commit()

@@ -144,3 +144,6 @@ backend/trader/scripts/optuna_trading.db.lock
 
 # Research store (Parquet) is rebuilt from the scraper
 backend/trader/data/research/
+
+# Vite/tsc build cache
+*.tsbuildinfo

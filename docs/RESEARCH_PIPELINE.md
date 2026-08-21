@@ -420,82 +420,132 @@ Worth stating plainly, because the failure mode here is believing the machinery.
 
 ---
 
-## 8. Deferred: the app layer
+## 8. The app layer
 
-Out of scope for the pipeline rebuild, recorded here so it is not rediscovered.
-Audited but not changed. The frontend is 1,945 lines, well organised, and
-`tsc --noEmit` passes clean — this is a fix list, not a rewrite.
+Landed. Recorded here with what each fix was, because several of the defects were
+of the same kind as the pipeline's: numbers displayed as measurements that nobody
+had measured.
 
 ### 8.1 Security
 
-Severity depends on exposure. `docker-compose.yml` publishes with Docker's
-default binding, which is all interfaces, so these are LAN-reachable as
-configured.
+All four closed.
 
-- **Postgres on `0.0.0.0:5432` with the password `yourpassword`** hardcoded in
-  compose. Bind to localhost, move the credential to an env file.
-- **No authentication on any endpoint.** There is not one auth dependency in the
-  API.
-- **CORS admits every origin with credentials.** `allow_origins` lists three
-  localhost entries *and* `"*"`; the wildcard defeats the list. Verified against
-  Starlette: an arbitrary origin is echoed back into
-  `Access-Control-Allow-Origin` alongside `Access-Control-Allow-Credentials:
-  true`. With no auth, any page the operator visits can read trades and wallet
-  balances and start research jobs.
-- **`POST /launch/{job}` passes `args` through** with only whitespace filtering.
-  Not remote code execution — the job name is checked against a discovered
-  allowlist and `Popen` receives a list, so there is no shell — but arbitrary
-  flags reach the launched script.
+- **Postgres and the API are bound to loopback**, and the compose password is a
+  required `.env` variable — `${POSTGRES_PASSWORD:?...}`, so `docker compose up`
+  refuses to start without it rather than falling back to a working default in
+  version control. `.env.example` is the template.
+- **`POST /research/launch` is authenticated and fails closed.** With no
+  `API_TOKEN` configured it returns 503, not 200: a deployment that forgot to set
+  the secret refuses to launch rather than launching for anyone. Comparison is
+  `hmac.compare_digest`, so a wrong token does not leak its prefix through
+  timing. Read-only routes stay open — they serve a local dashboard, expose no
+  credentials, and gating them buys nothing the origin policy does not already
+  provide.
+- **CORS origins come from the environment with `*` filtered out.** The wildcard
+  had made every other entry in the list decorative.
+- **`args` are validated, and rejected rather than sanitised.** Long lowercase
+  flags and a bounded value charset; no spaces, no shell metacharacters, no
+  filesystem paths. Rejecting matters: a silently stripped argument means the job
+  ran with settings the requester does not believe it ran with, and that result
+  looks legitimate.
+
+`backend/api/tests/test_security.py` holds the fail-closed property and the
+argument grammar.
 
 ### 8.2 Duplicated ORM models
 
-`backend/api/models/` and `core/pg_writer.py` each define the same 9 tables:
-96 duplicated column definitions. One has already drifted:
+`wallet.balance` is now 100,000 on both sides, and the divergence that produced
+it is guarded by `backend/trader/tests/test_orm_parity.py`, which compares every
+shared table column by column — name, type, nullability, primary key, default,
+server default — and compares the two migration lists as well.
 
-    wallet.balance   api = Column(Float, default=100000.0)
-                     pg  = Column(Float, default=10000.0)
-
-A 10x difference in starting balance, resolved by whichever process calls
-`create_all` first. The container-isolation reason for duplicating them is real,
-but a shared schema module installed into both images is a better answer than a
-comment asking people to remember.
-
-Both sides also run their own ad-hoc migrations — `app.py` executes
-`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` at import time, and
-`pg_writer._run_pg_migrations` does the same job separately. One migration path,
-whichever it is.
+This is a different answer than the shared-schema module suggested above, and
+deliberately so. A shared module means one image's package installed into the
+other, which reintroduces the coupling the duplication exists to avoid; the
+duplication is a legitimate isolation choice, and what it was missing was not
+deduplication but *enforcement*. "Keep both in sync" in a doc is a hope. A test
+that fails on the next divergence is a mechanism.
 
 ### 8.3 Correctness and quality
 
-- **Back button is broken.** `App.tsx` calls `pushState` with no `popstate`
-  listener, so the URL changes without the view.
-- **No error or loading state in any page.** When the API is unreachable the
-  dashboard shows stale numbers with no indication. On a trading dashboard that
-  is the wrong failure mode.
-- **`npm run lint` has never run.** No ESLint config exists, despite the script
-  and three eslint plugins in `devDependencies`. It is documented in CLAUDE.md as
-  a check to run.
-- **Polling ignores tab visibility.** The dashboard holds 5s, 30s and 60s
-  intervals — roughly 17k requests a day per open tab, whether or not anyone is
-  looking.
-- **Business logic in routing layers.** `endpoints/wallet.py` is 692 lines and
-  includes a third-party Ethplorer integration; `controllers/research.py` is 631.
+- **Back button works.** `App.tsx` has a `popstate` listener, and `RoutePath`
+  derives from the `ROUTES` table so a route without a render case is a type
+  error.
+- **Every page has loading, error and empty states.** `src/components/StateBlock.tsx`
+  and `src/hooks/usePolling.ts`. An error banner sits *above* existing data
+  rather than replacing it — a stale price is worth more than a blank panel, as
+  long as it is visibly stale. `loading` is distinct from `empty`, so a
+  successful fetch returning nothing no longer renders as a spinner that never
+  resolves.
+- **`npm run lint` runs.** `.eslintrc.cjs` exists; typecheck, lint and build are
+  all clean. `no-empty` with `allowEmptyCatch: false` is on, because
+  `.catch(() => {})` in seven places is how the frontend came to hide every
+  backend failure behind stale data.
+- **Polling pauses on hidden tabs** and refreshes immediately on return, and each
+  source polls at the rate its data actually moves. The wallet — which calls
+  Coinbase, an Ethereum RPC node, Ethplorer and the Solana RPC — was being
+  refetched every minute forever.
+- **One HTTP client.** `src/api/client.ts`: one base URL, one `ApiError` carrying
+  the server's `detail`, one place the token header is set, and a request timeout
+  so a hung fetch does not leave a screen frozen on its last value. Five copies
+  of `fetchWithError` had already drifted in what they reported.
+- **Logic out of the routing layers.** `endpoints/wallet.py` is 21 lines;
+  `controllers/wallet.py` holds the integrations.
 
-### 8.4 What the app should gain from the rebuild
+### 8.3.1 Fabricated measurements — not in the original audit
 
-The pipeline work creates capabilities the current UI has no way to reach, and
-this is the more interesting half of the deferred work:
+Found while rewriting, and the most serious item in this section. Three separate
+places presented invented numbers in a form indistinguishable from real ones:
 
-- **A model's provenance.** Every artifact records its feature-set hash, cost
-  config version, and data as-of timestamp. The UI should show which model is
-  live and exactly what it was trained on.
-- **The promotion gates as a screen.** Section 5 is a pass/fail table per
-  candidate. That is a UI, and it is the screen that decides what goes live.
-- **CPCV path distributions, not point estimates.** A Sharpe is a distribution
-  across 11 paths; showing the median and the 5th percentile is the difference
-  between a dashboard that informs and one that flatters.
-- **One promote action.** Train, gate, paper, and live are currently a sequence
-  of scripts launched by PID. With the pipeline unified behind one `decide()` and
-  one search ledger, promotion can be a single reviewable transition with an
-  audit trail — which is also what makes going from paper to real defensible
-  rather than nervous.
+- **`pr_auc` was `holdout_auc - 0.06`** and `precision_at_threshold` was
+  `holdout_auc - 0.04`. One number, displayed three times, with two constants
+  subtracted. And `holdout_auc` itself came from `signals.model_auc`, which the
+  new signal writer leaves null — AUC is undefined for a regression on net
+  return.
+- **`drift_delta` was `realised_win_rate - holdout_auc * 100`**, subtracting an
+  AUC from a percentage.
+- **Feature importance fell back to a hardcoded table** — `momentum_24h: 0.26`,
+  `trend_strength: 0.22`, four more — whenever `pruned_features_<coin>.json` was
+  absent, which was always, because it belonged to the deleted pipeline. An
+  explainability panel showing six plausible feature names with plausible weights
+  is the worst available failure: it renders exactly like the real thing.
+- **`get_research_runs` invented three runs per signal** — a train, an optimize
+  and a validate, with start times derived by subtracting twelve minutes from the
+  signal timestamp, durations hardcoded to 12, 20 and 8 minutes, and a status of
+  "success" for all of them. None of it had happened.
+- **The API served its own contract table with `fee_pct: 0.001`** for every
+  contract — a third copy of the cost model, carrying the 10bp/side figure the
+  whole rebuild exists to correct.
+
+All replaced. The API now serves measurements or nulls with a reason, importances
+come from the promoted model's booster, run history comes from `model_runs` joined
+to the promotion ledger, and `/coins/cde-specs` reads the real fee schedule from
+the same file the research pipeline prices its targets with.
+`backend/api/tests/test_model_surface.py` asserts that a missing measurement
+arrives as null.
+
+The metric that replaces the AUC family is the one a net-return model can be held
+to: the edge `decide()` claimed in basis points before each trade, against what
+the trades earned. A model whose realised net runs consistently below its
+forecast is mispriced, and it over-sizes every position that clears the
+conviction floor.
+
+### 8.4 What the app gained from the rebuild
+
+All four landed, on the new `/model` route.
+
+- **Provenance** — feature-set hash, cost config version, horizon, train window,
+  row count *and* effective observation count, with a warning when the effective
+  count is under 200 or when symbol identity is a feature.
+- **The promotion gates as a screen** — failures first, each with its measured
+  value beside its threshold and a plain-language note on what it protects
+  against. A gate that missed by 0.01 and one that missed by an order of
+  magnitude need different responses, and a red badge cannot tell them apart.
+- **Distributions, not point estimates** — bootstrap, per-period and synthetic
+  Sharpe each shown as median with p05 and p95.
+- **One promote action** — `core/promotion.py` is the only route to live. The
+  button launches `scripts.promote` through the authenticated endpoint; it does
+  not promote anything itself, because the only thing allowed to install a model
+  is the thing that ran the gates. Rejections stay in the ledger: the trial count
+  is what the deflated Sharpe discounts by. A forced promotion needs a reason and
+  stays visibly forced for as long as it is live.

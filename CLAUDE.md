@@ -56,7 +56,10 @@ python -m scripts.paper_engine                 # act on signals, account honestl
 python -m scripts.live_orchestrator            # the loop that runs all of the above
 
 # Frontend checks
-cd frontend && npm run typecheck && npm run lint
+cd frontend && npm run typecheck && npm run lint && npm run build
+
+# API tests
+cd backend/api && pytest
 ```
 
 ## The Research Pipeline
@@ -102,8 +105,10 @@ trial count is what the deflated Sharpe discounts by.
 
 - **`core/profiles.py` is the single source of truth** for per-coin feature sets, thresholds, and ML hyperparameters. Coins are described by a feature *archetype* (`mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`) plus tuned deltas. Changes cascade into training, search, and signal generation.
 - **`core/costs.py` is the single source of truth for money** — contract specs, exchange fee assumptions, round-trip costs, trade PnL, and position sizing. Load a venue's real schedule with `Config.with_cost_assumptions(find_cost_config())` — `configs/` lives under `backend/trader/` so the Docker build context includes it; the hardcoded defaults are 10bps/side, which is wrong for Coinbase CDE by 0.06x-2.5x depending on the contract.
-- **Duplicated ORM models**: `backend/trader/core/pg_writer.py` duplicates the API ORM models for container isolation. Keep both in sync when changing DB schema.
-- **No react-router**: Frontend routing is manual via `window.history.pushState` in `App.tsx`. Add pages by extending `RoutePath` type and adding a case.
+- **Duplicated ORM models**: `backend/trader/core/pg_writer.py` duplicates the API ORM models for container isolation. `backend/trader/tests/test_orm_parity.py` fails when they diverge in columns, types, nullability, defaults, or migration lists — a note in a doc was not enough; `wallet.balance` had already drifted 10,000 against 100,000, so whichever container created the row decided the paper account's starting balance.
+- **No react-router**: Frontend routing is manual via `window.history.pushState` in `App.tsx`. Add a page by adding an entry to `ROUTES` and a case in the render — the `RoutePath` type derives from `ROUTES`, so a missing case is a type error.
+- **Frontend HTTP goes through `src/api/client.ts`**: one base URL, one error type, one place the `X-API-Token` header is set. Poll with `usePolling`, which pauses on hidden tabs and surfaces failures. Five copies of `fetchWithError` had already drifted in how they reported errors, and every `.catch(() => {})` made a dead backend look like a quiet market.
+- **The API serves measurements, never substitutes.** A missing value is null with a reason. The research surface used to report `pr_auc` as `holdout_auc - 0.06`, `precision_at_threshold` as `holdout_auc - 0.04`, and — when the artifact it wanted was absent, which was always — a hardcoded table of six feature importances. All of it rendered identically to real data.
 - **Promotion is the gate**: `core/promotion.py` stages into `models/.staging/{version}/`, then atomically renames into place — but only after every gate in `core/metrics.py:DEFAULT_GATES` passed. `--force` needs a reason and records it. `live_orchestrator.py` decides *when* to ask; it never decides the answer.
 - **One `decide()`**: `core/signal.py` is the only place a trade is chosen. The backtest and the live signal writer both call it, which is why they cannot drift. The old per-family strategy classes under `core/strategies/` are deleted — they were orphaned by the reformulation.
 - **All trader scripts** share `scripts/_common.py` for data arguments, and accept CLI args that override env vars.

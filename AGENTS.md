@@ -26,7 +26,9 @@ docker-compose.yml  Orchestrates all services
   - `signals.py` — `/signals/`, `/signals/coin/{coin}`, `/signals/{signal_id}`
   - `wallet.py` — `/wallet/` (Coinbase spot + perps + Ledger addresses)
   - `paper.py` — `/paper/orders`, `/paper/fills`, `/paper/positions`, `/paper/equity`
-  - `research.py` — `/research/summary`, `/research/coins/{coin}`, `/research/runs`, `/research/features/{coin}`, `POST /research/launch/{job}`
+  - `research.py` — `/research/summary`, `/research/coins/{coin}`, `/research/runs`, `/research/features/{coin}`, `/research/scripts`, `/research/jobs`, `POST /research/launch/{job}`
+  - `model.py` — `/model/` (live provenance, gates, kill switch), `/model/promotions` (the ledger, rejections included), `/model/features` (real booster gains)
+- **Security** (`security.py`): `require_token` gates every mutating route on `API_TOKEN` and **fails closed** — no token configured means 503, not open. `validate_job_args` restricts what a launched script can be handed, rejecting rather than sanitising. `allowed_origins` filters `*` out of the CORS list. Before this, `POST /research/launch` had no authentication and the origin list ended with `*`, so any page the browser had open could start a trader script with arbitrary arguments in a container holding the exchange keys.
 - **Controllers**: Business logic in `controllers/` matching each endpoint module
 - **External deps**: `coinbase-advanced-py` for Coinbase API integration
 
@@ -75,10 +77,14 @@ docker-compose.yml  Orchestrates all services
 - **Framework**: React 18 + TypeScript + Vite
 - **Styling**: Tailwind CSS 3.4 with CSS custom properties (dark theme with glass-card effects)
 - **Pages** (in `src/pages/`):
-  - `TradingTerminalPage.tsx` (`/`) — Spot/CDE price cards, price charting, trades table, signals table, wallet summary. Auto-refreshes prices (3s), trades (10s), signals (15s).
-  - `StrategyLabPage.tsx` (`/strategy`) — Model health KPIs, coin strategy scoreboard, experiment timeline, explainability-lite (feature importance + signal distribution), paper trading tabs (positions, equity, performance, fills).
-- **Components** (in `src/components/`): `PriceCard`, `PriceChart`, `TradesTable`, `SignalsTable`, `WalletInfo`, `PaperPositionsTable`, `PaperEquityTable`, `PaperPerformancePanel`, `PaperFillsTable`
-- **API layer** (`src/api/`): `coinsApi.ts`, `tradesApi.ts`, `signalsApi.ts`, `walletApi.ts`, `paperApi.ts`, `researchApi.ts`
+  - `DashboardPage.tsx` (`/`) — Portfolio value, equity curve marked to live prices, open positions, price grid, recent signals and fills, model status. Contract sizes come from `/coins/cde-specs`, not a local table.
+  - `TradingPage.tsx` (`/trading`) — Per-instrument chart with fill markers, range selector, external wallet holdings, per-instrument signals and fills.
+  - `ResearchPage.tsx` (`/research`) — Edge calibration (expected net edge against realised, the comparison the model can be held to), per-instrument health with the reason attached, retrain history from `model_runs` joined to the promotion ledger, and the script runner.
+  - `ModelPage.tsx` (`/model`) — What is live and why it was allowed to be: the promotion gates with measured values beside thresholds, provenance, the simulation distributions, the candidate ledger including rejections, and the kill switch. Forced promotions stay visibly forced.
+- **Components** (in `src/components/`): `Sidebar`, `PriceCard`, `PriceChart`, `EquityChart`, `SignalsTable`, `PaperPositionsTable`, `PaperFillsTable`, `ModelStatusPanel`, `GateTable`, `StateBlock`. `SignalsTable` shows the forecast decomposition — net, price, carry, cost, edge-to-risk — because the classifier columns it used to show (`Mom`, `Trend`, `ML`, `AUC`) are all null now.
+- **API layer** (`src/api/`): `client.ts` is the only place that talks HTTP — one base URL, one `ApiError` with a real message, one place the `X-API-Token` header is set, and a request timeout. The rest (`coinsApi`, `tradesApi`, `signalsApi`, `walletApi`, `paperApi`, `researchApi`, `modelApi`) are thin wrappers over it. Five separate copies of `fetchWithError` had already drifted in what they reported.
+- **Polling** (`src/hooks/usePolling.ts`): pauses when the tab is hidden, reports failures instead of swallowing them, and distinguishes "loading" from "empty". Every page previously ran its own `setInterval` forever with `.catch(() => {})`, so a dead backend was indistinguishable from a quiet market.
+- **State components** (`src/components/StateBlock.tsx`): `Panel`, `Spinner`, `Empty`, `ErrorBlock`, `Freshness`. An error banner sits *above* existing data rather than replacing it — a stale price is worth more than a blank panel, as long as it is visibly stale.
 - **Types**: `src/types.ts` — shared TypeScript interfaces
 - **Routing**: Custom history-based routing in `App.tsx` (no react-router)
 - **Config**: `VITE_API_BASE_URL` env var (defaults to `http://localhost:8000`)

@@ -1,12 +1,15 @@
-import { useEffect, useState } from 'react';
-import { getCoinHistory, getCurrentPrices, getCDEPrices } from '../api/coinsApi';
+import { useMemo, useState } from 'react';
+
+import { getCDEPrices, getCoinHistory, getCurrentPrices } from '../api/coinsApi';
 import { getPaperFills } from '../api/paperApi';
-import { getRecentSignals as getSignals } from '../api/signalsApi';
+import { getRecentSignals } from '../api/signalsApi';
 import { getWallet } from '../api/walletApi';
-import { CoinSymbol, HistoryEntry, PaperFill, Signal, PriceData, WalletData, WalletAsset } from '../types';
+import PaperFillsTable from '../components/PaperFillsTable';
 import PriceChart from '../components/PriceChart';
 import SignalsTable from '../components/SignalsTable';
-import PaperFillsTable from '../components/PaperFillsTable';
+import { Empty, ErrorBlock, Freshness, Panel, Spinner } from '../components/StateBlock';
+import { usePolling } from '../hooks/usePolling';
+import { CoinSymbol, WalletAsset } from '../types';
 
 function fmt(v: number) {
   return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -38,54 +41,45 @@ type ChartMode = 'candle' | 'line';
 
 
 export default function TradingPage() {
-  const [coin,      setCoin]      = useState<CoinSymbol>('ETH');
-  const [range,     setRange]     = useState<Range>('1d');
+  const [coin, setCoin] = useState<CoinSymbol>('ETH');
+  const [range, setRange] = useState<Range>('1d');
   const [chartMode, setChartMode] = useState<ChartMode>('candle');
-  const [history,   setHistory]   = useState<HistoryEntry[]>([]);
-  const [fills,     setFills]     = useState<PaperFill[]>([]);
-  const [signals,   setSignals]   = useState<Signal[]>([]);
-  const [spotPrices,  setSpotPrices]  = useState<PriceData | null>(null);
-  const [cdePrices,   setCdePrices]   = useState<PriceData | null>(null);
   const [priceSource, setPriceSource] = useState<'spot' | 'cde'>('spot');
-  const [loading,   setLoading]   = useState(false);
-  const [wallet,    setWallet]    = useState<WalletData | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    getCoinHistory(coin, range).then(d => { if (!cancelled) { setHistory(d); setLoading(false); } }).catch(() => setLoading(false));
-    return () => { cancelled = true; };
-  }, [coin, range]);
+  // History reloads when the instrument or range changes; the rest polls at the
+  // rate its data moves, and everything stops while the tab is hidden. The
+  // wallet in particular calls Coinbase, and it was being refetched every minute
+  // forever regardless of whether anyone was looking.
+  const history = usePolling(() => getCoinHistory(coin, range), 60_000, [coin, range]);
+  const fills = usePolling(() => getPaperFills(50), 20_000);
+  const signals = usePolling(() => getRecentSignals(50), 20_000);
+  const spot = usePolling(getCurrentPrices, 5_000);
+  const cde = usePolling(getCDEPrices, 5_000);
+  const wallet = usePolling(getWallet, 120_000);
 
-  useEffect(() => {
-    const load = async () => {
-      try { setFills(await getPaperFills(50)); } catch { /* empty */ }
-      try { setSignals(await getSignals(50)); } catch { /* empty */ }
-      try { setSpotPrices(await getCurrentPrices()); } catch { /* empty */ }
-      try { setCdePrices(await getCDEPrices()); } catch { /* empty */ }
-    };
-    const loadWallet = async () => {
-      try { setWallet(await getWallet()); } catch { /* empty */ }
-    };
-    load();
-    loadWallet();
-    const id = setInterval(load, 8000);
-    const walletId = setInterval(loadWallet, 60000);
-    return () => { clearInterval(id); clearInterval(walletId); };
-  }, []);
-
-  const prices = priceSource === 'cde' ? cdePrices : spotPrices;
+  const priceState = priceSource === 'cde' ? cde : spot;
+  const prices = priceState.data;
   const coinPrice = prices?.[coin]?.price;
   const coinChange = prices?.[coin]?.change24h;
-  const coinSignals = signals.filter(s => s.coin === coin);
-  const coinFills   = fills.filter(f => f.coin === coin);
 
-  // Range % change: use exchange's rolling 24h for 1d, compute from chart history otherwise
-  const rangeChange = range === '1d'
-    ? (coinChange ?? null)
-    : history.length >= 2
-      ? ((history[history.length - 1].close - history[0].open) / history[0].open) * 100
-      : null;
+  const coinSignals = useMemo(
+    () => (signals.data ?? []).filter((s) => s.coin === coin),
+    [signals.data, coin],
+  );
+  const coinFills = useMemo(
+    () => (fills.data ?? []).filter((f) => f.coin === coin),
+    [fills.data, coin],
+  );
+
+  // The exchange's rolling 24h for the 1d range; computed from the chart's own
+  // window otherwise, since no endpoint reports a 1w or 1y change.
+  const bars = history.data ?? [];
+  const rangeChange =
+    range === '1d'
+      ? (coinChange ?? null)
+      : bars.length >= 2
+        ? ((bars[bars.length - 1].close - bars[0].open) / bars[0].open) * 100
+        : null;
   const priceColor = coinChange == null ? 'text-tx-primary' : coinChange >= 0 ? 'text-accent-emerald' : 'text-accent-rose';
 
   return (
@@ -123,7 +117,13 @@ export default function TradingPage() {
           ))}
         </div>
 
-        {/* Price display */}
+        {/* Price display. A missing price used to render as nothing at all, so a
+            dead price feed and a market with no quote looked the same. */}
+        {!coinPrice && priceState.error && (
+          <div className="ml-auto max-w-md">
+            <ErrorBlock error={priceState.error} onRetry={priceState.refresh} compact />
+          </div>
+        )}
         {coinPrice && (
           <div className="ml-auto flex items-baseline gap-2">
             <span className={`font-mono text-2xl font-semibold ${priceColor}`}>
@@ -184,24 +184,36 @@ export default function TradingPage() {
             </div>
           </div>
         </div>
-        <div className="h-72 relative">
-          {loading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-[rgba(8,12,20,0.6)] z-10 rounded-lg">
-              <span className="text-tx-muted text-sm">Loading…</span>
+        <div className="relative h-72">
+          {history.refreshing && bars.length > 0 && (
+            <div className="absolute right-2 top-2 z-10">
+              <Freshness lastUpdated={history.lastUpdated} refreshing />
             </div>
           )}
-          <PriceChart data={history} fills={coinFills} coin={coin} mode={chartMode} />
+          {history.error && bars.length === 0 ? (
+            <ErrorBlock error={history.error} onRetry={history.refresh} />
+          ) : history.loading && bars.length === 0 ? (
+            <Spinner label={`Loading ${coin} history`} />
+          ) : bars.length === 0 ? (
+            <Empty message={`No ${range} history for ${coin}.`} />
+          ) : (
+            <PriceChart data={bars} fills={coinFills} coin={coin} mode={chartMode} />
+          )}
         </div>
       </div>
 
-      {/* Real portfolio — external holdings only (no paper) */}
-      {wallet && (() => {
-        const spotVal   = wallet.coinbase?.spot?.value_usd ?? 0;
-        const ledgerVal = wallet.ledger?.value_usd ?? 0;
+      {/* Real portfolio — external holdings only, never paper. */}
+      {wallet.error && !wallet.data && (
+        <ErrorBlock error={wallet.error} onRetry={wallet.refresh} compact />
+      )}
+      {wallet.data && (() => {
+        const held = wallet.data;
+        const spotVal   = held.coinbase?.spot?.value_usd ?? 0;
+        const ledgerVal = held.ledger?.value_usd ?? 0;
         const total = spotVal + ledgerVal;
         if (total <= 0) return null;
-        const spotAssets  = (wallet.coinbase?.spot?.assets  ?? []).filter(a => a.value_usd >= 0.01);
-        const ledgerAssets = (wallet.ledger?.assets ?? []).filter(a => a.value_usd >= 0.01);
+        const spotAssets  = (held.coinbase?.spot?.assets  ?? []).filter(a => a.value_usd >= 0.01);
+        const ledgerAssets = (held.ledger?.assets ?? []).filter(a => a.value_usd >= 0.01);
         return (
           <div className="glass-card rounded-xl p-5">
             <div className="flex items-center justify-between mb-4">
@@ -237,16 +249,44 @@ export default function TradingPage() {
         <div className="glass-card rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <span className="text-tx-secondary text-xs font-medium tracking-widest uppercase">Signals — {coin}</span>
-            <span className="text-tx-muted text-xs">{coinSignals.length} total</span>
+            <div className="flex items-center gap-3">
+              <span className="text-tx-muted text-xs">{coinSignals.length} total</span>
+              <Freshness
+                lastUpdated={signals.lastUpdated}
+                refreshing={signals.refreshing}
+                error={signals.error}
+              />
+            </div>
           </div>
-          <SignalsTable signals={coinSignals} limit={20} />
+          <Panel
+            state={signals}
+            emptyWhen={() => coinSignals.length === 0}
+            emptyMessage={`No signals for ${coin}.`}
+            loadingLabel="Loading signals"
+          >
+            {() => <SignalsTable signals={coinSignals} limit={20} />}
+          </Panel>
         </div>
         <div className="glass-card rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <span className="text-tx-secondary text-xs font-medium tracking-widest uppercase">Fills — {coin}</span>
-            <span className="text-tx-muted text-xs">{coinFills.length} total</span>
+            <div className="flex items-center gap-3">
+              <span className="text-tx-muted text-xs">{coinFills.length} total</span>
+              <Freshness
+                lastUpdated={fills.lastUpdated}
+                refreshing={fills.refreshing}
+                error={fills.error}
+              />
+            </div>
           </div>
-          <PaperFillsTable fills={coinFills} limit={20} />
+          <Panel
+            state={fills}
+            emptyWhen={() => coinFills.length === 0}
+            emptyMessage={`No fills for ${coin}.`}
+            loadingLabel="Loading fills"
+          >
+            {() => <PaperFillsTable fills={coinFills} limit={20} />}
+          </Panel>
         </div>
       </div>
     </div>
