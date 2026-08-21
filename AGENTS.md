@@ -34,7 +34,11 @@ docker-compose.yml  Orchestrates all services
 
 - **Language**: Python 3.12
 - **Core modules** (`core/`):
-  - `coin_profiles.py` — Per-coin trading profiles (`CoinProfile` dataclass) with feature lists, thresholds, exit params, ML hyperparams. Profiles defined for BTC, ETH, SOL, XRP, DOGE. Each has base features + coin-specific extras (e.g., `BTC_EXTRA_FEATURES`, `SOL_EXTRA_FEATURES`, `DOGE_EXTRA_FEATURES`).
+  - `profiles.py` — Per-coin trading profiles (`CoinProfile`, frozen). 16 coins described by a feature *archetype* plus tuned deltas; archetypes are `mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`. The last two are templates parameterized by coin (`{coin}_trend_spread_12h`), so a profile can never ask for a column the builder doesn't emit.
+  - `coin_profiles.py` — **Superseded by `profiles.py`.** Retained only because `save_model`/`load_model`/`MODELS_DIR` still live here; they move to `core/model.py` in the rebuild.
+  - `costs.py` — Single source of truth for money: contract specs, exchange fee assumptions (`configs/exchange/*.json`), round-trip cost breakdown, trade PnL, position sizing. Absorbed the former `trading_costs.py` and `execution_sim.py`.
+  - `config.py` — One `Config` with `resolve()` implementing CLI > profile > default. CLI flags and env vars generated from declarative tables. `with_cost_assumptions()` loads a venue's real fee schedule.
+  - `datastore.py` — Bitemporal research store: Parquet partitioned by dataset/venue/symbol/month, queried via DuckDB. Venue is part of the key; every read is point-in-time via `as_of` on `available_time`.
   - `pg_writer.py` — Postgres writer for trades, signals, paper-trading persistence. Duplicates ORM models for container isolation.
 - **Data collection** (`data_collection/`):
   - `storage.py` — Abstract `DatabaseBase` + `SQLiteDatabase` implementation with bi-temporal schema
@@ -48,7 +52,6 @@ docker-compose.yml  Orchestrates all services
   - `train_model.py` — Backtesting + signal generation with ensemble training (3 lookback offsets), walk-forward validation
   - `live_orchestrator.py` — Scheduled cycle runner: pipeline → features → signals. Handles retrain scheduling, model staging/promotion, graceful shutdown.
   - `optimize.py` — Per-coin Optuna optimization with true holdout evaluation, deflated Sharpe tracking, TPE sampler
-  - `parallel_launch.py` — Process-level multi-coin optimization launcher with integrated robustness validation
   - `validate_robustness.py` — Post-optimization robustness validation producing paper-trade readiness scores
   - `paper_engine.py` — Paper trading execution engine (simulates live trading against generated signals)
   - `prune_features.py` — Feature pruning utility (removes low-importance features from coin profiles)
@@ -124,10 +127,10 @@ docker compose run --rm trader python -m scripts.train_model --backtest --thresh
 docker compose run --rm trader python -m scripts.live_orchestrator --retrain-only --run-once --train-window-days 90
 
 # Parallel optimization
-docker compose run --rm trader python -m scripts.parallel_launch --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
+docker compose run --rm trader python -m scripts.comprehensive_search
 
 # Single-coin optimization
-docker compose run --rm trader python -m scripts.optimize --coin BTC --trials 100 --jobs 1
+docker compose run --rm trader python -m scripts.gap_search
 
 # Frontend dev
 cd frontend && npm ci && npm run dev
@@ -138,13 +141,14 @@ cd backend/api && pip install -r requirements.txt && uvicorn app:app --reload
 
 ## Agent Instructions
 
-- When modifying trader logic, be aware that `coin_profiles.py` is the single source of truth for per-coin feature lists, thresholds, and ML hyperparameters. Changes there cascade into training, optimization, and signal generation.
+- When modifying trader logic, be aware that `core/profiles.py` is the single source of truth for per-coin feature sets, thresholds, and ML hyperparameters. Changes there cascade into training, search, and signal generation.
+- `docs/RESEARCH_PIPELINE.md` is the design spec for the in-flight feature/training rebuild. Read it before changing `core/` or `features/`.
 - The trader and API run in separate containers with duplicated ORM models (in `pg_writer.py`). Keep them in sync when changing database schema.
 - The frontend has no router library — routing is handled manually via `window.history.pushState` in `App.tsx`. Add new pages by extending the `RoutePath` type and adding a case.
 - All trader scripts support CLI args that override environment variables. Check `argparse` blocks at the bottom of each script for available options.
 - The orchestrator (`live_orchestrator.py`) manages model versioning with a staging directory pattern — new models are trained into `.staging/{version}/` then atomically promoted to the models directory.
 - Feature engineering is coin-specific. BTC uses mean-reversion extras (z-scores, RSI extremes), SOL uses momentum acceleration features, DOGE uses sentiment-proxy features. The base feature set is shared.
 - The research endpoints read from model artifacts and trade history to produce health KPIs, not from a separate research database.
-- Tests are comprehensive — 27 test files under `backend/trader/tests/` cover CV consistency, optimization fidelity, overfitting diagnostics, model promotion, economic metrics, parallel launch integrity, meta-labeling, and more. New features should include tests where practical.
+- 9 test files under `backend/trader/tests/` cover CV consistency and leakage controls, overfit diagnostics, study significance, meta-labeling calibration, member correlation, feature parity, and paper override paths. 17 further files were removed in the rebuild: they imported `scripts.optimize`, a module that no longer exists, and could not be collected. New features should include tests where practical.
 - Strategy families available for `--strategy-family`: `momentum_trend` (default), `breakout`, `mean_reversion`, `vol_overlay`, `trend_pullback`, `breakout_expansion`. Each is implemented as a class in `core/strategies/`. All families implement the `StrategyFamily` protocol defined in `core/strategies/base.py`.
-- `core/` contains more than just `coin_profiles.py` and `pg_writer.py` — it also includes `cv_splitters.py`, `labeling.py`, `meta_labeling.py`, `execution_sim.py`, `reason_codes.py`, `trading_costs.py`, `overfit_diagnostics.py`, `metrics_significance.py`, `study_significance.py`, `run_manifest.py`, and `paper_profile_overrides.py`.
+- `core/` also includes `cv_splitters.py`, `labeling.py`, `meta_labeling.py`, `reason_codes.py`, `overfit_diagnostics.py`, `metrics_significance.py`, `study_significance.py`, `run_manifest.py`, and `paper_profile_overrides.py`.

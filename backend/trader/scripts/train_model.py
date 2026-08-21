@@ -37,9 +37,7 @@ from core.coin_profiles import (
     get_coin_profile, save_model, load_model, list_saved_models,
     COIN_PROFILES, BASE_FEATURES, CoinProfile, MODELS_DIR,
 )
-from core.trading_costs import get_contract_spec
-from core.execution_sim import compute_trade_execution_pnl
-from core.costs import compute_cost_breakdown
+from core.costs import compute_cost_breakdown, compute_trade_pnl, get_contract_spec
 from core.labeling import (
     TripleBarrierSpec,
     compute_labels_from_feature_index,
@@ -477,7 +475,7 @@ def build_ensemble_member_specs() -> List[EnsembleMemberSpec]:
 def calculate_coinbase_fee(n_contracts: int, price: float, symbol: str,
                            config: Config) -> float:
     spec = get_contract_spec(symbol)
-    notional_per_contract = spec['units'] * price
+    notional_per_contract = spec.units * price
     pct_fee = n_contracts * notional_per_contract * config.fee_pct_per_side
     min_fee = n_contracts * config.min_fee_per_contract
     return max(pct_fee, min_fee)
@@ -490,8 +488,8 @@ def calculate_execution_costs(n_contracts: int, entry_price: float, exit_price: 
     Returns: (total_cost, pct_fee_component, min_fee_component, slippage_component)
     """
     spec = get_contract_spec(symbol)
-    entry_notional = n_contracts * spec['units'] * entry_price
-    exit_notional = n_contracts * spec['units'] * exit_price
+    entry_notional = n_contracts * spec.units * entry_price
+    exit_notional = n_contracts * spec.units * exit_price
 
     cost_breakdown = compute_cost_breakdown(
         entry_notional=entry_notional,
@@ -515,21 +513,14 @@ def calculate_execution_costs(n_contracts: int, entry_price: float, exit_price: 
 def calculate_pnl_exact(entry_price: float, exit_price: float, direction: int,
                          accum_funding: float, n_contracts: int, symbol: str,
                          config: Config) -> Tuple[float, float, float, float, float, float, float, float]:
-    breakdown = compute_trade_execution_pnl(
+    breakdown = compute_trade_pnl(
         entry_price=entry_price,
         exit_price=exit_price,
         direction=direction,
-        accum_funding=accum_funding,
         n_contracts=n_contracts,
         symbol=symbol,
-        fee_pct_per_side=config.fee_pct_per_side,
-        min_fee_per_contract=config.min_fee_per_contract,
-        slippage_bps=config.slippage_bps,
-        apply_funding=config.apply_funding,
-        apply_slippage=config.apply_slippage,
-        apply_impact=config.apply_impact,
-        impact_bps_per_contract=config.impact_bps_per_contract,
-        impact_max_bps_per_side=config.impact_max_bps_per_side,
+        params=config,
+        accum_funding=accum_funding,
     )
     if breakdown.notional == 0:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -550,7 +541,7 @@ def calculate_n_contracts(equity: float, price: float, symbol: str,
                            config: Config, vol_24h: float = 0.0,
                            profile: Optional[CoinProfile] = None) -> int:
     spec = get_contract_spec(symbol)
-    notional_per_contract = spec['units'] * price
+    notional_per_contract = spec.units * price
     if notional_per_contract <= 0:
         return 0
     pos_size = profile.position_size if profile else config.position_size
@@ -1173,10 +1164,10 @@ def load_data():
     for sym in data:
         spec = get_contract_spec(sym)
         price = data[sym]['ohlcv']['close'].iloc[-1]
-        notional = spec['units'] * price
+        notional = spec.units * price
         eff_fee = 0.10  # Coinbase CDE: 0.1% of notional per side, no per-contract floor
         profile = get_coin_profile(sym)
-        print(f"  {sym}: {spec['units']} units/contract, "
+        print(f"  {sym}: {spec.units} units/contract, "
               f"~${notional:.2f}/contract, "
               f"effective fee: {eff_fee:.3f}% per side | "
               f"profile: {profile.name} momentum")
@@ -1768,7 +1759,7 @@ def run_backtest(all_data: Dict, config: Config,
                         continue
 
                     spec = get_contract_spec(sym)
-                    notional_per_contract = spec['units'] * price
+                    notional_per_contract = spec.units * price
                     total_notional = n_contracts * notional_per_contract
                     est_roundtrip_cost, _, _, _ = calculate_execution_costs(
                         n_contracts, price, price, sym, config
@@ -2380,7 +2371,7 @@ def run_signals(all_data: Dict, config: Config, debug: bool = False, gate_artifa
                 n_contracts = None
             else:
                 spec = get_contract_spec(sym)
-                notional = n_contracts * spec['units'] * price
+                notional = n_contracts * spec.units * price
                 print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
                       f"{n_contracts} contracts | ${notional:,.0f} notional | "
                       f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")
@@ -2682,7 +2673,7 @@ def run_inference(all_data: Dict, config: Config, debug: bool = False, gate_arti
                 n_contracts = None
             else:
                 spec = get_contract_spec(sym)
-                notional = n_contracts * spec['units'] * price
+                notional = n_contracts * spec.units * price
                 print(f"🎯 {sym} [{profile.name}]: {dir_str} | "
                       f"{n_contracts} contracts | ${notional:,.0f} notional | "
                       f"Primary: {prob:.1%} | Meta: {meta_prob:.1%} | AUC: {auc:.3f}")

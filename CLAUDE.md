@@ -26,7 +26,7 @@ cd backend/trader && pytest
 cd backend/trader && pytest tests/test_<name>.py -v
 ```
 
-Tests live in `backend/trader/tests/` (28 files). No frontend tests exist.
+Tests live in `backend/trader/tests/` (9 files). No frontend tests exist.
 
 ## Key Commands
 
@@ -44,8 +44,9 @@ cd backend/api && pip install -r requirements.txt && uvicorn app:app --reload
 python -m scripts.run_pipeline
 python -m scripts.compute_features
 python -m scripts.train_model
-python -m scripts.optimize --coin BTC --trials 100 --jobs 1
-python -m scripts.parallel_launch --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
+python -m scripts.comprehensive_search
+python -m scripts.gap_search
+python -m scripts.weekly_search
 python -m scripts.validate_robustness
 python -m scripts.paper_engine
 python -m scripts.prune_features
@@ -55,9 +56,22 @@ python -m scripts.preflight_check
 cd frontend && npm run typecheck && npm run lint
 ```
 
+## In-Flight Rebuild
+
+`docs/RESEARCH_PIPELINE.md` is the design spec for the feature/training/validation
+rebuild — six verified defects, a venue-correct data layer, a pooled panel model,
+and a simulation stack (CPCV, deflated Sharpe, stationary bootstrap, synthetic
+panels, execution simulation) with hard promotion gates. Read it before changing
+anything under `core/` or `features/`.
+
+Landed so far: `core/costs.py`, `core/config.py`, `core/profiles.py`,
+`core/datastore.py`. Still on the old path: `scripts/train_model.py`,
+`features/engineering.py`, and the five search scripts.
+
 ## Critical Architecture Notes
 
-- **`coin_profiles.py` is the single source of truth** for per-coin feature lists, thresholds, and ML hyperparameters. Changes there cascade into training, optimization, and signal generation.
+- **`core/profiles.py` is the single source of truth** for per-coin feature sets, thresholds, and ML hyperparameters. Coins are described by a feature *archetype* (`mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`) plus tuned deltas. Changes cascade into training, search, and signal generation. `core/coin_profiles.py` is superseded and stays only until `save_model`/`load_model` move to `core/model.py`.
+- **`core/costs.py` is the single source of truth for money** — contract specs, exchange fee assumptions, round-trip costs, trade PnL, and position sizing. Load a venue's real schedule with `Config.with_cost_assumptions('configs/exchange/<file>.json')`; the hardcoded defaults are 10bps/side, which is wrong for Coinbase CDE by 0.06x-2.5x depending on the contract.
 - **Duplicated ORM models**: `backend/trader/core/pg_writer.py` duplicates the API ORM models for container isolation. Keep both in sync when changing DB schema.
 - **No react-router**: Frontend routing is manual via `window.history.pushState` in `App.tsx`. Add pages by extending `RoutePath` type and adding a case.
 - **Model staging pattern**: `live_orchestrator.py` trains into `.staging/{version}/` then atomically promotes to the models directory.
@@ -67,7 +81,7 @@ cd frontend && npm run typecheck && npm run lint
 
 - **Python**: Type hints throughout, dataclasses for config, `logging` module, `os.getenv()` with defaults. Scripts run as `python -m scripts.<name>`.
 - **TypeScript/React**: Functional components + hooks only, no class components. Fetch-based API layer (no axios). `recharts` for charts.
-- **Tests**: `pytest` for trader — 27 test files covering CV, optimization, diagnostics, and more. New features should include tests where practical.
+- **Tests**: `pytest` for trader — 9 test files covering CV leakage controls, meta-labeling calibration, overfit diagnostics, study significance, and feature parity. New features should include tests where practical.
 - **Strategy families**: `momentum_trend` (default), `breakout`, `mean_reversion`, `vol_overlay`, `trend_pullback`, `breakout_expansion` — each a class in `core/strategies/`.
 
 ## Environment Variables

@@ -11,7 +11,7 @@ import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
-from core.trading_costs import get_contract_spec
+from core.costs import get_contract_spec
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +264,7 @@ class CostAwareFeatures:
         close = df['close'].replace(0, np.nan)
 
         spec = get_contract_spec(symbol)
-        units = float(spec.get('units', 1.0))
+        units = float(spec.units)
         notional_per_contract = units * close
 
         pct_fee_per_side = pd.Series(fee_pct_per_side, index=df.index)
