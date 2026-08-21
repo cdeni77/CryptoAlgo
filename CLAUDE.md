@@ -259,6 +259,35 @@ volatility forecast improves sizing and gates entries. It is not itself tradeabl
 **Carry: still untested.** 18 funding rows. It is the one part of the original
 thesis that has never been evaluated, and it accumulates forward only.
 
+### The gate stack, once both defects were fixed
+
+Run against the 14 contracts with >= 231 days, h=1h, honest target, union-span
+simulation:
+
+    27 trades | net -3,455 (price -3,269, fees 187) | Sharpe -2.70 | win rate 33%
+    gates: 27 of 75,545 accepted (0.04%) | edge_below_cost rejected 61,750
+    bootstrap: Sharpe median -2.36 [p05 -4.84, p95 -0.56] | P(positive) 1% | ruin 0.0%
+    cost stress: baseline -2.70, fees 2x -2.83, spread 3x -2.96, both -3.09
+
+`edge_below_cost` rejecting 82 percent of candidates is the system working: the
+forecast does not cover the fee, so it declines. The 0.04 percent that got through
+still lost, and the loss is now almost entirely the prediction rather than costs.
+
+Both fixes moved the risk numbers a long way, and the earlier figures were the
+wrong ones:
+
+| | before | after |
+|---|---:|---:|
+| simulated span | 1,776 bars | **9,430** |
+| ruin probability | 99.9% | **0.0%** |
+| maxDD p95 | 89.0% | 28.4% |
+| bootstrap Sharpe median | -4.64 | -2.36 |
+| cost stress (both) | -8.19 | -3.09 |
+
+A 99.9 percent ruin probability on a strategy that loses 3.5 percent over eight
+months was always implausible. It came from measuring a levered book over 74 days
+of a single directional quarter. The strategy loses steadily; it does not blow up.
+
 ### Fill uncertainty is a second cost, and it is not in the fee schedule
 
 `close(t)` is a bar's last *trade*, so the move between it and `open(t+1)` — the
