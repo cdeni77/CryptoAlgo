@@ -1,5 +1,33 @@
 #!/usr/bin/env python3
-"""Live orchestrator for data pipeline, signal generation, and scheduled retraining."""
+"""The live loop: scrape, build features, emit signals, retrain on a cadence.
+
+    python -m scripts.live_orchestrator
+    python -m scripts.live_orchestrator --run-once
+    python -m scripts.live_orchestrator --retrain-only
+
+Each cycle runs the same four steps, in order, as separate processes:
+
+    run_pipeline              --backfill-only   fetch new bars, funding, OI
+    migrate_to_research_store                   sync the scraper DB into Parquet
+    build_features                              rebuild the panel
+    signals                                     decide, using the promoted model
+
+Retraining is on its own cadence and goes through `scripts.promote`, which is
+the only thing that can install a model. The orchestrator does not decide whether
+a candidate is good; it decides *when* to ask, and `core.promotion` answers with
+the gate results. That separation is the change from the previous version, which
+promoted any model that finished training and then checked its paper win rate
+afterwards — a lagging measurement on a model already trading with real size.
+
+The kill switch survives, and its job is now the one thing the gates cannot do:
+notice a *promoted* model decaying in live paper trading. The gates measure a
+candidate before it trades; this measures reality after. Both are needed, and
+neither substitutes for the other.
+
+Steps run as subprocesses on purpose. A segfault in LightGBM, an OOM during
+feature building, or an exchange client wedging on a socket then kills one step
+and not the loop, and the exit code says which step it was.
+"""
 
 from __future__ import annotations
 
@@ -8,28 +36,44 @@ import json
 import logging
 import math
 import os
-import shutil
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Optional, Sequence
 
-from core.coin_profiles import MODELS_DIR
-from core.paper_profile_overrides import load_paper_profile_overrides
+from core.model import MODELS_DIR
 from core.pg_writer import PgWriter
-from scripts.train_model import Config, load_data, resolve_paper_profile_overrides_path, retrain_models
+from core.promotion import current_record
 
-LOGGER = logging.getLogger("live_orchestrator")
+LOGGER = logging.getLogger('live_orchestrator')
 STOP_REQUESTED = False
-STATE_FILE = Path(os.getenv("ORCHESTRATOR_STATE_FILE", "./data/orchestrator_state.json"))
+STATE_FILE = Path(os.getenv('ORCHESTRATOR_STATE_FILE', './data/orchestrator_state.json'))
+
+# The promotion gates cannot be re-run cheaply enough to sit in the hot loop, so
+# a retrain is scheduled rather than triggered. This is how long a promoted model
+# is allowed to stay live before a fresh candidate is evaluated against it.
+DEFAULT_RETRAIN_DAYS = 7
+
+
+# ---------------------------------------------------------------------------
+# Kill switch
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class KillSwitchThresholds:
+    """When a *live* model has decayed enough to stop trusting it.
+
+    Deliberately different quantities from the promotion gates. Those are
+    out-of-sample statistics on a candidate; these are realised outcomes on the
+    model that is trading. A model can clear every gate and still degrade,
+    because the market it was fitted to stopped existing.
+    """
+
     min_win_rate: float
     min_profit_factor: float
     max_drawdown: float
@@ -40,113 +84,13 @@ class KillSwitchThresholds:
 
 def _monitoring_thresholds() -> KillSwitchThresholds:
     return KillSwitchThresholds(
-        min_win_rate=float(os.getenv("PAPER_MONITOR_MIN_WIN_RATE", "0.42")),
-        min_profit_factor=float(os.getenv("PAPER_MONITOR_MIN_PROFIT_FACTOR", "0.9")),
-        max_drawdown=float(os.getenv("PAPER_MONITOR_MAX_DRAWDOWN", "0.12")),
-        min_trades_per_week=float(os.getenv("PAPER_MONITOR_MIN_TRADES_PER_WEEK", "2.0")),
-        max_negative_expectancy_streak=int(os.getenv("PAPER_MONITOR_NEG_EXPECTANCY_STREAK", "2")),
-        min_samples=int(os.getenv("PAPER_MONITOR_MIN_SAMPLES", "8")),
+        min_win_rate=float(os.getenv('PAPER_MONITOR_MIN_WIN_RATE', '0.42')),
+        min_profit_factor=float(os.getenv('PAPER_MONITOR_MIN_PROFIT_FACTOR', '0.9')),
+        max_drawdown=float(os.getenv('PAPER_MONITOR_MAX_DRAWDOWN', '0.12')),
+        min_trades_per_week=float(os.getenv('PAPER_MONITOR_MIN_TRADES_PER_WEEK', '2.0')),
+        max_negative_expectancy_streak=int(os.getenv('PAPER_MONITOR_NEG_EXPECTANCY_STREAK', '2')),
+        min_samples=int(os.getenv('PAPER_MONITOR_MIN_SAMPLES', '8')),
     )
-
-
-def _handle_signal(signum, _frame):
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
-    LOGGER.info("Received signal %s, shutting down after current step.", signum)
-
-
-def _sleep_until_next_aligned(align_minute: int, max_wait_seconds: int = 3600) -> None:
-    """Sleep until the next :align_minute past the hour, capped at max_wait_seconds."""
-    now = datetime.now(timezone.utc)
-    next_run = now.replace(minute=align_minute, second=0, microsecond=0)
-    if next_run <= now:
-        next_run += timedelta(hours=1)
-    sleep_secs = min((next_run - now).total_seconds(), max_wait_seconds)
-    LOGGER.info("Sleeping until %s UTC (~%ds).", next_run.strftime("%H:%M"), int(sleep_secs))
-    time.sleep(sleep_secs)
-
-
-def _setup_logging(log_level: str, log_file: Path) -> None:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-
-    root.handlers.clear()
-    root.addHandler(stream_handler)
-    root.addHandler(file_handler)
-
-
-def _run_step(name: str, command: List[str]) -> None:
-    LOGGER.info("Starting step: %s", name)
-    LOGGER.info("Command: %s", " ".join(command))
-    result = subprocess.run(command, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"{name} failed with exit code {result.returncode}")
-    LOGGER.info("Completed step: %s", name)
-
-
-def _build_train_model_cmd(args: argparse.Namespace) -> List[str]:
-    cmd = [sys.executable, "-m", "scripts.train_model", "--inference"]
-
-    threshold = os.getenv("SIGNAL_THRESHOLD")
-    min_auc = os.getenv("MIN_AUC")
-    leverage = os.getenv("LEVERAGE")
-    exclude = os.getenv("EXCLUDE_SYMBOLS")
-    pruned_only = os.getenv("PRUNED_ONLY", "").lower() in ("1", "true", "yes")
-
-    if threshold:
-        cmd.extend(["--threshold", threshold])
-    if min_auc:
-        cmd.extend(["--min-auc", min_auc])
-    if leverage:
-        cmd.extend(["--leverage", leverage])
-    if exclude:
-        cmd.extend(["--exclude", exclude])
-    if pruned_only:
-        cmd.append("--pruned-only")
-    if args.debug:
-        cmd.append("--debug")
-
-    return cmd
-
-
-def _run_cycle(backfill_days: int, include_oi: bool, db_path: str, train_cmd: List[str]) -> None:
-    run_pipeline_cmd = [
-        sys.executable,
-        "-m", "scripts.run_pipeline",
-        "--backfill-only",
-        "--backfill-days",
-        str(backfill_days),
-        "--db-path",
-        db_path,
-    ]
-    if include_oi:
-        run_pipeline_cmd.append("--include-oi")
-
-    _run_step("run_pipeline backfill", run_pipeline_cmd)
-    _run_step("compute_features", [sys.executable, "-m", "scripts.compute_features"])
-    _run_step("train_model signals", train_cmd)
-
-
-def _load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def _save_state(state: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
 
 def _as_float(value: Any) -> float:
@@ -158,19 +102,13 @@ def _as_float(value: Any) -> float:
 
 def _paper_kpis(writer: PgWriter, lookback_days: int = 14) -> dict[str, Any]:
     since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    closed_positions = writer.get_closed_paper_positions_since(since)
+    closed = writer.get_closed_paper_positions_since(since)
     equity_points = writer.get_paper_equity_curve_since(since)
 
-    pnl_values = [_as_float(p.realized_pnl) for p in closed_positions]
-    trades = len(pnl_values)
-    wins = len([p for p in pnl_values if p > 0])
-    losses = [p for p in pnl_values if p < 0]
-    gross_profit = sum(p for p in pnl_values if p > 0)
-    gross_loss = abs(sum(losses))
-    win_rate = (wins / trades) if trades else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
-    expectancy = (sum(pnl_values) / trades) if trades else 0.0
-    trades_per_week = trades * (7 / lookback_days)
+    pnls = [_as_float(p.realized_pnl) for p in closed]
+    trades = len(pnls)
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p < 0))
 
     drawdown = 0.0
     if equity_points:
@@ -182,188 +120,363 @@ def _paper_kpis(writer: PgWriter, lookback_days: int = 14) -> dict[str, Any]:
                 drawdown = max(drawdown, (peak - equity) / peak)
 
     return {
-        "window_days": lookback_days,
-        "trades": trades,
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "drawdown": drawdown,
-        "expectancy": expectancy,
-        "trades_per_week": trades_per_week,
+        'window_days': lookback_days,
+        'trades': trades,
+        'win_rate': (len([p for p in pnls if p > 0]) / trades) if trades else 0.0,
+        'profit_factor': (
+            gross_profit / gross_loss if gross_loss > 0
+            else (float('inf') if gross_profit > 0 else 0.0)
+        ),
+        'drawdown': drawdown,
+        'expectancy': (sum(pnls) / trades) if trades else 0.0,
+        'trades_per_week': trades * (7 / lookback_days),
     }
 
 
-def _quarantine_reasons(kpis: dict[str, Any], thresholds: KillSwitchThresholds, state: dict[str, Any]) -> list[str]:
+def _quarantine_reasons(
+    kpis: dict[str, Any],
+    thresholds: KillSwitchThresholds,
+    state: dict[str, Any],
+) -> list[str]:
+    """Why the live model should stop trading, or an empty list.
+
+    Too few trades returns early with `insufficient_samples`, which is reported
+    but does *not* quarantine: "we have not seen enough to judge" is not the same
+    finding as "this is broken", and conflating them would halt every new model
+    in its first week.
+    """
+    if kpis['trades'] < thresholds.min_samples:
+        return [f"insufficient_samples:{kpis['trades']}<{thresholds.min_samples}"]
+
     reasons: list[str] = []
-    if kpis["trades"] < thresholds.min_samples:
-        reasons.append(
-            f"insufficient_samples:{kpis['trades']}<{thresholds.min_samples}"
-        )
-        return reasons
-
-    if kpis["win_rate"] < thresholds.min_win_rate:
+    if kpis['win_rate'] < thresholds.min_win_rate:
         reasons.append(f"win_rate_collapse:{kpis['win_rate']:.3f}<{thresholds.min_win_rate:.3f}")
-    if kpis["profit_factor"] < thresholds.min_profit_factor:
-        reasons.append(f"profit_factor_breach:{kpis['profit_factor']:.3f}<{thresholds.min_profit_factor:.3f}")
-    if kpis["drawdown"] > thresholds.max_drawdown:
-        reasons.append(f"drawdown_breach:{kpis['drawdown']:.3f}>{thresholds.max_drawdown:.3f}")
-    if kpis["trades_per_week"] < thresholds.min_trades_per_week:
-        reasons.append(f"low_trade_velocity:{kpis['trades_per_week']:.2f}<{thresholds.min_trades_per_week:.2f}")
-
-    neg_streak = int(state.get("negative_expectancy_streak", 0))
-    if kpis["expectancy"] < 0:
-        neg_streak += 1
-    else:
-        neg_streak = 0
-    state["negative_expectancy_streak"] = neg_streak
-    if neg_streak >= thresholds.max_negative_expectancy_streak:
+    if kpis['profit_factor'] < thresholds.min_profit_factor:
         reasons.append(
-            f"sustained_negative_expectancy:{neg_streak}>={thresholds.max_negative_expectancy_streak}"
+            f"profit_factor_breach:{kpis['profit_factor']:.3f}<{thresholds.min_profit_factor:.3f}"
+        )
+    if kpis['drawdown'] > thresholds.max_drawdown:
+        reasons.append(f"drawdown_breach:{kpis['drawdown']:.3f}>{thresholds.max_drawdown:.3f}")
+    if kpis['trades_per_week'] < thresholds.min_trades_per_week:
+        reasons.append(
+            f"low_trade_velocity:{kpis['trades_per_week']:.2f}<{thresholds.min_trades_per_week:.2f}"
+        )
+
+    streak = int(state.get('negative_expectancy_streak', 0))
+    streak = streak + 1 if kpis['expectancy'] < 0 else 0
+    state['negative_expectancy_streak'] = streak
+    if streak >= thresholds.max_negative_expectancy_streak:
+        reasons.append(
+            f'sustained_negative_expectancy:{streak}>='
+            f'{thresholds.max_negative_expectancy_streak}'
         )
 
     return reasons
 
 
-def _evaluate_paper_monitoring(version: str, writer: PgWriter | None) -> tuple[bool, dict[str, Any], list[str]]:
+def evaluate_live_model(writer: Optional[PgWriter]) -> tuple[bool, dict[str, Any]]:
+    """Check the promoted model against realised paper results.
+
+    Returns (quarantined, record). Writes the verdict into the state file so the
+    API can serve it without recomputing, and so a quarantine survives a restart.
+    """
     if writer is None:
-        return False, {}, []
+        return False, {}
 
     state = _load_state()
     thresholds = _monitoring_thresholds()
-    kpis = _paper_kpis(writer, lookback_days=int(os.getenv("PAPER_MONITOR_LOOKBACK_DAYS", "14")))
+    kpis = _paper_kpis(writer, lookback_days=int(os.getenv('PAPER_MONITOR_LOOKBACK_DAYS', '14')))
     reasons = _quarantine_reasons(kpis, thresholds, state)
-    quarantined = any(not r.startswith("insufficient_samples") for r in reasons)
+    quarantined = any(not r.startswith('insufficient_samples') for r in reasons)
 
-    monitoring_record = {
-        "evaluated_at": datetime.now(timezone.utc).isoformat(),
-        "version": version,
-        "kpis": kpis,
-        "thresholds": thresholds.__dict__,
-        "reasons": reasons,
-        "status": "quarantined" if quarantined else "active",
+    live = current_record(MODELS_DIR)
+    record = {
+        'evaluated_at': datetime.now(timezone.utc).isoformat(),
+        'version': live.version if live else None,
+        'kpis': kpis,
+        'thresholds': asdict(thresholds),
+        'reasons': reasons,
+        'status': 'quarantined' if quarantined else 'active',
     }
-    state["paper_monitoring"] = monitoring_record
-
-    quarantined_models = state.setdefault("quarantined_models", {})
+    state['paper_monitoring'] = record
     if quarantined:
-        quarantined_models["ALL"] = {
-            "version": version,
-            "status": "quarantined",
-            "reasons": reasons,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-    elif "ALL" in quarantined_models:
-        quarantined_models.pop("ALL", None)
-
+        state['quarantined_version'] = record['version']
+    else:
+        state.pop('quarantined_version', None)
     _save_state(state)
-    return quarantined, monitoring_record, reasons
+
+    if quarantined:
+        LOGGER.error('kill switch: live model %s quarantined (%s)',
+                     record['version'], ', '.join(reasons))
+    return quarantined, record
 
 
-def _promote_models(staging_dir: Path, target_dir: Path) -> None:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for staged in staging_dir.glob("*.joblib"):
-        os.replace(staged, target_dir / staged.name)
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 
-def _run_retrain(train_window_days: int, retrain_every_days: int, writer: PgWriter | None) -> bool:
-    now = datetime.now(timezone.utc)
-    version = now.strftime("%Y%m%dT%H%M%SZ")
-    staged_dir = MODELS_DIR / ".staging" / version
-    staged_dir.mkdir(parents=True, exist_ok=True)
-
-    pruned_only = os.getenv("PRUNED_ONLY", "").lower() in ("1", "true", "yes")
-    config = Config(retrain_frequency_days=retrain_every_days, enforce_pruned_features=pruned_only)
-    data = load_data()
-    run_id = None
-    if writer:
-        run_id = writer.create_model_run(
-            retrain_window_days=train_window_days,
-            symbols_total=len(data),
-            artifacts_version=version,
-        )
-
+def _load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {}
     try:
-        paper_profile_path = resolve_paper_profile_overrides_path()
-        profile_overrides = load_paper_profile_overrides(str(paper_profile_path))
-        if profile_overrides:
-            LOGGER.info("Retrain: loaded %d paper profile override(s) from %s", len(profile_overrides), paper_profile_path)
-        result = retrain_models(data, config, target_dir=staged_dir, train_window_days=train_window_days, profile_overrides=profile_overrides)
-        if result.get("symbols_trained", 0) == 0:
-            raise RuntimeError("No models trained successfully; refusing promotion")
+        return json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        LOGGER.warning('unreadable state file %s, starting fresh', STATE_FILE)
+        return {}
 
-        quarantined, monitoring_record, quarantine_reasons = _evaluate_paper_monitoring(version, writer)
-        result["paper_monitoring"] = monitoring_record
-        if quarantined:
-            LOGGER.error(
-                "Kill-switch triggered for version %s; quarantining models. Reasons: %s",
-                version,
-                ", ".join(quarantine_reasons),
-            )
-            raise RuntimeError(
-                "Model version quarantined by paper monitor: " + ", ".join(quarantine_reasons)
-            )
 
-        _promote_models(staged_dir, MODELS_DIR)
-
-        if writer and run_id:
-            writer.complete_model_run(
-                run_id=run_id,
-                success=True,
-                symbols_trained=result["symbols_trained"],
-                metrics=result,
-            )
-
-        state = _load_state()
-        state["last_successful_retrain_at"] = now.isoformat()
-        state["last_artifacts_version"] = version
-        _save_state(state)
-        LOGGER.info(
-            "Retrain success. Promoted %s models (version=%s).",
-            result["symbols_trained"],
-            version,
-        )
-        return True
-    except Exception as exc:
-        shutil.rmtree(staged_dir, ignore_errors=True)
-        if writer and run_id:
-            writer.complete_model_run(
-                run_id=run_id,
-                success=False,
-                symbols_trained=0,
-                error=str(exc),
-            )
-        LOGGER.exception("Retrain failed. Keeping previous models active.")
-        return False
+def _save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE_FILE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True, default=str))
+    os.replace(temporary, STATE_FILE)
 
 
 def _retrain_due(retrain_every_days: int) -> bool:
-    state = _load_state()
-    last_success = state.get("last_successful_retrain_at")
-    if not last_success:
+    last = _load_state().get('last_retrain_attempt_at')
+    if not last:
         return True
-
     try:
-        last_dt = datetime.fromisoformat(last_success)
+        return datetime.now(timezone.utc) >= datetime.fromisoformat(last) + timedelta(
+            days=retrain_every_days
+        )
     except ValueError:
         return True
 
-    return datetime.now(timezone.utc) >= (last_dt + timedelta(days=retrain_every_days))
+
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
+
+
+def _run_step(name: str, command: Sequence[str], *, allow_codes: Sequence[int] = (0,)) -> int:
+    """Run one step as its own process. Returns the exit code.
+
+    `allow_codes` is what makes the promotion step work: `scripts.promote` exits
+    2 when the gates block a candidate, which is a correct outcome and not a
+    failure of the loop.
+    """
+    LOGGER.info('step %s: %s', name, ' '.join(command))
+    code = subprocess.run(list(command), check=False).returncode
+    if code not in allow_codes:
+        raise RuntimeError(f'{name} failed with exit code {code}')
+    LOGGER.info('step %s finished (exit %d)', name, code)
+    return code
+
+
+def _data_arguments(args: argparse.Namespace) -> list[str]:
+    """The `scripts._common` argument surface, one place.
+
+    Every research script takes the same data arguments, so the orchestrator
+    passes the same set to all of them. A venue or cost config that differed
+    between the feature build and the signal write would silently score a model
+    on inputs it was not trained for.
+    """
+    flags = ['--venue', args.venue, '--min-quality', args.min_quality]
+    if args.store:
+        flags += ['--store', args.store]
+    if args.reference_venue:
+        flags += ['--reference-venue', args.reference_venue]
+    if args.symbols:
+        flags += ['--symbols', args.symbols]
+    if args.cost_config:
+        flags += ['--cost-config', args.cost_config]
+    flags += ['--log-level', args.log_level]
+    return flags
+
+
+def _scrape(args: argparse.Namespace, backfill_days: int) -> None:
+    command = [
+        sys.executable, '-m', 'scripts.run_pipeline',
+        '--backfill-only', '--backfill-days', str(backfill_days),
+        '--db-path', args.db_path,
+    ]
+    if args.include_oi:
+        command.append('--include-oi')
+    _run_step('scrape', command)
+
+
+def _sync_store(args: argparse.Namespace) -> None:
+    """Move what the scraper wrote into the research store.
+
+    The scraper owns SQLite; research owns Parquet. Keeping the copy explicit is
+    what makes a build reproducible: the store is bitemporal, so a later revision
+    of a bar becomes a new row rather than overwriting the one a past model was
+    trained on.
+    """
+    command = [
+        sys.executable, '-m', 'scripts.migrate_to_research_store',
+        '--db-path', args.db_path, '--venue', args.venue,
+    ]
+    if args.store:
+        command += ['--store', args.store]
+    _run_step('sync research store', command)
+
+
+def _build_features(args: argparse.Namespace) -> None:
+    _run_step('build features',
+              [sys.executable, '-m', 'scripts.build_features', *_data_arguments(args)])
+
+
+def _write_signals(args: argparse.Namespace) -> None:
+    command = [
+        sys.executable, '-m', 'scripts.signals',
+        '--model', str(MODELS_DIR / 'forecast.joblib'),
+        '--equity', str(args.equity),
+        *_data_arguments(args),
+    ]
+    _run_step('signals', command)
+
+
+def _attempt_promotion(args: argparse.Namespace, writer: Optional[PgWriter]) -> bool:
+    """Train a candidate and let the gates decide. Returns True if installed.
+
+    A blocked candidate is a normal outcome, not an error: the previous model
+    stays live and the ledger records why the new one did not displace it.
+    """
+    state = _load_state()
+    state['last_retrain_attempt_at'] = datetime.now(timezone.utc).isoformat()
+    _save_state(state)
+
+    run_id = None
+    if writer:
+        run_id = writer.create_model_run(
+            retrain_window_days=args.train_window_days,
+            symbols_total=0,
+            artifacts_version=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'),
+        )
+
+    command = [
+        sys.executable, '-m', 'scripts.promote',
+        '--models-dir', str(MODELS_DIR),
+        '--periods', str(args.walk_forward_periods),
+        '--equity', str(args.equity),
+        *_data_arguments(args),
+    ]
+    try:
+        code = _run_step('promote', command, allow_codes=(0, 2))
+    except RuntimeError as exc:
+        LOGGER.exception('promotion step crashed: %s', exc)
+        if writer and run_id:
+            writer.complete_model_run(run_id=run_id, success=False,
+                                      symbols_trained=0, error=str(exc))
+        return False
+
+    installed = code == 0
+    live = current_record(MODELS_DIR)
+    if installed:
+        state = _load_state()
+        state['last_promoted_version'] = live.version if live else None
+        state['last_promoted_at'] = datetime.now(timezone.utc).isoformat()
+        _save_state(state)
+        LOGGER.info('promoted %s', live.version if live else 'candidate')
+    else:
+        LOGGER.warning(
+            'candidate blocked by the gates; keeping %s live',
+            live.version if live else 'the existing model',
+        )
+
+    if writer and run_id:
+        writer.complete_model_run(
+            run_id=run_id,
+            success=installed,
+            symbols_trained=len(live.provenance.get('symbols', [])) if live and installed else 0,
+            metrics=live.as_dict() if live and installed else None,
+            error=None if installed else 'blocked by promotion gates',
+        )
+    return installed
+
+
+def _run_cycle(args: argparse.Namespace, backfill_days: int, *, quarantined: bool) -> None:
+    _scrape(args, backfill_days)
+    _sync_store(args)
+    _build_features(args)
+
+    if quarantined:
+        LOGGER.error('live model is quarantined: skipping the signal write')
+        return
+    if not (MODELS_DIR / 'forecast.joblib').exists():
+        LOGGER.warning(
+            'no promoted model at %s: skipping the signal write. Evaluate one with '
+            'python -m scripts.promote', MODELS_DIR / 'forecast.joblib',
+        )
+        return
+    _write_signals(args)
+
+
+# ---------------------------------------------------------------------------
+# Plumbing
+# ---------------------------------------------------------------------------
+
+
+def _handle_signal(signum, _frame) -> None:
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    LOGGER.info('received signal %s; stopping after the current step', signum)
+
+
+def _sleep_until_next_aligned(align_minute: int, max_wait_seconds: int) -> None:
+    now = datetime.now(timezone.utc)
+    next_run = now.replace(minute=align_minute, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += timedelta(hours=1)
+    seconds = min((next_run - now).total_seconds(), max_wait_seconds)
+    LOGGER.info('sleeping until %s UTC (~%ds)', next_run.strftime('%H:%M'), int(seconds))
+    time.sleep(seconds)
+
+
+def _setup_logging(level: str, log_file: Path) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root.handlers.clear()
+    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(log_file)):
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live trader orchestrator")
-    parser.add_argument("--backfill-days", type=int, default=int(os.getenv("INITIAL_BACKFILL_DAYS", "30")))
-    parser.add_argument("--cycle-interval-seconds", type=int, default=int(os.getenv("CYCLE_INTERVAL_SECONDS", "3600")))
-    parser.add_argument("--cycle-align-minute", type=int, default=int(os.getenv("CYCLE_ALIGN_MINUTE", "-1")))
-    parser.add_argument("--incremental-backfill-hours", type=int, default=int(os.getenv("INCREMENTAL_BACKFILL_HOURS", "6")))
-    parser.add_argument("--db-path", type=str, default=os.getenv("TRADER_DB_PATH", "/app/data/trading.db"))
-    parser.add_argument("--retrain-every-days", type=int, default=int(os.getenv("RETRAIN_EVERY_DAYS", "7")))
-    parser.add_argument("--train-window-days", type=int, default=int(os.getenv("TRAIN_WINDOW_DAYS", "90")))
-    parser.add_argument("--retrain-only", action="store_true")
-    parser.add_argument("--run-once", action="store_true")
-    parser.add_argument("--include-oi", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--log-level", type=str, default=os.getenv("LOG_LEVEL", "INFO"))
-    parser.add_argument("--log-file", type=str, default=os.getenv("ORCHESTRATOR_LOG_FILE", "/app/logs/live_orchestrator.log"))
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    # Data surface, matching scripts/_common.py so every step sees one dataset.
+    parser.add_argument('--db-path', default=os.getenv('TRADER_DB_PATH', '/app/data/trading.db'))
+    parser.add_argument('--store', default=os.getenv('RESEARCH_STORE') or None)
+    parser.add_argument('--venue', default=os.getenv('TRADE_VENUE', 'coinbase'))
+    parser.add_argument('--reference-venue', default=os.getenv('REFERENCE_VENUE', 'binance'))
+    parser.add_argument('--symbols', default=os.getenv('SYMBOLS') or None)
+    parser.add_argument('--min-quality', default='valid',
+                        choices=['valid', 'suspicious', 'unvalidated', 'all'])
+    parser.add_argument('--cost-config', default=os.getenv('COST_CONFIG') or None)
+
+    # Cadence.
+    parser.add_argument('--backfill-days', type=int,
+                        default=int(os.getenv('INITIAL_BACKFILL_DAYS', '30')))
+    parser.add_argument('--incremental-backfill-hours', type=int,
+                        default=int(os.getenv('INCREMENTAL_BACKFILL_HOURS', '6')))
+    parser.add_argument('--cycle-interval-seconds', type=int,
+                        default=int(os.getenv('CYCLE_INTERVAL_SECONDS', '3600')))
+    parser.add_argument('--cycle-align-minute', type=int,
+                        default=int(os.getenv('CYCLE_ALIGN_MINUTE', '-1')))
+    parser.add_argument('--retrain-every-days', type=int,
+                        default=int(os.getenv('RETRAIN_EVERY_DAYS', str(DEFAULT_RETRAIN_DAYS))))
+    parser.add_argument('--train-window-days', type=int,
+                        default=int(os.getenv('TRAIN_WINDOW_DAYS', '90')))
+    parser.add_argument('--walk-forward-periods', type=int,
+                        default=int(os.getenv('WALK_FORWARD_PERIODS', '6')))
+    parser.add_argument('--equity', type=float, default=float(os.getenv('EQUITY', '100000')))
+
+    # Modes.
+    parser.add_argument('--run-once', action='store_true', help='One cycle, then exit')
+    parser.add_argument('--retrain-only', action='store_true',
+                        help='Evaluate a candidate and exit')
+    parser.add_argument('--include-oi', action='store_true')
+    parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
+    parser.add_argument('--log-file',
+                        default=os.getenv('ORCHESTRATOR_LOG_FILE',
+                                          '/app/logs/live_orchestrator.log'))
     return parser.parse_args()
 
 
@@ -374,23 +487,25 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    writer = PgWriter() if os.environ.get("DATABASE_URL") else None
+    writer = PgWriter() if os.environ.get('DATABASE_URL') else None
+    if writer is None:
+        LOGGER.warning('DATABASE_URL unset: signals and monitoring will not be persisted')
 
     if args.retrain_only:
-        return 0 if _run_retrain(args.train_window_days, args.retrain_every_days, writer) else 1
+        return 0 if _attempt_promotion(args, writer) else 2
 
     incremental_days = max(1, math.ceil(args.incremental_backfill_hours / 24))
-    train_cmd = _build_train_model_cmd(args)
-
-    LOGGER.info("Live orchestrator starting.")
+    LOGGER.info('live orchestrator starting (venue=%s, retrain every %dd)',
+                args.venue, args.retrain_every_days)
 
     try:
-        _run_cycle(args.backfill_days, args.include_oi, args.db_path, train_cmd)
+        quarantined, _ = evaluate_live_model(writer)
+        _run_cycle(args, args.backfill_days, quarantined=quarantined)
 
-        cycle_num = 1
+        cycle = 1
         while not STOP_REQUESTED:
             if _retrain_due(args.retrain_every_days):
-                _run_retrain(args.train_window_days, args.retrain_every_days, writer)
+                _attempt_promotion(args, writer)
 
             if args.run_once:
                 break
@@ -398,22 +513,23 @@ def main() -> int:
             if 0 <= args.cycle_align_minute < 60:
                 _sleep_until_next_aligned(args.cycle_align_minute, args.cycle_interval_seconds)
             else:
-                LOGGER.info("Sleeping for %s seconds before next cycle.", args.cycle_interval_seconds)
+                LOGGER.info('sleeping %ds', args.cycle_interval_seconds)
                 time.sleep(args.cycle_interval_seconds)
             if STOP_REQUESTED:
                 break
 
-            cycle_num += 1
-            LOGGER.info("Starting recurring cycle #%s", cycle_num)
-            _run_cycle(incremental_days, args.include_oi, args.db_path, train_cmd)
+            cycle += 1
+            LOGGER.info('cycle #%d', cycle)
+            quarantined, _ = evaluate_live_model(writer)
+            _run_cycle(args, incremental_days, quarantined=quarantined)
 
-    except Exception as exc:
-        LOGGER.exception("Orchestrator failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - the loop reports and exits nonzero
+        LOGGER.exception('orchestrator failed: %s', exc)
         return 1
 
-    LOGGER.info("Orchestrator stopped cleanly.")
+    LOGGER.info('orchestrator stopped cleanly')
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

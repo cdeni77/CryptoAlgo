@@ -313,6 +313,7 @@ def test_all_gates_passing_promotes():
         'deflated_sharpe': 1.9, 'bootstrap_positive_fraction': 0.95,
         'synthetic_positive_fraction': 0.7, 'stressed_median_sharpe': 0.2,
         'parameter_plateau': 0.8, 'oos_trades': 250,
+        'max_exit_participation': 0.06,
     }
 
     promoted, gates = evaluate_gates(measurements)
@@ -328,6 +329,7 @@ def test_one_failing_gate_blocks():
         'pbo': 0.15, 'deflated_sharpe': 1.9,
         'bootstrap_positive_fraction': 0.95, 'synthetic_positive_fraction': 0.7,
         'stressed_median_sharpe': 0.2, 'parameter_plateau': 0.8, 'oos_trades': 250,
+        'max_exit_participation': 0.06,
     }
 
     promoted, gates = evaluate_gates(measurements)

@@ -1,18 +1,39 @@
+"""Research metrics and the script runner.
+
+The metrics half was rewritten because it described a classifier that no longer
+exists. Its inputs were `signals.model_auc` — which the new signal writer leaves
+null, because AUC is undefined for a regression on net return — and
+`optimization_results/*_validation.json`, an artifact of a deleted pipeline. Every
+tier read "UNKNOWN", every AUC-derived figure was a constant subtracted from a
+null, and `drift_delta` subtracted an AUC from a win-rate percentage.
+
+What it reports now is the comparison the model can actually be held to: the edge
+`decide()` claimed in basis points before each trade, against what the trade
+earned. That claim is checkable, and the gap between claim and outcome is the
+number worth watching — a model that overstates its edge over-sizes every
+position that clears the conviction floor.
+
+Nothing here substitutes a value for a missing measurement. A null means "not
+measured", and the dashboard says so.
+"""
+
 import ast
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
-from typing import Any, List, Optional, Tuple
+from collections import Counter
+from typing import Any, List, Optional, Sequence
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
 from models.research import (
     CoinHealthRow,
+    EdgeCalibration,
     FeatureImportanceItem,
     ResearchCoinDetailResponse,
     ResearchFeaturesResponse,
@@ -22,358 +43,362 @@ from models.research import (
     SignalDistributionItem,
 )
 from models.signals import Signal
-from models.trade import Trade
+from models.trade import ModelRun, PaperPosition, Trade
 
 DEFAULT_COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 
-TIER_SCALE_DEFAULTS = {
-    "FULL": 1.0,
-    "PILOT": 0.5,
-    "SHADOW": 0.2,
-    "REJECT": 0.0,
-    "UNKNOWN": 0.0,
-}
+# How many recent signals a per-coin view averages over. Long enough for the mean
+# forecast to be stable, short enough that a retrain three weeks ago does not
+# dominate the current model's numbers.
+SIGNAL_WINDOW = 500
 
-TIER_RANK = {"REJECT": 0, "SHADOW": 1, "PILOT": 2, "FULL": 3, "UNKNOWN": -1}
+# Calibration needs a sample before it means anything. Below this, the delta is
+# one or two trades' noise and reporting it invites acting on it.
+MIN_CALIBRATION_SAMPLE = 10
 
-LEGACY_RATING_TO_TIER = {
-    "READY": "FULL",
-    "CAUTIOUS": "PILOT",
-    "WEAK": "SHADOW",
-    "REJECT": "REJECT",
-}
+# A realised net edge this far below the forecast is a mispriced model, not
+# variance: it over-sizes every position that clears the conviction floor.
+CALIBRATION_AT_RISK_BPS = -20.0
+CALIBRATION_WATCH_BPS = -8.0
 
 
-def _validation_file_candidates(coin: str) -> list[Path]:
-    trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
-    coin = coin.upper()
-    return [
-        trader_dir / "scripts" / "optimization_results" / f"{coin}_validation.json",
-        trader_dir / "optimization_results" / f"{coin}_validation.json",
-        Path.cwd() / "backend" / "trader" / "scripts" / "optimization_results" / f"{coin}_validation.json",
-        Path.cwd() / "optimization_results" / f"{coin}_validation.json",
+def _mean(values: Sequence[Optional[float]]) -> Optional[float]:
+    present = [float(v) for v in values if v is not None]
+    return sum(present) / len(present) if present else None
+
+
+def _basis_points(pnl: Optional[float], notional: Optional[float]) -> Optional[float]:
+    if pnl is None or not notional:
+        return None
+    return float(pnl) / float(notional) * 10_000
+
+
+# ---------------------------------------------------------------------------
+# Per-instrument health
+# ---------------------------------------------------------------------------
+
+
+def _closed_paper_positions(db: Session, coin: Optional[str] = None) -> list[PaperPosition]:
+    """Closed paper positions, which carry the notional a return needs.
+
+    `trades` holds live/manual trades and has no notional column, so it cannot
+    express a return in basis points. Paper positions can, and paper is what the
+    model is actually being evaluated on.
+    """
+    query = db.query(PaperPosition).filter(PaperPosition.is_open.is_(False))
+    if coin:
+        query = query.filter(PaperPosition.coin == coin)
+    return query.all()
+
+
+def _calibration(signals: Sequence[Signal], closed: Sequence[PaperPosition]) -> EdgeCalibration:
+    """Forecast against outcome, both in basis points of notional.
+
+    Matched at the aggregate rather than trade by trade: a signal does not carry
+    the id of the position it produced, so pairing them individually would mean
+    guessing. Means over a common window answer the question that matters — is
+    the model's stated edge systematically too large — without that guess.
+    """
+    acted = [s for s in signals if s.passed_gates and s.expected_net_bps is not None]
+    expected = _mean([s.expected_net_bps for s in acted])
+
+    realised_values = [
+        _basis_points(p.realized_pnl, p.notional) for p in closed if p.notional
     ]
+    realised = _mean(realised_values)
+    sample = min(len(acted), len([v for v in realised_values if v is not None]))
 
+    delta = None
+    if expected is not None and realised is not None and sample >= MIN_CALIBRATION_SAMPLE:
+        delta = realised - expected
 
-def _load_validation_artifact(coin: str) -> Optional[dict[str, Any]]:
-    for candidate in _validation_file_candidates(coin):
-        if not candidate.exists():
-            continue
-        try:
-            with candidate.open("r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except (OSError, ValueError, TypeError):
-            continue
-    return None
-
-
-def _extract_tier_fields(validation_artifact: Optional[dict[str, Any]]) -> Tuple[str, float]:
-    readiness = (validation_artifact or {}).get("readiness", {})
-
-    tier_raw = readiness.get("readiness_tier")
-    if isinstance(tier_raw, str):
-        tier = tier_raw.strip().upper()
-    else:
-        rating = readiness.get("rating")
-        rating_key = rating.strip().upper() if isinstance(rating, str) else ""
-        tier = LEGACY_RATING_TO_TIER.get(rating_key, "UNKNOWN")
-
-    if tier not in TIER_SCALE_DEFAULTS:
-        tier = "UNKNOWN"
-
-    scale = readiness.get("recommended_position_scale")
-    if isinstance(scale, (int, float)):
-        position_scale = float(scale)
-    else:
-        position_scale = TIER_SCALE_DEFAULTS[tier]
-
-    return tier, position_scale
-
-
-
-
-def _load_orchestrator_state() -> dict[str, Any]:
-    state_file = Path(os.getenv("RESEARCH_MONITORING_STATE_FILE", "/app/data/orchestrator_state.json"))
-    if not state_file.exists():
-        return {}
-    try:
-        return json.loads(state_file.read_text())
-    except (OSError, ValueError, TypeError):
-        return {}
-
-
-def _model_monitoring_status(state: dict[str, Any], coin: str) -> tuple[str, list[str]]:
-    qmodels = state.get("quarantined_models", {})
-    for key in (coin.upper(), "ALL"):
-        entry = qmodels.get(key)
-        if not isinstance(entry, dict):
-            continue
-        reasons = entry.get("reasons")
-        if isinstance(reasons, list):
-            return "quarantined", [str(r) for r in reasons]
-        return "quarantined", []
-    return "active", []
-
-def _derive_robustness_gate(
-    holdout_auc: Optional[float],
-    signal_count: int,
-    readiness_tier: str,
-) -> bool:
-    if readiness_tier in {"FULL", "PILOT", "SHADOW", "REJECT"}:
-        return readiness_tier in {"FULL", "PILOT"}
-    return bool(holdout_auc is not None and holdout_auc >= 0.54 and signal_count >= 20)
-
-
-def _coin_metrics(db: Session, coin: str, monitor_state: Optional[dict[str, Any]] = None) -> CoinHealthRow:
-    latest_signal = db.query(Signal).filter(Signal.coin == coin).order_by(desc(Signal.timestamp)).first()
-
-    signal_count = db.query(func.count(Signal.id)).filter(Signal.coin == coin).scalar() or 0
-    acted_signals = db.query(func.count(Signal.id)).filter(Signal.coin == coin, Signal.acted_on.is_(True)).scalar() or 0
-    acted_rate = (acted_signals / signal_count * 100) if signal_count else 0.0
-
-    closed = db.query(Trade).filter(Trade.coin == coin, Trade.status == "closed").all()
-    win_count = len([t for t in closed if (t.net_pnl or 0) > 0])
-    win_rate = (win_count / len(closed) * 100) if closed else 0.0
-
-    holdout_auc = latest_signal.model_auc if latest_signal else None
-    pr_auc = (holdout_auc - 0.06) if holdout_auc is not None else None
-    precision_at_threshold = min(0.99, max(0.0, (holdout_auc or 0.5) - 0.04)) if holdout_auc is not None else None
-
-    expected_win_rate = (holdout_auc or 0.5) * 100
-    drift_delta = win_rate - expected_win_rate
-
-    last_opt_event = latest_signal.timestamp if latest_signal else None
-    freshness_hours = None
-    if last_opt_event:
-        freshness_hours = max(0.0, (datetime.now(timezone.utc) - last_opt_event).total_seconds() / 3600)
-
-    validation_artifact = _load_validation_artifact(coin)
-    readiness_tier, recommended_position_scale = _extract_tier_fields(validation_artifact)
-    robustness_gate = _derive_robustness_gate(holdout_auc, signal_count, readiness_tier)
-
-    monitor_state = monitor_state or {}
-    model_status, quarantine_reasons = _model_monitoring_status(monitor_state, coin)
-
-    healthy = (
-        holdout_auc is not None
-        and holdout_auc >= 0.56
-        and drift_delta >= -5
-        and (freshness_hours is None or freshness_hours <= 24 * 14)
-        and robustness_gate
+    return EdgeCalibration(
+        expected_net_bps=expected,
+        realised_net_bps=realised,
+        delta_bps=delta,
+        sample=sample,
     )
-    at_risk = (not robustness_gate) or drift_delta < -10
-    health = "healthy" if healthy else "at_risk" if at_risk else "watch"
+
+
+def _health(calibration: EdgeCalibration, trades_closed: int, signals_total: int) -> tuple[str, Optional[str]]:
+    """A grade derived from measurements, with the reason attached.
+
+    "unknown" is a real answer and the correct one until there is enough to
+    judge. The previous implementation always produced a grade, which meant a
+    brand-new install displayed "at_risk" for every instrument on no evidence.
+    """
+    if signals_total == 0:
+        return "unknown", "no signals yet"
+    if calibration.sample < MIN_CALIBRATION_SAMPLE:
+        return "unknown", (
+            f"{calibration.sample} matched observations, need "
+            f"{MIN_CALIBRATION_SAMPLE} before calibration means anything"
+        )
+
+    delta = calibration.delta_bps
+    if delta is None:
+        return "unknown", "no calibration measurement"
+    if delta <= CALIBRATION_AT_RISK_BPS:
+        return "at_risk", (
+            f"realised net runs {abs(delta):.0f}bp below forecast — the model is "
+            f"overstating its edge, which over-sizes every position it clears"
+        )
+    if delta <= CALIBRATION_WATCH_BPS:
+        return "watch", f"realised net {abs(delta):.0f}bp below forecast"
+    if trades_closed == 0:
+        return "watch", "signals but no closed trades yet"
+    return "healthy", f"realised net within {abs(delta):.0f}bp of forecast"
+
+
+def _coin_row(db: Session, coin: str) -> CoinHealthRow:
+    signals = (
+        db.query(Signal)
+        .filter(Signal.coin == coin)
+        .order_by(desc(Signal.timestamp))
+        .limit(SIGNAL_WINDOW)
+        .all()
+    )
+    passed = [s for s in signals if s.passed_gates]
+    blocked = [s.gate_failure_reason for s in signals if not s.passed_gates and s.gate_failure_reason]
+
+    closed = _closed_paper_positions(db, coin)
+    wins = len([p for p in closed if (p.realized_pnl or 0.0) > 0])
+    net_pnl = sum(float(p.realized_pnl or 0.0) for p in closed) if closed else None
+
+    calibration = _calibration(signals, closed)
+    health, reason = _health(calibration, len(closed), len(signals))
 
     return CoinHealthRow(
         coin=coin,
-        holdout_auc=holdout_auc,
-        pr_auc=pr_auc,
-        precision_at_threshold=precision_at_threshold,
-        win_rate_realized=win_rate,
-        acted_signal_rate=acted_rate,
-        drift_delta=drift_delta,
-        readiness_tier=readiness_tier,
-        recommended_position_scale=recommended_position_scale,
-        robustness_gate=robustness_gate,
-        optimization_freshness_hours=freshness_hours,
-        last_optimized_at=last_opt_event,
+        signals_total=len(signals),
+        signals_passed_gates=len(passed),
+        gate_pass_rate=(len(passed) / len(signals)) if signals else None,
+        top_gate_reason=Counter(blocked).most_common(1)[0][0] if blocked else None,
+        last_signal_at=signals[0].timestamp if signals else None,
+        expected_net_bps=_mean([s.expected_net_bps for s in passed]),
+        expected_carry_share=_mean([s.carry_share for s in passed]),
+        mean_cost_bps=_mean([s.cost_bps for s in signals]),
+        trades_closed=len(closed),
+        win_rate_realized=(wins / len(closed)) if closed else None,
+        net_pnl=net_pnl,
+        realised_net_bps=calibration.realised_net_bps,
+        calibration=calibration,
         health=health,
-        model_status=model_status,
-        quarantine_reasons=quarantine_reasons,
+        health_reason=reason,
     )
 
 
-def _all_coin_rows(db: Session) -> List[CoinHealthRow]:
-    db_coins = [c[0] for c in db.query(Signal.coin).distinct().all()]
-    coins = sorted(set(DEFAULT_COINS + db_coins))
-    monitor_state = _load_orchestrator_state()
-    return [_coin_metrics(db, coin, monitor_state=monitor_state) for coin in coins]
+def _coins(db: Session) -> list[str]:
+    seen = [c[0] for c in db.query(Signal.coin).distinct().all() if c[0]]
+    return sorted(set(DEFAULT_COINS) | set(seen))
 
 
-
-
-def _summary_tier(rows: List[CoinHealthRow]) -> tuple[str, float]:
-    if not rows:
-        return "UNKNOWN", 0.0
-
-    ranked_rows = sorted(rows, key=lambda row: TIER_RANK.get(row.readiness_tier, -1))
-    representative = ranked_rows[0]
-    return representative.readiness_tier, representative.recommended_position_scale
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 
 
 def get_research_summary(db: Session) -> ResearchSummaryResponse:
-    rows = _all_coin_rows(db)
-    if rows:
-        avg = lambda vals: sum(vals) / len(vals) if vals else 0.0
-        auc_values = [r.holdout_auc for r in rows if r.holdout_auc is not None]
-        pr_values = [r.pr_auc for r in rows if r.pr_auc is not None]
-        precision_values = [r.precision_at_threshold for r in rows if r.precision_at_threshold is not None]
+    """Universe totals plus the live model's identity and gate verdict."""
+    rows = [_coin_row(db, coin) for coin in _coins(db)]
 
-        summary_tier, summary_scale = _summary_tier(rows)
+    signals_total = sum(r.signals_total for r in rows)
+    signals_passed = sum(r.signals_passed_gates for r in rows)
+    trades_closed = sum(r.trades_closed for r in rows)
 
-        kpis = ResearchSummaryKpis(
-            holdout_auc=avg(auc_values) if auc_values else None,
-            pr_auc=avg(pr_values) if pr_values else None,
-            precision_at_threshold=avg(precision_values) if precision_values else None,
-            win_rate_realized=avg([r.win_rate_realized for r in rows]),
-            acted_signal_rate=avg([r.acted_signal_rate for r in rows]),
-            drift_delta=avg([r.drift_delta for r in rows]),
-            readiness_tier=summary_tier,
-            recommended_position_scale=summary_scale,
-            robustness_gate=all(r.robustness_gate for r in rows),
-        )
-    else:
-        summary_tier, summary_scale = _summary_tier(rows)
+    # Ratios are pooled, not averaged. Averaging per-coin win rates weights a
+    # coin with two trades the same as one with two hundred.
+    all_closed = _closed_paper_positions(db)
+    wins = len([p for p in all_closed if (p.realized_pnl or 0.0) > 0])
+    all_signals = (
+        db.query(Signal).order_by(desc(Signal.timestamp)).limit(SIGNAL_WINDOW * 4).all()
+    )
+    calibration = _calibration(all_signals, all_closed)
 
-        kpis = ResearchSummaryKpis(
-            holdout_auc=None,
-            pr_auc=None,
-            precision_at_threshold=None,
-            win_rate_realized=0,
-            acted_signal_rate=0,
-            drift_delta=0,
-            readiness_tier="UNKNOWN",
-            recommended_position_scale=0.0,
-            robustness_gate=False,
-        )
+    from controllers.model import get_live_model
 
-    return ResearchSummaryResponse(generated_at=datetime.now(timezone.utc), kpis=kpis, coins=rows)
+    live = get_live_model()
+    record = live.live
+    provenance = record.provenance if record else None
+
+    age_hours = None
+    if provenance and provenance.trained_at:
+        try:
+            trained = datetime.fromisoformat(str(provenance.trained_at))
+            if trained.tzinfo is None:
+                trained = trained.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - trained).total_seconds() / 3600
+        except ValueError:
+            age_hours = None
+
+    health, _ = _health(calibration, trades_closed, signals_total)
+    if live.kill_switch.status == "quarantined":
+        health = "at_risk"
+    elif not live.has_model:
+        health = "unknown"
+
+    kpis = ResearchSummaryKpis(
+        signals_total=signals_total,
+        signals_passed_gates=signals_passed,
+        gate_pass_rate=(signals_passed / signals_total) if signals_total else None,
+        trades_closed=trades_closed,
+        win_rate_realized=(wins / len(all_closed)) if all_closed else None,
+        net_pnl=sum(float(p.realized_pnl or 0.0) for p in all_closed) if all_closed else None,
+        expected_net_bps=calibration.expected_net_bps,
+        realised_net_bps=calibration.realised_net_bps,
+        calibration_delta_bps=calibration.delta_bps,
+        expected_carry_share=_mean(
+            [s.carry_share for s in all_signals if s.passed_gates]
+        ),
+        model_version=record.version if record else None,
+        model_promoted=bool(record and record.promoted),
+        model_forced=bool(record and record.forced),
+        model_age_hours=age_hours,
+        gates_failed=record.failed_gates if record else [],
+        kill_switch_status=live.kill_switch.status,
+        trials_to_date=live.trials_to_date,
+        health=health,
+    )
+
+    return ResearchSummaryResponse(
+        generated_at=datetime.now(timezone.utc), kpis=kpis, coins=rows
+    )
 
 
 def get_research_coin(db: Session, coin: str) -> ResearchCoinDetailResponse:
-    row = _coin_metrics(db, coin.upper(), monitor_state=_load_orchestrator_state())
-    return ResearchCoinDetailResponse(generated_at=datetime.now(timezone.utc), coin=row)
+    return ResearchCoinDetailResponse(
+        generated_at=datetime.now(timezone.utc), coin=_coin_row(db, coin.upper())
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run history
+# ---------------------------------------------------------------------------
 
 
 def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]:
-    signals = db.query(Signal).order_by(desc(Signal.timestamp)).limit(limit).all()
-    runs: List[ResearchRunResponse] = []
-    tier_cache: dict[str, tuple[str, float]] = {}
-    monitor_state = _load_orchestrator_state()
+    """Real retrain attempts, from `model_runs` joined to the promotion ledger.
 
-    def _run_tier(coin: str) -> tuple[str, float]:
-        key = coin.upper()
-        if key not in tier_cache:
-            tier_cache[key] = _extract_tier_fields(_load_validation_artifact(key))
-        return tier_cache[key]
+    The previous version invented three runs per signal — "train", "optimize" and
+    "validate" — with start times derived by subtracting twelve minutes from the
+    signal timestamp, hardcoded durations, and a status of "success" for all of
+    them. Nothing in that timeline had happened.
+    """
+    from controllers.model import get_promotion_history
 
-    for s in signals:
-        started_at = s.timestamp - timedelta(minutes=12)
-        finished_at = s.timestamp
-        auc = s.model_auc
-        readiness_tier, recommended_position_scale = _run_tier(s.coin)
-        run_gate = _derive_robustness_gate(auc, 0, readiness_tier)
-        model_status, quarantine_reasons = _model_monitoring_status(monitor_state, s.coin)
-        runs.extend(
-            [
-                ResearchRunResponse(
-                    id=f"train-{s.id}",
-                    coin=s.coin,
-                    run_type="train",
-                    status="success",
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    duration_seconds=12 * 60,
-                    holdout_auc=auc,
-                    readiness_tier=readiness_tier,
-                    recommended_position_scale=recommended_position_scale,
-                    robustness_gate=run_gate,
-                    model_status=model_status,
-                    quarantine_reasons=quarantine_reasons,
-                ),
-                ResearchRunResponse(
-                    id=f"optimize-{s.id}",
-                    coin=s.coin,
-                    run_type="optimize",
-                    status="success",
-                    started_at=started_at - timedelta(minutes=20),
-                    finished_at=started_at,
-                    duration_seconds=20 * 60,
-                    holdout_auc=auc,
-                    readiness_tier=readiness_tier,
-                    recommended_position_scale=recommended_position_scale,
-                    robustness_gate=run_gate,
-                    model_status=model_status,
-                    quarantine_reasons=quarantine_reasons,
-                ),
-                ResearchRunResponse(
-                    id=f"validate-{s.id}",
-                    coin=s.coin,
-                    run_type="validate",
-                    status="success",
-                    started_at=finished_at,
-                    finished_at=finished_at + timedelta(minutes=8),
-                    duration_seconds=8 * 60,
-                    holdout_auc=auc,
-                    readiness_tier=readiness_tier,
-                    recommended_position_scale=recommended_position_scale,
-                    robustness_gate=run_gate,
-                    model_status=model_status,
-                    quarantine_reasons=quarantine_reasons,
-                ),
-            ]
+    ledger = {r.version: r for r in get_promotion_history(limit=200).records}
+
+    runs = (
+        db.query(ModelRun).order_by(desc(ModelRun.run_started_at)).limit(limit).all()
+    )
+    out: List[ResearchRunResponse] = []
+    for run in runs:
+        duration = None
+        if run.run_finished_at and run.run_started_at:
+            duration = int((run.run_finished_at - run.run_started_at).total_seconds())
+
+        record = ledger.get(run.artifacts_version) if run.artifacts_version else None
+        out.append(
+            ResearchRunResponse(
+                id=f"run-{run.id}",
+                run_type="retrain",
+                status=run.status,
+                started_at=run.run_started_at,
+                finished_at=run.run_finished_at,
+                duration_seconds=duration,
+                artifacts_version=run.artifacts_version,
+                symbols_trained=run.symbols_trained or 0,
+                symbols_total=run.symbols_total or 0,
+                retrain_window_days=run.retrain_window_days,
+                promoted=record.promoted if record else None,
+                forced=bool(record and record.forced),
+                failed_gates=record.failed_gates if record else [],
+                sharpe=record.backtest.sharpe if record else None,
+                trades=record.backtest.trades if record else None,
+                error=run.error,
+            )
         )
 
-    return sorted(runs, key=lambda r: r.finished_at, reverse=True)[:limit]
+    # Ledger entries with no `model_runs` row: a candidate evaluated by hand
+    # rather than by the orchestrator. Worth showing — it still counts as a trial.
+    seen = {r.artifacts_version for r in runs if r.artifacts_version}
+    for version, record in list(ledger.items())[: max(0, limit - len(out))]:
+        if version in seen or not record.created_at:
+            continue
+        try:
+            started = datetime.fromisoformat(str(record.created_at))
+        except ValueError:
+            continue
+        out.append(
+            ResearchRunResponse(
+                id=f"ledger-{version}",
+                run_type="evaluation",
+                status="success" if record.promoted else "blocked",
+                started_at=started,
+                finished_at=started,
+                artifacts_version=version,
+                promoted=record.promoted,
+                forced=record.forced,
+                failed_gates=record.failed_gates,
+                sharpe=record.backtest.sharpe,
+                trades=record.backtest.trades,
+                error=record.error,
+            )
+        )
+
+    return sorted(out, key=lambda r: r.started_at, reverse=True)[:limit]
 
 
-def _load_pruned_features(coin: str) -> Optional[dict]:
-    trader_dir = Path(os.getenv("TRADER_DIR", "/trader"))
-    coin_lower = coin.lower()
-    candidates = [
-        trader_dir / "data" / "features" / f"pruned_features_{coin_lower}.json",
-        Path.cwd() / "backend" / "trader" / "data" / "features" / f"pruned_features_{coin_lower}.json",
-    ]
-    for path in candidates:
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-    return None
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
 
 
 def get_research_features(db: Session, coin: str) -> ResearchFeaturesResponse:
+    """Signal distribution for one instrument, plus real feature importances.
+
+    Importances come from the promoted model's booster and are per-*model*, not
+    per-coin: the model is a pooled panel with one feature set across the
+    universe, so the same ranking is correct for every instrument. The per-coin
+    part of this response is the signal distribution.
+
+    They used to be read from `pruned_features_<coin>.json`, an artifact of a
+    deleted pipeline, and the fallback when it was missing — which it always was
+    — was a hardcoded table of six plausible names with plausible weights. That
+    is the worst failure available to an explainability panel: it renders exactly
+    like the real thing, so nobody notices it is fiction.
+    """
     coin = coin.upper()
-    recent_signals = db.query(Signal).filter(Signal.coin == coin).order_by(desc(Signal.timestamp)).limit(200).all()
+    recent = (
+        db.query(Signal)
+        .filter(Signal.coin == coin)
+        .order_by(desc(Signal.timestamp))
+        .limit(200)
+        .all()
+    )
 
-    pruned = _load_pruned_features(coin)
-    feature_stats = (pruned or {}).get("feature_stats", {})
-    if feature_stats:
-        total_shap = sum(v["mean_abs_shap"] for v in feature_stats.values()) or 1.0
-        features = [
-            FeatureImportanceItem(feature=name, importance=stats["mean_abs_shap"] / total_shap)
-            for name, stats in sorted(feature_stats.items(), key=lambda x: x[1]["mean_abs_shap"], reverse=True)
-        ][:10]
-    else:
-        base = [
-            ("momentum_24h", 0.26),
-            ("trend_strength", 0.22),
-            ("funding_zscore", 0.17),
-            ("oi_velocity", 0.14),
-            ("volatility_regime", 0.12),
-            ("volume_spike", 0.09),
-        ]
-        total = sum(v for _, v in base)
-        features = [FeatureImportanceItem(feature=name, importance=val / total) for name, val in base]
+    from controllers.model import get_feature_importance
 
-    long_count = len([s for s in recent_signals if s.direction == "long"])
-    short_count = len([s for s in recent_signals if s.direction == "short"])
-    neutral_count = len([s for s in recent_signals if s.direction not in {"long", "short"}])
-    acted_count = len([s for s in recent_signals if s.acted_on])
+    importance = get_feature_importance()
 
-    distribution = [
-        SignalDistributionItem(label="Long", value=long_count),
-        SignalDistributionItem(label="Short", value=short_count),
-        SignalDistributionItem(label="Neutral", value=neutral_count),
-        SignalDistributionItem(label="Acted", value=acted_count),
-    ]
+    long_count = len([s for s in recent if s.direction == "long"])
+    short_count = len([s for s in recent if s.direction == "short"])
+    passed = len([s for s in recent if s.passed_gates])
 
     return ResearchFeaturesResponse(
         coin=coin,
         generated_at=datetime.now(timezone.utc),
-        feature_importance=features,
-        signal_distribution=distribution,
+        feature_importance=[
+            FeatureImportanceItem(feature=e.feature, importance=e.importance)
+            for e in importance.features[:10]
+        ],
+        importance_unavailable_reason=importance.unavailable_reason,
+        signal_distribution=[
+            SignalDistributionItem(label="Long", value=long_count),
+            SignalDistributionItem(label="Short", value=short_count),
+            SignalDistributionItem(label="Passed gates", value=passed),
+            SignalDistributionItem(label="Blocked", value=len(recent) - passed),
+        ],
     )
 
 

@@ -1,36 +1,30 @@
+import { get } from './client';
 import { PriceData, HistoryEntry, CDESpecs, CoinSymbol } from '../types';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
-
-async function fetchWithError<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`API error ${res.status}`);
-  return res.json();
-}
-
 export async function getCurrentPrices(): Promise<PriceData> {
-  return fetchWithError(`${API_BASE}/coins/prices`);
+  return get('/coins/prices');
 }
 
 export async function getCDEPrices(): Promise<PriceData> {
-  return fetchWithError(`${API_BASE}/coins/cde-prices`);
+  return get('/coins/cde-prices');
 }
 
 export async function getCDESpecs(): Promise<CDESpecs> {
-  return fetchWithError(`${API_BASE}/coins/cde-specs`);
+  return get('/coins/cde-specs');
 }
+
+const RANGE_PARAM: Record<string, [string, string]> = {
+  '1h': ['hours', '1'],
+  '1d': ['days', '1'],
+  '1w': ['days', '7'],
+  '1m': ['days', '30'],
+  '1y': ['days', '365'],
+};
 
 export async function getCoinHistory(
   symbol: CoinSymbol,
-  range: '1h' | '1d' | '1w' | '1m' | '1y' = '1d'
+  range: '1h' | '1d' | '1w' | '1m' | '1y' = '1d',
 ): Promise<HistoryEntry[]> {
-  const params = new URLSearchParams();
-  switch (range) {
-    case '1h': params.set('hours', '1'); break;
-    case '1d': params.set('days', '1'); break;
-    case '1w': params.set('days', '7'); break;
-    case '1m': params.set('days', '30'); break;
-    case '1y': params.set('days', '365'); break;
-  }
-  return fetchWithError(`${API_BASE}/coins/history/${symbol}?${params.toString()}`);
+  const [key, value] = RANGE_PARAM[range] ?? RANGE_PARAM['1d'];
+  return get(`/coins/history/${symbol}?${key}=${value}`);
 }

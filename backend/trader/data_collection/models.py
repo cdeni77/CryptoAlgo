@@ -182,6 +182,13 @@ class FundingRate(BiTemporalMixin):
     # Data provenance
     funding_source: str = "coinbase"  # coinbase | binance_proxy
 
+    # Which exchange this rate came from. Distinct from `funding_source`, which
+    # records the *kind* of source; this is the key the research store partitions
+    # on, and it belongs in the unique key so a proxy rate cannot overwrite the
+    # venue's own. Funding differs materially between venues — it is the edge
+    # this system is mostly betting on — so blending them is not a rounding error.
+    venue: str = 'unknown'
+
     # Quality
     quality: DataQuality = DataQuality.UNVALIDATED
     
@@ -242,6 +249,12 @@ class OpenInterest(BiTemporalMixin):
     open_interest_usd: Optional[float] = None
     
     # Quality
+    # Which exchange reported this. Coinbase exposes no open-interest endpoint,
+    # so this is always a proxy venue — and which proxy matters, because Bybit
+    # and Binance report materially different open interest for the same
+    # underlying. It was previously hardcoded to the string "ccxt" at insert
+    # time, which lost that distinction.
+    venue: str = 'unknown'
     quality: DataQuality = DataQuality.UNVALIDATED
     
     def to_dict(self) -> Dict[str, Any]:

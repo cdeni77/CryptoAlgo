@@ -14,6 +14,7 @@ from controllers.research import (
     list_research_jobs,
 )
 from database import get_db
+from security import require_token, validate_job_args
 from models.research import (
     ResearchCoinDetailResponse,
     ResearchFeaturesResponse,
@@ -71,10 +72,22 @@ def jobs(limit: int = Query(25, ge=1, le=200)):
     return list_research_jobs(limit=limit)
 
 
-@router.post("/launch/{job}", response_model=ResearchJobLaunchResponse)
+@router.post(
+    "/launch/{job}",
+    response_model=ResearchJobLaunchResponse,
+    dependencies=[Depends(require_token)],
+)
 def launch(job: str, request: ResearchJobLaunchRequest):
+    """Start a research script.
+
+    The only endpoint that runs a process, in a container that holds the exchange
+    API keys, so it carries both controls: `require_token` decides who may launch,
+    `validate_job_args` decides what they may pass. Authentication alone is not
+    enough — an authenticated caller still should not be able to hand a script an
+    arbitrary filesystem path.
+    """
     try:
-        return launch_research_job(job=job, args=request.args)
+        return launch_research_job(job=job, args=validate_job_args(request.args))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:

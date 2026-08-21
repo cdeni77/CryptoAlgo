@@ -41,93 +41,16 @@ logger = logging.getLogger(__name__)
 MARKET_SYMBOL = 'BIP'
 
 
-def _load_symbol(
-    store: ResearchStore,
-    symbol: str,
-    *,
-    venue: str,
-    reference_venue: Optional[str],
-    market_bars: Optional[pd.DataFrame],
-    as_of: Optional[str],
-    min_quality: Optional[str],
-) -> Optional[SymbolInputs]:
-    """Assemble one instrument's inputs, or None if it has no bars."""
+def build(args, config):
+    """Assemble the panel through the shared loader.
 
-    def frame(dataset: str, source_venue: str, index_only: bool = False) -> pd.DataFrame:
-        rows = store.read(
-            dataset, venue=source_venue, symbols=[symbol],
-            as_of=as_of, min_quality=min_quality,
-        )
-        if rows.empty:
-            return pd.DataFrame()
-        rows = rows.set_index(pd.to_datetime(rows['event_time'], utc=True)).sort_index()
-        return rows.drop(columns=[c for c in ('event_time', 'symbol', 'venue') if c in rows])
-
-    bars = frame('bars', venue)
-    if bars.empty:
-        logger.warning('%s: no bars on %s', symbol, venue)
-        return None
-
-    funding = frame('funding', venue)
-    open_interest = frame('open_interest', venue)
-
-    # Open interest has no Coinbase-native source, so it may only exist under a
-    # proxy venue. Fall back rather than dropping the positioning group.
-    if open_interest.empty and reference_venue:
-        open_interest = frame('open_interest', reference_venue)
-
-    reference_bars = frame('bars', reference_venue) if reference_venue else pd.DataFrame()
-
-    return SymbolInputs(
-        symbol=symbol,
-        bars=bars,
-        funding=funding if not funding.empty else None,
-        open_interest=open_interest if not open_interest.empty else None,
-        reference_bars=reference_bars if not reference_bars.empty else None,
-        market_bars=market_bars,
-    )
-
-
-def build(
-    store: ResearchStore,
-    *,
-    venue: str,
-    reference_venue: Optional[str],
-    symbols: Sequence[str],
-    config: Config,
-    as_of: Optional[str] = None,
-    min_quality: Optional[str] = 'valid',
-    groups: Optional[Sequence[str]] = None,
-) -> pd.DataFrame:
-    """Feature panel for `symbols`, MultiIndexed by (event_time, symbol)."""
-    market = store.read(
-        'bars', venue=venue, symbols=[MARKET_SYMBOL], as_of=as_of, min_quality=min_quality,
-    )
-    if market.empty:
-        logger.warning(
-            '%s has no bars on %s — the market_factor group will be empty, so no '
-            'instrument can express itself relative to the market',
-            MARKET_SYMBOL, venue,
-        )
-        market_bars = None
-    else:
-        market_bars = market.set_index(
-            pd.to_datetime(market['event_time'], utc=True)
-        ).sort_index()
-
-    inputs = []
-    for symbol in symbols:
-        item = _load_symbol(
-            store, symbol, venue=venue, reference_venue=reference_venue,
-            market_bars=market_bars, as_of=as_of, min_quality=min_quality,
-        )
-        if item is not None:
-            inputs.append(item)
-
-    if not inputs:
-        return pd.DataFrame()
-
-    return build_panel(inputs, config=config, groups=groups)
+    This script previously carried its own copy of the loading logic, which is
+    the duplication pattern the rebuild exists to remove. `core.dataset` is the
+    one place that turns "which venue, which symbols, as of when" into a panel,
+    so training, backtesting and live signals cannot disagree about the data.
+    """
+    from scripts._common import load
+    return load(args, config)
 
 
 def _report(panel: pd.DataFrame, config: Config, symbols: Sequence[str]) -> None:
@@ -158,97 +81,56 @@ def _report(panel: pd.DataFrame, config: Config, symbols: Sequence[str]) -> None
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--store', default=None, help='Research store root')
-    parser.add_argument('--venue', default='coinbase',
-                        help='Venue supplying the traded price')
-    parser.add_argument('--reference-venue', default='binance',
-                        help='Deeper venue for basis and lead-lag. Empty to disable.')
-    parser.add_argument('--symbols', default=None,
-                        help='Comma-separated CDE codes (default: every profile)')
-    parser.add_argument('--as-of', default=None,
-                        help='Bound reads by available_time for a reproducible build')
-    parser.add_argument('--min-quality', default='valid',
-                        choices=['valid', 'suspicious', 'unvalidated', 'all'],
-                        help='Lowest quality to include (default: valid only)')
+    from scripts._common import add_data_arguments, build_config, configure_logging, require_data
+
+    parser = add_data_arguments(argparse.ArgumentParser(description=__doc__))
     parser.add_argument('--groups', default=None,
                         help=f"Comma-separated subset of: {', '.join(g.name for g in GROUPS)}")
-    parser.add_argument('--cost-config', default=None,
-                        help='configs/exchange/*.json for the real fee schedule')
     parser.add_argument('--name', default='panel', help='Feature matrix name')
-    parser.add_argument('--list', action='store_true',
-                        help='Print the feature set and exit')
-    parser.add_argument('--dry-run', action='store_true',
-                        help='Build and report without writing')
+    parser.add_argument('--list', action='store_true', help='Print the feature set and exit')
+    parser.add_argument('--dry-run', action='store_true', help='Build and report without writing')
     args = parser.parse_args()
+    configure_logging(args.log_level)
 
     if args.list:
         for group in GROUPS:
             from core.features import _group_column_names
             columns = _group_column_names(group)
             flag = 'cross-sectional' if group.standardize else 'absolute'
-            print(f"\n{group.name}  ({len(columns)} features, {flag})")
+            print(f'\n{group.name}  ({len(columns)} features, {flag})')
             for column in columns:
-                print(f"  {column}")
-        print(f"\ntotal: {len(feature_columns())}")
+                print(f'  {column}')
+        print(f'\ntotal: {len(feature_columns())}')
         return 0
 
-    config = Config()
-    if args.cost_config:
-        config = config.with_cost_assumptions(args.cost_config)
-    else:
-        logger.warning(
-            'no --cost-config: using the %.4f%%/side default rather than the '
-            "venue's per-contract schedule, so fee_hurdle_bps will be wrong",
-            config.fee_pct_per_side * 100,
-        )
-
-    store = ResearchStore(args.store) if args.store else ResearchStore()
-    symbols = (
-        [s.strip().upper() for s in args.symbols.split(',')]
-        if args.symbols
-        else [profile.prefixes[0] for profile in COIN_PROFILES.values()]
-    )
-    groups = [g.strip() for g in args.groups.split(',')] if args.groups else None
-
-    panel = build(
-        store,
-        venue=args.venue,
-        reference_venue=args.reference_venue or None,
-        symbols=symbols,
-        config=config,
-        as_of=args.as_of,
-        min_quality=None if args.min_quality == 'all' else args.min_quality,
-        groups=groups,
-    )
-
-    if panel.empty:
-        logger.error(
-            'empty panel — is the research store populated? '
-            'Run: python -m scripts.migrate_to_research_store --venue %s', args.venue
-        )
+    config = build_config(args)
+    dataset = build(args, config)
+    if not require_data(dataset, args.venue):
         return 1
 
-    _report(panel, config, symbols)
+    panel = dataset.features
+    _report(panel, config, dataset.symbols)
 
     if args.dry_run:
         print('\n--dry-run: nothing written')
         return 0
 
+    store = ResearchStore(args.store) if args.store else ResearchStore()
     path, digest = store.write_features(
-        panel,
-        name=args.name,
+        panel, name=args.name,
         meta={
             'venue': args.venue,
             'reference_venue': args.reference_venue,
-            'symbols': symbols,
+            'symbols': dataset.symbols,
             'as_of': args.as_of,
             'min_quality': args.min_quality,
-            'groups': groups or [g.name for g in GROUPS],
+            'groups': [g.name for g in GROUPS],
             'cost_config': config.cost_config_version,
+            'horizon_bars': dataset.horizon_bars,
+            'warnings': dataset.warnings,
         },
     )
-    print(f"\nwrote {path}\nhash {digest}")
+    print(f'\nwrote {path}\nhash {digest}')
     return 0
 
 

@@ -94,7 +94,7 @@ structural cause of "training didn't align to paper trading."
 - 120-day windows at 1h bars = 2,880 rows. Computed with
   `core.cv.effective_sample_size`, the 72-hour barrier horizon leaves **40.0
   independent observations** — not an estimate, the concurrency-weighted count.
-  At a 108-hour horizon it is 26.7. Against 77 features.
+  At a 108-hour horizon it is 26.7. Against 76 features.
 - A single walk-forward path yields **one** Sharpe estimate with no confidence
   interval.
 - ~200 Optuna trials x 15 coins of selection pressure sits on top of that, with
@@ -417,3 +417,212 @@ Worth stating plainly, because the failure mode here is believing the machinery.
 - **A corrected cost model may erase the current results entirely.** Given 1.1,
   the ETH and BTC strategies were backtested at a fraction of their real cost.
   Some of what looks like a working strategy today is a fee error.
+
+---
+
+## 8. The app layer
+
+Landed. Recorded here with what each fix was, because several of the defects were
+of the same kind as the pipeline's: numbers displayed as measurements that nobody
+had measured.
+
+### 8.1 Security
+
+All four closed.
+
+- **Postgres and the API are bound to loopback**, and the compose password is a
+  required `.env` variable — `${POSTGRES_PASSWORD:?...}`, so `docker compose up`
+  refuses to start without it rather than falling back to a working default in
+  version control. `.env.example` is the template.
+- **`POST /research/launch` is authenticated and fails closed.** With no
+  `API_TOKEN` configured it returns 503, not 200: a deployment that forgot to set
+  the secret refuses to launch rather than launching for anyone. Comparison is
+  `hmac.compare_digest`, so a wrong token does not leak its prefix through
+  timing. Read-only routes stay open — they serve a local dashboard, expose no
+  credentials, and gating them buys nothing the origin policy does not already
+  provide.
+- **CORS origins come from the environment with `*` filtered out.** The wildcard
+  had made every other entry in the list decorative.
+- **`args` are validated, and rejected rather than sanitised.** Long lowercase
+  flags and a bounded value charset; no spaces, no shell metacharacters, no
+  filesystem paths. Rejecting matters: a silently stripped argument means the job
+  ran with settings the requester does not believe it ran with, and that result
+  looks legitimate.
+
+`backend/api/tests/test_security.py` holds the fail-closed property and the
+argument grammar.
+
+### 8.2 Duplicated ORM models
+
+`wallet.balance` is now 100,000 on both sides, and the divergence that produced
+it is guarded by `backend/trader/tests/test_orm_parity.py`, which compares every
+shared table column by column — name, type, nullability, primary key, default,
+server default — and compares the two migration lists as well.
+
+This is a different answer than the shared-schema module suggested above, and
+deliberately so. A shared module means one image's package installed into the
+other, which reintroduces the coupling the duplication exists to avoid; the
+duplication is a legitimate isolation choice, and what it was missing was not
+deduplication but *enforcement*. "Keep both in sync" in a doc is a hope. A test
+that fails on the next divergence is a mechanism.
+
+### 8.3 Correctness and quality
+
+- **Back button works.** `App.tsx` has a `popstate` listener, and `RoutePath`
+  derives from the `ROUTES` table so a route without a render case is a type
+  error.
+- **Every page has loading, error and empty states.** `src/components/StateBlock.tsx`
+  and `src/hooks/usePolling.ts`. An error banner sits *above* existing data
+  rather than replacing it — a stale price is worth more than a blank panel, as
+  long as it is visibly stale. `loading` is distinct from `empty`, so a
+  successful fetch returning nothing no longer renders as a spinner that never
+  resolves.
+- **`npm run lint` runs.** `.eslintrc.cjs` exists; typecheck, lint and build are
+  all clean. `no-empty` with `allowEmptyCatch: false` is on, because
+  `.catch(() => {})` in seven places is how the frontend came to hide every
+  backend failure behind stale data.
+- **Polling pauses on hidden tabs** and refreshes immediately on return, and each
+  source polls at the rate its data actually moves. The wallet — which calls
+  Coinbase, an Ethereum RPC node, Ethplorer and the Solana RPC — was being
+  refetched every minute forever.
+- **One HTTP client.** `src/api/client.ts`: one base URL, one `ApiError` carrying
+  the server's `detail`, one place the token header is set, and a request timeout
+  so a hung fetch does not leave a screen frozen on its last value. Five copies
+  of `fetchWithError` had already drifted in what they reported.
+- **Logic out of the routing layers.** `endpoints/wallet.py` is 21 lines;
+  `controllers/wallet.py` holds the integrations.
+
+### 8.3.1 Fabricated measurements — not in the original audit
+
+Found while rewriting, and the most serious item in this section. Three separate
+places presented invented numbers in a form indistinguishable from real ones:
+
+- **`pr_auc` was `holdout_auc - 0.06`** and `precision_at_threshold` was
+  `holdout_auc - 0.04`. One number, displayed three times, with two constants
+  subtracted. And `holdout_auc` itself came from `signals.model_auc`, which the
+  new signal writer leaves null — AUC is undefined for a regression on net
+  return.
+- **`drift_delta` was `realised_win_rate - holdout_auc * 100`**, subtracting an
+  AUC from a percentage.
+- **Feature importance fell back to a hardcoded table** — `momentum_24h: 0.26`,
+  `trend_strength: 0.22`, four more — whenever `pruned_features_<coin>.json` was
+  absent, which was always, because it belonged to the deleted pipeline. An
+  explainability panel showing six plausible feature names with plausible weights
+  is the worst available failure: it renders exactly like the real thing.
+- **`get_research_runs` invented three runs per signal** — a train, an optimize
+  and a validate, with start times derived by subtracting twelve minutes from the
+  signal timestamp, durations hardcoded to 12, 20 and 8 minutes, and a status of
+  "success" for all of them. None of it had happened.
+- **The API served its own contract table with `fee_pct: 0.001`** for every
+  contract — a third copy of the cost model, carrying the 10bp/side figure the
+  whole rebuild exists to correct.
+
+All replaced. The API now serves measurements or nulls with a reason, importances
+come from the promoted model's booster, run history comes from `model_runs` joined
+to the promotion ledger, and `/coins/cde-specs` reads the real fee schedule from
+the same file the research pipeline prices its targets with.
+`backend/api/tests/test_model_surface.py` asserts that a missing measurement
+arrives as null.
+
+The metric that replaces the AUC family is the one a net-return model can be held
+to: the edge `decide()` claimed in basis points before each trade, against what
+the trades earned. A model whose realised net runs consistently below its
+forecast is mispriced, and it over-sizes every position that clears the
+conviction floor.
+
+### 8.4 What the app gained from the rebuild
+
+All four landed, on the new `/model` route.
+
+- **Provenance** — feature-set hash, cost config version, horizon, train window,
+  row count *and* effective observation count, with a warning when the effective
+  count is under 200 or when symbol identity is a feature.
+- **The promotion gates as a screen** — failures first, each with its measured
+  value beside its threshold and a plain-language note on what it protects
+  against. A gate that missed by 0.01 and one that missed by an order of
+  magnitude need different responses, and a red badge cannot tell them apart.
+- **Distributions, not point estimates** — bootstrap, per-period and synthetic
+  Sharpe each shown as median with p05 and p95.
+- **One promote action** — `core/promotion.py` is the only route to live. The
+  button launches `scripts.promote` through the authenticated endpoint; it does
+  not promote anything itself, because the only thing allowed to install a model
+  is the thing that ran the gates. Rejections stay in the ledger: the trial count
+  is what the deflated Sharpe discounts by. A forced promotion needs a reason and
+  stays visibly forced for as long as it is live.
+
+---
+
+## 9. What the end-to-end rehearsal found
+
+The chain was run once on synthetic data seeded through the real storage layer —
+scrape schema, migration, features, targets, training, walk-forward, simulation,
+gates — rather than only through pytest's in-process calls. Three defects only a
+full run could surface.
+
+### 9.1 Venue was not in the scraper's unique keys
+
+`ohlcv` carried a `venue` column whose unique key stayed
+`(symbol, timeframe, event_time)`. Against `INSERT OR REPLACE`, that means a
+Binance bar silently replaces the Coinbase bar for the same instrument and hour:
+only one venue survives per bar, and the cross-venue features that need both at
+the same timestamp — basis, lead-lag — would have produced no rows at all while
+the column sat there looking correct.
+
+`funding_rates` and `open_interest` had no venue column, and their inserts wrote
+literals: funding recorded `source = "coinbase"` for every row including Binance
+proxy rates, and open interest recorded `"ccxt"`, which names the client library
+rather than an exchange.
+
+This is §1.3 one level down. The venue column was added; the key was not.
+
+Fixed, with a rebuild path for existing databases (SQLite cannot alter a UNIQUE
+constraint) and four tests. Rows the old key already collapsed are unrecoverable —
+re-running the backfill is the only way to get the second venue back.
+
+### 9.2 The horizon came from the config, not the data
+
+`train_forecast_model` read the horizon from `config.label_horizon_hours(profile)`
+regardless of what the targets were built at. With `--horizon 8`, the targets
+resolved at 8h while the model purged its validation split at the profile's 96h
+and recorded 96h in its provenance.
+
+Too wide is merely wasteful. The same bug with a horizon *longer* than the
+profile's purges less than one label span, which leaks. And the recorded value is
+not cosmetic — it drives `effective_observations`, the denominator under every
+significance claim. Measured on the rehearsal dataset: 72 effective observations
+reported, against 922 actual. A 12.8x understatement.
+
+`horizon_bars` is now a parameter on `train_forecast_model`,
+`cross_validate_forecast`, `generate_walk_forward_forecasts` and
+`walk_forward_backtest`, and every caller passes `dataset.horizon_bars`.
+
+### 9.3 The horizon is what governs whether there is enough data at all
+
+Not a defect — a constraint, and the most important practical output of the
+rehearsal. Overlapping labels are not independent observations: a label spanning
+`h` bars overlaps its `h-1` neighbours, so the effective sample is roughly
+`timestamps / h`.
+
+On 92 days of hourly data across five instruments:
+
+| horizon | effective observations | verdict |
+|---------|-----------------------|---------|
+| 96h (the profile default) | 18 from 1,768 timestamps | far too few |
+| 8h | 232 from 1,856 timestamps | enough to start |
+
+The two ways out are quantifiable, and `scripts/preflight.py` now states both:
+keep the horizon and scrape about `200 x horizon / 24` days, or keep the history
+and shorten the horizon to about `timestamps / 200` hours. At the 96h default,
+200 effective observations needs roughly 2.2 years of hourly history.
+
+This is much cheaper to learn before an overnight scrape than after.
+
+### 9.4 What the rehearsal confirmed works
+
+On a driftless-price panel with AR(1) funding, the suite reported what it should:
+the carry head found the funding (in-sample IC +0.49) while the price head found
+nothing (−0.04), and the gates blocked promotion with ten failures. `--quick`
+correctly leaves the skipped simulation gates as failures, so a fast development
+run can never promote. The API reads the resulting ledger entry — blocked, with
+its ten named gates, correct horizon and effective-observation count — and reports
+"no promoted model" for feature importances rather than substituting anything.

@@ -40,12 +40,17 @@ def main() -> int:
     parser.add_argument('--timeframe', default='1h')
     parser.add_argument('--symbols', default=None, help='Comma-separated subset')
     parser.add_argument('--coverage', action='store_true',
-                        help='Report what the store holds and exit')
+                        help='Report what the store already holds, without migrating')
     args = parser.parse_args()
 
     store = ResearchStore(args.store) if args.store else ResearchStore()
 
     if args.coverage:
+        # Report only. Said out loud because `--coverage --db-path ...` reads as
+        # "migrate, then show me", and silently skipping the migration means the
+        # numbers below describe whatever was already there.
+        print(f'reporting on {store.root} without migrating '
+              f'(drop --coverage to migrate first)')
         for dataset in ('bars', 'funding', 'open_interest'):
             frame = store.coverage(dataset)
             print(f"\n{dataset}:")

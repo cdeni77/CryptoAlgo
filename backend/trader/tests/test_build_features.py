@@ -14,8 +14,8 @@ import pytest
 
 from core.config import Config
 from core.datastore import ResearchStore
+from core.dataset import load_dataset
 from core.features import feature_columns
-from scripts.build_features import build
 
 SYMBOLS = ('BIP', 'ETP', 'SLP', 'XPP', 'DOP')
 PRICES = {'BIP': 60_000.0, 'ETP': 3_000.0, 'SLP': 150.0, 'XPP': 2.2, 'DOP': 0.35}
@@ -86,12 +86,18 @@ def store(tmp_path) -> ResearchStore:
 
 
 def _build(store: ResearchStore, config: Config, **kwargs) -> pd.DataFrame:
+    """Go through `core.dataset`, the loader every script and the live path share.
+
+    Testing the shared loader rather than one CLI's wrapper is the point: if this
+    passes, `build_features`, `train`, `backtest` and `signals` all see the same
+    panel, because there is only one function that can build one.
+    """
     params = dict(
         venue='coinbase', reference_venue='binance',
         symbols=list(SYMBOLS), config=config,
     )
     params.update(kwargs)
-    return build(store, **params)
+    return load_dataset(store, **params).features
 
 
 def test_builds_a_full_panel(store, config):

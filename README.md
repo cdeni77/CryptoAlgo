@@ -1,286 +1,234 @@
 # CryptoAlgo
 
-CryptoAlgo is a full-stack crypto trading research and monitoring workspace with:
+A research platform for trading Coinbase CDE perpetual futures. Three services:
 
-- a **FastAPI backend** for prices, trades, signals, wallet, and paper-trading telemetry,
-- a **React + Vite frontend** dashboard,
-- a **trader service** for data collection, feature engineering, signal generation, retraining, and optimization.
+- **trader** — data collection, features, model, simulation, promotion gates, paper trading
+- **api** — FastAPI over PostgreSQL, serving what the trader wrote
+- **frontend** — React/Vite dashboard
 
-It is designed for Coinbase CDE/perpetual workflows and includes both live orchestration and offline backtesting/optimization paths.
+The organising idea is that **nothing reaches live except through the gates**. A
+model is trained, walk-forward backtested, resampled, cost-stressed, run against
+synthetic panels, and measured against a fixed set of promotion criteria. It is
+installed only if every one of them passes. Rejections are kept, because the
+count of attempts is what the deflated Sharpe ratio has to discount by.
 
 ---
 
-## Repository Structure
+## Repository structure
 
 ```text
 backend/
-  api/        FastAPI service + PostgreSQL models/endpoints
-  trader/     Data pipeline, feature engineering, training, optimization, orchestrator
-frontend/     React/Vite dashboard
+  api/                FastAPI service, PostgreSQL models, endpoints, controllers
+  trader/
+    core/             The library: costs, features, targets, model, signal,
+                      backtest, simulation, promotion
+    data_collection/  Scraper: exchange clients, validation, SQLite storage
+    scripts/          One entrypoint per verb
+    configs/exchange/ Venue fee schedules
+frontend/             React 18 + Vite + TypeScript + Tailwind
+docs/RESEARCH_PIPELINE.md   The design spec. Read it before changing core/.
 docker-compose.yml
 ```
 
-Core trader scripts:
-
-- `scripts/run_pipeline.py` — OHLCV/funding/OI collection and backfill
-- `scripts/compute_features.py` — feature generation into CSV artifacts
-- `scripts/train_model.py` — backtesting + signal generation
-- `scripts/live_orchestrator.py` — scheduled cycle runner (pipeline → features → signals)
-- `scripts/optimize.py` — single-coin Optuna optimization with true holdout evaluation
-- `scripts/parallel_launch.py` — process-level multi-coin optimization launcher
-- `scripts/validate_robustness.py` — post-optimization robustness validation
-- `scripts/paper_engine.py` — paper trading execution engine
-- `scripts/prune_features.py` — feature pruning utility
-- `scripts/preflight_check.py` — preflight system validation
-
 ---
 
-## High-Level Architecture
+## The pipeline
 
 ```text
-Exchanges / Coinbase
-        │
+Coinbase (+ Binance as a reference venue)
+        │  run_pipeline
         ▼
-backend/trader/scripts/run_pipeline.py
-        │
+SQLite — the scraper's landing zone, venue-keyed
+        │  migrate_to_research_store
         ▼
-backend/trader/scripts/compute_features.py
-        │
-        ├────────────► backend/trader/scripts/train_model.py --signals
-        │                  │
-        │                  ├─ model artifacts (joblib)
-        │                  └─ writes trades/signals/paper telemetry
-        │
-        └────────────► backend/trader/scripts/optimize.py (offline tuning)
-
-backend/api (FastAPI + Postgres) ◄──────── frontend (React dashboard)
+Parquet + DuckDB — bitemporal, point-in-time readable
+        │  build_features
+        ▼
+Feature panel — 76 features in nine mechanism groups
+        │  core/targets.py
+        ▼
+Targets — net return, decomposed into price, carry and cost
+        │  train
+        ▼
+Model — three heads: price, carry, dispersion
+        │  core/signal.py decide()
+        ▼
+Decisions — one implementation, shared by the backtest and the live writer
+        │  backtest → simulation → gates
+        ▼
+promote — installs only if every gate passes
+        │  signals
+        ▼
+paper_engine — accounted exactly as the backtest accounts
 ```
+
+### What the model predicts
+
+Net return over the horizon, split into its parts:
+
+    net_long  = price_return + carry_return - cost
+    net_short = -price_return - carry_return - cost
+
+so `net_long + net_short == -2 * cost` exactly. The decomposition is the point.
+On hourly-funding perps, carry is the most plausible edge available — 2bp/hour is
+48bp/day against a round trip of 5bp (DOGE) to 54bp (ETH) — and a model that
+cannot express carry separately from price cannot find it.
 
 ---
 
-## Services (Docker Compose)
+## Running it
 
-`docker-compose.yml` defines:
-
-- **db**: PostgreSQL 16
-- **backend**: FastAPI (`/coins`, `/trades`, `/signals`, `/wallet`, `/paper`)
-- **frontend**: Nginx-served Vite build with Trading Terminal (`/`) and Strategy Lab (`/strategy`) routes
-- **trader**: orchestrated ML/data pipeline service
-
-Default local ports:
-
-- Frontend: `http://localhost:3000`
-- Backend API: `http://localhost:8000`
-- Postgres: `localhost:5432`
-
----
-
-## Quick Start
-
-### 1) Prerequisites
-
-- Docker + Docker Compose
-- Coinbase API credentials (optional for some public reads, required for full workflows)
-
-### 2) Configure environment
-
-At minimum, export or place in shell env:
+### Full stack
 
 ```bash
-export COINBASE_API_KEY="..."
-export COINBASE_API_SECRET="..."
-# Optional JSON for additional wallets: [{"coin":"SOL","address":"..."}, ...]
-export LEDGER_WALLETS_JSON='[]'
-```
-
-### 3) Start the stack
-
-```bash
+cp .env.example .env      # POSTGRES_PASSWORD is required
 docker compose up --build db backend frontend trader
 ```
 
-This starts:
+Postgres and the API bind to loopback. `POST /research/launch` needs `API_TOKEN`
+set and fails closed without it.
 
-- API + frontend,
-- trader orchestrator running periodic cycles,
-- persisted volumes for trader DB/models/logs and Postgres.
-
----
-
-## Common Workflows
-
-### Live/trader cycle (default service behavior)
-
-The orchestrator runs:
-
-1. `scripts/run_pipeline.py` (backfill/incremental market data)
-2. `scripts/compute_features.py`
-3. `scripts/train_model.py --signals`
-
-with scheduled repetition controlled by env/CLI options in `scripts/live_orchestrator.py`.
-
-### One-off backtest
+### Development
 
 ```bash
-docker compose run --rm trader \
-  python -m scripts.train_model --backtest --threshold 0.80 --min-auc 0.54 --leverage 4
+cd frontend && npm ci && npm run dev
+cd backend/api && pip install -r requirements.txt && uvicorn app:app --reload
 ```
 
-### Retrain-only run once
+### The research loop
+
+Every trader script shares the same data arguments (see `scripts/_common.py`), so
+none of them can disagree about which dataset they are looking at.
 
 ```bash
-docker compose run --rm trader \
-  python -m scripts.live_orchestrator --retrain-only --run-once --train-window-days 90
+cd backend/trader
+
+# 1. Collect, and move it into the research store
+python -m scripts.run_pipeline --backfill-only --backfill-days 365
+python -m scripts.migrate_to_research_store --venue coinbase
+
+# 2. Check it can actually train, BEFORE the long scrape
+python -m scripts.preflight
+
+# 3. Build the panel
+python -m scripts.build_features
+
+# 4. Train for inspection
+python -m scripts.train
+
+# 5. Walk-forward, simulation stack, gates — installs nothing
+python -m scripts.backtest --full
+
+# 6. Evaluate a candidate and install it if the gates pass
+python -m scripts.promote
+python -m scripts.promote --history      # what has been tried, and why not
+
+# 7. Search, decide, trade
+python -m scripts.search
+python -m scripts.signals
+python -m scripts.paper_engine
 ```
 
-### Parallel Optuna launch
+`scripts.live_orchestrator` runs steps 1, 3 and 7 on a cycle, with retraining on
+its own cadence through `promote`. It decides *when* to evaluate a candidate; it
+never decides whether one is good.
+
+---
+
+## Run preflight before you scrape
+
+Overlapping labels are not independent observations. A label spanning `h` bars
+overlaps its `h-1` neighbours, so the effective sample is roughly
+`timestamps / h`. Treating the row count as the sample size is how a t-statistic
+ends up several times too confident.
+
+Measured on 92 days of hourly data across five instruments:
+
+| horizon | effective observations | verdict |
+|---------|-----------------------|---------|
+| 96h | 18 from 1,768 timestamps | far too few |
+| 8h  | 232 from 1,856 timestamps | enough to start |
+
+The horizon and the history length trade off directly, and `scripts/preflight.py`
+quantifies both ways out: scrape about `200 x horizon / 24` days, or shorten the
+horizon to about `timestamps / 200` hours. It is much cheaper to learn this
+before an overnight scrape than after.
+
+---
+
+## The promotion gates
+
+Defined in `core/metrics.py:DEFAULT_GATES`, and every one of them has to pass. A
+gate with no measurement **fails** — "we did not run that test" is not evidence
+of safety.
+
+| gate | threshold | what it protects against |
+|------|-----------|--------------------------|
+| `cpcv_median_sharpe` | ≥ 0.5 | picking the best path instead of the middle |
+| `cpcv_p05_sharpe` | ≥ 0.0 | a strategy whose bad paths lose money |
+| `pbo` | ≤ 0.30 | the in-sample winner losing out-of-sample |
+| `deflated_sharpe` | ≥ 0.0 | the best of fifty random strategies looking good |
+| `bootstrap_positive_fraction` | ≥ 0.90 | one lucky ordering of trades |
+| `synthetic_positive_fraction` | ≥ 0.60 | fragility to paths that did not happen |
+| `stressed_median_sharpe` | ≥ 0.0 | costs being worse than assumed |
+| `parameter_plateau` | ≥ 0.60 | a spike fitted to noise rather than a mechanism |
+| `oos_trades` | ≥ 100 | statistics on too few trades |
+| `max_exit_participation` | ≤ 0.20 | fills that are fiction at the claimed size |
+
+`--force` can override them, but it requires a reason and records it, so a forced
+model stays visibly forced for as long as it is live. The `/model` route in the
+dashboard shows all of this, including the rejections.
+
+---
+
+## What the platform will not tell you
+
+Worth stating, because the machinery is easy to believe:
+
+- **Synthetic panels are not evidence of edge.** A generator contains only the
+  structure calibrated into it. Fit one with momentum and momentum strategies
+  will work on it; fit one without and nothing will. They test robustness and
+  sizing.
+- **A backtest cannot price liquidity it never saw.** Entries are sized against a
+  trailing lower-quartile of volume so the position stays exitable, but exits
+  land where the barrier fires. Exit participation is reported and gated, not
+  capped.
+- **Open interest comes from a proxy venue.** Coinbase publishes none, so the
+  positioning features describe a different book than the one being traded. The
+  loader says so in its warnings rather than leaving it implicit.
+- **A missing measurement is served as null.** The dashboard says "not measured"
+  instead of showing a plausible number. This is deliberate and hard-won.
+
+---
+
+## Testing
 
 ```bash
-docker compose run --rm trader \
-  python -m scripts.parallel_launch --trials 200 --jobs 16 --coins BTC,ETH,SOL,XRP,DOGE
+cd backend/trader && pytest              # the library and the pipeline
+cd backend/api    && pytest              # auth, argument validation, response shapes
+cd frontend       && npm run typecheck && npm run lint && npm run build
 ```
 
-Current optimization defaults are tuned for stronger robustness:
+The trader suite is organised around the failure modes that produced fake edge
+before, and each test names the one it guards:
 
-- `holdout-days=120`
-- `plateau-patience=100`
-- `plateau-min-delta=0.02`
-- `plateau-warmup=60`
-
-### Direct single-coin optimization
-
-```bash
-docker compose run --rm trader \
-  python -m scripts.optimize --coin BTC --trials 100 --jobs 1
-```
-
-### Strategy families
-
-`train_model.py` and `optimize.py` support the `--strategy-family` flag:
-
-| Family | Description |
-|---|---|
-| `momentum_trend` | Default — trades in direction of recent momentum |
-| `breakout` | Triggers on price breakouts beyond a rolling range |
-| `mean_reversion` | Fades extended moves back toward equilibrium |
-| `vol_overlay` | Volatility-weighted directional bias |
-| `trend_pullback` | Enters on pullbacks within an established trend |
-| `breakout_expansion` | Combines breakout strength with range-expansion confirmation |
-
-### Preflight check
-
-```bash
-docker compose run --rm trader python -m scripts.preflight_check
-```
-
-Validates exchange connectivity, DB paths, and required env vars before a live run.
-
-### Paper trading engine
-
-```bash
-docker compose run --rm trader python -m scripts.paper_engine
-```
-
-Runs the paper trading simulation loop against live signals.
+- `test_backtest.py` — lookahead. Trading in-sample forecasts returned a mean
+  price PnL of +95,000 at t = +7 on driftless random walks.
+- `test_model.py` — symbol-identity memorisation. Identity alone scored an
+  information coefficient of +0.54 on random walks.
+- `test_cv_and_metrics.py` — leaked fold statistics, and the gate arithmetic.
+- `test_targets.py` — the cost identity.
+- `test_ingest.py` — venue keying. Without venue in the unique key, each venue's
+  bars silently overwrote the other's.
+- `test_promotion.py` — a blocked candidate reaching the live path.
+- `test_orm_parity.py` — the two duplicated ORM model sets diverging.
 
 ---
 
-## API Surface
+## Documentation
 
-Base URL: `http://localhost:8000`
-
-- `GET /` — API health message
-- `GET /coins/prices` — current tracked prices
-- `GET /coins/cde-specs` — contract metadata for tracked symbols
-- `GET /coins/history/{symbol}` — historical spot OHLCV
-- `GET /trades/*` — trade history endpoints
-- `GET /signals/*` — signal endpoints
-- `GET /wallet/` — wallet summary exposing paper trading + Coinbase spot/perps + optional env-configured Ledger addresses
-- `GET /paper/*` — paper orders/fills/positions/equity telemetry
-- `GET /research/summary` — global strategy health KPIs + per-coin health rows
-- `GET /research/coins/{coin}` — single-coin strategy health detail
-- `GET /research/runs` — recent train/optimize/validate timeline events
-- `GET /research/features/{coin}` — explainability-lite feature importance + signal distribution
-- `POST /research/launch/{job}` — launch supported trader scripts (`run_pipeline`, `compute_features`, `train_model`, `optimize`, `validate_robustness`, `parallel_launch`, `live_orchestrator`, `paper_engine`)
-
-Note: legacy `/ops` endpoints were intentionally removed; operational control is CLI/orchestrator-driven.
-
----
-
-## Data & Artifacts
-
-Trader service stores persistent artifacts via Docker volumes:
-
-- `/app/data` — SQLite pipeline DB + exported features
-- `/app/models` — trained model artifacts
-- `/app/logs` — orchestrator/runtime logs
-
-Postgres service stores API-facing trade/signal/wallet/paper tables.
-
----
-
-## Key Configuration Knobs
-
-### Trader / orchestration
-
-- `CYCLE_INTERVAL_SECONDS` (default 3600)
-- `INCREMENTAL_BACKFILL_HOURS` (default 6)
-- `TRAIN_WINDOW_DAYS`
-- `RETRAIN_EVERY_DAYS`
-- `SIGNAL_THRESHOLD`
-- `MIN_AUC`
-- `LEVERAGE`
-- `EXCLUDE_SYMBOLS`
-
-### Feature generation
-
-- `FEATURE_LOOKBACK_DAYS` (default `1095`) to cap historical span used by `scripts/compute_features.py`.
-
----
-
-## Frontend Notes
-
-The dashboard now has two pages:
-
-- `/` **Trading Terminal**: spot/CDE price cards, charting, trades/signals tables, wallet summary.
-- `/strategy` **Strategy Lab**: model health KPIs, coin strategy scoreboard, experiment timeline, explainability-lite panels, and all paper positions/equity/performance/fills views.
-
-Operations controls were removed from the frontend to match backend endpoint removal.
-
----
-
-## Local Development Without Docker
-
-You can run each layer directly, but Docker Compose is the canonical path.
-
-- Frontend: `npm ci && npm run dev` in `frontend/`
-- API: install `backend/api/requirements.txt`, run `uvicorn app:app`
-- Trader: install `backend/trader/requirements.txt`, then run `python -m scripts.<name>` from `backend/trader/`.
-
-Make sure DB paths and `DATABASE_URL` are aligned with your local setup.
-
----
-
-## Troubleshooting
-
-### Not enough data / missing symbols in training
-
-- ensure `scripts/run_pipeline.py` has completed backfill,
-- verify feature CSVs exist under trader data dir,
-- check symbol mappings and available exchange history windows.
-
-### API up but frontend missing data
-
-- verify backend reachable from frontend (`VITE_API_BASE_URL`),
-- confirm Postgres health and API DB connection,
-- inspect API logs for Coinbase request errors.
-
-### Optimization appears to start from different years per coin
-
-This is expected when historical availability differs by symbol; holdout slicing is relative to each run’s global end, while earlier start dates depend on available historical bars.
-
----
-
-## Disclaimer
-
-This repository is for research and engineering workflows, not financial advice. Crypto derivatives trading carries substantial risk.
+- `docs/RESEARCH_PIPELINE.md` — the design spec: the defects that motivated the
+  rebuild, the architecture, the simulation layer, the gates, and what
+  simulation cannot tell you.
+- `AGENTS.md` — module-by-module architecture and conventions.
+- `CLAUDE.md` — the short version, plus the commands.

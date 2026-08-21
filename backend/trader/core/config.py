@@ -29,6 +29,39 @@ FILTER_MODES = ('hard', 'soft', 'off')
 TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
 
 
+# Where a venue fee schedule can be found. Searched in order, because the same
+# code runs from a repo checkout (cwd anywhere) and from the container image
+# (/app), and a single computed relative path got this wrong in the container:
+# `configs/` used to live above the build context, so it was never copied into
+# the image and every containerised run silently priced contracts at the
+# hardcoded 10bp/side.
+COST_CONFIG_SEARCH_PATHS: tuple[Path, ...] = (
+    Path(__file__).resolve().parent.parent / 'configs' / 'exchange',
+    Path('/app/configs/exchange'),
+    Path('configs/exchange'),
+)
+
+DEFAULT_COST_CONFIG_NAME = 'coinbase_us_perps_cde_v202602.json'
+
+
+def find_cost_config(name: str = DEFAULT_COST_CONFIG_NAME) -> Optional[Path]:
+    """Locate a fee schedule by name, or return None.
+
+    An absolute or already-valid relative path is used as given; a bare filename
+    is looked up in the search paths. Returning None rather than raising is
+    deliberate: the caller decides whether a missing schedule is fatal, and it
+    should say so loudly rather than fall through to a default nobody chose.
+    """
+    candidate = Path(name)
+    if candidate.is_absolute() or candidate.exists():
+        return candidate if candidate.exists() else None
+    for directory in COST_CONFIG_SEARCH_PATHS:
+        found = directory / candidate.name
+        if found.exists():
+            return found
+    return None
+
+
 @dataclass
 class Config:
     """Global run settings. Per-coin values live in `core.profiles.CoinProfile`."""
@@ -43,7 +76,17 @@ class Config:
 
     # --- Entry filters (profiles override per coin) ---
     signal_threshold: float = 0.80
+    # Classification-era: a probability threshold plus this margin. The forecast
+    # is a return now, so the decision path uses `min_edge_over_cost` instead —
+    # reusing this as a return threshold demanded 200bp of expected net, which no
+    # hourly forecast will ever clear.
     min_signal_edge: float = 0.02
+    # Expected net return must exceed the round-trip cost by this multiple again.
+    # Expressed relative to cost rather than as an absolute, because cost ranges
+    # from ~5bp on the group-B contracts to ~54bp on ETH: an absolute floor would
+    # be trivially met on one and unreachable on the other. At 0.5, DOGE needs
+    # ~2.5bp of forecast edge and ETH needs ~27bp.
+    min_edge_over_cost: float = 0.5
     min_momentum_magnitude: float = 0.07
     momentum_score_threshold: float = 1.0
     momentum_strict_mode: bool = False
@@ -115,7 +158,16 @@ class Config:
     strategy_family: str = 'momentum_trend'
     trade_freq_bucket: str = 'balanced'
 
+    # --- Labelling ---
+    # Directional consensus needed before a bar is labelled at all: 2 requires
+    # all three momentum components to agree, 1 accepts two of three.
+    direction_score_threshold: int = 2
+
     # --- Family-specific knobs (profiles override per coin) ---
+    # Every value a profile can override needs a default here, or `resolve`
+    # cannot complete the CLI > profile > default chain for it. The last four
+    # belong to the funding_carry, squeeze_breakout and oi_divergence families,
+    # which is why they were missing: those families were unreachable.
     pullback_depth_threshold: float = 0.020
     rebound_confirmation_threshold: float = 0.004
     trend_strength_min: float = 0.002
@@ -123,6 +175,10 @@ class Config:
     breakout_lookback: int = 48
     breakout_buffer: float = 0.003
     expansion_confirm_threshold: float = 0.004
+    funding_z_threshold: float = 2.5
+    squeeze_pct_threshold: float = 0.20
+    liq_threshold: float = 0.30
+    oi_z_threshold: float = 1.0
 
     # Fields the user explicitly set on the command line.
     cli_overrides: frozenset[str] = frozenset()

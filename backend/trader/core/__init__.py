@@ -1,11 +1,6 @@
-"""Core trading utilities shared by strategy scripts."""
+"""Core trading library.
 
-from .coin_profiles import COIN_PROFILES, MODELS_DIR, get_coin_profile
-from .pg_writer import PgWriter
-
-__all__ = [
-    "COIN_PROFILES",
-    "MODELS_DIR",
-    "PgWriter",
-    "get_coin_profile",
-]
+Deliberately thin. Importing `core` used to pull in the profile table and a
+Postgres engine as a side effect, which meant a script that only wanted the cost
+model paid for a database connection. Import from the module you need.
+"""

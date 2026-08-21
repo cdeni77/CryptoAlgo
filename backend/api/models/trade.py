@@ -95,6 +95,11 @@ class PaperPosition(Base):
     sl_price = Column(Float, nullable=True)
     max_hold_until = Column(DateTime(timezone=True), nullable=True)
     exit_reason = Column(String, nullable=True)
+    # Funding accrued so far, in account currency. On hourly-funding perps this
+    # is the largest cost after commission — 2bp/hour over a day is 48bp against
+    # a 5-54bp round trip — and the paper engine persists it so a restart does
+    # not forget what the position has already cost.
+    funding_paid = Column(Float, nullable=False, default=0.0)
 
 
 class PaperEquityCurve(Base):
@@ -208,6 +213,7 @@ class PaperPositionResponse(BaseModel):
     sl_price: Optional[float] = None
     max_hold_until: Optional[datetime] = None
     exit_reason: Optional[str] = None
+    funding_paid: float = 0.0
 
     class Config:
         from_attributes = True
