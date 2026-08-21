@@ -1,0 +1,28 @@
+{
+  "last_retrain_attempt_at": "2026-08-21T21:39:19.465290+00:00",
+  "paper_monitoring": {
+    "evaluated_at": "2026-08-21T21:34:23.483699+00:00",
+    "kpis": {
+      "drawdown": 0.0,
+      "expectancy": 0.0,
+      "profit_factor": 0.0,
+      "trades": 0,
+      "trades_per_week": 0.0,
+      "win_rate": 0.0,
+      "window_days": 14
+    },
+    "reasons": [
+      "insufficient_samples:0<8"
+    ],
+    "status": "active",
+    "thresholds": {
+      "max_drawdown": 0.12,
+      "max_negative_expectancy_streak": 2,
+      "min_profit_factor": 0.9,
+      "min_samples": 8,
+      "min_trades_per_week": 4.5,
+      "min_win_rate": 0.42
+    },
+    "version": null
+  }
+}
