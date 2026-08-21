@@ -204,6 +204,38 @@ and both are useful.
 - **TypeScript/React**: Functional components + hooks only, no class components. Fetch-based API layer (no axios). `recharts` for charts.
 - **Tests**: `pytest` for trader. The suite's job is to catch the failure modes that produced fake edge before: lookahead (`test_backtest.py`), symbol-identity memorisation (`test_model.py`), leaked fold statistics (`test_cv_and_metrics.py`), the cost identity (`test_targets.py`), and blocked candidates reaching live (`test_promotion.py`). Mark anything over ~10s `@pytest.mark.slow`.
 
+## The reference venue needs a proxy from a US IP
+
+Coinbase data — the instrument actually traded — is authenticated and US-legal,
+so it scrapes fine. The *reference* venue does not: Binance, OKX and Bybit all
+answer HTTP 451 to a US IP, and open interest has no Coinbase-native source at
+all (`run_pipeline.py:412`), so both come through CCXT.
+
+Without `HTTPS_PROXY` set you lose two feature groups:
+
+| group | features | source | blocked from a US IP |
+|-------|---------:|--------|----------------------|
+| `cross_venue` (basis, lead-lag) | 7 | reference venue via CCXT | yes |
+| `positioning` (OI) | 6 | CCXT, no Coinbase endpoint | yes (and `--include-oi` is opt-in) |
+| `carry` | 9 | Coinbase native funding | no |
+| `market_factor` | 9 | Coinbase BTC bars | no |
+
+**This degrades quietly by construction.** `build_panel` reindexes to the
+canonical 76-column list so a saved model always scores against the same matrix,
+which means a group that produced nothing arrives as an *all-NaN column*, not an
+absent one — the panel keeps its shape and looks healthy. And
+`feature_set_hash` hashes column *names*, so a model fit behind a geo-block and
+one fit through a proxy have the identical hash.
+
+Two things now say so out loud: `load_dataset` warns when the reference venue
+yields no bars, naming the symbols and the consequence, and the model's
+provenance carries `empty_features` and `n_features_populated` alongside
+`n_features`. `tests/test_reference_venue.py` covers both.
+
+If the scraper's CCXT fallback served a different exchange, bars are stamped with
+*that* venue's name — point `--reference-venue` at whichever one it stored, or
+the reader asks for `binance` and matches nothing.
+
 ## Environment Variables
 
 See `AGENTS.md` for the full table. Minimum required for live workflows: `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DATABASE_URL`, `POSTGRES_PASSWORD` (compose refuses to start without it), `COST_CONFIG` (unset misprices every contract by 0.06x–2.5x), and `API_TOKEN` + `VITE_API_TOKEN` if you want the dashboard's script runner.

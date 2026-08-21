@@ -340,6 +340,14 @@ class ForecastModel:
     # history, which makes the recorded ic/r2 optimistic. Reported rather
     # than assumed, because the fallback fires exactly when data is scarce.
     validation_purged: bool = True
+    # Columns the panel declared but never populated. `build_panel` reindexes to
+    # the canonical column list so a saved model always scores against the same
+    # matrix, which means a feature group that produced nothing arrives as an
+    # all-NaN column rather than an absent one. `feature_set_hash` is over column
+    # *names*, so without this a model fit with the cross-venue group and one fit
+    # without it are indistinguishable — the likely case for a US operator, whose
+    # reference venue answers 451.
+    empty_features: tuple[str, ...] = ()
     train_start: Optional[pd.Timestamp] = None
     train_end: Optional[pd.Timestamp] = None
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -446,6 +454,8 @@ class ForecastModel:
             'train_rows': self.train_rows,
             'effective_observations': round(self.effective_observations, 1),
             'validation_purged': self.validation_purged,
+            'n_features_populated': len(self.feature_columns) - len(self.empty_features),
+            'empty_features': list(self.empty_features),
             'train_start': str(self.train_start) if self.train_start is not None else None,
             'train_end': str(self.train_end) if self.train_end is not None else None,
             'symbols': list(self.symbol_categories),
@@ -617,6 +627,18 @@ def train_forecast_model(
     if not heads:
         return None
 
+    empty = tuple(
+        column for column in x.columns
+        if column != SYMBOL_COLUMN and x[column].isna().all()
+    )
+    if empty:
+        logger.warning(
+            'trained on %d of %d declared features: %s carried no data at all. '
+            'A feature group that produced nothing still arrives as an all-NaN '
+            'column, and the feature-set hash cannot see the difference',
+            len(x.columns) - len(empty), len(x.columns), ', '.join(empty),
+        )
+
     return ForecastModel(
         heads=heads,
         feature_columns=tuple(x.columns),
@@ -629,6 +651,7 @@ def train_forecast_model(
         train_rows=int(train_mask.sum()),
         effective_observations=_panel_effective_observations(x.index[train_mask], horizon),
         validation_purged=not purge_disabled,
+        empty_features=empty,
         train_start=pd.Timestamp(times[train_mask].min()) if train_mask.any() else None,
         train_end=pd.Timestamp(times[train_mask].max()) if train_mask.any() else None,
         metrics=metrics,

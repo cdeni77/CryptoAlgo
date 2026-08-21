@@ -16,7 +16,6 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
-import numpy as np
 import pandas as pd
 
 from core.config import Config
@@ -321,6 +320,8 @@ def load_dataset(
     bars: dict[str, pd.DataFrame] = {}
     funding: dict[str, pd.DataFrame] = {}
     oi_venues_used: set[str] = set()
+    symbols_with_reference: list[str] = []
+    symbols_without_reference: list[str] = []
 
     for symbol in requested:
         symbol_bars = _frame_for(store, 'bars', symbol, venue, as_of=as_of, min_quality=min_quality)
@@ -355,6 +356,9 @@ def load_dataset(
             _frame_for(store, 'bars', symbol, reference_venue, as_of=as_of, min_quality=min_quality)
             if reference_venue else pd.DataFrame()
         )
+        if reference_venue:
+            (symbols_with_reference if not reference_bars.empty
+             else symbols_without_reference).append(symbol)
 
         bars[symbol] = symbol_bars
         funding[symbol] = symbol_funding
@@ -383,6 +387,26 @@ def load_dataset(
             for symbol in bars if symbol in features.index.get_level_values('symbol')
         },
     )
+
+    # A reference venue that returns nothing is the quietest degradation in the
+    # loader: `cross_venue_features` returns an empty frame rather than NaN
+    # columns, so the panel is simply seven features narrower and looks healthy.
+    # It is also the likely case for a US operator — Binance, OKX and Bybit all
+    # answer 451 to a US IP — so it has to be said out loud.
+    if reference_venue and symbols_without_reference:
+        detail = (
+            'none of them' if not symbols_with_reference
+            else f'{len(symbols_without_reference)} of '
+                 f'{len(symbols_without_reference) + len(symbols_with_reference)}'
+        )
+        warnings.append(
+            f'no {reference_venue} bars for {detail}: '
+            f'{", ".join(sorted(symbols_without_reference))}. The cross-venue '
+            f'group (basis, lead-lag) is empty for those symbols, so the panel '
+            f'is narrower than it looks. If the venue is geo-blocked, scrape '
+            f'through a proxy; if the scraper fell back to another exchange, '
+            f'point --reference-venue at whichever one it stored.'
+        )
 
     if oi_venues_used:
         warnings.append(

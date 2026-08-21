@@ -125,6 +125,7 @@ Persistent volumes: `postgres_data`, `trader_data`, `trader_models`, `trader_log
 | `COST_CONFIG`               | `coinbase_us_perps_cde_v202602.json` — unset misprices every contract by 0.06x–2.5x | trader, paper-engine |
 | `TRADE_VENUE`               | `coinbase`              | trader    |
 | `REFERENCE_VENUE`           | `binance`               | trader    |
+| `HTTPS_PROXY` / `HTTP_PROXY` | unset — **required from a US IP** for reference-venue and open-interest data (Binance, OKX and Bybit all answer 451) | trader |
 | `SYMBOLS`                   | unset (the whole profile universe) | trader |
 | `EQUITY`                    | `100000`                | trader    |
 | `LEVERAGE`                  | `4`                     | trader    |
