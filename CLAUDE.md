@@ -227,13 +227,37 @@ fails if `build_targets` reaches for it.
 
 ### What the data actually supports, on the honest target
 
-- **Direction: nothing.** Holdout price IC is -0.027 at h=2, and +0.002 walk-forward.
-- **Volatility: a lot.** The dispersion head scores **+0.34**, and it went *up* when
-  the target was fixed, because it never depended on the artifact. Returns are
-  near-unpredictable and volatility is very predictable, which is the textbook
-  result and not a disappointment.
-- **Carry: still untested.** 18 funding rows. It is the one part of the original
-  thesis that has never been evaluated, and it accumulates forward only.
+**Direction: nothing.** Fifteen group-by-horizon combinations, walk-forward across
+three quarters, tradeable target. Per-quarter IC, and how many of the three shared
+the mean's sign:
+
+| group | h=1h | h=2h | h=4h |
+|-------|------|------|------|
+| cross_venue | +0.006 +0.011 +0.018 (**3/3**) | -0.003 -0.006 +0.015 (1/3) | -0.004 +0.007 -0.004 (1/3) |
+| cross_venue+trend | +0.002 +0.005 +0.007 (3/3) | +0.004 -0.014 +0.011 (2/3) | -0.002 -0.006 +0.018 (1/3) |
+| trend | +0.003 -0.000 -0.001 (1/3) | -0.001 -0.016 +0.003 (1/3) | +0.004 -0.009 +0.013 (2/3) |
+| liquidity | -0.014 -0.008 -0.007 (0/3) | +0.002 -0.008 +0.002 (2/3) | +0.001 -0.019 -0.005 (1/3) |
+| all populated | +0.005 +0.005 -0.009 (2/3) | +0.010 +0.015 -0.005 (2/3) | +0.018 +0.002 -0.037 (2/3) |
+
+The largest is `cross_venue` at h=1h: +0.012, positive in all three quarters, and
+an expected edge of **0.8bp against a 6.1bp cheapest round trip**. It also flips
+sign at h=2h and h=4h. Three-of-three sign agreement happens by chance in a
+quarter of cells, and 15 were tested, so three or four such cells are expected from
+noise. Treat this table as a negative result, and don't mine it.
+
+`cross_venue` remains the most interesting group because it has a *mechanism* — a
+thin nano perp lagging the deep Coinbase spot book its own index is built from —
+rather than a fitted pattern. But a mechanism that produces 0.8bp against a 6.1bp
+toll is not a strategy.
+
+**Volatility: a lot.** The dispersion head scores **+0.34** on the holdout, and it
+went *up* when the target was fixed, because it never depended on the artifact.
+Returns are near-unpredictable and volatility is very predictable, which is the
+textbook result and not a disappointment — but on perps, with no options, a
+volatility forecast improves sizing and gates entries. It is not itself tradeable.
+
+**Carry: still untested.** 18 funding rows. It is the one part of the original
+thesis that has never been evaluated, and it accumulates forward only.
 
 ### The sample is one bear market and one reversal
 

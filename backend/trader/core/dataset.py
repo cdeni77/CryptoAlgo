@@ -449,11 +449,9 @@ def load_dataset(
     # Group selection reaches build_panel, which also reindexes to
     # `feature_columns(groups)` — so a restricted panel has a genuinely shorter
     # canonical column list rather than the full 76 with the rest all-NaN. That
-    # matters: all-NaN columns still cost the model splits to rule out. Measured
-    # walk-forward against the tradeable target, cross_venue (7 features) is the
-    # only group positive in all three quarters — IC +0.012 at 1h against +0.000
-    # for all 61 that carry data — though under 1bp of edge against a 6.1bp
-    # cheapest round trip means it picks a better model, not a tradeable one.
+    # matters: all-NaN columns still cost the model splits to rule out. But no
+    # subset is known to be better — measured walk-forward against the tradeable
+    # target over 15 group-by-horizon cells, no group holds a consistent sign.
     features = build_panel(inputs, config=config, groups=feature_groups)
     resolved_horizon = horizon_bars or config.label_horizon_hours()
     targets = build_target_panel(

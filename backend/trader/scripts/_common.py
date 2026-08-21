@@ -52,18 +52,19 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                              "is a rule that reproduces itself rather than a "
                              "symbol list someone has to remember the reason for.")
     parser.add_argument('--feature-groups', default=None,
-                        help="Comma-separated feature groups to build, e.g. "
-                             "'cross_venue'. Default: all of them. Measured "
-                             "walk-forward on 399 days across three quarters "
-                             "against the tradeable open-to-open target, "
-                             "cross_venue (7 features) is the only group positive "
-                             "in every quarter, at IC +0.012 at a 1h horizon "
-                             "against +0.000 for all 61 that carry data. That is "
-                             "an edge of under 1bp against a cheapest round trip "
-                             "of 6.1bp, so it selects a better model rather than a "
-                             "tradeable one. Groups: carry, cross_venue, "
-                             "volatility, liquidity, positioning, trend, "
-                             "market_factor, seasonality, cost.")
+                        help="Comma-separated feature groups to build. Default: "
+                             "all of them, and on the evidence so far that is as "
+                             "good as any subset. Measured walk-forward across "
+                             "three quarters against the tradeable target, over 15 "
+                             "group-by-horizon combinations, no group holds a "
+                             "consistent sign: the best is cross_venue at h=1h "
+                             "(+0.012, positive in all three), which flips sign at "
+                             "h=2h and h=4h, and 3-of-3 agreement arises by chance "
+                             "in a quarter of cells. Use this to isolate a group "
+                             "for research, not because a subset is known to be "
+                             "better. Groups: carry, cross_venue, volatility, "
+                             "liquidity, positioning, trend, market_factor, "
+                             "seasonality, cost.")
     parser.add_argument('--cost-config', default=DEFAULT_COST_CONFIG_NAME,
                         help="Venue fee schedule: a path, or a filename looked up "
                              "in configs/exchange. 'none' to use the hardcoded default.")
