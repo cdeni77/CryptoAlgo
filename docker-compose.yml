@@ -29,6 +29,7 @@ services:
   # Backend API — FastAPI serving prices, trades, wallet to the frontend
   # ===========================================================================
   backend:
+    restart: unless-stopped
     build:
       context: ./backend/api
       dockerfile: Dockerfile
@@ -64,6 +65,7 @@ services:
   # Frontend — React/Vite dashboard
   # ===========================================================================
   frontend:
+    restart: unless-stopped
     build:
       context: ./frontend
       dockerfile: Dockerfile
