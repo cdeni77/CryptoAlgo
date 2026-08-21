@@ -366,3 +366,76 @@ def test_a_spot_only_scrape_exits_clean():
         'the funding failure is not conditioned on the run containing perpetuals, '
         'so a spot-only reference scrape exits 1 and aborts the live cycle'
     )
+
+
+def test_reference_history_deeper_than_the_trade_venue_is_unused(tmp_path):
+    """Spot older than the oldest perp bar cannot reach the panel.
+
+    `cross_venue_features` reindexes the reference series onto the *perp* index,
+    so anything before the first perp bar is dropped by that reindex — and the
+    reference venue feeds nothing else here: `load_dataset`'s funding and open
+    interest fallbacks both consult it, and Coinbase spot has neither.
+
+    This is why the scrape asks for 400 days on both legs rather than 1100 on
+    spot. CDE's oldest contract (BIP) was listed 2025-07-18, and the panel cannot
+    use a reference bar older than that. Measured rather than reasoned: one spot
+    path, truncated to the perp span versus left at full depth, must produce
+    identical cross-venue columns.
+    """
+    symbols = ('BIP', 'ETP', 'SLP')
+    prices = {'BIP': 60_000.0, 'ETP': 3_000.0, 'SLP': 150.0}
+    end = pd.Timestamp('2026-08-21 20:00', tz='UTC')
+    perp_hours, deep_hours = 60 * 24, 200 * 24
+
+    # One spot path per symbol, generated once at full depth.
+    spot_truth = {}
+    for i, symbol in enumerate(symbols):
+        rng = np.random.default_rng(1000 + i)
+        index = pd.date_range(end=end, periods=deep_hours, freq='1h')
+        spot_truth[symbol] = pd.Series(
+            prices[symbol] * np.exp(np.cumsum(rng.normal(0.0001, 0.012, deep_hours))),
+            index=index,
+        )
+
+    def frame(venue, symbol, close, rng):
+        opens = np.concatenate([[close.iloc[0]], close.values[:-1]])
+        return pd.DataFrame({
+            'venue': venue, 'symbol': symbol, 'event_time': close.index,
+            'available_time': close.index + pd.Timedelta(hours=1), 'quality': 'valid',
+            'open': opens, 'high': np.maximum(opens, close.values) * 1.004,
+            'low': np.minimum(opens, close.values) * 0.996, 'close': close.values,
+            'volume': rng.lognormal(8, 0.6, len(close)),
+            'quote_volume': np.nan, 'trade_count': np.nan,
+        })
+
+    def panel(spot_hours, root):
+        store = ResearchStore(root)
+        for i, symbol in enumerate(symbols):
+            index = pd.date_range(end=end, periods=perp_hours, freq='1h')
+            rng = np.random.default_rng(i)
+            close = pd.Series(
+                prices[symbol] * np.exp(np.cumsum(
+                    np.random.default_rng(i).normal(0.0001, 0.012, perp_hours))),
+                index=index,
+            )
+            store.write('bars', frame('coinbase', symbol, close, rng))
+            store.write('bars', frame('coinbase_spot', symbol,
+                                      spot_truth[symbol].tail(spot_hours),
+                                      np.random.default_rng(i)))
+        return load_dataset(store, venue='coinbase', reference_venue='coinbase_spot',
+                            symbols=list(symbols), min_quality='valid').features
+
+    shallow = panel(perp_hours, tmp_path / 'shallow')
+    deep = panel(deep_hours, tmp_path / 'deep')
+
+    cross_venue = [c for c in shallow.columns
+                   if c.startswith(('basis', 'ref_', 'lead_lag', 'contemp'))]
+    assert len(cross_venue) == 7, f'expected 7 cross-venue columns, got {cross_venue}'
+    assert shallow.shape == deep.shape
+
+    difference = (shallow[cross_venue] - deep[cross_venue]).abs().max().max()
+    assert difference == 0.0, (
+        f'reference history before the first perp bar changed the panel by '
+        f'{difference} — the reindex is no longer bounding it, so the scrape depth '
+        f'on the reference leg now matters'
+    )

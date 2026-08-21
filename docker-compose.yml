@@ -208,9 +208,19 @@ services:
       # and `.gitignore`'s blanket `data/` rule swallowed the file anyway, so the
       # suite failed from a clean clone while passing locally.
     # The orchestrator: initial backfill (30d) then hourly cycles
+    # 400 days, not 30. `--backfill-days` sets the depth of the FIRST cycle only
+    # — every cycle after it uses INCREMENTAL_BACKFILL_HOURS — so on a store that
+    # already holds history this is a cheap gap-fill, and on an empty one it
+    # *defines* the dataset. At 30 days a 24h horizon carries roughly 30 effective
+    # observations against the ~200 the promotion gates need, so every candidate
+    # would fail the sample-size gate for a reason nothing in the log named, and
+    # the loop would look healthy for weeks. 400 covers the whole of CDE: BIP, the
+    # oldest contract, was listed 2025-07-18. The reference-venue leg uses the
+    # same window, which is all the spot history the panel can use — it is joined
+    # onto the perp index, so bars older than the oldest perp are unreachable.
     command: >
       -m scripts.live_orchestrator
-        --backfill-days 30
+        --backfill-days 400
 
   # ===========================================================================
   # Paper Engine — consumes signals from PostgreSQL and simulates fills

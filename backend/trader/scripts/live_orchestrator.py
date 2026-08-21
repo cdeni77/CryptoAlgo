@@ -389,6 +389,58 @@ def _scrape_reference(args: argparse.Namespace, window_hours: float) -> None:
     _run_step('scrape-reference', command)
 
 
+def _preflight(args: argparse.Namespace) -> None:
+    """Once, after the first cycle: can this store train a promotable model?
+
+    `--backfill-days` sets the depth of the FIRST cycle only; every cycle after
+    it uses `--incremental-backfill-hours`. So on a store that already holds
+    history it is a harmless re-fetch, and on an empty one it silently *defines*
+    the dataset. Thirty days at a 24h horizon is roughly 30 effective
+    observations against the ~200 the gates require, so every promotion attempt
+    would fail the sample-size gate — correctly, and for a reason nothing in the
+    log named. The loop would look healthy for weeks.
+
+    Advisory, and deliberately not a gate: refusing to start would also refuse to
+    collect, and funding and open interest are forward-only, so a thin store is a
+    reason to run the loop rather than a reason not to. `scripts.promote` remains
+    the only thing that decides whether a model installs.
+    """
+    command = [
+        sys.executable, '-m', 'scripts.preflight',
+        '--venue', args.venue,
+        '--min-quality', args.min_quality,
+        '--skip-fit',                      # the fit is the slow part and not the question here
+    ]
+    if args.store:
+        command += ['--store', args.store]
+    if args.reference_venue:
+        command += ['--reference-venue', args.reference_venue]
+    if args.symbols:
+        command += ['--symbols', args.symbols]
+    if args.cost_config:
+        command += ['--cost-config', args.cost_config]
+    if args.horizon:
+        command += ['--horizon', str(args.horizon)]
+    if args.recency_half_life_days:
+        command += ['--recency-half-life-days', str(args.recency_half_life_days)]
+    if args.train_window_days:
+        command += ['--train-window-days', str(args.train_window_days)]
+
+    # Any exit code. A failing check is the message, not an error in the loop.
+    code = _run_step('preflight', command, allow_codes=tuple(range(0, 8)))
+    if code != 0:
+        LOGGER.error(
+            'preflight reported blocking findings (exit %d). The loop keeps '
+            'collecting — funding and open interest are forward-only, so a thin '
+            'store is a reason to run it — but promotion will keep failing until '
+            'they are addressed. A common cause on a fresh store: '
+            '--backfill-days is the FIRST cycle only, so it defined the whole '
+            'dataset. Deepen it with `run_pipeline --backfill-only '
+            '--backfill-days 400` (and `--spot-universe` for the reference '
+            'venue), then re-sync.', code,
+        )
+
+
 def _sync_store(args: argparse.Namespace) -> None:
     """Move what the scraper wrote into the research store.
 
@@ -624,6 +676,7 @@ def main() -> int:
     try:
         quarantined, _ = evaluate_live_model(writer)
         _run_cycle(args, args.backfill_days * 24, quarantined=quarantined)
+        _preflight(args)
 
         cycle = 1
         while not STOP_REQUESTED:

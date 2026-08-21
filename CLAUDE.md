@@ -275,15 +275,33 @@ Two things make it work:
 # Perps
 python -m scripts.run_pipeline --backfill-only --backfill-days 400 --timeframes 1h
 
-# Spot, under its own label, for the basis
-python -m scripts.run_pipeline --backfill-only --backfill-days 1100 --timeframes 1h \
-  --venue-label coinbase_spot \
-  --symbols BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD,AVAX-USD,ADA-USD,LINK-USD,LTC-USD
+# Spot, under its own label, for the basis. Same 400 days, and --spot-universe
+# resolves all 18 products rather than naming nine by hand.
+python -m scripts.run_pipeline --backfill-only --backfill-days 400 --timeframes 1h \
+  --spot-universe
 
 python -m scripts.migrate_to_research_store --venue coinbase
-python -m scripts.preflight --horizon 24 --recency-half-life-days 365 \
-  --reference-venue coinbase_spot
+python -m scripts.preflight --horizon 24 --recency-half-life-days 365
 ```
+
+**Both legs are 400 days, not 1100 on spot.** This used to ask for 1100, and it
+was wasted: `cross_venue_features` reindexes the reference series onto the *perp*
+index, so a spot bar older than the oldest perp bar is dropped by that reindex —
+and the reference venue feeds nothing else, since `load_dataset`'s funding and
+open-interest fallbacks both consult it and Coinbase spot has neither. Measured,
+not reasoned: one spot path truncated to the perp span versus left at full depth
+produces bit-identical cross-venue columns, which
+`tests/test_reference_venue.py::test_reference_history_deeper_than_the_trade_venue_is_unused`
+now pins. 400 covers all of CDE anyway — BIP, the oldest contract, was listed
+2025-07-18.
+
+**`--backfill-days` in `docker-compose.yml` is the FIRST cycle only.** Every cycle
+after it uses `INCREMENTAL_BACKFILL_HOURS`, so on a populated store it is a cheap
+gap-fill and on an empty one it *defines* the dataset. It was 30, which at a 24h
+horizon is roughly 30 effective observations against the ~200 the gates need — so
+a fresh start could never promote anything, and nothing in the log said why. It is
+400 now, and the orchestrator runs `scripts.preflight` once after the first cycle
+so the verdict is in the log rather than inferred from repeated gate failures.
 
 Note the panel needs at least three instruments for the relative groups to
 standardise (`min_universe=3`); below that they are legitimately NaN.
