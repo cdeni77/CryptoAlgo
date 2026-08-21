@@ -462,8 +462,14 @@ def cost_features(inputs: SymbolInputs, config: Optional[Config] = None) -> pd.D
     fee_per_side = np.maximum(pct_side, floor / _safe(notional_per_contract))
     hurdle = 2.0 * fee_per_side + slippage_round_trip
 
+    # The hurdle level is kept because it is the economically meaningful
+    # threshold a move has to clear, and it moves with price. Notional per
+    # contract is deliberately *not* a feature: it is near-constant per
+    # instrument, so a tree splits on it to recover instrument identity with a
+    # continuous variable — more expressive, and more overfittable, than the
+    # symbol category the pooled model already has. The model does not size
+    # positions either; `core.costs.size_position` does.
     out['fee_hurdle_bps'] = hurdle * 10_000
-    out['contract_notional_usd'] = notional_per_contract
 
     vol_24h = bars['close'].pct_change().rolling(24, min_periods=6).std()
     expected_move = vol_24h * 1.5
