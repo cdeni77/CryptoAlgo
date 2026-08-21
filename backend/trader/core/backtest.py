@@ -266,6 +266,12 @@ def run_backtest(
         return BacktestResult(initial_equity=initial_equity)
 
     volatility = {s: _realised_volatility(b['close']) for s, b in bars_by_symbol.items()}
+    # Trailing returns for the correlation cap. Built once; sliced per bar so the
+    # measurement only ever uses history already available at that timestamp.
+    returns_panel = pd.DataFrame({
+        symbol: bars['close'].pct_change() for symbol, bars in bars_by_symbol.items()
+    }).sort_index()
+    correlation_lookback = max(int(config.correlation_lookback_hours), 0)
     # Sizing liquidity, not fill liquidity: see `execution.liquidity_floor`.
     liquidity = {
         s: liquidity_floor(b['volume']) if 'volume' in b else pd.Series(dtype=float)
@@ -358,8 +364,13 @@ def run_backtest(
                 unrealised += position.unrealised(float(bars.loc[timestamp, 'close']))
         curve[timestamp] = equity + unrealised
 
-        if equity <= 0:
-            logger.warning('account wiped out at %s', timestamp)
+        floor = float(config.min_equity)
+        if equity <= max(floor, 0.0):
+            logger.warning(
+                'equity %.2f at or below the floor %.2f at %s: stopping. A floor '
+                'above zero is the point — an account at zero has been '
+                'unrecoverable for a while.', equity, floor, timestamp,
+            )
             break
 
         # --- 4. decide for the next bar ----------------------------------
@@ -389,9 +400,12 @@ def run_backtest(
             )
 
         if contexts:
+            window = None
+            if correlation_lookback:
+                window = returns_panel.loc[:timestamp].tail(correlation_lookback)
             decisions = decide_panel(
                 slice_, contexts=contexts, config=config,
-                profiles=profiles, counter=result.gates,
+                profiles=profiles, counter=result.gates, returns=window,
             )
             result.decisions.extend(decisions)
             pending = [d for d in decisions if d.tradeable]

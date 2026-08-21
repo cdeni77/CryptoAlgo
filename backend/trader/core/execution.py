@@ -418,6 +418,7 @@ def size_from_forecast(
     sigma: float,
     config: Config,
     stop_multiple: float = 3.0,
+    stop_sigma: Optional[float] = None,
     kelly_fraction: float = 0.25,
     max_fraction: float = MAX_POSITION_FRACTION,
     max_risk: float = MAX_RISK_PER_TRADE,
@@ -426,9 +427,20 @@ def size_from_forecast(
 
     Two independent limits, and the tighter one wins:
 
-    * Kelly, quartered and capped, sizes on conviction.
+    * Kelly, quartered and capped, sizes on conviction. This wants `sigma` — the
+      dispersion head's expected error on the **horizon** return, which is the
+      scale the forecast lives on.
     * The risk budget sizes on consequence — a stop-out must not cost more than
-      `max_risk` of equity, whatever the forecast claimed.
+      `max_risk` of equity, whatever the forecast claimed. This wants the
+      volatility the stop is actually placed with, which is the **per-bar**
+      realised vol `barrier_prices` receives.
+
+    `stop_sigma` is that per-bar figure. Passing the horizon sigma to both, as
+    this did, compares quantities that differ by about sqrt(horizon) — a factor of
+    ~10 at a 96-bar hold — so `MAX_RISK_PER_TRADE` bounded roughly a tenth of what
+    it claimed, and the docstring's "two independent limits" was comparing two
+    different units. The direction was conservative, which is why it never
+    surfaced as a loss.
 
     Returns zero when the result rounds below one contract, which for a small
     account on an expensive contract is a real constraint rather than an edge
@@ -446,7 +458,8 @@ def size_from_forecast(
         return 0
 
     budget = risk_budget_fraction(
-        sigma, stop_multiple=stop_multiple, max_risk=max_risk,
+        sigma if stop_sigma is None else stop_sigma,
+        stop_multiple=stop_multiple, max_risk=max_risk,
     )
     fraction = min(conviction, budget)
 

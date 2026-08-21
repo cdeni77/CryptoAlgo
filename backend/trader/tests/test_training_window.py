@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.config import CLI_PARAMS, Config
+from core.config import Config
 from core.cv import average_uniqueness, effective_sample_size
 from core.dataset import Dataset
 from scripts._common import add_data_arguments, build_config
@@ -87,20 +87,39 @@ def test_omitting_the_flag_keeps_the_config_default():
     assert build_config(args).recency_half_life_days == Config().recency_half_life_days
 
 
-def test_the_declared_flag_name_matches_the_wired_one():
-    """Two spellings of the same control would be worse than one.
+def test_every_config_field_the_flags_claim_to_set_is_actually_read():
+    """A flag that parses and reaches nothing is worse than no flag.
 
-    Parametrising over `CLI_PARAMS` looked tidier but deleted its own guard: if
-    the field ever leaves that tuple the comprehension yields nothing and pytest
-    reports `1 skipped`, not a failure — silently, in exactly the scenario this
-    file exists to catch.
+    `CLI_PARAMS` used to declare 22 of them, plus 5 environment variables, and
+    nothing called the machinery that would have wired them — including
+    `LEVERAGE`, which an operator could lower in docker-compose while the book
+    kept trading at 4x. It has been deleted; the surface is
+    `scripts/_common.py:add_data_arguments`, and this asserts that what it sets
+    is genuinely consumed somewhere.
     """
-    declared = [p for p in CLI_PARAMS if p.field == 'recency_half_life_days']
-    assert declared, 'recency_half_life_days is no longer declared in CLI_PARAMS'
+    import pathlib
+    import re
 
-    for param in declared:
-        args = _parser().parse_args([param.flag, '180'])
-        assert build_config(args).recency_half_life_days == 180.0
+    root = pathlib.Path(__file__).resolve().parents[1]
+    sources = {
+        path: path.read_text()
+        for directory in ('core', 'scripts', 'data_collection')
+        for path in (root / directory).rglob('*.py')
+        if '__pycache__' not in str(path) and path.name != 'config.py'
+    }
+
+    # Fields `build_config` sets from a flag.
+    common = (root / 'scripts' / '_common.py').read_text()
+    assigned = set(re.findall(r'replace\(config, (\w+)=', common))
+    assert assigned, 'no flag sets a Config field; the surface has moved'
+
+    unread = [
+        field for field in assigned
+        if not any(re.search(rf'\b{field}\b', text) for text in sources.values())
+    ]
+    assert not unread, (
+        f'these flags set a Config field nothing reads: {sorted(unread)}'
+    )
 
 
 # ---------------------------------------------------------------------------

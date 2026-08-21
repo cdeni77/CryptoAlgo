@@ -197,6 +197,29 @@ def _gate_rows(gates: list[Gate]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def surface_candidates(config: Config) -> dict[str, Config]:
+    """The parameter neighbourhood `parameter_plateau` and PBO are measured over.
+
+    Extracted so it can be tested without a seven-minute evaluation. The
+    `cli_overrides` entry is the load-bearing part: without it `Config.resolve`
+    prefers the per-coin profile's value and hands back the unperturbed number, so
+    every surface run was a byte-identical re-run of the centre — retention pinned
+    at its maximum, `parameter_plateau` unable to fail for any candidate with a
+    positive Sharpe, and duplicate rows degenerating the PBO matrix.
+    `core/search.py:configure` had this right; this did not.
+    """
+    out: dict[str, Config] = {}
+    for name in SURFACE_PARAMETERS:
+        value = getattr(config, name)
+        for factor, direction in ((1 + SURFACE_STEP, 'up'), (1 - SURFACE_STEP, 'down')):
+            out[f'{name}_{direction}'] = replace(
+                config,
+                **{name: type(value)(float(value) * factor)},
+                cli_overrides=frozenset(set(config.cli_overrides) | {name}),
+            )
+    return out
+
+
 def evaluate_candidate(
     dataset: Dataset,
     config: Config,
@@ -359,29 +382,12 @@ def evaluate_candidate(
             # small parameter changes because it comes from something about the
             # market; an overfit sits on a spike because it comes from something
             # about the sample.
-            centre_parameters = {
-                name: float(getattr(config, name)) for name in SURFACE_PARAMETERS
-            }
             surface_scores: dict[str, float] = {}
             score_matrix: list[list[float]] = [centre_paths]
 
-            for name, value in centre_parameters.items():
-                for factor, label in ((1 + SURFACE_STEP, 'up'), (1 - SURFACE_STEP, 'down')):
-                    # `cli_overrides` is what makes the perturbation survive
-                    # `Config.resolve`, which otherwise prefers the per-coin
-                    # profile's value and hands back the unperturbed number.
-                    # Without it every surface run was a byte-identical re-run of
-                    # the centre, so retention was pinned at 1.0 and this gate
-                    # could not fail for any candidate with a positive Sharpe.
-                    # The duplicate rows also went into the PBO score matrix.
-                    # `core/search.py:configure` had this right; this did not.
-                    candidate = replace(
-                        config,
-                        **{name: type(value)(value * factor)},
-                        cli_overrides=frozenset(set(config.cli_overrides) | {name}),
-                    )
+            for label, candidate in surface_candidates(config).items():
                     outcome, produced = run_with(candidate)
-                    surface_scores[f'{name}_{label}'] = outcome.sharpe
+                    surface_scores[label] = outcome.sharpe
                     paths = period_sharpes_of(outcome, produced.periods)
                     if len(paths) == len(centre_paths):
                         score_matrix.append(paths)

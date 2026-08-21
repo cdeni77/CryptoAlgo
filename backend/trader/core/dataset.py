@@ -259,6 +259,24 @@ def load_dataset(
     asked = list(symbols) if symbols else [
         profile.prefixes[0] for profile in COIN_PROFILES.values()
     ]
+    # `excluded_symbols` was parsed from `--exclude` and `EXCLUDE_SYMBOLS` and read
+    # by nothing, so an excluded instrument still traded. Applied here, before the
+    # store is touched, so it holds for features, targets, the backtest and the
+    # live signal writer alike. Matched on the underlying, so `--exclude BTC`
+    # covers `BIP`, `BTC-PERP` and `BIP-20DEC30-CDE`.
+    excluded = {s.strip().upper() for s in (config.excluded_symbols or []) if s.strip()}
+    if excluded:
+        excluded_bases = {resolve_base(s) or s for s in excluded}
+        kept = [
+            s for s in asked
+            if s.upper() not in excluded and (resolve_base(s) or s) not in excluded_bases
+        ]
+        if len(kept) != len(asked):
+            warnings.append(
+                f'excluded {len(asked) - len(kept)} symbol(s) by configuration: '
+                f'{", ".join(sorted(set(asked) - set(kept)))}'
+            )
+        asked = kept
     # Translate to the spellings the store holds before anything reads it.
     mapping, unresolved = resolve_store_symbols(store, asked, venue=venue)
     for symbol in unresolved:

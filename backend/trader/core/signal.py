@@ -24,7 +24,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,10 @@ from core.execution import size_from_forecast
 from core.profiles import CoinProfile
 
 logger = logging.getLogger(__name__)
+
+
+# Below this many overlapping bars a pairwise correlation describes noise.
+MIN_CORRELATION_OBSERVATIONS = 24
 
 
 class Gate(str, Enum):
@@ -54,6 +58,7 @@ class Gate(str, Enum):
     CONVICTION = 'conviction'
     COOLDOWN = 'cooldown'
     POSITION_LIMIT = 'position_limit'
+    CORRELATION_LIMIT = 'correlation_limit'
     SIZE_BELOW_ONE_CONTRACT = 'size_below_one_contract'
     PARTICIPATION_LIMIT = 'participation_limit'
 
@@ -91,6 +96,9 @@ class Decision:
     price: float = 0.0
     notional: float = 0.0
     participation: float = 0.0
+    # Highest absolute correlation with an already-accepted position, or None
+    # when there was not enough overlapping history to measure it.
+    max_correlation: Optional[float] = None
     # The liquidity the size was measured against, carried forward so the fill
     # can re-apply the same cap against the same number rather than against the
     # fill bar, which the decision never saw.
@@ -291,8 +299,10 @@ def decide(
         sigma=sigma,
         config=config,
         # The risk budget needs to know where the stop will sit, or it cannot
-        # bound what a stop-out costs.
+        # bound what a stop-out costs — and the stop is placed with the per-bar
+        # realised volatility, not the horizon-scale forecast dispersion.
         stop_multiple=float(config.resolve('vol_mult_sl', profile)),
+        stop_sigma=float(context.volatility),
     )
     if contracts < 1:
         return result(gate=Gate.SIZE_BELOW_ONE_CONTRACT, side=side)
@@ -314,6 +324,35 @@ def decide(
     )
 
 
+def _max_correlation(
+    returns: pd.DataFrame, symbol: str, against: Sequence[str]
+) -> Optional[float]:
+    """Highest absolute correlation between `symbol` and any already-accepted one.
+
+    None when there is not enough overlapping history to say — which must not be
+    read as "uncorrelated": the caller admits the position, because refusing to
+    trade on a missing measurement would halt the book on a newly listed
+    instrument.
+    """
+    if symbol not in returns.columns:
+        return None
+    peers = [s for s in against if s in returns.columns and s != symbol]
+    if not peers:
+        return None
+
+    target = returns[symbol]
+    worst: Optional[float] = None
+    for peer in peers:
+        pair = pd.concat([target, returns[peer]], axis=1).dropna()
+        if len(pair) < MIN_CORRELATION_OBSERVATIONS:
+            continue
+        value = float(pair.iloc[:, 0].corr(pair.iloc[:, 1]))
+        if not np.isfinite(value):
+            continue
+        worst = abs(value) if worst is None else max(worst, abs(value))
+    return worst
+
+
 def decide_panel(
     forecasts: pd.DataFrame,
     *,
@@ -321,6 +360,7 @@ def decide_panel(
     config: Config,
     profiles: Optional[dict[str, CoinProfile]] = None,
     counter: Optional[GateCounter] = None,
+    returns: Optional[pd.DataFrame] = None,
 ) -> list[Decision]:
     """Decide for every instrument at one timestamp, best edge first.
 
@@ -332,11 +372,38 @@ def decide_panel(
     ranked = forecasts.sort_values('edge_to_risk', ascending=False)
     decisions: list[Decision] = []
     taken = 0
+    accepted: list[str] = []
 
+    limit = float(config.max_portfolio_correlation)
     for (timestamp, symbol), row in ranked.iterrows():
         context = contexts.get(symbol)
         if context is None:
             continue
+
+        # A count limit is not a diversification limit. On a crypto panel where
+        # cross-correlation runs 0.7-0.9, five "diversified" positions are one bet
+        # at five times the size — and `max_portfolio_correlation` was declared,
+        # parsed from `--max-correlation`, and read by nothing. Candidates arrive
+        # best-edge-first, so rejecting the later one keeps the stronger of a
+        # correlated pair.
+        if accepted and returns is not None and 0.0 < limit < 1.0:
+            worst = _max_correlation(returns, symbol, accepted)
+            if worst is not None and worst > limit:
+                # Carry the forecast components like every other rejection, so a
+                # capped candidate can be inspected rather than merely counted.
+                rejected = Decision(
+                    symbol=symbol, timestamp=timestamp, side=int(row.get('side', 0) or 0),
+                    contracts=0, gate=Gate.CORRELATION_LIMIT,
+                    expected_net=float(row.get('expected_net', 0.0) or 0.0),
+                    sigma=float(row.get('sigma', 0.0) or 0.0),
+                    edge_to_risk=float(row.get('edge_to_risk', 0.0) or 0.0),
+                    cost=float(row.get('cost', 0.0) or 0.0),
+                    max_correlation=worst,
+                )
+                if counter is not None:
+                    counter.record(rejected)
+                decisions.append(rejected)
+                continue
         adjusted = DecisionContext(
             equity=context.equity,
             volatility=context.volatility,
@@ -353,5 +420,6 @@ def decide_panel(
         decisions.append(decision)
         if decision.tradeable:
             taken += 1
+            accepted.append(symbol)
 
     return decisions

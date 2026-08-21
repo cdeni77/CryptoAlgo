@@ -40,6 +40,14 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument('--recency-half-life-days', type=float, default=None,
                         help='Exponential decay on training weights, in days. '
                              '0 disables it (default: the Config value)')
+    parser.add_argument('--exclude', default=None,
+                        help='Comma-separated symbols to leave out entirely. '
+                             'Matched on the underlying, so BTC covers BIP and '
+                             'BTC-PERP.')
+    parser.add_argument('--max-correlation', type=float, default=None,
+                        help='Refuse a candidate whose trailing return correlation '
+                             'with an open position exceeds this. 0 disables the '
+                             'cap (default: the Config value).')
     parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
     return parser
 
@@ -88,6 +96,20 @@ def _with_recency(config: Config, args: argparse.Namespace) -> Config:
     half_life = getattr(args, 'recency_half_life_days', None)
     if half_life is not None:
         config = replace(config, recency_half_life_days=float(half_life))
+
+    excluded = getattr(args, 'exclude', None)
+    if excluded:
+        symbols = [s.strip().upper() for s in excluded.split(',') if s.strip()]
+        config = replace(config, excluded_symbols=symbols)
+        logging.info('excluding %s', ', '.join(symbols))
+
+    correlation = getattr(args, 'max_correlation', None)
+    if correlation is not None:
+        config = replace(config, max_portfolio_correlation=float(correlation))
+        logging.info(
+            'portfolio correlation cap: %s',
+            'disabled' if correlation <= 0 else f'{float(correlation):.2f}',
+        )
 
     if config.recency_half_life_days > 0:
         saturation_days = config.recency_half_life_days / math.log(2)

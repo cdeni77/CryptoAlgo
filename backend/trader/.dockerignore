@@ -1,0 +1,16 @@
+# The build context is 15 MB, most of it dead. `/app/models` is a declared
+# VOLUME, so anything copied there seeds a fresh trader_models volume — which
+# meant 16 legacy per-coin .joblib artefacts from the deleted classifier
+# pipeline appeared in a new deployment's models directory, where the promotion
+# machinery treats that directory as authoritative.
+models/
+optimization_results/
+data/
+logs/
+__pycache__/
+*.pyc
+features/
+.pytest_cache/
+.git/
+.env
+.env.*

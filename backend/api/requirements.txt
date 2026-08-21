@@ -4,7 +4,6 @@ sqlalchemy==2.0.35
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 pydantic==2.9.2
-alembic==1.13.3
 coinbase-advanced-py
 
 # Needed when running /trader optimization/training scripts from the backend container
@@ -12,15 +11,10 @@ numpy>=1.24.0
 pandas>=2.0.0
 scikit-learn
 lightgbm
-optuna
 aiohttp
 ccxt
-python-dateutil
 scipy
 joblib
-
-# Optional calibration backend used by trader scripts when beta calibration is enabled
-betacal
 
 # Optional Redis-backed queue for trader data pipeline
 redis>=5.0.0

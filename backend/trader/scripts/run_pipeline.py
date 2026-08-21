@@ -571,7 +571,12 @@ async def resolve_coinbase_symbols(api_key: str, api_secret: str) -> List[str]:
 
 # Main
 
-async def main():
+async def main() -> int:
+    # Collected rather than raised, so one instrument's failure does not abort the
+    # rest — but a non-empty list becomes a non-zero exit, which is what makes a
+    # failed scrape visible to the orchestrator.
+    failures: list[str] = []
+
     parser = argparse.ArgumentParser(
         description="Unified Data Pipeline for Coinbase Perps Trading",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -694,7 +699,14 @@ Examples:
                 
                 await backfill_ohlcv(pipeline, symbols, timeframes, start_time, end_time)
             else:
-                logger.warning("⚠️ No Coinbase API keys - skipping OHLCV backfill")
+                # An empty price history is not a successful scrape. This used to
+                # warn and return 0, so `live_orchestrator._run_step` — which
+                # inspects only the exit code — read it as a clean step.
+                logger.error(
+                    "no Coinbase API keys: OHLCV backfill skipped, so no price "
+                    "history was collected"
+                )
+                failures.append("ohlcv: COINBASE_API_KEY/SECRET not set")
         
         # Funding Rate Backfill
         if not args.ohlcv_only:
@@ -708,6 +720,9 @@ Examples:
     print("\n" + "=" * 70)
     print("📊 DATA SUMMARY")
     print("=" * 70)
+    if failures:
+        for problem in failures:
+            logger.error("scrape incomplete: %s", problem)
     
     # OHLCV summary
     print("\n📈 OHLCV Data:")
@@ -758,12 +773,12 @@ Examples:
         db.close()
         if pipeline:
             await pipeline.stop()
-        return
-    
+        return 1 if failures else 0
+
     if not api_key or not api_secret:
-        logger.warning("\n⚠️ No API keys - cannot start real-time collection")
+        logger.error("\nno API keys: cannot start real-time collection")
         db.close()
-        return
+        return 1
     
     # Ensure pipeline is initialized
     if pipeline is None:
@@ -800,4 +815,7 @@ Examples:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # `main()` returned None on every path and the exit code was discarded, so
+    # `live_orchestrator._run_step` — which inspects only the code — read a total
+    # scrape failure as a successful step. An int return now becomes the status.
+    raise SystemExit(asyncio.run(main()) or 0)

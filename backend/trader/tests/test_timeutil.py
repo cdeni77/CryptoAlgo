@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -185,8 +186,10 @@ def test_no_connector_decodes_an_epoch_without_a_zone(eastern_tz):
             code = line.split('#')[0]
             if 'utcfromtimestamp' in code:
                 offenders.append(f'{path.name}:{number} utcfromtimestamp')
-            elif 'fromtimestamp(' in code and 'tz=' not in code:
-                offenders.append(f'{path.name}:{number} fromtimestamp without tz')
+            elif 'fromtimestamp(' in code and not re.search(r'tz\s*=\s*(?!None)\S', code):
+                # `tz=None` contains 'tz=' and reads the local zone — it *is* the
+                # bug, and a substring check for 'tz=' let it through.
+                offenders.append(f'{path.name}:{number} fromtimestamp without a real tz')
             elif '.timestamp()' in code and 'naive_utc_to_epoch' not in code:
                 offenders.append(f'{path.name}:{number} .timestamp() on a naive value')
 

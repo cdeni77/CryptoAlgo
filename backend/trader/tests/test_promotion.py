@@ -257,11 +257,20 @@ def test_driftless_random_walks_do_not_promote(config):
 
     # And the rejection has to rest on a gate that reads the data, not on
     # bookkeeping. These are the ones noise should fail.
+    # Checked against DEFAULT_GATES, because two of the names originally listed
+    # here (`bootstrap_p05_sharpe`, `probability_positive`) were not gates at all
+    # and could never have appeared in `failed_gates` — the same class of mistake
+    # this test exists to catch.
+    from core.metrics import DEFAULT_GATES
+
     data_dependent = {
         'walk_forward_median_sharpe', 'walk_forward_p05_sharpe',
-        'deflated_sharpe', 'bootstrap_p05_sharpe', 'probability_positive',
-        'synthetic_positive_fraction',
+        'deflated_sharpe', 'bootstrap_positive_fraction',
+        'synthetic_positive_fraction', 'stressed_median_sharpe',
     }
+    unknown = data_dependent - set(DEFAULT_GATES)
+    assert not unknown, f'these are not gates: {sorted(unknown)}'
+
     assert data_dependent & set(record.failed_gates), (
         f'blocked, but only by bookkeeping gates: {record.failed_gates}'
     )
@@ -401,3 +410,96 @@ def test_a_quick_evaluation_cannot_promote(config):
     assert not record.promoted
     assert 'synthetic_positive_fraction' in record.failed_gates
     assert 'parameter_plateau' in record.failed_gates
+
+
+# ---------------------------------------------------------------------------
+# The gates that catch overfitting must be able to move
+# ---------------------------------------------------------------------------
+
+
+def test_the_plateau_perturbation_reaches_decide(config):
+    """`parameter_plateau` is inert unless the perturbation outranks the profile.
+
+    `replace(config, ...)` alone loses to `Config.resolve`, which prefers the
+    per-coin profile value — so every surface run was a byte-identical re-run of
+    the centre, retention pinned at its maximum, and the gate could not fail for
+    any candidate with a positive Sharpe. Mutation testing showed all 17
+    promotion tests passing with the fix reverted, so the fix needs its own guard.
+
+    This asserts the mechanism directly rather than running a 7-minute
+    evaluation: the perturbed value must survive `resolve` against a profile that
+    disagrees with it.
+    """
+    from core.profiles import COIN_PROFILES
+    from core.promotion import SURFACE_PARAMETERS, surface_candidates
+
+    candidates = surface_candidates(config)
+    assert len(candidates) == 2 * len(SURFACE_PARAMETERS)
+
+    # Every profile, because `resolve` prefers the profile's value and the
+    # profiles disagree with the Config defaults for most instruments.
+    for symbol, profile in COIN_PROFILES.items():
+        for label, candidate in candidates.items():
+            field = label.rsplit('_', 1)[0]
+            assert candidate.resolve(field, profile) != config.resolve(field, profile), (
+                f'{label} on {symbol}: the perturbation is lost to the profile, so '
+                f'the surface run repeats the centre and parameter_plateau cannot fail'
+            )
+
+
+def test_the_deflated_sharpe_hardens_as_trials_rise(config):
+    """The gate's whole job is to discount for the size of the search.
+
+    Fed an annualised Sharpe against a per-trade count, it passed at any trial
+    count — +8.1 at 50 trials and still +6.4 at 100,000. Reverting that fix left
+    all 17 promotion tests green, so the property needs stating: the statistic
+    must fall as `trials` rises, and a modest edge must eventually be rejected.
+    """
+    import numpy as np
+    from scipy import stats
+
+    from core.metrics import deflated_sharpe
+
+    rng = np.random.default_rng(0)
+    returns = rng.normal(0.0015, 0.01, 200)
+    per_trade = float(returns.mean() / returns.std(ddof=1))
+
+    scores = [
+        deflated_sharpe(
+            sharpe=per_trade, observations=len(returns), trials=trials,
+            skewness=float(stats.skew(returns)),
+            kurtosis=float(stats.kurtosis(returns, fisher=False)),
+        ).statistic
+        for trials in (1, 10, 100, 1_000, 10_000)
+    ]
+
+    assert scores == sorted(scores, reverse=True), (
+        f'the statistic does not fall as the search widens: {scores}'
+    )
+    assert scores[0] > 0, 'a real edge at one trial should not be rejected'
+    assert scores[-1] < scores[0] - 1.0, (
+        f'10,000 trials barely moved the statistic ({scores[0]:.2f} -> '
+        f'{scores[-1]:.2f}); it is being fed a ratio at the wrong frequency'
+    )
+
+
+def test_the_hold_never_outlives_the_forecast(config):
+    """`_hold_bars` enforces an invariant nothing else checks.
+
+    `Config.label_horizon_hours` documents it — "labels must span at least as long
+    as a position can stay open" — and the profiles violate it: XRP holds 108h
+    against a 96h forecast. Removing the cap left 45 tests passing.
+    """
+    from core.backtest import _hold_bars
+    from core.profiles import COIN_PROFILES
+
+    for horizon in (8, 24, 48, 96):
+        for name, profile in COIN_PROFILES.items():
+            hold = _hold_bars(config, profile, horizon)
+            assert 1 <= hold <= horizon, (
+                f'{name} at horizon {horizon}h holds {hold}h — a position '
+                f'outliving its forecast realises a return nobody predicted'
+            )
+
+    # And with no horizon the profile still governs, so the sweep is meaningful.
+    assert _hold_bars(config, COIN_PROFILES['XRP'], None) == 108

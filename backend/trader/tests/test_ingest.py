@@ -359,3 +359,52 @@ def _bars_at(db, symbol: str, stamp) -> list[dict]:
                 (symbol, stamp),
             ).fetchall()
         ]
+
+
+def test_the_ingestor_stamps_the_venue_on_funding(database):
+    """The code path, not just the schema key.
+
+    `test_funding_and_open_interest_are_venue_keyed` constructs
+    `FundingRate(..., venue=venue)` by hand and calls `db.insert_funding_rate`
+    directly, so it proves the unique key works and says nothing about whether
+    anything sets the field. `ingest_funding` did not: it set `funding_source` and
+    left `venue` at its `'unknown'` default, so every rate collided on
+    `(symbol, 'unknown', event_time)` and `INSERT OR REPLACE` kept the last
+    writer — a Binance proxy rate overwriting Coinbase's own, then read back as
+    Coinbase's. Removing the stamp again left all 13 tests in this file passing.
+    """
+    ingestor = Ingestor(database)
+    for rate, venue in ((0.0001, 'coinbase'), (0.0009, 'binance_proxy')):
+        ingestor.ingest_funding([FundingRate(
+            symbol='BIP-20DEC30-CDE', event_time=T0, available_time=T0,
+            rate=rate, mark_price=1.0, index_price=1.0,
+        )], venue=venue)
+
+    with database._get_connection() as connection:
+        rows = connection.execute(
+            'SELECT venue, rate FROM funding_rates ORDER BY venue'
+        ).fetchall()
+
+    stamped = {row[0]: row[1] for row in rows}
+    assert 'unknown' not in stamped, 'ingest_funding did not stamp the venue'
+    assert stamped == {'binance_proxy': 0.0009, 'coinbase': 0.0001}, (
+        f'a proxy rate overwrote the venue\'s own: {stamped}'
+    )
+
+
+def test_the_ingestor_stamps_the_venue_on_open_interest(database):
+    """Same property for the third dataset, so all three are covered."""
+    ingestor = Ingestor(database)
+    for value, venue in ((1000.0, 'bybit'), (2000.0, 'binance')):
+        ingestor.ingest_open_interest([OpenInterest(
+            symbol='BIP-20DEC30-CDE', event_time=T0, available_time=T0,
+            open_interest_contracts=value,
+        )], venue=venue)
+
+    with database._get_connection() as connection:
+        venues = {
+            row[0] for row in
+            connection.execute('SELECT venue FROM open_interest').fetchall()
+        }
+
+    assert 'unknown' not in venues and len(venues) == 2, venues

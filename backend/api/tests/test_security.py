@@ -221,12 +221,27 @@ def test_an_ascii_token_still_authorises(monkeypatch):
     require_token(x_api_token='correct-horse-battery-staple')  # must not raise
 
 
-def test_the_comparison_is_constant_time_on_bytes():
-    """Guard the mechanism, not just the outcome."""
-    import inspect
+def test_the_comparison_is_constant_time():
+    """Guard the mechanism behaviourally, not by grepping the source.
+
+    The version of this test did `inspect.getsource(require_token)` and asserted
+    `'compare_digest' in source` — but `getsource` includes the docstring and
+    comments, both of which name `compare_digest`. Replacing the comparison with
+    a plain `!=` left the prose intact and all 24 tests passing: the guard could
+    not distinguish the mechanism from the sentence describing it.
+
+    So check the bytecode instead, which contains only what executes.
+    """
+    import dis
 
     import security
 
-    source = inspect.getsource(security.require_token)
-    assert 'compare_digest' in source, 'auth must not use =='
-    assert 'encode(' in source, 'compare_digest must be given bytes, not str'
+    called = {
+        instruction.argval
+        for instruction in dis.get_instructions(security.require_token)
+        if instruction.opname in ('LOAD_GLOBAL', 'LOAD_ATTR', 'LOAD_METHOD')
+    }
+
+    assert 'compare_digest' in called, (
+        'require_token does not call compare_digest; a plain == leaks timing'
+    )

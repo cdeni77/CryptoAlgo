@@ -168,8 +168,11 @@ services:
       # host directory and masked the real one, which is exactly the bug the
       # note above describes: find_cost_config() then found nothing and every
       # contract was priced at the hardcoded default.
-      # Paper candidate overrides (optimizer results) — overlays the named volume subdir
-      - ./backend/trader/data/paper_candidates:/app/data/paper_candidates
+      # No paper_candidates mount: nothing in the codebase reads that path (it was
+      # an overlay for the deleted optimizer scripts). Adding a `.gitkeep` to make
+      # the bind source exist satisfied the test without removing the problem —
+      # and `.gitignore`'s blanket `data/` rule swallowed the file anyway, so the
+      # suite failed from a clean clone while passing locally.
     # The orchestrator: initial backfill (30d) then hourly cycles
     command: >
       -m scripts.live_orchestrator

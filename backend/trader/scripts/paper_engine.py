@@ -47,7 +47,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from core.config import DEFAULT_COST_CONFIG_NAME, Config, find_cost_config
-from core.costs import get_contract_spec
+from core.costs import resolve_base, get_contract_spec
 from core.execution import (
     MAINTENANCE_MARGIN_FRACTION,
     Position,
@@ -91,6 +91,7 @@ class FundingSource:
         self._rates: dict[str, float] = {}
         self._fetched_at = 0.0
         self._warned: set[str] = set()
+        self._resolved: dict[str, str] = {}
 
     def _refresh(self) -> None:
         try:
@@ -116,14 +117,42 @@ class FundingSource:
         self._fetched_at = time.monotonic()
 
     def hourly_rate(self, symbol: str) -> float:
+        """Funding for an instrument, whichever spelling the caller has.
+
+        `signals.coin` is the profile name (`BTC`) while the store keys funding on
+        the scraped product id (`BTC-PERP`, `BIP-20DEC30-CDE`), so an exact
+        lookup never matched: every position accrued zero funding while logging
+        "no funding rate for BTC" once and then staying silent. Carry is the
+        edge this system is built on, so a silent zero is the worst outcome
+        available. Resolution goes through `costs.resolve_base`, the same function
+        that prices the contract.
+        """
         if time.monotonic() - self._fetched_at > FUNDING_CACHE_SECONDS:
             self._refresh()
+
         key = (symbol or '').upper()
         if key in self._rates:
             return self._rates[key]
+
+        base = resolve_base(key)
+        if base is not None:
+            matches = sorted(
+                (stored for stored in self._rates if resolve_base(stored) == base),
+                key=lambda s: (-len(s), s),
+            )
+            if matches:
+                if key not in self._resolved:
+                    self._resolved[key] = matches[0]
+                    logger.info('funding for %s resolved to %s', key, matches[0])
+                return self._rates[matches[0]]
+
         if key not in self._warned:
             self._warned.add(key)
-            logger.warning('no funding rate for %s: accruing zero, which understates cost', key)
+            logger.warning(
+                'no funding rate for %s (store holds %s): accruing zero, which '
+                'understates cost',
+                key, ', '.join(sorted(self._rates)) or 'nothing',
+            )
         return 0.0
 
 
