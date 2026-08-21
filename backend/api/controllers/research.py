@@ -346,7 +346,16 @@ def get_research_runs(db: Session, limit: int = 50) -> List[ResearchRunResponse]
             )
         )
 
-    return sorted(out, key=lambda r: r.started_at, reverse=True)[:limit]
+    # Sorted on a timezone-normalised key. The two sources disagree: `model_runs`
+    # timestamps come back naive from SQLite, while the ledger's are parsed from
+    # ISO strings that carry an offset — and Python refuses to compare the two,
+    # which took the whole endpoint down with a 500.
+    return sorted(out, key=lambda r: _as_utc(r.started_at), reverse=True)[:limit]
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Assume UTC for a naive timestamp, so mixed sources can be ordered."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------

@@ -249,3 +249,48 @@ def test_the_research_features_endpoint_no_longer_invents_importances(client, em
 
     assert body['feature_importance'] == []
     assert body['importance_unavailable_reason']
+
+
+def test_research_runs_merges_naive_and_aware_timestamps(client, empty_models_dir):
+    """The run table and the ledger disagree about timezones. Ordering must cope.
+
+    `model_runs` timestamps come back naive from SQLite; the ledger's are parsed
+    from ISO strings that carry an offset. Python refuses to compare the two, and
+    sorting the merged list on the raw value took the whole endpoint down with a
+    500 — visible only once both sources actually had rows in them.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from database import SessionLocal
+    from models.trade import ModelRun
+
+    # A ledger entry, whose created_at is an offset-aware ISO string.
+    _write_ledger(empty_models_dir, [_record('20260301T000000Z-aaa111', promoted=True)])
+
+    # And a run row written through the ORM, which SQLite hands back naive.
+    db = SessionLocal()
+    started = datetime.now(timezone.utc) - timedelta(days=1)
+    db.add(ModelRun(
+        run_started_at=started, run_finished_at=started + timedelta(minutes=20),
+        status='success', retrain_window_days=90,
+        symbols_total=5, symbols_trained=5, artifacts_version='20260201T000000Z-zzz',
+    ))
+    db.commit()
+    db.close()
+
+    response = client.get('/research/runs')
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) >= 2, 'both sources should appear'
+    # Newest first, across both sources.
+    stamps = [r['started_at'] for r in rows]
+    assert stamps == sorted(stamps, reverse=True)
+
+
+def test_research_runs_reports_no_attempts_as_empty(client, empty_models_dir):
+    """No ledger and no run rows is a normal state, not an error."""
+    response = client.get('/research/runs')
+
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
