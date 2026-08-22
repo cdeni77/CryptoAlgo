@@ -1,0 +1,131 @@
+{
+  "version": "zero_fee_diagnostic",
+  "exchange": "coinbase",
+  "market": "us_perpetuals",
+  "assumption_profile": "zero_fee_diagnostic",
+  "execution_fee_mode": "bps",
+  "exchange_fee_mode": "per_contract_usd",
+  "retail_execution_fee": {
+    "enabled": false,
+    "mode": "bps",
+    "taker_fee_bps": 0.0,
+    "maker_fee_bps": 0.0,
+    "use_taker": true
+  },
+  "exchange_fee": {
+    "enabled": true,
+    "mode": "per_contract_usd",
+    "per_contract_usd": 0.0,
+    "symbol_overrides": {
+      "BTC": 0.0,
+      "BIP": 0.0,
+      "ETH": 0.0,
+      "ETP": 0.0,
+      "SLP": 0.0,
+      "XPP": 0.0,
+      "DOP": 0.0,
+      "AVAX": 0.0,
+      "AVP": 0.0,
+      "ADA": 0.0,
+      "ADP": 0.0,
+      "LINK": 0.0,
+      "LNP": 0.0,
+      "LTC": 0.0,
+      "LCP": 0.0,
+      "BCP": 0.0,
+      "NER": 0.0,
+      "SUP": 0.0,
+      "XLP": 0.0,
+      "POP": 0.0,
+      "SHP": 0.0,
+      "PEP": 0.0,
+      "HYPE": 0.0,
+      "HYP": 0.0,
+      "ONDO": 0.0,
+      "OND": 0.0
+    },
+    "participant_type_assumption": "non_professional",
+    "execution_type_assumption": "electronic",
+    "schedule_reference": {
+      "group_a": {
+        "symbols": [
+          "BTC",
+          "BIP",
+          "ETH",
+          "ETP"
+        ],
+        "market_maker": 0.45,
+        "non_professional": 0.75,
+        "professional": 0.75,
+        "block": 0.2
+      },
+      "group_b": {
+        "symbols": [
+          "SLP",
+          "XPP",
+          "DOP",
+          "AVAX",
+          "AVP",
+          "ADA",
+          "ADP",
+          "LINK",
+          "LNP",
+          "LTC",
+          "LCP",
+          "HYP",
+          "OND",
+          "BCP",
+          "NER",
+          "SUP",
+          "XLP",
+          "POP",
+          "SHP",
+          "PEP"
+        ],
+        "market_maker": 0.07,
+        "non_professional": 0.1,
+        "professional": 0.1,
+        "block": 0.05
+      }
+    }
+  },
+  "fees": {
+    "maker_bps": 0.0,
+    "taker_bps": 0.0,
+    "min_fee_per_contract": 0.0,
+    "use_taker": true
+  },
+  "slippage": {
+    "enabled": true,
+    "bps_per_side": 0.0
+  },
+  "impact": {
+    "enabled": false,
+    "bps_per_contract": 0.0,
+    "max_bps_per_side": 0.0
+  },
+  "funding": {
+    "enabled": true,
+    "funding_interval_hours": 1,
+    "method": "coinbase_us_perps_hourly"
+  },
+  "contract_sizes": {
+    "BIP": 0.01,
+    "ETP": 0.1,
+    "SLP": 5.0,
+    "XPP": 500.0,
+    "DOP": 5000.0,
+    "AVAX": 10.0,
+    "AVP": 10.0,
+    "ADA": 1000.0,
+    "ADP": 1000.0,
+    "LINK": 50.0,
+    "LNP": 50.0,
+    "LTC": 5.0,
+    "LCP": 5.0,
+    "HYPE": 10.0,
+    "HYP": 10.0,
+    "ONDO": 1000.0,
+    "OND": 1000.0
+  }
+}

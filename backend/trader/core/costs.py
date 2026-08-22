@@ -421,6 +421,24 @@ class ExchangeCostAssumptions:
             source_path=source_path,
         )
 
+    def free_of_charge(self) -> bool:
+        """True when this schedule charges nothing on any leg.
+
+        Used to flag a diagnostic schedule at load time. Reads the same fields
+        `effective_fee_pct_per_side` and the fee floor do, so it cannot drift from
+        what actually prices a trade.
+        """
+        legs = (
+            self.effective_fee_pct_per_side(),
+            float(getattr(self, "slippage_bps_per_side", 0.0) or 0.0),
+        )
+        floors = [self.effective_min_fee_per_contract()]
+        floors += [
+            float(v or 0.0)
+            for v in (getattr(self, "min_fee_symbol_overrides", None) or {}).values()
+        ]
+        return all(x == 0.0 for x in legs) and all(f == 0.0 for f in floors)
+
     def effective_fee_pct_per_side(self) -> float:
         if self.retail_execution_fee.enabled and self.retail_execution_fee.mode == "bps":
             return self.retail_execution_fee.fee_pct_per_side
@@ -479,6 +497,21 @@ def load_exchange_cost_assumptions(path: str | Path) -> ExchangeCostAssumptions:
                 f"{base} schedule={theirs:g} used={ours:g} ({ours / theirs:.3g}x)"
                 for base, (theirs, ours) in sorted(disagreements.items())
             ),
+        )
+
+    # A schedule that charges nothing is a diagnostic, never a venue. Trading is
+    # not free anywhere, so a zero here means either a hand-built experiment or a
+    # parse that silently produced defaults — and either way every backtest run
+    # against it reports a profit that does not exist. Loud, because the failure is
+    # otherwise invisible: the numbers look plausible and merely wonderful.
+    if assumptions.free_of_charge():
+        logger.warning(
+            "%s prices execution at ZERO on every leg. No venue is free, so this "
+            "is a diagnostic schedule: it answers 'would the signal be profitable "
+            "gross of costs', which separates a weak forecast from an expensive "
+            "venue. Nothing evaluated against it may be promoted or traded, and a "
+            "PnL from it is not a PnL",
+            p.name,
         )
     return assumptions
 

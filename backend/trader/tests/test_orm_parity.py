@@ -544,3 +544,72 @@ def test_every_modelled_contract_has_an_explicit_fee_floor():
         f'${config.min_fee_per_contract:.2f}/contract, the group-A rate, which '
         f'overstates their round trip several-fold.'
     )
+
+
+def test_a_zero_fee_schedule_is_flagged_and_no_real_venue_is_free():
+    """A schedule charging nothing is a diagnostic, never a venue.
+
+    `zero_fee_diagnostic.json` exists to answer one question — would the signal be
+    profitable gross of costs, which separates a weak forecast from an expensive
+    venue — and it sits in `configs/exchange/` next to the real schedules. Set
+    `COST_CONFIG=zero_fee_diagnostic.json` by accident and every backtest reports a
+    profit that does not exist, with numbers that look plausible and merely
+    wonderful. That is the failure mode this repo keeps finding, so it warns at load
+    time, and every shipped venue schedule must charge something.
+    """
+    import logging
+    from pathlib import Path
+
+    from core.config import find_cost_config
+    from core.costs import load_exchange_cost_assumptions
+
+    schedules = sorted(
+        (Path(__file__).resolve().parents[1] / 'configs' / 'exchange').glob('*.json')
+    )
+    assert schedules, 'no cost schedules found'
+
+    free = []
+    for path in schedules:
+        assumptions = load_exchange_cost_assumptions(path)
+        if assumptions.free_of_charge():
+            free.append(path.name)
+
+    # Exactly the diagnostic, and nothing that names a venue.
+    assert free == ['zero_fee_diagnostic.json'], (
+        f'schedules charging nothing: {free} — a venue schedule that prices '
+        f'execution at zero makes every backtest against it fiction'
+    )
+
+    # And the flag has to actually fire, or the guard is decoration.
+    diagnostic = find_cost_config('zero_fee_diagnostic.json')
+    with caplog_at(logging.WARNING) as records:
+        load_exchange_cost_assumptions(diagnostic)
+    assert any('ZERO' in r.getMessage() for r in records), (
+        'loading the zero-fee schedule produced no warning'
+    )
+
+
+class caplog_at:
+    """Minimal log capture, so this test does not depend on the caplog fixture."""
+
+    def __init__(self, level):
+        self.level = level
+        self.records = []
+
+    def __enter__(self):
+        import logging
+
+        self.handler = logging.Handler()
+        self.handler.setLevel(self.level)
+        self.handler.emit = self.records.append
+        logging.getLogger().addHandler(self.handler)
+        self.previous = logging.getLogger().level
+        logging.getLogger().setLevel(self.level)
+        return self.records
+
+    def __exit__(self, *exc):
+        import logging
+
+        logging.getLogger().removeHandler(self.handler)
+        logging.getLogger().setLevel(self.previous)
+        return False
