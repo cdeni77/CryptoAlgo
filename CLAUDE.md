@@ -120,6 +120,48 @@ walk-forward backtests, bootstraps, stresses and gates a candidate, then install
 it only if every gate passed. Rejections stay in `models/promotions/` because the
 trial count is what the deflated Sharpe discounts by.
 
+## Step one: can the instrument pay for its own trading?
+
+```bash
+python -m scripts.instrument_screen                       # every horizon, both gates
+python -m scripts.instrument_screen --horizons 24,96,168
+```
+
+`required IC = round_trip_cost / sigma_h`. Cost is fixed per round trip and
+dispersion grows as `sqrt(h)`, so the bar an instrument sets is a property of the
+venue and the contract, settled before a model exists. This screen was built
+last. Everything below it was built first, and most of what it cost could have
+been avoided by dividing 27bp by 46bp on day one.
+
+**Two gates, and they pull opposite ways.** `required_ic` falls as `1/sqrt(h)`;
+the effective sample falls as `1/h` and is capped again at roughly `3 x
+half_life` of history. Reporting either alone recommends a horizon the other
+forbids. Measured on this store, 18 contracts, half-life 50d:
+
+| horizon | required IC (best / median) | win-rate ceiling | effective obs | cost | sample |
+|---|---:|---:|---:|:--:|:--:|
+| 1h  | 0.251 / 0.404 | 54% | 27,621 | no | yes |
+| 4h  | 0.128 / 0.203 | 75% | 6,899 | no | yes |
+| 24h | 0.051 / 0.082 | 91% | 1,143 | no | yes |
+| **96h** | **0.024 / 0.045** | **95%** | **279** | **yes** | **yes** |
+
+**h=96h is the only horizon on this venue that clears both.** That contradicts
+the section below, which opens by rejecting 96h for having 18 effective
+observations — and both numbers are right. The 18 is a *single series*; the panel
+is pooled across 18 instruments, which is 279. The pooled figure is what
+`cross_validate_forecast` fits on, so it is the relevant one, and the older
+number is not.
+
+Two cautions before reading this as a recommendation. Pooled is generous: pairwise
+correlation across this book is 0.658, so 18 instruments are nearer 1.5
+independent ones, and 279 pooled observations is perhaps 25 independent. And
+h=96h is **untested** — clearing the cost gate says it is the only place worth
+trying, not that a forecast exists there. The best measured direction IC at any
+horizon is +0.018 at h=24h with 3 of 6 folds agreeing, which is a coin flip.
+
+The `--min-effective-obs` and `--max-required-ic` thresholds are arguments, so a
+run can disagree with them rather than silently accept whatever it finds.
+
 ## Before You Train: the horizon governs the sample size
 
 Overlapping labels are not independent observations. A label spanning `h` bars
