@@ -486,3 +486,92 @@ def test_decision_reports_its_carry_share():
     )
 
     assert decision.carry_share == pytest.approx(0.9)
+
+
+def test_the_equity_curve_and_the_trade_ledger_reconcile(config):
+    """The top-level accounting invariant, and nothing was asserting it.
+
+        final_equity - initial_equity == sum(trade.net_pnl)
+
+    Funding is the reason this can silently break. It is applied to equity
+    *during* the hold (`equity -= accrue_funding(...)`, one settlement at a time)
+    and recorded on the trade *at exit* (`funding_pnl = -position.funding_paid`),
+    so the two paths meet only if the sign convention holds at both ends. Every
+    piece of that is individually tested — a long pays a positive rate, funding is
+    charged on notional rather than margin — and the sum of the pieces was not.
+
+    A dropped or double-counted term here is invisible in every other number: the
+    Sharpe comes off the equity curve, the P&L attribution comes off the ledger,
+    and both look plausible while disagreeing. Run with funding deliberately far
+    from zero, so a term that goes missing has something to be missing.
+    """
+    from core.backtest import run_backtest
+
+    features, targets, bars_by, funding_by, profiles = _features_targets(
+        config, seed_offset=7, drift=0.0004, funding_mean=4e-5,
+    )
+    model = train_forecast_model(features, targets, config=config, horizon_bars=48)
+    assert model is not None
+
+    cost = targets['cost'].reindex(features.index).to_numpy()
+    forecasts = model.predict(features, cost=cost)
+
+    initial = 100_000.0
+    result = run_backtest(
+        forecasts=forecasts, bars_by_symbol=bars_by, funding_by_symbol=funding_by,
+        config=config, profiles=profiles, initial_equity=initial, horizon_bars=48,
+    )
+
+    assert result.n_trades > 0, 'no trades: the invariant is untested at zero'
+    assert abs(result.funding_pnl) > 0.0, (
+        'funding never accrued, so the path this test exists for is not exercised'
+    )
+
+    walked = result.final_equity - initial
+    assert walked == pytest.approx(result.net_pnl, rel=1e-9, abs=1e-6), (
+        f'the equity curve moved {walked:,.2f} while the ledger recorded '
+        f'{result.net_pnl:,.2f} — a term is dropped or double-counted between '
+        f'them (price {result.price_pnl:,.2f}, funding {result.funding_pnl:,.2f}, '
+        f'fees {result.fees:,.2f})'
+    )
+
+    # And the decomposition the report prints must itself add up.
+    assert result.net_pnl == pytest.approx(
+        result.price_pnl + result.funding_pnl - result.fees, rel=1e-9, abs=1e-6,
+    )
+
+
+def test_a_stop_fills_at_the_stop_and_that_is_optimistic(config):
+    """Recorded as a known understatement rather than left implicit.
+
+    `resolve_bar` exits a stopped position *at* `position.stop_loss`. A real stop
+    on a thin nano perp gaps through: the median close-to-next-open move on this
+    book is 1.7-28bp, and a stop triggered inside a bar fills wherever the book
+    is, not at the trigger. So modelled stop exits are better than reachable ones
+    by roughly that gap, on every stopped trade.
+
+    Not corrected, because the correction only makes a losing book lose more and
+    the size of it is a modelling choice rather than a measurement. Pinned,
+    because the day someone reads a stop-heavy result as tradeable this is the
+    caveat they need, and because a change that made stops fill *better* than the
+    trigger would be a real bug this catches.
+    """
+    from core.execution import Position, resolve_bar
+
+    entry, stop = 100.0, 98.0
+    position = Position('BIP', 1, 10, entry, pd.Timestamp('2026-01-01', tz='UTC'),
+                        entry_fee=0.0, margin=100_000.0,
+                        take_profit=110.0, stop_loss=stop)
+
+    # A bar that gaps well through the stop.
+    bar = _bar(97.5, 90.0, 95.0)
+    outcome = resolve_bar(position, bar, pd.Timestamp('2026-01-02', tz='UTC'))
+
+    assert outcome.exited
+    assert outcome.reason is ExitReason.STOP_LOSS
+    assert outcome.exit_price == pytest.approx(stop), (
+        'a stop that fills anywhere other than its trigger changed behaviour; if '
+        'it now fills worse that is a correction, if better it is a bug'
+    )
+    # The optimism, stated in the units that matter.
+    assert outcome.exit_price > float(bar['low']), 'the bar traded through the modelled fill'
