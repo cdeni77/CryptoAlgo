@@ -269,6 +269,45 @@ have to reach roughly **48 days**, at which point the effective sample is a few
 dozen observations. There is no horizon at which this forecast pays for the
 round trip.
 
+### The 27-cell survey, and why its best cell is the control
+
+`scripts.ic_survey` walks three horizons against nine feature-group sets, six
+purged folds each, every cell appended to `data/search/ledger.parquet`. The hit
+rule is pre-registered in the module: median price IC positive and at least five
+of six folds sharing that sign. Under the null each fold is a coin flip, so
+`P(>= 5/6) = 7/64 = 10.9%` and 27 cells expect 2.9 hits from noise.
+
+    cells surveyed        27
+    hits observed          3
+    hits expected (null) 3.0
+    P(>= 3 hits | null)  0.579
+
+**Three hits, three expected.** The survey found exactly what noise produces.
+
+The detail that settles it: **the highest-scoring cell in the whole grid is the
+control.** `seasonality,cost` at h=24h — hour-of-day and day-of-week sin/cos,
+`is_weekend`, and four fee-hurdle columns — scored price IC **+0.0538** with 5 of
+6 folds agreeing, reaching **60.7%** of the IC its own round trip needs. That is
+the best any cell came to paying for itself, and hour-of-day cannot forecast
+direction. Its `identity_ratio` is **1.0147**, above the hindsight ceiling: the
+cost columns are near-constant per instrument, so the model is ranking by
+instrument identity with a continuous variable, which is exactly the failure
+`contract_notional_usd` was removed from the feature set for.
+
+The control was put in the grid to measure the survey's own noise floor. It fired,
+and it beat every real feature set. Nothing else in the table needs interpreting.
+
+The other two hits are both h=1h `cross_venue` (+0.0047, 6/6) and
+`cross_venue,trend` (+0.0120, 5/6) — reproducing the cell these docs previously
+called "the largest", at **1.1% and 2.9%** of required IC respectively.
+
+Best real feature set anywhere in the grid: `all` at h=24h, price IC +0.0175,
+19.7% of required IC, and 3 of 6 folds — a coin flip.
+
+`net_ic_skill` is negative in 20 of 27 cells. At h=1h the cost-only floor is
++0.139 against net ICs of +0.11 to +0.14, so essentially all of net IC there was
+the fee schedule appearing on both sides of the correlation.
+
 **Volatility: a lot.** The dispersion head scores **+0.34** on the holdout, and it
 went *up* when the target was fixed, because it never depended on the artifact.
 Returns are near-unpredictable and volatility is very predictable, which is the
