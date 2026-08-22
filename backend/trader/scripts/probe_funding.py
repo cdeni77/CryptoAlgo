@@ -171,6 +171,93 @@ async def contract_sizes(client, products: list[str]) -> None:
     print()
 
 
+async def probe_dated_futures(client, expired_probes: list[str]) -> None:
+    """Do CDE's dated futures carry usable candle history?
+
+    This decides whether the perp-vs-dated-future spread is testable now or has to
+    wait. Unlike funding and open interest — snapshots with no history endpoint —
+    candles come from `/products/{id}/candles`, which is a range query. So dated
+    contracts might already hold months of bars.
+
+    The trade it would enable matters because of one number: the basis trade's cost
+    is dominated by the spot leg at 1.20 percent per side, 240bp round trip, which
+    is 97 percent of the total and pushes breakeven to 57 days. Both legs of a
+    calendar spread pay perp-style fees instead, roughly 20bp round trip each,
+    which would drop breakeven to about six days. That attacks the term that
+    dominates everything.
+
+    Two questions, and the second is the one that matters:
+
+    1. How much history does each *listed* dated contract have? They are listed a
+       few months before expiry, so expect 60-180 days each — enough to measure a
+       term structure, thin for gating.
+    2. Does an *expired* contract still serve candles? A calendar spread needs a
+       continuous series stitched across expiries. If delisted products still
+       answer, years of history can be built today. If they 404, the idea joins
+       funding in the accumulate-forward queue.
+
+    Caveat worth carrying into any result: a dated contract on a nano venue is
+    likely thinner than the perp, and six of fourteen perps already have median
+    fill uncertainty exceeding their own fee. Cheap fees on a stale book is the
+    trap that makes a backtest look good and a fill impossible, so run
+    `scripts.preflight` on anything this turns up before believing a spread.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    status, data = await client._request(
+        'GET', '/api/v3/brokerage/products',
+        params={'product_type': 'FUTURE'}, authenticated=True,
+    )
+    if status != 200:
+        print(f'product list: HTTP {status}')
+        return
+
+    perpetual, dated = [], []
+    for product in data.get('products', []):
+        details = product.get('future_product_details') or {}
+        # Only the perpetual-style contracts carry a funding interval.
+        target = perpetual if details.get('funding_interval') else dated
+        target.append(product.get('product_id', ''))
+
+    print('=' * 78)
+    print(f'{len(perpetual)} perpetual, {len(dated)} dated')
+    print('=' * 78)
+
+    end = datetime.now(timezone.utc).replace(tzinfo=None)
+    start = end - timedelta(days=400)
+
+    print(f'\n{"listed dated contract":26}{"1h bars":>9}{"days":>7}{"first":>12}{"last":>12}')
+    for product in sorted(dated):
+        try:
+            bars = await client.get_candles_range(
+                product_id=product, granularity='1h', start=start, end=end)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f'{product:26} {type(exc).__name__}: {str(exc)[:40]}')
+            continue
+        if not bars:
+            print(f'{product:26}{0:>9}')
+            continue
+        stamps = sorted(b.event_time for b in bars)
+        span = (stamps[-1] - stamps[0]).total_seconds() / 86_400
+        print(f'{product:26}{len(bars):>9}{span:>7.0f}'
+              f'{str(stamps[0].date()):>12}{str(stamps[-1].date()):>12}')
+
+    print(f'\n{"expired probe":26}{"result":>9}   '
+          f'(does a delisted product still serve candles?)')
+    for product in expired_probes:
+        try:
+            bars = await client.get_candles_range(
+                product_id=product, granularity='1h',
+                start=end - timedelta(days=250), end=end)
+            verdict = f'{len(bars)} bars' if bars else 'empty'
+        except Exception as exc:                                  # noqa: BLE001
+            verdict = f'{type(exc).__name__}'
+        print(f'{product:26}{verdict:>9}')
+    print('\nIf the expired probes return bars, a continuous stitched series can be '
+          'built today.\nIf they are empty or error, dated futures accumulate '
+          'forward only, like funding.')
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--product', default='BIP-20DEC30-CDE')
@@ -179,6 +266,16 @@ async def main() -> int:
                              'ones this system models. Answers "can I add X?".')
     parser.add_argument('--sizes-only', action='store_true',
                         help='Skip the endpoint probe, just dump contract sizes')
+    parser.add_argument('--dated-futures', action='store_true',
+                        help="How much candle history CDE's dated futures carry, "
+                             "and whether an expired contract still serves it. "
+                             "Decides whether a perp-vs-dated-future spread is "
+                             "testable now: both legs would pay perp-style fees "
+                             "instead of 240bp for a spot leg, which is 97 percent "
+                             "of the basis trade's cost.")
+    parser.add_argument('--expired-probes',
+                        default='BIT-26JUN26-CDE,SOL-26JUN26-CDE,ADA-27MAR26-CDE',
+                        help='Comma-separated delisted product ids to test')
     parser.add_argument('--funding-path', default=None,
                         help='Path of the historical-funding endpoint, from the '
                              'API reference. Given this, the probe queries it '
@@ -209,6 +306,13 @@ async def main() -> int:
 
         if args.list_contracts:
             await list_all_contracts(client)
+            return 0
+
+        if args.dated_futures:
+            await probe_dated_futures(
+                client,
+                [p.strip() for p in args.expired_probes.split(',') if p.strip()],
+            )
             return 0
 
         if args.funding_path:
