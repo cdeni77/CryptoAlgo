@@ -311,6 +311,43 @@ have to reach roughly **48 days**, at which point the effective sample is a few
 dozen observations. There is no horizon at which this forecast pays for the
 round trip.
 
+### h=96h was the last untested cell, and it fails on every gate
+
+The cost screen said h=96h was the only horizon clearing both the economics and
+the sample gate — required IC 0.024-0.045 against a 95% win-rate ceiling, 279
+effective observations. It had never been run. Run against the 14 contracts with
+>= 231 days, half-life 365d, honest target:
+
+    213 trades | net -21,509 (price -11,549, funding +0, fees 9,960)
+    Sharpe -3.87 | maxDD 21.8% | win rate 39.9% | liquidations 0
+    gates: 213 of 70,077 accepted (0.30%)
+    bootstrap: Sharpe median -3.48 [p05 -5.25, p95 -1.67] | P(positive) 0% | ruin 98.7%
+    cost stress: baseline -3.87, fees 2x -5.57, spread 3x -4.24, both -6.34 | survives: no
+    per-period: 6 walk-forward paths, all negative, positive fraction 0.00
+
+**The economics gate did exactly what the screen predicted, and it did not help.**
+Acceptance rose from 0.003% at h=1h to 0.30% here — a hundredfold, because the
+forecast now clears the round trip far more often. The win rate rose from 24% to
+39.9%. Both moved the way the arithmetic said they would. The Sharpe got *worse*,
+from -2.36 to -3.87.
+
+**And the binding constraint changed, which is the useful part.** The dominant
+gate is no longer `edge_below_cost` (6,157) but **`participation_limit` at
+49,387 — 70% of all rejections.** At a four-day hold the sized position is large
+relative to a bar's volume, so the book cannot absorb it. Below h=24h this system
+was constrained by the fee schedule; at h=96h it is constrained by the fact that
+these are nano contracts on a thin venue. There is no horizon where neither
+binds: short holds cannot pay the toll, long holds cannot be filled at size.
+
+Fees are 9,960 of the 21,509 loss — 46%. Price PnL is -11,549. Both halves are
+still broken, and cost stress kills it in every scenario.
+
+This closes the last configuration that had an argument behind it rather than a
+hope. Direction on this venue has now been rejected four independent ways: the
+cost arithmetic (34x short at h=1h, 7x at h=24h), a 27-cell pre-registered survey
+(3 hits, 3.0 expected, and the winner was the control), a sign-inverted simulation
+(inverting made gross PnL *worse*), and h=96h measured end to end.
+
 ### The feature panel is built for a strategy this venue cannot afford
 
 `cross_sectional_standardize` converts 8 of the 9 feature groups to z-scores
