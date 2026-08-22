@@ -246,3 +246,61 @@ def test_raising_leverage_past_the_risk_budget_stops_adding_size():
     assert _loss_at_stop(25.0) == pytest.approx(_loss_at_stop(10.0), rel=1e-6), (
         'past the budget, more leverage must not buy more risk'
     )
+
+
+def test_the_edge_to_risk_gate_is_sweepable_and_the_profile_cannot_override_it():
+    """It was a module constant, which made it the one gate nobody could move.
+
+    Every other threshold `decide()` reads is a `Config` field resolved against
+    the coin profile, so a sensitivity run can set it. `MIN_EDGE_TO_RISK` was
+    `0.05` in `core/signal.py`, so answering "how much of this result is the
+    gates" needed a monkeypatch — and a monkeypatched threshold is a measurement
+    nobody can reproduce from the CLI.
+
+    Two things have to hold for the field to be usable. It has to gate: raising
+    it must reject a forecast a lower value accepts. And an explicit setting has
+    to beat the default, because `Config.resolve` ignores the field unless the
+    name is in `cli_overrides` — the trap that makes a swept threshold silently
+    do nothing.
+    """
+    import core.signal as signal_module
+    from core.signal import decide
+
+    assert not hasattr(signal_module, 'MIN_EDGE_TO_RISK'), (
+        'the module constant is back; the Config field must be the only source'
+    )
+    assert Config().min_edge_to_risk > 0.0
+
+    def swept(value: float) -> Config:
+        base = Config()
+        return replace(
+            base, min_edge_to_risk=value, min_edge_over_cost=0.0,
+            cli_overrides=frozenset(base.cli_overrides | {'min_edge_to_risk'}),
+        )
+
+    # An edge of 0.4 sigma: comfortably above 0.05, far below 10.
+    forecast = pd.Series({
+        'price': 0.004, 'carry': 0.0, 'cost': 0.0005, 'sigma': 0.01,
+        'side': 1.0, 'expected_net': 0.004, 'edge_to_risk': 0.4,
+    })
+    context = DecisionContext(
+        equity=1_000_000, volatility=0.02, bar_volume=1e12,
+        price=60_000.0, max_positions=5,
+    )
+    timestamp = pd.Timestamp('2026-01-01', tz='UTC')
+
+    def at(threshold: float):
+        return decide(symbol='BIP', timestamp=timestamp, forecast=forecast,
+                      context=context, config=swept(threshold))
+
+    permissive, strict = at(0.0), at(10.0)
+
+    assert permissive.gate is None or permissive.gate != Gate.EDGE_TO_RISK
+    assert strict.gate == Gate.EDGE_TO_RISK, (
+        f'raising the threshold to 10 sigma did not gate; got {strict.gate}'
+    )
+
+    # Unmarked, the field is ignored in favour of the default — which is exactly
+    # how a hand-set threshold becomes a no-op.
+    unmarked = replace(Config(), min_edge_to_risk=10.0)
+    assert unmarked.resolve('min_edge_to_risk') == Config().min_edge_to_risk

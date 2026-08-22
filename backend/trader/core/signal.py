@@ -63,10 +63,6 @@ class Gate(str, Enum):
     PARTICIPATION_LIMIT = 'participation_limit'
 
 
-# Minimum forecast-to-risk ratio before a position is worth taking. A forecast
-# smaller than a fraction of its own uncertainty is noise, whatever its sign.
-MIN_EDGE_TO_RISK = 0.05
-
 # Refuse to trade more than this share of a bar's volume. Above it the backtest
 # is describing a market that would have moved away from the order.
 MAX_PARTICIPATION = 0.10
@@ -269,7 +265,7 @@ def decide(
 
     # -- and it must be large relative to its own uncertainty --------------
     edge_to_risk = expected_net / sigma
-    if edge_to_risk < MIN_EDGE_TO_RISK:
+    if edge_to_risk < float(config.resolve('min_edge_to_risk', profile)):
         return result(gate=Gate.EDGE_TO_RISK, side=side)
 
     # -- conviction floor, scaled to what the trade costs -----------------

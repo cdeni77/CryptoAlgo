@@ -82,6 +82,12 @@ class Config:
     # be trivially met on one and unreachable on the other. At 0.5, DOGE needs
     # ~2.5bp of forecast edge and ETH needs ~27bp.
     min_edge_over_cost: float = 0.5
+    # Minimum forecast-to-risk ratio before a position is worth taking: a
+    # forecast smaller than a fraction of its own uncertainty is noise, whatever
+    # its sign. Lived as a module constant in `core/signal.py`, which made it the
+    # one gate threshold no caller could sweep — so a sensitivity run had to
+    # monkeypatch it. Every other threshold here is a field; this is now one too.
+    min_edge_to_risk: float = 0.05
     min_momentum_magnitude: float = 0.07
     max_ensemble_std: float = 0.12
     min_directional_agreement: float = 0.67
