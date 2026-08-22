@@ -257,3 +257,60 @@ def test_the_tradeable_universe_is_a_rule_not_a_symbol_list():
             f'ADP and LCP are separated by {margin:.3f} on fill uncertainty; the '
             f'0.40 threshold is doing real work at a boundary inside its own noise'
         )
+
+
+def test_pruning_protects_the_data_that_cannot_be_refetched(tmp_path):
+    """Bars come back from a scrape; funding and open interest never do.
+
+    Both are single-value snapshots on the product endpoint — no range
+    parameters, no cursor — so they accumulate forward only and no request
+    recovers a deleted row. `.gitignore` un-ignores those two datasets for
+    exactly that reason.
+
+    So a universe prune must refuse them by default. A tool that treats a
+    regenerable partition and an irreplaceable one the same way is one flag away
+    from destroying the only data in the store that cannot be rebuilt.
+    """
+    import pathlib
+    import subprocess
+    import sys
+
+    root = tmp_path / 'research'
+    for dataset in ('bars', 'funding', 'open_interest'):
+        for symbol in ('BIP-20DEC30-CDE', 'LCP-20DEC30-CDE'):
+            d = root / dataset / 'venue=coinbase' / f'symbol={symbol}' / 'month=2026-01'
+            d.mkdir(parents=True)
+            (d / 'data.parquet').write_bytes(b'x' * 32)
+
+    def run(*extra):
+        return subprocess.run(
+            [sys.executable, '-m', 'scripts.prune_universe',
+             '--store', str(root), '--db-path', str(tmp_path / 'none.db'),
+             '--keep', 'BTC', *extra],
+            capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parents[1]),
+        )
+
+    # Dry run changes nothing at all.
+    out = run()
+    assert out.returncode == 0, out.stderr
+    assert 'dry run' in out.stdout
+    assert (root / 'bars/venue=coinbase/symbol=LCP-20DEC30-CDE').exists()
+
+    # Applying removes the out-of-universe bars and keeps the snapshots.
+    out = run('--apply')
+    assert out.returncode == 0, out.stderr
+    assert not (root / 'bars/venue=coinbase/symbol=LCP-20DEC30-CDE').exists(), \
+        'out-of-universe bars should be removed'
+    assert (root / 'funding/venue=coinbase/symbol=LCP-20DEC30-CDE').exists(), \
+        'funding is irreplaceable and must survive without an explicit override'
+    assert (root / 'open_interest/venue=coinbase/symbol=LCP-20DEC30-CDE').exists()
+    assert 'PROTECTED' in out.stdout
+
+    # The kept instrument is untouched throughout.
+    assert (root / 'bars/venue=coinbase/symbol=BIP-20DEC30-CDE').exists()
+
+    # And the override does delete them, so the protection is a default and not
+    # a dead branch.
+    out = run('--apply', '--include-irreplaceable')
+    assert out.returncode == 0, out.stderr
+    assert not (root / 'funding/venue=coinbase/symbol=LCP-20DEC30-CDE').exists()

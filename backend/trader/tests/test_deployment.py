@@ -569,6 +569,8 @@ def test_the_scrape_and_the_migration_agree_about_the_timeframe():
     'scripts.backtest', 'scripts.train', 'scripts.promote', 'scripts.signals',
     'scripts.preflight', 'scripts.search', 'scripts.build_features',
     'scripts.gate_sensitivity', 'scripts.instrument_screen',
+    'scripts.prune_universe', 'scripts.model_capacity',
+    'scripts.cross_sectional_backtest', 'scripts.ic_survey',
     'scripts.run_pipeline', 'scripts.live_orchestrator',
 ])
 def test_help_does_not_crash(module):
