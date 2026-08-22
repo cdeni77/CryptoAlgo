@@ -56,7 +56,7 @@ from core.config import Config
 from core.costs import get_contract_spec
 from core.cv import average_uniqueness
 from core.datastore import ResearchStore
-from core.targets import round_trip_cost_series
+from core.targets import required_information_coefficient, round_trip_cost_series
 from scripts._common import add_data_arguments, build_config, configure_logging
 
 # Above this, a forecast has to be better than anything this class of model
@@ -202,6 +202,23 @@ def main() -> int:
               .to_string(index=False, float_format=lambda x: f'{x:8.3f}'))
 
     summary, any_pass = _verdict(frame, args.max_required_ic, args.min_effective_obs)
+
+    # Cross-check the per-instrument table against the single implementation the
+    # `ic_covers_cost` promotion gate reads, so the screen and the gate can never
+    # disagree about what an instrument requires.
+    bars_by_symbol = {
+        symbol: group.set_index('event_time').sort_index()
+        for symbol, group in ResearchStore(args.store)
+        .read('bars', venue=args.venue).groupby('symbol')
+    }
+    print('\ncross-check against core.targets.required_information_coefficient '
+          '(what the promotion gate reads):')
+    for horizon in horizons:
+        shared = required_information_coefficient(
+            bars_by_symbol, config, horizon_bars=horizon)
+        mine = float(frame.loc[frame['horizon'] == horizon, 'required_ic'].median())
+        flag = 'ok' if abs(shared - mine) < 5e-4 else 'DISAGREE'
+        print(f'  h={horizon:>3}h  screen {mine:.4f}  gate {shared:.4f}  {flag}')
     print('\nby horizon')
     print(summary.to_string(index=False, float_format=lambda x: f'{x:8.3f}'))
 

@@ -315,6 +315,7 @@ def test_all_gates_passing_promotes():
         'parameter_plateau': 0.8, 'oos_trades': 250,
         'max_exit_participation': 0.06,
         'proxy_funding_symbols': 0.0,   # carry measured on the traded venue
+        'ic_covers_cost': 1.4,          # the forecast clears its own round trip
     }
 
     promoted, gates = evaluate_gates(measurements)
@@ -331,6 +332,7 @@ def test_one_failing_gate_blocks():
         'bootstrap_positive_fraction': 0.95, 'synthetic_positive_fraction': 0.7,
         'stressed_median_sharpe': 0.2, 'parameter_plateau': 0.8, 'oos_trades': 250,
         'max_exit_participation': 0.06, 'proxy_funding_symbols': 0.0,
+        'ic_covers_cost': 1.4,
     }
 
     promoted, gates = evaluate_gates(measurements)

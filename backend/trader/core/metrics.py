@@ -422,6 +422,23 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # Research on proxy funding is legitimate; promoting it is not, so this is a
     # gate rather than a warning. `--force` with a reason remains the escape.
     'proxy_funding_symbols': (0.0, 'max'),
+    # Measured out-of-sample price IC divided by the IC the universe's own round
+    # trip requires (`core.targets.required_information_coefficient`). At 1.0 the
+    # average forecast exactly breaks even before fill uncertainty; below it, the
+    # forecast does not cover the toll it pays to act on.
+    #
+    # This gate exists because its absence cost this project eight months. Every
+    # other gate here reads a *simulated outcome*, so a model 34x short of its own
+    # cost hurdle failed them all without any of them saying why — and a Sharpe
+    # needs far more data to estimate than an IC does, so the diagnosis arrived
+    # long after the effort.
+    #
+    # A candidate can in principle clear its costs on a high-conviction tail while
+    # its average forecast does not: `decide()` only acts when `expected_net > 0`,
+    # so the traded subset is selected. That is a real argument and it is also
+    # exactly the argument that kept a losing system alive, so it needs a human to
+    # write it down — `--force` with a reason, which records itself.
+    'ic_covers_cost': (1.0, 'min'),
 }
 
 

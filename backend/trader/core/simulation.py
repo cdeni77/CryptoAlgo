@@ -640,6 +640,11 @@ class SimulationReport:
     # `Dataset.proxy_funding_symbols`. `None` means the question was not asked,
     # which fails the gate — the same direction as every other measurement here.
     proxy_funding_symbols: Optional[tuple[str, ...]] = None
+    # Both halves of `ic_covers_cost`, kept separately so a rejection says which
+    # side of the ratio failed: a forecast that is too weak and a venue that is
+    # too expensive are the same number and completely different problems.
+    measured_price_ic: Optional[float] = None
+    required_price_ic: Optional[float] = None
 
     def measurements(self) -> dict[str, Optional[float]]:
         """Flat mapping for `core.metrics.evaluate_gates`.
@@ -669,10 +674,30 @@ class SimulationReport:
                 float(len(self.proxy_funding_symbols))
                 if self.proxy_funding_symbols is not None else None
             ),
+            'ic_covers_cost': self.ic_covers_cost,
         }
+
+    @property
+    def ic_covers_cost(self) -> Optional[float]:
+        """Measured IC as a multiple of the IC this universe requires.
+
+        None when either half is missing, which fails the gate. Not clamped: a
+        ratio of 0.03 and a ratio of 0.9 both fail, and the distance is the most
+        useful number in the record — 0.03 says change the instrument, 0.9 says
+        the model is close.
+        """
+        measured, required = self.measured_price_ic, self.required_price_ic
+        if measured is None or required is None:
+            return None
+        if not (np.isfinite(measured) and np.isfinite(required)) or required <= 0:
+            return None
+        return float(measured / required)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            'measured_price_ic': self.measured_price_ic,
+            'required_price_ic': self.required_price_ic,
+            'ic_covers_cost': self.ic_covers_cost,
             'bootstrap': self.bootstrap.as_dict() if self.bootstrap else None,
             'synthetic': self.synthetic.as_dict() if self.synthetic else None,
             'stress': self.stress.as_dict() if self.stress else None,

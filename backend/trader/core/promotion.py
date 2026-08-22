@@ -220,6 +220,40 @@ def surface_candidates(config: Config) -> dict[str, Config]:
     return out
 
 
+def _forecast_economics(
+    forecasts: "pd.DataFrame",
+    dataset,
+    config,
+) -> tuple[Optional[float], Optional[float]]:
+    """Out-of-sample price IC, and the IC this universe's round trip requires.
+
+    The two halves of the `ic_covers_cost` gate. Returned as a pair rather than a
+    ratio so a rejection can say which side failed: a weak forecast and an
+    expensive venue produce the same number and call for opposite responses.
+
+    The IC is Spearman on the price head against realised price return, aligned on
+    the forecast index. Price, not net: net return carries `-cost` on both sides
+    of the correlation, so scoring against it credits the fee schedule as signal —
+    on this store a forecast predicting nothing scores net IC +0.07.
+    """
+    from core.model import information_coefficient
+    from core.targets import required_information_coefficient
+
+    measured: Optional[float] = None
+    if forecasts is not None and not forecasts.empty and 'price' in forecasts:
+        realised = dataset.targets.reindex(forecasts.index)
+        if 'price' in realised:
+            value = information_coefficient(
+                forecasts['price'].to_numpy(), realised['price'].to_numpy(),
+            )
+            measured = float(value) if np.isfinite(value) else None
+
+    required = required_information_coefficient(
+        dataset.bars, config, horizon_bars=dataset.horizon_bars,
+    )
+    return measured, (float(required) if np.isfinite(required) else None)
+
+
 def evaluate_candidate(
     dataset: Dataset,
     config: Config,
@@ -281,12 +315,22 @@ def evaluate_candidate(
         'forecasts': generated.summary(),
     }
 
+    # The economics, measured on the same out-of-sample forecasts the backtest
+    # traded. `generated.forecasts` is walk-forward, so this is not in-sample, and
+    # it is the price head alone — net IC would credit the cost term appearing on
+    # both sides of the correlation (see `CVReport.net_ic_skill`).
+    measured_ic, required_ic = _forecast_economics(
+        generated.forecasts, dataset, config,
+    )
+
     report = SimulationReport(
         oos_trades=result.n_trades,
         max_exit_participation=result.max_exit_participation,
         # A tuple, possibly empty, rather than None: the question was asked. The
         # gate then reads its length, and zero passes.
         proxy_funding_symbols=tuple(dataset.proxy_funding_symbols),
+        measured_price_ic=measured_ic,
+        required_price_ic=required_ic,
     )
 
     def period_sharpes_of(outcome, periods) -> list[float]:

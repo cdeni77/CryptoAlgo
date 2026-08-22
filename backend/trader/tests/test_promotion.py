@@ -584,3 +584,137 @@ def test_the_model_artifact_records_proxy_funding():
         heads={}, feature_columns=('a',), symbol_categories=('BIP',),
         feature_set_hash='deadbeef', horizon_bars=24,
     ).provenance()['proxy_funding_symbols'] == []
+
+
+def test_a_forecast_that_cannot_cover_its_own_round_trip_is_blocked():
+    """The gate whose absence cost this project eight months.
+
+    Every other gate reads a *simulated outcome*, so a model 34x short of its own
+    cost hurdle failed all of them without any of them saying why. A Sharpe also
+    needs far more data to estimate than an IC does, so the diagnosis arrived long
+    after the effort. `ic_covers_cost` is measured IC over the IC the universe's
+    round trip requires, and 1.0 is break-even before fill uncertainty.
+
+    Asserted at the numbers actually measured on this store: a price IC of +0.012
+    against a required 0.404 at h=1h is a ratio of 0.03, and it must fail.
+    """
+    from core.metrics import DEFAULT_GATES, evaluate_gates
+    from core.simulation import SimulationReport
+
+    assert 'ic_covers_cost' in DEFAULT_GATES
+    threshold, comparison = DEFAULT_GATES['ic_covers_cost']
+    assert comparison == 'min' and threshold == pytest.approx(1.0)
+
+    measured_h1 = SimulationReport(measured_price_ic=0.012, required_price_ic=0.404)
+    assert measured_h1.ic_covers_cost == pytest.approx(0.0297, abs=1e-3)
+
+    gates = {g.name: g for g in evaluate_gates(
+        measured_h1.measurements(), require_all=True)[1]}
+    assert not gates['ic_covers_cost'].passed, (
+        'a forecast at 3% of its required IC must not reach live'
+    )
+
+    # A forecast that clears its hurdle passes this gate. Without this half the
+    # gate could be unconditionally failing and the test above would not notice.
+    clears = SimulationReport(measured_price_ic=0.09, required_price_ic=0.082)
+    assert clears.ic_covers_cost > 1.0
+    gates = {g.name: g for g in evaluate_gates(
+        clears.measurements(), require_all=True)[1]}
+    assert gates['ic_covers_cost'].passed
+
+
+def test_an_unmeasured_cost_ratio_fails_like_every_other_gate():
+    """"We did not check" is not evidence of safety.
+
+    Both halves are needed, and either missing means the question was not asked.
+    A ratio that quietly defaulted to passing would be worse than no gate, because
+    the record would show it green.
+    """
+    from core.metrics import evaluate_gates
+    from core.simulation import SimulationReport
+
+    for report in (
+        SimulationReport(),                                          # neither
+        SimulationReport(measured_price_ic=0.05),                    # no requirement
+        SimulationReport(required_price_ic=0.08),                    # no measurement
+        SimulationReport(measured_price_ic=0.05, required_price_ic=0.0),   # unusable
+        SimulationReport(measured_price_ic=float('nan'), required_price_ic=0.08),
+    ):
+        assert report.ic_covers_cost is None
+        gates = {g.name: g for g in evaluate_gates(
+            report.measurements(), require_all=True)[1]}
+        assert not gates['ic_covers_cost'].passed
+        assert gates['ic_covers_cost'].note == 'not measured'
+
+
+def test_both_halves_of_the_ratio_are_recorded_separately():
+    """A weak forecast and an expensive venue are the same ratio, opposite fixes."""
+    from core.simulation import SimulationReport
+
+    weak = SimulationReport(measured_price_ic=0.004, required_price_ic=0.082)
+    dear = SimulationReport(measured_price_ic=0.020, required_price_ic=0.404)
+
+    assert weak.ic_covers_cost == pytest.approx(dear.ic_covers_cost, rel=0.1)
+    recorded = weak.as_dict()
+    assert recorded['measured_price_ic'] == pytest.approx(0.004)
+    assert recorded['required_price_ic'] == pytest.approx(0.082)
+    assert recorded['ic_covers_cost'] == pytest.approx(weak.ic_covers_cost)
+
+
+def test_the_required_ic_is_measured_on_fillable_prices():
+    """Open-anchored, like the target.
+
+    Dispersion measured close-to-close includes the stale-print catch-up that no
+    position can capture — the artifact that accounted for 98% of this system's
+    apparent edge. Inflating sigma that way understates the required IC, which
+    would make the gate too lenient in exactly the direction that already cost
+    eight months.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from core.config import Config, find_cost_config
+    from core.targets import required_information_coefficient
+
+    path = find_cost_config()
+    if path is None:
+        pytest.skip('no cost config on the search path')
+    config = Config().with_cost_assumptions(path)
+
+    index = pd.date_range('2026-01-01', periods=3_000, freq='h', tz='UTC')
+    rng = np.random.default_rng(5)
+    opens = 60_000 * np.exp(np.cumsum(rng.normal(0, 0.004, len(index))))
+    # Closes carry a large independent print offset: a stale last trade. It must
+    # not change the requirement, because no position fills at it.
+    closes = opens * (1 + rng.normal(0, 0.01, len(index)))
+    bars = pd.DataFrame({'open': opens, 'high': opens * 1.02, 'low': opens * 0.98,
+                         'close': closes, 'volume': 1_000.0}, index=index)
+
+    honest = required_information_coefficient(
+        {'BIP-20DEC30-CDE': bars}, config, horizon_bars=4)
+    # Same bars with the stale offset removed: the requirement should barely move.
+    clean = bars.assign(close=opens)
+    reference = required_information_coefficient(
+        {'BIP-20DEC30-CDE': clean}, config, horizon_bars=4)
+
+    assert np.isfinite(honest) and honest > 0
+    assert honest == pytest.approx(reference, rel=0.15), (
+        f'stale closes moved the requirement from {reference:.4f} to {honest:.4f} '
+        f'— sigma is being measured on prices no position can fill at'
+    )
+
+    # And it falls with the hold, roughly as 1/sqrt(h).
+    long_hold = required_information_coefficient(
+        {'BIP-20DEC30-CDE': bars}, config, horizon_bars=64)
+    assert long_hold < honest
+    assert 2.0 < honest / long_hold < 6.0
+
+
+def test_an_empty_universe_yields_no_requirement_rather_than_zero():
+    """Zero would pass the gate trivially; NaN fails it."""
+    import numpy as np
+
+    from core.config import Config
+    from core.targets import required_information_coefficient
+
+    assert np.isnan(required_information_coefficient({}, Config(), horizon_bars=4))

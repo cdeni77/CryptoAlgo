@@ -121,6 +121,47 @@ def round_trip_cost_series(
     return pd.Series(2.0 * (fee_per_side + slippage), index=price.index)
 
 
+def required_information_coefficient(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    config: Config,
+    *,
+    horizon_bars: int,
+) -> float:
+    """Median `round_trip_cost / sigma_h` across a universe: the IC to break even.
+
+    The denominator under every conclusion this system produces. Cost is charged
+    once per round trip and dispersion grows as `sqrt(h)`, so the bar an
+    instrument sets falls with the hold and is otherwise a property of the venue,
+    settled before a model exists.
+
+    Anchored on `open`, not `close`, for the same reason the target is: a decision
+    from bar `t` fills at `open(t+1)`, and dispersion measured close-to-close
+    includes a move no position could have captured.
+
+    Median rather than mean, and across instruments rather than pooled, because
+    one contract with a tiny notional per contract (and therefore a large
+    commission share) should not set the bar for the book.
+
+    Returns NaN when nothing is measurable, which fails the gate that reads it —
+    the same direction as every other measurement here.
+    """
+    ratios: list[float] = []
+    horizon = int(horizon_bars)
+    for symbol, bars in bars_by_symbol.items():
+        if bars is None or bars.empty or 'open' not in bars or len(bars) < 200:
+            continue
+        frame = bars.sort_index()
+        opens = frame['open']
+        forward = (opens.shift(-(1 + horizon)) / opens.shift(-1)) - 1.0
+        sigma = float(forward.std())
+        if not np.isfinite(sigma) or sigma <= 0:
+            continue
+        cost = float(round_trip_cost_series(symbol, frame['close'], config).median())
+        if np.isfinite(cost) and cost > 0:
+            ratios.append(cost / sigma)
+    return float(np.median(ratios)) if ratios else float('nan')
+
+
 def target_spec_for(
     symbol: str,
     *,
