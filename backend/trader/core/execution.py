@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import Config
-from core.costs import fee_floor, get_contract_spec
+from core.costs import per_contract_fee, get_contract_spec
 
 logger = logging.getLogger(__name__)
 
@@ -475,11 +475,16 @@ def size_from_forecast(
 
 
 def entry_cost(contracts: int, price: float, symbol: str, config: Config) -> float:
-    """Commission for one side, in account currency."""
+    """Commission for one side, in account currency.
+
+    Percentage *plus* per-contract, which is what the venue's order ticket
+    charges. It used to be `max()` of the two; `core.costs.per_contract_fee`
+    carries the three tickets that ruled that out.
+    """
     spec = get_contract_spec(symbol)
     percentage = spec.notional(contracts, price) * config.fee_pct_per_side
-    floor = contracts * fee_floor(symbol, config)
-    return float(max(percentage, floor))
+    commission = contracts * per_contract_fee(symbol, config)
+    return float(percentage + commission)
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ def config(repo_root) -> Config:
 
 @pytest.fixture(scope='module')
 def cde_config():
-    """The real venue schedule: per-contract commission, no percentage fee."""
+    """The real venue schedule: 0.10% of notional plus a per-contract commission."""
     from core.config import Config, find_cost_config
     path = find_cost_config()
     if path is None:
@@ -221,11 +221,23 @@ def test_carry_alone_can_justify_a_position():
 
 
 def test_cost_varies_by_contract(config):
+    """And by how much: the spread is now modest, and that is the finding.
+
+    ETP is 0.1 ETH (~$300 of notional) against DOP's 5,000 DOGE (~$1,750), so a
+    fixed commission is ~6x the share of ETP's notional. But the commission is
+    the smaller of the two fee legs, and the percentage leg and the spread are
+    identical across the book, so the *round trip* differs by ~1.3x rather than
+    the >5x this asserted while ETP carried an explicit $0.75/contract.
+
+    The upper bound matters as much as the lower one. A wide per-contract spread
+    is what made "only the cheap contracts are tradeable" look like a result;
+    the tickets in `test_costs.py` say the venue does not price that way.
+    """
     eth = round_trip_cost('ETP', 3_000, config)
     doge = round_trip_cost('DOP', 0.35, config)
 
     assert eth > doge
-    assert eth / doge > 5
+    assert 1.15 < eth / doge < 1.6
 
 
 def test_cost_is_size_invariant(config):
@@ -354,8 +366,10 @@ def test_cost_moves_inversely_with_price(cde_config):
     assert cost.iloc[0] > cost.iloc[-1], 'cost must fall as price rises'
     assert cost.nunique() > 100, f'cost is near-constant across the sample ({cost.nunique()} values)'
     # The measured swing over a 30k-100k range, which one reference price reported
-    # as a single number.
-    assert 2.5 < cost.iloc[0] / cost.iloc[-1] < 3.2
+    # as a single number. Only the commission leg moves with price, and it is the
+    # smaller leg, so the swing is ~1.2x — it was ~3.3x while the commission was
+    # modelled as a floor and therefore *was* the whole fee on this contract.
+    assert 1.1 < cost.iloc[0] / cost.iloc[-1] < 1.4
 
 
 def test_the_panel_cost_is_per_bar_not_one_number(cde_config):
@@ -392,26 +406,37 @@ def test_the_panel_cost_does_not_depend_on_later_bars(cde_config):
     )
 
 
-def test_the_fee_floor_dominates_the_percentage_where_it_should(cde_config):
-    """`max(pct, floor)`, not `min`.
+def test_both_fee_components_are_charged_not_the_larger_of_them(cde_config):
+    """`pct + per_contract/notional`, not `max()` of the two.
 
-    Flipping that comparison zeroes the commission entirely under the CDE
-    schedule, whose `fee_pct_per_side` is 0 — the panel's mean cost falls from
-    ~22bp to the slippage term alone — and every existing test still passed,
-    because the only cost assertions were the sign identity and the scalar helper.
+    The venue's order ticket bills 0.10% of notional *and* ~$0.12 per contract;
+    it was modelled as a floor, so every leg came in light by the smaller
+    component's share. On a $782 BIP contract that is 1.5bp a side and on a $242
+    ETP contract 5bp — a fifth of the round trip on the contract with the least
+    notional per contract, which is most of this book.
+
+    Asserted as an identity rather than against a number, so it fails on a
+    return to `max()` whichever way the two components happen to rank.
     """
+    from core.costs import get_contract_spec, per_contract_fee
     from core.targets import round_trip_cost_series
 
-    assert cde_config.fee_pct_per_side == 0.0, 'CDE prices per contract, not per cent'
+    assert cde_config.fee_pct_per_side > 0.0, 'the schedule charges a percentage'
+    commission = per_contract_fee('BIP-20DEC30-CDE', cde_config)
+    assert commission > 0.0, 'the schedule charges per contract too'
 
-    close = _rising_bars(60_000, 60_000, periods=10)['close']
+    close = _rising_bars(60_000, 78_000, periods=10)['close']
     cost = round_trip_cost_series('BIP-20DEC30-CDE', close, cde_config)
 
-    slippage_only = 2.0 * (cde_config.slippage_bps / 10_000.0)
-    assert (cost > slippage_only * 1.5).all(), (
-        'the per-contract floor is not reaching the cost: a min/max flip would '
-        'leave only slippage'
-    )
+    units = get_contract_spec('BIP-20DEC30-CDE').units
+    slippage = cde_config.slippage_bps / 10_000.0
+    expected = 2.0 * (cde_config.fee_pct_per_side + commission / (close * units) + slippage)
+    pd.testing.assert_series_equal(cost, expected, check_names=False)
+
+    # And strictly above either component alone, which is what `max()` returns.
+    larger = 2.0 * (np.maximum(cde_config.fee_pct_per_side,
+                               commission / (close * units)) + slippage)
+    assert (cost > larger).all()
 
 
 def test_the_identity_holds_with_a_per_bar_cost(cde_config):

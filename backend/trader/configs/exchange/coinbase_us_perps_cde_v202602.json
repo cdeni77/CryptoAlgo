@@ -6,47 +6,21 @@
   "execution_fee_mode": "bps",
   "exchange_fee_mode": "per_contract_usd",
   "retail_execution_fee": {
-    "enabled": false,
+    "enabled": true,
     "mode": "bps",
-    "taker_fee_bps": 0.0,
-    "maker_fee_bps": 0.0,
+    "taker_fee_bps": 10.0,
+    "maker_fee_bps": 10.0,
     "use_taker": true
   },
   "exchange_fee": {
     "enabled": true,
     "mode": "per_contract_usd",
-    "per_contract_usd": 0.75,
-    "symbol_overrides": {
-      "BTC": 0.75,
-      "BIP": 0.75,
-      "ETH": 0.75,
-      "ETP": 0.75,
-      "SLP": 0.10,
-      "XPP": 0.10,
-      "DOP": 0.10,
-      "AVAX": 0.10,
-      "AVP": 0.10,
-      "ADA": 0.10,
-      "ADP": 0.10,
-      "LINK": 0.10,
-      "LNP": 0.10,
-      "LTC": 0.10,
-      "LCP": 0.10,
-      "BCP": 0.10,
-      "NER": 0.10,
-      "SUP": 0.10,
-      "XLP": 0.10,
-      "POP": 0.10,
-      "SHP": 0.10,
-      "PEP": 0.10,
-      "HYPE": 0.10,
-      "HYP": 0.10,
-      "ONDO": 0.10,
-      "OND": 0.10
-    },
+    "per_contract_usd": 0.12,
+    "symbol_overrides": {},
     "participant_type_assumption": "non_professional",
     "execution_type_assumption": "electronic",
     "schedule_reference": {
+      "note": "The venue's published per-contract commission, kept for reference only. It is NOT what the order ticket charges: see observed_app_fees, where BIP and ETP are billed the same ~$0.12/contract as group B, not $0.75. The published table is a member schedule; the app bills a retail all-in of 0.10% + ~$0.12/contract. Measurement wins.",
       "group_a": {
         "symbols": ["BTC", "BIP", "ETH", "ETP"],
         "market_maker": 0.45,
@@ -65,9 +39,9 @@
     }
   },
   "fees": {
-    "maker_bps": 0.0,
-    "taker_bps": 0.0,
-    "min_fee_per_contract": 0.75,
+    "maker_bps": 10.0,
+    "taker_bps": 10.0,
+    "per_contract_usd": 0.12,
     "use_taker": true
   },
   "slippage": {
@@ -84,6 +58,34 @@
     "funding_interval_hours": 1,
     "method": "coinbase_us_perps_hourly"
   },
+  "observed_ui_fee_bps": 10.0,
+  "observed_ui_fee_source": "coinbase_app_order_tickets_2026-08-22",
+  "observed_app_fees": [
+    {
+      "contract": "BIP",
+      "underlying_price": 78205.0,
+      "contracts": 1,
+      "notional_usd": 782.05,
+      "app_fee_usd": 0.90,
+      "source": "coinbase_app_order_ticket"
+    },
+    {
+      "contract": "XPP",
+      "underlying_price": 1.481,
+      "contracts": 1,
+      "notional_usd": 740.50,
+      "app_fee_usd": 0.86,
+      "source": "coinbase_app_order_ticket"
+    },
+    {
+      "contract": "ETP",
+      "underlying_price": 2425.0,
+      "contracts": 1,
+      "notional_usd": 242.50,
+      "app_fee_usd": 0.36,
+      "source": "coinbase_app_order_ticket"
+    }
+  ],
   "contract_sizes": {
     "BIP": 0.01,
     "ETP": 0.10,

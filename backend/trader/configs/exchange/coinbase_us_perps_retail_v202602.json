@@ -27,7 +27,7 @@
   "fees": {
     "maker_bps": 10.0,
     "taker_bps": 10.0,
-    "min_fee_per_contract": 0.0,
+    "per_contract_usd": 0.0,
     "use_taker": true
   },
   "slippage": {

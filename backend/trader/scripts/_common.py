@@ -108,9 +108,11 @@ def build_config(args: argparse.Namespace) -> Config:
     if not args.cost_config or args.cost_config.lower() == 'none':
         logging.warning(
             'no cost config: pricing every contract at the hardcoded %.1fbp/side '
-            'with no per-contract floor, which is wrong for every Coinbase CDE '
-            'contract by 0.06x to 2.5x',
+            'plus $%.2f/contract. Those match the fees measured off the venue '
+            'app, so the numbers are right — but the run records no schedule '
+            'version, so a later change to either is invisible',
             config.fee_pct_per_side * 10_000,
+            config.per_contract_fee_usd,
         )
         return _with_recency(config, args)
 

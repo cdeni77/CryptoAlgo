@@ -75,18 +75,19 @@ def _cost_schedule(config: Config, symbols: list[str]) -> Check:
     if not config.cost_config_version or config.cost_config_version == 'default':
         return Check(
             'cost schedule', False,
-            'running on the hardcoded 10bp/side default',
+            'running on the hardcoded cost defaults',
             'pass --cost-config configs/exchange/coinbase_us_perps_cde_v202602.json. '
-            'The default is wrong for every Coinbase CDE contract by 0.06x-2.5x, '
-            'in both directions, which inverts the ranking between coins.',
+            'The defaults now match the fees measured off the venue app, so the '
+            'numbers are right — but nothing records which fee model priced the '
+            'run, and a change to either is then invisible.',
         )
     missing = symbols_missing_fee_schedule(symbols, config) if symbols else []
     if missing:
         return Check(
             'cost schedule', True,
             f'loaded {config.cost_config_version}; no explicit fee for '
-            f'{", ".join(missing)} (falling back to '
-            f'${config.min_fee_per_contract:.2f}/contract)',
+            f'{", ".join(missing)} (billed the schedule default of '
+            f'${config.per_contract_fee_usd:.2f}/contract)',
         )
     return Check('cost schedule', True, f'loaded {config.cost_config_version}')
 

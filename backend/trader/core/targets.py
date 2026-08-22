@@ -50,7 +50,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import Config
-from core.costs import fee_floor, get_contract_spec
+from core.costs import per_contract_fee, get_contract_spec
 from core.profiles import CoinProfile
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,9 @@ def round_trip_cost(symbol: str, price: float, config: Config, *, contracts: int
     notional = spec.notional(contracts, price)
     if notional <= 0:
         return 0.0
-    fee_per_side = max(config.fee_pct_per_side, fee_floor(symbol, config) * contracts / notional)
+    # Additive, not a max(): the venue bills a percentage of notional *and* a
+    # per-contract commission. See `core.costs.per_contract_fee`.
+    fee_per_side = config.fee_pct_per_side + per_contract_fee(symbol, config) * contracts / notional
     slippage = config.slippage_bps / 10_000.0 if config.apply_slippage else 0.0
     return 2.0 * (fee_per_side + slippage)
 
@@ -110,11 +112,11 @@ def round_trip_cost_series(
     notional = price * spec.units * float(contracts)
 
     pct_fee = float(config.fee_pct_per_side)
-    floor_dollars = fee_floor(symbol, config) * float(contracts)
+    commission_dollars = per_contract_fee(symbol, config) * float(contracts)
     with np.errstate(divide='ignore', invalid='ignore'):
-        floor_fraction = np.where(notional > 0, floor_dollars / notional, np.nan)
+        commission_fraction = np.where(notional > 0, commission_dollars / notional, np.nan)
 
-    fee_per_side = np.maximum(pct_fee, floor_fraction)
+    fee_per_side = pct_fee + commission_fraction
     slippage = config.slippage_bps / 10_000.0 if config.apply_slippage else 0.0
     return pd.Series(2.0 * (fee_per_side + slippage), index=price.index)
 

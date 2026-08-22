@@ -17,12 +17,12 @@ distorting the result:
   trip* of fees internally, and then subtracted a separately computed exit fee on
   top. Accounting now moves cash once per side, as the backtest does.
 * **Funding was never accrued** — every PnL call passed `accum_funding=0.0`. On
-  hourly-funding perps that is the largest cost in the system after commission:
-  2bp/hour over a day is 48bp against a round trip of 5-54bp. Funding could
-  exceed fees and the paper book would not show it.
+  hourly-funding perps that accumulates against a ~23-30bp round trip, so at the
+  0.09bp/hour actually observed it takes days to matter and at the 2bp/hour once
+  assumed it takes hours. Either way the paper book would not have shown it.
 * **The fee schedule was never loaded**, so every contract was priced at the
-  hardcoded 10bp/side. That is wrong for every Coinbase CDE contract, by 0.06x
-  to 2.5x depending on which one.
+  hardcoded default. That default now matches the fees measured off the venue's
+  app, but it carries no version, so nothing records what priced a run.
 * **Liquidation was not modelled at all.** A levered position could mark far
   through its maintenance margin and keep running.
 
@@ -602,9 +602,11 @@ def _build_config(cost_config: Optional[str], leverage: Optional[float] = None) 
         # `config.taker_bps` does not exist — this line raised AttributeError on
         # the one path it guards, so `--cost-config none` crashed the engine
         # instead of warning it.
-        logger.warning('running on the hardcoded %.1fbp/side default, which is '
-                       'wrong for every Coinbase CDE contract',
-                       config.fee_pct_per_side * 10_000)
+        logger.warning('running on the hardcoded defaults: %.1fbp/side plus '
+                       '$%.2f/contract. Those match the fees measured off the '
+                       'venue app, but the book records no schedule version',
+                       config.fee_pct_per_side * 10_000,
+                       config.per_contract_fee_usd)
         return config
 
     path = find_cost_config(cost_config or DEFAULT_COST_CONFIG_NAME)

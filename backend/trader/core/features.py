@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import Config
-from core.costs import fee_floor, get_contract_spec
+from core.costs import per_contract_fee, get_contract_spec
 
 logger = logging.getLogger(__name__)
 
@@ -452,11 +452,11 @@ def cost_features(inputs: SymbolInputs, config: Optional[Config] = None) -> pd.D
     """Whether the expected move clears this instrument's fee hurdle.
 
     This is the group that makes the cost model visible to the model itself.
-    Because Coinbase charges per contract rather than per dollar, the hurdle is
-    size-dependent: one BTC contract is ~$600 of notional carrying the same
-    $0.75 commission as a $1,750 DOGE contract. So both the marginal
-    (one-contract) and a reference-notional hurdle are exposed — the gap between
-    them is exactly the small-account penalty.
+    Coinbase charges a percentage of notional *plus* a per-contract commission,
+    so the hurdle is not one number across the book: the commission is a larger
+    share of a small contract's notional, which is why a $242 ETP contract costs
+    14.9bp/side against a $782 BIP contract's 11.5bp. Both legs move with price,
+    so the hurdle is a per-bar series rather than a constant.
     """
     config = config or Config()
     bars = inputs.bars
@@ -467,7 +467,7 @@ def cost_features(inputs: SymbolInputs, config: Optional[Config] = None) -> pd.D
     notional_per_contract = spec.units * close
 
     pct_side = float(config.fee_pct_per_side)
-    floor = fee_floor(inputs.symbol, config)
+    commission = per_contract_fee(inputs.symbol, config)
     slippage_round_trip = 2.0 * float(config.slippage_bps) / 10_000.0
 
     # A per-contract commission is a fixed fraction of notional, because notional
@@ -475,7 +475,7 @@ def cost_features(inputs: SymbolInputs, config: Optional[Config] = None) -> pd.D
     # there is no large-order discount to model. What size does change is
     # granularity: one contract is the smallest position available, and
     # `contract_notional_usd` is how coarse that is.
-    fee_per_side = np.maximum(pct_side, floor / _safe(notional_per_contract))
+    fee_per_side = pct_side + commission / _safe(notional_per_contract)
     hurdle = 2.0 * fee_per_side + slippage_round_trip
 
     # The hurdle level is kept because it is the economically meaningful

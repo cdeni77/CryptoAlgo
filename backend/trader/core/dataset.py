@@ -493,15 +493,16 @@ def load_dataset(
     missing_schedule = symbols_missing_fee_schedule(list(bars), config)
     if missing_schedule:
         warnings.append(
-            f'no explicit fee schedule for {", ".join(missing_schedule)}: falling '
-            f'back to ${config.min_fee_per_contract:.2f}/contract, which '
-            f'understates profitability rather than overstating it'
+            f'no explicit fee schedule for {", ".join(missing_schedule)}: billed '
+            f'the schedule default of ${config.per_contract_fee_usd:.2f}/contract, '
+            f'which is the right answer only if the venue bills one rate'
         )
     if config.cost_config_version == 'legacy_default':
         warnings.append(
             'no exchange cost config loaded: costs are the hardcoded '
-            f'{config.fee_pct_per_side * 100:.2f}%/side default, which is wrong '
-            'for every Coinbase contract'
+            f'{config.fee_pct_per_side * 100:.2f}%/side plus '
+            f'${config.per_contract_fee_usd:.2f}/contract. Those match the fees '
+            'measured off the venue app, but the run records no schedule version'
         )
 
     return Dataset(

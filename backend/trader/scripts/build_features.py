@@ -75,8 +75,9 @@ def _report(panel: pd.DataFrame, config: Config, symbols: Sequence[str]) -> None
     if missing:
         print(
             f"\nno explicit fee schedule for {', '.join(missing)} — "
-            f"falling back to ${config.min_fee_per_contract:.2f}/contract, "
-            "which understates profitability rather than overstating it"
+            f"falling back to ${config.per_contract_fee_usd:.2f}/contract. "
+            "Harmless when the venue bills one rate, which Coinbase's app was "
+            "measured doing; a data gap on a schedule that bills by group"
         )
 
 

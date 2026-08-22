@@ -109,11 +109,18 @@ class Config:
     min_equity: float = 1000.0
 
     # --- Execution costs (see core.costs; satisfies its CostParams protocol) ---
+    # 0.10% of notional plus $0.12 per contract, which is what Coinbase's own
+    # order ticket charges — measured, not assumed, on three contracts spanning
+    # 3.2x in notional (see `core.costs.per_contract_fee`). The two are added,
+    # not maxed. These defaults used to be percentage-only, so an unconfigured
+    # run was systematically cheap by the commission's share of notional: 1.5bp
+    # a side on a $782 BIP contract, 5bp on a $242 ETP one.
     fee_pct_per_side: float = 0.0010
-    min_fee_per_contract: float = 0.0
-    # Per-symbol overrides of the per-contract floor. Empty means the scalar
-    # above applies everywhere; a loaded venue config fills this in.
-    min_fee_per_contract_by_symbol: dict[str, float] = field(default_factory=dict)
+    per_contract_fee_usd: float = 0.12
+    # Per-symbol overrides of the per-contract commission. Empty means the
+    # scalar above applies everywhere, which is what the app was measured doing;
+    # a venue that bills by instrument group fills this in.
+    per_contract_fee_by_symbol: dict[str, float] = field(default_factory=dict)
     slippage_bps: float = 2.0
     # Half-spread crossed on entry and exit. Threaded through the backtest as an
     # argument before, which meant `cost_stress`'s "3x slippage" scenario had
@@ -234,14 +241,14 @@ class Config:
         return replace(
             self,
             fee_pct_per_side=a.effective_fee_pct_per_side(),
-            min_fee_per_contract=a.effective_min_fee_per_contract(),
-            # Only when the exchange fee is actually enabled. `fee_floor` prefers
-            # this dict whenever it is non-empty, which bypassed
-            # `effective_min_fee_per_contract`'s own `enabled` check — so loading
-            # the retail schedule (10bp/side, exchange_fee disabled) still charged
-            # the CDE $0.75/contract commission and produced an identical
+            per_contract_fee_usd=a.effective_per_contract_fee(),
+            # Only when the exchange fee is actually enabled. `per_contract_fee`
+            # prefers this dict whenever it is non-empty, which bypassed
+            # `effective_per_contract_fee`'s own `enabled` check — so loading the
+            # retail schedule (10bp/side, exchange_fee disabled) still charged
+            # the CDE per-contract commission and produced an identical
             # round-trip to CDE from a completely different fee model.
-            min_fee_per_contract_by_symbol=(
+            per_contract_fee_by_symbol=(
                 dict(a.exchange_fee.symbol_overrides or {})
                 if a.exchange_fee.enabled else {}
             ),

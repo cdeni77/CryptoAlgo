@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from core.config import Config
-from core.costs import fee_floor, get_contract_spec
+from core.costs import per_contract_fee, get_contract_spec
 from core.features import (
     GROUPS,
     MAX_ABS_ZSCORE,
@@ -206,17 +206,21 @@ def test_degenerate_cross_section_yields_nan(config):
 def test_fee_hurdle_tracks_the_real_schedule(config):
     """Per-contract commission means the hurdle is set by notional per contract.
 
-    BTC and ETH carry a $0.75 commission on a few hundred dollars of notional;
-    the group-B contracts carry $0.10 on a thousand or more. That ordering is
-    the whole reason the hurdle belongs in the feature set.
+    The commission is one rate across the book, so what separates the contracts
+    is how much notional a contract carries: $0.12 against ETP's ~$300 is 4bp a
+    side and against DOP's ~$1,750 is 0.7bp. That ordering is the whole reason
+    the hurdle belongs in the feature set — and it is the *opposite* of the one
+    the old per-symbol table produced, where ETP's $0.75 made it dearest by a
+    factor the notional never justified.
     """
     hurdles = {}
     for symbol, price in [('BIP', 60_000), ('ETP', 3_000), ('SLP', 150), ('DOP', 0.35)]:
         inputs = _inputs(symbol, price, seed=30)
         hurdles[symbol] = cost_features(inputs, config=config)['fee_hurdle_bps'].iloc[-1]
 
-    assert fee_floor('BIP', config) == pytest.approx(0.75)
-    assert fee_floor('DOP', config) == pytest.approx(0.10)
+    # One rate for every contract; the hurdle's spread comes from notional.
+    assert per_contract_fee('BIP', config) == pytest.approx(per_contract_fee('DOP', config))
+    assert per_contract_fee('BIP', config) > 0.0
     assert hurdles['ETP'] > hurdles['BIP'] > hurdles['SLP']
     assert hurdles['DOP'] < hurdles['BIP']
 

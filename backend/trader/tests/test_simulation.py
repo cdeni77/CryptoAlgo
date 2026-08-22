@@ -196,23 +196,48 @@ def test_synthetic_panel_of_nothing_is_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_cost_stress_scales_the_per_symbol_schedule(config):
-    """Otherwise stressing fees does nothing on the contracts priced per contract.
+def test_cost_stress_scales_the_per_contract_commission(config):
+    """Otherwise stressing fees barely moves the contracts priced per contract.
 
-    Coinbase charges a flat amount per contract on most of the universe, so a
-    scenario that only multiplies the percentage fee leaves those instruments
-    untouched — and they are most of the book.
+    The commission is a fixed number of dollars, so doubling only the percentage
+    leg understates the stress on exactly the instruments whose cost the
+    commission dominates — the ones with the least notional per contract.
     """
     seen: list[float] = []
 
     def run(cfg: Config) -> float:
-        seen.append(cfg.min_fee_per_contract_by_symbol.get('BIP', 0.0))
+        seen.append(cfg.per_contract_fee_usd)
         return 1.0
 
     cost_stress(run, config)
 
+    base = config.per_contract_fee_usd
+    assert base > 0.0, 'baseline schedule charges nothing per contract'
+    assert base in seen, 'baseline schedule missing'
+    assert base * 2.0 in seen, 'the commission was not scaled by the fees_2x scenario'
+
+
+def test_cost_stress_scales_a_per_symbol_schedule_too(config):
+    """A venue that bills by instrument group must be stressed per symbol.
+
+    Coinbase's app was measured billing one rate, so `per_contract_fee_by_symbol`
+    is empty for it — but `per_contract_fee` prefers that dict whenever it is
+    populated, so a schedule that fills it in would otherwise re-run the
+    baseline under every fee scenario.
+    """
+    from dataclasses import replace
+
+    grouped = replace(config, per_contract_fee_by_symbol={'BIP': 0.75, 'DOP': 0.10})
+    seen: list[float] = []
+
+    def run(cfg: Config) -> float:
+        seen.append(cfg.per_contract_fee_by_symbol['BIP'])
+        return 1.0
+
+    cost_stress(run, grouped)
+
     assert 0.75 in seen, 'baseline schedule missing'
-    assert 1.5 in seen, 'per-symbol floor was not scaled by the fees_2x scenario'
+    assert 1.5 in seen, 'per-symbol commission was not scaled by the fees_2x scenario'
 
 
 def test_stress_survival_requires_every_scenario_positive():

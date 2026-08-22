@@ -318,8 +318,11 @@ def test_the_cost_schedule_is_reachable_without_a_cwd_assumption():
     trader's Docker build context is `backend/trader`, so the file was never
     copied into the image. `_common.py` computed one relative path from
     `__file__`, found nothing, logged a warning nobody read, and fell through to
-    the hardcoded 10bp/side — wrong for every Coinbase CDE contract by 0.06x to
-    2.5x, in both directions.
+    the hardcoded defaults. Those defaults now match the fees measured off the
+    venue's app, so what a missing schedule costs today is provenance rather than
+    accuracy — the run records no fee model, so a later change to either is
+    invisible. It cost accuracy when this was written, and would again the moment
+    the two diverge, which is what the assertions below are for.
     """
     import os
 
@@ -335,11 +338,22 @@ def test_the_cost_schedule_is_reachable_without_a_cwd_assumption():
     # Under the trader package, so the Docker build context includes it.
     assert 'backend/trader' in resolved.as_posix()
 
-    # And it has to load into a Config that actually differs from the default,
-    # or "loaded" would mean nothing.
+    # And it has to load into a Config carrying the file's own numbers, or
+    # "loaded" would mean nothing. The hardcoded defaults now match the measured
+    # venue, so the fees alone cannot show that the file was read — assert
+    # against the file's contents instead of against the default.
+    import json
+
+    payload = json.loads(resolved.read_text())
     loaded = Config().with_cost_assumptions(resolved)
     assert loaded.cost_config_version != Config().cost_config_version
-    assert loaded.min_fee_per_contract_by_symbol, 'no per-symbol fees came through'
+    assert loaded.fee_pct_per_side == pytest.approx(
+        payload['retail_execution_fee']['taker_fee_bps'] / 10_000.0
+    )
+    assert loaded.per_contract_fee_usd == pytest.approx(
+        payload['exchange_fee']['per_contract_usd']
+    )
+    assert loaded.slippage_bps == pytest.approx(payload['slippage']['bps_per_side'])
 
 
 def test_a_missing_cost_config_does_not_silently_pass(tmp_path):

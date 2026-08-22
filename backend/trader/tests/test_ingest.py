@@ -252,7 +252,7 @@ def test_funding_and_open_interest_are_venue_keyed(tmp_path):
     """Funding differs materially between venues, so a proxy must not overwrite it.
 
     Funding is the mechanism this system is mostly betting on — 2bp/hour is
-    48bp/day against a 5-54bp round trip — so a Binance rate silently stored as
+    48bp/day against a ~23-30bp round trip — so a Binance rate silently stored as
     Coinbase's own is not a labelling nit.
     """
     from datetime import datetime, timedelta, timezone

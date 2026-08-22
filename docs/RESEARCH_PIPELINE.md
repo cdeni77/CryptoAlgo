@@ -50,6 +50,17 @@ Round-trip cost, modelled vs actual:
 | AVP (AVAX) | $350   | 20.0 bp |  5.7 bp | 0.29x |
 | LCP (LTC)  | $475   | 20.0 bp |  4.2 bp | 0.21x |
 
+**Correction, 2026-08-22: the "actual" column above was itself wrong.** It came
+from the published member commission table, which the venue's retail app does not
+charge, and it applied the per-contract amount as a floor under the percentage fee
+rather than in addition to it. Three order tickets read off the app give
+`0.10% of notional + $0.12/contract`, which puts every contract in this table at
+27-34bp rather than 1.1-50bp. The defect §1.1 describes was real — the schedule
+was unreachable — but the magnitudes are superseded; see
+"The fee schedule is measured, not assumed" in `CLAUDE.md` and
+`backend/trader/tests/test_costs.py`. The remainder of §1.1 is kept as the record
+of what was found when.
+
 The error is not a constant bias — it runs in **both directions**. ETH was
 backtested at 40% of its real cost; DOGE at 17x. The old system's fee-aware
 labels (`TripleBarrierSpec.fee_pct_per_side`, since deleted along with the
@@ -247,8 +258,9 @@ hand-encode.
 
 There is no labeller. `core/targets.py` regresses net return, decomposed into
 `price`, `carry` and `cost`, because triple-barrier classification could not
-express carry — the most plausible edge on hourly-funding perps, where 2bp/hour
-is 48bp/day against a 5-54bp round trip. Of the paragraph below, only the
+express carry — the most plausible edge on hourly-funding perps. (The rate was
+assumed at 2bp/hour; the rates since measured are 0.1-0.5bp/hour against a
+27-65bp round trip, so a 48h hold covers 21-92% of a round trip on carry alone.) Of the paragraph below, only the
 average-uniqueness weighting survived (`core/cv.py:average_uniqueness`); there
 is no meta-labelling stage, and `Config.meta_probability_threshold` is orphaned.
 The original text:

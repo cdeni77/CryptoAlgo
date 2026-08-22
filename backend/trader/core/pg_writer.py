@@ -144,7 +144,7 @@ class PaperPosition(Base):
     exit_reason = Column(String, nullable=True)
     # Funding accrued so far, in account currency. On hourly-funding perps this
     # is the largest cost after commission — over a day-long hold, 2bp/hour is
-    # 48bp against a 5-54bp round trip. It has to survive a restart, or a
+    # 48bp against a ~23-30bp round trip. It has to survive a restart, or a
     # relaunched engine forgets what the position already cost.
     funding_paid = Column(Float, nullable=False, default=0.0)
 

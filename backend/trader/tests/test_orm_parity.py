@@ -504,25 +504,25 @@ def test_the_spot_universe_covers_every_contract_once():
     assert not any('1000' in p for p in products), products
 
 
-def test_every_modelled_contract_has_an_explicit_fee_floor():
-    """A missing floor silently charges the BTC/ETH rate to everything.
+def test_every_modelled_contract_prices_at_the_schedule_s_own_rate():
+    """No spelling of a modelled contract may fall through to a wrong number.
 
-    `fee_floor` falls back to `config.min_fee_per_contract`, which the CDE
-    schedule sets to 0.75 — the group-A rate for BIP and ETP. Every other
-    contract is 0.10. Seven of the eighteen (BCP, NER, SUP, XLP, POP, SHP, PEP)
-    were never listed, so they were priced 7.5x too expensive.
+    The schedule used to carry a per-symbol table — $0.75/contract on BIP and
+    ETP, $0.10 on the rest — and seven of the eighteen were never listed, so
+    they fell through to the group-A default and were priced 7.5x too expensive.
+    SHIB's round trip read 287bp instead of 42, DOT 172 instead of 26, and the
+    cost enters the *target* as well as the hurdle `decide()` compares against,
+    so those instruments looked untradeable and the cross-sectional cost
+    features ranked them on a fiction.
 
-    That is not a rounding error. SHIB's round trip read 287bp instead of 42bp,
-    DOT 172 instead of 26, and the cost enters the *target* through
-    `core/targets.py` as well as the hurdle `decide()` compares against — so
-    those instruments looked untradeable, and the cross-sectional cost features
-    ranked them against the others on a fiction.
-
-    `load_dataset` warns about this, and a warning was not enough: it fires on a
-    run nobody is reading closely, and the number it protects is money.
+    Order tickets off the venue's app then showed BIP and ETP billed the same
+    ~$0.12/contract as everything else, so the table is gone and the uniform
+    rate is now the right answer rather than a fallback. What still has to hold
+    is that every spelling resolves to *that* rate — bare code, decorated
+    product id, and underlying ticker alike — and that none resolves to zero.
     """
     from core.config import Config, find_cost_config
-    from core.costs import symbols_missing_fee_schedule
+    from core.costs import per_contract_fee, symbols_missing_fee_schedule
     from core.profiles import COIN_PROFILES
 
     path = find_cost_config()
@@ -530,20 +530,22 @@ def test_every_modelled_contract_has_an_explicit_fee_floor():
         pytest.skip('no cost config on the search path')
     config = Config().with_cost_assumptions(path)
 
-    # Every spelling a profile answers to, *and* the decorated product ids the
-    # store actually holds — `BIP-20DEC30-CDE`, not `BIP`. Testing bare codes
-    # alone missed a false positive on the decorated form: the check compared
-    # the resolved fee against the default, so BIP and ETP at an explicit $0.75
-    # were reported as uncovered while pricing correctly.
-    codes = sorted({p for profile in COIN_PROFILES.values() for p in profile.prefixes})
-    decorated = [f'{c}-20DEC30-CDE' for c in codes]
-    missing = symbols_missing_fee_schedule(codes + decorated, config)
+    rate = config.per_contract_fee_usd
+    assert rate > 0.0, 'a real venue charges something per contract'
 
-    assert not missing, (
-        f'no explicit per-contract fee for {missing}. They fall back to '
-        f'${config.min_fee_per_contract:.2f}/contract, the group-A rate, which '
-        f'overstates their round trip several-fold.'
+    codes = sorted({p for profile in COIN_PROFILES.values() for p in profile.prefixes})
+    spellings = codes + [f'{c}-20DEC30-CDE' for c in codes]
+
+    wrong = {s: per_contract_fee(s, config) for s in spellings
+             if per_contract_fee(s, config) != pytest.approx(rate)}
+    assert not wrong, (
+        f'these spellings do not price at the schedule rate ${rate:.2f}: {wrong}'
     )
+
+    # With one rate for the whole book there is no per-symbol table, so nothing
+    # can be missing from it. Asserted rather than assumed: a schedule that
+    # reintroduces per-symbol rates has to list every contract or this fails.
+    assert not symbols_missing_fee_schedule(spellings, config)
 
 
 def test_a_zero_fee_schedule_is_flagged_and_no_real_venue_is_free():

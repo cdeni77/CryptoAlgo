@@ -269,7 +269,7 @@ def get_contract_spec(symbol: str) -> ContractSpec:
 class FeeAssumptions:
     maker_bps: float = 10.0
     taker_bps: float = 10.0
-    min_fee_per_contract: float = 0.0
+    per_contract_fee_usd: float = 0.0
     use_taker: bool = True
 
     @property
@@ -348,6 +348,11 @@ class ExchangeCostAssumptions:
     contract_sizes: dict[str, float] | None = None
     observed_ui_fee_bps: float | None = None
     observed_ui_fee_source: str | None = None
+    # Order tickets read off the venue's own app: notional and the fee it quoted.
+    # These are the measurement the fee model is fitted to, so they travel with
+    # the schedule rather than living in a test file — see
+    # `tests/test_costs.py::test_the_schedule_reproduces_the_venue_s_own_order_tickets`.
+    observed_app_fees: tuple[dict[str, Any], ...] = ()
     source_path: str | None = None
 
     @classmethod
@@ -370,7 +375,13 @@ class ExchangeCostAssumptions:
             fees=FeeAssumptions(
                 maker_bps=maker_bps,
                 taker_bps=taker_bps,
-                min_fee_per_contract=float(fees.get("min_fee_per_contract", 0.20)),
+                # `min_fee_per_contract` is the old spelling, from when this was
+                # a floor on the percentage fee rather than an addition to it.
+                # Read for schedules outside this repo; ours use the new key.
+                per_contract_fee_usd=float(
+                    fees.get("per_contract_usd",
+                             fees.get("min_fee_per_contract", 0.20))
+                ),
                 use_taker=use_taker,
             ),
             retail_execution_fee=RetailExecutionFeeAssumptions(
@@ -418,6 +429,10 @@ class ExchangeCostAssumptions:
                 else None
             ),
             observed_ui_fee_source=payload.get("observed_ui_fee_source"),
+            observed_app_fees=tuple(
+                dict(row) for row in (payload.get("observed_app_fees") or [])
+                if isinstance(row, dict)
+            ),
             source_path=source_path,
         )
 
@@ -432,7 +447,7 @@ class ExchangeCostAssumptions:
             self.effective_fee_pct_per_side(),
             float(getattr(self, "slippage_bps_per_side", 0.0) or 0.0),
         )
-        floors = [self.effective_min_fee_per_contract()]
+        floors = [self.effective_per_contract_fee()]
         floors += [
             float(v or 0.0)
             for v in (getattr(self, "min_fee_symbol_overrides", None) or {}).values()
@@ -444,10 +459,10 @@ class ExchangeCostAssumptions:
             return self.retail_execution_fee.fee_pct_per_side
         return self.fees.fee_pct_per_side
 
-    def effective_min_fee_per_contract(self, symbol: str | None = None) -> float:
+    def effective_per_contract_fee(self, symbol: str | None = None) -> float:
         if self.exchange_fee.enabled and self.exchange_fee.mode == "per_contract_usd":
             return self.exchange_fee.per_contract_for_symbol(symbol)
-        return float(self.fees.min_fee_per_contract)
+        return float(self.fees.per_contract_fee_usd)
 
     def to_metadata(self) -> dict[str, Any]:
         cost_config_id = Path(self.source_path).stem if self.source_path else self.version
@@ -525,11 +540,13 @@ class CostParams(Protocol):
     """The subset of Config the cost functions read."""
 
     fee_pct_per_side: float
-    min_fee_per_contract: float
-    # Optional per-symbol overrides of the floor. Coinbase CDE bills $0.75 per
-    # contract on BTC and ETH but $0.10 on everything else, so a single scalar
-    # silently charges every instrument the most expensive rate.
-    min_fee_per_contract_by_symbol: dict[str, float]
+    # Charged *in addition* to `fee_pct_per_side`, not as a floor under it. The
+    # venue's order ticket bills 0.10% of notional plus ~$0.12 per contract, and
+    # a `max()` of the two understates every leg — see `per_contract_fee`.
+    per_contract_fee_usd: float
+    # Optional per-symbol overrides. Kept because a venue may bill per contract
+    # by instrument group; Coinbase's app does not, so ours is empty.
+    per_contract_fee_by_symbol: dict[str, float]
     slippage_bps: float
     impact_bps_per_contract: float
     impact_max_bps_per_side: float
@@ -546,12 +563,13 @@ def fee_schedule_key(symbol: str, overrides: dict[str, float]) -> Optional[str]:
     tickers, so try the symbol as given, then its prefix, then the underlying
     ticker, then any product code for that underlying.
 
-    Separated from `fee_floor` so that "did the schedule cover this?" is asked
-    directly. Comparing the returned *fee* against the default cannot answer it:
-    BIP and ETP are explicitly $0.75 and the default is also $0.75, so an
-    equality test reported both as uncovered while they were pricing correctly.
-    The same shape as using `units == DEFAULT_UNITS` to detect an unresolved
-    contract, which condemned BCH for genuinely being one unit per contract.
+    Separated from `per_contract_fee` so that "did the schedule cover this?" is
+    asked directly. Comparing the returned *fee* against the default cannot
+    answer it: back when BIP and ETP carried an explicit $0.75 and the default
+    was also $0.75, an equality test reported both as uncovered while they were
+    pricing correctly. The same shape as using `units == DEFAULT_UNITS` to detect
+    an unresolved contract, which condemned BCH for genuinely being one unit per
+    contract.
     """
     if not overrides:
         return None
@@ -566,11 +584,28 @@ def fee_schedule_key(symbol: str, overrides: dict[str, float]) -> Optional[str]:
     return next((c for c in candidates if c in overrides), None)
 
 
-def fee_floor(symbol: str, params: CostParams) -> float:
-    """Per-contract commission for `symbol`, falling back to the flat default."""
-    overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
+def per_contract_fee(symbol: str, params: CostParams) -> float:
+    """Per-contract commission for `symbol`, falling back to the flat default.
+
+    Additive with the percentage fee. This was `fee_floor` and was combined as
+    `max(pct, per_contract / notional)`, which is a different fee model from the
+    one the venue runs and understates every leg. Three order tickets off the
+    Coinbase app settle it:
+
+        BIP   $782.05 notional   ticket $0.90    max() says $0.78
+        XPP   $740.50 notional   ticket $0.86    max() says $0.74
+        ETP   $242.50 notional   ticket $0.36    max() says $0.24
+
+    0.10% + $0.12/contract reproduces all three to the half-cent, and no single
+    percentage does: the implied rate is 0.115% at $782 and 0.149% at $242.
+    That the three notionals span 3.2x is what makes them decisive; two tickets
+    at similar size cannot separate a flat percentage from a flat dollar amount.
+
+    `tests/test_costs.py` pins the tickets, so a return to `max()` fails.
+    """
+    overrides = getattr(params, 'per_contract_fee_by_symbol', None) or {}
     key = fee_schedule_key(symbol, overrides)
-    return float(overrides[key]) if key else float(params.min_fee_per_contract)
+    return float(overrides[key]) if key else float(params.per_contract_fee_usd)
 
 
 def symbols_missing_fee_schedule(
@@ -579,12 +614,13 @@ def symbols_missing_fee_schedule(
 ) -> list[str]:
     """Symbols with no explicit entry in the loaded per-contract fee schedule.
 
-    Those fall back to the flat default, which for Coinbase CDE is the expensive
-    BTC/ETH rate. That errs toward understating profitability rather than
-    overstating it, but it is a data gap and callers should say so rather than
-    let it pass silently. Resolve it against the venue's published schedule.
+    Empty when the schedule bills one rate for every contract, which is what the
+    Coinbase app was measured doing — there is then nothing for a per-symbol
+    entry to say. The mechanism is kept for a venue that does bill by instrument
+    group, where a symbol falling through to the default is a data gap rather
+    than the intended answer.
     """
-    overrides = getattr(params, 'min_fee_per_contract_by_symbol', None) or {}
+    overrides = getattr(params, 'per_contract_fee_by_symbol', None) or {}
     if not overrides:
         return []
     return sorted({s for s in symbols if fee_schedule_key(s, overrides) is None})

@@ -110,7 +110,8 @@ run_pipeline  ->  SQLite  ->  migrate_to_research_store  ->  Parquet + DuckDB
 
 **The formulation changed.** The old system classified triple-barrier outcomes
 behind a momentum gate. It could not express carry, which is the most plausible
-edge on hourly-funding perps: 2bp/hour is 48bp/day against a 5-54bp round trip.
+edge on hourly-funding perps — though at the funding rates since measured it is
+0.1-0.5bp/hour against a 27-65bp round trip, not the 2bp/hour these docs assumed.
 `core/targets.py` now regresses *net return*, decomposed into price, carry and
 cost, and `net_long + net_short == -2 * cost` holds exactly.
 
@@ -240,15 +241,33 @@ the mean's sign:
 | all populated | +0.005 +0.005 -0.009 (2/3) | +0.010 +0.015 -0.005 (2/3) | +0.018 +0.002 -0.037 (2/3) |
 
 The largest is `cross_venue` at h=1h: +0.012, positive in all three quarters, and
-an expected edge of **0.8bp against a 6.1bp cheapest round trip**. It also flips
+an expected edge of **0.8bp against a 27bp cheapest round trip**. It also flips
 sign at h=2h and h=4h. Three-of-three sign agreement happens by chance in a
 quarter of cells, and 15 were tested, so three or four such cells are expected from
 noise. Treat this table as a negative result, and don't mine it.
 
 `cross_venue` remains the most interesting group because it has a *mechanism* — a
 thin nano perp lagging the deep Coinbase spot book its own index is built from —
-rather than a fitted pattern. But a mechanism that produces 0.8bp against a 6.1bp
+rather than a fitted pattern. But a mechanism that produces 0.8bp against a 27bp
 toll is not a strategy.
+
+**How far off, in the units that decide it.** Required IC is `cost / sigma_h`,
+and cost is fixed per round trip while `sigma` grows as `sqrt(h)`, so the ratio
+improves only with the hold. Measured on this store, median across the 18
+contracts:
+
+| horizon | required IC (median) | range | measured |
+|---------|---------------------:|-------|---------:|
+| 1h  | 0.404 | 0.25 (NER) - 0.82 (SHP) | +0.012 |
+| 2h  | 0.287 | 0.18 - 0.59 | flips sign |
+| 4h  | 0.203 | 0.13 - 0.42 | flips sign |
+| 24h | 0.082 | 0.05 - 0.18 | untested |
+
+The best measured IC is 34x short of what h=1h needs and 7x short of h=24h. To
+close it on horizon alone — required IC scaling as `1/sqrt(h)` — the hold would
+have to reach roughly **48 days**, at which point the effective sample is a few
+dozen observations. There is no horizon at which this forecast pays for the
+round trip.
 
 **Volatility: a lot.** The dispersion head scores **+0.34** on the holdout, and it
 went *up* when the target was fixed, because it never depended on the artifact.
@@ -273,6 +292,13 @@ simulation:
 forecast does not cover the fee, so it declines. The 0.04 percent that got through
 still lost, and the loss is now almost entirely the prediction rather than costs.
 
+**These numbers predate the fee correction below and are not re-measured.** The
+schedule they were produced under priced the cheap contracts at 6-13bp against
+the 27-33bp the venue charges, so `edge_below_cost` will reject strictly more and
+the accepted trades were charged too little. Re-run before quoting them; the
+qualitative reading — the forecast does not cover the toll — is the one thing the
+correction can only strengthen.
+
 Both fixes moved the risk numbers a long way, and the earlier figures were the
 wrong ones:
 
@@ -288,6 +314,52 @@ A 99.9 percent ruin probability on a strategy that loses 3.5 percent over eight
 months was always implausible. It came from measuring a levered book over 74 days
 of a single directional quarter. The strategy loses steadily; it does not blow up.
 
+### The fee schedule is measured, not assumed
+
+Everything above is a comparison between a forecast and a round trip, so the
+round trip is the denominator of every conclusion here. It was wrong twice, in
+different ways, and both were found by reading order tickets off the venue's own
+app rather than by reasoning about a schedule document.
+
+**Wrong shape.** The model was `max(pct_fee, per_contract / notional)` — a floor
+under the percentage fee. The venue charges both, added. A floor understates every
+leg by the smaller component's share, which is 1.5bp a side on a $782 BIP
+contract and 5bp on a $242 ETP one.
+
+**Wrong numbers.** Coinbase publishes a member commission table (group A
+$0.75/contract on BTC and ETH, group B $0.10 on the rest) and the schedule
+encoded it with `taker_bps: 0` — per-contract only. Its retail app does not
+charge that. Three tickets:
+
+| contract | notional | app fee | old model | new model |
+|---|---:|---:|---:|---:|
+| BIP | $782.05 | $0.90 | $0.78 | **$0.9021** |
+| XPP | $740.50 | $0.86 | $0.74 | **$0.8605** |
+| ETP | $242.50 | $0.36 | $0.24 | **$0.3625** |
+
+`0.10% of notional + $0.12 per contract` reproduces all three to under half a
+cent. No single percentage does: the implied rate is 0.115% at $782 and 0.149% at
+$242. **The three notionals spanning 3.2x is what makes them decisive** — the
+first two, at $782 and $740, are consistent with a flat percentage *and* with a
+flat dollar amount, and for most of a day they were read as the former.
+`tests/test_costs.py` pins all three, and asserts that a flat percentage still
+fails to fit, so the per-contract term cannot be quietly dropped as redundant.
+
+The consequence is that **the fee schedule no longer distinguishes contracts.**
+It used to imply a 6.1bp-to-65.4bp spread across the book, and that spread was
+load-bearing: it is what made XPP and SLP look like the only affordable
+contracts, what made BIP's clean prices look like they came at 3x XPP's fee, and
+what put six contracts' fill uncertainty above their own cost. Every contract now
+pays the same percentage and the same commission, so the round trip is 27-65bp
+and what varies is notional per contract — a fact about contract sizes, not about
+fees.
+
+What follows from that correction is recorded where it applies: the fill
+uncertainty table below, the required-IC table above, the carry hours-to-cover
+table, and the horizon the carry thesis has to be tested at. The direction of
+every change is the same — costs went **up** on the contracts that looked cheap —
+so no conclusion here became more optimistic.
+
 ### Fill uncertainty is a second cost, and it is not in the fee schedule
 
 `close(t)` is a bar's last *trade*, so the move between it and `open(t+1)` — the
@@ -296,29 +368,41 @@ first price a decision can fill at — is pure fill uncertainty. It is absent fr
 `scripts/preflight.py:_prices_are_fresh` reports it per instrument.
 
 Measured on 399 days. Median close-to-next-open gap against each contract's own
-round trip:
+round trip, priced from the fee schedule the venue's app actually charges (0.10%
+of notional plus $0.12/contract — see **The fee schedule is measured, not
+assumed** below):
 
-| | median gap | round trip | |
-|---|---:|---:|---|
-| **XPP** | 4.4bp | 6.9bp | fresh **and** cheap |
-| **SLP** | 4.6bp | 8.4bp | fresh **and** cheap |
-| BIP | 1.7bp | 23.4bp | pristine price, fee 3x the noise... and 3x XPP's fee |
-| ETP | 2.9bp | 65.4bp | pristine price, unaffordable |
-| ADP | 12.4bp | 13.1bp | marginal |
-| XLP | 17.1bp | 6.1bp | **2.8x** — cheapest fee in the book, and unusable |
-| LNP, SUP | 13-15bp | 7-9bp | 1.7x |
-| BCP, DOP, LCP | 13-16bp | 9-12bp | 1.2-1.5x |
-| PEP | 28.0bp | 9.2bp | 3.0x, worst in the universe |
+| | median gap | round trip | gap / cost |
+|---|---:|---:|---:|
+| **BIP** | 1.7bp | 27.0bp | **0.06** |
+| **ETP** | 2.9bp | 34.0bp | **0.08** |
+| **XPP** | 4.4bp | 27.3bp | **0.16** |
+| **SLP** | 4.6bp | 29.3bp | **0.16** |
+| SHP | 17.1bp | 64.7bp | 0.26 |
+| AVP, POP | 15-16bp | 43-50bp | 0.31-0.34 |
+| HYP, ADP, LCP | 10-13bp | 28-34bp | 0.36-0.41 |
+| DOP, LNP, SUP, BCP | 13-16bp | 28-29bp | 0.44-0.54 |
+| OND, XLP, NER | 17-18bp | 27-31bp | 0.55-0.65 |
+| PEP | 28.3bp | 31.3bp | **0.90** |
 
-**Six of fourteen have median fill uncertainty larger than their own fee**, which
-makes them untradeable on hourly bars whatever a model says: the price moves more
-between the decision and the fill than the trade costs.
+**No contract has median fill uncertainty above its own round trip.** That is a
+correction, not a finding: this table read "six of fourteen" while the schedule
+billed 6.1-65.4bp across the book, and the venue does not price that way — every
+contract pays the same 0.10% and the same $0.12, so the round trip is 27-65bp
+and the spread that made cheap contracts look cheap was a modelling error. PEP at
+0.90 is the only one close to the line.
 
-And the trap is structural. The cheap contracts are cheap *because* they are thin,
-and thin means stale — XLP has the lowest fee in the book (6.1bp) and 2.8x fill
-uncertainty. The contracts with clean prices, BIP and ETP, carry the highest fees.
-Only **XPP and SLP** have both, which is the practical answer to "which of these
-can be traded at all".
+**The trap dissolved with it.** The old reading was structural and pessimistic:
+cheap contracts are cheap because they are thin, thin means stale, so the only
+affordable contracts were the unusable ones and XPP and SLP were the sole
+survivors. With one fee schedule across the book, freshness alone selects, and it
+selects the four contracts with the most history: **BIP (0.06), ETP (0.08), XPP
+and SLP (0.16)** — an order of magnitude cleaner than the rest, and BIP is at the
+*low* end of the cost range rather than three times XPP's.
+
+Fill uncertainty is still a real cost absent from `core/costs.py`, and it is
+still worth ranking contracts by. It is no longer a reason to exclude any of
+them.
 
 This is also why the per-instrument IC table from the close-anchored target ranked
 the thinnest contracts highest: staleness was the signal.
@@ -357,7 +441,7 @@ listing date.
 ## Critical Architecture Notes
 
 - **`core/profiles.py` is the single source of truth** for per-coin feature sets, thresholds, and ML hyperparameters. Coins are described by a feature *archetype* (`mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`) plus tuned deltas. Changes cascade into training, search, and signal generation.
-- **`core/costs.py` is the single source of truth for the money *inputs*** — contract specs, exchange fee assumptions, and the per-contract fee floor. Trade PnL and sizing are deliberately elsewhere and the module's closing comment says where: round-trip cost in `core/targets.py`, entry fee and Kelly/risk-budget sizing in `core/execution.py`. Load a venue's real schedule with `Config.with_cost_assumptions(find_cost_config())` — `configs/` lives under `backend/trader/` so the Docker build context includes it; the hardcoded defaults are 10bps/side, which is wrong for Coinbase CDE by 0.06x-2.5x depending on the contract.
+- **`core/costs.py` is the single source of truth for the money *inputs*** — contract specs, exchange fee assumptions, and the per-contract commission. Trade PnL and sizing are deliberately elsewhere and the module's closing comment says where: round-trip cost in `core/targets.py`, entry fee and Kelly/risk-budget sizing in `core/execution.py`. Load a venue's real schedule with `Config.with_cost_assumptions(find_cost_config())` — `configs/` lives under `backend/trader/` so the Docker build context includes it; the hardcoded defaults are 0.10%/side plus $0.12/contract, which is what the venue's app was measured charging — so an unconfigured run now prices correctly but records no schedule version, which is the remaining reason to load one.
 - **Duplicated ORM models**: `backend/trader/core/pg_writer.py` duplicates the API ORM models for container isolation. `backend/trader/tests/test_orm_parity.py` fails when they diverge in columns, types, nullability, defaults, or migration lists — a note in a doc was not enough; `wallet.balance` had already drifted 10,000 against 100,000, so whichever container created the row decided the paper account's starting balance.
 - **No react-router**: Frontend routing is manual via `window.history.pushState` in `App.tsx`. Add a page by adding an entry to `ROUTES` (path → label) **and** to `PAGES` (path → component). `RoutePath` derives from `ROUTES`; `PAGES` is a `Record<RoutePath, ComponentType>`, which is what makes a route with no component a `tsc` error. The render used to be a chain of `route === '/x' && <XPage />`, and this file used to claim that was exhaustive — it was not.
 - **Frontend HTTP goes through `src/api/client.ts`**: one base URL, one error type, one place the `X-API-Token` header is set. Poll with `usePolling`, which pauses on hidden tabs and surfaces failures. Five copies of `fetchWithError` had already drifted in how they reported errors, and every `.catch(() => {})` made a dead backend look like a quiet market.
@@ -399,24 +483,44 @@ can only ever be validated on history collected since collection started**, so
 start the hourly loop before you need it. Bars, by contrast, backfill fine.
 
 **2. The observed rate is ~22x smaller than the 2bp/hour these docs assumed.**
-`0.000009` per hour is **0.09 bp/hour**, or 2.16 bp/day. Hours of carry needed to
-cover a round trip, measured against the CDE fee schedule:
+`0.000009` per hour is **0.09 bp/hour**, or 2.16 bp/day. Against the round trip
+the venue actually charges, the hold needed for carry alone to cover a round trip
+is measured from the one funding snapshot per contract that exists (18 rows,
+2026-08-21) and each contract's median round trip:
 
-| contract | round trip | at 0.09 bp/h (observed) | at 2 bp/h (assumed) |
-|----------|-----------:|------------------------:|--------------------:|
-| XPP (XRP)  |  5.7 bp |  63 h |  2.9 h |
-| DOP (DOGE) |  7.3 bp |  81 h |  3.6 h |
-| SLP (SOL)  |  8.7 bp |  97 h |  4.3 h |
-| BIP (BTC)  | 25.0 bp | 278 h | 12.5 h |
-| ETP (ETH)  | 48.1 bp | 534 h | 24.1 h |
+| contract | rate | round trip | hours to cover |
+|----------|-----:|-----------:|---------------:|
+| NER (NEAR) | 0.5 bp/h | 26.5 bp |  **52 h** |
+| HYP (HYPE) | 0.3 bp/h | 27.2 bp |  80 h |
+| ADP, BCP, PEP | 0.3-0.4 bp/h | 30-35 bp | 92-98 h |
+| LNP (LINK) | 0.3 bp/h | 28.1 bp | 108 h |
+| XPP (XRP)  | 0.2 bp/h | 27.5 bp | 153 h |
+| DOP (DOGE) | 0.2 bp/h | 29.5 bp | 164 h |
+| SLP (SOL)  | 0.1 bp/h | 29.2 bp | 209 h |
+| BIP (BTC)  | 0.1 bp/h | 27.1 bp | 226 h |
+| ETP (ETH)  | 0.1 bp/h | 33.8 bp | 226 h |
+| SHP (SHIB) | 0.004 bp/h | 68.1 bp | 6,812 h |
 
-This is **one snapshot**, taken while BTC was +6.7% on the day, and funding is
-volatile and sometimes negative — so it is not a verdict on the carry thesis.
-But it does mean the "24h hold pays for itself on carry alone on four of five
-contracts" claim rests on an assumed number, not a measured one, and the first
-real observation is 22x lower. Collect the distribution before sizing anything on
-it. `scripts/preflight.py` reports sample size; it cannot tell you the edge is
-real.
+**Zero of eighteen cover a round trip within 48 hours**, and the four contracts
+with clean prices need 150-226 hours — six to nine days. The earlier table said
+2.9h for XPP because it priced the round trip at 5.7bp; the venue charges 27.5bp,
+so that number was five times too kind, and the fee correction changed the answer
+rather than the precision.
+
+That matters because it moves the horizon the carry thesis has to be tested at,
+and the horizon governs the sample size. A one-week hold at `h = 168` saturates
+at `24 x 730 / ln 2 / 168 = 150` effective observations even with the recency
+half-life pushed to two years, and reaching 200 with the decay off needs about
+**1,400 days of funding history** — which cannot be backfilled at all. So "carry
+alone pays for the round trip" is not testable on any timeline worth planning
+around at these rates.
+
+What keeps the thesis alive is that carry does not have to cover the round trip
+by itself. It has to make a hold that is *otherwise* marginal profitable, and it
+has to be measured on its distribution rather than on this one print: funding is
+volatile, sometimes negative, and one snapshot taken while BTC was +6.7% on the
+day is not a rate. Collect the distribution. `scripts/preflight.py` reports
+sample size; it cannot tell you the edge is real.
 
 ### Use Coinbase spot as the reference venue, not Binance
 
@@ -615,16 +719,16 @@ populated panel would have.
 
 ## What to do next, and when
 
-**Direction is answered: no.** 0.8bp of edge against a 6.9bp cheapest round trip,
+**Direction is answered: no.** 0.8bp of edge against a 27bp cheapest round trip,
 and more history does not move it — the recency half-life saturates, so 399 days
 gives 1,678 effective observations at h=4h and 2,000 days gives 3,088. The
-constraint is a factor of eight in the economics, not the sample size. Do not tune
-the directional model; 15 group-by-horizon cells have already been tested on this
-data and further searching spends statistical budget on a question the fee
-schedule has answered.
+constraint is the economics by a factor of **34 at h=1h and 7 at h=24h**, not the
+sample size. Do not tune the directional model; 15 group-by-horizon cells have
+already been tested on this data and further searching spends statistical budget
+on a question the fee schedule has answered.
 
-**Carry is the open question, and it has a date.** Funding accrues at 18 rows an
-hour and cannot be backfilled:
+**Carry is the open question, and the fee correction moved its horizon.** Funding
+accrues at 18 rows an hour and cannot be backfilled:
 
 | | funding rows | what becomes possible |
 |---|---:|---|
@@ -632,22 +736,32 @@ hour and cannot be backfilled:
 | +106d | 45,800 | h=48h clears the 200-observation gate at H=730 |
 | +180d | 77,760 | walk-forward quarters — a real evaluation |
 
-Those converge: 48h is where carry covers a round trip on 9 of 18 contracts at the
-*measured* funding rates, and it is also roughly when enough funding exists to test
-it. The specific question to ask then: **does funding at a 48h hold cover the round
-trip on XPP and SLP**, the only two contracts with both fresh prices and low fees.
+h=48h remains the horizon to test at, but not for the reason this section used to
+give. At the measured funding rates 48 hours of carry covers **no** contract's
+round trip outright — it covers 92% of NER's, 44-60% on HYP/ADP/BCP/PEP/LNP, and
+21-31% on the four with clean prices. So the question to ask is not "does carry
+pay for the round trip" but **"does carry plus a weak directional forecast clear
+it"**, which is a harder question and the only one the data will support: a hold
+long enough for carry to cover the toll alone is ~168h, and that saturates at 150
+effective observations however long the loop runs.
 
-**Execution cost is the one lever available sooner.** Maker on both sides would move
-the round trip toward ~5bp, which changes the 0.8-vs-6.9 ratio materially. It needs
-a fill-probability model `core/simulation.py` does not have — real work, but aimed
-at the binding constraint rather than at the model.
+**Whether a maker rate even exists is unverified, and it is the cheapest thing to
+find out.** This section used to call maker-on-both-sides the one lever available
+sooner, on the reasoning that it would move the round trip toward ~5bp. That was
+downstream of the wrong schedule. What is actually known: the three observed
+tickets are market orders, the schedule assumes `maker_bps == taker_bps == 10`
+because no maker ticket has been seen, and the spread component that a resting
+order could avoid is ~4bp of a 27bp round trip — a 15% saving, not an 80% one.
+If the 0.10% has a maker rate the picture changes materially; if it does not,
+execution is not a lever at all. **One limit order on the app answers it**, and
+until it does, do not build the fill-probability model `core/simulation.py`
+lacks.
 
 **Spot is not the answer.** Coinbase Advanced Trade charges 1.20% per side at this
-account's tier: 240bp round trip against the BTC perp's 23.2bp, 10x worse. Spot
-prices are genuinely cleaner (median close-to-open gap 1.1bp against the perps'
-14.2bp, and no flat-OHLC bars at all), but clearing 240bp at h=4h needs an IC of
-1.59 — above perfect foresight. Verified against the app: for `BIP` at $78,150 the
-schedule gives $0.91 per side on $781.50 notional and the app charges $0.90.
+account's tier: 240bp round trip against BIP's 27bp, 9x worse. Spot prices are
+genuinely cleaner (median close-to-open gap 1.1bp against the perps' 14.2bp, and
+no flat-OHLC bars at all), but clearing 240bp at h=4h needs an IC of ~2.6 against
+BTC's 92bp of four-hour dispersion — above perfect foresight.
 
 **Funding and open interest are the only irreplaceable data.** They are 296K each
 against 15M of bars and 49M of features, and unlike those two they cannot be
@@ -656,4 +770,4 @@ everything else in the research store regenerates.
 
 ## Environment Variables
 
-See `AGENTS.md` for the full table. Minimum required for live workflows: `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DATABASE_URL`, `POSTGRES_PASSWORD` (compose refuses to start without it), `COST_CONFIG` (unset misprices every contract by 0.06x–2.5x), and `API_TOKEN` + `VITE_API_TOKEN` if you want the dashboard's script runner.
+See `AGENTS.md` for the full table. Minimum required for live workflows: `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DATABASE_URL`, `POSTGRES_PASSWORD` (compose refuses to start without it), `COST_CONFIG` (unset still prices correctly — the defaults match the measured schedule — but records no fee version), and `API_TOKEN` + `VITE_API_TOKEN` if you want the dashboard's script runner.

@@ -499,10 +499,10 @@ def cost_stress(
     # spread and never reads `slippage_bps`, so the old "3x slippage" scenario
     # multiplied a field nothing consumed and re-ran the baseline unchanged.
     scenarios = scenarios or {
-        'fees_2x': {'fee_pct_per_side': 2.0, 'min_fee_per_contract': 2.0},
+        'fees_2x': {'fee_pct_per_side': 2.0, 'per_contract_fee_usd': 2.0},
         'spread_3x': {'spread_bps': 3.0, 'slippage_bps': 3.0},
         'both': {
-            'fee_pct_per_side': 2.0, 'min_fee_per_contract': 2.0,
+            'fee_pct_per_side': 2.0, 'per_contract_fee_usd': 2.0,
             'spread_bps': 3.0, 'slippage_bps': 3.0,
         },
     }
@@ -518,11 +518,11 @@ def cost_stress(
         }
         # The per-symbol schedule has to scale too, or stressing fees does
         # nothing on the contracts whose cost is set by the per-contract floor.
-        if 'min_fee_per_contract' in multipliers and config.min_fee_per_contract_by_symbol:
-            factor = multipliers['min_fee_per_contract']
-            changes['min_fee_per_contract_by_symbol'] = {
+        if 'per_contract_fee_usd' in multipliers and config.per_contract_fee_by_symbol:
+            factor = multipliers['per_contract_fee_usd']
+            changes['per_contract_fee_by_symbol'] = {
                 symbol: value * factor
-                for symbol, value in config.min_fee_per_contract_by_symbol.items()
+                for symbol, value in config.per_contract_fee_by_symbol.items()
             }
         stressed = _replace(config, **changes)
         results[name] = float(run(stressed))
