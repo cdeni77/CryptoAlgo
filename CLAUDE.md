@@ -369,6 +369,53 @@ none of the gate stack has been run against it. And nothing here is promoted:
 `ic_covers_cost` reads the price head against the raw target, so a residual model
 would need its own measurement wired in before it could pass a gate.
 
+### The market-neutral book: first positive net P&L, and why it is not evidence
+
+`scripts.cross_sectional_backtest` turns the residual IC into a book — rank the
+universe each rebalance, equal-weight the top and bottom `legs`, fill at the next
+open, pay the measured schedule on every leg that changes. Deliberately a
+*separate* execution path from `decide()`, because a market-neutral ranking and a
+directional hurdle are different decisions; it is research-only and wired to
+nothing.
+
+h=96h, 14 contracts, 6 purged folds, 57 rebalances (228 days):
+
+| config | residual IC | folds | gross | costs | net | Sharpe | **t** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **ridge_top3, 3 legs** | +0.0784 | 6/6 | +18,493 | -13,841 | **+4.65%** | **+0.90** | **+0.71** |
+| ridge_top3, 5 legs | +0.0784 | 6/6 | +13,131 | -10,961 | +2.17% | +0.41 | +0.32 |
+| lgbm_tiny, 3 legs | +0.0711 | 5/6 | **-6,548** | -11,719 | -18.27% | -1.51 | -1.19 |
+| lgbm_tiny, 5 legs | +0.0711 | 5/6 | **-13,220** | -8,364 | -21.58% | -2.67 | -2.11 |
+
+**The first positive net P&L in this project.** And three things in the same table
+say not to believe it.
+
+**1. `t = 0.71`.** 57 rebalances is 0.62 years. `t = Sharpe x sqrt(years)`, so
++0.90 annualised is 0.71 standard errors from zero. Reaching `t = 2` needs 4.9
+years of rebalances — **1,802 days**, against the 228 in hand. Four
+configurations were tested and one was positive; P(at least one of four positive
+under the null) is 94%.
+
+**2. Two models with the same IC give opposite gross P&L.** ridge_top3 at +0.0784
+makes +18,493 gross; lgbm_tiny at +0.0711 makes **-6,548**. If the IC were the
+mechanism, both would be positive — the ICs differ by 9% and the gross differs by
+sign. So the P&L is not coming from the forecast; it is coming from which
+particular names each model happened to rank over 57 draws. This is the single
+most diagnostic number here and it is the reason the +4.65% is not a result.
+
+**3. Costs are 74.8% of gross in the winning cell**, and that estimate is
+optimistic: no market impact, no stop slippage, and it assumes the open is
+available at size on contracts where `participation_limit` was already the
+binding gate at h=96h. Turnover is effectively total — 6.2 of 6 positions change
+per rebalance — so the ranking is not persistent and there is no cost relief to
+find.
+
+What this does establish: the residual formulation is the right *shape*. Gross was
+positive on the ridge, which no directional configuration ever managed, and the
+sign of the aggregate book is not carried by the market factor. What it does not
+establish is an edge, and the sample needed to tell the difference is the same
+~1,800 days the IC calculation asked for.
+
 ### h=96h was the last untested cell, and it fails on every gate
 
 The cost screen said h=96h was the only horizon clearing both the economics and
