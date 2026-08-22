@@ -311,6 +311,64 @@ have to reach roughly **48 days**, at which point the effective sample is a few
 dozen observations. There is no horizon at which this forecast pays for the
 round trip.
 
+### The cross-sectional residual is the target the features were built for
+
+Two measurements, taken together, changed the best available configuration.
+
+**Breadth.** Removing the cross-sectional mean takes effective breadth from 1.38
+names to 13.82, because the residuals are near-uncorrelated by construction:
+
+| horizon | raw rho | breadth | residual rho | breadth | SE gain |
+|---|---:|---:|---:|---:|---:|
+| 1h  | +0.651 | 1.48 | -0.086 | 13.82 | 3.06x |
+| 4h  | +0.704 | 1.38 | -0.086 | 13.82 | 3.17x |
+| 24h | +0.717 | 1.36 | -0.085 | 13.82 | 3.19x |
+| 96h | +0.753 | 1.29 | -0.116 | 10.89 | 2.91x |
+
+**Capacity.** `scripts.model_capacity --demeaned-target` runs the ladder against
+that residual. Every rung at h=4h turns positive, where against the raw target
+almost all were negative, and the fold agreement is unlike anything else measured
+here — `ridge_all`, `stump_depth2`, `lgbm_tiny` and `lgbm_production` all at
+**6 of 6**. Five of the 24 residual cells reach 6/6, against 0.75 expected by
+chance.
+
+So the signal is real and replicated across model classes. Then the economics:
+
+| horizon | sigma_resid | required IC | measured | x required | eff obs | SE | sigmas | folds |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4h  |  78.8bp | 0.3718 | +0.0279 | **0.08x** | 3,702 | 0.016 | 1.70 | 6/6 |
+| 24h | 189.3bp | 0.1548 | +0.0136 | 0.09x | 617 | 0.040 | 0.34 | 5/6 |
+| 96h | 398.3bp | 0.0736 | **+0.0784** | **1.07x** | 122 | 0.091 | 0.86 | 6/6 |
+
+**h=96h is the first cell in this entire project whose measured IC exceeds its own
+break-even requirement** — 1.07x, on 6 of 6 folds, with the smallest
+generalisation gap on the ladder (0.049 against the production head's 0.686).
+
+And it is still not established. At 122 effective observations per fold the IC
+standard error is 0.091, so +0.0784 is 0.86 standard errors from zero: the point
+estimate clears the hurdle and the interval contains zero comfortably. 6/6
+agreement is 3.1% per cell by chance, which is suggestive and not proof across 24
+cells.
+
+**The vise, one notch better.** h=4h is measurable (1.70 sigma) and 12x short of
+its requirement. h=96h clears its requirement and cannot be measured. Same shape
+as before, but for the first time one end of it is on the right side of the cost
+line.
+
+**What would settle it is exactly the backfill already on the table.** To put the
+h=96h estimate 4 standard errors from zero needs 2,603 effective observations
+against the ~729 the store holds — a factor of 3.6, or about **1,424 days of
+history**. The 1,825-day spot backfill covers it with room to spare. That is the
+first time a data request in this project has had a specific number behind it
+rather than a hope.
+
+Two caveats that have to travel with this result. It is a *market-neutral*
+formulation — long the top residuals, short the bottom — and
+`core/simulation.py` and `decide()` are built for directional single positions, so
+none of the gate stack has been run against it. And nothing here is promoted:
+`ic_covers_cost` reads the price head against the raw target, so a residual model
+would need its own measurement wired in before it could pass a gate.
+
 ### h=96h was the last untested cell, and it fails on every gate
 
 The cost screen said h=96h was the only horizon clearing both the economics and
