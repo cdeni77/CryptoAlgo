@@ -860,6 +860,23 @@ produces bit-identical cross-venue columns, which
 now pins. 400 covers all of CDE anyway — BIP, the oldest contract, was listed
 2025-07-18.
 
+**A deeper `--backfill-days` now actually fetches deeper history.** It did not
+until 2026-08-22: `pipeline.backfill` set `append_start` to the newest stored bar
+whenever anything was stored, so the requested `start` was discarded and only the
+forward gap was fetched — then it logged "already up to date". Asking a populated
+400-day store for 1,825 days fetched the missing hour. The only way to get more
+history was to delete the database.
+
+The prepend branch had been removed along with CCXT, correctly, for the reason it
+existed: it filled the span before a contract was listed with *another exchange's*
+bars for the same underlying. The defect there was the source, not the direction.
+It is back, fetching from the same connector and venue as every other bar, so
+deeper history is the same series and a request pre-dating a listing returns
+nothing rather than a substitute. `tests/test_backfill_windows.py` pins both
+directions — a deeper request must fetch, and a request inside the stored span
+must still be a no-op, or the hourly loop re-downloads its whole history every
+hour.
+
 **`--backfill-days` in `docker-compose.yml` is the FIRST cycle only.** Every cycle
 after it uses `INCREMENTAL_BACKFILL_HOURS`, so on a populated store it is a cheap
 gap-fill and on an empty one it *defines* the dataset. It was 30, which at a 24h

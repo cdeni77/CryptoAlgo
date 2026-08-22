@@ -189,3 +189,124 @@ def test_run_pipeline_accepts_a_fractional_window():
     source = inspect_source = __import__('inspect').getsource(rp)
     assert '"--backfill-hours"' in source
     assert 'type=float' in source
+
+
+# ---------------------------------------------------------------------------
+# Deeper history on a populated store
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_deeper_request_fetches_history_older_than_the_store(database):
+    """`--backfill-days 1825` against a 400-day store must fetch the 1,425 missing.
+
+    It did not. `append_start` was set to the newest stored bar whenever anything
+    was stored, so the requested `start` was discarded and the scrape fetched only
+    the forward gap — then logged "already up to date". Every deeper request on a
+    populated store was a no-op, which is exactly the situation once a loop has
+    been running: the only way to get more history was to delete the database.
+
+    The prepend branch had been removed along with CCXT, and correctly so for the
+    reason it existed: it filled the span before a contract was listed with
+    another exchange's bars for the same underlying. But the defect there was the
+    *source*, not the direction. This asserts the direction is back.
+    """
+    from datetime import timezone
+
+    from data_collection.pipeline import DataPipeline
+
+    stored = _bars(range(24))                      # one day, at T0
+    Ingestor(database).ingest_bars(stored, venue='coinbase')
+
+    requested = []
+
+    class _Pipe(DataPipeline):
+        def __init__(self):                        # no connector, no config
+            self._database = database
+            self._quality_tracker = _NullQuality()
+
+        def _venue_name(self):
+            return 'coinbase'
+
+        def _granularity_to_seconds(self, timeframe):
+            return 3_600
+
+        async def _fetch_bars(self, symbol, timeframe, start, end):
+            requested.append((start, end))
+            hours = int((end - start).total_seconds() // 3_600)
+            offset = int((start - T0).total_seconds() // 3_600)
+            return _bars(range(offset, offset + max(hours, 0)), symbol=symbol)
+
+        def _process_and_insert_bars(self, bars, symbol, timeframe, venue):
+            if not bars:
+                return 0
+            return Ingestor(database).ingest_bars(bars, venue=venue)
+
+    deep_start = T0 - timedelta(days=30)
+    # `end` past the stored day, so there is a genuine forward gap too and the
+    # test can show the prepend did not replace the append.
+    await _Pipe().backfill(start=deep_start, end=T0 + timedelta(days=3),
+                           symbols=['BTC-PERP'], timeframes=['1h'])
+
+    assert requested, 'nothing was fetched at all'
+    prepends = [(a, b) for a, b in requested if a < T0]
+    assert prepends, (
+        f'no request older than the stored history; the deeper start was '
+        f'discarded. Requests made: {requested}'
+    )
+    first_start, first_end = prepends[0]
+    assert first_start == deep_start, (
+        f'prepend began at {first_start}, not the requested {deep_start}'
+    )
+    assert first_end < T0, 'the prepend must stop before the stored span begins'
+
+    # The forward gap is still fetched, so restoring the prepend did not replace
+    # the append.
+    assert any(a >= T0 for a, _ in requested), f'no forward fetch: {requested}'
+
+    earliest = database.get_earliest_ohlcv_time('BTC-PERP', '1h', venue='coinbase')
+    assert earliest is not None and earliest <= deep_start + timedelta(hours=1)
+
+
+@pytest.mark.asyncio
+async def test_a_request_inside_the_stored_span_still_fetches_nothing(database):
+    """The fix must not turn every run into a full re-fetch.
+
+    An incremental cycle asks for a few hours against a store that already covers
+    them. That has to stay a no-op, or the hourly loop re-downloads its whole
+    history every hour.
+    """
+    from data_collection.pipeline import DataPipeline
+
+    Ingestor(database).ingest_bars(_bars(range(48)), venue='coinbase')
+    requested = []
+
+    class _Pipe(DataPipeline):
+        def __init__(self):
+            self._database = database
+            self._quality_tracker = _NullQuality()
+
+        def _venue_name(self):
+            return 'coinbase'
+
+        def _granularity_to_seconds(self, timeframe):
+            return 3_600
+
+        async def _fetch_bars(self, symbol, timeframe, start, end):
+            requested.append((start, end))
+            return []
+
+        def _process_and_insert_bars(self, bars, symbol, timeframe, venue):
+            return 0
+
+    # Entirely inside the stored span.
+    await _Pipe().backfill(start=T0 + timedelta(hours=6),
+                           end=T0 + timedelta(hours=40),
+                           symbols=['BTC-PERP'], timeframes=['1h'])
+
+    assert not requested, f'a covered range triggered fetches: {requested}'
+
+
+class _NullQuality:
+    def get_summary(self):
+        return {}

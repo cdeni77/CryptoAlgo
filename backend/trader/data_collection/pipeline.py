@@ -250,11 +250,51 @@ class DataPipeline:
                     self._database.get_latest_ohlcv_time(
                         symbol, timeframe, venue=venue)
                 )
+                first_time = ensure_naive_utc(
+                    self._database.get_earliest_ohlcv_time(
+                        symbol, timeframe, venue=venue)
+                )
                 fetched_any = False
-                # No prepend branch. It existed to fill the span before a
-                # contract was listed with another exchange's bars for the same
-                # underlying — a different quote currency, contract size, funding
-                # and participant set, stored under this symbol's name.
+
+                # Prepend: history older than anything stored. This branch was
+                # deleted along with CCXT and nothing replaced it, so on a
+                # populated store `append_start` jumped to the newest bar and the
+                # requested `start` was silently discarded — asking for 1,825 days
+                # against a store holding 400 fetched only the missing hour, and
+                # said "already up to date".
+                #
+                # What made the old prepend wrong was its *source*, not its
+                # direction: it filled the span before a contract was listed with
+                # another exchange's bars for the same underlying — a different
+                # quote currency, contract size, funding and participant set,
+                # stored under this symbol's name. This fetches from the same
+                # connector and the same venue as every other bar, so deeper
+                # history is the same series, and a request that pre-dates the
+                # listing simply returns nothing.
+                if first_time and start < first_time:
+                    prepend_end = first_time - tf_delta
+                    if start <= prepend_end:
+                        logger.info(
+                            f"Prepending {symbol} {timeframe} from {start} to "
+                            f"{prepend_end} (store starts {first_time})"
+                        )
+                        try:
+                            bars = await self._fetch_bars(
+                                symbol, timeframe, start, prepend_end)
+                            if self._process_and_insert_bars(
+                                    bars, symbol, timeframe, venue):
+                                fetched_any = True
+                            else:
+                                logger.info(
+                                    f"   {symbol} {timeframe}: no bars before "
+                                    f"{first_time}; the request pre-dates the "
+                                    f"instrument's own history"
+                                )
+                        except Exception as e:
+                            logger.error(f"Error prepending {symbol} {timeframe}: {e}")
+                            import traceback
+                            traceback.print_exc()
+
                 append_start = start
                 if last_time:
                     append_start = last_time + tf_delta
@@ -270,7 +310,10 @@ class DataPipeline:
                         import traceback
                         traceback.print_exc()
                 if not fetched_any:
-                    logger.info(f"Skipping {symbol} {timeframe} - already up to date in requested range")
+                    logger.info(
+                        f"Skipping {symbol} {timeframe} - store already covers "
+                        f"{first_time} to {last_time}, which spans the request"
+                    )
         logger.info("Backfill complete")
         logger.info(f"Quality summary: {self._quality_tracker.get_summary()}")
 
