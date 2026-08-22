@@ -311,6 +311,75 @@ have to reach roughly **48 days**, at which point the effective sample is a few
 dozen observations. There is no horizon at which this forecast pays for the
 round trip.
 
+### The feature panel is built for a strategy this venue cannot afford
+
+`cross_sectional_standardize` converts 8 of the 9 feature groups to z-scores
+across the universe at each bar — so the **common component is removed from the
+features**. The target keeps it. Measured on this store at h=4h:
+
+    share of target variance that is the common (market) component:  69.9%
+    sd(raw price target)       143.6bp
+    sd(demeaned price target)   78.8bp
+
+And the two halves of the panel behave in opposite directions, which is the
+mismatch stated as a measurement:
+
+| | mean abs IC vs **raw** target | vs **demeaned** target | improve when demeaned |
+|---|---:|---:|---:|
+| the 52 standardized features | 0.0067 | **0.0128** | 45 / 52 |
+| the 6 absolute features (seasonality, cost) | **0.0163** | 0.0068 | 0 / 6 |
+
+A clean double dissociation. Standardized features predict *relative* returns;
+absolute features predict *absolute* ones. The pipeline pairs standardized
+features with a raw directional target, which is the wrong half for 52 of 58.
+
+**This also explains the survey control.** `seasonality,cost` scored highest of
+27 cells partly because it is the only group left un-demeaned — the only feature
+set actually aligned with what the target measures. The instrument-identity
+reading (`identity_ratio` 1.0147) is the other half of it; both hold.
+
+**But the obvious fix is worse, and it was tested rather than assumed.**
+`--no-cross-sectional-standardize` exists now, and A/B against measured price IC:
+
+| horizon | standardized | absolute | identity_ratio |
+|---|---:|---:|---|
+| 4h  | -0.0132 | -0.0148 | 0.61 -> **0.68** |
+| 24h | **+0.0175** | **-0.0273** | 0.33 -> **0.52** |
+
+Removing the demeaning trades a target mismatch for a memorisation problem: the
+trees split on absolute level and recover instrument identity, and the identity
+ratio rises in both. So the panel is not simply misconfigured.
+
+**Aligning the other way is what the features want, and the economics forbid it.**
+The matching strategy is cross-sectional market-neutral — predict relative return,
+long the top and short the bottom. That pays *two* round trips to trade a
+lower-variance quantity, so at h=4h the requirement becomes
+`2 x 29.3bp / (78.8bp x sqrt 2) = 0.53` against the directional 0.203. Two and a
+half times harder.
+
+So the feature layer is correctly built for cross-sectional trading, and this
+venue cannot afford cross-sectional trading. That is not a bug to fix here; it is
+the same conclusion the cost screen reaches, arriving from the feature side. It
+is also precisely the pairing that works at 1-2bp round trips and fails at 27bp.
+
+`Dataset.cross_sectional_standardized` and the model provenance now record which
+panel a model was fitted on, because `feature_set_hash` hashes column *names* and
+cannot tell a demeaned panel from an absolute one.
+
+### The alignment canary
+
+`tests/test_model.py::test_a_perfect_feature_is_recovered_end_to_end` injects a
+feature equal to the realised outcome and asserts the pipeline recovers price IC
+above 0.9. Nothing in the suite checked this, and it is the first thing any "why
+is the IC zero" investigation has to rule out: a one-bar shift between panel and
+target, in either direction, destroys signal silently and reads exactly like no
+edge. Lookahead tests assert the model cannot see the *future*; this asserts it
+can see the *present*, which is the opposite failure and had no guard.
+
+It passes, and a mutation test alongside it shifts the target by one bar and
+asserts the canary fails — so the pipeline is aligned, and the near-zero ICs
+above are the data rather than a defect.
+
 ### The 27-cell survey, and why its best cell is the control
 
 `scripts.ic_survey` walks three horizons against nine feature-group sets, six

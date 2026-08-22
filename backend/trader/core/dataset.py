@@ -65,6 +65,19 @@ class Dataset:
     # because it changes which regimes the universe spans, which is not visible
     # from the symbol list alone.
     min_history_days: float = 0.0
+    # Whether relative features were converted to cross-sectional z-scores.
+    # Recorded because `feature_set_hash` hashes column *names*, so a demeaned
+    # panel and an absolute one are indistinguishable to it — the same blind spot
+    # that let an all-NaN feature group score identically to a populated one.
+    #
+    # It also decides what the model is being asked to predict. Demeaning removes
+    # the common component from the features, and on this book that component is
+    # 70% of the target's variance. Measured: the 52 standardized features average
+    # |IC| 0.0067 against the raw target and 0.0128 against the demeaned one,
+    # while the 6 absolute features go the other way, 0.0163 against raw and
+    # 0.0068 against demeaned. Pairing standardized features with a raw
+    # directional target is the wrong half of that dissociation for 52 of 58.
+    cross_sectional_standardized: bool = True
     warnings: list[str] = field(default_factory=list)
     # Symbols whose funding came from the reference venue instead of the traded
     # one. Structured, not just a warning string, because it has to survive into
@@ -265,6 +278,7 @@ def load_dataset(
     horizon_bars: Optional[int] = None,
     feature_groups: Optional[Sequence[str]] = None,
     min_history_days: float = 0.0,
+    standardize: bool = True,
 ) -> Dataset:
     """Build features and targets for a universe.
 
@@ -452,7 +466,8 @@ def load_dataset(
     # matters: all-NaN columns still cost the model splits to rule out. But no
     # subset is known to be better — measured walk-forward against the tradeable
     # target over 15 group-by-horizon cells, no group holds a consistent sign.
-    features = build_panel(inputs, config=config, groups=feature_groups)
+    features = build_panel(inputs, config=config, groups=feature_groups,
+                           standardize=standardize)
     resolved_horizon = horizon_bars or config.label_horizon_hours()
     targets = build_target_panel(
         bars, profiles=profiles, funding_by_symbol=funding, config=config,
@@ -508,6 +523,7 @@ def load_dataset(
     return Dataset(
         features=features,
         targets=targets,
+        cross_sectional_standardized=bool(standardize),
         bars=bars,
         funding=funding,
         profiles=profiles,

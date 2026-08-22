@@ -51,6 +51,16 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                              "simulation can cover. Prefer this to --exclude: it "
                              "is a rule that reproduces itself rather than a "
                              "symbol list someone has to remember the reason for.")
+    parser.add_argument(
+        '--no-cross-sectional-standardize', dest='standardize',
+        action='store_false', default=True,
+        help='Leave relative features absolute instead of z-scoring them across '
+             'the universe at each bar. Demeaning removes the common component, '
+             'and on this book that component is 70 percent of the target '
+             'variance, so a demeaned feature and a raw directional target are '
+             'mismatched. Measured: standardized features average 0.0067 abs IC '
+             'against the raw target and 0.0128 against a demeaned one; absolute '
+             'features go the other way.')
     parser.add_argument('--feature-groups', default=None,
                         help="Comma-separated feature groups to build. Default: "
                              "all of them, and on the evidence so far that is as "
@@ -194,6 +204,7 @@ def load(args: argparse.Namespace, config: Config) -> Dataset:
         horizon_bars=args.horizon,
         feature_groups=_feature_groups(getattr(args, 'feature_groups', None)),
         min_history_days=float(getattr(args, 'min_history_days', 0.0) or 0.0),
+        standardize=bool(getattr(args, 'standardize', True)),
     )
     window = getattr(args, 'train_window_days', None)
     if window:

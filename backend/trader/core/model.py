@@ -353,6 +353,12 @@ class ForecastModel:
     # target, so this is the difference between a carry edge measured on the cash
     # flow this account receives and one measured on somebody else's.
     proxy_funding_symbols: tuple[str, ...] = ()
+    # Whether the panel's relative features were cross-sectionally demeaned.
+    # `feature_set_hash` hashes column names, so a demeaned panel and an absolute
+    # one produce the identical hash — a saved model would happily score the wrong
+    # one. It also changes what the model was asked to predict: demeaning removes
+    # the common component, which is 70% of this target's variance.
+    cross_sectional_standardized: bool = True
     train_start: Optional[pd.Timestamp] = None
     train_end: Optional[pd.Timestamp] = None
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -459,6 +465,7 @@ class ForecastModel:
             'train_rows': self.train_rows,
             'effective_observations': round(self.effective_observations, 1),
             'validation_purged': self.validation_purged,
+            'cross_sectional_standardized': self.cross_sectional_standardized,
             'n_features_populated': len(self.feature_columns) - len(self.empty_features),
             'empty_features': list(self.empty_features),
             'proxy_funding_symbols': list(self.proxy_funding_symbols),
@@ -521,6 +528,7 @@ def train_forecast_model(
     data_as_of: Optional[str] = None,
     horizon_bars: Optional[int] = None,
     proxy_funding_symbols: Sequence[str] = (),
+    cross_sectional_standardized: bool = True,
 ) -> Optional[ForecastModel]:
     """Fit the three heads on a (event_time, symbol) panel.
 
@@ -668,6 +676,7 @@ def train_forecast_model(
         validation_purged=not purge_disabled,
         empty_features=empty,
         proxy_funding_symbols=tuple(proxy_funding_symbols),
+        cross_sectional_standardized=bool(cross_sectional_standardized),
         train_start=pd.Timestamp(times[train_mask].min()) if train_mask.any() else None,
         train_end=pd.Timestamp(times[train_mask].max()) if train_mask.any() else None,
         metrics=metrics,

@@ -39,6 +39,8 @@ def main() -> int:
     model = train_forecast_model(
         dataset.features, dataset.targets, config=config, data_as_of=args.as_of,
         horizon_bars=dataset.horizon_bars,
+        proxy_funding_symbols=dataset.proxy_funding_symbols,
+        cross_sectional_standardized=dataset.cross_sectional_standardized,
     )
     if model is None:
         print('\nnot enough resolved rows to train')

@@ -427,3 +427,100 @@ def test_the_walk_forward_backtest_trains_at_the_dataset_horizon(panel, config):
         f'walk-forward models recorded '
         f'{sorted({m.horizon_bars for m in generated.models})} instead of 8'
     )
+
+
+def test_a_perfect_feature_is_recovered_end_to_end():
+    """The alignment canary: inject the answer and the pipeline must find it.
+
+    Every "why is the IC zero" investigation has to rule this out first, and
+    nothing in the suite did. A one-bar shift between the feature panel and the
+    target — either direction — destroys signal silently and produces exactly the
+    reading this repo spent months interpreting: IC indistinguishable from zero,
+    on every feature set, at every horizon.
+
+    Lookahead tests cannot catch it. They assert the model does not see the
+    future; this asserts it *does* see the present, which is the opposite failure
+    and has no other guard. If the panel, the targets, the fold splitter, the
+    purge or the per-fold scaler misaligns anything, a feature that is literally
+    the realised outcome stops scoring near 1.0 and this fails.
+
+    Deliberately not `1.0`: `purged_walk_forward` drops the bars around each fold
+    boundary, LightGBM is a step function over a shallow tree, and the injected
+    column is scaled inside the fold. 0.9 clears all of that while leaving no room
+    for a misalignment.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from core.model import cross_validate_forecast
+
+    horizon = 4
+    times = pd.date_range('2026-01-01', periods=1_400, freq='h', tz='UTC')
+    symbols = ('BIP', 'ETP', 'XPP', 'SLP')
+    index = pd.MultiIndex.from_product([times, symbols], names=['event_time', 'symbol'])
+
+    rng = np.random.default_rng(19)
+    realised_price = pd.Series(rng.normal(0, 0.01, len(index)), index=index)
+    targets = pd.DataFrame({
+        'price': realised_price,
+        'carry': 0.0,
+        'cost': 0.0027,
+        'net_long': realised_price - 0.0027,
+        'net_short': -realised_price - 0.0027,
+    }, index=index)
+
+    # One informative column plus noise, so the fit has something to ignore.
+    features = pd.DataFrame({
+        'oracle': realised_price,
+        'noise_a': rng.normal(0, 1, len(index)),
+        'noise_b': rng.normal(0, 1, len(index)),
+    }, index=index)
+
+    report = cross_validate_forecast(
+        features, targets, n_folds=4, horizon_bars=horizon,
+    )
+
+    assert report.folds, 'no folds were evaluated'
+    assert report.price_ic.median > 0.9, (
+        f'a feature equal to the realised outcome scored price IC '
+        f'{report.price_ic.median:+.4f}. The panel and the targets are not '
+        f'aligned on (event_time, symbol), or a fold boundary is shifting one '
+        f'of them.'
+    )
+    assert report.price_ic.positive_fraction == 1.0, (
+        f'the oracle feature failed in some folds: {[f.price_ic for f in report.folds]}'
+    )
+
+
+def test_the_canary_fails_when_the_target_is_shifted():
+    """Mutation check: the canary above must actually be able to fail.
+
+    A test that passes on a broken pipeline is worse than no test. Shift the
+    target by one bar per symbol — the exact defect the canary exists to catch —
+    and the oracle feature must stop working.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from core.model import cross_validate_forecast
+
+    times = pd.date_range('2026-01-01', periods=1_400, freq='h', tz='UTC')
+    symbols = ('BIP', 'ETP', 'XPP', 'SLP')
+    index = pd.MultiIndex.from_product([times, symbols], names=['event_time', 'symbol'])
+
+    rng = np.random.default_rng(23)
+    truth = pd.Series(rng.normal(0, 0.01, len(index)), index=index)
+    # The feature sees the outcome one bar later than the target records it.
+    shifted = truth.groupby(level='symbol').shift(1).fillna(0.0)
+
+    targets = pd.DataFrame({'price': truth, 'carry': 0.0, 'cost': 0.0027},
+                           index=index)
+    features = pd.DataFrame({'oracle': shifted,
+                             'noise': rng.normal(0, 1, len(index))}, index=index)
+
+    report = cross_validate_forecast(features, targets, n_folds=4, horizon_bars=4)
+
+    assert abs(report.price_ic.median) < 0.15, (
+        f'a one-bar misalignment still scored {report.price_ic.median:+.4f} — the '
+        f'canary cannot distinguish aligned from misaligned data'
+    )
