@@ -310,3 +310,105 @@ async def test_a_request_inside_the_stored_span_still_fetches_nothing(database):
 class _NullQuality:
     def get_summary(self):
         return {}
+
+
+# ---------------------------------------------------------------------------
+# A write failure is not a fact about the market
+# ---------------------------------------------------------------------------
+
+
+def test_a_readonly_database_raises_instead_of_reporting_zero(tmp_path, monkeypatch):
+    """The defect that nearly concluded Coinbase has no history before 2025.
+
+    `insert_ohlcv_batch` caught every per-bar exception and returned a count. On a
+    read-only file that produced 34,060 identical ERROR lines and a return of 0,
+    and a caller cannot distinguish 0-because-nothing-was-served from
+    0-because-nothing-could-be-written. The scrape logged the second as the first
+    — "the request pre-dates the contract, so nothing is missing" — while 34,060
+    fetched bars sat in memory unwritten.
+
+    A failure affecting every row is one connection-level problem, not N row
+    problems, so it raises on the first occurrence with the cause attached.
+
+    Read-only is induced with `PRAGMA query_only` rather than `chmod`, because
+    these tests run as root and root ignores file permissions — the chmod version
+    of this test passed against the unfixed code.
+    """
+    import sqlite3
+    from contextlib import contextmanager
+
+    from data_collection import storage as storage_module
+    from data_collection.storage import SQLiteDatabase, StorageWriteError
+
+    path = tmp_path / 'trading.db'
+    db = SQLiteDatabase(str(path))
+    db.initialize()
+
+    original = SQLiteDatabase._get_connection
+
+    @contextmanager
+    def read_only(self):
+        with original(self) as conn:
+            conn.execute('PRAGMA query_only = ON')
+            yield conn
+
+    monkeypatch.setattr(SQLiteDatabase, '_get_connection',
+                        contextmanager(read_only.__wrapped__))
+
+    with pytest.raises(StorageWriteError) as caught:
+        Ingestor(db).ingest_bars(_bars(range(10)), venue='coinbase')
+
+    message = str(caught.value)
+    assert 'cannot write' in message
+    assert str(path) in message, 'the message must name the file that failed'
+    assert 'writable' in message, 'the message must say what to check'
+    # And it names how far it got, so a partial write is not mistaken for none.
+    assert '0 of 10' in message, message
+
+    # The same insert succeeds once writes are allowed again, so this is
+    # exercising the write path rather than a schema problem.
+    monkeypatch.setattr(SQLiteDatabase, '_get_connection', original)
+    assert Ingestor(db).ingest_bars(_bars(range(10)), venue='coinbase').inserted == 10
+
+
+@pytest.mark.asyncio
+async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(database, caplog):
+    """The log has to distinguish "no data" from "data we threw away".
+
+    When a prepend fetches bars and stores none of them, that is an error about
+    this process, not a discovery about the venue. Asserted on the message,
+    because the message is the only thing a human reads at 3am during a scrape.
+    """
+    import logging
+
+    from data_collection.pipeline import DataPipeline
+
+    Ingestor(database).ingest_bars(_bars(range(24)), venue='coinbase')
+
+    class _Pipe(DataPipeline):
+        def __init__(self):
+            self._database = database
+            self._quality_tracker = _NullQuality()
+
+        def _venue_name(self):
+            return 'coinbase'
+
+        def _granularity_to_seconds(self, timeframe):
+            return 3_600
+
+        async def _fetch_bars(self, symbol, timeframe, start, end):
+            # Deep history exists and is returned.
+            return _bars(range(-48, -24), symbol=symbol)
+
+        def _process_and_insert_bars(self, bars, symbol, timeframe, venue):
+            return 0                      # ...and nothing is stored.
+
+    with caplog.at_level(logging.ERROR):
+        await _Pipe().backfill(start=T0 - timedelta(days=2), end=T0 + timedelta(days=2),
+                               symbols=['BTC-PERP'], timeframes=['1h'])
+
+    errors = ' '.join(r.message for r in caplog.records if r.levelno >= logging.ERROR)
+    assert 'write failure' in errors, (
+        f'a fetched-but-unwritten span was not reported as a write failure: {errors}'
+    )
+    assert 'not missing history' in errors

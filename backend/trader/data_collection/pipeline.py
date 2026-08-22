@@ -278,22 +278,31 @@ class DataPipeline:
                             f"Prepending {symbol} {timeframe} from {start} to "
                             f"{prepend_end} (store starts {first_time})"
                         )
-                        try:
-                            bars = await self._fetch_bars(
-                                symbol, timeframe, start, prepend_end)
-                            if self._process_and_insert_bars(
-                                    bars, symbol, timeframe, venue):
-                                fetched_any = True
-                            else:
-                                logger.info(
-                                    f"   {symbol} {timeframe}: no bars before "
-                                    f"{first_time}; the request pre-dates the "
-                                    f"instrument's own history"
-                                )
-                        except Exception as e:
-                            logger.error(f"Error prepending {symbol} {timeframe}: {e}")
-                            import traceback
-                            traceback.print_exc()
+                        bars = await self._fetch_bars(
+                            symbol, timeframe, start, prepend_end)
+                        # "Nothing was written" and "nothing exists" are
+                        # different facts and only one of them is about the
+                        # market. Reporting the first as the second is how a
+                        # read-only database became the conclusion that Coinbase
+                        # serves no history before 2025, with 34,060 fetched bars
+                        # sitting in memory unwritten.
+                        if not bars:
+                            logger.info(
+                                f"   {symbol} {timeframe}: the venue served no "
+                                f"bars before {first_time}; the request "
+                                f"pre-dates this instrument's own history"
+                            )
+                        elif self._process_and_insert_bars(
+                                bars, symbol, timeframe, venue):
+                            fetched_any = True
+                        else:
+                            logger.error(
+                                f"   {symbol} {timeframe}: fetched "
+                                f"{len(bars):,} bars before {first_time} and "
+                                f"stored none of them. This is a write failure, "
+                                f"not missing history — the deeper span is "
+                                f"available and was discarded."
+                            )
 
                 append_start = start
                 if last_time:

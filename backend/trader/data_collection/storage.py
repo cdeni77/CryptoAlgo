@@ -25,6 +25,16 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
+class StorageWriteError(RuntimeError):
+    """A write failed for a reason that is not about the data.
+
+    Raised rather than counted, because a caller that receives 0 from an insert
+    cannot tell "the venue served nothing" from "this database is read-only" —
+    and the scrape logged the second as the first, concluding that Coinbase had
+    no history before 2025 while 34,060 bars sat in memory.
+    """
+
+
 class DatabaseBase(ABC):
     """Abstract base class for database implementations."""
     
@@ -336,6 +346,7 @@ class SQLiteDatabase(DatabaseBase):
         with self._get_connection() as conn:
             cursor = conn.cursor()
             inserted = 0
+            failures: List[str] = []
             
             for bar in bars:
                 try:
@@ -362,10 +373,34 @@ class SQLiteDatabase(DatabaseBase):
                         bar.quality_notes,
                     ))
                     inserted += 1
+                except sqlite3.OperationalError as e:
+                    # Connection-level: read-only file, full disk, locked
+                    # database. This affects every row, so looping over 34,000
+                    # bars emits 34,000 identical errors and then returns 0 —
+                    # which the caller cannot distinguish from "the venue has no
+                    # data for this span". Fail once, immediately, with the cause.
+                    raise StorageWriteError(
+                        f"cannot write to {self.db_path}: {e}. "
+                        f"{inserted} of {len(bars)} bars were written before this. "
+                        f"Check that the file and its directory are writable by "
+                        f"this process — SQLite needs the *directory* too, for its "
+                        f"-wal and -journal files — and that the disk is not full."
+                    ) from e
                 except Exception as e:
-                    logger.error(f"Failed to insert bar {bar.bar_id}: {e}")
+                    failures.append(f"{bar.bar_id}: {e}")
             
             conn.commit()
+            if failures and not inserted:
+                # Every row failed for a non-connection reason. Reporting zero
+                # here would read as "no data available" upstream.
+                raise StorageWriteError(
+                    f"all {len(bars)} bars rejected, first: {failures[0]}"
+                )
+            if failures:
+                logger.error(
+                    "%d of %d bars rejected (first: %s)",
+                    len(failures), len(bars), failures[0],
+                )
             return inserted
     
     def get_ohlcv(

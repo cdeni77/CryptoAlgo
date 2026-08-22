@@ -238,11 +238,16 @@ async def backfill_ohlcv(
                         first_bar_time = first_bar_time.to_pydatetime()
                     gap = first_bar_time - start_time
                     if gap > timedelta(hours=12):
-                        # Not a gap: the instrument did not exist yet.
+                        # Read off the *store*, so it only means "the instrument
+                        # did not exist yet" when the writes succeeded. When they
+                        # did not, this same line reads as a fact about the venue,
+                        # which is how a read-only database was reported as
+                        # Coinbase having no history before 2025.
                         logger.info(
-                            "   %s history starts %s; the %d day(s) requested "
-                            "before that pre-date the contract, so nothing is "
-                            "missing.",
+                            "   %s stored history starts %s, %d day(s) after the "
+                            "requested start. That means the contract did not "
+                            "exist yet ONLY if no write errors appear above; "
+                            "otherwise the span was fetched and discarded.",
                             symbol, first_bar_time.date(), gap.days,
                         )
                 
