@@ -613,6 +613,47 @@ provenance carries `empty_features` and `n_features_populated` alongside
 cross-venue columns arrived all-NaN — with the identical `feature_set_hash` a
 populated panel would have.
 
+## What to do next, and when
+
+**Direction is answered: no.** 0.8bp of edge against a 6.9bp cheapest round trip,
+and more history does not move it — the recency half-life saturates, so 399 days
+gives 1,678 effective observations at h=4h and 2,000 days gives 3,088. The
+constraint is a factor of eight in the economics, not the sample size. Do not tune
+the directional model; 15 group-by-horizon cells have already been tested on this
+data and further searching spends statistical budget on a question the fee
+schedule has answered.
+
+**Carry is the open question, and it has a date.** Funding accrues at 18 rows an
+hour and cannot be backfilled:
+
+| | funding rows | what becomes possible |
+|---|---:|---|
+| +90d | 38,880 | monthly folds — a first honest look |
+| +106d | 45,800 | h=48h clears the 200-observation gate at H=730 |
+| +180d | 77,760 | walk-forward quarters — a real evaluation |
+
+Those converge: 48h is where carry covers a round trip on 9 of 18 contracts at the
+*measured* funding rates, and it is also roughly when enough funding exists to test
+it. The specific question to ask then: **does funding at a 48h hold cover the round
+trip on XPP and SLP**, the only two contracts with both fresh prices and low fees.
+
+**Execution cost is the one lever available sooner.** Maker on both sides would move
+the round trip toward ~5bp, which changes the 0.8-vs-6.9 ratio materially. It needs
+a fill-probability model `core/simulation.py` does not have — real work, but aimed
+at the binding constraint rather than at the model.
+
+**Spot is not the answer.** Coinbase Advanced Trade charges 1.20% per side at this
+account's tier: 240bp round trip against the BTC perp's 23.2bp, 10x worse. Spot
+prices are genuinely cleaner (median close-to-open gap 1.1bp against the perps'
+14.2bp, and no flat-OHLC bars at all), but clearing 240bp at h=4h needs an IC of
+1.59 — above perfect foresight. Verified against the app: for `BIP` at $78,150 the
+schedule gives $0.91 per side on $781.50 notional and the app charges $0.90.
+
+**Funding and open interest are the only irreplaceable data.** They are 296K each
+against 15M of bars and 49M of features, and unlike those two they cannot be
+re-fetched at all. `.gitignore` un-ignores them specifically for that reason;
+everything else in the research store regenerates.
+
 ## Environment Variables
 
 See `AGENTS.md` for the full table. Minimum required for live workflows: `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DATABASE_URL`, `POSTGRES_PASSWORD` (compose refuses to start without it), `COST_CONFIG` (unset misprices every contract by 0.06x–2.5x), and `API_TOKEN` + `VITE_API_TOKEN` if you want the dashboard's script runner.

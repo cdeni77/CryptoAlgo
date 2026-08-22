@@ -589,3 +589,40 @@ def test_help_does_not_crash(module):
     assert result.returncode == 0, (
         f'{module} --help exited {result.returncode}:\n{result.stderr[-800:]}'
     )
+
+
+def test_the_irreplaceable_datasets_are_not_gitignored():
+    """Funding and open interest cannot be re-fetched. They must not need a flag.
+
+    CDE publishes no historical endpoint for either — both are snapshots on the
+    product payload, accumulating forward at one observation per contract per hour
+    — so a lost row is lost permanently. Bars re-fetch with
+    `run_pipeline --backfill-days 400` and features regenerate from bars.
+
+    The store was ignored wholesale, so those two survived only via a remembered
+    `git add -f`. That is how the deep-history partitions went missing once
+    already: a data push carried the two most recent months and silently dropped
+    the other twelve.
+    """
+    import subprocess
+
+    recoverable = ('bars', 'features')
+    irreplaceable = ('funding', 'open_interest')
+
+    for dataset in recoverable + irreplaceable:
+        path = f'backend/trader/data/research/{dataset}/venue=coinbase/probe.parquet'
+        result = subprocess.run(
+            ['git', 'check-ignore', '-q', path],
+            cwd=REPO_ROOT, capture_output=True,
+        )
+        ignored = result.returncode == 0
+        if dataset in irreplaceable:
+            assert not ignored, (
+                f'{dataset} is gitignored, but it cannot be re-fetched — a wipe '
+                f'loses it permanently and nothing will remind you to add it'
+            )
+        else:
+            assert ignored, (
+                f'{dataset} is tracked, but it regenerates: bars are 15M and '
+                f'features 49M against 296K for each irreplaceable dataset'
+            )
