@@ -69,6 +69,11 @@ DEFAULT_MAX_REQUIRED_IC = 0.05
 # the deflated Sharpe discounts what is left by the trial count.
 DEFAULT_MIN_EFFECTIVE_OBS = 200.0
 
+# Measured mean pairwise correlation of 4h returns across the CDE book. Used to
+# discount pooled observations to effective ones: 18 instruments moving together
+# are not 18 independent sources of evidence.
+PAIRWISE_CORRELATION = 0.658
+
 
 def _effective_observations(index: pd.DatetimeIndex, horizon: int,
                            half_life_days: float) -> float:
@@ -160,9 +165,27 @@ def _verdict(frame: pd.DataFrame, limit: float,
         round_trip_bps=('round_trip_bps', 'median'),
         effective_obs=('effective_obs', 'sum'),
     ).reset_index()
+    # Pooled observations overstate the sample by the universe's own
+    # correlation. `IR ~ IC x sqrt(breadth)` uses *effective* names, and
+    # `N / (1 + (N-1) rho)` at the measured rho = 0.658 turns 14 instruments into
+    # 1.47. Summing per-instrument observations and gating on that passed h=96h
+    # with 279 when the correlation-adjusted figure is ~46 across the whole span
+    # and ~16 per test fold — an IC standard error of 0.25, which no measurement
+    # at that horizon can beat.
+    breadth = grouped['instruments'] / (
+        1.0 + (grouped['instruments'] - 1.0) * PAIRWISE_CORRELATION)
+    grouped['effective_names'] = breadth
+    grouped['effective_obs_adj'] = (
+        grouped['effective_obs'] / grouped['instruments'] * breadth)
+    grouped['ic_standard_error'] = 1.0 / np.sqrt(
+        grouped['effective_obs_adj'].clip(lower=1.0))
     grouped['cost_ok'] = grouped['required_ic_best'] <= limit
-    grouped['sample_ok'] = grouped['effective_obs'] >= min_obs
-    grouped['passes'] = grouped['cost_ok'] & grouped['sample_ok']
+    grouped['sample_ok'] = grouped['effective_obs_adj'] >= min_obs
+    # A horizon whose required IC is inside its own measurement noise cannot be
+    # validated even if the economics work: you could not tell a model that
+    # clears the hurdle from one that does not.
+    grouped['measurable'] = grouped['required_ic_median'] > grouped['ic_standard_error']
+    grouped['passes'] = grouped['cost_ok'] & grouped['sample_ok'] & grouped['measurable']
     return grouped, bool(grouped['passes'].any())
 
 
@@ -220,7 +243,11 @@ def main() -> int:
         flag = 'ok' if abs(shared - mine) < 5e-4 else 'DISAGREE'
         print(f'  h={horizon:>3}h  screen {mine:.4f}  gate {shared:.4f}  {flag}')
     print('\nby horizon')
-    print(summary.to_string(index=False, float_format=lambda x: f'{x:8.3f}'))
+    print(summary[['horizon', 'instruments', 'effective_names', 'required_ic_median',
+                   'required_ic_best', 'ceiling_win_rate', 'effective_obs',
+                   'effective_obs_adj', 'ic_standard_error', 'cost_ok',
+                   'sample_ok', 'measurable', 'passes']]
+          .to_string(index=False, float_format=lambda x: f'{x:8.3f}'))
 
     print(f'\ngates: required IC <= {args.max_required_ic:.3f} '
           f'AND effective observations >= {args.min_effective_obs:.0f} '
@@ -237,6 +264,14 @@ def main() -> int:
         print(f'\nPASS at {horizons_ok} — both gates clear. Those are the '
               f'horizons worth modelling.')
     else:
+        unmeasurable = [int(r.horizon) for r in summary.itertuples()
+                        if r.cost_ok and not r.measurable]
+        if unmeasurable:
+            print(f'  h={unmeasurable} pay for themselves and cannot be verified: '
+                  f'the IC they require is inside their own measurement noise, so '
+                  f'a model that clears the hurdle is indistinguishable from one '
+                  f'that does not. That is the vise — short holds are measurable '
+                  f'and unaffordable, long holds affordable and unmeasurable.')
         cost_only = [int(r.horizon) for r in summary.itertuples()
                      if r.cost_ok and not r.sample_ok]
         sample_only = [int(r.horizon) for r in summary.itertuples()

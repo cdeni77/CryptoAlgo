@@ -74,8 +74,15 @@ def test_required_ic_falls_with_the_horizon_and_the_sample_falls_with_it(config)
     assert ceilings[0] < 0.75, 'a short hold cannot have a high ceiling'
 
 
-def test_the_verdict_needs_both_gates_not_either(config):
-    """A horizon that pays but cannot be fitted is not a pass."""
+def test_the_verdict_needs_every_gate_not_any_of_them(config):
+    """A horizon that pays but cannot be fitted or verified is not a pass.
+
+    Three conditions, and all must hold: the forecast requirement is reachable,
+    the effective sample is large enough to fit, and the requirement sits outside
+    its own measurement noise. The third was added after the ladder showed a
+    ridge reaching test IC +0.083 at h=96h against a standard error of 0.25 —
+    nominally twice the required IC, and a third of one standard error from zero.
+    """
     frame = pd.DataFrame([
         # Cheap to forecast, far too few observations.
         {'symbol': 'A', 'horizon': 96, 'required_ic': 0.02, 'ceiling_win_rate': 0.95,
@@ -91,8 +98,10 @@ def test_the_verdict_needs_both_gates_not_either(config):
     assert bool(rows.loc[96, 'cost_ok']) and not bool(rows.loc[96, 'sample_ok'])
     assert bool(rows.loc[1, 'sample_ok']) and not bool(rows.loc[1, 'cost_ok'])
 
-    # And a cell clearing both does pass, so the gate is not vacuously strict.
-    frame.loc[len(frame)] = {'symbol': 'A', 'horizon': 24, 'required_ic': 0.03,
+    # And a cell clearing all three does pass, so the gate is not vacuously
+    # strict. Required IC 0.05 against a standard error of ~0.032 at 1,000
+    # observations: affordable, fittable, and outside its own noise.
+    frame.loc[len(frame)] = {'symbol': 'A', 'horizon': 24, 'required_ic': 0.05,
                              'ceiling_win_rate': 0.9, 'round_trip_bps': 27.0,
                              'effective_obs': 1_000.0}
     _, now_passes = _verdict(frame, limit=0.05, min_obs=200.0)
@@ -122,3 +131,49 @@ def test_the_recency_decay_caps_the_sample_however_deep_the_store_is():
 
     # And with no decay the sample is just uniqueness, which scales with history.
     assert obs(1_095, 0.0) / obs(365, 0.0) == pytest.approx(3.0, rel=0.05)
+
+
+def test_pooled_observations_are_discounted_by_the_universe_s_own_correlation():
+    """18 instruments moving together are not 18 sources of evidence.
+
+    The screen originally summed per-instrument observations and gated on that,
+    which passed h=96h with 279. At the measured pairwise correlation of 0.658,
+    `N / (1 + (N-1) rho)` turns 18 instruments into 1.48 effective names, so the
+    honest figure is 23 — and the implied IC standard error is 0.21 against a
+    required IC of 0.045. A horizon whose requirement sits inside its own
+    measurement noise cannot be validated at all: a model that clears the hurdle
+    is indistinguishable from one that does not.
+
+    That is the vise this screen exists to show. Short holds are measurable and
+    unaffordable; long holds are affordable and unmeasurable.
+    """
+    import pandas as pd
+
+    from scripts.instrument_screen import PAIRWISE_CORRELATION, _verdict
+
+    assert 0.0 < PAIRWISE_CORRELATION < 1.0
+
+    # h=96h as measured: cheap to forecast, 279 pooled observations over 18 names.
+    frame = pd.DataFrame([
+        {'symbol': f'S{i}', 'horizon': 96, 'required_ic': 0.045,
+         'ceiling_win_rate': 0.95, 'round_trip_bps': 29.0,
+         'effective_obs': 279.0 / 18}
+        for i in range(18)
+    ])
+    summary, any_pass = _verdict(frame, limit=0.05, min_obs=200.0)
+    row = summary.iloc[0]
+
+    assert row['effective_obs'] == pytest.approx(279.0, rel=0.01)
+    assert row['effective_names'] < 2.0, row['effective_names']
+    assert row['effective_obs_adj'] < 40.0, (
+        f'pooled 279 discounted to {row["effective_obs_adj"]:.0f}; if this is '
+        f'still in the hundreds the correlation discount is not being applied'
+    )
+    # The economics pass and the measurability does not, which is the whole point.
+    assert bool(row['cost_ok'])
+    assert not bool(row['measurable']), (
+        f'required IC {row["required_ic_median"]:.3f} vs standard error '
+        f'{row["ic_standard_error"]:.3f} — a requirement inside its own noise '
+        f'must not be reported as verifiable'
+    )
+    assert not any_pass
