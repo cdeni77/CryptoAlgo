@@ -1,7 +1,7 @@
 {
   "last_retrain_attempt_at": "2026-08-21T21:39:19.465290+00:00",
   "paper_monitoring": {
-    "evaluated_at": "2026-08-21T21:34:23.483699+00:00",
+    "evaluated_at": "2026-08-22T23:21:22.686498+00:00",
     "kpis": {
       "drawdown": 0.0,
       "expectancy": 0.0,
