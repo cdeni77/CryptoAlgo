@@ -757,6 +757,12 @@ class FoldResult:
     net_ic: float
     price_ic_xs: float
     net_ic_xs: float
+    # What net IC a forecast with NO skill scores on this fold. `expected_net`
+    # and `realised_net` both carry the same `-cost` term, so the correlation
+    # between them is positive before any prediction happens. Carried per fold
+    # so net IC can be read against it rather than against zero.
+    net_ic_cost_only: float
+    net_ic_xs_cost_only: float
     identity_ceiling: float
     mean_expected_net_bps: float
     predictions: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -772,6 +778,8 @@ class CVReport:
     net_ic: PathDistribution
     price_ic_xs: PathDistribution
     net_ic_xs: PathDistribution
+    net_ic_cost_only: PathDistribution
+    net_ic_xs_cost_only: PathDistribution
     identity_ceiling: PathDistribution
     total_effective_observations: float
 
@@ -786,6 +794,29 @@ class CVReport:
         """
         ceiling = abs(self.identity_ceiling.median)
         return float(abs(self.price_ic.median) / ceiling) if ceiling > 1e-9 else float('nan')
+
+    @property
+    def net_ic_skill(self) -> float:
+        """Net IC above what a zero-skill forecast scores on the same folds.
+
+        `expected_net` and `realised_net` share the `-cost` term, so their
+        correlation starts positive: on this store at h=4h a forecast predicting
+        price = 0 and carry = 0 scores +0.0714 pooled and +0.1094
+        cross-sectionally, with every fold positive. Read against zero, that
+        looks like a stable signal; it is the fee schedule on both sides of a
+        correlation.
+
+        This is the difference, and it is what net IC was being read as. A
+        `volatility,trend,market_factor` set at h=4h scored net IC +0.0461
+        against a +0.0714 floor — negative skill reported as six-of-six positive
+        folds.
+        """
+        return float(self.net_ic.median - self.net_ic_cost_only.median)
+
+    @property
+    def net_ic_is_cost_only(self) -> bool:
+        """True when net IC does not beat a forecast that predicts nothing."""
+        return bool(np.isfinite(self.net_ic_skill) and self.net_ic_skill <= 0.0)
 
     @property
     def memorisation_suspected(self) -> bool:
@@ -812,6 +843,10 @@ class CVReport:
             'net_ic': self.net_ic.as_dict(),
             'price_ic_cross_sectional': self.price_ic_xs.as_dict(),
             'net_ic_cross_sectional': self.net_ic_xs.as_dict(),
+            'net_ic_cost_only': self.net_ic_cost_only.as_dict(),
+            'net_ic_cross_sectional_cost_only': self.net_ic_xs_cost_only.as_dict(),
+            'net_ic_skill': round(self.net_ic_skill, 4),
+            'net_ic_is_cost_only': self.net_ic_is_cost_only,
             'identity_ceiling_ic': self.identity_ceiling.as_dict(),
             'identity_ratio': round(self.identity_ratio, 3),
             'memorisation_suspected': self.memorisation_suspected,
@@ -821,10 +856,15 @@ class CVReport:
 
     def __str__(self) -> str:
         warning = '  MEMORISATION SUSPECTED' if self.memorisation_suspected else ''
+        if self.net_ic_is_cost_only:
+            warning += '  NET IC IS THE COST TERM'
         return (
             f"{len(self.folds)} folds | "
             f"price IC {self.price_ic.median:+.4f} (xs {self.price_ic_xs.median:+.4f}) | "
-            f"carry IC {self.carry_ic.median:+.4f} | net IC {self.net_ic.median:+.4f} | "
+            f"carry IC {self.carry_ic.median:+.4f} | "
+            f"net IC {self.net_ic.median:+.4f} "
+            f"(cost-only floor {self.net_ic_cost_only.median:+.4f}, "
+            f"skill {self.net_ic_skill:+.4f}) | "
             f"carry share {self.carry_share_of_signal:.0%} | "
             f"identity ceiling {self.identity_ceiling.median:+.4f} "
             f"(ratio {self.identity_ratio:.2f}){warning} | "
@@ -859,7 +899,8 @@ def cross_validate_forecast(
     x, y = align_panel(features, targets)
     empty = summarise_paths([])
     if len(x) < MIN_FOLD_ROWS:
-        return CVReport([], empty, empty, empty, empty, empty, empty, 0.0)
+        return CVReport([], empty, empty, empty, empty, empty, empty, empty,
+                        empty, 0.0)
 
     x = add_symbol_feature(x)
     categories = (
@@ -913,6 +954,12 @@ def cross_validate_forecast(
         cost = y_test['cost'].to_numpy()
         expected_net = forecasts['price'] + forecasts['carry'] - cost
         realised_net = y_test['price'].to_numpy() + y_test['carry'].to_numpy() - cost
+        # The same quantity for a forecast that predicts nothing. Cost is known
+        # at decision time, not forecast, so this is the floor net IC has to
+        # clear before any of it is skill. Measured on this store at h=4h it is
+        # +0.0714 pooled and +0.1094 cross-sectionally, which is larger than
+        # every net IC any feature set has produced here.
+        zero_skill = -cost
 
         results.append(FoldResult(
             fold=number,
@@ -922,6 +969,8 @@ def cross_validate_forecast(
             price_ic=information_coefficient(forecasts['price'], y_test['price'].to_numpy()),
             carry_ic=information_coefficient(forecasts['carry'], y_test['carry'].to_numpy()),
             net_ic=information_coefficient(expected_net, realised_net),
+            net_ic_cost_only=information_coefficient(zero_skill, realised_net),
+            net_ic_xs_cost_only=cross_sectional_ic(zero_skill, realised_net, x_test.index),
             price_ic_xs=cross_sectional_ic(
                 forecasts['price'], y_test['price'].to_numpy(), x_test.index),
             net_ic_xs=cross_sectional_ic(expected_net, realised_net, x_test.index),
@@ -945,6 +994,8 @@ def cross_validate_forecast(
         net_ic=distribution('net_ic'),
         price_ic_xs=distribution('price_ic_xs'),
         net_ic_xs=distribution('net_ic_xs'),
+        net_ic_cost_only=distribution('net_ic_cost_only'),
+        net_ic_xs_cost_only=distribution('net_ic_xs_cost_only'),
         identity_ceiling=distribution('identity_ceiling'),
         total_effective_observations=sum(r.effective_observations for r in results),
     )

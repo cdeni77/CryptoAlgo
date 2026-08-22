@@ -416,3 +416,105 @@ def test_the_reported_head_ic_is_a_holdout_measurement():
         if 'in-sample IC' in path.read_text():
             offenders.append(str(path.relative_to(root)))
     assert not offenders, f'holdout IC described as in-sample in: {offenders}'
+
+
+def test_net_ic_is_reported_against_what_a_skill_free_forecast_scores():
+    """`expected_net` and `realised_net` share the cost term, so net IC starts positive.
+
+        expected_net = forecast_price + forecast_carry - cost
+        realised_net = realised_price + realised_carry - cost
+
+    `-cost` is identical in both, and cost is known at decision time rather than
+    forecast, so correlating the two credits the fee schedule as signal. Measured
+    on this store at h=4h a forecast predicting price = 0 and carry = 0 scores
+    net IC +0.0714 pooled and +0.1094 cross-sectionally, with every fold
+    positive — which read against zero looks exactly like a stable edge.
+
+    It was being read against zero. A `volatility,trend,market_factor` feature
+    set at h=4h reported net IC +0.0461 across six folds, all positive, while
+    its price IC was -0.0107: the model had no directional skill and the metric
+    said six-of-six.
+
+    So the floor is measured per fold and `net_ic_skill` is the difference. This
+    test builds a forecast with no skill by construction and asserts that the
+    floor catches it — that net IC is comfortably positive, that the floor is
+    just as positive, and that the skill is not.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from core.model import cross_sectional_ic, information_coefficient
+
+    rng = np.random.default_rng(11)
+    n_times, symbols = 400, ('BIP', 'ETP', 'XPP', 'DOP')
+    index = pd.MultiIndex.from_product(
+        [pd.date_range('2026-01-01', periods=n_times, freq='4h', tz='UTC'), symbols],
+        names=['event_time', 'symbol'],
+    )
+    # Costs differ per instrument the way the real schedule does: one percentage
+    # and one commission, so the spread comes from notional per contract.
+    per_symbol = {'BIP': 0.0027, 'ETP': 0.0034, 'XPP': 0.0027, 'DOP': 0.0029}
+    cost = np.array([per_symbol[s] for _, s in index])
+    # Realised price moves are pure noise, and the forecast is identically zero.
+    realised_price = rng.normal(0.0, 0.0144, len(index))
+    forecast = np.zeros(len(index))
+
+    realised_net = realised_price - cost
+    expected_net = forecast - cost
+
+    net_ic = information_coefficient(expected_net, realised_net)
+    floor = information_coefficient(-cost, realised_net)
+    net_ic_xs = cross_sectional_ic(expected_net, realised_net, index)
+    floor_xs = cross_sectional_ic(-cost, realised_net, index)
+
+    # The metric is positive on a forecast that predicts nothing at all.
+    assert net_ic > 0.02, (
+        f'net IC {net_ic:+.4f} on a zero forecast — if this is near zero the '
+        f'fixture no longer reproduces the defect and the floor is untested'
+    )
+    # And the floor accounts for all of it, which is the whole point.
+    assert net_ic == pytest.approx(floor, abs=1e-9)
+    assert net_ic_xs == pytest.approx(floor_xs, abs=1e-9)
+    assert net_ic - floor == pytest.approx(0.0, abs=1e-9)
+
+    # The realised price forecast really was skill-free, so nothing was thrown away.
+    assert abs(information_coefficient(forecast, realised_price)) < 1e-9 or np.isnan(
+        information_coefficient(forecast, realised_price)
+    )
+
+
+def test_the_cv_report_flags_a_net_ic_that_is_only_the_cost_term():
+    """The floor has to reach the report, not just the fold.
+
+    A per-fold number nobody aggregates is a number nobody reads. `net_ic_skill`
+    is the difference against the floor and `net_ic_is_cost_only` is the flag,
+    and `__str__` has to say so — the string is what a research run prints and
+    what someone pastes into a commit message.
+    """
+    from core.metrics import summarise_paths
+    from core.model import CVReport
+
+    def report(net_ic: float, floor: float) -> CVReport:
+        return CVReport(
+            folds=[],
+            price_ic=summarise_paths([0.001]),
+            carry_ic=summarise_paths([0.0]),
+            net_ic=summarise_paths([net_ic]),
+            price_ic_xs=summarise_paths([0.001]),
+            net_ic_xs=summarise_paths([net_ic]),
+            net_ic_cost_only=summarise_paths([floor]),
+            net_ic_xs_cost_only=summarise_paths([floor]),
+            identity_ceiling=summarise_paths([0.01]),
+            total_effective_observations=1_000.0,
+        )
+
+    # The case that actually happened: net IC positive, floor higher.
+    fake = report(net_ic=0.0461, floor=0.0714)
+    assert fake.net_ic_skill < 0
+    assert fake.net_ic_is_cost_only
+    assert 'NET IC IS THE COST TERM' in str(fake)
+
+    real = report(net_ic=0.12, floor=0.0714)
+    assert real.net_ic_skill == pytest.approx(0.0486, abs=1e-4)
+    assert not real.net_ic_is_cost_only
+    assert 'NET IC IS THE COST TERM' not in str(real)
