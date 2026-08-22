@@ -53,8 +53,12 @@ def _override(config: Config, **fields) -> Config:
     return replace(config, cli_overrides=marked, **fields)
 
 
-def _scenarios(config: Config, n_symbols: int) -> list[tuple[str, Config, bool]]:
-    """(name, config, ignore_cost_hurdle) in order of increasing permissiveness."""
+def _scenarios(config: Config, n_symbols: int) -> list[tuple[str, Config, str]]:
+    """(name, config, signal mode) in order of increasing permissiveness.
+
+    Signal mode is 'net' (as shipped), 'gross' (cost-blind) or 'inverted'
+    (cost-blind and sign-flipped).
+    """
     loose_conviction = dict(min_edge_over_cost=0.0)
     loose_risk = dict(min_edge_to_risk=0.0)
     loose_vol = dict(min_vol_24h=0.0, max_vol_24h=10.0)
@@ -66,17 +70,18 @@ def _scenarios(config: Config, n_symbols: int) -> list[tuple[str, Config, bool]]
     everything = {**loose_conviction, **loose_risk, **loose_vol, **loose_portfolio}
 
     return [
-        ('production',          config,                              False),
-        ('no_conviction',       _override(config, **loose_conviction), False),
-        ('no_edge_to_risk',     _override(config, **loose_risk),       False),
-        ('any_volatility',      _override(config, **loose_vol),        False),
-        ('no_portfolio_caps',   _override(config, **loose_portfolio),  False),
-        ('all_gates_loose',     _override(config, **everything),       False),
-        ('ignore_cost_hurdle',  _override(config, **everything),       True),
+        ('production',          config,                                'net'),
+        ('no_conviction',       _override(config, **loose_conviction), 'net'),
+        ('no_edge_to_risk',     _override(config, **loose_risk),       'net'),
+        ('any_volatility',      _override(config, **loose_vol),        'net'),
+        ('no_portfolio_caps',   _override(config, **loose_portfolio),  'net'),
+        ('all_gates_loose',     _override(config, **everything),       'net'),
+        ('ignore_cost_hurdle',  _override(config, **everything),       'gross'),
+        ('inverted_gross',      _override(config, **everything),   'inverted'),
     ]
 
 
-def _gross(forecasts: pd.DataFrame) -> pd.DataFrame:
+def _restate(forecasts: pd.DataFrame, mode: str) -> pd.DataFrame:
     """Decide on the gross forecast, so the cost hurdle stops being a gate.
 
     `decide()` refuses a row whose `expected_net` is not positive, and
@@ -84,9 +89,19 @@ def _gross(forecasts: pd.DataFrame) -> pd.DataFrame:
     rejection. Replacing it with `|price + carry|` and taking that sign makes the
     decision cost-blind. Nothing about the *accounting* changes: the fill still
     pays the fee, the spread and the commission.
+
+    `mode='inverted'` flips the sign as well. That is not a strategy proposal —
+    inverting a signal because it lost on one sample is the purest form of
+    fitting to it. It is a *turnover* measurement, and the only one that
+    separates "the forecast is bad" from "no forecast could pay at this
+    frequency": if the sign-flipped book still loses, then sign accuracy is not
+    the binding constraint at this horizon and no improvement to the model
+    reaches profitability without cutting trade count.
     """
     out = forecasts.copy()
     gross = out['price'] + out['carry']
+    if mode == 'inverted':
+        gross = -gross
     out['side'] = np.sign(gross)
     out['expected_net'] = gross.abs()
     out['edge_to_risk'] = np.where(
@@ -126,8 +141,9 @@ def main() -> int:
     print('\n' + header)
     print('-' * len(header))
 
-    for name, scenario, gross in _scenarios(config, len(dataset.bars)):
-        forecasts = _gross(generated.forecasts) if gross else generated.forecasts
+    for name, scenario, mode in _scenarios(config, len(dataset.bars)):
+        forecasts = (generated.forecasts if mode == 'net'
+                     else _restate(generated.forecasts, mode))
         result = run_backtest(
             forecasts=forecasts,
             bars_by_symbol=dataset.bars,
@@ -141,7 +157,7 @@ def main() -> int:
         counts = getattr(gates, 'counts', None) or {}
         top = max(counts.items(), key=lambda kv: kv[1]) if counts else ('-', 0)
         summary = result.summary()
-        rows.append({'scenario': name, 'gross_signal': gross, **summary})
+        rows.append({'scenario': name, 'signal_mode': mode, **summary})
         print(f"{name:<20} {result.n_trades:>7} {result.net_pnl:>10,.0f} "
               f"{result.price_pnl:>10,.0f} {result.fees:>9,.0f} "
               f"{summary['return_pct']:>7.2f} {result.sharpe:>7.2f} "
