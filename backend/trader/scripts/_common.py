@@ -51,6 +51,29 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                              "simulation can cover. Prefer this to --exclude: it "
                              "is a rule that reproduces itself rather than a "
                              "symbol list someone has to remember the reason for.")
+    parser.add_argument('--max-round-trip-bps', type=float, default=0.0,
+                        help='Drop instruments whose median round trip exceeds this. '
+                             '0 disables. The cheapest contract on this venue is '
+                             '27bp, so 35 keeps the book within about 30 percent '
+                             'of it and drops SHP (65bp), AVP (50bp) and POP '
+                             '(43bp).')
+    parser.add_argument('--max-gap-over-cost', type=float, default=0.0,
+                        help='Drop instruments whose median close-to-next-open '
+                             'move exceeds this share of their round trip. 0 '
+                             'disables. That gap is fill uncertainty: a bar close '
+                             'is its last trade, so the price moves between the '
+                             'decision and the first fillable price. Symmetric, '
+                             'absent from the fee schedule, removed by no signal.')
+    parser.add_argument('--tradeable-five', action='store_true',
+                        help='The directional default: round trip <= 35bp, fill '
+                             'uncertainty <= 0.40x cost, history >= 231d. On this '
+                             'store that is exactly BIP, ETP, XPP, SLP, ADP — a '
+                             'rule that reproduces its own answer rather than a '
+                             'symbol list someone has to remember the reason for. '
+                             'Do NOT use it for cross-sectional work: breadth is '
+                             'the mechanism there, and 5 names give residual '
+                             'breadth 4.98 against 14 names 10.89, a 45 percent '
+                             'worse IC standard error.')
     parser.add_argument(
         '--no-cross-sectional-standardize', dest='standardize',
         action='store_false', default=True,
@@ -193,6 +216,17 @@ def _with_recency(config: Config, args: argparse.Namespace) -> Config:
 def load(args: argparse.Namespace, config: Config) -> Dataset:
     store = ResearchStore(args.store) if args.store else ResearchStore()
     symbols = [s.strip().upper() for s in args.symbols.split(',')] if args.symbols else None
+    # `--tradeable-five` is a preset over the three thresholds, not a fourth
+    # mechanism, so a run that passes both keeps whichever is stricter and the
+    # dataset still records the numbers rather than the flag name.
+    history_floor = float(getattr(args, 'min_history_days', 0.0) or 0.0)
+    max_round_trip = float(getattr(args, 'max_round_trip_bps', 0.0) or 0.0)
+    max_gap = float(getattr(args, 'max_gap_over_cost', 0.0) or 0.0)
+    if getattr(args, 'tradeable_five', False):
+        history_floor = max(history_floor, 231.0)
+        max_round_trip = min(max_round_trip, 35.0) if max_round_trip > 0 else 35.0
+        max_gap = min(max_gap, 0.40) if max_gap > 0 else 0.40
+
     dataset = load_dataset(
         store,
         venue=args.venue,
@@ -203,7 +237,9 @@ def load(args: argparse.Namespace, config: Config) -> Dataset:
         min_quality=None if args.min_quality == 'all' else args.min_quality,
         horizon_bars=args.horizon,
         feature_groups=_feature_groups(getattr(args, 'feature_groups', None)),
-        min_history_days=float(getattr(args, 'min_history_days', 0.0) or 0.0),
+        min_history_days=history_floor,
+        max_round_trip_bps=max_round_trip,
+        max_gap_over_cost=max_gap,
         standardize=bool(getattr(args, 'standardize', True)),
     )
     window = getattr(args, 'train_window_days', None)

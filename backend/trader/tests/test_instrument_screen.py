@@ -177,3 +177,83 @@ def test_pooled_observations_are_discounted_by_the_universe_s_own_correlation():
         f'must not be reported as verifiable'
     )
     assert not any_pass
+
+
+def test_the_tradeable_universe_is_a_rule_not_a_symbol_list():
+    """Three thresholds must reproduce the five, from the data, every run.
+
+    `--exclude BIP,ETP` needs someone to remember why each name is on the list;
+    a rule re-derives its own answer and fails loudly when the data moves. This is
+    the same reason `--min-history-days` is preferred over `--exclude` for the
+    ragged-listing problem.
+
+    Two of the three thresholds are derived. `max_round_trip_bps=35` is the fee
+    schedule: 27bp is the cheapest contract on this venue, so 35 keeps the book
+    within ~30% of it. `min_history_days=231` is the span that covers three
+    falling quarters plus the rally rather than the rally alone.
+
+    The third is a choice, and the test says so: at `max_gap_over_cost=0.40` this
+    admits ADP at 0.37 and rejects LCP at 0.41 — a 2.5% margin on a median, well
+    inside its own noise. The two are interchangeable on that metric and the
+    threshold was set knowing where they fell. Asserted anyway, because a silent
+    drift in either direction should be visible.
+    """
+    import pandas as pd
+
+    from core.config import Config, find_cost_config
+    from core.targets import round_trip_cost_series
+    from core.datastore import ResearchStore
+
+    path = find_cost_config()
+    if path is None:
+        pytest.skip('no cost config on the search path')
+    config = Config().with_cost_assumptions(path)
+
+    bars = ResearchStore().read('bars', venue='coinbase')
+    if bars.empty:
+        pytest.skip('no bars in the store')
+
+    rows = []
+    for symbol, group in bars.groupby('symbol'):
+        frame = group.set_index('event_time').sort_index()
+        if len(frame) < 500:
+            continue
+        round_trip = float(
+            round_trip_cost_series(symbol, frame['close'], config).median()) * 10_000
+        gap = float((frame['open'].shift(-1) / frame['close'] - 1.0)
+                    .abs().median()) * 10_000
+        rows.append({
+            'code': symbol.split('-')[0],
+            'days': (frame.index[-1] - frame.index[0]).total_seconds() / 86_400.0,
+            'round_trip_bps': round_trip,
+            'gap_over_cost': gap / round_trip if round_trip else float('inf'),
+        })
+    frame = pd.DataFrame(rows)
+
+    survivors = sorted(frame[(frame.round_trip_bps <= 35.0)
+                             & (frame.gap_over_cost <= 0.40)
+                             & (frame.days >= 231.0)].code)
+    assert survivors == ['ADP', 'BIP', 'ETP', 'SLP', 'XPP'], (
+        f'the rule now selects {survivors}. Either the store changed or a '
+        f'threshold drifted — check which before changing this assertion.'
+    )
+
+    # Each exclusion for the stated reason, so a rewrite cannot keep the answer
+    # while losing the mechanism.
+    by_code = frame.set_index('code')
+    for code in ('SHP', 'AVP', 'POP'):
+        if code in by_code.index:
+            assert by_code.loc[code, 'round_trip_bps'] > 35.0, code
+    for code in ('LCP', 'LNP', 'DOP', 'BCP', 'SUP', 'XLP', 'NER', 'PEP', 'OND'):
+        if code in by_code.index:
+            assert by_code.loc[code, 'gap_over_cost'] > 0.40, code
+    if 'HYP' in by_code.index:
+        assert by_code.loc['HYP', 'days'] < 231.0
+
+    # And the boundary is genuinely tight, which is the caveat worth keeping live.
+    if 'LCP' in by_code.index:
+        margin = by_code.loc['LCP', 'gap_over_cost'] - by_code.loc['ADP', 'gap_over_cost']
+        assert margin < 0.10, (
+            f'ADP and LCP are separated by {margin:.3f} on fill uncertainty; the '
+            f'0.40 threshold is doing real work at a boundary inside its own noise'
+        )

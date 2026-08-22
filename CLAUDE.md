@@ -120,6 +120,38 @@ walk-forward backtests, bootstraps, stresses and gates a candidate, then install
 it only if every gate passed. Rejections stay in `models/promotions/` because the
 trial count is what the deflated Sharpe discounts by.
 
+## The tradeable five, as a rule
+
+```bash
+python -m scripts.preflight --tradeable-five --horizon 24 --recency-half-life-days 365
+python -m scripts.backtest  --tradeable-five --horizon 24
+```
+
+`--tradeable-five` is a preset over three thresholds, and on this store it selects
+exactly **BIP, ETP, XPP, SLP, ADP**:
+
+| threshold | value | drops | why |
+|---|---|---|---|
+| `max_round_trip_bps` | 35 | SHP 65bp, AVP 50bp, POP 43bp | the cheapest contract here is 27bp, so 35 keeps the book within ~30% of it |
+| `max_gap_over_cost` | 0.40 | LCP 0.41, LNP 0.44, DOP 0.46, BCP 0.54, XLP 0.62, NER 0.65, PEP 0.90 | fill uncertainty: the median close-to-next-open move as a share of the round trip |
+| `min_history_days` | 231 | HYP (78d) | spans three falling quarters plus the rally, not the rally alone |
+
+A rule rather than `--exclude ADP,BIP,...` for the same reason `--min-history-days`
+is preferred: it re-derives its answer from the data every run and fails loudly
+when the data moves, instead of carrying a symbol list nobody remembers the reason
+for. `tests/test_instrument_screen.py` asserts the survivors *and* the mechanism
+of each exclusion.
+
+**Two of the three thresholds are derived; the middle one is a choice.** At 0.40
+this admits ADP at 0.37 and rejects LCP at 0.41 — a 2.5% margin on a median, well
+inside its own noise. Those two are interchangeable on that metric and the
+threshold was set knowing where they fell. Do not read the five as an optimum.
+
+**Do not use it for cross-sectional work.** Breadth is the mechanism there: 14
+names give residual breadth 10.89 and an IC standard error of 0.031; five give
+4.98 and 0.045, which is 45% worse — and a 3-long/3-short basket needs six names.
+The five are the directional universe. The residual candidate needs the wide one.
+
 ## Step one: can the instrument pay for its own trading?
 
 ```bash

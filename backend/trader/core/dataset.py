@@ -24,7 +24,7 @@ from core.costs import symbols_missing_fee_schedule
 from core.datastore import ResearchStore
 from core.features import SymbolInputs, build_panel
 from core.profiles import COIN_PROFILES, CoinProfile
-from core.targets import build_target_panel, summarise_targets
+from core.targets import round_trip_cost_series, build_target_panel, summarise_targets
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,12 @@ class Dataset:
     # because it changes which regimes the universe spans, which is not visible
     # from the symbol list alone.
     min_history_days: float = 0.0
+    # The tradeability thresholds that selected this universe. Recorded because
+    # which instruments a model saw is part of what it was fitted on, and neither
+    # `feature_set_hash` nor the symbol list explains *why* a name is absent —
+    # "excluded by rule" and "had no data" look identical after the fact.
+    max_round_trip_bps: float = 0.0
+    max_gap_over_cost: float = 0.0
     # Whether relative features were converted to cross-sectional z-scores.
     # Recorded because `feature_set_hash` hashes column *names*, so a demeaned
     # panel and an absolute one are indistinguishable to it — the same blind spot
@@ -278,6 +284,8 @@ def load_dataset(
     horizon_bars: Optional[int] = None,
     feature_groups: Optional[Sequence[str]] = None,
     min_history_days: float = 0.0,
+    max_round_trip_bps: float = 0.0,
+    max_gap_over_cost: float = 0.0,
     standardize: bool = True,
 ) -> Dataset:
     """Build features and targets for a universe.
@@ -372,6 +380,7 @@ def load_dataset(
     symbols_without_reference: list[str] = []
 
     thin_history: list[str] = []
+    untradeable: list[str] = []
     for symbol in requested:
         symbol_bars = _frame_for(store, 'bars', symbol, venue, as_of=as_of, min_quality=min_quality)
         if symbol_bars.empty:
@@ -393,6 +402,43 @@ def load_dataset(
             if span_days < min_history_days:
                 thin_history.append(f'{symbol} ({span_days:.0f}d)')
                 continue
+
+        # Tradeability, as a rule rather than a symbol list. `--exclude` needs
+        # someone to remember why each name is on it; these two thresholds
+        # reproduce their own answer from the data every run.
+        #
+        # `max_round_trip_bps` is the fee schedule: 27bp is the cheapest contract
+        # on this venue, so 35 keeps the book within ~30% of it and drops SHP
+        # (65bp), AVP (50bp) and POP (43bp), which need a third more forecast
+        # skill than the rest for no compensating advantage.
+        #
+        # `max_gap_over_cost` is fill uncertainty — the median close-to-next-open
+        # move as a share of the round trip. A bar's close is its last *trade*, so
+        # that gap is the price moving between the decision and the first fillable
+        # price. It is symmetric, absent from `core/costs.py`, and no signal
+        # removes it.
+        #
+        # Be honest about the boundary: at 0.40 this admits ADP at 0.37 and
+        # rejects LCP at 0.41. That is a 2.5% margin on a median, which is well
+        # inside its own noise — the two are interchangeable on this metric, and
+        # the threshold was set knowing where they fell. The cost and history
+        # thresholds are derived; this one is a choice.
+        if max_round_trip_bps > 0 or max_gap_over_cost > 0:
+            round_trip = float(
+                round_trip_cost_series(symbol, symbol_bars['close'], config).median()
+            ) * 10_000
+            if max_round_trip_bps > 0 and round_trip > max_round_trip_bps:
+                untradeable.append(f'{symbol} ({round_trip:.0f}bp round trip)')
+                continue
+            if max_gap_over_cost > 0 and 'open' in symbol_bars:
+                gap = float(
+                    (symbol_bars['open'].shift(-1) / symbol_bars['close'] - 1.0)
+                    .abs().median()
+                ) * 10_000
+                if round_trip > 0 and gap / round_trip > max_gap_over_cost:
+                    untradeable.append(
+                        f'{symbol} (fill uncertainty {gap / round_trip:.2f}x cost)')
+                    continue
 
         symbol_funding = _frame_for(store, 'funding', symbol, venue, as_of=as_of, min_quality=min_quality)
         if symbol_funding.empty and reference_venue:
@@ -447,6 +493,11 @@ def load_dataset(
             market_bars=market if not market.empty else None,
         ))
 
+    if untradeable:
+        warnings.append(
+            f'excluded {len(untradeable)} instrument(s) as untradeable: '
+            f'{", ".join(sorted(untradeable))}'
+        )
     if thin_history:
         warnings.append(
             f'excluded {len(thin_history)} instrument(s) with under '
@@ -524,6 +575,8 @@ def load_dataset(
         features=features,
         targets=targets,
         cross_sectional_standardized=bool(standardize),
+        max_round_trip_bps=float(max_round_trip_bps),
+        max_gap_over_cost=float(max_gap_over_cost),
         bars=bars,
         funding=funding,
         profiles=profiles,
