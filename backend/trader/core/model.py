@@ -180,10 +180,77 @@ class ForecastModel:
             json.dumps(self.provenance(), indent=2, default=str))
         return path
 
+    def integrity(self) -> dict:
+        """Cheap structural checks a loaded artifact must satisfy.
+
+        `load` is a bare `joblib.load`, so nothing about the object is verified —
+        not the feature list, not the config it was fitted under, not that the
+        booster inside it agrees with the column names beside it. A silently
+        mismatched feature vector is the worst of these: the matrix is built by
+        name from `self.features`, so a booster trained on a different list scores
+        a well-formed matrix of the wrong columns and returns numbers.
+        """
+        names = list(self.booster.feature_name())
+        return {
+            'features': list(self.features),
+            'booster_features': names,
+            'n_features': self.booster.num_feature(),
+        }
+
+    def verify(self, config: Optional[Config] = None) -> None:
+        """Raise unless this artifact can be scored as it stands.
+
+        Called at load. The fields compared against `config` are the ones that
+        change an answer rather than a path: a model fitted at offsets (3,6,9,12)
+        scored at (1,2) is being asked a question it was never fitted for, and
+        `core/dataset.py` only warned. `scripts/live.py` did not read
+        `config_provenance` at all.
+        """
+        names = list(self.booster.feature_name())
+        if names != list(self.features):
+            raise ValueError(
+                f'the booster was trained on {len(names)} columns and the artifact '
+                f'lists {len(self.features)}; the first disagreement is at '
+                f'{next((i for i, (a, b) in enumerate(zip(names, self.features)) if a != b), 0)}. '
+                f'The feature matrix is built by name from the artifact\'s list, so '
+                f'this would score a well-formed matrix of the wrong columns.'
+            )
+        if config is None:
+            return
+        stored = dict(self.config_provenance or {})
+        if not stored:
+            logger.warning('this artifact records no config provenance, so nothing '
+                           'can be checked against the running configuration')
+            return
+        current = config.provenance()
+        # Only the fields that change a number. Paths, versions and CLI notes
+        # differ legitimately between the run that fitted and the run that scores.
+        material = ('window_minutes', 'decision_offsets', 'vol_lookbacks_minutes',
+                    'embargo_minutes', 'fee_rate', 'maker_fee_rate', 'assume_maker',
+                    'half_spread_cents', 'min_traded_price', 'max_traded_price')
+        drift = {
+            key: (stored.get(key), current.get(key))
+            for key in material
+            if key in stored and key in current and stored[key] != current[key]
+        }
+        if drift:
+            detail = '; '.join(f'{k}: fitted {a!r}, running {b!r}'
+                              for k, (a, b) in sorted(drift.items()))
+            raise ValueError(
+                f'this artifact was fitted under a different configuration — '
+                f'{detail}. Scoring it here would answer a different question '
+                f'than the one the gates were evaluated on.'
+            )
+
     @staticmethod
-    def load(path: str | Path) -> 'ForecastModel':
+    def load(path: str | Path, config: Optional[Config] = None) -> 'ForecastModel':
         import joblib
-        return joblib.load(Path(path))
+        model = joblib.load(Path(path))
+        # Verified at load, not at first use. An artifact that cannot be scored
+        # should fail where the operator is looking, not several minutes into a
+        # cycle with a quote in hand.
+        model.verify(config)
+        return model
 
 
 def _fit_residual_scale(

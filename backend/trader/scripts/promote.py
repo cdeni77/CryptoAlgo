@@ -17,6 +17,9 @@ multiple-testing correction.
 from __future__ import annotations
 
 import argparse
+import logging
+import math
+import os
 
 import pandas as pd
 
@@ -27,6 +30,9 @@ from scripts._common import (
     add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
     setup_logging,
 )
+
+
+logger = logging.getLogger('promote')
 
 
 def main() -> int:
@@ -88,7 +94,83 @@ def main() -> int:
     attempt = promote(candidate, result.report, force=args.force,
                       force_reason=args.reason, trades=result.trades())
     print('\n' + attempt.summary())
+    publish_to_serving(attempt, result.report)
     return 0 if attempt.installed else 1
+
+
+def publish_to_serving(attempt, report) -> None:
+    """Mirror the attempt and its reliability table into the serving store.
+
+    `PgWriter.record_model_run` and `write_calibration` are the only writers of
+    the `model_runs` and `calibration` tables and had **zero callers anywhere**,
+    including tests — while `backend/api/controllers/serving.py` reads exclusively
+    from them and the dashboard's Model and Calibration pages poll those routes.
+    So those two tabs were empty forever regardless of real promotion activity,
+    and reading the filesystem ledger instead is not a workaround: the `backend`
+    compose service never mounts the `trader_models` volume.
+
+    Best effort on purpose. Promotion must not depend on a database being
+    reachable — the ledger under `models/promotions/` is the record of account,
+    and this is the dashboard's copy of it. A failure here is logged and the exit
+    status still reflects the gates.
+    """
+    if not os.getenv('DATABASE_URL'):
+        logger.info('DATABASE_URL is unset, so the dashboard will not show this '
+                    'attempt; the ledger under models/promotions/ still has it')
+        return
+    try:
+        from core.pg_writer import PgWriter
+
+        writer = PgWriter()
+        gates = {g.name: g.value for g in attempt.gates}
+        writer.record_model_run(
+            version=attempt.version,
+            installed=bool(attempt.installed),
+            forced=bool(attempt.forced),
+            force_reason=attempt.force_reason,
+            folds=len(report.folds),
+            windows_evaluated=int(report.total_windows),
+            log_loss_skill=_finite(report.mean_skill),
+            log_loss_skill_se=_finite(report.skill_standard_error),
+            folds_positive=int(report.folds_positive),
+            calibration_error=_finite(report.max_ece),
+            residual_scale=_finite(report.mean_residual_scale),
+            control_gain_share=_finite(report.max_control_gain_share),
+            sharpe=_finite(gates.get('sharpe')),
+            total_return=_finite(gates.get('total_return')),
+            gates=[{'name': g.name, 'value': _finite(g.value),
+                    'threshold': g.threshold, 'direction': g.direction,
+                    'passed': bool(g.passed)} for g in attempt.gates],
+            failed_gates=', '.join(g.name for g in attempt.gates if not g.passed),
+            provenance=attempt.payload().get('config'),
+        )
+        # The reliability table of the fold that produced the candidate — the one
+        # trained on the most history, and so the one deployed.
+        table = report.folds[-1].reliability_table if report.folds else None
+        if table is not None:
+            frame = table.frame()
+            writer.write_calibration(
+                attempt.version, 'model',
+                [{'bin_low': float(r.bin_low), 'bin_high': float(r.bin_high),
+                  'predicted': _finite(r.predicted), 'observed': _finite(r.observed),
+                  'count': int(r.count)}
+                 for r in frame.itertuples() if r.count > 0])
+        logger.info('recorded %s in the serving store', attempt.version)
+    except Exception as exc:  # noqa: BLE001 - the ledger is authoritative, not this
+        logger.warning('could not mirror %s into the serving store (%s); the '
+                       'ledger under models/promotions/ is unaffected',
+                       attempt.version, exc)
+
+
+def _finite(value):
+    """None rather than NaN: the serving columns are nullable and the API's
+    contract is that a missing measurement is null with a reason, never a
+    substitute."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 if __name__ == '__main__':

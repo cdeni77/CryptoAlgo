@@ -72,7 +72,7 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     'microstructure': (
         'autocorr_60', 'run_length', 'body_ratio_15', 'volume_z_15',
-        'trade_count_z_15', 'vwap_gap_15', 'signed_volume_15', 'zero_return_share_60',
+        'vwap_gap_15', 'signed_volume_15', 'zero_return_share_60',
     ),
     'cross_asset': (
         'peer_displacement', 'peer_return_5', 'peer_return_15',
@@ -177,13 +177,20 @@ def minute_state(
     volume.index = volume.index + pd.Timedelta(minutes=1)
     log_volume = np.log1p(volume)
     frame['volume_z_15'] = _zscore(log_volume.rolling(15, min_periods=5).mean(), MINUTES_PER_DAY)
-    if 'trade_count' in grid.columns:
-        counts = grid['trade_count'].astype(float).copy()
-        counts.index = counts.index + pd.Timedelta(minutes=1)
-        frame['trade_count_z_15'] = _zscore(
-            np.log1p(counts).rolling(15, min_periods=5).mean(), MINUTES_PER_DAY)
-    else:
-        frame['trade_count_z_15'] = np.nan
+    # `trade_count_z_15` used to live here and has been removed rather than
+    # repaired. Coinbase's candles endpoint returns open/high/low/close/volume and
+    # nothing else, so `trade_count` was NULL on 100% of 2,617,876 stored rows and
+    # the feature could never fire. It looked alive only because
+    # `tests/conftest.py` fabricated the column, so
+    # `test_every_declared_feature_is_produced` passed on synthetic data that the
+    # real store cannot produce. A declared feature that is structurally
+    # unavailable is worse than an absent one: it occupies a slot in the matrix,
+    # dilutes every importance share, and reads as a measurement.
+    #
+    # If a trade count is wanted, it has to come from a source that has one — the
+    # Exchange `/products/{id}/candles` endpoint does not carry it either, so that
+    # means trades or ticker aggregation, which is a data-collection change and not
+    # a feature change.
 
     close = grid['close'].copy()
     close.index = close.index + pd.Timedelta(minutes=1)

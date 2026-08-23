@@ -80,8 +80,12 @@ def make_bars(
         out[symbol] = pd.DataFrame({
             'event_time': times, 'open': price, 'high': high, 'low': low,
             'close': close, 'volume': np.exp(rng.normal(0, 0.4, n)) * seasonal,
+            # Both NULL, as the real store has them: Coinbase's candles endpoint
+            # returns OHLCV and nothing else. This fixture used to synthesise a
+            # plausible `trade_count`, which is how a feature that can never fire
+            # on real data passed `test_every_declared_feature_is_produced`.
             'quote_volume': np.nan,
-            'trade_count': (np.exp(rng.normal(0, 0.4, n)) * seasonal * 40).round(),
+            'trade_count': np.nan,
         })
     return out
 

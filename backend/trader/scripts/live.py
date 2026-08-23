@@ -312,6 +312,20 @@ def record_minute_prices(writer: PgWriter, bars: dict[str, pd.DataFrame],
     return written
 
 
+def as_utc(value) -> pd.Timestamp:
+    """A UTC timestamp, whether the source remembered the timezone or not.
+
+    The ORM columns are `DateTime(timezone=True)`, so Postgres hands back
+    tz-aware values and SQLite hands back naive ones — it has no timezone type.
+    `pd.Timestamp(x).tz_convert('UTC')` raises on the naive case, so any code
+    path that reads a timestamp back out of the store and assumes awareness works
+    against Postgres and raises against SQLite. Everything stored is UTC, so
+    localise when the tz is missing rather than guessing.
+    """
+    stamp = pd.Timestamp(value)
+    return stamp.tz_localize('UTC') if stamp.tz is None else stamp.tz_convert('UTC')
+
+
 def venue_settled_up(row: dict, side: str) -> Optional[bool]:
     """Did the *up* side win, according to the venue's settlement row?
 
@@ -378,8 +392,7 @@ def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
             from_venue = venue_settled_up(venue_settlements[ticker], position.side)
 
         # Ours: the mean over the minute ENDING at settle_time, and `>=`.
-        settle_minute = (pd.Timestamp(position.settle_time).tz_convert('UTC')
-                         - pd.Timedelta(minutes=1))
+        settle_minute = as_utc(position.settle_time) - pd.Timedelta(minutes=1)
         frame = bars.get(position.symbol)
         from_bars, settle_price = None, float('nan')
         if frame is not None:
@@ -947,8 +960,9 @@ async def main() -> int:
     if args.bankroll is not None:
         config = config.with_overrides(starting_bankroll=args.bankroll)
 
-    model = load_live() if args.model is None else __import__(
-        'core.model', fromlist=['ForecastModel']).ForecastModel.load(args.model)
+    model = (load_live(config=config) if args.model is None
+             else __import__('core.model', fromlist=['ForecastModel'])
+             .ForecastModel.load(args.model, config))
     if model is None:
         raise SystemExit(
             f'no artifact at {MODELS_ROOT / LIVE_MODEL}. Run '
