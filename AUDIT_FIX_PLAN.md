@@ -3,7 +3,67 @@
 Ordered, actionable tasks from `AUDIT_REPORT.md`. Each carries severity, files,
 expected behaviour, the change, required tests, and dependencies.
 
-## Status, 2026-08-23
+## Status, 2026-08-23 (updated after running the pipeline)
+
+**14 commits on `audit/critical-fixes`, 397 tests (385 fast + 12 slow), tree clean.**
+
+The pipeline has now been run end to end on a 326-day subset, which found four more
+bugs that static review could not: `--fill-gaps` fetched nothing at all, and three
+of my *own* fixes were over-corrections that a real venue outage exposed (a
+`non_finite_rows == 0` gate, a shrinkage guard that raised on any NaN and killed a
+whole evaluation, and log-loss computed over NaNs in two places). All corrected to
+rates with the rows excluded and counted.
+
+### What the run says
+
+* **Phase 1 passes.** Pooled out-of-sample log loss 0.44948 against 0.69315 —
+  35.2% better from arithmetic alone, where the docs claim 26%.
+* **`evaluate` passes 15 of 16 gates**, failing only `max_drawdown` (58.4%). Do not
+  read that as encouraging: three of the passes are within a hair of their
+  thresholds, `residual_scale` is 1.046 (above 1, so it wants to *amplify* the
+  correction), and predicted edge +2.00pp realised +0.99pp.
+* **The skill is real and it is not what the design says.** It is not the model
+  recalibrating the baseline (a free in-fold recalibration of the null gains
+  nothing out of sample), not the clock (`clock` alone scores -0.000002 on 1 of 6
+  folds — the 28% gain share was a false alarm and the gate measures the wrong
+  quantity), and not volatility (`vol_state` alone is negative). It is
+  **cross-asset lead-lag concentrated at offset 3**, which contradicts the
+  mid-window prediction `CLAUDE.md` and `evaluate.py` both stated. Both corrected.
+* **The money numbers cannot choose a configuration.** At essentially constant
+  skill, return spanned -50% to +303% across six configurations, and a
+  *higher*-skill setting lost half the account.
+
+### Still open, in the order it matters
+
+1. **Rotate the leaked credentials.** Only you can do this. `b70c78c` and
+   `6097ed1` are on `origin/main`.
+2. **Finish the store repair, then re-run on five years.** `--fill-gaps` is running:
+   BTC recovered +8,672 minutes, ETH is nearly done, SOL is queued. Everything
+   above is 326 days of one regime with a flat seasonality factor, and thirteen
+   exploratory trials with no multiple-testing correction. The five-year run is the
+   test.
+3. **Collect Kalshi quote history.** `scripts/market_benchmark.py` now exists and
+   prints "No settled window has both a recorded market quote and an outcome",
+   which is the honest state. Run `scripts.live --mode live --dry-run --loop` for
+   weeks; it reads the real book, places nothing, and records a row per window.
+   **Until that has thousands of windows, no number in this repository speaks to
+   profitability.**
+4. **Decide the drawdown question.** `max_drawdown <= 0.35` and
+   `max_stake_fraction = 0.05` are jointly inconsistent for a binary: a loss is
+   100% of stake, so twelve in a row is 60% of the account, and at ~14 trades a day
+   that streak is unremarkable. Either number can move; it is a risk-appetite call,
+   not a bug, and changing one to pass the other would be gaming a gate.
+5. **Do not `promote` yet.** It would install a model fitted on the unrepaired
+   store, and `max_drawdown` blocks it anyway.
+6. The remaining P2/P3 items below.
+
+Two things remain deliberately **not** fixed, and are decisions rather than
+defects: the backtest's counterparty is the baseline the model corrects (fixing it
+means collecting quotes, not inventing a worse price), and `min_edge_pp = 0.5pp` is
+below what any calibration measurement on this sample can resolve. Both are argued
+out in `AUDIT_REPORT.md`.
+
+## Original status, 2026-08-23
 
 Eight commits on `audit/critical-fixes`. **All of P0 except credential rotation is
 done, and most of P1 and P2.** The suite went from 230 tests to 348 (plus 28 in
