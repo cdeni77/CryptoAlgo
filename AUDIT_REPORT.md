@@ -1475,3 +1475,93 @@ wrong about the proportion: untraded minutes do exist, and they were 0.5% of the
 shortfall rather than most of it. The 2026-05-08 outage is also the source of the
 86 unscoreable rows the `non_finite_share` gate now reports, since a 6.5-hour hole
 leaves the 240-minute lookback unfillable for about two hours afterwards.
+
+---
+
+# Edge Investigation, five years (7,875,926 bars, 2021-08 to 2026-08)
+
+Re-run after the store repair, on 1,825 days across four regimes. Every direction
+from the 326-day subset held, and two of them strengthened enough to change what
+they mean.
+
+## Phase 1 passes, and the null is well calibrated *in the logit*
+
+```
+pooled log loss 0.45688 against 0.69313 = 34.1% better from arithmetic alone
+base rate 0.5030 | worst-fold ECE 0.01268 | worst max bin deviation 0.0219
+375 rows (0.021%) unscoreable | all 6 folds measured
+```
+
+The 0.0397 worst-bin deviation that nearly failed the new
+`calibration_max_deviation` gate on the subset fell to **0.0219** on 16x the data,
+confirming it was small-sample bin noise.
+
+The null is also regime-dependent, which is worth holding onto: the fitted tail
+runs `nu=15.03` in fold 0 (nearly Gaussian) to `nu=4.03` in fold 3 (very fat), and
+the offset-3 scale 1.197 to 1.462. "The null" is not one object across five years,
+and skill is measured as a difference against it.
+
+## The skill is not baseline recalibration — settled
+
+```
+                       mean         se        t    folds+
+model_skill        +0.001011   0.000177   +5.70      6/6
+platt_skill        -0.000055   0.000088   -0.62      3/6
+model_beyond_platt +0.001066   0.000098  +10.90      6/6
+model_beyond_iso   +0.001085   0.000157   +6.93      6/6
+platt_slope        +0.992872   0.008588              6/6
+```
+
+**The Platt slope is 0.9929 +/- 0.0086 — indistinguishable from 1.0.** So the
++0.5 to +0.8pp observed-above-predicted pattern visible in the reliability table
+is *not* a logit-scale bias, and there is nothing for a monotone map to harvest.
+A 2-parameter recalibration of the null captures **-5.4%** of the model's skill and
+a monotone one **-7.3%**; the model's advantage over the *recalibrated* null is
+larger than over the raw one.
+
+This was the audit's leading hypothesis and it is now refuted on the full sample,
+having also been refuted on the subset. It is closed.
+
+## The mechanism, on four regimes
+
+```
+groups                            skill        se       t  folds+  trees
+all groups                    +0.001011  0.000177   +5.70     6/6    302
+all minus clock               +0.000737  0.000151   +4.88     6/6    318
+cross_asset alone             +0.000427  0.000041  +10.40     6/6    188
+microstructure alone          +0.000230  0.000035   +6.53     6/6    169
+geometry alone                +0.000172  0.000134   +1.29     4/6    174
+clock alone (the CONTROL)     +0.000004  0.000016   +0.24     3/6     37
+vol_state alone               -0.000001  0.000011   -0.07     4/6     24
+```
+
+* **The control is zero.** `clock alone` scores +0.000004 on 3 of 6 folds — a coin
+  flip. Removing the clock costs 27% of the total, but that is *conditioning*, not
+  direction: time of day genuinely predicts volatility and spread behaviour that
+  other features measure. The individual groups also sum to +0.000832 against
+  +0.001011 for the full set, a **positive interaction of +0.000179**, which is the
+  same story. The benign explanation of the two, and the reason the ablation reports
+  each group alone rather than trusting a difference.
+* **`cross_asset` is the mechanism** — 42% of total skill, t=+10.40, 6/6 folds.
+  Third independent confirmation, after the subset and the archive's h=4h
+  cross-sectional residual (+0.0186, t=4.54, 6/6 over five years).
+* **`microstructure` is a real second contributor** — 23%, t=+6.53, 6/6. The subset
+  had it at t=+1.27 and lacked the power to see it.
+* **`vol_state` is exactly zero** — -0.000001 on 24 trees. The sigma-disagreement
+  thesis contributes nothing to the *model*. It does its work inside the null,
+  which is why the null beats a coin flip by 34%.
+* **`geometry` is weak and inconsistent** — 4/6 folds, t=+1.29, unchanged from the
+  subset.
+
+Skill also tripled with more data (+0.000287 -> +0.001011) and the tree count went
+51 -> 302. Overfitting shrinks with more data and three added regimes; this grew.
+
+## What still is not established
+
+Every number above is skill against `F(x/sigma)`, a formula in this repository.
+`scripts/market_benchmark.py` exists and correctly reports that no window has both
+a recorded venue quote and an outcome. A model can beat the formula by 0.001 nats
+and lose to a liquid book, and nothing here distinguishes those cases.
+
+And read every t against the fold correlation, not a normal table: six expanding
+folds share 50-83% of their training windows.
