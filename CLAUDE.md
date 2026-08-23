@@ -168,10 +168,34 @@ cannot know what offset 12 will look like, so best-of-offsets is not a strategy
 that can be run. `scripts/evaluate.py` reports edge per offset separately, which
 is how the offset set gets narrowed on evidence.
 
-The barrier framing predicts where that edge should live: `P` is most sensitive
+The barrier framing predicted where that edge should live: `P` is most sensitive
 to a sigma error when `|x|/sigma` is near 1, so the edge should peak mid-window
-with a moderate displacement and decay late, because a probability pinned near 1
-is insensitive to sigma. Untested — but it is a prediction, not a hope.
+with a moderate displacement and decay late. **That prediction has now been tested
+and it is wrong.** On 326 days of real bars the skill peaks at the *earliest*
+offset and is dead by offset 9:
+
+```
+offset      n   mean_skill  folds+
+     3  79765     0.000368     6/6
+     6  79769     0.000265     5/6
+     9  79770    -0.000004     3/6
+    12  79770     0.000103     4/6
+```
+
+And the mechanism is not sigma at all. `vol_state` alone scores **-0.000101**
+(2/6 folds) while `cross_asset` alone scores **+0.000183 at t=+3.39, 6/6 folds** —
+the strongest single group, and the only one with independent prior support (the
+archive's cross-sectional residual at h=4h: +0.0186, t=4.54, 6/6 folds). An
+earliest-offset peak is the wrong shape for a sigma error and the right one for
+lead-lag: a BTC move needs time for ETH and SOL to follow, so twelve remaining
+minutes express it and three do not.
+
+So the honest state of the thesis: the barrier reframing is still what makes the
+question tractable and the null strong, but the *edge* on top of it looks like
+cross-asset lead-lag concentrated at offset 3, not a volatility disagreement.
+Offsets 9 and 12 should probably go. See the Edge Investigation section of
+`AUDIT_REPORT.md` for the full measurement, including why the money numbers from
+that run must not be used to choose a configuration.
 
 ## Architecture
 
@@ -226,6 +250,13 @@ A feature earns its place only by naming a way the baseline is *wrong*.
 Keep `clock` in any survey. The previous project ran a 27-cell grid whose best
 cell was its own control, and that was the most useful result it produced.
 `ForecastModel.control_importance_share` is a gate at 0.30 for the same reason.
+
+**But the gain-share gate is measuring the wrong quantity, and an ablation is the
+real test.** Measured on 326 days: `control_gain_share` read 0.279 — nearly
+carrying the model, on the face of it — while `clock` *alone* scored
+**-0.000008 (t=-0.26, 2/6 folds)** and removing it slightly *improved* skill. A
+high LightGBM gain share means splits were spent there, not that the feature
+forecasts anything. Run the group alone before believing the share either way.
 
 ## Invariants — break these and the numbers stop meaning anything
 

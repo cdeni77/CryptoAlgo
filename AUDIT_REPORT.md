@@ -1262,3 +1262,131 @@ free of lookahead, and the baseline beats a coin flip by 32–35% from arithmeti
 alone — measured, and better than the docs claimed. It is a good foundation with
 an unverified conclusion resting on it, and the distance between those two is
 larger than the gate report suggests.
+
+---
+
+# Edge Investigation (2026-08-23, 326-day subset)
+
+Run on the most recent 326 days while the five-year repair was still in flight, so
+treat every number as provisional: one regime, a seasonality factor that fell back
+to flat (45.3 days against a 60-day minimum), and 6 folds sharing 50-83% of their
+training data. The *directions* are what matter.
+
+## The Phase 1 null
+
+```
+pooled log loss 0.44948 against 0.69315 for a coin flip = 35.2% better
+base rate 0.4996 | worst-fold ECE 0.01410 | worst max bin deviation 0.0397
+86 rows (0.027%) unscoreable, from one 6.5-hour venue outage on 2026-05-08
+```
+
+The barrier arithmetic works and is understated in the docs (which claim 26%).
+
+## Skill is real, and it is not what the docs say it is
+
+15 of 16 gates pass with the shipped config (`max_drawdown` 58.4% fails). But
+three of the passes are within a hair of their thresholds
+(`calibration_max_deviation` 0.03883/0.04, `control_gain_share` 0.27852/0.30),
+`residual_scale` reads 1.046 — above 1, so the fit wants to *amplify* the
+correction rather than shrink it — and predicted edge +2.00pp came in at +0.99pp
+realised. So the gate report alone would be misleading, which is the whole reason
+for what follows.
+
+**It is not the model recalibrating the baseline.** This was the audit's leading
+hypothesis and it is refuted. Give the null a free in-fold recalibration and score
+it out of sample:
+
+```
+                     mean        se        t     folds+
+model_skill      +0.000287  0.000128   +2.25     6/6
+platt_skill      -0.000022  0.000018   -1.21     3/6
+iso_skill        -0.000274  0.000055   -4.95     0/6
+model_beyond_platt +0.000309 0.000114  +2.72     6/6
+model_beyond_iso   +0.000562 0.000117  +4.80     6/6
+```
+
+A 2-parameter map gains nothing and a monotone map actively loses. The baseline's
+3.97pp worst-bin deviation is bin noise, not an exploitable bias.
+
+**It is not the clock.** Measured directly rather than through a gain share:
+
+```
+groups                            skill        se       t  folds+
+all five                      +0.000287  0.000128   +2.25     6/6
+clock only (the CONTROL)      -0.000008  0.000029   -0.26     2/6
+no clock                      +0.000315  0.000149   +2.12     6/6
+cross_asset only              +0.000183  0.000054   +3.39     6/6
+geometry only                 +0.000082  0.000071   +1.15     5/6
+vol_state only                -0.000101  0.000101   -1.00     2/6
+microstructure only           +0.000071  0.000056   +1.27     5/6
+```
+
+The control behaves exactly like a control, and removing it slightly *helps*. So
+`control_gain_share` at 0.279 was a false alarm: a high LightGBM gain share means
+splits were spent there, not that the feature forecasts. **The gate is measuring
+the wrong quantity** — an ablation is the real test and should be what gates.
+
+**It is cross-asset lead-lag, at the earliest offset.** `cross_asset` alone is the
+strongest single group, and it is the one mechanism with independent prior
+support: the archive records a cross-sectional residual signal at h=4h at +0.0186,
+t=4.54, 6/6 folds over five years and four regimes. Two unrelated horizons
+pointing at the same mechanism is the most encouraging result here.
+
+Per-offset, `cross_asset` alone:
+
+```
+offset      n   mean_skill  folds+   mean_abs_correction_pp
+     3  79765     0.000368     6/6                  0.782
+     6  79769     0.000265     5/6                  0.630
+     9  79770    -0.000004     3/6                  0.446
+    12  79770     0.000103     4/6                  0.242
+```
+
+**This contradicts the design thesis stated in `CLAUDE.md` and printed by
+`scripts/evaluate.py`** — that the edge should peak mid-window where
+`|x|/sigma ~ 1` and decay late, because that is where `P` is most sensitive to a
+sigma error. It peaks *earliest* and is dead by offset 9. That shape is wrong for
+a sigma-error mechanism and right for lead-lag: a BTC move needs time for ETH and
+SOL to follow, so twelve remaining minutes express it and three do not. Together
+with `vol_state` alone being *negative*, the sigma story does not survive and the
+lead-lag one does.
+
+## The money numbers are noise at this sample size
+
+Six configurations, forecast skill against realised money:
+
+```
+configuration                 skill      t   f+  trades   return  sharpe  realEdge   maxDD
+(3,6,9,12) all groups     +0.000287  +2.25  6/6   4,553 +212.18%   +2.81    +0.99  58.38%
+(3,6)      all groups     +0.000365  +1.94  5/6   1,123  -50.49%   -4.23    -0.14  51.85%
+(3,)       all groups     +0.000419  +3.14  6/6   5,290 +193.90%   +3.11    +0.52  28.16%
+(3,6,9,12) no clock       +0.000315  +2.12  6/6   3,010 +272.66%   +3.52    +3.30  43.21%
+(3,6)      no clock       +0.000391  +1.81  5/6   7,060 +302.94%   +3.41    +0.84  48.43%
+(3,6)      cross only     +0.000352  +2.65  6/6   4,485 +146.42%   +1.58    +0.88  38.19%
+```
+
+**Skill and money are decoupled.** `(3,6) all groups` has *higher* forecast skill
+than the shipped configuration and loses half the account. At essentially constant
+skill the return spans −50% to +303%, and every configuration draws down 28-58%,
+with several tripping the ruin floor in April 2026.
+
+The operational conclusion is a discipline rule: **do not select a configuration
+on these money figures.** That is precisely what `core/backtest.py:edge_curve`
+invites with "the right value of `min_edge_pp` is measured, not guessed" — measured
+on the same out-of-sample rows, with this much dispersion. Narrowing on *skill and
+mechanism* is defensible; narrowing on return is not.
+
+## What this changes
+
+* Offsets 9 and 12 carry no skill. `(3,)` or `(3, 6)` is the defensible set, chosen
+  on skill and on the lead-lag mechanism rather than on return.
+* `clock` measurably contributes nothing to the deployed model and should be kept
+  as an *ablation* control rather than a feature group whose gain share is gated.
+* `vol_state` contributes nothing on this subset, which is worth understanding
+  before adding more volatility features.
+* None of this is skill against the market. That still requires the quote history
+  the new `predictions.market_probability` / `market_ask_*` / `outcome` columns
+  exist to accumulate.
+* Seven group trials plus six configuration trials on one subset is a search, and
+  nothing here carries a multiple-testing correction. The five-year run on the
+  repaired store is the test.

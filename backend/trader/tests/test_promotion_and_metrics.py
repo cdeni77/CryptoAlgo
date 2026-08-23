@@ -256,18 +256,37 @@ def test_the_version_stamp_sorts_chronologically():
     assert first == '20260823T010203Z'
 
 
-def test_a_fold_with_non_finite_rows_cannot_pass():
-    """A data hole must report as a data hole, not as an absent forecast.
+def test_a_handful_of_unscoreable_rows_is_not_a_failure():
+    """An outage is not a defect, so the gate is a share and not a count.
 
-    31 non-finite rows in 99,388 turned five of six folds' metrics into NaN while
-    `scripts.baseline` printed "gate passed: worst-fold calibration error
-    0.01516 <= 0.02" — because `nan > 0.02` is False and pandas' `.max()` skips
-    NaN. "No skill" and "one missing bar" produced the same output.
+    A row with no volatility estimate has no forecast. Measured on real bars: one
+    6.5-hour Coinbase outage leaves ~86 rows in 372,532 unscoreable in the two
+    hours afterwards, because the 240-minute lookback cannot be filled. Refusing
+    to evaluate at all because the venue went down in May is not a judgement about
+    the model — and my first version of this gate did exactly that, and killed a
+    whole `scripts.evaluate` run.
     """
-    gates = evaluate_gates(report(non_finite=4))
-    by_name = {g.name: g for g in gates}
-    assert not by_name['non_finite_rows'].passed
-    assert not gates_passed(gates)
+    gates = {g.name: g for g in evaluate_gates(report(non_finite=4))}
+    assert gates['non_finite_share'].passed, (
+        f"24 unscoreable rows in ~480,000 scored {gates['non_finite_share'].value:.6f}; "
+        f'an outage has to pass'
+    )
+    assert gates_passed(evaluate_gates(report(non_finite=4)))
+
+
+def test_a_large_share_of_unscoreable_rows_does_fail():
+    """Because that is a lookback or an embargo, not the venue.
+
+    What must never happen again is the silence: `np.mean` propagated the NaN into
+    every fold statistic while `np.digitize` filed those rows in the 0.95-1.00
+    reliability bin — the band this system trades — and `scripts/baseline.py` then
+    printed "gate passed: worst-fold calibration error 0.01516 <= 0.02" with five
+    of six folds reading NaN, because `nan > 0.02` is False.
+    """
+    # 8,000 unscoreable per fold against 80,000 rows is 9%, well over the 0.1%.
+    gates = {g.name: g for g in evaluate_gates(report(non_finite=8_000))}
+    assert not gates['non_finite_share'].passed
+    assert not gates_passed(evaluate_gates(report(non_finite=8_000)))
 
 
 def test_a_nan_calibration_in_one_fold_reaches_the_gate():
