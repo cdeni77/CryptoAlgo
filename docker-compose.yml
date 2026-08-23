@@ -127,9 +127,9 @@ services:
       - KALSHI_PRIVATE_KEY=${KALSHI_PRIVATE_KEY:-}
       - KALSHI_PRIVATE_KEY_PATH=${KALSHI_PRIVATE_KEY_PATH:-}
       - KALSHI_BASE_URL=${KALSHI_BASE_URL:-}
-      - KALSHI_SERIES_BTC=${KALSHI_SERIES_BTC:-KXBTCD}
-      - KALSHI_SERIES_ETH=${KALSHI_SERIES_ETH:-KXETHD}
-      - KALSHI_SERIES_SOL=${KALSHI_SERIES_SOL:-KXSOLD}
+      - KALSHI_SERIES_BTC=${KALSHI_SERIES_BTC:-KXBTC15M}
+      - KALSHI_SERIES_ETH=${KALSHI_SERIES_ETH:-KXETH15M}
+      - KALSHI_SERIES_SOL=${KALSHI_SERIES_SOL:-KXSOL15M}
 
       # Venue fee schedule, resolved by name out of configs/venue. Unset still
       # prices correctly — the built-in defaults are the published Kalshi
