@@ -178,7 +178,7 @@ def test_no_connector_decodes_an_epoch_without_a_zone(eastern_tz):
     offenders = []
     for path in [
         *(root / 'data_collection').glob('*.py'),
-        root / 'scripts' / 'run_pipeline.py',
+        root / 'scripts' / 'scrape.py',
     ]:
         if path.name == 'timeutil.py':
             continue

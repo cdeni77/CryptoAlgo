@@ -154,41 +154,58 @@ def test_an_unknown_table_is_refused(database):
 # ---------------------------------------------------------------------------
 
 
-def test_the_incremental_window_is_expressed_in_hours():
-    """`ceil(hours / 24)` made 6 hours fetch 24."""
-    import sys
+def test_the_scrape_window_can_be_expressed_in_hours():
+    """`ceil(hours / 24)` once made a 6-hour incremental fetch pull 24.
 
-    from scripts.live_orchestrator import parse_args
+    Asserted by parsing the actual parser rather than by grepping the source for a
+    quoted flag name: the earlier version searched for `"--backfill-hours"` with
+    double quotes and broke on a module that uses single ones, which is a test
+    failing on its own formatting assumption rather than on the behaviour.
+    """
+    from scripts.scrape import build_parser
 
-    argv = sys.argv
-    sys.argv = ['live_orchestrator', '--incremental-backfill-hours', '6']
-    try:
-        args = parse_args()
-    finally:
-        sys.argv = argv
+    args = build_parser().parse_args(['--backfill-hours', '6'])
+    assert args.backfill_hours == 6.0
+    assert isinstance(args.backfill_hours, float), (
+        'an integral number of hours must not quantise the window'
+    )
 
-    assert args.incremental_backfill_hours == 6
-    # And the scrape step takes hours, so nothing rounds it back up to a day.
+
+def test_the_scrape_window_accepts_a_fraction_of_a_day():
+    """The hourly cycle wants 0.25 days, not 1."""
+    from scripts.scrape import build_parser
+
+    args = build_parser().parse_args(['--backfill-days', '0.25'])
+    assert args.backfill_days == pytest.approx(0.25)
+
+
+def test_hours_override_days_rather_than_adding_to_them():
+    from scripts.scrape import build_parser
+
+    args = build_parser().parse_args(['--backfill-days', '400', '--backfill-hours', '6'])
+    assert args.backfill_days == 400 and args.backfill_hours == 6.0
+    # `main` prefers hours when both are given; this pins the parser half of it.
     import inspect
 
-    from scripts.live_orchestrator import _scrape
+    import scripts.scrape as scrape
 
-    assert 'backfill-hours' in inspect.getsource(_scrape)
+    source = inspect.getsource(scrape.main)
+    assert 'backfill_hours' in source
+    assert source.index('backfill_hours') < source.index('backfill_days'), (
+        'days is consulted before hours, so hours cannot be the override'
+    )
 
 
-def test_run_pipeline_accepts_a_fractional_window():
-    """The hourly cycle needs sub-day windows."""
-    import sys
+def test_the_default_window_is_five_years():
+    """An empty store's first cycle *defines* the dataset.
 
-    from scripts.run_pipeline import main  # noqa: F401  (import guard)
+    `--backfill-days` in compose is the FIRST cycle only; every cycle after it
+    uses the incremental window. It was 30 once, which at this window size is far
+    too little to fit anything, and nothing in the log said why.
+    """
+    from scripts.scrape import build_parser
 
-    # Parse only; running it would hit the network.
-    import argparse
-    import scripts.run_pipeline as rp
-
-    source = inspect_source = __import__('inspect').getsource(rp)
-    assert '"--backfill-hours"' in source
-    assert 'type=float' in source
+    assert build_parser().parse_args([]).backfill_days == 1825
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,26 @@ def version_stamp(now: Optional[datetime] = None) -> str:
     return (now or datetime.now(timezone.utc)).strftime('%Y%m%dT%H%M%SZ')
 
 
+def _unique_version(ledger: Path, now: Optional[datetime] = None) -> str:
+    """A version no ledger entry already uses.
+
+    The stamp has second resolution, so two candidates evaluated in the same
+    second collided and the second overwrote the first — which silently lost an
+    attempt from the ledger. That matters more than it sounds: the ledger *is*
+    the trial count, and a trial count that undercounts makes every
+    multiple-testing correction computed from it too generous. Found by a test
+    that promoted three candidates in a loop and got one row back.
+    """
+    base = version_stamp(now)
+    if not (ledger / f'{base}.json').exists():
+        return base
+    for suffix in range(1, 1000):
+        candidate = f'{base}-{suffix:03d}'
+        if not (ledger / f'{candidate}.json').exists():
+            return candidate
+    raise RuntimeError(f'a thousand attempts already share the stamp {base}')
+
+
 @dataclass
 class PromotionAttempt:
     """One evaluated candidate, whatever the verdict."""
@@ -145,12 +165,12 @@ def promote(
             'losing system alive, so it has to be stated and stored.'
         )
     root = Path(root) if root else MODELS_ROOT
-    attempt = evaluate_candidate(model, report, gates=gates)
-    attempt.forced = bool(force)
-    attempt.force_reason = force_reason
-
     ledger = root / LEDGER
     ledger.mkdir(parents=True, exist_ok=True)
+    attempt = evaluate_candidate(model, report, gates=gates,
+                                 version=_unique_version(ledger))
+    attempt.forced = bool(force)
+    attempt.force_reason = force_reason
 
     if attempt.passed or force:
         staging = root / STAGING / attempt.version

@@ -197,7 +197,8 @@ def cost_stress(
 
     The half-spread is an assumption, not a measurement — no Kalshi order ticket
     has been read against `core/costs.py` — and it is larger than the fee at
-    every price above about 60c. So it is the parameter most likely to be wrong
+    price above 83c, where 0.07*p(1-p) falls below a cent. So it is the parameter
+    most likely to be wrong
     and the one that moves the answer most. A strategy that survives only at the
     assumed spread has not been demonstrated.
     """

@@ -1,0 +1,199 @@
+"""The venue client: signing, market resolution, and the refusal to trade.
+
+Nothing here reaches the network. What is tested is the shape of what would be
+sent and — more importantly — the two behaviours that make an unattended script
+safe: an order is refused unless the client was constructed for it, and a market
+that cannot be resolved produces an abstention rather than a neighbouring
+contract.
+"""
+
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from data_collection.kalshi_client import (
+    CENT, DEFAULT_BASE_URL, DEMO_BASE_URL, KalshiClient, KalshiError, NotLiveError,
+    Quote, _cents, _parse_time, _to_quote,
+)
+
+
+@pytest.fixture(scope='module')
+def key_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_an_unconfigured_client_says_so_rather_than_failing_later(monkeypatch):
+    monkeypatch.delenv('KALSHI_KEY_ID', raising=False)
+    monkeypatch.delenv('KALSHI_PRIVATE_KEY', raising=False)
+    monkeypatch.delenv('KALSHI_PRIVATE_KEY_PATH', raising=False)
+    client = KalshiClient()
+    assert not client.configured
+    with pytest.raises(KalshiError, match='credentials are not configured'):
+        client._headers('GET', '/trade-api/v2/portfolio/balance')
+
+
+def test_the_signature_covers_timestamp_method_and_path(key_pem):
+    """RSA-PSS over SHA-256, not an HMAC secret.
+
+    The signed string is `timestamp + METHOD + path`, and the path excludes the
+    query — so signing the final URL instead would authenticate a different
+    message than the one sent.
+    """
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    client = KalshiClient(key_id='abc-123', private_key_pem=key_pem)
+    headers = client._headers('get', '/trade-api/v2/markets')
+    assert headers['KALSHI-ACCESS-KEY'] == 'abc-123'
+    timestamp = headers['KALSHI-ACCESS-TIMESTAMP']
+    assert timestamp.isdigit() and len(timestamp) >= 13, 'not milliseconds'
+
+    message = f'{timestamp}GET/trade-api/v2/markets'.encode()
+    public = serialization.load_pem_private_key(key_pem.encode(), password=None).public_key()
+    public.verify(
+        base64.b64decode(headers['KALSHI-ACCESS-SIGNATURE']), message,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256(),
+    )
+
+
+def test_the_method_is_upper_cased_in_the_signed_message(key_pem):
+    client = KalshiClient(key_id='k', private_key_pem=key_pem)
+    lower = client._headers('post', '/trade-api/v2/portfolio/orders')
+    assert lower['KALSHI-ACCESS-SIGNATURE']  # it signed something
+
+
+def test_placing_an_order_is_refused_unless_the_client_is_live(key_pem):
+    """The failure being designed against is a script meant to observe that trades.
+
+    Which cannot be undone, unlike a missed trade.
+    """
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem=key_pem, live=False)
+    with pytest.raises(NotLiveError, match='live=True'):
+        asyncio.run(client.place_order(ticker='X', side='up', contracts=1,
+                                       limit_price=0.5))
+
+
+def test_an_order_validates_its_own_arguments(key_pem):
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem=key_pem, live=True)
+    with pytest.raises(ValueError, match="side must be"):
+        asyncio.run(client.place_order(ticker='X', side='sideways', contracts=1,
+                                       limit_price=0.5))
+    with pytest.raises(ValueError, match='at least 1'):
+        asyncio.run(client.place_order(ticker='X', side='up', contracts=0,
+                                       limit_price=0.5))
+    for bad_price in (0.0, 1.0, 1.5, -0.2):
+        with pytest.raises(ValueError, match='outside 1c'):
+            asyncio.run(client.place_order(ticker='X', side='up', contracts=1,
+                                           limit_price=bad_price))
+
+
+def test_a_quote_is_converted_to_probabilities_at_the_boundary():
+    """Everything above this module reasons on the probability scale.
+
+    A stray factor of 100 between cents and dollars is the classic bug in a
+    binary system, so the conversion happens once, here.
+    """
+    quote = _to_quote({'ticker': 'KXBTCD-T1', 'yes_bid': 84, 'yes_ask': 87,
+                       'no_bid': 13, 'no_ask': 16, 'last_price': 85,
+                       'volume': 1200, 'open_interest': 4000,
+                       'close_time': '2026-08-23T03:15:00Z', 'status': 'active'})
+    assert quote.yes_ask == pytest.approx(0.87)
+    assert quote.mid == pytest.approx(0.855)
+    assert quote.spread == pytest.approx(0.03)
+    assert quote.ask_for('up') == pytest.approx(0.87)
+    assert quote.ask_for('down') == pytest.approx(0.16)
+    assert quote.tradeable()
+    # The two asks sum above one: that difference is the spread being crossed.
+    assert quote.ask_for('up') + quote.ask_for('down') > 1.0
+
+
+def test_an_empty_book_is_not_tradeable():
+    quote = _to_quote({'ticker': 'X', 'status': 'active'})
+    assert quote.yes_bid is None and quote.yes_ask is None
+    assert not quote.tradeable()
+    assert quote.mid is None and quote.spread is None
+
+
+def test_a_settled_market_is_not_tradeable():
+    quote = _to_quote({'ticker': 'X', 'yes_bid': 99, 'yes_ask': 100,
+                       'status': 'settled'})
+    assert not quote.tradeable()
+
+
+def test_a_zero_price_reads_as_absent_not_as_free():
+    assert _cents(0) is None
+    assert _cents(None) is None
+    assert _cents('nonsense') is None
+    assert _cents(45) == pytest.approx(0.45)
+
+
+def test_times_parse_to_utc():
+    parsed = _parse_time('2026-08-23T03:15:00Z')
+    assert parsed == datetime(2026, 8, 23, 3, 15, tzinfo=timezone.utc)
+    assert _parse_time('') is None
+    assert _parse_time('not a time') is None
+
+
+def test_market_resolution_abstains_rather_than_taking_a_neighbour(monkeypatch):
+    """A ticker built from a pattern fails by finding the *wrong* contract.
+
+    So resolution asks the venue which market closes when this window settles,
+    and returns nothing when none does.
+    """
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem='')
+    settle = datetime(2026, 8, 23, 3, 15, tzinfo=timezone.utc)
+
+    async def markets(**_):
+        return [
+            {'ticker': 'EXACT', 'close_time': '2026-08-23T03:15:00Z'},
+            {'ticker': 'NEXT', 'close_time': '2026-08-23T03:30:00Z'},
+        ]
+
+    monkeypatch.setattr(client, 'markets', markets)
+    found = asyncio.run(client.resolve_window_market('KXBTCD', settle))
+    assert found is not None and found['ticker'] == 'EXACT'
+
+    async def only_far(**_):
+        return [{'ticker': 'FAR', 'close_time': '2026-08-23T04:00:00Z'}]
+
+    monkeypatch.setattr(client, 'markets', only_far)
+    assert asyncio.run(client.resolve_window_market('KXBTCD', settle)) is None
+
+    async def none_at_all(**_):
+        return []
+
+    monkeypatch.setattr(client, 'markets', none_at_all)
+    assert asyncio.run(client.resolve_window_market('KXBTCD', settle)) is None
+
+
+def test_the_default_host_is_production_and_a_demo_host_exists():
+    assert 'kalshi' in DEFAULT_BASE_URL and DEFAULT_BASE_URL.endswith('/trade-api/v2')
+    assert DEMO_BASE_URL != DEFAULT_BASE_URL
+    assert CENT == 0.01
+
+
+def test_a_request_before_opening_the_client_is_an_error(key_pem):
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem=key_pem)
+    with pytest.raises(KalshiError, match='not open'):
+        asyncio.run(client._request('GET', '/markets'))

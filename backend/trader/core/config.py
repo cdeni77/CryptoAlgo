@@ -132,7 +132,8 @@ class Config:
     maker_fee_rate: float = 0.0025
     assume_maker: bool = False
     # Half the quoted bid/ask, in cents of a dollar contract. An assumption,
-    # not a measurement, and larger than the fee at every price above ~60c —
+    # not a measurement, and larger than the fee at every price above 83c
+    # (where 0.07*p(1-p) drops below a cent) —
     # so it is reported separately and stressed rather than folded in.
     half_spread_cents: float = 1.0
 

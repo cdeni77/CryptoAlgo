@@ -36,7 +36,7 @@ that reasons about fees in percentage terms without the ceiling understates
 the cost of the smallest orders, which are the only orders a $100 account
 places.
 
-**The half-spread is larger than the fee above ~60c, and it is an assumption.**
+**The half-spread is larger than the fee above 83c, and it is an assumption.**
 No Kalshi order ticket has been read against this module. The taker formula
 above is the published schedule; the maker rate is modelled as a flat
 per-contract charge and is *unverified*. The last venue this repo priced was

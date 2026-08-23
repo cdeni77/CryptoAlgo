@@ -196,7 +196,13 @@ class VolModel:
         config: Config = DEFAULT_CONFIG,
     ) -> 'VolModel':
         matrix, names = _design(features, tuple(config.vol_lookbacks_minutes))
-        y = np.log(target.to_numpy(dtype=float))
+        raw = target.to_numpy(dtype=float)
+        # A zero realised volatility is a stretch with no trades, not a
+        # measurement of calm. Excluded before the log rather than after, so a
+        # degenerate series is dropped rather than warned about once per fit.
+        positive = np.isfinite(raw) & (raw > 0)
+        y = np.full_like(raw, np.nan)
+        y[positive] = np.log(raw[positive])
         usable = np.isfinite(y) & np.isfinite(matrix).all(axis=1)
         if usable.sum() < 10 * matrix.shape[1]:
             raise ValueError(

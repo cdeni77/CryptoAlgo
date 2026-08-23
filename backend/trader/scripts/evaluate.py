@@ -20,7 +20,8 @@ the live path uses, and reports the answer in the order it should be read:
 5. **The money**, per fold and then on one continuous $100 account.
 6. **Cost stress.** The half-spread is an assumption — no Kalshi order ticket
    has been read against `core/costs.py` — and it is larger than the fee at
-   every price above about 60c. A strategy that survives only at the assumed
+   price above 83c (where 0.07*p(1-p) falls below a cent). A strategy that
+   survives only at the assumed
    spread has not been demonstrated.
 7. **The edge curve.** Where the abstention gate should sit, measured rather
    than guessed.

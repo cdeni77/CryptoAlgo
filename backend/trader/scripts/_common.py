@@ -89,7 +89,7 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                                 'probability points. Abstention is the default action.')
     economics.add_argument('--half-spread-cents', type=float, default=None,
                            help='An assumption, not a measurement — larger than the fee '
-                                'at every price above ~60c, so it is the parameter most '
+                                'at every price above 83c, so it is the parameter most '
                                 'worth stressing.')
     economics.add_argument('--assume-maker', action='store_true', default=None)
     economics.add_argument('--fee-config', type=str, default=None,

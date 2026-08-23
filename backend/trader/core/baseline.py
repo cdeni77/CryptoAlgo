@@ -17,6 +17,20 @@ volatility forecast. Every measurement in this system is *incremental* against
 it — log loss skill, Brier skill, edge in probability points — and a model that
 cannot beat it has found nothing.
 
+**Scale and tail are jointly fitted and are not separately identified.** This is
+worth stating because the obvious reading of the two parameters is wrong. From
+binary outcomes alone only the composite mapping `z -> P(up)` is determined, and
+a thicker tail with a larger scale mimics a thinner tail with a smaller one
+through the bulk of the distribution. Measured: against a sigma inflated by
+1.2-1.4x, the fit returned `scale ~ 1.001` and `nu = 2.93` — it absorbed the
+whole inflation into the tail parameter and left the scale alone.
+
+So do not read `scale` as "the sigma inflation" or `nu` as "the tail thickness of
+returns". Read the pair as one calibration of the barrier map, and judge it the
+only way it can be judged: by whether the resulting probabilities are calibrated
+out of sample. `tests/test_baseline.py` asserts that property rather than either
+parameter's value.
+
 **What the baseline deliberately does not contain.** Its drift is structurally
 zero and is never fitted. A non-zero drift is exactly the alpha under test; if
 the null were allowed to fit one, the null would absorb the finding and report
@@ -29,7 +43,8 @@ arithmetic:
   bias `sigma_remaining` by roughly a constant per offset, and correcting a
   known bias against realised outcomes is not skill, it is calibration. Leaving
   it uncorrected would hand the model an easy win that says nothing about
-  forecasting.
+  forecasting. (Which parameter the correction lands in is not determined — see
+  above — only that the composite is corrected.)
 * **The tail thickness.** One-minute crypto returns are fat-tailed, so a
   Gaussian barrier is overconfident at large displacements — it would assign
   0.999 where 0.99 is right, and a model that merely knew this would look
@@ -132,6 +147,10 @@ class BarrierBaseline:
     default_scale: float = 1.0
     n_fitted: int = 0
     fitted_log_loss: float = float('nan')
+    # The same fit with every scale pinned at one, at the *fitted* tail. Reported
+    # for context and not as a fair baseline: because scale and tail are jointly
+    # fitted, the tail can already have absorbed a scale misspecification, and
+    # then these two numbers agree to eight decimals while both are correct.
     unscaled_log_loss: float = float('nan')
 
     # ---- prediction -----------------------------------------------------

@@ -320,6 +320,9 @@ GATE_NOTES: dict[str, str] = {
     'coverage': 'abstaining on everything passes every other gate trivially',
     'realised_edge_pp': 'what actually happened, against what the model claimed. The '
                         'gap between the two is the winner\'s curse',
+    'total_return': 'on one continuous account across the whole out-of-sample '
+                    'span, sized additively so the slope is the per-trade edge '
+                    'rather than an exponential of it',
     'sharpe': 'annualised on trades actually placed, never on windows available',
     'sharpe_implausible': f'a Sharpe above {5.0} on a public venue is a bug '
                           f'signature, not an edge — every other gate asks '
