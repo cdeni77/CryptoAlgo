@@ -13,7 +13,7 @@ a failure names itself:
 4. **Can a market be resolved for the next window?** The real test. Markets are
    found by close time, not by pattern, so this is the step that proves the whole
    chain — series, clock alignment, and market status — and it prints the book so
-   the assumed 1c half-spread can be checked against a real one.
+   the assumed 0.5c half-spread can be checked against a real one.
 
 Read-only throughout. It constructs the client without `live=True`, so it
 *cannot* place an order even if something in it tried.
@@ -219,10 +219,17 @@ async def main() -> int:
                 note(f'book {quote.yes_bid:.2f} / {quote.yes_ask:.2f}  '
                      f'spread {spread_cents:.0f}c  volume {quote.volume:,}  '
                      f'OI {quote.open_interest:,}')
+                # `.1f`, not `.0f`: the default is 0.5c and `.0f` printed it as
+                # "0c", so the one line whose job is to check the cost assumption
+                # was misreporting it as zero. And the ask is what you pay, so the
+                # all-in figure must not add a half-spread on top of it — that is
+                # the same double-charge `core/decide.py` had.
                 note(f'buying "up" at {quote.yes_ask:.2f} costs '
-                     f'{quote.yes_ask + fee:.4f} all-in; the backtest assumed '
-                     f'{DEFAULT_CONFIG.half_spread_cents:.0f}c of half-spread, '
-                     f'this book shows {spread_cents / 2:.1f}c')
+                     f'{quote.yes_ask + fee:.4f} all-in (the ask already crossed '
+                     f'the spread); the backtest assumes '
+                     f'{DEFAULT_CONFIG.half_spread_cents:.1f}c of half-spread on a '
+                     f'counterfactual mid, this book shows '
+                     f'{spread_cents / 2:.1f}c')
 
     print('\n' + '=' * 78)
     if failures:

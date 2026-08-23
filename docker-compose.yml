@@ -125,7 +125,13 @@ services:
       # process listing.
       - KALSHI_KEY_ID=${KALSHI_KEY_ID:-}
       - KALSHI_PRIVATE_KEY=${KALSHI_PRIVATE_KEY:-}
-      - KALSHI_PRIVATE_KEY_PATH=${KALSHI_PRIVATE_KEY_PATH:-}
+      # The CONTAINER path, not the host one. `.env` holds a host path for
+      # running scripts outside Docker, and passing it through meant the key
+      # "existed" and could not be opened — `check_venue` caught exactly that.
+      # The PEM is bind-mounted below; KALSHI_PRIVATE_KEY stays unset because a
+      # multi-line PEM cannot survive a single .env line, and a PEM in an
+      # environment variable is a PEM in every process listing.
+      - KALSHI_PRIVATE_KEY_PATH=/run/secrets/kalshi.pem
       - KALSHI_BASE_URL=${KALSHI_BASE_URL:-}
       - KALSHI_SERIES_BTC=${KALSHI_SERIES_BTC:-KXBTC15M}
       - KALSHI_SERIES_ETH=${KALSHI_SERIES_ETH:-KXETH15M}
@@ -169,6 +175,10 @@ services:
       - trader_logs:/app/logs
       # Source mount for development (remove in production).
       - ./backend/trader:/app
+      # The Kalshi signing key, read-only. Defaults to /dev/null so the other
+      # services still start without it; the key load then fails with a clear
+      # message rather than a missing-file traceback.
+      - ${KALSHI_PEM_PATH:-/dev/null}:/run/secrets/kalshi.pem:ro
     # Paper mode, cycling every minute. It scores, prices and records; it places
     # nothing and needs no Kalshi credentials.
     #
@@ -239,6 +249,20 @@ services:
       - ./backend/trader:/app
     command: >
       -m scripts.evaluate
+      
+  trade-live:
+    profiles: ["live"]
+    extends:
+      service: trader
+    restart: unless-stopped
+    command: >
+      -m scripts.live
+        --loop
+        --cycle-seconds 60
+        --mode live
+        --place-orders
+        --force
+        --reason "live smoke test on a $100 account"
 
 volumes:
   postgres_data:

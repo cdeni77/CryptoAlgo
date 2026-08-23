@@ -143,6 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--reason', type=str, default=None,
                         help='Required with --force. Recorded on every row written.')
+    parser.add_argument('--clear-halt', action='store_true',
+                        help='Clear a circuit-breaker halt and exit, placing no '
+                             'orders. Requires --reason, because a breaker cleared '
+                             'without one recorded is a breaker nobody learns from.')
     parser.add_argument('--model', type=str, default=None,
                         help=f'Artifact path (default {MODELS_ROOT}/{LIVE_MODEL})')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -1015,6 +1019,37 @@ async def main() -> int:
         raise SystemExit('--place-orders requires --mode live')
     if args.force and not args.reason:
         raise SystemExit('--force needs --reason, and it is recorded on every row')
+
+    if args.clear_halt:
+        # Handled before the model is loaded, so a halt can be cleared on a box
+        # with no artifact installed — otherwise recovering from a breaker would
+        # require promoting a model first, which is absurd.
+        #
+        # The breakers are deliberately sticky: one that resets itself at midnight
+        # is a speed bump rather than a breaker. But sticky with no way to clear it
+        # is a trap, and that is what this was until now.
+        if not args.reason:
+            raise SystemExit(
+                '--clear-halt needs --reason. The breaker fired for a cause, and '
+                'clearing it without recording why you believe that cause is '
+                'resolved is how the next one gets ignored too.')
+        writer = PgWriter()
+        account = writer.account()
+        if account is None:
+            raise SystemExit('no account row to clear')
+        if not account.halted:
+            print(f'account #{account.id} is not halted; nothing to clear '
+                  f'(bankroll ${account.bankroll:.2f})')
+            return 0
+        previous = account.halted_reason
+        writer.update_account(halted=False, halted_reason=None)
+        logger.warning('halt CLEARED on account #%s. It had halted because: %s. '
+                       'Reason given for clearing: %s',
+                       account.id, previous, args.reason)
+        print(f'cleared. it had halted because: {previous}')
+        print(f'bankroll ${account.bankroll:.2f}, '
+              f'realized ${account.realized_pnl:+.2f}')
+        return 0
 
     config = DEFAULT_CONFIG.with_fee_assumptions(find_fee_config())
     if args.bankroll is not None:

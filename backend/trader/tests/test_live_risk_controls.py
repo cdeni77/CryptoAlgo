@@ -314,3 +314,48 @@ class TestMarketBenchmark:
         bars = self.bars('BTC-USD', window + timedelta(minutes=14), 101.0)
         assert settle_predictions(writer, bars, now=NOW) == 1
         assert settle_predictions(writer, bars, now=NOW) == 0
+
+
+class TestClearingAHalt:
+    """A sticky breaker with no way to clear it is a trap.
+
+    The breakers are deliberately sticky — one that resets itself at midnight is a
+    speed bump rather than a breaker — but for a while there was no CLI to clear
+    one, so a halt overnight left no documented recovery short of hand-editing the
+    database. `--clear-halt` closes that, and requires a reason.
+    """
+
+    def parser(self):
+        from scripts.live import build_parser
+        return build_parser()
+
+    def test_clearing_requires_a_reason(self):
+        """A breaker cleared without a recorded cause is one nobody learns from."""
+        args = self.parser().parse_args(['--clear-halt'])
+        assert args.clear_halt and args.reason is None
+
+    def test_a_reason_is_carried(self):
+        args = self.parser().parse_args(
+            ['--clear-halt', '--reason', 'investigated the streak'])
+        assert args.clear_halt
+        assert args.reason == 'investigated the streak'
+
+    def test_a_halt_can_be_cleared_and_the_previous_reason_survives(self, writer):
+        """The account must come back tradeable, and say what stopped it."""
+        writer.update_account(halted=True, halted_reason='12 consecutive losses')
+        assert writer.account().halted
+
+        previous = writer.account().halted_reason
+        writer.update_account(halted=False, halted_reason=None)
+
+        assert previous == '12 consecutive losses'
+        assert not writer.account().halted
+        assert writer.account().halted_reason is None
+        # And the breakers must not immediately re-halt a clean account.
+        assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
+
+    def test_clearing_does_not_touch_the_bankroll(self, writer):
+        """Clearing a breaker is not a reset. The money stays where it is."""
+        writer.update_account(bankroll=61.25, halted=True, halted_reason='daily loss')
+        writer.update_account(halted=False, halted_reason=None)
+        assert writer.account().bankroll == pytest.approx(61.25)
