@@ -243,6 +243,16 @@ services:
       - MODELS_ROOT=/app/models
       - FEE_CONFIG=${FEE_CONFIG:-}
       - LOG_LEVEL=INFO
+      # `scripts.promote` mirrors each attempt into the serving store so the
+      # dashboard's Model and Calibration pages have something to render. Without
+      # this it logs "DATABASE_URL is unset, so the dashboard will not show this
+      # attempt" and both tabs stay empty after a *successful* promotion — which
+      # looks like a broken page rather than a missing variable.
+      #
+      # The ledger under models/promotions/ remains the record of account; this is
+      # only the dashboard's copy, and promotion does not depend on the database
+      # being reachable.
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
     volumes:
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models

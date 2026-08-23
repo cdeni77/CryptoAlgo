@@ -465,31 +465,60 @@ class KalshiClient:
             raise ValueError(f"side must be 'up' or 'down', got {side!r}")
         if contracts < 1:
             raise ValueError(f'contracts must be at least 1, got {contracts}')
-        # Round UP, not to nearest. `int(round(...))` is banker's rounding to a
-        # whole cent, and `core/costs.py` models a tapered deci-cent ladder — so
-        # a 0.945 limit became 94c and a 0.0450 limit became 4c, both *below* the
-        # intended price, in exactly the tails where this strategy's economics are
-        # best. Under `fill_or_kill` an under-priced limit is a guaranteed kill,
-        # and the fill-readback used to record a kill as a full fill.
+
+        # V2. The V1 endpoint returns 410 `deprecated_v1_order_endpoint`, found on
+        # the first real cycle — no amount of testing against our own mocks would
+        # have caught it.
         #
-        # The epsilon absorbs binary representation: 0.60 is 59.999...c in float,
-        # and a bare ceil would send 60c as 61c.
-        cents = int(math.ceil(limit_price / CENT - 1e-9))
+        # This is not a renamed path. V2 quotes a SINGLE book from the YES side:
+        # `bid` means buy YES, `ask` means sell YES, and selling YES is
+        # economically buying NO at `1 - price`. There is no `action`, no `type`,
+        # no `yes_price`/`no_price`, and `self_trade_prevention_type` is required.
+        #
+        # So `limit_price` arrives as what we would PAY for `side` (that is what
+        # `decide` computes) and has to be converted to a YES-denominated limit:
+        # paying 0.30 for NO is selling YES at 0.70. Sending 0.30 as an `ask`
+        # would offer to sell YES at thirty cents — the same class of error as
+        # inverting the side outright, and the mutation that survived all 230
+        # tests before this was written.
+        book_side = 'bid' if side == 'up' else 'ask'
+        yes_limit = limit_price if side == 'up' else 1.0 - limit_price
+
+        # Round so the limit never becomes one that CANNOT fill. A bid fills
+        # against asks at or below it, so round up; an ask fills against bids at
+        # or above it, so round down. Rounding the wrong way under `fill_or_kill`
+        # is a guaranteed kill, which the old code did in the tails by using
+        # banker's rounding on a deci-cent ladder.
+        #
+        # The epsilon absorbs binary representation: 0.60 is 59.999...c in float.
+        if book_side == 'bid':
+            cents = int(math.ceil(yes_limit / CENT - 1e-9))
+        else:
+            cents = int(math.floor(yes_limit / CENT + 1e-9))
         if not 1 <= cents <= 99:
-            raise ValueError(f'limit price {limit_price} is outside 1c..99c')
+            raise ValueError(
+                f'limit {limit_price} on the {side} side is a YES limit of '
+                f'{yes_limit:.4f} ({cents}c), outside 1c..99c'
+            )
 
         body = {
             'ticker': ticker,
-            'client_order_id': client_order_id or str(uuid.uuid4()),
-            'action': 'buy',
-            'side': 'yes' if side == 'up' else 'no',
-            'count': int(contracts),
-            'type': 'limit',
+            'side': book_side,
+            # Decimal strings, not integers. `count` accepts up to 2 decimals and
+            # `price` 2-4; a bare int for count is rejected.
+            'count': f'{int(contracts)}.00',
+            'price': f'{cents / 100.0:.4f}',
             'time_in_force': time_in_force,
-            ('yes_price' if side == 'up' else 'no_price'): cents,
+            # Required in V2. `taker_at_cross` crosses the spread, which is what a
+            # fill_or_kill on a wasting 15-minute market is for; `maker` would rest
+            # and is the opposite of the intent.
+            'self_trade_prevention_type': 'taker_at_cross',
         }
-        logger.info('placing %s %d @ %dc on %s', side, contracts, cents, ticker)
-        payload = await self._request('POST', '/portfolio/orders', body=body)
+        if client_order_id:
+            body['client_order_id'] = client_order_id
+        logger.info('placing %s (%s) %d @ %dc YES on %s',
+                    side, book_side, contracts, cents, ticker)
+        payload = await self._request('POST', '/portfolio/events/orders', body=body)
         return dict(payload.get('order', payload))
 
     async def cancel(self, order_id: str) -> dict:

@@ -70,7 +70,9 @@ import pandas as pd
 
 from core.config import Config, DEFAULT_CONFIG, find_fee_config
 from core.dataset import score_live
-from core.decide import Decision, Reason, WindowExposure, decide, rejection_histogram
+from core.decide import (
+    Decision, Reason, Side, WindowExposure, decide, rejection_histogram,
+)
 from core.dataset import DatasetError
 from core.pg_writer import AccountModeMismatch, PgWriter, TraderAlreadyRunning
 from core.promotion import LIVE_MODEL, MODELS_ROOT, load_live
@@ -851,19 +853,29 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
     if status in ('canceled', 'cancelled', 'killed', 'rejected', 'expired'):
         return 0, float('nan')
 
+    # `int(...)`, not `int(str)`: V2 returns these as fixed-point decimal strings
+    # like "10.00", and `int("10.00")` raises ValueError — which this function
+    # caught and turned into "nothing filled". A real, paid-for fill would have
+    # been recorded as no fill and the position dropped on the floor, which is the
+    # most expensive way to be wrong here.
+    def count(value) -> Optional[int]:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
     filled = None
     for key in ('taker_fill_count', 'filled_count', 'fill_count'):
         if order.get(key) is not None:
-            try:
-                filled = int(order[key])
-                break
-            except (TypeError, ValueError):
+            filled = count(order[key])
+            if filled is None:
                 return 0, float('nan')
+            break
     if filled is None and order.get('remaining_count') is not None:
-        try:
-            filled = requested - int(order['remaining_count'])
-        except (TypeError, ValueError):
+        remaining = count(order['remaining_count'])
+        if remaining is None:
             return 0, float('nan')
+        filled = requested - remaining
     if filled is None:
         # No fill field at all. Only 'executed'/'filled' justifies believing the
         # whole order traded; anything else (including an empty body) is unknown,
@@ -955,6 +967,14 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
             return False
 
         filled, fill_price = filled_from_order(order, decision.contracts)
+        # V2 quotes everything from the YES side, so a DOWN fill comes back as the
+        # price we SOLD yes at. What we paid for the NO contract is `1 - that`.
+        # Recording 0.69 where 0.31 was paid would not corrupt PnL — that is
+        # computed from `outlay` — but it would put a wrong price on the position
+        # and make `realised_edge_pp` and every displayed number wrong for half the
+        # trades.
+        if np.isfinite(fill_price) and decision.side is not Side.UP:
+            fill_price = 1.0 - fill_price
         if filled <= 0:
             writer.resolve_ticket(
                 ticket_id, status='killed',
