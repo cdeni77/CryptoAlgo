@@ -317,6 +317,23 @@ def _fit_residual_scale(
     return float(np.clip(result.x, 0.0, 2.0))
 
 
+def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
+                     correction: np.ndarray, alpha: float) -> float:
+    """Log loss over the rows that carry a forecast.
+
+    These three numbers go into the artifact's provenance and its `summary()`
+    line, and they were computed over unfiltered arrays — so a single row with a
+    NaN sigma printed `inner log loss nan vs baseline nan (skill +nan)` for the
+    whole model. Observed on real bars, where one venue outage is enough.
+    """
+    outcome = np.asarray(outcome, dtype=float)
+    keep = (np.isfinite(outcome) & np.isfinite(base_logit) & np.isfinite(correction))
+    if not keep.any():
+        return float('nan')
+    return log_loss(outcome[keep],
+                    expit(base_logit[keep] + alpha * correction[keep]))
+
+
 def fit_model(
     train: pd.DataFrame,
     baseline: BarrierBaseline,
@@ -446,14 +463,14 @@ def fit_model(
         groups=tuple(groups) if groups else (),
         n_train_rows=len(train), n_train_windows=len(windows),
         empty_features=empty, best_iteration=booster.best_iteration,
-        train_log_loss=log_loss(
+        train_log_loss=_finite_log_loss(
             inner_train['outcome'].to_numpy(dtype=float),
-            expit(inner_train[BASELINE_LOGIT].to_numpy(dtype=float)
-                  + alpha * np.asarray(
-                      booster.predict(_feature_matrix(inner_train, populated), raw_score=True),
-                      dtype=float))),
-        inner_log_loss=log_loss(outcome, expit(base_logit + alpha * correction)),
-        inner_baseline_log_loss=log_loss(outcome, expit(base_logit)),
+            inner_train[BASELINE_LOGIT].to_numpy(dtype=float),
+            np.asarray(booster.predict(_feature_matrix(inner_train, populated),
+                                       raw_score=True), dtype=float),
+            alpha),
+        inner_log_loss=_finite_log_loss(outcome, base_logit, correction, alpha),
+        inner_baseline_log_loss=_finite_log_loss(outcome, base_logit, correction, 0.0),
         config_provenance=config.provenance(),
     )
     logger.info(model.summary())
