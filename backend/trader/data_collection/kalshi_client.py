@@ -364,6 +364,40 @@ class KalshiClient:
         payload = await self._request('GET', '/portfolio/fills', params=_clean(params))
         return list(payload.get('fills', []))
 
+    async def settlements(self, **params) -> list[dict]:
+        """Settled positions, as the venue resolved them.
+
+        The authority on what a position was worth. Settling from our own bars
+        means settling against an OHLC mean of Coinbase standing in for sixty
+        seconds of CF Benchmarks BRTI — a close proxy that will sometimes
+        disagree, and when it does our books are wrong and the venue's are right.
+        """
+        payload = await self._request('GET', '/portfolio/settlements',
+                                      params=_clean(params))
+        return list(payload.get('settlements', []))
+
+    async def reconcile(self) -> dict:
+        """Balance, open positions and recent fills, as the venue sees them.
+
+        One call site for everything authoritative, so the live loop can compare
+        its own arithmetic against the account of record rather than assume the
+        two agree.
+        """
+        balance = await self.balance()
+        positions = await self.positions()
+        fills = await self.fills(limit=200)
+        settled = []
+        try:
+            settled = await self.settlements(limit=200)
+        except KalshiError as exc:
+            logger.warning('settlements unavailable (%s); falling back to fills', exc)
+        return {
+            'balance': balance,
+            'positions': positions,
+            'fills': fills,
+            'settlements': settled,
+        }
+
     async def orders(self, **params) -> list[dict]:
         payload = await self._request('GET', '/portfolio/orders', params=_clean(params))
         return list(payload.get('orders', []))

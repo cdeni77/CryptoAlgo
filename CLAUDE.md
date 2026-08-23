@@ -376,6 +376,22 @@ Credentials: `KALSHI_KEY_ID` plus `KALSHI_PRIVATE_KEY` (the PEM) or
 `KALSHI_PRIVATE_KEY_PATH`. Auth is RSA-PSS over SHA-256 of
 `timestamp + METHOD + path`, not an HMAC secret.
 
+**Live, the venue is the account of record.** In paper mode the bankroll is
+arithmetic and settlement comes from our own bars. Live, both are estimates of
+someone else's ledger, and where they disagree the venue is right:
+
+* Balance from `/portfolio/balance` every cycle. Our running figure is kept
+  alongside and the drift is logged rather than silently overwritten — a drift
+  that grows is an unrecorded fill, a partial, or a fee we mispriced.
+* Settlement from `/portfolio/settlements` where it knows. Ours is an OHLC mean
+  of Coinbase standing in for sixty seconds of CF Benchmarks BRTI, which is a
+  close proxy and not the same number.
+* Fills read back, not assumed. A `fill_or_kill` that killed leaves a ticket and
+  no position, and a position the venue does not report is logged as exactly
+  that.
+
+`--no-reconcile` turns it off, which is only reasonable for debugging.
+
 **Prices arrive as dollar-denominated strings.** The venue serves
 `yes_bid_dollars: "0.1900"`, and the integer-cent fields the older documentation
 describes (`yes_bid: 19`) come back `null`. Reading only the latter parsed every

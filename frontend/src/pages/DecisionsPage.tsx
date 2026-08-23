@@ -70,7 +70,7 @@ export function DecisionsPage() {
             columns={columns}
             rows={rows}
             keyOf={(p) => `${p.symbol}-${p.window_open}-${p.offset_minutes}`}
-            empty={<Empty what="No decisions recorded." next="python -m scripts.paper" />}
+            empty={<Empty what="No decisions recorded." next="python -m scripts.live" />}
           />
         )}
       </Panel>

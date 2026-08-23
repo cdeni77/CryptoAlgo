@@ -63,7 +63,7 @@ export function LivePage() {
         {state.windows.length === 0 ? (
           <Empty
             what="No decision has been recorded yet."
-            next="python -m scripts.paper"
+            next="python -m scripts.live"
           />
         ) : (
           <div className="grid gap-4 lg:grid-cols-3">

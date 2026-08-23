@@ -51,7 +51,7 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
     return (
       <Empty
         what="No settled positions yet, so there is no equity curve."
-        next="python -m scripts.paper"
+        next="python -m scripts.live"
       />
     );
   }

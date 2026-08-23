@@ -159,10 +159,15 @@ def funnel(db: Session, *, days: int = 7) -> list[dict[str, Any]]:
     ).all()
     counts = {reason: int(n) for reason, n in rows}
     total = sum(counts.values())
+    if total == 0:
+        # Nothing decided in this span. Returning a single zero-count `traded`
+        # row drew a chart axis with one empty bar, which reads as "we looked and
+        # the answer was zero" rather than "we have not looked yet".
+        return []
     return [{
         'reason': reason, 'count': counts.get(reason, 0),
         'share': counts.get(reason, 0) / total if total else None,
-    } for reason in FUNNEL_ORDER if reason in counts or reason == 'traded']
+    } for reason in FUNNEL_ORDER if reason in counts]
 
 
 def positions(db: Session, *, open_only: bool = False,

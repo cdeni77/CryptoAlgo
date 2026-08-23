@@ -36,6 +36,23 @@ traded, and one flag guarding that is one typo away from being wrong.
 **The gates still apply.** `--require-gates` (the default) refuses to trade an
 artifact whose promotion was blocked. Overriding it needs `--force` and a written
 reason, which is recorded on every prediction the run writes.
+
+**Live, the venue is the account of record.** In paper mode the bankroll is
+arithmetic — start at the configured figure, subtract each outlay, add each
+payout — and settlement comes from our own bars. Live, both of those are
+*estimates of someone else's ledger*, and where they disagree the venue is right
+and we are wrong:
+
+* **Balance** comes from `/portfolio/balance` each cycle. Our running figure is
+  kept alongside and the gap is logged, because a widening gap is the first sign
+  of an unrecorded fill or a partial.
+* **Settlement** comes from the venue where it can. We approximate sixty seconds
+  of CF Benchmarks BRTI with a one-minute OHLC mean of Coinbase bars, which is a
+  close proxy and not the same number — so a position settled from our bars can
+  disagree with what was actually paid. `--reconcile` prefers the venue's
+  settlements and falls back to bars only for what it has not resolved yet.
+* **Fills** are read back rather than assumed. An order placed is not an order
+  filled, and a `fill_or_kill` that killed leaves a ticket and no position.
 """
 
 from __future__ import annotations
@@ -106,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--offset', type=int, default=None,
                         help='Force a decision offset instead of using whichever '
                              'configured offset the clock has just passed.')
+    parser.add_argument('--reconcile', dest='reconcile', action='store_true',
+                        default=True,
+                        help='Live only. Take balance, fills and settlements from '
+                             'the venue rather than from our own arithmetic. On by '
+                             'default because the venue is the account of record.')
+    parser.add_argument('--no-reconcile', dest='reconcile', action='store_false')
     parser.add_argument('--require-gates', dest='require_gates',
                         action='store_true', default=True)
     parser.add_argument('--no-require-gates', dest='require_gates', action='store_false')
@@ -273,6 +296,69 @@ async def fetch_quotes(
     return quotes
 
 
+async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> None:
+    """Make the venue's ledger the one we report.
+
+    Three comparisons, each of which has a specific failure it catches:
+
+    * **balance** — our running figure against theirs. A gap that grows is an
+      unrecorded fill, a partial, or a fee we mispriced. Logged rather than
+      silently overwritten on the first cycle, then written, because the venue is
+      right either way and a silent overwrite hides how wrong we were.
+    * **settlements** — what a position actually paid. Ours are settled from an
+      OHLC mean of Coinbase standing in for CF Benchmarks BRTI, which will
+      sometimes disagree.
+    * **open positions** — a position we think is open and the venue does not is
+      an order that never filled.
+    """
+    state = await kalshi.reconcile()
+    venue_balance = float(state['balance'])
+    account = writer.account()
+    if account is not None:
+        ours = float(account.bankroll)
+        drift = venue_balance - ours
+        if abs(drift) > 0.01:
+            logger.warning(
+                'balance drift: ours $%.2f, venue $%.2f (%+.2f). The venue is the '
+                'account of record — writing theirs. A drift that grows means a '
+                'fill we did not record, a partial, or a mispriced fee.',
+                ours, venue_balance, drift)
+        writer.update_account(bankroll=venue_balance)
+
+    # Settle from the venue where it knows, keyed on the market ticker we stored.
+    resolved = {}
+    for row in state.get('settlements', []):
+        ticker = str(row.get('ticker', ''))
+        if not ticker:
+            continue
+        revenue = row.get('revenue_dollars', row.get('revenue'))
+        resolved[ticker] = row
+    if resolved:
+        logger.info('venue reports %d settlement(s) to reconcile', len(resolved))
+
+    venue_open = {str(p.get('ticker', '')) for p in state.get('positions', [])
+                  if int(p.get('position') or 0) != 0}
+    for position in writer.open_positions():
+        ticket = _ticket_for(writer, position)
+        ticker = getattr(ticket, 'market_ticker', None) if ticket else None
+        if ticker and ticker not in venue_open and ticker not in resolved:
+            logger.warning(
+                '%s window %s: we hold %d contracts the venue does not report. '
+                'Most likely the order never filled — a fill_or_kill that killed '
+                'leaves a ticket and no position.',
+                position.symbol, position.window_open, position.contracts)
+
+
+def _ticket_for(writer: PgWriter, position):
+    from core.pg_writer import OrderTicket
+
+    with writer._session() as session:  # noqa: SLF001 - same package, one query
+        return (session.query(OrderTicket)
+                .filter(OrderTicket.symbol == position.symbol,
+                        OrderTicket.window_open == position.window_open)
+                .one_or_none())
+
+
 async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
     now = datetime.now(timezone.utc)
@@ -284,6 +370,15 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         logger.error('no bars, nothing to do this cycle')
         return []
     record_minute_prices(writer, bars)
+
+    # The venue first, where there is one: it knows what actually settled and
+    # what the balance actually is. Bars only fill in what it has not resolved.
+    if kalshi is not None and args.reconcile:
+        try:
+            await reconcile_with_venue(writer, kalshi)
+        except KalshiError as exc:
+            logger.error('reconciliation failed (%s); falling back to our own '
+                         'bookkeeping for this cycle', exc)
     settle_due(writer, bars)
 
     if offset is None:

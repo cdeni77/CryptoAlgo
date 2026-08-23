@@ -318,3 +318,98 @@ def test_resolution_uses_close_time_and_not_the_ticker():
     found = asyncio.run(client.resolve_window_market('KXBTC15M', settle))
     assert found is not None
     assert found['ticker'] == 'KXBTC15M-26AUG230045-45'
+
+
+def test_reconcile_pulls_everything_authoritative_in_one_call():
+    """Balance, positions, fills and settlements — the account of record.
+
+    In paper mode the bankroll is arithmetic and settlement comes from our own
+    bars. Live, both are estimates of someone else's ledger: we approximate sixty
+    seconds of CF Benchmarks BRTI with a one-minute OHLC mean of Coinbase bars, so
+    a position settled from bars can disagree with what was actually paid. Where
+    they disagree the venue is right.
+    """
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem='')
+    calls: list[str] = []
+
+    async def balance():
+        calls.append('balance')
+        return 137.42
+
+    async def positions():
+        calls.append('positions')
+        return [{'ticker': 'KXBTC15M-A', 'position': 3}]
+
+    async def fills(**_):
+        calls.append('fills')
+        return [{'ticker': 'KXBTC15M-A', 'count': 3}]
+
+    async def settlements(**_):
+        calls.append('settlements')
+        return [{'ticker': 'KXBTC15M-B', 'revenue_dollars': '3.0000'}]
+
+    client.balance = balance
+    client.positions = positions
+    client.fills = fills
+    client.settlements = settlements
+
+    state = asyncio.run(client.reconcile())
+    assert set(calls) == {'balance', 'positions', 'fills', 'settlements'}
+    assert state['balance'] == pytest.approx(137.42)
+    assert len(state['positions']) == 1
+    assert len(state['settlements']) == 1
+
+
+def test_reconcile_survives_settlements_being_unavailable():
+    """An endpoint that moves must not take the balance check down with it."""
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem='')
+
+    async def balance():
+        return 100.0
+
+    async def positions():
+        return []
+
+    async def fills(**_):
+        return []
+
+    async def settlements(**_):
+        raise KalshiError('GET /portfolio/settlements -> 404')
+
+    client.balance = balance
+    client.positions = positions
+    client.fills = fills
+    client.settlements = settlements
+
+    state = asyncio.run(client.reconcile())
+    assert state['balance'] == pytest.approx(100.0)
+    assert state['settlements'] == []
+
+
+def test_the_live_loop_reconciles_before_settling_from_bars():
+    """Order matters: the venue knows, our bars approximate."""
+    import inspect
+
+    from scripts import live
+
+    source = inspect.getsource(live.run_cycle)
+    assert 'reconcile_with_venue' in source
+    assert source.index('reconcile_with_venue') < source.index('settle_due('), (
+        'bars settle positions before the venue is consulted, so a disagreement '
+        'is resolved the wrong way'
+    )
+
+
+def test_reconciliation_writes_the_venues_balance_not_ours():
+    """A silent overwrite would hide how far our arithmetic had drifted."""
+    import inspect
+
+    from scripts.live import reconcile_with_venue
+
+    source = inspect.getsource(reconcile_with_venue)
+    assert 'balance drift' in source, 'the gap is not reported'
+    assert 'update_account(bankroll=venue_balance)' in source

@@ -171,7 +171,9 @@ that group to a peer mean rather than erroring.
    as profit.
 6. **Never let a blocked candidate reach `models/forecast.joblib`.** Promotion is
    the only path, and `--force` needs a written reason.
-7. **When a claim in these docs is measurable, measure it.** Six numbers in
+7. **Live, never trust our own bookkeeping over the venue's.** Balance, fills
+   and settlements come from Kalshi; ours are an estimate of their ledger.
+8. **When a claim in these docs is measurable, measure it.** Six numbers in
    earlier versions of this file were wrong — the fee crossover (twice), the
    scale interpretation, a forward-looking target that looked backwards, the tick
    size, and the settlement rule itself. Every one was found by a test or by a

@@ -58,8 +58,8 @@ export function Rail({ routes, current, onNavigate, lastUpdated }: RailProps) {
 
       <div className="border-t border-rule px-5 py-4 font-mono text-micro leading-4 text-ink-3">
         <div>fee 0.07·p(1−p)</div>
-        <div>+1¢ half-spread</div>
-        <div className="mt-2 text-ink-3/70">assumed, not measured</div>
+        <div>+0.5¢ half-spread</div>
+        <div className="mt-2 text-ink-3/70">spread measured; depth read from the book</div>
         {lastUpdated && (
           <div className="mt-3 border-t border-rule pt-3">
             {lastUpdated.toLocaleTimeString(undefined, { hour12: false })}

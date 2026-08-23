@@ -126,7 +126,7 @@ export function AccountPage() {
               empty={
                 <Empty
                   what="Nothing has settled yet."
-                  next="python -m scripts.paper"
+                  next="python -m scripts.live"
                 />
               }
             />
