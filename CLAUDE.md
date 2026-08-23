@@ -379,7 +379,7 @@ python -m scripts.live --mode live --dry-run        # real book, no orders
 python -m scripts.live --mode live --place-orders   # real orders
 python -m scripts.live --loop --cycle-seconds 60
 
-# Tests. pytest.ini sets -n auto: 348 tests in ~35s.
+# Tests. pytest.ini sets -n auto: 381 tests in ~90s (`-m "not slow"` for the fast loop).
 cd backend/trader && pytest
 cd backend/api && pytest
 

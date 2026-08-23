@@ -452,19 +452,85 @@ def test_an_empty_batch_is_retried_with_backoff_not_immediately():
     assert list(EMPTY_BATCH_BACKOFF_SECONDS) == sorted(EMPTY_BATCH_BACKOFF_SECONDS), (
         'the waits must grow, or the later attempts add nothing'
     )
-    source = inspect.getsource(CoinbaseRESTClient.get_candles_range)
-    assert 'EMPTY_BATCH_BACKOFF_SECONDS' in source
-    assert 'asyncio.sleep(delay)' in source, 'it retries without waiting'
+
+@pytest.mark.asyncio
+async def test_an_empty_batch_is_retried_with_growing_waits():
+    """Behaviour, not source text.
+
+    This asserted `'EMPTY_BATCH_BACKOFF_SECONDS' in source` and
+    `'asyncio.sleep(delay)' in source`. Both would keep passing if the retry loop
+    were rewritten to sleep once and give up, or to sleep on the wrong branch —
+    they check that two identifiers appear in a function body. Count the attempts
+    instead.
+    """
+    import asyncio
+
+    from data_collection.coinbase_connector import (
+        EMPTY_BATCH_BACKOFF_SECONDS, CoinbaseRESTClient,
+    )
+
+    calls: list[tuple[int, int]] = []
+    waits: list[float] = []
+
+    async def always_empty(method, path, params=None, **kwargs):
+        calls.append((int(params['start']), int(params['end'])))
+        return 200, {'candles': []}
+
+    async def record_sleep(seconds):
+        waits.append(seconds)
+
+    client = CoinbaseRESTClient(api_key=None, api_secret=None)
+    client._request = always_empty                      # noqa: SLF001
+    original, asyncio.sleep = asyncio.sleep, record_sleep
+    try:
+        start = datetime(2025, 1, 1)
+        await client.get_candles_range(
+            'BTC-USD', '1m', start, start + timedelta(minutes=600))
+    finally:
+        asyncio.sleep = original
+
+    assert len(calls) > len(EMPTY_BATCH_BACKOFF_SECONDS), (
+        f'{len(calls)} requests for {len(EMPTY_BATCH_BACKOFF_SECONDS)} configured '
+        f'backoffs: the empty batch was not retried through the whole ladder'
+    )
+    assert waits, 'it retried without waiting at all'
+    assert waits[:len(EMPTY_BATCH_BACKOFF_SECONDS)] == list(EMPTY_BATCH_BACKOFF_SECONDS), (
+        f'waited {waits[:4]}, expected {list(EMPTY_BATCH_BACKOFF_SECONDS)}'
+    )
 
 
-def test_skipped_windows_are_recorded_on_the_client():
-    """So a caller can act on them rather than parse a log line."""
-    import inspect
+@pytest.mark.asyncio
+async def test_a_window_that_never_answers_is_recorded_on_the_client():
+    """So a caller can act on it rather than parse a log line.
 
+    This checked `'self.last_skipped_windows' in source`, which is true of a
+    function that assigns the attribute and never populates it.
+    """
     from data_collection.coinbase_connector import CoinbaseRESTClient
 
-    source = inspect.getsource(CoinbaseRESTClient.get_candles_range)
-    assert 'self.last_skipped_windows' in source
+    async def always_empty(method, path, params=None, **kwargs):
+        return 200, {'candles': []}
+
+    async def no_wait(seconds):
+        return None
+
+    import asyncio
+
+    client = CoinbaseRESTClient(api_key=None, api_secret=None)
+    client._request = always_empty                      # noqa: SLF001
+    original, asyncio.sleep = asyncio.sleep, no_wait
+    try:
+        start = datetime(2025, 1, 1)
+        bars = await client.get_candles_range(
+            'BTC-USD', '1m', start, start + timedelta(minutes=600))
+    finally:
+        asyncio.sleep = original
+
+    assert bars == []
+    assert client.last_skipped_windows, (
+        'nothing came back and nothing was recorded, so a caller cannot tell a '
+        'quiet market from a venue that stopped answering'
+    )
 
 
 def test_gap_detection_finds_a_multi_hour_hole(tmp_path):

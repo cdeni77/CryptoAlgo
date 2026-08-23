@@ -51,6 +51,12 @@ class Position:
     model_probability: float
     baseline_probability: float
     edge: float
+    # 'quote' when the venue's own ask priced this, 'baseline' when the calibrated
+    # barrier stood in for a market that was not observed. CLAUDE.md states this
+    # must be on every row precisely so a backtest cannot be mistaken for a fill —
+    # and it was on `Decision` and on the `predictions` table but *not* on the
+    # trade ledger, which is the frame anyone actually inspects.
+    price_source: str = 'baseline'
 
     @classmethod
     def of(cls, decision: Decision) -> 'Position':
@@ -63,7 +69,7 @@ class Position:
             outlay=decision.stake, fee=decision.fee,
             model_probability=decision.model_probability,
             baseline_probability=decision.baseline_probability,
-            edge=decision.edge,
+            edge=decision.edge, price_source=decision.price_source,
         )
 
     def payout(self, settled_up: bool) -> float:
@@ -180,7 +186,8 @@ class Book:
             return pd.DataFrame(columns=[
                 'symbol', 'window_open', 'settle_time', 'offset', 'side', 'contracts',
                 'price', 'outlay', 'fee', 'model_probability', 'baseline_probability',
-                'edge', 'settled_up', 'payout', 'pnl', 'return_on_stake', 'bankroll_after'])
+                'edge', 'price_source', 'settled_up', 'payout', 'pnl',
+                'return_on_stake', 'bankroll_after'])
         rows = []
         for s in self.settlements:
             p = s.position
@@ -190,7 +197,7 @@ class Book:
                 'contracts': p.contracts, 'price': p.price, 'outlay': p.outlay,
                 'fee': p.fee, 'model_probability': p.model_probability,
                 'baseline_probability': p.baseline_probability, 'edge': p.edge,
-                'settled_up': s.settled_up, 'payout': s.payout, 'pnl': s.pnl,
+                'price_source': p.price_source, 'settled_up': s.settled_up, 'payout': s.payout, 'pnl': s.pnl,
                 'return_on_stake': s.return_on_stake, 'bankroll_after': s.bankroll_after,
             })
         return pd.DataFrame(rows)

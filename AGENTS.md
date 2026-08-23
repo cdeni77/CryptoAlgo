@@ -50,7 +50,7 @@ backend/trader/
     promote.py     the only path to models/forecast.joblib
     live.py        score, price, decide, act. paper | live --dry-run | live
     check_venue.py prove the Kalshi key and series, read-only, places nothing
-  tests/           348 tests, ~35s in parallel
+  tests/           381 tests, ~90s in parallel
   configs/venue/   fee schedules (optional; defaults match the published one)
 
 backend/api/

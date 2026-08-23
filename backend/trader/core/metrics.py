@@ -220,7 +220,44 @@ class EvaluationReport:
 
     @property
     def mean_residual_scale(self) -> float:
+        """Reported, not gated. See `median_residual_scale`."""
         return float(np.mean([f.residual_scale for f in self.folds])) if self.folds else float('nan')
+
+    @property
+    def median_residual_scale(self) -> float:
+        """What the `residual_scale` gate reads.
+
+        The mean was the wrong aggregation for an overfitting detector. Measured
+        on a provably zero-signal null across three folds: two folds correctly
+        returned alpha ~0 and one ran to the 2.0 clip on a handful of trees, so
+        the **mean was 0.667** and cleared the 0.25 gate while two thirds of the
+        evidence said there was nothing there. The question the gate asks is
+        whether the correction survives out of sample *typically*, and one
+        runaway fold should not answer it.
+
+        A fold sitting exactly on a clip boundary is also not a fit — it means the
+        optimiser wanted more than the parameterisation allows, which on a null is
+        noise — so those are called out.
+
+        Two honest limits. With an even number of folds the median averages the two
+        middle values, so at two folds it *is* the mean and buys nothing. And at a
+        small sample alpha is noisy either way: measured on a 30-day two-fold null
+        it came back `[1.305, 0.0]`, while on a 70-day slice it reads 0.0000. This
+        gate is therefore a backstop and not the thing that catches a null —
+        `log_loss_skill` and `folds_skill_positive` are, and they did on the same
+        run. Do not treat a passing `residual_scale` as evidence of anything.
+        """
+        if not self.folds:
+            return float('nan')
+        values = np.asarray([f.residual_scale for f in self.folds], dtype=float)
+        at_bound = int(np.sum(np.isclose(values, 2.0) | np.isclose(values, 0.0)))
+        if at_bound:
+            logger.warning(
+                '%d of %d folds put the shrinkage on a clip boundary (%s). A '
+                'boundary is the optimiser giving up on the parameterisation, not '
+                'a fitted value.', at_bound, len(values),
+                ', '.join(f'{v:.3f}' for v in values))
+        return float(np.median(values))
 
     @property
     def max_control_gain_share(self) -> float:
@@ -272,7 +309,7 @@ class EvaluationReport:
             'calibration_error': self.max_ece,
             'calibration_max_deviation': self.max_calibration_deviation,
             'non_finite_rows': float(self.total_non_finite),
-            'residual_scale': self.mean_residual_scale,
+            'residual_scale': self.median_residual_scale,
             'control_gain_share': self.max_control_gain_share,
             'windows_evaluated': float(self.total_windows),
             'trades': float(continuous.n_trades) if continuous else 0.0,
