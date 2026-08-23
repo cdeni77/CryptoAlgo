@@ -20,8 +20,10 @@ RUN pip install --no-cache-dir -U pip && \
 # Copy full trader codebase
 COPY . .
 
-# Create data and model directories
-RUN mkdir -p /app/data /app/data/features /app/models /app/logs
+# Create data and model directories. No `data/features`: the feature panel is
+# built per fold and never persisted — a cached panel is a panel whose
+# provenance nobody can reconstruct.
+RUN mkdir -p /app/data /app/data/research /app/models /app/logs
 
 # Volume mount points for persistent data
 VOLUME ["/app/data", "/app/models", "/app/logs"]

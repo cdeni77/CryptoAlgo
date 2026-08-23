@@ -45,7 +45,6 @@ services:
       # No quotes around the default: `json.loads("'[]'")` raises, and the
       # exception is swallowed, so a quoted default was indistinguishable from
       # "not configured" — as would be a typo in a real wallet list.
-      - LEDGER_WALLETS_JSON=${LEDGER_WALLETS_JSON:-[]}
       # Shared secret for POST /research/launch, which starts a process in a
       # container holding the exchange keys. Unset means that route returns 503
       # — it fails closed rather than running unauthenticated.
@@ -90,17 +89,16 @@ services:
     # `frontend/.env` still applies to `npm run dev`.
 
   # ===========================================================================
-  # Trader — the research pipeline (scrape → features → signals), plus retraining
+  # Trader — the live loop
   #
-  # Each cycle, scripts.live_orchestrator runs:
-  #   run_pipeline  →  migrate_to_research_store  →  build_features  →  signals
+  # One service, not two. This replaces the previous orchestrator/paper-engine
+  # split, which had a signal writer and a fill simulator that disagreed about
+  # what had already happened. `scripts.live` does one cycle end to end: fetch
+  # bars, record minute prices, settle what matured, score the current window,
+  # price it, decide, act.
   #
-  # Retraining is on its own cadence (RETRAIN_EVERY_DAYS) and goes through
-  # scripts.promote, which installs a candidate only if every promotion gate in
-  # core/metrics.py passes. A blocked candidate leaves the previous model live
-  # and records why in models/promotions/.
-  #
-  # Configurable via environment variables (see defaults below).
+  # Defaults to paper mode and places nothing. Going live takes two flags, and
+  # they are separate on purpose — see the command block below.
   # ===========================================================================
   trader:
     build:
@@ -110,60 +108,36 @@ services:
     environment:
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
-      - TRADER_DIR=/trader
-      # Timezone
       - TZ=America/New_York
 
-      # Pipeline database (SQLite inside the container, persisted via volume)
+      # Scraper database (SQLite in the container, persisted via the volume below)
       - TRADER_DB_PATH=/app/data/trading.db
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
 
-      # Research store (Parquet + DuckDB), rebuilt from the scraper DB
+      # Research store (Parquet + DuckDB). Absolute, not cwd-relative: a relative
+      # path resolved against whatever directory a script started in created a
+      # second, empty store that simply went unread.
       - RESEARCH_STORE=/app/data/research
+      - MODELS_ROOT=/app/models
 
-      # Venue. Coinbase supplies the traded price; the reference venue is a
-      # deeper market used only for basis and lead-lag features.
-      #
-      # Coinbase spot, not Binance. Binance, OKX and Bybit all answer HTTP 451 to
-      # a US IP, so `binance` here resolved to no bars at all and the seven
-      # cross_venue features arrived as all-NaN columns — which build_panel
-      # reindexes into the canonical 76, so the panel keeps its shape and the
-      # feature_set_hash is identical to a populated one. Coinbase's own spot book
-      # is deeper than the nano perp, reachable without a proxy, and is the market
-      # the perp's index is built from, which makes its basis the thing that
-      # actually drives funding. The orchestrator refreshes it each cycle
-      # (`_scrape_reference`) only when this is `coinbase_spot`.
-      - TRADE_VENUE=coinbase
-      - REFERENCE_VENUE=coinbase_spot
+      # Kalshi. Only needed for `--mode live`; paper mode never opens a client.
+      # Prefer the PATH form — a PEM in an environment variable is a PEM in every
+      # process listing.
+      - KALSHI_KEY_ID=${KALSHI_KEY_ID:-}
+      - KALSHI_PRIVATE_KEY=${KALSHI_PRIVATE_KEY:-}
+      - KALSHI_PRIVATE_KEY_PATH=${KALSHI_PRIVATE_KEY_PATH:-}
+      - KALSHI_BASE_URL=${KALSHI_BASE_URL:-}
+      - KALSHI_SERIES_BTC=${KALSHI_SERIES_BTC:-KXBTCD}
+      - KALSHI_SERIES_ETH=${KALSHI_SERIES_ETH:-KXETHD}
+      - KALSHI_SERIES_SOL=${KALSHI_SERIES_SOL:-KXSOLD}
 
-      # The real CDE fee schedule, resolved by name out of configs/exchange.
-      # Without it every contract is priced at the hardcoded 10bp/side, which is
-      # wrong by 0.06x-2.5x depending on the contract — in both directions, so it
-      # inverts the ranking between coins. `configs/` lives inside
-      # backend/trader precisely so the Docker build context includes it.
-      - COST_CONFIG=coinbase_us_perps_cde_v202602.json
+      # Venue fee schedule, resolved by name out of configs/venue. Unset still
+      # prices correctly — the built-in defaults are the published Kalshi
+      # schedule — but records no version in a model's provenance. `configs/`
+      # lives inside backend/trader precisely so the build context includes it.
+      - FEE_CONFIG=${FEE_CONFIG:-}
 
-      - LEVERAGE=4
-      - EQUITY=100000
-
-      # Forecast horizon. Unset falls back to the coin profile's 96h hold, which
-      # carries ~70 effective observations against the ~200 the gates need on the
-      # ~400 days of CDE history that exist — so the loop could never train a
-      # promotable model. 24h with RECENCY_HALF_LIFE_DAYS=365 gives ~280, and is
-      # what the cost schedule argues for independently.
-      - HORIZON_HOURS=24
-      - RECENCY_HALF_LIFE_DAYS=365
-
-      # Scheduling
-      - CYCLE_INTERVAL_SECONDS=3600          # Max cycle interval (fallback)
-      - CYCLE_ALIGN_MINUTE=3                 # Run at :03 past every hour (1:03, 2:03, ...)
-      - INCREMENTAL_BACKFILL_HOURS=6         # Fetch last 6h of data each cycle
-      - RETRAIN_EVERY_DAYS=7                 # How long a promoted model stays live
-      - WALK_FORWARD_PERIODS=6               # Out-of-sample stretches per evaluation
-
-      # Logging
       - LOG_LEVEL=INFO
-
       # Optional: HTTP proxy for exchange API calls
       # - HTTPS_PROXY=http://your-proxy:8080
     depends_on:
@@ -180,112 +154,91 @@ services:
       retries: 3
       start_period: 20s
     volumes:
-      # Persist the SQLite DB, trained models, feature CSVs, and logs across restarts.
+      # Persist the scraper DB, the research store, models and logs.
       #
-      # These are named volumes, and they are mounted *deeper* than the
-      # `./backend/trader:/app` bind below — so Docker layers them on top, and the
-      # container never sees a `backend/trader/data` scraped on the host. A store
-      # built by hand is invisible here and the loop backfills from scratch into a
-      # second, hidden copy. Point TRADER_DATA_MOUNT at the host directory to use
-      # it instead (`TRADER_DATA_MOUNT=./backend/trader/data`); the named volume
-      # stays the default because `data/` is gitignored, so a bind default would
-      # be a path Docker creates empty on a clean clone. Whatever you set, both
-      # this service and paper-engine read it — test_deployment.py asserts they
-      # cannot diverge.
+      # These are named volumes mounted *deeper* than the `./backend/trader:/app`
+      # bind below, so Docker layers them on top and the container never sees a
+      # `backend/trader/data` scraped on the host. A store built by hand is
+      # invisible here and the loop backfills from scratch into a second, hidden
+      # copy. Point TRADER_DATA_MOUNT at the host directory to use it instead
+      # (`TRADER_DATA_MOUNT=./backend/trader/data`); the named volume stays the
+      # default because `data/` is gitignored, so a bind default would be a path
+      # Docker creates empty on a clean clone.
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
       - trader_logs:/app/logs
-      # Mount source for development (remove in production)
+      # Source mount for development (remove in production).
       - ./backend/trader:/app
-      # `configs/` already lives inside backend/trader, so the bind mount above
-      # brings it in. Mounting a repo-root `./configs` here created an empty
-      # host directory and masked the real one, which is exactly the bug the
-      # note above describes: find_cost_config() then found nothing and every
-      # contract was priced at the hardcoded default.
-      # No paper_candidates mount: nothing in the codebase reads that path (it was
-      # an overlay for the deleted optimizer scripts). Adding a `.gitkeep` to make
-      # the bind source exist satisfied the test without removing the problem —
-      # and `.gitignore`'s blanket `data/` rule swallowed the file anyway, so the
-      # suite failed from a clean clone while passing locally.
-    # The orchestrator: initial backfill (30d) then hourly cycles
-    # 400 days, not 30. `--backfill-days` sets the depth of the FIRST cycle only
-    # — every cycle after it uses INCREMENTAL_BACKFILL_HOURS — so on a store that
-    # already holds history this is a cheap gap-fill, and on an empty one it
-    # *defines* the dataset. At 30 days a 24h horizon carries roughly 30 effective
-    # observations against the ~200 the promotion gates need, so every candidate
-    # would fail the sample-size gate for a reason nothing in the log named, and
-    # the loop would look healthy for weeks. 400 covers the whole of CDE: BIP, the
-    # oldest contract, was listed 2025-07-18. The reference-venue leg uses the
-    # same window, which is all the spot history the panel can use — it is joined
-    # onto the perp index, so bars older than the oldest perp are unreachable.
+    # Paper mode, cycling every minute. It scores, prices and records; it places
+    # nothing and needs no Kalshi credentials.
+    #
+    # To trade for real, two flags, and they are separate deliberately — one flag
+    # guarding an irreversible action is one typo away from being wrong:
+    #
+    #   -m scripts.live --loop --mode live --dry-run        read the real book
+    #   -m scripts.live --loop --mode live --place-orders    place orders
+    #
+    # `--require-gates` is on by default and refuses to trade an artifact whose
+    # promotion was blocked. There is no artifact at all until
+    # `python -m scripts.promote` installs one, and the loop exits saying so.
     command: >
-      -m scripts.live_orchestrator
-        --backfill-days 400
+      -m scripts.live
+        --loop
+        --cycle-seconds 60
 
   # ===========================================================================
-  # Paper Engine — consumes signals from PostgreSQL and simulates fills
+  # Scrape — one-off, runs to completion then exits
+  #
+  # Phase 0. Five years of one-minute bars for the three symbols: ~2.6M minutes
+  # each, ~8,800 requests each, a few hours. Resumable — an interrupted run
+  # continues rather than restarting, and a re-run on a populated store fetches
+  # only what is missing at either end.
+  #
+  #   docker compose run --rm scrape
+  #   docker compose run --rm scrape -m scripts.sync_store
   # ===========================================================================
-  paper-engine:
+  scrape:
+    profiles: ["tools"]
     build:
       context: ./backend/trader
       dockerfile: Dockerfile
-    restart: unless-stopped
     environment:
-      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
-      - TZ=America/New_York
-      # The paper engine accrues funding from the research store and prices
-      # fills from the venue fee schedule. With neither set it read an empty
-      # store (so funding was silently never accrued) and fell back to the
-      # hardcoded 10bp/side — the two failures its own docstring exists to fix.
+      - COINBASE_API_KEY=${COINBASE_API_KEY:-}
+      - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
+      - TRADER_DB_PATH=/app/data/trading.db
       - RESEARCH_STORE=/app/data/research
-      - COST_CONFIG=coinbase_us_perps_cde_v202602.json
-      # Must match the trader's LEVERAGE. This engine reads config.leverage for
-      # the margin it reserves and for the `cash * leverage` cap that clips a
-      # signal's contract count, so a mismatch means the book sizes positions
-      # differently from the signal writer that produced them.
-      - LEVERAGE=4
       - LOG_LEVEL=INFO
-    depends_on:
-      db:
-        condition: service_healthy
-      trader:
-        condition: service_started
     volumes:
-      # The store the orchestrator writes is the store this reads — same default,
-      # same override, or funding is accrued from a store nothing collected into.
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ./backend/trader:/app
     command: >
-      -m scripts.paper_engine
-        --poll-seconds 5
-        --max-signal-age-minutes 60
+      -m scripts.scrape
+        --backfill-days 1825
 
   # ===========================================================================
-  # Trader — one-off evaluation (runs once, then exits)
+  # Evaluate — one-off. Walk-forward, gates, cost stress. Installs nothing.
   #
-  # Uncomment to walk-forward backtest a candidate, run the simulation stack and
-  # print the promotion gates without installing anything. Swap the command for
-  # `python -m scripts.promote` to install it if the gates pass, or
-  # `python -m scripts.preflight` to check whether the data can train at all.
+  #   docker compose run --rm evaluate
+  #   docker compose run --rm evaluate -m scripts.baseline       # read this first
+  #   docker compose run --rm evaluate -m scripts.promote        # install if it passes
+  #   docker compose run --rm evaluate -m scripts.promote --history
   # ===========================================================================
-  # trader-evaluate:
-  #   build:
-  #     context: ./backend/trader
-  #     dockerfile: Dockerfile
-  #   environment:
-  #     - TRADER_DB_PATH=/app/data/trading.db
-  #     - RESEARCH_STORE=/app/data/research
-  #     - LOG_LEVEL=INFO
-  #   volumes:
-  #     - trader_data:/app/data
-  #     - trader_models:/app/models
-  #     - trader_logs:/app/logs
-  #     - ./backend/trader:/app
-  #   command: >
-  #     python -m scripts.backtest
-  #       --full
-  #       --venue coinbase
-  #       --cost-config coinbase_us_perps_cde_v202602.json
+  evaluate:
+    profiles: ["tools"]
+    build:
+      context: ./backend/trader
+      dockerfile: Dockerfile
+    environment:
+      - RESEARCH_STORE=/app/data/research
+      - MODELS_ROOT=/app/models
+      - FEE_CONFIG=${FEE_CONFIG:-}
+      - LOG_LEVEL=INFO
+    volumes:
+      - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
+      - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
+      - ./backend/trader:/app
+    command: >
+      -m scripts.evaluate
 
 volumes:
   postgres_data:
