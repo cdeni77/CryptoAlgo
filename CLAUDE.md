@@ -401,6 +401,66 @@ none of the gate stack has been run against it. And nothing here is promoted:
 `ic_covers_cost` reads the price head against the raw target, so a residual model
 would need its own measurement wired in before it could pass a gate.
 
+### The signal is real, it is 2bp, and the toll is 29bp
+
+Five years of Coinbase spot (655k rows, 15 names with >= 1100 days, four regime
+transitions) is enough to resolve what 400 days could not. The residual capacity
+ladder across four horizons:
+
+| horizon | sigma_resid | best test IC | folds | required IC | ratio |
+|---|---:|---:|---:|---:|---:|
+| **4h** | 119.7bp | **+0.0208** | **6/6** | 0.245 | 0.085x |
+| 24h | 303.4bp | +0.0062 | 5/6 | 0.097 | 0.064x |
+| 96h | 398.3bp | -0.0151 | 4/6 | 0.074 | negative |
+| 168h | 941.1bp | -0.0321 | 4/6 | 0.031 | negative |
+
+**The effect lives entirely at h=4h.** Per-fold ICs, `lgbm_production`, purged
+expanding-window folds:
+
+    2022-12 -> 2023-07   +0.0250
+    2023-07 -> 2024-02   +0.0300
+    2024-02 -> 2024-10   +0.0180
+    2024-10 -> 2025-05   +0.0130
+    2025-05 -> 2026-01   +0.0020
+    2026-01 -> 2026-08   +0.0235
+
+    mean +0.0186 | sd 0.0100 | SE 0.0041 | t = +4.54 | p = 0.006
+
+Six of six positive across a bear tail, a recovery, a bull and the present. The SE
+is measured from fold dispersion, not from `N/(1+(N-1)rho)` — that formula is
+degenerate here, because cross-sectional demeaning mechanically forces the average
+pairwise correlation to about `-1/(N-1)` and the denominator goes negative. Any
+breadth-derived standard error on a demeaned panel is unsafe.
+
+Three caveats that travel with it. This is the best of 8 rungs x 4 horizons, so
+Bonferroni puts p at 0.20 — not significant under the strictest correction; what
+partly offsets that is replication across model families at the same horizon
+(`ridge_all` +0.0130, `lgbm_small` +0.0137, `lgbm_production` +0.0208). The
+magnitude is unstable, varying 15x across folds with one fold at zero. And the
+folds share training data, so the SE is probably a little optimistic.
+
+**None of that changes the decision, because the economics do not depend on it:**
+
+    edge = IC x sigma = 0.0186 x 119.7bp = 2.2bp per 4-hour period
+    toll = 29.3bp round trip on CDE
+         = 13x short
+
+**Break-even needs a round trip at or below ~2.5bp.** That is the useful output of
+this whole line of work — not a model, a threshold, measured rather than
+estimated. Liquid ETFs and index futures are roughly 1-2bp. The cheapest offshore
+crypto perp is ~11bp, still 4x too much. CDE at 27-65bp is 11-26x too much.
+
+And the horizon lever is closed: required IC falls as `1/sqrt(h)`, but the
+measured IC decays *faster*, so the ratio gets worse with the hold (0.085x at
+h=4h, 0.064x at h=24h, negative beyond). Holding longer to amortise a fixed toll
+only works if the forecast survives the horizon. This one does not.
+
+Deliberately not claimed: plugging this into `IR ~ IC x sqrt(breadth x periods)`
+produces a headline Sharpe near 4, and it is not credible — it assumes full
+deployment on every name every period, no capacity limit and no decay within the
+hold. The per-period figure and the 2.5bp threshold are what the measurement
+supports.
+
 ### The market-neutral book: first positive net P&L, and why it is not evidence
 
 `scripts.cross_sectional_backtest` turns the residual IC into a book — rank the
