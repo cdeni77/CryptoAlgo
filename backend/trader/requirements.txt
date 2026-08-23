@@ -35,10 +35,16 @@ joblib
 # Optional Redis-backed queue (in-memory queue remains default)
 redis>=5.0.0
 
-# Research store (core/datastore.py, core/search.py). Imported at module scope by
-# every script via scripts/_common.py, so the container cannot start without them.
+# Research store (core/datastore.py). Imported at module scope by every research
+# script via scripts/_common.py, so the container cannot start without them.
 duckdb>=1.0.0
 pyarrow>=15.0.0
+
+# Kalshi authentication. RSA-PSS over SHA-256, not an HMAC secret, so this is a
+# hard requirement rather than a transitive one — `data_collection/kalshi_client`
+# imports it at signing time and the container would fail on the first live
+# cycle without it.
+cryptography>=42.0.0
 
 # Postgres bridge (for pg_writer.py)
 sqlalchemy>=2.0.0

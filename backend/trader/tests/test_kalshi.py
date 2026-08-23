@@ -197,3 +197,66 @@ def test_a_request_before_opening_the_client_is_an_error(key_pem):
     client = KalshiClient(key_id='k', private_key_pem=key_pem)
     with pytest.raises(KalshiError, match='not open'):
         asyncio.run(client._request('GET', '/markets'))
+
+
+# ------------------------------------------------------- the preflight script
+
+def test_the_preflight_cannot_place_an_order():
+    """It constructs the client without live=True, so ordering is impossible.
+
+    A read-only check that could trade would be worse than no check at all.
+    """
+    import inspect
+
+    from scripts import check_venue
+
+    source = inspect.getsource(check_venue)
+    assert 'live=False' in source
+    assert 'place_order' not in source
+
+
+def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
+    """Both surface as an HTTP error and the fix is completely different.
+
+    Measured: this container's own egress policy returns 403 "Host not in
+    allowlist", which under the previous message read as "the key id and the
+    private key are not a pair" — sending the reader to rotate a credential that
+    was never even seen.
+    """
+    import inspect
+
+    from scripts import check_venue
+
+    source = inspect.getsource(check_venue.main)
+    assert 'allowlist' in source
+    assert 'NETWORK policy' in source
+    assert source.index('allowlist') < source.index('rejected the signature'), (
+        'the auth branch is checked first, so a network block is reported as an '
+        'auth failure'
+    )
+
+
+def test_the_preflight_is_launchable_from_the_dashboard():
+    """It is read-only, so the job allow-list should include it."""
+    import sys
+    from pathlib import Path
+
+    api_root = Path(__file__).resolve().parents[2] / 'api'
+    if not api_root.exists():
+        pytest.skip('API package not present')
+    sys.path.insert(0, str(api_root))
+    try:
+        for name in list(sys.modules):
+            if name.startswith(('endpoints', 'security')):
+                del sys.modules[name]
+        from endpoints.jobs import JOBS
+
+        assert 'scripts.check_venue' in JOBS
+        # And the live loop is deliberately NOT launchable from a web request:
+        # two copies racing over one account.
+        assert 'scripts.live' not in JOBS
+    finally:
+        sys.path.remove(str(api_root))
+        for name in list(sys.modules):
+            if name.startswith(('endpoints', 'security')):
+                del sys.modules[name]

@@ -305,6 +305,7 @@ python -m scripts.promote                     # install, gates permitting
 python -m scripts.promote --history           # what has been tried, and why not
 
 # Phase 5 — trading
+python -m scripts.check_venue                       # prove the key, read-only
 python -m scripts.live                              # paper
 python -m scripts.live --mode live --dry-run        # real book, no orders
 python -m scripts.live --mode live --place-orders   # real orders
@@ -335,6 +336,19 @@ abstains.
 Credentials: `KALSHI_KEY_ID` plus `KALSHI_PRIVATE_KEY` (the PEM) or
 `KALSHI_PRIVATE_KEY_PATH`. Auth is RSA-PSS over SHA-256 of
 `timestamp + METHOD + path`, not an HMAC secret.
+
+`scripts/check_venue.py` proves all of it before any money moves, and answers the
+four questions separately so a failure names itself: does the PEM load, does the
+venue accept the signature, do the series tickers exist, and can a market be
+resolved for the next window. It constructs the client without `live=True`, so it
+cannot place an order even if something in it tried. It also prints the real
+book, which is how the assumed 1c half-spread gets checked against a measured
+one.
+
+**The series tickers in `.env.example` are unverified.** `KXBTCD`/`KXETHD`/
+`KXSOLD` are a guess; `check_venue` is how you find out. A wrong series fails
+loudly — "no market closes within 90s of ..." — rather than trading a
+neighbouring contract.
 
 **The honest state of things.** As of this writing there is no scraped data, no
 trained model, and no measured edge. The phase gates exist because the edge is a

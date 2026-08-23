@@ -43,6 +43,7 @@ TRADER_DIR = Path(os.getenv('TRADER_DIR', '/app'))
 JOBS: dict[str, str] = {
     'scripts.scrape': 'fetch one-minute Coinbase spot bars into SQLite',
     'scripts.sync_store': 'copy SQLite rows into the Parquet research store',
+    'scripts.check_venue': 'prove the Kalshi credentials and series, read only',
     'scripts.baseline': 'fit and report the barrier baseline',
     'scripts.evaluate': 'walk-forward evaluation with gates and cost stress',
     'scripts.train': 'fit one model for inspection',
