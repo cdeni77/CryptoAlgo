@@ -282,3 +282,39 @@ def test_the_series_are_the_fifteen_minute_ones():
             f'{symbol} points at {series!r}; without the 15M suffix this is an '
             f'hourly threshold series and every window will abstain'
         )
+
+
+def test_resolution_uses_close_time_and_not_the_ticker():
+    """The ticker is named in Eastern; `close_time` is UTC.
+
+    `KXBTC15M-26AUG230045` settles at 04:45Z, because 00:45 EDT is 04:45 UTC.
+    Parsing the ticker for its settlement would mean hardcoding the venue's
+    timezone and its daylight-saving rule, and being wrong twice a year — so this
+    asserts the resolver never looks at the ticker string.
+    """
+    import asyncio
+    import inspect
+    from datetime import datetime, timezone
+
+    from data_collection import kalshi_client
+
+    source = inspect.getsource(kalshi_client.KalshiClient.resolve_window_market)
+    assert 'close_time' in source
+    for parsed in ('ticker[', 'strptime', '%b', 'AUG'):
+        assert parsed not in source, (
+            f'{parsed!r} suggests the ticker is being parsed for a time'
+        )
+
+    # And behaviourally: a ticker whose name disagrees with its close_time must
+    # be matched on the close_time.
+    client = kalshi_client.KalshiClient(key_id='k', private_key_pem='')
+    settle = datetime(2026, 8, 23, 4, 45, tzinfo=timezone.utc)
+
+    async def markets(**_):
+        return [{'ticker': 'KXBTC15M-26AUG230045-45',
+                 'close_time': '2026-08-23T04:45:00Z'}]
+
+    client.markets = markets
+    found = asyncio.run(client.resolve_window_market('KXBTC15M', settle))
+    assert found is not None
+    assert found['ticker'] == 'KXBTC15M-26AUG230045-45'

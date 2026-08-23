@@ -48,8 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--series', type=str, default=None,
                         help='Comma-separated series tickers to try instead of '
                              'the configured ones.')
-    parser.add_argument('--windows', type=int, default=2,
-                        help='How many upcoming windows to try resolving.')
+    parser.add_argument('--windows', type=int, default=1,
+                        help='How many windows to try resolving. Default 1 — the '
+                             'venue lists only the window currently open, so '
+                             'asking for more reports expected absences as '
+                             'failures.')
     return parser
 
 
@@ -171,9 +174,17 @@ async def main() -> int:
                 'against')
             return 1
 
+        # The venue lists exactly one open market per series: the window
+        # currently running. The next one is created when this one settles. So
+        # step 1 is the live window and anything beyond it is expected to be
+        # absent — which is worth stating, because the abstention message reads
+        # like a failure and is not one.
         now = datetime.now(timezone.utc)
         window = now.replace(second=0, microsecond=0)
         window -= timedelta(minutes=window.minute % DEFAULT_CONFIG.window_minutes)
+        if args.windows > 1:
+            note('windows beyond the first are not listed yet; their absence is '
+                 'the venue not having created them, not a misconfiguration')
         for step in range(1, args.windows + 1):
             settle = window + timedelta(
                 minutes=DEFAULT_CONFIG.window_minutes * step)
@@ -191,9 +202,15 @@ async def main() -> int:
                 ticker = str(market.get('ticker', ''))
                 quote = await client.quote(ticker)
                 if not quote.tradeable():
-                    bad(f'{symbol}: {ticker} resolved but is not tradeable '
+                    bad(f'{symbol}: {ticker} resolved but has no two-sided book '
                         f'(status {quote.status}, bid {quote.yes_bid}, '
-                        f'ask {quote.yes_ask})')
+                        f'ask {quote.yes_ask}, volume {quote.volume:,})')
+                    note('the market exists and the resolution worked — there is '
+                        'simply nobody quoting it right now. A spread cannot be '
+                        'crossed that does not exist, so the live loop abstains.')
+                    note('This is the assumption most likely to sink the whole '
+                         'idea, and it is measurable: '
+                         '`python -m scripts.measure_book --hours 24`')
                     failures += 1
                     continue
                 spread_cents = (quote.spread or 0) * 100

@@ -2,13 +2,27 @@
 
 **Markets are resolved by asking the venue, never by building a ticker.** A
 15-minute up/down market has a ticker, and it would be easy to construct one
-from a series prefix, a date and a strike. That is a guess that keeps working
+from a series prefix, a date and a time. That is a guess that keeps working
 until the venue renames a series or changes a format, and then it fails by
 finding *no* market — or, far worse, the wrong one. So `resolve_window_market`
 lists the venue's own markets and picks the one whose close time is the window's
 settlement. It re-derives its answer from the venue every run and fails loudly
-when the venue moves, which is the same principle the research code uses for
-instrument selection.
+when the venue moves.
+
+Two measured reasons this is not over-caution. `KXBTCD` looks like the daily
+Bitcoin series and is in fact hourly with an explicit strike in the ticker
+(`KXBTCD-26AUG2317-T86749.99`) — a threshold ladder, not an up/down market;
+pointed at it, every window abstained with the distance printed rather than
+trading a contract 30 minutes away. And the 15-minute tickers are named in
+**Eastern** time while `close_time` is UTC: `KXBTC15M-26AUG230045` closes at
+04:45Z, because 00:45 EDT is 04:45 UTC. Parsing the ticker for its settlement
+would mean hardcoding the venue's timezone and its daylight-saving rule, and
+would be wrong twice a year. `close_time` is unambiguous, so that is what is
+compared.
+
+The venue lists **one open market per series** — the window currently running.
+The next is created when this one settles, so a lookahead resolution correctly
+finds nothing, and the live loop only ever needs the window it is inside.
 
 **Live decisions must be priced against the real book.** The backtest has no
 quote history, so it stands the calibrated baseline in for the market — a
