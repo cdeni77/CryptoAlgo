@@ -156,9 +156,47 @@ def _as_datetime(value) -> datetime:
     return datetime.fromisoformat(text)
 
 
+def coalesce(gaps: list[tuple[datetime, datetime]], *, span_minutes: int
+             ) -> list[tuple[datetime, datetime]]:
+    """Merge nearby gaps into spans one request can cover.
+
+    The pagination bug left holes exactly 301 minutes apart, which is one more
+    than a request can span, so those coalesce into nothing — but a store with
+    clustered outages (SOL has 211 multi-minute runs) collapses a long way, and
+    the venue is billed per request either way.
+    """
+    if not gaps:
+        return []
+    merged = [gaps[0]]
+    for start, end in gaps[1:]:
+        first_start, _ = merged[-1]
+        if int((end - first_start).total_seconds() // 60) <= span_minutes:
+            merged[-1] = (first_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
 async def fill_gaps(pipeline: DataPipeline, symbols: list[str], db_path: str,
                     venue: str, *, min_minutes: int) -> int:
-    """Re-request every gap, then report what came back."""
+    """Re-request every gap, forcing the fetch, and report what came back.
+
+    Two things used to make this a no-op at scale.
+
+    It called `pipeline.backfill()` without `force`, and `backfill` resumes from
+    the store's own boundaries — so for an *interior* hole the prepend branch was
+    skipped and `append_start` jumped past the requested `end`. Nothing was
+    fetched, and it logged "store already covers ... which spans the request".
+    That is why ~10,000 recoverable minutes per symbol survived every run of the
+    tool built to recover them.
+
+    And it took a `COUNT(*)` over the whole table before and after each gap.
+    Measured on the real store: 141ms a call, 2 calls x 8,721 gaps = **41 minutes
+    of pure counting per symbol**. Counting once per symbol is the same
+    information.
+    """
+    from data_collection.coinbase_connector import MAX_CANDLES_PER_REQUEST
+
     recovered = 0
     for symbol in symbols:
         gaps = find_gaps(db_path, symbol, TIMEFRAME, venue, min_minutes=min_minutes)
@@ -166,24 +204,28 @@ async def fill_gaps(pipeline: DataPipeline, symbols: list[str], db_path: str,
             logger.info('%s: no gaps of %d+ minutes', symbol, min_minutes)
             continue
         total = sum(int((b - a).total_seconds() // 60) for a, b in gaps)
-        logger.info('%s: %d gap(s) totalling %d minutes', symbol, len(gaps), total)
-        for start, end in gaps:
-            span = int((end - start).total_seconds() // 60)
-            logger.info('  refetching %s..%s (%d minutes)',
-                        f'{start:%Y-%m-%d %H:%M}', f'{end:%Y-%m-%d %H:%M}', span)
-            before = _stored_count(db_path, symbol, venue)
-            # A minute either side, so a boundary bar is not missed by an
-            # off-by-one in the range the venue considers inclusive.
-            await pipeline.backfill(
-                start=start - timedelta(minutes=1),
-                end=end + timedelta(minutes=1),
-                symbols=[symbol], timeframes=[TIMEFRAME])
-            gained = _stored_count(db_path, symbol, venue) - before
-            recovered += gained
-            if gained == 0:
-                logger.info('    nothing returned — the venue has no data here')
-            else:
-                logger.info('    recovered %d bars', gained)
+        # A minute either side, so a boundary bar is not missed by an off-by-one
+        # in the range the venue treats as inclusive.
+        padded = [(a - timedelta(minutes=1), b + timedelta(minutes=1))
+                  for a, b in gaps]
+        requests = coalesce(padded, span_minutes=MAX_CANDLES_PER_REQUEST - 1)
+        logger.info('%s: %d gap(s) totalling %d minutes, in %d request(s)',
+                    symbol, len(gaps), total, len(requests))
+
+        before = _stored_count(db_path, symbol, venue)
+        for index, (start, end) in enumerate(requests, 1):
+            if index == 1 or index % 250 == 0 or index == len(requests):
+                logger.info('  [%d/%d] %s..%s', index, len(requests),
+                            f'{start:%Y-%m-%d %H:%M}', f'{end:%Y-%m-%d %H:%M}')
+            await pipeline.backfill(start=start, end=end, symbols=[symbol],
+                                    timeframes=[TIMEFRAME], force=True)
+        gained = _stored_count(db_path, symbol, venue) - before
+        recovered += gained
+        logger.info('%s: recovered %d of %d missing minutes (%.1f%%)',
+                    symbol, gained, total, 100.0 * gained / total if total else 0.0)
+        if gained < total:
+            logger.info('  the remainder is minutes in which nothing traded — the '
+                        'venue has no candle and never will')
     return recovered
 
 

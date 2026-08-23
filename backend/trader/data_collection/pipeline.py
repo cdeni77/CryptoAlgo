@@ -230,7 +230,28 @@ class DataPipeline:
         return inserted
 
     async def backfill(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
-                       symbols: Optional[List[str]] = None, timeframes: Optional[List[str]] = None):
+                       symbols: Optional[List[str]] = None, timeframes: Optional[List[str]] = None,
+                       force: bool = False):
+        """Fetch history into the store.
+
+        By default this is *resumable*: it prepends anything older than the
+        earliest stored bar and appends anything newer than the latest, and skips
+        a range the store already spans. That is right for growing a store and
+        wrong for repairing one.
+
+        `force=True` fetches exactly `[start, end]` and writes it, whatever is
+        already there. Without it, `scripts/scrape.py:fill_gaps` could not do its
+        job at all: for an interior hole the prepend branch is skipped (the hole
+        is newer than the store's first bar) and `append_start` jumps to
+        `last_time + 1min`, which is *past* the requested `end` — so the fetch
+        never happened and it logged "store already covers ... which spans the
+        request". Ten thousand recoverable minutes per symbol sat in that hole
+        while the tool built to recover them reported success.
+
+        Writes are `INSERT OR REPLACE` on `UNIQUE(symbol, timeframe, venue,
+        event_time)`, so a forced refetch is idempotent and also repairs a bar
+        that was stored wrong — a partial candle, for instance.
+        """
         end = ensure_naive_utc(end) if end else utc_now()
         start = ensure_naive_utc(start) if start else (end - timedelta(days=self.config.backfill_days))
         symbols = symbols or self.config.symbols
@@ -255,6 +276,26 @@ class DataPipeline:
                         symbol, timeframe, venue=venue)
                 )
                 fetched_any = False
+
+                if force:
+                    logger.info(
+                        f"Refetching {symbol} {timeframe} {start} to {end} "
+                        f"(forced; ignoring what the store already holds)")
+                    try:
+                        bars = await self._fetch_bars(symbol, timeframe, start, end)
+                        if not bars:
+                            logger.info(
+                                f"   {symbol} {timeframe}: the venue served no bars "
+                                f"for {start}..{end}")
+                        elif not self._process_and_insert_bars(
+                                bars, symbol, timeframe, venue):
+                            logger.error(
+                                f"   {symbol} {timeframe}: fetched {len(bars):,} "
+                                f"bars and stored none. That is a write failure, "
+                                f"not missing history.")
+                    except Exception as exc:
+                        logger.error(f"Error refetching {symbol} {timeframe}: {exc}")
+                    continue
 
                 # Prepend: history older than anything stored. This branch was
                 # deleted along with CCXT and nothing replaced it, so on a
