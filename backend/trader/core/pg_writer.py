@@ -692,6 +692,28 @@ class PgWriter:
             )
 
     # ---- the market benchmark -------------------------------------------
+    def scored_against_market(self) -> list[tuple]:
+        """Every settled window where the venue's own probability was recorded.
+
+        `(symbol, window_open, offset_minutes, market_probability,
+        baseline_probability, model_probability, outcome)`.
+
+        Traded *and* refused, which is the point — the traded subset is selected by
+        our own model's opinion, and it is our own opinion under test.
+        """
+        with self._session() as session:
+            return list(
+                session.query(
+                    Prediction.symbol, Prediction.window_open,
+                    Prediction.offset_minutes, Prediction.market_probability,
+                    Prediction.baseline_probability, Prediction.model_probability,
+                    Prediction.outcome)
+                .filter(Prediction.market_probability.isnot(None))
+                .filter(Prediction.outcome.isnot(None))
+                .order_by(Prediction.window_open)
+            )
+
+
     def windows_awaiting_outcome(self, now: datetime, *, limit: int = 500
                                 ) -> list[tuple[str, datetime, datetime, float]]:
         """Settled windows whose predictions still have no realised outcome.
