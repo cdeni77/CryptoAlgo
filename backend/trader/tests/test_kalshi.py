@@ -260,3 +260,25 @@ def test_the_preflight_is_launchable_from_the_dashboard():
         for name in list(sys.modules):
             if name.startswith(('endpoints', 'security')):
                 del sys.modules[name]
+
+
+def test_the_series_are_the_fifteen_minute_ones():
+    """`KXBTCD` is the hourly series, and pointing at it abstains on every window.
+
+    Measured against the live venue: `KXBTCD` returns 200 open markets, all
+    closing on the hour, with an explicit strike in the ticker
+    (`KXBTCD-26AUG2317-T86749.99`) — a threshold ladder, not an up/down market.
+    The 15-minute series is `KXBTC15M`, whose tickers are series + date + HHMM
+    with no strike, because the strike is the price at the window's open.
+
+    Worth a test rather than a comment: the failure was silent in the sense that
+    everything reported healthy — credentials fine, series present, hundreds of
+    markets — and only the resolution step said no.
+    """
+    from scripts.live import SERIES_BY_SYMBOL
+
+    for symbol, series in SERIES_BY_SYMBOL.items():
+        assert series.endswith('15M'), (
+            f'{symbol} points at {series!r}; without the 15M suffix this is an '
+            f'hourly threshold series and every window will abstain'
+        )

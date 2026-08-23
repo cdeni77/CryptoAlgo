@@ -70,10 +70,17 @@ FETCH_MINUTES = 1_500
 # Resolved to an actual market by close time — see
 # `KalshiClient.resolve_window_market` — so a series rename fails loudly here
 # rather than silently trading the wrong contract.
+#
+# The `15M` suffix is load-bearing. `KXBTCD` was tried first and every window
+# abstained: it is the *hourly* series, and its tickers carry an explicit strike
+# (`KXBTCD-26AUG2317-T86749.99`), making it a threshold ladder rather than an
+# up/down market. `KXBTC15M-26AUG230030` is series + date + HHMM with no strike
+# suffix, which is the tell — the strike is the price at the window's open, and
+# that is exactly what `core/windows.py` builds a target from.
 SERIES_BY_SYMBOL = {
-    'BTC-USD': os.getenv('KALSHI_SERIES_BTC', 'KXBTCD'),
-    'ETH-USD': os.getenv('KALSHI_SERIES_ETH', 'KXETHD'),
-    'SOL-USD': os.getenv('KALSHI_SERIES_SOL', 'KXSOLD'),
+    'BTC-USD': os.getenv('KALSHI_SERIES_BTC', 'KXBTC15M'),
+    'ETH-USD': os.getenv('KALSHI_SERIES_ETH', 'KXETH15M'),
+    'SOL-USD': os.getenv('KALSHI_SERIES_SOL', 'KXSOL15M'),
 }
 
 # Minute prices older than this are dropped from the serving store each cycle.

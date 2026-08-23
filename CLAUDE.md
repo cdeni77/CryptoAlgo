@@ -345,10 +345,16 @@ cannot place an order even if something in it tried. It also prints the real
 book, which is how the assumed 1c half-spread gets checked against a measured
 one.
 
-**The series tickers in `.env.example` are unverified.** `KXBTCD`/`KXETHD`/
-`KXSOLD` are a guess; `check_venue` is how you find out. A wrong series fails
-loudly — "no market closes within 90s of ..." — rather than trading a
-neighbouring contract.
+**The series are `KXBTC15M` / `KXETH15M` / `KXSOL15M`**, and the `15M` matters.
+`KXBTCD` was tried first: it exists, it has hundreds of open markets, and every
+window abstained — because it closes on the *hour* and its tickers carry an
+explicit strike (`KXBTCD-26AUG2317-T86749.99`), making it a threshold ladder
+rather than an up/down market. `KXBTC15M-26AUG230030` is series + date + HHMM
+with no strike suffix, which is the tell: the strike is the price at the window's
+open, which is what `core/windows.py` builds.
+
+That abstention was the resolution logic working. A ticker built from a pattern
+would have found *something* 15 or 30 minutes away and traded it.
 
 **The honest state of things.** As of this writing there is no scraped data, no
 trained model, and no measured edge. The phase gates exist because the edge is a
