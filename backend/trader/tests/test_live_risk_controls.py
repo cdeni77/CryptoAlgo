@@ -210,3 +210,107 @@ class TestDecideRefusals:
         assert d.side is Side.DOWN
         assert d.model_probability == pytest.approx(0.72)
         assert d.baseline_probability == pytest.approx(0.60)
+
+
+class TestMarketBenchmark:
+    """The recorded quote is worthless without the answer beside it.
+
+    `market_probability` was written on every decision and read by nothing, there
+    was no `outcome` column on `predictions` at all, and `positions` — the only
+    place an outcome existed — covers just the windows that traded. So the one
+    economically meaningful question, "is the market's probability better than
+    ours", could not be asked of an unselected sample.
+    """
+
+    def prediction(self, w: PgWriter, *, symbol: str, window: datetime,
+                   offset: int, strike: float, mid: float | None) -> None:
+        w.write_prediction(
+            symbol=symbol, window_open=window,
+            settle_time=window + timedelta(minutes=15), offset_minutes=offset,
+            decision_time=window + timedelta(minutes=offset), strike=strike,
+            last_price=strike, displacement=0.0, sigma_remaining=0.001,
+            z_score=0.0, baseline_probability=0.5, model_probability=0.55,
+            market_probability=mid, market_ask_up=0.53, market_ask_down=0.49,
+            price_source='quote', reason='edge_below_gate', traded=False,
+            side=None, price=None, effective_cost=None, edge=None,
+            contracts=None, model_version=None)
+
+    def bars(self, symbol: str, minute: datetime, value: float) -> dict:
+        return {symbol: pd.DataFrame([{
+            'event_time': pd.Timestamp(minute), 'open': value, 'high': value,
+            'low': value, 'close': value, 'volume': 1.0}])}
+
+    def test_a_refused_window_still_gets_its_outcome(self, writer):
+        """The whole point: the unselected sample is the useful one."""
+        from scripts.live import settle_predictions
+
+        window = NOW - timedelta(minutes=30)
+        for offset in (3, 6, 9, 12):
+            self.prediction(writer, symbol='BTC-USD', window=window,
+                            offset=offset, strike=100.0, mid=0.52)
+        settle_minute = window + timedelta(minutes=14)
+        filled = settle_predictions(
+            writer, self.bars('BTC-USD', settle_minute, 101.0), now=NOW)
+
+        assert filled == 4, f'expected all four offsets filled, got {filled}'
+        with writer._session() as session:  # noqa: SLF001
+            from core.pg_writer import Prediction
+            rows = session.query(Prediction).all()
+            assert {r.outcome for r in rows} == {1}
+            assert {r.market_probability for r in rows} == {0.52}
+
+    def test_the_outcome_uses_the_trained_rule(self, writer):
+        """`>=` on the mean of the minute ENDING at settle_time.
+
+        A window that lands exactly on its strike pays the up side, and the bar
+        read must be the one before `settle_time` — not the one starting there.
+        `resolve_window` is shared with `settle_due` so the two cannot drift, which
+        is how they drifted before.
+        """
+        from scripts.live import settle_predictions
+
+        window = NOW - timedelta(minutes=30)
+        self.prediction(writer, symbol='BTC-USD', window=window, offset=3,
+                        strike=100.0, mid=0.5)
+        settle_predictions(
+            writer, self.bars('BTC-USD', window + timedelta(minutes=14), 100.0),
+            now=NOW)
+        with writer._session() as session:  # noqa: SLF001
+            from core.pg_writer import Prediction
+            assert session.query(Prediction).one().outcome == 1, (
+                'a dead-flat window must pay the up side'
+            )
+
+    def test_a_window_with_no_bar_yet_is_left_alone(self, writer):
+        from scripts.live import settle_predictions
+
+        window = NOW - timedelta(minutes=30)
+        self.prediction(writer, symbol='BTC-USD', window=window, offset=3,
+                        strike=100.0, mid=0.5)
+        empty = {'BTC-USD': pd.DataFrame(
+            columns=['event_time', 'open', 'high', 'low', 'close', 'volume'])}
+        assert settle_predictions(writer, empty, now=NOW) == 0
+        with writer._session() as session:  # noqa: SLF001
+            from core.pg_writer import Prediction
+            assert session.query(Prediction).one().outcome is None
+
+    def test_an_unsettled_window_is_not_touched(self, writer):
+        """`settle_time` in the future must not be resolved from a stray bar."""
+        from scripts.live import settle_predictions
+
+        future = NOW + timedelta(minutes=30)
+        self.prediction(writer, symbol='BTC-USD', window=future, offset=3,
+                        strike=100.0, mid=0.5)
+        assert settle_predictions(
+            writer, self.bars('BTC-USD', future + timedelta(minutes=14), 101.0),
+            now=NOW) == 0
+
+    def test_filling_twice_is_a_no_op(self, writer):
+        from scripts.live import settle_predictions
+
+        window = NOW - timedelta(minutes=30)
+        self.prediction(writer, symbol='BTC-USD', window=window, offset=3,
+                        strike=100.0, mid=0.5)
+        bars = self.bars('BTC-USD', window + timedelta(minutes=14), 101.0)
+        assert settle_predictions(writer, bars, now=NOW) == 1
+        assert settle_predictions(writer, bars, now=NOW) == 0

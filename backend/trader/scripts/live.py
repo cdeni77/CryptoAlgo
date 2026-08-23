@@ -354,6 +354,55 @@ def venue_settled_up(row: dict, side: str) -> Optional[bool]:
     return None
 
 
+def resolve_window(strike: float, settle_time, symbol: str,
+                   bars: dict[str, pd.DataFrame]) -> tuple[Optional[bool], float]:
+    """Did this window settle up, per the trained rule? Plus the value used.
+
+    One implementation, because `settle_due` and `settle_predictions` must agree —
+    the whole reason the live settlement drifted from the training label in the
+    first place was a second copy of this arithmetic.
+
+    The rule is `core/windows.py`'s: the `(O+H+L+C)/4` mean of the minute *ending*
+    at `settle_time`, compared with `>=` because the venue's `strike_type` is
+    `greater_or_equal`. Returns `(None, nan)` when the bar is not there yet.
+    """
+    frame = bars.get(symbol)
+    if frame is None:
+        return None, float('nan')
+    minute = as_utc(settle_time) - pd.Timedelta(minutes=1)
+    row = frame.loc[frame['event_time'] == minute]
+    if row.empty:
+        return None, float('nan')
+    value = float(bar_mean(row).iloc[0])
+    if not np.isfinite(value):
+        return None, float('nan')
+    return value >= strike, value
+
+
+def settle_predictions(writer: PgWriter, bars: dict[str, pd.DataFrame],
+                       *, now: Optional[datetime] = None) -> int:
+    """Fill in the realised outcome on every settled window, traded or not.
+
+    Without this the market benchmark cannot exist. `market_probability` is
+    recorded on each decision — the venue's own mid — and scoring it needs the
+    answer beside it. `settle_due` only touches windows we *hold*, which is the
+    ~6% we chose to trade: exactly the selected sample that cannot answer "is the
+    market's probability better than ours".
+    """
+    # Injectable so a test can place a window in the past without waiting for the
+    # wall clock to agree.
+    now = now or datetime.now(timezone.utc)
+    filled = 0
+    for symbol, window_open, settle_time, strike in writer.windows_awaiting_outcome(now):
+        settled_up, _ = resolve_window(strike, settle_time, symbol, bars)
+        if settled_up is None:
+            continue
+        filled += writer.set_window_outcome(symbol, window_open, settled_up=settled_up)
+    if filled:
+        logger.info('recorded the outcome on %d prediction row(s)', filled)
+    return filled
+
+
 def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
                *, venue_settlements: Optional[dict[str, dict]] = None,
                ) -> list[tuple[int, float]]:
@@ -393,14 +442,8 @@ def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
 
         # Ours: the mean over the minute ENDING at settle_time, and `>=`.
         settle_minute = as_utc(position.settle_time) - pd.Timedelta(minutes=1)
-        frame = bars.get(position.symbol)
-        from_bars, settle_price = None, float('nan')
-        if frame is not None:
-            row = frame.loc[frame['event_time'] == settle_minute]
-            if not row.empty:
-                settle_price = float(bar_mean(row).iloc[0])
-                if np.isfinite(settle_price):
-                    from_bars = settle_price >= strike
+        from_bars, settle_price = resolve_window(
+            strike, position.settle_time, position.symbol, bars)
 
         if from_venue is not None and from_bars is not None and from_venue != from_bars:
             logger.warning(
@@ -608,6 +651,9 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             logger.error('reconciliation failed (%s); falling back to our own '
                          'bookkeeping for this cycle', exc)
     settle_due(writer, bars, venue_settlements=venue_settlements)
+    # Independent of whether anything was held: this is what turns the recorded
+    # market quotes into a scoreable sample.
+    settle_predictions(writer, bars)
 
     if offset is None:
         logger.info('%d minutes into the window; first decision offset is +%dm',
@@ -627,6 +673,10 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         quotes[s][0].ask_for('down') if s in quotes else np.nan for s in scored['symbol']]
     scored['market_ticker'] = [
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
+    # `Quote.mid` is None on a one-sided book, which is the honest answer: the
+    # midpoint of a single quote is not a midpoint.
+    scored['market_mid'] = [
+        quotes[s][0].mid if s in quotes else np.nan for s in scored['symbol']]
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is
@@ -722,7 +772,17 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             z_score=_finite(row.get('z_score')),
             baseline_probability=float(row['baseline_probability']),
             model_probability=float(row['model_probability']),
-            market_probability=_finite(row.get('ask_up')),
+            # The venue's belief (the mid) and what a trade would cost (both
+            # asks). This was `ask_up` recorded under the name
+            # `market_probability` — a price rather than a probability, one side
+            # of the book only, and read by nothing. The mid is the right input
+            # to "does the model beat the market"; the ask carries half the
+            # spread, so scoring against it would flatter us by exactly what we
+            # pay to cross. Written on EVERY row, refused ones included, because
+            # the sample that can answer that question has to be unselected.
+            market_probability=_finite(row.get('market_mid')),
+            market_ask_up=_finite(row.get('ask_up')),
+            market_ask_down=_finite(row.get('ask_down')),
             price_source=decision.price_source,
             reason=decision.reason.value, traded=decision.traded,
             side=decision.side.value if decision.side else None,

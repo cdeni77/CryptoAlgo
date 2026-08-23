@@ -84,7 +84,23 @@ class Prediction(Base):
     # A backtest has no quotes and stands the calibrated baseline in for the
     # market; a live decision reads the real book. Those are different claims and
     # a row that does not distinguish them makes a backtest look like a fill.
+    # The venue's own view, and the realised answer. These three exist for one
+    # purpose: to eventually score the MARKET's probability against the outcome,
+    # on every window, traded or refused.
+    #
+    # That is the only economically meaningful benchmark and nothing in this
+    # system could compute it. `market_probability` was written and read by
+    # nothing, there was no `outcome` column at all, and `positions` only covers
+    # the ~6% of windows that traded — a selected sample. Beating F(x/sigma) says
+    # nothing about beating the price you would actually pay.
+    #
+    # `market_probability` is the MID (the venue's belief). The two asks are what
+    # a trade would cost, which is a different question and needed for expected
+    # value rather than for calibration.
     market_probability = Column(Float, nullable=True)
+    market_ask_up = Column(Float, nullable=True)
+    market_ask_down = Column(Float, nullable=True)
+    outcome = Column(Integer, nullable=True)
     price_source = Column(String, nullable=False, default='baseline')
 
     # the decision
@@ -336,6 +352,19 @@ MIGRATIONS: tuple[str, ...] = (
     'ON minute_prices (symbol, minute DESC)',
     'CREATE INDEX IF NOT EXISTS ix_order_tickets_window '
     'ON order_tickets (window_open DESC)',
+    # NOTE: the market-benchmark columns on `predictions` (market_ask_up,
+    # market_ask_down, outcome) deliberately have NO migration here.
+    #
+    # `ADD COLUMN IF NOT EXISTS` is not parseable on SQLite, so it would be
+    # skipped by the dialect guard in `_run_migrations` and production would be
+    # running a statement the test suite had never executed — which is exactly
+    # the trap `tests/test_orm_parity.py` was written to close, and exactly what
+    # the previous all-ADD-COLUMN list did.
+    #
+    # The ORM gives them to a fresh database via `create_all`, and the serving
+    # store is regenerated telemetry rather than a record of account, so an
+    # existing one is wiped: `docker compose down -v`. The research store and the
+    # scraped SQLite are the irreplaceable parts and neither is touched.
 )
 
 
@@ -661,6 +690,42 @@ class PgWriter:
                 .filter(Position.settled_at >= since)
                 .order_by(Position.settled_at.desc())
             )
+
+    # ---- the market benchmark -------------------------------------------
+    def windows_awaiting_outcome(self, now: datetime, *, limit: int = 500
+                                ) -> list[tuple[str, datetime, datetime, float]]:
+        """Settled windows whose predictions still have no realised outcome.
+
+        One row per (symbol, window), with the strike, newest first. This is what
+        makes the market benchmark possible: `market_probability` is recorded on
+        every window including the refused ones, and without the outcome beside it
+        the venue's probability can never be scored. `positions` cannot substitute
+        — it only covers the ~6% of windows that traded, which is a selected
+        sample and the wrong one.
+        """
+        with self._session() as session:
+            rows = (session.query(Prediction.symbol, Prediction.window_open,
+                                  Prediction.settle_time, Prediction.strike)
+                    .filter(Prediction.settle_time <= now)
+                    .filter(Prediction.outcome.is_(None))
+                    .group_by(Prediction.symbol, Prediction.window_open,
+                              Prediction.settle_time, Prediction.strike)
+                    .order_by(Prediction.window_open.desc())
+                    .limit(limit))
+            return [(str(a), b, c, float(d)) for a, b, c, d in rows]
+
+    def set_window_outcome(self, symbol: str, window_open: datetime,
+                           *, settled_up: bool) -> int:
+        """Record the realised outcome on every offset of one window."""
+        with self._session() as session:
+            n = (session.query(Prediction)
+                 .filter(Prediction.symbol == symbol,
+                         Prediction.window_open == window_open,
+                         Prediction.outcome.is_(None))
+                 .update({Prediction.outcome: 1 if settled_up else 0},
+                         synchronize_session=False))
+            session.commit()
+            return int(n)
 
     # ---- account --------------------------------------------------------
     def ensure_account(self, starting_bankroll: float,
