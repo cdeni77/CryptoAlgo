@@ -1,0 +1,378 @@
+"""Measurement, and the gates a candidate has to clear.
+
+Everything here is *incremental against the baseline*. A log loss, an accuracy
+or a Brier score quoted on its own is uninterpretable in this system, because
+the barrier arithmetic alone takes log loss from 0.693 to about 0.513 — a 26%
+improvement over a coin flip using nothing but a clock and a volatility
+estimate. Reported against 50% that reads as a large edge. It is not an edge at
+all, and the only number that means anything is the difference.
+
+**Standard errors come from fold dispersion.** Not from `N/(1+(N-1)rho)`: four
+decision offsets share one label, the three symbols are ~0.7 correlated within
+a window, and a breadth formula on that structure is not merely optimistic but
+degenerate. Six folds give five degrees of freedom, which is few — and honestly
+few, which is better than a precise-looking number from the wrong formula.
+
+**The gates exist because a Sharpe ratio is the wrong first question.** On the
+perp system a model 34x short of its cost hurdle failed every gate without any
+of them saying why, because they all read simulated outcomes. Here the first
+four gates read the *forecast* — skill, fold agreement, calibration, and how
+much of the model's claimed correction survives out of sample — and only then
+does the money get looked at. A weak forecast and an expensive venue are the
+same ratio and opposite fixes.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Iterable, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from core.baseline import Reliability, brier, log_loss, reliability
+from core.book import BookStats
+from core.config import Config, DEFAULT_CONFIG
+
+logger = logging.getLogger(__name__)
+
+
+def log_loss_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) -> float:
+    """Baseline log loss minus model log loss. Positive means the model helped."""
+    return log_loss(outcome, baseline) - log_loss(outcome, model)
+
+
+def brier_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) -> float:
+    base = brier(outcome, baseline)
+    return (base - brier(outcome, model)) / base if base > 0 else float('nan')
+
+
+@dataclass
+class FoldEvaluation:
+    """One fold's out-of-sample measurement."""
+
+    index: int
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    n_rows: int
+    n_windows: int
+    model_log_loss: float
+    baseline_log_loss: float
+    model_brier: float
+    baseline_brier: float
+    model_ece: float
+    baseline_ece: float
+    residual_scale: float
+    control_gain_share: float
+    reliability_table: Optional[Reliability] = None
+    stats: Optional[BookStats] = None
+    per_offset: Optional[pd.DataFrame] = None
+
+    @property
+    def skill(self) -> float:
+        return self.baseline_log_loss - self.model_log_loss
+
+    @property
+    def brier_skill(self) -> float:
+        return ((self.baseline_brier - self.model_brier) / self.baseline_brier
+                if self.baseline_brier > 0 else float('nan'))
+
+    def line(self) -> str:
+        money = ''
+        if self.stats is not None:
+            money = (f' | {self.stats.n_trades:,} trades '
+                     f'{self.stats.total_return:+.2%} Sharpe {self.stats.sharpe:+.2f}')
+        return (f'  fold {self.index} [{self.test_start:%Y-%m-%d}..{self.test_end:%Y-%m-%d}] '
+                f'{self.n_windows:,}w  skill {self.skill:+.5f}  '
+                f'ECE {self.model_ece:.4f} (base {self.baseline_ece:.4f})  '
+                f'alpha {self.residual_scale:.3f}{money}')
+
+
+def evaluate_fold(
+    index: int,
+    test: pd.DataFrame,
+    model_probability: np.ndarray,
+    baseline_probability: np.ndarray,
+    *,
+    residual_scale: float,
+    control_gain_share: float,
+    stats: Optional[BookStats] = None,
+) -> FoldEvaluation:
+    from core.cv import effective_observations
+
+    outcome = test['outcome'].to_numpy(dtype=float)
+    per_offset = None
+    if 'offset' in test.columns:
+        frame = test.assign(_m=model_probability, _b=baseline_probability)
+        rows = []
+        for offset, part in frame.groupby('offset'):
+            y = part['outcome'].to_numpy(dtype=float)
+            rows.append({
+                'offset': int(offset), 'n': len(part),
+                'skill': log_loss_skill(y, part['_m'].to_numpy(), part['_b'].to_numpy()),
+                'mean_abs_correction_pp': float(
+                    np.mean(np.abs(part['_m'] - part['_b'])) * 100.0),
+            })
+        per_offset = pd.DataFrame(rows)
+
+    return FoldEvaluation(
+        index=index,
+        test_start=pd.Timestamp(test['window_open'].min()),
+        test_end=pd.Timestamp(test['window_open'].max()),
+        n_rows=len(test), n_windows=effective_observations(test),
+        model_log_loss=log_loss(outcome, model_probability),
+        baseline_log_loss=log_loss(outcome, baseline_probability),
+        model_brier=brier(outcome, model_probability),
+        baseline_brier=brier(outcome, baseline_probability),
+        model_ece=reliability(outcome, model_probability).expected_calibration_error,
+        baseline_ece=reliability(outcome, baseline_probability).expected_calibration_error,
+        residual_scale=residual_scale, control_gain_share=control_gain_share,
+        reliability_table=reliability(outcome, model_probability),
+        stats=stats, per_offset=per_offset,
+    )
+
+
+@dataclass
+class EvaluationReport:
+    """Every fold, plus the aggregate and the continuous-deployment book."""
+
+    folds: list[FoldEvaluation]
+    continuous: Optional[BookStats] = None
+    config_provenance: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+    # ---- forecast ------------------------------------------------------
+    @property
+    def skills(self) -> np.ndarray:
+        return np.array([f.skill for f in self.folds], dtype=float)
+
+    @property
+    def mean_skill(self) -> float:
+        return float(np.mean(self.skills)) if len(self.folds) else float('nan')
+
+    @property
+    def skill_standard_error(self) -> float:
+        """From fold dispersion. See the module docstring for why not breadth."""
+        if len(self.folds) < 2:
+            return float('nan')
+        return float(np.std(self.skills, ddof=1) / np.sqrt(len(self.folds)))
+
+    @property
+    def skill_t(self) -> float:
+        se = self.skill_standard_error
+        return self.mean_skill / se if se and np.isfinite(se) and se > 0 else float('nan')
+
+    @property
+    def folds_positive(self) -> int:
+        return int((self.skills > 0).sum())
+
+    @property
+    def folds_total(self) -> int:
+        return len(self.folds)
+
+    @property
+    def sign_agreement_p_value(self) -> float:
+        """P(at least this many folds positive | no skill), each fold a coin flip.
+
+        With six folds, five or more positive happens 10.9% of the time by
+        chance. That is the number to hold against any "five of six" claim, and
+        it is why the gate asks for five *and* a positive aggregate rather than
+        treating agreement as proof.
+        """
+        from scipy import stats as sstats
+        n, k = self.folds_total, self.folds_positive
+        if n == 0:
+            return float('nan')
+        return float(sstats.binom.sf(k - 1, n, 0.5))
+
+    @property
+    def max_ece(self) -> float:
+        return float(max((f.model_ece for f in self.folds), default=float('nan')))
+
+    @property
+    def mean_residual_scale(self) -> float:
+        return float(np.mean([f.residual_scale for f in self.folds])) if self.folds else float('nan')
+
+    @property
+    def max_control_gain_share(self) -> float:
+        return float(max((f.control_gain_share for f in self.folds), default=float('nan')))
+
+    @property
+    def total_windows(self) -> int:
+        return int(sum(f.n_windows for f in self.folds))
+
+    # ---- money ---------------------------------------------------------
+    @property
+    def traded_folds(self) -> list[BookStats]:
+        return [f.stats for f in self.folds if f.stats is not None]
+
+    @property
+    def total_trades(self) -> int:
+        return int(sum(s.n_trades for s in self.traded_folds))
+
+    @property
+    def mean_fold_return(self) -> float:
+        stats = self.traded_folds
+        return float(np.mean([s.total_return for s in stats])) if stats else float('nan')
+
+    @property
+    def folds_profitable(self) -> int:
+        return int(sum(1 for s in self.traded_folds if s.total_return > 0))
+
+    def per_offset(self) -> pd.DataFrame:
+        frames = [f.per_offset.assign(fold=f.index) for f in self.folds if f.per_offset is not None]
+        if not frames:
+            return pd.DataFrame()
+        allrows = pd.concat(frames, ignore_index=True)
+        return allrows.groupby('offset').agg(
+            n=('n', 'sum'), mean_skill=('skill', 'mean'),
+            folds_positive=('skill', lambda s: int((s > 0).sum())),
+            folds=('skill', 'size'),
+            mean_abs_correction_pp=('mean_abs_correction_pp', 'mean'),
+        ).reset_index()
+
+    def gate_values(self) -> dict[str, float]:
+        """Everything `DEFAULT_GATES` reads, in one dict."""
+        continuous = self.continuous
+        return {
+            'log_loss_skill': self.mean_skill,
+            'folds_skill_positive': float(self.folds_positive),
+            'calibration_error': self.max_ece,
+            'residual_scale': self.mean_residual_scale,
+            'control_gain_share': self.max_control_gain_share,
+            'windows_evaluated': float(self.total_windows),
+            'trades': float(continuous.n_trades) if continuous else 0.0,
+            'coverage': continuous.coverage if continuous else float('nan'),
+            'realised_edge_pp': continuous.realised_edge_pp if continuous else float('nan'),
+            'total_return': continuous.total_return if continuous else float('nan'),
+            'sharpe': continuous.sharpe if continuous else float('nan'),
+            'sharpe_implausible': (
+                1.0 if (continuous and np.isfinite(continuous.sharpe)
+                        and continuous.sharpe > IMPLAUSIBLE_SHARPE) else 0.0),
+            'max_drawdown': continuous.max_drawdown if continuous else float('nan'),
+            'halted': 1.0 if (continuous and continuous.halted) else 0.0,
+        }
+
+    def summary(self) -> str:
+        lines = [
+            f'{self.folds_total} folds, {self.total_windows:,} out-of-sample windows',
+            *[f.line() for f in self.folds],
+            '',
+            f'  log loss skill {self.mean_skill:+.5f} +/- {self.skill_standard_error:.5f} '
+            f'(t = {self.skill_t:+.2f}), {self.folds_positive}/{self.folds_total} folds '
+            f'positive (p = {self.sign_agreement_p_value:.3f})',
+            f'  worst-fold calibration error {self.max_ece:.4f} | '
+            f'mean alpha {self.mean_residual_scale:.3f} | '
+            f'worst control gain share {self.max_control_gain_share:.1%}',
+        ]
+        if self.continuous is not None:
+            lines += ['', '  continuous book: ' + self.continuous.summary().replace('\n', '\n  ')]
+        if self.notes:
+            lines += [''] + [f'  note: {n}' for n in self.notes]
+        return '\n'.join(lines)
+
+
+# ---- gates ---------------------------------------------------------------
+
+# name -> (threshold, direction). 'min' passes at or above, 'max' at or below.
+# Ordered as they should be read: the forecast first, the money second. A
+# candidate that fails a forecast gate should not have its Sharpe discussed.
+DEFAULT_GATES: dict[str, tuple[float, str]] = {
+    # --- the forecast ---
+    'log_loss_skill': (0.0, 'min'),
+    'folds_skill_positive': (5.0, 'min'),
+    'calibration_error': (0.02, 'max'),
+    'residual_scale': (0.25, 'min'),
+    'control_gain_share': (0.30, 'max'),
+    'windows_evaluated': (20_000.0, 'min'),
+    # --- the money ---
+    'trades': (200.0, 'min'),
+    'coverage': (0.0005, 'min'),
+    'realised_edge_pp': (0.0, 'min'),
+    'total_return': (0.0, 'min'),
+    'sharpe': (0.5, 'min'),
+    'sharpe_implausible': (0.0, 'max'),
+    'max_drawdown': (0.35, 'max'),
+    'halted': (0.0, 'max'),
+}
+
+# Above this, a Sharpe ratio is evidence of a defect rather than of an edge.
+# Nothing trading a public venue at 30,000 trades a year earns a Sharpe of 12;
+# the first run of this stack reported 12.6 and every other gate passed it,
+# because they all asked whether the number was good and none asked whether it
+# was possible.
+IMPLAUSIBLE_SHARPE = 5.0
+
+GATE_NOTES: dict[str, str] = {
+    'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark',
+    'folds_skill_positive': 'five of six agreeing happens 10.9% of the time by chance, '
+                            'so this is necessary and not sufficient',
+    'calibration_error': 'the system trades its confident predictions, so being wrong '
+                         'about how confident it is matters more than the mean',
+    'residual_scale': 'how much of the claimed correction survives out of sample; near '
+                      'zero means it found nothing however good the in-sample loss',
+    'control_gain_share': 'hour-of-day cannot forecast direction. If the clock carries '
+                          'the model, the measurement is broken, not the market',
+    'windows_evaluated': 'the whole reason for this venue is sample size; without it '
+                         'the standard error cannot resolve a 1pp edge',
+    'trades': 'fewer than this and the money numbers are anecdote',
+    'coverage': 'abstaining on everything passes every other gate trivially',
+    'realised_edge_pp': 'what actually happened, against what the model claimed. The '
+                        'gap between the two is the winner\'s curse',
+    'sharpe': 'annualised on trades actually placed, never on windows available',
+    'sharpe_implausible': f'a Sharpe above {5.0} on a public venue is a bug '
+                          f'signature, not an edge — every other gate asks '
+                          f'whether the number is good, this one asks whether '
+                          f'it is possible',
+    'max_drawdown': 'a $100 account has to survive to compound',
+    'halted': 'the bankroll floor was breached during the run',
+}
+
+
+@dataclass(frozen=True)
+class Gate:
+    name: str
+    value: float
+    threshold: float
+    direction: str
+    note: str = ''
+
+    @property
+    def passed(self) -> bool:
+        if not np.isfinite(self.value):
+            return False          # not measured fails, like every other gate here
+        return (self.value >= self.threshold if self.direction == 'min'
+                else self.value <= self.threshold)
+
+    def line(self) -> str:
+        mark = 'pass' if self.passed else 'FAIL'
+        comparison = '>=' if self.direction == 'min' else '<='
+        return (f'  [{mark}] {self.name:<24} {self.value:>10.5f} {comparison} '
+                f'{self.threshold:<10.5f} {self.note}')
+
+
+def evaluate_gates(
+    report: EvaluationReport,
+    gates: Optional[dict[str, tuple[float, str]]] = None,
+) -> list[Gate]:
+    """Score a report against every gate. Missing values fail."""
+    gates = gates or DEFAULT_GATES
+    values = report.gate_values()
+    return [
+        Gate(name=name, value=values.get(name, float('nan')), threshold=threshold,
+             direction=direction, note=GATE_NOTES.get(name, ''))
+        for name, (threshold, direction) in gates.items()
+    ]
+
+
+def gates_passed(gates: Sequence[Gate]) -> bool:
+    return all(g.passed for g in gates)
+
+
+def gate_report(gates: Sequence[Gate]) -> str:
+    failed = [g for g in gates if not g.passed]
+    header = ('all gates passed' if not failed
+              else f'{len(failed)} of {len(gates)} gates failed: '
+                   + ', '.join(g.name for g in failed))
+    return '\n'.join([header] + [g.line() for g in gates])

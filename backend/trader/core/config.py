@@ -143,6 +143,27 @@ class Config:
     # that survives being wrong about the edge by a factor of two.
     kelly_fraction: float = 0.25
     max_stake_fraction: float = 0.05      # of bankroll, per position
+
+    # A hard dollar cap per position, standing in for market depth. This is an
+    # ASSUMPTION and an unmeasured one: nobody has read the depth of a Kalshi
+    # 15-minute crypto book at a given price. It matters because it binds long
+    # before a percentage cap does — at $25 it starts constraining as soon as the
+    # account passes about $500 — and without it a backtest compounds a $100
+    # account into size no venue could fill and reports the result as a return.
+    # Measure the book, then set this from the measurement.
+    max_stake_dollars: Optional[float] = 25.0
+
+    # Size from the *starting* bankroll rather than the current one.
+    #
+    # Default off — meaning additive, non-compounding — because compounding turns
+    # a per-trade edge estimate into an exponential, and an exponential is
+    # dominated by the error in that estimate rather than by the estimate. On a
+    # 2.8pp edge over 28,000 trades the compounded figure came out at 2e17
+    # percent, which is arithmetic rather than a finding. With this off, the
+    # equity curve's slope *is* the per-trade edge and can be read directly.
+    #
+    # Turn it on to project deployment, and label the output as a projection.
+    compound: bool = False
     max_window_exposure_fraction: float = 0.08
     # The three symbols' 15-minute returns are ~0.7 correlated, so three
     # simultaneous same-direction positions are one position at three times
@@ -177,9 +198,27 @@ class Config:
     # error turns out to be, and `scripts/evaluate.py` reports the whole curve
     # rather than assuming one.
     min_edge_pp: float = 0.5
-    # Only trade where out-of-sample calibration was actually measured.
-    min_traded_price: float = 0.55
+    # Traded-price band, and it must be symmetric. The edge here is a
+    # disagreement about sigma_remaining, and that disagreement points both
+    # ways: a smaller sigma than the market assumes makes the probability more
+    # extreme than the quote, so buy the favourite; a larger sigma makes the
+    # favourite overpriced, so buy the longshot. A one-sided band such as
+    # [0.55, 0.95] permits only the first and silently discards half the
+    # strategy.
+    #
+    # What the ends actually exclude is where the *microstructure assumptions*
+    # break, not where the forecast is weak. Below 10c a one-cent tick is a 10%
+    # relative price error and the assumed half-spread is 10% of the stake, so
+    # the fill assumption dominates everything else. Above 95c there is under 5c
+    # of upside and tick quantisation is larger than any plausible edge.
+    min_traded_price: float = 0.10
     max_traded_price: float = 0.95
+
+    # An outlier guard, not an economic gate. A sigma disagreement produces
+    # modest departures from the quote; a 40-point departure is a bug, a stale
+    # price, or a signal that is not the one under test. Rejecting it loudly is
+    # better than sizing it.
+    max_disagreement_pp: float = 25.0
     # Stop trading below this fraction of the starting bankroll.
     ruin_floor_fraction: float = 0.50
 

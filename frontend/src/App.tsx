@@ -1,163 +1,105 @@
-import { ComponentType, useCallback, useEffect, useState } from 'react';
-
-import { getPaperConfig } from './api/paperApi';
-import Sidebar from './components/Sidebar';
-import DashboardPage from './pages/DashboardPage';
-import ModelPage from './pages/ModelPage';
-import ResearchPage from './pages/ResearchPage';
-import TradingPage from './pages/TradingPage';
+/** Routing, and the shell.
+ *
+ * No react-router. Routing is manual through `window.history.pushState`, and the
+ * two maps below are what keep it honest: `RoutePath` derives from `ROUTES`, and
+ * `PAGES` is a `Record<RoutePath, ComponentType>` — so adding a route without a
+ * component is a `tsc` error rather than a blank screen. The render used to be a
+ * chain of `route === '/x' && <XPage />` and this file used to claim that was
+ * exhaustive. It was not.
+ */
+import { useCallback, useEffect, useState } from 'react';
+import type { ComponentType } from 'react';
+import { Rail } from './components/Rail';
+import { AccountPage } from './pages/AccountPage';
+import { CalibrationPage } from './pages/CalibrationPage';
+import { DecisionsPage } from './pages/DecisionsPage';
+import { LivePage } from './pages/LivePage';
+import { ModelPage } from './pages/ModelPage';
 
 export const ROUTES = {
-  '/': 'Dashboard',
-  '/trading': 'Trading',
-  '/research': 'Research',
-  '/model': 'Model',
+  '/': { label: 'Live', hint: 'the barrier state now, per symbol' },
+  '/decisions': { label: 'Decisions', hint: 'every decision point, traded or refused' },
+  '/calibration': { label: 'Calibration', hint: 'is the forecast honest about its own confidence' },
+  '/model': { label: 'Model', hint: 'gates, and every candidate ever evaluated' },
+  '/account': { label: 'Account', hint: 'equity over time and settled positions' },
 } as const;
 
 export type RoutePath = keyof typeof ROUTES;
 
-// `Record<RoutePath, ...>` is what makes adding a route to ROUTES without
-// rendering it a compile error. The render used to be a chain of
-// `route === '/x' && <XPage />`, which is exhaustive only by inspection: a new
-// entry in ROUTES got a sidebar link, a title and a blank page.
+/** A Record, not a lookup with a fallback. A route with no component will not
+ *  compile, which is the whole reason this is typed this way. */
 const PAGES: Record<RoutePath, ComponentType> = {
-  '/': DashboardPage,
-  '/trading': TradingPage,
-  '/research': ResearchPage,
+  '/': LivePage,
+  '/decisions': DecisionsPage,
+  '/calibration': CalibrationPage,
   '/model': ModelPage,
+  '/account': AccountPage,
 };
 
-function isRoute(path: string): path is RoutePath {
-  return path in ROUTES;
-}
-
-function currentRoute(): RoutePath {
+function currentPath(): RoutePath {
   const path = window.location.pathname;
-  return isRoute(path) ? path : '/';
+  return (path in ROUTES ? path : '/') as RoutePath;
 }
 
 export default function App() {
-  const [route, setRoute] = useState<RoutePath>(currentRoute);
-  const [utc, setUtc] = useState('');
-  const [activeCoins, setActiveCoins] = useState<string[] | null>(null);
-  const [activeCoinsError, setActiveCoinsError] = useState<string | null>(null);
+  const [route, setRoute] = useState<RoutePath>(currentPath);
+  const [now, setNow] = useState(new Date());
 
-  const navigate = useCallback((path: RoutePath) => {
-    if (path === window.location.pathname) return;
-    window.history.pushState(null, '', path);
-    setRoute(path);
+  useEffect(() => {
+    const onPop = () => setRoute(currentPath());
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  // Without this, the browser's back button changed the URL and left the page
-  // rendering the route it was already on — history entries that went nowhere.
+  // The header clock ticks on the quarter-hour grid the whole system runs on, so
+  // a stale screen is visible as a stale clock rather than as plausible numbers.
   useEffect(() => {
-    const onPopState = () => setRoute(currentRoute());
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    const timer = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    document.title = `${ROUTES[route]} · CryptoAlgo`;
-  }, [route]);
-
-  // The engine's active-coin list, for the sidebar. The previous version
-  // swallowed the error on the grounds that it is "just a label" — but the label
-  // renders "Loading…" whenever the fetch fails, in the persistent chrome of
-  // every page, so a dead backend was indistinguishable from a slow one forever.
-  // It also bypassed usePolling and so kept polling a hidden tab.
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      getPaperConfig()
-        .then((cfg) => {
-          if (cancelled) return;
-          setActiveCoins(cfg.active_coins);
-          setActiveCoinsError(null);
-        })
-        .catch((caught: unknown) => {
-          if (cancelled) return;
-          setActiveCoins(null);
-          setActiveCoinsError(caught instanceof Error ? caught.message : String(caught));
-        });
-
-    let id: number | undefined;
-    const start = () => {
-      if (id === undefined) id = window.setInterval(load, 60_000);
-    };
-    const stop = () => {
-      if (id !== undefined) {
-        window.clearInterval(id);
-        id = undefined;
-      }
-    };
-    const onVisibilityChange = () => {
-      if (document.hidden) {
-        stop();
-      } else {
-        void load();
-        start();
-      }
-    };
-
-    load();
-    if (!document.hidden) start();
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    return () => {
-      cancelled = true;
-      stop();
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-    };
-  }, []);
-
-  // Ticking only while the tab is visible. A background tab re-rendering the
-  // whole shell every second for a clock nobody is reading is pure waste.
-  useEffect(() => {
-    let id: number | undefined;
-    const tick = () => setUtc(`${new Date().toUTCString().slice(17, 25)} UTC`);
-
-    const start = () => {
-      if (id === undefined) id = window.setInterval(tick, 1000);
-    };
-    const stop = () => {
-      if (id !== undefined) window.clearInterval(id);
-      id = undefined;
-    };
-    const onVisibilityChange = () => {
-      if (document.hidden) {
-        stop();
-      } else {
-        tick();
-        start();
-      }
-    };
-
-    tick();
-    if (!document.hidden) start();
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    return () => {
-      stop();
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-    };
+  const navigate = useCallback((path: string) => {
+    const next = (path in ROUTES ? path : '/') as RoutePath;
+    window.history.pushState({}, '', next);
+    setRoute(next);
   }, []);
 
   const Page = PAGES[route];
+  const secondsIntoWindow = (now.getUTCMinutes() % 15) * 60 + now.getUTCSeconds();
+  const secondsLeft = 15 * 60 - secondsIntoWindow;
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#080c14] font-sans antialiased">
-      <Sidebar route={route} navigate={navigate} activeCoins={activeCoins} activeCoinsError={activeCoinsError} />
+    <div className="flex min-h-screen bg-paper">
+      <Rail
+        routes={Object.entries(ROUTES).map(([path, meta]) => ({
+          path,
+          label: meta.label,
+          hint: meta.hint,
+        }))}
+        current={route}
+        onNavigate={navigate}
+        lastUpdated={null}
+      />
 
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <header className="flex flex-shrink-0 items-center justify-between border-b border-[rgba(56,189,248,0.08)] bg-[#0c1120] px-6 py-3.5">
-          <span className="text-sm font-medium uppercase tracking-widest text-tx-secondary">
-            {ROUTES[route]}
-          </span>
-          <span className="font-mono text-xs text-tx-muted">{utc}</span>
+      <main className="min-w-0 flex-1">
+        <header className="sticky top-0 z-10 flex items-center justify-between gap-6 border-b border-rule bg-paper/95 px-8 py-4 backdrop-blur-sm">
+          <div>
+            <div className="eyebrow">{ROUTES[route].hint}</div>
+            <h1 className="text-lg font-semibold text-ink">{ROUTES[route].label}</h1>
+          </div>
+          <div className="text-right">
+            <div className="eyebrow">next settlement</div>
+            <div className="font-mono text-mid font-medium tabular-nums text-ink">
+              {String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:
+              {String(secondsLeft % 60).padStart(2, '0')}
+            </div>
+          </div>
         </header>
 
-        <main className="bg-grid min-h-0 flex-1 overflow-y-auto" id="main">
+        <div className="mx-auto max-w-shell px-8 py-8">
           <Page />
-        </main>
-      </div>
+        </div>
+      </main>
     </div>
   );
 }

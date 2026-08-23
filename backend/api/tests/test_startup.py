@@ -92,7 +92,8 @@ def test_startup_creates_the_tables(tmp_path, monkeypatch, fresh_app):
         assert client.get('/').status_code == 200
         tables = set(inspect(module.engine).get_table_names())
 
-    for expected in ('signals', 'paper_positions', 'wallet'):
+    for expected in ('predictions', 'positions', 'account', 'equity_curve',
+                     'model_runs', 'calibration'):
         assert expected in tables, f'{expected} missing after startup: {sorted(tables)}'
 
 

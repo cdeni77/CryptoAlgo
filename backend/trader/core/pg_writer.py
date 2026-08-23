@@ -1,618 +1,434 @@
-"""Postgres writer for trader service, including paper-trading persistence."""
+"""The serving store: what the API and the frontend read.
+
+Two stores, two jobs. `core/datastore.py` is the research store — immutable
+Parquet, point-in-time reads, the thing feature builds and backtests run on.
+This is PostgreSQL, mutable, and holds only what a dashboard needs to show:
+predictions we actually made, positions we actually took, and the account.
+
+**A binary needs almost none of what a perpetual future needed.** The previous
+schema carried mark price, unrealised PnL, funding accrual, take-profit and
+stop-loss levels, notional and leverage. None of them exists here. A contract is
+bought once at a known price, cannot lose more than its stake, accrues nothing,
+and settles once at $1 or $0. Carrying those columns would mean writing zeros
+into them forever and inviting a dashboard to render a zero as a measurement.
+
+**Refusals are stored, not just trades.** A dashboard showing only trades cannot
+show that the system declined 99% of windows because the forecast did not cover
+the fee — which is the most informative thing it could say, and was on the perp
+system.
+
+**These models are duplicated in `backend/api/models/` for container isolation,
+and `tests/test_orm_parity.py` fails when they diverge** in columns, types,
+nullability, defaults or the migration list. That test exists because
+`wallet.balance` once differed by a factor of ten between the two copies, so
+whichever container created the row decided the account's starting balance.
+"""
+
+from __future__ import annotations
 
 import enum
+import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 from sqlalchemy import (
-    JSON, Boolean, Column, DateTime, Enum, Float, Integer, String, Text,
-    create_engine, text,
+    JSON, Boolean, Column, DateTime, Float, Index, Integer, String, Text,
+    UniqueConstraint, create_engine, text,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.sql import func
 
-# ── Inline model definitions (mirror of the API models) ────────────
-# We duplicate the ORM classes here so the trader doesn't need to
-# import from the API codebase (they run in separate containers).
+logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
 
-class PaperOrderStatus(str, enum.Enum):
-    NEW = "new"
-    FILLED = "filled"
-    CANCELED = "canceled"
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-class Signal(Base):
-    __tablename__ = "signals"
+class Outcome(str, enum.Enum):
+    """A position's terminal state. There is no third possibility."""
+
+    PENDING = 'pending'
+    WON = 'won'
+    LOST = 'lost'
+
+
+class Prediction(Base):
+    """One scored decision point: (symbol, window, offset), traded or refused."""
+
+    __tablename__ = 'predictions'
+
     id = Column(Integer, primary_key=True, index=True)
-    coin = Column(String, nullable=False, index=True)
-    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
-    direction = Column(String, nullable=False)
-    confidence = Column(Float, nullable=False)
-    raw_probability = Column(Float, nullable=True)
-    model_auc = Column(Float, nullable=True)
-    price_at_signal = Column(Float, nullable=True)
-    momentum_pass = Column(Boolean, nullable=True)
-    trend_pass = Column(Boolean, nullable=True)
-    regime_pass = Column(Boolean, nullable=True)
-    ml_pass = Column(Boolean, nullable=True)
-    contracts_suggested = Column(Integer, nullable=True)
-    notional_usd = Column(Float, nullable=True)
-    acted_on = Column(Boolean, default=False)
-    trade_id = Column(Integer, nullable=True)
-    passed_gates = Column(Boolean, nullable=False, default=True)
-    gate_failure_reason = Column(String, nullable=True)
+    symbol = Column(String, nullable=False, index=True)
+    window_open = Column(DateTime(timezone=True), nullable=False, index=True)
+    settle_time = Column(DateTime(timezone=True), nullable=False, index=True)
+    offset_minutes = Column(Integer, nullable=False)
+    decision_time = Column(DateTime(timezone=True), nullable=False)
+
+    # the barrier, as observed
+    strike = Column(Float, nullable=False)
+    last_price = Column(Float, nullable=False)
+    displacement = Column(Float, nullable=False)
+    sigma_remaining = Column(Float, nullable=True)
+    z_score = Column(Float, nullable=True)
+
+    # the two probabilities, and never one without the other
+    baseline_probability = Column(Float, nullable=False)
+    model_probability = Column(Float, nullable=False)
+
+    # the decision
+    reason = Column(String, nullable=False, index=True)
+    traded = Column(Boolean, nullable=False, default=False)
+    side = Column(String, nullable=True)
+    price = Column(Float, nullable=True)
+    effective_cost = Column(Float, nullable=True)
+    edge = Column(Float, nullable=True)
+    contracts = Column(Integer, nullable=True)
+
+    model_version = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # -- the decision, decomposed ------------------------------------------
-    # These replace the classification columns above, which no longer describe
-    # what the model produces. `confidence` and `raw_probability` were a
-    # probability and an AUC; the model regresses net return, so the honest
-    # record is the forecast broken into its parts and the cost it has to clear.
-    # The old columns stay nullable and unwritten rather than being dropped,
-    # because historical rows still hold real values from the previous system.
-    expected_net_bps = Column(Float, nullable=True)
-    expected_price_bps = Column(Float, nullable=True)
-    expected_carry_bps = Column(Float, nullable=True)
-    cost_bps = Column(Float, nullable=True)
-    sigma_bps = Column(Float, nullable=True)
-    edge_to_risk = Column(Float, nullable=True)
-    # Share of the expected edge that is carry rather than direction. A book
-    # whose edge is mostly carry is a different strategy with different risks.
-    carry_share = Column(Float, nullable=True)
-    participation = Column(Float, nullable=True)
-    # Which promoted model produced this. Without it, a signal cannot be
-    # attributed after a retrain, and calibration is measured across two models.
-    model_version = Column(String, nullable=True)
+    __table_args__ = (
+        UniqueConstraint('symbol', 'window_open', 'offset_minutes',
+                         name='uq_prediction_point'),
+        Index('ix_predictions_traded_window', 'traded', 'window_open'),
+    )
 
 
-class Wallet(Base):
-    __tablename__ = "wallet"
-    id = Column(Integer, primary_key=True)
-    # Matches backend/api/models/wallet.py. The two drifted — 10000 here against
-    # 100000 there — so whichever container created the row decided the starting
-    # balance, and the paper equity curve started from a different number than
-    # the dashboard reported.
-    balance = Column(Float, default=100000.0)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+class Position(Base):
+    """One contract purchase, held to settlement. No marking, no exit."""
+
+    __tablename__ = 'positions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    prediction_id = Column(Integer, nullable=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    window_open = Column(DateTime(timezone=True), nullable=False, index=True)
+    settle_time = Column(DateTime(timezone=True), nullable=False, index=True)
+    offset_minutes = Column(Integer, nullable=False)
+
+    side = Column(String, nullable=False)
+    contracts = Column(Integer, nullable=False)
+    price = Column(Float, nullable=False)
+    outlay = Column(Float, nullable=False)     # everything paid, fee included
+    fee = Column(Float, nullable=False)
+    model_probability = Column(Float, nullable=False)
+    baseline_probability = Column(Float, nullable=False)
+    edge = Column(Float, nullable=False)
+
+    outcome = Column(String, nullable=False, default=Outcome.PENDING.value, index=True)
+    settled_up = Column(Boolean, nullable=True)
+    payout = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+    settled_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'window_open', name='uq_position_window'),
+        Index('ix_positions_open', 'outcome', 'settle_time'),
+    )
+
+
+class Account(Base):
+    """The single account row. A $100 bankroll, and what it is now."""
+
+    __tablename__ = 'account'
+
+    id = Column(Integer, primary_key=True, index=True)
+    starting_bankroll = Column(Float, nullable=False, default=100.0)
+    bankroll = Column(Float, nullable=False, default=100.0)
+    staked = Column(Float, nullable=False, default=0.0)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    fees_paid = Column(Float, nullable=False, default=0.0)
+    halted = Column(Boolean, nullable=False, default=False)
+    halted_reason = Column(String, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now())
+
+
+class EquityPoint(Base):
+    """Equity at a settlement. Never marked to a model probability.
+
+    Marking an open binary at our own forecast books the edge we believe in as
+    profit we have not received, which is how a losing system draws a rising
+    equity curve. `staked` is carried at cost.
+    """
+
+    __tablename__ = 'equity_curve'
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    equity = Column(Float, nullable=False)
+    bankroll = Column(Float, nullable=False)
+    staked = Column(Float, nullable=False, default=0.0)
+    open_positions = Column(Integer, nullable=False, default=0)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class ModelRun(Base):
-    __tablename__ = "model_runs"
+    """A promotion attempt. Blocked ones are kept: they are the trial count."""
+
+    __tablename__ = 'model_runs'
+
     id = Column(Integer, primary_key=True, index=True)
-    run_started_at = Column(DateTime(timezone=True), nullable=False, index=True)
-    run_finished_at = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String, nullable=False, index=True)
-    retrain_window_days = Column(Integer, nullable=False, default=90)
-    symbols_total = Column(Integer, nullable=False, default=0)
-    symbols_trained = Column(Integer, nullable=False, default=0)
-    artifacts_version = Column(String, nullable=True)
-    metrics = Column(JSON, nullable=True)
-    error = Column(Text, nullable=True)
+    version = Column(String, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    installed = Column(Boolean, nullable=False, default=False)
+    forced = Column(Boolean, nullable=False, default=False)
+    force_reason = Column(Text, nullable=True)
+
+    folds = Column(Integer, nullable=True)
+    windows_evaluated = Column(Integer, nullable=True)
+    log_loss_skill = Column(Float, nullable=True)
+    log_loss_skill_se = Column(Float, nullable=True)
+    folds_positive = Column(Integer, nullable=True)
+    calibration_error = Column(Float, nullable=True)
+    residual_scale = Column(Float, nullable=True)
+    control_gain_share = Column(Float, nullable=True)
+    sharpe = Column(Float, nullable=True)
+    total_return = Column(Float, nullable=True)
+    gates = Column(JSON, nullable=True)
+    failed_gates = Column(Text, nullable=True)
+    provenance = Column(JSON, nullable=True)
+
+
+class CalibrationBin(Base):
+    """A row of the reliability table, for the one chart that cannot be faked.
+
+    A model can hit the base rate exactly while being wrong at every level of
+    confidence. Since this system only trades its confident predictions, a
+    miscalibration in the 0.85-0.95 band matters far more than the headline.
+    """
+
+    __tablename__ = 'calibration'
+
+    id = Column(Integer, primary_key=True, index=True)
+    model_version = Column(String, nullable=False, index=True)
+    source = Column(String, nullable=False)        # 'model' or 'baseline'
+    bin_low = Column(Float, nullable=False)
+    bin_high = Column(Float, nullable=False)
+    predicted = Column(Float, nullable=True)
+    observed = Column(Float, nullable=True)
+    count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-
-class PaperOrder(Base):
-    __tablename__ = "paper_orders"
-    id = Column(Integer, primary_key=True, index=True)
-    signal_id = Column(Integer, nullable=False, index=True)
-    coin = Column(String, nullable=False, index=True)
-    side = Column(String, nullable=False)
-    contracts = Column(Integer, nullable=False)
-    target_price = Column(Float, nullable=False)
-    status = Column(Enum(PaperOrderStatus), nullable=False, default=PaperOrderStatus.NEW)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (
+        UniqueConstraint('model_version', 'source', 'bin_low',
+                         name='uq_calibration_bin'),
+    )
 
 
-class PaperFill(Base):
-    __tablename__ = "paper_fills"
-    id = Column(Integer, primary_key=True, index=True)
-    order_id = Column(Integer, nullable=False, index=True)
-    signal_id = Column(Integer, nullable=False, index=True)
-    coin = Column(String, nullable=False, index=True)
-    side = Column(String, nullable=False)
-    contracts = Column(Integer, nullable=False)
-    fill_price = Column(Float, nullable=False)
-    fee = Column(Float, nullable=False)
-    notional = Column(Float, nullable=False)
-    slippage_bps = Column(Float, nullable=False, default=0.0)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
-
-
-class PaperPosition(Base):
-    __tablename__ = "paper_positions"
-    id = Column(Integer, primary_key=True, index=True)
-    coin = Column(String, nullable=False, index=True)
-    side = Column(String, nullable=False)
-    contracts = Column(Integer, nullable=False)
-    entry_price = Column(Float, nullable=False)
-    mark_price = Column(Float, nullable=False)
-    notional = Column(Float, nullable=False)
-    realized_pnl = Column(Float, nullable=False, default=0.0)
-    unrealized_pnl = Column(Float, nullable=False, default=0.0)
-    fees_paid = Column(Float, nullable=False, default=0.0)
-    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    is_open = Column(Boolean, nullable=False, default=True, index=True)
-    # Exit parameters frozen at open time — paper engine uses these to close positions
-    tp_price = Column(Float, nullable=True)
-    sl_price = Column(Float, nullable=True)
-    max_hold_until = Column(DateTime(timezone=True), nullable=True)
-    exit_reason = Column(String, nullable=True)
-    # Funding accrued so far, in account currency. On hourly-funding perps this
-    # is the largest cost after commission — over a day-long hold, 2bp/hour is
-    # 48bp against a ~23-30bp round trip. It has to survive a restart, or a
-    # relaunched engine forgets what the position already cost.
-    funding_paid = Column(Float, nullable=False, default=0.0)
-
-
-class PaperEquityCurve(Base):
-    __tablename__ = "paper_equity_curve"
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
-    equity = Column(Float, nullable=False)
-    cash_balance = Column(Float, nullable=False)
-    unrealized_pnl = Column(Float, nullable=False)
-    realized_pnl = Column(Float, nullable=False)
-    open_positions = Column(Integer, nullable=False, default=0)
-
-
-class PaperEngineConfig(Base):
-    """Single-row table written by the paper engine on startup to expose its runtime config."""
-    __tablename__ = "paper_engine_config"
-    id = Column(Integer, primary_key=True, default=1)
-    active_coins = Column(JSON, nullable=False, default=list)
-    tier_map = Column(JSON, nullable=False, default=dict)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+# Indexes and constraints added after a table first shipped. Applied by
+# `_run_migrations` and asserted identical to the API's list by test_orm_parity —
+# an index that exists in one container and not the other is a query that is
+# fast in development and a table scan in production.
+MIGRATIONS: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS ix_predictions_reason_window '
+    'ON predictions (reason, window_open DESC)',
+    'CREATE INDEX IF NOT EXISTS ix_positions_settled_at '
+    'ON positions (settled_at DESC)',
+    'CREATE INDEX IF NOT EXISTS ix_equity_curve_timestamp_desc '
+    'ON equity_curve (timestamp DESC)',
+)
 
 
 class PgWriter:
-    def __init__(self, database_url: Optional[str] = None):
-        url = database_url or os.environ.get("DATABASE_URL")
-        if not url:
-            raise RuntimeError("DATABASE_URL env var is not set.")
-        self.engine = create_engine(url)
-        self.SessionLocal = sessionmaker(bind=self.engine)
-        Base.metadata.create_all(self.engine)
-        self._run_pg_migrations()
+    """Everything the trader writes to the serving store."""
 
-    def _run_pg_migrations(self) -> None:
-        """Add columns that post-date create_all(). Idempotent — safe on every startup."""
-        stmts = [
-            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS tp_price DOUBLE PRECISION",
-            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS sl_price DOUBLE PRECISION",
-            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS max_hold_until TIMESTAMP WITH TIME ZONE",
-            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS exit_reason VARCHAR",
-            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS funding_paid "
-            "DOUBLE PRECISION NOT NULL DEFAULT 0.0",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_net_bps DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_price_bps DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_carry_bps DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS cost_bps DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS sigma_bps DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS edge_to_risk DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS carry_share DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS participation DOUBLE PRECISION",
-            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS model_version VARCHAR",
-            # Indexes, not columns. `create_all` only touches missing *tables*, so
-            # an index added to an existing model never reaches a database that
-            # already has the table. The names match what SQLAlchemy's
-            # `index=True` generates (ix_<table>_<column>), so a fresh create and
-            # an upgraded database end up with the same index rather than two.
-            "CREATE INDEX IF NOT EXISTS ix_paper_fills_created_at "
-            "ON paper_fills (created_at)",
-            "CREATE INDEX IF NOT EXISTS ix_paper_positions_is_open "
-            "ON paper_positions (is_open)",
-            "CREATE INDEX IF NOT EXISTS ix_paper_positions_opened_at "
-            "ON paper_positions (opened_at)",
-        ]
-        with self.engine.begin() as conn:
-            for stmt in stmts:
-                conn.execute(text(stmt))
+    def __init__(self, database_url: Optional[str] = None):
+        url = database_url or os.getenv('DATABASE_URL')
+        if not url:
+            raise ValueError('DATABASE_URL is not set')
+        self._engine = create_engine(url, pool_pre_ping=True, future=True)
+        self._sessions = sessionmaker(bind=self._engine, future=True)
+        Base.metadata.create_all(self._engine)
+        self._run_migrations()
+
+    def _run_migrations(self) -> None:
+        with self._engine.begin() as connection:
+            for statement in MIGRATIONS:
+                try:
+                    connection.execute(text(statement))
+                except Exception as exc:  # noqa: BLE001 - SQLite in tests lacks some syntax
+                    logger.debug('migration skipped (%s): %s', exc, statement)
 
     def _session(self) -> Session:
-        return self.SessionLocal()
+        return self._sessions()
 
-    # ── Signals ─────────────────────────────────────────────────────
-    def write_signal(
-        self,
-        coin: str,
-        timestamp: datetime,
-        direction: str,
-        confidence: float,
-        mode: str = "signals",
-        idempotency_key: str | None = None,
-        raw_probability: float | None = None,
-        model_auc: float | None = None,
-        price_at_signal: float | None = None,
-        momentum_pass: bool | None = None,
-        trend_pass: bool | None = None,
-        regime_pass: bool | None = None,
-        ml_pass: bool | None = None,
-        contracts_suggested: int | None = None,
-        notional_usd: float | None = None,
-        acted_on: bool = False,
-        trade_id: int | None = None,
-        passed_gates: bool = True,
-        gate_failure_reason: str | None = None,
-        expected_net_bps: float | None = None,
-        expected_price_bps: float | None = None,
-        expected_carry_bps: float | None = None,
-        cost_bps: float | None = None,
-        sigma_bps: float | None = None,
-        edge_to_risk: float | None = None,
-        carry_share: float | None = None,
-        participation: float | None = None,
-        model_version: str | None = None,
-    ) -> int:
-        """Insert one signal row. Returns the signal id (idempotent for coin+timestamp+direction).
+    # ---- predictions ----------------------------------------------------
+    def write_prediction(self, **fields) -> int:
+        """Upsert one decision point. Idempotent on (symbol, window, offset).
 
-        The decomposition arguments are the real record of what `decide()` chose:
-        the forecast split into price and carry, the cost it has to clear, and the
-        uncertainty it is measured against. The older `confidence`, `raw_probability`
-        and `model_auc` arguments described a classifier and should be left unset —
-        writing a return into a column named "probability" is how the research
-        dashboard came to be displaying quantities that mean nothing.
+        Idempotent because the orchestrator can re-run a cycle — a retry after a
+        network failure must not double-count a refusal or, worse, a trade.
         """
-        _ = mode
-        with self._session() as db:
-            if idempotency_key:
-                # Deduplicate by coin+direction within the same minute window
-                minute_start = timestamp.replace(second=0, microsecond=0)
-                minute_end = minute_start + timedelta(minutes=1)
-                existing = db.query(Signal).filter(
-                    Signal.coin == coin,
-                    Signal.timestamp >= minute_start,
-                    Signal.timestamp < minute_end,
-                    Signal.direction == direction,
-                ).first()
-                if existing:
-                    return existing.id
-
-            def _f(v):
-                return float(v) if v is not None else None
-
-            sig = Signal(
-                coin=coin,
-                timestamp=timestamp,
-                direction=direction,
-                confidence=_f(confidence),
-                raw_probability=_f(raw_probability),
-                model_auc=_f(model_auc),
-                price_at_signal=_f(price_at_signal),
-                momentum_pass=momentum_pass,
-                trend_pass=trend_pass,
-                regime_pass=regime_pass,
-                ml_pass=ml_pass,
-                contracts_suggested=int(contracts_suggested) if contracts_suggested is not None else None,
-                notional_usd=_f(notional_usd),
-                acted_on=acted_on,
-                trade_id=trade_id,
-                passed_gates=passed_gates,
-                gate_failure_reason=gate_failure_reason,
-                expected_net_bps=_f(expected_net_bps),
-                expected_price_bps=_f(expected_price_bps),
-                expected_carry_bps=_f(expected_carry_bps),
-                cost_bps=_f(cost_bps),
-                sigma_bps=_f(sigma_bps),
-                edge_to_risk=_f(edge_to_risk),
-                carry_share=_f(carry_share),
-                participation=_f(participation),
-                model_version=model_version,
-            )
-            db.add(sig)
-            db.commit()
-            db.refresh(sig)
-            return sig.id
-
-    def update_balance(self, new_balance: float) -> None:
-        with self._session() as db:
-            w = db.query(Wallet).order_by(Wallet.id.desc()).first()
-            if w:
-                w.balance = new_balance
-            else:
-                db.add(Wallet(balance=new_balance))
-            db.commit()
-
-    # ── Model runs ──────────────────────────────────────────────────
-    def create_model_run(self, retrain_window_days: int, symbols_total: int, artifacts_version: str | None = None) -> int:
-        with self._session() as db:
-            run = ModelRun(
-                run_started_at=datetime.now(timezone.utc),
-                status="running",
-                retrain_window_days=retrain_window_days,
-                symbols_total=symbols_total,
-                artifacts_version=artifacts_version,
-            )
-            db.add(run)
-            db.commit()
-            db.refresh(run)
-            return run.id
-
-    def complete_model_run(
-        self,
-        run_id: int,
-        success: bool,
-        symbols_trained: int,
-        metrics: dict | None = None,
-        error: str | None = None,
-        artifacts_version: str | None = None,
-    ) -> bool:
-        """Close out a run row.
-
-        `artifacts_version` is written here rather than at creation because only
-        `core.promotion.new_version()` knows it — it carries a uuid suffix so two
-        runs in the same second cannot collide in the ledger. Minting a timestamp
-        up front produced a version that named no directory in
-        models/promotions/.
-        """
-        with self._session() as db:
-            run = db.query(ModelRun).filter(ModelRun.id == run_id).first()
-            if not run:
-                return False
-            run.run_finished_at = datetime.now(timezone.utc)
-            run.status = "success" if success else "failed"
-            run.symbols_trained = symbols_trained
-            run.metrics = metrics
-            run.error = error
-            if artifacts_version:
-                run.artifacts_version = artifacts_version
-            db.commit()
-            return True
-    def upsert_wallet_balance(self, new_balance: float) -> None:
-        """Alias for wallet balance upsert used by the trader loops."""
-        self.update_balance(new_balance)
-    def create_paper_order(self, signal_id: int, coin: str, side: str, contracts: int, target_price: float) -> int:
-        with self._session() as db:
-            order = PaperOrder(
-                signal_id=signal_id,
-                coin=coin,
-                side=side,
-                contracts=contracts,
-                target_price=target_price,
-                status=PaperOrderStatus.NEW,
-            )
-            db.add(order)
-            db.commit()
-            db.refresh(order)
-            return order.id
-
-    def mark_paper_order_filled(self, order_id: int) -> None:
-        with self._session() as db:
-            order = db.query(PaperOrder).filter(PaperOrder.id == order_id).first()
-            if order:
-                order.status = PaperOrderStatus.FILLED
-                db.commit()
-
-    def create_paper_fill(self, order_id: int, signal_id: int, coin: str, side: str, contracts: int, fill_price: float, fee: float, notional: float, slippage_bps: float = 0.0) -> int:
-        with self._session() as db:
-            fill = PaperFill(
-                order_id=order_id,
-                signal_id=signal_id,
-                coin=coin,
-                side=side,
-                contracts=contracts,
-                fill_price=fill_price,
-                fee=fee,
-                notional=notional,
-                slippage_bps=slippage_bps,
-            )
-            db.add(fill)
-            db.commit()
-            db.refresh(fill)
-            return fill.id
-
-    def get_open_paper_position(self, coin: str) -> Optional[PaperPosition]:
-        with self._session() as db:
-            return (
-                db.query(PaperPosition)
-                .filter(PaperPosition.coin == coin, PaperPosition.is_open.is_(True))
-                .order_by(PaperPosition.id.desc())
-                .first()
-            )
-
-    def get_all_open_paper_positions_for_coin(self, coin: str) -> list[PaperPosition]:
-        with self._session() as db:
-            return (
-                db.query(PaperPosition)
-                .filter(PaperPosition.coin == coin, PaperPosition.is_open.is_(True))
-                .order_by(PaperPosition.id.asc())
-                .all()
-            )
-
-    def get_all_open_paper_positions(self) -> list[PaperPosition]:
-        with self._session() as db:
-            return (
-                db.query(PaperPosition)
-                .filter(PaperPosition.is_open.is_(True))
-                .order_by(PaperPosition.id.asc())
-                .all()
-            )
-
-    def update_paper_position_mark(self, position_id: int, mark_price: float, unrealized_pnl: float) -> None:
-        with self._session() as db:
-            position = db.query(PaperPosition).filter(PaperPosition.id == position_id).first()
-            if position:
-                position.mark_price = mark_price
-                position.unrealized_pnl = unrealized_pnl
-                db.commit()
-
-    def accrue_paper_position_funding(self, position_id: int, amount: float) -> float:
-        """Add funding to a position's running total and return the new total.
-
-        Persisted rather than held in memory so a restarted engine does not
-        forget what the position has already cost it — which, on a multi-day
-        hold, can exceed the whole round-trip commission.
-        """
-        with self._session() as db:
-            position = db.query(PaperPosition).filter(PaperPosition.id == position_id).first()
-            if not position:
-                return 0.0
-            position.funding_paid = float(position.funding_paid or 0.0) + float(amount)
-            db.commit()
-            return float(position.funding_paid)
-
-    def get_latest_signal_price(self, coin: str) -> Optional[float]:
-        with self._session() as db:
-            sig = (
-                db.query(Signal.price_at_signal)
-                .filter(Signal.coin == coin, Signal.price_at_signal.isnot(None))
-                .order_by(Signal.id.desc())
-                .first()
-            )
-            return float(sig.price_at_signal) if sig else None
-
-    def upsert_paper_position(self, coin: str, side: str, contracts: int, entry_price: float, mark_price: float, notional: float, realized_pnl: float, unrealized_pnl: float, fees_paid: float, is_open: bool = True, tp_price: float | None = None, sl_price: float | None = None, max_hold_until: datetime | None = None) -> int:
-        # Always INSERT a new position row. The old position must be explicitly closed via
-        # close_paper_position() before this is called. Overwriting in-place would cause
-        # "re-entry without close" — the side/entry_price would silently flip on the same row.
-        import logging as _logging
-        _log = _logging.getLogger("pg_writer")
-        with self._session() as db:
-            existing = (
-                db.query(PaperPosition)
-                .filter(PaperPosition.coin == coin, PaperPosition.side == side, PaperPosition.is_open.is_(True))
-                .first()
-            )
-            if existing:
-                _log.warning(
-                    "upsert_paper_position: same-side open position already exists for %s %s (id=%s) — skipping insert",
-                    coin, side, existing.id,
-                )
+        with self._session() as session:
+            existing = session.query(Prediction).filter_by(
+                symbol=fields['symbol'], window_open=fields['window_open'],
+                offset_minutes=fields['offset_minutes'],
+            ).one_or_none()
+            if existing is not None:
+                for key, value in fields.items():
+                    setattr(existing, key, value)
+                session.commit()
                 return existing.id
-            position = PaperPosition(
-                coin=coin,
-                side=side,
-                contracts=contracts,
-                entry_price=entry_price,
-                mark_price=mark_price,
-                notional=notional,
-                realized_pnl=realized_pnl,
-                unrealized_pnl=unrealized_pnl,
-                fees_paid=fees_paid,
-                is_open=is_open,
-                tp_price=tp_price,
-                sl_price=sl_price,
-                max_hold_until=max_hold_until,
-            )
-            db.add(position)
-            db.commit()
-            db.refresh(position)
-            return position.id
-
-    def close_paper_position(self, position_id: int, mark_price: float, realized_pnl: float, fees_paid: float, exit_reason: str | None = None) -> None:
-        with self._session() as db:
-            position = db.query(PaperPosition).filter(PaperPosition.id == position_id).first()
-            if not position:
-                return
-            position.mark_price = mark_price
-            position.realized_pnl = realized_pnl
-            position.unrealized_pnl = 0.0
-            position.fees_paid = fees_paid
-            position.is_open = False
-            if exit_reason:
-                position.exit_reason = exit_reason
-            db.commit()
-
-    def get_recent_signal_prices_for_coin(self, coin: str, limit: int = 48) -> list[tuple[datetime, float]]:
-        """Return the last `limit` (timestamp, price_at_signal) pairs for a coin, oldest first."""
-        with self._session() as db:
-            rows = (
-                db.query(Signal.timestamp, Signal.price_at_signal)
-                .filter(Signal.coin == coin, Signal.price_at_signal.isnot(None))
-                .order_by(Signal.id.desc())
-                .limit(limit)
-                .all()
-            )
-        return [(r.timestamp, float(r.price_at_signal)) for r in reversed(rows)]
-
-    def write_paper_equity_point(self, equity: float, cash_balance: float, unrealized_pnl: float, realized_pnl: float, open_positions: int, timestamp: Optional[datetime] = None) -> int:
-        with self._session() as db:
-            row = PaperEquityCurve(
-                timestamp=timestamp or datetime.now(timezone.utc),
-                equity=equity,
-                cash_balance=cash_balance,
-                unrealized_pnl=unrealized_pnl,
-                realized_pnl=realized_pnl,
-                open_positions=open_positions,
-            )
-            db.add(row)
-            db.commit()
-            db.refresh(row)
+            row = Prediction(**fields)
+            session.add(row)
+            session.commit()
             return row.id
 
-    def get_unprocessed_signals(self, since_id: int) -> list[Signal]:
-        with self._session() as db:
-            return (
-                db.query(Signal)
-                .filter(Signal.id > since_id, Signal.acted_on.is_(False), Signal.passed_gates.is_(True))
-                .order_by(Signal.id.asc())
-                .all()
+    def recent_predictions(self, limit: int = 200, *, traded_only: bool = False) -> list[Prediction]:
+        with self._session() as session:
+            query = session.query(Prediction)
+            if traded_only:
+                query = query.filter(Prediction.traded.is_(True))
+            return list(query.order_by(Prediction.window_open.desc()).limit(limit))
+
+    def refusal_counts(self, since: Optional[datetime] = None) -> dict[str, int]:
+        """The funnel, as the dashboard shows it."""
+        with self._session() as session:
+            query = session.query(Prediction.reason, func.count(Prediction.id))
+            if since is not None:
+                query = query.filter(Prediction.window_open >= since)
+            return {reason: int(count) for reason, count in query.group_by(Prediction.reason)}
+
+    # ---- positions ------------------------------------------------------
+    def open_position(self, **fields) -> int:
+        with self._session() as session:
+            row = Position(outcome=Outcome.PENDING.value, **fields)
+            session.add(row)
+            session.commit()
+            return row.id
+
+    def positions_due(self, now: datetime) -> list[Position]:
+        with self._session() as session:
+            return list(
+                session.query(Position)
+                .filter(Position.outcome == Outcome.PENDING.value)
+                .filter(Position.settle_time <= now)
+                .order_by(Position.settle_time)
             )
 
-    def mark_signal_acted(self, signal_id: int) -> None:
-        with self._session() as db:
-            sig = db.query(Signal).filter(Signal.id == signal_id).first()
-            if sig:
-                sig.acted_on = True
-                db.commit()
+    def settle_position(self, position_id: int, *, settled_up: bool) -> Optional[float]:
+        """Resolve one position and return its PnL, or None if already settled."""
+        with self._session() as session:
+            row = session.get(Position, position_id)
+            if row is None or row.outcome != Outcome.PENDING.value:
+                return None
+            won = settled_up if row.side == 'up' else not settled_up
+            payout = float(row.contracts) if won else 0.0
+            row.settled_up = settled_up
+            row.payout = payout
+            row.pnl = payout - row.outlay
+            row.outcome = Outcome.WON.value if won else Outcome.LOST.value
+            row.settled_at = utcnow()
+            session.commit()
+            return row.pnl
 
-    def count_open_positions(self) -> int:
-        with self._session() as db:
-            return db.query(PaperPosition).filter(PaperPosition.is_open.is_(True)).count()
-
-    def get_closed_paper_positions_since(self, since: datetime) -> list[PaperPosition]:
-        with self._session() as db:
-            return (
-                db.query(PaperPosition)
-                .filter(PaperPosition.is_open.is_(False), PaperPosition.updated_at >= since)
-                .order_by(PaperPosition.updated_at.asc())
-                .all()
+    def open_positions(self) -> list[Position]:
+        with self._session() as session:
+            return list(
+                session.query(Position)
+                .filter(Position.outcome == Outcome.PENDING.value)
+                .order_by(Position.settle_time)
             )
 
-    def get_paper_equity_curve_since(self, since: datetime) -> list[PaperEquityCurve]:
-        with self._session() as db:
-            return (
-                db.query(PaperEquityCurve)
-                .filter(PaperEquityCurve.timestamp >= since)
-                .order_by(PaperEquityCurve.timestamp.asc())
-                .all()
+    def settled_positions_since(self, since: datetime) -> list[Position]:
+        with self._session() as session:
+            return list(
+                session.query(Position)
+                .filter(Position.outcome != Outcome.PENDING.value)
+                .filter(Position.settled_at >= since)
+                .order_by(Position.settled_at.desc())
             )
 
-    def upsert_paper_engine_config(self, active_coins: list[str], tier_map: dict[str, str]) -> None:
-        """Write (or overwrite) the single paper_engine_config row so the API can expose it."""
-        with self._session() as db:
-            row = db.query(PaperEngineConfig).filter(PaperEngineConfig.id == 1).first()
-            if row:
-                row.active_coins = sorted(active_coins)
-                row.tier_map = tier_map
-            else:
-                db.add(PaperEngineConfig(id=1, active_coins=sorted(active_coins), tier_map=tier_map))
-            db.commit()
+    # ---- account --------------------------------------------------------
+    def ensure_account(self, starting_bankroll: float) -> Account:
+        with self._session() as session:
+            row = session.query(Account).order_by(Account.id).first()
+            if row is None:
+                row = Account(starting_bankroll=starting_bankroll,
+                              bankroll=starting_bankroll)
+                session.add(row)
+                session.commit()
+                session.refresh(row)
+            return row
 
-    def compute_paper_state_from_history(self, initial_equity: float = 10_000.0) -> dict:
-        """Reconstruct correct cash_balance/realized/unrealized from fill + position history.
+    def account(self) -> Optional[Account]:
+        with self._session() as session:
+            return session.query(Account).order_by(Account.id).first()
 
-        This is used on engine startup to avoid the reset-to-10000 bug after container restarts.
-        Formula: cash = initial - sum(open_fees_from_fills) + sum(realized_pnl_from_closed_positions)
-        """
-        with self._session() as db:
-            total_open_fees = db.query(func.sum(PaperFill.fee)).scalar() or 0.0
-            total_realized = (
-                db.query(func.sum(PaperPosition.realized_pnl))
-                .filter(PaperPosition.is_open.is_(False))
-                .scalar()
-            ) or 0.0
-            open_positions = (
-                db.query(PaperPosition).filter(PaperPosition.is_open.is_(True)).all()
+    def update_account(self, **fields) -> None:
+        with self._session() as session:
+            row = session.query(Account).order_by(Account.id).first()
+            if row is None:
+                raise ValueError('no account row; call ensure_account first')
+            for key, value in fields.items():
+                setattr(row, key, value)
+            session.commit()
+
+    def write_equity_point(self, **fields) -> int:
+        with self._session() as session:
+            row = EquityPoint(**fields)
+            session.add(row)
+            session.commit()
+            return row.id
+
+    def equity_curve_since(self, since: datetime) -> list[EquityPoint]:
+        with self._session() as session:
+            return list(
+                session.query(EquityPoint)
+                .filter(EquityPoint.timestamp >= since)
+                .order_by(EquityPoint.timestamp)
             )
-            total_unrealized = sum(float(p.unrealized_pnl or 0) for p in open_positions)
-        cash = initial_equity - float(total_open_fees) + float(total_realized)
-        return {
-            "cash_balance": cash,
-            "realized_pnl": float(total_realized),
-            "unrealized_pnl": total_unrealized,
-        }
+
+    # ---- model runs and calibration -------------------------------------
+    def record_model_run(self, **fields) -> int:
+        with self._session() as session:
+            existing = session.query(ModelRun).filter_by(
+                version=fields['version']).one_or_none()
+            if existing is not None:
+                for key, value in fields.items():
+                    setattr(existing, key, value)
+                session.commit()
+                return existing.id
+            row = ModelRun(**fields)
+            session.add(row)
+            session.commit()
+            return row.id
+
+    def latest_model_run(self) -> Optional[ModelRun]:
+        with self._session() as session:
+            return (session.query(ModelRun)
+                    .order_by(ModelRun.created_at.desc()).first())
+
+    def model_runs(self, limit: int = 50) -> list[ModelRun]:
+        with self._session() as session:
+            return list(session.query(ModelRun)
+                        .order_by(ModelRun.created_at.desc()).limit(limit))
+
+    def write_calibration(self, model_version: str, source: str,
+                          bins: Iterable[dict]) -> int:
+        """Replace the reliability table for one (version, source)."""
+        written = 0
+        with self._session() as session:
+            session.query(CalibrationBin).filter_by(
+                model_version=model_version, source=source).delete()
+            for row in bins:
+                session.add(CalibrationBin(model_version=model_version,
+                                           source=source, **row))
+                written += 1
+            session.commit()
+        return written
+
+    def calibration(self, model_version: Optional[str] = None) -> list[CalibrationBin]:
+        with self._session() as session:
+            query = session.query(CalibrationBin)
+            if model_version:
+                query = query.filter_by(model_version=model_version)
+            return list(query.order_by(CalibrationBin.source, CalibrationBin.bin_low))

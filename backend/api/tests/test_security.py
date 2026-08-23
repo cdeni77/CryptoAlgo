@@ -1,6 +1,6 @@
 """The launch endpoint is the API's only way to start a process. Guard it.
 
-Before this, `POST /research/launch/{job}` had no authentication and the CORS
+Before this, `POST /jobs/{job}` had no authentication and the CORS
 policy ended with `"*"`, so any page the browser had open could start a trader
 script — with arbitrary arguments, in a container holding the exchange API keys.
 The module name was constrained to a discovered script; nothing else was.
@@ -35,21 +35,21 @@ def test_launch_is_disabled_when_no_token_is_configured(client, clean_token):
     This is the direction that matters: a deployment that forgot to set the token
     should refuse to launch, not launch for anyone.
     """
-    response = client.post('/research/launch/preflight', json={'args': []})
+    response = client.post('/jobs/scripts.baseline', json={'args': []})
 
     assert response.status_code == 503
     assert 'API_TOKEN' in response.json()['detail']
 
 
 def test_launch_rejects_a_missing_token(client, with_token):
-    response = client.post('/research/launch/preflight', json={'args': []})
+    response = client.post('/jobs/scripts.baseline', json={'args': []})
 
     assert response.status_code == 401
 
 
 def test_launch_rejects_a_wrong_token(client, with_token):
     response = client.post(
-        '/research/launch/preflight',
+        '/jobs/scripts.baseline',
         json={'args': []},
         headers={'X-API-Token': 'not-the-token'},
     )
