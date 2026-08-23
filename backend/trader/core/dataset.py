@@ -170,6 +170,39 @@ class Dataset:
 
 
 @dataclass
+class ScoringBundle:
+    """Everything needed to score a window that has never been seen.
+
+    The promoted artifact used to carry only the baseline, which meant it could
+    not score a fresh window on its own: the volatility model and the intraday
+    seasonality factor are both *fitted*, both live inside the fold, and both are
+    required before a barrier probability exists. An artifact missing them is one
+    that can be evaluated and not deployed, and nothing said so until the live
+    path tried.
+
+    Deliberately excludes the per-minute state frames. Those are derived from
+    bars and are hundreds of megabytes; the live path rebuilds them from the last
+    day of bars in milliseconds.
+    """
+
+    seasonality: dict[str, Seasonality]
+    vol_models: dict[str, VolModel]
+    baseline: BarrierBaseline
+    symbols: tuple[str, ...]
+    window_minutes: int
+    decision_offsets: tuple[int, ...]
+
+    def covers(self, symbol: str) -> bool:
+        return symbol in self.seasonality and symbol in self.vol_models
+
+    def summary(self) -> str:
+        return (f'scoring bundle: {len(self.vol_models)} symbols, '
+                f'{self.window_minutes}min windows at '
+                f'{", ".join(f"+{o}m" for o in self.decision_offsets)}, '
+                f'{self.baseline.distribution} baseline')
+
+
+@dataclass
 class FoldFit:
     """The three fitted objects, plus the rows they were fitted on."""
 
@@ -178,6 +211,15 @@ class FoldFit:
     baseline: BarrierBaseline
     train_windows: int
     states: dict[str, pd.DataFrame] = field(default_factory=dict, repr=False)
+
+    def bundle(self, config: Config) -> ScoringBundle:
+        """The deployable subset: fits, no frames."""
+        return ScoringBundle(
+            seasonality=self.seasonality, vol_models=self.vol_models,
+            baseline=self.baseline, symbols=tuple(sorted(self.vol_models)),
+            window_minutes=config.window_minutes,
+            decision_offsets=tuple(config.decision_offsets),
+        )
 
     def summary(self) -> str:
         lines = [f'fold fit on {self.train_windows:,} windows']
@@ -302,3 +344,63 @@ def _score_windows(
         raise DatasetError('every symbol lacked a volatility model')
     scored = pd.concat(parts, ignore_index=True)
     return build_features(scored, states, config, groups=groups)
+
+
+def score_live(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    bundle: ScoringBundle,
+    config: Config,
+    *,
+    window_open: pd.Timestamp,
+    offset: int,
+    groups: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Score exactly one decision point per symbol, from freshly fetched bars.
+
+    The same code path as the backtest, deliberately: `minute_state`,
+    `apply_seasonality`, the fold's own `VolModel`, then `build_features` and the
+    fold's own baseline. `core/backtest.py` and this function differ only in
+    which windows they ask for, which is what stops the live path and the
+    measured path from drifting apart — the previous incarnation of this repo had
+    them disagree about entry price for months.
+
+    The outcome column is present and NaN. A window being decided has not
+    settled, and writing a plausible zero into it would make an unresolved bet
+    look like a loss.
+    """
+    if offset not in bundle.decision_offsets:
+        logger.warning('offset +%dm is not one the model was fitted at (%s)',
+                       offset, bundle.decision_offsets)
+    grids, states = {}, {}
+    for symbol, bars in bars_by_symbol.items():
+        if not bundle.covers(symbol):
+            logger.error('%s has no fitted volatility model in this artifact, skipped', symbol)
+            continue
+        grid = minute_grid(bars)
+        grids[symbol] = grid
+        flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
+        state = minute_state(grid, flat, config)
+        states[symbol] = apply_seasonality(state, bundle.seasonality[symbol])
+    if not states:
+        raise DatasetError('no symbol could be scored with this artifact')
+    states = attach_cross_asset(states, REFERENCE_SYMBOL, config)
+
+    windows, _ = build_window_panel(
+        {s: bars_by_symbol[s] for s in states}, config, offsets=(offset,))
+    slice_ = windows.loc[windows['window_open'] == window_open]
+    if slice_.empty:
+        raise DatasetError(
+            f'no window opens at {window_open} — the bars may not reach it yet, '
+            f'or its boundary minute is missing'
+        )
+    dataset = Dataset(config=config, grids=grids, states=states, windows=windows,
+                      reports={}, forward_vol={})
+    table = _score_windows(dataset, states, bundle.vol_models, bundle.seasonality,
+                           slice_, config, groups=groups)
+    scored = attach_baseline(table, bundle.baseline)
+    # The window has not settled. Say so rather than carrying the value the
+    # window table computed from a settle price that does not exist yet.
+    scored['outcome'] = np.nan
+    scored['settle_price'] = np.nan
+    scored['settle_return'] = np.nan
+    return scored

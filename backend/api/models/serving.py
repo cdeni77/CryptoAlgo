@@ -63,6 +63,13 @@ class Prediction(Base):
     baseline_probability = Column(Float, nullable=False)
     model_probability = Column(Float, nullable=False)
 
+    # What the forecast was actually judged against, and where that came from.
+    # A backtest has no quotes and stands the calibrated baseline in for the
+    # market; a live decision reads the real book. Those are different claims and
+    # a row that does not distinguish them makes a backtest look like a fill.
+    market_probability = Column(Float, nullable=True)
+    price_source = Column(String, nullable=False, default='baseline')
+
     # the decision
     reason = Column(String, nullable=False, index=True)
     traded = Column(Boolean, nullable=False, default=False)
@@ -79,6 +86,36 @@ class Prediction(Base):
         UniqueConstraint('symbol', 'window_open', 'offset_minutes',
                          name='uq_prediction_point'),
         Index('ix_predictions_traded_window', 'traded', 'window_open'),
+    )
+
+
+class MinutePrice(Base):
+    """One minute of price per symbol, for the window chart.
+
+    The prediction rows carry `last_price` at four offsets, which is enough to
+    decide with and far too sparse to draw. A barrier problem's natural picture
+    is the path against the line it has to finish above, and that needs every
+    minute.
+
+    Cheap: three symbols at one row a minute is 4,320 rows a day. The research
+    store keeps the authoritative bars; this is a rolling window for the screen,
+    and `prune` drops what has scrolled off.
+    """
+
+    __tablename__ = 'minute_prices'
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    minute = Column(DateTime(timezone=True), nullable=False, index=True)
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    close = Column(Float, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'minute', name='uq_minute_price'),
+        Index('ix_minute_prices_symbol_minute', 'symbol', 'minute'),
     )
 
 
@@ -118,11 +155,18 @@ class Position(Base):
 
 
 class Account(Base):
-    """The single account row. A $100 bankroll, and what it is now."""
+    """The single account row: the bankroll, and what it is now.
+
+    `mode` is 'paper' or 'live' and it is not cosmetic. A live account holds real
+    money, so every surface that shows a number from this row has to be able to
+    say which kind it is — a live account that renders identically to a paper one
+    is the single worst failure this schema could permit.
+    """
 
     __tablename__ = 'account'
 
     id = Column(Integer, primary_key=True, index=True)
+    mode = Column(String, nullable=False, default='paper', index=True)
     starting_bankroll = Column(Float, nullable=False, default=100.0)
     bankroll = Column(Float, nullable=False, default=100.0)
     staked = Column(Float, nullable=False, default=0.0)
@@ -207,6 +251,59 @@ class CalibrationBin(Base):
     )
 
 
+class OrderTicket(Base):
+    """A live decision, as something a person can act on.
+
+    This repository has no Kalshi API client and no Kalshi credentials, so in
+    live mode the engine does not place orders — it writes a ticket carrying
+    everything needed to place one, and records what came back. Being explicit
+    about that boundary is the point: a system that silently did nothing while
+    appearing to trade would be worse than one that says a human is in the loop.
+
+    `status` moves new -> placed -> filled, or new -> skipped. Nothing here
+    advances it automatically; the dashboard does, or a future order client will.
+    """
+
+    __tablename__ = 'order_tickets'
+
+    id = Column(Integer, primary_key=True, index=True)
+    prediction_id = Column(Integer, nullable=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    window_open = Column(DateTime(timezone=True), nullable=False, index=True)
+    settle_time = Column(DateTime(timezone=True), nullable=False)
+    offset_minutes = Column(Integer, nullable=False)
+
+    # The venue's own identifier for the market, resolved by asking the venue
+    # which market opens and closes on this window rather than by building a
+    # ticker from a pattern. A pattern is a guess that keeps working until the
+    # venue renames a series.
+    market_ticker = Column(String, nullable=True, index=True)
+    venue_order_id = Column(String, nullable=True)
+
+    side = Column(String, nullable=False)
+    contracts = Column(Integer, nullable=False)
+    # The price the decision was sized at, and the worst price still worth
+    # paying. A ticket without a limit is an instruction to pay anything.
+    limit_price = Column(Float, nullable=False)
+    max_price = Column(Float, nullable=False)
+    expected_cost = Column(Float, nullable=False)
+    model_probability = Column(Float, nullable=False)
+    edge = Column(Float, nullable=False)
+
+    status = Column(String, nullable=False, default='new', index=True)
+    filled_contracts = Column(Integer, nullable=True)
+    filled_price = Column(Float, nullable=True)
+    filled_at = Column(DateTime(timezone=True), nullable=True)
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'window_open', name='uq_ticket_window'),
+        Index('ix_order_tickets_status_created', 'status', 'created_at'),
+    )
+
+
 # Indexes and constraints added after a table first shipped. Applied by
 # `_run_migrations` and asserted identical to the API's list by test_orm_parity —
 # an index that exists in one container and not the other is a query that is
@@ -218,4 +315,8 @@ MIGRATIONS: tuple[str, ...] = (
     'ON positions (settled_at DESC)',
     'CREATE INDEX IF NOT EXISTS ix_equity_curve_timestamp_desc '
     'ON equity_curve (timestamp DESC)',
+    'CREATE INDEX IF NOT EXISTS ix_minute_prices_recent '
+    'ON minute_prices (symbol, minute DESC)',
+    'CREATE INDEX IF NOT EXISTS ix_order_tickets_window '
+    'ON order_tickets (window_open DESC)',
 )

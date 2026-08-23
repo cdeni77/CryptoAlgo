@@ -130,7 +130,8 @@ def walk_forward(
         logger.info(fold.label())
         fit, train_table = fit_fold(dataset, fold.train, config, groups=groups)
         weights = recency_weights(train_table['window_open'], config.recency_half_life_days)
-        model = fit_model(train_table, fit.baseline, config, groups=groups, weights=weights)
+        model = fit_model(train_table, fit.baseline, config, groups=groups,
+                          weights=weights, scoring=fit.bundle(config))
         models.append(model)
 
         test_table = apply_fold(dataset, fit, fold.test, config, groups=groups)

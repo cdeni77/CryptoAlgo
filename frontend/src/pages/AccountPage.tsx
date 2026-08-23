@@ -45,10 +45,15 @@ export function AccountPage() {
   return (
     <div className="space-y-8">
       <SectionHead
-        eyebrow={`started at $${state.starting_bankroll.toFixed(2)}`}
+        eyebrow={`${state.mode === 'live' ? 'live · real money' : 'paper'} · started at $${state.starting_bankroll.toFixed(2)}`}
         title="Account"
         note="Equity is cash plus open stake at cost. Marking an open binary at our own forecast would book belief as profit, which is how a losing system draws a rising curve."
-        right={state.halted ? <Chip tone="fail">halted</Chip> : undefined}
+        right={
+          <div className="flex items-center gap-4">
+            {state.mode === 'live' && <Chip tone="below">live</Chip>}
+            {state.halted && <Chip tone="fail">halted</Chip>}
+          </div>
+        }
       />
 
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">

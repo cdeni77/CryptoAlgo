@@ -36,6 +36,49 @@ export type Reason =
 export type Side = 'up' | 'down';
 export type PositionOutcome = 'pending' | 'won' | 'lost';
 
+export interface MinuteBar {
+  minute: string;
+  open: number;
+  high: number | null;
+  low: number | null;
+  close: number;
+}
+
+export interface WindowStrike {
+  symbol: string;
+  window_open: string;
+  settle_time: string;
+  strike: number;
+}
+
+export interface PriceSeries {
+  symbol: string;
+  minutes: number;
+  bars: MinuteBar[];
+  strikes: WindowStrike[];
+}
+
+export interface OrderTicket {
+  id: number;
+  symbol: string;
+  window_open: string;
+  settle_time: string;
+  offset_minutes: number;
+  market_ticker: string | null;
+  side: Side;
+  contracts: number;
+  limit_price: number;
+  max_price: number;
+  expected_cost: number;
+  model_probability: number;
+  edge: number;
+  status: 'new' | 'placed' | 'filled' | 'skipped';
+  filled_contracts: number | null;
+  filled_price: number | null;
+  filled_at: string | null;
+  note: string | null;
+}
+
 export interface Prediction {
   symbol: string;
   window_open: string;
@@ -49,6 +92,12 @@ export interface Prediction {
   z_score: number | null;
   baseline_probability: number;
   model_probability: number;
+  /** The venue's implied probability, when a real book was read. */
+  market_probability: number | null;
+  /** 'quote' when the venue's ask priced this decision, 'baseline' when the
+   *  calibrated barrier stood in for a market that was not observed. Those are
+   *  different claims and the UI must not render them identically. */
+  price_source: 'quote' | 'baseline';
   reason: Reason;
   traded: boolean;
   side: Side | null;
@@ -82,6 +131,8 @@ export interface Position {
 
 export interface AccountState {
   configured: boolean;
+  /** Real money or not. Surfaced everywhere a number from this account appears. */
+  mode: 'paper' | 'live';
   starting_bankroll: number;
   bankroll: Measured<number>;
   /** Bankroll plus open stake carried at COST — never marked to our own
@@ -173,6 +224,7 @@ export interface LiveState {
   windows: Prediction[];
   account: AccountState;
   open_positions: Position[];
+  tickets: OrderTicket[];
 }
 
 export interface JobDescriptor {

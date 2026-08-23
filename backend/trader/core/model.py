@@ -67,6 +67,11 @@ class ForecastModel:
     booster: Any
     features: list[str]
     baseline: BarrierBaseline
+    # Everything else the live path needs: the fitted volatility models and
+    # seasonality factors. Without these the artifact can be evaluated and not
+    # deployed, which is a distinction nothing surfaced until the live path
+    # tried to score a window.
+    scoring: Any = None
     residual_scale: float = 1.0
     groups: tuple[str, ...] = ()
     n_train_rows: int = 0
@@ -138,8 +143,14 @@ class ForecastModel:
             'inner_log_loss_skill': self.inner_baseline_log_loss - self.inner_log_loss,
             'control_importance_share': self.control_importance_share,
             'baseline': self.baseline.provenance(),
+            'deployable': self.scoring is not None,
             'config': self.config_provenance,
         }
+
+    @property
+    def deployable(self) -> bool:
+        """Can this artifact score a window it has never seen?"""
+        return self.scoring is not None
 
     def summary(self) -> str:
         skill = self.inner_baseline_log_loss - self.inner_log_loss
@@ -197,6 +208,7 @@ def fit_model(
     *,
     groups: Optional[Sequence[str]] = None,
     weights: Optional[np.ndarray] = None,
+    scoring: Any = None,
 ) -> ForecastModel:
     """Fit the residual classifier on a training slice.
 
@@ -269,7 +281,8 @@ def fit_model(
 
     model = ForecastModel(
         booster=booster, features=list(populated), baseline=baseline,
-        residual_scale=alpha, groups=tuple(groups) if groups else (),
+        scoring=scoring, residual_scale=alpha,
+        groups=tuple(groups) if groups else (),
         n_train_rows=len(train), n_train_windows=len(windows),
         empty_features=empty, best_iteration=booster.best_iteration,
         train_log_loss=log_loss(

@@ -22,7 +22,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from models.serving import (
-    Account, CalibrationBin, EquityPoint, ModelRun, Outcome, Position, Prediction,
+    Account, CalibrationBin, EquityPoint, MinutePrice, ModelRun, OrderTicket,
+    Outcome, Position, Prediction,
 )
 
 # Reasons a decision was refused, in funnel order. The dashboard shows them in
@@ -55,6 +56,7 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
     if row is None:
         return {
             'configured': False,
+            'mode': 'paper',
             'starting_bankroll': starting_bankroll,
             'bankroll': _missing('no account row yet — the paper engine has not run'),
             'equity': _missing('no account row yet — the paper engine has not run'),
@@ -66,6 +68,10 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
         }
     return {
         'configured': True,
+        # 'paper' or 'live'. Surfaced on every response that carries a number
+        # from this row, because a live account that renders identically to a
+        # paper one is the worst failure this surface could permit.
+        'mode': row.mode,
         'starting_bankroll': row.starting_bankroll,
         'bankroll': _measured(row.bankroll),
         # Equity is bankroll plus open stake carried at COST. Deliberately not
@@ -124,6 +130,10 @@ def _prediction_payload(row: Prediction) -> dict[str, Any]:
         'sigma_remaining': row.sigma_remaining, 'z_score': row.z_score,
         'baseline_probability': row.baseline_probability,
         'model_probability': row.model_probability,
+        'market_probability': row.market_probability,
+        # 'quote' when the venue's own ask priced this, 'baseline' when the
+        # calibrated barrier stood in for a market that was not observed.
+        'price_source': row.price_source,
         'reason': row.reason, 'traded': bool(row.traded), 'side': row.side,
         'price': row.price, 'effective_cost': row.effective_cost,
         'edge': row.edge, 'contracts': row.contracts,
@@ -254,3 +264,66 @@ def calibration(db: Session, *, version: Optional[str] = None) -> dict[str, Any]
             'predicted': r.predicted, 'observed': r.observed, 'count': r.count,
         } for r in rows],
     }
+
+
+def minute_prices(db: Session, symbol: str, *, minutes: int = 240) -> list[dict[str, Any]]:
+    """Recent one-minute bars for one symbol, for the window chart.
+
+    A barrier problem's natural picture is the price path against the line it has
+    to finish above, and the prediction rows carry only four points per window —
+    enough to decide with, far too sparse to draw.
+    """
+    since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    rows = db.execute(
+        select(MinutePrice)
+        .where(MinutePrice.symbol == symbol, MinutePrice.minute >= since)
+        .order_by(MinutePrice.minute)
+    ).scalars().all()
+    return [{
+        'minute': r.minute, 'open': r.open, 'high': r.high,
+        'low': r.low, 'close': r.close,
+    } for r in rows]
+
+
+def window_strikes(db: Session, *, minutes: int = 240) -> list[dict[str, Any]]:
+    """The strike of each recent window, per symbol.
+
+    The chart draws these as horizontal segments spanning their own window, which
+    is what makes "above or below" readable at a glance — a single line across the
+    whole chart would be wrong, because the strike is reset every fifteen minutes.
+    """
+    since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    rows = db.execute(
+        select(Prediction.symbol, Prediction.window_open, Prediction.settle_time,
+               func.min(Prediction.strike))
+        .where(Prediction.window_open >= since)
+        .group_by(Prediction.symbol, Prediction.window_open, Prediction.settle_time)
+        .order_by(Prediction.window_open)
+    ).all()
+    return [{
+        'symbol': symbol, 'window_open': window_open, 'settle_time': settle_time,
+        'strike': float(strike),
+    } for symbol, window_open, settle_time, strike in rows]
+
+
+def tickets(db: Session, *, open_only: bool = True, limit: int = 50) -> list[dict[str, Any]]:
+    """Live order tickets.
+
+    This repository places orders through the Kalshi client when told to twice;
+    a ticket is the record of the decision either way, so a dry run and a fill
+    are distinguishable after the fact.
+    """
+    query = select(OrderTicket).order_by(OrderTicket.created_at.desc()).limit(limit)
+    if open_only:
+        query = (select(OrderTicket).where(OrderTicket.status == 'new')
+                 .order_by(OrderTicket.created_at.desc()).limit(limit))
+    return [{
+        'id': r.id, 'symbol': r.symbol, 'window_open': r.window_open,
+        'settle_time': r.settle_time, 'offset_minutes': r.offset_minutes,
+        'market_ticker': r.market_ticker, 'side': r.side, 'contracts': r.contracts,
+        'limit_price': r.limit_price, 'max_price': r.max_price,
+        'expected_cost': r.expected_cost, 'model_probability': r.model_probability,
+        'edge': r.edge, 'status': r.status,
+        'filled_contracts': r.filled_contracts, 'filled_price': r.filled_price,
+        'filled_at': r.filled_at, 'note': r.note,
+    } for r in db.execute(query).scalars().all()]

@@ -36,6 +36,7 @@ def get_live(db: Session = Depends(get_db)):
         'windows': serving.live_windows(db),
         'account': serving.account_state(db),
         'open_positions': serving.positions(db, open_only=True),
+        'tickets': serving.tickets(db, open_only=True, limit=20),
     }
 
 
@@ -62,6 +63,24 @@ def get_positions(
     db: Session = Depends(get_db),
 ):
     return {'positions': serving.positions(db, open_only=open_only, limit=limit)}
+
+
+@router.get('/prices/{symbol}')
+def get_prices(symbol: str, minutes: int = Query(240, ge=15, le=2880),
+               db: Session = Depends(get_db)):
+    """One-minute bars and the strike of each window they span."""
+    return {
+        'symbol': symbol, 'minutes': minutes,
+        'bars': serving.minute_prices(db, symbol, minutes=minutes),
+        'strikes': [s for s in serving.window_strikes(db, minutes=minutes)
+                    if s['symbol'] == symbol],
+    }
+
+
+@router.get('/tickets')
+def get_tickets(open_only: bool = True, limit: int = Query(50, ge=1, le=200),
+                db: Session = Depends(get_db)):
+    return {'tickets': serving.tickets(db, open_only=open_only, limit=limit)}
 
 
 @router.get('/model')

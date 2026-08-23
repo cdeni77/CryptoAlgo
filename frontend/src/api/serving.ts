@@ -15,8 +15,10 @@ import type {
   LiveState,
   ModelAttempt,
   ModelState,
+  OrderTicket,
   Position,
   Prediction,
+  PriceSeries,
 } from '../types';
 
 export const fetchLive = () => get<LiveState>('/live');
@@ -38,6 +40,12 @@ export const fetchPositions = (openOnly = false, limit = 100) =>
   get<{ positions: Position[] }>(
     `/positions?open_only=${openOnly}&limit=${limit}`,
   );
+
+export const fetchPrices = (symbol: string, minutes = 240) =>
+  get<PriceSeries>(`/prices/${encodeURIComponent(symbol)}?minutes=${minutes}`);
+
+export const fetchTickets = (openOnly = true, limit = 50) =>
+  get<{ tickets: OrderTicket[] }>(`/tickets?open_only=${openOnly}&limit=${limit}`);
 
 export const fetchModel = () => get<ModelState>('/model');
 

@@ -8,11 +8,12 @@
  * between are supporting detail.
  */
 import { usePolling } from '../hooks/usePolling';
-import { fetchFunnel, fetchLive } from '../api/serving';
-import type { Prediction } from '../types';
+import { fetchFunnel, fetchLive, fetchPrices } from '../api/serving';
+import type { OrderTicket, Prediction } from '../types';
 import { FunnelChart } from '../components/Charts';
 import { ProbabilityScale } from '../components/ProbabilityScale';
 import { QuarterTrack } from '../components/QuarterTrack';
+import { WindowChart } from '../components/WindowChart';
 import {
   Chip,
   Column,
@@ -43,6 +44,16 @@ export function LivePage() {
 
   return (
     <div className="space-y-8">
+      {account.mode === 'live' && (
+        <div className="flex items-center gap-3 border-l-2 border-below bg-below-wash px-4 py-2">
+          <Chip tone="below">live</Chip>
+          <span className="text-tiny text-ink">
+            This account holds real money. Positions below are actual exposure,
+            not a simulation.
+          </span>
+        </div>
+      )}
+
       <section>
         <SectionHead
           eyebrow={`${state.windows.length} symbols · ${WINDOW_MINUTES}-minute windows`}
@@ -66,7 +77,13 @@ export function LivePage() {
       <section className="grid gap-4 lg:grid-cols-[1fr_1.4fr]">
         <Panel>
           <SectionHead
-            eyebrow={account.halted ? 'halted' : 'paper account'}
+            eyebrow={
+              account.halted
+                ? 'halted'
+                : account.mode === 'live'
+                  ? 'live account · real money'
+                  : 'paper account'
+            }
             title="Account"
             note="Open positions are carried at cost, never marked to our own forecast."
           />
@@ -109,6 +126,23 @@ export function LivePage() {
         </Panel>
       </section>
 
+      {state.tickets.length > 0 && (
+        <section>
+          <SectionHead
+            eyebrow={`${state.tickets.length} awaiting`}
+            title="Order tickets"
+            note="Written for every live decision. A ticket that was never placed and a fill are different things, and the status column is the difference."
+          />
+          <Panel flush>
+            <DataTable
+              columns={ticketColumns}
+              rows={state.tickets}
+              keyOf={(t) => String(t.id)}
+            />
+          </Panel>
+        </section>
+      )}
+
       <section>
         <SectionHead
           eyebrow={`${state.open_positions.length} open`}
@@ -125,6 +159,26 @@ export function LivePage() {
         </Panel>
       </section>
     </div>
+  );
+}
+
+/** The last two hours of price for one symbol, with each window's strike.
+ *
+ * Polled separately from the decision state and at a slower cadence: the path is
+ * two hours of history that changes one minute at a time, while the decision
+ * changes every cycle. One request for both would refetch 120 bars to learn a
+ * probability moved.
+ */
+function SymbolChart({ symbol }: { symbol: string }) {
+  const series = usePolling(() => fetchPrices(symbol, 120), 60_000, [symbol]);
+  if (series.loading) return <Loading what="prices" />;
+  if (series.error) return <Failed error={series.error} what={`${symbol} prices`} />;
+  return (
+    <WindowChart
+      bars={series.data?.bars ?? []}
+      strikes={series.data?.strikes ?? []}
+      height={140}
+    />
   );
 }
 
@@ -156,6 +210,11 @@ function WindowCard({ window: w }: { window: Prediction }) {
           offsets={OFFSETS}
           secondsToSettle={secondsToSettle}
         />
+      </div>
+
+      <div className="mt-4 border-t border-rule pt-3">
+        <div className="eyebrow mb-1">price against strike</div>
+        <SymbolChart symbol={w.symbol} />
       </div>
 
       <div className="mt-4">
@@ -210,16 +269,58 @@ function WindowCard({ window: w }: { window: Prediction }) {
             {signedPp(w.edge)}
           </div>
         </div>
-        <Metric
-          label="strike"
-          value={w.strike}
-          digits={w.strike > 1000 ? 0 : 2}
-          tone="muted"
-        />
+        <div>
+          <div
+            className="eyebrow"
+            title={
+              w.price_source === 'quote'
+                ? "the venue's own ask priced this decision"
+                : 'no book was read; the calibrated barrier stood in for the market'
+            }
+          >
+            priced by
+          </div>
+          <div className="mt-0.5 font-mono text-mid font-medium text-ink-2">
+            {w.price_source === 'quote' ? 'quote' : 'baseline'}
+          </div>
+        </div>
       </dl>
     </Panel>
   );
 }
+
+const ticketColumns: Column<OrderTicket>[] = [
+  { key: 'symbol', head: 'symbol', render: (t) => <span className="font-mono">{t.symbol}</span> },
+  {
+    key: 'market',
+    head: 'market',
+    render: (t) => (
+      <span className="font-mono text-micro text-ink-3">{t.market_ticker ?? '—'}</span>
+    ),
+  },
+  { key: 'side', head: 'side', render: (t) => <SideChip side={t.side} /> },
+  { key: 'contracts', head: 'qty', numeric: true, render: (t) => t.contracts },
+  { key: 'limit', head: 'limit', numeric: true, render: (t) => cents(t.limit_price) },
+  { key: 'max', head: 'max', numeric: true, render: (t) => cents(t.max_price) },
+  { key: 'cost', head: 'cost', numeric: true, render: (t) => `$${t.expected_cost.toFixed(2)}` },
+  { key: 'edge', head: 'edge', numeric: true, render: (t) => signedPp(t.edge) },
+  {
+    key: 'status',
+    head: 'status',
+    render: (t) => (
+      <Chip
+        tone={
+          t.status === 'filled' ? 'pass'
+            : t.status === 'placed' ? 'accent'
+            : t.status === 'skipped' ? 'fail'
+            : 'warn'
+        }
+      >
+        {t.status}
+      </Chip>
+    ),
+  },
+];
 
 const openColumns: Column<import('../types').Position>[] = [
   { key: 'symbol', head: 'symbol', render: (p) => <span className="font-mono">{p.symbol}</span> },

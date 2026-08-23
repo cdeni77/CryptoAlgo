@@ -41,7 +41,9 @@ import numpy as np
 import pandas as pd
 
 from core.config import Config, DEFAULT_CONFIG
-from core.costs import TICK, effective_price, expected_value_per_contract, trade_fee
+from core.costs import (
+    TICK, effective_price, expected_value_per_contract, fee_per_contract, trade_fee,
+)
 
 
 class Side(str, Enum):
@@ -84,6 +86,10 @@ class Decision:
     stake: float = 0.0
     fee: float = 0.0
     kelly_fraction: float = float('nan')
+    # 'quote' when the venue's own ask priced this, 'baseline' when the
+    # calibrated barrier stood in for a market that was not observed.
+    price_source: str = 'baseline'
+    market_ticker: Optional[str] = None
 
     @property
     def traded(self) -> bool:
@@ -125,6 +131,29 @@ class WindowExposure:
         )
 
 
+def _optional(get, key: str) -> Optional[float]:
+    """A finite float from the row, or None. A NaN is an absent value here."""
+    try:
+        value = get(key)
+    except (KeyError, IndexError):
+        return None
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _optional_str(get, key: str) -> Optional[str]:
+    try:
+        value = get(key)
+    except (KeyError, IndexError):
+        return None
+    return None if value is None else str(value)
+
+
 def round_to_tick_array(price: np.ndarray) -> np.ndarray:
     """Kalshi quotes in whole cents, and the rounding is a real friction."""
     return np.clip(np.round(np.asarray(price, dtype=float) / TICK) * TICK,
@@ -153,6 +182,9 @@ def price_and_edge(
     q_up: np.ndarray,
     market_up: np.ndarray,
     config: Config = DEFAULT_CONFIG,
+    *,
+    ask_up: Optional[np.ndarray] = None,
+    ask_down: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Choose the better side, and price it. Vectorised, and the only copy.
 
@@ -170,10 +202,18 @@ def price_and_edge(
     longshot.
     """
     q_up = np.asarray(q_up, dtype=float)
-    price_up = round_to_tick_array(np.asarray(market_up, dtype=float))
-    price_down = round_to_tick_array(1.0 - price_up)
-    cost_up = np.asarray(effective_price(price_up, config), dtype=float)
-    cost_down = np.asarray(effective_price(price_down, config), dtype=float)
+    if ask_up is not None and ask_down is not None:
+        # A real book. The ask already includes the spread, so adding an assumed
+        # half-spread on top would charge for crossing it twice.
+        price_up = round_to_tick_array(np.asarray(ask_up, dtype=float))
+        price_down = round_to_tick_array(np.asarray(ask_down, dtype=float))
+        cost_up = price_up + np.asarray(fee_per_contract(price_up, config), dtype=float)
+        cost_down = price_down + np.asarray(fee_per_contract(price_down, config), dtype=float)
+    else:
+        price_up = round_to_tick_array(np.asarray(market_up, dtype=float))
+        price_down = round_to_tick_array(1.0 - price_up)
+        cost_up = np.asarray(effective_price(price_up, config), dtype=float)
+        cost_down = np.asarray(effective_price(price_down, config), dtype=float)
     edge_up = q_up - cost_up
     edge_down = (1.0 - q_up) - cost_down
     is_up = edge_up >= edge_down
@@ -212,7 +252,15 @@ def stateless_screen(
     finite = np.isfinite(q) & np.isfinite(m)
     counts[Reason.NOT_FINITE.value] = int((~finite).sum())
 
-    _, price, probability, _, edge = price_and_edge(np.where(finite, q, 0.5), m, config)
+    # If the frame carries a real book, screen against it — otherwise the
+    # vectorised path and the scalar path would disagree about which rows can
+    # trade, and the histogram would not add up to the decisions.
+    has_book = 'ask_up' in rows.columns and 'ask_down' in rows.columns
+    _, price, probability, _, edge = price_and_edge(
+        np.where(finite, q, 0.5), m, config,
+        ask_up=rows['ask_up'].to_numpy(dtype=float) if has_book else None,
+        ask_down=rows['ask_down'].to_numpy(dtype=float) if has_book else None,
+    )
     in_band = (price >= config.min_traded_price) & (price <= config.max_traded_price)
     plausible = np.abs(probability - price) * 100.0 <= config.max_disagreement_pp
     clears = edge >= config.min_edge_pp / 100.0
@@ -269,8 +317,14 @@ def decide(
     if exposure.positions >= config.max_positions_per_window:
         return refuse(Reason.POSITION_LIMIT)
 
+    ask_up = _optional(get, 'ask_up')
+    ask_down = _optional(get, 'ask_down')
+    has_book = ask_up is not None and ask_down is not None
     is_up_a, price_a, probability_a, cost_a, edge_a = price_and_edge(
-        np.array([q_up]), np.array([p_market]), config)
+        np.array([q_up]), np.array([p_market]), config,
+        ask_up=np.array([ask_up]) if has_book else None,
+        ask_down=np.array([ask_down]) if has_book else None,
+    )
     side = Side.UP if bool(is_up_a[0]) else Side.DOWN
     price = float(price_a[0])
     probability = float(probability_a[0])
@@ -278,7 +332,9 @@ def decide(
     edge = float(edge_a[0])
 
     common = dict(side=side, price=price, effective_cost=cost,
-                  model_probability=probability, edge=edge)
+                  model_probability=probability, edge=edge,
+                  price_source='quote' if has_book else 'baseline',
+                  market_ticker=_optional_str(get, 'market_ticker'))
 
     if not (config.min_traded_price <= price <= config.max_traded_price):
         return refuse(Reason.PRICE_OUT_OF_BAND, **common)
