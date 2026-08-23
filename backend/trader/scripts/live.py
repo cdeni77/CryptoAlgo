@@ -480,6 +480,13 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> dict[s
     state = await kalshi.reconcile()
     venue_balance = float(state['balance'])
     account = writer.account()
+    if not np.isfinite(venue_balance):
+        # The venue is the account of record only when it actually answered.
+        # Writing an unreadable balance over a correct one is worse than keeping
+        # ours and saying so.
+        logger.error('the venue did not return a readable balance; keeping our own '
+                     'figure this cycle rather than overwriting it')
+        account = None
     if account is not None:
         ours = float(account.bankroll)
         drift = venue_balance - ours

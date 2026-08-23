@@ -110,6 +110,32 @@ class Partition:
         )
 
 
+def _in_utc(frame: pd.DataFrame) -> pd.DataFrame:
+    """Force every timezone-aware column to UTC.
+
+    DuckDB returns `TIMESTAMPTZ` in the *process's local* timezone, so the same
+    Parquet file read on two machines produced two different `event_time`
+    representations — and the trader container sets `TZ=America/New_York`.
+    Nothing downstream re-normalised: `core/features.py` derives minute-of-day
+    straight off this index for the intraday seasonality and for
+    `us_equity_hours`, whose bounds are written as UTC minutes.
+
+    So the research path indexed seasonality in local time while
+    `scripts/live.py:fetch_bars` builds its index with an explicit `tz='UTC'`.
+    That is a train/serve skew in a fitted object, and it moves with DST twice a
+    year. Measured elsewhere in this audit: the same bars under an
+    `America/New_York` index shift the fitted seasonal peak by 353 minutes.
+
+    Pinned here rather than at each call site, because the point is that no
+    consumer should have to remember.
+    """
+    for column in frame.columns:
+        dtype = frame[column].dtype
+        if isinstance(dtype, pd.DatetimeTZDtype):
+            frame[column] = frame[column].dt.tz_convert('UTC')
+    return frame
+
+
 class ResearchStore:
     """Parquet-backed research store with point-in-time reads."""
 
@@ -253,15 +279,20 @@ class ResearchStore:
             placeholders = ', '.join('?' for _ in symbols)
             clauses.append(f'symbol IN ({placeholders})')
             params.extend(s.upper() for s in symbols)
+        # Bound as plain `datetime`, not `pd.Timestamp`. Under pandas 3.0 the
+        # Timestamp is no longer implicitly convertible by the driver's binder and
+        # every `--start`/`--end` run raised, which meant no run could be
+        # date-limited at all — including the small ones you would use to check a
+        # change quickly.
         if start is not None:
             clauses.append('event_time >= ?')
-            params.append(pd.Timestamp(start, tz='UTC'))
+            params.append(pd.Timestamp(start, tz='UTC').to_pydatetime())
         if end is not None:
             clauses.append('event_time <= ?')
-            params.append(pd.Timestamp(end, tz='UTC'))
+            params.append(pd.Timestamp(end, tz='UTC').to_pydatetime())
         if as_of is not None:
             clauses.append('available_time <= ?')
-            params.append(pd.Timestamp(as_of, tz='UTC'))
+            params.append(pd.Timestamp(as_of, tz='UTC').to_pydatetime())
         if min_quality is not None:
             if min_quality not in QUALITY_LEVELS:
                 raise DataStoreError(
@@ -285,7 +316,7 @@ class ResearchStore:
             f") ORDER BY symbol, event_time"
         )
         with duckdb.connect() as con:
-            return con.execute(sql, [glob, *params]).df()
+            return _in_utc(con.execute(sql, [glob, *params]).df())
 
     def panel(
         self,

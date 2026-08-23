@@ -166,6 +166,8 @@ def _price(raw: dict, name: str) -> Optional[float]:
         try:
             value = float(dollars)
         except (TypeError, ValueError):
+            logger.warning('%s_dollars was %r, which is not a number; treating the '
+                           'level as absent', name, dollars)
             value = 0.0
         return value if value > 0 else None
     cents = raw.get(name)
@@ -306,9 +308,41 @@ class KalshiClient:
 
     # ---- reading --------------------------------------------------------
     async def balance(self) -> float:
-        """Available balance in dollars."""
+        """Available balance in dollars, or NaN when the venue did not say.
+
+        Two corrections. It read only the integer-cent `balance` field, while
+        every other number in this file prefers the `_dollars` form — this module
+        already learned that lesson for quotes, where reading only the cents
+        field reported "no two-sided book" against a market quoting 0.19/0.20.
+        A venue that serves `balance_dollars` here would have been read 100x low.
+
+        And a missing or unparseable field defaulted to `0`, silently, producing a
+        plausible-looking $0.00. That is the worst possible failure for this
+        particular number: `reconcile_with_venue` writes it straight onto the
+        account, so a parse change would have overwritten a correct bankroll with
+        zero — and `check_venue.py` treats a zero balance as a legitimate
+        outcome ("a zero balance still proves auth"), so the one script whose job
+        is to catch this would have printed OK. NaN instead, which the callers
+        already treat as unsafe.
+        """
         payload = await self._request('GET', '/portfolio/balance')
-        return float(payload.get('balance', 0)) * CENT
+        dollars = payload.get('balance_dollars')
+        if dollars is not None:
+            try:
+                return float(dollars)
+            except (TypeError, ValueError):
+                logger.error('balance_dollars was %r, which is not a number', dollars)
+                return float('nan')
+        cents = payload.get('balance')
+        if cents is None:
+            logger.error('the venue returned no balance field; keys were %s',
+                         sorted(payload)[:12])
+            return float('nan')
+        try:
+            return float(cents) * CENT
+        except (TypeError, ValueError):
+            logger.error('balance was %r, which is not a number', cents)
+            return float('nan')
 
     async def markets(self, **params) -> list[dict]:
         """One page of markets. `series_ticker`, `status`, `limit` all apply."""

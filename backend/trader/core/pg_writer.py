@@ -360,12 +360,29 @@ class PgWriter:
         self._run_migrations()
 
     def _run_migrations(self) -> None:
+        """Apply the additive migrations, tolerating only SQLite's dialect gaps.
+
+        This used to catch bare `Exception` and log at `debug`, so *any* migration
+        failure against real Postgres — a type mismatch, a lock timeout, a
+        permissions problem — vanished at a level most deployments do not
+        capture, and the failure resurfaced later as a confusing runtime error on
+        the accounting database instead of a loud one at startup.
+
+        The tolerance it was written for is real but narrow: `MIGRATIONS` uses
+        `ADD COLUMN IF NOT EXISTS` and similar, which SQLite does not parse, and
+        the tests run on SQLite. So tolerate it on SQLite and nowhere else.
+        """
+        sqlite = self._engine.dialect.name == 'sqlite'
         with self._engine.begin() as connection:
             for statement in MIGRATIONS:
                 try:
                     connection.execute(text(statement))
-                except Exception as exc:  # noqa: BLE001 - SQLite in tests lacks some syntax
-                    logger.debug('migration skipped (%s): %s', exc, statement)
+                except Exception as exc:  # noqa: BLE001 - re-raised unless SQLite
+                    if not sqlite:
+                        logger.error('migration failed on %s: %s\n  %s',
+                                     self._engine.dialect.name, exc, statement)
+                        raise
+                    logger.debug('migration skipped on sqlite (%s): %s', exc, statement)
 
     def _session(self) -> Session:
         return self._sessions()
