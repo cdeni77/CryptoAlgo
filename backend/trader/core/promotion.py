@@ -1,29 +1,20 @@
-"""Promotion: the only route a model takes from training to live.
+"""Promotion is the gate, and rejections are kept.
 
-The previous system's promotion rule was "did any model finish training", with a
-paper-trading win-rate check bolted on afterwards. That is backwards. Win rate is
-a lagging indicator measured on the model already trading; by the time it moves,
-the money is spent. The decision has to happen before the model is live, on
-evidence the model has never seen.
+A candidate is trained, walk-forward evaluated, gated, and only then installed.
+The staging directory is renamed into place atomically, so `models/forecast.joblib`
+is either the old model or the new one and never a half-written file that the
+live path loads at the wrong moment.
 
-So a candidate here is trained, walk-forward backtested, resampled, stressed, and
-measured against `core.metrics.DEFAULT_GATES`. Only a candidate that clears every
-gate is promoted, and the whole evaluation is written to a ledger entry that lives
-next to the artifact:
+**Rejections stay on disk, and that is not sentiment.** The trial count is what
+a deflated Sharpe discounts by, and a project that deletes its failures cannot
+compute its own multiple-testing correction. `models/promotions/` is the ledger:
+every attempt, its gates, and — if forced — the written reason.
 
-    models/forecast.joblib               the promoted model
-    models/promotions/<version>.json     one entry per evaluation, kept forever
-    models/promotions/current.json       which version is live, and why
-
-Keeping rejected candidates is the point of the ledger. A directory containing
-only successes cannot tell you how many configurations were tried, and the number
-of attempts is exactly what the deflated Sharpe ratio needs to discount by. The
-ledger is also what the API serves to the provenance and gates screens: the
-frontend does not recompute any of this, it reads what the promotion recorded.
-
-`--force` exists because a human may have a reason the gates cannot see, but it
-records the override in the ledger rather than bypassing it, so a forced model is
-visibly forced for as long as it is live.
+**`--force` needs a reason and records it.** There is one genuinely good argument
+for overriding a gate here: a model can be right on a high-conviction tail while
+its average forecast is not, and the gates read averages. That argument is real,
+and it is also exactly the argument that kept a losing perp system alive for
+months. So it is available, it is written down, and it travels with the artifact.
 """
 
 from __future__ import annotations
@@ -32,591 +23,228 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
-from uuid import uuid4
+from typing import Optional, Sequence
 
-import numpy as np
-from scipy import stats
+import pandas as pd
 
-from core.config import Config
-from core.dataset import Dataset
+from core.config import Config, DEFAULT_CONFIG
 from core.metrics import (
-    Gate,
-    deflated_sharpe,
-    evaluate_gates,
-    gate_report,
-    probability_of_backtest_overfitting,
-    sharpe_ratio,
-    summarise_paths,
+    DEFAULT_GATES, EvaluationReport, Gate, evaluate_gates, gate_report, gates_passed,
 )
-from core.model import ForecastModel, train_forecast_model
-from core.targets import build_target_panel
-from core.simulation import (
-    SimulationReport,
-    SurfaceResult,
-    bootstrap_trades,
-    cost_stress,
-    synthetic_panel,
-)
+from core.model import ForecastModel
 
 logger = logging.getLogger(__name__)
 
-PROMOTIONS_DIRNAME = 'promotions'
-CURRENT_FILENAME = 'current.json'
-MODEL_FILENAME = 'forecast.joblib'
-STAGING_DIRNAME = '.staging'
-
-# Resamples for the trade bootstrap. Two thousand is enough for a stable p05 on a
-# few hundred trades and cheap enough to run on every candidate.
-BOOTSTRAP_RESAMPLES = 2_000
-
-# The thresholds `core.signal.decide` actually trades on. Perturbing these is what
-# distinguishes a plateau from a spike, and re-running them also yields the
-# candidates x splits matrix the PBO estimate needs — so two gates come from one
-# set of runs rather than two.
-SURFACE_PARAMETERS = ('min_edge_over_cost', 'vol_mult_tp', 'vol_mult_sl')
-SURFACE_STEP = 0.2
-SURFACE_KEEP_FRACTION = 0.7
+_TRADER_ROOT = Path(__file__).resolve().parents[1]
+MODELS_ROOT = Path(os.getenv('MODELS_ROOT') or _TRADER_ROOT / 'models')
+LIVE_MODEL = 'forecast.joblib'
+STAGING = '.staging'
+LEDGER = 'promotions'
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def version_stamp(now: Optional[datetime] = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime('%Y%m%dT%H%M%SZ')
 
 
-def new_version() -> str:
-    """A sortable, collision-free version stamp.
+def _unique_version(ledger: Path, now: Optional[datetime] = None) -> str:
+    """A version no ledger entry already uses.
 
-    The timestamp prefix dominates the sort, so sorting by name still orders by
-    time. The suffix is what makes it safe: a search campaign evaluates many
-    candidates per second, and a bare second-resolution stamp had them
-    overwriting each other's ledger entries — which silently shrinks the trial
-    count that the deflated Sharpe ratio discounts by.
+    The stamp has second resolution, so two candidates evaluated in the same
+    second collided and the second overwrote the first — which silently lost an
+    attempt from the ledger. That matters more than it sounds: the ledger *is*
+    the trial count, and a trial count that undercounts makes every
+    multiple-testing correction computed from it too generous. Found by a test
+    that promoted three candidates in a loop and got one row back.
     """
-    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    return f'{stamp}-{uuid4().hex[:6]}'
-
-
-def _record_path(directory: Path, version: str) -> Path:
-    """Where a version's record lives, never colliding with a different one.
-
-    `new_version` makes collisions essentially impossible, but a caller may pass
-    its own version string, and an overwritten record is a lost trial rather than
-    a visible error. So a clash disambiguates instead of clobbering.
-    """
-    path = directory / f'{version}.json'
-    if not path.exists():
-        return path
-    try:
-        existing = json.loads(path.read_text()).get('version')
-    except (json.JSONDecodeError, OSError):
-        existing = None
-    if existing == version:
-        return path  # a rewrite of the same record, which is fine
-    for n in range(2, 1_000):
-        candidate = directory / f'{version}-{n}.json'
-        if not candidate.exists():
-            logger.warning('version %s already recorded; writing %s', version, candidate.name)
+    base = version_stamp(now)
+    if not (ledger / f'{base}.json').exists():
+        return base
+    for suffix in range(1, 1000):
+        candidate = f'{base}-{suffix:03d}'
+        if not (ledger / f'{candidate}.json').exists():
             return candidate
-    raise RuntimeError(f'cannot find a free record path for version {version}')
-
-
-# ---------------------------------------------------------------------------
-# The record
-# ---------------------------------------------------------------------------
+    raise RuntimeError(f'a thousand attempts already share the stamp {base}')
 
 
 @dataclass
-class PromotionRecord:
-    """One candidate evaluation, whether or not it was promoted.
-
-    This is the unit the ledger stores and the API serves. It carries the whole
-    case for or against the model — provenance, out-of-sample result, simulation
-    distributions, and every gate with its measured value — so nothing
-    downstream has to re-derive a verdict and reach a different one.
-    """
+class PromotionAttempt:
+    """One evaluated candidate, whatever the verdict."""
 
     version: str
-    created_at: str = field(default_factory=_now)
-    promoted: bool = False
+    created_at: str
+    gates: list[Gate]
     forced: bool = False
     force_reason: Optional[str] = None
-    provenance: dict[str, Any] = field(default_factory=dict)
-    backtest: dict[str, Any] = field(default_factory=dict)
-    simulation: dict[str, Any] = field(default_factory=dict)
-    measurements: dict[str, Optional[float]] = field(default_factory=dict)
-    gates: list[dict[str, Any]] = field(default_factory=list)
-    dataset: dict[str, Any] = field(default_factory=dict)
-    error: Optional[str] = None
+    installed: bool = False
+    model_provenance: dict = field(default_factory=dict)
+    report_provenance: dict = field(default_factory=dict)
 
     @property
-    def failed_gates(self) -> list[str]:
-        return [g['name'] for g in self.gates if not g.get('passed')]
+    def passed(self) -> bool:
+        return gates_passed(self.gates)
 
-    def as_dict(self) -> dict[str, Any]:
+    def payload(self) -> dict:
         return {
             'version': self.version,
             'created_at': self.created_at,
-            'promoted': self.promoted,
+            'passed': self.passed,
+            'installed': self.installed,
             'forced': self.forced,
             'force_reason': self.force_reason,
-            'failed_gates': self.failed_gates,
-            'provenance': self.provenance,
-            'backtest': self.backtest,
-            'simulation': self.simulation,
-            'measurements': self.measurements,
-            'gates': self.gates,
-            'dataset': self.dataset,
-            'error': self.error,
+            'gates': [
+                {'name': g.name, 'value': g.value, 'threshold': g.threshold,
+                 'direction': g.direction, 'passed': g.passed}
+                for g in self.gates
+            ],
+            'failed_gates': [g.name for g in self.gates if not g.passed],
+            'model': self.model_provenance,
+            'report': self.report_provenance,
         }
 
-    def __str__(self) -> str:
-        if self.error:
-            return f'{self.version}: failed to evaluate ({self.error})'
-        verdict = 'PROMOTED' if self.promoted else f'BLOCKED by {len(self.failed_gates)} gate(s)'
-        if self.forced:
-            verdict += ' (FORCED)'
-        return f'{self.version}: {verdict}'
+    def summary(self) -> str:
+        verdict = ('installed' if self.installed else
+                   'blocked' if not self.passed else 'passed but not installed')
+        forced = f' (forced: {self.force_reason})' if self.forced else ''
+        return f'{self.version}: {verdict}{forced}\n' + gate_report(self.gates)
 
 
-def _gate_rows(gates: list[Gate]) -> list[dict[str, Any]]:
-    return [{
-        'name': g.name,
-        'value': g.value,
-        'threshold': g.threshold,
-        'comparison': g.comparison,
-        'passed': g.passed,
-        'note': getattr(g, 'note', '') or None,
-    } for g in gates]
-
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-
-def surface_candidates(config: Config) -> dict[str, Config]:
-    """The parameter neighbourhood `parameter_plateau` and PBO are measured over.
-
-    Extracted so it can be tested without a seven-minute evaluation. The
-    `cli_overrides` entry is the load-bearing part: without it `Config.resolve`
-    prefers the per-coin profile's value and hands back the unperturbed number, so
-    every surface run was a byte-identical re-run of the centre — retention pinned
-    at its maximum, `parameter_plateau` unable to fail for any candidate with a
-    positive Sharpe, and duplicate rows degenerating the PBO matrix.
-    `core/search.py:configure` had this right; this did not.
-    """
-    out: dict[str, Config] = {}
-    for name in SURFACE_PARAMETERS:
-        value = getattr(config, name)
-        for factor, direction in ((1 + SURFACE_STEP, 'up'), (1 - SURFACE_STEP, 'down')):
-            out[f'{name}_{direction}'] = replace(
-                config,
-                **{name: type(value)(float(value) * factor)},
-                cli_overrides=frozenset(set(config.cli_overrides) | {name}),
-            )
-    return out
-
-
-def _forecast_economics(
-    forecasts: "pd.DataFrame",
-    dataset,
-    config,
-) -> tuple[Optional[float], Optional[float]]:
-    """Out-of-sample price IC, and the IC this universe's round trip requires.
-
-    The two halves of the `ic_covers_cost` gate. Returned as a pair rather than a
-    ratio so a rejection can say which side failed: a weak forecast and an
-    expensive venue produce the same number and call for opposite responses.
-
-    The IC is Spearman on the price head against realised price return, aligned on
-    the forecast index. Price, not net: net return carries `-cost` on both sides
-    of the correlation, so scoring against it credits the fee schedule as signal —
-    on this store a forecast predicting nothing scores net IC +0.07.
-    """
-    from core.model import information_coefficient
-    from core.targets import required_information_coefficient
-
-    measured: Optional[float] = None
-    if forecasts is not None and not forecasts.empty and 'price' in forecasts:
-        realised = dataset.targets.reindex(forecasts.index)
-        if 'price' in realised:
-            value = information_coefficient(
-                forecasts['price'].to_numpy(), realised['price'].to_numpy(),
-            )
-            measured = float(value) if np.isfinite(value) else None
-
-    required = required_information_coefficient(
-        dataset.bars, config, horizon_bars=dataset.horizon_bars,
-    )
-    return measured, (float(required) if np.isfinite(required) else None)
+def report_provenance(report: EvaluationReport) -> dict:
+    return {
+        'folds': report.folds_total,
+        'windows_evaluated': report.total_windows,
+        'log_loss_skill': report.mean_skill,
+        'log_loss_skill_se': report.skill_standard_error,
+        'log_loss_skill_t': report.skill_t,
+        'folds_positive': report.folds_positive,
+        'sign_agreement_p': report.sign_agreement_p_value,
+        'max_calibration_error': report.max_ece,
+        'mean_residual_scale': report.mean_residual_scale,
+        'max_control_gain_share': report.max_control_gain_share,
+        'gate_values': report.gate_values(),
+        'config': report.config_provenance,
+        'notes': report.notes,
+    }
 
 
 def evaluate_candidate(
-    dataset: Dataset,
-    config: Config,
+    model: ForecastModel,
+    report: EvaluationReport,
     *,
+    gates: Optional[dict[str, tuple[float, str]]] = None,
     version: Optional[str] = None,
-    n_periods: int = 6,
-    initial_equity: float = 100_000.0,
-    # None so `Config.spread_bps` governs and `cost_stress` can move it. An
-    # explicit 4.0 here silently beat the config and left the fill unstressed.
-    spread_bps: Optional[float] = None,
-    synthetic_paths: int = 20,
-    full: bool = True,
-    data_as_of: Optional[str] = None,
-    trials: int = 1,
-) -> tuple[Optional[ForecastModel], PromotionRecord]:
-    """Train a candidate and build the whole case for or against it.
-
-    Returns the trained model and its record. The model is returned even when the
-    gates block it, because a blocked candidate is still worth inspecting — but
-    `promote` will refuse to install it, which is the separation that matters.
-
-    `trials` is how many configurations have been evaluated in total, including
-    this one — the ledger's count. The deflated Sharpe discounts by it, and
-    under-reporting it is the most common way a backtest passes a significance
-    test it should fail.
-
-    Set `full=False` to skip the synthetic panels, cost stress, parameter surface
-    and PBO. That is for a fast development loop only: all four are gated, and a
-    skipped gate fails, so a `full=False` evaluation can never promote.
-    """
-    from core.backtest import walk_forward_backtest
-
-    record = PromotionRecord(version=version or new_version())
-    record.dataset = dataset.summary()
-
-    model = train_forecast_model(
-        dataset.features, dataset.targets, config=config, data_as_of=data_as_of,
-        horizon_bars=dataset.horizon_bars,
-        proxy_funding_symbols=dataset.proxy_funding_symbols,
-        cross_sectional_standardized=dataset.cross_sectional_standardized,
+) -> PromotionAttempt:
+    """Score a candidate without touching the filesystem."""
+    return PromotionAttempt(
+        version=version or version_stamp(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        gates=evaluate_gates(report, gates or DEFAULT_GATES),
+        model_provenance=model.provenance(),
+        report_provenance=report_provenance(report),
     )
-    if model is None:
-        record.error = 'not enough resolved rows to train'
-        return None, record
-    record.provenance = model.provenance()
-
-    # The out-of-sample result. Walk-forward is not an option here: backtesting a
-    # model over its own training window measures memorisation, and on driftless
-    # random walks that read as a t-statistic of +7.
-    result, generated = walk_forward_backtest(
-        dataset.features, dataset.targets,
-        bars_by_symbol=dataset.bars, funding_by_symbol=dataset.funding,
-        config=config, profiles=dataset.profiles,
-        n_periods=n_periods, initial_equity=initial_equity, spread_bps=spread_bps,
-        horizon_bars=dataset.horizon_bars,
-    )
-    record.backtest = {
-        **result.summary(),
-        'periods': [[str(a), str(b)] for a, b in generated.periods],
-        'forecasts': generated.summary(),
-    }
-
-    # The economics, measured on the same out-of-sample forecasts the backtest
-    # traded. `generated.forecasts` is walk-forward, so this is not in-sample, and
-    # it is the price head alone — net IC would credit the cost term appearing on
-    # both sides of the correlation (see `CVReport.net_ic_skill`).
-    measured_ic, required_ic = _forecast_economics(
-        generated.forecasts, dataset, config,
-    )
-
-    report = SimulationReport(
-        oos_trades=result.n_trades,
-        max_exit_participation=result.max_exit_participation,
-        # A tuple, possibly empty, rather than None: the question was asked. The
-        # gate then reads its length, and zero passes.
-        proxy_funding_symbols=tuple(dataset.proxy_funding_symbols),
-        measured_price_ic=measured_ic,
-        required_price_ic=required_ic,
-    )
-
-    def period_sharpes_of(outcome, periods) -> list[float]:
-        """Sharpe per walk-forward period. Each is an independent OOS stretch."""
-        out: list[float] = []
-        for start, end in periods:
-            window = outcome.equity_curve.loc[
-                (outcome.equity_curve.index >= start) & (outcome.equity_curve.index <= end)
-            ]
-            out.append(sharpe_ratio(window.pct_change().dropna()) if len(window) > 2 else 0.0)
-        return out
-
-    def run_with(candidate_config: Config, bars=None):
-        panel_bars = bars if bars is not None else dataset.bars
-        # `decide()` reads its cost hurdle from the target frame, so reusing the
-        # baseline targets left the hurdle unstressed in every cost scenario:
-        # the fills got more expensive while the decision to trade did not, which
-        # is not what raising costs does. Rebuilding them under the candidate
-        # config is also what makes the synthetic-panel gate coherent, since a
-        # synthetic price path implies different costs per bar.
-        targets = dataset.targets
-        if candidate_config is not config or bars is not None:
-            targets = build_target_panel(
-                panel_bars,
-                funding_by_symbol=dataset.funding,
-                profiles=dataset.profiles,
-                config=candidate_config,
-                horizon_bars=dataset.horizon_bars,
-                index_by_symbol={
-                    s: b.index for s, b in panel_bars.items()
-                },
-            )
-        outcome, produced = walk_forward_backtest(
-            dataset.features, targets,
-            bars_by_symbol=panel_bars,
-            funding_by_symbol=dataset.funding,
-            config=candidate_config, profiles=dataset.profiles,
-            n_periods=n_periods, initial_equity=initial_equity,
-            spread_bps=spread_bps, horizon_bars=dataset.horizon_bars,
-        )
-        return outcome, produced
-
-    if result.trades:
-        returns = result.trades_frame()['net_return'].to_numpy()
-        report.bootstrap = bootstrap_trades(returns, n_resamples=BOOTSTRAP_RESAMPLES)
-
-        # Sharpe of each walk-forward sub-period: dispersion across TIME within
-        # one out-of-sample path. These gates were named `cpcv_*`, which promised
-        # something else — combinatorial purged CV recombines held-out groups into
-        # many complete alternative histories, and 11 such paths carry far more
-        # information than 6 consecutive slices of one. That machinery exists and
-        # is tested (`core.cv.combinatorial_purged_splits`, `assemble_paths`), but
-        # it costs 66 model fits against this loop's 6, so it is not on the
-        # promotion path by choice. The name now says what is measured.
-        centre_paths = period_sharpes_of(result, generated.periods)
-        if centre_paths:
-            report.per_period = summarise_paths(centre_paths)
-
-        # The deflated Sharpe needs the number of configurations tried, not the
-        # number kept. `trials` is the ledger's count, which is why rejections are
-        # never deleted: under-reporting it is the most common way a backtest
-        # passes a significance test it should fail.
-        #
-        # It also needs the Sharpe and the observation count at the SAME
-        # frequency, because both terms of the correction scale as 1/sqrt(n).
-        # Passing the annualised Sharpe against a per-trade count inflated the
-        # statistic by roughly sqrt(HOURS_PER_YEAR / holding period): an
-        # annualised 1.0 over 150 trades scored +8.1 at 50 trials and still
-        # +6.4 at a hundred thousand, so the one gate whose job is to discount
-        # for the size of the search could not reject anything. The per-trade
-        # ratio over the trade count is the pairing the function documents.
-        per_trade_sharpe = float(
-            np.mean(returns) / np.std(returns, ddof=1)
-        ) if returns.size > 1 and np.std(returns, ddof=1) > 0 else 0.0
-        significance = deflated_sharpe(
-            sharpe=per_trade_sharpe,
-            observations=max(int(returns.size), 2),
-            trials=max(int(trials), 1),
-            # Trade returns are neither symmetric nor thin-tailed; supplying the
-            # moments stops the estimate assuming they are.
-            skewness=float(stats.skew(returns)) if returns.size > 2 else None,
-            kurtosis=float(stats.kurtosis(returns, fisher=False)) if returns.size > 3 else None,
-        )
-        # `statistic` is the z-score of the observed Sharpe against the expected
-        # best of `trials` worthless strategies. Positive means it beat that
-        # benchmark, which is what the gate's `>= 0` threshold asks.
-        report.deflated_sharpe = (
-            significance.statistic if significance.valid else None
-        )
-
-        if full:
-            report.stress = cost_stress(lambda cfg: run_with(cfg)[0].sharpe, config)
-
-            # Perturbing the thresholds `decide()` actually uses gives two gates
-            # from one set of runs: the surface's retention, and a
-            # (candidates x splits) matrix for PBO. A real edge is insensitive to
-            # small parameter changes because it comes from something about the
-            # market; an overfit sits on a spike because it comes from something
-            # about the sample.
-            surface_scores: dict[str, float] = {}
-            score_matrix: list[list[float]] = [centre_paths]
-
-            for label, candidate in surface_candidates(config).items():
-                    outcome, produced = run_with(candidate)
-                    surface_scores[label] = outcome.sharpe
-                    paths = period_sharpes_of(outcome, produced.periods)
-                    if len(paths) == len(centre_paths):
-                        score_matrix.append(paths)
-
-            kept = sum(
-                1 for score in surface_scores.values()
-                if score >= SURFACE_KEEP_FRACTION * result.sharpe
-            )
-            report.surface = SurfaceResult(
-                centre=result.sharpe,
-                neighbours=surface_scores,
-                # Retention is meaningless when the centre itself loses money:
-                # "neighbours at least 70% as good as a negative Sharpe" would
-                # reward being uniformly bad. Report zero instead.
-                retention=(kept / len(surface_scores))
-                if surface_scores and result.sharpe > 0 else 0.0,
-            )
-
-            if len(score_matrix) >= 2 and len(centre_paths) >= 2:
-                report.pbo = probability_of_backtest_overfitting(
-                    np.asarray(score_matrix, dtype=float)
-                ).pbo
-
-            synthetic_sharpes = []
-            for seed in range(synthetic_paths):
-                outcome, _ = run_with(config, bars=synthetic_panel(dataset.bars, seed=seed))
-                synthetic_sharpes.append(outcome.sharpe)
-            report.synthetic = summarise_paths(synthetic_sharpes)
-
-    record.simulation = report.as_dict()
-    record.measurements = report.measurements()
-    promoted, gates = evaluate_gates(record.measurements)
-    record.gates = _gate_rows(gates)
-    record.promoted = bool(promoted)
-    return model, record
-
-
-# ---------------------------------------------------------------------------
-# The ledger
-# ---------------------------------------------------------------------------
-
-
-def promotions_dir(models_dir: Path) -> Path:
-    return Path(models_dir) / PROMOTIONS_DIRNAME
-
-
-def write_record(record: PromotionRecord, models_dir: Path) -> Path:
-    """Append the record to the ledger. Rejections are kept too.
-
-    A ledger of successes only cannot answer "how many configurations were
-    tried", and that count is the trials figure the deflated Sharpe ratio
-    discounts by. Throwing the failures away makes the surviving number look
-    better than the evidence supports.
-    """
-    directory = promotions_dir(models_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = _record_path(directory, record.version)
-    _write_json_atomically(path, record.as_dict())
-    return path
-
-
-def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(payload, indent=2, default=str))
-    os.replace(temporary, path)
-
-
-def load_records(models_dir: Path, *, limit: Optional[int] = None) -> list[PromotionRecord]:
-    """Every evaluation, newest first. Malformed entries are skipped, not fatal."""
-    directory = promotions_dir(models_dir)
-    if not directory.exists():
-        return []
-
-    paths = sorted(
-        (p for p in directory.glob('*.json') if p.name != CURRENT_FILENAME),
-        reverse=True,
-    )
-    records: list[PromotionRecord] = []
-    for path in paths[:limit] if limit else paths:
-        try:
-            payload = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('skipping unreadable promotion record %s: %s', path, exc)
-            continue
-        payload.pop('failed_gates', None)  # derived, not stored state
-        records.append(PromotionRecord(**payload))
-    return records
-
-
-def current_record(models_dir: Path) -> Optional[PromotionRecord]:
-    """Which version is live, according to the pointer written at promotion."""
-    path = promotions_dir(models_dir) / CURRENT_FILENAME
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    payload.pop('failed_gates', None)
-    return PromotionRecord(**payload)
-
-
-def trials_to_date(models_dir: Path) -> int:
-    """How many candidates have been evaluated, for the deflated Sharpe.
-
-    At least one, because the model in front of you is itself a trial.
-    """
-    return max(len(load_records(models_dir)), 1)
-
-
-# ---------------------------------------------------------------------------
-# Promotion
-# ---------------------------------------------------------------------------
 
 
 def promote(
     model: ForecastModel,
-    record: PromotionRecord,
+    report: EvaluationReport,
     *,
-    models_dir: Path,
+    root: Optional[Path] = None,
+    gates: Optional[dict[str, tuple[float, str]]] = None,
     force: bool = False,
     force_reason: Optional[str] = None,
-) -> tuple[bool, PromotionRecord]:
-    """Install the model, but only if its gates passed or a human overrode them.
+    trades: Optional[pd.DataFrame] = None,
+) -> PromotionAttempt:
+    """Gate, then install atomically. Records the attempt either way."""
+    if force and not force_reason:
+        raise ValueError(
+            'a forced promotion needs a written reason. The one good argument for '
+            'overriding these gates — skill on a high-conviction tail that the '
+            'average forecast does not show — is also the argument that kept a '
+            'losing system alive, so it has to be stated and stored.'
+        )
+    root = Path(root) if root else MODELS_ROOT
+    ledger = root / LEDGER
+    ledger.mkdir(parents=True, exist_ok=True)
+    attempt = evaluate_candidate(model, report, gates=gates,
+                                 version=_unique_version(ledger))
+    attempt.forced = bool(force)
+    attempt.force_reason = force_reason
 
-    The install goes through a staging directory and an atomic rename, so a crash
-    mid-write cannot leave a half-written artifact being scored against live
-    prices. A refused candidate still gets a ledger entry — that is how the trial
-    count stays honest.
+    if attempt.passed or force:
+        staging = root / STAGING / attempt.version
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+        model.save(staging / LIVE_MODEL)
+        (staging / 'promotion.json').write_text(
+            json.dumps(attempt.payload(), indent=2, default=str))
+        if trades is not None and not trades.empty:
+            trades.to_parquet(staging / 'trades.parquet', index=False)
+
+        # Stage the whole directory, then move one file into place. The live
+        # path opens `forecast.joblib` by name, so a partially written file at
+        # that path is a loaded model with a truncated booster — which fails
+        # somewhere else entirely, hours later.
+        destination = root / LIVE_MODEL
+        temporary = root / f'.{LIVE_MODEL}.incoming'
+        shutil.copy2(staging / LIVE_MODEL, temporary)
+        os.replace(temporary, destination)
+        provenance = staging / f'{Path(LIVE_MODEL).stem}.provenance.json'
+        if provenance.exists():
+            shutil.copy2(provenance, root / provenance.name)
+        attempt.installed = True
+        logger.info('installed %s -> %s', attempt.version, destination)
+    else:
+        logger.warning('blocked %s: %s', attempt.version,
+                       ', '.join(g.name for g in attempt.gates if not g.passed))
+
+    (ledger / f'{attempt.version}.json').write_text(
+        json.dumps(attempt.payload(), indent=2, default=str))
+    return attempt
+
+
+def load_live(root: Optional[Path] = None) -> Optional[ForecastModel]:
+    path = (Path(root) if root else MODELS_ROOT) / LIVE_MODEL
+    if not path.exists():
+        return None
+    return ForecastModel.load(path)
+
+
+def history(root: Optional[Path] = None) -> pd.DataFrame:
+    """Every attempt, newest first. What has been tried, and why not.
+
+    The trial count is the point: a deflated Sharpe needs it, and so does anyone
+    reading a passing result and wondering how many candidates it took.
     """
-    models_dir = Path(models_dir)
-
-    if not record.promoted and force:
-        if not force_reason:
-            raise ValueError('forcing a blocked promotion requires a reason')
-        record.forced = True
-        record.force_reason = force_reason
-        record.promoted = True
-        logger.warning(
-            'forcing promotion of %s past %d failed gate(s) (%s): %s',
-            record.version, len(record.failed_gates),
-            ', '.join(record.failed_gates), force_reason,
-        )
-
-    if not record.promoted:
-        write_record(record, models_dir)
-        logger.error(
-            'refusing to promote %s: %s failed',
-            record.version, ', '.join(record.failed_gates) or 'evaluation',
-        )
-        return False, record
-
-    staging = models_dir / STAGING_DIRNAME / record.version
-    staging.mkdir(parents=True, exist_ok=True)
-    try:
-        staged = model.save(staging / MODEL_FILENAME)
-        models_dir.mkdir(parents=True, exist_ok=True)
-        os.replace(staged, models_dir / MODEL_FILENAME)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-    write_record(record, models_dir)
-    directory = promotions_dir(models_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    _write_json_atomically(directory / CURRENT_FILENAME, record.as_dict())
-
-    logger.info('promoted %s to %s', record.version, models_dir / MODEL_FILENAME)
-    return True, record
+    ledger = (Path(root) if root else MODELS_ROOT) / LEDGER
+    if not ledger.exists():
+        return pd.DataFrame()
+    rows = []
+    for path in sorted(ledger.glob('*.json'), reverse=True):
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            logger.warning('unreadable ledger entry %s', path)
+            continue
+        report = payload.get('report', {})
+        rows.append({
+            'version': payload.get('version'),
+            'created_at': payload.get('created_at'),
+            'passed': payload.get('passed'),
+            'installed': payload.get('installed'),
+            'forced': payload.get('forced'),
+            'failed_gates': ', '.join(payload.get('failed_gates', [])),
+            'log_loss_skill': report.get('log_loss_skill'),
+            'folds_positive': report.get('folds_positive'),
+            'windows_evaluated': report.get('windows_evaluated'),
+            'force_reason': payload.get('force_reason'),
+        })
+    return pd.DataFrame(rows)
 
 
-def report(record: PromotionRecord) -> str:
-    """The human-readable verdict, gates and failures first."""
-    if record.error:
-        return f'{record.version}: {record.error}'
-    gates = [
-        Gate(g['name'], g['value'], g['threshold'], g['comparison'], g['passed'],
-             g.get('note') or '')
-        for g in record.gates
-    ]
-    lines = [gate_report(gates)]
-    if record.forced:
-        lines.append(f'FORCED: {record.force_reason}')
-    return '\n'.join(lines)
+def trial_count(root: Optional[Path] = None) -> int:
+    """How many candidates have been evaluated. The multiple-testing denominator."""
+    frame = history(root)
+    return 0 if frame.empty else len(frame)

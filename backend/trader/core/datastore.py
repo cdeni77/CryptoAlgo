@@ -49,17 +49,21 @@ DEFAULT_ROOT = Path(os.getenv('RESEARCH_STORE') or _TRADER_ROOT / 'data' / 'rese
 # Datasets and the columns they must carry. `event_time` and `available_time`
 # are required everywhere — they are what makes a point-in-time read possible.
 SCHEMAS: dict[str, tuple[str, ...]] = {
-    'bars': (
+    # The dataset this system reads. One-minute bars, and the timeframe is in
+    # the dataset name rather than a column because the whole pipeline runs on
+    # one timeframe — a `timeframe` column would be constant, and the previous
+    # `bars` dataset had no such column at all, which made its implicit hourly
+    # granularity a fact you had to know rather than one you could read.
+    'minute_bars': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
     ),
-    'funding': (
+    # `bars` is the hourly perp and spot history the previous system read. Kept
+    # in the schema because a store on disk may still hold it and an unreadable
+    # partition is worse than an unused one; written by nothing.
+    'bars': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
-        'rate', 'mark_price', 'index_price', 'interval_hours', 'is_settlement',
-    ),
-    'open_interest': (
-        'venue', 'symbol', 'event_time', 'available_time', 'quality',
-        'oi_contracts', 'oi_base', 'oi_usd',
+        'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
     ),
     'book_snapshots': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
@@ -382,13 +386,19 @@ def feature_hash(frame: pd.DataFrame) -> str:
     return hasher.hexdigest()[:16]
 
 
+# Which research dataset a scraped timeframe belongs in. The 15-minute binary
+# system reads `minute_bars` and nothing else; anything coarser is archive.
+BARS_DATASET_BY_TIMEFRAME = {'1m': 'minute_bars'}
+
+
 def from_sqlite(
     store: ResearchStore,
     sqlite_path: str | Path,
     *,
     venue: str,
-    timeframe: str = '1h',
+    timeframe: str = '1m',
     symbols: Optional[Iterable[str]] = None,
+    include_archive: bool = True,
 ) -> dict[str, int]:
     """Migrate the scraper's SQLite tables into the research store.
 
@@ -441,7 +451,22 @@ def from_sqlite(
                 bars['row_venue'] != 'unknown', venue
             )
             bars = bars.drop(columns=['row_venue'])
-            counts['bars'] = store.write('bars', bars)
+            dataset = BARS_DATASET_BY_TIMEFRAME.get(timeframe, 'bars')
+            counts[dataset] = store.write(dataset, bars)
+
+        # Funding and open interest are archive: nothing in the binary system
+        # reads them, and no endpoint serves either historically, so they cannot
+        # be re-fetched at any price. They are migrated anyway, because the
+        # SQLite database is the only other copy and deleting it after a sync
+        # that skipped them would destroy the only irreplaceable data here.
+        def has_table(name: str) -> bool:
+            row = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()
+            return row is not None
+
+        if not include_archive:
+            return counts
 
         funding = pd.read_sql_query(
             "SELECT symbol, event_time, available_time, quality, rate, mark_price, "
@@ -449,7 +474,7 @@ def from_sqlite(
             + venue_expression('funding_rates', ('funding_source',))
             + " FROM funding_rates",
             con,
-        )
+        ) if has_table('funding_rates') else pd.DataFrame()
         if not funding.empty:
             funding['venue'] = funding['row_venue'].where(
                 funding['row_venue'] != 'unknown', venue
@@ -465,7 +490,7 @@ def from_sqlite(
             + venue_expression('open_interest', ('source',))
             + " FROM open_interest",
             con,
-        )
+        ) if has_table('open_interest') else pd.DataFrame()
         if not oi.empty:
             oi['venue'] = oi['row_venue'].where(oi['row_venue'] != 'unknown', venue)
             oi = oi.drop(columns=['row_venue'])

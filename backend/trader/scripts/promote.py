@@ -1,133 +1,95 @@
-"""Evaluate a candidate model and install it only if the gates pass.
+"""Evaluate a candidate and install it, gates permitting.
 
-    python -m scripts.promote                  # evaluate, promote if it clears
-    python -m scripts.promote --evaluate-only  # build the case, install nothing
-    python -m scripts.promote --history        # what has been tried, and why not
-    python -m scripts.promote --force 'reason' # override, recorded in the ledger
+The only path to `models/forecast.joblib`. The live signal writer loads that
+file by name and nothing else, so this is the single place a model becomes real.
 
-This is the only path a model takes to live. `scripts.train` writes an artifact
-for inspection; nothing that has not been through here is scored against real
-prices, because the gates and the artifact are written together and the live
-signal writer reads the promoted one.
+Every attempt is recorded in `models/promotions/`, passed or blocked. That
+ledger is the trial count, and the trial count is what any claim of skill has
+to be discounted by — a project that deletes its failures cannot compute its own
+multiple-testing correction.
 
-Every evaluation lands in `models/promotions/`, rejections included. The count of
-attempts is what the deflated Sharpe discounts by, so a directory containing only
-successes would flatter every survivor.
+    python -m scripts.promote
+    python -m scripts.promote --history
+    python -m scripts.promote --force --reason "skill is on the >0.9 tail; the
+        average forecast is flat and the gates read averages"
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import sys
-from pathlib import Path
 
-from core.model import MODELS_DIR
-from core.promotion import (
-    current_record,
-    evaluate_candidate,
-    load_records,
-    promote,
-    report,
-    trials_to_date,
+import pandas as pd
+
+from core.backtest import walk_forward
+from core.metrics import evaluate_gates, gate_report
+from core.promotion import history, load_live, promote, trial_count
+from scripts._common import (
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
+    setup_logging,
 )
-from scripts._common import add_data_arguments, build_config, configure_logging, load, require_data
-
-
-def _print_history(models_dir: Path, limit: int) -> int:
-    records = load_records(models_dir, limit=limit)
-    live = current_record(models_dir)
-
-    if not records:
-        print('no promotion history. Evaluate a candidate: python -m scripts.promote')
-        return 0
-
-    print(f'\n{len(records)} evaluation(s), newest first '
-          f'(live: {live.version if live else "none"})\n')
-    for record in records:
-        marker = '*' if live and record.version == live.version else ' '
-        verdict = 'promoted' if record.promoted else 'blocked'
-        if record.forced:
-            verdict += ' (forced)'
-        sharpe = record.backtest.get('sharpe')
-        trades = record.backtest.get('trades')
-        detail = f'Sharpe {sharpe:+.2f} on {trades} trades' if sharpe is not None else 'no result'
-        print(f'{marker} {record.version}  {verdict:18s} {detail}')
-        if record.failed_gates:
-            print(f'    failed: {", ".join(record.failed_gates)}')
-        if record.error:
-            print(f'    error: {record.error}')
-    return 0
 
 
 def main() -> int:
-    parser = add_data_arguments(argparse.ArgumentParser(description=__doc__))
-    parser.add_argument('--models-dir', default=str(MODELS_DIR))
-    parser.add_argument('--periods', type=int, default=6, help='Walk-forward retrains')
-    parser.add_argument('--equity', type=float, default=100_000.0)
-    parser.add_argument('--spread-bps', type=float, default=None,
-                        help='Half-spread in bp. Default: the Config value, so the cost-stress scenarios can move it.')
-    parser.add_argument('--synthetic-paths', type=int, default=20)
-    parser.add_argument('--quick', action='store_true',
-                        help='Skip synthetic panels and cost stress. Cannot promote: '
-                             'a skipped gate fails.')
-    parser.add_argument('--evaluate-only', action='store_true',
-                        help='Build the case and record it without installing')
-    parser.add_argument('--force', default=None, metavar='REASON',
-                        help='Install a blocked candidate, recording the reason')
-    parser.add_argument('--history', action='store_true', help='Print past evaluations')
-    parser.add_argument('--limit', type=int, default=20, help='History entries to show')
-    parser.add_argument('--json', action='store_true', help='Emit the record as JSON')
+    parser = add_data_arguments(argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__))
+    parser.add_argument('--history', action='store_true',
+                        help='What has been tried, and why not. Then exit.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Evaluate and score the gates, install nothing.')
+    parser.add_argument('--force', action='store_true')
+    parser.add_argument('--reason', type=str, default=None,
+                        help='Required with --force, and stored with the artifact.')
     args = parser.parse_args()
-    configure_logging(args.log_level)
+    setup_logging(args.verbose)
 
-    models_dir = Path(args.models_dir)
     if args.history:
-        return _print_history(models_dir, args.limit)
+        frame = history()
+        if frame.empty:
+            print('no promotion attempts recorded')
+            return 0
+        pd.set_option('display.width', 200, 'display.max_colwidth', 60)
+        print(frame.to_string(index=False))
+        print(f'\n{len(frame)} attempts, {int(frame["installed"].sum())} installed. '
+              f'Any claim of skill discounts by the trial count.')
+        return 0
 
-    config = build_config(args)
-    dataset = load(args, config)
-    if not require_data(dataset, args.venue):
-        return 1
+    if args.force and not args.reason:
+        raise SystemExit(
+            '--force needs --reason. The one good argument for overriding these '
+            'gates — skill on a high-conviction tail that the average forecast '
+            'does not show — is also the argument that kept a losing system '
+            'alive, so it has to be written down.')
 
-    print(f'\ndataset: {dataset}')
-    model, record = evaluate_candidate(
-        dataset, config,
-        n_periods=args.periods, initial_equity=args.equity,
-        spread_bps=args.spread_bps, synthetic_paths=args.synthetic_paths,
-        full=not args.quick, data_as_of=args.as_of,
-        # Every candidate ever evaluated counts, including this one. The deflated
-        # Sharpe discounts by this number, which is the whole reason rejections
-        # stay in the ledger.
-        trials=trials_to_date(models_dir) + 1,
-    )
+    config = config_from_args(args)
+    groups = groups_from_args(args)
+    print_header('Promotion', config)
+    print(f'  attempts so far: {trial_count()}')
+    live = load_live()
+    if live is not None:
+        print(f'  currently live: alpha={live.residual_scale:.3f}, '
+              f'{len(live.features)} features, trained on '
+              f'{live.n_train_windows:,} windows')
+    print()
 
-    if model is None:
-        print(f'\n{record}')
-        return 1
+    dataset = load_dataset(args, config)
+    result = walk_forward(dataset, config, groups=groups, trade=True)
+    print('\n' + result.report.summary())
 
-    print('\nprovenance:')
-    for key, value in record.provenance.items():
-        print(f'  {key}: {value}')
-    print(f"\nwalk-forward: {json.dumps(record.backtest.get('trades'))} trades, "
-          f"Sharpe {record.backtest.get('sharpe')}")
-    print(f'\n{report(record)}')
+    if args.dry_run:
+        print('\n' + gate_report(evaluate_gates(result.report)))
+        print('\ndry run: nothing installed, nothing recorded')
+        return 0
 
-    if args.evaluate_only:
-        from core.promotion import write_record
-        path = write_record(record, models_dir)
-        print(f'\nrecorded {path} (--evaluate-only: nothing installed)')
-        return 0 if record.promoted else 2
-
-    installed, record = promote(
-        model, record, models_dir=models_dir,
-        force=args.force is not None, force_reason=args.force,
-    )
-    if args.json:
-        print(json.dumps(record.as_dict(), indent=2, default=str))
-    print(f'\n{record}')
-    return 0 if installed else 2
+    # The last fold's model is the candidate: it is the one trained on the most
+    # history, which is what would be deployed. The earlier folds are its
+    # evidence, not alternatives to it.
+    candidate = result.models[-1]
+    attempt = promote(candidate, result.report, force=args.force,
+                      force_reason=args.reason, trades=result.trades())
+    print('\n' + attempt.summary())
+    return 0 if attempt.installed else 1
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    raise SystemExit(main())

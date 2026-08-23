@@ -1,649 +1,251 @@
-"""Backtest: an event loop over `decide()`.
+"""Walk-forward: fit, score, trade, measure — six times, in order.
 
-The only thing this file does is walk bars forward, ask `core.signal.decide` what
-to do, and hand the answer to `core.execution`. It contains no thresholds, no
-gates and no sizing of its own, which is the property that matters: the live
-signal writer calls the same `decide()` with the same forecasts, so the two
-cannot drift apart. The previous system's backtest and live path were separate
-676-line and 329-line implementations, and that is why they disagreed.
+The loop is deliberately boring, because everything interesting has already
+been decided elsewhere. Each fold fits its own seasonality, volatility model,
+baseline and classifier on training windows only, scores the test block through
+`core.dataset.apply_fold`, and runs the resulting probabilities through the same
+`decide()` the live path calls. Nothing in here chooses a trade or prices one.
 
-Bar timing is the other thing this gets right. At each bar the loop:
+**Two books, and they answer different questions.** A per-fold book starts fresh
+at the configured bankroll, so the six folds are comparable to each other. One
+continuous book runs the whole out-of-sample span with a single bankroll, so
+fold 0's losses shrink fold 1's stakes — which is what deployment actually does
+to a $100 account. The per-fold numbers are the measurement; the continuous one
+is the answer.
 
-1. Accrues funding on open positions at that bar's settlement.
-2. Resolves exits against the bar's own high and low, checking liquidation
-   before the stop and the stop before the take-profit.
-3. Marks equity to the close.
-4. Decides using features and forecasts as of that close — and enters at the
-   *next* bar's open.
-
-Deciding from a close and filling at the same close is a one-bar lookahead, and
-at hourly frequency that bar is the whole move.
+**Settlement is processed before the next window's decision.** A position opened
+in the window starting at 10:00 settles at 10:15, which is the instant the next
+window opens. Deciding first and settling afterwards would let the bankroll be
+staked twice over, and at a $100 account with a 5% cap that is the difference
+between a real constraint and none.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
-from core.config import Config
-from core.execution import (
-    ClosedTrade,
-    ExitReason,
-    Fill,
-    Position,
-    accrue_funding,
-    close_position,
-    liquidity_floor,
-    open_position,
-    resolve_bar,
-)
-from core.metrics import DrawdownProfile, drawdown_profile, sharpe_ratio
-from core.model import ForecastModel
-from core.profiles import CoinProfile
-from core.signal import MAX_PARTICIPATION, Decision, DecisionContext, GateCounter, decide_panel
+from core.book import Book, BookStats, summarise
+from core.config import Config, DEFAULT_CONFIG
+from core.cv import WindowFold, assert_no_leakage, effective_observations, purged_walk_forward, recency_weights
+from core.dataset import Dataset, apply_fold, fit_fold
+from core.decide import Decision, Reason, decide_window, rejection_histogram, stateless_screen
+from core.metrics import EvaluationReport, FoldEvaluation, evaluate_fold
+from core.model import ForecastModel, fit_model
 
 logger = logging.getLogger(__name__)
 
-HOURS_PER_YEAR = 24 * 365
-
-# Volatility estimate used for barrier widths and the regime gate. Matches the
-# window the features use, so the backtest and the model see the same regime.
-VOL_WINDOW_BARS = 24
-
 
 @dataclass
-class BacktestResult:
-    """Everything a run produced, decomposed for attribution.
+class RunResult:
+    """Everything one walk-forward produced, so a script can report all of it."""
 
-    `price_pnl`, `funding_pnl` and `fees` sum to the net. That split is what
-    distinguishes a model problem from a cost problem: gross price PnL positive
-    and net negative is the second, and no amount of retraining fixes it.
-    """
+    report: EvaluationReport
+    models: list[ForecastModel]
+    books: list[Book]
+    continuous_book: Optional[Book]
+    rejections: pd.Series
+    scored: pd.DataFrame
 
-    trades: list[ClosedTrade] = field(default_factory=list)
-    fills: list[Fill] = field(default_factory=list)
-    equity_curve: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
-    decisions: list[Decision] = field(default_factory=list)
-    gates: GateCounter = field(default_factory=GateCounter)
-    initial_equity: float = 0.0
-
-    # -- aggregates ---------------------------------------------------------
-
-    @property
-    def net_pnl(self) -> float:
-        return float(sum(t.net_pnl for t in self.trades))
-
-    @property
-    def price_pnl(self) -> float:
-        return float(sum(t.price_pnl for t in self.trades))
-
-    @property
-    def funding_pnl(self) -> float:
-        return float(sum(t.funding_pnl for t in self.trades))
-
-    @property
-    def fees(self) -> float:
-        return float(sum(t.fees for t in self.trades))
-
-    @property
-    def final_equity(self) -> float:
-        return float(self.equity_curve.iloc[-1]) if len(self.equity_curve) else self.initial_equity
-
-    @property
-    def n_trades(self) -> int:
-        return len(self.trades)
-
-    @property
-    def win_rate(self) -> float:
-        if not self.trades:
-            return 0.0
-        return float(np.mean([t.net_pnl > 0 for t in self.trades]))
-
-    @property
-    def liquidations(self) -> int:
-        return sum(1 for t in self.trades if t.liquidated)
-
-    @property
-    def carry_contribution(self) -> float:
-        """Share of gross profit that came from funding rather than price.
-
-        Near 1 means a carry harvester. Near 0 means a directional bet. The two
-        deserve different scrutiny, and a single PnL number hides which you have.
-        """
-        gross = abs(self.price_pnl) + abs(self.funding_pnl)
-        return float(abs(self.funding_pnl) / gross) if gross > 0 else 0.0
-
-    @property
-    def max_entry_participation(self) -> float:
-        """Largest share of a bar an *entry* took. A breach here is a bug."""
-        return max((t.entry_participation for t in self.trades), default=0.0)
-
-    @property
-    def max_exit_participation(self) -> float:
-        """Largest share of a bar an *exit* took. A breach here is a capacity finding.
-
-        Exits are not optional: the barrier fires into whatever bar is there.
-        Entries are sized against `liquidity_floor` precisely to keep this number
-        down, but it cannot be capped, only reported.
-        """
-        return max((t.exit_participation for t in self.trades), default=0.0)
-
-    @property
-    def max_participation(self) -> float:
-        """Largest share of a bar's volume any single order took."""
-        return max((t.max_participation for t in self.trades), default=0.0)
-
-    # -- risk ---------------------------------------------------------------
-
-    def returns(self) -> pd.Series:
-        return self.equity_curve.pct_change().dropna() if len(self.equity_curve) > 1 else pd.Series(dtype=float)
-
-    @property
-    def sharpe(self) -> float:
-        return sharpe_ratio(self.returns(), periods_per_year=HOURS_PER_YEAR)
-
-    @property
-    def drawdown(self) -> DrawdownProfile:
-        return drawdown_profile(self.equity_curve, periods_per_year=HOURS_PER_YEAR)
-
-    def trades_frame(self) -> pd.DataFrame:
-        """Trades as a frame, for the ledger and for bootstrap resampling."""
-        if not self.trades:
+    def trades(self) -> pd.DataFrame:
+        if self.continuous_book is None:
             return pd.DataFrame()
-        return pd.DataFrame([{
-            'symbol': t.symbol, 'direction': t.direction, 'contracts': t.contracts,
-            'entry_time': t.entry_time, 'exit_time': t.exit_time,
-            'entry_price': t.entry_price, 'exit_price': t.exit_price,
-            'exit_reason': t.exit_reason.value,
-            'price_pnl': t.price_pnl, 'funding_pnl': t.funding_pnl, 'fees': t.fees,
-            'net_pnl': t.net_pnl, 'net_return': t.net_return,
-            'notional': t.notional, 'bars_held': t.bars_held,
-            'entry_participation': t.entry_participation,
-            'exit_participation': t.exit_participation,
-            'max_participation': t.max_participation,
-        } for t in self.trades])
-
-    def summary(self) -> dict[str, Any]:
-        drawdown = self.drawdown
-        return {
-            'trades': self.n_trades,
-            'net_pnl': round(self.net_pnl, 2),
-            'price_pnl': round(self.price_pnl, 2),
-            'funding_pnl': round(self.funding_pnl, 2),
-            'fees': round(self.fees, 2),
-            'carry_contribution': round(self.carry_contribution, 3),
-            'return_pct': round(
-                (self.final_equity / self.initial_equity - 1) * 100, 2
-            ) if self.initial_equity else 0.0,
-            'sharpe': round(self.sharpe, 3),
-            'max_drawdown': round(drawdown.max_drawdown, 4),
-            'time_to_recovery': drawdown.time_to_recovery,
-            'win_rate': round(self.win_rate, 4),
-            'liquidations': self.liquidations,
-            'max_entry_participation': round(self.max_entry_participation, 4),
-            'max_exit_participation': round(self.max_exit_participation, 4),
-            'gates': self.gates.summary(),
-        }
-
-    def __str__(self) -> str:
-        return (
-            f"{self.n_trades} trades | net {self.net_pnl:+,.0f} "
-            f"(price {self.price_pnl:+,.0f}, funding {self.funding_pnl:+,.0f}, "
-            f"fees {self.fees:,.0f}) | Sharpe {self.sharpe:+.2f} | "
-            f"maxDD {self.drawdown.max_drawdown:.1%} | "
-            f"carry {self.carry_contribution:.0%} | liq {self.liquidations}"
-        )
+        return self.continuous_book.trades()
 
 
-# ---------------------------------------------------------------------------
-# The loop
-# ---------------------------------------------------------------------------
-
-
-def _realised_volatility(close: pd.Series) -> pd.Series:
-    """Trailing volatility, shifted so the value at t is knowable at t."""
-    return close.pct_change().rolling(VOL_WINDOW_BARS).std().shift(1)
-
-
-def _hold_bars(
-    config: Config, profile: Optional[CoinProfile], horizon_bars: Optional[int]
-) -> int:
-    """Maximum hold, never longer than the forecast it was opened on.
-
-    The profile's hold and the dataset's horizon disagreed for four of five
-    traded instruments, and holding past the horizon realises a return the
-    forecast never described. Capping is the conservative direction: barriers
-    already exit earlier than the maximum, so shortening a hold changes when a
-    position closes, while lengthening it past the horizon makes the target
-    meaningless.
-    """
-    hold = config.label_horizon_hours(profile)
-    if horizon_bars is None:
-        return hold
-    return max(1, min(int(hold), int(horizon_bars)))
-
-
-def run_backtest(
+def run_book(
+    scored: pd.DataFrame,
+    config: Config = DEFAULT_CONFIG,
     *,
-    forecasts: pd.DataFrame,
-    bars_by_symbol: dict[str, pd.DataFrame],
-    funding_by_symbol: Optional[dict[str, pd.DataFrame]] = None,
-    config: Optional[Config] = None,
-    profiles: Optional[dict[str, CoinProfile]] = None,
-    initial_equity: float = 100_000.0,
-    spread_bps: Optional[float] = None,
-    horizon_bars: Optional[int] = None,
-) -> BacktestResult:
-    """Walk the panel forward, deciding at each close and filling at the next open.
+    book: Optional[Book] = None,
+) -> tuple[Book, list[Decision]]:
+    """Walk scored windows in chronological order, deciding and settling.
 
-    `forecasts` is the output of `ForecastModel.predict`, MultiIndexed by
-    (event_time, symbol). Bars and funding are per instrument.
-
-    `horizon_bars` is the span the forecasts describe, and it caps how long a
-    position may stay open. Without it the hold came from the per-coin profile
-    while the targets came from the dataset's single horizon, so the model
-    forecast one thing and the backtest waited for another — BTC held 60h against
-    a 96h forecast, XRP 108h. `Config.label_horizon_hours` already documents the
-    invariant ("labels must span at least as long as a position can stay open");
-    this is what enforces it.
+    `scored` needs `model_probability` alongside the window columns. One pass,
+    no lookahead: the only thing available when a window is decided is the row
+    itself and the bankroll, and the bankroll depends only on windows that have
+    already settled.
     """
-    config = config or Config()
-    profiles = profiles or {}
-    funding_by_symbol = funding_by_symbol or {}
-    # The spread lives on Config so `cost_stress` can move it; an explicit
-    # argument still wins for callers that want to sweep it directly.
-    spread = float(config.spread_bps if spread_bps is None else spread_bps)
-    horizon = int(horizon_bars) if horizon_bars else None
-
-    timestamps = pd.DatetimeIndex(
-        forecasts.index.get_level_values('event_time').unique()
-    ).sort_values()
-    if timestamps.empty:
-        return BacktestResult(initial_equity=initial_equity)
-
-    volatility = {s: _realised_volatility(b['close']) for s, b in bars_by_symbol.items()}
-    # Trailing returns for the correlation cap. Built once; sliced per bar so the
-    # measurement only ever uses history already available at that timestamp.
-    returns_panel = pd.DataFrame({
-        symbol: bars['close'].pct_change() for symbol, bars in bars_by_symbol.items()
-    }).sort_index()
-    correlation_lookback = max(int(config.correlation_lookback_hours), 0)
-    # Sizing liquidity, not fill liquidity: see `execution.liquidity_floor`.
-    liquidity = {
-        s: liquidity_floor(b['volume']) if 'volume' in b else pd.Series(dtype=float)
-        for s, b in bars_by_symbol.items()
+    book = book or Book(config=config)
+    decisions: list[Decision] = []
+    # Screen the whole span once, vectorised, before touching the per-window
+    # loop. On real data the state-independent gates reject the overwhelming
+    # majority of rows, and grouping five years of minutes into windows to
+    # iterate over rows that could never trade is where the runtime went.
+    screened, stateless_rejections = stateless_screen(scored, config)
+    outcomes = {
+        (row.symbol, row.window_open): bool(row.outcome)
+        for row in scored.drop_duplicates(['symbol', 'window_open']).itertuples()
     }
-    funding = {
-        s: f['rate'].reindex(bars_by_symbol[s].index).ffill()
-        for s, f in funding_by_symbol.items() if s in bars_by_symbol
-    }
-
-    equity = float(initial_equity)
-    open_positions: dict[str, Position] = {}
-    entry_participation: dict[str, float] = {}
-    last_exit_bar: dict[str, int] = {}
-    pending: list[Decision] = []
-
-    result = BacktestResult(initial_equity=initial_equity)
-    curve: dict[pd.Timestamp, float] = {}
-
-    for bar_number, timestamp in enumerate(timestamps):
-        # --- 1. fill what was decided at the previous close ---------------
-        for decision in pending:
-            bars = bars_by_symbol.get(decision.symbol)
-            if bars is None or timestamp not in bars.index:
-                continue
-            if decision.symbol in open_positions:
-                continue
-            vol = volatility[decision.symbol].get(timestamp, np.nan)
-            if not np.isfinite(vol) or vol <= 0:
-                continue
-            position, fill = open_position(
-                symbol=decision.symbol,
-                direction=decision.side,
-                contracts=decision.contracts,
-                bar=bars.loc[timestamp],
-                timestamp=timestamp,
-                config=config,
-                volatility=float(vol),
-                tp_mult=float(config.resolve('vol_mult_tp', profiles.get(decision.symbol))),
-                sl_mult=float(config.resolve('vol_mult_sl', profiles.get(decision.symbol))),
-                hold_bars=_hold_bars(config, profiles.get(decision.symbol), horizon),
-                spread_bps=spread,
-                participation_limit=MAX_PARTICIPATION,
-                liquidity=decision.sizing_liquidity,
-            )
-            if position is None:
-                # The fill bar was too thin to take the order at all.
-                continue
-            open_positions[decision.symbol] = position
-            entry_participation[decision.symbol] = fill.participation
-            equity -= fill.fee
-            result.fills.append(fill)
-        pending = []
-
-        # --- 2. funding, then exits, on every open position ---------------
-        for symbol in list(open_positions):
-            position = open_positions[symbol]
-            bars = bars_by_symbol[symbol]
-            if timestamp not in bars.index:
-                continue
-            bar = bars.loc[timestamp]
-            position.bars_held += 1
-
-            rate = funding.get(symbol, pd.Series(dtype=float)).get(timestamp, 0.0)
-            equity -= accrue_funding(position, float(rate or 0.0), float(bar['close']))
-
-            outcome = resolve_bar(position, bar, timestamp)
-            if outcome.exited:
-                trade, fill = close_position(
-                    position, bar=bar, timestamp=timestamp,
-                    exit_price=outcome.exit_price, reason=outcome.reason,
-                    config=config, spread_bps=spread,
-                    entry_participation=entry_participation.get(symbol, 0.0),
-                )
-                # Funding was charged to equity as it accrued, so only the price
-                # move and the exit fee land here — charging it twice would
-                # double-count the largest cost in the system.
-                equity += trade.price_pnl - fill.fee
-                result.trades.append(trade)
-                result.fills.append(fill)
-                open_positions.pop(symbol)
-                entry_participation.pop(symbol, None)
-                last_exit_bar[symbol] = bar_number
-
-        # --- 3. mark to market -------------------------------------------
-        unrealised = 0.0
-        for symbol, position in open_positions.items():
-            bars = bars_by_symbol[symbol]
-            if timestamp in bars.index:
-                unrealised += position.unrealised(float(bars.loc[timestamp, 'close']))
-        curve[timestamp] = equity + unrealised
-
-        floor = float(config.min_equity)
-        if equity <= max(floor, 0.0):
-            logger.warning(
-                'equity %.2f at or below the floor %.2f at %s: stopping. A floor '
-                'above zero is the point — an account at zero has been '
-                'unrecoverable for a while.', equity, floor, timestamp,
-            )
-            break
-
-        # --- 4. decide for the next bar ----------------------------------
-        try:
-            slice_ = forecasts.xs(timestamp, level='event_time', drop_level=False)
-        except KeyError:
+    for window_open, rows in screened.groupby('window_open', sort=True):
+        # Settle first: a position from the previous window matures at exactly
+        # this instant. Deciding before settling would stake the same dollars
+        # twice, which at a $100 account with a 5% cap is the difference between
+        # a real constraint and none. Matured positions are found by settle_time
+        # rather than by scanning the outcome map, which would be quadratic.
+        matured = [p for p in book.open_positions if p.settle_time <= window_open]
+        if matured:
+            book.settle({(p.symbol, p.window_open): outcomes[(p.symbol, p.window_open)]
+                         for p in matured if (p.symbol, p.window_open) in outcomes})
+        if book.halted_at is not None:
             continue
-
-        contexts: dict[str, DecisionContext] = {}
-        for symbol in slice_.index.get_level_values('symbol'):
-            bars = bars_by_symbol.get(symbol)
-            if bars is None or timestamp not in bars.index or symbol in open_positions:
-                continue
-            bar = bars.loc[timestamp]
-            since_exit = (
-                bar_number - last_exit_bar[symbol] if symbol in last_exit_bar else None
-            )
-            floor = liquidity[symbol].get(timestamp, np.nan)
-            contexts[symbol] = DecisionContext(
-                equity=equity,
-                volatility=float(volatility[symbol].get(timestamp, np.nan)),
-                bar_volume=float(floor) if np.isfinite(floor) else float(bar.get('volume', 0.0)),
-                price=float(bar['close']),
-                open_positions=len(open_positions),
-                bars_since_exit=since_exit,
-                max_positions=config.max_positions,
-            )
-
-        if contexts:
-            window = None
-            if correlation_lookback:
-                window = returns_panel.loc[:timestamp].tail(correlation_lookback)
-            decisions = decide_panel(
-                slice_, contexts=contexts, config=config,
-                profiles=profiles, counter=result.gates, returns=window,
-            )
-            result.decisions.extend(decisions)
-            pending = [d for d in decisions if d.tradeable]
-
-    # --- close anything still open ---------------------------------------
-    final = timestamps[-1]
-    for symbol, position in list(open_positions.items()):
-        bars = bars_by_symbol[symbol]
-        if final not in bars.index:
-            continue
-        bar = bars.loc[final]
-        trade, fill = close_position(
-            position, bar=bar, timestamp=final, exit_price=float(bar['close']),
-            reason=ExitReason.END_OF_DATA, config=config, spread_bps=spread,
-            entry_participation=entry_participation.get(symbol, 0.0),
-        )
-        equity += trade.price_pnl - fill.fee
-        result.trades.append(trade)
-        result.fills.append(fill)
-        curve[final] = equity
-
-    result.equity_curve = pd.Series(curve).sort_index()
-    return result
+        for decision in decide_window(rows, config, bankroll=book.bankroll):
+            decisions.append(decision)
+            book.record(decision)
+    # Anything still open at the end of the span settles on its own outcome.
+    if book.open_positions:
+        book.settle(outcomes)
+    book.stateless_rejections = stateless_rejections
+    return book, decisions
 
 
-def backtest_from_model(
-    model: ForecastModel,
-    features: pd.DataFrame,
-    *,
-    bars_by_symbol: dict[str, pd.DataFrame],
-    costs: pd.Series,
-    funding_by_symbol: Optional[dict[str, pd.DataFrame]] = None,
+def walk_forward(
+    dataset: Dataset,
     config: Optional[Config] = None,
-    profiles: Optional[dict[str, CoinProfile]] = None,
-    initial_equity: float = 100_000.0,
-    spread_bps: Optional[float] = None,
-    allow_in_sample: bool = False,
-) -> BacktestResult:
-    """Score a feature panel with one model, then backtest the result.
-
-    Refuses in-sample rows unless explicitly told otherwise, because trading a
-    model's own training window is not a backtest — it is a measurement of how
-    well the model memorised. On driftless random walks that produced a mean
-    price PnL of +95,000 with a t-statistic of +7 across six seeds.
-
-    For anything that matters, use `walk_forward_backtest`.
-    """
-    model.assert_compatible(features)
-
-    overlap = model.in_sample_rows(features)
-    if overlap and not allow_in_sample:
-        raise ValueError(
-            f'{overlap} of {len(features)} rows fall inside the training window '
-            f'(ending {model.train_end}). Backtesting them measures memorisation, '
-            f'not skill. Use walk_forward_backtest, or pass allow_in_sample=True '
-            f'if you specifically want the in-sample number.'
-        )
-
-    aligned_cost = costs.reindex(features.index).ffill().fillna(0.0)
-    forecasts = model.predict(features, cost=aligned_cost.to_numpy())
-    return run_backtest(
-        forecasts=forecasts,
-        bars_by_symbol=bars_by_symbol,
-        funding_by_symbol=funding_by_symbol,
-        config=config,
-        profiles=profiles,
-        initial_equity=initial_equity,
-        spread_bps=spread_bps,
-        horizon_bars=model.horizon_bars,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Walk-forward
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class WalkForwardForecasts:
-    """Out-of-sample forecasts, and the models that produced them."""
-
-    forecasts: pd.DataFrame
-    models: list[ForecastModel] = field(default_factory=list)
-    periods: list[tuple[pd.Timestamp, pd.Timestamp]] = field(default_factory=list)
-    # The span these forecasts describe. Carried rather than re-derived so the
-    # backtest cannot hold a position longer than the forecast it opened on.
-    horizon_bars: Optional[int] = None
-
-    @property
-    def coverage(self) -> int:
-        return len(self.forecasts)
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            'periods': len(self.periods),
-            'rows': self.coverage,
-            'first': str(self.periods[0][0]) if self.periods else None,
-            'last': str(self.periods[-1][1]) if self.periods else None,
-            'mean_effective_observations': round(
-                float(np.mean([m.effective_observations for m in self.models])), 1
-            ) if self.models else 0.0,
-        }
-
-
-def generate_walk_forward_forecasts(
-    features: pd.DataFrame,
-    targets: pd.DataFrame,
     *,
-    config: Optional[Config] = None,
-    profiles: Optional[dict[str, CoinProfile]] = None,
-    n_periods: int = 6,
-    min_train_fraction: float = 0.35,
-    horizon_bars: Optional[int] = None,
-) -> WalkForwardForecasts:
-    """Retrain periodically and forecast only forward.
+    groups: Optional[Sequence[str]] = None,
+    trade: bool = True,
+    folds: Optional[Sequence[WindowFold]] = None,
+) -> RunResult:
+    """Fit and evaluate across purged expanding folds."""
+    config = config or dataset.config
+    window_index = dataset.window_index
+    folds = list(folds) if folds is not None else purged_walk_forward(
+        window_index, n_folds=config.n_folds, embargo_minutes=config.embargo_minutes)
 
-    For each period the model is fitted on everything before it, minus one label
-    horizon so no training outcome resolves inside the period being forecast.
-    Every returned row is therefore a forecast the model could have made at the
-    time, which is the only kind a backtest may trade.
-
-    This is also what the simulation layer consumes: CPCV paths, the bootstrap
-    and the synthetic panels all need out-of-sample forecasts, not in-sample ones.
-    """
-    from core.model import align_panel, train_forecast_model
-
-    config = config or Config()
-    profiles = profiles or {}
-
-    x, y = align_panel(features, targets)
-    if x.empty:
-        return WalkForwardForecasts(pd.DataFrame())
-
-    times = pd.DatetimeIndex(x.index.get_level_values('event_time'))
-    unique = times.unique().sort_values()
-    # The horizon the *targets* were built at, which is not always the profile's:
-    # `--horizon` overrides it. This sets both the purge width between train and
-    # forecast period and what each refitted model records, so reading it from the
-    # config alone purged 96h for targets built at 8h.
-    horizon = int(horizon_bars) if horizon_bars else config.label_horizon_hours()
-
-    start = int(len(unique) * min_train_fraction)
-    if start >= len(unique) - n_periods:
-        return WalkForwardForecasts(pd.DataFrame(), horizon_bars=horizon)
-
-    edges = np.linspace(start, len(unique), n_periods + 1).astype(int)
-    pieces: list[pd.DataFrame] = []
+    evaluations: list[FoldEvaluation] = []
     models: list[ForecastModel] = []
-    periods: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    books: list[Book] = []
+    all_decisions: list[Decision] = []
+    stateless_totals = pd.Series(dtype=float)
+    scored_parts: list[pd.DataFrame] = []
+    notes: list[str] = []
 
-    for begin, end in zip(edges[:-1], edges[1:]):
-        if end <= begin:
-            continue
-        period_start, period_end = unique[begin], unique[end - 1]
-
-        # Purge one horizon: a training row entered just before `period_start`
-        # resolves inside the period we are about to forecast.
-        train_cutoff = period_start - pd.Timedelta(hours=horizon)
-        train_mask = times < train_cutoff
-        if train_mask.sum() < 500:
-            continue
-
-        # Assert it rather than trust the line above. `core.cv.assert_no_leakage`
-        # guards the CV folds, but this split — the one every promotion gate is
-        # computed from — had no equivalent check, and no test: removing the
-        # purge entirely left the whole suite green, because the nearest guard
-        # asserts `model.train_end < period_start` and the purge sits *inside*
-        # that boundary. A label spanning `horizon` bars from the last training
-        # row must resolve strictly before the first bar being forecast.
-        if train_mask.any():
-            last_train = times[train_mask].max()
-            if last_train + pd.Timedelta(hours=horizon) > period_start:
-                raise AssertionError(
-                    f'walk-forward leak: last training bar {last_train} plus a '
-                    f'{horizon}h label resolves at or after the forecast period '
-                    f'start {period_start}'
-                )
-
-        model = train_forecast_model(
-            x[train_mask], y[train_mask], config=config,
-            data_as_of=str(train_cutoff),
-            # The same horizon this loop purges by, so the model's own validation
-            # split and its recorded provenance agree with the targets it saw.
-            horizon_bars=horizon,
-        )
-        if model is None:
-            continue
-
-        period_mask = (times >= period_start) & (times <= period_end)
-        period_features = x[period_mask]
-        cost = y.loc[period_features.index, 'cost'].to_numpy()
-        pieces.append(model.predict(period_features, cost=cost))
+    for fold in folds:
+        assert_no_leakage(fold)
+        logger.info(fold.label())
+        fit, train_table = fit_fold(dataset, fold.train, config, groups=groups)
+        weights = recency_weights(train_table['window_open'], config.recency_half_life_days)
+        model = fit_model(train_table, fit.baseline, config, groups=groups,
+                          weights=weights, scoring=fit.bundle(config))
         models.append(model)
-        periods.append((period_start, period_end))
 
-    if not pieces:
-        return WalkForwardForecasts(pd.DataFrame(), horizon_bars=horizon)
+        test_table = apply_fold(dataset, fit, fold.test, config, groups=groups)
+        test_table = test_table.assign(
+            model_probability=model.predict(test_table),
+            fold=fold.index,
+        )
+        scored_parts.append(test_table)
 
-    return WalkForwardForecasts(
-        forecasts=pd.concat(pieces).sort_index(), models=models, periods=periods,
-        horizon_bars=horizon,
+        stats: Optional[BookStats] = None
+        if trade:
+            book, decisions = run_book(test_table, config)
+            books.append(book)
+            all_decisions.extend(decisions)
+            stateless_totals = stateless_totals.add(
+                book.stateless_rejections, fill_value=0)
+            stats = summarise(book, windows_available=effective_observations(test_table))
+
+        evaluations.append(evaluate_fold(
+            fold.index, test_table,
+            test_table['model_probability'].to_numpy(),
+            test_table['baseline_probability'].to_numpy(),
+            residual_scale=model.residual_scale,
+            control_gain_share=model.control_importance_share,
+            stats=stats,
+        ))
+        logger.info(evaluations[-1].line())
+
+    scored = pd.concat(scored_parts, ignore_index=True).sort_values(
+        ['window_open', 'symbol', 'offset'], ignore_index=True)
+
+    continuous_book: Optional[Book] = None
+    continuous_stats: Optional[BookStats] = None
+    if trade:
+        continuous_book, _ = run_book(scored, config)
+        continuous_stats = summarise(
+            continuous_book, windows_available=effective_observations(scored))
+
+    if len(dataset.symbols) < 3:
+        notes.append(
+            f'universe is {len(dataset.symbols)} symbols; the cross_asset group '
+            f'is thinner than its column count suggests')
+
+    report = EvaluationReport(
+        folds=evaluations, continuous=continuous_stats,
+        config_provenance=config.provenance(), notes=notes,
+    )
+    return RunResult(
+        report=report, models=models, books=books, continuous_book=continuous_book,
+        rejections=rejection_histogram(all_decisions)
+                   .add(stateless_totals, fill_value=0).astype(int),
+        scored=scored,
     )
 
 
-def walk_forward_backtest(
-    features: pd.DataFrame,
-    targets: pd.DataFrame,
+def cost_stress(
+    scored: pd.DataFrame,
+    config: Config = DEFAULT_CONFIG,
     *,
-    bars_by_symbol: dict[str, pd.DataFrame],
-    funding_by_symbol: Optional[dict[str, pd.DataFrame]] = None,
-    config: Optional[Config] = None,
-    profiles: Optional[dict[str, CoinProfile]] = None,
-    n_periods: int = 6,
-    initial_equity: float = 100_000.0,
-    spread_bps: Optional[float] = None,
-    horizon_bars: Optional[int] = None,
-) -> tuple[BacktestResult, WalkForwardForecasts]:
-    """The only honest backtest: retrain forward, trade only what was forecastable.
+    scenarios: Optional[dict[str, dict]] = None,
+) -> pd.DataFrame:
+    """Re-run the book under worse cost assumptions.
 
-    Returns the result and the forecast set, because the forecasts are worth
-    keeping — the gates and the bootstrap both operate on them.
+    The half-spread is an assumption, not a measurement — no Kalshi order ticket
+    has been read against `core/costs.py` — and it is larger than the fee at
+    price above 83c, where 0.07*p(1-p) falls below a cent. So it is the parameter
+    most likely to be wrong
+    and the one that moves the answer most. A strategy that survives only at the
+    assumed spread has not been demonstrated.
     """
-    generated = generate_walk_forward_forecasts(
-        features, targets, config=config, profiles=profiles, n_periods=n_periods,
-        horizon_bars=horizon_bars,
-    )
-    if generated.forecasts.empty:
-        return BacktestResult(initial_equity=initial_equity), generated
+    scenarios = scenarios or {
+        'baseline': {},
+        'spread 2x': {'half_spread_cents': config.half_spread_cents * 2},
+        'spread 3x': {'half_spread_cents': config.half_spread_cents * 3},
+        'fee 2x': {'fee_rate': config.fee_rate * 2},
+        'both 2x': {'half_spread_cents': config.half_spread_cents * 2,
+                    'fee_rate': config.fee_rate * 2},
+        'maker': {'assume_maker': True, 'half_spread_cents': 0.0},
+    }
+    rows = []
+    for name, overrides in scenarios.items():
+        variant = config.with_overrides(**overrides) if overrides else config
+        book, _ = run_book(scored, variant)
+        stats = summarise(book, windows_available=effective_observations(scored))
+        rows.append({
+            'scenario': name, 'trades': stats.n_trades, 'coverage': stats.coverage,
+            'total_return': stats.total_return, 'sharpe': stats.sharpe,
+            'win_rate': stats.win_rate, 'realised_edge_pp': stats.realised_edge_pp,
+            'fees': stats.total_fees, 'max_drawdown': stats.max_drawdown,
+        })
+    return pd.DataFrame(rows)
 
-    result = run_backtest(
-        forecasts=generated.forecasts,
-        bars_by_symbol=bars_by_symbol,
-        funding_by_symbol=funding_by_symbol,
-        config=config,
-        profiles=profiles,
-        initial_equity=initial_equity,
-        spread_bps=spread_bps,
-        # The models were fitted at this horizon, so a position may not outlive it.
-        horizon_bars=generated.horizon_bars,
-    )
-    return result, generated
+
+def edge_curve(
+    scored: pd.DataFrame,
+    config: Config = DEFAULT_CONFIG,
+    *,
+    gates_pp: Sequence[float] = (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0),
+) -> pd.DataFrame:
+    """How the book behaves as the abstention gate tightens.
+
+    The right value of `min_edge_pp` is measured, not guessed: it trades coverage
+    against the calibration error it is protecting against. A curve that
+    improves monotonically as the gate tightens says the forecast is real and
+    concentrated; one that peaks and falls says the tail is noise.
+    """
+    rows = []
+    for gate in gates_pp:
+        book, decisions = run_book(scored, config.with_overrides(min_edge_pp=gate))
+        stats = summarise(book, windows_available=effective_observations(scored))
+        rows.append({
+            'min_edge_pp': gate, 'trades': stats.n_trades, 'coverage': stats.coverage,
+            'total_return': stats.total_return, 'sharpe': stats.sharpe,
+            'win_rate': stats.win_rate, 'mean_edge_pp': stats.mean_edge_pp,
+            'realised_edge_pp': stats.realised_edge_pp,
+        })
+    return pd.DataFrame(rows)

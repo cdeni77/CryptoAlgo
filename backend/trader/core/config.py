@@ -1,309 +1,301 @@
-"""Run configuration: one dataclass, resolved from defaults, env and CLI.
+"""Configuration for the 15-minute binary system.
 
-Precedence for any tunable is always the same, and lives in `Config.resolve`:
+One frozen dataclass, one source of truth. Everything a run can disagree
+about is a field here, and every script exposes the fields that change an
+answer as CLI arguments — so a run that used a different offset set, a
+different fee assumption or a different bankroll says so in its own
+provenance rather than being reconstructed later from a shell history.
 
-    CLI flag  >  per-coin profile  >  Config default
+The fields group into five decisions, and they are independent:
 
-`cli_overrides` records which fields the user actually passed on the command
-line, so a flag can beat a profile while an untouched default cannot — that is
-what `resolve` consults, and it is why `dataclasses.replace` alone is not enough
-to override a per-coin value.
-
-Flags live in `scripts/_common.py`, next to the code that reads them. A
-declarative `CLI_PARAMS`/`ENV_PARAMS` layer used to be declared here and was
-called by nothing; see the note at the end of this module.
+* **What is traded.** Three Coinbase spot series, 15-minute windows, and a
+  handful of decision offsets inside each window.
+* **What volatility is.** The remaining-variance forecast is the only input the
+  barrier baseline needs, so its lookbacks and its seasonality live here.
+* **What the null is.** ``baseline_*`` describes the arithmetic a clock and a
+  volatility estimate can already do. Beating it is the entire question.
+* **What a trade costs.** Kalshi's fee is a function of price, not a spread in
+  basis points, and the half-spread is a separate field because it is an
+  assumption rather than a measurement.
+* **How much is staked.** A $100 account makes the integer-contract minimum a
+  real gate rather than a rounding detail, and it makes correlation across the
+  three symbols a sizing problem rather than a footnote.
 """
 
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, field, fields, replace
+import os
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Optional
 
-from core.costs import load_exchange_cost_assumptions
+_TRADER_ROOT = Path(__file__).resolve().parents[1]
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from core.profiles import CoinProfile
-
-
-CALIBRATION_STRATEGIES = ('platt', 'isotonic', 'beta')
-FILTER_MODES = ('hard', 'soft', 'off')
-TRADE_FREQ_BUCKETS = ('conservative', 'balanced', 'aggressive')
+DEFAULT_FEE_CONFIG_NAME = 'kalshi_v202608.json'
 
 
-# Where a venue fee schedule can be found. Searched in order, because the same
-# code runs from a repo checkout (cwd anywhere) and from the container image
-# (/app), and a single computed relative path got this wrong in the container:
-# `configs/` used to live above the build context, so it was never copied into
-# the image and every containerised run silently priced contracts at the
-# hardcoded 10bp/side.
-COST_CONFIG_SEARCH_PATHS: tuple[Path, ...] = (
-    Path(__file__).resolve().parent.parent / 'configs' / 'exchange',
-    Path('/app/configs/exchange'),
-    Path('configs/exchange'),
-)
+def find_fee_config(name: str = DEFAULT_FEE_CONFIG_NAME) -> Optional[Path]:
+    """Locate a venue fee schedule, or return None.
 
-DEFAULT_COST_CONFIG_NAME = 'coinbase_us_perps_cde_v202602.json'
-
-
-def find_cost_config(name: str = DEFAULT_COST_CONFIG_NAME) -> Optional[Path]:
-    """Locate a fee schedule by name, or return None.
-
-    An absolute or already-valid relative path is used as given; a bare filename
-    is looked up in the search paths. Returning None rather than raising is
-    deliberate: the caller decides whether a missing schedule is fatal, and it
-    should say so loudly rather than fall through to a default nobody chose.
+    Deliberately returns None rather than raising: the caller decides whether
+    an unversioned run is acceptable. The hardcoded defaults below reproduce
+    the published Kalshi schedule, so an unconfigured run prices correctly but
+    records no schedule version — which is the remaining reason to load one.
     """
-    candidate = Path(name)
-    if candidate.is_absolute() or candidate.exists():
+    explicit = os.getenv('FEE_CONFIG')
+    if explicit:
+        candidate = Path(explicit)
         return candidate if candidate.exists() else None
-    for directory in COST_CONFIG_SEARCH_PATHS:
-        found = directory / candidate.name
-        if found.exists():
-            return found
-    return None
+    candidate = _TRADER_ROOT / 'configs' / 'venue' / name
+    return candidate if candidate.exists() else None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
-    """Global run settings. Per-coin values live in `core.profiles.CoinProfile`."""
+    # ---- universe and market structure -----------------------------------
+    symbols: tuple[str, ...] = ('BTC-USD', 'ETH-USD', 'SOL-USD')
+    venue: str = 'coinbase_spot'
+    timeframe: str = '1m'
 
-    # --- Walk-forward windows ---
+    # A Kalshi crypto up/down market opens on a quarter-hour boundary and
+    # settles on the next one. `window_minutes` is therefore a property of the
+    # venue, not a tunable — it is a field so a test can build a 4-minute
+    # window without monkeypatching a module constant.
+    window_minutes: int = 15
 
-    # --- Entry filters (profiles override per coin) ---
-    signal_threshold: float = 0.80
-    # Classification-era: a probability threshold plus this margin. The forecast
-    # is a return now, so the decision path uses `min_edge_over_cost` instead —
-    # reusing this as a return threshold demanded 200bp of expected net, which no
-    # hourly forecast will ever clear.
-    # Expected net return must exceed the round-trip cost by this multiple again.
-    # Expressed relative to cost rather than as an absolute, because cost ranges
-    # from ~5bp on the group-B contracts to ~54bp on ETH: an absolute floor would
-    # be trivially met on one and unreachable on the other. At 0.5, DOGE needs
-    # ~2.5bp of forecast edge and ETH needs ~27bp.
-    min_edge_over_cost: float = 0.5
-    # Minimum forecast-to-risk ratio before a position is worth taking: a
-    # forecast smaller than a fraction of its own uncertainty is noise, whatever
-    # its sign. Lived as a module constant in `core/signal.py`, which made it the
-    # one gate threshold no caller could sweep — so a sensitivity run had to
-    # monkeypatch it. Every other threshold here is a field; this is now one too.
-    min_edge_to_risk: float = 0.05
-    min_momentum_magnitude: float = 0.07
-    max_ensemble_std: float = 0.12
-    min_directional_agreement: float = 0.67
-    meta_probability_threshold: float = 0.57
+    # Minutes after the window opens at which a decision is scored. Each is a
+    # separate row with its own displacement and its own remaining variance,
+    # and they share a label — so folds split on the *window*, never the row.
+    # Four offsets spread across the window cover the barrier geometry from
+    # near-coin-flip to nearly-settled without carrying fourteen near-copies
+    # of every observation.
+    decision_offsets: tuple[int, ...] = (3, 6, 9, 12)
 
-    # --- Regime filter ---
-    min_vol_24h: float = 0.008
-    max_vol_24h: float = 0.06
+    # ---- volatility ------------------------------------------------------
+    # Trailing realised-volatility lookbacks, in minutes, blended HAR-style.
+    # 15 and 60 carry the state, 240 and 1440 carry the level; a single
+    # lookback is either too noisy or too slow and there is no setting that is
+    # both.
+    vol_lookbacks_minutes: tuple[int, ...] = (15, 60, 240, 1440)
 
-    # --- Directional macro filter policies ---
+    # Intraday seasonality is a multiplicative minute-of-day factor, smoothed,
+    # because a per-minute factor from a finite sample is mostly noise. Set
+    # `seasonality_smooth_minutes` to 0 to disable seasonality entirely.
+    seasonality_smooth_minutes: int = 31
+    seasonality_min_days: int = 60
 
-    # --- Exits ---
-    vol_mult_tp: float = 5.5
-    vol_mult_sl: float = 3.0
-    max_hold_hours: int = 96
-    cooldown_hours: float = 24.0
+    # A floor under the per-minute volatility forecast, in basis points. A
+    # dead-quiet minute otherwise divides by ~0 and the baseline returns 0 or 1
+    # with total confidence.
+    min_sigma_bps_per_minute: float = 0.5
 
-    # --- Risk / sizing ---
-    max_positions: int = 5
-    position_size: float = 0.15
-    # Float, not int: `--leverage 1.5` is a reasonable thing for an operator to
-    # want, and `execution.py` already casts to float at both use sites.
-    leverage: float = 4.0
-    vol_sizing_target: float = 0.025
-    min_equity: float = 1000.0
+    # ---- the baseline (the null hypothesis) ------------------------------
+    # 'normal' or 'student_t'. One-minute crypto returns are fat-tailed, so a
+    # Gaussian barrier overstates confidence at large displacements. Which
+    # distribution calibrates better out of sample is measured, not assumed.
+    baseline_distribution: str = 'student_t'
+    baseline_nu: Optional[float] = None          # fitted when None
+    baseline_fit_scale_per_offset: bool = True   # one scale factor per offset
 
-    # --- Execution costs (see core.costs; satisfies its CostParams protocol) ---
-    # 0.10% of notional plus $0.12 per contract, which is what Coinbase's own
-    # order ticket charges — measured, not assumed, on three contracts spanning
-    # 3.2x in notional (see `core.costs.per_contract_fee`). The two are added,
-    # not maxed. These defaults used to be percentage-only, so an unconfigured
-    # run was systematically cheap by the commission's share of notional: 1.5bp
-    # a side on a $782 BIP contract, 5bp on a $242 ETP one.
-    fee_pct_per_side: float = 0.0010
-    per_contract_fee_usd: float = 0.12
-    # Per-symbol overrides of the per-contract commission. Empty means the
-    # scalar above applies everywhere, which is what the app was measured doing;
-    # a venue that bills by instrument group fills this in.
-    per_contract_fee_by_symbol: dict[str, float] = field(default_factory=dict)
-    slippage_bps: float = 2.0
-    # Half-spread crossed on entry and exit. Threaded through the backtest as an
-    # argument before, which meant `cost_stress`'s "3x slippage" scenario had
-    # nothing to multiply — `core/execution.py` reads this, never `slippage_bps`.
-    spread_bps: float = 4.0
-    apply_funding: bool = True
-    apply_slippage: bool = True
-    apply_impact: bool = False
-    impact_bps_per_contract: float = 0.0
-    impact_max_bps_per_side: float = 10.0
-    # Which schedule was loaded, for provenance. Set by
-    # `with_cost_assumptions`; reported alongside the version.
-    cost_config_path: Optional[str] = None
-    cost_config_version: str = 'legacy_default'
+    # The baseline's drift is structurally zero and is not fitted. A non-zero
+    # drift *is* the alpha; it belongs to the model under test, and putting it
+    # in the null would hide exactly what the null exists to expose.
 
-    # --- Labels ---
-    label_forward_hours: int = 24
-    label_vol_target: float = 1.8
+    # ---- model -----------------------------------------------------------
+    # The classifier predicts a correction to the baseline: the baseline's
+    # logit enters as an init_score offset, so an untrained model reproduces
+    # the baseline exactly and every parameter it fits is incremental skill.
+    learning_rate: float = 0.03
+    n_estimators: int = 400
+    num_leaves: int = 15
+    max_depth: int = 4
+    min_child_samples: int = 500
+    subsample: float = 0.7
+    colsample_bytree: float = 0.6
+    reg_lambda: float = 10.0
+    early_stopping_rounds: int = 40
 
-    # --- Model / validation ---
-    min_val_auc: float = 0.54
-    recency_half_life_days: float = 50.0
+    # ---- cross-validation ------------------------------------------------
+    n_folds: int = 6
+    # Purge and embargo, in minutes, applied on both sides of every test
+    # block. It must cover the longest feature lookback (1440) as well as the
+    # label span (15), because a train row immediately after a test block
+    # computes its features from test-period bars.
+    embargo_minutes: int = 1440
+    recency_half_life_days: Optional[float] = None
+    train_window_days: Optional[float] = None
 
-    # --- Portfolio ---
-    max_portfolio_correlation: float = 0.75
-    correlation_lookback_hours: int = 72
-    excluded_symbols: Optional[list[str]] = None
+    # ---- costs (Kalshi) --------------------------------------------------
+    # fee per contract = ceil(fee_rate * price * (1 - price) * 100) / 100,
+    # charged on the trade and never on settlement. See core/costs.py.
+    fee_rate: float = 0.07
+    maker_fee_rate: float = 0.0025
+    assume_maker: bool = False
+    # Half the quoted bid/ask, in cents of a dollar contract. An assumption,
+    # not a measurement, and larger than the fee at every price above 83c
+    # (where 0.07*p(1-p) drops below a cent) —
+    # so it is reported separately and stressed rather than folded in.
+    half_spread_cents: float = 1.0
 
-    # --- Features ---
+    # ---- sizing and risk (a $100 account) --------------------------------
+    starting_bankroll: float = 100.0
+    # Fraction of full Kelly. Full Kelly on a binary at an extreme price asks
+    # for a third of the account on a 5pp edge; a quarter is the largest value
+    # that survives being wrong about the edge by a factor of two.
+    kelly_fraction: float = 0.25
+    max_stake_fraction: float = 0.05      # of bankroll, per position
 
-    # --- Strategy selection ---
-    strategy_family: str = 'momentum_trend'
-    trade_freq_bucket: str = 'balanced'
+    # A hard dollar cap per position, standing in for market depth. This is an
+    # ASSUMPTION and an unmeasured one: nobody has read the depth of a Kalshi
+    # 15-minute crypto book at a given price. It matters because it binds long
+    # before a percentage cap does — at $25 it starts constraining as soon as the
+    # account passes about $500 — and without it a backtest compounds a $100
+    # account into size no venue could fill and reports the result as a return.
+    # Measure the book, then set this from the measurement.
+    max_stake_dollars: Optional[float] = 25.0
 
-    # --- Labelling ---
-    # Directional consensus needed before a bar is labelled at all: 2 requires
-    # all three momentum components to agree, 1 accepts two of three.
-    direction_score_threshold: int = 2
+    # Size from the *starting* bankroll rather than the current one.
+    #
+    # Default off — meaning additive, non-compounding — because compounding turns
+    # a per-trade edge estimate into an exponential, and an exponential is
+    # dominated by the error in that estimate rather than by the estimate. On a
+    # 2.8pp edge over 28,000 trades the compounded figure came out at 2e17
+    # percent, which is arithmetic rather than a finding. With this off, the
+    # equity curve's slope *is* the per-trade edge and can be read directly.
+    #
+    # Turn it on to project deployment, and label the output as a projection.
+    compound: bool = False
+    max_window_exposure_fraction: float = 0.08
+    # The three symbols' 15-minute returns are ~0.7 correlated, so three
+    # simultaneous same-direction positions are one position at three times
+    # the size. Cap the count as well as the notional.
+    max_positions_per_window: int = 2
 
-    # --- Family-specific knobs (profiles override per coin) ---
-    # Every value a profile can override needs a default here, or `resolve`
-    # cannot complete the CLI > profile > default chain for it. The last four
-    # belong to the funding_carry, squeeze_breakout and oi_divergence families,
-    # which is why they were missing: those families were unreachable.
-    pullback_depth_threshold: float = 0.020
-    rebound_confirmation_threshold: float = 0.004
-    trend_strength_min: float = 0.002
-    pullback_lookback: int = 24
-    breakout_lookback: int = 48
-    breakout_buffer: float = 0.003
-    expansion_confirm_threshold: float = 0.004
-    funding_z_threshold: float = 2.5
-    squeeze_pct_threshold: float = 0.20
-    liq_threshold: float = 0.30
-    oi_z_threshold: float = 1.0
+    # One entry per (symbol, window). The four decision offsets are the same
+    # bet observed at four moments, not four bets, so letting each fire
+    # independently would put four times the intended size on one 15-minute
+    # move. The live-honest rule is to walk the offsets in order and take the
+    # first that clears every gate; `scripts/evaluate.py` reports edge per
+    # offset separately, which is how the offset set gets narrowed on evidence
+    # rather than by taking the best one in hindsight.
+    max_entries_per_window: int = 1
 
-    # Fields the user explicitly set on the command line.
+    # Settlement is free; an exit is not. Selling a contract back pays a second
+    # fee and crosses the spread a second time, so an early exit at 85c costs
+    # 3.8pp against the 1.9pp of holding to settle. And there is no risk reason
+    # to override that: a binary's loss is capped at the stake from the instant
+    # of entry, so there is no liquidation to avoid and nothing a stop-loss
+    # protects. An exit therefore has to be justified by the forecast flipping
+    # far enough to beat a fresh round of costs, which is a high bar — hence
+    # off by default, and `exit_edge_pp` on top of it when enabled.
+    allow_early_exit: bool = False
+    exit_edge_pp: float = 1.0
+    min_contracts: int = 1                # round down; zero contracts is a skip
+    # Surplus over break-even, in probability points, demanded before a trade
+    # is considered at all. Abstention is the default action, and this is the
+    # dial that decides how often it is overridden. It guards against
+    # calibration error rather than against fees — the fee is already inside
+    # break-even — so the right value is whatever the measured calibration
+    # error turns out to be, and `scripts/evaluate.py` reports the whole curve
+    # rather than assuming one.
+    min_edge_pp: float = 0.5
+    # Traded-price band, and it must be symmetric. The edge here is a
+    # disagreement about sigma_remaining, and that disagreement points both
+    # ways: a smaller sigma than the market assumes makes the probability more
+    # extreme than the quote, so buy the favourite; a larger sigma makes the
+    # favourite overpriced, so buy the longshot. A one-sided band such as
+    # [0.55, 0.95] permits only the first and silently discards half the
+    # strategy.
+    #
+    # What the ends actually exclude is where the *microstructure assumptions*
+    # break, not where the forecast is weak. Below 10c a one-cent tick is a 10%
+    # relative price error and the assumed half-spread is 10% of the stake, so
+    # the fill assumption dominates everything else. Above 95c there is under 5c
+    # of upside and tick quantisation is larger than any plausible edge.
+    min_traded_price: float = 0.10
+    max_traded_price: float = 0.95
+
+    # An outlier guard, not an economic gate. A sigma disagreement produces
+    # modest departures from the quote; a 40-point departure is a bug, a stale
+    # price, or a signal that is not the one under test. Rejecting it loudly is
+    # better than sizing it.
+    max_disagreement_pp: float = 25.0
+    # Stop trading below this fraction of the starting bankroll.
+    ruin_floor_fraction: float = 0.50
+
+    # ---- provenance ------------------------------------------------------
+    fee_config_path: Optional[str] = None
+    fee_config_version: str = 'builtin_kalshi_v202608'
     cli_overrides: frozenset[str] = frozenset()
 
-    # -- Resolution ---------------------------------------------------------
+    # ---- derived ---------------------------------------------------------
+    @property
+    def settle_offset(self) -> int:
+        """Minutes from window open to settlement."""
+        return self.window_minutes
 
-    def resolve(
-        self,
-        name: str,
-        profile: Optional["CoinProfile"] = None,
-        mode: str = 'direct',
-    ) -> Any:
-        """Effective value of `name` under CLI > profile > default precedence.
+    def remaining_minutes(self, offset: int) -> int:
+        """Minutes of unresolved price movement left at a decision offset.
 
-        `mode` makes clamping explicit at the call site: 'ceiling' caps the
-        result at the Config default, 'floor' raises it to the default,
-        'direct' leaves it alone. Clamping applies to numbers only.
+        The decision at offset ``m`` sees the close of the bar covering
+        ``[m-1, m)``, so the unobserved span is ``window_minutes - m``. The
+        sub-minute staleness inside that last bar is absorbed by the baseline's
+        fitted scale factor rather than modelled here.
         """
-        default = _default_of(type(self), name)
+        return self.window_minutes - offset
 
-        if name in self.cli_overrides:
-            value = getattr(self, name)
-        elif profile is not None and hasattr(profile, name):
-            value = getattr(profile, name)
-        else:
-            value = default
-
-        if isinstance(default, str) or isinstance(value, str):
-            return str(value or default)
-
-        if isinstance(value, bool):
-            return bool(value)
-
-        value = float(value)
-        if mode == 'ceiling':
-            return min(value, float(default))
-        if mode == 'floor':
-            return max(value, float(default))
-        return value
-
-    def resolve_int(self, name: str, profile: Optional["CoinProfile"] = None, mode: str = 'direct') -> int:
-        return int(self.resolve(name, profile, mode))
-
-    def label_horizon_hours(self, profile: Optional["CoinProfile"] = None) -> int:
-        """Prefer the execution hold horizon; fall back to the label horizon.
-
-        Labels must span at least as long as a position can stay open, or the
-        model is trained on an outcome the backtest never waits for.
-        """
-        max_hold = self.resolve_int('max_hold_hours', profile)
-        if max_hold > 0:
-            return max_hold
-        return self.resolve_int('label_forward_hours', profile)
-
-
-    def with_cost_assumptions(self, path: str | Path) -> "Config":
-        """Return a copy with fees/slippage/impact taken from an exchange config.
-
-        Loads `configs/exchange/*.json` (see `core.costs`). Without this the
-        run uses the hardcoded Coinbase CDE defaults above.
-        """
-        a = load_exchange_cost_assumptions(path)
+    def with_overrides(self, **values: Any) -> 'Config':
+        """Return a copy with `values` applied, recording which fields moved."""
+        known = {f.name for f in fields(self)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise ValueError(f"unknown config fields: {', '.join(unknown)}")
+        applied = {k: v for k, v in values.items() if v is not None}
+        if not applied:
+            return self
         return replace(
-            self,
-            fee_pct_per_side=a.effective_fee_pct_per_side(),
-            per_contract_fee_usd=a.effective_per_contract_fee(),
-            # Only when the exchange fee is actually enabled. `per_contract_fee`
-            # prefers this dict whenever it is non-empty, which bypassed
-            # `effective_per_contract_fee`'s own `enabled` check — so loading the
-            # retail schedule (10bp/side, exchange_fee disabled) still charged
-            # the CDE per-contract commission and produced an identical
-            # round-trip to CDE from a completely different fee model.
-            per_contract_fee_by_symbol=(
-                dict(a.exchange_fee.symbol_overrides or {})
-                if a.exchange_fee.enabled else {}
-            ),
-            slippage_bps=a.slippage.bps_per_side,
-            apply_slippage=a.slippage.enabled,
-            apply_impact=a.impact.enabled,
-            impact_bps_per_contract=a.impact.bps_per_contract,
-            impact_max_bps_per_side=a.impact.max_bps_per_side,
-            apply_funding=a.funding.enabled,
-            cost_config_path=str(path),
-            cost_config_version=a.version,
+            self, **applied,
+            cli_overrides=frozenset(self.cli_overrides | set(applied)),
         )
 
+    def with_fee_assumptions(self, path: Optional[Path]) -> 'Config':
+        """Load a venue fee schedule, or return self unchanged when there is none."""
+        if path is None:
+            return self
+        import json
+        payload = json.loads(Path(path).read_text())
+        fees = payload.get('fees', {})
+        return replace(
+            self,
+            fee_rate=float(fees.get('fee_rate', self.fee_rate)),
+            maker_fee_rate=float(fees.get('maker_fee_rate', self.maker_fee_rate)),
+            half_spread_cents=float(fees.get('half_spread_cents', self.half_spread_cents)),
+            fee_config_path=str(path),
+            fee_config_version=str(payload.get('version', 'unversioned')),
+        )
+
+    def provenance(self) -> dict[str, Any]:
+        """The fields that change an answer, for the model artifact."""
+        return {
+            'symbols': list(self.symbols),
+            'venue': self.venue,
+            'timeframe': self.timeframe,
+            'window_minutes': self.window_minutes,
+            'decision_offsets': list(self.decision_offsets),
+            'vol_lookbacks_minutes': list(self.vol_lookbacks_minutes),
+            'baseline_distribution': self.baseline_distribution,
+            'baseline_nu': self.baseline_nu,
+            'n_folds': self.n_folds,
+            'embargo_minutes': self.embargo_minutes,
+            'recency_half_life_days': self.recency_half_life_days,
+            'train_window_days': self.train_window_days,
+            'fee_rate': self.fee_rate,
+            'half_spread_cents': self.half_spread_cents,
+            'fee_config_version': self.fee_config_version,
+            'kelly_fraction': self.kelly_fraction,
+            'min_edge_pp': self.min_edge_pp,
+            'cli_overrides': sorted(self.cli_overrides),
+        }
 
 
-
-
-def _default_of(cls: type, name: str) -> Any:
-    """Dataclass default for `name`, resolving default_factory."""
-    for f in fields(cls):
-        if f.name != name:
-            continue
-        if f.default is not MISSING:
-            return f.default
-        if f.default_factory is not MISSING:      # type: ignore[misc]
-            return f.default_factory()             # type: ignore[misc]
-        break
-    raise AttributeError(f"{cls.__name__} has no field {name!r}")
-
-
-
-
-
-
-# Env vars that, when set, outrank per-coin profiles.
-_ENV_HARD_OVERRIDES = frozenset({'signal_threshold', 'min_val_auc'})
-
-
-# ---------------------------------------------------------------------------
-# Deliberately absent: a declarative CLI/env layer
-# ---------------------------------------------------------------------------
-#
-# `CliParam`, `CLI_PARAMS`, `ENV_PARAMS`, `Config.add_cli_args`, `from_env`,
-# `from_args` and `build_parser` used to live here. Nothing called any of them:
-# every script builds a bare `Config()` and `scripts/_common.py` declares the
-# flags it needs by hand. So the declarative layer was documentation that looked
-# like wiring — 22 flags and 5 environment variables that parsed, stored, and
-# reached nothing, including `LEVERAGE` in docker-compose.yml, which an operator
-# could lower while the book kept trading at 4x.
-#
-# The surface that exists is `scripts/_common.py:add_data_arguments`. Add a flag
-# there, where it is visibly connected to something.
+DEFAULT_CONFIG = Config()

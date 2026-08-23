@@ -6,8 +6,13 @@ imports the other's package. That duplication is a deliberate isolation choice,
 but "keep both in sync" written in a doc is not a mechanism — it is a hope, and
 it had already failed. `wallet.balance` defaulted to 10,000 on the trader side and
 100,000 on the API side, so whichever container created the row decided the
-paper account's starting balance, and the equity curve began from a different
-number than the dashboard reported.
+account's starting balance, and the equity curve began from a different number
+than the dashboard reported.
+
+The API copy is now *generated* from the trader's module rather than transcribed,
+which removes the transcription failure mode — but not this test's job. A
+generated copy can still fall out of date, and the migration lists are written by
+hand on both sides.
 
 This test is the mechanism. It compares every shared table column by column,
 including nullability and defaults, and fails on the next divergence rather than
@@ -41,7 +46,7 @@ def _load_api_models() -> Any:
     inserted = str(API_ROOT)
     sys.path.insert(0, inserted)
     try:
-        for module in ('models.base', 'models.signals', 'models.trade', 'models.wallet'):
+        for module in ('models.base', 'models.serving'):
             importlib.import_module(module)
         return importlib.import_module('models.base').Base
     finally:
@@ -183,70 +188,77 @@ def test_shared_columns_have_the_same_definition(schemas):
 
 
 def test_the_migration_lists_match(schemas):
-    """Both containers run the same idempotent ALTERs, so the lists must agree.
+    """The two containers must apply exactly the same migrations.
 
-    Whichever service starts second has to add any column the first one's
-    `create_all` did not, or a writer will insert into a column the reader's
-    model expects and cannot find.
+    Compared by *value*, not by parsing the two source files for string literals.
+    That earlier version was fragile in the way that matters: it broke when the
+    quoting style changed and it could not see through the API now referencing
+    the mirror's list instead of restating it — so it would have failed on a
+    change that made divergence structurally impossible.
+
+    What is asserted is the invariant itself: whatever the API applies is
+    character-for-character what the trader applies, in the same order. Order
+    counts because an index created before the table it names is an error, not a
+    no-op.
     """
-    import re
+    trader, api = schemas
+    from core.pg_writer import MIGRATIONS as trader_migrations
 
-    trader_source = (TRADER_ROOT / 'core' / 'pg_writer.py').read_text()
-    api_source = (API_ROOT / 'app.py').read_text()
-
-    # Table, column AND type. Capturing only the column name meant
-    # `cost_bps VARCHAR` on one side against `DOUBLE PRECISION` on the other
-    # passed, as did the right column added to the wrong table — which is the
-    # drift class this check exists for.
-    pattern = re.compile(
-        r'ALTER TABLE\s+(\w+)\s+ADD COLUMN IF NOT EXISTS\s+(\w+)\s+([A-Za-z ]+)',
-        re.IGNORECASE,
+    api_serving = _load_api_module('models.serving')
+    api_migrations = getattr(api_serving, 'MIGRATIONS', None)
+    assert api_migrations is not None, (
+        'the API mirror declares no MIGRATIONS; the trader has '
+        f'{len(trader_migrations)}'
     )
-    trader_columns = set(pattern.findall(trader_source))
-    api_columns = set(pattern.findall(api_source))
+    assert list(api_migrations) == list(trader_migrations), (
+        'migration lists differ.\n'
+        f'  trader only: {sorted(set(trader_migrations) - set(api_migrations))}\n'
+        f'  api only:    {sorted(set(api_migrations) - set(trader_migrations))}'
+    )
 
-    assert trader_columns, 'no migrations found in pg_writer.py'
-    assert trader_columns == api_columns, (
-        f'migration lists differ — only in trader: '
-        f'{sorted(trader_columns - api_columns)}; '
-        f'only in api: {sorted(api_columns - trader_columns)}'
+    app_source = (API_ROOT / 'app.py').read_text()
+    assert 'POSTGRES_MIGRATIONS' in app_source, (
+        'app.py no longer defines POSTGRES_MIGRATIONS, so nothing applies them'
     )
 
 
-def test_the_index_migrations_match(schemas):
-    """Indexes drift the same way columns do, and are invisible to create_all.
+def test_the_api_applies_the_migrations_it_declares(monkeypatch):
+    """`app.py` must run the same list the mirror holds, not a copy of it.
 
-    `create_all` only creates missing *tables*, so `index=True` added to an
-    existing model never reaches a database that already has the table. Both
-    containers therefore carry explicit `CREATE INDEX IF NOT EXISTS`
-    statements, and the column check above cannot see them — its pattern
-    matches `ALTER TABLE` only.
+    The failure this rules out is a second literal list in `app.py` that drifts
+    from the mirror's — which is exactly the shape of the bug the whole module
+    exists for, one level up.
     """
-    import re
+    from core.pg_writer import MIGRATIONS as trader_migrations
 
-    trader_source = (TRADER_ROOT / 'core' / 'pg_writer.py').read_text()
-    api_source = (API_ROOT / 'app.py').read_text()
+    # `app.py` imports `database`, which refuses to import without a URL.
+    # A URL nothing is listening on is fine: `create_engine` is lazy, and this
+    # test never opens a connection.
+    monkeypatch.setenv('DATABASE_URL', 'postgresql://nobody:nothing@127.0.0.1:1/absent')
+    app_module = _load_api_module('app')
+    applied = list(getattr(app_module, 'POSTGRES_MIGRATIONS', ()))
+    assert applied == list(trader_migrations), (
+        'app.py applies a different list from the one the models declare'
+    )
 
-    # Statements are wrapped across string literals, so join them first.
-    def indexes(source: str) -> set[tuple[str, str, str]]:
-        flat = re.sub(r'"\s*\n\s*"', '', source)
-        return set(
-            re.findall(
-                r'CREATE INDEX IF NOT EXISTS\s+(\w+)\s+ON\s+(\w+)\s*\(([^)]*)\)',
-                flat,
-                re.IGNORECASE,
-            )
+
+def test_the_migrations_are_dialect_portable():
+    """Every migration must run on SQLite as well as Postgres.
+
+    Not a portability nicety: the API test suite runs on SQLite, so a
+    Postgres-only statement is a migration the tests never execute. The previous
+    list was all `ADD COLUMN IF NOT EXISTS`, which meant a dialect guard skipped
+    the whole thing under test and the migrations production ran had never been
+    run anywhere else.
+    """
+    from core.pg_writer import MIGRATIONS
+
+    for statement in MIGRATIONS:
+        assert statement.upper().startswith('CREATE INDEX IF NOT EXISTS'), (
+            f'{statement!r} is not a portable, idempotent index creation. '
+            f'Anything else needs a dialect guard, and a guard means the test '
+            f'suite stops exercising it.'
         )
-
-    trader_indexes = indexes(trader_source)
-    api_indexes = indexes(api_source)
-
-    assert trader_indexes, 'no index migrations found in pg_writer.py'
-    assert trader_indexes == api_indexes, (
-        f'index migrations differ — only in trader: '
-        f'{sorted(trader_indexes - api_indexes)}; '
-        f'only in api: {sorted(api_indexes - trader_indexes)}'
-    )
 
 
 def test_every_index_migration_names_a_column_the_model_indexes(schemas):
@@ -290,82 +302,6 @@ def test_every_index_migration_names_a_column_the_model_indexes(schemas):
 # ---------------------------------------------------------------------------
 
 
-def test_the_api_contract_sizes_match_the_cost_model():
-    """Contract size is money, and it had drifted 2x-5x in three places.
-
-    `core/costs.py` is the single source of truth for money (CLAUDE.md), but the
-    API serves its own `CDE_PRODUCTS` table to the frontend, which prefers the
-    API value over its own fallback. AVAX read 5 against 10, LINK 10 against 50,
-    LTC 1 against 5 — and contract size multiplies straight into notional, fee as
-    a fraction of notional, margin, liquidation price, participation rate and
-    PnL. The five instruments actually traded happened to agree, which is why
-    nothing surfaced it.
-
-    Duplication here is deliberate (the containers do not import each other), so
-    the guard is the same one `test_orm_parity` applies to the ORMs: compare them
-    and fail on divergence.
-    """
-    from core.costs import CONTRACT_UNITS
-
-    api_products = _load_api_module('endpoints.coins').CDE_PRODUCTS
-
-    mismatches = []
-    for asset, product in api_products.items():
-        expected = CONTRACT_UNITS.get(asset)
-        if expected is None:
-            continue
-        actual = float(product['units_per_contract'])
-        if abs(actual - float(expected)) > 1e-9:
-            mismatches.append(
-                f'{asset} ({product.get("code")}): API {actual} vs core/costs.py {expected}'
-            )
-
-    assert not mismatches, (
-        'contract sizes disagree, so notional and PnL differ between the '
-        'services:\n  ' + '\n  '.join(mismatches)
-    )
-
-
-def test_every_api_product_is_known_to_the_cost_model():
-    """A product the cost model has never heard of gets a default contract size.
-
-    Asserted through `get_contract_spec`, which is what production calls, rather
-    than through set membership in `CONTRACT_UNITS`. The two differ: the meme
-    contracts are keyed `1000PEPE` / `1000SHIB` there while the API and
-    `core/profiles.py` call them `PEPE` / `SHIB`, and `resolve_base` bridges that
-    with an alias. The literal version flagged both as unknown when they price
-    correctly — a false alarm on a naming convention, which is worse than no
-    check because it trains you to ignore it.
-    """
-    from core.costs import DEFAULT_UNITS, get_contract_spec
-
-    api_products = _load_api_module('endpoints.coins').CDE_PRODUCTS
-
-    # `base == 'UNKNOWN'` is the fallback, not `units == DEFAULT_UNITS`: BCH is
-    # genuinely one unit per contract (confirmed against the venue's own
-    # `contract_size`), so a units-based check condemns a correct entry forever.
-    unpriced = [
-        name for name, detail in api_products.items()
-        # Resolve from the product id the API serves, since that is what a
-        # caller passes back in.
-        if get_contract_spec(detail.get('symbol') or name).base == 'UNKNOWN'
-    ]
-    assert not unpriced, (
-        f'served by the API but unresolvable by get_contract_spec, so priced at '
-        f'the {DEFAULT_UNITS} fallback: {sorted(unpriced)}'
-    )
-
-    # And the size the API advertises must be the size the cost model uses.
-    mismatches = [
-        f"{name}: api={detail['units_per_contract']:g} "
-        f"cost_model={get_contract_spec(detail['symbol']).units:g}"
-        for name, detail in api_products.items()
-        if float(detail['units_per_contract'])
-        != get_contract_spec(detail['symbol']).units
-    ]
-    assert not mismatches, 'contract size differs from the cost model:\n  ' + '\n  '.join(mismatches)
-
-
 def test_no_table_is_declared_without_a_writer(schemas):
     """A table nothing writes is a surface that serves fabricated aggregates.
 
@@ -382,236 +318,3 @@ def test_no_table_is_declared_without_a_writer(schemas):
         'the `trades` table is back. Nothing wrote it before; if something '
         'writes it now, delete this test and say what.'
     )
-
-
-def test_the_venue_schedule_agrees_with_the_contract_units_table():
-    """Three sources declare contract size. All three have to say the same thing.
-
-    Contract size multiplies straight into notional, fee-as-a-fraction-of-
-    notional, margin, liquidation price, participation rate and PnL — so a
-    disagreement is a silent multiplier on every number the system produces.
-
-    `test_the_api_contract_sizes_match_the_cost_model` above compares two of the
-    three: the API's `CDE_PRODUCTS` against `core/costs.py:CONTRACT_UNITS`. It
-    passed while the file both are meant to derive from — the venue fee schedule
-    in `configs/exchange/` — disagreed on three instruments:
-
-        AVAX   CONTRACT_UNITS 10   schedule 5    (2x)
-        LINK   CONTRACT_UNITS 50   schedule 10   (5x)
-        LTC    CONTRACT_UNITS  5   schedule 1    (5x)
-
-    `ExchangeCostAssumptions.contract_sizes` is parsed out of that file and read
-    by nothing — `get_contract_spec` always uses `CONTRACT_UNITS` — so the
-    schedule's sizes were dead data and the disagreement had no way to surface.
-
-    Resolved by asking the venue: `future_product_details.contract_size` on the
-    product endpoint reports 10 / 50 / 5 for all three, agreeing with
-    `CONTRACT_UNITS` across all sixteen contracts — so the schedule was the wrong
-    one and is corrected. `probe_funding --sizes-only` reproduces that table.
-    The edit was inert (those sizes are read by nothing), which is exactly why
-    nothing caught it: this test and the loader's warning are the mechanism now.
-    """
-    import json
-
-    from core.costs import CONTRACT_UNITS, resolve_base
-
-    schedule_path = (
-        TRADER_ROOT / 'configs' / 'exchange' / 'coinbase_us_perps_cde_v202602.json'
-    )
-    if not schedule_path.exists():
-        pytest.skip(f'no venue schedule at {schedule_path}')
-
-    declared = json.loads(schedule_path.read_text()).get('contract_sizes') or {}
-    assert declared, 'the venue schedule declares no contract sizes'
-
-    mismatches = []
-    for key, size in sorted(declared.items()):
-        # The schedule keys on both the asset (AVAX) and the contract code (AVP);
-        # both resolve to the same base, which is what CONTRACT_UNITS keys on.
-        base = resolve_base(key)
-        if base is None or base not in CONTRACT_UNITS:
-            continue
-        if float(CONTRACT_UNITS[base]) != float(size):
-            mismatches.append(
-                f'{key} (base {base}): schedule={size} CONTRACT_UNITS={CONTRACT_UNITS[base]} '
-                f'({float(CONTRACT_UNITS[base]) / float(size):.3g}x)'
-            )
-
-    assert not mismatches, (
-        'contract sizes disagree between the venue schedule and the money '
-        'module:\n  ' + '\n  '.join(mismatches)
-        + '\n\nCheck Coinbase\'s published contract specs and fix whichever is '
-          'wrong. Contract size multiplies into notional, fees, margin, '
-          'liquidation price and PnL, so this is not a cosmetic difference.'
-    )
-
-
-def test_the_api_serves_every_instrument_the_trader_models():
-    """One universe, or an explicit reason why not.
-
-    The trader modelled sixteen contracts (`core/profiles.py`) while the API and
-    frontend served nine. Nothing was wrong with either list on its own, and that
-    is the problem: the nine got mistaken for the traded universe when writing
-    the spot scrape, which would have left seven instruments with no cross-venue
-    features and no dashboard row.
-
-    The API cannot import the trader (separate containers), so the tables are
-    duplicated on purpose and this is the mechanism — the same one
-    `test_the_api_contract_sizes_match_the_cost_model` applies to sizes.
-    """
-    from core.costs import SPOT_PRODUCTS, resolve_base
-    from core.profiles import COIN_PROFILES
-
-    coins = _load_api_module('endpoints.coins')
-    modelled = {resolve_base(name) for name in COIN_PROFILES}
-
-    served_cde = {resolve_base(name) for name in coins.CDE_PRODUCTS}
-    missing = sorted(b for b in modelled - served_cde if b)
-    assert not missing, (
-        f'the trader models these but the API serves no CDE product for them: '
-        f'{missing}. They will have no dashboard row and no /coins/cde-specs '
-        f'entry, so the frontend falls back for their contract size.'
-    )
-
-    served_spot = {resolve_base(name) for name in coins.COINBASE_PRODUCTS}
-    missing_spot = sorted(b for b in modelled - served_spot if b)
-    assert not missing_spot, (
-        f'no spot product served for {missing_spot}; spot is the reference venue '
-        f'the cross-venue features use'
-    )
-
-    # And the trader's own spot table has to cover the same set, since that is
-    # what `--spot-universe` scrapes from.
-    uncovered = sorted(b for b in modelled if b and b not in SPOT_PRODUCTS)
-    assert not uncovered, f'SPOT_PRODUCTS has no entry for {uncovered}'
-
-
-def test_the_spot_universe_covers_every_contract_once():
-    """`--spot-universe` is what stops the list being hand-typed. It has to be
-    complete and free of duplicates, or a silently short scrape is back."""
-    from core.costs import spot_universe
-    from core.profiles import COIN_PROFILES
-
-    products = spot_universe(sorted(COIN_PROFILES))
-
-    assert len(products) == len(COIN_PROFILES), (
-        f'{len(products)} spot products for {len(COIN_PROFILES)} contracts'
-    )
-    assert len(set(products)) == len(products), 'a spot product appears twice'
-    assert all(p.endswith('-USD') for p in products), products
-    # The meme contracts are keyed 1000PEPE/1000SHIB but spot is plain.
-    assert 'PEPE-USD' in products and 'SHIB-USD' in products
-    assert not any('1000' in p for p in products), products
-
-
-def test_every_modelled_contract_prices_at_the_schedule_s_own_rate():
-    """No spelling of a modelled contract may fall through to a wrong number.
-
-    The schedule used to carry a per-symbol table — $0.75/contract on BIP and
-    ETP, $0.10 on the rest — and seven of the eighteen were never listed, so
-    they fell through to the group-A default and were priced 7.5x too expensive.
-    SHIB's round trip read 287bp instead of 42, DOT 172 instead of 26, and the
-    cost enters the *target* as well as the hurdle `decide()` compares against,
-    so those instruments looked untradeable and the cross-sectional cost
-    features ranked them on a fiction.
-
-    Order tickets off the venue's app then showed BIP and ETP billed the same
-    ~$0.12/contract as everything else, so the table is gone and the uniform
-    rate is now the right answer rather than a fallback. What still has to hold
-    is that every spelling resolves to *that* rate — bare code, decorated
-    product id, and underlying ticker alike — and that none resolves to zero.
-    """
-    from core.config import Config, find_cost_config
-    from core.costs import per_contract_fee, symbols_missing_fee_schedule
-    from core.profiles import COIN_PROFILES
-
-    path = find_cost_config()
-    if path is None:
-        pytest.skip('no cost config on the search path')
-    config = Config().with_cost_assumptions(path)
-
-    rate = config.per_contract_fee_usd
-    assert rate > 0.0, 'a real venue charges something per contract'
-
-    codes = sorted({p for profile in COIN_PROFILES.values() for p in profile.prefixes})
-    spellings = codes + [f'{c}-20DEC30-CDE' for c in codes]
-
-    wrong = {s: per_contract_fee(s, config) for s in spellings
-             if per_contract_fee(s, config) != pytest.approx(rate)}
-    assert not wrong, (
-        f'these spellings do not price at the schedule rate ${rate:.2f}: {wrong}'
-    )
-
-    # With one rate for the whole book there is no per-symbol table, so nothing
-    # can be missing from it. Asserted rather than assumed: a schedule that
-    # reintroduces per-symbol rates has to list every contract or this fails.
-    assert not symbols_missing_fee_schedule(spellings, config)
-
-
-def test_a_zero_fee_schedule_is_flagged_and_no_real_venue_is_free():
-    """A schedule charging nothing is a diagnostic, never a venue.
-
-    `zero_fee_diagnostic.json` exists to answer one question — would the signal be
-    profitable gross of costs, which separates a weak forecast from an expensive
-    venue — and it sits in `configs/exchange/` next to the real schedules. Set
-    `COST_CONFIG=zero_fee_diagnostic.json` by accident and every backtest reports a
-    profit that does not exist, with numbers that look plausible and merely
-    wonderful. That is the failure mode this repo keeps finding, so it warns at load
-    time, and every shipped venue schedule must charge something.
-    """
-    import logging
-    from pathlib import Path
-
-    from core.config import find_cost_config
-    from core.costs import load_exchange_cost_assumptions
-
-    schedules = sorted(
-        (Path(__file__).resolve().parents[1] / 'configs' / 'exchange').glob('*.json')
-    )
-    assert schedules, 'no cost schedules found'
-
-    free = []
-    for path in schedules:
-        assumptions = load_exchange_cost_assumptions(path)
-        if assumptions.free_of_charge():
-            free.append(path.name)
-
-    # Exactly the diagnostic, and nothing that names a venue.
-    assert free == ['zero_fee_diagnostic.json'], (
-        f'schedules charging nothing: {free} — a venue schedule that prices '
-        f'execution at zero makes every backtest against it fiction'
-    )
-
-    # And the flag has to actually fire, or the guard is decoration.
-    diagnostic = find_cost_config('zero_fee_diagnostic.json')
-    with caplog_at(logging.WARNING) as records:
-        load_exchange_cost_assumptions(diagnostic)
-    assert any('ZERO' in r.getMessage() for r in records), (
-        'loading the zero-fee schedule produced no warning'
-    )
-
-
-class caplog_at:
-    """Minimal log capture, so this test does not depend on the caplog fixture."""
-
-    def __init__(self, level):
-        self.level = level
-        self.records = []
-
-    def __enter__(self):
-        import logging
-
-        self.handler = logging.Handler()
-        self.handler.setLevel(self.level)
-        self.handler.emit = self.records.append
-        logging.getLogger().addHandler(self.handler)
-        self.previous = logging.getLogger().level
-        logging.getLogger().setLevel(self.level)
-        return self.records
-
-    def __exit__(self, *exc):
-        import logging
-
-        logging.getLogger().removeHandler(self.handler)
-        logging.getLogger().setLevel(self.previous)
-        return False

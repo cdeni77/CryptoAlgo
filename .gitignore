@@ -142,27 +142,16 @@ backend/trader/scripts/optuna_trading.db
 backend/trader/scripts/optuna_trading.db.lock
 *.db.lock
 
-# Research store (Parquet) is rebuilt from the scraper — except the two datasets
-# that cannot be rebuilt at all.
+# Research store (Parquet) and the scraper's SQLite are both rebuilt from the
+# venue, so neither is tracked. There used to be an exception here: CDE publishes
+# no historical endpoint for perpetual funding or open interest, so those two
+# datasets accumulated forward one observation per contract per hour and a lost
+# row was lost permanently — they were un-ignored for that reason alone.
 #
-# CDE publishes no historical endpoint for funding or open interest. Both are
-# snapshots on the product payload, so they accumulate forward at one observation
-# per contract per hour and a lost row is lost permanently. Bars re-fetch with
-# `run_pipeline --backfill-days 400`; features regenerate from bars.
-#
-# The sizes make the decision obvious: bars 15M and features 49M, both
-# recoverable, against funding 296K and open interest 296K, neither recoverable.
-# Under one percent of the store is the irreplaceable part, and about 6MB a year.
-# Leaving it to a remembered `git add -f` is how the deep-history partitions went
-# missing once already.
-!backend/trader/data/
-backend/trader/data/*
-!backend/trader/data/research/
-backend/trader/data/research/*
-!backend/trader/data/research/funding/
-!backend/trader/data/research/funding/**
-!backend/trader/data/research/open_interest/
-!backend/trader/data/research/open_interest/**
+# The 15-minute binary system reads neither. It trades a Kalshi contract on the
+# price of Bitcoin, priced from Coinbase spot bars, which re-fetch. So the
+# exception is gone and nothing under data/ is tracked.
+backend/trader/data/
 
 # Vite/tsc build cache
 *.tsbuildinfo

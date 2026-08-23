@@ -1,477 +1,381 @@
-"""Performance metrics and the significance tests that decide what ships.
+"""Measurement, and the gates a candidate has to clear.
 
-Consolidates `metrics_significance.py`, `study_significance.py` and
-`overfit_diagnostics.py`. The formulas are Bailey and López de Prado's and are
-carried over unchanged; what is new is that they live together, and that the
-inputs which make them honest — the effective sample size and the true trial
-count — are parameters the caller must supply rather than defaults nobody sets.
+Everything here is *incremental against the baseline*. A log loss, an accuracy
+or a Brier score quoted on its own is uninterpretable in this system, because
+the barrier arithmetic alone takes log loss from 0.693 to about 0.513 — a 26%
+improvement over a coin flip using nothing but a clock and a volatility
+estimate. Reported against 50% that reads as a large edge. It is not an edge at
+all, and the only number that means anything is the difference.
 
-Four things get measured, in increasing order of how much they hurt:
+**Standard errors come from fold dispersion.** Not from `N/(1+(N-1)rho)`: four
+decision offsets share one label, the three symbols are ~0.7 correlated within
+a window, and a breadth formula on that structure is not merely optimistic but
+degenerate. Six folds give five degrees of freedom, which is few — and honestly
+few, which is better than a precise-looking number from the wrong formula.
 
-    sharpe / drawdown   What the equity curve did.
-    PSR                 Is the Sharpe distinguishable from zero, given how few
-                        independent observations there really are?
-    DSR                 Is it distinguishable from the best of N tries?
-    PBO                 Does picking the in-sample winner actually help
-                        out of sample, or is selection pure noise?
-
-The last two are the ones that reject strategies. A Sharpe of 1.2 chosen from
-3,000 configurations on 40 independent observations is not a discovery, and only
-DSR and PBO will say so.
+**The gates exist because a Sharpe ratio is the wrong first question.** On the
+perp system a model 34x short of its cost hurdle failed every gate without any
+of them saying why, because they all read simulated outcomes. Here the first
+four gates read the *forecast* — skill, fold agreement, calibration, and how
+much of the model's claimed correction survives out of sample — and only then
+does the money get looked at. A weak forecast and an expensive venue are the
+same ratio and opposite fixes.
 """
 
 from __future__ import annotations
 
-import math
+import logging
 from dataclasses import dataclass, field
-from statistics import NormalDist
-from typing import Any, Mapping, Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
-_NORMAL = NormalDist()
-_EULER_MASCHERONI = 0.5772156649015329
+from core.baseline import Reliability, brier, log_loss, reliability
+from core.book import BookStats
+from core.config import Config, DEFAULT_CONFIG
 
-HOURS_PER_YEAR = 24 * 365
-
-
-# ---------------------------------------------------------------------------
-# Descriptive
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 
-def _finite(value: Any, default: float | None = None) -> float | None:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return default
-    return out if math.isfinite(out) else default
+def log_loss_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) -> float:
+    """Baseline log loss minus model log loss. Positive means the model helped."""
+    return log_loss(outcome, baseline) - log_loss(outcome, model)
 
 
-def sample_moments(samples: Sequence[float]) -> tuple[float, float, float, float]:
-    """Mean, variance, skewness and kurtosis. Kurtosis is non-excess (Gaussian = 3)."""
-    arr = np.asarray([float(x) for x in samples], dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return 0.0, 0.0, 0.0, 3.0
-
-    mean = float(arr.mean())
-    centered = arr - mean
-    variance = float((centered ** 2).mean())
-    if variance <= 1e-12:
-        return mean, variance, 0.0, 3.0
-
-    sigma = math.sqrt(variance)
-    return (
-        mean,
-        variance,
-        float(((centered / sigma) ** 3).mean()),
-        float(((centered / sigma) ** 4).mean()),
-    )
+def brier_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) -> float:
+    base = brier(outcome, baseline)
+    return (base - brier(outcome, model)) / base if base > 0 else float('nan')
 
 
-def sharpe_ratio(
-    returns: Sequence[float],
-    *,
-    periods_per_year: int = HOURS_PER_YEAR,
-    risk_free: float = 0.0,
-) -> float:
-    """Annualised Sharpe of a per-period return series."""
-    arr = np.asarray([float(x) for x in returns], dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size < 2:
-        return 0.0
-    excess = arr - (risk_free / periods_per_year)
-    sigma = excess.std(ddof=1)
-    if sigma <= 1e-12:
-        return 0.0
-    return float(excess.mean() / sigma * math.sqrt(periods_per_year))
+@dataclass
+class FoldEvaluation:
+    """One fold's out-of-sample measurement."""
 
-
-@dataclass(frozen=True)
-class DrawdownProfile:
-    """Depth and duration of the worst stretch, and how long recovery took."""
-
-    max_drawdown: float
-    max_drawdown_duration: int
-    time_to_recovery: Optional[int]
-    calmar: float
-
-
-def drawdown_profile(
-    equity: Sequence[float],
-    *,
-    periods_per_year: int = HOURS_PER_YEAR,
-) -> DrawdownProfile:
-    """Drawdown statistics from an equity curve.
-
-    `time_to_recovery` is None when the curve never regained its prior peak —
-    which is the case a single max-drawdown number hides.
-    """
-    arr = np.asarray([float(x) for x in equity], dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size < 2:
-        return DrawdownProfile(0.0, 0, None, 0.0)
-
-    peaks = np.maximum.accumulate(arr)
-    drawdowns = np.divide(arr - peaks, peaks, out=np.zeros_like(arr), where=peaks > 0)
-    trough = int(np.argmin(drawdowns))
-    max_dd = float(-drawdowns[trough])
-
-    peak_before = int(np.argmax(arr[:trough + 1])) if trough > 0 else 0
-    recovered = np.flatnonzero(arr[trough:] >= peaks[trough])
-    time_to_recovery = int(recovered[0]) if recovered.size else None
-    duration = (trough - peak_before) + (time_to_recovery or (arr.size - trough))
-
-    total_return = (arr[-1] / arr[0]) - 1.0 if arr[0] > 0 else 0.0
-    years = max(arr.size / periods_per_year, 1e-9)
-    annualised = (1.0 + total_return) ** (1.0 / years) - 1.0 if total_return > -1 else -1.0
-    calmar = annualised / max_dd if max_dd > 1e-12 else 0.0
-
-    return DrawdownProfile(max_dd, int(duration), time_to_recovery, float(calmar))
-
-
-# ---------------------------------------------------------------------------
-# Probabilistic Sharpe ratio
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class SignificanceResult:
-    """A significance test outcome, with the inputs that produced it."""
-
-    valid: bool
-    statistic: float
-    probability: float
-    observations: int
-    detail: dict[str, Any] = field(default_factory=dict)
-    reason: str = ''
-
-    def __bool__(self) -> bool:
-        return self.valid
-
-
-def probabilistic_sharpe(
-    *,
-    sharpe: float,
-    observations: int,
-    benchmark: float = 0.0,
-    skewness: float | None = None,
-    kurtosis: float | None = None,
-) -> SignificanceResult:
-    """P(true Sharpe > benchmark), adjusting for skew and fat tails.
-
-    `observations` must be the **effective** count from `core.cv`, not the row
-    count. Passing 2,880 hourly rows where the labels carry 40 independent
-    outcomes inflates confidence by roughly the square root of 72.
-    """
-    sr = _finite(sharpe, 0.0) or 0.0
-    n = int(max(0, observations or 0))
-    bench = _finite(benchmark, 0.0) or 0.0
-    skew = _finite(skewness, 0.0) or 0.0
-    kurt = _finite(kurtosis, 3.0) or 3.0
-    assumed_normal = skewness is None or kurtosis is None
-
-    detail = {
-        'sharpe': sr, 'benchmark': bench, 'skewness': skew, 'kurtosis': kurt,
-        'assumed_normal_moments': assumed_normal,
-    }
-    if n < 2:
-        return SignificanceResult(False, 0.0, 0.0, n, detail, 'insufficient_observations')
-
-    variance = 1.0 - skew * sr + (kurt - 1.0) * (sr ** 2) / 4.0
-    if variance <= 1e-12:
-        return SignificanceResult(False, 0.0, 0.0, n, detail, 'degenerate_variance')
-
-    z = (sr - bench) * math.sqrt(max(1.0, n - 1.0)) / math.sqrt(variance)
-    return SignificanceResult(True, float(z), float(_NORMAL.cdf(z)), n, detail)
-
-
-def expected_max_sharpe(trials: int, observations: int) -> float:
-    """Sharpe you would expect from the luckiest of `trials` worthless strategies.
-
-    The benchmark a real edge has to clear. It grows with the number of
-    configurations tried, which is why the trial count must be recorded rather
-    than guessed.
-    """
-    tests = int(max(1, trials))
-    n = int(max(1, observations))
-    if tests == 1:
-        return 0.0
-    z1 = _NORMAL.inv_cdf(1.0 - 1.0 / tests)
-    z2 = _NORMAL.inv_cdf(1.0 - 1.0 / (tests * math.e))
-    return ((1.0 - _EULER_MASCHERONI) * z1 + _EULER_MASCHERONI * z2) / math.sqrt(n)
-
-
-def deflated_sharpe(
-    *,
-    sharpe: float,
-    observations: int,
-    trials: int,
-    skewness: float | None = None,
-    kurtosis: float | None = None,
-) -> SignificanceResult:
-    """Is the observed Sharpe better than the best of `trials` coin flips?
-
-    `trials` is the total number of configurations evaluated across the whole
-    search, not the number kept. Under-reporting it is the most common way a
-    backtest passes a significance test it should fail.
-    """
-    sr = _finite(sharpe, 0.0) or 0.0
-    n = int(max(0, observations or 0))
-    tests = int(max(1, trials or 1))
-    skew = _finite(skewness, 0.0) or 0.0
-    kurt = _finite(kurtosis, 3.0) or 3.0
-    assumed_normal = skewness is None or kurtosis is None
-
-    benchmark = expected_max_sharpe(tests, n)
-    detail = {
-        'sharpe': sr, 'trials': tests, 'expected_max_sharpe': float(benchmark),
-        'skewness': skew, 'kurtosis': kurt, 'assumed_normal_moments': assumed_normal,
-    }
-    if n < 2:
-        return SignificanceResult(False, 0.0, 1.0, n, detail, 'insufficient_observations')
-
-    variance = 1.0 + 0.5 * sr * sr - skew * sr + ((kurt - 3.0) / 4.0) * sr * sr
-    sigma = math.sqrt(max(variance / max(1.0, n), 1e-12))
-    z = (sr - benchmark) / sigma
-    p_value = 1.0 - _NORMAL.cdf(z)
-    detail['p_value'] = float(p_value)
-    return SignificanceResult(True, float(z), float(1.0 - p_value), n, detail)
-
-
-# ---------------------------------------------------------------------------
-# Probability of backtest overfitting
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class PBOResult:
-    """Combinatorially-symmetric cross-validation estimate of overfitting.
-
-    `pbo` is the share of splits where the configuration that looked best in
-    sample landed below the median out of sample. At 0.5 selection is doing
-    nothing; above it, picking the in-sample winner is actively harmful.
-    """
-
-    pbo: Optional[float]
-    n_candidates: int
-    n_splits: int
-    logits: tuple[float, ...] = ()
-    oos_percentiles: tuple[float, ...] = ()
-    reason: str = ''
+    index: int
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    n_rows: int
+    n_windows: int
+    model_log_loss: float
+    baseline_log_loss: float
+    model_brier: float
+    baseline_brier: float
+    model_ece: float
+    baseline_ece: float
+    residual_scale: float
+    control_gain_share: float
+    reliability_table: Optional[Reliability] = None
+    stats: Optional[BookStats] = None
+    per_offset: Optional[pd.DataFrame] = None
 
     @property
-    def valid(self) -> bool:
-        return self.pbo is not None
+    def skill(self) -> float:
+        return self.baseline_log_loss - self.model_log_loss
+
+    @property
+    def brier_skill(self) -> float:
+        return ((self.baseline_brier - self.model_brier) / self.baseline_brier
+                if self.baseline_brier > 0 else float('nan'))
+
+    def line(self) -> str:
+        money = ''
+        if self.stats is not None:
+            money = (f' | {self.stats.n_trades:,} trades '
+                     f'{self.stats.total_return:+.2%} Sharpe {self.stats.sharpe:+.2f}')
+        return (f'  fold {self.index} [{self.test_start:%Y-%m-%d}..{self.test_end:%Y-%m-%d}] '
+                f'{self.n_windows:,}w  skill {self.skill:+.5f}  '
+                f'ECE {self.model_ece:.4f} (base {self.baseline_ece:.4f})  '
+                f'alpha {self.residual_scale:.3f}{money}')
 
 
-def probability_of_backtest_overfitting(score_matrix: np.ndarray) -> PBOResult:
-    """PBO from a (candidates x splits) matrix of out-of-sample scores.
+def evaluate_fold(
+    index: int,
+    test: pd.DataFrame,
+    model_probability: np.ndarray,
+    baseline_probability: np.ndarray,
+    *,
+    residual_scale: float,
+    control_gain_share: float,
+    stats: Optional[BookStats] = None,
+) -> FoldEvaluation:
+    from core.cv import effective_observations
 
-    For each split held out in turn: pick the candidate with the best mean score
-    on the remaining splits, then see where that candidate ranks on the held-out
-    one. A genuine edge ranks high; an overfit ranks at chance.
-    """
-    arr = np.asarray(score_matrix, dtype=float)
-    if arr.ndim != 2:
-        return PBOResult(None, 0, 0, reason='score_matrix_must_be_2d')
+    outcome = test['outcome'].to_numpy(dtype=float)
+    per_offset = None
+    if 'offset' in test.columns:
+        frame = test.assign(_m=model_probability, _b=baseline_probability)
+        rows = []
+        for offset, part in frame.groupby('offset'):
+            y = part['outcome'].to_numpy(dtype=float)
+            rows.append({
+                'offset': int(offset), 'n': len(part),
+                'skill': log_loss_skill(y, part['_m'].to_numpy(), part['_b'].to_numpy()),
+                'mean_abs_correction_pp': float(
+                    np.mean(np.abs(part['_m'] - part['_b'])) * 100.0),
+            })
+        per_offset = pd.DataFrame(rows)
 
-    n_candidates, n_splits = arr.shape
-    if n_candidates < 2 or n_splits < 2:
-        return PBOResult(
-            None, n_candidates, n_splits, reason='need_at_least_2_candidates_and_2_splits'
-        )
-
-    epsilon = 1e-9
-    logits: list[float] = []
-    percentiles: list[float] = []
-
-    for holdout in range(n_splits):
-        in_sample = [i for i in range(n_splits) if i != holdout]
-        with np.errstate(invalid='ignore'):
-            in_sample_means = np.nanmean(arr[:, in_sample], axis=1)
-        in_sample_means = np.where(np.isfinite(in_sample_means), in_sample_means, -np.inf)
-        winner = int(np.argmax(in_sample_means))
-
-        held_out = np.where(np.isfinite(arr[:, holdout]), arr[:, holdout], -np.inf)
-        rank = int(np.flatnonzero(np.argsort(held_out) == winner)[0])
-        percentile = min(1.0 - epsilon, max(epsilon, (rank + 1) / n_candidates))
-
-        percentiles.append(float(percentile))
-        logits.append(float(math.log(percentile / (1.0 - percentile))))
-
-    # Share of splits whose in-sample winner fell strictly below the
-    # out-of-sample median. A logit of exactly zero is the median itself, which
-    # is neither above nor below it, so it does not count as a failure.
-    pbo = float(sum(1 for value in logits if value < 0.0) / len(logits))
-
-    return PBOResult(
-        pbo=pbo,
-        n_candidates=int(n_candidates),
-        n_splits=int(n_splits),
-        logits=tuple(logits),
-        oos_percentiles=tuple(percentiles),
+    return FoldEvaluation(
+        index=index,
+        test_start=pd.Timestamp(test['window_open'].min()),
+        test_end=pd.Timestamp(test['window_open'].max()),
+        n_rows=len(test), n_windows=effective_observations(test),
+        model_log_loss=log_loss(outcome, model_probability),
+        baseline_log_loss=log_loss(outcome, baseline_probability),
+        model_brier=brier(outcome, model_probability),
+        baseline_brier=brier(outcome, baseline_probability),
+        model_ece=reliability(outcome, model_probability).expected_calibration_error,
+        baseline_ece=reliability(outcome, baseline_probability).expected_calibration_error,
+        residual_scale=residual_scale, control_gain_share=control_gain_share,
+        reliability_table=reliability(outcome, model_probability),
+        stats=stats, per_offset=per_offset,
     )
 
 
-# ---------------------------------------------------------------------------
-# CPCV path distribution
-# ---------------------------------------------------------------------------
+@dataclass
+class EvaluationReport:
+    """Every fold, plus the aggregate and the continuous-deployment book."""
 
+    folds: list[FoldEvaluation]
+    continuous: Optional[BookStats] = None
+    config_provenance: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
-@dataclass(frozen=True)
-class PathDistribution:
-    """Sharpe across CPCV paths — the shape the promotion gates read.
+    # ---- forecast ------------------------------------------------------
+    @property
+    def skills(self) -> np.ndarray:
+        return np.array([f.skill for f in self.folds], dtype=float)
 
-    `median` and `p05` are what get gated. A high mean with a negative 5th
-    percentile is a strategy that works on most cuts of the data and blows up on
-    some, which a single walk-forward number would have reported as a success.
-    """
+    @property
+    def mean_skill(self) -> float:
+        return float(np.mean(self.skills)) if len(self.folds) else float('nan')
 
-    n_paths: int
-    mean: float
-    median: float
-    p05: float
-    p95: float
-    std: float
-    positive_fraction: float
-    values: tuple[float, ...] = ()
+    @property
+    def skill_standard_error(self) -> float:
+        """From fold dispersion. See the module docstring for why not breadth."""
+        if len(self.folds) < 2:
+            return float('nan')
+        return float(np.std(self.skills, ddof=1) / np.sqrt(len(self.folds)))
 
-    def as_dict(self) -> dict[str, Any]:
+    @property
+    def skill_t(self) -> float:
+        se = self.skill_standard_error
+        return self.mean_skill / se if se and np.isfinite(se) and se > 0 else float('nan')
+
+    @property
+    def folds_positive(self) -> int:
+        return int((self.skills > 0).sum())
+
+    @property
+    def folds_total(self) -> int:
+        return len(self.folds)
+
+    @property
+    def sign_agreement_p_value(self) -> float:
+        """P(at least this many folds positive | no skill), each fold a coin flip.
+
+        With six folds, five or more positive happens 10.9% of the time by
+        chance. That is the number to hold against any "five of six" claim, and
+        it is why the gate asks for five *and* a positive aggregate rather than
+        treating agreement as proof.
+        """
+        from scipy import stats as sstats
+        n, k = self.folds_total, self.folds_positive
+        if n == 0:
+            return float('nan')
+        return float(sstats.binom.sf(k - 1, n, 0.5))
+
+    @property
+    def max_ece(self) -> float:
+        return float(max((f.model_ece for f in self.folds), default=float('nan')))
+
+    @property
+    def mean_residual_scale(self) -> float:
+        return float(np.mean([f.residual_scale for f in self.folds])) if self.folds else float('nan')
+
+    @property
+    def max_control_gain_share(self) -> float:
+        return float(max((f.control_gain_share for f in self.folds), default=float('nan')))
+
+    @property
+    def total_windows(self) -> int:
+        return int(sum(f.n_windows for f in self.folds))
+
+    # ---- money ---------------------------------------------------------
+    @property
+    def traded_folds(self) -> list[BookStats]:
+        return [f.stats for f in self.folds if f.stats is not None]
+
+    @property
+    def total_trades(self) -> int:
+        return int(sum(s.n_trades for s in self.traded_folds))
+
+    @property
+    def mean_fold_return(self) -> float:
+        stats = self.traded_folds
+        return float(np.mean([s.total_return for s in stats])) if stats else float('nan')
+
+    @property
+    def folds_profitable(self) -> int:
+        return int(sum(1 for s in self.traded_folds if s.total_return > 0))
+
+    def per_offset(self) -> pd.DataFrame:
+        frames = [f.per_offset.assign(fold=f.index) for f in self.folds if f.per_offset is not None]
+        if not frames:
+            return pd.DataFrame()
+        allrows = pd.concat(frames, ignore_index=True)
+        return allrows.groupby('offset').agg(
+            n=('n', 'sum'), mean_skill=('skill', 'mean'),
+            folds_positive=('skill', lambda s: int((s > 0).sum())),
+            folds=('skill', 'size'),
+            mean_abs_correction_pp=('mean_abs_correction_pp', 'mean'),
+        ).reset_index()
+
+    def gate_values(self) -> dict[str, float]:
+        """Everything `DEFAULT_GATES` reads, in one dict."""
+        continuous = self.continuous
         return {
-            'n_paths': self.n_paths, 'mean': self.mean, 'median': self.median,
-            'p05': self.p05, 'p95': self.p95, 'std': self.std,
-            'positive_fraction': self.positive_fraction,
+            'log_loss_skill': self.mean_skill,
+            'folds_skill_positive': float(self.folds_positive),
+            'calibration_error': self.max_ece,
+            'residual_scale': self.mean_residual_scale,
+            'control_gain_share': self.max_control_gain_share,
+            'windows_evaluated': float(self.total_windows),
+            'trades': float(continuous.n_trades) if continuous else 0.0,
+            'coverage': continuous.coverage if continuous else float('nan'),
+            'realised_edge_pp': continuous.realised_edge_pp if continuous else float('nan'),
+            'total_return': continuous.total_return if continuous else float('nan'),
+            'sharpe': continuous.sharpe if continuous else float('nan'),
+            'sharpe_implausible': (
+                1.0 if (continuous and np.isfinite(continuous.sharpe)
+                        and continuous.sharpe > IMPLAUSIBLE_SHARPE) else 0.0),
+            'max_drawdown': continuous.max_drawdown if continuous else float('nan'),
+            'halted': 1.0 if (continuous and continuous.halted) else 0.0,
         }
 
-
-def summarise_paths(path_scores: Sequence[float]) -> PathDistribution:
-    """Reduce per-path scores to the distribution the gates evaluate.
-
-    Non-finite scores are dropped before any percentile is taken. A fold whose
-    IC is undefined — too few rows, or a constant forecast — contributes nothing
-    rather than turning the whole distribution into NaN.
-    """
-    arr = np.asarray([
-        float(x) for x in path_scores
-        if x is not None and np.isfinite(float(x))
-    ], dtype=float)
-    if arr.size == 0:
-        return PathDistribution(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ())
-
-    return PathDistribution(
-        n_paths=int(arr.size),
-        mean=float(arr.mean()),
-        median=float(np.median(arr)),
-        p05=float(np.percentile(arr, 5)),
-        p95=float(np.percentile(arr, 95)),
-        std=float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
-        positive_fraction=float((arr > 0).mean()),
-        values=tuple(float(x) for x in arr),
-    )
+    def summary(self) -> str:
+        lines = [
+            f'{self.folds_total} folds, {self.total_windows:,} out-of-sample windows',
+            *[f.line() for f in self.folds],
+            '',
+            f'  log loss skill {self.mean_skill:+.5f} +/- {self.skill_standard_error:.5f} '
+            f'(t = {self.skill_t:+.2f}), {self.folds_positive}/{self.folds_total} folds '
+            f'positive (p = {self.sign_agreement_p_value:.3f})',
+            f'  worst-fold calibration error {self.max_ece:.4f} | '
+            f'mean alpha {self.mean_residual_scale:.3f} | '
+            f'worst control gain share {self.max_control_gain_share:.1%}',
+        ]
+        if self.continuous is not None:
+            lines += ['', '  continuous book: ' + self.continuous.summary().replace('\n', '\n  ')]
+        if self.notes:
+            lines += [''] + [f'  note: {n}' for n in self.notes]
+        return '\n'.join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Promotion gates
-# ---------------------------------------------------------------------------
+# ---- gates ---------------------------------------------------------------
+
+# name -> (threshold, direction). 'min' passes at or above, 'max' at or below.
+# Ordered as they should be read: the forecast first, the money second. A
+# candidate that fails a forecast gate should not have its Sharpe discussed.
+DEFAULT_GATES: dict[str, tuple[float, str]] = {
+    # --- the forecast ---
+    'log_loss_skill': (0.0, 'min'),
+    'folds_skill_positive': (5.0, 'min'),
+    'calibration_error': (0.02, 'max'),
+    'residual_scale': (0.25, 'min'),
+    'control_gain_share': (0.30, 'max'),
+    'windows_evaluated': (20_000.0, 'min'),
+    # --- the money ---
+    'trades': (200.0, 'min'),
+    'coverage': (0.0005, 'min'),
+    'realised_edge_pp': (0.0, 'min'),
+    'total_return': (0.0, 'min'),
+    'sharpe': (0.5, 'min'),
+    'sharpe_implausible': (0.0, 'max'),
+    'max_drawdown': (0.35, 'max'),
+    'halted': (0.0, 'max'),
+}
+
+# Above this, a Sharpe ratio is evidence of a defect rather than of an edge.
+# Nothing trading a public venue at 30,000 trades a year earns a Sharpe of 12;
+# the first run of this stack reported 12.6 and every other gate passed it,
+# because they all asked whether the number was good and none asked whether it
+# was possible.
+IMPLAUSIBLE_SHARPE = 5.0
+
+GATE_NOTES: dict[str, str] = {
+    'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark',
+    'folds_skill_positive': 'five of six agreeing happens 10.9% of the time by chance, '
+                            'so this is necessary and not sufficient',
+    'calibration_error': 'the system trades its confident predictions, so being wrong '
+                         'about how confident it is matters more than the mean',
+    'residual_scale': 'how much of the claimed correction survives out of sample; near '
+                      'zero means it found nothing however good the in-sample loss',
+    'control_gain_share': 'hour-of-day cannot forecast direction. If the clock carries '
+                          'the model, the measurement is broken, not the market',
+    'windows_evaluated': 'the whole reason for this venue is sample size; without it '
+                         'the standard error cannot resolve a 1pp edge',
+    'trades': 'fewer than this and the money numbers are anecdote',
+    'coverage': 'abstaining on everything passes every other gate trivially',
+    'realised_edge_pp': 'what actually happened, against what the model claimed. The '
+                        'gap between the two is the winner\'s curse',
+    'total_return': 'on one continuous account across the whole out-of-sample '
+                    'span, sized additively so the slope is the per-trade edge '
+                    'rather than an exponential of it',
+    'sharpe': 'annualised on trades actually placed, never on windows available',
+    'sharpe_implausible': f'a Sharpe above {5.0} on a public venue is a bug '
+                          f'signature, not an edge — every other gate asks '
+                          f'whether the number is good, this one asks whether '
+                          f'it is possible',
+    'max_drawdown': 'a $100 account has to survive to compound',
+    'halted': 'the bankroll floor was breached during the run',
+}
 
 
 @dataclass(frozen=True)
 class Gate:
-    """One promotion criterion and whether it passed."""
-
     name: str
-    value: Optional[float]
+    value: float
     threshold: float
-    comparison: str        # 'min' — value must be at least; 'max' — at most
-    passed: bool
+    direction: str
     note: str = ''
 
-    def __str__(self) -> str:
-        mark = 'PASS' if self.passed else 'FAIL'
-        shown = 'n/a' if self.value is None else f'{self.value:.4f}'
-        symbol = '>=' if self.comparison == 'min' else '<='
-        return f'[{mark}] {self.name}: {shown} {symbol} {self.threshold}'
+    @property
+    def passed(self) -> bool:
+        if not np.isfinite(self.value):
+            return False          # not measured fails, like every other gate here
+        return (self.value >= self.threshold if self.direction == 'min'
+                else self.value <= self.threshold)
 
-
-# Defaults mirror docs/RESEARCH_PIPELINE.md section 5. They are deliberately
-# strict: at ~40 independent observations the honest prior is that most apparent
-# edges are noise, and a gate set that keeps confirming strategies is not
-# measuring anything.
-DEFAULT_GATES: dict[str, tuple[float, str]] = {
-    'walk_forward_median_sharpe': (0.5, 'min'),
-    'walk_forward_p05_sharpe': (0.0, 'min'),
-    'pbo': (0.30, 'max'),
-    'deflated_sharpe': (0.0, 'min'),
-    'bootstrap_positive_fraction': (0.90, 'min'),
-    'synthetic_positive_fraction': (0.60, 'min'),
-    'stressed_median_sharpe': (0.0, 'min'),
-    'parameter_plateau': (0.60, 'min'),
-    'oos_trades': (100.0, 'min'),
-    # Twice the entry cap. Entries are sized against a pessimistic liquidity
-    # floor so they stay exitable, but the exit bar is whatever the barrier
-    # lands in; if that routinely swallows a fifth of the volume, the strategy
-    # has a capacity ceiling the backtest is not honouring.
-    'max_exit_participation': (0.20, 'max'),
-    # Count of symbols whose carry was trained on another venue's funding. Zero
-    # is the only passing value. Coinbase CDE publishes no historical funding
-    # (only the current rate), which makes borrowing a deeper venue's history the
-    # obvious shortcut — and it trains the carry head on a cash flow this account
-    # will never receive, then reports the resulting edge as if it were real.
-    # Research on proxy funding is legitimate; promoting it is not, so this is a
-    # gate rather than a warning. `--force` with a reason remains the escape.
-    'proxy_funding_symbols': (0.0, 'max'),
-    # Measured out-of-sample price IC divided by the IC the universe's own round
-    # trip requires (`core.targets.required_information_coefficient`). At 1.0 the
-    # average forecast exactly breaks even before fill uncertainty; below it, the
-    # forecast does not cover the toll it pays to act on.
-    #
-    # This gate exists because its absence cost this project eight months. Every
-    # other gate here reads a *simulated outcome*, so a model 34x short of its own
-    # cost hurdle failed them all without any of them saying why — and a Sharpe
-    # needs far more data to estimate than an IC does, so the diagnosis arrived
-    # long after the effort.
-    #
-    # A candidate can in principle clear its costs on a high-conviction tail while
-    # its average forecast does not: `decide()` only acts when `expected_net > 0`,
-    # so the traded subset is selected. That is a real argument and it is also
-    # exactly the argument that kept a losing system alive, so it needs a human to
-    # write it down — `--force` with a reason, which records itself.
-    'ic_covers_cost': (1.0, 'min'),
-}
+    def line(self) -> str:
+        mark = 'pass' if self.passed else 'FAIL'
+        comparison = '>=' if self.direction == 'min' else '<='
+        return (f'  [{mark}] {self.name:<24} {self.value:>10.5f} {comparison} '
+                f'{self.threshold:<10.5f} {self.note}')
 
 
 def evaluate_gates(
-    measurements: Mapping[str, Optional[float]],
-    *,
-    thresholds: Optional[Mapping[str, tuple[float, str]]] = None,
-    require_all: bool = True,
-) -> tuple[bool, list[Gate]]:
-    """Check measurements against the promotion thresholds.
+    report: EvaluationReport,
+    gates: Optional[dict[str, tuple[float, str]]] = None,
+) -> list[Gate]:
+    """Score a report against every gate. Missing values fail."""
+    gates = gates or DEFAULT_GATES
+    values = report.gate_values()
+    return [
+        Gate(name=name, value=values.get(name, float('nan')), threshold=threshold,
+             direction=direction, note=GATE_NOTES.get(name, ''))
+        for name, (threshold, direction) in gates.items()
+    ]
 
-    A missing measurement fails rather than passing silently: "we did not run
-    that test" is not evidence of safety. Returns (promoted, gates).
-    """
-    thresholds = dict(thresholds or DEFAULT_GATES)
-    gates: list[Gate] = []
 
-    for name, (threshold, comparison) in thresholds.items():
-        value = _finite(measurements.get(name), None)
-        if value is None:
-            gates.append(Gate(name, None, threshold, comparison, False, 'not measured'))
-            continue
-        passed = value >= threshold if comparison == 'min' else value <= threshold
-        gates.append(Gate(name, value, threshold, comparison, bool(passed)))
-
-    promoted = all(g.passed for g in gates) if require_all else any(g.passed for g in gates)
-    return promoted, gates
+def gates_passed(gates: Sequence[Gate]) -> bool:
+    return all(g.passed for g in gates)
 
 
 def gate_report(gates: Sequence[Gate]) -> str:
-    """Human-readable gate summary, failures first."""
-    ordered = sorted(gates, key=lambda g: (g.passed, g.name))
-    lines = [str(g) for g in ordered]
-    failed = sum(1 for g in gates if not g.passed)
-    verdict = 'PROMOTED' if failed == 0 else f'BLOCKED by {failed} gate(s)'
-    return '\n'.join(lines + ['', verdict])
+    failed = [g for g in gates if not g.passed]
+    header = ('all gates passed' if not failed
+              else f'{len(failed)} of {len(gates)} gates failed: '
+                   + ', '.join(g.name for g in failed))
+    return '\n'.join([header] + [g.line() for g in gates])

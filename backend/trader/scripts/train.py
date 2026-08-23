@@ -1,82 +1,102 @@
-"""Train a forecast model and save it with its provenance.
+"""Fit one model on all available history, for inspection. Not for promotion.
 
-    python -m scripts.train
-    python -m scripts.train --as-of 2026-06-01 --out models/forecast_june.joblib
+This is the microscope, not the gate. It trains on everything up to the most
+recent windows, holds back the last fold's worth for a single out-of-sample
+look, and prints what the model paid attention to. Use it to answer "what is it
+actually using" and "did the correction survive"; use `scripts.evaluate` to
+answer "does it work" and `scripts.promote` to install anything.
 
-The saved artifact records its feature-set hash, the cost config that priced its
-targets, and the training window — so a model can always say what it was trained
-on, and a stale one is detectable rather than silently scoring wrong inputs.
+Two numbers here are worth more than the rest:
+
+* **alpha**, the residual scale — how much of the model's claimed correction
+  survives on held-out rows. Near zero means it found nothing, however good the
+  training loss looked.
+* **the control's share of gain.** Hour of day cannot forecast direction. If the
+  `clock` group carries the model, the measurement is broken rather than the
+  market interesting. The previous incarnation of this project ran a 27-cell
+  survey whose best cell was its own control, and that was the most useful
+  result it produced.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 from pathlib import Path
 
-from core.model import MODELS_DIR, cross_validate_forecast, train_forecast_model
-from scripts._common import add_data_arguments, build_config, configure_logging, load, require_data
+import numpy as np
+import pandas as pd
+
+from core.baseline import log_loss, reliability
+from core.cv import purged_walk_forward, recency_weights
+from core.dataset import apply_fold, fit_fold
+from core.features import population_report
+from core.model import fit_model
+from scripts._common import (
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
+    setup_logging,
+)
 
 
 def main() -> int:
-    parser = add_data_arguments(argparse.ArgumentParser(description=__doc__))
-    parser.add_argument('--out', default=None, help='Where to write the model')
-    parser.add_argument('--cv-folds', type=int, default=6)
-    parser.add_argument('--skip-cv', action='store_true',
-                        help='Train only; skip the out-of-sample scoring')
+    parser = add_data_arguments(argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__))
+    parser.add_argument('--save', type=str, default=None,
+                        help='Write the fitted model here. This does not promote it — '
+                             '`scripts.promote` is the only path to the live artifact.')
+    parser.add_argument('--top', type=int, default=20)
     args = parser.parse_args()
-    configure_logging(args.log_level)
+    setup_logging(args.verbose)
+    config = config_from_args(args)
+    groups = groups_from_args(args)
+    print_header('Train one model, for inspection', config)
 
-    config = build_config(args)
-    dataset = load(args, config)
-    if not require_data(dataset, args.venue):
-        return 1
+    dataset = load_dataset(args, config)
+    folds = purged_walk_forward(dataset.window_index, n_folds=config.n_folds,
+                                embargo_minutes=config.embargo_minutes)
+    fold = folds[-1]
+    print(f'  {fold.label()}  (the last fold; this is one look, not an evaluation)')
 
-    print(f'\ndataset: {dataset}')
-    print(json.dumps(dataset.summary(), indent=2, default=str))
+    fit, train = fit_fold(dataset, fold.train, config, groups=groups)
+    print('\n' + fit.summary())
 
-    model = train_forecast_model(
-        dataset.features, dataset.targets, config=config, data_as_of=args.as_of,
-        horizon_bars=dataset.horizon_bars,
-        proxy_funding_symbols=dataset.proxy_funding_symbols,
-        cross_sectional_standardized=dataset.cross_sectional_standardized,
-    )
-    if model is None:
-        print('\nnot enough resolved rows to train')
-        return 1
+    weights = recency_weights(train['window_open'], config.recency_half_life_days)
+    model = fit_model(train, fit.baseline, config, groups=groups, weights=weights)
+    print('\n' + model.summary())
 
-    print('\nprovenance:')
-    for key, value in model.provenance().items():
-        print(f'  {key}: {value}')
+    test = apply_fold(dataset, fit, fold.test, config, groups=groups)
+    y = test['outcome'].to_numpy(dtype=float)
+    p = model.predict(test)
+    pb = test['baseline_probability'].to_numpy(dtype=float)
+    print(f'\n  held-out: log loss {log_loss(y, p):.5f} vs baseline {log_loss(y, pb):.5f} '
+          f'(skill {log_loss(y, pb) - log_loss(y, p):+.5f})')
+    print(f'  held-out calibration error {reliability(y, p).expected_calibration_error:.5f} '
+          f'vs baseline {reliability(y, pb).expected_calibration_error:.5f}')
+    print('\n  held-out reliability:')
+    print(reliability(y, p).table())
 
-    print('\nper-head validation:')
-    for head, metrics in model.metrics.items():
-        rendered = '  '.join(
-            f'{k}={v:+.4f}' if isinstance(v, float) else f'{k}={v}'
-            for k, v in metrics.items()
-        )
-        print(f'  {head:11s} {rendered}')
+    print(f'\n  top {args.top} features by gain:')
+    importance = model.importance().head(args.top)
+    for row in importance.itertuples():
+        flag = '  <- CONTROL' if row.is_control else ''
+        print(f'    {row.feature:<28} {row.share:6.2%}{flag}')
+    print(f'\n  control group takes {model.control_importance_share:.1%} of total gain. '
+          f'Hour of day cannot\n  forecast direction, so a large share here indicts the '
+          f'measurement, not the market.')
 
-    if not args.skip_cv:
-        report = cross_validate_forecast(
-            dataset.features, dataset.targets, config=config, n_folds=args.cv_folds,
-            horizon_bars=dataset.horizon_bars,
-        )
-        print(f'\ncross-validation: {report}')
-        print(json.dumps(report.as_dict(), indent=2, default=str))
-        if report.memorisation_suspected:
-            print(
-                '\nWARNING: price IC is close to the hindsight identity ceiling, '
-                'which means the ranking may be reproducing instrument level '
-                'rather than timing.'
-            )
+    populated = population_report(test, groups)
+    thin = populated[populated['share'] < 0.9]
+    if not thin.empty:
+        print('\n  features under 90% populated (an empty group has the same shape as a '
+              'working one):')
+        print('    ' + thin.to_string(index=False).replace('\n', '\n    '))
 
-    out = Path(args.out) if args.out else MODELS_DIR / 'forecast.joblib'
-    model.save(out)
-    print(f'\nsaved {out}')
+    if args.save:
+        path = model.save(Path(args.save))
+        print(f'\n  wrote {path} and {path.with_suffix(".provenance.json")}')
+        print('  this is NOT promoted — run `python -m scripts.promote` for that')
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    raise SystemExit(main())

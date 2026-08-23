@@ -156,31 +156,6 @@ def test_venue_is_persisted_per_row(ingestor, database):
     assert counts == {'coinbase': 10, 'binance': 5}
 
 
-def test_research_store_excludes_flagged_data_by_default(ingestor, database, tmp_path):
-    """Quality survives the migration, and `read` filters on it.
-
-    This is the loop closing: validated at ingest, flagged in storage, excluded
-    from the feature build unless explicitly requested.
-    """
-    from core.datastore import ResearchStore, from_sqlite
-
-    ingestor.ingest_funding([_funding(1, 0.00001), _funding(2, 0.5)], venue='coinbase')
-
-    store = ResearchStore(tmp_path / 'research')
-    from_sqlite(store, database.db_path, venue='coinbase')
-
-    clean = store.read('funding')
-    everything = store.read('funding', min_quality=None)
-
-    assert len(clean) == 1, 'suspicious funding leaked into a default read'
-    assert len(everything) == 2
-    assert set(everything['quality']) == {'valid', 'suspicious'}
-
-
-# ---------------------------------------------------------------------------
-# Venue is part of the key
-# ---------------------------------------------------------------------------
-
 
 def test_two_venues_coexist_for_the_same_bar(tmp_path):
     """Both venues' bars for the same hour must survive. Neither may replace the other.
@@ -415,165 +390,8 @@ def test_the_ingestor_stamps_the_venue_on_open_interest(database):
 # ---------------------------------------------------------------------------
 
 
-def test_the_funding_snapshot_is_taken_outside_the_gap_loop():
-    """CDE publishes no funding history, so the snapshot is the whole series.
-
-    It was fetched inside `for win_start, win_end in windows` and stored only if
-    `win_start <= event_time <= win_end`. Both halves broke collection:
-
-    * `funding_time` is the settlement the rate applies to, and the backfill
-      window ends at "now" — so a next-hour settlement fell outside every window
-      and was dropped.
-    * With no gaps in the range, the loop body never runs. That is the steady
-      state once an hour has a row, so the series would stop growing.
-
-    Either way the failure is silent, on data that cannot be re-fetched later.
-    Checked against the parse tree rather than the text: an indentation heuristic
-    measured the `try`/`if` nesting around the call instead of the loop it needed
-    to be outside of, and passed or failed for the wrong reason.
-    """
-    import ast
-    from pathlib import Path
-
-    tree = ast.parse(
-        (Path(__file__).resolve().parents[1] / 'scripts' / 'run_pipeline.py').read_text()
-    )
-    func = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'backfill_funding_rates'
-    )
-
-    # `get_contract_snapshot` is the accessor now: funding and open interest ride
-    # one product payload, so they cannot straddle a settlement. Both spellings
-    # count — the property under test is where the call sits, not its name.
-    SNAPSHOT_CALLS = {'get_contract_snapshot', 'get_funding_rate'}
-
-    def calls_current_funding(node) -> bool:
-        return any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr in SNAPSHOT_CALLS
-            for n in ast.walk(node)
-        )
-
-    window_loops = [
-        node for node in ast.walk(func)
-        if isinstance(node, ast.For)
-        and isinstance(node.target, ast.Tuple)
-        and {getattr(e, 'id', '') for e in node.target.elts} == {'win_start', 'win_end'}
-    ]
-    assert window_loops, 'the per-window loop is gone; this test needs rewriting'
-
-    for loop in window_loops:
-        assert not calls_current_funding(loop), (
-            'the current-funding snapshot is inside the per-window loop again. '
-            'It must run once per symbol: funding_time can fall outside every '
-            'window, and a range with no gaps never enters the loop at all.'
-        )
-
-    assert calls_current_funding(func), (
-        'nothing fetches the current funding rate, so the series cannot grow'
-    )
-
-    # And no window test may guard it anywhere in the function.
-    compares = [
-        n for n in ast.walk(func)
-        if isinstance(n, ast.Compare)
-        and 'win_start' in ast.dump(n) and 'event_time' in ast.dump(n)
-    ]
-    assert not compares, (
-        'a window comparison against event_time is back; funding_time can sit '
-        'after the end of the backfill range'
-    )
 
 
-def test_spot_symbols_get_no_funding_product():
-    """Funding is a perpetual cash flow. Spot has none, so it must not be mapped.
-
-    `_extract_coin_code('BTC-USD')` resolves to 'BIP', so the funding product map
-    happily pointed every spot symbol at the corresponding CDE perp. A spot
-    scrape then fetched the *perp's* funding rate and filed it under the spot
-    symbol — the right number under a key that has no such thing, once per
-    settlement, indistinguishable in the store from a real observation.
-
-    Confirmed in a live store: `BTC-USD`, `ETH-USD` and sixteen others each
-    carried a funding row alongside their CDE counterparts.
-    """
-    from scripts.run_pipeline import SPOT_QUOTES, _extract_coin_code
-
-    for spot in ('BTC-USD', 'ETH-USD', 'PEPE-USD', 'SOL-USDC', 'XRP-USDT'):
-        assert SPOT_QUOTES.search(spot), f'{spot} not recognised as spot'
-        # The trap: the code resolves, which is why the guard has to be explicit.
-        assert _extract_coin_code(spot), (
-            f'{spot} resolves to a perp code, so skipping it cannot rely on '
-            f'resolution failing'
-        )
-
-    for perp in ('BIP-20DEC30-CDE', 'HYP-20DEC30-CDE', 'BTC-PERP'):
-        assert not SPOT_QUOTES.search(perp), f'{perp} wrongly treated as spot'
-
-
-def test_the_funding_snapshot_is_filed_under_the_run_venue():
-    """A hardcoded venue misfiles funding on any run with a venue label.
-
-    The snapshot insert passed `venue='coinbase'` literally, so a spot run's rows
-    landed on the perp venue. Combined with the mapping bug above, that put
-    perp funding under a spot symbol on the perp venue — two wrongs in one row.
-    """
-    import inspect
-
-    from scripts import run_pipeline
-
-    source = inspect.getsource(run_pipeline.backfill_funding_rates)
-    assert 'venue_label' in inspect.signature(
-        run_pipeline.backfill_funding_rates
-    ).parameters, 'the funding backfill no longer takes a venue label'
-    assert "ingest_funding(\n                        [current], venue=venue_label" in source \
-        or 'venue=venue_label' in source, (
-        'the snapshot is not filed under the run venue'
-    )
-
-
-def test_open_interest_rides_the_funding_snapshot():
-    """One request, one instant, two records — and neither from another exchange.
-
-    Open interest used to come from CCXT, because this client had no method for
-    it and a comment recorded that absence as "Coinbase exposes no open-interest
-    endpoint". It is on the product payload, under
-    `future_product_details.open_interest`, on the contract actually traded:
-    268,164 for BIP-20DEC30-CDE against 21,579,279 for gate's BTC/USDT:USDT.
-
-    Fetching the two separately would double the request count and let the funding
-    row keyed to 22:00 be paired with open interest read after the 22:00 print.
-    """
-    import ast
-    from pathlib import Path
-
-    source = (Path(__file__).resolve().parents[1] / 'scripts' / 'run_pipeline.py').read_text()
-    tree = ast.parse(source)
-    func = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'backfill_funding_rates'
-    )
-
-    attributes = {
-        n.func.attr for n in ast.walk(func)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-    }
-    assert 'get_contract_snapshot' in attributes, (
-        'the snapshot no longer comes from one product request'
-    )
-    assert 'ingest_open_interest' in attributes, (
-        'the open interest half of the snapshot is fetched and then dropped'
-    )
-
-    # Nothing reaches for another exchange. Prose mentioning CCXT is fine and
-    # wanted — the comments explaining why it was removed are the record — so the
-    # check is on imports and calls, which is what test_no_module_imports_ccxt does.
-    assert 'CCXTConnector' not in {
-        n.func.id for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-    }
 
 
 def test_no_module_imports_ccxt():
@@ -609,81 +427,6 @@ def test_no_module_imports_ccxt():
         ]
         assert not declared, f'{requirements.name} still declares {declared}'
 
-
-def test_the_snapshot_stores_funding_and_open_interest_together():
-    """The glue, exercised rather than inspected.
-
-    The AST tests above pin *where* the snapshot call sits; this runs it. Both
-    halves of one product payload have to land, under the run's venue label, keyed
-    on the symbol the caller asked for rather than the Coinbase product id —
-    every one of those was a bug at some point today.
-    """
-    import asyncio
-    from unittest import mock
-
-    from data_collection.storage import SQLiteDatabase
-    from scripts import run_pipeline
-
-    payload = {
-        'product_id': 'BIP-20DEC30-CDE', 'price': '77105',
-        'future_product_details': {
-            'funding_rate': '0.000009', 'funding_interval': '3600s',
-            'funding_time': '2026-08-21T22:00:00Z',
-            'open_interest': '268164', 'index_price': '77118.16',
-        },
-    }
-
-    class FakeClient:
-        def __init__(self):
-            self.requests = 0
-
-        async def get_contract_snapshot(self, product_id):
-            self.requests += 1
-            from data_collection.coinbase_connector import CoinbaseRESTClient
-            parse = CoinbaseRESTClient.__dict__
-            unbound = object.__new__(CoinbaseRESTClient)
-            return (parse['_parse_funding'](unbound, product_id, payload),
-                    parse['_parse_open_interest'](unbound, product_id, payload))
-
-        async def get_funding_rate_history(self, *a, **k):
-            return []
-
-        async def close(self):
-            pass
-
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        database = SQLiteDatabase(f'{tmp}/trading.db')
-        database.initialize()
-        client = FakeClient()
-
-        with mock.patch.object(run_pipeline, 'CoinbaseRESTClient', lambda *a: client), \
-             mock.patch.object(run_pipeline, 'resolve_coinbase_funding_product_map',
-                               mock.AsyncMock(return_value={'BIP': 'BIP-20DEC30-CDE'})):
-            asyncio.run(run_pipeline.backfill_funding_rates(
-                ['BIP'], T0, T0 + timedelta(hours=1), database,
-                api_key='k', api_secret='s', venue_label='coinbase',
-            ))
-
-        with database._get_connection() as conn:
-            funding = [dict(r) for r in conn.cursor().execute(
-                'SELECT symbol, venue, rate FROM funding_rates')]
-            interest = [dict(r) for r in conn.cursor().execute(
-                'SELECT symbol, venue, open_interest_contracts FROM open_interest')]
-
-    assert client.requests == 1, f'{client.requests} product requests for one symbol'
-
-    assert len(funding) == 1, f'funding rows: {funding}'
-    assert funding[0]['symbol'] == 'BIP', 'stored under the product id, not the symbol'
-    assert funding[0]['venue'] == 'coinbase'
-    assert funding[0]['rate'] == pytest.approx(9e-6)
-
-    assert len(interest) == 1, (
-        f'open interest rows: {interest} — the snapshot half was dropped'
-    )
-    assert interest[0]['symbol'] == 'BIP'
-    assert interest[0]['venue'] == 'coinbase'
-    assert interest[0]['open_interest_contracts'] == pytest.approx(268164.0)
 
 
 def test_the_open_interest_snapshot_is_keyed_on_the_hour():
@@ -746,3 +489,37 @@ def test_repeat_snapshots_in_one_hour_upsert(database):
 
     assert len(rows) == 1, f'three reads in one hour produced {len(rows)} rows'
     assert rows[0]['open_interest_contracts'] == 269500.0, 'the latest read must win'
+
+
+def test_the_minute_bar_dataset_rejects_a_flagged_row_by_default():
+    """Quality survives the trip into the research store.
+
+    A validator that marks a bar suspicious is useless if the reader averages it
+    in anyway. Replaces a test that asserted the same thing about the `funding`
+    dataset, which no longer exists — spot has no funding, and the perpetual
+    contracts this repo used to trade are gone.
+    """
+    import pandas as pd
+    from core.datastore import DEFAULT_MIN_QUALITY, ResearchStore
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as root:
+        store = ResearchStore(root)
+        when = pd.Timestamp('2026-01-01', tz='UTC')
+        store.write('minute_bars', pd.DataFrame([
+            {'venue': 'coinbase_spot', 'symbol': 'BTC-USD', 'event_time': when,
+             'available_time': when + pd.Timedelta(minutes=1), 'quality': 'valid',
+             'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 1.0,
+             'quote_volume': None, 'trade_count': 1},
+            {'venue': 'coinbase_spot', 'symbol': 'BTC-USD',
+             'event_time': when + pd.Timedelta(minutes=1),
+             'available_time': when + pd.Timedelta(minutes=2), 'quality': 'suspicious',
+             'open': 99.0, 'high': 99.0, 'low': 99.0, 'close': 99.0, 'volume': 1.0,
+             'quote_volume': None, 'trade_count': 1},
+        ]))
+        assert DEFAULT_MIN_QUALITY == 'valid'
+        clean = store.read('minute_bars', venue='coinbase_spot', symbols=['BTC-USD'])
+        assert len(clean) == 1 and clean['close'].iloc[0] == 1.0
+        everything = store.read('minute_bars', venue='coinbase_spot',
+                                symbols=['BTC-USD'], min_quality='unvalidated')
+        assert len(everything) == 2

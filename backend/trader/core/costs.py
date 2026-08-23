@@ -1,645 +1,224 @@
-"""Execution cost model: contract specs, exchange fee assumptions, and trade PnL.
+"""What a Kalshi binary costs to trade.
 
-This is the single source of truth for anything that converts a position into
-dollars. It absorbs what used to be split across `core/costs.py`,
-`core/trading_costs.py` and `core/execution_sim.py`, plus the fee/sizing helpers
-that lived in `scripts/train_model.py`.
+This module is the single source of truth for the money *inputs*. Sizing and
+the running account are deliberately elsewhere — `core/book.py` — because the
+last version of this repo mixed them and the fee model could not be corrected
+without touching position sizing.
 
-Three layers, in dependency order:
+**The fee is a function of price, and that shape is the whole strategy.**
+Kalshi charges, per order:
 
-1. Contract specs      — how many base units one contract represents.
-2. Cost assumptions    — fees/slippage/impact/funding, loaded from configs/exchange/*.json.
-3. Computation         — round-trip costs, trade PnL, and position sizing.
+    fee = ceil(fee_rate * contracts * price * (1 - price) * 100) / 100
+
+in dollars, with `price` the contract price in dollars (0..1) and `fee_rate`
+0.07. Settlement is free, so a held-to-expiry binary pays *one* fee, not a
+round trip. The `p(1-p)` term means the fee is maximal at 50c and falls toward
+either extreme:
+
+| price | fee/contract | as a share of the stake |
+|------:|-------------:|------------------------:|
+|   50c |      $0.0175 |                   3.50% |
+|   70c |      $0.0147 |                   2.10% |
+|   85c |      $0.0089 |                   1.05% |
+|   90c |      $0.0063 |                   0.70% |
+|   95c |      $0.0033 |                   0.35% |
+
+A perpetual future charges a fixed toll regardless of conviction, so a
+confident forecast and a marginal one pay the same. Here they do not: a
+confident bet is a cheap bet. That is why the barrier framing and this venue
+fit together — the barrier's confident predictions are the large-displacement,
+late-in-the-window ones, which is exactly where `p(1-p)` is small.
+
+**The ceiling matters at a $100 account.** One contract at 50c owes $0.0175 and
+is charged $0.02 — 14% more than the formula, because the rounding is per
+order, not per contract. At two contracts it is $0.035 -> $0.04. Anything
+that reasons about fees in percentage terms without the ceiling understates
+the cost of the smallest orders, which are the only orders a $100 account
+places.
+
+**The half-spread is larger than the fee above 83c, and it is an assumption.**
+No Kalshi order ticket has been read against this module. The taker formula
+above is the published schedule; the maker rate is modelled as a flat
+per-contract charge and is *unverified*. The last venue this repo priced was
+wrong in both shape and magnitude for a day, and it was settled by reading
+three real tickets rather than by reasoning — so treat every number here as
+provisional until a filled order confirms it, and keep the half-spread
+reported separately so a stress run can move it alone.
 """
 
 from __future__ import annotations
 
-import json
-import logging
-import re
+import math
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Protocol
+from typing import Optional, Union
 
-logger = logging.getLogger(__name__)
+import numpy as np
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from core.profiles import CoinProfile
+from core.config import Config, DEFAULT_CONFIG
 
+Numeric = Union[float, np.ndarray]
 
-# ---------------------------------------------------------------------------
-# 1. Contract specs
-# ---------------------------------------------------------------------------
-
-# Base units per contract, keyed by the underlying ticker. Coinbase CDE sizes,
-# user-verified. Only `units` is ever needed to price a position — the old table
-# also carried per-symbol `fee_pct`/`min_fee_usd` columns that nothing read,
-# because fees come from the exchange cost assumptions below.
-CONTRACT_UNITS: dict[str, float] = {
-    'BTC': 0.01,
-    'ETH': 0.10,
-    'XRP': 500,
-    'SOL': 5,
-    'DOGE': 5000,
-    'AVAX': 10,
-    'ADA': 1000,
-    'LINK': 50,
-    'LTC': 5,
-    'NEAR': 500,
-    'SUI': 500,
-    'BCH': 1,
-    'XLM': 5000,
-    'DOT': 100,
-    '1000SHIB': 10000,
-    '1000PEPE': 100000,
-    'HYPE': 10,
-    'ONDO': 1000,
-}
-
-# Coinbase CDE product codes -> underlying ticker.
-CDE_CODE_TO_BASE: dict[str, str] = {
-    'BIP': 'BTC',
-    'ETP': 'ETH',
-    'XPP': 'XRP',
-    'SLP': 'SOL',
-    'DOP': 'DOGE',
-    'AVP': 'AVAX',
-    'ADP': 'ADA',
-    'LNP': 'LINK',
-    'LCP': 'LTC',
-    'NER': 'NEAR',
-    'SUP': 'SUI',
-    'BCP': 'BCH',
-    'XLP': 'XLM',
-    'POP': 'DOT',
-    'SHP': '1000SHIB',
-    'PEP': '1000PEPE',
-    'HYP': 'HYPE',
-    'OND': 'ONDO',
-}
-
-# Short aliases people actually type for the 1000x meme contracts.
-_BASE_ALIASES: dict[str, str] = {
-    'SHIB': '1000SHIB',
-    'PEPE': '1000PEPE',
-}
-
-DEFAULT_UNITS = 1.0
+# A contract settles at $1 or $0. Every price here is in dollars, not cents,
+# because mixing the two is the classic factor-of-100 error and the venue's own
+# UI uses cents.
+CONTRACT_PAYOUT = 1.0
+TICK = 0.01
 
 
-@dataclass(frozen=True)
-class ContractSpec:
-    """Resolved contract sizing for a symbol."""
-
-    symbol: str
-    base: str
-    units: float
-
-    @property
-    def is_default(self) -> bool:
-        return self.base == 'UNKNOWN'
-
-    def notional(self, n_contracts: float, price: float) -> float:
-        return float(n_contracts) * self.units * float(price)
+def _ceil_cents(dollars: Numeric) -> Numeric:
+    """Round up to the next whole cent."""
+    scaled = np.asarray(dollars, dtype=float) * 100.0
+    # Guard the float representation: 0.07 * 1 * 0.25 * 100 is 1.7499999...,
+    # and ceiling that gives 2 correctly, but an exact 2.0 must not become 3.
+    rounded = np.ceil(np.round(scaled, 9)) / 100.0
+    return float(rounded) if np.isscalar(dollars) or np.ndim(dollars) == 0 else rounded
 
 
-def resolve_base(symbol: str) -> Optional[str]:
-    """Map any symbol spelling to an underlying ticker, or None if unknown."""
-    token = symbol.upper().strip()
+def trade_fee(
+    contracts: Numeric,
+    price: Numeric,
+    config: Config = DEFAULT_CONFIG,
+    *,
+    maker: Optional[bool] = None,
+) -> Numeric:
+    """Total dollar fee for an order of `contracts` at `price`.
 
-    for candidate in (token, token.split('-')[0]):
-        if candidate in CDE_CODE_TO_BASE:
-            return CDE_CODE_TO_BASE[candidate]
-        if candidate in _BASE_ALIASES:
-            return _BASE_ALIASES[candidate]
-        if candidate in CONTRACT_UNITS:
-            return candidate
-
-    # Fall back to a substring scan for decorated symbols like
-    # "BTC-PERP-20DEC30-CDE". Longest key first so '1000SHIB' beats 'SHIB'
-    # and the result never depends on dict insertion order.
-    keys = list(CDE_CODE_TO_BASE) + list(_BASE_ALIASES) + list(CONTRACT_UNITS)
-    for key in sorted(keys, key=len, reverse=True):
-        if key in token:
-            return CDE_CODE_TO_BASE.get(key) or _BASE_ALIASES.get(key) or key
-
-    return None
-
-
-_resolve_base = resolve_base  # historical name
-
-
-# CME-style futures month codes, which CDE follows. Not a lookup anyone should
-# reinvent inline: getting one letter wrong resolves to a contract that exists
-# and is the wrong month.
-FUTURES_MONTH_CODES = {
-    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
-    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z',
-}
-
-_CDE_PRODUCT = re.compile(
-    r'^(?P<code>[A-Z0-9]+)-(?P<day>\d{1,2})(?P<month>[A-Z]{3})(?P<year>\d{2})-CDE$',
-    re.IGNORECASE,
-)
-_MONTH_NAMES = {
-    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-    'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
-}
-
-
-# The Coinbase *spot* product quoting each traded underlying. Spot is the
-# reference venue this account can actually reach — the offshore perp venues are
-# 451 from a US IP — and it is the market the perp's index is built from, so its
-# basis is what drives funding.
-#
-# Explicit rather than derived: the meme contracts are keyed `1000PEPE` and
-# `1000SHIB` here because that is how their contract units are quoted, while
-# spot is plain `PEPE-USD` / `SHIB-USD`. A `.replace('1000', '')` would work
-# today and break on the first asset with 1000 in its real ticker.
-SPOT_PRODUCTS: dict[str, str] = {
-    'BTC': 'BTC-USD',
-    'ETH': 'ETH-USD',
-    'SOL': 'SOL-USD',
-    'XRP': 'XRP-USD',
-    'DOGE': 'DOGE-USD',
-    'AVAX': 'AVAX-USD',
-    'ADA': 'ADA-USD',
-    'LINK': 'LINK-USD',
-    'LTC': 'LTC-USD',
-    'BCH': 'BCH-USD',
-    'DOT': 'DOT-USD',
-    'NEAR': 'NEAR-USD',
-    'SUI': 'SUI-USD',
-    'XLM': 'XLM-USD',
-    '1000PEPE': 'PEPE-USD',
-    '1000SHIB': 'SHIB-USD',
-    'HYPE': 'HYPE-USD',
-    'ONDO': 'ONDO-USD',
-}
-
-
-def spot_product(symbol: str) -> Optional[str]:
-    """The Coinbase spot product for whatever spelling names an instrument.
-
-    Takes a CDE product id, a contract code or a bare base — anything
-    `resolve_base` understands — and returns the spot product id, or None for an
-    underlying with no spot listing.
+    Rounded up to the next cent *per order*, which is how the venue charges and
+    why a one-contract order pays a disproportionate rate.
     """
-    base = resolve_base(symbol)
-    return SPOT_PRODUCTS.get(base) if base else None
+    is_maker = config.assume_maker if maker is None else maker
+    contracts_arr = np.asarray(contracts, dtype=float)
+    price_arr = np.asarray(price, dtype=float)
+    if is_maker:
+        raw = config.maker_fee_rate * contracts_arr
+    else:
+        raw = config.fee_rate * contracts_arr * price_arr * (1.0 - price_arr)
+    return _ceil_cents(raw)
 
 
-def spot_universe(symbols: Iterable[str]) -> list[str]:
-    """Spot products for a set of instruments, deduplicated and ordered.
+def fee_per_contract(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
+    """The unrounded per-contract fee, for reasoning about the schedule.
 
-    This exists so the spot scrape is never hand-typed. Written by hand once, it
-    listed nine products against the sixteen the trader models — the API and
-    frontend serve nine, and that list got mistaken for the traded universe — so
-    seven instruments would have silently had no cross-venue features.
+    Not what an order is charged — `trade_fee` is, and it rounds up per order.
+    This is the continuous function used to derive break-even thresholds, where
+    the ceiling would make the answer depend on order size.
     """
-    out: list[str] = []
-    for symbol in symbols:
-        product = spot_product(symbol)
-        if product and product not in out:
-            out.append(product)
-    return out
+    price_arr = np.asarray(price, dtype=float)
+    if config.assume_maker:
+        return np.full_like(price_arr, config.maker_fee_rate)
+    return config.fee_rate * price_arr * (1.0 - price_arr)
 
 
-def psf_symbol(product_id: str) -> Optional[str]:
-    """Convert a CDE product id to the Perp Style Futures symbol.
+def effective_price(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
+    """What a contract really costs: quoted price, plus the half-spread crossed,
+    plus the fee.
 
-    `BIP-20DEC30-CDE` -> `BIPZ30`. The two name the same instrument, but the
-    Coinbase Derivatives historical-funding endpoint keys on the PSF form while
-    the Advanced Trade product and candle endpoints key on the long form — so
-    the scraper needs both spellings for one contract.
-
-    Returns None for anything that is not a decorated CDE product id, including
-    the bare codes and `*-PERP` spellings, because there is nothing to derive an
-    expiry from.
+    This is the number a forecast has to beat. Expressed on the probability
+    scale, because a binary's price *is* a probability and the comparison is
+    then dimensionless — no basis points, no notional.
     """
-    match = _CDE_PRODUCT.match((product_id or '').strip().upper())
-    if match is None:
-        return None
-    month = _MONTH_NAMES.get(match.group('month').upper())
-    if month is None:
-        return None
-    return f"{match.group('code')}{FUTURES_MONTH_CODES[month]}{match.group('year')}"
+    crossed = np.asarray(price, dtype=float) + config.half_spread_cents / 100.0
+    crossed = np.clip(crossed, TICK, 1.0 - TICK)
+    return crossed + fee_per_contract(crossed, config)
 
 
-def contract_size_disagreements(
-    declared: dict[str, float] | None,
-) -> dict[str, tuple[float, float]]:
-    """Where a venue schedule's contract sizes differ from `CONTRACT_UNITS`.
+def break_even_probability(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
+    """The true probability at which buying at `price` breaks even.
 
-    Returns {base: (schedule_size, contract_units_size)}.
-
-    `ExchangeCostAssumptions.contract_sizes` is parsed out of every venue file
-    and read by nothing — `get_contract_spec` always uses `CONTRACT_UNITS` — so
-    a schedule that disagreed had no way to say so. Three instruments do
-    disagree in the shipped CDE file (AVAX 2x, LINK 5x, LTC 5x), and contract
-    size multiplies into notional, fees, margin, liquidation price and PnL.
-    Which side is right is a question for Coinbase's published specs; this
-    function exists so the question gets asked.
+    Identical to `effective_price` — a binary paying $1 breaks even when the
+    win probability equals the all-in cost. Named separately because the two
+    readings are used in different arguments and conflating them is how a
+    required-edge table ends up off by a fee.
     """
-    out: dict[str, tuple[float, float]] = {}
-    for key, size in (declared or {}).items():
-        base = resolve_base(key)
-        if base is None or base not in CONTRACT_UNITS:
-            continue
-        ours = float(CONTRACT_UNITS[base])
-        if ours != float(size):
-            out[base] = (float(size), ours)
-    return out
+    return effective_price(price, config)
 
 
-def get_contract_spec(symbol: str) -> ContractSpec:
-    """Resolve a symbol (CDE code, ticker, or decorated product id) to its spec."""
-    base = resolve_base(symbol)
-    if base is None:
-        return ContractSpec(symbol=symbol, base='UNKNOWN', units=DEFAULT_UNITS)
-    return ContractSpec(symbol=symbol, base=base, units=float(CONTRACT_UNITS[base]))
+def required_edge_pp(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
+    """Edge over the quoted price, in probability points, needed to break even."""
+    return (np.asarray(effective_price(price, config), dtype=float)
+            - np.asarray(price, dtype=float)) * 100.0
 
 
-# ---------------------------------------------------------------------------
-# 2. Exchange cost assumptions (configs/exchange/*.json)
-# ---------------------------------------------------------------------------
+def expected_value_per_contract(
+    probability: Numeric,
+    price: Numeric,
+    config: Config = DEFAULT_CONFIG,
+) -> Numeric:
+    """Expected dollars per contract, net of the half-spread and the fee.
 
-
-@dataclass(frozen=True)
-class FeeAssumptions:
-    maker_bps: float = 10.0
-    taker_bps: float = 10.0
-    per_contract_fee_usd: float = 0.0
-    use_taker: bool = True
-
-    @property
-    def fee_pct_per_side(self) -> float:
-        bps = self.taker_bps if self.use_taker else self.maker_bps
-        return float(max(bps, 0.0) / 10_000.0)
+    `probability` is the forecast for the side being bought. Positive means the
+    trade is worth taking before any sizing or risk consideration; sizing then
+    decides how much, and the exposure gates decide whether at all.
+    """
+    cost = np.asarray(effective_price(price, config), dtype=float)
+    return np.asarray(probability, dtype=float) * CONTRACT_PAYOUT - cost
 
 
 @dataclass(frozen=True)
-class RetailExecutionFeeAssumptions:
-    enabled: bool = False
-    mode: str = "bps"
-    taker_fee_bps: float = 10.0
-    maker_fee_bps: float = 10.0
-    use_taker: bool = True
+class FeeSchedule:
+    """A rendered view of the schedule, for reports and for the API."""
 
-    @property
-    def fee_pct_per_side(self) -> float:
-        if not self.enabled:
-            return 0.0
-        bps = self.taker_fee_bps if self.use_taker else self.maker_fee_bps
-        return float(max(bps, 0.0) / 10_000.0)
-
-
-@dataclass(frozen=True)
-class ExchangeFeeAssumptions:
-    enabled: bool = False
-    mode: str = "per_contract_usd"
-    per_contract_usd: float = 0.0
-    symbol_overrides: dict[str, float] | None = None
-    participant_type_assumption: str | None = None
-    execution_type_assumption: str | None = None
-
-    def per_contract_for_symbol(self, symbol: str | None = None) -> float:
-        if not self.enabled:
-            return 0.0
-        if symbol and self.symbol_overrides:
-            return float(self.symbol_overrides.get(symbol.upper(), self.per_contract_usd))
-        return float(self.per_contract_usd)
-
-
-@dataclass(frozen=True)
-class SlippageAssumptions:
-    enabled: bool = True
-    bps_per_side: float = 2.0
-
-
-@dataclass(frozen=True)
-class ImpactAssumptions:
-    enabled: bool = False
-    bps_per_contract: float = 0.0
-    max_bps_per_side: float = 10.0
-
-
-@dataclass(frozen=True)
-class FundingAssumptions:
-    enabled: bool = True
-    interval_hours: int = 1
-    method: str = "default"
-
-
-@dataclass(frozen=True)
-class ExchangeCostAssumptions:
+    fee_rate: float
+    maker_fee_rate: float
+    half_spread_cents: float
     version: str
-    exchange: str
-    market: str
-    fees: FeeAssumptions
-    retail_execution_fee: RetailExecutionFeeAssumptions
-    exchange_fee: ExchangeFeeAssumptions
-    slippage: SlippageAssumptions
-    impact: ImpactAssumptions
-    funding: FundingAssumptions
-    execution_fee_mode: str = "bps"
-    exchange_fee_mode: str = "per_contract_usd"
-    assumption_profile: str = "legacy"
-    contract_sizes: dict[str, float] | None = None
-    observed_ui_fee_bps: float | None = None
-    observed_ui_fee_source: str | None = None
-    # Order tickets read off the venue's own app: notional and the fee it quoted.
-    # These are the measurement the fee model is fitted to, so they travel with
-    # the schedule rather than living in a test file — see
-    # `tests/test_costs.py::test_the_schedule_reproduces_the_venue_s_own_order_tickets`.
-    observed_app_fees: tuple[dict[str, Any], ...] = ()
-    source_path: str | None = None
+    verified_against_ticket: bool = False
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any], source_path: str | None = None) -> "ExchangeCostAssumptions":
-        fees = payload.get("fees", {})
-        retail = payload.get("retail_execution_fee", {})
-        exch = payload.get("exchange_fee", {})
-        slippage = payload.get("slippage", {})
-        impact = payload.get("impact", {})
-        funding = payload.get("funding", {})
-
-        maker_bps = float(fees.get("maker_bps", 10.0))
-        taker_bps = float(fees.get("taker_bps", 10.0))
-        use_taker = bool(fees.get("use_taker", True))
-
+    def of(cls, config: Config = DEFAULT_CONFIG) -> 'FeeSchedule':
         return cls(
-            version=str(payload.get("version", "legacy_default")),
-            exchange=str(payload.get("exchange", "unknown")),
-            market=str(payload.get("market", "perps")),
-            fees=FeeAssumptions(
-                maker_bps=maker_bps,
-                taker_bps=taker_bps,
-                # `min_fee_per_contract` is the old spelling, from when this was
-                # a floor on the percentage fee rather than an addition to it.
-                # Read for schedules outside this repo; ours use the new key.
-                per_contract_fee_usd=float(
-                    fees.get("per_contract_usd",
-                             fees.get("min_fee_per_contract", 0.20))
-                ),
-                use_taker=use_taker,
-            ),
-            retail_execution_fee=RetailExecutionFeeAssumptions(
-                enabled=bool(retail.get("enabled", False)),
-                mode=str(retail.get("mode", "bps")),
-                taker_fee_bps=float(retail.get("taker_fee_bps", taker_bps)),
-                maker_fee_bps=float(retail.get("maker_fee_bps", maker_bps)),
-                use_taker=bool(retail.get("use_taker", use_taker)),
-            ),
-            exchange_fee=ExchangeFeeAssumptions(
-                enabled=bool(exch.get("enabled", False)),
-                mode=str(exch.get("mode", "per_contract_usd")),
-                per_contract_usd=float(exch.get("per_contract_usd", 0.0)),
-                symbol_overrides={
-                    str(k).upper(): float(v)
-                    for k, v in (exch.get("symbol_overrides") or {}).items()
-                    if isinstance(k, str)
-                },
-                participant_type_assumption=exch.get("participant_type_assumption"),
-                execution_type_assumption=exch.get("execution_type_assumption"),
-            ),
-            slippage=SlippageAssumptions(
-                enabled=bool(slippage.get("enabled", True)),
-                bps_per_side=float(slippage.get("bps_per_side", 2.0)),
-            ),
-            impact=ImpactAssumptions(
-                enabled=bool(impact.get("enabled", False)),
-                bps_per_contract=float(impact.get("bps_per_contract", 0.0)),
-                max_bps_per_side=float(impact.get("max_bps_per_side", 10.0)),
-            ),
-            funding=FundingAssumptions(
-                enabled=bool(funding.get("enabled", True)),
-                interval_hours=int(funding.get("funding_interval_hours", funding.get("interval_hours", 1))),
-                method=str(funding.get("method", "default")),
-            ),
-            execution_fee_mode=str(payload.get("execution_fee_mode", "bps")),
-            exchange_fee_mode=str(payload.get("exchange_fee_mode", "per_contract_usd")),
-            assumption_profile=str(payload.get("assumption_profile", "legacy")),
-            contract_sizes={
-                str(k).upper(): float(v) for k, v in (payload.get("contract_sizes") or {}).items()
-            },
-            observed_ui_fee_bps=(
-                float(payload["observed_ui_fee_bps"])
-                if payload.get("observed_ui_fee_bps") is not None
-                else None
-            ),
-            observed_ui_fee_source=payload.get("observed_ui_fee_source"),
-            observed_app_fees=tuple(
-                dict(row) for row in (payload.get("observed_app_fees") or [])
-                if isinstance(row, dict)
-            ),
-            source_path=source_path,
+            fee_rate=config.fee_rate,
+            maker_fee_rate=config.maker_fee_rate,
+            half_spread_cents=config.half_spread_cents,
+            version=config.fee_config_version,
         )
 
-    def free_of_charge(self) -> bool:
-        """True when this schedule charges nothing on any leg.
-
-        Used to flag a diagnostic schedule at load time. Reads the same fields
-        `effective_fee_pct_per_side` and the fee floor do, so it cannot drift from
-        what actually prices a trade.
-        """
-        legs = (
-            self.effective_fee_pct_per_side(),
-            float(getattr(self, "slippage_bps_per_side", 0.0) or 0.0),
+    def table(self, prices: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95)) -> list[dict]:
+        config = Config(
+            fee_rate=self.fee_rate,
+            maker_fee_rate=self.maker_fee_rate,
+            half_spread_cents=self.half_spread_cents,
         )
-        floors = [self.effective_per_contract_fee()]
-        floors += [
-            float(v or 0.0)
-            for v in (getattr(self, "min_fee_symbol_overrides", None) or {}).values()
-        ]
-        return all(x == 0.0 for x in legs) and all(f == 0.0 for f in floors)
-
-    def effective_fee_pct_per_side(self) -> float:
-        if self.retail_execution_fee.enabled and self.retail_execution_fee.mode == "bps":
-            return self.retail_execution_fee.fee_pct_per_side
-        return self.fees.fee_pct_per_side
-
-    def effective_per_contract_fee(self, symbol: str | None = None) -> float:
-        if self.exchange_fee.enabled and self.exchange_fee.mode == "per_contract_usd":
-            return self.exchange_fee.per_contract_for_symbol(symbol)
-        return float(self.fees.per_contract_fee_usd)
-
-    def to_metadata(self) -> dict[str, Any]:
-        cost_config_id = Path(self.source_path).stem if self.source_path else self.version
-        parts = cost_config_id.split("_") if cost_config_id else []
-        return {
-            "version": self.version,
-            "cost_config_id": cost_config_id,
-            "config_id": cost_config_id,
-            "source_path": self.source_path,
-            "exchange": (parts[0] if parts else None) or self.exchange,
-            "market": self.market,
-            "venue": parts[1] if len(parts) > 1 else None,
-            "version_tag": next((t for t in parts if re.match(r"^v\d+", t)), None),
-            "execution_fee_mode": self.execution_fee_mode,
-            "exchange_fee_mode": self.exchange_fee_mode,
-            "funding_interval_hours": int(self.funding.interval_hours),
-            "assumption_profile": self.assumption_profile,
-            "observed_ui_fee_bps": self.observed_ui_fee_bps,
-            "observed_ui_fee_source": self.observed_ui_fee_source,
-            "participant_type_assumption": self.exchange_fee.participant_type_assumption,
-            "execution_type_assumption": self.exchange_fee.execution_type_assumption,
-            "applied": {
-                "funding": bool(self.funding.enabled),
-                "slippage": bool(self.slippage.enabled),
-                "impact": bool(self.impact.enabled),
-                "retail_execution_fee": bool(self.retail_execution_fee.enabled),
-                "exchange_fee": bool(self.exchange_fee.enabled),
-            },
-        }
+        rows = []
+        for price in prices:
+            fee = float(fee_per_contract(price, config))
+            rows.append({
+                'price': price,
+                'fee_per_contract': fee,
+                'fee_share_of_stake': fee / price,
+                'required_edge_pp': float(required_edge_pp(price, config)),
+                'break_even_probability': float(break_even_probability(price, config)),
+            })
+        return rows
 
 
-def load_exchange_cost_assumptions(path: str | Path) -> ExchangeCostAssumptions:
-    p = Path(path)
-    with p.open("r", encoding="utf-8") as f:
-        assumptions = ExchangeCostAssumptions.from_dict(json.load(f), source_path=str(p))
+def unaffordable_price_band(
+    max_required_edge_pp: float,
+    config: Config = DEFAULT_CONFIG,
+    *,
+    step: float = 0.01,
+) -> tuple[float, float]:
+    """The contiguous price range where the fee and half-spread alone demand
+    more than `max_required_edge_pp` of edge over the quote.
 
-    disagreements = contract_size_disagreements(assumptions.contract_sizes)
-    if disagreements:
-        logger.warning(
-            "%s declares contract sizes that disagree with core.costs "
-            "CONTRACT_UNITS, which is what actually sizes every position: %s. "
-            "Contract size multiplies into notional, fees, margin, liquidation "
-            "price and PnL — check Coinbase's published specs and fix whichever "
-            "is wrong",
-            p.name,
-            ", ".join(
-                f"{base} schedule={theirs:g} used={ours:g} ({ours / theirs:.3g}x)"
-                for base, (theirs, ours) in sorted(disagreements.items())
-            ),
-        )
+    The threshold is an argument rather than `config.min_edge_pp` because the
+    two are different quantities and conflating them costs a fee: break-even
+    edge is measured *over the quoted price*, while `min_edge_pp` is the
+    surplus demanded *over break-even*.
 
-    # A schedule that charges nothing is a diagnostic, never a venue. Trading is
-    # not free anywhere, so a zero here means either a hand-built experiment or a
-    # parse that silently produced defaults — and either way every backtest run
-    # against it reports a profit that does not exist. Loud, because the failure is
-    # otherwise invisible: the numbers look plausible and merely wonderful.
-    if assumptions.free_of_charge():
-        logger.warning(
-            "%s prices execution at ZERO on every leg. No venue is free, so this "
-            "is a diagnostic schedule: it answers 'would the signal be profitable "
-            "gross of costs', which separates a weak forecast from an expensive "
-            "venue. Nothing evaluated against it may be promoted or traded, and a "
-            "PnL from it is not a PnL",
-            p.name,
-        )
-    return assumptions
+    Reported as the *unaffordable* middle rather than the affordable ends,
+    because `p(1-p)` makes the affordable set two disjoint tails and the
+    min/max of a disjoint set reads as "everything is affordable", which is the
+    opposite of what the schedule says. What the band means: inside it, no
+    forecast this project has ever produced could pay for the trade; outside
+    it, the venue is not the binding constraint.
 
-
-# ---------------------------------------------------------------------------
-# 3. Computation
-# ---------------------------------------------------------------------------
-
-
-class CostParams(Protocol):
-    """The subset of Config the cost functions read."""
-
-    fee_pct_per_side: float
-    # Charged *in addition* to `fee_pct_per_side`, not as a floor under it. The
-    # venue's order ticket bills 0.10% of notional plus ~$0.12 per contract, and
-    # a `max()` of the two understates every leg — see `per_contract_fee`.
-    per_contract_fee_usd: float
-    # Optional per-symbol overrides. Kept because a venue may bill per contract
-    # by instrument group; Coinbase's app does not, so ours is empty.
-    per_contract_fee_by_symbol: dict[str, float]
-    slippage_bps: float
-    impact_bps_per_contract: float
-    impact_max_bps_per_side: float
-    apply_slippage: bool
-    apply_impact: bool
-    apply_funding: bool
-    leverage: float
-
-
-def fee_schedule_key(symbol: str, overrides: dict[str, float]) -> Optional[str]:
-    """The schedule key covering `symbol`, or None if the schedule has no entry.
-
-    The venue's schedule is keyed by a mix of CDE product codes and plain
-    tickers, so try the symbol as given, then its prefix, then the underlying
-    ticker, then any product code for that underlying.
-
-    Separated from `per_contract_fee` so that "did the schedule cover this?" is
-    asked directly. Comparing the returned *fee* against the default cannot
-    answer it: back when BIP and ETP carried an explicit $0.75 and the default
-    was also $0.75, an equality test reported both as uncovered while they were
-    pricing correctly. The same shape as using `units == DEFAULT_UNITS` to detect
-    an unresolved contract, which condemned BCH for genuinely being one unit per
-    contract.
+    This says where the venue makes a trade affordable at all, which is a
+    different question from where the model has measured skill.
+    `Config.min_traded_price` / `max_traded_price` enforce the second.
     """
-    if not overrides:
-        return None
-
-    token = symbol.upper().strip()
-    base = resolve_base(token)
-    candidates = [token, token.split('-')[0]]
-    if base:
-        candidates.append(base)
-        candidates.extend(code for code, mapped in CDE_CODE_TO_BASE.items() if mapped == base)
-
-    return next((c for c in candidates if c in overrides), None)
-
-
-def per_contract_fee(symbol: str, params: CostParams) -> float:
-    """Per-contract commission for `symbol`, falling back to the flat default.
-
-    Additive with the percentage fee. This was `fee_floor` and was combined as
-    `max(pct, per_contract / notional)`, which is a different fee model from the
-    one the venue runs and understates every leg. Three order tickets off the
-    Coinbase app settle it:
-
-        BIP   $782.05 notional   ticket $0.90    max() says $0.78
-        XPP   $740.50 notional   ticket $0.86    max() says $0.74
-        ETP   $242.50 notional   ticket $0.36    max() says $0.24
-
-    0.10% + $0.12/contract reproduces all three to the half-cent, and no single
-    percentage does: the implied rate is 0.115% at $782 and 0.149% at $242.
-    That the three notionals span 3.2x is what makes them decisive; two tickets
-    at similar size cannot separate a flat percentage from a flat dollar amount.
-
-    `tests/test_costs.py` pins the tickets, so a return to `max()` fails.
-    """
-    overrides = getattr(params, 'per_contract_fee_by_symbol', None) or {}
-    key = fee_schedule_key(symbol, overrides)
-    return float(overrides[key]) if key else float(params.per_contract_fee_usd)
-
-
-def symbols_missing_fee_schedule(
-    symbols: Iterable[str],
-    params: CostParams,
-) -> list[str]:
-    """Symbols with no explicit entry in the loaded per-contract fee schedule.
-
-    Empty when the schedule bills one rate for every contract, which is what the
-    Coinbase app was measured doing — there is then nothing for a per-symbol
-    entry to say. The mechanism is kept for a venue that does bill by instrument
-    group, where a symbol falling through to the default is a data gap rather
-    than the intended answer.
-    """
-    overrides = getattr(params, 'per_contract_fee_by_symbol', None) or {}
-    if not overrides:
-        return []
-    return sorted({s for s in symbols if fee_schedule_key(s, overrides) is None})
-
-
-# ---------------------------------------------------------------------------
-# Deliberately absent: trade PnL and position sizing
-# ---------------------------------------------------------------------------
-#
-# This module used to carry `CostBreakdown`, `compute_cost_breakdown`,
-# `round_trip_costs`, `entry_fee`, `TradePnL`, `compute_trade_pnl`,
-# `kelly_fraction` and `size_position` — roughly 215 lines that nothing outside
-# the module ever called. What actually runs is:
-#
-#   round-trip cost   ->  core/targets.py:round_trip_cost (and the per-bar series)
-#   entry fee         ->  core/execution.py:entry_cost
-#   Kelly sizing      ->  core/execution.py:fractional_kelly + size_from_forecast
-#
-# CLAUDE.md calls this module the single source of truth for money, and for the
-# parts that remain — contract specs, fee assumptions, the fee floor — it is.
-# Two implementations of the parts that were dead was worse than one, because the
-# dead copy read as authoritative.
+    grid = np.arange(TICK, 1.0, step)
+    expensive = grid[required_edge_pp(grid, config) > max_required_edge_pp]
+    if expensive.size == 0:
+        return (math.nan, math.nan)
+    return (float(expensive.min()), float(expensive.max()))

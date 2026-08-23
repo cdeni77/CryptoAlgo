@@ -1,279 +1,186 @@
-"""Shared CLI plumbing: arguments every script needs, resolved one way."""
+"""Arguments every script shares, so no two scripts can disagree about the data.
+
+Seven scripts read the research store, and every one of them can change an
+answer by loading a different universe, a different span, a different offset
+set or a different fee schedule. They take those arguments from here, so a run
+cannot silently differ from the run it is being compared against — and the
+`Config` that comes back records which fields the command line moved.
+
+The operational scripts (`scrape`, `sync_store`, `paper`, `orchestrator`) take a
+different set and roll their own, because they are about moving bytes rather
+than about measurement.
+"""
 
 from __future__ import annotations
 
 import argparse
 import logging
-import math
 import os
-from dataclasses import replace
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
-from core.config import (
-    COST_CONFIG_SEARCH_PATHS,
-    DEFAULT_COST_CONFIG_NAME,
-    Config,
-    find_cost_config,
-)
-from core.dataset import Dataset, load_dataset, report_warnings
+import pandas as pd
+
+from core.config import Config, DEFAULT_CONFIG, find_fee_config
+from core.dataset import Dataset, load_minute_bars
 from core.datastore import ResearchStore
+from core.features import ALL_GROUPS
+
+
+def setup_logging(verbose: bool = False) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format='%(asctime)s %(levelname)-7s %(name)-22s %(message)s',
+        datefmt='%H:%M:%S',
+        stream=sys.stdout,
+    )
+    for noisy in ('urllib3', 'matplotlib', 'numba'):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument('--store', default=None, help='Research store root')
-    parser.add_argument('--venue', default='coinbase', help='Venue supplying the traded price')
-    # Coinbase spot, not Binance. Binance, OKX and Bybit all answer HTTP 451 to a
-    # US IP, so the old default resolved to nothing and the cross_venue group came
-    # back as seven all-NaN columns — which build_panel reindexes into the
-    # canonical 76 and therefore looks healthy. Coinbase's own spot book is
-    # deeper than the nano perp, reachable, and is the market the perp's index is
-    # built from, which makes its basis the thing that actually drives funding.
-    parser.add_argument('--reference-venue', default=os.getenv('REFERENCE_VENUE', 'coinbase_spot'),
-                        help='Deeper venue for basis and lead-lag; empty to disable')
-    parser.add_argument('--symbols', default=None, help='Comma-separated CDE codes')
-    parser.add_argument('--as-of', default=None,
-                        help='Bound reads by available_time for a reproducible run')
-    parser.add_argument('--min-quality', default='valid',
-                        choices=['valid', 'suspicious', 'unvalidated', 'all'])
-    parser.add_argument('--horizon', type=int, default=None,
-                        help='Forecast horizon in hours (default: the profile hold)')
-    parser.add_argument('--min-history-days', type=float, default=0.0,
-                        help="Drop instruments with fewer than this many days of "
-                             "bars. A contract with too little history is not a "
-                             "small version of one with enough, it is a sample "
-                             "from a different period: CDE listings are spread "
-                             "across a year, so the youngest contracts exist only "
-                             "inside the most recent regime. On a 399-day store, "
-                             "231 keeps the 14 that span three falling quarters "
-                             "and the rally, and drops the four that only ever saw "
-                             "the rally. It also sets the shortest span the "
-                             "simulation can cover. Prefer this to --exclude: it "
-                             "is a rule that reproduces itself rather than a "
-                             "symbol list someone has to remember the reason for.")
-    parser.add_argument('--max-round-trip-bps', type=float, default=0.0,
-                        help='Drop instruments whose median round trip exceeds this. '
-                             '0 disables. The cheapest contract on this venue is '
-                             '27bp, so 35 keeps the book within about 30 percent '
-                             'of it and drops SHP (65bp), AVP (50bp) and POP '
-                             '(43bp).')
-    parser.add_argument('--max-gap-over-cost', type=float, default=0.0,
-                        help='Drop instruments whose median close-to-next-open '
-                             'move exceeds this share of their round trip. 0 '
-                             'disables. That gap is fill uncertainty: a bar close '
-                             'is its last trade, so the price moves between the '
-                             'decision and the first fillable price. Symmetric, '
-                             'absent from the fee schedule, removed by no signal.')
-    parser.add_argument('--tradeable-five', action='store_true',
-                        help='The directional default: round trip <= 35bp, fill '
-                             'uncertainty <= 0.40x cost, history >= 231d. On this '
-                             'store that is exactly BIP, ETP, XPP, SLP, ADP — a '
-                             'rule that reproduces its own answer rather than a '
-                             'symbol list someone has to remember the reason for. '
-                             'Do NOT use it for cross-sectional work: breadth is '
-                             'the mechanism there, and 5 names give residual '
-                             'breadth 4.98 against 14 names 10.89, a 45 percent '
-                             'worse IC standard error.')
-    parser.add_argument(
-        '--no-cross-sectional-standardize', dest='standardize',
-        action='store_false', default=True,
-        help='Leave relative features absolute instead of z-scoring them across '
-             'the universe at each bar. Demeaning removes the common component, '
-             'and on this book that component is 70 percent of the target '
-             'variance, so a demeaned feature and a raw directional target are '
-             'mismatched. Measured: standardized features average 0.0067 abs IC '
-             'against the raw target and 0.0128 against a demeaned one; absolute '
-             'features go the other way.')
-    parser.add_argument('--feature-groups', default=None,
-                        help="Comma-separated feature groups to build. Default: "
-                             "all of them, and on the evidence so far that is as "
-                             "good as any subset. Measured walk-forward across "
-                             "three quarters against the tradeable target, over 15 "
-                             "group-by-horizon combinations, no group holds a "
-                             "consistent sign: the best is cross_venue at h=1h "
-                             "(+0.012, positive in all three), which flips sign at "
-                             "h=2h and h=4h, and 3-of-3 agreement arises by chance "
-                             "in a quarter of cells. Use this to isolate a group "
-                             "for research, not because a subset is known to be "
-                             "better. Groups: carry, cross_venue, volatility, "
-                             "liquidity, positioning, trend, market_factor, "
-                             "seasonality, cost.")
-    parser.add_argument('--cost-config', default=DEFAULT_COST_CONFIG_NAME,
-                        help="Venue fee schedule: a path, or a filename looked up "
-                             "in configs/exchange. 'none' to use the hardcoded default.")
-    parser.add_argument('--train-window-days', type=float, default=None,
-                        help='Fit on the most recent N days only (default: all history)')
-    parser.add_argument('--recency-half-life-days', type=float, default=None,
-                        help='Exponential decay on training weights, in days. '
-                             '0 disables it (default: the Config value)')
-    parser.add_argument('--exclude', default=None,
-                        help='Comma-separated symbols to leave out entirely. '
-                             'Matched on the underlying, so BTC covers BIP and '
-                             'BTC-PERP.')
-    parser.add_argument('--max-correlation', type=float, default=None,
-                        help='Refuse a candidate whose trailing return correlation '
-                             'with an open position exceeds this. 0 disables the '
-                             'cap (default: the Config value).')
-    parser.add_argument('--leverage', type=float, default=None,
-                        help='Notional multiple on the sized position, and the '
-                             'divisor for margin (default: the Config value).')
-    parser.add_argument('--log-level', default=os.getenv('LOG_LEVEL', 'INFO'))
+    """Every argument that changes which rows a run sees, or how it treats them."""
+    data = parser.add_argument_group('data')
+    data.add_argument('--symbols', type=str, default=None,
+                      help='Comma-separated spot products. Default: '
+                           + ','.join(DEFAULT_CONFIG.symbols))
+    data.add_argument('--venue', type=str, default=None,
+                      help=f'Research-store venue label (default {DEFAULT_CONFIG.venue})')
+    data.add_argument('--start', type=str, default=None, help='ISO date, inclusive')
+    data.add_argument('--end', type=str, default=None, help='ISO date, exclusive')
+    data.add_argument('--train-window-days', type=float, default=None,
+                      help='Hard cut to the last N days of windows. Distinct from '
+                           '--recency-half-life-days, which is a soft weighting; '
+                           'both are useful and neither substitutes for the other.')
+    data.add_argument('--research-store', type=str, default=None,
+                      help='Override RESEARCH_STORE')
+
+    market = parser.add_argument_group('market structure')
+    market.add_argument('--window-minutes', type=int, default=None,
+                        help='Kalshi crypto up/down windows are 15 minutes. Changing '
+                             'this describes a different market.')
+    market.add_argument('--offsets', type=str, default=None,
+                        help='Comma-separated decision offsets in minutes. Default: '
+                             + ','.join(str(o) for o in DEFAULT_CONFIG.decision_offsets))
+
+    model = parser.add_argument_group('model and validation')
+    model.add_argument('--groups', type=str, default=None,
+                       help='Comma-separated feature groups. Available: '
+                            + ','.join(ALL_GROUPS) + '. `clock` is the control — '
+                            'keep it in any survey so the noise floor is visible.')
+    model.add_argument('--baseline-distribution', type=str, default=None,
+                       choices=['normal', 'student_t'])
+    model.add_argument('--n-folds', type=int, default=None)
+    model.add_argument('--embargo-minutes', type=int, default=None,
+                       help='Purge on both sides of every test block. Must cover the '
+                            'longest feature lookback (1440), not just the label span.')
+    model.add_argument('--recency-half-life-days', type=float, default=None,
+                       help='Soft exponential decay by age. Off by default: at this '
+                            'window size the sample is large enough that decay costs '
+                            'more than the non-stationarity it buys.')
+
+    economics = parser.add_argument_group('economics')
+    economics.add_argument('--bankroll', type=float, default=None,
+                           help=f'Starting account (default ${DEFAULT_CONFIG.starting_bankroll:.0f})')
+    economics.add_argument('--kelly-fraction', type=float, default=None)
+    economics.add_argument('--min-edge-pp', type=float, default=None,
+                           help='Surplus over break-even demanded before trading, in '
+                                'probability points. Abstention is the default action.')
+    economics.add_argument('--half-spread-cents', type=float, default=None,
+                           help='An assumption, not a measurement — larger than the fee '
+                                'at every price above 83c, so it is the parameter most '
+                                'worth stressing.')
+    economics.add_argument('--assume-maker', action='store_true', default=None)
+    economics.add_argument('--fee-config', type=str, default=None,
+                           help='Venue fee schedule JSON. Unset still prices correctly '
+                                '(the defaults match the published schedule) but records '
+                                'no version.')
+
+    parser.add_argument('-v', '--verbose', action='store_true')
     return parser
 
 
-def configure_logging(level: str) -> None:
-    logging.basicConfig(level=level.upper(), format='%(levelname)s %(message)s')
+def _parse_list(value: Optional[str]) -> Optional[tuple]:
+    if not value:
+        return None
+    return tuple(part.strip() for part in value.split(',') if part.strip())
 
 
-def build_config(args: argparse.Namespace) -> Config:
-    """A Config with the venue's real fee schedule loaded unless refused.
+def config_from_args(args: argparse.Namespace) -> Config:
+    """Build the run's Config, recording which fields the command line moved."""
+    if getattr(args, 'research_store', None):
+        os.environ['RESEARCH_STORE'] = args.research_store
 
-    Loading it by default is deliberate: the hardcoded 10bp/side is wrong for
-    every Coinbase contract, and the previous system never loaded the file at all.
-    """
-    config = Config()
-    # Every return below goes through `_with_recency`, which is where
-    # --leverage, --exclude, --max-correlation and --recency-half-life-days are
-    # applied. Two of these branches used to `return config` directly, so
-    # `--cost-config none` silently discarded all four — including the half-life,
-    # the lever preflight reports on. Four flags that parsed, stored, and reached
-    # nothing, which is the exact class of bug they were added to remove.
-    if not args.cost_config or args.cost_config.lower() == 'none':
-        logging.warning(
-            'no cost config: pricing every contract at the hardcoded %.1fbp/side '
-            'plus $%.2f/contract. Those match the fees measured off the venue '
-            'app, so the numbers are right — but the run records no schedule '
-            'version, so a later change to either is invisible',
-            config.fee_pct_per_side * 10_000,
-            config.per_contract_fee_usd,
-        )
-        return _with_recency(config, args)
+    overrides: dict = {}
+    symbols = _parse_list(getattr(args, 'symbols', None))
+    if symbols:
+        overrides['symbols'] = symbols
+    offsets = _parse_list(getattr(args, 'offsets', None))
+    if offsets:
+        overrides['decision_offsets'] = tuple(int(o) for o in offsets)
+    for field, attr in (
+        ('venue', 'venue'), ('window_minutes', 'window_minutes'),
+        ('baseline_distribution', 'baseline_distribution'), ('n_folds', 'n_folds'),
+        ('embargo_minutes', 'embargo_minutes'),
+        ('recency_half_life_days', 'recency_half_life_days'),
+        ('train_window_days', 'train_window_days'),
+        ('starting_bankroll', 'bankroll'), ('kelly_fraction', 'kelly_fraction'),
+        ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
+        ('assume_maker', 'assume_maker'),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            overrides[field] = value
 
-    path = find_cost_config(args.cost_config)
-    if path is None:
-        logging.error(
-            'cost config not found: %s (searched %s). Falling back to the '
-            'hardcoded default, which misprices every contract.',
-            args.cost_config,
-            ', '.join(str(d) for d in COST_CONFIG_SEARCH_PATHS),
-        )
-        return _with_recency(config, args)
-    return _with_recency(config.with_cost_assumptions(path), args)
+    config = DEFAULT_CONFIG.with_overrides(**overrides)
+    path = Path(args.fee_config) if getattr(args, 'fee_config', None) else find_fee_config()
+    if getattr(args, 'fee_config', None) and not path.exists():
+        raise SystemExit(f'fee config not found: {path}')
+    return config.with_fee_assumptions(path)
 
 
-def _with_recency(config: Config, args: argparse.Namespace) -> Config:
-    """Apply --recency-half-life-days, and say what the weighting will do.
-
-    The half-life decides how much of a long history actually reaches the model:
-    weights sum to about `24 * H / ln 2` bar-equivalents however far back the
-    store goes, so past roughly 3H the extra history changes the fit very little.
-    That is the intended behaviour of a decay, but it has to be visible, because
-    it is easy to scrape two more years and wonder why nothing moved.
-    """
-    half_life = getattr(args, 'recency_half_life_days', None)
-    if half_life is not None:
-        config = replace(config, recency_half_life_days=float(half_life))
-
-    excluded = getattr(args, 'exclude', None)
-    if excluded:
-        symbols = [s.strip().upper() for s in excluded.split(',') if s.strip()]
-        config = replace(config, excluded_symbols=symbols)
-        logging.info('excluding %s', ', '.join(symbols))
-
-    # `LEVERAGE=4` sat in docker-compose.yml read by nothing, which is the
-    # dangerous shape for this particular knob: an operator lowering it saw the
-    # book keep trading at 4x. It multiplies target notional in
-    # `execution.size_from_forecast` and divides margin, so it is money.
-    leverage = getattr(args, 'leverage', None)
-    if leverage is not None:
-        if leverage <= 0:
-            raise SystemExit('--leverage must be positive')
-        config = replace(config, leverage=float(leverage))
-        logging.info('leverage %.2fx', float(leverage))
-
-    correlation = getattr(args, 'max_correlation', None)
-    if correlation is not None:
-        config = replace(config, max_portfolio_correlation=float(correlation))
-        logging.info(
-            'portfolio correlation cap: %s',
-            'disabled' if correlation <= 0 else f'{float(correlation):.2f}',
-        )
-
-    if config.recency_half_life_days > 0:
-        saturation_days = config.recency_half_life_days / math.log(2)
-        logging.info(
-            'recency half-life %.0fd: the weighted sample saturates near %.0f '
-            'days of full-weight data, so history much beyond %.0fd mostly '
-            'informs the folds rather than the fit',
-            config.recency_half_life_days, saturation_days,
-            3 * config.recency_half_life_days,
-        )
-    else:
-        logging.info('recency weighting off: every row weighted by uniqueness alone')
-    return config
+def groups_from_args(args: argparse.Namespace) -> Optional[tuple[str, ...]]:
+    return _parse_list(getattr(args, 'groups', None))
 
 
-def load(args: argparse.Namespace, config: Config) -> Dataset:
-    store = ResearchStore(args.store) if args.store else ResearchStore()
-    symbols = [s.strip().upper() for s in args.symbols.split(',')] if args.symbols else None
-    # `--tradeable-five` is a preset over the three thresholds, not a fourth
-    # mechanism, so a run that passes both keeps whichever is stricter and the
-    # dataset still records the numbers rather than the flag name.
-    history_floor = float(getattr(args, 'min_history_days', 0.0) or 0.0)
-    max_round_trip = float(getattr(args, 'max_round_trip_bps', 0.0) or 0.0)
-    max_gap = float(getattr(args, 'max_gap_over_cost', 0.0) or 0.0)
-    if getattr(args, 'tradeable_five', False):
-        history_floor = max(history_floor, 231.0)
-        max_round_trip = min(max_round_trip, 35.0) if max_round_trip > 0 else 35.0
-        max_gap = min(max_gap, 0.40) if max_gap > 0 else 0.40
-
-    dataset = load_dataset(
-        store,
-        venue=args.venue,
-        reference_venue=args.reference_venue or None,
-        symbols=symbols,
-        config=config,
-        as_of=args.as_of,
-        min_quality=None if args.min_quality == 'all' else args.min_quality,
-        horizon_bars=args.horizon,
-        feature_groups=_feature_groups(getattr(args, 'feature_groups', None)),
-        min_history_days=history_floor,
-        max_round_trip_bps=max_round_trip,
-        max_gap_over_cost=max_gap,
-        standardize=bool(getattr(args, 'standardize', True)),
+def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
+    """Read the store, lay the window grid, report coverage."""
+    logger = logging.getLogger('dataset')
+    store = ResearchStore()
+    bars = load_minute_bars(
+        config, store=store,
+        start=pd.Timestamp(args.start, tz='UTC') if getattr(args, 'start', None) else None,
+        end=pd.Timestamp(args.end, tz='UTC') if getattr(args, 'end', None) else None,
     )
-    window = getattr(args, 'train_window_days', None)
-    if window:
-        dataset = dataset.trailing(window)
-    report_warnings(dataset)
+    dataset = Dataset.build(bars, config).trailing(config.train_window_days)
+    coverage = dataset.coverage()
+    logger.info('coverage:\n%s', coverage.to_string(index=False))
+    worst = coverage['boundary_drop_rate'].max() if len(coverage) else 0.0
+    if worst > 0.02:
+        logger.warning(
+            'up to %.2f%% of windows are dropped for a missing boundary minute. '
+            'Each missing minute kills two windows — the one settling on it and '
+            'the one opening on it — so this is twice the gap rate.', worst * 100)
+    logger.info('%s windows, %s rows, %.0f days',
+                f'{len(dataset.window_index):,}', f'{len(dataset.windows):,}',
+                dataset.span_days)
     return dataset
 
 
-def _feature_groups(raw):
-    """Parse and validate --feature-groups. An unknown name is an error, not a skip.
-
-    Silently dropping a typo would build a smaller panel than asked for and train
-    a model whose `feature_set_hash` matches nothing anyone intended — the same
-    quiet-degradation shape as a geo-blocked venue arriving as all-NaN columns.
-    """
-    if not raw:
-        return None
-    from core.features import GROUPS_BY_NAME
-    names = [n.strip() for n in str(raw).split(',') if n.strip()]
-    unknown = [n for n in names if n not in GROUPS_BY_NAME]
-    if unknown:
-        raise SystemExit(
-            f'unknown feature group(s): {", ".join(unknown)}. '
-            f'Available: {", ".join(GROUPS_BY_NAME)}'
-        )
-    return names or None
-
-
-def require_data(dataset: Dataset, venue: str) -> bool:
-    if dataset.features.empty:
-        logging.error(
-            'empty dataset. Populate the research store first:\n'
-            '  python -m scripts.migrate_to_research_store --venue %s --coverage', venue
-        )
-        return False
-    return True
+def print_header(title: str, config: Config) -> None:
+    print('=' * 78)
+    print(title)
+    print('=' * 78)
+    print(f'universe          {", ".join(config.symbols)} on {config.venue}')
+    print(f'window            {config.window_minutes}min, decisions at '
+          f'{", ".join(f"+{o}m" for o in config.decision_offsets)}')
+    print(f'baseline          {config.baseline_distribution}'
+          + (f' (nu={config.baseline_nu})' if config.baseline_nu else ' (nu fitted)'))
+    print(f'fees              {config.fee_rate:.3f} x p(1-p) per contract + '
+          f'{config.half_spread_cents:.1f}c half-spread [{config.fee_config_version}]')
+    print(f'account           ${config.starting_bankroll:.2f}, '
+          f'{config.kelly_fraction:.2f} Kelly, gate {config.min_edge_pp:.2f}pp')
+    if config.cli_overrides:
+        print(f'cli overrides     {", ".join(sorted(config.cli_overrides))}')
+    print()

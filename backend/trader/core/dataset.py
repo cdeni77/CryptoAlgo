@@ -1,602 +1,406 @@
-"""Assembling a research dataset from the store.
+"""Loading the panel, and keeping every fitted thing inside its fold.
 
-One place that turns "which venue, which symbols, as of when" into features,
-targets and the bars a backtest needs. Every CLI goes through here, so a training
-run, a backtest and a live signal cycle cannot disagree about what the data is —
-the same class of problem as having three copies of the decision.
+Three objects in this system are *fitted*: the volatility model, the intraday
+seasonality factor, and the barrier baseline's scale and tail. All three are
+fitted against realised outcomes, so all three leak if they see a test fold.
+None of them is a headline number, which is exactly why the leak would go
+unnoticed — a seasonality factor estimated on the full sample makes the
+baseline stronger and the model look weaker, and nobody audits a result in that
+direction.
 
-Point-in-time is threaded through rather than bolted on: `as_of` bounds every
-read by `available_time`, so a run reproduced for a past date sees the data as it
-stood then, not as it was later revised.
+So the split here is deliberate:
+
+* **`Dataset` holds only what is computable from trailing bars.** The minute
+  grid, the per-minute state (rolling statistics, all backward-looking), and the
+  window table with its outcomes. Building it is the expensive step and it
+  happens once.
+* **`FoldFit` holds the three fitted objects**, and is constructed from a
+  training slice. Applying it to any slice is cheap.
+
+The seasonality shortcut matters for this to be affordable: only three of the
+forty-two feature columns depend on the fitted factor, and all three are a
+minute-of-day lookup, so `apply_seasonality` re-derives them per fold in
+milliseconds instead of rebuilding five years of rolling windows six times.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
-from typing import Any, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Iterable, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
-from core.config import Config
-from core.costs import resolve_base
-from core.costs import symbols_missing_fee_schedule
+from core.baseline import BarrierBaseline, attach_baseline
+from core.config import Config, DEFAULT_CONFIG
 from core.datastore import ResearchStore
-from core.features import SymbolInputs, build_panel
-from core.profiles import COIN_PROFILES, CoinProfile
-from core.targets import round_trip_cost_series, build_target_panel, summarise_targets
+from core.features import apply_seasonality, attach_cross_asset, build_features, minute_state
+from core.vol import (
+    MINUTES_PER_DAY, Seasonality, VolModel, forward_realised_vol, log_returns,
+    sigma_remaining as scale_sigma,
+)
+from core.windows import GridReport, build_window_panel, minute_grid
 
 logger = logging.getLogger(__name__)
 
-MARKET_SYMBOL = 'BIP'
+MINUTE_DATASET = 'minute_bars'
+REFERENCE_SYMBOL = 'BTC-USD'
 
 
-def _since(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
-    """Rows at or after `cutoff`, tolerating the empty frames the loader stores.
+class DatasetError(RuntimeError):
+    pass
 
-    A symbol with no funding on either venue is held as an empty DataFrame,
-    which carries a RangeIndex; comparing that to a Timestamp raises.
-    """
-    if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
-        return frame
-    return frame[frame.index >= cutoff]
+
+def load_minute_bars(
+    config: Config = DEFAULT_CONFIG,
+    *,
+    store: Optional[ResearchStore] = None,
+    start: Optional[pd.Timestamp] = None,
+    end: Optional[pd.Timestamp] = None,
+    symbols: Optional[Sequence[str]] = None,
+) -> dict[str, pd.DataFrame]:
+    """Read one-minute bars for the universe out of the research store."""
+    store = store or ResearchStore()
+    wanted = tuple(symbols) if symbols else config.symbols
+    bars: dict[str, pd.DataFrame] = {}
+    for symbol in wanted:
+        frame = store.read(
+            MINUTE_DATASET, venue=config.venue, symbols=[symbol],
+            start=start, end=end,
+        )
+        if frame is None or frame.empty:
+            logger.error('%s: no %s rows in the store for venue %r',
+                         symbol, MINUTE_DATASET, config.venue)
+            continue
+        bars[symbol] = frame.sort_values('event_time', ignore_index=True)
+    if not bars:
+        raise DatasetError(
+            f'no one-minute bars for {list(wanted)} on venue {config.venue!r}. '
+            f'Run `python -m scripts.scrape --backfill-days 1825` and then '
+            f'`python -m scripts.sync_store`.'
+        )
+    missing = sorted(set(wanted) - set(bars))
+    if missing:
+        logger.warning('universe is short of %s — the cross_asset group will be '
+                       'thinner than it looks', missing)
+    return bars
 
 
 @dataclass
 class Dataset:
-    """A feature panel, its targets, and the bars they were built from."""
+    """The parts of the panel that no fit has touched."""
 
-    features: pd.DataFrame
-    targets: pd.DataFrame
-    bars: dict[str, pd.DataFrame]
-    funding: dict[str, pd.DataFrame]
-    profiles: dict[str, CoinProfile]
-    venue: str
-    reference_venue: Optional[str]
-    as_of: Optional[str]
-    horizon_bars: int
-    # Which feature groups were built. None means all of them. Recorded because
-    # the panel's shape is the model's input contract: a model fit on
-    # cross_venue+trend cannot score against a 76-column panel, and
-    # `feature_set_hash` only distinguishes them because `feature_columns(groups)`
-    # shortens the name list.
-    feature_groups: Optional[tuple[str, ...]] = None
-    # Minimum bar span an instrument needed to be included, in days. Recorded
-    # because it changes which regimes the universe spans, which is not visible
-    # from the symbol list alone.
-    min_history_days: float = 0.0
-    # The tradeability thresholds that selected this universe. Recorded because
-    # which instruments a model saw is part of what it was fitted on, and neither
-    # `feature_set_hash` nor the symbol list explains *why* a name is absent —
-    # "excluded by rule" and "had no data" look identical after the fact.
-    max_round_trip_bps: float = 0.0
-    max_gap_over_cost: float = 0.0
-    # Whether relative features were converted to cross-sectional z-scores.
-    # Recorded because `feature_set_hash` hashes column *names*, so a demeaned
-    # panel and an absolute one are indistinguishable to it — the same blind spot
-    # that let an all-NaN feature group score identically to a populated one.
-    #
-    # It also decides what the model is being asked to predict. Demeaning removes
-    # the common component from the features, and on this book that component is
-    # 70% of the target's variance. Measured: the 52 standardized features average
-    # |IC| 0.0067 against the raw target and 0.0128 against the demeaned one,
-    # while the 6 absolute features go the other way, 0.0163 against raw and
-    # 0.0068 against demeaned. Pairing standardized features with a raw
-    # directional target is the wrong half of that dissociation for 52 of 58.
-    cross_sectional_standardized: bool = True
-    warnings: list[str] = field(default_factory=list)
-    # Symbols whose funding came from the reference venue instead of the traded
-    # one. Structured, not just a warning string, because it has to survive into
-    # the model artifact and the promotion gates: funding feeds the `carry`
-    # component of the net-return target directly, so a proxy series trains the
-    # carry head on a cash flow this account will never receive. Coinbase CDE
-    # publishes no historical funding, which makes borrowing it the obvious
-    # shortcut and this the guard against taking it silently.
-    proxy_funding_symbols: list[str] = field(default_factory=list)
+    config: Config
+    grids: dict[str, pd.DataFrame]
+    states: dict[str, pd.DataFrame]
+    windows: pd.DataFrame
+    reports: dict[str, GridReport]
+    forward_vol: dict[str, pd.Series]
 
+    @classmethod
+    def build(
+        cls,
+        bars_by_symbol: dict[str, pd.DataFrame],
+        config: Config = DEFAULT_CONFIG,
+        *,
+        reference: str = REFERENCE_SYMBOL,
+    ) -> 'Dataset':
+        grids = {s: minute_grid(b) for s, b in bars_by_symbol.items()}
+        flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
+        states = {s: minute_state(g, flat, config) for s, g in grids.items()}
+        states = attach_cross_asset(states, reference, config)
+        windows, reports = build_window_panel(bars_by_symbol, config)
+        forward = {s: forward_realised_vol(g, config.window_minutes) for s, g in grids.items()}
+        return cls(config=config, grids=grids, states=states, windows=windows,
+                   reports=reports, forward_vol=forward)
+
+    # ---- shape ---------------------------------------------------------
     @property
     def symbols(self) -> list[str]:
-        return sorted(self.bars)
+        return sorted(self.grids)
 
     @property
-    def resolved_index(self) -> pd.MultiIndex:
-        """Rows with a resolved target — the only ones that can train or score."""
-        return self.targets.dropna(subset=['price']).index
+    def window_index(self) -> pd.DatetimeIndex:
+        """The distinct window opens, sorted. Folds split on this, never on rows."""
+        return pd.DatetimeIndex(sorted(self.windows['window_open'].unique()))
 
-    def summary(self) -> dict[str, Any]:
-        target_summary = summarise_targets(self.targets)
-        times = self.features.index.get_level_values('event_time')
-        return {
-            'venue': self.venue,
-            'reference_venue': self.reference_venue,
-            'proxy_funding_symbols': list(self.proxy_funding_symbols),
-            'as_of': self.as_of,
-            'symbols': self.symbols,
-            'rows': int(len(self.features)),
-            'features': int(self.features.shape[1]),
-            'resolved_targets': int(len(self.resolved_index)),
-            'horizon_bars': self.horizon_bars,
-            'first_bar': str(times.min()) if len(times) else None,
-            'last_bar': str(times.max()) if len(times) else None,
-            'carry_share': round(target_summary.carry_share, 3),
-            'mean_cost_bps': round(target_summary.mean_cost_bps, 2),
-            'warnings': self.warnings,
-        }
+    @property
+    def span_days(self) -> float:
+        index = self.window_index
+        if len(index) < 2:
+            return 0.0
+        return (index[-1] - index[0]).total_seconds() / 86400.0
 
-    def trailing(self, days: float) -> "Dataset":
-        """The same dataset restricted to the most recent `days` of event time.
+    def coverage(self) -> pd.DataFrame:
+        rows = []
+        for symbol, report in sorted(self.reports.items()):
+            rows.append({
+                'symbol': symbol,
+                'first_minute': report.first_minute,
+                'last_minute': report.last_minute,
+                'minutes_expected': report.minutes_expected,
+                'minutes_present': report.minutes_present,
+                'minute_coverage': report.minute_coverage,
+                'windows': report.windows_total,
+                'dropped_boundary': report.windows_dropped_boundary,
+                'boundary_drop_rate': report.boundary_drop_rate,
+                'interior_gaps': report.windows_with_interior_gaps,
+            })
+        return pd.DataFrame(rows)
 
-        A training window and a recency half-life are different instruments and
-        both are useful: the window bounds what is loaded and fitted, the
-        half-life shapes what matters inside it. The window is applied after the
-        features are built, so a feature that needed 200 bars of history still
-        saw them — only the rows offered to the model are cut.
+    def trailing(self, days: Optional[float]) -> 'Dataset':
+        """A hard cut to the last `days` of windows.
+
+        Distinct from the recency half-life, which is a soft weighting. Both are
+        useful and they are not substitutes: this one changes what the model can
+        see, the other changes how much it cares.
         """
-        if days is None or days <= 0 or self.features.empty:
+        if not days:
             return self
-
-        times = pd.DatetimeIndex(self.features.index.get_level_values('event_time'))
-        cutoff = times.max() - pd.Timedelta(days=float(days))
-        if cutoff <= times.min():
+        index = self.window_index
+        if len(index) == 0:
             return self
-
-        keep = times >= cutoff
-        features = self.features[keep]
-        target_times = pd.DatetimeIndex(self.targets.index.get_level_values('event_time'))
-        targets = self.targets[target_times >= cutoff]
-
-        return replace(
-            self,
-            features=features,
-            targets=targets,
-            bars={s: _since(f, cutoff) for s, f in self.bars.items()},
-            funding={s: _since(f, cutoff) for s, f in self.funding.items()},
-            warnings=[
-                *self.warnings,
-                f'training window: kept the last {float(days):,.0f} days '
-                f'({len(features):,} of {len(self.features):,} rows)',
-            ],
-        )
-
-    def __str__(self) -> str:
-        return (
-            f"{len(self.symbols)} symbols | {len(self.features):,} rows x "
-            f"{self.features.shape[1]} features | "
-            f"{len(self.resolved_index):,} resolved targets | "
-            f"horizon {self.horizon_bars}h"
-        )
-
-
-def _frame_for(
-    store: ResearchStore,
-    dataset: str,
-    symbol: str,
-    venue: str,
-    *,
-    as_of: Optional[str],
-    min_quality: Optional[str],
-) -> pd.DataFrame:
-    rows = store.read(
-        dataset, venue=venue, symbols=[symbol], as_of=as_of, min_quality=min_quality
-    )
-    if rows.empty:
-        return pd.DataFrame()
-    indexed = rows.set_index(pd.to_datetime(rows['event_time'], utc=True)).sort_index()
-    return indexed.drop(
-        columns=[c for c in ('event_time', 'symbol', 'venue', 'quality') if c in indexed]
-    )
-
-
-def _resolve_oi_venue(
-    store: ResearchStore,
-    symbol: str,
-    preferred: list[Optional[str]],
-    *,
-    as_of: Optional[str],
-    min_quality: Optional[str],
-) -> Optional[str]:
-    """Find a venue that actually reports open interest for this symbol.
-
-    Coinbase exposes no open-interest endpoint, so this is always a proxy, and it
-    is looked up rather than assumed: it is not necessarily the same venue used
-    for the cross-venue basis. Whichever venue supplies it is recorded, because
-    Bybit and Binance report materially different open interest.
-    """
-    for candidate in preferred:
-        if candidate and not _frame_for(
-            store, 'open_interest', symbol, candidate,
-            as_of=as_of, min_quality=min_quality
-        ).empty:
-            return candidate
-
-    coverage = store.coverage('open_interest')
-    if coverage.empty:
-        return None
-    available = coverage[coverage['symbol'] == symbol.upper()]
-    return str(available.iloc[0]['venue']) if not available.empty else None
-
-
-def resolve_store_symbols(
-    store: ResearchStore,
-    requested: Sequence[str],
-    *,
-    venue: str,
-) -> tuple[dict[str, str], list[str]]:
-    """Map requested symbols onto the spellings the store actually holds.
-
-    The scraper and the readers disagreed about what a symbol is. `run_pipeline`
-    stores whatever the venue calls the product — `BTC-PERP`, or
-    `AVP-20DEC30-CDE` — while `load_dataset` asked for the bare profile prefix
-    (`BIP`, `ETP`). `ResearchStore._prepare` only upper-cases, so the two never
-    met: on a store built by the documented scrape command, every lookup missed
-    and the panel came back empty with one "no bars" warning per instrument. It
-    looked like a data problem and was a naming problem.
-
-    Resolution goes through `costs._resolve_base`, which already maps every
-    spelling — CDE code, ticker, or decorated product id — onto an underlying,
-    and is the same function that prices the contract. Returns
-    `{requested: stored}` plus the requested symbols nothing in the store matches.
-    """
-    coverage = store.coverage('bars')
-    if coverage.empty:
-        return {}, list(requested)
-
-    available = [str(s) for s in coverage.loc[coverage['venue'] == venue, 'symbol'].unique()]
-    if not available:
-        available = [str(s) for s in coverage['symbol'].unique()]
-
-    by_base: dict[str, list[str]] = {}
-    for stored in available:
-        base = resolve_base(stored)
-        if base:
-            by_base.setdefault(base, []).append(stored)
-
-    resolved: dict[str, str] = {}
-    missing: list[str] = []
-    for symbol in requested:
-        upper = symbol.upper()
-        if upper in available:          # already the stored spelling
-            resolved[symbol] = upper
-            continue
-        base = resolve_base(symbol)
-        candidates = by_base.get(base or '', [])
-        if candidates:
-            # Deterministic when a base has several contracts: prefer an exact
-            # prefix match, then the longest name, so the choice never depends on
-            # scrape order.
-            exact = [c for c in candidates if c.split('-')[0] == upper]
-            resolved[symbol] = sorted(exact or candidates, key=lambda s: (-len(s), s))[0]
-        else:
-            missing.append(symbol)
-    return resolved, missing
-
-
-def load_dataset(
-    store: ResearchStore,
-    *,
-    venue: str = 'coinbase',
-    reference_venue: Optional[str] = 'coinbase_spot',
-    oi_venue: Optional[str] = None,
-    symbols: Optional[Sequence[str]] = None,
-    config: Optional[Config] = None,
-    as_of: Optional[str] = None,
-    min_quality: Optional[str] = 'valid',
-    horizon_bars: Optional[int] = None,
-    feature_groups: Optional[Sequence[str]] = None,
-    min_history_days: float = 0.0,
-    max_round_trip_bps: float = 0.0,
-    max_gap_over_cost: float = 0.0,
-    standardize: bool = True,
-) -> Dataset:
-    """Build features and targets for a universe.
-
-    Open interest is resolved to whichever venue reports it, because Coinbase
-    exposes no open-interest endpoint. Those figures therefore describe a
-    different book than the one being traded, and the positioning features carry
-    that caveat — which is recorded in `warnings` rather than left implicit.
-    """
-    config = config or Config()
-    warnings: list[str] = []
-
-    asked = list(symbols) if symbols else [
-        profile.prefixes[0] for profile in COIN_PROFILES.values()
-    ]
-    # `excluded_symbols` was parsed from `--exclude` and `EXCLUDE_SYMBOLS` and read
-    # by nothing, so an excluded instrument still traded. Applied here, before the
-    # store is touched, so it holds for features, targets, the backtest and the
-    # live signal writer alike. Matched on the underlying, so `--exclude BTC`
-    # covers `BIP`, `BTC-PERP` and `BIP-20DEC30-CDE`.
-    excluded = {s.strip().upper() for s in (config.excluded_symbols or []) if s.strip()}
-    if excluded:
-        excluded_bases = {resolve_base(s) or s for s in excluded}
-        kept = [
-            s for s in asked
-            if s.upper() not in excluded and (resolve_base(s) or s) not in excluded_bases
-        ]
-        if len(kept) != len(asked):
-            warnings.append(
-                f'excluded {len(asked) - len(kept)} symbol(s) by configuration: '
-                f'{", ".join(sorted(set(asked) - set(kept)))}'
-            )
-        asked = kept
-    # Translate to the spellings the store holds before anything reads it.
-    mapping, unresolved = resolve_store_symbols(store, asked, venue=venue)
-    for symbol in unresolved:
-        warnings.append(f'{symbol}: nothing in the store resolves to it on {venue}')
-    requested = [mapping[s] for s in asked if s in mapping]
-    for asked_name, stored_name in mapping.items():
-        if asked_name.upper() != stored_name:
-            warnings.append(f'{asked_name} resolved to {stored_name}')
-
-    # The same translation, against the reference venue. Keyed by the *stored*
-    # trade spelling, because that is what the loop below iterates over.
-    reference_spellings: dict[str, str] = {}
-    if reference_venue:
-        reference_map, _ = resolve_store_symbols(
-            store, requested, venue=reference_venue
-        )
-        reference_spellings = {
-            symbol: reference_map[symbol]
-            for symbol in requested if symbol in reference_map
-        }
-
-    # Profiles are keyed by the stored spelling, since that is what every
-    # downstream lookup uses.
-    # One profile per symbol, chosen deterministically. A dict comprehension over
-    # two loops silently keeps whichever match comes last in COIN_PROFILES order,
-    # which is not a decision anyone made.
-    profiles: dict[str, CoinProfile] = {}
-    for symbol in asked:
-        stored = mapping.get(symbol)
-        if stored is None:
-            continue
-        exact = [p for p in COIN_PROFILES.values() if symbol in p.prefixes]
-        by_base = [p for p in COIN_PROFILES.values() if resolve_base(symbol) == p.name]
-        candidates = exact or by_base
-        if len(candidates) > 1:
-            warnings.append(
-                f'{symbol} matches {len(candidates)} profiles '
-                f'({", ".join(p.name for p in candidates)}); using the first'
-            )
-        if candidates:
-            profiles[stored] = candidates[0]
-
-    market_symbol = mapping.get(MARKET_SYMBOL) or MARKET_SYMBOL
-    market = _frame_for(
-        store, 'bars', market_symbol, venue, as_of=as_of, min_quality=min_quality
-    )
-    if market.empty:
-        warnings.append(
-            f'{market_symbol} has no bars on {venue}: the market_factor features '
-            f'will be empty, so nothing can be expressed relative to the market'
-        )
-
-    inputs: list[SymbolInputs] = []
-    bars: dict[str, pd.DataFrame] = {}
-    funding: dict[str, pd.DataFrame] = {}
-    oi_venues_used: set[str] = set()
-    proxy_funding_symbols: list[str] = []
-    symbols_with_reference: list[str] = []
-    symbols_without_reference: list[str] = []
-
-    thin_history: list[str] = []
-    untradeable: list[str] = []
-    for symbol in requested:
-        symbol_bars = _frame_for(store, 'bars', symbol, venue, as_of=as_of, min_quality=min_quality)
-        if symbol_bars.empty:
-            warnings.append(f'{symbol}: no bars on {venue}, skipped')
-            continue
-
-        # A contract with too little history is not a small version of one with
-        # enough — it is a sample from a different period. CDE listings are spread
-        # across a year, so on a 399-day store four contracts have ~395 days, ten
-        # have ~240 and four have under 170. The four youngest exist only inside
-        # the most recent rally, which is why they are the only four that rose and
-        # why selecting instruments on measured performance here selects by listing
-        # date. They also set the shortest span the simulation can cover.
-        if min_history_days > 0:
-            span_days = (
-                (symbol_bars.index.max() - symbol_bars.index.min()).total_seconds()
-                / 86_400.0
-            )
-            if span_days < min_history_days:
-                thin_history.append(f'{symbol} ({span_days:.0f}d)')
-                continue
-
-        # Tradeability, as a rule rather than a symbol list. `--exclude` needs
-        # someone to remember why each name is on it; these two thresholds
-        # reproduce their own answer from the data every run.
-        #
-        # `max_round_trip_bps` is the fee schedule: 27bp is the cheapest contract
-        # on this venue, so 35 keeps the book within ~30% of it and drops SHP
-        # (65bp), AVP (50bp) and POP (43bp), which need a third more forecast
-        # skill than the rest for no compensating advantage.
-        #
-        # `max_gap_over_cost` is fill uncertainty — the median close-to-next-open
-        # move as a share of the round trip. A bar's close is its last *trade*, so
-        # that gap is the price moving between the decision and the first fillable
-        # price. It is symmetric, absent from `core/costs.py`, and no signal
-        # removes it.
-        #
-        # Be honest about the boundary: at 0.40 this admits ADP at 0.37 and
-        # rejects LCP at 0.41. That is a 2.5% margin on a median, which is well
-        # inside its own noise — the two are interchangeable on this metric, and
-        # the threshold was set knowing where they fell. The cost and history
-        # thresholds are derived; this one is a choice.
-        if max_round_trip_bps > 0 or max_gap_over_cost > 0:
-            round_trip = float(
-                round_trip_cost_series(symbol, symbol_bars['close'], config).median()
-            ) * 10_000
-            if max_round_trip_bps > 0 and round_trip > max_round_trip_bps:
-                untradeable.append(f'{symbol} ({round_trip:.0f}bp round trip)')
-                continue
-            if max_gap_over_cost > 0 and 'open' in symbol_bars:
-                gap = float(
-                    (symbol_bars['open'].shift(-1) / symbol_bars['close'] - 1.0)
-                    .abs().median()
-                ) * 10_000
-                if round_trip > 0 and gap / round_trip > max_gap_over_cost:
-                    untradeable.append(
-                        f'{symbol} (fill uncertainty {gap / round_trip:.2f}x cost)')
-                    continue
-
-        symbol_funding = _frame_for(store, 'funding', symbol, venue, as_of=as_of, min_quality=min_quality)
-        if symbol_funding.empty and reference_venue:
-            symbol_funding = _frame_for(
-                store, 'funding', symbol, reference_venue, as_of=as_of, min_quality=min_quality
-            )
-            if not symbol_funding.empty:
-                proxy_funding_symbols.append(symbol)
-                warnings.append(
-                    f'{symbol}: funding taken from {reference_venue}, not {venue} — '
-                    f'the carry features describe a different venue than the trade'
-                )
-
-        resolved_oi_venue = _resolve_oi_venue(
-            store, symbol, [oi_venue, venue, reference_venue],
-            as_of=as_of, min_quality=min_quality,
-        )
-        open_interest = (
-            _frame_for(store, 'open_interest', symbol, resolved_oi_venue,
-                       as_of=as_of, min_quality=min_quality)
-            if resolved_oi_venue else pd.DataFrame()
-        )
-        if not open_interest.empty and resolved_oi_venue != venue:
-            oi_venues_used.add(resolved_oi_venue)
-
-        # Resolved separately against the reference venue's own spellings. The
-        # same symbol string existing on both venues is only true by accident:
-        # the CCXT path stores Binance bars under the *Coinbase* product id, so
-        # `BIP-20DEC30-CDE` matched there. Coinbase spot calls the same
-        # underlying `BTC-USD`, so a direct lookup finds nothing and the whole
-        # cross-venue group comes back empty — which is the configuration a US
-        # operator most wants, since the offshore venues are geo-blocked and
-        # spot is the market the perp's index is built from.
-        reference_symbol = reference_spellings.get(symbol) if reference_venue else None
-        reference_bars = (
-            _frame_for(store, 'bars', reference_symbol, reference_venue,
-                       as_of=as_of, min_quality=min_quality)
-            if reference_symbol else pd.DataFrame()
-        )
-        if reference_venue:
-            (symbols_with_reference if not reference_bars.empty
-             else symbols_without_reference).append(symbol)
-
-        bars[symbol] = symbol_bars
-        funding[symbol] = symbol_funding
-        inputs.append(SymbolInputs(
-            symbol=symbol,
-            bars=symbol_bars,
-            funding=symbol_funding if not symbol_funding.empty else None,
-            open_interest=open_interest if not open_interest.empty else None,
-            reference_bars=reference_bars if not reference_bars.empty else None,
-            market_bars=market if not market.empty else None,
-        ))
-
-    if untradeable:
-        warnings.append(
-            f'excluded {len(untradeable)} instrument(s) as untradeable: '
-            f'{", ".join(sorted(untradeable))}'
-        )
-    if thin_history:
-        warnings.append(
-            f'excluded {len(thin_history)} instrument(s) with under '
-            f'{min_history_days:.0f}d of bars: {", ".join(sorted(thin_history))}'
-        )
-
-    if not inputs:
+        cutoff = index[-1] - pd.Timedelta(days=days)
         return Dataset(
-            pd.DataFrame(), pd.DataFrame(), {}, {}, profiles,
-            venue, reference_venue, as_of, 0, warnings=warnings,
-            proxy_funding_symbols=sorted(proxy_funding_symbols),
+            config=self.config, grids=self.grids, states=self.states,
+            windows=self.windows.loc[self.windows['window_open'] >= cutoff].reset_index(drop=True),
+            reports=self.reports, forward_vol=self.forward_vol,
         )
 
-    # Group selection reaches build_panel, which also reindexes to
-    # `feature_columns(groups)` — so a restricted panel has a genuinely shorter
-    # canonical column list rather than the full 76 with the rest all-NaN. That
-    # matters: all-NaN columns still cost the model splits to rule out. But no
-    # subset is known to be better — measured walk-forward against the tradeable
-    # target over 15 group-by-horizon cells, no group holds a consistent sign.
-    features = build_panel(inputs, config=config, groups=feature_groups,
-                           standardize=standardize)
-    resolved_horizon = horizon_bars or config.label_horizon_hours()
-    targets = build_target_panel(
-        bars, profiles=profiles, funding_by_symbol=funding, config=config,
-        horizon_bars=resolved_horizon,
-        index_by_symbol={
-            symbol: features.xs(symbol, level='symbol').index
-            for symbol in bars if symbol in features.index.get_level_values('symbol')
-        },
-    )
 
-    # A reference venue that returns nothing is the quietest degradation in the
-    # loader: `cross_venue_features` returns an empty frame rather than NaN
-    # columns, so the panel is simply seven features narrower and looks healthy.
-    # It is also the likely case for a US operator — Binance, OKX and Bybit all
-    # answer 451 to a US IP — so it has to be said out loud.
-    if reference_venue and symbols_without_reference:
-        detail = (
-            'none of them' if not symbols_with_reference
-            else f'{len(symbols_without_reference)} of '
-                 f'{len(symbols_without_reference) + len(symbols_with_reference)}'
-        )
-        warnings.append(
-            f'no {reference_venue} bars for {detail}: '
-            f'{", ".join(sorted(symbols_without_reference))}. The cross-venue '
-            f'group (basis, lead-lag) is empty for those symbols, so the panel '
-            f'is narrower than it looks. If the venue is geo-blocked, scrape '
-            f'through a proxy; if the scraper fell back to another exchange, '
-            f'point --reference-venue at whichever one it stored.'
-        )
+@dataclass
+class ScoringBundle:
+    """Everything needed to score a window that has never been seen.
 
-    if oi_venues_used:
-        warnings.append(
-            f'open interest taken from {", ".join(sorted(oi_venues_used))}, not '
-            f'{venue}: Coinbase publishes none, so the positioning features '
-            f'describe a different book than the one being traded'
-        )
+    The promoted artifact used to carry only the baseline, which meant it could
+    not score a fresh window on its own: the volatility model and the intraday
+    seasonality factor are both *fitted*, both live inside the fold, and both are
+    required before a barrier probability exists. An artifact missing them is one
+    that can be evaluated and not deployed, and nothing said so until the live
+    path tried.
 
-    missing_schedule = symbols_missing_fee_schedule(list(bars), config)
-    if missing_schedule:
-        warnings.append(
-            f'no explicit fee schedule for {", ".join(missing_schedule)}: billed '
-            f'the schedule default of ${config.per_contract_fee_usd:.2f}/contract, '
-            f'which is the right answer only if the venue bills one rate'
-        )
-    if config.cost_config_version == 'legacy_default':
-        warnings.append(
-            'no exchange cost config loaded: costs are the hardcoded '
-            f'{config.fee_pct_per_side * 100:.2f}%/side plus '
-            f'${config.per_contract_fee_usd:.2f}/contract. Those match the fees '
-            'measured off the venue app, but the run records no schedule version'
-        )
-
-    return Dataset(
-        features=features,
-        targets=targets,
-        cross_sectional_standardized=bool(standardize),
-        max_round_trip_bps=float(max_round_trip_bps),
-        max_gap_over_cost=float(max_gap_over_cost),
-        bars=bars,
-        funding=funding,
-        profiles=profiles,
-        venue=venue,
-        reference_venue=reference_venue,
-        as_of=as_of,
-        horizon_bars=resolved_horizon,
-        feature_groups=tuple(feature_groups) if feature_groups else None,
-        min_history_days=float(min_history_days),
-        warnings=warnings,
-        proxy_funding_symbols=sorted(proxy_funding_symbols),
-    )
-
-
-def report_warnings(dataset: Dataset) -> None:
-    """Print data caveats prominently.
-
-    These are the things that quietly invalidate a result — a missing fee
-    schedule, funding from the wrong venue — so they are surfaced every run
-    rather than logged once and forgotten.
+    Deliberately excludes the per-minute state frames. Those are derived from
+    bars and are hundreds of megabytes; the live path rebuilds them from the last
+    day of bars in milliseconds.
     """
-    for warning in dataset.warnings:
-        logger.warning('%s', warning)
+
+    seasonality: dict[str, Seasonality]
+    vol_models: dict[str, VolModel]
+    baseline: BarrierBaseline
+    symbols: tuple[str, ...]
+    window_minutes: int
+    decision_offsets: tuple[int, ...]
+
+    def covers(self, symbol: str) -> bool:
+        return symbol in self.seasonality and symbol in self.vol_models
+
+    def summary(self) -> str:
+        return (f'scoring bundle: {len(self.vol_models)} symbols, '
+                f'{self.window_minutes}min windows at '
+                f'{", ".join(f"+{o}m" for o in self.decision_offsets)}, '
+                f'{self.baseline.distribution} baseline')
+
+
+@dataclass
+class FoldFit:
+    """The three fitted objects, plus the rows they were fitted on."""
+
+    seasonality: dict[str, Seasonality]
+    vol_models: dict[str, VolModel]
+    baseline: BarrierBaseline
+    train_windows: int
+    states: dict[str, pd.DataFrame] = field(default_factory=dict, repr=False)
+
+    def bundle(self, config: Config) -> ScoringBundle:
+        """The deployable subset: fits, no frames."""
+        return ScoringBundle(
+            seasonality=self.seasonality, vol_models=self.vol_models,
+            baseline=self.baseline, symbols=tuple(sorted(self.vol_models)),
+            window_minutes=config.window_minutes,
+            decision_offsets=tuple(config.decision_offsets),
+        )
+
+    def summary(self) -> str:
+        lines = [f'fold fit on {self.train_windows:,} windows']
+        for symbol in sorted(self.vol_models):
+            season = self.seasonality[symbol]
+            lines.append(
+                f'  {symbol}: {self.vol_models[symbol].summary()} | '
+                f'seasonal amplitude {season.amplitude:.2f} over {season.days_observed:.0f}d'
+            )
+        lines.append(f'  {self.baseline.summary()}')
+        return '\n'.join(lines)
+
+
+def fit_fold(
+    dataset: Dataset,
+    train_window_opens: pd.DatetimeIndex,
+    config: Optional[Config] = None,
+    *,
+    groups: Optional[Sequence[str]] = None,
+) -> tuple[FoldFit, pd.DataFrame]:
+    """Fit seasonality, the volatility model and the baseline on training windows.
+
+    Returns the fit and the *training* feature table. Scoring any other slice
+    goes through `apply_fold`, which shares this fit — so a test row can never
+    be scored against a model that saw it.
+    """
+    config = config or dataset.config
+    train_end = train_window_opens.max() if len(train_window_opens) else None
+    if train_end is None:
+        raise DatasetError('empty training window set')
+
+    seasonality: dict[str, Seasonality] = {}
+    vol_models: dict[str, VolModel] = {}
+    states: dict[str, pd.DataFrame] = {}
+    for symbol, grid in dataset.grids.items():
+        # Only bars strictly before the end of training may inform either fit.
+        cut = grid.loc[grid.index < train_end]
+        returns = log_returns(cut)
+        seasonality[symbol] = Seasonality.fit(returns, config)
+        state = apply_seasonality(dataset.states[symbol], seasonality[symbol])
+        states[symbol] = state
+        target = dataset.forward_vol[symbol]
+        train_rows = state.loc[state.index < train_end]
+        aligned = target.reindex(train_rows.index)
+        usable = train_rows.loc[aligned.notna() & (aligned > 0)]
+        vol_models[symbol] = VolModel.fit(usable, aligned.loc[usable.index], config)
+
+    train_table = _score_windows(
+        dataset, states, vol_models, seasonality,
+        dataset.windows.loc[dataset.windows['window_open'].isin(train_window_opens)],
+        config, groups=groups,
+    )
+    baseline = BarrierBaseline.fit(train_table, config)
+    fit = FoldFit(seasonality=seasonality, vol_models=vol_models, baseline=baseline,
+                  train_windows=len(train_window_opens), states=states)
+    return fit, attach_baseline(train_table, baseline)
+
+
+def apply_fold(
+    dataset: Dataset,
+    fit: FoldFit,
+    window_opens: pd.DatetimeIndex,
+    config: Optional[Config] = None,
+    *,
+    groups: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Score a slice of windows with a fit made elsewhere."""
+    config = config or dataset.config
+    table = _score_windows(
+        dataset, fit.states, fit.vol_models, fit.seasonality,
+        dataset.windows.loc[dataset.windows['window_open'].isin(window_opens)],
+        config, groups=groups,
+    )
+    return attach_baseline(table, fit.baseline)
+
+
+def _score_windows(
+    dataset: Dataset,
+    states: dict[str, pd.DataFrame],
+    vol_models: dict[str, VolModel],
+    seasonalities: dict[str, Seasonality],
+    windows: pd.DataFrame,
+    config: Config,
+    *,
+    groups: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Attach the volatility forecast, then the features, to a window slice."""
+    if windows.empty:
+        raise DatasetError('no windows in this slice')
+    parts = []
+    for symbol, part in windows.groupby('symbol', sort=True):
+        state = states.get(symbol)
+        model = vol_models.get(symbol)
+        if state is None or model is None:
+            logger.warning('%s: no volatility model, slice dropped', symbol)
+            continue
+        sigma = model.predict(state)
+        decision = pd.DatetimeIndex(part['decision_time'])
+        part = part.copy()
+        part['sigma_per_min'] = sigma.reindex(decision).to_numpy()
+        remaining = (config.window_minutes - part['offset']).to_numpy()
+
+        # The HAR forecasts volatility *at the decision minute*, seasonality
+        # included. The remaining span is a different set of minutes and can
+        # straddle a seasonal ramp — a window opening at 13:28 covers the New
+        # York cash open — so scale by the ratio of the root-mean seasonal
+        # factor over the minutes actually left to the factor at the decision
+        # minute. Variance adds, which is why it is a root mean and not a mean.
+        seasonality = seasonalities[symbol]
+        now_factor = seasonality.at(decision)
+        ramp = np.ones(len(part))
+        for span in np.unique(remaining):
+            mask = remaining == span
+            ramp[mask] = (seasonality.mean_over(decision[mask], int(span))
+                          / np.maximum(now_factor[mask], 1e-9))
+        part['seasonal_ramp'] = np.log(np.maximum(ramp, 1e-9))
+        part['sigma_remaining'] = scale_sigma(
+            part['sigma_per_min'].to_numpy(), remaining, ramp)
+        part['log_sigma_per_min'] = np.log(np.maximum(part['sigma_per_min'], 1e-9))
+        parts.append(part)
+    if not parts:
+        raise DatasetError('every symbol lacked a volatility model')
+    scored = pd.concat(parts, ignore_index=True)
+    return build_features(scored, states, config, groups=groups)
+
+
+def score_live(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    bundle: ScoringBundle,
+    config: Config,
+    *,
+    window_open: pd.Timestamp,
+    offset: int,
+    groups: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Score exactly one decision point per symbol, from freshly fetched bars.
+
+    The same code path as the backtest, deliberately: `minute_state`,
+    `apply_seasonality`, the fold's own `VolModel`, then `build_features` and the
+    fold's own baseline. `core/backtest.py` and this function differ only in
+    which windows they ask for, which is what stops the live path and the
+    measured path from drifting apart — the previous incarnation of this repo had
+    them disagree about entry price for months.
+
+    The outcome column is present and NaN. A window being decided has not
+    settled, and writing a plausible zero into it would make an unresolved bet
+    look like a loss.
+    """
+    if offset not in bundle.decision_offsets:
+        logger.warning('offset +%dm is not one the model was fitted at (%s)',
+                       offset, bundle.decision_offsets)
+    grids, states = {}, {}
+    for symbol, bars in bars_by_symbol.items():
+        if not bundle.covers(symbol):
+            logger.error('%s has no fitted volatility model in this artifact, skipped', symbol)
+            continue
+        grid = minute_grid(bars)
+        grids[symbol] = grid
+        flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
+        state = minute_state(grid, flat, config)
+        states[symbol] = apply_seasonality(state, bundle.seasonality[symbol])
+    if not states:
+        raise DatasetError('no symbol could be scored with this artifact')
+    states = attach_cross_asset(states, REFERENCE_SYMBOL, config)
+
+    windows, _ = build_window_panel(
+        {s: bars_by_symbol[s] for s in states}, config, offsets=(offset,))
+    slice_ = windows.loc[windows['window_open'] == window_open]
+    if slice_.empty:
+        raise DatasetError(
+            f'no window opens at {window_open} — the bars may not reach it yet, '
+            f'or its boundary minute is missing'
+        )
+    dataset = Dataset(config=config, grids=grids, states=states, windows=windows,
+                      reports={}, forward_vol={})
+    table = _score_windows(dataset, states, bundle.vol_models, bundle.seasonality,
+                           slice_, config, groups=groups)
+    scored = attach_baseline(table, bundle.baseline)
+    # The window has not settled. Say so rather than carrying the value the
+    # window table computed from a settle price that does not exist yet.
+    scored['outcome'] = np.nan
+    scored['settle_price'] = np.nan
+    scored['settle_return'] = np.nan
+    return scored

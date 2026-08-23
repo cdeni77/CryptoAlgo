@@ -7,18 +7,14 @@ from sqlalchemy import text
 
 from database import engine
 from security import TOKEN_ENV, allowed_origins, token_configured
-from endpoints.coins import router as coins_router
-from endpoints.model import router as model_router
-from endpoints.paper import router as paper_router
-from endpoints.research import router as research_router
-from endpoints.signals import router as signals_router
-from endpoints.wallet import router as wallet_router
+from endpoints.jobs import router as jobs_router
+from endpoints.serving import router as serving_router
 from models.base import Base
 
-# Ensure model modules are imported so SQLAlchemy registers tables on Base.metadata.
-from models import signals as _signals_models 
-from models import trade as _trade_models  
-from models import wallet as _wallet_models  
+# Imported for its side effect: SQLAlchemy only knows about a table once the
+# module defining it has been imported, so `create_all` below would otherwise
+# create nothing.
+from models import serving as _serving_models  # noqa: F401
 
 # Columns added after the tables were first created. `create_all` above only
 # creates missing *tables*, so a new column on an existing table needs this.
@@ -28,34 +24,19 @@ from models import wallet as _wallet_models
 # side has to exist on the other or whichever starts second writes to a column the
 # first cannot read. `backend/trader/tests/test_orm_parity.py` fails when the two
 # lists diverge.
-POSTGRES_MIGRATIONS = (
-    "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS tp_price DOUBLE PRECISION",
-    "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS sl_price DOUBLE PRECISION",
-    "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS max_hold_until TIMESTAMP WITH TIME ZONE",
-    "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS exit_reason VARCHAR",
-    "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS funding_paid "
-    "DOUBLE PRECISION NOT NULL DEFAULT 0.0",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_net_bps DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_price_bps DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_carry_bps DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS cost_bps DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS sigma_bps DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS edge_to_risk DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS carry_share DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS participation DOUBLE PRECISION",
-    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS model_version VARCHAR",
-    # Indexes, not columns. `create_all` only touches missing *tables*, so
-    # an index added to an existing model never reaches a database that
-    # already has the table. The names match what SQLAlchemy's
-    # `index=True` generates (ix_<table>_<column>), so a fresh create and
-    # an upgraded database end up with the same index rather than two.
-    "CREATE INDEX IF NOT EXISTS ix_paper_fills_created_at "
-    "ON paper_fills (created_at)",
-    "CREATE INDEX IF NOT EXISTS ix_paper_positions_is_open "
-    "ON paper_positions (is_open)",
-    "CREATE INDEX IF NOT EXISTS ix_paper_positions_opened_at "
-    "ON paper_positions (opened_at)",
-)
+# Indexes and constraints added after a table first shipped.
+#
+# Kept literally identical to `backend/trader/core/pg_writer.py:MIGRATIONS` — the
+# two processes own the same tables from separate containers, so an index that
+# exists on one side and not the other is a query that is fast in development and
+# a table scan in production. `backend/trader/tests/test_orm_parity.py` fails when
+# the two lists diverge.
+#
+# These are all `CREATE INDEX IF NOT EXISTS`, which SQLite also understands, so
+# unlike the `ADD COLUMN IF NOT EXISTS` list this replaced they are exercised by
+# the test suite rather than skipped by it.
+POSTGRES_MIGRATIONS = _serving_models.MIGRATIONS
+
 
 
 # An arbitrary but fixed key. Postgres advisory locks are global to the
@@ -65,23 +46,20 @@ _BOOTSTRAP_LOCK_KEY = 8_931_774_205_113
 
 
 def run_migrations() -> None:
-    """Apply the additive column migrations. Postgres only, by construction.
+    """Apply the index migrations.
 
-    `ADD COLUMN IF NOT EXISTS` is Postgres syntax, so this checks the dialect
-    rather than catching the failure. Guarding beats swallowing: a caught
-    exception here would also hide a genuine migration failure on the deployment
-    that needs these to run.
+    Every statement is `CREATE INDEX IF NOT EXISTS`, which both Postgres and
+    SQLite understand, so this no longer checks the dialect and skips itself in
+    tests — the migrations the test suite runs are the migrations production
+    runs. The advisory lock below is still Postgres-only, because only Postgres
+    has four uvicorn workers racing to create the same tables.
     """
-    if engine.dialect.name != "postgresql":
-        logging.getLogger("api").info(
-            "skipping column migrations on %s: they are Postgres-specific",
-            engine.dialect.name,
-        )
-        return
     with engine.begin() as connection:
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(:key)"), {"key": _BOOTSTRAP_LOCK_KEY}
-        )
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": _BOOTSTRAP_LOCK_KEY},
+            )
         for statement in POSTGRES_MIGRATIONS:
             connection.execute(text(statement))
 
@@ -125,9 +103,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Trading History & Market API",
-    description="API for signals, paper trading telemetry, and research",
-    version="0.3.0",
+    title="Quarter — 15-minute binary telemetry",
+    description=(
+        "Read-only telemetry for the barrier system: the current window state "
+        "per symbol, the decision funnel, the paper account, and the "
+        "reliability table. Every response distinguishes a measured value from "
+        "an explicit null with a reason. Nothing here substitutes a plausible "
+        "number for a missing one."
+    ),
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -145,19 +129,21 @@ app.add_middleware(
 
 if not token_configured():
     logging.getLogger("api").warning(
-        "%s is not set: POST /research/launch is disabled. Set it to enable "
-        "launching research jobs from the dashboard.",
+        "%s is not set: POST /jobs/{job} is disabled and returns 503. Set it to "
+        "enable launching research scripts from the dashboard.",
         TOKEN_ENV,
     )
 
-app.include_router(coins_router)
-app.include_router(wallet_router)
-app.include_router(signals_router)
-app.include_router(paper_router)
-app.include_router(research_router)
-app.include_router(model_router)
+app.include_router(serving_router)
+app.include_router(jobs_router)
 
 
 @app.get("/")
 def root():
-    return {"message": "Trading History & Market API is running"}
+    return {
+        "service": "quarter",
+        "what": "15-minute binary barrier system telemetry",
+        "routes": ["/live", "/account", "/account/equity", "/predictions",
+                   "/funnel", "/positions", "/model", "/model/history",
+                   "/model/calibration", "/jobs"],
+    }
