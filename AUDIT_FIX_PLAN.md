@@ -3,8 +3,41 @@
 Ordered, actionable tasks from `AUDIT_REPORT.md`. Each carries severity, files,
 expected behaviour, the change, required tests, and dependencies.
 
-**Read this first.** The live path is currently dead — `score_live` raises on
-every cycle (P0-1). That means every other live defect is *latent*. Fixing P0-1
+## Status, 2026-08-23
+
+Eight commits on `audit/critical-fixes`. **All of P0 except credential rotation is
+done, and most of P1 and P2.** The suite went from 230 tests to 348 (plus 28 in
+`backend/api`), and every fix was checked by reintroducing the bug and confirming a
+test fails — three mutants that survived all 230 original tests are now killed.
+
+What is still open, in the order it matters:
+
+1. **Rotate the leaked credentials.** Only you can do this. `b70c78c` and
+   `6097ed1` are on `origin/main`.
+2. **Re-fill the store and retrain.** Every model fitted before the pagination fix
+   was fitted on a grid missing one minute in 301, and the loss phase is fixed in
+   training but moves in serving. Run `scripts.scrape --fill-gaps` (now defaulting
+   to `--min-gap-minutes 1`), then `sync_store`, then re-evaluate.
+3. **Collect Kalshi quote history.** `--mode live --dry-run` writes
+   `market_probability` on every window now. Until there are months of it, nothing
+   here speaks to profitability — see the Final Adversarial Review in
+   `AUDIT_REPORT.md`.
+4. **Paper-trade for a week and read the funnel.** Nothing in this system has ever
+   completed a cycle. Every fix is verified by a test and none by a live run.
+5. The remaining P2/P3 items below, chiefly `core/backtest.py` at 0% coverage,
+   `run_cycle`/`act_on` untested, six more `inspect.getsource` assertions, and the
+   absence of any CI.
+
+Two things are deliberately **not** fixed and are decisions rather than defects:
+the backtest's counterparty is the baseline the model corrects (fixing it means
+collecting quotes, not inventing a worse price), and `min_edge_pp = 0.5pp` is below
+what any calibration measurement on this sample can resolve (500 rows at p=0.9
+carry a 1.3pp standard error). Both are argued out in `AUDIT_REPORT.md`.
+
+---
+
+**Read this first (historical — P0-7 has since landed).** The live path was dead —
+`score_live` raised on every cycle. That means every other live defect is *latent*. Fixing P0-1
 alone would activate duplicate orders (P0-2), debit-only accounting (P0-3), the
 wrong settlement rule (P0-4) and phantom positions (P0-6) all at once. **P0-1
 must be the last of the P0 live fixes to land, or the whole P0 block must land

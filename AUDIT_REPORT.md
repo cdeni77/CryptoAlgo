@@ -1067,3 +1067,198 @@ tickets cover only the ~6% of windows that traded — a selected sample. **No Ka
 quote history is stored and none is being recorded.** The system can currently
 demonstrate that a model beats an analytic formula; it cannot demonstrate that the
 formula beats the market.
+
+---
+
+# What has been fixed
+
+Eight commits on `audit/critical-fixes`. The suite went from 230 tests to 345, and
+every fix below was checked by reintroducing the bug and confirming a test fails.
+
+| finding | status |
+|---|---|
+| Live path cannot score the current window | **fixed** — `build_windows(include_unsettled=True)`; verified at every offset, and withheld when the feed is short |
+| Live re-enters the same (symbol, window) every cycle | **fixed** — exposure seeded from committed positions and tickets; `open_position` idempotent; Postgres advisory lock for single-writer |
+| Paper bankroll never credited a win | **fixed** — payout credited inside `settle_position`'s transaction; increments via one relative `UPDATE` |
+| Live settles on the wrong rule | **fixed** — `bar_mean` of the minute ending at `settle_time`, `>=`; venue settlements applied as authoritative |
+| Venue settlements fetched and discarded | **fixed** — returned and applied; reverse reconciliation added |
+| Unresolved market books a phantom position | **fixed** — `Reason.NO_QUOTE`; live prices from the book or abstains |
+| Fills assumed, not read back | **fixed** — `status`/`remaining_count`/`taker_fill_count` parsed; position written from the fill |
+| Coinbase pagination destroys 1 minute in 301 | **fixed** — span is `(limit - 1) * tf`; `--min-gap-minutes` defaults to 1 |
+| In-progress candle stored | **fixed** — dropped by `available_time <= now` |
+| NaN pooled into the top reliability bin | **fixed** — excluded and counted; `non_finite_rows == 0` gate |
+| `scripts/baseline.py` gate fails open | **fixed** — refuses on unmeasured folds |
+| Calibration gate blind to the traded band | **partly fixed** — `calibration_max_deviation` gate, 2pp tail bins, empty-bin NaN fixed. See the caveat below |
+| `residual_scale` returns scipy's bracket seed | **fixed** — non-convergence and non-finite input raise; reads 0.0000 on a null |
+| Inner split unpurged; alpha shares rows with early stopping | **fixed** — embargoed, and separate blocks |
+| `--dry-run` never read | **fixed** — mutually exclusive with `--place-orders` |
+| Live account renders as paper | **fixed** — `ensure_account` refuses a mode change rather than silently inheriting |
+| `--require-gates` tests `installed` not `passed` | **fixed** |
+| `--force` reachable over HTTP | **fixed** — `FORBIDDEN_FLAGS` in `validate_job_args` |
+| Limit prices truncated below intent | **fixed** — rounds up; slippage capped at a share of the edge |
+| Half-spread charged on top of a real ask | **fixed** |
+| Sharpe averages per-trade ratios | **fixed** — dollars per calendar day; `sharpe_per_trade` retained |
+| Price band asymmetric | **fixed** — `[0.05, 0.95]`, enforced in `__post_init__` |
+| Embargo validated against itself | **partly fixed** — `Config` refuses `embargo < window_minutes`; `assert_no_leakage` is still self-referential |
+| No stale-data guard | **fixed** — bar age, missing symbol, and remaining-window floor |
+| No probability range check | **fixed** |
+| No circuit breaker; `halted` never written | **fixed** — daily loss and consecutive losses, persisted |
+| Artifact loaded on trust | **fixed** — `verify()` at load: booster/feature agreement and material config drift |
+| `trade_count_z_15` permanently NaN | **fixed** — removed; the fixture no longer fabricates it |
+| `model_runs`/`calibration` never written | **fixed** — `scripts/promote.py` mirrors best-effort |
+| Store returns local time | **fixed** — reads pinned to UTC |
+| `--start`/`--end` crash on pandas 3.0 | **fixed** |
+| `us_equity_hours` EDT-only | **fixed** — converted through `zoneinfo` |
+| `balance()` single encoding, silent zero | **fixed** — both encodings, NaN on failure, reconcile refuses to write it |
+| Migrations swallow every exception | **fixed** — tolerated on SQLite only |
+| Dependencies unpinned | **fixed** — exact pins, agreement between containers enforced by test |
+| Secrets in pushed history | **NOT FIXED — requires rotation by the operator** |
+| Backtest prices against the baseline | **NOT FIXED — architectural, see below** |
+| No market-implied benchmark | **NOT FIXED — needs quote history collected first** |
+| `core/backtest.py` at 0% coverage | **NOT FIXED** |
+
+## Three that are deliberately not fixed
+
+**The counterparty.** `core/decide.py` prices the counterfactual market as the
+calibrated baseline, and the model is fitted on that baseline's logit as
+`init_score`. So the backtest's "edge" is arithmetically the model's own claimed
+correction minus costs, and there is no adverse-selection term: the backtest
+cannot show a loss caused by the market being smarter than the model. Changing the
+price to something pessimistic would be inventing a counterparty rather than
+measuring one. The fix is to collect real quotes, which is why `market_probability`
+is now written on every live decision.
+
+**The 0.5pp/2pp tension.** `min_edge_pp` is 0.5pp and the calibration gates
+permit more error than that. This is not an oversight that can be closed by
+tightening a threshold: 500 rows in a bin at p=0.9 carry a 1.3pp standard error,
+so no calibration measurement on this sample can *resolve* 0.5pp. Either
+`min_edge_pp` rises above the measurable error or the gate is understood as
+bounding the damage rather than certifying the edge. That is a decision about risk
+appetite, not a bug, and it is left to the operator with the numbers stated.
+
+**Secrets rotation.** Nothing in a repository can un-leak a pushed blob.
+
+---
+
+# Recommended Fixes
+
+Grouped as the plan requires. Everything marked *(done)* is on
+`audit/critical-fixes`; `AUDIT_FIX_PLAN.md` carries the detail and the ordering
+constraints for what remains.
+
+### P0 — Must fix before any live trading
+- Rotate the Coinbase key/secret, the Postgres password and `API_TOKEN`. **Open — operator action.**
+- Score the window being decided *(done)*, one entry per (symbol, window) *(done)*, credit settlements *(done)*, settle on the trained rule *(done)*, book only confirmed fills *(done)*, honour `--dry-run` *(done)*, correct the order envelope *(done)*.
+- **Open:** run `scripts.live --mode paper --loop` for a week and read the funnel before considering `--place-orders`. Every fix above is verified by tests and by construction; none has been verified by a cycle that actually ran against the venue.
+
+### P1 — Must fix before increasing capital
+- Coinbase pagination *(done)*, in-progress candle *(done)*, NaN handling *(done)*, calibration gates *(partly — see the caveat)*, inner-split purge *(done)*, stale-input refusal *(done)*, artifact verification *(done)*, circuit breakers *(done)*.
+- **Open:** re-scrape or `--fill-gaps` the whole store, then retrain. Every model fitted before the pagination fix was fitted on a grid missing one minute in 301, with the loss phase fixed in training and moving in serving.
+- **Open:** collect Kalshi quote history and measure the model against it. Until that exists, no number in this repository speaks to profitability.
+- **Open:** decide the `min_edge_pp` question above, explicitly, and write the reasoning down.
+
+### P2 — Important reliability improvements
+- Half-spread *(done)*, side-adjusted reporting *(done)*, Sharpe *(done)*, `n_features_populated` *(done)*, migrations *(done)*, `balance()` *(done)*, serving-store writers *(done)*, `trade_count_z_15` *(done)*, two source-text tests *(done)*, `--start/--end` *(done)*, UTC pinning *(done)*, `us_equity_hours` *(done)*.
+- **Open:** `core/backtest.py` has 158 statements at 0% coverage — no test imports it. It needs a `slow`-marked end-to-end walk-forward.
+- **Open:** `run_cycle`, `act_on` and `reconcile_with_venue` are still untested end to end; `scripts/live.py` sits at ~19%.
+- **Open:** six remaining `inspect.getsource` assertions in `test_kalshi.py` and `test_backfill_windows.py`.
+- **Open:** reclassify `seasonal_ramp` — it is a deterministic function of minute-of-day and offset, filed under `vol_state`, so its gain is not counted against the control gate. And decide whether offset-dependent `clock` columns belong in a control at all, since per-offset recalibration is legitimate.
+- **Open:** `max_disagreement_pp` stays at 25.0. Tightening it to 8.0 was tried and reverted — a sigma disagreement at a 0.88 quote legitimately moves P(up) to 0.70. The real protection is the price band plus requiring a real quote, both now in place.
+- **Open:** a loop-liveness healthcheck. The trader healthcheck tests a Postgres connection, so a crash loop is invisible to compose.
+
+### P3 — Cleanup / maintainability
+- Dependency pinning *(done)*, documentation corrections *(done)*.
+- **Open:** `Mapped[]` typing on `core/pg_writer.py` — 43 of mypy's 106 errors are in the file that carried the bankroll bug, so type checking could not see it.
+- **Open:** a `ruff` config and CI. There is no CI at all, which means `test_orm_parity.py` is not actually enforced on merge.
+- **Open:** delete or quarantine the perp-era code — `RedisQueue`, funding/OI models and tables, the `--live` scrape path, `write_features`/`read_features`.
+- **Open:** rename one of the two `serving.py` modules so mypy can resolve imports.
+
+---
+
+# Final Adversarial Review
+
+Paid to argue against deployment, here are the five strongest arguments.
+
+**1. Nothing in this repository can measure whether the strategy is profitable,
+and the number it does produce is close to tautological.** The backtest's market
+price *is* the calibrated baseline, and the model is fitted on that baseline's
+logit as `init_score`. So "edge" is the model's own claimed correction minus
+costs, with no term for the market being right when we are wrong. Two independent
+demonstrations: a model that knows the truth exactly earns +2219% against a
+baseline-priced counterparty, +191% against a half-informed one and **zero
+against an informed one**; and a "model" with no forecasting content at all — an
+isotonic recalibration of the baseline against its own measured bias — passed all
+fourteen gates with +94% and a Sharpe of 3.29. The venue needs to have priced away
+only half of the null's known 0.44–1.33pp bias for the system to take no trades,
+and for a liquid BTC binary that is the likely case, not the pessimistic one.
+
+**2. The one real skill number is explainable four ways before it is alpha.** The
+five-year BTC walk-forward reports +0.000897 ± 0.000240, 6/6 folds positive. But
+consecutive folds share 50–83% of their training windows, so at ρ≈0.7 "6 of 6" is
+a **22%** event under the null and t > 3.74 an **18.9%** event — not the 1.6% and
+0.68% independence implies. Four of six folds were scored with an unfitted
+shrinkage constant. The correction is largest at offset 3 and negative at offset
+12, which is where the null is worst calibrated and the exact opposite of what the
+barrier framing predicts. And two of the top four features by gain are the clock
+control, with `hour_sin` at #2 — the repo's own documented failure mode, at a
+threshold too loose to catch it.
+
+**3. Nothing has ever run.** The live loop could not score a window, the paper
+bankroll could not go up, and the paper container crashed on the second cycle of
+its first window. So there is no operational history at all: no fill ever read
+back, no settlement ever reconciled, no drift ever observed, no idea what the
+venue actually does with a duplicate `client_order_id`. Every fix in this branch is
+verified by a test and by construction, and not one is verified by a cycle that
+ran. The first week of paper trading will find things this audit did not.
+
+**4. The training data was wrong in a way that differs between training and
+serving.** One minute in 301 was destroyed for five years. The paginator's phase
+is fixed during a backfill and moves on every live fetch, so the two lose
+different minutes — 0.332% of live cycles lose the exact minute that becomes
+`last_price`. Everything fitted before this branch was fitted on that grid. The
+store needs re-filling and the model refitting before any number is worth reading,
+and that has not happened yet.
+
+**5. The measurement apparatus was itself unreliable, which is worse than a
+model being wrong.** A 0.03% data hole turned five of six folds' metrics into NaN
+while the Phase 1 gate printed "gate passed". The overfitting detector returned
+scipy's golden-section bracket point and cleared its own threshold. The
+calibration gate could not see the band where the money goes. The Sharpe gate was
+policing a quantity that can carry the opposite sign from the account. Those are
+fixed, but they were all *simultaneously* true, and the system reported 12 of 14
+gates passing in that state. The prior on further undetected measurement error
+should be high.
+
+## What would need to exist before I would call it production-ready
+
+1. **Kalshi quote history, and skill measured against it.** Several months of
+   `--mode live --dry-run` writing `market_probability` and `outcome` on every
+   window, traded or refused. Positive log-loss skill *against the market's own
+   price* is the only result that matters, and no amount of skill against
+   `F(x/σ)` substitutes for it.
+2. **A store re-filled after the pagination fix, and a model refitted on it**, with
+   the walk-forward rerun and the `non_finite_rows` gate at zero on its own merits.
+3. **A month of paper trading with no crash, no unexplained balance drift, and a
+   funnel that matches the backtest's.** Coverage, rejection histogram and realised
+   edge should agree between the two within their error bars; if live coverage is
+   materially lower, the difference is the thing to understand before sizing.
+4. **`min_edge_pp` reconciled with the measurable calibration error**, in writing —
+   including the possibility that the answer is "this sample cannot support a
+   0.5pp gate, so the strategy needs a bigger edge to be tradeable."
+5. **The control question settled.** Either `hour_sin` and `quarter_of_hour` stop
+   being top-four features, or the control gate is redesigned so that legitimate
+   per-offset recalibration does not count against it while genuine clock
+   dependence does. As it stands the gate can neither pass a good model
+   confidently nor fail a clock-driven one.
+6. **`core/backtest.py` covered, and `run_cycle`/`act_on` tested end to end** against
+   a mocked venue, including the hostile cases in the execution audit above.
+7. **CI.** There is none, so `test_orm_parity.py` — which exists because that mirror
+   already drifted once by a factor of ten — is not enforced on merge.
+8. **Credentials rotated**, and a pre-commit hook backing the two new tests.
+
+None of that is a reason the hypothesis is wrong. The barrier reframing is right,
+the label reproduces the venue's published rule, the feature pipeline is provably
+free of lookahead, and the baseline beats a coin flip by 32–35% from arithmetic
+alone — measured, and better than the docs claimed. It is a good foundation with
+an unverified conclusion resting on it, and the distance between those two is
+larger than the gate report suggests.
