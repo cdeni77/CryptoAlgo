@@ -1,216 +1,171 @@
-# agents.md — CryptoAlgo Codex Agent Configuration
+# AGENTS.md — Quarter
+
+Architecture and conventions. `CLAUDE.md` carries the reasoning — the reframe,
+the economics, the invariants and what has already been rejected. Read that
+first; this file says where things are.
 
 ## Project Overview
 
-CryptoAlgo is a full-stack crypto trading research and monitoring workspace built for Coinbase CDE/perpetual workflows. It includes live orchestration, offline backtesting/optimization, and a paper-trading pipeline.
+Barrier-probability trading on Kalshi 15-minute BTC/ETH/SOL up-down markets. A
+window opens on a quarter-hour boundary, records the price there as its strike,
+and settles on whether the price at the next boundary is strictly above it. The
+displacement from the strike is known exactly; only the volatility over the
+minutes that remain has to be forecast.
+
+**The benchmark is `F(x / sigma_n)`, never 50%.** Everything is measured
+incrementally against that baseline. See `CLAUDE.md`.
 
 ## Repository Structure
 
 ```
-backend/
-  api/              FastAPI service (Python 3.12, PostgreSQL)
-  trader/           ML pipeline: data collection, features, training, optimization
-frontend/           React 18 + Vite + TypeScript + Tailwind CSS dashboard
-docker-compose.yml  Orchestrates all services
+backend/trader/
+  core/
+    config.py      one frozen dataclass; every field that changes an answer
+    windows.py     the 15-min grid as a table: symbol x window x offset
+    vol.py         HAR on log realised vol + circular-smoothed minute-of-day
+    baseline.py    the null: F(x/sigma), scale and tail fitted, drift never
+    features.py    4 mechanism groups + 1 control, 42 columns
+    dataset.py     Dataset (unfitted) / FoldFit / ScoringBundle / score_live
+    cv.py          window-level purged expanding folds, 1-day embargo
+    model.py       LightGBM on the baseline logit as init_score
+    costs.py       Kalshi fees: ceil(0.07*C*p*(1-p)) per order, free settlement
+    decide.py      the ONLY place a trade is chosen
+    book.py        the account: enter, settle, equity at cost
+    backtest.py    walk-forward, cost stress, the edge curve
+    metrics.py     log-loss skill, calibration, and the 14 gates
+    promotion.py   stage, gate, atomic rename, append to the ledger
+    datastore.py   Parquet + DuckDB research store, point-in-time reads
+    pg_writer.py   the serving store (mirrored in backend/api/models/serving.py)
+  data_collection/
+    coinbase_connector.py  REST + websocket, one-minute candles
+    kalshi_client.py       RSA-PSS auth, quotes, balance, orders, fills
+    pipeline.py storage.py queue.py validator.py models.py ingest.py timeutil.py
+  scripts/
+    _common.py     shared data arguments; no two scripts disagree about data
+    scrape.py      one-minute Coinbase spot bars -> SQLite
+    sync_store.py  SQLite -> Parquet
+    baseline.py    fit and report the null (the Phase 1 gate)
+    train.py       one model, for inspection. Not for promotion.
+    evaluate.py    walk-forward: skill, funnel, money, stress, gates
+    promote.py     the only path to models/forecast.joblib
+    live.py        score, price, decide, act. paper | live --dry-run | live
+  tests/           207 tests, 26s in parallel
+  configs/venue/   fee schedules (optional; defaults match the published one)
+
+backend/api/
+  app.py           lifespan bootstrap, advisory-locked on Postgres
+  models/serving.py    GENERATED from core/pg_writer.py — do not hand-edit
+  controllers/serving.py
+  endpoints/serving.py (read-only)  endpoints/jobs.py (the one mutating route)
+  security.py      require_token (fails closed) + validate_job_args
+
+frontend/src/
+  App.tsx          manual routing; ROUTES + PAGES as a Record, so a route with
+                   no component is a tsc error rather than a blank screen
+  api/client.ts    one base URL, one error type, one place the token is set
+  api/serving.ts   every request the app makes
+  components/      Logo, Rail, QuarterTrack, ProbabilityScale, WindowChart,
+                   Charts, Primitives
+  pages/           Live, Decisions, Calibration, Model, Account
+  lib/format.ts    formatters (not components — the fast-refresh rule is right)
 ```
 
-### Backend — API (`backend/api/`)
+## The serving store
 
-- **Framework**: FastAPI 0.115, SQLAlchemy 2.0, Pydantic 2.9
-- **Database**: PostgreSQL 16 via `psycopg2-binary`
-- **Entry point**: `app.py` creates the FastAPI app, registers CORS, includes all routers
-- **Models**: `models/base.py` (declarative base), `models/trade.py` (paper orders, fills, positions, equity curve, `ModelRun`, `PaperEngineConfig` — no live-trade table; see below), `models/signals.py`, `models/wallet.py`, `models/model.py`, `models/research.py`
-- **Endpoints** (each in `endpoints/`):
-  - `coins.py` — `/coins/prices`, `/coins/cde-prices`, `/coins/cde-specs`, `/coins/history/{symbol}`
-  - `signals.py` — `/signals/`
-  - `wallet.py` — `/wallet/` (Coinbase spot + perps + Ledger addresses)
-  - `paper.py` — `/paper/summary`, `/paper/fills`, `/paper/positions`, `/paper/equity`, `/paper/config`, `/paper/model-status`
-  - `research.py` — `/research/summary`, `/research/runs`, `/research/features/{coin}`, `/research/scripts`, `/research/jobs`, `/research/jobs/{pid}/logs`, `POST /research/launch/{job}`
-  - `model.py` — `/model/` (live provenance, gates, kill switch), `/model/promotions` (the ledger, rejections included), `/model/features` (real booster gains)
-- **Security** (`security.py`): `require_token` gates every mutating route on `API_TOKEN` and **fails closed** — no token configured means 503, not open. `validate_job_args` restricts what a launched script can be handed, rejecting rather than sanitising. `allowed_origins` filters `*` out of the CORS list. Before this, `POST /research/launch` had no authentication and the origin list ended with `*`, so any page the browser had open could start a trader script with arbitrary arguments in a container holding the exchange keys.
-- **No live-trade ledger.** There was a `trades` table, a `/trades` router and a `/trades/stats`, and nothing ever wrote a row: the only writers (`PgWriter.open_trade`/`.close_trade`) had no callers, so the endpoint served a win rate of `0.0` computed over an empty table, which renders identically to a measured 0%. All of it is deleted, and `tests/test_orm_parity.py` fails if the table comes back. The paper engine's ledger is `paper_positions`, which carries funding, exit reason and TP/SL; live execution should extend those tables rather than add a parallel schema.
-- **Schema bootstrap runs at startup, not at import.** The API runs under `uvicorn --workers 4`; `create_all` used to run at module scope in each worker, and its check-then-create is not atomic, so a loser died with DuplicateTable before FastAPI existed to log it. `app.bootstrap_schema()` now runs from the lifespan hook under a Postgres transaction-scoped advisory lock.
-- **Controllers**: Business logic in `controllers/`. Five controllers for six endpoint modules — `endpoints/coins.py` holds its product tables and the Coinbase client inline.
-- **External deps**: `coinbase-advanced-py` for Coinbase API integration
+Six tables plus two for the live path. A binary needs almost none of what a
+perpetual future needed — no mark price, no unrealised PnL, no funding accrual,
+no stop levels, no leverage.
 
-### Backend — Trader (`backend/trader/`)
+| table | what |
+|---|---|
+| `predictions` | one row per (symbol, window, offset), **traded or refused** |
+| `positions` | one contract purchase, held to settlement |
+| `account` | bankroll, and `mode` — 'paper' or 'live' |
+| `equity_curve` | equity at each settlement, open stake at **cost** |
+| `model_runs` | every promotion attempt, blocked ones included |
+| `calibration` | the reliability table, model and baseline |
+| `minute_prices` | a rolling window for the chart (research store stays authoritative) |
+| `order_tickets` | a live decision, and what came back |
 
-- **Language**: Python 3.12
-- **Core modules** (`core/`):
-  - `profiles.py` — Per-coin trading profiles (`CoinProfile`, frozen). 16 coins described by a feature *archetype* plus tuned deltas; archetypes are `mean_reversion`, `momentum_breakout`, `meme`, `trend_persistence`, `compression_breakout`. The last two are templates parameterized by coin (`{coin}_trend_spread_12h`), so a profile can never ask for a column the builder doesn't emit.
-  - `costs.py` — Single source of truth for the *money inputs*: contract specs (`ContractSpec`, `get_contract_spec`), exchange fee assumptions (`configs/exchange/*.json`), the per-contract commission (`per_contract_fee`, added to the percentage fee rather than flooring it — see its docstring for the order tickets that settled the shape), and `symbols_missing_fee_schedule`. Absorbed the former `trading_costs.py` and `execution_sim.py`. Trade PnL and position sizing are deliberately **not** here — the module's own closing comment lists where each went: round-trip cost to `targets.py:round_trip_cost`, entry fee to `execution.py:entry_cost`, sizing to `execution.py:fractional_kelly` + `size_from_forecast`.
-  - `config.py` — One `Config` with `resolve()` implementing CLI > profile > default. There is deliberately **no** declarative CLI/env layer: `CliParam`, `CLI_PARAMS`, `ENV_PARAMS`, `add_cli_args`, `from_env`, `from_args` and `build_parser` were deleted because nothing called them, and they advertised 22 flags and 5 environment variables that parsed, stored and reached nothing. Arguments live in `scripts/_common.py`. `with_cost_assumptions()` loads a venue's real fee schedule; `find_cost_config()` locates it by name across the repo checkout and the container image. `configs/` lives under `backend/trader/` on purpose — the trader's Docker build context is that directory, so a schedule above it is never copied into the image.
-  - `features.py` — 76 features in nine mechanism groups (carry, cross_venue, volatility, liquidity, positioning, trend, market_factor, seasonality, cost). Relative groups are cross-sectionally standardised per timestamp so one pooled model can span the universe; absolute ones (fee hurdle, hour-of-day) are left on their own scale. Zero-lookahead is asserted by test.
-  - `cv.py` — Purged walk-forward and combinatorial purged CV (12 groups, 2 held out, 66 splits, 11 paths). `assert_no_leakage` fails a fold whose purge is shorter than the label horizon. `effective_sample_size` reports the concurrency-weighted observation count: a 120-day hourly window at a 72h horizon carries 40, not 2,880. Also holds `FoldPreprocessor` for leak-free per-fold scaling.
-  - `metrics.py` — Sharpe, drawdown, PSR, deflated Sharpe, PBO, CPCV path distributions, and the promotion gates. A gate with no measurement fails rather than passing.
-  - `targets.py` — What the model predicts: net return over the horizon, decomposed into `price`, `carry` and `cost`. Replaces the triple-barrier classification, which could not express carry — the most plausible edge on hourly-funding perps. The identity `net_long + net_short == -2 * cost` holds exactly, which is the test that the decomposition is real.
-  - `model.py` — `ForecastModel`: three LightGBM heads (price, carry, dispersion) plus the provenance to trust them. The dispersion head fits on *walk-forward* residuals — fitted in-sample it understated risk 2.35x, which would have over-levered by the same factor. `USE_SYMBOL_IDENTITY = False`: identity alone scored IC +0.54 on random walks, so it is excluded and `identity_ceiling_ic` reports the memorisation ceiling instead.
-  - `signal.py` — One `decide()`. Every gate and threshold lives here (sizing is called out to `execution.size_from_forecast`), and both the backtest and the live signal writer call it. The previous system had three implementations, which is why its backtest and paper trading disagreed.
-  - `execution.py` — Fills, slippage (square-root participation), funding accrual, barriers, liquidation, and sizing. Entries size against `liquidity_floor` — a trailing lower-quartile of volume — because the exit bar is not the entry bar; capping only on the deciding bar let a 10% entry dump 47% of the bar it exited through.
-  - `backtest.py` — The event loop over `decide()`. `walk_forward_backtest` retrains per period and purges one horizon; the in-sample variant raises by default. Backtesting a model over its own training window returned +95,000 mean price PnL at t = +7 on driftless random walks.
-  - `simulation.py` — Stationary bootstrap (Politis-Romano, Politis-White block length), regime-switching synthetic panels, cost stress, parameter surface, capacity curve. Turns one backtest number into a distribution.
-  - `search.py` — One campaign runner with an append-only Parquet ledger. Replaces five search scripts that each had their own idea of a trial.
-  - `dataset.py` — The single loader. Every script and the live path go through it, so they cannot disagree about the data.
-  - `promotion.py` — The only route to live: train, walk-forward, bootstrap, stress, gate, install. Rejections stay in `models/promotions/` because the trial count is what the deflated Sharpe discounts by. `--force` requires a reason and records it.
-  - `datastore.py` — Bitemporal research store: Parquet partitioned by dataset/venue/symbol/month, queried via DuckDB. Venue is part of the key; every read is point-in-time via `as_of` on `available_time`.
-  - `pg_writer.py` — Postgres writer for signals, model runs and paper-trading persistence (`Signal`, `Wallet`, `ModelRun`, `PaperOrder`, `PaperFill`, `PaperPosition`, `PaperEquityCurve`, `PaperEngineConfig`). Duplicates ORM models for container isolation; `tests/test_orm_parity.py` compares columns, defaults, indexes and both migration lists against the API's copy.
-- **Data collection** (`data_collection/`):
-  - `storage.py` — Abstract `DatabaseBase` + `SQLiteDatabase` implementation with bi-temporal schema
-  - `models.py` — Data models: `OHLCVBar`, `FundingRate`, `OpenInterest`
-- **Scripts** (`scripts/`) — the seven *research* scripts (`train`, `backtest`, `promote`, `search`, `signals`, `preflight`, `build_features`) share `add_data_arguments` from `_common.py`, so no two can disagree about the dataset. The four *operational* ones (`run_pipeline`, `migrate_to_research_store`, `paper_engine`, `live_orchestrator`) hand-roll their own argparse and accept a different set:
-  - `run_pipeline.py` — OHLCV, funding rate and OI collection, routed through `data_collection/ingest.py` so nothing reaches storage unvalidated
-  - `migrate_to_research_store.py` — SQLite → Parquet, preserving venue and revision history
-  - `build_features.py` — Assemble and materialise the feature panel with a content hash
-  - `preflight.py` — Can this train? Cost schedule, store coverage, panel, targets, effective sample size, cross-section width, model fit. Run it before a long scrape.
-  - `train.py` — Fit a model for inspection, with CPCV scoring
-  - `backtest.py` — Walk-forward, then the simulation stack, then the gates
-  - `promote.py` — Evaluate a candidate and install it only if the gates pass. `--history` shows what has been tried.
-  - `search.py` — Run a campaign against the ledger
-  - `signals.py` — `decide()` on the latest bar, written through `pg_writer`
-  - `paper_engine.py` — Act on signals and account for them exactly as the backtest does: one cash movement per side, funding accrued hourly, liquidation modelled
-  - `live_orchestrator.py` — The loop: scrape → sync → features → signals, with retraining on its own cadence through `promote`. Decides *when* to ask, never what the answer is.
-- **ML stack**: LightGBM, scikit-learn
-- **Data**: SQLite for the scraper, Parquet + DuckDB for research, joblib for model artifacts, Postgres for serving
+Storing the refusals is the point: a dashboard showing only trades cannot show
+that the system declined 99% of windows because the forecast did not cover the
+fee, which is the most informative thing it has to say.
 
-### Frontend (`frontend/`)
-
-- **Framework**: React 18 + TypeScript + Vite
-- **Styling**: Tailwind CSS 3.4 with CSS custom properties (dark theme with glass-card effects)
-- **Pages** (in `src/pages/`):
-  - `DashboardPage.tsx` (`/`) — Portfolio value, equity curve marked to live prices, open positions, price grid, recent signals and fills, model status. Contract sizes come from `/coins/cde-specs` or not at all — there is no local fallback table. There was one, carried over from a deleted cost module, and three of its nine entries had drifted against the real schedule (AVAX 10 against 5, LINK 50 against 10, LTC 5 against 1). Contract size multiplies straight into unrealised PnL, so each of those misreported a position by that factor until the API answered. A position whose contract size is unknown now shows the stored mark.
-  - `TradingPage.tsx` (`/trading`) — Per-instrument chart with fill markers, range selector, external wallet holdings, per-instrument signals and fills.
-  - `ResearchPage.tsx` (`/research`) — Edge calibration (expected net edge against realised, the comparison the model can be held to), per-instrument health with the reason attached, retrain history from `model_runs` joined to the promotion ledger, and the script runner.
-  - `ModelPage.tsx` (`/model`) — What is live and why it was allowed to be: the promotion gates with measured values beside thresholds, provenance, the simulation distributions, the candidate ledger including rejections, and the kill switch. Forced promotions stay visibly forced.
-- **Components** (in `src/components/`): `Sidebar`, `PriceCard`, `PriceChart`, `EquityChart`, `SignalsTable`, `PaperPositionsTable`, `PaperFillsTable`, `ModelStatusPanel`, `GateTable`, `StateBlock`. `SignalsTable` shows the forecast decomposition — net, price, carry, cost, edge-to-risk — because the classifier columns it used to show (`Mom`, `Trend`, `ML`, `AUC`) are all null now.
-- **API layer** (`src/api/`): `client.ts` is the only place that talks HTTP — one base URL, one `ApiError` with a real message, one place the `X-API-Token` header is set, and a request timeout. The rest (`coinsApi`, `signalsApi`, `walletApi`, `paperApi`, `researchApi`, `modelApi`) are thin wrappers over it. Five separate copies of `fetchWithError` had already drifted in what they reported.
-- **Polling** (`src/hooks/usePolling.ts`): pauses when the tab is hidden, reports failures instead of swallowing them, and distinguishes "loading" from "empty". Every page previously ran its own `setInterval` forever with `.catch(() => {})`, so a dead backend was indistinguishable from a quiet market.
-- **State components** (`src/components/StateBlock.tsx`): `Panel`, `Spinner`, `Empty`, `ErrorBlock`, `Freshness`. An error banner sits *above* existing data rather than replacing it — a stale price is worth more than a blank panel, as long as it is visibly stale.
-- **Types**: `src/types.ts` — shared TypeScript interfaces
-- **Routing**: Custom history-based routing in `App.tsx` (no react-router). `ROUTES` maps path to label; `PAGES: Record<RoutePath, ComponentType>` maps path to component. Add a page by adding an entry to *both* — `RoutePath` is derived (`keyof typeof ROUTES`), so it is not something you edit, and the `Record` is what makes a route with no component a compile error. The render used to be a chain of `route === '/x' && <XPage />`, exhaustive only by inspection.
-- **Config**: `VITE_API_BASE_URL` env var (defaults to `http://localhost:8000`)
+**`backend/api/models/serving.py` is generated from `core/pg_writer.py`.** Change
+the trader's module, copy the shared block across, then run
+`backend/trader/tests/test_orm_parity.py`. That test compares every column,
+type, nullability and default, plus the migration lists — because "keep both in
+sync" in a doc is a hope, and it had already failed once by a factor of ten.
 
 ## Docker Compose Services
 
-| Service        | Image/Build       | Port | Depends On            |
-|----------------|-------------------|------|-----------------------|
-| `db`           | `postgres:16`     | 5432 | —                     |
-| `backend`      | `backend/api/`    | 8000 | db                    |
-| `frontend`     | `frontend/`       | 3000 | backend               |
-| `trader`       | `backend/trader/` | —    | db (healthy)          |
-| `paper-engine` | `backend/trader/` | —    | db (healthy), trader  |
+| service | what it does |
+|---|---|
+| `db` | PostgreSQL. `POSTGRES_PASSWORD` is required; compose refuses without it. |
+| `backend` | FastAPI, `uvicorn --workers 4`. Schema bootstrap is in the lifespan hook behind an advisory lock, not at import — four workers racing `create_all` killed the losers before FastAPI existed to log it. |
+| `frontend` | Vite dev server or the built bundle. |
+| `trader` | `scripts.live --loop`. Defaults to paper mode. |
 
-`paper-engine` runs `scripts.paper_engine` and is the thing that acts on signals
-and keeps the paper account. Compose commands here name services explicitly, so
-leaving it off the list leaves the engine down and the account frozen.
-Health checks exist on `db` and `trader` only; `frontend/Dockerfile` is the only
-multi-stage build.
-
-Persistent volumes: `postgres_data`, `trader_data`, `trader_models`, `trader_logs`.
+`--backfill-days` in compose is the **first cycle only**. On an empty store it
+*defines* the dataset; every cycle after uses the incremental window.
 
 ## Key Environment Variables
 
-| Variable                    | Default / Required      | Used By   |
-|-----------------------------|-------------------------|-----------|
-| `COINBASE_API_KEY`          | Required for full flows | backend, trader |
-| `COINBASE_API_SECRET`       | Required for full flows | backend, trader |
-| `DATABASE_URL`              | postgres connection URI | backend, trader |
-| `POSTGRES_PASSWORD`         | **Required** — compose refuses to start without it | db, backend, trader |
-| `API_TOKEN`                 | unset ⇒ `POST /research/launch` returns 503 | backend |
-| `VITE_API_TOKEN`            | unset ⇒ the promote button cannot authenticate | frontend |
-| `CORS_ALLOW_ORIGINS`        | comma-separated; `*` is filtered out | backend |
-| `LEDGER_WALLETS_JSON`       | `[]`                    | backend   |
-| `VITE_API_BASE_URL`         | `http://localhost:8000` | frontend  |
-| `TRADER_DB_PATH`            | `/app/data/trading.db` in compose; `backend/trader/data/trading.db` when a script is run on a host | trader |
-| `RESEARCH_STORE`            | `/app/data/research`    | trader, paper-engine |
-| `TRADER_DATA_MOUNT`         | `trader_data` (a named volume). Read by compose, not by code: set it to `./backend/trader/data` to run the containers against a store scraped on the host, which the named volume otherwise masks | compose |
-| `COST_CONFIG`               | `coinbase_us_perps_cde_v202602.json` — unset still prices correctly (the hardcoded defaults match the measured schedule) but records no fee version | trader, paper-engine |
-| `TRADE_VENUE`               | `coinbase`              | trader    |
-| `REFERENCE_VENUE`           | `coinbase_spot` — Binance/OKX/Bybit are 451 from a US IP, so the old `binance` default resolved to seven all-NaN columns | trader |
-| `HTTPS_PROXY` / `HTTP_PROXY` | unset, and no longer needed by anything. Every source is Coinbase: perp bars, spot bars, funding and open interest. CCXT is gone, so the 451s from Binance/OKX/Bybit no longer cost any features | trader |
-| `SYMBOLS`                   | unset (the whole profile universe) | trader |
-| `EQUITY`                    | `100000`                | trader    |
-| `LEVERAGE`                  | `4`                     | trader    |
-| `CYCLE_INTERVAL_SECONDS`    | `3600`                  | trader    |
-| `CYCLE_ALIGN_MINUTE`        | `3`                     | trader    |
-| `INCREMENTAL_BACKFILL_HOURS`| `6`                     | trader    |
-| `INITIAL_BACKFILL_DAYS`     | see `live_orchestrator`  | trader    |
-| `TRAIN_WINDOW_DAYS`         | `0` (all history)       | trader    |
-| `RECENCY_HALF_LIFE_DAYS`    | unset (`Config`: `50`)  | trader    |
-| `RETRAIN_EVERY_DAYS`        | `7`                     | trader    |
-| `WALK_FORWARD_PERIODS`      | `6`                     | trader    |
-| `MODELS_DIR`                | `models/`               | trader, backend |
-| `SEARCH_LEDGER`             | see `scripts/search.py` | trader    |
-| `ORCHESTRATOR_STATE_FILE`   | see `live_orchestrator` | trader    |
-| `PAPER_MONITOR_*`           | six thresholds, see `live_orchestrator:_monitoring_thresholds` | trader |
-| `TRADER_DIR`                | `../trader`             | backend   |
-| `LOG_LEVEL`                 | `INFO`                  | all       |
+| variable | used by | notes |
+|---|---|---|
+| `COINBASE_API_KEY` / `_SECRET` | scrape, live | one-minute candles |
+| `KALSHI_KEY_ID` | live | required for `--mode live` |
+| `KALSHI_PRIVATE_KEY` | live | the PEM itself |
+| `KALSHI_PRIVATE_KEY_PATH` | live | or a file holding it |
+| `KALSHI_BASE_URL` | live | defaults to production; a demo host exists |
+| `KALSHI_SERIES_BTC/ETH/SOL` | live | series tickers, resolved to markets by close time |
+| `DATABASE_URL` | api, trader | PostgreSQL |
+| `POSTGRES_PASSWORD` | db | compose refuses to start without it |
+| `RESEARCH_STORE` | all research | Parquet root; absolute, not cwd-relative |
+| `MODELS_ROOT` | promote, live | where `forecast.joblib` lives |
+| `FEE_CONFIG` | all research | optional; defaults are the published schedule |
+| `API_TOKEN` | api | mutating routes fail **closed** without it |
+| `VITE_API_TOKEN` | frontend | must match `API_TOKEN` |
+| `CORS_ALLOW_ORIGINS` | api | `*` is filtered out |
+| `TRADER_DIR` | api | where `endpoints/jobs.py` launches scripts |
 
-Every variable compose sets is read by something —
-`tests/test_deployment.py::test_every_environment_variable_compose_sets_is_read_by_something`
-enforces it. Four rows used to sit in this table naming variables no code read:
-`SIGNAL_THRESHOLD`, `MIN_AUC`, `EXCLUDE_SYMBOLS` and `FEATURE_LOOKBACK_DAYS`.
-`LEVERAGE` was the dangerous one — it was in compose, documented here, and read
-nowhere, so an operator lowering it watched the book keep sizing at 4x. It is
-wired now (`--leverage`, threaded from the orchestrator).
+## Traded Universe
 
-## Tracked Coins
+`BTC-USD`, `ETH-USD`, `SOL-USD` — Coinbase spot product ids, used verbatim from
+the scrape command through the research store to the serving database. **There is
+no translation step**, and `tests/test_symbols.py` pins that absence: the
+previous system stored `BTC-PERP` while the reader asked for `BIP`, and every
+lookup missed.
 
-Two universes, deliberately different sizes:
-
-- **Served by the API and the frontend (9):** BTC, ETH, SOL, XRP, DOGE, AVAX, ADA, LINK, LTC — each with a spot product (`{COIN}-USD`) and a CDE perpetual contract (e.g. `BIP-20DEC30-CDE`, `ETP-20DEC30-CDE`, `SLP-20DEC30-CDE`, `XPP-20DEC30-CDE`, `DOP-20DEC30-CDE`). `endpoints/coins.py` and `frontend/src/types.ts:ALL_COINS` agree on this list.
-- **Modelled by the trader (16):** the nine above plus BCH, DOT, NEAR, PEPE, SHIB, SUI, XLM — `core/profiles.py:COIN_PROFILES`.
+`BTC-USD` is the `cross_asset` reference. Dropping it from the universe weakens
+that group to a peer mean rather than erroring.
 
 ## Coding Conventions
 
-- **Python**: Type hints throughout, dataclasses for config, logging via `logging` module. Scripts are runnable as modules (`python -m scripts.<name>`). Use `os.getenv()` with sensible defaults for all config.
-- **TypeScript/React**: Functional components with hooks, no class components. Custom CSS variables for theming. `recharts` for charting. Fetch-based API layer (no axios).
-- **SQL**: SQLAlchemy ORM for Postgres tables, raw SQLite for trader pipeline data. Bi-temporal schema in trader storage.
-- **Docker**: volume mounts for development hot-reload. Multi-stage build on the frontend only; health checks on `db` and `trader` only.
-
-## Common Commands
-
-```bash
-# Start everything. Name paper-engine too — services are explicit here, so
-# omitting it leaves the engine down and the paper account frozen.
-docker compose up --build db backend frontend trader paper-engine
-
-# Is the data ready to train on?
-docker compose run --rm trader python -m scripts.preflight
-
-# One-off walk-forward backtest with the full simulation stack and the gates
-docker compose run --rm trader python -m scripts.backtest --full
-
-# Evaluate a candidate; installs it only if every gate passes
-docker compose run --rm trader python -m scripts.promote
-
-# What has been tried, and why it did not promote
-docker compose run --rm trader python -m scripts.promote --history
-
-# One retrain cycle through the gates
-docker compose run --rm trader python -m scripts.live_orchestrator --retrain-only
-
-# Parameter search against the append-only ledger
-docker compose run --rm trader python -m scripts.search
-
-# Frontend dev
-cd frontend && npm ci && npm run dev
-
-# API dev
-cd backend/api && pip install -r requirements.txt && uvicorn app:app --reload
-```
+- **Python**: type hints throughout, frozen dataclasses for config, `logging`,
+  `os.getenv` with defaults. Scripts run as `python -m scripts.<name>`.
+- **TypeScript/React**: function components and hooks only. Fetch-based API layer,
+  no axios. `recharts` for charts. Formatters live outside component modules.
+- **Design**: an instrument panel, not a trading terminal. Two poles (`above`
+  teal / `below` clay) are the *only* colours that carry direction; `accent` is
+  neither, so structure cannot read as a signal; gate semantics are a third set.
+  No gradients, no glow, no shadow depth, no hover lift, no emoji, 2px corners,
+  tabular numerals everywhere. Both themes complete at token level.
+- **Tests**: `pytest`. The suite's job is to catch a pipeline that *manufactures*
+  edge, so every capability test is paired with a null. Mark anything over ~10s
+  `@pytest.mark.slow`.
 
 ## Agent Instructions
 
-- When modifying trader logic, be aware that `core/profiles.py` is the single source of truth for per-coin feature sets, thresholds, and ML hyperparameters. Changes there cascade into training, search, and signal generation.
-- `docs/RESEARCH_PIPELINE.md` is the design spec. Read it before changing anything under `core/`.
-- **Nothing reaches live except through `core/promotion.py`.** It trains, walk-forward backtests, bootstraps, stresses and gates a candidate, and installs it only if every gate in `core/metrics.py:DEFAULT_GATES` passed. Rejections are kept: the trial count is what the deflated Sharpe ratio discounts by. If you add a promotion criterion, add it to `DEFAULT_GATES` and to `SimulationReport.measurements()` — a gate with no measurement fails, which is the intended direction.
-- **The horizon comes from the data, not the config.** `train_forecast_model`, `cross_validate_forecast`, `generate_walk_forward_forecasts` and `walk_forward_backtest` all take `horizon_bars`, and callers pass `dataset.horizon_bars`. It sets the purge width between train and test and is recorded in the model's provenance, where it drives `effective_observations`. Reading it from the config instead meant a run with `--horizon 8` built targets at 8h while the model purged at the profile's 96h and reported a twelvefold-understated effective sample — and the same bug with a *longer* horizon purges less than one label span, which leaks.
-- **One `decide()`.** `core/signal.py` holds every gate and threshold, and calls `execution.size_from_forecast` for the size. Both the backtest and the live signal writer call it; do not add a second path. Three separate implementations is why the previous system's backtest and paper trading disagreed.
-- The trader and API run in separate containers with duplicated ORM models (in `pg_writer.py`). Keep them in sync when changing database schema — `tests/test_orm_parity.py` compares columns, types, nullability, defaults, indexes, and both the column and index migration lists, and fails on divergence. `create_all` only creates missing *tables*, so a new column **or index** on an existing model needs a matching `ALTER`/`CREATE INDEX IF NOT EXISTS` in both places.
-- The frontend has no router library — routing is handled manually via `window.history.pushState` in `App.tsx`. Add a page by adding an entry to `ROUTES` (path → label) *and* to `PAGES` (path → component). Do not try to edit `RoutePath`: it is `keyof typeof ROUTES`. `PAGES` is typed `Record<RoutePath, ComponentType>`, so a route with no component fails `tsc`.
-- The research scripts take CLI args only (`scripts/_common.py:add_data_arguments`); `live_orchestrator.py` and `paper_engine.py` are the two that default their flags from environment variables, which is how compose configures a deployment. Check the `argparse` block at the bottom of each script for what it actually accepts.
-- `core/promotion.py` stages into `models/.staging/{version}/` and atomically renames into place. `live_orchestrator.py` decides *when* to evaluate a candidate; it never decides whether one is good.
-- Feature engineering is declarative and universe-wide, not per-coin scripts. `core/features.py` emits nine mechanism groups; `core/profiles.py` selects which columns a coin's archetype uses. A profile can never ask for a column the builder does not emit — the templates are parameterised by coin.
-- The research endpoints read from model artifacts, the promotion ledger, `signals` and `paper_positions`. There is no live-trade history and no separate research database. Edge calibration compares the mean forecast over a signal window against the mean realised return of paper positions **opened inside that same window** — the two used to come from different periods, so a retrained model was graded on returns earned by its predecessor.
-- Tests under `backend/trader/tests/` are organised around the failure modes that produced fake edge before: lookahead (`test_backtest.py`), symbol-identity memorisation (`test_model.py`), leaked fold statistics (`test_cv_and_metrics.py`), the cost identity (`test_targets.py`), and blocked candidates reaching live (`test_promotion.py`). Mark anything over ~10s `@pytest.mark.slow`.
-- **Deleted in the rebuild**, so do not reference them: `core/labels.py`, `backend/api/endpoints/trade.py`, `backend/api/controllers/trade.py`, `frontend/src/api/tradesApi.ts`, `scripts/train_model.py`, `scripts/compute_features.py`, the five search scripts, `scripts/validate_robustness.py`, `scripts/prune_features.py`, `scripts/preflight_check.py`, `features/` entirely, `core/coin_profiles.py`, `core/labeling.py`, `core/meta_labeling.py`, `core/paper_profile_overrides.py`, `core/strategies/`, `core/cv_splitters.py`, `core/metrics_significance.py`, `core/study_significance.py`, `core/overfit_diagnostics.py`, `core/preprocessing_cv.py`, `core/reason_codes.py`, `core/run_manifest.py`, `core/trading_costs.py`, `core/execution_sim.py`.
+1. **Read `CLAUDE.md` before changing anything under `core/`.** The invariants
+   there are each the fix to a specific bug that cost this project real time.
+2. **Never measure against 50%.** Skill is the difference against the baseline.
+3. **Never split cross-validation on the row.** Four offsets share a settlement.
+4. **Never mark an open position to the model's own forecast.** That books belief
+   as profit.
+5. **Never let a blocked candidate reach `models/forecast.joblib`.** Promotion is
+   the only path, and `--force` needs a written reason.
+6. **When a claim in these docs is measurable, measure it.** Three numbers in the
+   previous version of this file were wrong (the fee crossover, the scale
+   interpretation, a forward-looking target that looked backwards) and each was
+   found by a test rather than by review.
