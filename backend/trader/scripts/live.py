@@ -200,6 +200,98 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
     return out
 
 
+def check_circuit_breakers(writer: PgWriter, config: Config,
+                           *, now: datetime) -> Optional[str]:
+    """Halt the account on a bad day or a bad streak. Returns the reason, or None.
+
+    `Account.halted` and `halted_reason` existed as columns, were rendered on the
+    dashboard as a safety chip, and **were never written by anything** — the only
+    code that set them was `core/book.py`, the backtest's in-memory account,
+    which `scripts/live.py` does not import. So the indicator was structurally
+    incapable of turning on, and the `halted` promotion gate read the simulated
+    account rather than the real one.
+
+    The ruin floor in `decide` was the only live limit, and it fires after half
+    the account is gone. At 96 windows a day across three symbols that is a long
+    way to bleed: the nominal worst case was $768/day against a $100 bankroll.
+
+    A halt is sticky. Clearing it is a manual decision, because a breaker that
+    resets itself at midnight is a speed bump.
+    """
+    account = writer.account()
+    if account is None:
+        return None
+    if account.halted:
+        return str(account.halted_reason or 'halted')
+
+    def halt(reason: str) -> str:
+        writer.update_account(halted=True, halted_reason=reason[:400])
+        logger.error('HALTED: %s. No further entries until this is cleared by '
+                     'hand.', reason)
+        return reason
+
+    if not np.isfinite(float(account.bankroll)):
+        return halt('the bankroll is not a finite number, so nothing about the '
+                    'account can be trusted')
+
+    since = pd.Timestamp(now).tz_convert('UTC').normalize().to_pydatetime()
+    today = writer.settled_positions_since(since)
+    if today:
+        realised = sum(float(p.pnl or 0.0) for p in today)
+        limit = -abs(config.max_daily_loss_fraction) * config.starting_bankroll
+        if realised <= limit:
+            return halt(f'today is {realised:+.2f} against a limit of {limit:.2f} '
+                        f'({config.max_daily_loss_fraction:.0%} of the starting '
+                        f'bankroll) over {len(today)} settlements')
+
+    recent = writer.settled_positions_since(
+        (pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(days=7)).to_pydatetime())
+    streak = 0
+    for position in sorted(recent, key=lambda p: p.settled_at or since, reverse=True):
+        if float(position.pnl or 0.0) < 0:
+            streak += 1
+        else:
+            break
+    if streak >= config.max_consecutive_losses:
+        return halt(f'{streak} consecutive losing settlements, at or over the '
+                    f'limit of {config.max_consecutive_losses}')
+    return None
+
+
+def stale_symbols(bars: dict[str, pd.DataFrame], config: Config,
+                  *, now: datetime) -> dict[str, str]:
+    """Symbols whose feed is too old, or absent, with the reason.
+
+    There was no staleness guard anywhere. The last `event_time` was logged
+    (`fetch_bars`) and never compared to the wall clock or to the decision
+    minute, so a delayed or partial fetch was scored as though it were current.
+    Two distinct hazards:
+
+    * **An old feed.** The forward-fill inside `build_windows` is right for a
+      minute in which nothing traded and cannot tell that from a minute not yet
+      fetched, so a stale feed produces a fabricated `last_price` and the barrier
+      treats it as a measurement.
+    * **A missing symbol.** `fetch_bars` logged and continued, which silently
+      redefines the *other* symbols' `cross_asset` features — measured,
+      `beta_1440` moved 7.7x with no error and no NaN. The universe is part of
+      the feature definition, so a short universe is a different model.
+    """
+    reasons: dict[str, str] = {}
+    cutoff = pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(
+        seconds=int(config.max_bar_age_seconds))
+    for symbol in config.symbols:
+        frame = bars.get(symbol)
+        if frame is None or frame.empty:
+            reasons[symbol] = 'no bars returned'
+            continue
+        newest = pd.Timestamp(frame['event_time'].iloc[-1])
+        if newest < cutoff:
+            age = (pd.Timestamp(now).tz_convert('UTC') - newest).total_seconds()
+            reasons[symbol] = (f'newest bar {newest} is {age:.0f}s old, over the '
+                               f'{config.max_bar_age_seconds}s limit')
+    return reasons
+
+
 def record_minute_prices(writer: PgWriter, bars: dict[str, pd.DataFrame],
                          *, hours: int = 6) -> int:
     """Store the last few hours of bars so the dashboard can draw the path."""
@@ -468,6 +560,24 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         return []
     record_minute_prices(writer, bars)
 
+    halted = check_circuit_breakers(writer, config, now=now)
+    if halted:
+        logger.error('account halted (%s); settling only, no new entries', halted)
+        offset = None
+
+    stale = stale_symbols(bars, config, now=now)
+    if stale:
+        # Settlement and reconciliation below still run: they read the past, which
+        # a short feed does not invalidate, and a matured position should not be
+        # left hanging because this cycle cannot decide.
+        for symbol, why in sorted(stale.items()):
+            logger.error('%s: %s', symbol, why)
+        logger.error('the universe is %d of %d symbols this cycle, so no decision '
+                     'is made — a short universe redefines every cross-asset '
+                     'feature rather than simply omitting one row',
+                     len(config.symbols) - len(stale), len(config.symbols))
+        offset = None
+
     # The venue first, where there is one: it knows what actually settled and
     # what the balance actually is. Bars only fill in what it has not resolved.
     venue_settlements: dict[str, dict] = {}
@@ -564,8 +674,24 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                     window_open, sorted(entered), staked)
     decisions: list[Decision] = []
 
+    # Live prices from the book or not at all. Without this a row with no quote
+    # falls back to the backtest's counterfactual price — our own baseline — and
+    # can still return TRADED, which is how an unresolved market booked a
+    # position for an order that was never sent.
+    require_quote = args.mode == 'live'
     for _, row in scored.sort_values('symbol').iterrows():
-        decision = decide(row, config, bankroll=account.bankroll, exposure=exposure)
+        # Re-read the clock. `now` was taken at the top of the cycle, and between
+        # then and here sit a Coinbase fetch, four authenticated reconcile calls,
+        # LightGBM inference and one quote call per symbol at up to 15s each.
+        remaining = (settle_time - pd.Timestamp.now(tz='UTC')).total_seconds()
+        if remaining < config.min_remaining_seconds:
+            logger.warning(
+                '%s: %.0fs left of the window, under the %ds floor — the sigma on '
+                'this row is for %s and the clock has moved past it',
+                row['symbol'], remaining, config.min_remaining_seconds, settle_time)
+            break
+        decision = decide(row, config, bankroll=account.bankroll,
+                          exposure=exposure, require_quote=require_quote)
         decisions.append(decision)
         writer.write_prediction(
             symbol=decision.symbol, window_open=window_open, settle_time=settle_time,

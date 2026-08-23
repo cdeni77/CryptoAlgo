@@ -1,0 +1,212 @@
+"""The live path's refusals, which mostly did not exist.
+
+`Account.halted` and `halted_reason` were columns on the serving table, rendered
+on the dashboard as a safety chip, and written by nothing — the only code that
+set them was `core/book.py`, the *backtest's* in-memory account. So the
+indicator could never turn on, and the only live limit was the ruin floor, which
+fires after half the account is gone.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from core.config import Config
+from core.decide import Reason, Side, WindowExposure, decide
+from core.pg_writer import PgWriter
+from scripts.live import check_circuit_breakers, stale_symbols
+
+NOW = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
+CONFIG = Config()
+
+
+@pytest.fixture
+def url(tmp_path) -> str:
+    return f'sqlite:///{tmp_path}/serving.db'
+
+
+@pytest.fixture
+def writer(url) -> PgWriter:
+    w = PgWriter(database_url=url)
+    w.ensure_account(CONFIG.starting_bankroll, mode='paper')
+    return w
+
+
+def settle(w: PgWriter, *, index: int, pnl: float, when: datetime) -> None:
+    """Book and resolve one position with a chosen PnL."""
+    window = when - timedelta(minutes=15 * (index + 1))
+    position_id = w.open_position(
+        symbol=f'SYM{index}-USD', window_open=window,
+        settle_time=window + timedelta(minutes=15), offset_minutes=3,
+        side='up', contracts=10, price=0.5, outlay=abs(pnl) if pnl < 0 else 10 - pnl,
+        fee=0.02, model_probability=0.6, baseline_probability=0.5, edge=0.01)
+    assert position_id is not None
+    # `settle_position` derives the payout from the side and the outcome, so
+    # steer it with the outcome rather than by writing pnl directly.
+    w.settle_position(position_id, settled_up=pnl > 0)
+
+
+class TestCircuitBreakers:
+    def test_a_clean_account_is_not_halted(self, writer):
+        assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
+        assert not writer.account().halted
+
+    def test_a_losing_day_halts_the_account(self, writer):
+        # Each loss is the full outlay. Twelve $2 losses is 24% of a $100 start,
+        # over the 15% daily limit.
+        for i in range(12):
+            settle(writer, index=i, pnl=-2.0, when=NOW)
+        reason = check_circuit_breakers(writer, CONFIG, now=NOW)
+        assert reason is not None and 'limit' in reason
+        assert writer.account().halted
+        assert writer.account().halted_reason
+
+    def test_a_losing_streak_halts_the_account(self, writer):
+        config = Config(max_daily_loss_fraction=0.99, max_consecutive_losses=4)
+        for i in range(4):
+            settle(writer, index=i, pnl=-0.10, when=NOW)
+        reason = check_circuit_breakers(writer, config, now=NOW)
+        assert reason is not None and 'consecutive' in reason
+        assert writer.account().halted
+
+    def test_a_win_breaks_the_streak(self, writer):
+        config = Config(max_daily_loss_fraction=0.99, max_consecutive_losses=3)
+        for i in range(3):
+            settle(writer, index=i, pnl=-0.10, when=NOW)
+        settle(writer, index=99, pnl=+0.10, when=NOW)     # most recent
+        assert check_circuit_breakers(writer, config, now=NOW) is None
+
+    def test_a_halt_survives_a_restart(self, writer, url):
+        """The whole point of putting it on the account rather than in memory."""
+        writer.update_account(halted=True, halted_reason='set by hand')
+        restarted = PgWriter(database_url=url)
+        assert check_circuit_breakers(restarted, CONFIG, now=NOW) == 'set by hand'
+        assert restarted.account().halted
+
+    def test_a_non_finite_bankroll_halts(self, writer):
+        """Reachable on Postgres, not through SQLite.
+
+        `double precision NOT NULL` accepts NaN; SQLite coerces it to NULL and
+        rejects it, so the column cannot hold the value this guard is for. The
+        route in is `reconcile_with_venue` writing the venue's balance —
+        `KalshiClient.balance()` returns 0.0 on a missing field and parses the
+        string "nan" happily. So the guard is checked against the account object
+        directly rather than through a store that cannot represent the problem.
+        """
+        real = writer.account()
+
+        class NanBankroll:
+            halted = False
+            halted_reason = None
+            bankroll = float('nan')
+            id = real.id
+
+        writer.account = lambda: NanBankroll()      # type: ignore[method-assign]
+        reason = check_circuit_breakers(writer, CONFIG, now=NOW)
+        assert reason is not None and 'finite' in reason
+
+
+class TestStaleness:
+    def _bars(self, newest: pd.Timestamp) -> pd.DataFrame:
+        index = pd.date_range(newest - pd.Timedelta(minutes=30), newest,
+                              freq='1min', tz='UTC')
+        return pd.DataFrame({'event_time': index, 'open': 1.0, 'high': 1.0,
+                             'low': 1.0, 'close': 1.0, 'volume': 1.0})
+
+    def test_a_fresh_universe_is_accepted(self):
+        newest = pd.Timestamp(NOW) - pd.Timedelta(minutes=1)
+        bars = {s: self._bars(newest) for s in CONFIG.symbols}
+        assert stale_symbols(bars, CONFIG, now=NOW) == {}
+
+    def test_an_old_feed_is_named(self):
+        fresh = pd.Timestamp(NOW) - pd.Timedelta(minutes=1)
+        bars = {s: self._bars(fresh) for s in CONFIG.symbols}
+        first = sorted(CONFIG.symbols)[0]
+        bars[first] = self._bars(pd.Timestamp(NOW) - pd.Timedelta(minutes=20))
+        stale = stale_symbols(bars, CONFIG, now=NOW)
+        assert set(stale) == {first}
+        assert 'old' in stale[first]
+
+    def test_a_missing_symbol_is_named(self):
+        """Not merely one fewer row — the universe defines every cross-asset
+        feature, so a short universe is a different model. Measured: dropping a
+        symbol moved `beta_1440` 7.7x with no error and no NaN."""
+        newest = pd.Timestamp(NOW) - pd.Timedelta(minutes=1)
+        bars = {s: self._bars(newest) for s in CONFIG.symbols}
+        dropped = sorted(CONFIG.symbols)[-1]
+        del bars[dropped]
+        stale = stale_symbols(bars, CONFIG, now=NOW)
+        assert set(stale) == {dropped}
+        assert 'no bars' in stale[dropped]
+
+
+class TestDecideRefusals:
+    def row(self, **over):
+        base = dict(symbol='BTC-USD',
+                    window_open=pd.Timestamp('2026-08-23 00:30', tz='UTC'),
+                    settle_time=pd.Timestamp('2026-08-23 00:45', tz='UTC'),
+                    offset=3, model_probability=0.72, baseline_probability=0.60)
+        base.update(over)
+        return base
+
+    @pytest.mark.parametrize('q', (1.02, 1.20, -0.05, 2.0))
+    def test_a_probability_outside_zero_one_is_refused(self, q):
+        """Kelly does not object to q > 1: q=1.20 sized at 7.1x bankroll, and
+        only `max_stake_fraction` stood between that and an order."""
+        d = decide(self.row(model_probability=q), CONFIG, bankroll=100.0,
+                   exposure=WindowExposure())
+        assert d.reason is Reason.PROBABILITY_INVALID
+        assert d.contracts == 0
+
+    def test_a_non_finite_bankroll_is_refused(self):
+        """`nan < floor` is False, so a NaN bankroll used to be sized."""
+        d = decide(self.row(), CONFIG, bankroll=float('nan'),
+                   exposure=WindowExposure())
+        assert d.reason is Reason.BANKROLL_FLOOR
+
+    def test_live_refuses_to_price_from_our_own_baseline(self):
+        """With no book, `decide` falls back to the counterfactual price. That is
+        right in a backtest and wrong live, where it booked a position for an
+        order that could not be sent."""
+        without = decide(self.row(), CONFIG, bankroll=100.0,
+                         exposure=WindowExposure(), require_quote=True)
+        assert without.reason is Reason.NO_QUOTE
+
+        withbook = decide(self.row(ask_up=0.60, ask_down=0.40), CONFIG,
+                          bankroll=100.0, exposure=WindowExposure(),
+                          require_quote=True)
+        assert withbook.traded and withbook.price_source == 'quote'
+
+    def test_the_half_spread_is_not_charged_on_top_of_a_real_ask(self):
+        """The ask already includes the spread. Charging it again debited
+        $0.005/contract that never left the account, which is exactly the balance
+        drift the operator is told to read as an unrecorded fill."""
+        from core.costs import trade_fee
+
+        quoted = decide(self.row(ask_up=0.60, ask_down=0.40), CONFIG,
+                        bankroll=100.0, exposure=WindowExposure())
+        assert quoted.traded
+        cash = quoted.contracts * quoted.price + float(
+            trade_fee(quoted.contracts, quoted.price, CONFIG))
+        assert quoted.stake == pytest.approx(cash, abs=1e-9)
+
+        # The counterfactual price is a mid, so crossing it does cost the spread.
+        counterfactual = decide(self.row(), CONFIG, bankroll=100.0,
+                                exposure=WindowExposure())
+        assert counterfactual.traded
+        assert counterfactual.stake > (
+            counterfactual.contracts * counterfactual.price
+            + float(trade_fee(counterfactual.contracts, counterfactual.price, CONFIG)))
+
+    def test_both_probabilities_are_reported_on_the_traded_side(self):
+        """A DOWN trade stored P(down) beside P(up), so their difference — which
+        reads like the disagreement being traded — was meaningless."""
+        d = decide(self.row(model_probability=0.28, baseline_probability=0.40),
+                   CONFIG, bankroll=100.0, exposure=WindowExposure())
+        assert d.side is Side.DOWN
+        assert d.model_probability == pytest.approx(0.72)
+        assert d.baseline_probability == pytest.approx(0.60)

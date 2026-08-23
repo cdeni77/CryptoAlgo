@@ -57,6 +57,8 @@ class Reason(str, Enum):
 
     TRADED = 'traded'
     NOT_FINITE = 'not_finite'                  # missing probability or price
+    PROBABILITY_INVALID = 'probability_invalid'  # outside [0, 1] after scoring
+    NO_QUOTE = 'no_quote'                      # live, and the book was not readable
     PRICE_OUT_OF_BAND = 'price_out_of_band'    # tick and spread dominate here
     DISAGREEMENT_IMPLAUSIBLE = 'disagreement_implausible'  # too far from the quote
     EDGE_BELOW_GATE = 'edge_below_gate'        # the forecast does not pay
@@ -287,11 +289,21 @@ def decide(
     *,
     bankroll: float,
     exposure: Optional[WindowExposure] = None,
+    require_quote: bool = False,
 ) -> Decision:
     """Choose a side, a size, or nothing, for one scored row.
 
     `row` needs `symbol`, `window_open`, `settle_time`, `offset`,
     `model_probability` and `baseline_probability`.
+
+    `require_quote` is for the live path. Without it, a row carrying no
+    `ask_up`/`ask_down` falls back to the backtest's counterfactual price — the
+    calibrated baseline — and can still return TRADED. That is right in a
+    backtest, which has no market to ask, and wrong live: it priced against our
+    own forecast, and the caller then booked a position for an order it could not
+    send. Measured with an unresolved market: 0 orders placed, a 5-contract
+    position written, $3.10 debited. Measured with a one-sided book: a claimed
+    +8.04pp when the truth against the real 0.90 ask was -11.10pp.
     """
     exposure = exposure or WindowExposure()
     get = row.get if hasattr(row, 'get') else row.__getitem__
@@ -314,8 +326,19 @@ def decide(
     p_market = base.baseline_probability
     if not (np.isfinite(q_up) and np.isfinite(p_market)):
         return base
+    # A probability outside [0, 1] is not a confident forecast, it is a broken
+    # one. `clip_prob` guards the scoring path, but nothing guarded `decide`, and
+    # Kelly does not object: q=1.02 against a 0.90 baseline sized at 1.225x
+    # bankroll and q=1.20 at 7.128x. Only `max_stake_fraction` stood between that
+    # and the order.
+    if not (0.0 <= q_up <= 1.0 and 0.0 <= p_market <= 1.0):
+        return refuse(Reason.PROBABILITY_INVALID)
 
-    if bankroll < config.starting_bankroll * config.ruin_floor_fraction:
+    # `nan < x` is False, so a NaN bankroll used to sail past the floor and get
+    # sized. It reaches here whenever the venue's balance could not be parsed —
+    # `balance()` returns 0.0 on a missing field and a `"nan"` string parses.
+    if not np.isfinite(bankroll) or (
+            bankroll < config.starting_bankroll * config.ruin_floor_fraction):
         return refuse(Reason.BANKROLL_FLOOR)
     if symbol in exposure.symbols_entered:
         return refuse(Reason.ALREADY_ENTERED)
@@ -325,6 +348,8 @@ def decide(
     ask_up = _optional(get, 'ask_up')
     ask_down = _optional(get, 'ask_down')
     has_book = ask_up is not None and ask_down is not None
+    if require_quote and not has_book:
+        return refuse(Reason.NO_QUOTE)
     is_up_a, price_a, probability_a, cost_a, edge_a = price_and_edge(
         np.array([q_up]), np.array([p_market]), config,
         ask_up=np.array([ask_up]) if has_book else None,
@@ -336,8 +361,16 @@ def decide(
     cost = float(cost_a[0])
     edge = float(edge_a[0])
 
+    # `model_probability` is the probability of the side actually taken, so the
+    # baseline has to be too. It was not: a DOWN trade stored P(down) beside
+    # P(up), and their difference — which reads like the disagreement being
+    # traded — was meaningless for every DOWN row. With model 0.28 and baseline
+    # 0.40 the stored pair was (0.72, 0.40), a gap of 0.32 against a real
+    # disagreement of 0.12.
     common = dict(side=side, price=price, effective_cost=cost,
-                  model_probability=probability, edge=edge,
+                  model_probability=probability,
+                  baseline_probability=p_market if side is Side.UP else 1.0 - p_market,
+                  edge=edge,
                   price_source='quote' if has_book else 'baseline',
                   market_ticker=_optional_str(get, 'market_ticker'))
 
@@ -380,9 +413,22 @@ def decide(
     # of a small order exceeds the schedule. Re-check expected value against
     # what will actually be charged rather than against the continuous formula.
     fee = float(trade_fee(contracts, price, config))
-    outlay = contracts * (price + config.half_spread_cents / 100.0) + fee
+    # The crossing cost belongs only to the counterfactual price. When `price` is
+    # a real ask it already includes the spread, which `price_and_edge` gets
+    # right — but this line added the half-spread unconditionally, so live
+    # recorded a stake $0.005/contract above the cash actually paid ($4.98 booked
+    # against $4.94 charged). That debited a phantom loss on every trade and
+    # manufactured exactly the balance drift the operator is told to read as an
+    # unrecorded fill. It also made the live EV re-check 0.5c/contract stricter
+    # than the backtest's, so the two paths abstained differently.
+    crossing = 0.0 if has_book else config.half_spread_cents / 100.0
+    outlay = contracts * (price + crossing) + fee
     realised_cost = outlay / contracts
-    if probability - realised_cost <= 0:
+    # `> min_edge_pp`, not `> 0`. Clearing the continuous gate and then landing at
+    # break-even once the per-order fee rounds up is not a trade worth taking:
+    # measured at 0.90 with one contract, a +0.505pp continuous edge is +0.107pp
+    # after rounding, and it was accepted.
+    if probability - realised_cost <= config.min_edge_pp / 100.0:
         return refuse(Reason.FEE_CEILING, kelly_fraction=kelly, **common)
 
     from dataclasses import replace

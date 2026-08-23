@@ -277,8 +277,35 @@ class Config:
     # 0.7832 sent against a 0.60 ask, 18c of slippage tolerance on a 1c spread.
     slippage_share_of_edge: float = 0.25
     max_slippage_cents: float = 1.0
+
+    # ---- freshness -------------------------------------------------------
+    # There was no staleness guard of any kind. The feed's last `event_time` was
+    # logged and never asserted against the wall clock or against the decision
+    # minute, so a delayed or partial fetch was scored as though it were current:
+    # ten missing minutes moved the displacement from +4.93bp to +2.41bp and the
+    # cycle traded anyway. A quote is worse — the book moves within the window,
+    # and `now` was read once at the top of the cycle and never revalidated
+    # before the order went out, with a Coinbase fetch, four authenticated
+    # reconcile calls, inference and six 15-second quote calls in between.
+    max_bar_age_seconds: int = 150
+    max_quote_age_seconds: int = 45
+    # Refuse to enter when this little of the window remains. `choose_offset`
+    # floors to whole minutes, so a row built as "minute 12" could be submitted
+    # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
+    min_remaining_seconds: int = 45
     # Stop trading below this fraction of the starting bankroll.
     ruin_floor_fraction: float = 0.50
+
+    # ---- circuit breakers ------------------------------------------------
+    # The ruin floor was the only limit that existed, and it only fires after
+    # half the account is gone — 96 windows a day x 3 symbols means a broken
+    # model bleeds continuously, and the nominal worst case was $768/day against
+    # a $100 bankroll. These bound the day and the streak instead, and unlike the
+    # floor they are recorded on the account so they survive a restart. Clearing
+    # a halt is deliberately manual: an automatic reset makes a circuit breaker a
+    # speed bump.
+    max_daily_loss_fraction: float = 0.15
+    max_consecutive_losses: int = 12
 
     # ---- provenance ------------------------------------------------------
     fee_config_path: Optional[str] = None
