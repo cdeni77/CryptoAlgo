@@ -15,6 +15,7 @@ machine.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -111,3 +112,69 @@ def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
         pytest.fail(
             'unanchored ignore rules that match a plausible source directory at '
             'any depth:\n' + '\n'.join(offenders))
+
+
+def test_no_secret_bearing_file_is_tracked():
+    """Nothing that carries a credential may be in the repository.
+
+    `.gitignore` matched `.env` by basename only, so it covered
+    `backend/api/.env` and missed `frontend/.env` and `frontend/.env.local`. Both
+    misses were used: a live Coinbase key and an EC private key were committed in
+    b70c78c (deleted the next commit, still reachable on origin/main), and an API
+    token in 6097ed1. Deleting a file does not remove the blob, so the only
+    control that works is never committing it — which is what this asserts.
+
+    `*.example` files are the templates and are meant to be tracked.
+    """
+    offenders = []
+    for path in sorted(_tracked()):
+        name = Path(path).name
+        if name.endswith('.example'):
+            continue
+        if name == '.env' or name.startswith('.env.'):
+            offenders.append(f'{path} — an env file')
+        elif Path(path).suffix in {'.pem', '.key', '.p8', '.pfx'}:
+            offenders.append(f'{path} — a key file')
+        elif name.startswith('id_rsa'):
+            offenders.append(f'{path} — an SSH private key')
+
+    assert not offenders, (
+        'these tracked files carry credentials by convention:\n  '
+        + '\n  '.join(offenders)
+        + '\nUntrack them (`git rm --cached`), rotate whatever they held, and '
+          'check the .gitignore pattern is `.env*` rather than `.env`.'
+    )
+
+
+def test_no_tracked_file_contains_a_private_key_block():
+    """A PEM block in any tracked file, whatever the filename.
+
+    The leak that happened was in a file named `.env`, but the pattern above only
+    catches names. This catches content, so a key pasted into a config, a
+    notebook or a test fixture is caught too.
+    """
+    # A header alone is not a key. `scripts/check_venue.py` names the PEM header
+    # in a diagnostic message and this file quotes it to build the pattern, so
+    # matching the header would report both forever and the test would be
+    # switched off. Require a header line followed by an actual base64 body.
+    header = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+    body = re.compile(r'^[A-Za-z0-9+/=]{40,}\s*$', re.MULTILINE)
+
+    offenders = []
+    for path in sorted(_tracked()):
+        full = REPO / path
+        if not full.is_file() or full.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = full.read_text(errors='ignore')
+        except OSError:
+            continue
+        match = header.search(text)
+        if match and body.search(text, match.end()):
+            offenders.append(path)
+
+    assert not offenders, (
+        f'these tracked files contain a private-key block: {offenders}. '
+        f'Rotate the key immediately — a commit is permanent even after deletion.'
+    )
+

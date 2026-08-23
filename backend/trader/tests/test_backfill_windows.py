@@ -496,9 +496,18 @@ def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
     assert gaps[0][0] == datetime(2025, 10, 25, 15, 14)
 
 
-def test_a_single_missing_minute_is_not_a_gap_worth_refetching():
-    """A minute in which nothing traded has no candle, and asking twice gets the
-    same nothing. Only multi-minute blocks are worth a request."""
+def test_min_minutes_controls_whether_a_lone_missing_minute_is_a_gap():
+    """`min_minutes` is the threshold, and 1 includes isolated single minutes.
+
+    This test used to be called
+    `test_a_single_missing_minute_is_not_a_gap_worth_refetching`, asserting that
+    a lone hole is "a minute in which nothing traded". That premise was false —
+    86% of the isolated holes in the real store were a client-side pagination
+    off-by-one, spaced exactly 301 minutes apart and co-occurring across symbols
+    177x more often than chance allows. The mechanism the body checks is correct
+    and unchanged; only the claim in the name was wrong, and the default moved
+    from 2 to 1 as a result.
+    """
     import sqlite3
     import tempfile
     from datetime import datetime, timedelta

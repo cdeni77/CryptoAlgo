@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import enum
 import logging
+from contextlib import contextmanager
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
@@ -338,6 +339,14 @@ MIGRATIONS: tuple[str, ...] = (
 )
 
 
+class TraderAlreadyRunning(RuntimeError):
+    """Another process holds the trading lock on this database."""
+
+
+class AccountModeMismatch(RuntimeError):
+    """The stored account was opened in a different mode than this run asks for."""
+
+
 class PgWriter:
     """Everything the trader writes to the serving store."""
 
@@ -430,6 +439,45 @@ class PgWriter:
             session.commit()
             return int(n)
 
+    # ---- single-writer guard --------------------------------------------
+    @contextmanager
+    def exclusive_trader_lock(self):
+        """Hold a database-wide lock for the duration of a trading process.
+
+        There was no singleton of any kind. `docker-compose` runs a `trader`
+        service and nothing stopped an operator also running
+        `python -m scripts.live` by hand — two processes, one account, one
+        window. Measured, both sized a full position off the same bankroll.
+
+        A Postgres session-level advisory lock is the right primitive: it is
+        released automatically when the connection drops, so a killed trader does
+        not strand the lock. On SQLite (tests) there is no advisory lock and no
+        concurrency to guard, so this yields with a warning rather than pretending.
+        """
+        if self._engine.dialect.name != 'postgresql':
+            logger.warning('no advisory lock on %s; single-writer is unenforced',
+                           self._engine.dialect.name)
+            yield True
+            return
+        # An arbitrary but stable key. Distinct from the API's schema-bootstrap
+        # lock in backend/api/app.py so the two cannot block each other.
+        key = 0x51545241  # 'QTRA'
+        connection = self._engine.connect()
+        try:
+            got = bool(connection.execute(
+                text('SELECT pg_try_advisory_lock(:k)'), {'k': key}).scalar())
+            if not got:
+                raise TraderAlreadyRunning(
+                    'another process already holds the trading lock on this '
+                    'database. Two traders against one account double every '
+                    'position and race on the bankroll. Stop the other one — '
+                    'most likely the compose `trader` service — or point this '
+                    'run at a different DATABASE_URL.'
+                )
+            yield True
+        finally:
+            connection.close()
+
     # ---- order tickets ---------------------------------------------------
     def write_ticket(self, **fields) -> int:
         """Record a live decision as something a person can place."""
@@ -460,15 +508,41 @@ class PgWriter:
             if row is None:
                 return
             row.status = status
-            row.filled_contracts = filled_contracts
-            row.filled_price = filled_price
-            row.note = note
-            row.filled_at = utcnow() if status == 'filled' else None
+            # Only overwrite a recorded fill with another recorded fill. These
+            # default to None, so a later call — e.g. the venue rejecting a
+            # duplicate submission as `skipped` — used to erase the
+            # filled_contracts / filled_price / filled_at of a real, filled,
+            # real-money order, destroying the only local record of it.
+            if filled_contracts is not None:
+                row.filled_contracts = filled_contracts
+            if filled_price is not None:
+                row.filled_price = filled_price
+            if note is not None:
+                row.note = note
+            if status == 'filled':
+                row.filled_at = utcnow()
             session.commit()
 
     # ---- positions ------------------------------------------------------
-    def open_position(self, **fields) -> int:
+    def open_position(self, **fields) -> Optional[int]:
+        """Book a position, once, for a (symbol, window). Returns None if it exists.
+
+        A bare insert against `uq_position_window` used to raise `IntegrityError`
+        on the second cycle of any window, and `scripts/live.py`'s loop catches
+        only `KeyboardInterrupt` — so the process died, *after* the duplicate
+        order was already on the wire, and `restart: unless-stopped` brought it
+        back to do it again. The constraint was doing its job; the caller was
+        not. Get-or-create makes the second attempt a no-op the caller can see,
+        matching `write_ticket`.
+        """
         with self._session() as session:
+            existing = session.query(Position).filter_by(
+                symbol=fields['symbol'], window_open=fields['window_open']).one_or_none()
+            if existing is not None:
+                logger.warning(
+                    '%s window %s already holds a position; not booking a second',
+                    fields['symbol'], fields['window_open'])
+                return None
             row = Position(outcome=Outcome.PENDING.value, **fields)
             session.add(row)
             session.commit()
@@ -484,7 +558,26 @@ class PgWriter:
             )
 
     def settle_position(self, position_id: int, *, settled_up: bool) -> Optional[float]:
-        """Resolve one position and return its PnL, or None if already settled."""
+        """Resolve one position, credit the account, and return its PnL.
+
+        Returns None if the position was already settled, which is what makes a
+        re-run of `settle_due` idempotent.
+
+        **The payout is credited here, in the same transaction as the outcome.**
+        It used to be nowhere: `act_on` debited the stake and nothing ever
+        credited a win, so the only two writers of `Account.bankroll` were the
+        entry debit and the live venue overwrite. In paper mode there is no venue,
+        so the bankroll fell by the stake on every trade and rose never — the
+        equity curve decayed to the ruin floor regardless of the win rate, and
+        `realized_pnl` was a hard-coded zero rendered as a measurement. The
+        backtest (`core/book.py`) always did this correctly, which is exactly why
+        no gate caught it: the two accounting paths had diverged and only the
+        simulated one was right.
+
+        Crediting inside the position's own transaction is deliberate. A payout
+        applied in a second transaction can be lost to a crash between the two,
+        and then the position says "won" while the bankroll never saw the money.
+        """
         with self._session() as session:
             row = session.get(Position, position_id)
             if row is None or row.outcome != Outcome.PENDING.value:
@@ -496,8 +589,44 @@ class PgWriter:
             row.pnl = payout - row.outlay
             row.outcome = Outcome.WON.value if won else Outcome.LOST.value
             row.settled_at = utcnow()
+            pnl = float(row.pnl)
+            # Relative UPDATE rather than read-modify-write: the arithmetic
+            # happens in the database, so a concurrent debit cannot be lost.
+            session.query(Account).update(
+                {Account.bankroll: Account.bankroll + payout,
+                 Account.realized_pnl: Account.realized_pnl + pnl},
+                synchronize_session=False,
+            )
             session.commit()
-            return row.pnl
+            return pnl
+
+    def entries_for_window(self, window_open: datetime) -> tuple[frozenset[str], float, int]:
+        """What is already committed for one window: symbols, stake, count.
+
+        The live loop used to build `WindowExposure()` empty on every cycle, so
+        `ALREADY_ENTERED`, `POSITION_LIMIT` and `WINDOW_EXPOSURE` were evaluated
+        against nothing and a single window could be entered once per cycle per
+        offset — up to twelve times where the backtest permits one. Exposure has
+        to come from the durable store, because the process restarts and the
+        window does not.
+
+        Tickets count as well as positions: a ticket exists from the moment an
+        order is sent, so a crash between sending and booking still shows up.
+        """
+        with self._session() as session:
+            symbols: set[str] = set()
+            stake = 0.0
+            for row in (session.query(Position)
+                        .filter(Position.window_open == window_open)):
+                symbols.add(str(row.symbol))
+                stake += float(row.outlay or 0.0)
+            for row in (session.query(OrderTicket)
+                        .filter(OrderTicket.window_open == window_open)
+                        .filter(OrderTicket.status != 'skipped')):
+                if str(row.symbol) not in symbols:
+                    symbols.add(str(row.symbol))
+                    stake += float(row.expected_cost or 0.0)
+            return frozenset(symbols), stake, len(symbols)
 
     def open_positions(self) -> list[Position]:
         with self._session() as session:
@@ -529,6 +658,23 @@ class PgWriter:
                 session.add(row)
                 session.commit()
                 session.refresh(row)
+                return row
+            # `mode` used to be set only on creation. Paper is the compose
+            # default, so the first run created a paper account and every later
+            # `--mode live` run kept rendering as paper on every dashboard
+            # surface — the failure this schema's own comment calls the worst it
+            # could permit. Switching mode is not a display change either: the
+            # bankroll history belongs to the other mode, so refuse rather than
+            # silently inherit it.
+            if row.mode != mode:
+                raise AccountModeMismatch(
+                    f"this account was opened in {row.mode!r} mode and holds its "
+                    f"bankroll and settled history. Running in {mode!r} mode "
+                    f"against it would report one mode's money under the other's "
+                    f"name. Use a separate DATABASE_URL for {mode!r}, or reset "
+                    f"this one deliberately."
+                )
+            session.refresh(row)
             return row
 
     def account(self) -> Optional[Account]:
@@ -536,12 +682,42 @@ class PgWriter:
             return session.query(Account).order_by(Account.id).first()
 
     def update_account(self, **fields) -> None:
+        """Set absolute fields on the account.
+
+        For anything that is an *increment* — a stake debited, a payout credited,
+        a fee accrued — use `adjust_account` instead. This method reads the row
+        into Python and writes it back, so two overlapping callers lose one
+        another's change.
+        """
         with self._session() as session:
             row = session.query(Account).order_by(Account.id).first()
             if row is None:
                 raise ValueError('no account row; call ensure_account first')
             for key, value in fields.items():
                 setattr(row, key, value)
+            session.commit()
+
+    def adjust_account(self, *, bankroll_delta: float = 0.0,
+                       fees_delta: float = 0.0,
+                       realized_delta: float = 0.0) -> None:
+        """Apply increments to the account in one atomic statement.
+
+        `bankroll = bankroll - stake` used to be computed in Python between two
+        separate transactions. Nothing enforces one trader process, so a
+        supervisor restart overlap or an operator running paper and live against
+        one `DATABASE_URL` silently dropped one of the two debits. Doing the
+        arithmetic in SQL removes the read entirely, so there is no window to
+        lose.
+        """
+        with self._session() as session:
+            updated = session.query(Account).update(
+                {Account.bankroll: Account.bankroll + bankroll_delta,
+                 Account.fees_paid: Account.fees_paid + fees_delta,
+                 Account.realized_pnl: Account.realized_pnl + realized_delta},
+                synchronize_session=False,
+            )
+            if not updated:
+                raise ValueError('no account row; call ensure_account first')
             session.commit()
 
     def write_equity_point(self, **fields) -> int:

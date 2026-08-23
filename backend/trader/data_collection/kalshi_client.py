@@ -47,6 +47,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -430,7 +431,16 @@ class KalshiClient:
             raise ValueError(f"side must be 'up' or 'down', got {side!r}")
         if contracts < 1:
             raise ValueError(f'contracts must be at least 1, got {contracts}')
-        cents = int(round(limit_price / CENT))
+        # Round UP, not to nearest. `int(round(...))` is banker's rounding to a
+        # whole cent, and `core/costs.py` models a tapered deci-cent ladder — so
+        # a 0.945 limit became 94c and a 0.0450 limit became 4c, both *below* the
+        # intended price, in exactly the tails where this strategy's economics are
+        # best. Under `fill_or_kill` an under-priced limit is a guaranteed kill,
+        # and the fill-readback used to record a kill as a full fill.
+        #
+        # The epsilon absorbs binary representation: 0.60 is 59.999...c in float,
+        # and a bare ceil would send 60c as 61c.
+        cents = int(math.ceil(limit_price / CENT - 1e-9))
         if not 1 <= cents <= 99:
             raise ValueError(f'limit price {limit_price} is outside 1c..99c')
 

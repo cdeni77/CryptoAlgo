@@ -81,10 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
                              'those are usually a rate limit rather than absent '
                              'data, and a full re-scrape to recover ten hours is '
                              'not proportionate.')
-    parser.add_argument('--min-gap-minutes', type=int, default=2,
-                        help='Ignore gaps shorter than this. A single missing '
-                             'minute is usually a minute in which nothing traded, '
-                             'which no amount of re-requesting will produce.')
+    parser.add_argument('--min-gap-minutes', type=int, default=1,
+                        help='Ignore gaps shorter than this. Defaults to 1, so '
+                             'isolated single minutes ARE re-requested: 86%% of '
+                             'them were destroyed by a client-side pagination '
+                             'off-by-one, not by an absence of trading, and they '
+                             'come back on a second ask.')
     parser.add_argument('--live', action='store_true',
                         help='After backfilling, keep polling for new bars. The '
                              'orchestrator uses this; a one-off backfill does not.')
@@ -99,10 +101,23 @@ def find_gaps(db_path: str, symbol: str, timeframe: str, venue: str,
     Read straight from SQLite rather than the research store, because this runs
     before the sync and the scraper's table is the one with the hole in it.
 
-    Single missing minutes are excluded by default: a minute in which nothing
-    traded has no candle to fetch, and asking for it again produces the same
-    nothing. What this is for is the multi-hour block that appears when a batch
-    request failed — those come back on a second ask.
+    `min_minutes=1` — the default — includes isolated single minutes, and that
+    is a correction. This used to default to 2 on the stated grounds that "a
+    single missing minute is usually a minute in which nothing traded, which no
+    amount of re-requesting will produce". That premise was false, and it made
+    this tool skip exactly the holes the scraper was creating:
+
+    * 8,721 of BTC's 10,124 missing minutes were isolated singles;
+    * 98.9% of the gaps between them were *exactly* 301 minutes apart;
+    * the rate was 0.003318 against 1/301 = 0.003322;
+    * and 5,121 of them fell on the identical minute in ETH, against 28.9
+      expected by chance — two independent order books do not go untraded in the
+      same 8,700 minutes.
+
+    They were a `limit=300` request over an inclusive 301-minute span
+    (`CoinbaseRESTClient.get_candles_range`, now fixed). Genuinely untraded
+    minutes do exist and re-requesting them is cheap and idempotent, so the
+    default errs toward asking.
     """
     import sqlite3
 

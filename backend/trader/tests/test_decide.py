@@ -52,7 +52,11 @@ def test_no_trade_when_the_forecast_agrees_with_the_market():
 
 
 def test_the_gates_fire_in_funnel_order():
-    config = Config(min_traded_price=0.20, max_traded_price=0.90,
+    # Narrow, and symmetric: `Config` now refuses an asymmetric band, because a
+    # one-sided band silently discards the buy-the-longshot half of the strategy.
+    # This test wants a narrow band to force PRICE_OUT_OF_BAND, which 0.20/0.80
+    # does just as well as the old 0.20/0.90.
+    config = Config(min_traded_price=0.20, max_traded_price=0.80,
                     max_disagreement_pp=25.0, min_edge_pp=0.5)
     # Price outside the band is refused before the disagreement is considered.
     assert decide(row(baseline_probability=0.95, model_probability=0.99),

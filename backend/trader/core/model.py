@@ -130,7 +130,10 @@ class ForecastModel:
         return {
             'features': list(self.features),
             'n_features': len(self.features),
-            'n_features_populated': len(self.features) - len(self.empty_features),
+            # `features` is already the populated list, so subtracting the empty
+            # ones again reported 28 for 35. It goes into every provenance record
+            # the trial count is read from.
+            'n_features_populated': len(self.features),
             'empty_features': list(self.empty_features),
             'groups': list(self.groups),
             'residual_scale': self.residual_scale,
@@ -194,10 +197,34 @@ def _fit_residual_scale(
     """
     from scipy import optimize
 
+    # Refuse non-finite input rather than optimising over it. A single NaN makes
+    # the objective NaN at every alpha, `minimize_scalar` gives up, and it
+    # returns its golden-section bracket seed 0.7639320225 with
+    # `success=False`. That value was never checked, so the *overfitting
+    # detector* returned a search constant that sails past its own
+    # `residual_scale >= 0.25` gate. On a five-year BTC walk-forward four of six
+    # folds returned exactly 0.7639320225, and those four folds carried the
+    # reported skill.
+    finite = (np.isfinite(baseline_logit) & np.isfinite(correction)
+              & np.isfinite(np.asarray(outcome, dtype=float)))
+    if not finite.all():
+        raise ValueError(
+            f'{int((~finite).sum())} of {finite.size} validation rows are '
+            f'non-finite, so the shrinkage cannot be fitted. Scoring them would '
+            f'silently return scipy\'s bracket seed and pass the residual_scale '
+            f'gate on an unfitted constant. Fix the upstream data hole.'
+        )
+
     def objective(alpha: float) -> float:
         return log_loss(outcome, expit(baseline_logit + float(alpha) * correction))
 
     result = optimize.minimize_scalar(objective, bounds=(0.0, 2.0), method='bounded')
+    if not result.success or not np.isfinite(result.x):
+        raise ValueError(
+            f'the shrinkage fit did not converge ({getattr(result, "message", "")!r}). '
+            f'Reporting its abandoned bracket point as a fitted alpha is how an '
+            f'unfitted constant reaches a gate.'
+        )
     return float(np.clip(result.x, 0.0, 2.0))
 
 
