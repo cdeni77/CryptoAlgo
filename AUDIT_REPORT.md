@@ -1390,3 +1390,65 @@ mechanism* is defensible; narrowing on return is not.
 * Seven group trials plus six configuration trials on one subset is a search, and
   nothing here carries a multiple-testing correction. The five-year run on the
   repaired store is the test.
+
+## The sizing knobs are not what they look like
+
+`max_drawdown <= 0.35` was the only gate the shipped configuration failed, at
+58.4%. Two measurements, and both refuted what I expected.
+
+**`max_stake_fraction` is close to inert.** Cutting it fivefold barely moves the
+drawdown and leaves return and trade count almost unchanged:
+
+```
+stake frac  window cap  trades     return  sharpe   maxDD  realEdge
+      0.05        0.08   4,553  +212.18%   +2.81  58.38%    +0.99
+      0.03        0.05   4,553  +214.86%   +2.96  52.79%    +0.99
+      0.02        0.04   4,552  +234.46%   +3.45  48.79%    +0.98
+      0.01        0.02   4,537  +187.14%   +3.64  43.47%    +0.95
+```
+
+Fractional Kelly binds first: at a 1-2pp edge, `0.25 * (q-c)/(1-c) * $100` is
+roughly $0.50-$1.00 against a $5 cap.
+
+**`kelly_fraction` is secretly an edge filter.** It is the real lever, and not for
+the reason it appears:
+
+```
+kelly frac  trades     return  sharpe   maxDD  realEdge  gate
+      0.25   4,553  +212.18%   +2.81  58.38%    +0.99   FAIL
+      0.15   3,148  +138.28%   +3.25  32.19%    +2.23   pass
+      0.10   1,941   +85.48%   +3.34  20.84%    +3.32   pass
+      0.05     567   +22.87%   +2.00   8.64%    +3.73   pass
+```
+
+Sizing should change how much is staked, not how often — yet trades fall eightfold
+and realised edge per contract nearly quadruples. The rejection histograms say why:
+
+```
+                     kelly 0.25  kelly 0.10  change
+below_min_contracts        1813        8218   +6405
+traded                     3221        1941   -1280
+edge_below_gate          242571      242571       0
+price_out_of_band         63954       63954       0
+```
+
+`edge_below_gate` is **identical**, so `min_edge_pp` is not doing the filtering.
+`decide()` floors the stake to whole contracts, so a smaller Kelly fraction pushes
+marginal trades under one contract and refuses them. The drawdown falls and the
+per-contract edge rises because the *survivors are the higher-edge trades*, not
+because the sizing got safer.
+
+So `kelly_fraction` and `min_edge_pp` are coupled, and the repository documented
+them as independent. Anyone lowering Kelly to control drawdown is also raising the
+effective edge threshold, and would attribute the improvement to the wrong cause.
+Documented in `core/config.py` and `CLAUDE.md`.
+
+**And this is where the discipline rule bites on my own analysis.** The table above
+makes `kelly_fraction = 0.10` look strictly better — it passes the drawdown gate,
+Sharpe rises from 2.81 to 3.34, and realised edge triples. Choosing it on those
+grounds would be exactly the selection this report argues against two sections
+earlier, on the same 326 days where return spanned -50% to +303% at constant
+skill. What is defensible is the *mechanism*: the integer floor makes Kelly a
+selectivity control, and a lower setting trades coverage for concentration. Which
+point on that curve to take is a risk-appetite decision to make deliberately, on
+the full five years, and to write down.

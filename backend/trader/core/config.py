@@ -167,6 +167,22 @@ class Config:
     # Fraction of full Kelly. Full Kelly on a binary at an extreme price asks
     # for a third of the account on a 5pp edge; a quarter is the largest value
     # that survives being wrong about the edge by a factor of two.
+    # Fractional Kelly. **This is also an edge filter, and that is not obvious.**
+    #
+    # `decide` floors the stake to whole contracts, so a lower Kelly fraction does
+    # not merely stake less — it pushes marginal trades below one contract and
+    # refuses them as BELOW_MIN_CONTRACTS. Measured on 326 days, dropping 0.25 to
+    # 0.10 left `edge_below_gate` *identical* at 242,571 while
+    # `below_min_contracts` went 1,813 -> 8,218 and trades fell 3,221 -> 1,941.
+    # Realised edge per contract rose from +0.99pp to +3.32pp and the drawdown fell
+    # from 58% to 21%, not because the sizing was safer but because the surviving
+    # trades were the higher-edge ones.
+    #
+    # So `kelly_fraction` and `min_edge_pp` are coupled: anyone lowering Kelly to
+    # control drawdown is also raising the effective edge threshold, and anyone
+    # reading the two as independent knobs will be surprised. `max_stake_fraction`
+    # below, by contrast, is close to inert at this edge size — Kelly binds first,
+    # and cutting that cap 5x barely moved the drawdown.
     kelly_fraction: float = 0.25
     max_stake_fraction: float = 0.05      # of bankroll, per position
 

@@ -319,6 +319,15 @@ forecasts anything. Run the group alone before believing the share either way.
   calibrated baseline in for the market; a live decision reads the real ask. Those
   are different claims, and a row that cannot distinguish them makes a backtest
   look like a fill.
+- **`kelly_fraction` is also an edge filter, and the two are not independent.**
+  `decide()` floors the stake to whole contracts, so a smaller Kelly fraction does
+  not just stake less — it pushes marginal trades under one contract and refuses
+  them. Measured on 326 days, 0.25 -> 0.10 left `edge_below_gate` *identical* at
+  242,571 while `below_min_contracts` went 1,813 -> 8,218; realised edge per
+  contract rose +0.99pp -> +3.32pp and drawdown fell 58% -> 21%, because the
+  survivors were the higher-edge trades rather than because the sizing was safer.
+  `max_stake_fraction` is nearly inert at this edge size by comparison: Kelly binds
+  first, and cutting that cap fivefold barely moved the drawdown.
 - **Sizing is additive by default** (`compound=False`). Compounding turns a
   per-trade edge estimate into an exponential, and the exponential is dominated
   by the *error* in the estimate. The first full run compounded $100 into
