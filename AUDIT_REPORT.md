@@ -1452,3 +1452,26 @@ skill. What is defensible is the *mechanism*: the integer floor makes Kelly a
 selectivity control, and a lower setting trades coverage for concentration. Which
 point on that curve to take is a risk-appetite decision to make deliberately, on
 the full five years, and to write down.
+
+## The pagination repair, verified
+
+`--fill-gaps` (itself fixed, since it had been fetching nothing) recovered 8,672
+minutes for BTC and 8,667 for ETH. The signature is gone:
+
+```
+             before                                after
+BTC   8,721 isolated singles, 98.9% at 301   ->   49 singles, 0.0% at 301
+ETH   8,714 isolated singles, 98.9% at 301   ->   47 singles, 0.0% at 301
+```
+
+The residual 1,452 (BTC) and 1,489 (ETH) minutes are genuine and unrecoverable:
+46-48 multi-minute runs that are real venue outages — 391/394 min on 2026-05-08,
+349/350 min on 2025-10-25, 277/278 min on 2023-03-04, each hitting all symbols
+simultaneously — plus ~48 isolated minutes with no periodic structure, which is
+what a genuinely untraded minute looks like.
+
+So the original claim in `CLAUDE.md` was *directionally* right about one thing and
+wrong about the proportion: untraded minutes do exist, and they were 0.5% of the
+shortfall rather than most of it. The 2026-05-08 outage is also the source of the
+86 unscoreable rows the `non_finite_share` gate now reports, since a 6.5-hour hole
+leaves the 240-minute lookback unfillable for about two hours afterwards.
