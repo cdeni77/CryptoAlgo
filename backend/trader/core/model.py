@@ -50,6 +50,10 @@ BASELINE_LOGIT = 'baseline_probability_logit'
 # Fraction of the training windows held back to fit `residual_scale` and to
 # early-stop on. Taken from the *end* of training, so it is the most recent
 # data and the shrinkage is measured on the regime nearest the test block.
+# Fewest windows an inner block may hold and still be split in two. Below
+# this, early stopping and the shrinkage fit share rows and alpha reads high.
+MIN_INNER_BLOCK_WINDOWS = 200
+
 INNER_VALIDATION_FRACTION = 0.2
 
 
@@ -267,9 +271,54 @@ def fit_model(
     if len(windows) < 20:
         raise ValueError(f'{len(windows)} training windows is not enough to fit')
     cut = windows[int(len(windows) * (1.0 - INNER_VALIDATION_FRACTION))]
-    inner_train = train.loc[train['window_open'] < cut]
-    inner_valid = train.loc[train['window_open'] >= cut]
-    if inner_valid.empty or inner_train.empty:
+
+    # Purge the inner split the same way the outer one is purged.
+    #
+    # This boundary used to be hard: the last inner-training window was fifteen
+    # minutes from the first inner-validation window, against the 1,440 the outer
+    # CV insists on for exactly the same stated reason. Two things are fitted
+    # here — LightGBM's `best_iteration` and `residual_scale` — and
+    # `residual_scale` is the single number guarding against overconfidence, with
+    # its own gate. Leaking into it does not inflate the reported out-of-sample
+    # skill, which is measured on the properly embargoed outer fold; it ships a
+    # model whose shrinkage is too weak and makes its gate easier to pass than
+    # intended.
+    embargo = pd.Timedelta(minutes=int(config.embargo_minutes))
+    inner_train = train.loc[train['window_open'] < cut - embargo]
+    if inner_train.empty:
+        # A short training slice cannot afford the full embargo. Say so rather
+        # than silently dropping it — the window is still purged by the label's
+        # own horizon, which is the part that must not be skipped.
+        fallback = pd.Timedelta(minutes=int(config.window_minutes))
+        logger.warning(
+            'the %d-minute inner embargo leaves no training rows in a slice of '
+            '%d windows; falling back to %s. The shrinkage this fits will be '
+            'optimistic.', config.embargo_minutes, len(windows), fallback)
+        inner_train = train.loc[train['window_open'] < cut - fallback]
+
+    # Early stopping and the shrinkage must not share rows. `residual_scale`
+    # answers "how much of the claimed correction survives out of sample", and
+    # measured on the same rows that chose the tree count it answers "how much
+    # survives on the rows the tree count was selected for" — it read 0.902 on a
+    # provably zero-signal null. Split the validation block in two.
+    valid_windows = windows[windows >= cut]
+    holdout = train.loc[train['window_open'] >= cut]
+    inner_valid, alpha_rows = holdout, holdout
+    if len(valid_windows) >= 2 * MIN_INNER_BLOCK_WINDOWS:
+        mid = valid_windows[len(valid_windows) // 2]
+        stop_block = train.loc[(train['window_open'] >= cut)
+                               & (train['window_open'] < mid - embargo)]
+        alpha_block = train.loc[train['window_open'] >= mid]
+        if not stop_block.empty and not alpha_block.empty:
+            inner_valid, alpha_rows = stop_block, alpha_block
+    if inner_valid is alpha_rows:
+        logger.warning(
+            'the inner validation block (%d windows) is too small to separate '
+            'early stopping from the shrinkage fit; alpha will be measured on '
+            'the rows the tree count was chosen for and will read high.',
+            len(valid_windows))
+
+    if inner_valid.empty or inner_train.empty or alpha_rows.empty:
         raise ValueError('inner validation split is empty')
 
     def dataset(frame: pd.DataFrame, reference=None):
@@ -300,10 +349,10 @@ def fit_model(
         callbacks=[lgb.early_stopping(config.early_stopping_rounds, verbose=False)],
     )
 
-    valid_matrix = _feature_matrix(inner_valid, populated)
-    correction = np.asarray(booster.predict(valid_matrix, raw_score=True), dtype=float)
-    base_logit = inner_valid[BASELINE_LOGIT].to_numpy(dtype=float)
-    outcome = inner_valid['outcome'].to_numpy(dtype=float)
+    alpha_matrix = _feature_matrix(alpha_rows, populated)
+    correction = np.asarray(booster.predict(alpha_matrix, raw_score=True), dtype=float)
+    base_logit = alpha_rows[BASELINE_LOGIT].to_numpy(dtype=float)
+    outcome = alpha_rows['outcome'].to_numpy(dtype=float)
     alpha = _fit_residual_scale(base_logit, correction, outcome)
 
     model = ForecastModel(

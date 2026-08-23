@@ -83,6 +83,7 @@ def main() -> int:
                 'coin_flip': log_loss(y, np.full_like(p, float(y.mean()))),
                 'ece': rel.expected_calibration_error,
                 'max_dev': rel.max_deviation,
+                'n_non_finite': rel.n_non_finite,
                 'nu': fit.baseline.nu,
                 'scale': ' '.join(f'{o}m={s:.3f}' for o, s in sorted(fit.baseline.scale.items())),
             })
@@ -116,15 +117,41 @@ def main() -> int:
               '  predictions: a Gaussian barrier assigns 0.999 where 0.99 is right,\n'
               '  and a model that merely knew that would look skilful.')
 
-    worst_ece = max(pd.DataFrame(rows)['ece'].max() for rows in results.values())
     print()
+    # `pandas.Series.max()` skips NaN, and `nan > 0.02` is False, so this gate
+    # used to fail OPEN: with 31 non-finite rows in 99,388 it printed
+    # "gate passed: worst-fold calibration error 0.01516 <= 0.02" while five of
+    # six folds had reported `log loss nan, ECE nan`. Refuse on unmeasured folds
+    # before comparing anything, so a data hole reads as a data hole.
+    all_ece = np.concatenate([
+        pd.DataFrame(rows)['ece'].to_numpy(dtype=float) for rows in results.values()])
+    all_non_finite = int(sum(
+        int(pd.DataFrame(rows)['n_non_finite'].sum()) for rows in results.values()
+        if 'n_non_finite' in pd.DataFrame(rows).columns))
+    unmeasured = int((~np.isfinite(all_ece)).sum())
+    if unmeasured:
+        print(f'  GATE FAILED: {unmeasured} of {all_ece.size} folds could not be '
+              f'measured at all (calibration came back NaN).')
+        print('  That is a hole in the data, not a verdict on the baseline, and it '
+              'is not the same answer as "no skill".')
+        print('  Find the missing bars before reading anything below.')
+        return 1
+    if all_non_finite:
+        print(f'  GATE FAILED: {all_non_finite} row(s) carried a non-finite '
+              f'probability or outcome.')
+        print('  Those rows used to be counted in the 0.95-1.00 reliability bin, '
+              'which is the band this system trades.')
+        return 1
+
+    worst_ece = float(np.max(all_ece))
     if worst_ece > 0.02:
         print(f'  GATE FAILED: worst-fold calibration error {worst_ece:.5f} exceeds 0.02.')
         print('  Skill measured against a miscalibrated baseline is partly the '
               'baseline\'s error.')
         print('  Fix this before training anything.')
         return 1
-    print(f'  gate passed: worst-fold calibration error {worst_ece:.5f} <= 0.02')
+    print(f'  gate passed: worst-fold calibration error {worst_ece:.5f} <= 0.02 '
+          f'across {all_ece.size} folds, none unmeasured')
     print('  next: python -m scripts.evaluate')
     return 0
 

@@ -308,17 +308,69 @@ class Reliability:
     predicted: np.ndarray
     observed: np.ndarray
     count: np.ndarray
+    # Rows excluded because the prediction or the outcome was not finite. These
+    # used to be *counted*, in the top bin — see `reliability`.
+    n_non_finite: int = 0
 
     @property
     def expected_calibration_error(self) -> float:
-        total = self.count.sum()
-        if total == 0:
+        """Count-weighted mean |predicted - observed| over populated bins.
+
+        Restricted to populated bins because an empty one carries `predicted =
+        nan` and `count = 0`, and `0 * nan` is `nan` — so a single unvisited bin
+        turned the whole metric into NaN, which then passed a `<= 0.02` max-gate
+        because `nan > 0.02` is False. That was reachable before and is close to
+        certain now that the tails are binned at 2pp.
+        """
+        populated = self.count > 0
+        total = self.count[populated].sum()
+        if not total:
             return float('nan')
-        return float(np.sum(self.count * np.abs(self.predicted - self.observed)) / total)
+        return float(np.sum(self.count[populated]
+                            * np.abs(self.predicted[populated]
+                                     - self.observed[populated])) / total)
+
+    def error_above(self, threshold: float) -> float:
+        """Count-weighted calibration error over bins at or above `threshold`.
+
+        The aggregate ECE cannot see the band that matters. It is count-weighted
+        over every row, and most rows sit at the extremes where the barrier is
+        already decided and calibration is nearly free. Constructed and measured:
+        a model perfectly calibrated on 190,000 pinned rows and 5pp overconfident
+        on the 10,000 rows it actually trades scores an aggregate ECE of 0.0044
+        and passes a 0.02 gate, because those rows contribute 0.05 * 10/200 =
+        0.0025.
+
+        Restricting to the confident bins is not a substitute for measuring the
+        traded subset directly, but it needs no book to compute and it moves when
+        the aggregate does not.
+        """
+        mask = (self.edges[:-1] >= threshold - 1e-12) & (self.count > 0)
+        total = self.count[mask].sum()
+        if not total:
+            return float('nan')
+        return float(np.sum(self.count[mask]
+                            * np.abs(self.predicted[mask] - self.observed[mask])) / total)
 
     @property
     def max_deviation(self) -> float:
         populated = self.count > 0
+        if not populated.any():
+            return float('nan')
+        return float(np.max(np.abs(self.predicted[populated] - self.observed[populated])))
+
+    def worst_deviation(self, *, min_count: int = 500) -> float:
+        """The largest bin deviation, over bins with enough rows to mean anything.
+
+        `max_deviation` over every populated bin is dominated by whichever bin
+        holds three rows. This is the gateable version: a bin of `min_count`
+        observations at p=0.9 has a binomial standard error near 1.3pp, so
+        anything much below that is noise and a threshold has to sit above it.
+        Worth saying plainly — no calibration gate computed this way can resolve
+        the 0.5pp that `min_edge_pp` requires. The gate bounds the damage; it
+        cannot certify the edge.
+        """
+        populated = self.count >= int(min_count)
         if not populated.any():
             return float('nan')
         return float(np.max(np.abs(self.predicted[populated] - self.observed[populated])))
@@ -355,9 +407,27 @@ def reliability(
     are not comparable.
     """
     if edges is None:
-        edges = np.array([0.0, 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.0])
-    p = clip_prob(probability)
-    y = np.asarray(outcome, dtype=float)
+        # Symmetric, and 2pp wide in the tails. The old ladder was 10pp wide
+        # everywhere, which averages away exactly what it is for: a model 5pp
+        # overconfident at 0.94 and 5pp underconfident at 0.86 reported an ECE of
+        # 0.000078 across a single [0.85, 0.95] bin — passing a 0.02 gate by 256x
+        # while every trade it took at 0.94 lost 5pp. Fixed edges rather than
+        # quantiles, still, so two runs' tables stay comparable.
+        edges = np.array([
+            0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50,
+            0.60, 0.70, 0.80, 0.85, 0.90, 0.92, 0.94, 0.96, 0.98, 1.0,
+        ])
+    raw = np.asarray(probability, dtype=float)
+    y_all = np.asarray(outcome, dtype=float)
+    # `np.digitize(nan, ...)` returns the last index, so a NaN prediction was
+    # counted in the most-confident bin — the band this system trades. On real
+    # data 31 non-finite rows in 99,388 put `predicted nan / observed 0.9813 /
+    # n 57,890` in the 0.95-1.00 row of the reliability table and turned every
+    # calibration number into NaN. Exclude them, and say how many.
+    finite = np.isfinite(raw) & np.isfinite(y_all)
+    n_non_finite = int((~finite).sum())
+    p = clip_prob(raw[finite])
+    y = y_all[finite]
     index = np.clip(np.digitize(p, edges[1:-1]), 0, len(edges) - 2)
     predicted = np.full(len(edges) - 1, np.nan)
     observed = np.full(len(edges) - 1, np.nan)
@@ -368,7 +438,8 @@ def reliability(
         if count[b]:
             predicted[b] = p[mask].mean()
             observed[b] = y[mask].mean()
-    return Reliability(edges=edges, predicted=predicted, observed=observed, count=count)
+    return Reliability(edges=edges, predicted=predicted, observed=observed,
+                       count=count, n_non_finite=n_non_finite)
 
 
 def attach_baseline(

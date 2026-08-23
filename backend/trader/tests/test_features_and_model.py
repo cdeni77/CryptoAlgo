@@ -226,3 +226,56 @@ def test_score_live_reports_no_outcome_for_an_unsettled_window(prepared):
         window_open=dataset.window_index[-3], offset=FAST.decision_offsets[0])
     assert scored['outcome'].isna().all()
     assert scored['settle_price'].isna().all()
+
+
+def test_the_shrinkage_reads_near_zero_on_a_null():
+    """`residual_scale` is the overfitting detector, so a null must fail its gate.
+
+    It read **0.902** on a provably zero-signal dataset and passed
+    `residual_scale >= 0.25`, for two compounding reasons. First, early stopping
+    and the shrinkage fit shared `inner_valid`, so alpha answered "how much of
+    the correction survives on the rows the tree count was chosen for". Second,
+    `_fit_residual_scale` never checked `result.success`: one NaN made the
+    objective NaN everywhere, `minimize_scalar` gave up, and its golden-section
+    bracket point **0.7639320225** was returned as a fitted value — which also
+    clears 0.25. Four of six folds in a five-year BTC walk-forward returned
+    exactly that constant.
+    """
+    from core.config import Config
+    from core.dataset import Dataset, fit_fold
+    from core.model import fit_model
+    from tests.conftest import make_bars
+
+    config = Config(n_estimators=120, early_stopping_rounds=15, n_folds=3,
+                    seasonality_min_days=5)
+    bars = make_bars(days=70, lead=0.0, seed=11)   # lead=0: nothing to find
+    dataset = Dataset.build(bars, config)
+    index = dataset.window_index
+    fit, train_table = fit_fold(dataset, index[:int(len(index) * 0.85)], config)
+    model = fit_model(train_table, fit.baseline, config)
+
+    assert model.residual_scale < 0.25, (
+        f'alpha is {model.residual_scale:.4f} on a null; the gate it guards is '
+        f'0.25, so this would promote'
+    )
+    assert model.residual_scale != pytest.approx(0.7639320225, abs=1e-6), (
+        'that is scipy\'s golden-section bracket seed, not a fitted value — '
+        '_fit_residual_scale is swallowing a non-convergence again'
+    )
+
+
+def test_the_shrinkage_refuses_non_finite_validation_rows():
+    """A NaN must raise, not quietly become 0.7639320225."""
+    import numpy as np
+
+    from core.model import _fit_residual_scale
+
+    logit = np.array([0.1, 0.2, 0.3, 0.4])
+    correction = np.array([0.01, -0.02, 0.03, -0.01])
+    outcome = np.array([1.0, 0.0, 1.0, 0.0])
+    assert 0.0 <= _fit_residual_scale(logit, correction, outcome) <= 2.0
+
+    with pytest.raises(ValueError, match='non-finite'):
+        _fit_residual_scale(logit, np.array([0.01, np.nan, 0.03, -0.01]), outcome)
+    with pytest.raises(ValueError, match='non-finite'):
+        _fit_residual_scale(np.array([0.1, np.nan, 0.3, 0.4]), correction, outcome)

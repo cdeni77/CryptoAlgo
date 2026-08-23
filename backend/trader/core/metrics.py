@@ -68,6 +68,12 @@ class FoldEvaluation:
     reliability_table: Optional[Reliability] = None
     stats: Optional[BookStats] = None
     per_offset: Optional[pd.DataFrame] = None
+    # Rows whose prediction or outcome was not finite. Reported so a data hole
+    # says "data hole" instead of "no skill" — see `n_non_finite` in the gates.
+    n_non_finite: int = 0
+    # The worst deviation in any adequately-populated reliability bin. The mean
+    # ECE cannot see the traded band; this can.
+    model_max_deviation: float = float('nan')
 
     @property
     def skill(self) -> float:
@@ -102,6 +108,7 @@ def evaluate_fold(
     from core.cv import effective_observations
 
     outcome = test['outcome'].to_numpy(dtype=float)
+    model_reliability = reliability(outcome, model_probability)
     per_offset = None
     if 'offset' in test.columns:
         frame = test.assign(_m=model_probability, _b=baseline_probability)
@@ -125,10 +132,12 @@ def evaluate_fold(
         baseline_log_loss=log_loss(outcome, baseline_probability),
         model_brier=brier(outcome, model_probability),
         baseline_brier=brier(outcome, baseline_probability),
-        model_ece=reliability(outcome, model_probability).expected_calibration_error,
+        model_ece=model_reliability.expected_calibration_error,
         baseline_ece=reliability(outcome, baseline_probability).expected_calibration_error,
         residual_scale=residual_scale, control_gain_share=control_gain_share,
-        reliability_table=reliability(outcome, model_probability),
+        reliability_table=model_reliability,
+        n_non_finite=model_reliability.n_non_finite,
+        model_max_deviation=model_reliability.worst_deviation(),
         stats=stats, per_offset=per_offset,
     )
 
@@ -188,7 +197,26 @@ class EvaluationReport:
 
     @property
     def max_ece(self) -> float:
-        return float(max((f.model_ece for f in self.folds), default=float('nan')))
+        # `np.max`, not the builtin. Builtin `max` with a NaN in the sequence is
+        # order-dependent — `max([0.015, nan])` is 0.015 and `max([nan, 0.015])`
+        # is nan — so a fold whose calibration could not be computed silently
+        # vanished and the gate passed on the folds that worked. `Gate.passed`
+        # already fails closed on a non-finite value; the aggregation has to let
+        # it get there.
+        if not self.folds:
+            return float('nan')
+        return float(np.max(np.asarray([f.model_ece for f in self.folds], dtype=float)))
+
+    @property
+    def max_calibration_deviation(self) -> float:
+        if not self.folds:
+            return float('nan')
+        return float(np.max(np.asarray(
+            [f.model_max_deviation for f in self.folds], dtype=float)))
+
+    @property
+    def total_non_finite(self) -> int:
+        return int(sum(f.n_non_finite for f in self.folds))
 
     @property
     def mean_residual_scale(self) -> float:
@@ -196,7 +224,10 @@ class EvaluationReport:
 
     @property
     def max_control_gain_share(self) -> float:
-        return float(max((f.control_gain_share for f in self.folds), default=float('nan')))
+        if not self.folds:
+            return float('nan')
+        return float(np.max(np.asarray(
+            [f.control_gain_share for f in self.folds], dtype=float)))
 
     @property
     def total_windows(self) -> int:
@@ -239,6 +270,8 @@ class EvaluationReport:
             'log_loss_skill': self.mean_skill,
             'folds_skill_positive': float(self.folds_positive),
             'calibration_error': self.max_ece,
+            'calibration_max_deviation': self.max_calibration_deviation,
+            'non_finite_rows': float(self.total_non_finite),
             'residual_scale': self.mean_residual_scale,
             'control_gain_share': self.max_control_gain_share,
             'windows_evaluated': float(self.total_windows),
@@ -283,6 +316,17 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     'log_loss_skill': (0.0, 'min'),
     'folds_skill_positive': (5.0, 'min'),
     'calibration_error': (0.02, 'max'),
+    # The mean ECE is count-weighted over every row, and most rows sit where the
+    # barrier is already decided. Measured: a model 5pp overconfident on the
+    # 5% of rows it trades scores 0.0044 and passes. This bounds the worst
+    # adequately-populated bin instead. It cannot resolve `min_edge_pp` (0.5pp) —
+    # 500 rows at p=0.9 carry a 1.3pp standard error — so it bounds the damage
+    # rather than certifying the edge.
+    'calibration_max_deviation': (0.04, 'max'),
+    # A data hole must report as a data hole. 31 non-finite rows in 99,388 turned
+    # five of six folds' metrics into NaN while `scripts/baseline.py` printed
+    # "gate passed", because `nan > 0.02` is False and pandas' max skips NaN.
+    'non_finite_rows': (0.0, 'max'),
     'residual_scale': (0.25, 'min'),
     'control_gain_share': (0.30, 'max'),
     'windows_evaluated': (20_000.0, 'min'),
@@ -310,6 +354,10 @@ GATE_NOTES: dict[str, str] = {
                             'so this is necessary and not sufficient',
     'calibration_error': 'the system trades its confident predictions, so being wrong '
                          'about how confident it is matters more than the mean',
+    'calibration_max_deviation': 'the mean ECE averages away the band the money is in; '
+                                 'this bounds the worst populated bin',
+    'non_finite_rows': 'a NaN prediction is a data hole, not a forecast. Counting it '
+                       'as one made "no skill" and "one missing bar" the same output',
     'residual_scale': 'how much of the claimed correction survives out of sample; near '
                       'zero means it found nothing however good the in-sample loss',
     'control_gain_share': 'hour-of-day cannot forecast direction. If the clock carries '
