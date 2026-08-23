@@ -264,18 +264,75 @@ def test_the_shrinkage_reads_near_zero_on_a_null():
     )
 
 
-def test_the_shrinkage_refuses_non_finite_validation_rows():
-    """A NaN must raise, not quietly become 0.7639320225."""
+def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
+    """A NaN must not become 0.7639320225, and must not stop the run either.
+
+    The defect was never the NaN itself — it was reporting scipy's abandoned
+    golden-section bracket point as a fitted alpha, which cleared the
+    `residual_scale >= 0.25` gate on a value that is a search constant. Refusing
+    outright was my first fix and it was wrong in the other direction: one
+    6.5-hour Coinbase outage leaves ~83 rows in 26,488 without a volatility
+    estimate, and that killed an entire evaluation.
+
+    So: drop the unscoreable rows, insist enough remain to mean anything, and
+    still raise if the optimiser does not converge.
+    """
     import numpy as np
 
-    from core.model import _fit_residual_scale
+    from core.model import MIN_SHRINKAGE_ROWS, _fit_residual_scale
 
-    logit = np.array([0.1, 0.2, 0.3, 0.4])
-    correction = np.array([0.01, -0.02, 0.03, -0.01])
-    outcome = np.array([1.0, 0.0, 1.0, 0.0])
-    assert 0.0 <= _fit_residual_scale(logit, correction, outcome) <= 2.0
+    rng = np.random.default_rng(0)
+    n = MIN_SHRINKAGE_ROWS * 4
+    logit = rng.normal(0, 1.0, n)
+    correction = rng.normal(0, 0.1, n)
+    outcome = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(float)
 
-    with pytest.raises(ValueError, match='non-finite'):
-        _fit_residual_scale(logit, np.array([0.01, np.nan, 0.03, -0.01]), outcome)
-    with pytest.raises(ValueError, match='non-finite'):
-        _fit_residual_scale(np.array([0.1, np.nan, 0.3, 0.4]), correction, outcome)
+    clean = _fit_residual_scale(logit, correction, outcome)
+    assert 0.0 <= clean <= 2.0
+    assert clean != pytest.approx(0.7639320225, abs=1e-6), (
+        "that is scipy's bracket seed, not a fitted value"
+    )
+
+    # A handful of NaNs is an outage, and must change the answer only slightly.
+    holed = correction.copy()
+    holed[:20] = np.nan
+    with_holes = _fit_residual_scale(logit, holed, outcome)
+    assert 0.0 <= with_holes <= 2.0
+    assert abs(with_holes - clean) < 0.25, (
+        f'dropping 20 of {n} rows moved alpha from {clean:.4f} to '
+        f'{with_holes:.4f}; that is not an exclusion, that is a different fit'
+    )
+
+    # Too few scoreable rows is a data problem and must say so.
+    mostly_nan = correction.copy()
+    mostly_nan[MIN_SHRINKAGE_ROWS // 2:] = np.nan
+    with pytest.raises(ValueError, match='scoreable rows remain'):
+        _fit_residual_scale(logit, mostly_nan, outcome)
+
+
+def test_the_shrinkage_raises_when_the_optimiser_does_not_converge(monkeypatch):
+    """The actual bug, pinned directly.
+
+    `minimize_scalar` returning `success=False` was never checked, so its bracket
+    point `0.7639320225` was returned as a fitted alpha. Four of six folds in a
+    five-year BTC walk-forward returned exactly that.
+    """
+    import numpy as np
+    from scipy import optimize
+
+    from core.model import MIN_SHRINKAGE_ROWS, _fit_residual_scale
+
+    n = MIN_SHRINKAGE_ROWS * 2
+    rng = np.random.default_rng(1)
+    logit = rng.normal(0, 1.0, n)
+    correction = rng.normal(0, 0.1, n)
+    outcome = (rng.random(n) < 0.5).astype(float)
+
+    class Abandoned:
+        x = 0.7639320225002102
+        success = False
+        message = 'stopped early'
+
+    monkeypatch.setattr(optimize, 'minimize_scalar', lambda *a, **k: Abandoned())
+    with pytest.raises(ValueError, match='did not converge'):
+        _fit_residual_scale(logit, correction, outcome)

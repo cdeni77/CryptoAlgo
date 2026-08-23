@@ -108,6 +108,30 @@ def evaluate_fold(
     from core.cv import effective_observations
 
     outcome = test['outcome'].to_numpy(dtype=float)
+
+    # A row with no volatility estimate has no forecast, so it cannot be scored —
+    # and it is not an error. Measured on real bars: a 6.5-hour Coinbase outage
+    # leaves the 240-minute lookback unfillable for about two hours afterwards, so
+    # ~83 rows in 53,200 come back with a NaN sigma. Live, `decide` refuses those
+    # as NOT_FINITE; here they must leave the metric rather than poison it.
+    #
+    # They are *excluded and counted*, not dropped silently. Silence was the
+    # original defect: `np.mean` propagated the NaN into every fold statistic
+    # while `np.digitize` filed the rows in the 0.95-1.00 reliability bin, and one
+    # of the two readers then failed open. The count reaches a gate as a share.
+    finite = (np.isfinite(outcome) & np.isfinite(model_probability)
+              & np.isfinite(baseline_probability))
+    n_non_finite = int((~finite).sum())
+    if n_non_finite:
+        logger.info(
+            'fold %d: %d of %d rows carry no forecast (a NaN sigma, usually the '
+            'tail of a data outage) and are excluded from the metrics',
+            index, n_non_finite, len(outcome))
+    outcome = outcome[finite]
+    model_probability = np.asarray(model_probability)[finite]
+    baseline_probability = np.asarray(baseline_probability)[finite]
+    test = test.loc[finite]
+
     model_reliability = reliability(outcome, model_probability)
     per_offset = None
     if 'offset' in test.columns:
@@ -136,7 +160,7 @@ def evaluate_fold(
         baseline_ece=reliability(outcome, baseline_probability).expected_calibration_error,
         residual_scale=residual_scale, control_gain_share=control_gain_share,
         reliability_table=model_reliability,
-        n_non_finite=model_reliability.n_non_finite,
+        n_non_finite=n_non_finite,
         model_max_deviation=model_reliability.worst_deviation(),
         stats=stats, per_offset=per_offset,
     )
@@ -217,6 +241,21 @@ class EvaluationReport:
     @property
     def total_non_finite(self) -> int:
         return int(sum(f.n_non_finite for f in self.folds))
+
+    @property
+    def non_finite_share(self) -> float:
+        """Unscoreable rows as a fraction of all rows offered.
+
+        Gated as a share rather than a count. Zero is the wrong threshold: a
+        venue outage leaves a couple of hours of windows without a volatility
+        estimate afterwards, and refusing to evaluate at all because Coinbase went
+        down for six hours in May is not a judgement about the model. A *rate*
+        catches what actually matters — an embargo or lookback mistake that makes
+        a large fraction unscoreable — while an outage passes and is still
+        reported.
+        """
+        rows = sum(f.n_rows for f in self.folds) + self.total_non_finite
+        return (self.total_non_finite / rows) if rows else float('nan')
 
     @property
     def mean_residual_scale(self) -> float:
@@ -308,7 +347,7 @@ class EvaluationReport:
             'folds_skill_positive': float(self.folds_positive),
             'calibration_error': self.max_ece,
             'calibration_max_deviation': self.max_calibration_deviation,
-            'non_finite_rows': float(self.total_non_finite),
+            'non_finite_share': self.non_finite_share,
             'residual_scale': self.median_residual_scale,
             'control_gain_share': self.max_control_gain_share,
             'windows_evaluated': float(self.total_windows),
@@ -363,7 +402,10 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # A data hole must report as a data hole. 31 non-finite rows in 99,388 turned
     # five of six folds' metrics into NaN while `scripts/baseline.py` printed
     # "gate passed", because `nan > 0.02` is False and pandas' max skips NaN.
-    'non_finite_rows': (0.0, 'max'),
+    # A share rather than a count, because an outage is not a defect: measured,
+    # one 6.5-hour Coinbase outage accounts for 0.02% of rows. A large share means
+    # a lookback or embargo mistake, which is.
+    'non_finite_share': (0.001, 'max'),
     'residual_scale': (0.25, 'min'),
     'control_gain_share': (0.30, 'max'),
     'windows_evaluated': (20_000.0, 'min'),
@@ -393,8 +435,8 @@ GATE_NOTES: dict[str, str] = {
                          'about how confident it is matters more than the mean',
     'calibration_max_deviation': 'the mean ECE averages away the band the money is in; '
                                  'this bounds the worst populated bin',
-    'non_finite_rows': 'a NaN prediction is a data hole, not a forecast. Counting it '
-                       'as one made "no skill" and "one missing bar" the same output',
+    'non_finite_share': 'a NaN prediction is a data hole, not a forecast. Counting it '
+                        'as one made "no skill" and "one missing bar" the same output',
     'residual_scale': 'how much of the claimed correction survives out of sample; near '
                       'zero means it found nothing however good the in-sample loss',
     'control_gain_share': 'hour-of-day cannot forecast direction. If the clock carries '

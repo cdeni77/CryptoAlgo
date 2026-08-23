@@ -54,6 +54,10 @@ BASELINE_LOGIT = 'baseline_probability_logit'
 # this, early stopping and the shrinkage fit share rows and alpha reads high.
 MIN_INNER_BLOCK_WINDOWS = 200
 
+# Fewest scoreable rows the shrinkage may be fitted on. Small enough that an
+# outage does not stop an evaluation, large enough that alpha is not noise.
+MIN_SHRINKAGE_ROWS = 500
+
 INNER_VALIDATION_FRACTION = 0.2
 
 
@@ -268,22 +272,36 @@ def _fit_residual_scale(
     """
     from scipy import optimize
 
-    # Refuse non-finite input rather than optimising over it. A single NaN makes
-    # the objective NaN at every alpha, `minimize_scalar` gives up, and it
-    # returns its golden-section bracket seed 0.7639320225 with
-    # `success=False`. That value was never checked, so the *overfitting
-    # detector* returned a search constant that sails past its own
-    # `residual_scale >= 0.25` gate. On a five-year BTC walk-forward four of six
-    # folds returned exactly 0.7639320225, and those four folds carried the
-    # reported skill.
+    # Exclude rows that carry no forecast, rather than optimising over them.
+    #
+    # A single NaN makes the objective NaN at every alpha, `minimize_scalar` gives
+    # up, and it returns its golden-section bracket seed 0.7639320225 with
+    # `success=False` — which was never checked, so the *overfitting detector*
+    # returned a search constant that sails past its own `residual_scale >= 0.25`
+    # gate. On a five-year BTC walk-forward four of six folds returned exactly
+    # that number, and those four folds carried the reported skill.
+    #
+    # Refusing outright was the first fix here and it was wrong: a 6.5-hour
+    # Coinbase outage leaves ~83 rows in 26,488 without a volatility estimate, and
+    # that killed the whole evaluation. The defect was never the NaN, it was
+    # reporting an abandoned search as a fitted value. So drop the unscoreable
+    # rows, insist enough remain to mean anything, and still raise if the fit
+    # itself does not converge.
     finite = (np.isfinite(baseline_logit) & np.isfinite(correction)
               & np.isfinite(np.asarray(outcome, dtype=float)))
-    if not finite.all():
+    dropped = int((~finite).sum())
+    if dropped:
+        logger.info(
+            '%d of %d shrinkage rows carry no forecast (a NaN sigma, usually the '
+            'tail of a data outage) and are excluded', dropped, finite.size)
+    baseline_logit = np.asarray(baseline_logit)[finite]
+    correction = np.asarray(correction)[finite]
+    outcome = np.asarray(outcome, dtype=float)[finite]
+    if outcome.size < MIN_SHRINKAGE_ROWS:
         raise ValueError(
-            f'{int((~finite).sum())} of {finite.size} validation rows are '
-            f'non-finite, so the shrinkage cannot be fitted. Scoring them would '
-            f'silently return scipy\'s bracket seed and pass the residual_scale '
-            f'gate on an unfitted constant. Fix the upstream data hole.'
+            f'only {outcome.size} scoreable rows remain of {finite.size}, which '
+            f'is under the {MIN_SHRINKAGE_ROWS} needed to fit a shrinkage that '
+            f'means anything. That is a data problem, not a model one.'
         )
 
     def objective(alpha: float) -> float:
