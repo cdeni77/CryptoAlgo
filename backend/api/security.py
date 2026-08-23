@@ -43,6 +43,23 @@ FLAG = re.compile(r'^--[a-z][a-z0-9]*(-[a-z0-9]+)*$')
 # metacharacters, no leading dash (which would smuggle in an unvetted flag).
 VALUE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_,.:=+-]*$')
 
+# Flags that must never arrive over HTTP, whatever job they are aimed at.
+#
+# `--force` makes `scripts.promote` install an artifact whose gates FAILED, and
+# `scripts/live.py` used to test only whether something was `installed` — so one
+# authenticated request could put a gate-failing model on disk and have the
+# trader pick it up. `FLAG`'s pattern accepts `--force` happily, and the token
+# guarding this route is inlined into the client bundle by Vite, so it is not a
+# secret. Overriding a safety gate is a decision to make at a terminal, with a
+# written reason, not through a dashboard button.
+FORBIDDEN_FLAGS = frozenset({
+    '--force',
+    '--no-require-gates',
+    '--place-orders',
+    '--mode',
+    '--no-reconcile',
+})
+
 MAX_ARGS = 24
 MAX_VALUE_LENGTH = 120
 
@@ -112,6 +129,16 @@ def validate_job_args(args: Optional[Iterable[str]]) -> list[str]:
     """
     if not args:
         return []
+
+    for arg in args:
+        if str(arg).split('=', 1)[0] in FORBIDDEN_FLAGS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f'{arg!r} overrides a safety gate and is refused over HTTP. '
+                    f'Run it at a terminal, where the decision is attributable.'
+                ),
+            )
 
     cleaned = [str(a).strip() for a in args if str(a).strip()]
     if len(cleaned) > MAX_ARGS:

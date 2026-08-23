@@ -217,6 +217,9 @@ class BookStats:
     sharpe: float
     max_drawdown: float
     halted: bool
+    # The old per-trade figure, kept for continuity because it is what every
+    # historical report contains. `sharpe` is now the account's.
+    sharpe_per_trade: float = float('nan')
 
     @property
     def growth_multiple(self) -> float:
@@ -277,9 +280,39 @@ def summarise(book: Book, *, windows_available: int) -> BookStats:
         (trades['settle_time'].max() - trades['window_open'].min()).total_seconds(), 1.0)
     trades_per_year = n * SECONDS_PER_YEAR / span_seconds
     sd = float(np.std(returns, ddof=1)) if n > 1 else float('nan')
-    # Per-trade Sharpe scaled by trades actually placed per year. Scaling by
-    # windows per year instead would inflate this by 1/coverage.
-    sharpe = (float(np.mean(returns)) / sd * np.sqrt(trades_per_year)) if sd and sd > 0 else float('nan')
+    # The old number: the mean of per-trade *ratios*, annualised by how often
+    # trades happened to cluster. Kept because every historical report contains
+    # it, and reported separately so the two can be compared.
+    sharpe_per_trade = (float(np.mean(returns)) / sd * np.sqrt(trades_per_year)
+                        ) if sd and sd > 0 else float('nan')
+
+    # The account's Sharpe: dollars per calendar day, zero days included.
+    #
+    # `sharpe_per_trade` is not the portfolio's risk-adjusted return and can
+    # carry the opposite sign. It equal-weights `pnl / outlay`, while the account
+    # experiences dollars — and stakes range from cents to the cap, so the two
+    # diverge. Measured on constructed books: 900 small wins plus 50 large losses
+    # gives +35.53 per-trade against -37.48 for the account (which lost $214),
+    # and a size-skewed profitable book gives -116.51 per-trade against +68.81
+    # for the account. A gate reading the first is not policing the second, which
+    # matters most for `sharpe_implausible`, whose whole job is to notice a
+    # number that cannot be real.
+    #
+    # Annualising on calendar time rather than on the traded span also stops a
+    # sparse strategy inflating its own frequency: four trades inside one hour of
+    # a five-year evaluation were being annualised as 35,064 trades a year.
+    # Idle days belong in the denominator — with `compound=False` the capital is
+    # committed to the strategy whether or not it fires.
+    daily = (trades.set_index('settle_time')['pnl'].sort_index()
+             .resample('1D').sum())
+    if len(daily) > 1:
+        calendar = pd.date_range(daily.index.min(), daily.index.max(),
+                                 freq='1D', tz=daily.index.tz)
+        daily = daily.reindex(calendar, fill_value=0.0)
+    daily_values = daily.to_numpy(dtype=float)
+    daily_sd = float(np.std(daily_values, ddof=1)) if len(daily_values) > 1 else float('nan')
+    sharpe = (float(np.mean(daily_values)) / daily_sd * np.sqrt(365.25)
+              ) if daily_sd and daily_sd > 0 else float('nan')
     running_max = equity.cummax()
     drawdown = float(((running_max - equity) / running_max).max()) if len(equity) else 0.0
 
@@ -294,6 +327,7 @@ def summarise(book: Book, *, windows_available: int) -> BookStats:
         mean_edge_pp=float(trades['edge'].mean() * 100.0),
         realised_edge_pp=float(((trades['payout'] > 0).mean() - effective_cost.mean()) * 100.0),
         mean_return_on_stake=float(np.mean(returns)), sd_return_on_stake=sd,
-        trades_per_year=trades_per_year, sharpe=sharpe, max_drawdown=drawdown,
+        trades_per_year=trades_per_year, sharpe=sharpe,
+        sharpe_per_trade=sharpe_per_trade, max_drawdown=drawdown,
         halted=book.halted_at is not None,
     )
