@@ -15,6 +15,7 @@ machine.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -111,3 +112,130 @@ def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
         pytest.fail(
             'unanchored ignore rules that match a plausible source directory at '
             'any depth:\n' + '\n'.join(offenders))
+
+
+def test_no_secret_bearing_file_is_tracked():
+    """Nothing that carries a credential may be in the repository.
+
+    `.gitignore` matched `.env` by basename only, so it covered
+    `backend/api/.env` and missed `frontend/.env` and `frontend/.env.local`. Both
+    misses were used: a live Coinbase key and an EC private key were committed in
+    b70c78c (deleted the next commit, still reachable on origin/main), and an API
+    token in 6097ed1. Deleting a file does not remove the blob, so the only
+    control that works is never committing it — which is what this asserts.
+
+    `*.example` files are the templates and are meant to be tracked.
+    """
+    offenders = []
+    for path in sorted(_tracked()):
+        name = Path(path).name
+        if name.endswith('.example'):
+            continue
+        if name == '.env' or name.startswith('.env.'):
+            offenders.append(f'{path} — an env file')
+        elif Path(path).suffix in {'.pem', '.key', '.p8', '.pfx'}:
+            offenders.append(f'{path} — a key file')
+        elif name.startswith('id_rsa'):
+            offenders.append(f'{path} — an SSH private key')
+
+    assert not offenders, (
+        'these tracked files carry credentials by convention:\n  '
+        + '\n  '.join(offenders)
+        + '\nUntrack them (`git rm --cached`), rotate whatever they held, and '
+          'check the .gitignore pattern is `.env*` rather than `.env`.'
+    )
+
+
+def test_no_tracked_file_contains_a_private_key_block():
+    """A PEM block in any tracked file, whatever the filename.
+
+    The leak that happened was in a file named `.env`, but the pattern above only
+    catches names. This catches content, so a key pasted into a config, a
+    notebook or a test fixture is caught too.
+    """
+    # A header alone is not a key. `scripts/check_venue.py` names the PEM header
+    # in a diagnostic message and this file quotes it to build the pattern, so
+    # matching the header would report both forever and the test would be
+    # switched off. Require a header line followed by an actual base64 body.
+    header = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+    body = re.compile(r'^[A-Za-z0-9+/=]{40,}\s*$', re.MULTILINE)
+
+    offenders = []
+    for path in sorted(_tracked()):
+        full = REPO / path
+        if not full.is_file() or full.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = full.read_text(errors='ignore')
+        except OSError:
+            continue
+        match = header.search(text)
+        if match and body.search(text, match.end()):
+            offenders.append(path)
+
+    assert not offenders, (
+        f'these tracked files contain a private-key block: {offenders}. '
+        f'Rotate the key immediately — a commit is permanent even after deletion.'
+    )
+
+
+
+def _pins(path: Path) -> dict[str, str]:
+    """Package -> exact version, from a requirements file."""
+    pattern = re.compile(r'^([A-Za-z0-9_.\-]+)==([^\s#]+)')
+    found: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            found[match.group(1).lower().replace('_', '-')] = match.group(2)
+    return found
+
+
+def _requirement_lines(path: Path) -> list[str]:
+    return [line.strip() for line in path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith('#')]
+
+
+REQUIREMENTS = ('backend/trader/requirements.txt', 'backend/api/requirements.txt')
+
+
+@pytest.mark.parametrize('relative', REQUIREMENTS)
+def test_every_dependency_is_pinned(relative):
+    """A build that cannot be reproduced cannot be audited.
+
+    `scikit-learn`, `lightgbm`, `scipy` and `joblib` carried no version at all and
+    `coinbase-advanced-py` no constraint whatsoever, so `pip install` at
+    image-build time pulled whatever was newest that day — in exactly the packages
+    that deserialize the promoted model and sign live orders. A `.joblib` artifact
+    is only reliably loadable by the library version that wrote it.
+    """
+    path = REPO / relative
+    unpinned = [line for line in _requirement_lines(path) if '==' not in line]
+    assert not unpinned, (
+        f'{relative} has unpinned requirements: {unpinned}. Pin them to the '
+        f'version the suite passes against, and move them one at a time.'
+    )
+
+
+def test_the_two_requirement_files_agree_on_shared_packages():
+    """The API container runs trader scripts.
+
+    `POST /jobs/{module}` executes `python -m scripts.<module>` with the API
+    container's interpreter, so `joblib`, `lightgbm`, `scikit-learn`, `numpy` and
+    `pandas` are load-bearing on both sides: an artifact written under one version
+    and read under another either fails to load or, worse, loads and scores
+    differently. `sqlalchemy` matters for a second reason — `backend/api/models/
+    serving.py` is a hand-maintained mirror of `core/pg_writer.py`, and two ORM
+    versions is a way for that mirror to drift while `test_orm_parity.py` still
+    passes.
+    """
+    trader, api = (_pins(REPO / relative) for relative in REQUIREMENTS)
+    shared = sorted(set(trader) & set(api))
+    assert shared, 'the two files share no pinned package, which cannot be right'
+    disagreements = {name: (trader[name], api[name])
+                     for name in shared if trader[name] != api[name]}
+    assert not disagreements, (
+        'these packages are pinned to different versions in the two containers: '
+        + '; '.join(f'{name}: trader {a}, api {b}'
+                    for name, (a, b) in sorted(disagreements.items()))
+    )

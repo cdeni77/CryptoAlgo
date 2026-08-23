@@ -231,12 +231,30 @@ def edge_curve(
     *,
     gates_pp: Sequence[float] = (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0),
 ) -> pd.DataFrame:
-    """How the book behaves as the abstention gate tightens.
+    """How the book behaves as the abstention gate tightens. A DIAGNOSTIC.
 
-    The right value of `min_edge_pp` is measured, not guessed: it trades coverage
-    against the calibration error it is protecting against. A curve that
-    improves monotonically as the gate tightens says the forecast is real and
-    concentrated; one that peaks and falls says the tail is noise.
+    **Do not choose `min_edge_pp` from this curve.** The docstring here used to say
+    "the right value of `min_edge_pp` is measured, not guessed", which invites
+    exactly the thing that cannot be done: every row is scored on the *same*
+    out-of-sample rows, so a value picked by reading them is no longer out of
+    sample. It is the selection bias the archive section of `CLAUDE.md` was written
+    about, one level up.
+
+    Measured on 326 days, the money on a run this size is not stable enough to
+    choose anything with. Across six configurations, forecast skill and realised
+    return came apart completely: `(3,6)` with all groups had *higher* skill than
+    the shipped configuration (+0.000365 against +0.000287) and lost half the
+    account, and at essentially constant skill the return spanned -50% to +303%.
+    The curve below moved non-monotonically over the same rows — 2.24, 2.12, 2.12,
+    2.65, 2.61, 2.24, 1.63 — which by its own reading below means the tail is
+    noise, and by the same token so is the peak.
+
+    What the shape is still good for is a sanity check on *concentration*: a curve
+    that improves as the gate tightens says the forecast is real and concentrated;
+    one that peaks and falls says the tail is noise. Read the shape, not the
+    argmax. Narrowing a configuration on skill and on a named mechanism is
+    defensible — `scripts/ablate.py` is for that — and narrowing it on return is
+    not.
     """
     rows = []
     for gate in gates_pp:

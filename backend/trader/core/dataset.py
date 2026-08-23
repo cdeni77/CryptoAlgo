@@ -394,13 +394,21 @@ def score_live(
         raise DatasetError('no symbol could be scored with this artifact')
     states = attach_cross_asset(states, REFERENCE_SYMBOL, config)
 
+    # `include_unsettled=True`: the window being decided has not settled, which is
+    # the entire point. Without it `build_windows` trims the in-progress window
+    # away and this raised on every live cycle — the loop caught only
+    # `KeyboardInterrupt`, so the process died and never placed an order.
     windows, _ = build_window_panel(
-        {s: bars_by_symbol[s] for s in states}, config, offsets=(offset,))
+        {s: bars_by_symbol[s] for s in states}, config, offsets=(offset,),
+        include_unsettled=True)
     slice_ = windows.loc[windows['window_open'] == window_open]
     if slice_.empty:
         raise DatasetError(
-            f'no window opens at {window_open} — the bars may not reach it yet, '
-            f'or its boundary minute is missing'
+            f'no window opens at {window_open} for offset +{offset}m. Either the '
+            f'feed does not reach {window_open} + {offset}m - 1min yet (a stale '
+            f'or partial fetch, which is withheld rather than forward-filled), '
+            f'or the previous window has no settlement minute so this one has no '
+            f'strike.'
         )
     dataset = Dataset(config=config, grids=grids, states=states, windows=windows,
                       reports={}, forward_vol={})

@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import pytest
 
 from data_collection.kalshi_client import (
@@ -390,26 +391,112 @@ def test_reconcile_survives_settlements_being_unavailable():
     assert state['settlements'] == []
 
 
-def test_the_live_loop_reconciles_before_settling_from_bars():
-    """Order matters: the venue knows, our bars approximate."""
-    import inspect
+def test_the_venues_settlement_wins_over_our_bars(tmp_path):
+    """Behaviour, not source text.
 
-    from scripts import live
+    This pair of tests used to read `inspect.getsource` and assert that certain
+    strings appeared in it — `'reconcile_with_venue' in source`,
+    `'update_account(bankroll=venue_balance)' in source`. Both passed for the
+    whole time the settlement reconciliation they describe **did not exist**:
+    `reconcile_with_venue` built a dict of the venue's settlements, logged its
+    length, and dropped it, and `settle_position` was called from exactly one
+    place — `settle_due`, off our own bars, with the wrong rule. A test that
+    checks a function contains a substring is a test of the comment.
 
-    source = inspect.getsource(live.run_cycle)
-    assert 'reconcile_with_venue' in source
-    assert source.index('reconcile_with_venue') < source.index('settle_due('), (
-        'bars settle positions before the venue is consulted, so a disagreement '
-        'is resolved the wrong way'
+    So: construct a position, hand `settle_due` a venue settlement that disagrees
+    with the bars, and assert the venue's answer is the one booked.
+    """
+    from core.pg_writer import PgWriter
+    from scripts.live import settle_due
+
+    writer = PgWriter(database_url=f'sqlite:///{tmp_path}/serving.db')
+    writer.ensure_account(100.0, mode='live')
+
+    window = datetime(2026, 8, 23, 0, 30, tzinfo=timezone.utc)
+    settle_time = window + timedelta(minutes=15)
+    ticker = 'KXBTC15M-26AUG230045'
+    writer.write_prediction(
+        symbol='BTC-USD', window_open=window, settle_time=settle_time,
+        offset_minutes=3, decision_time=window + timedelta(minutes=3),
+        strike=100.0, last_price=100.0, displacement=0.0, sigma_remaining=0.001,
+        z_score=0.0, baseline_probability=0.5, model_probability=0.6,
+        market_probability=0.6, price_source='quote', reason='traded', traded=True,
+        side='up', price=0.6, effective_cost=0.62, edge=0.01, contracts=5,
+        model_version=None)
+    writer.write_ticket(
+        symbol='BTC-USD', window_open=window, settle_time=settle_time,
+        offset_minutes=3, market_ticker=ticker, side='up', contracts=5,
+        limit_price=0.6, max_price=0.61, expected_cost=3.1,
+        model_probability=0.6, edge=0.01)
+    writer.open_position(
+        symbol='BTC-USD', window_open=window, settle_time=settle_time,
+        offset_minutes=3, side='up', contracts=5, price=0.6, outlay=3.1, fee=0.02,
+        model_probability=0.6, baseline_probability=0.5, edge=0.01)
+
+    # Bars that say DOWN: the settling minute's mean is below the strike of 100.
+    minute = settle_time - timedelta(minutes=1)
+    bars = {'BTC-USD': pd.DataFrame([{
+        'event_time': pd.Timestamp(minute), 'open': 99.0, 'high': 99.0,
+        'low': 99.0, 'close': 99.0, 'volume': 1.0}])}
+
+    settled = settle_due(
+        writer, bars,
+        venue_settlements={ticker: {'ticker': ticker, 'market_result': 'yes'}})
+
+    assert len(settled) == 1
+    position = writer.settled_positions_since(window)[0]
+    assert position.settled_up is True, (
+        'the bars said down and the venue said yes; the venue is the account of '
+        'record and its answer must be the one booked'
     )
+    assert position.payout == 5.0
+    # And the payout reached the account, which it never used to.
+    assert writer.account().bankroll == pytest.approx(100.0 + 5.0)
+    assert writer.account().realized_pnl == pytest.approx(5.0 - 3.1)
 
 
-def test_reconciliation_writes_the_venues_balance_not_ours():
-    """A silent overwrite would hide how far our arithmetic had drifted."""
-    import inspect
+def test_settling_from_bars_uses_the_trained_rule(tmp_path):
+    """The mean over the minute ENDING at settle_time, compared with `>=`.
 
-    from scripts.live import reconcile_with_venue
+    `settle_due` read the `open` of the bar *starting* at `settle_time` and used a
+    strict `>`. Three deviations from the label the model is trained against, and
+    measured on real bars they disagreed on 3.4-8.2% of windows. A dead-flat
+    window is the cheapest case that separates them: `>=` pays the up side and `>`
+    does not.
+    """
+    from core.pg_writer import PgWriter
+    from scripts.live import settle_due
 
-    source = inspect.getsource(reconcile_with_venue)
-    assert 'balance drift' in source, 'the gap is not reported'
-    assert 'update_account(bankroll=venue_balance)' in source
+    writer = PgWriter(database_url=f'sqlite:///{tmp_path}/serving.db')
+    writer.ensure_account(100.0, mode='paper')
+    window = datetime(2026, 8, 23, 0, 30, tzinfo=timezone.utc)
+    settle_time = window + timedelta(minutes=15)
+    writer.write_prediction(
+        symbol='BTC-USD', window_open=window, settle_time=settle_time,
+        offset_minutes=3, decision_time=window + timedelta(minutes=3),
+        strike=100.0, last_price=100.0, displacement=0.0, sigma_remaining=0.001,
+        z_score=0.0, baseline_probability=0.5, model_probability=0.6,
+        market_probability=None, price_source='baseline', reason='traded',
+        traded=True, side='up', price=0.5, effective_cost=0.52, edge=0.01,
+        contracts=2, model_version=None)
+    writer.open_position(
+        symbol='BTC-USD', window_open=window, settle_time=settle_time,
+        offset_minutes=3, side='up', contracts=2, price=0.5, outlay=1.04, fee=0.02,
+        model_probability=0.6, baseline_probability=0.5, edge=0.01)
+
+    # The minute ending at settle_time is exactly flat on the strike. The minute
+    # *starting* at settle_time is below it — which is what the old code read.
+    bars = {'BTC-USD': pd.DataFrame([
+        {'event_time': pd.Timestamp(settle_time - timedelta(minutes=1)),
+         'open': 100.0, 'high': 100.0, 'low': 100.0, 'close': 100.0, 'volume': 1.0},
+        {'event_time': pd.Timestamp(settle_time),
+         'open': 98.0, 'high': 98.0, 'low': 98.0, 'close': 98.0, 'volume': 1.0},
+    ])}
+
+    settle_due(writer, bars)
+    position = writer.settled_positions_since(window)[0]
+    assert position.settled_up is True, (
+        'a window that ends exactly on its strike pays the up side, because '
+        'strike_type is greater_or_equal — and the bar read must be the one '
+        'ENDING at settle_time, not the one starting there'
+    )

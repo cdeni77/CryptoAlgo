@@ -50,6 +50,14 @@ BASELINE_LOGIT = 'baseline_probability_logit'
 # Fraction of the training windows held back to fit `residual_scale` and to
 # early-stop on. Taken from the *end* of training, so it is the most recent
 # data and the shrinkage is measured on the regime nearest the test block.
+# Fewest windows an inner block may hold and still be split in two. Below
+# this, early stopping and the shrinkage fit share rows and alpha reads high.
+MIN_INNER_BLOCK_WINDOWS = 200
+
+# Fewest scoreable rows the shrinkage may be fitted on. Small enough that an
+# outage does not stop an evaluation, large enough that alpha is not noise.
+MIN_SHRINKAGE_ROWS = 500
+
 INNER_VALIDATION_FRACTION = 0.2
 
 
@@ -130,7 +138,10 @@ class ForecastModel:
         return {
             'features': list(self.features),
             'n_features': len(self.features),
-            'n_features_populated': len(self.features) - len(self.empty_features),
+            # `features` is already the populated list, so subtracting the empty
+            # ones again reported 28 for 35. It goes into every provenance record
+            # the trial count is read from.
+            'n_features_populated': len(self.features),
             'empty_features': list(self.empty_features),
             'groups': list(self.groups),
             'residual_scale': self.residual_scale,
@@ -173,10 +184,77 @@ class ForecastModel:
             json.dumps(self.provenance(), indent=2, default=str))
         return path
 
+    def integrity(self) -> dict:
+        """Cheap structural checks a loaded artifact must satisfy.
+
+        `load` is a bare `joblib.load`, so nothing about the object is verified —
+        not the feature list, not the config it was fitted under, not that the
+        booster inside it agrees with the column names beside it. A silently
+        mismatched feature vector is the worst of these: the matrix is built by
+        name from `self.features`, so a booster trained on a different list scores
+        a well-formed matrix of the wrong columns and returns numbers.
+        """
+        names = list(self.booster.feature_name())
+        return {
+            'features': list(self.features),
+            'booster_features': names,
+            'n_features': self.booster.num_feature(),
+        }
+
+    def verify(self, config: Optional[Config] = None) -> None:
+        """Raise unless this artifact can be scored as it stands.
+
+        Called at load. The fields compared against `config` are the ones that
+        change an answer rather than a path: a model fitted at offsets (3,6,9,12)
+        scored at (1,2) is being asked a question it was never fitted for, and
+        `core/dataset.py` only warned. `scripts/live.py` did not read
+        `config_provenance` at all.
+        """
+        names = list(self.booster.feature_name())
+        if names != list(self.features):
+            raise ValueError(
+                f'the booster was trained on {len(names)} columns and the artifact '
+                f'lists {len(self.features)}; the first disagreement is at '
+                f'{next((i for i, (a, b) in enumerate(zip(names, self.features)) if a != b), 0)}. '
+                f'The feature matrix is built by name from the artifact\'s list, so '
+                f'this would score a well-formed matrix of the wrong columns.'
+            )
+        if config is None:
+            return
+        stored = dict(self.config_provenance or {})
+        if not stored:
+            logger.warning('this artifact records no config provenance, so nothing '
+                           'can be checked against the running configuration')
+            return
+        current = config.provenance()
+        # Only the fields that change a number. Paths, versions and CLI notes
+        # differ legitimately between the run that fitted and the run that scores.
+        material = ('window_minutes', 'decision_offsets', 'vol_lookbacks_minutes',
+                    'embargo_minutes', 'fee_rate', 'maker_fee_rate', 'assume_maker',
+                    'half_spread_cents', 'min_traded_price', 'max_traded_price')
+        drift = {
+            key: (stored.get(key), current.get(key))
+            for key in material
+            if key in stored and key in current and stored[key] != current[key]
+        }
+        if drift:
+            detail = '; '.join(f'{k}: fitted {a!r}, running {b!r}'
+                              for k, (a, b) in sorted(drift.items()))
+            raise ValueError(
+                f'this artifact was fitted under a different configuration — '
+                f'{detail}. Scoring it here would answer a different question '
+                f'than the one the gates were evaluated on.'
+            )
+
     @staticmethod
-    def load(path: str | Path) -> 'ForecastModel':
+    def load(path: str | Path, config: Optional[Config] = None) -> 'ForecastModel':
         import joblib
-        return joblib.load(Path(path))
+        model = joblib.load(Path(path))
+        # Verified at load, not at first use. An artifact that cannot be scored
+        # should fail where the operator is looking, not several minutes into a
+        # cycle with a quote in hand.
+        model.verify(config)
+        return model
 
 
 def _fit_residual_scale(
@@ -194,11 +272,66 @@ def _fit_residual_scale(
     """
     from scipy import optimize
 
+    # Exclude rows that carry no forecast, rather than optimising over them.
+    #
+    # A single NaN makes the objective NaN at every alpha, `minimize_scalar` gives
+    # up, and it returns its golden-section bracket seed 0.7639320225 with
+    # `success=False` — which was never checked, so the *overfitting detector*
+    # returned a search constant that sails past its own `residual_scale >= 0.25`
+    # gate. On a five-year BTC walk-forward four of six folds returned exactly
+    # that number, and those four folds carried the reported skill.
+    #
+    # Refusing outright was the first fix here and it was wrong: a 6.5-hour
+    # Coinbase outage leaves ~83 rows in 26,488 without a volatility estimate, and
+    # that killed the whole evaluation. The defect was never the NaN, it was
+    # reporting an abandoned search as a fitted value. So drop the unscoreable
+    # rows, insist enough remain to mean anything, and still raise if the fit
+    # itself does not converge.
+    finite = (np.isfinite(baseline_logit) & np.isfinite(correction)
+              & np.isfinite(np.asarray(outcome, dtype=float)))
+    dropped = int((~finite).sum())
+    if dropped:
+        logger.info(
+            '%d of %d shrinkage rows carry no forecast (a NaN sigma, usually the '
+            'tail of a data outage) and are excluded', dropped, finite.size)
+    baseline_logit = np.asarray(baseline_logit)[finite]
+    correction = np.asarray(correction)[finite]
+    outcome = np.asarray(outcome, dtype=float)[finite]
+    if outcome.size < MIN_SHRINKAGE_ROWS:
+        raise ValueError(
+            f'only {outcome.size} scoreable rows remain of {finite.size}, which '
+            f'is under the {MIN_SHRINKAGE_ROWS} needed to fit a shrinkage that '
+            f'means anything. That is a data problem, not a model one.'
+        )
+
     def objective(alpha: float) -> float:
         return log_loss(outcome, expit(baseline_logit + float(alpha) * correction))
 
     result = optimize.minimize_scalar(objective, bounds=(0.0, 2.0), method='bounded')
+    if not result.success or not np.isfinite(result.x):
+        raise ValueError(
+            f'the shrinkage fit did not converge ({getattr(result, "message", "")!r}). '
+            f'Reporting its abandoned bracket point as a fitted alpha is how an '
+            f'unfitted constant reaches a gate.'
+        )
     return float(np.clip(result.x, 0.0, 2.0))
+
+
+def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
+                     correction: np.ndarray, alpha: float) -> float:
+    """Log loss over the rows that carry a forecast.
+
+    These three numbers go into the artifact's provenance and its `summary()`
+    line, and they were computed over unfiltered arrays — so a single row with a
+    NaN sigma printed `inner log loss nan vs baseline nan (skill +nan)` for the
+    whole model. Observed on real bars, where one venue outage is enough.
+    """
+    outcome = np.asarray(outcome, dtype=float)
+    keep = (np.isfinite(outcome) & np.isfinite(base_logit) & np.isfinite(correction))
+    if not keep.any():
+        return float('nan')
+    return log_loss(outcome[keep],
+                    expit(base_logit[keep] + alpha * correction[keep]))
 
 
 def fit_model(
@@ -240,9 +373,54 @@ def fit_model(
     if len(windows) < 20:
         raise ValueError(f'{len(windows)} training windows is not enough to fit')
     cut = windows[int(len(windows) * (1.0 - INNER_VALIDATION_FRACTION))]
-    inner_train = train.loc[train['window_open'] < cut]
-    inner_valid = train.loc[train['window_open'] >= cut]
-    if inner_valid.empty or inner_train.empty:
+
+    # Purge the inner split the same way the outer one is purged.
+    #
+    # This boundary used to be hard: the last inner-training window was fifteen
+    # minutes from the first inner-validation window, against the 1,440 the outer
+    # CV insists on for exactly the same stated reason. Two things are fitted
+    # here — LightGBM's `best_iteration` and `residual_scale` — and
+    # `residual_scale` is the single number guarding against overconfidence, with
+    # its own gate. Leaking into it does not inflate the reported out-of-sample
+    # skill, which is measured on the properly embargoed outer fold; it ships a
+    # model whose shrinkage is too weak and makes its gate easier to pass than
+    # intended.
+    embargo = pd.Timedelta(minutes=int(config.embargo_minutes))
+    inner_train = train.loc[train['window_open'] < cut - embargo]
+    if inner_train.empty:
+        # A short training slice cannot afford the full embargo. Say so rather
+        # than silently dropping it — the window is still purged by the label's
+        # own horizon, which is the part that must not be skipped.
+        fallback = pd.Timedelta(minutes=int(config.window_minutes))
+        logger.warning(
+            'the %d-minute inner embargo leaves no training rows in a slice of '
+            '%d windows; falling back to %s. The shrinkage this fits will be '
+            'optimistic.', config.embargo_minutes, len(windows), fallback)
+        inner_train = train.loc[train['window_open'] < cut - fallback]
+
+    # Early stopping and the shrinkage must not share rows. `residual_scale`
+    # answers "how much of the claimed correction survives out of sample", and
+    # measured on the same rows that chose the tree count it answers "how much
+    # survives on the rows the tree count was selected for" — it read 0.902 on a
+    # provably zero-signal null. Split the validation block in two.
+    valid_windows = windows[windows >= cut]
+    holdout = train.loc[train['window_open'] >= cut]
+    inner_valid, alpha_rows = holdout, holdout
+    if len(valid_windows) >= 2 * MIN_INNER_BLOCK_WINDOWS:
+        mid = valid_windows[len(valid_windows) // 2]
+        stop_block = train.loc[(train['window_open'] >= cut)
+                               & (train['window_open'] < mid - embargo)]
+        alpha_block = train.loc[train['window_open'] >= mid]
+        if not stop_block.empty and not alpha_block.empty:
+            inner_valid, alpha_rows = stop_block, alpha_block
+    if inner_valid is alpha_rows:
+        logger.warning(
+            'the inner validation block (%d windows) is too small to separate '
+            'early stopping from the shrinkage fit; alpha will be measured on '
+            'the rows the tree count was chosen for and will read high.',
+            len(valid_windows))
+
+    if inner_valid.empty or inner_train.empty or alpha_rows.empty:
         raise ValueError('inner validation split is empty')
 
     def dataset(frame: pd.DataFrame, reference=None):
@@ -273,10 +451,10 @@ def fit_model(
         callbacks=[lgb.early_stopping(config.early_stopping_rounds, verbose=False)],
     )
 
-    valid_matrix = _feature_matrix(inner_valid, populated)
-    correction = np.asarray(booster.predict(valid_matrix, raw_score=True), dtype=float)
-    base_logit = inner_valid[BASELINE_LOGIT].to_numpy(dtype=float)
-    outcome = inner_valid['outcome'].to_numpy(dtype=float)
+    alpha_matrix = _feature_matrix(alpha_rows, populated)
+    correction = np.asarray(booster.predict(alpha_matrix, raw_score=True), dtype=float)
+    base_logit = alpha_rows[BASELINE_LOGIT].to_numpy(dtype=float)
+    outcome = alpha_rows['outcome'].to_numpy(dtype=float)
     alpha = _fit_residual_scale(base_logit, correction, outcome)
 
     model = ForecastModel(
@@ -285,14 +463,14 @@ def fit_model(
         groups=tuple(groups) if groups else (),
         n_train_rows=len(train), n_train_windows=len(windows),
         empty_features=empty, best_iteration=booster.best_iteration,
-        train_log_loss=log_loss(
+        train_log_loss=_finite_log_loss(
             inner_train['outcome'].to_numpy(dtype=float),
-            expit(inner_train[BASELINE_LOGIT].to_numpy(dtype=float)
-                  + alpha * np.asarray(
-                      booster.predict(_feature_matrix(inner_train, populated), raw_score=True),
-                      dtype=float))),
-        inner_log_loss=log_loss(outcome, expit(base_logit + alpha * correction)),
-        inner_baseline_log_loss=log_loss(outcome, expit(base_logit)),
+            inner_train[BASELINE_LOGIT].to_numpy(dtype=float),
+            np.asarray(booster.predict(_feature_matrix(inner_train, populated),
+                                       raw_score=True), dtype=float),
+            alpha),
+        inner_log_loss=_finite_log_loss(outcome, base_logit, correction, alpha),
+        inner_baseline_log_loss=_finite_log_loss(outcome, base_logit, correction, 0.0),
         config_provenance=config.provenance(),
     )
     logger.info(model.summary())

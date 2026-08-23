@@ -45,6 +45,8 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional, Sequence
 
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 
@@ -52,6 +54,11 @@ from core.config import Config, DEFAULT_CONFIG
 from core.vol import MINUTES_PER_DAY, Seasonality, log_returns, realised_vol, vol_features
 
 logger = logging.getLogger(__name__)
+
+# The exchange `us_equity_hours` is about. `zoneinfo` handles DST, which a
+# fixed UTC band cannot: 13:30-20:00 UTC is the session in EDT and misses the
+# last hour of it in EST.
+NEW_YORK = ZoneInfo('America/New_York')
 
 # The canonical column list, per group. `build_features` reindexes to exactly
 # this so a saved model always scores against the same matrix — a group that
@@ -65,7 +72,7 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     'microstructure': (
         'autocorr_60', 'run_length', 'body_ratio_15', 'volume_z_15',
-        'trade_count_z_15', 'vwap_gap_15', 'signed_volume_15', 'zero_return_share_60',
+        'vwap_gap_15', 'signed_volume_15', 'zero_return_share_60',
     ),
     'cross_asset': (
         'peer_displacement', 'peer_return_5', 'peer_return_15',
@@ -170,13 +177,20 @@ def minute_state(
     volume.index = volume.index + pd.Timedelta(minutes=1)
     log_volume = np.log1p(volume)
     frame['volume_z_15'] = _zscore(log_volume.rolling(15, min_periods=5).mean(), MINUTES_PER_DAY)
-    if 'trade_count' in grid.columns:
-        counts = grid['trade_count'].astype(float).copy()
-        counts.index = counts.index + pd.Timedelta(minutes=1)
-        frame['trade_count_z_15'] = _zscore(
-            np.log1p(counts).rolling(15, min_periods=5).mean(), MINUTES_PER_DAY)
-    else:
-        frame['trade_count_z_15'] = np.nan
+    # `trade_count_z_15` used to live here and has been removed rather than
+    # repaired. Coinbase's candles endpoint returns open/high/low/close/volume and
+    # nothing else, so `trade_count` was NULL on 100% of 2,617,876 stored rows and
+    # the feature could never fire. It looked alive only because
+    # `tests/conftest.py` fabricated the column, so
+    # `test_every_declared_feature_is_produced` passed on synthetic data that the
+    # real store cannot produce. A declared feature that is structurally
+    # unavailable is worse than an absent one: it occupies a slot in the matrix,
+    # dilutes every importance share, and reads as a measurement.
+    #
+    # If a trade count is wanted, it has to come from a source that has one — the
+    # Exchange `/products/{id}/candles` endpoint does not carry it either, so that
+    # means trades or ticker aggregation, which is a data-collection change and not
+    # a feature change.
 
     close = grid['close'].copy()
     close.index = close.index + pd.Timedelta(minutes=1)
@@ -262,12 +276,20 @@ def _clock_features(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
     out['hour_cos'] = np.cos(2 * np.pi * minute_of_day / MINUTES_PER_DAY)
     out['dow_sin'] = np.sin(2 * np.pi * decision.dayofweek / 7)
     out['dow_cos'] = np.cos(2 * np.pi * decision.dayofweek / 7)
-    # 13:30-20:00 UTC covers the US cash session across both daylight regimes.
-    # Deliberately a wide band rather than a DST-exact one: the point is a
-    # liquidity control, and an exact boundary invites reading its coefficient
-    # as a finding.
-    out['us_equity_hours'] = ((minute_of_day >= 13 * 60 + 30) & (minute_of_day < 20 * 60)
-                              & (decision.dayofweek < 5)).astype(float)
+    # The US cash session, in New York local time so that it is the session in
+    # both daylight regimes rather than in one.
+    #
+    # The comment here used to claim 13:30-20:00 UTC "covers the US cash session
+    # across both daylight regimes". It does not: that is 09:30-16:00 EDT exactly,
+    # and in EST the session is 14:30-21:00 UTC — so for roughly four months a
+    # year the flag was on for the hour before the open and off for the last hour
+    # of trading. Converting is cheaper than a wide band and removes the
+    # judgement call.
+    local = decision.tz_convert(NEW_YORK) if decision.tz is not None else decision
+    local_minute = local.hour * 60 + local.minute
+    out['us_equity_hours'] = ((local_minute >= 9 * 60 + 30)
+                              & (local_minute < 16 * 60)
+                              & (local.dayofweek < 5)).astype(float)
     return out
 
 

@@ -4,6 +4,15 @@ Full architecture and agent guidance lives in `AGENTS.md`. This file adds
 Claude Code-specific notes and, more importantly, the reasoning that is easy to
 lose.
 
+**Read `AUDIT_REPORT.md` first.** An adversarial audit in August 2026 found that
+the research core is sound — no lookahead, and the backtest and live paths compute
+identical feature vectors to 16 decimal places — while everything that traded was
+broken: the live loop could not score the window it was deciding, the paper
+bankroll was never credited a win, and the scraper had been losing one minute in
+every 301 for five years. Several claims in *this* file were among the things
+disproved, and are corrected in place below. `AUDIT_FIX_PLAN.md` tracks what
+remains.
+
 ## Project in One Sentence
 
 Barrier-probability trading on Kalshi 15-minute BTC/ETH/SOL up-down markets:
@@ -116,16 +125,24 @@ Three consequences worth holding onto:
   small order, so this is the dominant correction rather than a rounding detail.
   `decide()` re-checks expected value against what will actually be charged,
   after rounding to whole contracts.
-* **The half-spread overtakes the fee at 83c**, where `0.07*p*(1-p)` falls below
-  a cent. Above that the assumption is the larger cost, which is why it is a
-  separate, stressed parameter. (These docs said "~60c" for a while. They were
-  wrong; `tests/test_costs.py` derives the crossover now.)
+* **The half-spread overtakes the fee at 92.26c** at the current 0.5c default,
+  where `0.07*p*(1-p)` falls below half a cent. Above that the assumption is the
+  larger cost, which is why it is a separate, stressed parameter. This number has
+  now been wrong twice: "~60c", then "83c" — which is the crossover against a
+  *one-cent* half-spread, the old default, and was left behind when the measured
+  spread halved it. At 83c the fee is still $0.0099, about 2x the half-spread.
+  `tests/test_costs.py` derives it; the prose is the thing that keeps drifting.
 * **The price band must be symmetric.** The edge here is a disagreement about
   `sigma_remaining`, and that points both ways: a smaller sigma than the market
   assumes makes the probability *more* extreme than the quote, so buy the
   favourite; a larger sigma makes the favourite overpriced, so buy the longshot.
   A one-sided band such as [0.55, 0.95] permits only the first and silently
-  discards half the strategy.
+  discards half the strategy. **This was not hypothetical: the shipped default was
+  [0.05, 0.97].** 1 - 0.97 is 0.03, so it admitted 96-97c favourites and refused
+  3-4c longshots — and the asymmetry ran the wrong way on cost, since at 96c a 1pp
+  calibration error destroys ~43% of the gross edge and at 4c about 1%. It is
+  [0.05, 0.95] now, and `Config.__post_init__` refuses an asymmetric band rather
+  than leaving it to this paragraph.
 * **The tick is tapered, and this corrects a stated reason.** The venue's
   `price_level_structure` is `tapered_deci_cent`: a *tenth* of a cent below 10c
   and above 90c, a full cent in between. The band's low end used to be justified
@@ -151,10 +168,34 @@ cannot know what offset 12 will look like, so best-of-offsets is not a strategy
 that can be run. `scripts/evaluate.py` reports edge per offset separately, which
 is how the offset set gets narrowed on evidence.
 
-The barrier framing predicts where that edge should live: `P` is most sensitive
+The barrier framing predicted where that edge should live: `P` is most sensitive
 to a sigma error when `|x|/sigma` is near 1, so the edge should peak mid-window
-with a moderate displacement and decay late, because a probability pinned near 1
-is insensitive to sigma. Untested — but it is a prediction, not a hope.
+with a moderate displacement and decay late. **That prediction has now been tested
+and it is wrong.** On 326 days of real bars the skill peaks at the *earliest*
+offset and is dead by offset 9:
+
+```
+offset      n   mean_skill  folds+
+     3  79765     0.000368     6/6
+     6  79769     0.000265     5/6
+     9  79770    -0.000004     3/6
+    12  79770     0.000103     4/6
+```
+
+And the mechanism is not sigma at all. `vol_state` alone scores **-0.000101**
+(2/6 folds) while `cross_asset` alone scores **+0.000183 at t=+3.39, 6/6 folds** —
+the strongest single group, and the only one with independent prior support (the
+archive's cross-sectional residual at h=4h: +0.0186, t=4.54, 6/6 folds). An
+earliest-offset peak is the wrong shape for a sigma error and the right one for
+lead-lag: a BTC move needs time for ETH and SOL to follow, so twelve remaining
+minutes express it and three do not.
+
+So the honest state of the thesis: the barrier reframing is still what makes the
+question tractable and the null strong, but the *edge* on top of it looks like
+cross-asset lead-lag concentrated at offset 3, not a volatility disagreement.
+Offsets 9 and 12 should probably go. See the Edge Investigation section of
+`AUDIT_REPORT.md` for the full measurement, including why the money numbers from
+that run must not be used to choose a configuration.
 
 ## Architecture
 
@@ -210,6 +251,13 @@ Keep `clock` in any survey. The previous project ran a 27-cell grid whose best
 cell was its own control, and that was the most useful result it produced.
 `ForecastModel.control_importance_share` is a gate at 0.30 for the same reason.
 
+**But the gain-share gate is measuring the wrong quantity, and an ablation is the
+real test.** Measured on 326 days: `control_gain_share` read 0.279 — nearly
+carrying the model, on the face of it — while `clock` *alone* scored
+**-0.000008 (t=-0.26, 2/6 folds)** and removing it slightly *improved* skill. A
+high LightGBM gain share means splits were spent there, not that the feature
+forecasts anything. Run the group alone before believing the share either way.
+
 ## Invariants — break these and the numbers stop meaning anything
 
 - **Both ends of the target are one-minute averages, and a tie resolves UP.**
@@ -219,7 +267,19 @@ cell was its own control, and that was the most useful result it produced.
   `[t0 - 1min, t0)`, the settlement value is the mean over `[t1 - 1min, t1)`, and
   the comparison is `>=` because `strike_type` is `greater_or_equal`. An earlier
   version used `open(t0)`, `open(t1)` and a strict `>` — a defensible reading of
-  "up/down in the next 15 minutes", and wrong in three places at once.
+  "up/down in the next 15 minutes", and wrong in three places at once. **That fix
+  landed in `core/windows.py` and not in `scripts/live.py`**, where `settle_due`
+  kept reading `open(t1)` with a strict `>` until the audit; measured, the two
+  disagreed on 3.4-8.2% of windows, and its docstring still justified the `open`
+  on the grounds that "the strike was read the same way".
+
+  The `>=` is right because it matches `strike_type`, and for no other reason.
+  The justification this file used to give — that "flat windows are not rare on a
+  minute grid" — is wrong by four orders of magnitude: **1 exact tie in 173,937**
+  real BTC windows. Both ends are OHLC means of a liquid asset, so ties are
+  essentially measure-zero. Relatedly `windows.base_rate` claimed the base rate
+  should sit slightly *below* 0.5; measured it is **0.5009 (BTC) / 0.5031 (ETH)**,
+  above, exactly as `>=` implies.
 - **A window's strike is the previous window's settlement value.** Both are the
   mean over the same minute. Consecutive markets chain, which is a real
   structural dependence and one more reason the embargo is a day.
@@ -259,6 +319,15 @@ cell was its own control, and that was the most useful result it produced.
   calibrated baseline in for the market; a live decision reads the real ask. Those
   are different claims, and a row that cannot distinguish them makes a backtest
   look like a fill.
+- **`kelly_fraction` is also an edge filter, and the two are not independent.**
+  `decide()` floors the stake to whole contracts, so a smaller Kelly fraction does
+  not just stake less — it pushes marginal trades under one contract and refuses
+  them. Measured on 326 days, 0.25 -> 0.10 left `edge_below_gate` *identical* at
+  242,571 while `below_min_contracts` went 1,813 -> 8,218; realised edge per
+  contract rose +0.99pp -> +3.32pp and drawdown fell 58% -> 21%, because the
+  survivors were the higher-edge trades rather than because the sizing was safer.
+  `max_stake_fraction` is nearly inert at this edge size by comparison: Kelly binds
+  first, and cutting that cap fivefold barely moved the drawdown.
 - **Sizing is additive by default** (`compound=False`). Compounding turns a
   per-trade edge estimate into an exponential, and the exponential is dominated
   by the *error* in the estimate. The first full run compounded $100 into
@@ -350,7 +419,7 @@ python -m scripts.live --mode live --dry-run        # real book, no orders
 python -m scripts.live --mode live --place-orders   # real orders
 python -m scripts.live --loop --cycle-seconds 60
 
-# Tests. pytest.ini sets -n auto: 207 tests in 26s.
+# Tests. pytest.ini sets -n auto: 381 tests in ~90s (`-m "not slow"` for the fast loop).
 cd backend/trader && pytest
 cd backend/api && pytest
 
@@ -418,21 +487,42 @@ open, which is what `core/windows.py` builds.
 That abstention was the resolution logic working. A ticker built from a pattern
 would have found *something* 15 or 30 minutes away and traded it.
 
-**Expect ~0.5% of minutes to be missing, and know which kind.** A five-year BTC
-backfill returned 2,617,876 of ~2,630,880 minutes. Most of the shortfall is
-minutes in which nothing traded — the venue has no candle and never will, and
-asking again gets the same nothing. A few are multi-hour blocks from a batch
-request that failed, and those *do* come back: `--fill-gaps` finds runs of two or
-more missing minutes and re-requests only those.
+**Expect ~0.4% of minutes to be missing, and 86% of them were our own bug.** A
+five-year BTC backfill returned 2,617,876 of 2,628,000 minutes. This file used to
+say most of the shortfall was minutes in which nothing traded. That was false, and
+it was the stated reason `--fill-gaps` skipped single-minute holes by default —
+so the repair tool skipped precisely the holes the scraper was creating.
+
+`get_candles_range` asked for a 300-minute span with `limit=300`, and Coinbase
+treats both `start` and `end` as inclusive. The request therefore named 301 candle
+starts, the venue returned the newest 300, and the loop advanced past the one it
+dropped: **one minute in every 301, for five years.** Five independent
+confirmations — 98.9% of the gaps between holes were exactly 301 minutes apart;
+the rate was 0.003318 against 1/301 = 0.003322; it was flat across UTC hour,
+weekday and year; and 5,121 of BTC's 8,721 isolated holes fell on the identical
+minute in ETH against 28.9 expected by chance. Two independent order books do not
+go untraded in the same 8,700 minutes.
+
+Fixed, and `--min-gap-minutes` now defaults to 1 so the singles are re-requested.
+Genuinely untraded minutes do exist; re-asking is cheap and idempotent, so the
+default errs toward asking. **Run `--fill-gaps` on any store built before this.**
 
 The cost of a missing minute is specific now that both ends of the target are
 one-minute averages: only a minute at index 14 of a window matters, and each one
-kills two windows (that window's settlement and the next one's strike). At 0.5%
-missing spread across all fifteen positions, that is roughly 1% of windows lost —
+kills two windows (that window's settlement and the next one's strike). At 0.4%
+missing spread across all fifteen positions, that is roughly 0.8% of windows lost —
 `Dataset.coverage()` reports it per symbol and `load_dataset` warns above 2%.
 
-**The honest state of things.** As of this writing there is no scraped data, no
-trained model, and no measured edge. The phase gates exist because the edge is a
+**The honest state of things.** There are now ~2.6M one-minute bars per symbol
+for BTC and ETH (2021-08 to 2026-08); SOL was still scraping at the time of the
+audit. There is still no promoted model. A five-year BTC walk-forward run during
+the audit reported mean log-loss skill +0.000897 +/- 0.000240 over 6/6 positive
+folds — but read `AUDIT_REPORT.md` before believing it: the backtest's
+counterfactual price *is* the baseline the model is fitted to correct, four of six
+folds were scored with an unfitted shrinkage constant, the correction peaks at the
+offset where the null is worst calibrated rather than mid-window as predicted, and
+two of the top four features by gain are the clock control. At rho 0.7 between
+folds, "6 of 6 positive" is a 22% event under the null, not 1.6%. The phase gates exist because the edge is a
 *hypothesis*: `scripts/evaluate.py` failing is the expected outcome until proven
 otherwise, and nothing about the live plumbing existing changes that. Trading
 before Phase 3 passes is risking real money on an unestablished edge.

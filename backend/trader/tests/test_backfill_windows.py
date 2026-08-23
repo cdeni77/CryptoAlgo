@@ -452,19 +452,85 @@ def test_an_empty_batch_is_retried_with_backoff_not_immediately():
     assert list(EMPTY_BATCH_BACKOFF_SECONDS) == sorted(EMPTY_BATCH_BACKOFF_SECONDS), (
         'the waits must grow, or the later attempts add nothing'
     )
-    source = inspect.getsource(CoinbaseRESTClient.get_candles_range)
-    assert 'EMPTY_BATCH_BACKOFF_SECONDS' in source
-    assert 'asyncio.sleep(delay)' in source, 'it retries without waiting'
+
+@pytest.mark.asyncio
+async def test_an_empty_batch_is_retried_with_growing_waits():
+    """Behaviour, not source text.
+
+    This asserted `'EMPTY_BATCH_BACKOFF_SECONDS' in source` and
+    `'asyncio.sleep(delay)' in source`. Both would keep passing if the retry loop
+    were rewritten to sleep once and give up, or to sleep on the wrong branch —
+    they check that two identifiers appear in a function body. Count the attempts
+    instead.
+    """
+    import asyncio
+
+    from data_collection.coinbase_connector import (
+        EMPTY_BATCH_BACKOFF_SECONDS, CoinbaseRESTClient,
+    )
+
+    calls: list[tuple[int, int]] = []
+    waits: list[float] = []
+
+    async def always_empty(method, path, params=None, **kwargs):
+        calls.append((int(params['start']), int(params['end'])))
+        return 200, {'candles': []}
+
+    async def record_sleep(seconds):
+        waits.append(seconds)
+
+    client = CoinbaseRESTClient(api_key=None, api_secret=None)
+    client._request = always_empty                      # noqa: SLF001
+    original, asyncio.sleep = asyncio.sleep, record_sleep
+    try:
+        start = datetime(2025, 1, 1)
+        await client.get_candles_range(
+            'BTC-USD', '1m', start, start + timedelta(minutes=600))
+    finally:
+        asyncio.sleep = original
+
+    assert len(calls) > len(EMPTY_BATCH_BACKOFF_SECONDS), (
+        f'{len(calls)} requests for {len(EMPTY_BATCH_BACKOFF_SECONDS)} configured '
+        f'backoffs: the empty batch was not retried through the whole ladder'
+    )
+    assert waits, 'it retried without waiting at all'
+    assert waits[:len(EMPTY_BATCH_BACKOFF_SECONDS)] == list(EMPTY_BATCH_BACKOFF_SECONDS), (
+        f'waited {waits[:4]}, expected {list(EMPTY_BATCH_BACKOFF_SECONDS)}'
+    )
 
 
-def test_skipped_windows_are_recorded_on_the_client():
-    """So a caller can act on them rather than parse a log line."""
-    import inspect
+@pytest.mark.asyncio
+async def test_a_window_that_never_answers_is_recorded_on_the_client():
+    """So a caller can act on it rather than parse a log line.
 
+    This checked `'self.last_skipped_windows' in source`, which is true of a
+    function that assigns the attribute and never populates it.
+    """
     from data_collection.coinbase_connector import CoinbaseRESTClient
 
-    source = inspect.getsource(CoinbaseRESTClient.get_candles_range)
-    assert 'self.last_skipped_windows' in source
+    async def always_empty(method, path, params=None, **kwargs):
+        return 200, {'candles': []}
+
+    async def no_wait(seconds):
+        return None
+
+    import asyncio
+
+    client = CoinbaseRESTClient(api_key=None, api_secret=None)
+    client._request = always_empty                      # noqa: SLF001
+    original, asyncio.sleep = asyncio.sleep, no_wait
+    try:
+        start = datetime(2025, 1, 1)
+        bars = await client.get_candles_range(
+            'BTC-USD', '1m', start, start + timedelta(minutes=600))
+    finally:
+        asyncio.sleep = original
+
+    assert bars == []
+    assert client.last_skipped_windows, (
+        'nothing came back and nothing was recorded, so a caller cannot tell a '
+        'quiet market from a venue that stopped answering'
+    )
 
 
 def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
@@ -496,9 +562,18 @@ def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
     assert gaps[0][0] == datetime(2025, 10, 25, 15, 14)
 
 
-def test_a_single_missing_minute_is_not_a_gap_worth_refetching():
-    """A minute in which nothing traded has no candle, and asking twice gets the
-    same nothing. Only multi-minute blocks are worth a request."""
+def test_min_minutes_controls_whether_a_lone_missing_minute_is_a_gap():
+    """`min_minutes` is the threshold, and 1 includes isolated single minutes.
+
+    This test used to be called
+    `test_a_single_missing_minute_is_not_a_gap_worth_refetching`, asserting that
+    a lone hole is "a minute in which nothing traded". That premise was false —
+    86% of the isolated holes in the real store were a client-side pagination
+    off-by-one, spaced exactly 301 minutes apart and co-occurring across symbols
+    177x more often than chance allows. The mechanism the body checks is correct
+    and unchanged; only the claim in the name was wrong, and the default moved
+    from 2 to 1 as a result.
+    """
     import sqlite3
     import tempfile
     from datetime import datetime, timedelta
@@ -524,3 +599,90 @@ def test_a_single_missing_minute_is_not_a_gap_worth_refetching():
                          min_minutes=2) == []
         assert len(find_gaps(str(database), 'BTC-USD', '1m', 'coinbase_spot',
                              min_minutes=1)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_forced_backfill_fetches_an_interior_range():
+    """`--fill-gaps` could not fill a gap, which is the whole job.
+
+    `backfill` resumes from the store's own boundaries: it prepends what is older
+    than the earliest bar and appends what is newer than the latest. For a hole in
+    the *middle* the prepend branch is skipped (the hole is newer than the first
+    bar) and `append_start` jumps to `last_time + 1min`, which is past the
+    requested `end` — so `append_start < end` is False and nothing is fetched. It
+    logged "store already covers ... which spans the request" and returned
+    success. Ten thousand recoverable minutes per symbol survived every run of the
+    tool built to recover them.
+    """
+    from datetime import datetime as dt
+
+    from data_collection.pipeline import DataPipeline
+
+    fetched: list[tuple] = []
+
+    async def fake_fetch(self, symbol, timeframe, start, end):
+        fetched.append((start, end))
+        return []
+
+    class FakeDB:
+        def get_latest_ohlcv_time(self, *a, **k):
+            return dt(2026, 8, 23, 4, 17)
+
+        def get_earliest_ohlcv_time(self, *a, **k):
+            return dt(2021, 8, 24, 4, 18)
+
+    class FakeConfig:
+        symbols = ['BTC-USD']
+        timeframes = ['1m']
+        backfill_days = 1825
+
+    pipeline = DataPipeline.__new__(DataPipeline)
+    pipeline._database = FakeDB()
+    pipeline.config = FakeConfig()
+    pipeline._venue_name = lambda: 'coinbase_spot'
+    pipeline._granularity_to_seconds = lambda tf: 60
+    pipeline._quality_tracker = type('Q', (), {'get_summary': lambda s: {}})()
+    pipeline._process_and_insert_bars = lambda *a, **k: True
+
+    hole_start, hole_end = dt(2023, 5, 3, 5, 59), dt(2023, 5, 3, 6, 1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(DataPipeline, '_fetch_bars', fake_fetch)
+
+        await pipeline.backfill(start=hole_start, end=hole_end,
+                                symbols=['BTC-USD'], timeframes=['1m'])
+        assert fetched == [], (
+            'the resuming path fetched an interior range; if that is now intended, '
+            'this test no longer describes the defect'
+        )
+
+        await pipeline.backfill(start=hole_start, end=hole_end,
+                                symbols=['BTC-USD'], timeframes=['1m'], force=True)
+        assert fetched == [(hole_start, hole_end)], (
+            f'a forced backfill must fetch exactly the range asked for; got {fetched}'
+        )
+
+
+def test_gaps_are_coalesced_into_requests_a_batch_can_cover():
+    """One request per hole is the venue's bill; merging what fits is free.
+
+    Holes left by the 301-for-300 pagination bug are one minute further apart than
+    a request can span, so those cannot merge — but a store with clustered outages
+    collapses a long way, and `fill_gaps` used to issue one request per gap
+    regardless.
+    """
+    from datetime import datetime as dt
+
+    from scripts.scrape import coalesce
+
+    base = dt(2025, 1, 1)
+    spaced = [(base + timedelta(minutes=301 * i), base + timedelta(minutes=301 * i + 1))
+              for i in range(5)]
+    assert len(coalesce(spaced, span_minutes=299)) == 5, (
+        'holes 301 apart cannot share a 300-minute request'
+    )
+
+    clustered = [(base + timedelta(minutes=10 * i), base + timedelta(minutes=10 * i + 2))
+                 for i in range(20)]
+    assert len(coalesce(clustered, span_minutes=299)) == 1
+
+    assert coalesce([], span_minutes=299) == []

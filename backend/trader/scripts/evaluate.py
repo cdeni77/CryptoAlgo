@@ -23,8 +23,10 @@ the live path uses, and reports the answer in the order it should be read:
    price above 83c (where 0.07*p(1-p) falls below a cent). A strategy that
    survives only at the assumed
    spread has not been demonstrated.
-7. **The edge curve.** Where the abstention gate should sit, measured rather
-   than guessed.
+7. **The edge curve.** A diagnostic on concentration — read the shape, not the
+   argmax. Choosing `min_edge_pp` from it would be selecting on the same
+   out-of-sample rows it is scored on; see `core/backtest.py:edge_curve` for the
+   measurement showing why the money on a run this size cannot choose anything.
 
     python -m scripts.evaluate
     python -m scripts.evaluate --groups clock        # the control, alone

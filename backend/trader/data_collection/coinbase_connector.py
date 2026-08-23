@@ -92,6 +92,13 @@ def _funding_interval_hours(raw: Any) -> float:
 EMPTY_BATCH_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
 
 
+# The venue's hard cap on candles per request. Both `start` and `end` are
+# inclusive, so a request may span at most this many candle STARTS — see
+# `get_candles_range`, where using the full span instead of `n - 1` silently
+# destroyed one minute in every 301.
+MAX_CANDLES_PER_REQUEST = 300
+
+
 class CoinbaseRESTClient:
     BASE_URL = "https://api.coinbase.com"
     
@@ -174,7 +181,7 @@ class CoinbaseRESTClient:
             "1h": "ONE_HOUR", "2h": "TWO_HOUR", "6h": "SIX_HOUR", "1d": "ONE_DAY",
         }
         api_granularity = granularity_map.get(granularity, "ONE_HOUR")
-        params = {"granularity": api_granularity, "limit": min(limit, 300)}
+        params = {"granularity": api_granularity, "limit": min(limit, MAX_CANDLES_PER_REQUEST)}
         if start:
             params["start"] = naive_utc_to_epoch_seconds(start)
         if end:
@@ -202,7 +209,23 @@ class CoinbaseRESTClient:
             except (KeyError, ValueError, TypeError):
                 continue
         bars.sort(key=lambda x: x.event_time)
-        return bars
+        # Drop the candle that has not closed yet. `end` is almost always
+        # `utc_now()` at the call sites, so the newest candle returned was the
+        # one for the minute in progress: a partial bar whose high, low, close
+        # and volume are all wrong, stored permanently because
+        # `DataPipeline._poll` only accepts `event_time > last_known` and so never
+        # re-requests it. Observed directly — a scrape started at 04:17:29Z stored
+        # `04:17:00` for both symbols with 51.9% of a minute's volume.
+        #
+        # `available_time` is already `event_time + timeframe`, i.e. the instant
+        # the bar closes, so this is the same "knowable at close" rule the rest of
+        # the system uses rather than a second convention.
+        now = utc_now()
+        closed = [b for b in bars if b.available_time <= now]
+        if len(closed) != len(bars):
+            logger.debug('%s: dropped %d unclosed candle(s)', product_id,
+                         len(bars) - len(closed))
+        return closed
     
     async def get_candles_range(self, product_id: str, granularity: str, start: datetime, end: datetime) -> List[OHLCVBar]:
         if start.tzinfo is None:
@@ -214,9 +237,21 @@ class CoinbaseRESTClient:
         attempt = 0
         skipped_windows: List[tuple] = []
         tf_seconds = self._granularity_to_seconds(granularity)
-        batch_duration = tf_seconds * 300
+        # `limit - 1`, not `limit`. Coinbase treats both `start` and `end` as
+        # INCLUSIVE, so a span of `limit * tf` names `limit + 1` candle starts.
+        # With `limit=300` the API returned the newest 300 and dropped the oldest
+        # — `current_start` itself — and the loop below then advanced past it.
+        # One minute destroyed in every 301, forever.
+        #
+        # It was not a rounding detail. In the five-year store this produced
+        # 8,721 of BTC's 10,124 missing minutes: 98.9% of the gaps between holes
+        # were exactly 301 minutes, the rate was 0.003318 against 1/301 =
+        # 0.003322, and 5,121 of BTC's holes fell on the identical minute in ETH
+        # against 28.9 expected by chance. Two independent order books do not go
+        # untraded in the same 8,700 minutes.
+        batch_span = timedelta(seconds=tf_seconds * (MAX_CANDLES_PER_REQUEST - 1))
         while current_start < end:
-            batch_end = min(current_start + timedelta(seconds=batch_duration), end)
+            batch_end = min(current_start + batch_span, end)
             if (batch_end - current_start).total_seconds() < tf_seconds:
                 break
             bars = await self.get_candles(product_id, granularity, current_start, batch_end)

@@ -71,8 +71,10 @@ import pandas as pd
 from core.config import Config, DEFAULT_CONFIG, find_fee_config
 from core.dataset import score_live
 from core.decide import Decision, Reason, WindowExposure, decide, rejection_histogram
-from core.pg_writer import PgWriter
+from core.dataset import DatasetError
+from core.pg_writer import AccountModeMismatch, PgWriter, TraderAlreadyRunning
 from core.promotion import LIVE_MODEL, MODELS_ROOT, load_live
+from core.windows import bar_mean
 from data_collection.coinbase_connector import CoinbaseRESTClient
 from data_collection.kalshi_client import KalshiClient, KalshiError, Quote
 
@@ -109,10 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
-    parser.add_argument('--dry-run', action='store_true', default=None,
-                        help='Read the real book, size the order, place nothing. '
-                             'Implied unless --place-orders is given.')
-    parser.add_argument('--place-orders', action='store_true',
+    # Mutually exclusive, at the parser. `--dry-run` used to be declared and
+    # never read — `args.dry_run` appeared nowhere in this file — so
+    # `--mode live --dry-run --place-orders` parsed cleanly and placed real
+    # orders. A flag documented as a safety guard has to be either honoured or
+    # a usage error; silently ignored is the one option that gets money lost.
+    orders = parser.add_mutually_exclusive_group()
+    orders.add_argument('--dry-run', action='store_true', default=False,
+                        help='Read the real book, size the order, place nothing '
+                             'and book nothing. Implied unless --place-orders.')
+    orders.add_argument('--place-orders', action='store_true',
                         help='Actually place orders. Requires --mode live, and is '
                              'a separate flag from it deliberately.')
     parser.add_argument('--loop', action='store_true',
@@ -192,6 +200,98 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
     return out
 
 
+def check_circuit_breakers(writer: PgWriter, config: Config,
+                           *, now: datetime) -> Optional[str]:
+    """Halt the account on a bad day or a bad streak. Returns the reason, or None.
+
+    `Account.halted` and `halted_reason` existed as columns, were rendered on the
+    dashboard as a safety chip, and **were never written by anything** — the only
+    code that set them was `core/book.py`, the backtest's in-memory account,
+    which `scripts/live.py` does not import. So the indicator was structurally
+    incapable of turning on, and the `halted` promotion gate read the simulated
+    account rather than the real one.
+
+    The ruin floor in `decide` was the only live limit, and it fires after half
+    the account is gone. At 96 windows a day across three symbols that is a long
+    way to bleed: the nominal worst case was $768/day against a $100 bankroll.
+
+    A halt is sticky. Clearing it is a manual decision, because a breaker that
+    resets itself at midnight is a speed bump.
+    """
+    account = writer.account()
+    if account is None:
+        return None
+    if account.halted:
+        return str(account.halted_reason or 'halted')
+
+    def halt(reason: str) -> str:
+        writer.update_account(halted=True, halted_reason=reason[:400])
+        logger.error('HALTED: %s. No further entries until this is cleared by '
+                     'hand.', reason)
+        return reason
+
+    if not np.isfinite(float(account.bankroll)):
+        return halt('the bankroll is not a finite number, so nothing about the '
+                    'account can be trusted')
+
+    since = pd.Timestamp(now).tz_convert('UTC').normalize().to_pydatetime()
+    today = writer.settled_positions_since(since)
+    if today:
+        realised = sum(float(p.pnl or 0.0) for p in today)
+        limit = -abs(config.max_daily_loss_fraction) * config.starting_bankroll
+        if realised <= limit:
+            return halt(f'today is {realised:+.2f} against a limit of {limit:.2f} '
+                        f'({config.max_daily_loss_fraction:.0%} of the starting '
+                        f'bankroll) over {len(today)} settlements')
+
+    recent = writer.settled_positions_since(
+        (pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(days=7)).to_pydatetime())
+    streak = 0
+    for position in sorted(recent, key=lambda p: p.settled_at or since, reverse=True):
+        if float(position.pnl or 0.0) < 0:
+            streak += 1
+        else:
+            break
+    if streak >= config.max_consecutive_losses:
+        return halt(f'{streak} consecutive losing settlements, at or over the '
+                    f'limit of {config.max_consecutive_losses}')
+    return None
+
+
+def stale_symbols(bars: dict[str, pd.DataFrame], config: Config,
+                  *, now: datetime) -> dict[str, str]:
+    """Symbols whose feed is too old, or absent, with the reason.
+
+    There was no staleness guard anywhere. The last `event_time` was logged
+    (`fetch_bars`) and never compared to the wall clock or to the decision
+    minute, so a delayed or partial fetch was scored as though it were current.
+    Two distinct hazards:
+
+    * **An old feed.** The forward-fill inside `build_windows` is right for a
+      minute in which nothing traded and cannot tell that from a minute not yet
+      fetched, so a stale feed produces a fabricated `last_price` and the barrier
+      treats it as a measurement.
+    * **A missing symbol.** `fetch_bars` logged and continued, which silently
+      redefines the *other* symbols' `cross_asset` features — measured,
+      `beta_1440` moved 7.7x with no error and no NaN. The universe is part of
+      the feature definition, so a short universe is a different model.
+    """
+    reasons: dict[str, str] = {}
+    cutoff = pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(
+        seconds=int(config.max_bar_age_seconds))
+    for symbol in config.symbols:
+        frame = bars.get(symbol)
+        if frame is None or frame.empty:
+            reasons[symbol] = 'no bars returned'
+            continue
+        newest = pd.Timestamp(frame['event_time'].iloc[-1])
+        if newest < cutoff:
+            age = (pd.Timestamp(now).tz_convert('UTC') - newest).total_seconds()
+            reasons[symbol] = (f'newest bar {newest} is {age:.0f}s old, over the '
+                               f'{config.max_bar_age_seconds}s limit')
+    return reasons
+
+
 def record_minute_prices(writer: PgWriter, bars: dict[str, pd.DataFrame],
                          *, hours: int = 6) -> int:
     """Store the last few hours of bars so the dashboard can draw the path."""
@@ -212,42 +312,164 @@ def record_minute_prices(writer: PgWriter, bars: dict[str, pd.DataFrame],
     return written
 
 
-def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame]) -> list[tuple[int, float]]:
-    """Settle every matured position from the bar opening on its settle minute.
+def as_utc(value) -> pd.Timestamp:
+    """A UTC timestamp, whether the source remembered the timezone or not.
 
-    `open` of the settle minute, not `close` of the minute before: the strike was
-    read the same way, so the window's return is open-to-open. Anchoring one end
-    on a last trade and the other on a first trade is how this project once
-    manufactured 98% of an apparent edge.
+    The ORM columns are `DateTime(timezone=True)`, so Postgres hands back
+    tz-aware values and SQLite hands back naive ones — it has no timezone type.
+    `pd.Timestamp(x).tz_convert('UTC')` raises on the naive case, so any code
+    path that reads a timestamp back out of the store and assumes awareness works
+    against Postgres and raises against SQLite. Everything stored is UTC, so
+    localise when the tz is missing rather than guessing.
+    """
+    stamp = pd.Timestamp(value)
+    return stamp.tz_localize('UTC') if stamp.tz is None else stamp.tz_convert('UTC')
+
+
+def venue_settled_up(row: dict, side: str) -> Optional[bool]:
+    """Did the *up* side win, according to the venue's settlement row?
+
+    The venue is the account of record, so this is preferred over any bar-derived
+    answer. Kalshi has published more than one shape for this, so read an
+    explicit result where there is one and fall back to inferring from revenue
+    and the side we held. Returns None when neither is legible — the caller then
+    falls back to bars and says so, rather than guessing.
+    """
+    for key in ('market_result', 'result', 'settlement_result'):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip().lower() in ('yes', 'no'):
+            return value.strip().lower() == 'yes'
+    revenue = row.get('revenue_dollars', row.get('revenue'))
+    try:
+        revenue = float(revenue)
+    except (TypeError, ValueError):
+        return None
+    # Revenue is what the position paid out. A paid-out `up` holding means yes
+    # won; a paid-out `down` holding means it lost.
+    won = revenue > 0.0
+    if side == 'up':
+        return won
+    if side == 'down':
+        return not won
+    return None
+
+
+def resolve_window(strike: float, settle_time, symbol: str,
+                   bars: dict[str, pd.DataFrame]) -> tuple[Optional[bool], float]:
+    """Did this window settle up, per the trained rule? Plus the value used.
+
+    One implementation, because `settle_due` and `settle_predictions` must agree —
+    the whole reason the live settlement drifted from the training label in the
+    first place was a second copy of this arithmetic.
+
+    The rule is `core/windows.py`'s: the `(O+H+L+C)/4` mean of the minute *ending*
+    at `settle_time`, compared with `>=` because the venue's `strike_type` is
+    `greater_or_equal`. Returns `(None, nan)` when the bar is not there yet.
+    """
+    frame = bars.get(symbol)
+    if frame is None:
+        return None, float('nan')
+    minute = as_utc(settle_time) - pd.Timedelta(minutes=1)
+    row = frame.loc[frame['event_time'] == minute]
+    if row.empty:
+        return None, float('nan')
+    value = float(bar_mean(row).iloc[0])
+    if not np.isfinite(value):
+        return None, float('nan')
+    return value >= strike, value
+
+
+def settle_predictions(writer: PgWriter, bars: dict[str, pd.DataFrame],
+                       *, now: Optional[datetime] = None) -> int:
+    """Fill in the realised outcome on every settled window, traded or not.
+
+    Without this the market benchmark cannot exist. `market_probability` is
+    recorded on each decision — the venue's own mid — and scoring it needs the
+    answer beside it. `settle_due` only touches windows we *hold*, which is the
+    ~6% we chose to trade: exactly the selected sample that cannot answer "is the
+    market's probability better than ours".
+    """
+    # Injectable so a test can place a window in the past without waiting for the
+    # wall clock to agree.
+    now = now or datetime.now(timezone.utc)
+    filled = 0
+    for symbol, window_open, settle_time, strike in writer.windows_awaiting_outcome(now):
+        settled_up, _ = resolve_window(strike, settle_time, symbol, bars)
+        if settled_up is None:
+            continue
+        filled += writer.set_window_outcome(symbol, window_open, settled_up=settled_up)
+    if filled:
+        logger.info('recorded the outcome on %d prediction row(s)', filled)
+    return filled
+
+
+def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
+               *, venue_settlements: Optional[dict[str, dict]] = None,
+               ) -> list[tuple[int, float]]:
+    """Settle every matured position, on the venue's rule.
+
+    **This must agree with `core/windows.py:build_windows` exactly**, because the
+    model is trained against that label and the money is booked against this one.
+    It did not. This function read the *open* of the bar starting at `settle_time`
+    and compared with a strict `>`, while the target is the `(O+H+L+C)/4` mean of
+    the minute *ending* at `settle_time` compared with `>=`. Three deviations at
+    once — wrong minute, wrong estimator, wrong comparison — and measured on real
+    bars they disagreed on 3.4-8.2% of windows. Its docstring justified the
+    `open` because "the strike was read the same way", which stopped being true
+    when the averaged target landed and left the comment arguing for the bug.
+
+    The venue's own settlement wins wherever it is available. Ours is an OHLC
+    mean of Coinbase standing in for sixty seconds of CF Benchmarks BRTI, which
+    is a close proxy and not the same number; every disagreement is logged
+    because a persistent one is the basis risk becoming measurable.
     """
     now = datetime.now(timezone.utc)
+    venue_settlements = venue_settlements or {}
     settled: list[tuple[int, float]] = []
     for position in writer.positions_due(now):
-        frame = bars.get(position.symbol)
-        if frame is None:
-            continue
-        settle_minute = pd.Timestamp(position.settle_time).tz_convert('UTC')
-        row = frame.loc[frame['event_time'] == settle_minute]
-        if row.empty:
-            logger.warning('%s window %s: no bar at the settle minute yet, waiting',
-                           position.symbol, position.window_open)
-            continue
-        settle_price = float(row['open'].iloc[0])
-        settled_up = settle_price > float(position.price_reference) \
-            if hasattr(position, 'price_reference') else None
-        # The strike is on the prediction row, not the position, so read it back.
         strike = _strike_for(writer, position)
         if strike is None:
             logger.error('%s window %s: no strike recorded, cannot settle',
                          position.symbol, position.window_open)
             continue
-        settled_up = settle_price > strike
-        pnl = writer.settle_position(position.id, settled_up=settled_up)
+
+        # The venue first, where it knows.
+        ticket = _ticket_for(writer, position)
+        ticker = getattr(ticket, 'market_ticker', None) if ticket else None
+        from_venue = None
+        if ticker and ticker in venue_settlements:
+            from_venue = venue_settled_up(venue_settlements[ticker], position.side)
+
+        # Ours: the mean over the minute ENDING at settle_time, and `>=`.
+        settle_minute = as_utc(position.settle_time) - pd.Timedelta(minutes=1)
+        from_bars, settle_price = resolve_window(
+            strike, position.settle_time, position.symbol, bars)
+
+        if from_venue is not None and from_bars is not None and from_venue != from_bars:
+            logger.warning(
+                '%s window %s: the venue settled %s and our bars say %s '
+                '(mean %.4f vs strike %.4f). Taking the venue. A persistent '
+                'disagreement here is the Coinbase-vs-BRTI basis, measured.',
+                position.symbol, position.window_open,
+                'up' if from_venue else 'down', 'up' if from_bars else 'down',
+                settle_price, strike)
+
+        settled_up = from_venue if from_venue is not None else from_bars
+        if settled_up is None:
+            logger.warning(
+                '%s window %s: neither the venue nor a bar at %s can settle this '
+                'yet, waiting', position.symbol, position.window_open,
+                settle_minute)
+            continue
+
+        pnl = writer.settle_position(position.id, settled_up=bool(settled_up))
         if pnl is not None:
             settled.append((position.id, pnl))
-            logger.info('settled %s %s: %s at %.4f vs strike %.4f -> %+.2f',
+            logger.info('settled %s %s: %s (%s) vs strike %.4f -> %+.2f',
                         position.symbol, position.window_open,
-                        'up' if settled_up else 'down', settle_price, strike, pnl)
+                        'up' if settled_up else 'down',
+                        'venue' if from_venue is not None else f'mean {settle_price:.4f}',
+                        strike, pnl)
     return settled
 
 
@@ -296,7 +518,7 @@ async def fetch_quotes(
     return quotes
 
 
-async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> None:
+async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> dict[str, dict]:
     """Make the venue's ledger the one we report.
 
     Three comparisons, each of which has a specific failure it catches:
@@ -314,6 +536,13 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> None:
     state = await kalshi.reconcile()
     venue_balance = float(state['balance'])
     account = writer.account()
+    if not np.isfinite(venue_balance):
+        # The venue is the account of record only when it actually answered.
+        # Writing an unreadable balance over a correct one is worse than keeping
+        # ours and saying so.
+        logger.error('the venue did not return a readable balance; keeping our own '
+                     'figure this cycle rather than overwriting it')
+        account = None
     if account is not None:
         ours = float(account.bankroll)
         drift = venue_balance - ours
@@ -326,12 +555,17 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> None:
         writer.update_account(bankroll=venue_balance)
 
     # Settle from the venue where it knows, keyed on the market ticker we stored.
-    resolved = {}
+    # This dict used to be built, logged, and dropped on the floor — `revenue` was
+    # assigned and never read (ruff F841), `resolved` was used only as a
+    # membership set for the warning below, and `settle_position` was called from
+    # exactly one place: `settle_due`, off our own bars. So the documented
+    # "settlement from /portfolio/settlements where it knows" did not exist. It is
+    # returned now, and `run_cycle` hands it to `settle_due`.
+    resolved: dict[str, dict] = {}
     for row in state.get('settlements', []):
         ticker = str(row.get('ticker', ''))
         if not ticker:
             continue
-        revenue = row.get('revenue_dollars', row.get('revenue'))
         resolved[ticker] = row
     if resolved:
         logger.info('venue reports %d settlement(s) to reconcile', len(resolved))
@@ -347,6 +581,24 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> None:
                 'Most likely the order never filled — a fill_or_kill that killed '
                 'leaves a ticket and no position.',
                 position.symbol, position.window_open, position.contracts)
+
+    # The reverse direction, which was never checked: a position the venue holds
+    # and we do not. That is what an order POST that timed out after the venue
+    # accepted it leaves behind, and it is the one discrepancy that costs money
+    # silently.
+    ours = set()
+    for position in writer.open_positions():
+        ticket = _ticket_for(writer, position)
+        ticker = getattr(ticket, 'market_ticker', None) if ticket else None
+        if ticker:
+            ours.add(ticker)
+    for ticker in sorted(venue_open - ours):
+        logger.error(
+            'the venue reports an open position in %s that we have no record of. '
+            'An order was filled and not booked — most likely a POST that timed '
+            'out after being accepted. Reconcile by hand before trading again.',
+            ticker)
+    return resolved
 
 
 def _ticket_for(writer: PgWriter, position):
@@ -371,15 +623,37 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         return []
     record_minute_prices(writer, bars)
 
+    halted = check_circuit_breakers(writer, config, now=now)
+    if halted:
+        logger.error('account halted (%s); settling only, no new entries', halted)
+        offset = None
+
+    stale = stale_symbols(bars, config, now=now)
+    if stale:
+        # Settlement and reconciliation below still run: they read the past, which
+        # a short feed does not invalidate, and a matured position should not be
+        # left hanging because this cycle cannot decide.
+        for symbol, why in sorted(stale.items()):
+            logger.error('%s: %s', symbol, why)
+        logger.error('the universe is %d of %d symbols this cycle, so no decision '
+                     'is made — a short universe redefines every cross-asset '
+                     'feature rather than simply omitting one row',
+                     len(config.symbols) - len(stale), len(config.symbols))
+        offset = None
+
     # The venue first, where there is one: it knows what actually settled and
     # what the balance actually is. Bars only fill in what it has not resolved.
+    venue_settlements: dict[str, dict] = {}
     if kalshi is not None and args.reconcile:
         try:
-            await reconcile_with_venue(writer, kalshi)
+            venue_settlements = await reconcile_with_venue(writer, kalshi)
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
                          'bookkeeping for this cycle', exc)
-    settle_due(writer, bars)
+    settle_due(writer, bars, venue_settlements=venue_settlements)
+    # Independent of whether anything was held: this is what turns the recorded
+    # market quotes into a scoreable sample.
+    settle_predictions(writer, bars)
 
     if offset is None:
         logger.info('%d minutes into the window; first decision offset is +%dm',
@@ -399,6 +673,10 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         quotes[s][0].ask_for('down') if s in quotes else np.nan for s in scored['symbol']]
     scored['market_ticker'] = [
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
+    # `Quote.mid` is None on a one-sided book, which is the honest answer: the
+    # midpoint of a single quote is not a midpoint.
+    scored['market_mid'] = [
+        quotes[s][0].mid if s in quotes else np.nan for s in scored['symbol']]
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is
@@ -451,12 +729,39 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             if depth is not None:
                 scored.loc[index, f'depth_{side}'] = depth
 
-    account = writer.ensure_account(config.starting_bankroll, mode=args.mode)
-    exposure = WindowExposure()
+    account = writer.account()
+    if account is None:
+        raise RuntimeError('no account row; main() must call ensure_account first')
+
+    # Seed exposure from what is already committed for THIS window, so
+    # `ALREADY_ENTERED` / `POSITION_LIMIT` / `WINDOW_EXPOSURE` survive a new
+    # cycle, a new offset and a process restart.
+    entered, staked, n_entered = writer.entries_for_window(
+        window_open.to_pydatetime() if hasattr(window_open, 'to_pydatetime') else window_open)
+    exposure = WindowExposure(stake=staked, positions=n_entered, symbols_entered=entered)
+    if entered:
+        logger.info('window %s already holds %s ($%.2f); those symbols will refuse',
+                    window_open, sorted(entered), staked)
     decisions: list[Decision] = []
 
+    # Live prices from the book or not at all. Without this a row with no quote
+    # falls back to the backtest's counterfactual price — our own baseline — and
+    # can still return TRADED, which is how an unresolved market booked a
+    # position for an order that was never sent.
+    require_quote = args.mode == 'live'
     for _, row in scored.sort_values('symbol').iterrows():
-        decision = decide(row, config, bankroll=account.bankroll, exposure=exposure)
+        # Re-read the clock. `now` was taken at the top of the cycle, and between
+        # then and here sit a Coinbase fetch, four authenticated reconcile calls,
+        # LightGBM inference and one quote call per symbol at up to 15s each.
+        remaining = (settle_time - pd.Timestamp.now(tz='UTC')).total_seconds()
+        if remaining < config.min_remaining_seconds:
+            logger.warning(
+                '%s: %.0fs left of the window, under the %ds floor — the sigma on '
+                'this row is for %s and the clock has moved past it',
+                row['symbol'], remaining, config.min_remaining_seconds, settle_time)
+            break
+        decision = decide(row, config, bankroll=account.bankroll,
+                          exposure=exposure, require_quote=require_quote)
         decisions.append(decision)
         writer.write_prediction(
             symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
@@ -467,7 +772,17 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             z_score=_finite(row.get('z_score')),
             baseline_probability=float(row['baseline_probability']),
             model_probability=float(row['model_probability']),
-            market_probability=_finite(row.get('ask_up')),
+            # The venue's belief (the mid) and what a trade would cost (both
+            # asks). This was `ask_up` recorded under the name
+            # `market_probability` — a price rather than a probability, one side
+            # of the book only, and read by nothing. The mid is the right input
+            # to "does the model beat the market"; the ask carries half the
+            # spread, so scoring against it would flatter us by exactly what we
+            # pay to cross. Written on EVERY row, refused ones included, because
+            # the sample that can answer that question has to be unselected.
+            market_probability=_finite(row.get('market_mid')),
+            market_ask_up=_finite(row.get('ask_up')),
+            market_ask_down=_finite(row.get('ask_down')),
             price_source=decision.price_source,
             reason=decision.reason.value, traded=decision.traded,
             side=decision.side.value if decision.side else None,
@@ -478,69 +793,205 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         logger.info(decision.describe())
         if not decision.traded:
             continue
-        exposure = exposure.with_(decision)
-        await act_on(args, writer, kalshi, decision, row)
+        # Only count exposure we actually took on. `act_on` returns False when
+        # the order was refused, killed, or never sent.
+        if await act_on(args, writer, kalshi, decision, row):
+            exposure = exposure.with_(decision)
 
+    # Re-read: `account` was loaded before the decisions and is now stale by
+    # every stake debited this cycle.
+    account = writer.account()
+    open_now = writer.open_positions()
     writer.write_equity_point(
-        timestamp=now, equity=account.bankroll,
-        bankroll=account.bankroll,
-        staked=sum(p.outlay for p in writer.open_positions()),
-        open_positions=len(writer.open_positions()),
-        realized_pnl=account.realized_pnl,
+        timestamp=now,
+        equity=(account.bankroll + sum(p.outlay for p in open_now)) if account else 0.0,
+        bankroll=account.bankroll if account else 0.0,
+        staked=sum(p.outlay for p in open_now),
+        open_positions=len(open_now),
+        realized_pnl=account.realized_pnl if account else 0.0,
     )
     return decisions
 
 
+def order_limit_price(decision: Decision) -> float:
+    """The worst price still worth paying for this decision.
+
+    Was `price + edge` — the break-even price. Under `fill_or_kill` that lets a
+    thin book walk the whole order to a zero-EV fill and still call it a trade;
+    measured, it sent 0.7832 against a 0.60 ask, 18c of tolerance on a 1c
+    measured spread. Pay away a bounded fraction of the edge instead, capped in
+    cents, so a fill always keeps most of what the forecast claimed.
+    """
+    config = DEFAULT_CONFIG
+    edge = decision.edge if np.isfinite(decision.edge) else 0.0
+    allowance = min(max(0.0, edge) * config.slippage_share_of_edge,
+                    config.max_slippage_cents / 100.0)
+    return float(min(0.99, decision.price + allowance))
+
+
+def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
+    """Contracts actually filled, and at what price, from the venue's reply.
+
+    This used to be `int(order.get('count', decision.contracts))`. `count` is the
+    size *requested*, and `status`, `remaining_count` and `taker_fill_count` were
+    never read — so a killed `fill_or_kill`, a partial fill, and an HTTP 200 with
+    an empty body all recorded a full fill and debited the bankroll for contracts
+    nobody held. The documented claim that "a fill_or_kill that killed leaves a
+    ticket and no position" was false.
+
+    Returns `(0, nan)` for anything that is not a confirmed fill. Assuming a fill
+    is the one error here that cannot be reconciled later: the position is
+    invented, `settle_due` settles it, and the PnL is fiction.
+    """
+    status = str(order.get('status', '') or '').strip().lower()
+    if status in ('canceled', 'cancelled', 'killed', 'rejected', 'expired'):
+        return 0, float('nan')
+
+    filled = None
+    for key in ('taker_fill_count', 'filled_count', 'fill_count'):
+        if order.get(key) is not None:
+            try:
+                filled = int(order[key])
+                break
+            except (TypeError, ValueError):
+                return 0, float('nan')
+    if filled is None and order.get('remaining_count') is not None:
+        try:
+            filled = requested - int(order['remaining_count'])
+        except (TypeError, ValueError):
+            return 0, float('nan')
+    if filled is None:
+        # No fill field at all. Only 'executed'/'filled' justifies believing the
+        # whole order traded; anything else (including an empty body) is unknown,
+        # and unknown must not become a position.
+        if status in ('executed', 'filled'):
+            filled = requested
+        else:
+            return 0, float('nan')
+
+    filled = max(0, min(int(filled), requested))
+    price = float('nan')
+    for key in ('average_fill_price_dollars', 'avg_price_dollars',
+                'average_fill_price', 'yes_price', 'no_price'):
+        raw = order.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        # Integer-cent fields on the same keys as dollar ones; the venue serves
+        # both shapes. Above 1.0 it can only be cents.
+        price = value / 100.0 if value > 1.0 else value
+        break
+    return filled, price
+
+
 async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
-                 decision: Decision, row) -> None:
-    """Record the position, and place the order when asked to twice."""
+                 decision: Decision, row) -> bool:
+    """Record the ticket, place the order when asked to twice, book the fill.
+
+    Returns whether a position was booked, so the caller only counts exposure it
+    actually took on.
+
+    **A position is written only when money actually moved.** Previously control
+    fell through to `open_position` in every branch: an unresolved market (no
+    ticker) wrote a position and debited the bankroll having sent no order, and so
+    did `--mode live --dry-run`. Both produced holdings the venue had never heard
+    of, which `settle_due` then settled into invented PnL — the exact failure the
+    `price_source` column exists to make visible.
+    """
+    placing = bool(args.place_orders) and kalshi is not None and not args.dry_run
+
+    if placing and not decision.market_ticker:
+        logger.error(
+            '%s window %s: no market resolved, so nothing can be bought. '
+            'Abstaining rather than booking a position against our own baseline.',
+            decision.symbol, decision.window_open)
+        return False
+
     ticket_id = writer.write_ticket(
         symbol=decision.symbol, window_open=decision.window_open,
         settle_time=decision.settle_time, offset_minutes=decision.offset,
         market_ticker=decision.market_ticker, side=decision.side.value,
         contracts=decision.contracts, limit_price=decision.price,
-        # The worst price still worth paying: where the edge reaches zero. A
-        # ticket without this is an instruction to pay anything.
-        max_price=float(min(0.99, decision.price + max(0.0, decision.edge))),
+        # The worst price still worth paying. Capped at a fraction of the edge:
+        # paying the whole edge away leaves a zero-EV fill, and under
+        # fill_or_kill that is what walking the book to break-even buys.
+        max_price=order_limit_price(decision),
         expected_cost=decision.stake, model_probability=decision.model_probability,
         edge=decision.edge,
     )
 
-    placed_price = decision.price
     filled = decision.contracts
-    if args.place_orders and kalshi is not None and decision.market_ticker:
+    placed_price = decision.price
+    if placing:
         try:
             order = await kalshi.place_order(
                 ticker=decision.market_ticker, side=decision.side.value,
                 contracts=decision.contracts,
-                limit_price=float(min(0.99, decision.price + max(0.0, decision.edge))),
+                limit_price=order_limit_price(decision),
                 client_order_id=f'{decision.symbol}-{decision.window_open:%Y%m%d%H%M}',
             )
-            filled = int(order.get('count', decision.contracts))
-            writer.resolve_ticket(ticket_id, status='placed',
-                                  filled_contracts=filled,
-                                  filled_price=placed_price,
-                                  note=str(order.get('order_id', ''))[:200])
-            logger.info('placed order %s', order.get('order_id'))
         except (KalshiError, ValueError) as exc:
             writer.resolve_ticket(ticket_id, status='skipped', note=str(exc)[:400])
             logger.error('order refused, no position recorded: %s', exc)
-            return
-    elif args.mode == 'live':
-        logger.info('dry run: ticket %d written, no order placed', ticket_id)
+            return False
+        except (asyncio.TimeoutError, OSError) as exc:
+            # The request may well have reached the venue. Do NOT book a position
+            # and do NOT retry: `client_order_id` is deterministic per
+            # (symbol, window), so the next cycle's attempt is the venue's problem
+            # to deduplicate, and reconciliation will surface a fill we never saw.
+            writer.resolve_ticket(ticket_id, status='unknown', note=str(exc)[:400])
+            logger.error(
+                'the order request to %s failed in flight (%s). It may have been '
+                'accepted. Not booking a position and not retrying; the next '
+                'reconcile will report a venue position we do not hold.',
+                decision.market_ticker, exc)
+            return False
 
+        filled, fill_price = filled_from_order(order, decision.contracts)
+        if filled <= 0:
+            writer.resolve_ticket(
+                ticket_id, status='killed',
+                note=f"status={order.get('status')!r} order_id={str(order.get('order_id',''))[:60]}")
+            logger.warning(
+                '%s window %s: the order did not fill (status %r). No position.',
+                decision.symbol, decision.window_open, order.get('status'))
+            return False
+        if np.isfinite(fill_price):
+            placed_price = fill_price
+        writer.resolve_ticket(
+            ticket_id, status='filled', filled_contracts=filled,
+            filled_price=placed_price,
+            note=str(order.get('order_id', ''))[:200])
+        if filled < decision.contracts:
+            logger.warning('%s window %s: partial fill %d of %d',
+                           decision.symbol, decision.window_open,
+                           filled, decision.contracts)
+        logger.info('filled %d @ %.4f (order %s)', filled, placed_price,
+                    order.get('order_id'))
+    elif args.mode == 'live':
+        # A real book was read and priced; nothing was bought. Recording a
+        # position here would put a holding on the books that does not exist.
+        logger.info('dry run: ticket %d written, no order placed, no position',
+                    ticket_id)
+        return False
+
+    outlay = decision.stake * (filled / decision.contracts) if decision.contracts else 0.0
+    fee = decision.fee * (filled / decision.contracts) if decision.contracts else 0.0
     writer.open_position(
         symbol=decision.symbol, window_open=decision.window_open,
         settle_time=decision.settle_time, offset_minutes=decision.offset,
         side=decision.side.value, contracts=filled, price=placed_price,
-        outlay=decision.stake, fee=decision.fee,
+        outlay=outlay, fee=fee,
         model_probability=decision.model_probability,
         baseline_probability=decision.baseline_probability, edge=decision.edge,
     )
-    account = writer.account()
-    if account is not None:
-        writer.update_account(bankroll=account.bankroll - decision.stake,
-                              fees_paid=account.fees_paid + decision.fee)
+    # Relative, in one statement: a read-then-write across two transactions loses
+    # one of two overlapping debits, and nothing enforces a single writer.
+    writer.adjust_account(bankroll_delta=-outlay, fees_delta=fee)
+    return True
 
 
 def _finite(value) -> Optional[float]:
@@ -569,8 +1020,9 @@ async def main() -> int:
     if args.bankroll is not None:
         config = config.with_overrides(starting_bankroll=args.bankroll)
 
-    model = load_live() if args.model is None else __import__(
-        'core.model', fromlist=['ForecastModel']).ForecastModel.load(args.model)
+    model = (load_live(config=config) if args.model is None
+             else __import__('core.model', fromlist=['ForecastModel'])
+             .ForecastModel.load(args.model, config))
     if model is None:
         raise SystemExit(
             f'no artifact at {MODELS_ROOT / LIVE_MODEL}. Run '
@@ -597,6 +1049,13 @@ async def main() -> int:
     print()
 
     writer = PgWriter()
+    try:
+        account = writer.ensure_account(config.starting_bankroll, mode=args.mode)
+    except AccountModeMismatch as exc:
+        raise SystemExit(str(exc))
+    logger.info('account #%s mode=%s bankroll $%.2f realized $%+.2f',
+                account.id, account.mode, account.bankroll, account.realized_pnl)
+
     kalshi: Optional[KalshiClient] = None
     if args.mode == 'live':
         kalshi = KalshiClient(live=bool(args.place_orders))
@@ -608,14 +1067,25 @@ async def main() -> int:
         logger.info('Kalshi balance $%.2f', await kalshi.balance())
 
     try:
-        while True:
-            decisions = await run_cycle(args, config, writer, model, kalshi)
-            if decisions:
-                counts = rejection_histogram(decisions)
-                logger.info('cycle: %s', counts[counts > 0].to_dict())
-            if not args.loop:
-                return 0
-            await asyncio.sleep(args.cycle_seconds)
+        with writer.exclusive_trader_lock():
+            while True:
+                try:
+                    decisions = await run_cycle(args, config, writer, model, kalshi)
+                except DatasetError as exc:
+                    # One unscoreable cycle is not a reason to exit. This used to
+                    # be fatal: `score_live` raised on every cycle and the loop
+                    # caught only KeyboardInterrupt, so the process died and
+                    # `restart: unless-stopped` crash-looped it forever.
+                    logger.error('cycle skipped, nothing scored: %s', exc)
+                    decisions = []
+                if decisions:
+                    counts = rejection_histogram(decisions)
+                    logger.info('cycle: %s', counts[counts > 0].to_dict())
+                if not args.loop:
+                    return 0
+                await asyncio.sleep(args.cycle_seconds)
+    except TraderAlreadyRunning as exc:
+        raise SystemExit(str(exc))
     except KeyboardInterrupt:
         logger.info('stopped')
         return 0
@@ -631,11 +1101,22 @@ def _refuse_if_blocked() -> None:
     if frame.empty:
         raise SystemExit('no promotion attempt recorded; refusing to trade')
     latest = frame.iloc[0]
+    # `installed` and `passed` are different questions. `--force` installs an
+    # artifact whose gates FAILED and records installed=True, so testing
+    # `installed` alone let a gate-failing model trade silently — and
+    # `POST /jobs/scripts.promote {"args": ["--force", "--reason", "x"]}` reaches
+    # that from a single HTTP request. Test the gates.
     if not bool(latest.get('installed')):
         raise SystemExit(
             f"the newest attempt {latest.get('version')} was blocked on "
             f"{latest.get('failed_gates')}. Trading it needs --no-require-gates "
             f"and --force with a written reason.")
+    if 'passed' in frame.columns and not bool(latest.get('passed')):
+        raise SystemExit(
+            f"the newest attempt {latest.get('version')} was force-installed "
+            f"with failing gates ({latest.get('failed_gates')}). It is on disk, "
+            f"but --require-gates means what it says. Trading it needs "
+            f"--no-require-gates and --force with a written reason.")
 
 
 if __name__ == '__main__':

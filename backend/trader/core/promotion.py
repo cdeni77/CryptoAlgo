@@ -205,11 +205,17 @@ def promote(
     return attempt
 
 
-def load_live(root: Optional[Path] = None) -> Optional[ForecastModel]:
+def load_live(root: Optional[Path] = None, config=None) -> Optional[ForecastModel]:
+    """The promoted artifact, verified against `config` when one is given.
+
+    `scripts/live.py` never read `config_provenance`, so a model promoted under
+    one set of economics traded under whatever the current defaults happened to
+    be — worth up to the whole `min_edge_pp` gate in probability terms, silently.
+    """
     path = (Path(root) if root else MODELS_ROOT) / LIVE_MODEL
     if not path.exists():
         return None
-    return ForecastModel.load(path)
+    return ForecastModel.load(path, config)
 
 
 def history(root: Optional[Path] = None) -> pd.DataFrame:

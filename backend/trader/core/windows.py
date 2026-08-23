@@ -59,6 +59,7 @@ read.
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -164,6 +165,7 @@ def build_windows(
     config: Config = DEFAULT_CONFIG,
     *,
     offsets: Optional[Sequence[int]] = None,
+    include_unsettled: bool = False,
 ) -> tuple[pd.DataFrame, GridReport]:
     """One row per (window, decision offset) for a single symbol's minute bars.
 
@@ -173,6 +175,34 @@ def build_windows(
     seconds rather than an afternoon, and — more usefully — it makes the
     alignment a property of the array shape instead of an off-by-one hiding in
     an index expression.
+
+    **`include_unsettled` is what makes live scoring possible at all.** The trim
+    to whole windows (`// window`) and the settlement read at `means[:, window-1]`
+    together mean the window *currently in progress* is absent twice over: it has
+    neither a full complement of minutes nor a settlement minute. So
+    `core/dataset.py:score_live` asked for the window it was deciding, got an
+    empty slice, and raised `DatasetError` on every cycle — at offsets 3, 6, 9
+    and 12 alike. The window only became scoreable once it had already settled.
+    `scripts/live.py` did not catch it and its loop catches only
+    `KeyboardInterrupt`, so paper and live trading crash-looped and had never
+    completed a single window.
+
+    With `include_unsettled=True` the grid is padded to a whole window so the
+    trailing partial window survives the reshape. Its `strike` is real — that is
+    the *previous* window's minute-14 mean, which has happened — while
+    `settle_price`, `settle_return` and `outcome` come back NaN, because they have
+    not. Everything the decision needs (`last_price`, `displacement`, the
+    excursions) reads bars strictly before `decision_time` exactly as before, so
+    the arithmetic is shared with the backtest rather than reimplemented. That
+    sharing is why the two paths were measured bit-identical to 16 decimal
+    places, and it is the reason this is a flag on `build_windows` rather than a
+    second window builder.
+
+    A row is withheld when the feed does not actually reach `decision_time`. The
+    interior forward-fill is the right answer for a minute in which nothing
+    traded, but it cannot distinguish that from a minute that has not been
+    fetched yet — and ffilling a stale feed would invent a `last_price` and hand
+    it to the barrier as fact.
     """
     window = int(config.window_minutes)
     offsets = tuple(int(o) for o in (offsets if offsets is not None else config.decision_offsets))
@@ -194,6 +224,20 @@ def build_windows(
     if start < grid.index[0]:
         start = start + pd.Timedelta(minutes=window)
     offset_into = int((start - grid.index[0]) / pd.Timedelta(minutes=1))
+
+    # How many minutes of the trailing window are missing because it has not
+    # happened yet. Padded with all-NaN rows so the reshape below still sees a
+    # rectangle; `pad_minutes` is then how far back the real bars stop.
+    real_minutes = len(grid)
+    pad_minutes = 0
+    if include_unsettled:
+        remainder = (len(grid) - offset_into) % window
+        if remainder:
+            pad_minutes = window - remainder
+            extra = pd.date_range(grid.index[-1] + pd.Timedelta(minutes=1),
+                                  periods=pad_minutes, freq='1min', tz=grid.index.tz)
+            grid = grid.reindex(grid.index.append(extra))
+
     n_windows = (len(grid) - offset_into) // window
     if n_windows < 2:
         raise WindowError(
@@ -238,16 +282,34 @@ def build_windows(
     # that ends exactly where it started pays the up side. On a minute grid exact
     # ties are not rare, and a strict comparison hands every one of them to the
     # wrong side.
-    outcome = (settle_price >= strike).astype(np.int8)
+    settled = np.isfinite(settle_price)
+    if include_unsettled:
+        # Float, so an undecided window can say so. `(nan >= x)` is False, which
+        # would file every in-progress window as a loss.
+        outcome = np.where(settled, settle_price >= strike, np.nan)
+    else:
+        outcome = (settle_price >= strike).astype(np.int8)
 
     frames = []
     for offset in offsets:
         last_price = filled[:, offset - 1]
-        with np.errstate(invalid='ignore'):
+        # `errstate` does not silence numpy's all-NaN-slice RuntimeWarning, which
+        # is a different mechanism (`warnings`, not the floating-point error
+        # state). Both are suppressed here so the intent in the original guard
+        # actually holds.
+        with np.errstate(invalid='ignore'), warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
             high_so_far = np.nanmax(highs[:, :offset], axis=1)
             low_so_far = np.nanmin(lows[:, :offset], axis=1)
         high_so_far = np.where(np.isnan(high_so_far), np.maximum(strike, last_price), high_so_far)
         low_so_far = np.where(np.isnan(low_so_far), np.minimum(strike, last_price), low_so_far)
+
+        missing = minutes_missing.copy()
+        if include_unsettled and pad_minutes and n_windows:
+            # The trailing window's later minutes have not happened; counting them
+            # as gaps would say the data is bad rather than young. Count only what
+            # the decision could have seen.
+            missing[-1] = int(np.isnan(closes[-1, :offset]).sum())
         frames.append(pd.DataFrame({
             'symbol': symbol,
             'window_open': window_open,
@@ -262,22 +324,49 @@ def build_windows(
             'settle_price': settle_price,
             'settle_return': settle_return,
             'outcome': outcome,
-            'minutes_missing': minutes_missing.astype(np.int16),
-            'complete': minutes_missing == 0,
+            'minutes_missing': missing.astype(np.int16),
+            'complete': missing == 0,
         }))
 
     table = pd.concat(frames, ignore_index=True)
     # `boundary_ok` is exactly `strike` and `settle_price` both present, so the
     # filter is written on the columns rather than by mapping the mask back
     # through the window index — one expression, no searchsorted to get wrong.
-    table = table.loc[table['strike'].notna() & table['settle_price'].notna()]
+    # `strike` is always required: it is the previous window's settlement average
+    # and inventing one would defeat the point of a barrier. `settle_price` is
+    # required only when the caller wants settled windows — a window being
+    # decided has none yet, and that is the normal case live.
+    keep = table['strike'].notna()
+    if not include_unsettled:
+        keep = keep & table['settle_price'].notna()
+    else:
+        # The trailing window's real bars stop at index `window - pad_minutes`. A
+        # decision at offset `m` reads index `m - 1`, so anything at or past the
+        # pad boundary is being forward-filled out of a feed that simply has not
+        # caught up. `filled` would hand the barrier a fabricated `last_price`
+        # and nothing downstream could tell.
+        if pad_minutes:
+            last_real = window - pad_minutes
+            stale = (
+                (table['window_open'] == window_open[-1])
+                & (table['offset'] > last_real)
+            )
+            if stale.any():
+                logger.warning(
+                    '%s: withholding %d row(s) for the window opening %s — the '
+                    'feed reaches minute %d of %d, so offsets past +%dm would be '
+                    'decided on a forward-filled price rather than a traded one',
+                    symbol, int(stale.sum()), window_open[-1], last_real, window,
+                    last_real)
+            keep = keep & ~stale
+    table = table.loc[keep]
     table = table.sort_values(['window_open', 'symbol', 'offset'], ignore_index=True)
 
     report = GridReport(
         symbol=symbol,
         first_minute=grid.index[0],
         last_minute=grid.index[-1],
-        minutes_expected=len(grid),
+        minutes_expected=real_minutes,
         minutes_present=int(grid['close'].notna().sum()),
         windows_total=n_windows,
         windows_dropped_boundary=int((~boundary_ok).sum()),
@@ -291,15 +380,22 @@ def build_window_panel(
     config: Config = DEFAULT_CONFIG,
     *,
     offsets: Optional[Sequence[int]] = None,
+    include_unsettled: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, GridReport]]:
-    """`build_windows` across the universe, concatenated and sorted by decision time."""
+    """`build_windows` across the universe, concatenated and sorted by decision time.
+
+    `include_unsettled` is passed straight through; see `build_windows`. The live
+    path needs it and the backtest must never have it, because an unsettled row
+    carries a NaN label.
+    """
     tables, reports = [], {}
     for symbol in sorted(bars_by_symbol):
         bars = bars_by_symbol[symbol]
         if bars is None or bars.empty:
             logger.warning('%s: no bars, skipped', symbol)
             continue
-        table, report = build_windows(bars, symbol, config, offsets=offsets)
+        table, report = build_windows(bars, symbol, config, offsets=offsets,
+                                      include_unsettled=include_unsettled)
         tables.append(table)
         reports[symbol] = report
         logger.info(report.summary())

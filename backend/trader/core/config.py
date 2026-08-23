@@ -167,6 +167,22 @@ class Config:
     # Fraction of full Kelly. Full Kelly on a binary at an extreme price asks
     # for a third of the account on a 5pp edge; a quarter is the largest value
     # that survives being wrong about the edge by a factor of two.
+    # Fractional Kelly. **This is also an edge filter, and that is not obvious.**
+    #
+    # `decide` floors the stake to whole contracts, so a lower Kelly fraction does
+    # not merely stake less — it pushes marginal trades below one contract and
+    # refuses them as BELOW_MIN_CONTRACTS. Measured on 326 days, dropping 0.25 to
+    # 0.10 left `edge_below_gate` *identical* at 242,571 while
+    # `below_min_contracts` went 1,813 -> 8,218 and trades fell 3,221 -> 1,941.
+    # Realised edge per contract rose from +0.99pp to +3.32pp and the drawdown fell
+    # from 58% to 21%, not because the sizing was safer but because the surviving
+    # trades were the higher-edge ones.
+    #
+    # So `kelly_fraction` and `min_edge_pp` are coupled: anyone lowering Kelly to
+    # control drawdown is also raising the effective edge threshold, and anyone
+    # reading the two as independent knobs will be surprised. `max_stake_fraction`
+    # below, by contrast, is close to inert at this edge size — Kelly binds first,
+    # and cutting that cap 5x barely moved the drawdown.
     kelly_fraction: float = 0.25
     max_stake_fraction: float = 0.05      # of bankroll, per position
 
@@ -242,21 +258,122 @@ class Config:
     # quantisation is finer in the tails, not coarser, and the real reason for
     # care at a low price is that the payoff is 50:1 and a small calibration
     # error dominates the expected value.
+    #
+    # Symmetric about 0.5, deliberately. It was [0.05, 0.97], and 1 - 0.97 is
+    # 0.03, not 0.05 — so the band admitted 96-97c favourites (the smaller-sigma
+    # view) while refusing 3-4c longshots (the larger-sigma view), silently
+    # clipping half the thesis. The asymmetry also ran the wrong way on cost: at
+    # 96c a 1pp calibration error destroys ~43% of the gross edge, at 4c about
+    # 1%. Keep `max_traded_price == 1 - min_traded_price`; the invariant is
+    # asserted in `__post_init__`.
     min_traded_price: float = 0.05
-    max_traded_price: float = 0.97
+    max_traded_price: float = 0.95
 
     # An outlier guard, not an economic gate. A sigma disagreement produces
     # modest departures from the quote; a 40-point departure is a bug, a stale
     # price, or a signal that is not the one under test. Rejecting it loudly is
     # better than sizing it.
+    # Kept at 25.0 deliberately, having tried 8.0 and measured what it costs. A
+    # sigma disagreement at an extreme price moves the probability a long way:
+    # at a 0.88 quote, believing sigma is much larger takes P(up) to 0.70, an
+    # 18-point departure that is the strategy working rather than a bug. Several
+    # tests encode exactly that, and tightening this gate silently deletes the
+    # buy-the-longshot half of the thesis — the same failure the asymmetric band
+    # caused. The misparsed-quote risk this looked like it was guarding is
+    # actually handled by the price band (a cents-as-dollars quote reads 20.0 and
+    # is out of band; a 100x-low one reads 0.002 and is too) and by refusing to
+    # trade live without a real two-sided quote.
     max_disagreement_pp: float = 25.0
+
+    # ---- order envelope --------------------------------------------------
+    # How much of the claimed edge may be paid away to get filled, and the hard
+    # cap on that in cents. The live path used to send `price + edge` as the
+    # limit — literally the break-even price — so under `fill_or_kill` a thin
+    # book could walk the order to a zero-EV fill and call it a trade. Measured:
+    # 0.7832 sent against a 0.60 ask, 18c of slippage tolerance on a 1c spread.
+    slippage_share_of_edge: float = 0.25
+    max_slippage_cents: float = 1.0
+
+    # ---- freshness -------------------------------------------------------
+    # There was no staleness guard of any kind. The feed's last `event_time` was
+    # logged and never asserted against the wall clock or against the decision
+    # minute, so a delayed or partial fetch was scored as though it were current:
+    # ten missing minutes moved the displacement from +4.93bp to +2.41bp and the
+    # cycle traded anyway. A quote is worse — the book moves within the window,
+    # and `now` was read once at the top of the cycle and never revalidated
+    # before the order went out, with a Coinbase fetch, four authenticated
+    # reconcile calls, inference and six 15-second quote calls in between.
+    max_bar_age_seconds: int = 150
+    max_quote_age_seconds: int = 45
+    # Refuse to enter when this little of the window remains. `choose_offset`
+    # floors to whole minutes, so a row built as "minute 12" could be submitted
+    # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
+    min_remaining_seconds: int = 45
     # Stop trading below this fraction of the starting bankroll.
     ruin_floor_fraction: float = 0.50
+
+    # ---- circuit breakers ------------------------------------------------
+    # The ruin floor was the only limit that existed, and it only fires after
+    # half the account is gone — 96 windows a day x 3 symbols means a broken
+    # model bleeds continuously, and the nominal worst case was $768/day against
+    # a $100 bankroll. These bound the day and the streak instead, and unlike the
+    # floor they are recorded on the account so they survive a restart. Clearing
+    # a halt is deliberately manual: an automatic reset makes a circuit breaker a
+    # speed bump.
+    max_daily_loss_fraction: float = 0.15
+    max_consecutive_losses: int = 12
 
     # ---- provenance ------------------------------------------------------
     fee_config_path: Optional[str] = None
     fee_config_version: str = 'builtin_kalshi_v202608'
     cli_overrides: frozenset[str] = frozenset()
+
+    # ---- invariants ------------------------------------------------------
+    def __post_init__(self) -> None:
+        """Refuse a configuration whose numbers contradict each other.
+
+        These were all comments before, and every one of them was violated by the
+        shipped defaults or reachable from a CLI flag.
+        """
+        if abs(self.max_traded_price - (1.0 - self.min_traded_price)) > 1e-9:
+            raise ValueError(
+                f'the price band must be symmetric about 0.5: '
+                f'max_traded_price {self.max_traded_price} != '
+                f'1 - min_traded_price {1.0 - self.min_traded_price}. The edge is '
+                f'a disagreement about sigma and it points both ways — an '
+                f'asymmetric band silently permits only one direction of it.'
+            )
+        # What the embargo must actually cover, for the *expanding* scheme this
+        # repo uses. Features are all trailing, so a training row's lookback
+        # extends backwards, away from the test block — the feature lookback
+        # length is NOT the binding constraint, and requiring the embargo to
+        # exceed it would be superstition. What genuinely reaches forward is:
+        #   - the label, which settles `window_minutes` after the window opens;
+        #   - `core/vol.py:forward_realised_vol`, the HAR target, which reads to
+        #     `window_open + window_minutes`.
+        # Both need `window_minutes`. The 1440 default is deliberately far
+        # larger, and becomes load-bearing only if the scheme ever goes rolling,
+        # where a training block *follows* a test block and `log_rv_1440` would
+        # then read across it.
+        #
+        # This check exists because `core/cv.py:assert_no_leakage` cannot do it:
+        # it compares each fold's gap against the *configured* embargo, which the
+        # fold was built from, so it passes at every value — measured, it passes
+        # at `--embargo-minutes 0`.
+        if self.embargo_minutes < self.window_minutes:
+            raise ValueError(
+                f'embargo_minutes {self.embargo_minutes} is under window_minutes '
+                f'{self.window_minutes}. A training window inside that gap '
+                f'settles after the test block starts, so its label is built '
+                f'from test-period bars, and the HAR target reaches there too. '
+                f'The default of 1440 is deliberately much larger.'
+            )
+        if not 0.0 <= self.slippage_share_of_edge < 1.0:
+            raise ValueError(
+                f'slippage_share_of_edge must lie in [0, 1]; got '
+                f'{self.slippage_share_of_edge}. At 1.0 the limit price is the '
+                f'break-even price and a fill is worth nothing.'
+            )
 
     # ---- derived ---------------------------------------------------------
     @property

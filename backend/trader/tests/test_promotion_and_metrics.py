@@ -39,7 +39,8 @@ def stats(**over) -> BookStats:
     return BookStats(**base)
 
 
-def fold(index=0, skill=0.002, ece=0.009, alpha=0.7, control=0.18, **over):
+def fold(index=0, skill=0.002, ece=0.009, alpha=0.7, control=0.18,
+         deviation=0.02, non_finite=0, **over):
     return FoldEvaluation(
         index=index,
         test_start=pd.Timestamp('2025-01-01', tz='UTC') + pd.Timedelta(days=60 * index),
@@ -49,12 +50,19 @@ def fold(index=0, skill=0.002, ece=0.009, alpha=0.7, control=0.18, **over):
         model_brier=0.17, baseline_brier=0.175,
         model_ece=ece, baseline_ece=0.021,
         residual_scale=alpha, control_gain_share=control,
+        # A fold that does not report these is a fold whose calibration was not
+        # measured, and both gates fail closed on a missing value — so the
+        # fixture has to supply them like any other measurement.
+        model_max_deviation=deviation, n_non_finite=non_finite,
         stats=stats(**over))
 
 
-def report(skills=(0.002,) * 6, **over) -> EvaluationReport:
+def report(skills=(0.002,) * 6, *, deviation=0.02, non_finite=0,
+           **over) -> EvaluationReport:
+    """`deviation` and `non_finite` are per-fold; everything else sizes the book."""
     return EvaluationReport(
-        folds=[fold(i, skill=s) for i, s in enumerate(skills)],
+        folds=[fold(i, skill=s, deviation=deviation, non_finite=non_finite)
+               for i, s in enumerate(skills)],
         continuous=stats(**over), config_provenance=Config().provenance())
 
 
@@ -246,3 +254,69 @@ def test_the_version_stamp_sorts_chronologically():
     second = version_stamp(now + timedelta(seconds=1))
     assert first < second
     assert first == '20260823T010203Z'
+
+
+def test_a_handful_of_unscoreable_rows_is_not_a_failure():
+    """An outage is not a defect, so the gate is a share and not a count.
+
+    A row with no volatility estimate has no forecast. Measured on real bars: one
+    6.5-hour Coinbase outage leaves ~86 rows in 372,532 unscoreable in the two
+    hours afterwards, because the 240-minute lookback cannot be filled. Refusing
+    to evaluate at all because the venue went down in May is not a judgement about
+    the model — and my first version of this gate did exactly that, and killed a
+    whole `scripts.evaluate` run.
+    """
+    gates = {g.name: g for g in evaluate_gates(report(non_finite=4))}
+    assert gates['non_finite_share'].passed, (
+        f"24 unscoreable rows in ~480,000 scored {gates['non_finite_share'].value:.6f}; "
+        f'an outage has to pass'
+    )
+    assert gates_passed(evaluate_gates(report(non_finite=4)))
+
+
+def test_a_large_share_of_unscoreable_rows_does_fail():
+    """Because that is a lookback or an embargo, not the venue.
+
+    What must never happen again is the silence: `np.mean` propagated the NaN into
+    every fold statistic while `np.digitize` filed those rows in the 0.95-1.00
+    reliability bin — the band this system trades — and `scripts/baseline.py` then
+    printed "gate passed: worst-fold calibration error 0.01516 <= 0.02" with five
+    of six folds reading NaN, because `nan > 0.02` is False.
+    """
+    # 8,000 unscoreable per fold against 80,000 rows is 9%, well over the 0.1%.
+    gates = {g.name: g for g in evaluate_gates(report(non_finite=8_000))}
+    assert not gates['non_finite_share'].passed
+    assert not gates_passed(evaluate_gates(report(non_finite=8_000)))
+
+
+def test_a_nan_calibration_in_one_fold_reaches_the_gate():
+    """The aggregation must not skip the fold it could not measure.
+
+    `max_ece` used the builtin `max`, which is order-dependent with NaN:
+    `max([0.015, nan])` is 0.015 and `max([nan, 0.015])` is nan. So whether an
+    unmeasurable fold was noticed depended on fold ordering. `Gate.passed`
+    already fails closed on a non-finite value; the aggregation has to let it
+    get there.
+    """
+    folds = [fold(0, ece=float('nan')), fold(1), fold(2), fold(3), fold(4), fold(5)]
+    subject = EvaluationReport(folds=folds, continuous=stats(),
+                               config_provenance=Config().provenance())
+    assert not np.isfinite(subject.max_ece), 'the NaN fold was skipped'
+    assert not {g.name: g for g in evaluate_gates(subject)}['calibration_error'].passed
+
+
+def test_a_model_miscalibrated_only_where_it_trades_is_refused():
+    """The mean ECE averages away the band the money is in.
+
+    Constructed and measured: perfectly calibrated on 190,000 pinned rows and
+    5pp overconfident on the 10,000 it trades gives an aggregate ECE of 0.0044 —
+    a pass with 78% of the budget unused — because those rows contribute
+    0.05 * 10/200 = 0.0025. `calibration_max_deviation` is the gate that sees it.
+    """
+    gates = {g.name: g for g in evaluate_gates(report(deviation=0.05))}
+    assert gates['calibration_error'].passed, (
+        'the mean ECE is meant to be blind to this; if it is not, the fixture '
+        'no longer demonstrates the problem'
+    )
+    assert not gates['calibration_max_deviation'].passed
+

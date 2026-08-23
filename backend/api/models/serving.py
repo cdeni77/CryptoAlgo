@@ -67,7 +67,23 @@ class Prediction(Base):
     # A backtest has no quotes and stands the calibrated baseline in for the
     # market; a live decision reads the real book. Those are different claims and
     # a row that does not distinguish them makes a backtest look like a fill.
+    # The venue's own view, and the realised answer. These three exist for one
+    # purpose: to eventually score the MARKET's probability against the outcome,
+    # on every window, traded or refused.
+    #
+    # That is the only economically meaningful benchmark and nothing in this
+    # system could compute it. `market_probability` was written and read by
+    # nothing, there was no `outcome` column at all, and `positions` only covers
+    # the ~6% of windows that traded — a selected sample. Beating F(x/sigma) says
+    # nothing about beating the price you would actually pay.
+    #
+    # `market_probability` is the MID (the venue's belief). The two asks are what
+    # a trade would cost, which is a different question and needed for expected
+    # value rather than for calibration.
     market_probability = Column(Float, nullable=True)
+    market_ask_up = Column(Float, nullable=True)
+    market_ask_down = Column(Float, nullable=True)
+    outcome = Column(Integer, nullable=True)
     price_source = Column(String, nullable=False, default='baseline')
 
     # the decision

@@ -70,19 +70,27 @@ def main() -> int:
             assert_no_leakage(fold)
             fit, _ = fit_fold(dataset, fold.train, variant, groups=groups)
             test = apply_fold(dataset, fit, fold.test, variant, groups=groups)
-            y = test['outcome'].to_numpy(dtype=float)
-            p = test['baseline_probability'].to_numpy(dtype=float)
+            y_all = test['outcome'].to_numpy(dtype=float)
+            p_all = test['baseline_probability'].to_numpy(dtype=float)
+            # A row with no volatility estimate has no forecast. `log_loss` uses
+            # `np.mean`, so leaving them in made the whole fold read NaN — which
+            # then passed a `<= 0.02` gate, because `nan > 0.02` is False.
+            keep = np.isfinite(y_all) & np.isfinite(p_all)
+            y, p = y_all[keep], p_all[keep]
+            unscoreable = int((~keep).sum())
             pooled_y.append(y)
             pooled_p.append(p)
             rel = reliability(y, p)
             rows.append({
                 'fold': fold.index,
                 'test_start': fold.test_start, 'test_end': fold.test_end,
-                'windows': effective_observations(test),
+                'windows': effective_observations(test.loc[keep]),
+                'n': int(keep.sum()),
                 'log_loss': log_loss(y, p),
                 'coin_flip': log_loss(y, np.full_like(p, float(y.mean()))),
                 'ece': rel.expected_calibration_error,
                 'max_dev': rel.max_deviation,
+                'n_non_finite': unscoreable,
                 'nu': fit.baseline.nu,
                 'scale': ' '.join(f'{o}m={s:.3f}' for o, s in sorted(fit.baseline.scale.items())),
             })
@@ -116,15 +124,55 @@ def main() -> int:
               '  predictions: a Gaussian barrier assigns 0.999 where 0.99 is right,\n'
               '  and a model that merely knew that would look skilful.')
 
-    worst_ece = max(pd.DataFrame(rows)['ece'].max() for rows in results.values())
     print()
+    # `pandas.Series.max()` skips NaN, and `nan > 0.02` is False, so this gate
+    # used to fail OPEN: with 31 non-finite rows in 99,388 it printed
+    # "gate passed: worst-fold calibration error 0.01516 <= 0.02" while five of
+    # six folds had reported `log loss nan, ECE nan`. Refuse on unmeasured folds
+    # before comparing anything, so a data hole reads as a data hole.
+    all_ece = np.concatenate([
+        pd.DataFrame(rows)['ece'].to_numpy(dtype=float) for rows in results.values()])
+    all_non_finite = int(sum(
+        int(pd.DataFrame(rows)['n_non_finite'].sum()) for rows in results.values()
+        if 'n_non_finite' in pd.DataFrame(rows).columns))
+    unmeasured = int((~np.isfinite(all_ece)).sum())
+    if unmeasured:
+        print(f'  GATE FAILED: {unmeasured} of {all_ece.size} folds could not be '
+              f'measured at all (calibration came back NaN).')
+        print('  That is a hole in the data, not a verdict on the baseline, and it '
+              'is not the same answer as "no skill".')
+        print('  Find the missing bars before reading anything below.')
+        return 1
+    total_rows = int(sum(int(pd.DataFrame(rows)['n'].sum()) for rows in results.values()
+                         if 'n' in pd.DataFrame(rows).columns)) or all_ece.size
+    share = all_non_finite / max(total_rows + all_non_finite, 1)
+    if all_non_finite:
+        # Reported, not fatal. A row with no volatility estimate has no forecast:
+        # measured, a single 6.5-hour Coinbase outage leaves ~83 rows in 53,200
+        # unscoreable in the two hours afterwards, because the 240-minute lookback
+        # cannot be filled. Live, `decide` refuses those as NOT_FINITE. What used
+        # to be wrong was the silence — they were counted in the 0.95-1.00
+        # reliability bin and turned every fold statistic into NaN while this
+        # script printed "gate passed".
+        print(f'  {all_non_finite:,} row(s) ({share:.4%}) carried no forecast — a '
+              f'NaN sigma, which is the tail of a data outage. Excluded from every '
+              f'number above and counted here.')
+        if share > 0.001:
+            print(f'  GATE FAILED: {share:.3%} of rows are unscoreable, over the '
+                  f'0.1% allowance.')
+            print('  An outage costs a couple of hours. This much means a lookback '
+                  'or an embargo is wrong, not the venue.')
+            return 1
+
+    worst_ece = float(np.max(all_ece))
     if worst_ece > 0.02:
         print(f'  GATE FAILED: worst-fold calibration error {worst_ece:.5f} exceeds 0.02.')
         print('  Skill measured against a miscalibrated baseline is partly the '
               'baseline\'s error.')
         print('  Fix this before training anything.')
         return 1
-    print(f'  gate passed: worst-fold calibration error {worst_ece:.5f} <= 0.02')
+    print(f'  gate passed: worst-fold calibration error {worst_ece:.5f} <= 0.02 '
+          f'across {all_ece.size} folds, none unmeasured')
     print('  next: python -m scripts.evaluate')
     return 0
 

@@ -226,3 +226,113 @@ def test_score_live_reports_no_outcome_for_an_unsettled_window(prepared):
         window_open=dataset.window_index[-3], offset=FAST.decision_offsets[0])
     assert scored['outcome'].isna().all()
     assert scored['settle_price'].isna().all()
+
+
+def test_the_shrinkage_reads_near_zero_on_a_null():
+    """`residual_scale` is the overfitting detector, so a null must fail its gate.
+
+    It read **0.902** on a provably zero-signal dataset and passed
+    `residual_scale >= 0.25`, for two compounding reasons. First, early stopping
+    and the shrinkage fit shared `inner_valid`, so alpha answered "how much of
+    the correction survives on the rows the tree count was chosen for". Second,
+    `_fit_residual_scale` never checked `result.success`: one NaN made the
+    objective NaN everywhere, `minimize_scalar` gave up, and its golden-section
+    bracket point **0.7639320225** was returned as a fitted value — which also
+    clears 0.25. Four of six folds in a five-year BTC walk-forward returned
+    exactly that constant.
+    """
+    from core.config import Config
+    from core.dataset import Dataset, fit_fold
+    from core.model import fit_model
+    from tests.conftest import make_bars
+
+    config = Config(n_estimators=120, early_stopping_rounds=15, n_folds=3,
+                    seasonality_min_days=5)
+    bars = make_bars(days=70, lead=0.0, seed=11)   # lead=0: nothing to find
+    dataset = Dataset.build(bars, config)
+    index = dataset.window_index
+    fit, train_table = fit_fold(dataset, index[:int(len(index) * 0.85)], config)
+    model = fit_model(train_table, fit.baseline, config)
+
+    assert model.residual_scale < 0.25, (
+        f'alpha is {model.residual_scale:.4f} on a null; the gate it guards is '
+        f'0.25, so this would promote'
+    )
+    assert model.residual_scale != pytest.approx(0.7639320225, abs=1e-6), (
+        'that is scipy\'s golden-section bracket seed, not a fitted value — '
+        '_fit_residual_scale is swallowing a non-convergence again'
+    )
+
+
+def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
+    """A NaN must not become 0.7639320225, and must not stop the run either.
+
+    The defect was never the NaN itself — it was reporting scipy's abandoned
+    golden-section bracket point as a fitted alpha, which cleared the
+    `residual_scale >= 0.25` gate on a value that is a search constant. Refusing
+    outright was my first fix and it was wrong in the other direction: one
+    6.5-hour Coinbase outage leaves ~83 rows in 26,488 without a volatility
+    estimate, and that killed an entire evaluation.
+
+    So: drop the unscoreable rows, insist enough remain to mean anything, and
+    still raise if the optimiser does not converge.
+    """
+    import numpy as np
+
+    from core.model import MIN_SHRINKAGE_ROWS, _fit_residual_scale
+
+    rng = np.random.default_rng(0)
+    n = MIN_SHRINKAGE_ROWS * 4
+    logit = rng.normal(0, 1.0, n)
+    correction = rng.normal(0, 0.1, n)
+    outcome = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(float)
+
+    clean = _fit_residual_scale(logit, correction, outcome)
+    assert 0.0 <= clean <= 2.0
+    assert clean != pytest.approx(0.7639320225, abs=1e-6), (
+        "that is scipy's bracket seed, not a fitted value"
+    )
+
+    # A handful of NaNs is an outage, and must change the answer only slightly.
+    holed = correction.copy()
+    holed[:20] = np.nan
+    with_holes = _fit_residual_scale(logit, holed, outcome)
+    assert 0.0 <= with_holes <= 2.0
+    assert abs(with_holes - clean) < 0.25, (
+        f'dropping 20 of {n} rows moved alpha from {clean:.4f} to '
+        f'{with_holes:.4f}; that is not an exclusion, that is a different fit'
+    )
+
+    # Too few scoreable rows is a data problem and must say so.
+    mostly_nan = correction.copy()
+    mostly_nan[MIN_SHRINKAGE_ROWS // 2:] = np.nan
+    with pytest.raises(ValueError, match='scoreable rows remain'):
+        _fit_residual_scale(logit, mostly_nan, outcome)
+
+
+def test_the_shrinkage_raises_when_the_optimiser_does_not_converge(monkeypatch):
+    """The actual bug, pinned directly.
+
+    `minimize_scalar` returning `success=False` was never checked, so its bracket
+    point `0.7639320225` was returned as a fitted alpha. Four of six folds in a
+    five-year BTC walk-forward returned exactly that.
+    """
+    import numpy as np
+    from scipy import optimize
+
+    from core.model import MIN_SHRINKAGE_ROWS, _fit_residual_scale
+
+    n = MIN_SHRINKAGE_ROWS * 2
+    rng = np.random.default_rng(1)
+    logit = rng.normal(0, 1.0, n)
+    correction = rng.normal(0, 0.1, n)
+    outcome = (rng.random(n) < 0.5).astype(float)
+
+    class Abandoned:
+        x = 0.7639320225002102
+        success = False
+        message = 'stopped early'
+
+    monkeypatch.setattr(optimize, 'minimize_scalar', lambda *a, **k: Abandoned())
+    with pytest.raises(ValueError, match='did not converge'):
+        _fit_residual_scale(logit, correction, outcome)

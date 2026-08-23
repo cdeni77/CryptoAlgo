@@ -106,7 +106,25 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
-.env
+#
+# `.env` matched by basename only, so it ignored `backend/api/.env` but NOT
+# `frontend/.env` or `frontend/.env.local`. A `.env` holding a live Coinbase key
+# and an EC private key was committed in b70c78c and deleted in c49e9c0 — the
+# blob is still reachable on origin/main, and `frontend/.env.local` leaked an
+# API token the same way in 6097ed1. The documented dev workflow tells you to
+# put VITE_API_TOKEN in exactly the file the old pattern missed. Match every
+# variant, and keep the checked-in templates.
+.env*
+!.env.example
+!*.env.example
+
+# Private keys and credentials. Never in the tree, never in a build context.
+*.pem
+*.key
+*.p8
+*.pfx
+id_rsa*
+
 .venv
 env/
 venv/

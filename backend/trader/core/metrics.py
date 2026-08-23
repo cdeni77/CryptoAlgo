@@ -68,6 +68,12 @@ class FoldEvaluation:
     reliability_table: Optional[Reliability] = None
     stats: Optional[BookStats] = None
     per_offset: Optional[pd.DataFrame] = None
+    # Rows whose prediction or outcome was not finite. Reported so a data hole
+    # says "data hole" instead of "no skill" — see `n_non_finite` in the gates.
+    n_non_finite: int = 0
+    # The worst deviation in any adequately-populated reliability bin. The mean
+    # ECE cannot see the traded band; this can.
+    model_max_deviation: float = float('nan')
 
     @property
     def skill(self) -> float:
@@ -102,6 +108,31 @@ def evaluate_fold(
     from core.cv import effective_observations
 
     outcome = test['outcome'].to_numpy(dtype=float)
+
+    # A row with no volatility estimate has no forecast, so it cannot be scored —
+    # and it is not an error. Measured on real bars: a 6.5-hour Coinbase outage
+    # leaves the 240-minute lookback unfillable for about two hours afterwards, so
+    # ~83 rows in 53,200 come back with a NaN sigma. Live, `decide` refuses those
+    # as NOT_FINITE; here they must leave the metric rather than poison it.
+    #
+    # They are *excluded and counted*, not dropped silently. Silence was the
+    # original defect: `np.mean` propagated the NaN into every fold statistic
+    # while `np.digitize` filed the rows in the 0.95-1.00 reliability bin, and one
+    # of the two readers then failed open. The count reaches a gate as a share.
+    finite = (np.isfinite(outcome) & np.isfinite(model_probability)
+              & np.isfinite(baseline_probability))
+    n_non_finite = int((~finite).sum())
+    if n_non_finite:
+        logger.info(
+            'fold %d: %d of %d rows carry no forecast (a NaN sigma, usually the '
+            'tail of a data outage) and are excluded from the metrics',
+            index, n_non_finite, len(outcome))
+    outcome = outcome[finite]
+    model_probability = np.asarray(model_probability)[finite]
+    baseline_probability = np.asarray(baseline_probability)[finite]
+    test = test.loc[finite]
+
+    model_reliability = reliability(outcome, model_probability)
     per_offset = None
     if 'offset' in test.columns:
         frame = test.assign(_m=model_probability, _b=baseline_probability)
@@ -125,10 +156,12 @@ def evaluate_fold(
         baseline_log_loss=log_loss(outcome, baseline_probability),
         model_brier=brier(outcome, model_probability),
         baseline_brier=brier(outcome, baseline_probability),
-        model_ece=reliability(outcome, model_probability).expected_calibration_error,
+        model_ece=model_reliability.expected_calibration_error,
         baseline_ece=reliability(outcome, baseline_probability).expected_calibration_error,
         residual_scale=residual_scale, control_gain_share=control_gain_share,
-        reliability_table=reliability(outcome, model_probability),
+        reliability_table=model_reliability,
+        n_non_finite=n_non_finite,
+        model_max_deviation=model_reliability.worst_deviation(),
         stats=stats, per_offset=per_offset,
     )
 
@@ -188,15 +221,89 @@ class EvaluationReport:
 
     @property
     def max_ece(self) -> float:
-        return float(max((f.model_ece for f in self.folds), default=float('nan')))
+        # `np.max`, not the builtin. Builtin `max` with a NaN in the sequence is
+        # order-dependent — `max([0.015, nan])` is 0.015 and `max([nan, 0.015])`
+        # is nan — so a fold whose calibration could not be computed silently
+        # vanished and the gate passed on the folds that worked. `Gate.passed`
+        # already fails closed on a non-finite value; the aggregation has to let
+        # it get there.
+        if not self.folds:
+            return float('nan')
+        return float(np.max(np.asarray([f.model_ece for f in self.folds], dtype=float)))
+
+    @property
+    def max_calibration_deviation(self) -> float:
+        if not self.folds:
+            return float('nan')
+        return float(np.max(np.asarray(
+            [f.model_max_deviation for f in self.folds], dtype=float)))
+
+    @property
+    def total_non_finite(self) -> int:
+        return int(sum(f.n_non_finite for f in self.folds))
+
+    @property
+    def non_finite_share(self) -> float:
+        """Unscoreable rows as a fraction of all rows offered.
+
+        Gated as a share rather than a count. Zero is the wrong threshold: a
+        venue outage leaves a couple of hours of windows without a volatility
+        estimate afterwards, and refusing to evaluate at all because Coinbase went
+        down for six hours in May is not a judgement about the model. A *rate*
+        catches what actually matters — an embargo or lookback mistake that makes
+        a large fraction unscoreable — while an outage passes and is still
+        reported.
+        """
+        rows = sum(f.n_rows for f in self.folds) + self.total_non_finite
+        return (self.total_non_finite / rows) if rows else float('nan')
 
     @property
     def mean_residual_scale(self) -> float:
+        """Reported, not gated. See `median_residual_scale`."""
         return float(np.mean([f.residual_scale for f in self.folds])) if self.folds else float('nan')
 
     @property
+    def median_residual_scale(self) -> float:
+        """What the `residual_scale` gate reads.
+
+        The mean was the wrong aggregation for an overfitting detector. Measured
+        on a provably zero-signal null across three folds: two folds correctly
+        returned alpha ~0 and one ran to the 2.0 clip on a handful of trees, so
+        the **mean was 0.667** and cleared the 0.25 gate while two thirds of the
+        evidence said there was nothing there. The question the gate asks is
+        whether the correction survives out of sample *typically*, and one
+        runaway fold should not answer it.
+
+        A fold sitting exactly on a clip boundary is also not a fit — it means the
+        optimiser wanted more than the parameterisation allows, which on a null is
+        noise — so those are called out.
+
+        Two honest limits. With an even number of folds the median averages the two
+        middle values, so at two folds it *is* the mean and buys nothing. And at a
+        small sample alpha is noisy either way: measured on a 30-day two-fold null
+        it came back `[1.305, 0.0]`, while on a 70-day slice it reads 0.0000. This
+        gate is therefore a backstop and not the thing that catches a null —
+        `log_loss_skill` and `folds_skill_positive` are, and they did on the same
+        run. Do not treat a passing `residual_scale` as evidence of anything.
+        """
+        if not self.folds:
+            return float('nan')
+        values = np.asarray([f.residual_scale for f in self.folds], dtype=float)
+        at_bound = int(np.sum(np.isclose(values, 2.0) | np.isclose(values, 0.0)))
+        if at_bound:
+            logger.warning(
+                '%d of %d folds put the shrinkage on a clip boundary (%s). A '
+                'boundary is the optimiser giving up on the parameterisation, not '
+                'a fitted value.', at_bound, len(values),
+                ', '.join(f'{v:.3f}' for v in values))
+        return float(np.median(values))
+
+    @property
     def max_control_gain_share(self) -> float:
-        return float(max((f.control_gain_share for f in self.folds), default=float('nan')))
+        if not self.folds:
+            return float('nan')
+        return float(np.max(np.asarray(
+            [f.control_gain_share for f in self.folds], dtype=float)))
 
     @property
     def total_windows(self) -> int:
@@ -239,7 +346,9 @@ class EvaluationReport:
             'log_loss_skill': self.mean_skill,
             'folds_skill_positive': float(self.folds_positive),
             'calibration_error': self.max_ece,
-            'residual_scale': self.mean_residual_scale,
+            'calibration_max_deviation': self.max_calibration_deviation,
+            'non_finite_share': self.non_finite_share,
+            'residual_scale': self.median_residual_scale,
             'control_gain_share': self.max_control_gain_share,
             'windows_evaluated': float(self.total_windows),
             'trades': float(continuous.n_trades) if continuous else 0.0,
@@ -283,6 +392,20 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     'log_loss_skill': (0.0, 'min'),
     'folds_skill_positive': (5.0, 'min'),
     'calibration_error': (0.02, 'max'),
+    # The mean ECE is count-weighted over every row, and most rows sit where the
+    # barrier is already decided. Measured: a model 5pp overconfident on the
+    # 5% of rows it trades scores 0.0044 and passes. This bounds the worst
+    # adequately-populated bin instead. It cannot resolve `min_edge_pp` (0.5pp) —
+    # 500 rows at p=0.9 carry a 1.3pp standard error — so it bounds the damage
+    # rather than certifying the edge.
+    'calibration_max_deviation': (0.04, 'max'),
+    # A data hole must report as a data hole. 31 non-finite rows in 99,388 turned
+    # five of six folds' metrics into NaN while `scripts/baseline.py` printed
+    # "gate passed", because `nan > 0.02` is False and pandas' max skips NaN.
+    # A share rather than a count, because an outage is not a defect: measured,
+    # one 6.5-hour Coinbase outage accounts for 0.02% of rows. A large share means
+    # a lookback or embargo mistake, which is.
+    'non_finite_share': (0.001, 'max'),
     'residual_scale': (0.25, 'min'),
     'control_gain_share': (0.30, 'max'),
     'windows_evaluated': (20_000.0, 'min'),
@@ -310,6 +433,10 @@ GATE_NOTES: dict[str, str] = {
                             'so this is necessary and not sufficient',
     'calibration_error': 'the system trades its confident predictions, so being wrong '
                          'about how confident it is matters more than the mean',
+    'calibration_max_deviation': 'the mean ECE averages away the band the money is in; '
+                                 'this bounds the worst populated bin',
+    'non_finite_share': 'a NaN prediction is a data hole, not a forecast. Counting it '
+                        'as one made "no skill" and "one missing bar" the same output',
     'residual_scale': 'how much of the claimed correction survives out of sample; near '
                       'zero means it found nothing however good the in-sample loss',
     'control_gain_share': 'hour-of-day cannot forecast direction. If the clock carries '
