@@ -15,27 +15,45 @@ required is `sigma_n`. This module produces the table that makes that
 statement testable: one row per (symbol, window, decision offset), carrying
 the displacement, the excursion so far, the settle price and the outcome.
 
-**Conventions, stated once because getting them wrong is silent.**
+**The conventions are the venue's, read off a live market's own rules.** They
+are not a modelling choice, and three of them are not what a reasonable person
+would guess:
+
+> If the simple average of the sixty seconds of CF Benchmarks' BRTI before
+> 12:45 AM EDT on Aug 23, 2026 is **at least** the simple average of the sixty
+> seconds of CF Benchmarks' BRTI before 12:30 AM EDT, then the market resolves
+> to Yes.
+
+* **Both ends are one-minute averages, not point prices.** The strike is the mean
+  over `[t0 - 1min, t0)` and the settlement value is the mean over
+  `[t1 - 1min, t1)`. An earlier version of this module used `open(t0)` and
+  `open(t1)`, which is a different quantity and a noisier one.
+* **The strike of a window is the settlement value of the window before it.** Both
+  are the mean over the same minute — the one ending at `t0`. Consecutive markets
+  therefore chain, which is a real structural dependence and one more reason the
+  cross-validation embargo is a day rather than a window.
+* **A tie resolves UP.** `strike_type` is `greater_or_equal`, so the comparison is
+  `>=`. A strict `>` hands every dead-flat window to the down side, and flat
+  windows are not rare on a minute grid.
+* The settlement index is **CF Benchmarks BRTI**, not Coinbase spot. This module
+  builds the target from Coinbase bars because that is the history available;
+  Coinbase is a large BRTI constituent, so it is a close proxy and not the same
+  number. That basis is an unmeasured risk, recorded here rather than hidden.
+
+Two conventions that are ours and unchanged:
 
 * A bar's `event_time` is the minute it *opens*. The bar covering
   `[10:03, 10:04)` has `event_time` 10:03 and is knowable at 10:04.
-* The strike is `open` of the bar at `t0`, and the settle price is `open` of
-  the bar at `t0 + 15`. Both are "the first trade at or after the boundary",
-  which makes the window's return an open-to-open return — the only kind this
-  project trusts. The previous incarnation of this repo anchored a target on
-  `close(t)`, a last trade that could be twenty minutes stale, and 98% of the
-  apparent edge turned out to be that staleness.
 * A decision at offset `m` sees the close of the bar covering `[m-1, m)` and
-  nothing after it. `decision_time = t0 + m` is therefore both the timestamp
-  of the decision and the row's `available_time`.
-* The outcome is `settle_price > strike`, strictly. A dead-flat window is a
-  loss for the "up" side, which is how the venue resolves it.
+  nothing after it. `decision_time = t0 + m` is both the timestamp of the
+  decision and the row's `available_time`.
 
-**A window is dropped, never repaired, when its strike or settle minute has no
-bar.** Interior gaps are forward-filled for the displacement — a minute with no
-trades genuinely carries no new information, so the last trade is the correct
-point-in-time price — but a missing boundary would have to be invented, and the
-whole point of the strike is that it is the number the venue read.
+**A window is dropped, never repaired, when the minute either average is taken
+over has no bar.** Interior gaps are forward-filled for the displacement — a
+minute with no trades genuinely carries no new information, so the last trade is
+the correct point-in-time price — but a missing average would have to be
+invented, and the whole point of the strike is that it is the number the venue
+read.
 """
 
 from __future__ import annotations
@@ -61,6 +79,24 @@ WINDOW_COLUMNS = (
     'settle_price', 'settle_return', 'outcome',
     'minutes_missing', 'complete',
 )
+
+
+def bar_mean(frame: pd.DataFrame) -> pd.Series:
+    """The average price within each bar: `(O + H + L + C) / 4`.
+
+    Standing in for "the simple average of the sixty seconds", which one-minute
+    bars cannot reproduce exactly. The OHLC mean is the usual proxy and is
+    materially better than the close alone, which is one of the sixty
+    observations rather than a summary of them.
+
+    Two alternatives were considered and are worth naming: `(H + L) / 2` ignores
+    where the bar spent its time, and `close` is what an earlier version of this
+    module effectively used and is the noisiest of the three. Any of them biases
+    the strike and the settlement value *identically* — both ends use this same
+    function — so the difference largely cancels in the comparison, which is why
+    the approximation is tolerable at all.
+    """
+    return (frame['open'] + frame['high'] + frame['low'] + frame['close']) / 4.0
 
 
 class WindowError(ValueError):
@@ -151,33 +187,39 @@ def build_windows(
 
     grid = minute_grid(bars)
 
-    # Trim to a whole number of windows, starting on a boundary. One extra
-    # minute is needed beyond the last window because the settle price is the
-    # *next* window's opening bar.
+    # Trim to a whole number of windows, starting on a boundary. No extra minute
+    # is needed past the end: the settlement average is taken over the window's
+    # *own* last minute, so it is inside the body.
     start = floor_to_window(grid.index[:1], window)[0]
     if start < grid.index[0]:
         start = start + pd.Timedelta(minutes=window)
     offset_into = int((start - grid.index[0]) / pd.Timedelta(minutes=1))
-    usable = len(grid) - offset_into - 1
-    n_windows = usable // window
-    if n_windows < 1:
-        raise WindowError(f"{symbol}: {len(grid)} minutes is under one full window")
+    n_windows = (len(grid) - offset_into) // window
+    if n_windows < 2:
+        raise WindowError(
+            f"{symbol}: {len(grid)} minutes is under two full windows, and the "
+            f"first window has no strike — its strike is the previous window's "
+            f"settlement average, which does not exist yet"
+        )
 
     body = grid.iloc[offset_into: offset_into + n_windows * window]
-    settle_rows = grid.iloc[offset_into + window: offset_into + n_windows * window + 1: window]
+    means = bar_mean(body).to_numpy(dtype=float).reshape(n_windows, window)
 
     def reshaped(column: str) -> np.ndarray:
         return body[column].to_numpy(dtype=float).reshape(n_windows, window)
 
-    opens, highs, lows, closes = (reshaped(c) for c in ('open', 'high', 'low', 'close'))
+    highs, lows, closes = (reshaped(c) for c in ('high', 'low', 'close'))
 
-    window_open = body.index[::window]
-    strike = opens[:, 0]
-    settle_price = settle_rows['open'].to_numpy(dtype=float)
-    if settle_price.shape[0] != n_windows:  # defensive: the slice above must line up
-        raise WindowError(
-            f"{symbol}: {settle_price.shape[0]} settle prices for {n_windows} windows"
-        )
+    # The settlement value is the mean over the last minute of the window, and
+    # the strike is that same quantity for the window before — so one array,
+    # shifted. The first window is dropped for want of a predecessor.
+    settle_all = means[:, window - 1]
+    window_open = body.index[::window][1:]
+    strike = settle_all[:-1]
+    settle_price = settle_all[1:]
+    highs, lows, closes = highs[1:], lows[1:], closes[1:]
+    means = means[1:]
+    n_windows -= 1
 
     minutes_missing = np.isnan(closes).sum(axis=1)
     boundary_ok = np.isfinite(strike) & np.isfinite(settle_price)
@@ -192,7 +234,11 @@ def build_windows(
     filled = np.where(np.isnan(filled), strike[:, None], filled)
 
     settle_return = settle_price / strike - 1.0
-    outcome = (settle_price > strike).astype(np.int8)
+    # `>=`, not `>`. The venue's `strike_type` is `greater_or_equal`, so a window
+    # that ends exactly where it started pays the up side. On a minute grid exact
+    # ties are not rare, and a strict comparison hands every one of them to the
+    # wrong side.
+    outcome = (settle_price >= strike).astype(np.int8)
 
     frames = []
     for offset in offsets:

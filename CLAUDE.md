@@ -89,13 +89,25 @@ trip. The `p(1-p)` term is the whole reason the barrier framing and this venue
 fit together: **a confident bet is a cheap bet**, which is the opposite of a
 perpetual future's fixed toll.
 
-| price | fee/contract | share of stake | required edge (with 1c half-spread) |
-|------:|-------------:|---------------:|------------------------------------:|
-|   50c |      $0.0175 |          3.50% |                              2.75pp |
-|   70c |      $0.0147 |          2.10% |                              2.44pp |
-|   85c |      $0.0089 |          1.05% |                              1.84pp |
-|   90c |      $0.0063 |          0.70% |                              1.57pp |
-|   95c |      $0.0033 |          0.35% |                              1.27pp |
+| price | fee/contract | share of stake | required edge (0.5c half-spread) |
+|------:|-------------:|---------------:|---------------------------------:|
+|   50c |      $0.0175 |          3.50% |                           2.25pp |
+|   70c |      $0.0147 |          2.10% |                           1.96pp |
+|   85c |      $0.0089 |          1.05% |                           1.37pp |
+|   90c |      $0.0063 |          0.70% |                           1.10pp |
+|   95c |      $0.0033 |          0.35% |                           0.80pp |
+
+**The half-spread is 0.5c, measured.** The live BTC 15-minute book quoted
+0.19/0.20 and 0.10/0.11 — a one-cent spread. The previous default of 1.0c was
+twice too pessimistic, so every required-edge figure in this table used to be too
+high. It is still one symbol at one time of day; `scripts/measure_book.py`
+samples it properly and `scripts/evaluate.py` stresses it either way.
+
+**The book is deeper than the sizing rules need.** That same order book had
+thousands of contracts within a few cents of the touch, and 441 resting at the
+best level — about $48. `max_stake_dollars` at $25 is therefore conservative
+rather than optimistic, which is the direction to be wrong in. `decide()` now
+prefers a measured depth over that guess whenever the row carries one.
 
 Three consequences worth holding onto:
 
@@ -113,9 +125,14 @@ Three consequences worth holding onto:
   assumes makes the probability *more* extreme than the quote, so buy the
   favourite; a larger sigma makes the favourite overpriced, so buy the longshot.
   A one-sided band such as [0.55, 0.95] permits only the first and silently
-  discards half the strategy. What the ends actually exclude is where the
-  *microstructure* assumptions break: below 10c a one-cent tick is a 10%
-  relative price error, above 95c there is under 5c of upside.
+  discards half the strategy.
+* **The tick is tapered, and this corrects a stated reason.** The venue's
+  `price_level_structure` is `tapered_deci_cent`: a *tenth* of a cent below 10c
+  and above 90c, a full cent in between. The band's low end used to be justified
+  as "below 10c a one-cent tick is a 10% relative price error", which is wrong by
+  a factor of ten — quantisation is finer in the tails, not coarser. The real
+  reason for care at a low price is that the payoff is 50:1, so a small
+  calibration error dominates the expected value.
 
 ### Two policy decisions, both driven by the fee shape
 
@@ -195,11 +212,32 @@ cell was its own control, and that was the most useful result it produced.
 
 ## Invariants — break these and the numbers stop meaning anything
 
-- **The strike and the settle price are both `open`s.** A bar's `close` is its
-  last *trade*; its `open` is the first trade at or after the boundary. The
-  previous formulation anchored a target on `close(t)` while the simulator
-  entered at the next open, and **98% of the apparent edge was that mismatch**.
-  `tests/test_windows.py` pins both ends.
+- **Both ends of the target are one-minute averages, and a tie resolves UP.**
+  Read off a live market's own `rules_primary`: *"the simple average of the sixty
+  seconds of CF Benchmarks' BRTI before 12:45 ... is **at least** the simple
+  average of the sixty seconds ... before 12:30"*. So the strike is the mean over
+  `[t0 - 1min, t0)`, the settlement value is the mean over `[t1 - 1min, t1)`, and
+  the comparison is `>=` because `strike_type` is `greater_or_equal`. An earlier
+  version used `open(t0)`, `open(t1)` and a strict `>` — a defensible reading of
+  "up/down in the next 15 minutes", and wrong in three places at once.
+- **A window's strike is the previous window's settlement value.** Both are the
+  mean over the same minute. Consecutive markets chain, which is a real
+  structural dependence and one more reason the embargo is a day.
+- **Averaging reduces variance, so the barrier divides by less than the clock
+  says.** The unresolved quantity is a one-minute mean, and the variance of a
+  time-average over an interval is a third of its endpoint's — remaining variance
+  at offset `m` is `(W - delta - m) + delta/3`, which at `m=12` is 2.33 minutes
+  rather than 3. Ignoring it overstates sigma by 13%, and the baseline's fitted
+  scale would have quietly absorbed it; a fitted parameter that absorbs a known
+  analytic correction stops meaning anything.
+- **The settlement index is CF Benchmarks BRTI, not Coinbase spot.** The target is
+  built from Coinbase bars because that is the history that exists, and Coinbase
+  is a large BRTI constituent — a close proxy, not the same number. Live, the
+  venue publishes `floor_strike` and `scripts/live.py` prefers it, so the basis is
+  only taken in the backtest. It is an **unmeasured risk**.
+- **A one-minute OHLC mean stands in for sixty seconds of index prints.** Both
+  ends use the same approximation, so most of its bias cancels in the comparison
+  — which is the only reason it is tolerable.
 - **A decision at offset `m` sees the close of bar `m-1` and nothing after.** A
   one-minute leak in a fifteen-minute window is 7% of the whole question and
   reads exactly like skill.
@@ -291,6 +329,7 @@ asks whether the number is good; this one asks whether it is possible.
 # hours. Resumable: an interrupted run continues rather than restarting.
 cd backend/trader
 python -m scripts.scrape --backfill-days 1825
+python -m scripts.scrape --fill-gaps        # recover any batch that gave up
 python -m scripts.sync_store
 
 # Phase 1 — the null. Read this before believing any model result.
@@ -337,6 +376,13 @@ Credentials: `KALSHI_KEY_ID` plus `KALSHI_PRIVATE_KEY` (the PEM) or
 `KALSHI_PRIVATE_KEY_PATH`. Auth is RSA-PSS over SHA-256 of
 `timestamp + METHOD + path`, not an HMAC secret.
 
+**Prices arrive as dollar-denominated strings.** The venue serves
+`yes_bid_dollars: "0.1900"`, and the integer-cent fields the older documentation
+describes (`yes_bid: 19`) come back `null`. Reading only the latter parsed every
+quote as empty and reported "no two-sided book on any symbol" against a market
+quoting 0.19/0.20 with 1,594 contracts on the bid. Both encodings are accepted
+now. Sizes are `_fp` fixed-point strings on the same pattern.
+
 `scripts/check_venue.py` proves all of it before any money moves, and answers the
 four questions separately so a failure names itself: does the PEM load, does the
 venue accept the signature, do the series tickers exist, and can a market be
@@ -355,6 +401,19 @@ open, which is what `core/windows.py` builds.
 
 That abstention was the resolution logic working. A ticker built from a pattern
 would have found *something* 15 or 30 minutes away and traded it.
+
+**Expect ~0.5% of minutes to be missing, and know which kind.** A five-year BTC
+backfill returned 2,617,876 of ~2,630,880 minutes. Most of the shortfall is
+minutes in which nothing traded — the venue has no candle and never will, and
+asking again gets the same nothing. A few are multi-hour blocks from a batch
+request that failed, and those *do* come back: `--fill-gaps` finds runs of two or
+more missing minutes and re-requests only those.
+
+The cost of a missing minute is specific now that both ends of the target are
+one-minute averages: only a minute at index 14 of a window matters, and each one
+kills two windows (that window's settlement and the next one's strike). At 0.5%
+missing spread across all fifteen positions, that is roughly 1% of windows lost —
+`Dataset.coverage()` reports it per symbol and `load_dataset` warns above 2%.
 
 **The honest state of things.** As of this writing there is no scraped data, no
 trained model, and no measured edge. The phase gates exist because the edge is a

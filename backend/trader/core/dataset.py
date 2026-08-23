@@ -320,7 +320,13 @@ def _score_windows(
         decision = pd.DatetimeIndex(part['decision_time'])
         part = part.copy()
         part['sigma_per_min'] = sigma.reindex(decision).to_numpy()
-        remaining = (config.window_minutes - part['offset']).to_numpy()
+        # Variance-minutes, not wall-clock minutes. The settlement value is a
+        # one-minute average, and the variance of a time-average over an interval
+        # is a third of its endpoint's — so the unresolved variance at offset m is
+        # `(window - delta - m) + delta/3`, which at m=12 is 2.33 rather than 3.
+        remaining = np.array(
+            [config.remaining_variance_minutes(o) for o in part['offset']],
+            dtype=float)
 
         # The HAR forecasts volatility *at the decision minute*, seasonality
         # included. The remaining span is a different set of minutes and can
@@ -331,9 +337,12 @@ def _score_windows(
         seasonality = seasonalities[symbol]
         now_factor = seasonality.at(decision)
         ramp = np.ones(len(part))
-        for span in np.unique(remaining):
-            mask = remaining == span
-            ramp[mask] = (seasonality.mean_over(decision[mask], int(span))
+        # Rounded up to whole minutes for the seasonal lookup: the factor is a
+        # per-minute table, so a fractional span has no entry of its own and the
+        # conservative reading is the longer one.
+        for span in np.unique(np.ceil(remaining).astype(int)):
+            mask = np.ceil(remaining).astype(int) == span
+            ramp[mask] = (seasonality.mean_over(decision[mask], max(int(span), 1))
                           / np.maximum(now_factor[mask], 1e-9))
         part['seasonal_ramp'] = np.log(np.maximum(ramp, 1e-9))
         part['sigma_remaining'] = scale_sigma(

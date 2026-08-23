@@ -202,11 +202,21 @@ def test_the_histogram_covers_every_reason():
     assert counts.sum() == 0
 
 
-def test_prices_round_to_whole_cents():
+def test_prices_round_to_the_venues_tapered_ladder():
+    """A tenth of a cent in the tails, a cent in the middle.
+
+    `price_level_structure: tapered_deci_cent`, confirmed by a live order book
+    whose levels step 0.0010 below 0.10 and 0.0100 above it. Rounding everything
+    to a cent moved every tail price by up to half a cent — at 2c a 25% relative
+    error on the thing being traded.
+    """
     assert round_to_tick(0.8749) == pytest.approx(0.87)
     assert round_to_tick(0.8751) == pytest.approx(0.88)
-    assert round_to_tick(0.0) == pytest.approx(0.01)
-    assert round_to_tick(1.0) == pytest.approx(0.99)
+    assert round_to_tick(0.0123) == pytest.approx(0.012)
+    assert round_to_tick(0.0987) == pytest.approx(0.099)
+    assert round_to_tick(0.9234) == pytest.approx(0.923)
+    assert round_to_tick(0.0) == pytest.approx(0.001)
+    assert round_to_tick(1.0) == pytest.approx(0.999)
 
 
 def test_price_and_edge_is_vectorised_and_scalar_consistent():
@@ -219,3 +229,36 @@ def test_price_and_edge_is_vectorised_and_scalar_consistent():
         assert bool(single[0][0]) == bool(is_up[i])
         assert single[1][0] == pytest.approx(price[i])
         assert single[4][0] == pytest.approx(edge[i])
+
+
+def test_a_measured_depth_caps_the_stake():
+    """`max_stake_dollars` is a standing guess; the book is a measurement.
+
+    When a row carries what is actually resting at the touch, that is the real
+    cap — the first live book showed 59 contracts on a 20c ask, about $12, and
+    sizing was willing to stake $25 of a market that could absorb half of it.
+    """
+    config = Config()
+    base = row(baseline_probability=0.20, model_probability=0.30)
+    unconstrained = decide(base, config, bankroll=100.0)
+    assert unconstrained.traded
+
+    thin = decide({**base, 'depth_up': 1.5}, config, bankroll=100.0)
+    assert thin.traded
+    assert thin.stake <= 1.5 + thin.fee, (thin.stake, thin.fee)
+    assert thin.contracts < unconstrained.contracts
+
+    # A book too thin for one contract is a skip, not a rounded-down zero.
+    empty = decide({**base, 'depth_up': 0.05}, config, bankroll=100.0)
+    assert not empty.traded
+    assert empty.reason is Reason.BELOW_MIN_CONTRACTS
+
+
+def test_a_depth_on_the_other_side_does_not_cap_this_one():
+    """The cap must read the side actually being bought."""
+    config = Config()
+    base = row(baseline_probability=0.20, model_probability=0.30)
+    assert decide(base, config, bankroll=100.0).side is Side.UP
+    unaffected = decide({**base, 'depth_down': 0.01}, config, bankroll=100.0)
+    assert unaffected.traded
+    assert unaffected.contracts == decide(base, config, bankroll=100.0).contracts

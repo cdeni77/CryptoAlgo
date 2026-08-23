@@ -251,7 +251,11 @@ def _clock_features(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
     window_open = pd.DatetimeIndex(frame['window_open'])
     out = pd.DataFrame(index=frame.index)
     out['elapsed_fraction'] = frame['offset'] / config.window_minutes
-    out['remaining_minutes'] = config.window_minutes - frame['offset']
+    # Variance-minutes, matching what `sigma_remaining` was scaled by. Reporting
+    # wall-clock minutes here while the barrier divides by something else gives
+    # the model two inconsistent views of the same clock.
+    out['remaining_minutes'] = [
+        config.remaining_variance_minutes(o) for o in frame['offset']]
     out['quarter_of_hour'] = window_open.minute // config.window_minutes
     minute_of_day = decision.hour * 60 + decision.minute
     out['hour_sin'] = np.sin(2 * np.pi * minute_of_day / MINUTES_PER_DAY)

@@ -305,6 +305,57 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     scored['market_ticker'] = [
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
 
+    # The venue publishes the number it will settle against, as `floor_strike`,
+    # the moment the window opens. Prefer it over the one built from bars: ours is
+    # a one-minute OHLC mean standing in for sixty seconds of CF Benchmarks BRTI,
+    # and the difference is a basis we can simply not take when the real figure is
+    # on the wire. The bar-derived strike stays for the backtest, which has no
+    # market to ask.
+    for index, row in scored.iterrows():
+        quote = quotes.get(row['symbol'], (None, None))[0]
+        if quote is None or quote.floor_strike is None:
+            continue
+        venue_strike = float(quote.floor_strike)
+        ours = float(row['strike'])
+        drift_bps = abs(venue_strike / ours - 1) * 10_000
+        if drift_bps > 25:
+            logger.warning(
+                '%s: our strike %.2f differs from the venue\'s %.2f by %.1fbp. '
+                'Ours is an OHLC mean of Coinbase bars; theirs is BRTI. Using '
+                'theirs, but a gap this wide suggests a stale bar feed.',
+                row['symbol'], ours, venue_strike, drift_bps)
+        scored.loc[index, 'strike_source'] = 'venue'
+        scored.loc[index, 'strike'] = venue_strike
+        scored.loc[index, 'displacement'] = float(row['last_price']) / venue_strike - 1.0
+        if np.isfinite(row.get('sigma_remaining', np.nan)) and row['sigma_remaining'] > 0:
+            scored.loc[index, 'z_score'] = (
+                scored.loc[index, 'displacement'] / row['sigma_remaining'])
+
+    if 'strike_source' not in scored.columns:
+        scored['strike_source'] = 'bars'
+    scored['strike_source'] = scored['strike_source'].fillna('bars')
+
+    # The displacement moved, so the barrier probability has to be recomputed
+    # from it rather than carried over from the bar-derived strike.
+    if (scored['strike_source'] == 'venue').any():
+        from core.baseline import attach_baseline
+        scored = attach_baseline(scored.drop(
+            columns=['baseline_probability', 'baseline_probability_logit'],
+            errors='ignore'), model.scoring.baseline)
+        scored['model_probability'] = model.predict(scored)
+
+    # Depth at the touch caps the stake. Measured, unlike
+    # `Config.max_stake_dollars`, which is a standing guess — so when the book
+    # tells us, believe the book.
+    for index, row in scored.iterrows():
+        quote = quotes.get(row['symbol'], (None, None))[0]
+        if quote is None:
+            continue
+        for side in ('up', 'down'):
+            depth = quote.depth_dollars(side)
+            if depth is not None:
+                scored.loc[index, f'depth_{side}'] = depth
+
     account = writer.ensure_account(config.starting_bankroll, mode=args.mode)
     exposure = WindowExposure()
     decisions: list[Decision] = []

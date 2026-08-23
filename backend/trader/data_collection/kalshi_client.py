@@ -88,6 +88,14 @@ class Quote:
     Converted at the boundary on purpose: everything above this module reasons on
     the probability scale, and a stray factor of 100 between cents and dollars is
     the classic bug in a binary system.
+
+    **The venue serves prices as dollar-denominated strings**, in fields suffixed
+    `_dollars`: `yes_bid_dollars: "0.1900"`. This module originally read integer
+    cents from `yes_bid`, which is absent — so every quote parsed as null, every
+    book looked empty, and the first live sampling run reported "no two-sided
+    book on any symbol" against a market that was quoting 0.19/0.20 with 1,594
+    contracts on the bid. Both encodings are accepted now, because a venue that
+    changed once can change back.
     """
 
     ticker: str
@@ -100,6 +108,17 @@ class Quote:
     open_interest: int
     close_time: Optional[datetime]
     status: str
+    # Contracts resting at the touch. The depth assumption
+    # (`Config.max_stake_dollars`) has been an unmeasured guess; these make it
+    # measurable, and the first observation was 59 contracts on the ask at 20c —
+    # about $12, well under the $25 the sizing rules were willing to stake.
+    yes_bid_size: Optional[float] = None
+    yes_ask_size: Optional[float] = None
+    # The number the market settles against, published once the window opens.
+    # The live path should prefer this over anything computed from bars.
+    floor_strike: Optional[float] = None
+    strike_type: Optional[str] = None
+    open_time: Optional[datetime] = None
 
     @property
     def mid(self) -> Optional[float]:
@@ -117,11 +136,63 @@ class Quote:
         """What it costs to buy `side` right now, crossing the spread."""
         return self.yes_ask if side == 'up' else self.no_ask
 
+    def size_for(self, side: str) -> Optional[float]:
+        """Contracts available at the touch on the side being bought."""
+        return self.yes_ask_size if side == 'up' else self.yes_bid_size
+
+    def depth_dollars(self, side: str) -> Optional[float]:
+        """What the touch is worth in dollars — the real cap on a stake."""
+        price = self.ask_for(side)
+        size = self.size_for(side)
+        if price is None or size is None:
+            return None
+        return price * size
+
     def tradeable(self) -> bool:
         return self.status == 'active' and self.yes_bid is not None and self.yes_ask is not None
 
 
+def _price(raw: dict, name: str) -> Optional[float]:
+    """A price in dollars, from whichever encoding the venue used.
+
+    Kalshi serves `yes_bid_dollars: "0.1900"` — a string, already in dollars.
+    Older documentation describes `yes_bid: 19`, an integer in cents. Reading only
+    the second gets None from a live market and an empty book from a market that
+    is quoting, so both are tried and the dollar form wins.
+    """
+    dollars = raw.get(f'{name}_dollars')
+    if dollars is not None:
+        try:
+            value = float(dollars)
+        except (TypeError, ValueError):
+            value = 0.0
+        return value if value > 0 else None
+    cents = raw.get(name)
+    if cents is None:
+        return None
+    try:
+        value = float(cents)
+    except (TypeError, ValueError):
+        return None
+    return value * CENT if value > 0 else None
+
+
+def _quantity(raw: dict, *names: str) -> float:
+    """A count, from a `_fp` fixed-point string or a plain number."""
+    for name in names:
+        for key in (f'{name}_fp', name):
+            value = raw.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
 def _cents(value: Any) -> Optional[float]:
+    """Integer cents to dollars. Retained for the legacy encoding and tests."""
     if value is None:
         return None
     try:
@@ -354,15 +425,21 @@ def _clean(params: dict) -> dict:
 
 
 def _to_quote(raw: dict) -> Quote:
+    strike = raw.get('floor_strike')
     return Quote(
         ticker=str(raw.get('ticker', '')),
-        yes_bid=_cents(raw.get('yes_bid')),
-        yes_ask=_cents(raw.get('yes_ask')),
-        no_bid=_cents(raw.get('no_bid')),
-        no_ask=_cents(raw.get('no_ask')),
-        last_price=_cents(raw.get('last_price')),
-        volume=int(raw.get('volume') or 0),
-        open_interest=int(raw.get('open_interest') or 0),
+        yes_bid=_price(raw, 'yes_bid'),
+        yes_ask=_price(raw, 'yes_ask'),
+        no_bid=_price(raw, 'no_bid'),
+        no_ask=_price(raw, 'no_ask'),
+        last_price=_price(raw, 'last_price'),
+        volume=int(_quantity(raw, 'volume')),
+        open_interest=int(_quantity(raw, 'open_interest')),
         close_time=_parse_time(raw.get('close_time')),
         status=str(raw.get('status', 'unknown')),
+        yes_bid_size=_quantity(raw, 'yes_bid_size') or None,
+        yes_ask_size=_quantity(raw, 'yes_ask_size') or None,
+        floor_strike=float(strike) if strike is not None else None,
+        strike_type=raw.get('strike_type'),
+        open_time=_parse_time(raw.get('open_time')),
     )

@@ -74,11 +74,116 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--end', type=str, default=None, help='YYYY-MM-DD')
     parser.add_argument('--db-path', type=str, default='./data/trading.db')
     parser.add_argument('--venue-label', type=str, default=VENUE_LABEL)
+    parser.add_argument('--fill-gaps', action='store_true',
+                        help='Find minutes the store is missing and re-request '
+                             'only those. Cheap — a handful of requests — and the '
+                             'right tool after a backfill logs a skipped window: '
+                             'those are usually a rate limit rather than absent '
+                             'data, and a full re-scrape to recover ten hours is '
+                             'not proportionate.')
+    parser.add_argument('--min-gap-minutes', type=int, default=2,
+                        help='Ignore gaps shorter than this. A single missing '
+                             'minute is usually a minute in which nothing traded, '
+                             'which no amount of re-requesting will produce.')
     parser.add_argument('--live', action='store_true',
                         help='After backfilling, keep polling for new bars. The '
                              'orchestrator uses this; a one-off backfill does not.')
     parser.add_argument('-v', '--verbose', action='store_true')
     return parser
+
+
+def find_gaps(db_path: str, symbol: str, timeframe: str, venue: str,
+              *, min_minutes: int) -> list[tuple[datetime, datetime]]:
+    """Runs of consecutive missing minutes in the stored history.
+
+    Read straight from SQLite rather than the research store, because this runs
+    before the sync and the scraper's table is the one with the hole in it.
+
+    Single missing minutes are excluded by default: a minute in which nothing
+    traded has no candle to fetch, and asking for it again produces the same
+    nothing. What this is for is the multi-hour block that appears when a batch
+    request failed — those come back on a second ask.
+    """
+    import sqlite3
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            'SELECT event_time FROM ohlcv WHERE symbol = ? AND timeframe = ? '
+            'AND venue = ? ORDER BY event_time',
+            (symbol, timeframe, venue),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        logger.error('cannot read %s: %s', db_path, exc)
+        return []
+    finally:
+        connection.close()
+
+    if len(rows) < 2:
+        return []
+
+    step = timedelta(minutes=1)
+    gaps: list[tuple[datetime, datetime]] = []
+    previous = ensure_naive_utc(_as_datetime(rows[0][0]))
+    for (raw,) in rows[1:]:
+        current = ensure_naive_utc(_as_datetime(raw))
+        missing = int((current - previous).total_seconds() // 60) - 1
+        if missing >= min_minutes:
+            gaps.append((previous + step, current))
+        previous = current
+    return gaps
+
+
+def _as_datetime(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value).replace('Z', '+00:00')
+    return datetime.fromisoformat(text)
+
+
+async def fill_gaps(pipeline: DataPipeline, symbols: list[str], db_path: str,
+                    venue: str, *, min_minutes: int) -> int:
+    """Re-request every gap, then report what came back."""
+    recovered = 0
+    for symbol in symbols:
+        gaps = find_gaps(db_path, symbol, TIMEFRAME, venue, min_minutes=min_minutes)
+        if not gaps:
+            logger.info('%s: no gaps of %d+ minutes', symbol, min_minutes)
+            continue
+        total = sum(int((b - a).total_seconds() // 60) for a, b in gaps)
+        logger.info('%s: %d gap(s) totalling %d minutes', symbol, len(gaps), total)
+        for start, end in gaps:
+            span = int((end - start).total_seconds() // 60)
+            logger.info('  refetching %s..%s (%d minutes)',
+                        f'{start:%Y-%m-%d %H:%M}', f'{end:%Y-%m-%d %H:%M}', span)
+            before = _stored_count(db_path, symbol, venue)
+            # A minute either side, so a boundary bar is not missed by an
+            # off-by-one in the range the venue considers inclusive.
+            await pipeline.backfill(
+                start=start - timedelta(minutes=1),
+                end=end + timedelta(minutes=1),
+                symbols=[symbol], timeframes=[TIMEFRAME])
+            gained = _stored_count(db_path, symbol, venue) - before
+            recovered += gained
+            if gained == 0:
+                logger.info('    nothing returned — the venue has no data here')
+            else:
+                logger.info('    recovered %d bars', gained)
+    return recovered
+
+
+def _stored_count(db_path: str, symbol: str, venue: str) -> int:
+    import sqlite3
+
+    connection = sqlite3.connect(db_path)
+    try:
+        return int(connection.execute(
+            'SELECT COUNT(*) FROM ohlcv WHERE symbol = ? AND timeframe = ? '
+            'AND venue = ?', (symbol, TIMEFRAME, venue)).fetchone()[0])
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        connection.close()
 
 
 async def main() -> int:
@@ -127,6 +232,13 @@ async def main() -> int:
     failures: list[str] = []
     try:
         await pipeline.initialize()
+        if args.fill_gaps:
+            recovered = await fill_gaps(
+                pipeline, symbols, args.db_path, args.venue_label,
+                min_minutes=args.min_gap_minutes)
+            print(f'\nrecovered {recovered:,} bars')
+            print('next: python -m scripts.sync_store')
+            return 0
         await pipeline.backfill(start=start, end=end, symbols=symbols,
                                 timeframes=[TIMEFRAME])
         if args.live:

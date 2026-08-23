@@ -7,14 +7,23 @@
 
 # Distribution / packaging
 .Python
-build/
+/build/
 develop-eggs/
 dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repository root. These are Python venv directories, and as a
+# bare `lib/` the rule matched at ANY depth — which silently swallowed
+# `frontend/src/lib/format.ts`. The file existed on the machine that wrote it, so
+# every local typecheck, lint and test passed; the Docker build, which copies from
+# the repository, failed with "Cannot find module '../lib/format'" seven times.
+#
+# That is the second time a blanket rule in this file has hidden a real source
+# file from a clean clone. Anchor new rules unless they genuinely need to match
+# everywhere.
+/lib/
+/lib64/
 parts/
 sdist/
 var/

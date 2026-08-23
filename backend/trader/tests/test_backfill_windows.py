@@ -429,3 +429,98 @@ async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(data
         f'a fetched-but-unwritten span was not reported as a write failure: {errors}'
     )
     assert 'not missing history' in errors
+
+
+# ---------------------------------------------------------------------------
+# Empty batches, and recovering from them
+# ---------------------------------------------------------------------------
+
+def test_an_empty_batch_is_retried_with_backoff_not_immediately():
+    """A rate limit answers an instant retry exactly as it answered the first ask.
+
+    The previous version retried once with no delay, which cannot recover the
+    most likely cause of an empty batch. On a five-year backfill of ~8,700
+    batches per symbol, two gave up that way and left two five-hour holes.
+    """
+    import inspect
+
+    from data_collection.coinbase_connector import (
+        EMPTY_BATCH_BACKOFF_SECONDS, CoinbaseRESTClient,
+    )
+
+    assert len(EMPTY_BATCH_BACKOFF_SECONDS) >= 3, 'one retry is not a strategy'
+    assert list(EMPTY_BATCH_BACKOFF_SECONDS) == sorted(EMPTY_BATCH_BACKOFF_SECONDS), (
+        'the waits must grow, or the later attempts add nothing'
+    )
+    source = inspect.getsource(CoinbaseRESTClient.get_candles_range)
+    assert 'EMPTY_BATCH_BACKOFF_SECONDS' in source
+    assert 'asyncio.sleep(delay)' in source, 'it retries without waiting'
+
+
+def test_skipped_windows_are_recorded_on_the_client():
+    """So a caller can act on them rather than parse a log line."""
+    import inspect
+
+    from data_collection.coinbase_connector import CoinbaseRESTClient
+
+    source = inspect.getsource(CoinbaseRESTClient.get_candles_range)
+    assert 'self.last_skipped_windows' in source
+
+
+def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
+    """The shape of the real failure: a 300-minute block from one failed batch."""
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    from scripts.scrape import find_gaps
+
+    database = tmp_path / 'gaps.db'
+    connection = sqlite3.connect(database)
+    connection.execute(
+        'CREATE TABLE ohlcv (symbol TEXT, timeframe TEXT, venue TEXT, '
+        'event_time TEXT)')
+    start = datetime(2025, 10, 25, 12, 0)
+    rows = [
+        ('BTC-USD', '1m', 'coinbase_spot', (start + timedelta(minutes=i)).isoformat(' '))
+        for i in range(600)
+        if not (194 <= i < 494) and i != 550        # a 300-min hole, and one lone minute
+    ]
+    connection.executemany('INSERT INTO ohlcv VALUES (?,?,?,?)', rows)
+    connection.commit()
+    connection.close()
+
+    gaps = find_gaps(str(database), 'BTC-USD', '1m', 'coinbase_spot', min_minutes=2)
+    assert len(gaps) == 1
+    span = int((gaps[0][1] - gaps[0][0]).total_seconds() // 60)
+    assert span == 300
+    assert gaps[0][0] == datetime(2025, 10, 25, 15, 14)
+
+
+def test_a_single_missing_minute_is_not_a_gap_worth_refetching():
+    """A minute in which nothing traded has no candle, and asking twice gets the
+    same nothing. Only multi-minute blocks are worth a request."""
+    import sqlite3
+    import tempfile
+    from datetime import datetime, timedelta
+    from pathlib import Path
+
+    from scripts.scrape import find_gaps
+
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / 'one.db'
+        connection = sqlite3.connect(database)
+        connection.execute(
+            'CREATE TABLE ohlcv (symbol TEXT, timeframe TEXT, venue TEXT, '
+            'event_time TEXT)')
+        start = datetime(2025, 1, 1)
+        rows = [('BTC-USD', '1m', 'coinbase_spot',
+                 (start + timedelta(minutes=i)).isoformat(' '))
+                for i in range(100) if i != 50]
+        connection.executemany('INSERT INTO ohlcv VALUES (?,?,?,?)', rows)
+        connection.commit()
+        connection.close()
+
+        assert find_gaps(str(database), 'BTC-USD', '1m', 'coinbase_spot',
+                         min_minutes=2) == []
+        assert len(find_gaps(str(database), 'BTC-USD', '1m', 'coinbase_spot',
+                             min_minutes=1)) == 1

@@ -62,7 +62,47 @@ Numeric = Union[float, np.ndarray]
 # because mixing the two is the classic factor-of-100 error and the venue's own
 # UI uses cents.
 CONTRACT_PAYOUT = 1.0
-TICK = 0.01
+
+# The venue's `price_level_structure` is `tapered_deci_cent`: a tenth of a cent
+# in the tails and a full cent through the middle. Read off a live market's own
+# `price_ranges`, and confirmed by its order book, whose levels step 0.0010 below
+# 0.10 and 0.0100 above it.
+#
+# `TICK` was a flat 0.01 and that was wrong in the direction that matters. It
+# also invalidated the stated reason for excluding low prices — "below 10c a
+# one-cent tick is a 10% relative price error" — when the tick there is a tenth
+# of that.
+PRICE_TICKS: tuple[tuple[float, float, float], ...] = (
+    (0.0000, 0.1000, 0.0010),
+    (0.1000, 0.9000, 0.0100),
+    (0.9000, 1.0000, 0.0010),
+)
+TICK = 0.01          # the middle band's tick, kept for the fee-rounding maths
+MIN_PRICE = 0.0010
+MAX_PRICE = 0.9990
+
+
+def tick_at(price: Numeric) -> Numeric:
+    """The venue's tick size at a price."""
+    values = np.asarray(price, dtype=float)
+    out = np.full(values.shape, PRICE_TICKS[1][2], dtype=float)
+    for low, high, step in PRICE_TICKS:
+        out = np.where((values >= low) & (values < high), step, out)
+    return float(out) if np.ndim(price) == 0 else out
+
+
+def round_to_tick(price: Numeric) -> Numeric:
+    """Snap to a price the venue will actually accept.
+
+    Tapered, so a 4c quote rounds to a tenth of a cent and a 40c quote to a
+    cent. Rounding everything to a cent silently moved every tail price by up to
+    half a cent, which at 2c is a 25% relative error on the thing being traded.
+    """
+    values = np.asarray(price, dtype=float)
+    step = np.asarray(tick_at(values), dtype=float)
+    snapped = np.round(values / step) * step
+    snapped = np.clip(np.round(snapped, 4), MIN_PRICE, MAX_PRICE)
+    return float(snapped) if np.ndim(price) == 0 else snapped
 
 
 def _ceil_cents(dollars: Numeric) -> Numeric:

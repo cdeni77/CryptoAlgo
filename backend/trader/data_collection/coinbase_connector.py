@@ -86,6 +86,12 @@ def _funding_interval_hours(raw: Any) -> float:
         return 1.0
 
 
+# Waits between attempts on an empty batch. Geometric, because the failure being
+# recovered from is a rate limit — and a rate limit answers an immediate retry
+# exactly as it answered the first request.
+EMPTY_BATCH_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
+
+
 class CoinbaseRESTClient:
     BASE_URL = "https://api.coinbase.com"
     
@@ -205,7 +211,7 @@ class CoinbaseRESTClient:
             end = end.replace(tzinfo=timezone.utc)
         all_bars = []
         current_start = start
-        retried_window = False
+        attempt = 0
         skipped_windows: List[tuple] = []
         tf_seconds = self._granularity_to_seconds(granularity)
         batch_duration = tf_seconds * 300
@@ -218,32 +224,51 @@ class CoinbaseRESTClient:
                 all_bars.extend(bars)
                 last_time = bars[-1].event_time.replace(tzinfo=timezone.utc) if bars[-1].event_time.tzinfo is None else bars[-1].event_time
                 next_start = last_time + timedelta(seconds=tf_seconds)
-                retried_window = False
+                attempt = 0
                 current_start = max(next_start, current_start + timedelta(seconds=tf_seconds))
             else:
                 # `get_candles` returns [] for both "no data in this window" and
                 # "the request failed", and advancing past a failure silently
-                # drops 300 bars. Retry once, then record the gap rather than
-                # stepping over it as though the market had been quiet.
-                if not retried_window:
-                    retried_window = True
+                # drops 300 bars.
+                #
+                # Retried with BACKOFF, not immediately. The previous version
+                # retried once with no delay, which is the one thing that cannot
+                # recover the most likely cause: a rate limit answers the second
+                # request exactly as it answered the first. On a five-year
+                # backfill of ~8,700 batches per symbol, two gave up this way and
+                # left two five-hour holes in the history.
+                if attempt < len(EMPTY_BATCH_BACKOFF_SECONDS):
+                    delay = EMPTY_BATCH_BACKOFF_SECONDS[attempt]
+                    attempt += 1
                     logger.warning(
-                        'empty candle batch for %s %s..%s: retrying once',
-                        product_id, current_start, batch_end,
+                        'empty candle batch for %s %s..%s: attempt %d/%d, '
+                        'waiting %.1fs',
+                        product_id, current_start, batch_end, attempt,
+                        len(EMPTY_BATCH_BACKOFF_SECONDS), delay,
                     )
+                    await asyncio.sleep(delay)
                     continue
                 skipped_windows.append((current_start, batch_end))
-                retried_window = False
+                attempt = 0
                 current_start = batch_end
             await asyncio.sleep(0.1)
         if skipped_windows:
             logger.error(
-                '%s %s: %d window(s) still empty after a retry and missing from '
-                'the history: %s',
+                '%s %s: %d window(s) still empty after %d attempts with backoff '
+                'and missing from the history: %s%s',
                 product_id, granularity, len(skipped_windows),
+                len(EMPTY_BATCH_BACKOFF_SECONDS) + 1,
                 ', '.join(f'{a:%Y-%m-%d %H:%M}..{b:%Y-%m-%d %H:%M}'
                           for a, b in skipped_windows[:5]),
+                '' if len(skipped_windows) <= 5 else f' (+{len(skipped_windows) - 5} more)',
             )
+            logger.error(
+                'recover these with `python -m scripts.scrape --fill-gaps`, which '
+                're-requests only the minutes the store is missing'
+            )
+        # Recorded on the client so a caller can act on them rather than parse a
+        # log line. Overwritten per call, which is what a caller wants.
+        self.last_skipped_windows = list(skipped_windows)
         unique = {b.event_time: b for b in all_bars}
         return sorted(unique.values(), key=lambda x: x.event_time)
     

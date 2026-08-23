@@ -161,12 +161,18 @@ that group to a peer mean rather than erroring.
 1. **Read `CLAUDE.md` before changing anything under `core/`.** The invariants
    there are each the fix to a specific bug that cost this project real time.
 2. **Never measure against 50%.** Skill is the difference against the baseline.
-3. **Never split cross-validation on the row.** Four offsets share a settlement.
-4. **Never mark an open position to the model's own forecast.** That books belief
+3. **The target's conventions are the venue's, not a modelling choice.** Both
+   ends are one-minute averages, a tie resolves UP, and a window's strike is the
+   previous window's settlement. Check `rules_primary` on a live market before
+   changing any of it.
+4. **Never split cross-validation on the row.** Four offsets share a settlement,
+   and consecutive windows share a price.
+5. **Never mark an open position to the model's own forecast.** That books belief
    as profit.
-5. **Never let a blocked candidate reach `models/forecast.joblib`.** Promotion is
+6. **Never let a blocked candidate reach `models/forecast.joblib`.** Promotion is
    the only path, and `--force` needs a written reason.
-6. **When a claim in these docs is measurable, measure it.** Three numbers in the
-   previous version of this file were wrong (the fee crossover, the scale
-   interpretation, a forward-looking target that looked backwards) and each was
-   found by a test rather than by review.
+7. **When a claim in these docs is measurable, measure it.** Six numbers in
+   earlier versions of this file were wrong — the fee crossover (twice), the
+   scale interpretation, a forward-looking target that looked backwards, the tick
+   size, and the settlement rule itself. Every one was found by a test or by a
+   live API response, none by review.

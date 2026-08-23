@@ -42,7 +42,8 @@ import pandas as pd
 
 from core.config import Config, DEFAULT_CONFIG
 from core.costs import (
-    TICK, effective_price, expected_value_per_contract, fee_per_contract, trade_fee,
+    MAX_PRICE, MIN_PRICE, TICK, effective_price, expected_value_per_contract,
+    fee_per_contract, round_to_tick as _round_to_tick, trade_fee,
 )
 
 
@@ -155,9 +156,13 @@ def _optional_str(get, key: str) -> Optional[str]:
 
 
 def round_to_tick_array(price: np.ndarray) -> np.ndarray:
-    """Kalshi quotes in whole cents, and the rounding is a real friction."""
-    return np.clip(np.round(np.asarray(price, dtype=float) / TICK) * TICK,
-                   TICK, 1.0 - TICK)
+    """Snap to the venue's tick ladder — a tenth of a cent in the tails.
+
+    Delegates to `core.costs.round_to_tick` so there is one ladder. This used to
+    round everything to a whole cent, which moved every tail price by up to half
+    a cent: at 2c that is a 25% relative error on the price being traded.
+    """
+    return np.asarray(_round_to_tick(np.asarray(price, dtype=float)), dtype=float)
 
 
 def round_to_tick(price: float) -> float:
@@ -354,6 +359,12 @@ def decide(
     )
     if config.max_stake_dollars is not None:
         stake_target = min(stake_target, config.max_stake_dollars)
+    # A measured depth beats the standing guess. `max_stake_dollars` exists
+    # because nobody had read the book; when a row carries what is actually
+    # resting at the touch, that is the real cap.
+    measured_depth = _optional(get, f'depth_{side.value}')
+    if measured_depth is not None and measured_depth > 0:
+        stake_target = min(stake_target, measured_depth)
     # Never stake more than is actually there, whatever the fractions say.
     stake_target = min(stake_target, bankroll)
     room = config.max_window_exposure_fraction * sizing_base - exposure.stake

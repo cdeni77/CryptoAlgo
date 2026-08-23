@@ -63,6 +63,27 @@ class Config:
     # window without monkeypatching a module constant.
     window_minutes: int = 15
 
+    # The venue settles on an *average*, not a point price. From the market's own
+    # rules: "the simple average of the sixty seconds of CF Benchmarks' BRTI
+    # before 12:45 AM EDT ... is at least the simple average of the sixty seconds
+    # ... before 12:30 AM EDT". So both the strike and the settlement value are
+    # one-minute means, and the strike of a window is exactly the settlement
+    # value of the window before it — consecutive markets chain.
+    #
+    # This has a real consequence for the barrier: averaging *reduces* variance.
+    # The unresolved quantity at offset m is the mean over the last minute, whose
+    # variance about the last observed price is
+    #     sigma^2 * ((window - delta - m) + delta/3)
+    # rather than sigma^2 * (window - m). At m=12 that is 2.33 minutes of
+    # variance, not 3 — a 22% overstatement if ignored. See
+    # `remaining_variance_minutes`.
+    settle_average_minutes: float = 1.0
+
+    # A tie resolves YES. `strike_type` on the market is `greater_or_equal`, so a
+    # dead-flat window pays the up side — the opposite of what a strict `>` would
+    # give it, and worth a field because it is a venue fact rather than a choice.
+    tie_resolves_up: bool = True
+
     # Minutes after the window opens at which a decision is scored. Each is a
     # separate row with its own displacement and its own remaining variance,
     # and they share a label — so folds split on the *window*, never the row.
@@ -131,11 +152,15 @@ class Config:
     fee_rate: float = 0.07
     maker_fee_rate: float = 0.0025
     assume_maker: bool = False
-    # Half the quoted bid/ask, in cents of a dollar contract. An assumption,
-    # not a measurement, and larger than the fee at every price above 83c
-    # (where 0.07*p(1-p) drops below a cent) —
-    # so it is reported separately and stressed rather than folded in.
-    half_spread_cents: float = 1.0
+    # Half the quoted bid/ask, in cents of a dollar contract.
+    #
+    # MEASURED, no longer assumed: the live BTC 15-minute book quoted 0.19/0.20
+    # and 0.10/0.11 — a one-cent spread, so half a cent. The previous default of
+    # 1.0 was twice too pessimistic, which made every backtested required-edge
+    # figure too high rather than too low. Still a single observation on one
+    # symbol at one time of day, so `scripts/measure_book.py` samples it properly
+    # and `scripts/evaluate.py` stresses it either way.
+    half_spread_cents: float = 0.5
 
     # ---- sizing and risk (a $100 account) --------------------------------
     starting_bankroll: float = 100.0
@@ -207,13 +232,18 @@ class Config:
     # [0.55, 0.95] permits only the first and silently discards half the
     # strategy.
     #
-    # What the ends actually exclude is where the *microstructure assumptions*
-    # break, not where the forecast is weak. Below 10c a one-cent tick is a 10%
-    # relative price error and the assumed half-spread is 10% of the stake, so
-    # the fill assumption dominates everything else. Above 95c there is under 5c
-    # of upside and tick quantisation is larger than any plausible edge.
-    min_traded_price: float = 0.10
-    max_traded_price: float = 0.95
+    # What the ends exclude is where the *microstructure* becomes the dominant
+    # uncertainty, not where the forecast is weak.
+    #
+    # The original justification for the low end was wrong and is worth
+    # recording: "below 10c a one-cent tick is a 10% relative price error". The
+    # venue's `price_level_structure` is `tapered_deci_cent` — the tick is a
+    # *tenth* of a cent below 10c and above 90c, and a cent only in between. So
+    # quantisation is finer in the tails, not coarser, and the real reason for
+    # care at a low price is that the payoff is 50:1 and a small calibration
+    # error dominates the expected value.
+    min_traded_price: float = 0.05
+    max_traded_price: float = 0.97
 
     # An outlier guard, not an economic gate. A sigma disagreement produces
     # modest departures from the quote; a 40-point departure is a bug, a stale
@@ -235,14 +265,35 @@ class Config:
         return self.window_minutes
 
     def remaining_minutes(self, offset: int) -> int:
-        """Minutes of unresolved price movement left at a decision offset.
+        """Wall-clock minutes from the decision to settlement.
 
-        The decision at offset ``m`` sees the close of the bar covering
-        ``[m-1, m)``, so the unobserved span is ``window_minutes - m``. The
-        sub-minute staleness inside that last bar is absorbed by the baseline's
-        fitted scale factor rather than modelled here.
+        Reported, not used for scaling volatility — `remaining_variance_minutes`
+        is what the barrier divides by, and the two differ because the settlement
+        value is an average.
         """
         return self.window_minutes - offset
+
+    def remaining_variance_minutes(self, offset: float) -> float:
+        """Minutes of *variance* left between the last observed price and settlement.
+
+        The settlement value is the mean over the final `settle_average_minutes`,
+        not the price at the boundary. For a diffusion, the variance of that mean
+        about a price observed at offset `m` is
+
+            sigma^2 * ((window - delta - m) + delta / 3)
+
+        The first term is the drift to the start of the averaging window; the
+        `delta/3` is the variance of a time-average over an interval of length
+        `delta`, which is a third of the variance of its endpoint. Ignoring the
+        averaging overstates remaining variance — at offset 12 of a 15-minute
+        window, by 3 minutes against 2.33, which is 13% on sigma.
+
+        The baseline's fitted per-offset scale would absorb most of this, but
+        absorbing a known analytic correction into a fitted nuisance parameter is
+        how a fitted parameter stops meaning anything.
+        """
+        delta = float(self.settle_average_minutes)
+        return max(0.0, (self.window_minutes - delta - float(offset)) + delta / 3.0)
 
     def with_overrides(self, **values: Any) -> 'Config':
         """Return a copy with `values` applied, recording which fields moved."""
