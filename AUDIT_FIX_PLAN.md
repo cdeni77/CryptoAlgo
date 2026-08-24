@@ -3,6 +3,66 @@
 Ordered, actionable tasks from `AUDIT_REPORT.md`. Each carries severity, files,
 expected behaviour, the change, required tests, and dependencies.
 
+## Status, 2026-08-24 (after 24 hours of real orders)
+
+**20 commits, 422 tests, tree clean. Live on a $100 account since 2026-08-23
+15:18 UTC.** The Addendum in `AUDIT_REPORT.md` has the detail; this is what it
+means for the queue.
+
+Four defects that neither static review nor the backtest found, all four in the
+code that *verifies* rather than the code that trades, all four silent:
+
+1. **[CRITICAL] V1 order endpoint retired** (`410`). V2 quotes one book from the
+   YES side, so a DOWN order converts to `1 - price` rather than relabelling.
+   Fixed; three mutants die where the V1 side-flip left 230 tests green.
+2. **[CRITICAL] `position_fp`, not `position`.** `venue_open` was the empty set on
+   every cycle, so the position cross-check was dead in *both* directions —
+   including the reverse one this plan and the report both claimed had been added.
+   Fixed.
+3. **[HIGH] Every settlement credited twice for one cycle.** The venue credits on
+   settle, and we adopted its balance before crediting our own. Bankroll
+   self-healed; Kelly sized off the inflated figure and the drift alarm cried wolf
+   on every win. Fixed by ordering.
+4. **[HIGH] `client_order_id` enforced one *attempt* per window.** A killed
+   fill-or-kill consumes the id, so the first thin-volume kill locked the window.
+   57 of 69 refusals were our own key, at a *higher* claimed edge (8.37pp) than
+   the fills (5.77pp). Fixed by keying on the offset too.
+
+**Closed from P1: the market benchmark is a gate.** `market_windows` and
+`model_minus_market` are read before `log_loss_skill`, because the arithmetic null
+is not the counterparty. This mattered immediately: over 1,109 rows the market's
+log loss is **0.331** against the model's **0.430**, on every symbol and every
+offset, and the model is indistinguishable from its own baseline. A candidate like
+that passed all fourteen previous gates.
+
+**The money does not settle it either way.** $100 → $165.23, +$65.67 realised,
+venue-confirmed. A bootstrap under "the market's de-spread mid is the true
+probability", using each trade's real price, size and fee, puts expected P&L at
+**−$23** and makes +$63 a **2–4%** event (ρ 0 → 0.9). So this is mild evidence
+*for* an edge, and it is one day and 88 windows.
+
+### New queue, in priority order
+
+1. **[P1] `init_score` should be the market's logit, not the baseline's.** The
+   model is fitted to correct the forecaster that loses by 0.10 nats. Blocked on
+   enough recorded quote history to fit against; unblocks itself as (2) runs.
+2. **[P1] Accumulate 2,000 windows of quotes, then re-read `model_minus_market`.**
+   ~a week at 96 windows/day across three symbols. If it is still negative the
+   strategy is falsified on its own terms and the honest move is back to research.
+   **Keep placing real orders while this runs** — `--dry-run` records the quotes
+   but assumes every intended order fills, and 30% do not, so the fill selection
+   would go unmeasured.
+3. **[P2] Audit every remaining `_fp` / `_dollars` field.** The same trap has now
+   been found in quotes, fills and positions. `settlements.revenue` is safe only
+   because it is used as a sign test and never as a magnitude — safety that stops
+   holding the moment someone reads the field for its value.
+4. **[P2] A `killed` ticket blocks the window and probably should not.** A
+   confirmed zero fill bought nothing, so the window could reopen the way
+   `skipped` does. Conservative as it stands; worth measuring how often it costs
+   an entry before changing it.
+
+---
+
 ## Status, 2026-08-23 (updated after running the pipeline)
 
 **14 commits on `audit/critical-fixes`, 397 tests (385 fast + 12 slow), tree clean.**

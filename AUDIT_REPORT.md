@@ -24,6 +24,16 @@ implementation and are called out as such.
 | Is order execution safe / idempotent? | **NO** |
 | Are reported profitability metrics believable? | **NO** — no profitability metric has ever been produced; there is no trained model and no measured edge |
 
+> **Addendum, 2026-08-24.** This system has now traded real money for 24 hours.
+> Four defects were found that this audit did not, all four in the code that
+> *verifies* rather than the code that trades, and the market benchmark was
+> measured for the first time. Point 3 of the Final Adversarial Review predicted
+> this in these words: *"no fill ever read back, no settlement ever reconciled,
+> no drift ever observed, no idea what the venue actually does with a duplicate
+> `client_order_id`. ... The first week of paper trading will find things this
+> audit did not."* All four items on that list were the four defects. See
+> **Addendum — the first 24 hours live**, at the end of this document.
+
 ## The one-paragraph version
 
 The research core of this project is unusually well built. The barrier reframing is
@@ -1081,7 +1091,7 @@ every fix below was checked by reintroducing the bug and confirming a test fails
 | Live re-enters the same (symbol, window) every cycle | **fixed** — exposure seeded from committed positions and tickets; `open_position` idempotent; Postgres advisory lock for single-writer |
 | Paper bankroll never credited a win | **fixed** — payout credited inside `settle_position`'s transaction; increments via one relative `UPDATE` |
 | Live settles on the wrong rule | **fixed** — `bar_mean` of the minute ending at `settle_time`, `>=`; venue settlements applied as authoritative |
-| Venue settlements fetched and discarded | **fixed** — returned and applied; reverse reconciliation added |
+| Venue settlements fetched and discarded | **fixed** — returned and applied. *The "reverse reconciliation added" half of this claim was false: it read `row['position']`, a field V2 does not send, so it could never fire. See the Addendum.* |
 | Unresolved market books a phantom position | **fixed** — `Reason.NO_QUOTE`; live prices from the book or abstains |
 | Fills assumed, not read back | **fixed** — `status`/`remaining_count`/`taker_fill_count` parsed; position written from the fill |
 | Coinbase pagination destroys 1 minute in 301 | **fixed** — span is `(limit - 1) * tf`; `--min-gap-minutes` defaults to 1 |
@@ -1613,3 +1623,224 @@ paths, which is an operator's decision rather than an auditor's.
 token in. That pattern is fixed, and two tests now fail on a tracked env file or on
 any tracked file containing a real PEM body. The mechanism that produced this is
 closed regardless of how much the particular values mattered.
+
+---
+
+# Addendum — the first 24 hours live (2026-08-24)
+
+**Method:** the same as above, on a running system. Every number here is read from
+the live Postgres store, the container logs, or a read-only call to the venue
+constructed without `live=True`. Real orders were placed on a $100 account
+throughout, at $2–5 a trade.
+
+Point 3 of the Final Adversarial Review said the audit's blind spot was that
+nothing had ever run, and listed four things nobody had observed: a fill read
+back, a settlement reconciled, a drift observed, and what the venue does with a
+duplicate `client_order_id`. **Those four things turned out to be the four
+defects.** The prediction was right, and it was right about the specific items,
+which is worth more than the general warning.
+
+The pattern across all four is worth stating plainly: **the code that trades
+worked on first contact; the code that checks the code that trades did not.**
+Every fail-closed path was exercised for real within hours — a retired endpoint, a
+killed fill-or-kill, a rejected duplicate, an unresolvable market — and not one of
+them booked a phantom position. Every *verification* mechanism was broken, and all
+four were silent.
+
+## [CRITICAL] The order endpoint was retired, and V2 is not a renamed path
+
+The first real order returned `410 deprecated_v1_order_endpoint`. That part was
+survivable — `order refused, no position recorded`, no phantom holding, which is
+one of this audit's own CRITICAL fixes working on its first real test.
+
+The hazard was in the migration. V2 quotes a **single book from the YES side**:
+`bid` buys YES, and `ask` sells YES, which is economically buying NO at
+`1 - price`. `decide()` produces what we would *pay* for the chosen side, so a
+DOWN order at 31c must be sent as an `ask` at **69c**. Sending 31c as an `ask`
+offers to sell YES for thirty-one cents — a strictly worse error than inverting
+the side, and one that looks plausible in a log line. The rounding direction
+inverts with it: a bid must ceiling to the cent and an ask must floor, or a
+`fill_or_kill` cannot fill at all.
+
+**Fixed** in `data_collection/kalshi_client.py`. Three mutants now die where the
+V1 side-flip had left all 230 tests passing: inverted book side (5 failures),
+missing `1 - price` conversion (4), reversed ask rounding (4).
+
+## [CRITICAL] Both directions of the position cross-check were dead
+
+`reconcile_with_venue` filtered open positions with
+`int(row.get('position') or 0) != 0`. **V2 does not send a `position` field.** It
+sends `position_fp`, a fixed-point string, negative for the short-YES leg that a
+NO position is held as. Read from `/portfolio/positions` while a position we had
+just watched fill was open:
+
+```json
+{"ticker": "KXBTC15M-26AUG241000-00", "position_fp": "-5.00",
+ "market_exposure_dollars": "2.150000", "fees_paid_dollars": "0.085800"}
+```
+
+`int(None or 0)` is `0`, so `venue_open` was the empty set on every cycle. One
+empty set broke the check in both directions at once:
+
+* **forward** — *"we hold 5 contracts the venue does not report. Most likely the
+  order never filled"* fired once a minute against a position that was open and
+  fine. The alarm for a killed fill-or-kill was permanently on, which is the same
+  as it being off.
+* **reverse** — *"the venue reports an open position we have no record of"* could
+  never fire. **This is the direction the report above singles out as the one that
+  costs money silently**, and the row in "What has been fixed" claiming it was
+  added is corrected in place. It has been structurally incapable of firing since
+  it was written.
+
+This is the same trap as the quote fields, where `yes_bid_dollars` carries the
+value and the integer-cent field the older documentation describes comes back
+`null`. `_quantity` already existed for it; the positions path never used it.
+
+**Fixed** via `KalshiClient.position_size`, which accepts both encodings and
+returns `0.0` rather than raising on junk — `int('-5.00')` raises `ValueError`
+inside a set comprehension where nothing would catch it, aborting the
+reconciliation mid-cycle so the balance was never adopted either. Verified by the
+clock: container restarted `13:59:36Z`, last false alarm `13:58:47Z`, none since.
+
+## [HIGH] Every settlement was credited twice for one cycle
+
+`run_cycle` adopted the venue's balance and *then* called `settle_due`. The venue
+credits a settlement the instant the market settles, so the payout was already in
+the balance we adopted, and `settle_position` added it again:
+
+```
+09:15:38  ours $147.03, venue $168.03 (+21.00)   <- venue credited the payout
+09:16:42  ours $189.03, venue $168.03 (-21.00)   <- we credited the same payout
+09:19:56  ours $160.67, venue $161.07 ( +0.41)   <- reconciled back
+```
+
+No money moved — the next cycle corrected the bankroll, and our computed PnL
+matches the venue's balance change to seven cents across 155 positions. Two things
+went wrong anyway. Kelly sized off a bankroll inflated by the payout for up to a
+full cycle, and the inflation scales with the win, so it is largest exactly when
+the account has just been most volatile. And every settlement produced a large
+spurious drift warning, in a log that is the only thing standing between an
+unrecorded fill and silence.
+
+**Fixed** by splitting `adopt_venue_balance` out of `reconcile_with_venue` and
+calling it after settlement. The test drives the real `run_cycle`, because
+asserting a hand-written sequence of two calls only tests the sequence in the
+test; restoring the old order fails it with `got 113.80 ... the payout was booked
+twice`.
+
+What the alarm reports now that it is not crying wolf: `+0.15`, `+0.26`, `+0.07` —
+a persistent few cents, always in the venue's favour, i.e. we slightly
+over-estimate our own fees against what they actually charge. Invisible before.
+
+## [HIGH] The order key enforced one *attempt* per window, not one *position*
+
+`client_order_id` was `{symbol}-{window}`. A `fill_or_kill` that kills still
+consumes the id at the venue, so the first thin-volume kill locked every later
+offset out of that window. From `order_tickets` after 24 hours:
+
+| outcome | n | avg claimed edge |
+|---|---:|---:|
+| filled | 159 | 5.77pp |
+| refused: duplicate `client_order_id` | 57 | **8.37pp** |
+| refused: `fill_or_kill_insufficient_resting_volume` | 9 | 3.94pp |
+| refused: V1 `410` | 3 | 5.23pp |
+
+Read carelessly this is textbook adverse selection — the trades that fail carry a
+higher edge than the trades that fill. It is not. 57 of 69 failures were **our own
+key**, and the 9 genuine thin-book refusals were the *lowest*-edge group of the
+three. The market was not selecting against us; we were blocking ourselves out of
+the better half of our own signal.
+
+Double-entry was never what this key protected — `entries_for_window` does that,
+counting a ticket in any status but `skipped`, so a crash between sending an order
+and booking a position still blocks the window while `skipped` correctly reopens
+it. **Fixed** by putting the offset in the key. Observed working within minutes:
+in window 14:30–14:45, ETH was refused at `+3m` for thin volume and then **filled
+3 @ 0.13 at `+6m`** — a fill the old key made impossible.
+
+The upside is bounded by `max_positions_per_window = 2`, which is correct and
+unchanged: three ~0.7-correlated symbols in one window is largely one bet at 3x
+size, the same logic that makes four offsets one bet rather than four.
+
+## The market benchmark, measured for the first time
+
+`scripts/market_benchmark.py` existed and had never had data. Over 1,109 scored
+rows and 285 windows of live-recorded quotes:
+
+| slice | n | market_ll | baseline_ll | model_ll | model − market |
+|---|---:|---:|---:|---:|---:|
+| all | 1109 | **+0.331** | +0.428 | +0.430 | **−0.098** |
+| BTC-USD | 365 | +0.309 | +0.415 | +0.415 | −0.106 |
+| ETH-USD | 373 | +0.310 | +0.408 | +0.409 | −0.100 |
+| SOL-USD | 371 | +0.375 | +0.460 | +0.465 | −0.089 |
+
+**The market is a better forecaster than the model on every symbol and every
+offset, and the model is indistinguishable from its own baseline.** Restricted to
+the 108 rows actually traded, against the de-spread mid `(ask_up + (1 −
+ask_down))/2`: model 0.5851, baseline 0.5775, market **0.5389**, gap **−0.0461**.
+Selection narrows the gap and never closes it — and on the traded subset the model
+is *worse than its own baseline*, so the ML layer is actively harmful exactly where
+it is used.
+
+This is a structural indictment of the gate set, not just of this candidate. A
+model like that passes `log_loss_skill` **by construction** — it does beat
+`F(x/sigma)` — and passes the other thirteen gates too. `market_windows` and
+`model_minus_market` are gates now, read first, and they fail as *unmeasured*
+until 2,000 windows of quotes exist.
+
+## The money, and why it does not settle the question either way
+
+$100 → $165.23 in 24 hours: 153 settled positions, 42.5% win rate at a
+contract-weighted entry of 33.3c against a 34.7% breakeven, +$65.67 realised,
+$13.35 fees (4.1% of stake). Venue-confirmed, so it is real money and not an
+accounting artifact.
+
+The right test is not the win rate but a bootstrap under the null that the
+market's de-spread mid is the true probability, using each trade's actual price,
+size and fee. On 158 settled trades over 88 windows, with a Gaussian copula for
+within-window correlation:
+
+| ρ | mean | sd | P(net ≥ +$62.96) |
+|---:|---:|---:|---:|
+| 0.0 | −$23.04 | $41.17 | 0.022 |
+| 0.5 | −$23.13 | $43.82 | 0.029 |
+| 0.9 | −$22.97 | $46.77 | 0.038 |
+
+Expected P&L if the market were right was **−$23**. Being up $63 is a **2–4%
+event** under that null, and clustering barely matters because there are only 1.80
+symbols per window. **So "it is just variance" is too strong** — this is genuine
+mild evidence against the market-is-right null, and it subsumes rather than
+compounds the earlier objection that five trades carry 73% of the profit: that
+concentration is exactly what the $41 standard deviation is made of.
+
+Two measurements now point opposite ways, and the reconciliation is the
+interesting part. Log loss punishes confident errors severely; a binary bet at a
+fixed price only cares which side of the price the truth lands on. A forecaster
+can be badly calibrated in magnitude and still pick the right side of its own
+disagreement. For money the bootstrap is the objective and log loss is the proxy,
+so the bootstrap wins on relevance — while being far more underpowered, at one day
+and 88 windows.
+
+## What this changes about the verdicts
+
+Nothing in the Executive Summary flips. *Safe to trade real money* stays **NO**,
+for a narrower and better-evidenced reason than before: the model does not beat
+the price it trades against on the only sample where that has been measured, and
+the gates were not asking. The plumbing is materially better than the audit found
+it — four fail-closed paths held under real conditions — and the measurement
+apparatus was wrong again, in four new places, which is the fifth point of the
+Final Adversarial Review holding up exactly as written: *"the prior on further
+undetected measurement error should be high."*
+
+Concretely open, in priority order:
+
+1. **`init_score` should be the market's logit, not the baseline's.** The model
+   currently learns to correct the weaker of the two forecasters by 0.10 nats.
+   Correcting the price is the residual that pays, and it is now recordable.
+2. **2,000 windows of quotes**, then re-read `model_minus_market`. At ~96 windows
+   a day across three symbols that is about a week. If it is still negative the
+   strategy is falsified on its own terms.
+3. **The same fixed-point trap, everywhere else.** Found in quotes, then fills,
+   then positions. `settlements.revenue` is safe only by accident — it is used
+   solely as a sign test, never as a magnitude — which is the kind of safety that
+   stops holding the moment someone reads the field for its value.
