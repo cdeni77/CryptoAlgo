@@ -63,7 +63,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -524,15 +524,73 @@ async def fetch_quotes(
     return quotes
 
 
-async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> dict[str, dict]:
-    """Make the venue's ledger the one we report.
+class VenueState(NamedTuple):
+    """What the venue says, read before we settle anything ourselves.
+
+    The balance travels with the settlements rather than being written on the
+    spot, because the order of those two operations turned out to matter — see
+    `adopt_venue_balance`.
+    """
+
+    settlements: dict[str, dict]
+    balance: float
+
+
+def adopt_venue_balance(writer: PgWriter, venue_balance: float) -> None:
+    """Make the venue's balance the one we report. **Call this after settling.**
+
+    Our running figure against theirs: a gap that grows is an unrecorded fill, a
+    partial, or a fee we mispriced. Logged rather than silently overwritten,
+    because the venue is right either way and a silent overwrite hides how wrong
+    we were.
+
+    **The ordering is the whole point, and getting it backwards cost the alarm its
+    meaning.** This used to run at the top of the cycle, before `settle_due`. But
+    the venue credits a settlement the moment it settles, so by the time we read
+    the balance the payout is already in it — and then `settle_due` credited the
+    same payout again. Measured over the first live night, on real money:
+
+        09:15:38  ours $147.03, venue $168.03 (+21.00)   <- venue credited
+        09:16:42  ours $189.03, venue $168.03 (-21.00)   <- we credited it again
+        09:19:56  ours $160.67, venue $161.07 ( +0.41)   <- reconciled back
+
+    The bankroll self-healed on the next cycle, so no money moved. Two things did
+    go wrong. Kelly sized off a bankroll inflated by the payout for up to a full
+    cycle; and the drift log filled with benign +/-$21 pairs, which is exactly the
+    noise a genuine unrecorded fill would hide in. An alarm that cries wolf every
+    time a position settles is not an alarm.
+
+    Settling first makes the drift mean what it says: a disagreement between our
+    bookkeeping and the venue's, with the ordering artifact removed.
+    """
+    if not np.isfinite(venue_balance):
+        # The venue is the account of record only when it actually answered.
+        # Writing an unreadable balance over a correct one is worse than keeping
+        # ours and saying so.
+        logger.error('the venue did not return a readable balance; keeping our own '
+                     'figure this cycle rather than overwriting it')
+        return
+    account = writer.account()
+    if account is None:
+        return
+    ours = float(account.bankroll)
+    drift = venue_balance - ours
+    if abs(drift) > 0.01:
+        logger.warning(
+            'balance drift: ours $%.2f, venue $%.2f (%+.2f). The venue is the '
+            'account of record — writing theirs. A drift that grows means a '
+            'fill we did not record, a partial, or a mispriced fee.',
+            ours, venue_balance, drift)
+    writer.update_account(bankroll=venue_balance)
+
+
+async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> VenueState:
+    """Read the venue's ledger. Writes nothing except warnings.
 
     Three comparisons, each of which has a specific failure it catches:
 
-    * **balance** — our running figure against theirs. A gap that grows is an
-      unrecorded fill, a partial, or a fee we mispriced. Logged rather than
-      silently overwritten on the first cycle, then written, because the venue is
-      right either way and a silent overwrite hides how wrong we were.
+    * **balance** — carried out in `VenueState` and written by
+      `adopt_venue_balance` *after* settlement, not here.
     * **settlements** — what a position actually paid. Ours are settled from an
       OHLC mean of Coinbase standing in for CF Benchmarks BRTI, which will
       sometimes disagree.
@@ -541,24 +599,6 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> dict[s
     """
     state = await kalshi.reconcile()
     venue_balance = float(state['balance'])
-    account = writer.account()
-    if not np.isfinite(venue_balance):
-        # The venue is the account of record only when it actually answered.
-        # Writing an unreadable balance over a correct one is worse than keeping
-        # ours and saying so.
-        logger.error('the venue did not return a readable balance; keeping our own '
-                     'figure this cycle rather than overwriting it')
-        account = None
-    if account is not None:
-        ours = float(account.bankroll)
-        drift = venue_balance - ours
-        if abs(drift) > 0.01:
-            logger.warning(
-                'balance drift: ours $%.2f, venue $%.2f (%+.2f). The venue is the '
-                'account of record — writing theirs. A drift that grows means a '
-                'fill we did not record, a partial, or a mispriced fee.',
-                ours, venue_balance, drift)
-        writer.update_account(bankroll=venue_balance)
 
     # Settle from the venue where it knows, keyed on the market ticker we stored.
     # This dict used to be built, logged, and dropped on the floor — `revenue` was
@@ -604,7 +644,7 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> dict[s
             'An order was filled and not booked — most likely a POST that timed '
             'out after being accepted. Reconcile by hand before trading again.',
             ticker)
-    return resolved
+    return VenueState(settlements=resolved, balance=venue_balance)
 
 
 def _ticket_for(writer: PgWriter, position):
@@ -647,12 +687,17 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                      len(config.symbols) - len(stale), len(config.symbols))
         offset = None
 
-    # The venue first, where there is one: it knows what actually settled and
-    # what the balance actually is. Bars only fill in what it has not resolved.
+    # Read the venue first, where there is one: it knows what actually settled,
+    # and bars only fill in what it has not resolved. Its *balance* is adopted
+    # after we settle, not here — the venue credits a payout the moment it
+    # settles, so adopting first and settling second counted every payout twice
+    # for a cycle. `adopt_venue_balance` has the measured log.
     venue_settlements: dict[str, dict] = {}
+    venue_balance = float('nan')
     if kalshi is not None and args.reconcile:
         try:
-            venue_settlements = await reconcile_with_venue(writer, kalshi)
+            venue = await reconcile_with_venue(writer, kalshi)
+            venue_settlements, venue_balance = venue.settlements, venue.balance
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
                          'bookkeeping for this cycle', exc)
@@ -660,6 +705,9 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # Independent of whether anything was held: this is what turns the recorded
     # market quotes into a scoreable sample.
     settle_predictions(writer, bars)
+    # Now that our own credits are in, the drift is a real disagreement.
+    if kalshi is not None and args.reconcile:
+        adopt_venue_balance(writer, venue_balance)
 
     if offset is None:
         logger.info('%d minutes into the window; first decision offset is +%dm',
