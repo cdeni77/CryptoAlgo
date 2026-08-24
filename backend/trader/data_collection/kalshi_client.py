@@ -395,6 +395,29 @@ class KalshiClient:
         payload = await self._request('GET', '/portfolio/positions')
         return list(payload.get('market_positions', []))
 
+    @staticmethod
+    def position_size(row: dict) -> float:
+        """Signed contracts held in one market, from a positions row.
+
+        **The field is `position_fp`, and it is a fixed-point string.** The live
+        loop read `row['position']`, which V2 does not send at all, so
+        `int(row.get('position') or 0)` was `int(0)` for every row — every open
+        position looked closed. Measured against a position we had just watched
+        fill:
+
+            {"ticker": "KXBTC15M-26AUG241000-00", "position_fp": "-5.00",
+             "market_exposure_dollars": "2.150000", ...}
+
+        This is the same trap as the quote fields, which arrive as
+        `yes_bid_dollars` strings while the integer-cent fields documented
+        elsewhere come back null. `_quantity` already existed for it; the
+        positions path simply never used it.
+
+        Negative is a short YES, which is how a NO position is held — so callers
+        asking "is anything open here" want `!= 0`, not `> 0`.
+        """
+        return _quantity(row, 'position')
+
     async def fills(self, **params) -> list[dict]:
         payload = await self._request('GET', '/portfolio/fills', params=_clean(params))
         return list(payload.get('fills', []))

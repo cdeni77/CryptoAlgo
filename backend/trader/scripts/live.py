@@ -616,8 +616,15 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> VenueS
     if resolved:
         logger.info('venue reports %d settlement(s) to reconcile', len(resolved))
 
+    # `KalshiClient.position_size` and not `p['position']`: the field is
+    # `position_fp`, a fixed-point string, and reading the name from the older
+    # documentation made `venue_open` the empty set on every cycle. That broke
+    # this check in both directions at once — the forward one warned that every
+    # real position "the venue does not report", and the reverse one, for a
+    # position the venue holds and we do not, could never fire at all. The
+    # reverse is the case the audit called the one that costs money silently.
     venue_open = {str(p.get('ticker', '')) for p in state.get('positions', [])
-                  if int(p.get('position') or 0) != 0}
+                  if KalshiClient.position_size(p) != 0}
     for position in writer.open_positions():
         ticket = _ticket_for(writer, position)
         ticker = getattr(ticket, 'market_ticker', None) if ticket else None
