@@ -223,10 +223,35 @@ class Config:
     # Turn it on to project deployment, and label the output as a projection.
     compound: bool = False
     max_window_exposure_fraction: float = 0.08
-    # The three symbols' 15-minute returns are ~0.7 correlated, so three
-    # simultaneous same-direction positions are one position at three times
-    # the size. Cap the count as well as the notional.
-    max_positions_per_window: int = 2
+    # How many of the three symbols may hold a position in one window.
+    #
+    # This was 2, justified as "the three symbols' 15-minute returns are ~0.7
+    # correlated, so three simultaneous same-direction positions are one position
+    # at three times the size." **Measured, that overstates it.** On 122 live
+    # windows where all three settled, the pairwise correlation of settle
+    # direction is BTC-ETH +0.607, BTC-SOL +0.590, ETH-SOL +0.656 — mean +0.618,
+    # with all three agreeing 71.3% of the time against 25% under independence.
+    #
+    # High, but not one bet. The variance of n unit bets at rho = 0.618:
+    #
+    #   1 leg   sd 1.00x   2 legs  sd 1.80x   3 legs  sd 2.59x
+    #
+    # so the third leg adds 50% of the stake for 44% more risk. Per unit of risk
+    # that is 1.16 against 1.11 for two — slightly *better*, provided the edge is
+    # real and roughly even across symbols.
+    #
+    # The reason it is 3 now is measurement, not that argument. `decide()` walks
+    # symbols alphabetically and refuses at the exposure gates *before* computing
+    # an edge, so a binding cap dropped whoever came last in the alphabet and
+    # recorded no edge for them: SOL was blocked 184 times against BTC's 104 and
+    # ETH's 95. Per-symbol performance cannot be compared when one symbol is
+    # structurally starved of entries, and the cap was the thing making the
+    # comparison unfair. At 3 it stops binding, so the ordering bias mostly
+    # disappears with it.
+    #
+    # `max_window_exposure_fraction` still caps the notional, which is the limit
+    # that was actually doing the work.
+    max_positions_per_window: int = 3
 
     # One entry per (symbol, window). The four decision offsets are the same
     # bet observed at four moments, not four bets, so letting each fire

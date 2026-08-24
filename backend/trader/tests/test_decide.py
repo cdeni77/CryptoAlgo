@@ -266,3 +266,59 @@ def test_a_depth_on_the_other_side_does_not_cap_this_one():
     unaffected = decide({**base, 'depth_down': 0.01}, config, bankroll=100.0)
     assert unaffected.traded
     assert unaffected.contracts == decide(base, config, bankroll=100.0).contracts
+
+
+class TestHowManySymbolsMayHoldOneWindow:
+    """`max_positions_per_window`, and why it is 3 rather than 2.
+
+    The old value was justified as "the three symbols are ~0.7 correlated, so
+    three simultaneous positions are one position at three times the size."
+    Measured on 122 live windows where all three settled, the pairwise
+    correlation of settle direction is +0.607 / +0.590 / +0.656 — mean +0.618,
+    all three agreeing 71.3% of the time against 25% under independence.
+
+    High, and not one bet: at rho 0.618 the sd of n unit bets is 1.00x, 1.80x,
+    2.59x, so a third leg is 50% more stake for 44% more risk.
+
+    The operative reason is measurement, though. `decide()` walks symbols
+    alphabetically and refuses at the exposure gates before computing an edge, so
+    a binding cap dropped whoever came last in the alphabet and recorded no edge
+    for them — SOL blocked 184 times against BTC 104 and ETH 95. Per-symbol
+    performance is not comparable when one symbol is starved by the alphabet.
+    """
+
+    def test_all_three_symbols_may_hold_a_position_in_one_window(self):
+        config = Config()
+        assert config.max_positions_per_window >= 3, (
+            'with fewer slots than symbols the cap binds every window and the '
+            'excluded symbol is chosen by alphabet, not by edge'
+        )
+
+    def test_the_third_symbol_is_no_longer_refused_on_count_alone(self):
+        """The regression this changes. Two already in, a third arrives."""
+        exposure = WindowExposure(stake=4.40, positions=2,
+                                  symbols_entered=frozenset({'BTC-USD', 'ETH-USD'}))
+        out = decide(row(symbol='SOL-USD'), Config(), bankroll=120.0,
+                     exposure=exposure)
+        assert out.reason is not Reason.POSITION_LIMIT
+
+    def test_a_fourth_position_would_still_be_refused(self):
+        """The cap is raised, not removed. Three symbols, three slots."""
+        exposure = WindowExposure(stake=6.60, positions=3,
+                                  symbols_entered=frozenset(
+                                      {'BTC-USD', 'ETH-USD', 'SOL-USD'}))
+        out = decide(row(symbol='XRP-USD'), Config(), bankroll=120.0,
+                     exposure=exposure)
+        assert out.reason is Reason.POSITION_LIMIT
+
+    def test_the_notional_cap_still_binds_before_the_count(self):
+        """`max_window_exposure_fraction` is the limit actually doing the work —
+        8% of bankroll, which on a small account is reached well before three
+        positions on a large one."""
+        exposure = WindowExposure(stake=9.00, positions=1,
+                                  symbols_entered=frozenset({'BTC-USD'}))
+        out = decide(row(symbol='SOL-USD'), Config(), bankroll=120.0,
+                     exposure=exposure)
+        assert out.reason is Reason.WINDOW_EXPOSURE, (
+            'raising the count cap must not let the notional cap through'
+        )
