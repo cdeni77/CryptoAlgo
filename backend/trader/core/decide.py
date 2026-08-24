@@ -68,6 +68,7 @@ class Reason(str, Enum):
     POSITION_LIMIT = 'position_limit'          # too many correlated legs this window
     ALREADY_ENTERED = 'already_entered'        # one entry per window
     BANKROLL_FLOOR = 'bankroll_floor'          # stop-trading floor breached
+    HALTED = 'halted'                          # a circuit breaker is latched
 
 
 @dataclass(frozen=True)
@@ -290,6 +291,7 @@ def decide(
     bankroll: float,
     exposure: Optional[WindowExposure] = None,
     require_quote: bool = False,
+    halted: bool = False,
 ) -> Decision:
     """Choose a side, a size, or nothing, for one scored row.
 
@@ -340,6 +342,23 @@ def decide(
     if not np.isfinite(bankroll) or (
             bankroll < config.starting_bankroll * config.ruin_floor_fraction):
         return refuse(Reason.BANKROLL_FLOOR)
+    # A latched circuit breaker refuses the entry and nothing else.
+    #
+    # It used to short-circuit the whole cycle: `run_cycle` set `offset = None` on
+    # a halt, which returns before `score_live`, so a halted account wrote no
+    # predictions and recorded no quotes. The breaker exists to stop risking
+    # money, and stopping the measurement was collateral damage nobody chose —
+    # and the expensive kind, because the market benchmark needs windows and a
+    # halt froze the count. On a $100 account with a 15% daily-loss breaker
+    # sitting almost exactly on the expected burn rate, that meant the recording
+    # run could not reach its own sample-size target.
+    #
+    # Refusing here instead keeps the row honest: it is scored, priced against
+    # the real book, written with `reason='halted'`, and settled like any other,
+    # so `market_benchmark` and the calibration history keep accruing while no
+    # money moves.
+    if halted:
+        return refuse(Reason.HALTED)
     if symbol in exposure.symbols_entered:
         return refuse(Reason.ALREADY_ENTERED)
     if exposure.positions >= config.max_positions_per_window:

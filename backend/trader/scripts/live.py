@@ -703,8 +703,13 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     halted = check_circuit_breakers(writer, config, now=now)
     if halted:
-        logger.error('account halted (%s); settling only, no new entries', halted)
-        offset = None
+        # Note the offset is deliberately NOT cleared. That returns before
+        # `score_live`, which stopped the recording as well as the trading — and
+        # the measurement is the reason this loop is running. `decide()` refuses
+        # every row with `Reason.HALTED` instead, so quotes, scores and outcomes
+        # keep accruing for `market_benchmark` while no money moves.
+        logger.error('account halted (%s); scoring and recording continue, '
+                     'no new entries', halted)
 
     stale = stale_symbols(bars, config, now=now)
     if stale:
@@ -856,7 +861,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                 row['symbol'], remaining, config.min_remaining_seconds, settle_time)
             break
         decision = decide(row, config, bankroll=account.bankroll,
-                          exposure=exposure, require_quote=require_quote)
+                          exposure=exposure, require_quote=require_quote,
+                          halted=bool(halted))
         decisions.append(decision)
         writer.write_prediction(
             symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
