@@ -359,3 +359,97 @@ class TestClearingAHalt:
         writer.update_account(bankroll=61.25, halted=True, halted_reason='daily loss')
         writer.update_account(halted=False, halted_reason=None)
         assert writer.account().bankroll == pytest.approx(61.25)
+
+
+class TestTheDrawdownBreaker:
+    """Peak-to-current drawdown on realised equity.
+
+    **The daily rule cannot see this shape, and it is the shape that happened.**
+    Over the first two live days equity ran $100 -> $166.86 by 13:00 UTC and gave
+    back $63.92 over the next ten hours — all inside one UTC day, so that day's
+    realised was **+$3.81** against a -$15.00 limit. The daily rule saw a good day
+    while the account sat 38.3% below its high, and nothing else was watching:
+    `max_drawdown <= 0.35` was a promotion gate on the *backtest* only.
+    """
+
+    def _run_up_then_give_back(self, w: PgWriter, up: float, down: float,
+                               when: datetime, *, legs: int = 6) -> None:
+        """Win `up` dollars, then lose `down`, in a FEW large settlements.
+
+        Few on purpose. The first version used $2 steps, which meant giving back
+        $64 took 32 consecutive losses — and that trips
+        `max_consecutive_losses = 12` on its own. Two of these tests then passed
+        while the drawdown breaker did nothing, which mutation testing caught:
+        blanking the peak calculation left them green. Keeping every streak under
+        the limit is what isolates the breaker under test.
+        """
+        assert legs < CONFIG.max_consecutive_losses, (
+            'the loss streak would trip the consecutive-loss breaker and mask '
+            'the drawdown breaker this class is about'
+        )
+        i = 0
+        for _ in range(legs):
+            settle(w, index=i, pnl=+up / legs, when=when); i += 1
+        for _ in range(legs):
+            settle(w, index=i, pnl=-down / legs, when=when); i += 1
+
+    def test_the_measured_case_halts(self, writer):
+        """+$66 then -$64 on a $100 start: 38% below the peak, and the daily
+        rule's view of it is a *positive* day."""
+        self._run_up_then_give_back(writer, up=66.0, down=64.0, when=NOW)
+        account = writer.account()
+        assert float(account.realized_pnl) == pytest.approx(2.0, abs=0.5), (
+            'the day is net positive, which is exactly why the daily rule misses it'
+        )
+        reason = check_circuit_breakers(writer, CONFIG, now=NOW)
+        assert reason is not None and 'drawdown' in reason, reason
+        assert writer.account().halted
+
+    def test_a_shallow_giveback_does_not_halt(self, writer):
+        """+$20 then -$4 is 3.3% off the peak. Nowhere near the limit."""
+        self._run_up_then_give_back(writer, up=20.0, down=4.0, when=NOW)
+        assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
+
+    def test_it_measures_from_the_peak_and_not_from_the_start(self, writer):
+        """The whole point. An account back at its starting bankroll has lost
+        nothing by the start-based view and everything it gained by the peak."""
+        self._run_up_then_give_back(writer, up=60.0, down=60.0, when=NOW)
+        account = writer.account()
+        assert float(account.realized_pnl) == pytest.approx(0.0, abs=0.5)
+        reason = check_circuit_breakers(writer, CONFIG, now=NOW)
+        assert reason is not None and 'drawdown' in reason, (
+            f'flat against the start but 37.5% off the peak. Got: {reason!r}. '
+            f'Accepting any halt here let the consecutive-loss breaker stand in '
+            f'for the one under test.'
+        )
+
+    def test_a_steadily_winning_account_is_never_halted(self, writer):
+        """The high-water mark must track upward, or every win looks like a
+        drawdown from some earlier lower peak."""
+        for i in range(20):
+            settle(writer, index=i, pnl=+2.0, when=NOW)
+        assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
+
+    def test_the_threshold_matches_the_promotion_gate(self):
+        """A drawdown that blocks promotion should stop the money too."""
+        from core.metrics import DEFAULT_GATES
+
+        assert Config().max_drawdown_fraction == DEFAULT_GATES['max_drawdown'][0]
+
+
+class TestTheHighWaterMark:
+    def test_it_is_the_running_maximum_not_the_final_value(self, writer):
+        settle(writer, index=0, pnl=+10.0, when=NOW)
+        settle(writer, index=1, pnl=+10.0, when=NOW)
+        settle(writer, index=2, pnl=-15.0, when=NOW)
+        assert writer.realised_high_water() == pytest.approx(20.0, abs=0.5)
+        assert float(writer.account().realized_pnl) == pytest.approx(5.0, abs=0.5)
+
+    def test_an_account_that_only_ever_lost_has_a_peak_of_zero(self, writer):
+        """Not a negative peak — the drawdown is measured from the starting
+        bankroll, which is the highest the account has ever been."""
+        settle(writer, index=0, pnl=-5.0, when=NOW)
+        assert writer.realised_high_water() == pytest.approx(0.0, abs=1e-6)
+
+    def test_an_empty_account_has_no_peak(self, writer):
+        assert writer.realised_high_water() == 0.0

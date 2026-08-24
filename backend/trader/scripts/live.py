@@ -250,6 +250,32 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
                         f'({config.max_daily_loss_fraction:.0%} of the starting '
                         f'bankroll) over {len(today)} settlements')
 
+    # Peak-to-current drawdown on realised equity.
+    #
+    # **The daily rule cannot see this shape, and it is the shape that happened.**
+    # Equity ran $100 -> $166.86 by 13:00 UTC on the second day and gave back
+    # $63.92 over the next ten hours — all inside one UTC day, so that day's
+    # realised was +$3.81 against a -$15.00 limit. The daily rule saw a good day
+    # while the account sat 38.3% below its high. `max_drawdown <= 0.35` was
+    # already a promotion gate on the *backtest*; a threshold worth enforcing on a
+    # simulation is worth enforcing on the money.
+    #
+    # Realised basis on both sides: `realised_high_water()` is the running maximum
+    # of the same series `account.realized_pnl` currently holds, derived from the
+    # settlements rather than stored, so there is no second source of truth to
+    # drift.
+    peak_realised = writer.realised_high_water()
+    start = float(config.starting_bankroll)
+    peak_equity = start + max(peak_realised, 0.0)
+    current_equity = start + float(account.realized_pnl or 0.0)
+    if peak_equity > 0:
+        drawdown = (peak_equity - current_equity) / peak_equity
+        if drawdown >= config.max_drawdown_fraction:
+            return halt(
+                f'drawdown {drawdown:.1%} from a peak of ${peak_equity:.2f} to '
+                f'${current_equity:.2f}, at or over the '
+                f'{config.max_drawdown_fraction:.0%} limit')
+
     recent = writer.settled_positions_since(
         (pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(days=7)).to_pydatetime())
     streak = 0

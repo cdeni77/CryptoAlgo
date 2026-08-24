@@ -691,6 +691,26 @@ class PgWriter:
                 .order_by(Position.settled_at.desc())
             )
 
+    def realised_high_water(self) -> float:
+        """The highest cumulative realised PnL this account has ever reached.
+
+        Derived from the settlements rather than stored on the account, so it
+        needs no column and cannot drift out of sync with the ledger it
+        summarises. `account.realized_pnl` is the current value of the same
+        series, so the pair gives peak and current without a second source of
+        truth.
+        """
+        with self._session() as session:
+            rows = (session.query(Position.pnl)
+                    .filter(Position.outcome != Outcome.PENDING.value)
+                    .filter(Position.settled_at.isnot(None))
+                    .order_by(Position.settled_at.asc()))
+            peak = running = 0.0
+            for (value,) in rows:
+                running += float(value or 0.0)
+                peak = max(peak, running)
+            return peak
+
     # ---- the market benchmark -------------------------------------------
     def scored_against_market(self) -> list[tuple]:
         """Every settled window where the venue's own probability was recorded.

@@ -280,7 +280,21 @@ class Config:
     # break-even — so the right value is whatever the measured calibration
     # error turns out to be, and `scripts/evaluate.py` reports the whole curve
     # rather than assuming one.
-    min_edge_pp: float = 0.5
+    # Raised from 0.5 on the out-of-sample edge curve, five years and six folds.
+    # `realised_edge_pp` is monotone in the gate across all three sweep cells
+    # (0.85 -> 2.80, 0.99 -> 2.68, 1.11 -> 2.95), which is only true if the edge
+    # estimate carries signal — filtering on a noise estimate would not raise
+    # realised edge. Live agreed independently: the two lowest edge buckets lost
+    # and the two highest won.
+    #
+    # 1.5 rather than the argmax of total return, because that argmax is noise —
+    # the same curve computed three ways peaks at 0.25, 1.00 and 1.50. What the
+    # data supports is "tighter is better per trade"; where to stop is a judgment.
+    # At 1.5 total expected edge is flat against 0.5 (-2%) for 40% less exposure,
+    # so it is the same money at 26% better return per unit of risk — and 40% less
+    # capital at risk is right under both hypotheses, since if the edge turns out
+    # to be negative it loses 40% less.
+    min_edge_pp: float = 1.5
     # Traded-price band, and it must be symmetric. The edge here is a
     # disagreement about sigma_remaining, and that disagreement points both
     # ways: a smaller sigma than the market assumes makes the probability more
@@ -363,6 +377,16 @@ class Config:
     # speed bump.
     max_daily_loss_fraction: float = 0.15
     max_consecutive_losses: int = 12
+    # Peak-to-current drawdown on realised equity, live. Same 0.35 the promotion
+    # gate applies to the backtest — a threshold worth enforcing on a simulation
+    # is worth enforcing on the account.
+    #
+    # It exists because the daily-loss rule cannot see this shape. Measured on the
+    # first two days: equity ran $100 -> $166.86 by 13:00 UTC and gave back $63.92
+    # over the next ten hours, all inside one UTC day. Realised for that day was
+    # **+$3.81** against a -$15.00 limit, so the daily rule saw a good day while
+    # the account was down 38.3% from its high and nothing was watching.
+    max_drawdown_fraction: float = 0.35
 
     # ---- provenance ------------------------------------------------------
     fee_config_path: Optional[str] = None
