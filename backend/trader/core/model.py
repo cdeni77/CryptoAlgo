@@ -47,6 +47,63 @@ from core.features import CONTROL_GROUPS, feature_columns
 logger = logging.getLogger(__name__)
 
 BASELINE_LOGIT = 'baseline_probability_logit'
+MARKET_LOGIT = 'market_probability_logit'
+
+# Which forecaster the correction is fitted on top of. `Config.init_score_source`
+# selects it; this maps the name to the column.
+#
+# **The baseline is the weaker of the two, measurably.** Over 1,109 live-recorded
+# rows and 285 symbol-windows, log loss was 0.331 for the market's de-spread mid,
+# 0.428 for `F(x/sigma)` and 0.430 for the model — the same sign on all three
+# symbols and all four offsets, and on the 108 rows actually traded the model came
+# in *worse* than its own baseline. So a model initialised on the baseline spends
+# its capacity correcting a forecaster that is already 0.10 nats behind the price
+# it has to trade against, and "beat the baseline" stops implying anything about
+# whether the trade pays.
+#
+# Initialised on the market instead, three things change, and the second is the
+# reason to want it:
+#
+# * The residual being fitted is `logit(truth) - logit(price)` — how the price is
+#   wrong, which is exactly the quantity the money depends on.
+# * **The null inverts, in the right direction.** An untrained baseline-init model
+#   reproduces `F(x/sigma)`, which disagrees with the price by 5.79pp on average —
+#   a large apparent edge that is mostly noise, and it is *live by default*. An
+#   untrained market-init model reproduces the price, so the edge is identically
+#   zero and nothing trades. The default state becomes "the price is right",
+#   which is the honest prior.
+# * `decide()`'s edge becomes the model's own output rather than a difference
+#   between two independently-fitted things.
+#
+# It is not trainable yet, and the gap is not close: 285 symbol-windows of
+# recorded quotes exist against a `windows_evaluated >= 20,000` gate — roughly
+# seventy days of recording at ~285 a day. The mechanism is here, refusing
+# clearly, so that the day the data exists this is a config change and not a
+# rewrite.
+INIT_SCORE_COLUMNS = {'baseline': BASELINE_LOGIT, 'market': MARKET_LOGIT}
+
+
+def attach_market_logit(table: pd.DataFrame,
+                        column: str = 'market_probability') -> pd.DataFrame:
+    """Attach `market_probability_logit` for a market-initialised model.
+
+    Rows with no quote stay NaN rather than borrowing the baseline. A market-init
+    model that silently fell back to the baseline on a missing quote would be a
+    baseline-init model wearing the other one's provenance, which is the precise
+    failure this whole arrangement exists to avoid — and it would be invisible,
+    because the two produce identically well-formed numbers.
+    """
+    out = table.copy()
+    if column not in out.columns:
+        raise ValueError(
+            f'{column} is missing. A market-initialised model can only be scored '
+            f'where a real quote was recorded; a backtest has no book, so this is '
+            f'the expected failure there rather than something to work around.'
+        )
+    values = out[column].to_numpy(dtype=float)
+    out[MARKET_LOGIT] = np.where(np.isfinite(values), logit(clip_prob(values)),
+                                 np.nan)
+    return out
 # Fraction of the training windows held back to fit `residual_scale` and to
 # early-stop on. Taken from the *end* of training, so it is the most recent
 # data and the shrinkage is measured on the regime nearest the test block.
@@ -89,7 +146,20 @@ class ForecastModel:
     train_log_loss: float = float('nan')
     inner_log_loss: float = float('nan')
     inner_baseline_log_loss: float = float('nan')
+    # Which forecaster the correction sits on top of. Stored, because scoring a
+    # market-init correction on a baseline logit (or the reverse) produces a
+    # perfectly well-formed probability that answers a different question.
+    init_score_source: str = 'baseline'
     config_provenance: dict = field(default_factory=dict)
+
+    @property
+    def init_score_column(self) -> str:
+        try:
+            return INIT_SCORE_COLUMNS[self.init_score_source]
+        except KeyError:                     # pragma: no cover - guarded on fit
+            raise ValueError(
+                f'unknown init_score_source {self.init_score_source!r}; '
+                f'expected one of {sorted(INIT_SCORE_COLUMNS)}') from None
 
     # ---- prediction -----------------------------------------------------
     def raw_correction(self, table: pd.DataFrame) -> np.ndarray:
@@ -98,16 +168,34 @@ class ForecastModel:
         return np.asarray(self.booster.predict(matrix, raw_score=True), dtype=float)
 
     def predict(self, table: pd.DataFrame, *, shrink: bool = True) -> np.ndarray:
-        """Calibrated probability that the window settles above its strike."""
-        if BASELINE_LOGIT not in table.columns:
+        """Calibrated probability that the window settles above its strike.
+
+        A row whose init column is NaN comes back NaN. That is a market-init model
+        meeting a window with no quote, and it must not fall through to the
+        baseline: `decide()` abstains on a non-finite probability, and the
+        `non_finite_share` gate counts them, so the abstention is both safe and
+        visible. Substituting the baseline would be silent and would put the
+        wrong provenance on a real trade.
+        """
+        column = self.init_score_column
+        if column not in table.columns:
             raise ValueError(
-                f'{BASELINE_LOGIT} is missing — score through '
-                f'core.dataset.apply_fold, which attaches it from the fold\'s own '
-                f'baseline. Recomputing it here would silently use a different one.'
+                f'{column} is missing — score through core.dataset.apply_fold, '
+                f'which attaches it from the fold\'s own baseline, or '
+                f'attach_market_logit for a market-initialised model. Recomputing '
+                f'it here would silently use a different one.'
             )
-        base = table[BASELINE_LOGIT].to_numpy(dtype=float)
+        base = table[column].to_numpy(dtype=float)
         alpha = self.residual_scale if shrink else 1.0
-        return clip_prob(expit(base + alpha * self.raw_correction(table)))
+        out = clip_prob(expit(base + alpha * self.raw_correction(table)))
+        # Redundant today and kept deliberately. NaN already propagates through
+        # `expit` and `np.clip`, so mutating this line away changes nothing and
+        # mutation testing cannot tell the difference — which is exactly why the
+        # guarantee is written down here and pinned by
+        # `test_clip_prob_propagates_nan_which_this_relies_on`. A `clip_prob` that
+        # one day filled NaN with 0.5 would turn "no quote" into "a coin flip,
+        # confidently asserted" on a real-money path, silently.
+        return np.where(np.isfinite(base), out, np.nan)
 
     def predict_baseline(self, table: pd.DataFrame) -> np.ndarray:
         return clip_prob(table['baseline_probability'].to_numpy(dtype=float))
@@ -145,6 +233,10 @@ class ForecastModel:
             'empty_features': list(self.empty_features),
             'groups': list(self.groups),
             'residual_scale': self.residual_scale,
+            # Which forecaster this is a correction to. A promoted artifact that
+            # does not say is an artifact whose skill number means one of two
+            # different things.
+            'init_score_source': self.init_score_source,
             'n_train_rows': self.n_train_rows,
             'n_train_windows': self.n_train_windows,
             'best_iteration': self.best_iteration,
@@ -219,8 +311,22 @@ class ForecastModel:
                 f'The feature matrix is built by name from the artifact\'s list, so '
                 f'this would score a well-formed matrix of the wrong columns.'
             )
+        if self.init_score_source not in INIT_SCORE_COLUMNS:
+            raise ValueError(
+                f'this artifact records init_score_source='
+                f'{self.init_score_source!r}, which nothing can score')
         if config is None:
             return
+        wanted = getattr(config, 'init_score_source', 'baseline')
+        if wanted != self.init_score_source:
+            raise ValueError(
+                f'this artifact was fitted on the {self.init_score_source} logit '
+                f'and the running configuration asks for {wanted}. The correction '
+                f'is a residual of one specific forecaster, so adding it to the '
+                f'other one produces a well-formed probability that answers a '
+                f'different question — which is exactly how this would go '
+                f'unnoticed.'
+            )
         stored = dict(self.config_provenance or {})
         if not stored:
             logger.warning('this artifact records no config provenance, so nothing '
@@ -353,8 +459,53 @@ def fit_model(
     import lightgbm as lgb
 
     columns = feature_columns(groups)
-    if BASELINE_LOGIT not in train.columns:
-        raise ValueError(f'{BASELINE_LOGIT} is missing from the training table')
+    source = getattr(config, 'init_score_source', 'baseline')
+    if source not in INIT_SCORE_COLUMNS:
+        raise ValueError(f'init_score_source={source!r}; expected one of '
+                         f'{sorted(INIT_SCORE_COLUMNS)}')
+    init_column = INIT_SCORE_COLUMNS[source]
+    if init_column not in train.columns:
+        extra = ''
+        if source == 'market':
+            # The likeliest way to arrive here, and it is not a bug to route
+            # around: `walk_forward` builds its tables from bars and has no book,
+            # so a market-initialised model cannot be backtested at all. Saying
+            # that here is the difference between a clear refusal and someone
+            # attaching the baseline column to make the error go away.
+            extra = (' A backtest has no order book, so a market-initialised '
+                     'model can only be fitted and scored on live-recorded '
+                     'quotes. Substituting the baseline here would make "beat '
+                     'the price" and "beat the baseline" the same question '
+                     'answered twice with the same number.')
+        raise ValueError(f'{init_column} is missing from the training table '
+                         f'(init_score_source={source!r}).{extra}')
+    if source == 'market':
+        # Only on this path, and it is not a tolerance dial. A row with no quote
+        # cannot carry a market residual at all — there is nothing to be a
+        # residual of — so it is dropped rather than tolerated. Keeping it would
+        # hand LightGBM an init score that is NaN precisely where our recording
+        # failed, and "did we have a quote" is a property of our uptime, not of
+        # the market.
+        #
+        # A blanket coverage floor across both sources was tried first and was
+        # wrong: the baseline logit is legitimately non-finite on a small share of
+        # rows (a venue outage leaves a real hole), test fixtures sit at 98.5%,
+        # and `non_finite_share` already gates that end. Two earlier fixes in this
+        # repo failed the same way — a `non_finite_rows == 0` gate and a shrinkage
+        # guard that raised on any NaN — so the baseline path is left exactly as
+        # it was.
+        finite = np.isfinite(train[init_column].to_numpy(dtype=float))
+        dropped = int((~finite).sum())
+        if dropped:
+            logger.warning(
+                'dropping %d of %d training rows with no recorded quote: a '
+                'market-initialised correction has nothing to correct there',
+                dropped, len(train))
+        train = train.loc[finite].copy()
+        if train.empty:
+            raise ValueError(
+                f'every training row has a non-finite {init_column}, so there is '
+                f'no market to fit a residual against')
 
     populated = [
         c for c in columns
@@ -430,7 +581,7 @@ def fit_model(
         return lgb.Dataset(
             _feature_matrix(frame, populated),
             label=frame['outcome'].to_numpy(dtype=float),
-            init_score=frame[BASELINE_LOGIT].to_numpy(dtype=float),
+            init_score=frame[init_column].to_numpy(dtype=float),
             weight=w, feature_name=list(populated), reference=reference,
             free_raw_data=False,
         )
@@ -453,7 +604,7 @@ def fit_model(
 
     alpha_matrix = _feature_matrix(alpha_rows, populated)
     correction = np.asarray(booster.predict(alpha_matrix, raw_score=True), dtype=float)
-    base_logit = alpha_rows[BASELINE_LOGIT].to_numpy(dtype=float)
+    base_logit = alpha_rows[init_column].to_numpy(dtype=float)
     outcome = alpha_rows['outcome'].to_numpy(dtype=float)
     alpha = _fit_residual_scale(base_logit, correction, outcome)
 
@@ -463,9 +614,10 @@ def fit_model(
         groups=tuple(groups) if groups else (),
         n_train_rows=len(train), n_train_windows=len(windows),
         empty_features=empty, best_iteration=booster.best_iteration,
+        init_score_source=source,
         train_log_loss=_finite_log_loss(
             inner_train['outcome'].to_numpy(dtype=float),
-            inner_train[BASELINE_LOGIT].to_numpy(dtype=float),
+            inner_train[init_column].to_numpy(dtype=float),
             np.asarray(booster.predict(_feature_matrix(inner_train, populated),
                                        raw_score=True), dtype=float),
             alpha),

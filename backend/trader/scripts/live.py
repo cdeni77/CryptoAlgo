@@ -664,6 +664,31 @@ def _ticket_for(writer: PgWriter, position):
                 .one_or_none())
 
 
+def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:
+    """Attach whatever init score this artifact was fitted on.
+
+    The baseline logit is already on the table — `score_live` attaches it from the
+    fold's own baseline. A market-initialised artifact needs the recorded quote's
+    implied probability instead, taken from the de-spread mid rather than the ask:
+    the init score is the market's estimate of the probability, not what we would
+    pay for it.
+
+    `Quote.mid` is None on a one-sided book, so those rows carry NaN and
+    `ForecastModel.predict` returns NaN for them. That is the correct outcome — a
+    correction to a price we could not read is not a forecast — and `decide()`
+    abstains on it rather than falling back to the baseline under the wrong
+    provenance.
+    """
+    source = getattr(model, 'init_score_source', 'baseline')
+    if source != 'market':
+        return scored
+    from core.model import attach_market_logit
+
+    out = scored.copy()
+    out['market_probability'] = out['market_mid']
+    return attach_market_logit(out)
+
+
 async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
     now = datetime.now(timezone.utc)
@@ -724,7 +749,6 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     scored = score_live(bars, model.scoring, config,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
-    scored['model_probability'] = model.predict(scored)
 
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
     quotes = await fetch_quotes(kalshi, list(scored['symbol'].unique()), settle_time)
@@ -738,6 +762,16 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # midpoint of a single quote is not a midpoint.
     scored['market_mid'] = [
         quotes[s][0].mid if s in quotes else np.nan for s in scored['symbol']]
+
+    # Scoring happens *after* the book is read, not before. A baseline-initialised
+    # model does not care — that is why this used to run above the quote fetch —
+    # but a market-initialised one is a correction to the price and cannot be
+    # evaluated without it. Leaving the old order in place would have left a
+    # runtime failure waiting behind a config flag, which is the shape of most of
+    # what the audit found. Behaviour is unchanged for the default source: the
+    # only thing between the two positions was `settle_time`.
+    scored = prepare_init_score(scored, model)
+    scored['model_probability'] = model.predict(scored)
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is

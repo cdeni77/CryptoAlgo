@@ -126,6 +126,22 @@ class Config:
     # The classifier predicts a correction to the baseline: the baseline's
     # logit enters as an init_score offset, so an untrained model reproduces
     # the baseline exactly and every parameter it fits is incremental skill.
+    # Which forecaster the LightGBM correction is fitted on top of: 'baseline'
+    # for `F(x/sigma)`, 'market' for the recorded quote's implied probability.
+    #
+    # 'baseline' is the default and the only one currently fittable. 'market' is
+    # the better objective and is blocked on data, not on code: over 1,109
+    # live-recorded rows the market's log loss was 0.331 against the baseline's
+    # 0.428, so a baseline-init model spends itself correcting the forecaster
+    # that is already 0.10 nats behind the price. It also inverts the null in the
+    # right direction — an untrained market-init model reproduces the price, so
+    # nothing trades, where an untrained baseline-init model disagrees with the
+    # price by 5.79pp on average and trades on it.
+    #
+    # 285 symbol-windows of quotes exist against a `windows_evaluated >= 20,000`
+    # gate. `core/model.py` refuses clearly rather than substituting.
+    init_score_source: str = 'baseline'
+
     learning_rate: float = 0.03
     n_estimators: int = 400
     num_leaves: int = 15
@@ -335,6 +351,13 @@ class Config:
         These were all comments before, and every one of them was violated by the
         shipped defaults or reachable from a CLI flag.
         """
+        if self.init_score_source not in ('baseline', 'market'):
+            raise ValueError(
+                f"init_score_source={self.init_score_source!r}; expected "
+                f"'baseline' or 'market'. A typo here would otherwise surface as "
+                f"a KeyError deep inside the fit, after the fold's baseline, "
+                f"volatility models and seasonality had already been fitted."
+            )
         if abs(self.max_traded_price - (1.0 - self.min_traded_price)) > 1e-9:
             raise ValueError(
                 f'the price band must be symmetric about 0.5: '
@@ -453,6 +476,10 @@ class Config:
             'vol_lookbacks_minutes': list(self.vol_lookbacks_minutes),
             'baseline_distribution': self.baseline_distribution,
             'baseline_nu': self.baseline_nu,
+            # Which forecaster the correction sits on. Without it in the ledger,
+            # two attempts with the same `log_loss_skill` could be measuring
+            # skill over two different benchmarks.
+            'init_score_source': self.init_score_source,
             'n_folds': self.n_folds,
             'embargo_minutes': self.embargo_minutes,
             'recency_half_life_days': self.recency_half_life_days,
