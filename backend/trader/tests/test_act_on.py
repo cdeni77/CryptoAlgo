@@ -12,6 +12,7 @@ the wire, what position exists afterwards, and what happened to the bankroll.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ import pandas as pd
 import pytest
 
 from core.decide import Decision, Reason, Side
+from data_collection.kalshi_client import KalshiError
 from core.pg_writer import PgWriter
 from scripts.live import act_on, filled_from_order, order_limit_price
 
@@ -231,3 +233,69 @@ class TestLimitPrice:
         allowance = order_limit_price(generous) - generous.price
         assert allowance == pytest.approx(
             DEFAULT_CONFIG.max_slippage_cents / 100.0, abs=1e-9)
+
+
+class TestTheIdempotencyKey:
+    """The venue-side key must not enforce a stricter rule than the policy.
+
+    Keyed on (symbol, window) alone it meant one order *attempt* per window,
+    while the policy is one *position* per window. Those differ exactly when an
+    order does not fill — and a fill_or_kill that kills still consumes the id, so
+    the first thin-volume kill locked every later offset out of the window with
+    `409 order_already_exists`.
+
+    Measured over the first live night: 57 of 69 unfilled attempts were our own
+    duplicate key rather than the venue refusing us, at a *higher* average
+    claimed edge (8.37pp) than the attempts that filled (5.77pp). Only 9 were
+    genuine `fill_or_kill_insufficient_resting_volume`, at 3.94pp.
+    """
+
+    def _key(self, writer, offset: int) -> str:
+        kalshi = FakeKalshi(reply={'order': {'order_id': 'o', 'status': 'executed',
+                                             'filled_count': '5.00'}})
+        d = decision()
+        d = replace(d, offset=offset)
+        run(act_on(args(), writer, kalshi, d, None))
+        return kalshi.orders[-1]['client_order_id']
+
+    def test_two_offsets_in_one_window_are_two_different_orders(self, writer):
+        """The regression. These were the same string, so the second was refused
+        by the venue no matter how good the price had become."""
+        assert self._key(writer, 3) != self._key(writer, 6)
+
+    def test_the_same_offset_twice_is_the_same_order(self, writer):
+        """Still idempotent where it matters: a cycle that runs twice, or a retry
+        after a response we never saw, must not buy twice."""
+        assert self._key(writer, 9) == self._key(writer, 9)
+
+    def test_the_key_names_the_symbol_the_window_and_the_offset(self, writer):
+        key = self._key(writer, 12)
+        assert key.startswith('BTC-USD-'), key
+        assert key.endswith('-12'), f'the offset must be in the key: {key}'
+        assert f'{WINDOW:%Y%m%d%H%M}' in key, key
+
+    def test_a_refused_order_leaves_the_window_open_to_the_next_offset(self, writer):
+        """The other half of the mechanism, and it already worked: `skipped`
+        means nothing was bought, so `entries_for_window` must not count it.
+        Without this the new key would change nothing — the decision would never
+        be made a second time."""
+        kalshi = FakeKalshi(raises=KalshiError('409 fill_or_kill_insufficient_resting_volume'))
+        assert run(act_on(args(), writer, kalshi, decision(), None)) is False
+        symbols, staked, count = writer.entries_for_window(pd.Timestamp(WINDOW))
+        assert count == 0 and symbols == frozenset(), (
+            'a refused order blocked the window, so no later offset can try'
+        )
+
+    def test_a_crash_before_booking_still_blocks_the_window(self, writer):
+        """The guard the old key was accidentally providing, which must survive
+        the change. A ticket left in any status but `skipped` is an entry."""
+        writer.write_ticket(
+            symbol='BTC-USD', window_open=pd.Timestamp(WINDOW),
+            settle_time=pd.Timestamp(WINDOW + timedelta(minutes=15)),
+            offset_minutes=3, side=Side.UP.value, contracts=5, limit_price=0.60,
+            max_price=0.61, expected_cost=3.14, model_probability=0.72,
+            edge=0.08, status='new')
+        symbols, staked, count = writer.entries_for_window(pd.Timestamp(WINDOW))
+        assert count == 1 and symbols == frozenset({'BTC-USD'}), (
+            'a ticket with no position must still count as an entry'
+        )

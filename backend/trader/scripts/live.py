@@ -1002,7 +1002,33 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                 ticker=decision.market_ticker, side=decision.side.value,
                 contracts=decision.contracts,
                 limit_price=order_limit_price(decision),
-                client_order_id=f'{decision.symbol}-{decision.window_open:%Y%m%d%H%M}',
+                # **The offset belongs in this key.** Keyed on (symbol, window)
+                # alone it enforced one order *attempt* per window, while the
+                # policy is one *position* per window — and those differ exactly
+                # when an order does not fill. A fill_or_kill that kills still
+                # consumes the id at the venue, so the first thin-volume kill
+                # locked every later offset out of that window with
+                # `409 order_already_exists`.
+                #
+                # Measured over the first live night: 57 of 69 unfilled attempts
+                # were our own duplicate key, not the venue refusing us, and they
+                # carried a *higher* claimed edge (8.37pp) than the ones that
+                # filled (5.77pp). Only 9 were genuine
+                # `fill_or_kill_insufficient_resting_volume`, at 3.94pp — the
+                # lowest of the three. So the market was not selecting against
+                # us; we were blocking ourselves out of the better half of our
+                # own signal.
+                #
+                # Double-entry is not what this key was protecting. That is
+                # `entries_for_window`, which counts a ticket in any status but
+                # `skipped` — so a crash between sending an order and booking the
+                # position still blocks the window, and `skipped` (nothing
+                # bought) correctly reopens it. One attempt per offset is the
+                # documented rule: walk the offsets in order, take the first that
+                # clears every gate.
+                client_order_id=(
+                    f'{decision.symbol}-{decision.window_open:%Y%m%d%H%M}'
+                    f'-{decision.offset:02d}'),
             )
         except (KalshiError, ValueError) as exc:
             writer.resolve_ticket(ticket_id, status='skipped', note=str(exc)[:400])
