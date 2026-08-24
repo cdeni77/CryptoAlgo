@@ -1821,6 +1821,63 @@ disagreement. For money the bootstrap is the objective and log loss is the proxy
 so the bootstrap wins on relevance — while being far more underpowered, at one day
 and 88 windows.
 
+## Tested and rejected: the offset-3 edge is not a sigma-scale artifact
+
+Worth recording because it was a good hypothesis with a specific mechanism, and
+because re-running it would cost another afternoon.
+
+The baseline's fitted scale declines monotonically with offset — 1.268, 1.189,
+1.094, 0.965 — and the five-year edge investigation found skill peaking at offset
+3 and dead by offset 9. The offset with the largest sigma inflation is the offset
+with all the apparent skill and essentially all the trades. Our probabilities also
+sit closer to 0.5 than the market's by 0.067 on average, which is what an inflated
+sigma produces. So: is the "edge" just a too-large sigma making us price cheap
+sides above the market, in the one region the venue's own calibration table shows
+it already overprices?
+
+**No.** Refitting a multiplier `a` on the current sigma with `nu` held at 5.075,
+against two targets independently — the market's de-spread mid, and the realised
+outcomes on the same 1,133 rows and 97 windows:
+
+| slice | n | a_market | a_outcome | scale now → market → outcome |
+|---|---:|---:|---:|---|
+| all | 1133 | 1.023 | 0.950 | 1.133 → 1.159 → 1.077 |
+| offset 3 | 291 | 1.178 | 1.087 | 1.268 → 1.494 → 1.378 |
+| offset 6 | 291 | 1.098 | 1.098 | 1.189 → 1.307 → 1.306 |
+| offset 9 | 288 | 0.987 | 0.926 | 1.094 → 1.080 → 1.014 |
+| offset 12 | 263 | 0.844 | 0.664 | 0.965 → 0.815 → 0.641 |
+
+At offset 3, where the trades are, **both the market and the outcomes want the
+sigma larger, not smaller** — the opposite of the hypothesis. Pooled `a_outcome`
+is 0.950 with a 90% block-bootstrap CI over windows of [0.760, 1.155], containing
+1.0. And the aggregate closeness-to-0.5 turns out to be a mix across offsets, with
+offset 12 wanting sigma 34% smaller while offset 3 wants it larger, so no single
+scale story fits.
+
+The decisive number is that rescaling cannot close the gap at all:
+
+```
+mean |baseline - market|, the quantity the trading edge is drawn from:
+  at a=1, as traded           12.35pp
+  at the market's implied a   12.08pp
+  at the outcome-optimal a    11.86pp
+```
+
+Half a point of a twelve-point disagreement is attributable to sigma scale. The
+result is robust to how `a_market` is defined, because the residual is ~12pp even
+at the outcome-optimal scale. Log loss against outcomes agrees from the other
+side: 0.42578 at a=1, 0.42606 at the market's a, 0.42551 at the outcome-optimal
+a — a 0.0005 spread against the market's 0.32915. **The five-year scale fit
+generalised fine and the baseline is a properly calibrated null.** It is simply
+not competitive with the price.
+
+So the market's 0.10 nats is not recalibration, and no scale parameter recovers
+it. The price carries information the barrier form cannot express, which is a
+harder problem than a mis-tuned sigma and the honest reading of it. It also
+strengthens the case for initialising on the market rather than weakening it: if
+the price holds information our functional form cannot produce, fitting a
+correction *to the price* is the only way to use it.
+
 ## What this changes about the verdicts
 
 Nothing in the Executive Summary flips. *Safe to trade real money* stays **NO**,

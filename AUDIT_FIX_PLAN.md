@@ -52,11 +52,17 @@ probability", using each trade's real price, size and fee, puts expected P&L at
    **Keep placing real orders while this runs** — `--dry-run` records the quotes
    but assumes every intended order fills, and 30% do not, so the fill selection
    would go unmeasured.
-3. **[P2] Audit every remaining `_fp` / `_dollars` field.** The same trap has now
+3. **[REJECTED] The offset-3 edge as a sigma-scale artifact.** Tested and dead:
+   at offset 3 both the market and the realised outcomes want the sigma *larger*,
+   and rescaling moves the disagreement with the market from 12.35pp only to
+   11.86pp. Log loss barely moves at all. Recorded in the report so it is not
+   re-run; it also raises the priority of (1), since the price evidently holds
+   information the barrier form cannot express.
+4. **[P2] Audit every remaining `_fp` / `_dollars` field.** The same trap has now
    been found in quotes, fills and positions. `settlements.revenue` is safe only
    because it is used as a sign test and never as a magnitude — safety that stops
    holding the moment someone reads the field for its value.
-4. **[P2] A `killed` ticket blocks the window and probably should not.** A
+5. **[P2] A `killed` ticket blocks the window and probably should not.** A
    confirmed zero fill bought nothing, so the window could reopen the way
    `skipped` does. Conservative as it stands; worth measuring how often it costs
    an entry before changing it.
