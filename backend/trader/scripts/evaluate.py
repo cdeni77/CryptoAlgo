@@ -128,7 +128,13 @@ def main() -> int:
     print('\n' + '-' * 78)
     print('GATES')
     print('-' * 78)
-    gates = evaluate_gates(report)
+    # The market gates read live-recorded quotes, which this run does not have and
+    # structurally cannot: a backtest has no book. Reading them here anyway means
+    # `evaluate` reports the same verdict `promote` will, rather than passing a
+    # candidate that promotion then blocks for a reason `evaluate` never mentioned.
+    from scripts.promote import market_measurement
+
+    gates = evaluate_gates(report, extra=market_measurement())
     print(gate_report(gates))
 
     if args.out:

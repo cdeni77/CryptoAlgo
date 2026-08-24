@@ -382,12 +382,103 @@ class EvaluationReport:
         return '\n'.join(lines)
 
 
+# ---- the market as the benchmark -----------------------------------------
+
+# Below this the comparison is an anecdote. Two thousand windows at ~96 a day is
+# roughly three weeks of one symbol, or a week of three.
+MIN_MARKET_WINDOWS = 2_000
+
+MARKET_COLUMNS = ('symbol', 'window_open', 'offset', 'market', 'baseline',
+                  'model', 'outcome')
+
+
+def market_frame(rows: Iterable[Sequence]) -> pd.DataFrame:
+    """Rows from `PgWriter.scored_against_market()`, cleaned."""
+    frame = pd.DataFrame(list(rows), columns=list(MARKET_COLUMNS))
+    return frame.dropna(subset=['market', 'baseline', 'model', 'outcome'])
+
+
+def market_slice(part: pd.DataFrame, label: str) -> dict:
+    """Log loss and Brier for the price, the arithmetic and the model."""
+    y = part['outcome'].to_numpy(dtype=float)
+    out: dict = {'slice': label, 'n': len(part)}
+    for name in ('market', 'baseline', 'model'):
+        p = part[name].to_numpy(dtype=float)
+        out[f'{name}_ll'] = log_loss(y, p)
+        out[f'{name}_brier'] = brier(y, p)
+    # The number that decides everything: positive means our probability is a
+    # better forecast than the price we would have to pay.
+    out['model_minus_market'] = out['market_ll'] - out['model_ll']
+    out['baseline_minus_market'] = out['market_ll'] - out['baseline_ll']
+    return out
+
+
+def market_comparison(frame: pd.DataFrame) -> pd.DataFrame:
+    """The per-slice table: overall, then by symbol, then by offset."""
+    if frame.empty:
+        return pd.DataFrame()
+    parts = [market_slice(frame, 'all')]
+    for symbol, part in frame.groupby('symbol'):
+        parts.append(market_slice(part, f'symbol {symbol}'))
+    for offset, part in frame.groupby('offset'):
+        parts.append(market_slice(part, f'offset +{int(offset)}m'))
+    return pd.DataFrame(parts)
+
+
+def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
+    """What `DEFAULT_GATES` reads about the market, from live-recorded quotes.
+
+    **This cannot come from the backtest, and that is the point.** A backtest has
+    no order book, so `price_source` stands the calibrated baseline in for the
+    market — which makes "beat the market" and "beat the baseline" the same
+    question and answers both with the same number. The comparison is only
+    available from quotes the live loop actually recorded.
+
+    Measured on the first day of live quotes, and this is why the gate exists:
+    the market's log loss was 0.333 against the model's 0.430 and the baseline's
+    0.429, on every symbol and every offset. A candidate can pass all twelve
+    other gates — `log_loss_skill` beats `F(x/sigma)` by construction — while
+    being a materially worse forecaster than the price it has to trade against.
+
+    Empty or short input returns values that fail rather than values that pass:
+    `market_windows` counts what there is and `model_minus_market` is NaN, and
+    `Gate.passed` is False for both. Not measured is not the same as measured
+    good, and promotion is the wrong place to blur them.
+    """
+    frame = market_frame(rows)
+    if frame.empty:
+        return {'market_windows': 0.0,
+                'model_minus_market': float('nan'),
+                'baseline_minus_market': float('nan')}
+    windows = float(frame.drop_duplicates(['symbol', 'window_open']).shape[0])
+    overall = market_slice(frame, 'all')
+    return {'market_windows': windows,
+            'model_minus_market': float(overall['model_minus_market']),
+            'baseline_minus_market': float(overall['baseline_minus_market'])}
+
+
 # ---- gates ---------------------------------------------------------------
 
 # name -> (threshold, direction). 'min' passes at or above, 'max' at or below.
 # Ordered as they should be read: the forecast first, the money second. A
 # candidate that fails a forecast gate should not have its Sharpe discussed.
 DEFAULT_GATES: dict[str, tuple[float, str]] = {
+    # --- the benchmark that decides whether any of the rest pays ---
+    #
+    # These two come first because the benchmark below them is the wrong one to
+    # stop at. `log_loss_skill` asks whether the model beats `F(x/sigma)`, and it
+    # does — but the arithmetic null is not the counterparty. The price is.
+    # Measured on the first day of live quotes: market log loss 0.333, baseline
+    # 0.429, model 0.430, with the same sign on all three symbols and all four
+    # offsets. Every other gate would have passed that.
+    #
+    # Neither can be computed from a backtest, which has no book, so both read
+    # NaN and fail until the live loop has recorded enough quotes. That is the
+    # honest state of the question rather than an obstacle to route around;
+    # `--force` with a written reason is the documented way past it, and the
+    # ledger records that it was used.
+    'market_windows': (float(MIN_MARKET_WINDOWS), 'min'),
+    'model_minus_market': (0.0, 'min'),
     # --- the forecast ---
     'log_loss_skill': (0.0, 'min'),
     'folds_skill_positive': (5.0, 'min'),
@@ -428,6 +519,12 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
 IMPLAUSIBLE_SHARPE = 5.0
 
 GATE_NOTES: dict[str, str] = {
+    'market_windows': 'the market comparison needs live-recorded quotes; a '
+                      'backtest has no book and stands the baseline in for one, '
+                      'which answers a different question with the same number',
+    'model_minus_market': 'the price is the counterparty, not F(x/sigma). Beating '
+                          'the arithmetic null while losing to the quote is the '
+                          'failure this whole stack is built to not make',
     'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark',
     'folds_skill_positive': 'five of six agreeing happens 10.9% of the time by chance, '
                             'so this is necessary and not sufficient',
@@ -485,10 +582,20 @@ class Gate:
 def evaluate_gates(
     report: EvaluationReport,
     gates: Optional[dict[str, tuple[float, str]]] = None,
+    *,
+    extra: Optional[dict[str, float]] = None,
 ) -> list[Gate]:
-    """Score a report against every gate. Missing values fail."""
+    """Score a report against every gate. Missing values fail.
+
+    `extra` carries measurements the report structurally cannot produce — at
+    present the market comparison, which needs an order book the backtest does
+    not have. Anything absent stays NaN and therefore fails, so forgetting to
+    pass it cannot turn into a pass.
+    """
     gates = gates or DEFAULT_GATES
     values = report.gate_values()
+    if extra:
+        values.update(extra)
     return [
         Gate(name=name, value=values.get(name, float('nan')), threshold=threshold,
              direction=direction, note=GATE_NOTES.get(name, ''))

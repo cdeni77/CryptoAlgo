@@ -23,22 +23,20 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
-import numpy as np
 import pandas as pd
 
-from core.baseline import clip_prob, log_loss, reliability
+from core.baseline import reliability
+from core.metrics import (MIN_MARKET_WINDOWS, market_comparison,
+                          market_frame)
 
 # Below this there is nothing to say. At 0.5pp of edge the standard error on a
 # win rate needs thousands of windows before a sign is meaningful; this is the
 # point at which the *aggregate* log loss starts to separate, not the point at
 # which a trading decision is justified.
-MIN_WINDOWS = 2_000
-
-
-def brier(outcome: np.ndarray, p: np.ndarray) -> float:
-    return float(np.mean((clip_prob(p) - outcome) ** 2))
+# One definition, shared with the gate in `core/metrics.py`. Two copies of a
+# threshold is two thresholds.
+MIN_WINDOWS = MIN_MARKET_WINDOWS
 
 
 def main() -> int:
@@ -68,9 +66,7 @@ def main() -> int:
         print('backtest has no quotes, which is the whole reason this exists.')
         return 1
 
-    frame = pd.DataFrame(rows, columns=[
-        'symbol', 'window_open', 'offset', 'market', 'baseline', 'model', 'outcome'])
-    frame = frame.dropna(subset=['market', 'baseline', 'model', 'outcome'])
+    frame = market_frame(rows)
     windows = frame.drop_duplicates(['symbol', 'window_open']).shape[0]
 
     print(f'{len(frame):,} scored rows over {windows:,} windows, '
@@ -78,25 +74,7 @@ def main() -> int:
     print(f'symbols: {", ".join(sorted(frame["symbol"].unique()))}')
     print()
 
-    def table(part: pd.DataFrame, label: str) -> dict:
-        y = part['outcome'].to_numpy(dtype=float)
-        out = {'slice': label, 'n': len(part)}
-        for name in ('market', 'baseline', 'model'):
-            p = part[name].to_numpy(dtype=float)
-            out[f'{name}_ll'] = log_loss(y, p)
-            out[f'{name}_brier'] = brier(y, p)
-        # The number that decides everything: positive means the model's
-        # probability is better than the price on offer.
-        out['model_minus_market'] = out['market_ll'] - out['model_ll']
-        out['baseline_minus_market'] = out['market_ll'] - out['baseline_ll']
-        return out
-
-    parts = [table(frame, 'all')]
-    for symbol, part in frame.groupby('symbol'):
-        parts.append(table(part, f'symbol {symbol}'))
-    for offset, part in frame.groupby('offset'):
-        parts.append(table(part, f'offset +{int(offset)}m'))
-    summary = pd.DataFrame(parts)
+    summary = market_comparison(frame)
 
     pd.set_option('display.width', 220)
     print(summary[['slice', 'n', 'market_ll', 'baseline_ll', 'model_ll',

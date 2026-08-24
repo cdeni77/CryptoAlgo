@@ -19,7 +19,8 @@ import pytest
 from core.book import BookStats
 from core.config import Config
 from core.metrics import (
-    DEFAULT_GATES, GATE_NOTES, IMPLAUSIBLE_SHARPE, EvaluationReport, FoldEvaluation,
+    DEFAULT_GATES, GATE_NOTES, IMPLAUSIBLE_SHARPE, MIN_MARKET_WINDOWS,
+    EvaluationReport, FoldEvaluation, market_gate_values,
     Gate, brier_skill, evaluate_gates, gate_report, gates_passed, log_loss_skill,
 )
 from core.promotion import (
@@ -64,6 +65,18 @@ def report(skills=(0.002,) * 6, *, deviation=0.02, non_finite=0,
         folds=[fold(i, skill=s, deviation=deviation, non_finite=non_finite)
                for i, s in enumerate(skills)],
         continuous=stats(**over), config_provenance=Config().provenance())
+
+
+def beats_the_market() -> dict:
+    """The market measurement a fully-passing candidate must carry.
+
+    Added for the same reason `model_max_deviation` and `n_non_finite` had to be
+    added to `fold()`: a gate reads a measurement, and a fixture that omits it is
+    describing a candidate that was never measured. `market_gate_values` is
+    defined further down with the rest of the market tests; it is a pure
+    function of rows, so calling it here is not a dependency on those tests.
+    """
+    return market_gate_values(market_rows(4_000, model_edge=+0.35))
 
 
 class FakeModel:
@@ -199,7 +212,8 @@ def test_a_blocked_candidate_does_not_reach_the_live_path(tmp_path):
 
 
 def test_a_passing_candidate_installs_atomically(tmp_path):
-    attempt = promote(FakeModel(), report(), root=tmp_path)
+    attempt = promote(FakeModel(), report(), root=tmp_path,
+                      extra=beats_the_market())
     assert attempt.passed and attempt.installed
     assert (tmp_path / LIVE_MODEL).exists()
     assert not list(tmp_path.glob(f'.{LIVE_MODEL}.incoming')), (
@@ -226,7 +240,7 @@ def test_a_forced_install_records_the_reason_with_the_artifact(tmp_path):
 def test_every_attempt_is_recorded_even_when_blocked(tmp_path):
     promote(FakeModel(), report(sharpe=-2.0), root=tmp_path)
     promote(FakeModel(), report(sharpe=-3.0), root=tmp_path)
-    promote(FakeModel(), report(), root=tmp_path)
+    promote(FakeModel(), report(), root=tmp_path, extra=beats_the_market())
     frame = history(tmp_path)
     assert len(frame) == 3
     assert trial_count(tmp_path) == 3
@@ -241,7 +255,8 @@ def test_the_ledger_survives_an_unreadable_entry(tmp_path):
 
 
 def test_evaluate_candidate_touches_no_filesystem(tmp_path):
-    attempt = evaluate_candidate(FakeModel(), report())
+    attempt = evaluate_candidate(FakeModel(), report(),
+                                 extra=beats_the_market())
     assert attempt.passed
     assert not attempt.installed
     assert not any(tmp_path.iterdir())
@@ -271,7 +286,8 @@ def test_a_handful_of_unscoreable_rows_is_not_a_failure():
         f"24 unscoreable rows in ~480,000 scored {gates['non_finite_share'].value:.6f}; "
         f'an outage has to pass'
     )
-    assert gates_passed(evaluate_gates(report(non_finite=4)))
+    assert gates_passed(evaluate_gates(report(non_finite=4),
+                                       extra=beats_the_market()))
 
 
 def test_a_large_share_of_unscoreable_rows_does_fail():
@@ -320,3 +336,97 @@ def test_a_model_miscalibrated_only_where_it_trades_is_refused():
     )
     assert not gates['calibration_max_deviation'].passed
 
+
+
+# ---- the market as the benchmark -----------------------------------------
+
+def market_rows(n: int, *, model_edge: float = 0.0, windows: int = 4_000):
+    """Synthetic `scored_against_market()` rows.
+
+    `model_edge` shifts the model's probability toward the truth relative to the
+    price, so a positive value is a model that genuinely forecasts better than
+    the quote and a negative one is a model that is worse.
+    """
+    rng = np.random.default_rng(11)
+    rows = []
+    for i in range(n):
+        outcome = float(rng.integers(0, 2))
+        market = 0.5 + (0.18 if outcome else -0.18) + rng.normal(0, 0.04)
+        market = float(np.clip(market, 0.02, 0.98))
+        toward = (1.0 - market) if outcome else (0.0 - market)
+        model = float(np.clip(market + model_edge * toward, 0.01, 0.99))
+        rows.append(('BTC-USD', pd.Timestamp('2026-08-01', tz='UTC')
+                     + pd.Timedelta(minutes=15 * (i % windows)),
+                     3, market, market, model, outcome))
+    return rows
+
+
+class TestTheMarketGates:
+    """The benchmark the other gates do not test.
+
+    `log_loss_skill` asks whether the model beats `F(x/sigma)`. It is not the
+    counterparty — the price is. Measured on the first day of live quotes: market
+    log loss 0.333, baseline 0.429, model 0.430, same sign on all three symbols
+    and all four offsets. Every other gate passed that run.
+    """
+
+    def test_a_model_that_loses_to_the_price_fails_even_passing_everything_else(self):
+        """The regression this pair of gates exists for."""
+        others = {g.name: g.passed for g in evaluate_gates(
+            report(), extra=market_gate_values(market_rows(4_000, model_edge=-0.35)))}
+        assert others['log_loss_skill'], 'the fixture must otherwise be a passing one'
+        assert others['sharpe']
+        assert not others['model_minus_market'], (
+            'a model worse than the quote it must trade against was promotable'
+        )
+
+    def test_a_model_that_beats_the_price_passes(self):
+        gates = {g.name: g.passed for g in evaluate_gates(
+            report(), extra=market_gate_values(market_rows(4_000, model_edge=+0.35)))}
+        assert gates['model_minus_market'] and gates['market_windows']
+
+    def test_too_few_windows_fails_however_good_the_comparison_looks(self):
+        """A week of one symbol is an anecdote, and an anecdote that flatters us
+        is the one most likely to be believed."""
+        values = market_gate_values(market_rows(300, model_edge=+0.35, windows=100))
+        gates = {g.name: g.passed for g in evaluate_gates(report(), extra=values)}
+        assert values['model_minus_market'] > 0
+        assert not gates['market_windows']
+
+    def test_no_quotes_at_all_fails_rather_than_passes(self):
+        """Not measured is not measured good. The whole point of routing this
+        through a gate instead of a script is that a script can go unrun."""
+        values = market_gate_values([])
+        assert values['market_windows'] == 0
+        assert not np.isfinite(values['model_minus_market'])
+        gates = {g.name: g.passed for g in evaluate_gates(report(), extra=values)}
+        assert not gates['market_windows'] and not gates['model_minus_market']
+
+    def test_forgetting_to_pass_the_measurement_cannot_promote(self):
+        """`extra` is optional in the signature, so omitting it must fail closed.
+        A benchmark that disappears when a caller forgets it is not a benchmark."""
+        gates = {g.name: g.passed for g in evaluate_gates(report())}
+        assert not gates['model_minus_market']
+        assert not gates['market_windows']
+
+    def test_the_market_gates_are_read_before_the_baseline_ones(self):
+        """Ordering is the argument: `log_loss_skill` beating F(x/sigma) is not
+        the question that decides whether this pays."""
+        names = list(DEFAULT_GATES)
+        assert names.index('model_minus_market') < names.index('log_loss_skill')
+        assert names.index('market_windows') < names.index('sharpe')
+
+    def test_the_threshold_is_defined_once(self):
+        """`scripts.market_benchmark` and the gate must not drift apart."""
+        from scripts.market_benchmark import MIN_WINDOWS
+
+        assert MIN_WINDOWS == MIN_MARKET_WINDOWS
+        assert DEFAULT_GATES['market_windows'][0] == float(MIN_MARKET_WINDOWS)
+
+    def test_a_backtest_alone_can_never_satisfy_these(self):
+        """A backtest has no book: `price_source` stands the calibrated baseline
+        in for the market, which answers "beat the baseline" twice rather than
+        answering "beat the price" once. So the report cannot supply these, and
+        `gate_values` must not pretend to."""
+        assert 'model_minus_market' not in report().gate_values()
+        assert 'market_windows' not in report().gate_values()

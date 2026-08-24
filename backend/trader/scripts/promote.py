@@ -35,6 +35,37 @@ from scripts._common import (
 logger = logging.getLogger('promote')
 
 
+def market_measurement() -> dict[str, float]:
+    """The market comparison, from live-recorded quotes in the serving store.
+
+    Returns values that FAIL when there is nothing to read. The gate has to be
+    unmeasurable-and-failing rather than absent, because absent is how a
+    benchmark quietly stops being applied — and this particular benchmark is the
+    one the whole stack exists to satisfy.
+    """
+    from core.metrics import market_gate_values
+
+    url = os.getenv('DATABASE_URL')
+    if not url:
+        print('  DATABASE_URL is unset, so the market comparison cannot be read. '
+              'The market gates will fail as unmeasured; that is not the same as '
+              'the model losing to the price, and the gate line says so.')
+        return market_gate_values([])
+    try:
+        from core.pg_writer import PgWriter
+
+        rows = PgWriter(database_url=url).scored_against_market()
+    except Exception as exc:                      # noqa: BLE001 - report and fail closed
+        print(f'  the serving store could not be read ({exc}); the market gates '
+              f'will fail as unmeasured.')
+        return market_gate_values([])
+    values = market_gate_values(rows)
+    print(f'  market comparison: {int(values["market_windows"]):,} windows of '
+          f'recorded quotes, model_minus_market '
+          f'{values["model_minus_market"]:+.6f}')
+    return values
+
+
 def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -82,8 +113,10 @@ def main() -> int:
     result = walk_forward(dataset, config, groups=groups, trade=True)
     print('\n' + result.report.summary())
 
+    market = market_measurement()
+
     if args.dry_run:
-        print('\n' + gate_report(evaluate_gates(result.report)))
+        print('\n' + gate_report(evaluate_gates(result.report, extra=market)))
         print('\ndry run: nothing installed, nothing recorded')
         return 0
 
@@ -92,7 +125,8 @@ def main() -> int:
     # evidence, not alternatives to it.
     candidate = result.models[-1]
     attempt = promote(candidate, result.report, force=args.force,
-                      force_reason=args.reason, trades=result.trades())
+                      force_reason=args.reason, trades=result.trades(),
+                      extra=market)
     print('\n' + attempt.summary())
     publish_to_serving(attempt, result.report)
     return 0 if attempt.installed else 1

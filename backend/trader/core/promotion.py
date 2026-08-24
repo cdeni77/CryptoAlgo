@@ -135,12 +135,18 @@ def evaluate_candidate(
     *,
     gates: Optional[dict[str, tuple[float, str]]] = None,
     version: Optional[str] = None,
+    extra: Optional[dict[str, float]] = None,
 ) -> PromotionAttempt:
-    """Score a candidate without touching the filesystem."""
+    """Score a candidate without touching the filesystem.
+
+    `extra` is for measurements the report cannot produce — the market
+    comparison, which needs live-recorded quotes. Omitting it leaves those gates
+    NaN, and NaN fails, so a caller that forgets cannot promote by accident.
+    """
     return PromotionAttempt(
         version=version or version_stamp(),
         created_at=datetime.now(timezone.utc).isoformat(),
-        gates=evaluate_gates(report, gates or DEFAULT_GATES),
+        gates=evaluate_gates(report, gates or DEFAULT_GATES, extra=extra),
         model_provenance=model.provenance(),
         report_provenance=report_provenance(report),
     )
@@ -155,6 +161,7 @@ def promote(
     force: bool = False,
     force_reason: Optional[str] = None,
     trades: Optional[pd.DataFrame] = None,
+    extra: Optional[dict[str, float]] = None,
 ) -> PromotionAttempt:
     """Gate, then install atomically. Records the attempt either way."""
     if force and not force_reason:
@@ -167,7 +174,7 @@ def promote(
     root = Path(root) if root else MODELS_ROOT
     ledger = root / LEDGER
     ledger.mkdir(parents=True, exist_ok=True)
-    attempt = evaluate_candidate(model, report, gates=gates,
+    attempt = evaluate_candidate(model, report, gates=gates, extra=extra,
                                  version=_unique_version(ledger))
     attempt.forced = bool(force)
     attempt.force_reason = force_reason
