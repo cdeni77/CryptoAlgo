@@ -27,6 +27,7 @@ from core.dataset import (Dataset, FoldFit, apply_fold, apply_seasonality,
 from core.datastore import ResearchStore
 from core.inference import governing, model_minus_market
 from core.model import ForecastModel
+from core.promotion import load_live
 
 logger = logging.getLogger('retro')
 
@@ -58,8 +59,9 @@ def score_artifact(model: ForecastModel, config, quotes: pd.DataFrame) -> pd.Dat
     every window here is unseen by it. Rebuilding a `FoldFit` from the bundle is
     what makes this the *deployed* model rather than a refit one.
     """
-    lo = quotes['window_open'].min() - pd.Timedelta(days=3)
-    hi = quotes['window_open'].max() + pd.Timedelta(hours=1)
+    # `ResearchStore.read` builds its own tz-aware bounds, so hand it naive ones.
+    lo = (quotes['window_open'].min() - pd.Timedelta(days=3)).tz_convert(None)
+    hi = (quotes['window_open'].max() + pd.Timedelta(hours=1)).tz_convert(None)
     bars = load_minute_bars(config, store=ResearchStore(), start=lo, end=hi)
     dataset = Dataset.build(bars, config)
 
@@ -151,9 +153,12 @@ def main() -> int:
           f'({100*len(usable)/len(quotes):.2f}%), '
           f'{quotes["window_open"].dt.floor("D").nunique()} UTC days')
 
-    model = ForecastModel.load(None, config)
+    model = load_live(config=config)
+    if model is None:
+        print('no promoted artifact in MODELS_ROOT'); return 1
     print(f'artifact: {len(model.features)} features, alpha {model.residual_scale:.4f}, '
-          f'trained on {model.n_train_windows:,} windows')
+          f'trained on {model.n_train_windows:,} windows, '
+          f'init_score_source={model.init_score_source}')
     scored = score_artifact(model, config, usable)
 
     joined = scored.merge(
