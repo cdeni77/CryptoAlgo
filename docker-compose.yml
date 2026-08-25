@@ -291,6 +291,27 @@ services:
           sleep 3600
         done
 
+  # ===========================================================================
+  # Depth recorder — the one dataset that cannot be backfilled.
+  #
+  # Verified: `GET /markets/{ticker}/orderbook` on a settled market returns
+  # `{"no_dollars": [], "yes_dollars": []}`. No ladder, no resting size, no queue
+  # position, ever. The candlestick history gives top-of-book and nothing behind
+  # it. So depth exists only while a market is open and only if something is
+  # listening — every day this is down is a day of fill evidence that is gone.
+  #
+  # It is the missing half of the economic question: the retroactive economics can
+  # now price a trade at the venue's real ask, but it must assume the order
+  # filled, and nothing historical can say whether it would have.
+  # ===========================================================================
+  depth-recorder:
+    profiles: ["live"]
+    extends:
+      service: trader
+    restart: unless-stopped
+    command: >
+      -m scripts.record_depth
+
   trade-live:
     profiles: ["live"]
     extends:

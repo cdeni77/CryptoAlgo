@@ -69,6 +69,21 @@ def main() -> int:
     frame = market_frame(rows)
     windows = frame.drop_duplicates(['symbol', 'window_open']).shape[0]
 
+    # The quote lag, which is a bias and not a curiosity. Features are built for
+    # the nominal offset; the book is read whenever the cycle reached it.
+    if 'decision_time' in frame.columns:
+        lag = ((pd.to_datetime(frame['decision_time'], utc=True)
+                - pd.to_datetime(frame['window_open'], utc=True)).dt.total_seconds() / 60.0
+               - frame['offset'].astype(float))
+        frame = frame.assign(lag_minutes=lag)
+        finite = frame['lag_minutes'].dropna()
+        if len(finite):
+            print(f'quote lag past the nominal offset: median {finite.median():.2f}m, '
+                  f'p90 {finite.quantile(0.9):.2f}m, max {finite.max():.2f}m')
+            print(f'  one minute of information is worth ~0.027 nats (measured by '
+                  f'shifting the offset), so this lag favours the market.')
+            print()
+
     print(f'{len(frame):,} scored rows over {windows:,} windows, '
           f'{frame["window_open"].min()} to {frame["window_open"].max()}')
     print(f'symbols: {", ".join(sorted(frame["symbol"].unique()))}')

@@ -65,6 +65,41 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
     ),
+    # The venue's own quote at each decision offset, backfilled from Kalshi's
+    # candlesticks. This is the only dataset here that is not derived from
+    # Coinbase, and it is the one the market benchmark needs: a backtest built
+    # from bars has no order book, so `price_source` substitutes the calibrated
+    # baseline for the market and "beat the price" and "beat the baseline" become
+    # one question answered twice with the same number.
+    #
+    # `event_time` is the offset instant (window_open + offset minutes), which is
+    # what the quote describes and what the partitioning wants. `window_open` is
+    # carried separately because it is the join key against `core/windows.py`.
+    'venue_quotes': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'window_open', 'offset_minutes', 'market_ticker',
+        'yes_bid', 'yes_ask', 'market_probability', 'spread',
+        'volume', 'open_interest', 'usable', 'exclude_reason',
+    ),
+    # Order-book depth at each decision offset, from the websocket. **This is the
+    # only dataset here that cannot be backfilled at any price.** Verified:
+    # `GET /markets/{ticker}/orderbook` on a settled market returns
+    # `{"no_dollars": [], "yes_dollars": []}` — no ladder, no resting size, no
+    # queue position, ever. Kalshi's candlesticks give top-of-book bid and ask and
+    # nothing behind them.
+    #
+    # It matters because it is the missing half of the economic question. The
+    # retroactive economics can price a trade at the venue's real ask, but it must
+    # assume the order filled, and nothing in any historical endpoint can say
+    # whether it would have. Every day this is not running is a day of fill
+    # evidence that cannot be recovered later.
+    'venue_depth': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'offset_minutes',
+        'yes_bid', 'yes_ask', 'yes_bid_size', 'yes_ask_size',
+        'depth_bid_1c', 'depth_bid_5c', 'depth_ask_1c', 'depth_ask_5c',
+        'levels_bid', 'levels_ask', 'seq', 'gaps',
+    ),
     'book_snapshots': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'bid', 'ask', 'bid_size', 'ask_size', 'depth_1pct_bid', 'depth_1pct_ask',

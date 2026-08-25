@@ -389,12 +389,17 @@ class EvaluationReport:
 MIN_MARKET_WINDOWS = 2_000
 
 MARKET_COLUMNS = ('symbol', 'window_open', 'offset', 'market', 'baseline',
-                  'model', 'outcome')
+                  'model', 'outcome', 'decision_time')
 
 
 def market_frame(rows: Iterable[Sequence]) -> pd.DataFrame:
-    """Rows from `PgWriter.scored_against_market()`, cleaned."""
-    frame = pd.DataFrame(list(rows), columns=list(MARKET_COLUMNS))
+    """Rows from `PgWriter.scored_against_market()`, cleaned.
+
+    Tolerates rows without `decision_time` so an older store still reads.
+    """
+    listed = list(rows)
+    width = len(listed[0]) if listed else len(MARKET_COLUMNS)
+    frame = pd.DataFrame(listed, columns=list(MARKET_COLUMNS[:width]))
     return frame.dropna(subset=['market', 'baseline', 'model', 'outcome'])
 
 

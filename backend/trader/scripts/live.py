@@ -736,6 +736,47 @@ def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:
     return attach_market_logit(out)
 
 
+# How early to wake, so the quote lands ON the offset rather than after it. The
+# cycle spends this fetching bars, reconciling and scoring before it reads the
+# book; measured in-cycle latency is ~5-15s.
+DECISION_LEAD_SECONDS = 12.0
+
+
+def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime] = None) -> float:
+    """Sleep until just before the next decision offset, not a fixed interval.
+
+    **The free-running timer was a measurement bias.** The loop slept
+    `--cycle-seconds` from wherever it happened to be, so a decision nominally at
+    +3m was taken whenever a cycle next landed in [3m, 4m). Measured over the
+    first two live days: +3.62m on average, up to +4.16m.
+
+    The features are built for the nominal offset while the price is read late, so
+    the market gets up to a minute of information the model does not have — and
+    one minute is worth ~0.027 nats, measured by shifting the offset, against a
+    total model edge of +0.002. The bias was comparable to the whole effect and
+    ran against us.
+
+    Waking at `window_open + offset - lead` collapses it to the in-cycle latency.
+    Falls back to `--cycle-seconds` when no offset is ahead in this window, so
+    settlement and reconciliation still run on their old cadence.
+    """
+    now = now or datetime.now(timezone.utc)
+    window_open, _ = current_window(now, config)
+    horizon = float(getattr(args, 'cycle_seconds', 60) or 60)
+    candidates = []
+    for window in (window_open, window_open + timedelta(minutes=config.window_minutes)):
+        for offset in config.decision_offsets:
+            target = window + timedelta(minutes=offset) - timedelta(seconds=DECISION_LEAD_SECONDS)
+            delay = (target - now).total_seconds()
+            if delay > 1.0:
+                candidates.append(delay)
+    if not candidates:
+        return horizon
+    # Never sleep past the ordinary cadence: settlement and venue reconciliation
+    # are on the same cycle and should not wait for the next decision offset.
+    return float(min(min(candidates), horizon))
+
+
 async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
     now = datetime.now(timezone.utc)
@@ -804,6 +845,19 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
     quotes = await fetch_quotes(kalshi, list(scored['symbol'].unique()), settle_time)
+    # **When the book was actually read**, which is not `window_open + offset`.
+    #
+    # Measured over the first two live days: a decision nominally at +3m read its
+    # quote at +3.62m on average and up to +4.16m. The features are built for the
+    # nominal offset, so the market's price carries up to a minute of information
+    # the model does not have — and one minute is worth ~0.027 nats, measured, as
+    # against a total model edge of +0.002. The bias is comparable to the whole
+    # effect, and it runs against us.
+    #
+    # It is not a trading bug: a fresh quote is what a fill would actually pay.
+    # It is a *measurement* bug, and the fix is for the row to say what happened
+    # rather than what was intended, so `market_benchmark` can filter or correct.
+    quote_time = pd.Timestamp.now(tz='UTC')
     scored['ask_up'] = [
         quotes[s][0].ask_for('up') if s in quotes else np.nan for s in scored['symbol']]
     scored['ask_down'] = [
@@ -913,7 +967,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         decisions.append(decision)
         writer.write_prediction(
             symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
-            offset_minutes=offset, decision_time=window_open + pd.Timedelta(minutes=offset),
+            offset_minutes=offset, decision_time=quote_time,
             strike=float(row['strike']), last_price=float(row['last_price']),
             displacement=float(row['displacement']),
             sigma_remaining=_finite(row.get('sigma_remaining')),
@@ -1306,7 +1360,7 @@ async def main() -> int:
                     logger.info('cycle: %s', counts[counts > 0].to_dict())
                 if not args.loop:
                     return 0
-                await asyncio.sleep(args.cycle_seconds)
+                await asyncio.sleep(seconds_until_next_decision(config, args))
     except TraderAlreadyRunning as exc:
         raise SystemExit(str(exc))
     except KeyboardInterrupt:
