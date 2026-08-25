@@ -804,6 +804,19 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
     quotes = await fetch_quotes(kalshi, list(scored['symbol'].unique()), settle_time)
+    # **When the book was actually read**, which is not `window_open + offset`.
+    #
+    # Measured over the first two live days: a decision nominally at +3m read its
+    # quote at +3.62m on average and up to +4.16m. The features are built for the
+    # nominal offset, so the market's price carries up to a minute of information
+    # the model does not have — and one minute is worth ~0.027 nats, measured, as
+    # against a total model edge of +0.002. The bias is comparable to the whole
+    # effect, and it runs against us.
+    #
+    # It is not a trading bug: a fresh quote is what a fill would actually pay.
+    # It is a *measurement* bug, and the fix is for the row to say what happened
+    # rather than what was intended, so `market_benchmark` can filter or correct.
+    quote_time = pd.Timestamp.now(tz='UTC')
     scored['ask_up'] = [
         quotes[s][0].ask_for('up') if s in quotes else np.nan for s in scored['symbol']]
     scored['ask_down'] = [
@@ -913,7 +926,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         decisions.append(decision)
         writer.write_prediction(
             symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
-            offset_minutes=offset, decision_time=window_open + pd.Timedelta(minutes=offset),
+            offset_minutes=offset, decision_time=quote_time,
             strike=float(row['strike']), last_price=float(row['last_price']),
             displacement=float(row['displacement']),
             sigma_remaining=_finite(row.get('sigma_remaining')),
