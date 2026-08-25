@@ -271,10 +271,31 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
     if peak_equity > 0:
         drawdown = (peak_equity - current_equity) / peak_equity
         if drawdown >= config.max_drawdown_fraction:
-            return halt(
-                f'drawdown {drawdown:.1%} from a peak of ${peak_equity:.2f} to '
-                f'${current_equity:.2f}, at or over the '
-                f'{config.max_drawdown_fraction:.0%} limit')
+            # **Only a halt once it is also real capital loss.** The first
+            # version halted on the drawdown alone, and immediately stopped an
+            # account sitting at $107.94 on a $100 start — up 8%, having never
+            # cost anything, because it had once been up 67%. That is a fund's
+            # rule, for protecting banked gains. This account exists to find out
+            # whether an edge is real, and what it has to protect is the stake.
+            #
+            # The stake is already guarded twice: `ruin_floor_fraction` refuses
+            # every trade below 50% of the starting bankroll, and the daily rule
+            # bounds one day's loss at 15% of it. So above water this is a signal
+            # rather than a stop, and it says so in the log.
+            if current_equity < start:
+                return halt(
+                    f'drawdown {drawdown:.1%} from a peak of ${peak_equity:.2f} '
+                    f'to ${current_equity:.2f}, at or over the '
+                    f'{config.max_drawdown_fraction:.0%} limit, and below the '
+                    f'${start:.2f} starting bankroll')
+            logger.warning(
+                'drawdown %.1f%% from a peak of $%.2f to $%.2f — over the %.0f%% '
+                'limit but still above the $%.2f starting bankroll, so this is a '
+                'signal and not a halt. The stake is guarded by the ruin floor '
+                '($%.2f) and the daily loss limit.',
+                100 * drawdown, peak_equity, current_equity,
+                100 * config.max_drawdown_fraction, start,
+                start * config.ruin_floor_fraction)
 
     recent = writer.settled_positions_since(
         (pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(days=7)).to_pydatetime())

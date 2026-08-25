@@ -393,14 +393,31 @@ class TestTheDrawdownBreaker:
         for _ in range(legs):
             settle(w, index=i, pnl=-down / legs, when=when); i += 1
 
-    def test_the_measured_case_halts(self, writer):
-        """+$66 then -$64 on a $100 start: 38% below the peak, and the daily
-        rule's view of it is a *positive* day."""
+    def test_a_deep_drawdown_that_is_still_above_water_does_not_halt(self, writer):
+        """+$66 then -$64 on a $100 start. 38% below the peak, and up 8% on the
+        stake — which is the real case that fired first time and should not have.
+
+        Halting here protects banked gains, which is a fund's job. This account
+        exists to find out whether an edge is real, and the stake is already
+        guarded by the ruin floor and the daily limit.
+        """
         self._run_up_then_give_back(writer, up=66.0, down=64.0, when=NOW)
         account = writer.account()
-        assert float(account.realized_pnl) == pytest.approx(2.0, abs=0.5), (
-            'the day is net positive, which is exactly why the daily rule misses it'
+        assert float(account.realized_pnl) == pytest.approx(2.0, abs=0.5)
+        assert check_circuit_breakers(writer, CONFIG, now=NOW) is None, (
+            'halted an account that is up on the money the user put in'
         )
+
+    def test_the_same_drawdown_below_the_stake_does_halt(self, writer):
+        """+$40 then -$50: 35.7% off the peak AND $10 of real capital gone.
+
+        The numbers are chosen so the *daily* rule cannot fire — -$10 is inside
+        its -$15 limit — because the first version used -$60 and the daily rule
+        caught it first, which would have let this test pass without the
+        drawdown breaker doing anything. Same masking as the loss-streak one.
+        """
+        self._run_up_then_give_back(writer, up=40.0, down=50.0, when=NOW)
+        assert float(writer.account().realized_pnl) == pytest.approx(-10.0, abs=0.5)
         reason = check_circuit_breakers(writer, CONFIG, now=NOW)
         assert reason is not None and 'drawdown' in reason, reason
         assert writer.account().halted
@@ -416,11 +433,9 @@ class TestTheDrawdownBreaker:
         self._run_up_then_give_back(writer, up=60.0, down=60.0, when=NOW)
         account = writer.account()
         assert float(account.realized_pnl) == pytest.approx(0.0, abs=0.5)
-        reason = check_circuit_breakers(writer, CONFIG, now=NOW)
-        assert reason is not None and 'drawdown' in reason, (
-            f'flat against the start but 37.5% off the peak. Got: {reason!r}. '
-            f'Accepting any halt here let the consecutive-loss breaker stand in '
-            f'for the one under test.'
+        assert check_circuit_breakers(writer, CONFIG, now=NOW) is None, (
+            'exactly flat on the stake: nothing of the users money is gone, so '
+            'the drawdown is a signal rather than a stop'
         )
 
     def test_a_steadily_winning_account_is_never_halted(self, writer):
