@@ -260,6 +260,37 @@ services:
     command: >
       -m scripts.evaluate
       
+  # ===========================================================================
+  # Store sync — keeps the research store current with the live period.
+  #
+  # `scrape` and `sync_store` were one-off `docker compose run` commands, so
+  # nothing ran them once the live loop started. Measured 2026-08-25: the
+  # research store's newest bar was 2026-08-23 04:17 while live windows ran to
+  # 2026-08-25 00:00 — so not one traded window could be replayed offline, and
+  # the Kalshi quote archive was unusable for comparing a candidate model against
+  # the market. That is the one thing the archive exists for.
+  #
+  # Hourly. Both steps are idempotent and resumable: `scrape` fetches only what
+  # is missing at either end, `sync_store` rewrites only new partitions.
+  # ===========================================================================
+  store-sync:
+    profiles: ["live"]
+    extends:
+      service: trader
+    restart: unless-stopped
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-c"
+      - |
+        while true; do
+          echo "[store-sync] $$(date -u +%FT%TZ) scrape"
+          python -m scripts.scrape --backfill-days 3 || echo "[store-sync] scrape failed"
+          echo "[store-sync] $$(date -u +%FT%TZ) sync_store"
+          python -m scripts.sync_store || echo "[store-sync] sync failed"
+          echo "[store-sync] $$(date -u +%FT%TZ) sleeping 1h"
+          sleep 3600
+        done
+
   trade-live:
     profiles: ["live"]
     extends:
