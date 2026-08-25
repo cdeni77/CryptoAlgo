@@ -134,3 +134,47 @@ class TestEquityHours:
             'demonstrates the problem'
         )
         assert self.flag(january_close) == 1.0
+
+
+def test_a_date_limited_read_accepts_bounds_that_are_already_tz_aware(store):
+    """`--start`/`--end` were still broken, just with a different exception.
+
+    `scripts/_common.load_dataset` builds `pd.Timestamp(args.end, tz='UTC')` and
+    hands it in; `read` then did `pd.Timestamp(end, tz='UTC')` on a value that was
+    already aware, which pandas refuses:
+
+        ValueError: Cannot pass a datetime or Timestamp with tzinfo with the tz
+        parameter. Use tz_convert instead.
+
+    So no `scripts.evaluate --end ...` run could start, which is exactly the run
+    you need to retrain on a chosen window. The boundary should accept either
+    shape rather than requiring callers to guess.
+    """
+    sliced = store.read(
+        'minute_bars',
+        start=pd.Timestamp('2025-01-01 02:00', tz='UTC'),
+        end=pd.Timestamp('2025-01-01 03:00', tz='UTC'),
+    )
+    assert len(sliced) == 61
+
+
+def test_a_naive_and_an_aware_bound_select_the_same_rows(store):
+    """The two spellings must not mean different windows."""
+    naive = store.read('minute_bars', start='2025-01-01 02:00',
+                       end='2025-01-01 03:00')
+    aware = store.read('minute_bars',
+                       start=pd.Timestamp('2025-01-01 02:00', tz='UTC'),
+                       end=pd.Timestamp('2025-01-01 03:00', tz='UTC'))
+    assert len(naive) == len(aware)
+    assert naive['event_time'].equals(aware['event_time'])
+
+
+def test_a_bound_in_another_zone_is_converted_not_relabelled(store):
+    """21:00 New York on 2024-12-31 is 02:00 UTC on 2025-01-01."""
+    aware = store.read(
+        'minute_bars',
+        start=pd.Timestamp('2024-12-31 21:00', tz=NEW_YORK),
+        end=pd.Timestamp('2024-12-31 22:00', tz=NEW_YORK),
+    )
+    assert len(aware) == 61
+    assert aware['event_time'].min() == pd.Timestamp('2025-01-01 02:00', tz='UTC')

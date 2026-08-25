@@ -32,22 +32,28 @@ CFG = Config()
 def test_the_fee_follows_the_published_formula():
     for contracts, price in ((1, 0.50), (3, 0.85), (10, 0.20), (7, 0.97)):
         raw = CFG.fee_rate * contracts * price * (1 - price)
-        expected = math.ceil(round(raw * 100, 9)) / 100
+        expected = math.ceil(round(raw * 10_000, 6)) / 10_000
         assert trade_fee(contracts, price, CFG) == pytest.approx(expected)
 
 
 def test_the_ceiling_is_per_order_not_per_contract():
-    """A one-contract order pays a higher rate than the schedule implies.
+    """The ceiling is still per order — it is just no longer material.
 
-    0.07 x 1 x 0.25 = $0.0175, charged as $0.02 — 14% more. At a $100 account
-    every order is a small order, so this is the dominant correction rather than
-    a rounding detail.
+    This test used to assert $0.02 for one contract at 50c and call the 14%
+    surcharge "the dominant correction" at a $100 account. Measured against 328
+    real fills, the granularity is a hundredth of a cent, so the same order pays
+    $0.0175 and the per-order effect is a rounding detail after all.
+
+    The direction of the effect is unchanged and still worth pinning: rounding is
+    per order, so splitting an order can only cost more, never less.
     """
-    assert trade_fee(1, 0.50, CFG) == pytest.approx(0.02)
-    assert trade_fee(2, 0.50, CFG) == pytest.approx(0.04)
-    # Ten contracts: 0.175 -> 0.18, so the per-contract rate falls with size.
-    assert trade_fee(10, 0.50, CFG) == pytest.approx(0.18)
-    assert trade_fee(10, 0.50, CFG) / 10 < trade_fee(1, 0.50, CFG)
+    assert trade_fee(1, 0.50, CFG) == pytest.approx(0.0175)
+    assert trade_fee(2, 0.50, CFG) == pytest.approx(0.035)
+    assert trade_fee(10, 0.50, CFG) == pytest.approx(0.175)
+    # A price whose raw fee is not a whole number of hundredth-cents still
+    # rounds up once per order, so per-contract cost falls (very slightly) with
+    # size.
+    assert trade_fee(7, 0.37, CFG) / 7 < trade_fee(1, 0.37, CFG)
 
 
 def test_a_confident_bet_is_a_cheap_bet():
@@ -156,3 +162,49 @@ def test_the_payout_is_one_dollar():
     # 100 winning contracts bought at 85c return $100 against an $85 outlay.
     assert expected_value_per_contract(1.0, 0.85, CFG) == pytest.approx(
         1.0 - float(effective_price(0.85, CFG)))
+
+
+# --- measured against real fills, 2026-08-25 -------------------------------
+#
+# 328 filled orders were read back from `GET /portfolio/fills` — the first time
+# any order ticket had been checked against this module. The venue's `fee_cost`
+# matches `ceil(rate * n * p * (1-p) * 10_000) / 10_000` on 311 of them: the
+# ceiling is to a **hundredth of a cent**, not to a whole cent.
+#
+# The whole-cent rule this module used over-charged by 7% in aggregate and ~17%
+# on a small order, which made every net-edge gate too strict.
+
+def test_the_fee_rounds_up_to_a_hundredth_of_a_cent():
+    """The venue's granularity, from a real ticket.
+
+    Fill: 4 contracts of NO at $0.76, `fee_cost` $0.051100.
+    0.07 * 4 * 0.76 * 0.24 = $0.0510720, and the venue charged $0.0511.
+    A whole-cent ceiling would have charged $0.06 — 17% more.
+    """
+    assert trade_fee(4, 0.76, CFG) == pytest.approx(0.0511, abs=1e-9)
+
+
+def test_a_one_contract_order_is_not_rounded_to_two_cents():
+    """0.07 * 1 * 0.5 * 0.5 = $0.0175 exactly, and that is what is charged.
+
+    The old rule billed $0.02 and this module's docstring called that 14%
+    surcharge "the dominant correction" at a $100 account. It is not a
+    correction at all — the granularity is 100x finer than assumed.
+    """
+    assert trade_fee(1, 0.50, CFG) == pytest.approx(0.0175, abs=1e-9)
+
+
+def test_the_fee_is_still_ceiled_not_truncated():
+    """Rounding is still upward — the venue never charges less than the formula."""
+    raw = CFG.fee_rate * 3 * 0.37 * 0.63
+    charged = float(trade_fee(3, 0.37, CFG))
+    assert charged >= raw
+    assert charged - raw < 1e-4
+
+
+def test_the_per_order_ceiling_no_longer_penalises_small_orders_materially():
+    """Ten one-contract orders cost within a hundredth of a cent each of one
+    ten-contract order. Under the whole-cent rule they cost 11% more."""
+    single = float(trade_fee(1, 0.50, CFG))
+    ten = float(trade_fee(10, 0.50, CFG))
+    assert 10 * single - ten < 1e-3

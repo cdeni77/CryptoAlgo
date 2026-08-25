@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,6 +192,29 @@ def _in_utc(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _utc_bound(value) -> datetime:
+    """A query bound as a plain UTC `datetime`, from naive or aware input.
+
+    Two separate failures met here. `pd.Timestamp` stopped being implicitly
+    convertible by the driver's binder under pandas 3.0, so the bound has to be a
+    plain `datetime` — hence `.to_pydatetime()`. And `pd.Timestamp(x, tz='UTC')`
+    *raises* when `x` already carries a timezone, which is exactly what
+    `scripts/_common.load_dataset` hands in:
+
+        ValueError: Cannot pass a datetime or Timestamp with tzinfo with the tz
+        parameter. Use tz_convert instead.
+
+    So `--start`/`--end` were unusable on every script that reads the store — the
+    date-limited run you need to retrain on a chosen window could not start. This
+    is the boundary, so it accepts either shape rather than making each caller
+    guess which one is wanted. An aware bound is *converted*, never relabelled, so
+    a New York timestamp selects the UTC rows it actually names.
+    """
+    stamp = pd.Timestamp(value)
+    stamp = stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
+    return stamp.to_pydatetime()
+
+
 class ResearchStore:
     """Parquet-backed research store with point-in-time reads."""
 
@@ -341,13 +365,13 @@ class ResearchStore:
         # change quickly.
         if start is not None:
             clauses.append('event_time >= ?')
-            params.append(pd.Timestamp(start, tz='UTC').to_pydatetime())
+            params.append(_utc_bound(start))
         if end is not None:
             clauses.append('event_time <= ?')
-            params.append(pd.Timestamp(end, tz='UTC').to_pydatetime())
+            params.append(_utc_bound(end))
         if as_of is not None:
             clauses.append('available_time <= ?')
-            params.append(pd.Timestamp(as_of, tz='UTC').to_pydatetime())
+            params.append(_utc_bound(as_of))
         if min_quality is not None:
             if min_quality not in QUALITY_LEVELS:
                 raise DataStoreError(

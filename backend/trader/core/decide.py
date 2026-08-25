@@ -67,6 +67,7 @@ class Reason(str, Enum):
     WINDOW_EXPOSURE = 'window_exposure'        # too much already at risk this window
     POSITION_LIMIT = 'position_limit'          # too many correlated legs this window
     ALREADY_ENTERED = 'already_entered'        # one entry per window
+    OFFSET_NOT_TRADED = 'offset_not_traded'    # scored, but not an entry offset
     BANKROLL_FLOOR = 'bankroll_floor'          # stop-trading floor breached
     HALTED = 'halted'                          # a circuit breaker is latched
 
@@ -359,6 +360,13 @@ def decide(
     # money moves.
     if halted:
         return refuse(Reason.HALTED)
+    # Scored but not tradeable. Every offset is still measured — that sample is
+    # what the forecast tests read — but only `entry_offsets` may open a position.
+    # See `Config.entry_offsets`: the earliest offset that cleared was taking 90%
+    # of windows at 0.040c per contract, against 3.304c at +12m alone.
+    tradeable = config.entry_offsets
+    if tradeable is not None and int(base.offset) not in tuple(tradeable):
+        return refuse(Reason.OFFSET_NOT_TRADED)
     if symbol in exposure.symbols_entered:
         return refuse(Reason.ALREADY_ENTERED)
     if exposure.positions >= config.max_positions_per_window:

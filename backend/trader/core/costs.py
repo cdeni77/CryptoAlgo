@@ -8,11 +8,12 @@ without touching position sizing.
 **The fee is a function of price, and that shape is the whole strategy.**
 Kalshi charges, per order:
 
-    fee = ceil(fee_rate * contracts * price * (1 - price) * 100) / 100
+    fee = ceil(fee_rate * contracts * price * (1 - price) * 10_000) / 10_000
 
 in dollars, with `price` the contract price in dollars (0..1) and `fee_rate`
-0.07. Settlement is free, so a held-to-expiry binary pays *one* fee, not a
-round trip. The `p(1-p)` term means the fee is maximal at 50c and falls toward
+0.07. **The ceiling is to a hundredth of a cent, and that is measured** — see
+`_ceil_fee`. Settlement is free, so a held-to-expiry binary pays *one* fee, not
+a round trip. The `p(1-p)` term means the fee is maximal at 50c and falls toward
 either extreme:
 
 | price | fee/contract | as a share of the stake |
@@ -29,21 +30,21 @@ confident bet is a cheap bet. That is why the barrier framing and this venue
 fit together — the barrier's confident predictions are the large-displacement,
 late-in-the-window ones, which is exactly where `p(1-p)` is small.
 
-**The ceiling matters at a $100 account.** One contract at 50c owes $0.0175 and
-is charged $0.02 — 14% more than the formula, because the rounding is per
-order, not per contract. At two contracts it is $0.035 -> $0.04. Anything
-that reasons about fees in percentage terms without the ceiling understates
-the cost of the smallest orders, which are the only orders a $100 account
-places.
+**The ceiling does NOT matter at a $100 account, and this file used to claim the
+opposite.** It said one contract at 50c owes $0.0175 and is charged $0.02 — 14%
+more — and called that "the dominant correction rather than a rounding detail".
+Measured against 328 real fills, the granularity is a hundredth of a cent, so
+that order pays $0.0175 and the per-order effect is worth under a hundredth of a
+cent. The old assumption over-charged 7% in aggregate and ~17% on the smallest
+orders, which made every net-edge gate too strict and refused trades that were
+profitable. Rounding is still per order, so splitting an order can only cost
+more — never less.
 
-**The half-spread is larger than the fee above 83c, and it is an assumption.**
-No Kalshi order ticket has been read against this module. The taker formula
-above is the published schedule; the maker rate is modelled as a flat
-per-contract charge and is *unverified*. The last venue this repo priced was
-wrong in both shape and magnitude for a day, and it was settled by reading
-three real tickets rather than by reasoning — so treat every number here as
-provisional until a filled order confirms it, and keep the half-spread
-reported separately so a stress run can move it alone.
+**The taker side is now measured; the maker side is not.** All 328 fills came
+back `is_taker: true`, so the maker rate here remains a flat modelled
+per-contract charge that no order ticket has ever confirmed. Treat it as
+provisional, and keep the half-spread reported separately so a stress run can
+move it alone.
 """
 
 from __future__ import annotations
@@ -105,12 +106,22 @@ def round_to_tick(price: Numeric) -> Numeric:
     return float(snapped) if np.ndim(price) == 0 else snapped
 
 
-def _ceil_cents(dollars: Numeric) -> Numeric:
-    """Round up to the next whole cent."""
-    scaled = np.asarray(dollars, dtype=float) * 100.0
-    # Guard the float representation: 0.07 * 1 * 0.25 * 100 is 1.7499999...,
-    # and ceiling that gives 2 correctly, but an exact 2.0 must not become 3.
-    rounded = np.ceil(np.round(scaled, 9)) / 100.0
+# **The granularity, measured.** 328 filled orders were read back from
+# `GET /portfolio/fills` on 2026-08-25 — the first time this module was ever
+# checked against a real ticket. `fee_cost` matches
+# `ceil(rate * n * p * (1-p) * 10_000) / 10_000` on 311 of them: the ceiling is
+# to a hundredth of a cent. The whole-cent rule assumed here previously
+# over-charged 7% in aggregate and ~17% on a one-contract order, which made
+# every net-edge gate too strict and refused trades that were profitable.
+FEE_GRANULARITY_PER_DOLLAR = 10_000.0
+
+
+def _ceil_fee(dollars: Numeric) -> Numeric:
+    """Round a fee up to the venue's granularity — a hundredth of a cent."""
+    scaled = np.asarray(dollars, dtype=float) * FEE_GRANULARITY_PER_DOLLAR
+    # Guard the float representation: an exact multiple must not be pushed up a
+    # step by 1e-16 of representation error.
+    rounded = np.ceil(np.round(scaled, 6)) / FEE_GRANULARITY_PER_DOLLAR
     return float(rounded) if np.isscalar(dollars) or np.ndim(dollars) == 0 else rounded
 
 
@@ -123,8 +134,10 @@ def trade_fee(
 ) -> Numeric:
     """Total dollar fee for an order of `contracts` at `price`.
 
-    Rounded up to the next cent *per order*, which is how the venue charges and
-    why a one-contract order pays a disproportionate rate.
+    Rounded up *per order* to a hundredth of a cent, which is how the venue
+    charges — measured against 328 real fills, not assumed. The per-order
+    ceiling therefore costs a one-contract order well under a cent extra, rather
+    than the 14% the whole-cent assumption implied.
     """
     is_maker = config.assume_maker if maker is None else maker
     contracts_arr = np.asarray(contracts, dtype=float)
@@ -133,7 +146,7 @@ def trade_fee(
         raw = config.maker_fee_rate * contracts_arr
     else:
         raw = config.fee_rate * contracts_arr * price_arr * (1.0 - price_arr)
-    return _ceil_cents(raw)
+    return _ceil_fee(raw)
 
 
 def fee_per_contract(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
