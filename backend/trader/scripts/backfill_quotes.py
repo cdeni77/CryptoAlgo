@@ -59,6 +59,14 @@ logger = logging.getLogger('backfill_quotes')
 
 SERIES = {'KXBTC15M': 'BTC-USD', 'KXETH15M': 'ETH-USD', 'KXSOL15M': 'SOL-USD'}
 OFFSETS = (3, 6, 9, 12)
+# +14m is not traded. It exists so `DECISION_RULE.md` Appendix A's control can
+# run: at 14 minutes into a 15-minute window the market is nearly settled and must
+# score very well but NOT perfectly. A `market_ll` near 0.00 there is the
+# signature of a candle that contains the settlement itself, and the difference
+# between model and market would hide it because both are scored against the same
+# leaked outcome. Pulled as a separate sampled pass, since a control does not need
+# every market.
+CONTROL_OFFSET = 14
 WINDOW_MINUTES = 15
 # Measured 12.1-12.6 req/s without throttling against a Basic-tier ceiling of
 # 20/s (200 read tokens/s at 10 tokens a request). Stay under it deliberately.
@@ -122,7 +130,8 @@ def classify(bid: float, ask: float) -> tuple[bool, str]:
 
 
 def rows_from_candles(candles: list[dict], *, symbol: str, ticker: str,
-                      open_time: datetime) -> list[dict]:
+                      open_time: datetime,
+                      offsets: tuple[int, ...] = OFFSETS) -> list[dict]:
     open_ts = int(open_time.timestamp())
     by_offset: dict[int, dict] = {}
     for candle in candles:
@@ -132,7 +141,7 @@ def rows_from_candles(candles: list[dict], *, symbol: str, ticker: str,
             by_offset[delta] = candle
 
     out: list[dict] = []
-    for offset in OFFSETS:
+    for offset in offsets:
         event_time = open_time + timedelta(minutes=offset)
         candle = by_offset.get(offset)
         if candle is None:
@@ -280,6 +289,11 @@ async def run(args) -> int:
             markets = await enumerate_settled(client, series)
             markets.sort(key=lambda m: m['open_time'])
             todo = [m for m in markets if m['ticker'] not in done]
+            if args.limit_per_series:
+                # Evenly spaced across the whole span, not the first N — a control
+                # drawn from one end of the history would be a control of that end.
+                step = max(1, len(todo) // args.limit_per_series)
+                todo = todo[::step][:args.limit_per_series]
             logger.info('%s: %d settled markets, %d to pull (%d already done)',
                         series, len(markets), len(todo), len(markets) - len(todo))
             batch: list[dict] = []
@@ -315,7 +329,8 @@ async def run(args) -> int:
                 if len(payloads) > 1:
                     straddled += 1
                 batch.extend(rows_from_candles(
-                    candles, symbol=symbol, ticker=ticker, open_time=open_time))
+                    candles, symbol=symbol, ticker=ticker, open_time=open_time,
+                    offsets=args.offsets))
                 done.add(ticker)
                 total += 1
                 if len(batch) >= args.batch_rows:
@@ -342,8 +357,13 @@ def main() -> int:
                         help='requests per second (Basic tier ceiling is 20)')
     parser.add_argument('--batch-rows', type=int, default=4000)
     parser.add_argument('--checkpoint', default='/app/data/quote_backfill.json')
+    parser.add_argument('--offsets', default=','.join(str(o) for o in OFFSETS),
+                        help='minutes after open to store; 14 is the control')
+    parser.add_argument('--limit-per-series', type=int, default=0,
+                        help='sample this many markets, evenly spaced (0 = all)')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
+    args.offsets = tuple(int(x) for x in str(args.offsets).split(',') if x.strip())
     logging.basicConfig(level=logging.INFO if not args.verbose else logging.DEBUG,
                         format='%(asctime)s %(levelname)-7s %(name)s %(message)s',
                         datefmt='%H:%M:%S')

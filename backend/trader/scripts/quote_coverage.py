@@ -24,6 +24,13 @@ import pandas as pd
 from core.datastore import ResearchStore
 
 FOLD_BLOCKS, TEST_BLOCKS = 7, 6      # linspace(0, N, n_folds+2); block 0 is seed
+# `GET /historical/cutoff` on 2026-08-25. The backfill routes by it, so a
+# difference in how the two endpoints populate bid/ask would concentrate
+# exclusions in the earliest weeks — and a bootstrap that resamples by DAY is hurt
+# worst by exactly that, because it removes whole blocks rather than scattered
+# rows. Pre-registered in DECISION_RULE.md Appendix A.1 as a check that runs
+# before any result is read.
+CUTOFF = pd.Timestamp('2026-06-25T00:00:00Z')
 GATE = 20_000
 EXCLUSION_CEILING = 0.05
 
@@ -61,6 +68,35 @@ def main() -> int:
     share = 1.0 - frame['usable'].mean()
     verdict = 'OK' if share <= EXCLUSION_CEILING else 'OVER CEILING — TEST VOID'
     print(f'  total excluded         {100*share:.3f}%   {verdict}\n')
+
+    print(f'across the historical cutoff ({CUTOFF:%Y-%m-%d}) — '
+          f'a date-correlated hole would break the day bootstrap')
+    frame['side'] = pd.Series(
+        ['before cutoff' if t < CUTOFF else 'after cutoff'
+         for t in frame['window_open']], index=frame.index)
+    sides = frame.groupby('side').agg(
+        rows=('usable', 'size'),
+        markets=('market_ticker', 'nunique'),
+        two_sided=('usable', 'mean'),
+        median_spread_c=('spread', lambda v: 100 * v.median()),
+    )
+    # rows expected = 4 offsets per market; a shortfall is a missing candle
+    sides['rows_expected'] = sides['markets'] * 4
+    sides['returned_share'] = sides['rows'] / sides['rows_expected']
+    print(sides.to_string(float_format=lambda v: f'{v:.4f}'))
+    reasons = (frame.loc[~frame['usable']]
+               .pivot_table(index='exclude_reason', columns='side',
+                            values='usable', aggfunc='size', fill_value=0))
+    if not reasons.empty:
+        print('\nexclusion reasons by side')
+        print(reasons.to_string())
+    if len(sides) == 2:
+        gap = abs(sides['two_sided'].iloc[0] - sides['two_sided'].iloc[1])
+        note = ('MATERIAL — report before running the test' if gap > 0.02
+                else 'no material difference')
+        print(f'\n  two-sided share differs by {100*gap:.2f}pp across the cutoff'
+              f'   {note}')
+    print()
 
     print('median spread by week and symbol, in cents (SOL convergence)')
     ok = frame.loc[frame['usable']].copy()
