@@ -924,9 +924,13 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # clears every gate — four decision points per window, not eighteen. Anything
     # further from its offset than the tolerance settles and reconciles, then
     # returns.
+    # An explicit `--offset` is a deliberate override — a backfill, a manual
+    # decision, or a test — and must be honoured whatever the clock says. Only the
+    # offset the scheduler chose is subject to the tolerance.
+    scheduler_chose = args.offset is None
     on_offset = offset is not None and abs(
         elapsed - offset) * 60.0 <= DECISION_TOLERANCE_SECONDS
-    if offset is not None and not on_offset:
+    if scheduler_chose and offset is not None and not on_offset:
         logger.debug('%.2fm into the window, nearest offset +%dm is %.0fs away; '
                      'settling and reconciling only',
                      elapsed, offset, abs(elapsed - offset) * 60.0)
