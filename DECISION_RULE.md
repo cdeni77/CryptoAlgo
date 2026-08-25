@@ -240,3 +240,79 @@ exclusion list or date bounds after the number is seen; and no re-running this
 test with a different artifact to find one that passes. If a second artifact is
 ever tested, it counts as a second trial and is recorded in the promotion ledger
 like any other.
+
+---
+
+# Appendix A.1 — the pass criterion (added 2026-08-25, still before the number)
+
+**An addition, not an edit.** Appendix A stands; this fixes three things it left
+loose, all of which would otherwise be settled after the result was visible.
+
+## The forecast leg is not a sign test
+
+Appendix A's outcome table separates significance from sign, but the body's
+forecast column reads `>= 0`, and a point estimate of +0.001 inside a 90%
+interval of [−0.05, +0.05] would satisfy that. It should not.
+
+**A forecast pass requires the one-sided lower bound to exceed 0** — equivalently
+`p <= 0.05` with a positive point estimate, since the 5th percentile lying above
+zero is the same statement. The threshold is **0**, not something larger, because
+this leg only asks whether the model forecasts better than the price at all;
+whether the margin is large enough to pay is the economic test's question and it
+is a different one, on different data.
+
+## Three outcomes, not two, and "cannot resolve" is a real one
+
+An interval spanning zero can mean two different things and they must not be
+pooled:
+
+* **No edge** — the interval spans zero and is *tight enough to exclude a
+  material edge*.
+* **Cannot resolve** — the interval spans zero and still admits a material one.
+
+**Material is fixed here as +0.001 nats**, which is not arbitrary: it is the
+model's own demonstrated out-of-sample skill over `F(x/sigma)` (+0.00101, six
+folds, five years). An edge over the *market* smaller than the edge it has
+already shown over the *baseline* is not worth acting on.
+
+| forecast result | branch |
+|---|---|
+| lower bound > 0 | **pass** — subject to Appendix A's bug checklist |
+| spans 0, upper bound < +0.001 | **no edge**, resolved |
+| spans 0, upper bound >= +0.001 | **cannot resolve** |
+| upper bound < 0 | **fail** — the market is better, and it is established |
+
+**"Cannot resolve" does not fall through to the pivot list and does not pass.**
+It means this test did not answer the question, the body's forward-recording
+forecast test runs to term as originally written, and nothing about the strategy
+changes on the strength of it. Recording it as its own branch now is the whole
+point: after the fact it would be argued as either of its neighbours.
+
+## The 5-day block will govern, and ~14 blocks is thin
+
+Stated as a prediction rather than left to be discovered. `core/inference.py`'s
+own fixture shows 5-day intervals running **1.9–2.0x wider** than 1-day ones under
+an AR(1) day-level effect, and a regime *is* persistence. So under "the more
+conservative governs", the 5-day result will govern in practice, and the effective
+inference base is **~14 blocks over 69 days, not 69**.
+
+That is thin, and it is the honest number. **A wide interval is therefore the
+expected outcome, not a surprise, and must not be relitigated as one** — it is the
+predicted consequence of a 69-day sample, which is why "cannot resolve" is a
+pre-registered branch above rather than an escape hatch invented on the day.
+
+## Two additional checks before any result is read
+
+* **Exclusions must not be date-correlated across the 2026-06-25 cutoff.** The
+  two endpoints serve identical values under different names and the backfill
+  routes by that cutoff, so a difference in how bid/ask is populated on either
+  side would concentrate exclusions in the earliest weeks. A bootstrap that
+  resamples by day is hurt worst by exactly that: it removes whole blocks rather
+  than scattered rows. The coverage report breaks out rows returned, two-sided
+  share, median spread and exclusion reasons on each side of the boundary. **A
+  material difference must be reported before the test runs**, not after.
+* **Absolute log loss by offset, not only the difference.** At +14m the market
+  should score very low — the window is nearly settled — but **bounded away from
+  zero**. A `market_ll` near 0.00 at that offset is the signature of a candle that
+  contains the settlement itself, and the difference alone hides it because both
+  forecasters would be scored against the same leaked outcome.
