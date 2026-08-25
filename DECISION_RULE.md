@@ -316,3 +316,62 @@ pre-registered branch above rather than an escape hatch invented on the day.
   zero**. A `market_ll` near 0.00 at that offset is the signature of a candle that
   contains the settlement itself, and the difference alone hides it because both
   forecasters would be scored against the same leaked outcome.
+
+---
+
+# Appendix B — the market-initialised refit (added 2026-08-25, before fitting)
+
+**An addition, not an edit.** Written before any model is fitted.
+
+This is what the quote backfill was for. `init_score` becomes `logit(price)`
+instead of `logit(F(x/sigma))`, so the model learns `logit(truth) - logit(price)` —
+how the price is wrong, which is the quantity the money depends on.
+
+## The sample is 69 days and that is not a choice
+
+The market-init residual only exists where a price exists. The three series began
+2026-06-17, so 19,341 symbol-windows over 70 UTC days is the entire population,
+not a subset someone picked. Every caveat about one regime applies and cannot be
+fixed by waiting less or looking harder.
+
+Two consequences fixed here in advance:
+
+* **This model cannot be promoted on these gates.** `windows_evaluated` needs
+  20,000 and 6/7 of 19,341 is 16,578. It is short, it will stay short until
+  ~2026-09-08, and that is a fact about the sample rather than a reason to relax
+  the gate.
+* **Fold agreement is worth nothing here.** Six folds over 69 days are ~11 days
+  each; "5 of 6 positive" is a 34.6% event at rho 0.7. The number to read is the
+  effect against its own dispersion, by the same circular block bootstrap over
+  UTC days that Appendix A fixes.
+
+## Split, fixed now
+
+* **Fit and validate:** `window_open` in [2026-06-17, 2026-08-19), purged
+  walk-forward, 6 folds, 1-day embargo — the same machinery as everything else.
+* **Forward holdout:** `window_open` in [2026-08-19, 2026-08-25]. **Never fitted
+  on, never used to choose anything.** Roughly 7 days, ~2,000 symbol-windows.
+* The holdout is read **once**. If it is read and the answer is disliked, that is
+  the end of the experiment, not the start of a search.
+
+## What counts as success
+
+Against the same benchmark as Appendix A, on the holdout:
+
+| result | reading |
+|---|---|
+| `model_minus_market` lower bound > 0 | the refit beats the price out of sample |
+| spans 0, upper bound < +0.001 | no improvement, resolved |
+| spans 0, upper bound >= +0.001 | cannot resolve on 7 days — expected, and not a failure |
+| upper bound < 0 | the refit is worse than the price |
+
+**The comparison that decides whether the refit was worth doing is against the
+BASELINE-init artifact on the same holdout rows**, not against zero. The existing
+force-promoted model already scores +0.002105 against the market over this era. A
+market-init model that scores less than that has cost accuracy for elegance.
+
+## What a bug looks like
+
+`init_score = logit(price)` means an untrained model reproduces the price exactly,
+so `model_minus_market` must be ~0.000000 at zero trees. Anything else means the
+init score is not what the code thinks it is. That check runs first.
