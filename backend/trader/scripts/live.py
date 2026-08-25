@@ -815,10 +815,21 @@ def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:
     return attach_market_logit(out)
 
 
-# How early to wake, so the quote lands ON the offset rather than after it. The
-# cycle spends this fetching bars, reconciling and scoring before it reads the
-# book; measured in-cycle latency is ~5-15s.
-DECISION_LEAD_SECONDS = 12.0
+# Wake just AFTER the offset, not before it.
+#
+# The first version of this woke 12 seconds early, reasoning that the cycle needs
+# that long to fetch bars, reconcile and score before it reads the book. It made
+# the lag four times worse — 2.64 minutes against the 0.62 it was meant to fix.
+#
+# `choose_offset(elapsed)` returns the largest offset at or below `elapsed`. Waking
+# at 5.8 minutes therefore selects offset **3**, not 6, and scores the old offset
+# nearly three minutes late. The simulation that vetted the early wake checked
+# where the loop landed and never checked what `choose_offset` would do with it.
+#
+# One second past the boundary picks the intended offset, and the residual lag is
+# then just the in-cycle latency before the book is read. Driving that below ~15s
+# means reordering the cycle to fetch quotes first, which is a separate change.
+DECISION_LAG_SECONDS = 1.0
 
 
 def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime] = None) -> float:
@@ -835,7 +846,7 @@ def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime]
     total model edge of +0.002. The bias was comparable to the whole effect and
     ran against us.
 
-    Waking at `window_open + offset - lead` collapses it to the in-cycle latency.
+    Waking at `window_open + offset + 1s` collapses it to the in-cycle latency.
     Falls back to `--cycle-seconds` when no offset is ahead in this window, so
     settlement and reconciliation still run on their old cadence.
     """
@@ -845,7 +856,7 @@ def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime]
     candidates = []
     for window in (window_open, window_open + timedelta(minutes=config.window_minutes)):
         for offset in config.decision_offsets:
-            target = window + timedelta(minutes=offset) - timedelta(seconds=DECISION_LEAD_SECONDS)
+            target = window + timedelta(minutes=offset) + timedelta(seconds=DECISION_LAG_SECONDS)
             delay = (target - now).total_seconds()
             if delay > 1.0:
                 candidates.append(delay)
