@@ -834,9 +834,15 @@ DECISION_LAG_SECONDS = 1.0
 # waiting for the next one. Wider than a cycle takes (~10s), narrower than the gap
 # between offsets (180s).
 MISSED_TARGET_GRACE_SECONDS = 60.0
+# How close to an offset instant a cycle must be to make a decision at all. Wider
+# than a cycle takes (~10s) plus the grace above; far narrower than the 180s
+# between offsets, so each offset is decided once.
+DECISION_TOLERANCE_SECONDS = 75.0
 
 
-def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime] = None) -> float:
+def seconds_until_next_decision(config: Config, args, *,
+                                now: Optional[datetime] = None,
+                                already_fired: Optional[set] = None) -> float:
     """Sleep until just before the next decision offset, not a fixed interval.
 
     **The free-running timer was a measurement bias.** The loop slept
@@ -857,6 +863,11 @@ def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime]
     now = now or datetime.now(timezone.utc)
     window_open, _ = current_window(now, config)
     horizon = float(getattr(args, 'cycle_seconds', 60) or 60)
+    if already_fired is not None:
+        # Keep only this window and the next; anything older cannot fire again.
+        keep = {window_open, window_open + timedelta(minutes=config.window_minutes)}
+        already_fired.intersection_update(
+            {k for k in already_fired if k[0] in keep})
     candidates = []
     for window in (window_open, window_open + timedelta(minutes=config.window_minutes)):
         for offset in config.decision_offsets:
@@ -870,8 +881,20 @@ def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime]
             # a two-second overshoot at 02:03:01 became a decision at 02:04:10,
             # labelled +3m and taken at +4.17m. Every offset was missed the same
             # way, which is worse than the free-running timer this replaced.
+            # A target just behind us fires NOW rather than being skipped — but
+            # exactly ONCE. Without the `already_fired` guard this returns 0.5s,
+            # the cycle runs, the target is still inside the grace window, and it
+            # fires again: measured, fourteen order attempts in three minutes
+            # where there should have been one or two. `already_entered` does not
+            # save you, because a refused order books no position and is
+            # legitimately retryable.
+            key = (window, offset)
             if -MISSED_TARGET_GRACE_SECONDS < delay <= 1.0:
-                return 0.5
+                if already_fired is None or key not in already_fired:
+                    if already_fired is not None:
+                        already_fired.add(key)
+                    return 0.5
+                continue
             if delay > 1.0:
                 candidates.append(delay)
     if not candidates:
@@ -887,6 +910,27 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     window_open, elapsed = current_window(now, config)
     offset = args.offset if args.offset is not None else choose_offset(elapsed, config)
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
+
+    # **Decide AT an offset, not on every cycle that happens to be past one.**
+    #
+    # `choose_offset` returns the largest offset at or below `elapsed`, so at 4, 5
+    # and 6 minutes into a window it returns 3, 3, 6 — and every cycle in between
+    # produced a full decision and an order attempt. Measured: fourteen order
+    # attempts in three minutes where there should have been two. The intermediate
+    # cycles exist to settle and reconcile on a steady cadence; they were never
+    # meant to trade.
+    #
+    # `CLAUDE.md`'s rule is to walk the offsets in order and take the first that
+    # clears every gate — four decision points per window, not eighteen. Anything
+    # further from its offset than the tolerance settles and reconciles, then
+    # returns.
+    on_offset = offset is not None and abs(
+        elapsed - offset) * 60.0 <= DECISION_TOLERANCE_SECONDS
+    if offset is not None and not on_offset:
+        logger.debug('%.2fm into the window, nearest offset +%dm is %.0fs away; '
+                     'settling and reconciling only',
+                     elapsed, offset, abs(elapsed - offset) * 60.0)
+        offset = None
 
     # **The book is read FIRST, before bars and reconciliation.**
     #
@@ -1495,6 +1539,10 @@ async def main() -> int:
 
     try:
         with writer.exclusive_trader_lock():
+            # (window_open, offset) pairs already acted on, so a target that was
+            # missed and fired late is not fired repeatedly for the whole grace
+            # window. Bounded: pruned to the current and next window.
+            fired_targets: set = set()
             while True:
                 try:
                     decisions = await run_cycle(args, config, writer, model, kalshi)
@@ -1510,7 +1558,8 @@ async def main() -> int:
                     logger.info('cycle: %s', counts[counts > 0].to_dict())
                 if not args.loop:
                     return 0
-                await asyncio.sleep(seconds_until_next_decision(config, args))
+                await asyncio.sleep(seconds_until_next_decision(
+                    config, args, already_fired=fired_targets))
     except TraderAlreadyRunning as exc:
         raise SystemExit(str(exc))
     except KeyboardInterrupt:
