@@ -149,7 +149,18 @@ async def run(args) -> int:
                     await ws.send(json.dumps({'id': 1, 'cmd': 'subscribe', 'params': {
                         'channels': ['orderbook_delta'],
                         'market_tickers': sorted(wanted)}}))
-                    deadline = datetime.now(timezone.utc) + timedelta(minutes=16)
+                    # Resubscribe at the next window boundary, not on a fixed
+                    # 16-minute timer. A market becomes `open` when its window
+                    # starts, so a fixed timer that began mid-window subscribes to
+                    # a market whose offsets have already passed and then sits
+                    # idle — which is exactly what the first run did: it
+                    # subscribed at +12.6m to a window whose last offset was 38
+                    # seconds behind it, and recorded nothing for 16 minutes.
+                    now = datetime.now(timezone.utc)
+                    boundary = now.replace(second=0, microsecond=0, minute=(
+                        now.minute // config.window_minutes) * config.window_minutes)
+                    deadline = boundary + timedelta(minutes=config.window_minutes,
+                                                    seconds=5)
                     while datetime.now(timezone.utc) < deadline:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)

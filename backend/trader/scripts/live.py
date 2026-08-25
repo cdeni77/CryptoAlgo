@@ -711,6 +711,41 @@ def _ticket_for(writer: PgWriter, position):
                 .one_or_none())
 
 
+def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
+                  config: Config) -> None:
+    """Write the venue's top of book, with sizes, to the research store.
+
+    Best effort: a failure here must never stop a trading cycle, because this is
+    measurement and the cycle is money.
+    """
+    try:
+        from core.datastore import ResearchStore
+
+        rows = []
+        for symbol in scored['symbol']:
+            quote = quotes.get(symbol, (None, None))[0]
+            if quote is None or quote.yes_bid is None or quote.yes_ask is None:
+                continue
+            event_time = pd.Timestamp(window_open) + pd.Timedelta(minutes=offset)
+            rows.append({
+                'venue': 'kalshi', 'symbol': symbol, 'event_time': event_time,
+                'available_time': pd.Timestamp.now(tz='UTC'), 'quality': 'valid',
+                'market_ticker': quotes[symbol][1], 'window_open': window_open,
+                'offset_minutes': offset,
+                'yes_bid': float(quote.yes_bid), 'yes_ask': float(quote.yes_ask),
+                'yes_bid_size': float(quote.yes_bid_size or 0.0),
+                'yes_ask_size': float(quote.yes_ask_size or 0.0),
+                'depth_bid_1c': float('nan'), 'depth_bid_5c': float('nan'),
+                'depth_ask_1c': float('nan'), 'depth_ask_5c': float('nan'),
+                'levels_bid': float('nan'), 'levels_ask': float('nan'),
+                'seq': float('nan'), 'gaps': 0.0,
+            })
+        if rows:
+            ResearchStore().write('venue_depth', pd.DataFrame(rows))
+    except Exception as exc:                       # noqa: BLE001 - never break a cycle
+        logger.warning('could not record top of book (%s)', str(exc)[:120])
+
+
 def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:
     """Attach whatever init score this artifact was fitted on.
 
@@ -878,6 +913,18 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # only thing between the two positions was `settle_time`.
     scored = prepare_init_score(scored, model)
     scored['model_probability'] = model.predict(scored)
+
+    # **Record the top of book we already have.** `Quote` parses `yes_bid_size`
+    # and `yes_ask_size` from the same REST response the price comes from, and
+    # `decide()` already uses them to cap the stake — and then they were dropped.
+    #
+    # They are the missing half of the economic question and they cost nothing:
+    # no historical endpoint carries size (candlesticks give top-of-book price and
+    # nothing behind it; the settled orderbook returns empty), so a size not
+    # written down here is gone. Observed at the touch: BTC ~6,900 contracts, ETH
+    # ~109, SOL ~6.9 — against orders of ~7, which makes SOL the case where this
+    # actually decides whether a fill was possible.
+    _record_touch(scored, quotes, window_open, offset, config)
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is
