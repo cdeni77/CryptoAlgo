@@ -872,6 +872,29 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     now = datetime.now(timezone.utc)
     window_open, elapsed = current_window(now, config)
     offset = args.offset if args.offset is not None else choose_offset(elapsed, config)
+    settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
+
+    # **The book is read FIRST, before bars and reconciliation.**
+    #
+    # The quote has to describe the same instant the model's features do. With the
+    # scheduler waking one second past the offset, the remaining lag is whatever
+    # the cycle does before it reads the book — measured at 5.8s, of which the
+    # Coinbase fetch is ~3s and venue reconciliation ~1s. Reading the book first
+    # takes that to roughly one second.
+    #
+    # Safe for trading as well as honest for measurement: a quote that goes stale
+    # during the cycle can only cost a fill, never an overpay, because the order
+    # is `fill_or_kill` at a limit derived from this price. Not filling is the
+    # direction to be wrong in.
+    quotes: dict = {}
+    quote_time = pd.Timestamp.now(tz='UTC')
+    if offset is not None and kalshi is not None:
+        try:
+            quotes = await fetch_quotes(kalshi, list(config.symbols), settle_time)
+            quote_time = pd.Timestamp.now(tz='UTC')
+        except Exception as exc:              # noqa: BLE001 - the cycle still settles
+            logger.error('could not read the book (%s); no decision this cycle', exc)
+            quotes, offset = {}, None
 
     bars = await fetch_bars(config)
     if not bars:
@@ -933,8 +956,6 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
 
-    settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
-    quotes = await fetch_quotes(kalshi, list(scored['symbol'].unique()), settle_time)
     # **When the book was actually read**, which is not `window_open + offset`.
     #
     # Measured over the first two live days: a decision nominally at +3m read its
@@ -947,7 +968,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # It is not a trading bug: a fresh quote is what a fill would actually pay.
     # It is a *measurement* bug, and the fix is for the row to say what happened
     # rather than what was intended, so `market_benchmark` can filter or correct.
-    quote_time = pd.Timestamp.now(tz='UTC')
+    # `quote_time` is stamped where the book is actually read, at the top of the
+    # cycle.
     scored['ask_up'] = [
         quotes[s][0].ask_for('up') if s in quotes else np.nan for s in scored['symbol']]
     scored['ask_down'] = [
