@@ -136,6 +136,56 @@ def main() -> int:
         print(f'    {symbol}  n={len(part):>5,}  win {part["won"].mean():.3f}  '
               f'pnl ${part["pnl"].sum():+9,.2f}  '
               f'edge {100*part["pnl"].sum()/part["contracts"].sum():+.2f}pp')
+    # --- the money gates, at real prices ------------------------------------
+    #
+    # `sharpe_implausible` fired on the promoted artifact at 5.61 and blocked it.
+    # That gate's job is to notice a number that cannot be real, and it was right:
+    # every money figure behind it came from a backtest where `price_source` is
+    # the calibrated baseline, so the model was trading against its own null at a
+    # price derived from the very thing it was fitted to correct. The Sharpe was
+    # not measuring a forecast, it was measuring a self-referential trade.
+    #
+    # Recomputed here against the venue's actual bid and ask, using the identical
+    # definition from `core/book.py`: daily PnL on calendar days with idle days
+    # in the denominator, annualised on sqrt(365.25). Not per-trade, which can
+    # carry the opposite sign from the account.
+    trades = trades.sort_values('window_open')
+    settle = pd.to_datetime(trades['window_open'], utc=True) + pd.Timedelta(
+        minutes=config.window_minutes)
+    daily = trades.assign(settle=settle).set_index('settle')['pnl'].resample('1D').sum()
+    if len(daily) > 1:
+        calendar = pd.date_range(daily.index.min(), daily.index.max(), freq='1D',
+                                 tz=daily.index.tz)
+        daily = daily.reindex(calendar, fill_value=0.0)
+    values = daily.to_numpy(dtype=float)
+    sd = float(np.std(values, ddof=1)) if len(values) > 1 else float('nan')
+    sharpe = float(np.mean(values)) / sd * np.sqrt(365.25) if sd else float('nan')
+    equity = args.bankroll + trades['pnl'].cumsum()
+    drawdown = float(((equity.cummax() - equity) / equity.cummax()).max())
+    total_return = float(pnl / args.bankroll)
+
+    from core.metrics import DEFAULT_GATES, IMPLAUSIBLE_SHARPE
+    print('\n  the money gates, recomputed at the venue\'s real prices')
+    checks = [
+        ('realised_edge_pp', 100 * pnl / trades['contracts'].sum(), 'min'),
+        ('total_return', total_return, 'min'),
+        ('sharpe', sharpe, 'min'),
+        ('max_drawdown', drawdown, 'max'),
+        ('trades', float(len(trades)), 'min'),
+        ('coverage', len(trades) / len(joined), 'min'),
+    ]
+    for name, value, direction in checks:
+        threshold = DEFAULT_GATES[name][0]
+        ok = value >= threshold if direction == 'min' else value <= threshold
+        print(f'    [{"pass" if ok else "FAIL"}] {name:<20}{value:>12.5f} '
+              f'{">=" if direction == "min" else "<="} {threshold}')
+    implausible = np.isfinite(sharpe) and sharpe > IMPLAUSIBLE_SHARPE
+    print(f'    [{"FAIL" if implausible else "pass"}] {"sharpe_implausible":<20}'
+          f'{sharpe:>12.5f} <= {IMPLAUSIBLE_SHARPE}'
+          f'{"   <- still a bug signature" if implausible else "   <- plausible now"}')
+    print(f'\n    for comparison, the backtest at its counterfactual price: '
+          f'sharpe 5.61, return 71.51')
+
     print('\n  NOTE: fills are still assumed. There is no depth history, and live '
           'measurement\n  says ~30% of intended orders do not fill — with the '
           'failures carrying a HIGHER\n  claimed edge than the fills. The price is '
