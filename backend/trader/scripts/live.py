@@ -830,6 +830,10 @@ def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:
 # then just the in-cycle latency before the book is read. Driving that below ~15s
 # means reordering the cycle to fetch quotes first, which is a separate change.
 DECISION_LAG_SECONDS = 1.0
+# How far past an offset instant is still worth acting on immediately rather than
+# waiting for the next one. Wider than a cycle takes (~10s), narrower than the gap
+# between offsets (180s).
+MISSED_TARGET_GRACE_SECONDS = 60.0
 
 
 def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime] = None) -> float:
@@ -858,6 +862,16 @@ def seconds_until_next_decision(config: Config, args, *, now: Optional[datetime]
         for offset in config.decision_offsets:
             target = window + timedelta(minutes=offset) + timedelta(seconds=DECISION_LAG_SECONDS)
             delay = (target - now).total_seconds()
+            # **A target just behind us must fire NOW, not be skipped.**
+            #
+            # The sleep is computed after the cycle finishes, so a cycle that runs
+            # even slightly long ends up past the target it was aiming at. Dropping
+            # it then jumps to the NEXT offset, capped at the ordinary cadence — so
+            # a two-second overshoot at 02:03:01 became a decision at 02:04:10,
+            # labelled +3m and taken at +4.17m. Every offset was missed the same
+            # way, which is worse than the free-running timer this replaced.
+            if -MISSED_TARGET_GRACE_SECONDS < delay <= 1.0:
+                return 0.5
             if delay > 1.0:
                 candidates.append(delay)
     if not candidates:
@@ -978,6 +992,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
     # `Quote.mid` is None on a one-sided book, which is the honest answer: the
     # midpoint of a single quote is not a midpoint.
+    scored['exchange_index'] = [
+        quotes[s][0].exchange_index if s in quotes else 0 for s in scored['symbol']]
     scored['market_mid'] = [
         quotes[s][0].mid if s in quotes else np.nan for s in scored['symbol']]
 
@@ -1001,7 +1017,12 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # written down here is gone. Observed at the touch: BTC ~6,900 contracts, ETH
     # ~109, SOL ~6.9 — against orders of ~7, which makes SOL the case where this
     # actually decides whether a fill was possible.
-    await _record_touch(scored, quotes, window_open, offset, config, kalshi)
+    # Kept behind a flag from the bisect that cleared it: this was the last change
+    # deployed before every order began returning `market_not_found`, so it was the
+    # first suspect. Disabling it changed nothing — the cause was the market's
+    # `exchange_index` moving to 2 while the order body defaulted to 0.
+    if os.getenv('RECORD_TOUCH', '1') == '1':
+        await _record_touch(scored, quotes, window_open, offset, config, kalshi)
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is
@@ -1261,10 +1282,15 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
 
     filled = decision.contracts
     placed_price = decision.price
+    # The market's own exchange, not the order body's default of 0. See
+    # `Quote.exchange_index` — a mismatch returns `404 market_not_found`, which
+    # names the market rather than the mismatch and took a bisect to find.
+    exchange_index = int(getattr(row, 'get', lambda *_: 0)('exchange_index', 0) or 0)
     if placing:
         try:
             order = await kalshi.place_order(
                 ticker=decision.market_ticker, side=decision.side.value,
+                exchange_index=exchange_index,
                 contracts=decision.contracts,
                 limit_price=order_limit_price(decision),
                 # **The offset belongs in this key.** Keyed on (symbol, window)

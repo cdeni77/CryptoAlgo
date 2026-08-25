@@ -115,6 +115,13 @@ class Quote:
     # about $12, well under the $25 the sizing rules were willing to stake.
     yes_bid_size: Optional[float] = None
     yes_ask_size: Optional[float] = None
+    # **Which exchange the market lives on.** The order body's `exchange_index`
+    # defaults to 0, and on 2026-08-25 every KX*15M market reported 2 — orders
+    # defaulting to 0 came back `404 market_not_found` for a market every read
+    # endpoint confirmed was active. 274 orders had filled earlier the same night,
+    # so the series moved rather than the code breaking. Carrying the market's own
+    # value means a future migration costs nothing.
+    exchange_index: int = 0
     # The number the market settles against, published once the window opens.
     # The live path should prefer this over anything computed from bars.
     floor_strike: Optional[float] = None
@@ -466,6 +473,7 @@ class KalshiClient:
         *,
         ticker: str,
         side: str,
+        exchange_index: int = 0,
         contracts: int,
         limit_price: float,
         client_order_id: Optional[str] = None,
@@ -536,6 +544,10 @@ class KalshiClient:
             # fill_or_kill on a wasting 15-minute market is for; `maker` would rest
             # and is the opposite of the intent.
             'self_trade_prevention_type': 'taker_at_cross',
+            # Which exchange holds the market. Omitting it defaults to 0, and a
+            # market on another exchange is then simply not found — a 404 that
+            # names the market rather than the mismatch.
+            'exchange_index': int(exchange_index),
         }
         if client_order_id:
             body['client_order_id'] = client_order_id
@@ -565,6 +577,7 @@ def _to_quote(raw: dict) -> Quote:
         last_price=_price(raw, 'last_price'),
         volume=int(_quantity(raw, 'volume')),
         open_interest=int(_quantity(raw, 'open_interest')),
+        exchange_index=int(raw.get('exchange_index') or 0),
         close_time=_parse_time(raw.get('close_time')),
         status=str(raw.get('status', 'unknown')),
         yes_bid_size=_quantity(raw, 'yes_bid_size') or None,
