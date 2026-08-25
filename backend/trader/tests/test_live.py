@@ -94,3 +94,93 @@ def test_paper_is_the_default_mode():
     assert args.mode == 'paper'
     assert not args.place_orders
     assert args.require_gates is True
+
+
+# --- the decision tolerance, measured 2026-08-25 ---------------------------
+#
+# The market's price moves ~8.4 percentage points per minute. Holding the signal
+# fixed and moving only the quote, one minute of staleness costs 0.025-0.074 nats
+# of log loss against a total model edge of 0.002-0.005 — a break-even lag of
+# about three seconds.
+#
+# `DECISION_TOLERANCE_SECONDS` was 75, which is wider than the ordinary cycle
+# cadence (60s). So after the scheduler fired on target, the *next* ordinary
+# cycle — a full minute later — was still inside tolerance and decided the same
+# offset again. Observed live on window 07:00 offset +3m: at +5s the model wanted
+# ETH up at 0.81; at +76s it wanted ETH down at 0.07, and read the market's own
+# 12-point move as a *larger* edge. The on-time orders did not fill; the stale
+# one did.
+
+def test_the_decision_tolerance_is_tighter_than_the_cycle_cadence():
+    """A tolerance wider than the cadence lets every offset be decided twice.
+
+    The second decision is a full cadence late, which is 20x the measured
+    break-even lag. This is the constant that permitted it.
+    """
+    from scripts.live import DECISION_TOLERANCE_SECONDS
+
+    assert DECISION_TOLERANCE_SECONDS < 60.0, (
+        'tolerance must be narrower than the ordinary cycle, or the cycle after '
+        'an on-target decision re-decides the same offset while stale'
+    )
+
+
+def test_the_decision_tolerance_fits_the_measured_latency_budget():
+    """Break-even lag is ~3s strict, ~10s generous. Allow the cycle to run."""
+    from scripts.live import DECISION_TOLERANCE_SECONDS
+
+    assert 5.0 <= DECISION_TOLERANCE_SECONDS <= 20.0
+
+
+def test_a_stale_cycle_does_not_decide_the_offset_it_has_drifted_past():
+    """+72s past an offset must abstain; +6s must act.
+
+    These are the two lags actually observed in production.
+    """
+    from scripts.live import decision_offset
+
+    # 6 seconds past +3m -> decide at 3
+    assert decision_offset(3 + 6 / 60.0, CFG) == 3
+    # 72 seconds past +3m -> too stale, abstain rather than trade a moved market
+    assert decision_offset(3 + 72 / 60.0, CFG) is None
+
+
+def test_an_explicit_offset_overrides_the_tolerance():
+    """A forced offset is a deliberate instruction — a backfill or a manual run —
+    and is not subject to the staleness gate."""
+    from scripts.live import decision_offset
+
+    assert decision_offset(3 + 600 / 60.0, CFG, forced=3) == 3
+
+
+def test_before_the_first_offset_there_is_nothing_to_decide():
+    from scripts.live import decision_offset
+
+    assert decision_offset(1.0, CFG) is None
+
+
+def test_the_exchange_shard_is_read_off_the_markets_not_hardcoded():
+    """Which shard holds the money we can spend is the venue's statement.
+
+    Kalshi moved the KX*15M series to `exchange_index` 2 mid-session on
+    2026-08-25. A constant would have to be edited on the next move; the quotes
+    carry it.
+    """
+    from data_collection.kalshi_client import Quote
+    from scripts.live import venue_exchange_index
+
+    def quote(ticker: str) -> Quote:
+        return Quote(ticker=ticker, yes_bid=0.50, yes_ask=0.51, no_bid=0.49,
+                     no_ask=0.50, last_price=0.50, volume=1, open_interest=1,
+                     close_time=None, status='active', exchange_index=2)
+
+    quotes = {'BTC-USD': quote('a'), 'ETH-USD': quote('b')}
+    assert venue_exchange_index(quotes) == 2
+
+
+def test_with_no_quotes_no_shard_is_claimed():
+    """No book read this cycle means no basis for narrowing the balance, so fall
+    back to the whole-account figure rather than guessing a shard."""
+    from scripts.live import venue_exchange_index
+
+    assert venue_exchange_index({}) is None

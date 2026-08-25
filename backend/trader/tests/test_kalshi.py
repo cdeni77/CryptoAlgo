@@ -335,7 +335,7 @@ def test_reconcile_pulls_everything_authoritative_in_one_call():
     client = KalshiClient(key_id='k', private_key_pem='')
     calls: list[str] = []
 
-    async def balance():
+    async def balance(*, exchange_index=None):
         calls.append('balance')
         return 137.42
 
@@ -369,7 +369,7 @@ def test_reconcile_survives_settlements_being_unavailable():
 
     client = KalshiClient(key_id='k', private_key_pem='')
 
-    async def balance():
+    async def balance(*, exchange_index=None):
         return 100.0
 
     async def positions():
@@ -500,3 +500,90 @@ def test_settling_from_bars_uses_the_trained_rule(tmp_path):
         'strike_type is greater_or_equal — and the bar read must be the one '
         'ENDING at settle_time, not the one starting there'
     )
+
+
+# --- per-shard balance, measured 2026-08-25 --------------------------------
+#
+# Kalshi shards its exchange by category and **subaccount balances are local to a
+# shard**. `GET /portfolio/balance` returns a `balance_breakdown` array, one entry
+# per `exchange_index`. The KX*15M crypto series report `exchange_index=2`.
+#
+# Observed live: `balance_dollars` read "107.9618" while shard 2 held $1.35 and
+# shard 0 held $106.61. Every order was refused `insufficient_balance` against a
+# $107.96 balance, and sizing ran against 80x the capital it could reach.
+
+BREAKDOWN_PAYLOAD = {
+    'balance': 10796,
+    'balance_dollars': '107.9618',
+    'balance_breakdown': [
+        {'balance': '106.6085', 'exchange_index': 0},
+        {'balance': '0.0000', 'exchange_index': 1},
+        {'balance': '1.3533', 'exchange_index': 2},
+        {'balance': '0.0000', 'exchange_index': 3},
+    ],
+}
+
+
+def _client_returning(payload, key_pem):
+    client = KalshiClient(key_id='k', private_key_pem=key_pem)
+
+    async def _request(method, path, **kwargs):
+        return payload
+
+    client._request = _request
+    return client
+
+
+@pytest.mark.asyncio
+async def test_the_spendable_balance_is_the_shard_the_market_lives_on(key_pem):
+    """Only shard 2 can pay for a shard-2 market, whatever the total says."""
+    client = _client_returning(BREAKDOWN_PAYLOAD, key_pem)
+    assert await client.balance(exchange_index=2) == pytest.approx(1.3533)
+
+
+@pytest.mark.asyncio
+async def test_the_default_balance_is_still_the_total(key_pem):
+    """Callers that do not name a shard keep the old, whole-account meaning."""
+    client = _client_returning(BREAKDOWN_PAYLOAD, key_pem)
+    assert await client.balance() == pytest.approx(107.9618)
+
+
+@pytest.mark.asyncio
+async def test_a_shard_absent_from_the_breakdown_holds_nothing(key_pem):
+    """Not an error, and not the total: an unlisted shard is empty."""
+    client = _client_returning(BREAKDOWN_PAYLOAD, key_pem)
+    assert await client.balance(exchange_index=7) == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_a_venue_with_no_breakdown_falls_back_to_the_total(key_pem):
+    """Older responses carry no breakdown. Returning NaN there would halt trading
+    on a venue that is behaving correctly, so fall back rather than fail."""
+    client = _client_returning({'balance_dollars': '50.0000'}, key_pem)
+    assert await client.balance(exchange_index=2) == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reads_the_balance_of_the_shard_it_is_told_about(key_pem):
+    """The loop must compare its bankroll against money it can actually spend.
+
+    `reconcile` fed `balance()` with no shard, so the cross-shard total became the
+    adopted bankroll and sizing ran against capital an order could not reach.
+    """
+    client = KalshiClient(key_id='k', private_key_pem=key_pem)
+    seen = {}
+
+    async def _request(method, path, **kwargs):
+        if path == '/portfolio/balance':
+            return BREAKDOWN_PAYLOAD
+        return {}
+
+    async def _balance(*, exchange_index=None):
+        seen['exchange_index'] = exchange_index
+        return 1.3533
+
+    client._request = _request
+    client.balance = _balance
+    state = await client.reconcile(exchange_index=2)
+    assert seen['exchange_index'] == 2
+    assert state['balance'] == pytest.approx(1.3533)

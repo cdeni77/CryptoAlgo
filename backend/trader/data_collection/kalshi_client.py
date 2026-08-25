@@ -314,8 +314,12 @@ class KalshiClient:
             return json.loads(text) if text else {}
 
     # ---- reading --------------------------------------------------------
-    async def balance(self) -> float:
+    async def balance(self, *, exchange_index: Optional[int] = None) -> float:
         """Available balance in dollars, or NaN when the venue did not say.
+
+        Pass `exchange_index` to get the balance **spendable on that shard**,
+        which is the only figure an order against a market on it can draw on.
+        Omit it for the whole-account total.
 
         Two corrections. It read only the integer-cent `balance` field, while
         every other number in this file prefers the `_dollars` form — this module
@@ -333,6 +337,32 @@ class KalshiClient:
         already treat as unsafe.
         """
         payload = await self._request('GET', '/portfolio/balance')
+
+        # **Balances are local to an exchange shard.** Kalshi shards by category
+        # and `balance_breakdown` carries one entry per `exchange_index`. The
+        # KX*15M crypto series report shard 2, and on 2026-08-25 this account had
+        # $106.61 on shard 0 and $1.35 on shard 2 — so `balance_dollars` of
+        # $107.96 was 80x the capital an order could actually reach, and every
+        # order came back `insufficient_balance` against an apparently healthy
+        # balance. A caller that names the shard gets what it can spend there; a
+        # caller that does not keeps the whole-account meaning.
+        if exchange_index is not None:
+            breakdown = payload.get('balance_breakdown')
+            if isinstance(breakdown, list) and breakdown:
+                for row in breakdown:
+                    try:
+                        if int(row.get('exchange_index', -1)) == int(exchange_index):
+                            return float(row.get('balance'))
+                    except (TypeError, ValueError):
+                        logger.error('balance_breakdown row was %r', row)
+                        return float('nan')
+                # A shard the venue does not list holds nothing. Reporting the
+                # total here would be the original bug wearing a new name.
+                return 0.0
+            # No breakdown at all: an older response shape, or a venue that does
+            # not shard. Falling through to the total is right, and refusing
+            # would halt trading on a venue behaving correctly.
+
         dollars = payload.get('balance_dollars')
         if dollars is not None:
             try:
@@ -441,14 +471,18 @@ class KalshiClient:
                                       params=_clean(params))
         return list(payload.get('settlements', []))
 
-    async def reconcile(self) -> dict:
+    async def reconcile(self, *, exchange_index: Optional[int] = None) -> dict:
         """Balance, open positions and recent fills, as the venue sees them.
 
         One call site for everything authoritative, so the live loop can compare
         its own arithmetic against the account of record rather than assume the
         two agree.
+
+        `exchange_index` narrows the balance to the shard the traded markets live
+        on. Without it the cross-shard total is reported, which is not money any
+        single order can draw on — see `balance`.
         """
-        balance = await self.balance()
+        balance = await self.balance(exchange_index=exchange_index)
         positions = await self.positions()
         fills = await self.fills(limit=200)
         settled = []

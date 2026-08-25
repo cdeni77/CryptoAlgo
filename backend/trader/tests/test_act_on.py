@@ -299,3 +299,58 @@ class TestTheIdempotencyKey:
         assert count == 1 and symbols == frozenset({'BTC-USD'}), (
             'a ticket with no position must still count as an entry'
         )
+
+
+class TestOutlayMatchesTheFill:
+    """The bankroll must be debited what the venue charged, not what we intended.
+
+    `outlay` and `fee` were pro-rated from `decision.stake` and `decision.fee`,
+    both computed at the *decision* price. But `price` is booked from the fill,
+    and a `fill_or_kill` fills at or better than its limit — so actual cash out is
+    always <= the booked outlay and our bankroll read systematically low.
+
+    Observed live 2026-08-25: `placing down 1 @ 0.08` then `filled 1 @ 0.0530`.
+    The position recorded price 0.0530 and an outlay computed from 0.08, and the
+    reconciler logged the difference as unexplained "balance drift".
+    """
+
+    def test_the_outlay_is_the_price_actually_paid(self, writer):
+        from core.costs import trade_fee
+        from core.config import Config
+
+        # Decision at 0.60; the venue fills all 5 at 0.50.
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'f',
+                             'average_fill_price_dollars': '0.5000'})
+        assert run(act_on(args(), writer, kalshi, decision(contracts=5,
+                                                          price=0.60), None)) is True
+        position = writer.open_positions()[0]
+        assert float(position.price) == pytest.approx(0.50), 'fill price not booked'
+        # `outlay` is fee-inclusive, matching `decide()`'s `stake`.
+        expected = 5 * 0.50 + float(trade_fee(5, 0.50, Config()))
+        assert float(position.outlay) == pytest.approx(expected, abs=1e-6), (
+            'outlay was pro-rated from the decision stake at 0.60 rather than '
+            'computed from the 0.50 actually paid'
+        )
+
+    def test_the_fee_is_charged_on_the_fill_not_the_decision(self, writer):
+        """A fee at the decision price is the wrong fee once the fill differs."""
+        from core.costs import trade_fee
+        from core.config import Config
+
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'g',
+                             'average_fill_price_dollars': '0.5000'})
+        assert run(act_on(args(), writer, kalshi, decision(contracts=5,
+                                                          price=0.60), None)) is True
+        position = writer.open_positions()[0]
+        assert float(position.fee) == pytest.approx(
+            float(trade_fee(5, 0.50, Config())), abs=1e-6)
+
+    def test_the_bankroll_falls_by_exactly_outlay_plus_fee(self, writer):
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'h',
+                             'average_fill_price_dollars': '0.5000'})
+        before = float(writer.account().bankroll)
+        assert run(act_on(args(), writer, kalshi, decision(contracts=5,
+                                                          price=0.60), None)) is True
+        position = writer.open_positions()[0]
+        after = float(writer.account().bankroll)
+        assert before - after == pytest.approx(float(position.outlay), abs=1e-6)

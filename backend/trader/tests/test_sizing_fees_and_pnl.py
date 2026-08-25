@@ -45,31 +45,54 @@ def row(**over):
 
 # ------------------------------------------------------- the per-order ceiling
 
-def test_the_fee_ceiling_gate_is_reachable_and_fires_at_the_rounding_excess():
-    """At 50c a one-contract order owes $0.0175 and is charged $0.02.
+def test_the_per_order_fee_ceiling_no_longer_has_an_excess_worth_gating():
+    """The premise of the FEE_CEILING gate was measured away.
 
-    The excess is $0.0025, so an edge of 0.25pp or less survives the continuous
-    check and dies on the real charge. These are the boundary numbers:
-    cost = 0.505 + 0.07*0.505*0.495 = 0.522498.
+    This test used to assert that one contract at 50c owes $0.0175 and is charged
+    $0.02 — a $0.0025 excess that killed any edge under 0.25pp. Checked against
+    328 real fills on 2026-08-25, the venue ceilings to a **hundredth of a cent**,
+    so that order pays $0.0175 exactly and the excess at 50c is zero.
+
+    Two consequences, both asserted here:
+
+    * the per-order excess can never exceed $0.0001, whatever the price; and
+    * the gate is therefore **unreachable**. An edge small enough to be killed by
+      a hundredth of a cent is far too small to size a single contract, so
+      `BELOW_MIN_CONTRACTS` always fires first. The refusal is kept because it is
+      a correct statement about a venue that might coarsen its rounding again --
+      but nothing reaches it today, and a future reader should not believe the old
+      docstring's arithmetic.
     """
     config = Config(min_edge_pp=0.0, kelly_fraction=1.0, max_stake_dollars=0.60,
                     min_contracts=1)
-    cost = float(effective_price(0.50, config))
-    assert cost == pytest.approx(0.522498, abs=1e-6)
+    # The continuous formula is unchanged; only the charged amount moved.
+    assert float(effective_price(0.50, config)) == pytest.approx(0.522498, abs=1e-6)
+    assert float(trade_fee(1, 0.50, config)) == pytest.approx(0.0175)
 
-    # Edge of exactly the rounding excess: refused, and refused by name.
-    marginal = decide(row(baseline_probability=0.50, model_probability=cost + 0.0025),
-                      config, bankroll=100.0)
-    assert marginal.reason is Reason.FEE_CEILING, marginal.reason
+    for price in (0.05, 0.37, 0.50, 0.63, 0.91):
+        for contracts in (1, 3, 17):
+            raw = 0.07 * contracts * price * (1 - price)
+            excess = float(trade_fee(contracts, price, config)) - raw
+            # -1e-12 not 0: an exact multiple lands a float epsilon below.
+            assert -1e-12 <= excess < 1e-4, (price, contracts, excess)
+
+    # The excess at 37c is $0.0000830. An edge below it cannot buy a contract.
+    cost_37 = float(effective_price(0.37, config))
+    marginal = decide(
+        row(baseline_probability=0.37, model_probability=cost_37 + 4e-5),
+        config, bankroll=100.0)
     assert marginal.contracts == 0
+    assert marginal.reason is Reason.BELOW_MIN_CONTRACTS, (
+        'if this becomes FEE_CEILING the venue has coarsened its rounding and '
+        'the cost model needs re-measuring against real fills'
+    )
 
-    # A hair more: it trades, and the fee charged is the ceiling, not the formula.
-    trades = decide(row(baseline_probability=0.50, model_probability=cost + 0.0035),
+    # And a real edge trades, charged the ceiling rather than the raw formula.
+    trades = decide(row(baseline_probability=0.37, model_probability=cost_37 + 0.01),
                     config, bankroll=100.0)
-    assert trades.traded
-    assert trades.contracts == 1
-    assert trades.fee == pytest.approx(0.02)
-    assert trades.fee > 0.07 * 1 * 0.50 * 0.50, 'charged the formula, not the ceiling'
+    assert trades.traded and trades.contracts >= 1
+    assert trades.fee == pytest.approx(float(trade_fee(trades.contracts,
+                                                       trades.price, config)))
 
 
 def test_the_fee_ceiling_gate_is_dead_under_the_default_edge_gate():

@@ -63,7 +63,7 @@ class VenueStub:
         self.balance = balance
         self.reads = 0
 
-    async def reconcile(self):
+    async def reconcile(self, *, exchange_index=None):
         self.reads += 1
         return {
             'balance': self.balance,

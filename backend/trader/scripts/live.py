@@ -69,6 +69,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import Config, DEFAULT_CONFIG, find_fee_config
+from core.costs import trade_fee
 from core.dataset import score_live
 from core.decide import (
     Decision, Reason, Side, WindowExposure, decide, rejection_histogram,
@@ -133,6 +134,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--offset', type=int, default=None,
                         help='Force a decision offset instead of using whichever '
                              'configured offset the clock has just passed.')
+    parser.add_argument('--entry-offsets', type=int, nargs='+', default=[12],
+                        metavar='M',
+                        help='Which decision offsets may OPEN a position. Every '
+                             'configured offset is still scored and recorded; this '
+                             'restricts only entries. Default 12: measured over 70 '
+                             'days, taking the earliest offset that cleared the '
+                             'gate returned 0.040c per contract (t=0.10) against '
+                             '3.304c at +12m alone (t=5.98), and in production 90%% '
+                             'of entries landed at +3m. Pass "9 12" for the '
+                             'conservative widening, or every offset to restore the '
+                             'old behaviour.')
     parser.add_argument('--reconcile', dest='reconcile', action='store_true',
                         default=True,
                         help='Live only. Take balance, fills and settlements from '
@@ -631,7 +643,35 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float) -> None:
     writer.update_account(bankroll=venue_balance)
 
 
-async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> VenueState:
+def venue_exchange_index(quotes: dict) -> Optional[int]:
+    """Which exchange shard the traded markets live on, per the venue.
+
+    Kalshi shards its exchange by category and **balances are local to a shard**,
+    so the only balance an order can draw on is the one on the shard holding its
+    market. On 2026-08-25 the KX*15M series moved to shard 2 while this account's
+    funds sat on shard 0, and every order was refused `insufficient_balance`
+    against an apparently healthy $107.96 total.
+
+    Read off the quotes rather than configured, for the same reason markets are
+    resolved by asking rather than by building a ticker: a constant is a guess
+    that keeps working until the venue moves, and then it is silently wrong.
+    Returns None when no book was read, which means the whole-account total.
+    """
+    seen = {int(q.exchange_index) for q in quotes.values()
+            if getattr(q, 'exchange_index', None) is not None}
+    if not seen:
+        return None
+    if len(seen) > 1:
+        # Never observed. Narrowing to one shard would understate the balance
+        # available to the others, so decline to narrow at all.
+        logger.warning('markets span exchange shards %s; using the account total',
+                       sorted(seen))
+        return None
+    return seen.pop()
+
+
+async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
+                               exchange_index: Optional[int] = None) -> VenueState:
     """Read the venue's ledger. Writes nothing except warnings.
 
     Three comparisons, each of which has a specific failure it catches:
@@ -644,7 +684,7 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient) -> VenueS
     * **open positions** — a position we think is open and the venue does not is
       an order that never filled.
     """
-    state = await kalshi.reconcile()
+    state = await kalshi.reconcile(exchange_index=exchange_index)
     venue_balance = float(state['balance'])
 
     # Settle from the venue where it knows, keyed on the market ticker we stored.
@@ -834,10 +874,62 @@ DECISION_LAG_SECONDS = 1.0
 # waiting for the next one. Wider than a cycle takes (~10s), narrower than the gap
 # between offsets (180s).
 MISSED_TARGET_GRACE_SECONDS = 60.0
-# How close to an offset instant a cycle must be to make a decision at all. Wider
-# than a cycle takes (~10s) plus the grace above; far narrower than the 180s
-# between offsets, so each offset is decided once.
-DECISION_TOLERANCE_SECONDS = 75.0
+# How close to an offset instant a cycle must be to make a decision at all.
+#
+# **This is a latency budget, not a convenience window, and 75 was catastrophic.**
+# Measured 2026-08-25 on the quote backfill: holding the signal at the offset it
+# was built for and moving only the quote, one minute of staleness costs
+# 0.025 nats at +3m and 0.074 nats at +12m, against a total model edge over the
+# market of 0.002-0.005. Break-even lag is ~3s on the strict reading and ~10s on
+# the generous one (price discovery near settlement is back-loaded, so linear
+# interpolation over two minutes overstates the first seconds).
+#
+# At 75 the tolerance was WIDER than the ordinary cadence (60s), so after the
+# scheduler fired on target the next routine cycle was still inside it and
+# decided the same offset a full minute late. Observed on window 07:00 offset
+# +3m: at +5s the model wanted ETH up at 0.81; at +76s it wanted ETH down at
+# 0.07, reading the market's own 12-point move as a *larger* edge (7.43pp against
+# 3.04pp). The on-time orders did not fill and the stale one did, which is the
+# same mechanism as the ~30% no-fill rate seen from the other side.
+#
+# 15s admits the on-target cycle (observed +5s to +6s, book read first) with
+# margin for a slow fetch, and refuses anything a cadence behind.
+DECISION_TOLERANCE_SECONDS = 15.0
+
+
+def decision_offset(elapsed: float, config: Config,
+                    forced: Optional[int] = None) -> Optional[int]:
+    """The offset this cycle may decide at, or None to settle and reconcile only.
+
+    **Decide AT an offset, not on every cycle that happens to be past one.**
+    `choose_offset` returns the largest offset at or below `elapsed`, so at 4, 5
+    and 6 minutes into a window it returns 3, 3, 6 — and every cycle in between
+    once produced a full decision and an order attempt. Measured: fourteen order
+    attempts in three minutes where there should have been two. The intermediate
+    cycles exist to settle and reconcile on a steady cadence; they were never
+    meant to trade.
+
+    The gate is `DECISION_TOLERANCE_SECONDS`, which is a measured latency budget
+    — see the constant. A cycle further from its offset than that has watched the
+    market move away from the signal it is holding, and the "edge" it computes is
+    that displacement rather than a forecast. It abstains.
+
+    An explicit `--offset` is a deliberate override — a backfill, a manual
+    decision, or a test — and is honoured whatever the clock says. Only the offset
+    the scheduler chose is subject to the tolerance.
+    """
+    if forced is not None:
+        return forced
+    offset = choose_offset(elapsed, config)
+    if offset is None:
+        return None
+    lag_seconds = abs(elapsed - offset) * 60.0
+    if lag_seconds > DECISION_TOLERANCE_SECONDS:
+        logger.debug('%.2fm into the window, offset +%dm is %.0fs away (budget '
+                     '%.0fs); settling and reconciling only',
+                     elapsed, offset, lag_seconds, DECISION_TOLERANCE_SECONDS)
+        return None
+    return offset
 
 
 def seconds_until_next_decision(config: Config, args, *,
@@ -908,33 +1000,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
     now = datetime.now(timezone.utc)
     window_open, elapsed = current_window(now, config)
-    offset = args.offset if args.offset is not None else choose_offset(elapsed, config)
+    offset = decision_offset(elapsed, config, forced=args.offset)
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
-
-    # **Decide AT an offset, not on every cycle that happens to be past one.**
-    #
-    # `choose_offset` returns the largest offset at or below `elapsed`, so at 4, 5
-    # and 6 minutes into a window it returns 3, 3, 6 — and every cycle in between
-    # produced a full decision and an order attempt. Measured: fourteen order
-    # attempts in three minutes where there should have been two. The intermediate
-    # cycles exist to settle and reconcile on a steady cadence; they were never
-    # meant to trade.
-    #
-    # `CLAUDE.md`'s rule is to walk the offsets in order and take the first that
-    # clears every gate — four decision points per window, not eighteen. Anything
-    # further from its offset than the tolerance settles and reconciles, then
-    # returns.
-    # An explicit `--offset` is a deliberate override — a backfill, a manual
-    # decision, or a test — and must be honoured whatever the clock says. Only the
-    # offset the scheduler chose is subject to the tolerance.
-    scheduler_chose = args.offset is None
-    on_offset = offset is not None and abs(
-        elapsed - offset) * 60.0 <= DECISION_TOLERANCE_SECONDS
-    if scheduler_chose and offset is not None and not on_offset:
-        logger.debug('%.2fm into the window, nearest offset +%dm is %.0fs away; '
-                     'settling and reconciling only',
-                     elapsed, offset, abs(elapsed - offset) * 60.0)
-        offset = None
 
     # **The book is read FIRST, before bars and reconciliation.**
     #
@@ -996,7 +1063,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     venue_balance = float('nan')
     if kalshi is not None and args.reconcile:
         try:
-            venue = await reconcile_with_venue(writer, kalshi)
+            venue = await reconcile_with_venue(
+                writer, kalshi, exchange_index=venue_exchange_index(quotes))
             venue_settlements, venue_balance = venue.settlements, venue.balance
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
@@ -1190,7 +1258,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             continue
         # Only count exposure we actually took on. `act_on` returns False when
         # the order was refused, killed, or never sent.
-        if await act_on(args, writer, kalshi, decision, row):
+        if await act_on(args, writer, kalshi, decision, row, config=config):
             exposure = exposure.with_(decision)
 
     # Re-read: `account` was loaded before the decisions and is now stale by
@@ -1293,7 +1361,8 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
 
 
 async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
-                 decision: Decision, row) -> bool:
+                 decision: Decision, row, *,
+                 config: Config = DEFAULT_CONFIG) -> bool:
     """Record the ticket, place the order when asked to twice, book the fill.
 
     Returns whether a position was booked, so the caller only counts exposure it
@@ -1330,6 +1399,9 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
 
     filled = decision.contracts
     placed_price = decision.price
+    # Set only when the venue reported a real fill price, which is what licenses
+    # recomputing the outlay from it rather than from the decision's stake.
+    venue_fill_price: Optional[float] = None
     # The market's own exchange, not the order body's default of 0. See
     # `Quote.exchange_index` — a mismatch returns `404 market_not_found`, which
     # names the market rather than the mismatch and took a bisect to find.
@@ -1405,6 +1477,7 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
             return False
         if np.isfinite(fill_price):
             placed_price = fill_price
+            venue_fill_price = float(fill_price)
         writer.resolve_ticket(
             ticket_id, status='filled', filled_contracts=filled,
             filled_price=placed_price,
@@ -1422,8 +1495,31 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                     ticket_id)
         return False
 
-    outlay = decision.stake * (filled / decision.contracts) if decision.contracts else 0.0
-    fee = decision.fee * (filled / decision.contracts) if decision.contracts else 0.0
+    # **Book the fill, not the intention.**
+    #
+    # These were pro-rated from `decision.stake` and `decision.fee`, both computed
+    # at the *decision* price, while `price` on the position is taken from the
+    # fill. A `fill_or_kill` fills at or better than its limit, so the cash
+    # actually leaving the account was always <= the booked outlay and the
+    # bankroll read systematically low — surfacing later as unexplained "balance
+    # drift" against the venue, which the operator is told to read as an
+    # unrecorded fill.
+    #
+    # Observed 2026-08-25: `placing down 1 @ 0.08` then `filled 1 @ 0.0530`. The
+    # position recorded price 0.0530 and an outlay derived from 0.08.
+    #
+    # Recomputed ONLY when the venue actually reported a fill price. Without a
+    # book, `decide()` folds the half-spread into `stake` (`crossing`), and
+    # rebuilding the outlay from price alone would silently drop it and make paper
+    # trading cheaper than it is. `outlay` is fee-inclusive, matching
+    # `decide()`'s `stake`.
+    ratio = (filled / decision.contracts) if decision.contracts else 0.0
+    if filled and venue_fill_price is not None:
+        fee = float(trade_fee(filled, venue_fill_price, config))
+        outlay = float(filled) * float(venue_fill_price) + fee
+    else:
+        outlay = decision.stake * ratio
+        fee = decision.fee * ratio
     writer.open_position(
         symbol=decision.symbol, window_open=decision.window_open,
         settle_time=decision.settle_time, offset_minutes=decision.offset,
@@ -1446,6 +1542,24 @@ def _finite(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if np.isfinite(number) else None
+
+
+def config_from_args(args) -> Config:
+    """The run's configuration, with everything that changes an answer explicit.
+
+    `entry_offsets` is applied here rather than defaulted in `Config` because
+    `scripts.evaluate` must keep measuring every offset — a narrowed library
+    default would make the sweep unable to price the very cells that justify the
+    narrowing.
+    """
+    config = DEFAULT_CONFIG.with_fee_assumptions(find_fee_config())
+    overrides: dict = {}
+    if args.bankroll is not None:
+        overrides['starting_bankroll'] = args.bankroll
+    entry = getattr(args, 'entry_offsets', None)
+    if entry:
+        overrides['entry_offsets'] = tuple(int(o) for o in entry)
+    return config.with_overrides(**overrides) if overrides else config
 
 
 async def main() -> int:
@@ -1491,9 +1605,7 @@ async def main() -> int:
               f'realized ${account.realized_pnl:+.2f}')
         return 0
 
-    config = DEFAULT_CONFIG.with_fee_assumptions(find_fee_config())
-    if args.bankroll is not None:
-        config = config.with_overrides(starting_bankroll=args.bankroll)
+    config = config_from_args(args)
 
     model = (load_live(config=config) if args.model is None
              else __import__('core.model', fromlist=['ForecastModel'])

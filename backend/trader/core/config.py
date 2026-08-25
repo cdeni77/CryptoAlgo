@@ -92,6 +92,43 @@ class Config:
     # of every observation.
     decision_offsets: tuple[int, ...] = (3, 6, 9, 12)
 
+    # Which of those offsets may actually OPEN a position.
+    #
+    # Every offset above is still scored — that sample is what `market_benchmark`
+    # and the retroactive forecast test read, and narrowing it would destroy the
+    # measurement. This narrows only entries.
+    #
+    # Measured over 70 days and 19,339 symbol-windows, per-contract edge after the
+    # measured fee and a 0.5c half-spread, one entry per (symbol, window), 1pp
+    # gate:
+    #
+    #     earliest offset that clears (what ran)   0.040c   t=0.10
+    #     +9m or +12m                              1.206c   t=2.68
+    #     +12m only                                3.304c   t=5.98
+    #
+    # The loop books one position per symbol-window and takes whichever offset the
+    # clock has passed, so the earliest that clears wins and `already_entered`
+    # locks out the rest. In production 250 of 277 settled entries — 90% — landed
+    # at +3m, the weakest cell, and exactly one landed at +12m. At +3m the plain
+    # barrier baseline is genuinely *worse* than the market (-0.00065 log loss),
+    # so the trades clearing there are disproportionately false positives, and
+    # taking one forfeits the +12m opportunity in the same window.
+    #
+    # Robust on every split: all three symbols, both calendar halves (4.475c vs
+    # 4.282c at a 2pp gate), all three months, 80% of days positive, and
+    # strongest at spreads <= 1c (t=5.95) — i.e. in the most tradeable books.
+    #
+    # **None means every scored offset may enter**, which is what a backtest
+    # and every evaluation sweep need — narrowing the research default would
+    # make `scripts.evaluate` unable to measure the very cells this comment
+    # cites. The narrowing is a *deployment* choice: `scripts.live` defaults
+    # `--entry-offsets` to 12, so the trading policy is explicit at the
+    # command line and visible in `docker-compose.yml` rather than buried in a
+    # library default.
+    #
+    # (9, 12) is the conservative widening if the coverage loss matters.
+    entry_offsets: Optional[tuple[int, ...]] = None
+
     # ---- volatility ------------------------------------------------------
     # Trailing realised-volatility lookbacks, in minutes, blended HAR-style.
     # 15 and 60 carry the state, 240 and 1440 carry the level; a single
@@ -400,6 +437,23 @@ class Config:
         These were all comments before, and every one of them was violated by the
         shipped defaults or reachable from a CLI flag.
         """
+        stray = tuple(o for o in (self.entry_offsets or ())
+                      if o not in tuple(self.decision_offsets))
+        if stray:
+            raise ValueError(
+                f'entry_offsets {stray} are not in decision_offsets '
+                f'{tuple(self.decision_offsets)}. An offset that is never scored '
+                f'can never produce a decision, so this configuration would '
+                f'abstain on every window and look like a dead signal rather '
+                f'than a misconfiguration.'
+            )
+        if self.entry_offsets is not None and not self.entry_offsets:
+            raise ValueError(
+                'entry_offsets is empty, so no window could ever be entered. Use '
+                'None for "every scored offset", or --mode paper / --dry-run to '
+                'run measurement-only — each of which says so explicitly rather '
+                'than looking like a signal that never fires.'
+            )
         if self.init_score_source not in ('baseline', 'market'):
             raise ValueError(
                 f"init_score_source={self.init_score_source!r}; expected "
