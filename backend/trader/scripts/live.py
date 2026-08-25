@@ -711,12 +711,38 @@ def _ticket_for(writer: PgWriter, position):
                 .one_or_none())
 
 
-def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
-                  config: Config) -> None:
-    """Write the venue's top of book, with sizes, to the research store.
+def _cumulative(levels, *, best: float, within: float, invert: bool) -> float:
+    """Resting size at prices at least as good as `best +/- within`.
+
+    This, not the touch, is what decides a `fill_or_kill`. Our limit sits a cent
+    or two past the touch, so the order fills only if the cumulative size up to
+    that limit covers it. Measured on SOL: the touch held 6 contracts against a
+    7-contract order, while cumulative within 2c was ~19 — the touch alone says
+    "no fill" where the ladder says "fills".
+    """
+    total = 0.0
+    for entry in levels or []:
+        try:
+            price, size = float(entry[0]), float(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        effective = (1.0 - price) if invert else price
+        if (effective <= best + within) if invert else (effective >= best - within):
+            total += size
+    return total
+
+
+async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
+                        config: Config, kalshi) -> None:
+    """Write the venue's book — top of book plus cumulative depth — to the store.
 
     Best effort: a failure here must never stop a trading cycle, because this is
     measurement and the cycle is money.
+
+    The ladder comes from `GET /markets/{ticker}/orderbook`, which works while a
+    market is open and returns empty once it settles. That asymmetry is the whole
+    reason this runs live: depth is not in any historical endpoint, so a book not
+    written down now is gone.
     """
     try:
         from core.datastore import ResearchStore
@@ -726,6 +752,17 @@ def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
             quote = quotes.get(symbol, (None, None))[0]
             if quote is None or quote.yes_bid is None or quote.yes_ask is None:
                 continue
+            ticker = quotes[symbol][1]
+            yes_levels, no_levels = [], []
+            if kalshi is not None and ticker:
+                try:
+                    book = await kalshi._request(  # noqa: SLF001
+                        'GET', f'/markets/{ticker}/orderbook')
+                    ladder = book.get('orderbook_fp') or book.get('orderbook') or {}
+                    yes_levels = ladder.get('yes_dollars') or ladder.get('yes') or []
+                    no_levels = ladder.get('no_dollars') or ladder.get('no') or []
+                except Exception:                  # noqa: BLE001 - top of book still lands
+                    pass
             event_time = pd.Timestamp(window_open) + pd.Timedelta(minutes=offset)
             rows.append({
                 'venue': 'kalshi', 'symbol': symbol, 'event_time': event_time,
@@ -735,9 +772,16 @@ def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
                 'yes_bid': float(quote.yes_bid), 'yes_ask': float(quote.yes_ask),
                 'yes_bid_size': float(quote.yes_bid_size or 0.0),
                 'yes_ask_size': float(quote.yes_ask_size or 0.0),
-                'depth_bid_1c': float('nan'), 'depth_bid_5c': float('nan'),
-                'depth_ask_1c': float('nan'), 'depth_ask_5c': float('nan'),
-                'levels_bid': float('nan'), 'levels_ask': float('nan'),
+                'depth_bid_1c': _cumulative(yes_levels, best=float(quote.yes_bid),
+                                            within=0.01, invert=False),
+                'depth_bid_5c': _cumulative(yes_levels, best=float(quote.yes_bid),
+                                            within=0.05, invert=False),
+                'depth_ask_1c': _cumulative(no_levels, best=float(quote.yes_ask),
+                                            within=0.01, invert=True),
+                'depth_ask_5c': _cumulative(no_levels, best=float(quote.yes_ask),
+                                            within=0.05, invert=True),
+                'levels_bid': float(len(yes_levels)),
+                'levels_ask': float(len(no_levels)),
                 'seq': float('nan'), 'gaps': 0.0,
             })
         if rows:
@@ -924,7 +968,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # written down here is gone. Observed at the touch: BTC ~6,900 contracts, ETH
     # ~109, SOL ~6.9 — against orders of ~7, which makes SOL the case where this
     # actually decides whether a fill was possible.
-    _record_touch(scored, quotes, window_open, offset, config)
+    await _record_touch(scored, quotes, window_open, offset, config, kalshi)
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is

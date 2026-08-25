@@ -1,4 +1,26 @@
-"""Record order-book depth at each decision offset, from the websocket.
+"""Record the venue's order book every minute, raw.
+
+**Deliberately more than any current consumer needs**, because it cannot be
+recovered. Verified: `GET /markets/{ticker}/orderbook` returns
+`{"no_dollars": [], "yes_dollars": []}` the moment a market settles, and no
+historical endpoint carries size at all. Everything else in the research store can
+be rebuilt from source; this exists only if something wrote it down at the time.
+
+The full ladder is stored, not a summary. Today's consumer wants cumulative size
+up to a limit, to say whether a `fill_or_kill` would have filled — but the measured
+finding of this project is that the market holds information the feature set
+cannot express, and book imbalance, ladder slope, depth asymmetry and level counts
+are all plausible carriers that appear in no feature group. A projection chosen for
+one question closes every other one.
+
+Sampled every minute rather than at the four decision offsets: the path of the book
+through a window is plausibly more informative than four snapshots of it, and the
+cost is the same order — 3 symbols x 15 minutes x 96 windows is ~4,300 calls a day,
+0.05 req/s against a 20/s budget.
+
+Originally written against the websocket. That was over-built: REST
+`/markets/{ticker}/orderbook` returns the whole ladder for an open market in one
+call, so the websocket bought only latency, which this does not need.
 
 **This is the only data in the project that cannot be backfilled at any price.**
 Verified against the API: `GET /markets/{ticker}/orderbook` on a settled market

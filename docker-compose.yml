@@ -304,13 +304,13 @@ services:
   # now price a trade at the venue's real ask, but it must assume the order
   # filled, and nothing historical can say whether it would have.
   # ===========================================================================
-  depth-recorder:
+  ladder-recorder:
     profiles: ["live"]
     extends:
       service: trader
     restart: unless-stopped
     command: >
-      -m scripts.record_depth
+      -m scripts.record_ladder
 
   trade-live:
     profiles: ["live"]

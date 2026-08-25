@@ -93,6 +93,26 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
     # assume the order filled, and nothing in any historical endpoint can say
     # whether it would have. Every day this is not running is a day of fill
     # evidence that cannot be recovered later.
+    # The raw ladder, both sides, every minute a market is open. Deliberately
+    # more than any current consumer needs.
+    #
+    # **Because it cannot be recovered.** Verified: the orderbook endpoint returns
+    # empty the moment a market settles, and no historical endpoint carries size
+    # at all. Every other dataset here can be rebuilt from source; this one exists
+    # only if something wrote it down at the time.
+    #
+    # And the shape may matter more than the summary. The measured finding is that
+    # the market holds information the feature set cannot express — book
+    # imbalance, ladder slope, depth asymmetry and level counts are all plausible
+    # carriers of it, and none of them appears in any feature group today. The
+    # 1c/5c buckets in `venue_depth` are a lossy projection chosen for one
+    # question (would a fill_or_kill have filled). Storing the levels keeps every
+    # other question open.
+    'venue_ladder': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'minute_into_window',
+        'yes_levels', 'no_levels', 'yes_total', 'no_total',
+    ),
     'venue_depth': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'offset_minutes',
