@@ -981,6 +981,29 @@ def decision_offset(elapsed: float, config: Config,
     return offset
 
 
+def mark_decided(fired_targets: set, decisions: list) -> None:
+    """Record every (window, offset) a cycle actually decided.
+
+    **Two different things start a cycle, and only one of them was recording.**
+    The `--cycle-seconds` cadence lands wherever it lands; if that is inside
+    `DECISION_TOLERANCE_SECONDS` of an offset, the cycle decides and orders.
+    `seconds_until_next_decision` then fired the same offset again a moment
+    later, because its `already_fired` set only held targets the planner itself
+    had scheduled. Measured on the live account: seventeen of forty-two order
+    attempts were the venue refusing `order_already_exists` on a duplicate
+    `client_order_id`, always five seconds after the first attempt.
+
+    A refused decision counts as fired. The offset was evaluated, and re-running
+    it produces the identical deterministic `client_order_id` — so a retry
+    cannot reach the book, only the 409.
+    """
+    for decision in decisions:
+        window = decision.window_open
+        if not isinstance(window, pd.Timestamp):
+            window = pd.Timestamp(window)
+        fired_targets.add((window, int(decision.offset)))
+
+
 def seconds_until_next_decision(config: Config, args, *,
                                 now: Optional[datetime] = None,
                                 already_fired: Optional[set] = None) -> float:
@@ -1338,16 +1361,31 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 def order_limit_price(decision: Decision) -> float:
     """The worst price still worth paying for this decision.
 
-    Was `price + edge` — the break-even price. Under `fill_or_kill` that lets a
-    thin book walk the whole order to a zero-EV fill and still call it a trade;
-    measured, it sent 0.7832 against a 0.60 ask, 18c of tolerance on a 1c
-    measured spread. Pay away a bounded fraction of the edge instead, capped in
-    cents, so a fill always keeps most of what the forecast claimed.
+    **Pay down to the gate, not to a fraction.** `min_edge_pp` is the threshold
+    that admitted this trade, so any fill leaving at least that much is one the
+    system has already said yes to — while no fill at all earns zero. Everything
+    above the gate is therefore spendable.
+
+    The rule this replaced was `min(edge * 0.25, 1c)`, which allowed the live
+    BTC decision of 2026-08-26 just 0.92c of give against a book that moves ~2c
+    in the seconds between reading it and the order landing. Measured over the
+    first live nights: 26 of 42 attempts did not fill, and they missed on price
+    rather than on size.
+
+    Crossing further costs little: the order is `immediate_or_cancel` with
+    `taker_at_cross`, so it fills against resting size from the touch outward
+    and stops. The limit bounds the worst fill; it does not set the price. It
+    only binds where the touch was too thin to fill at the old limit — which is
+    precisely the case that used to return nothing at all.
+
+    `max_slippage_cents` stays as a rail against a book so thin the order walks
+    it absurdly far. That is not hypothetical: the original `price + edge` limit
+    sent 0.7832 against a 0.60 ask, 18c of tolerance on a 1c measured spread.
     """
     config = DEFAULT_CONFIG
     edge = decision.edge if np.isfinite(decision.edge) else 0.0
-    allowance = min(max(0.0, edge) * config.slippage_share_of_edge,
-                    config.max_slippage_cents / 100.0)
+    spendable = max(0.0, edge - config.min_edge_pp / 100.0)
+    allowance = min(spendable, config.max_slippage_cents / 100.0)
     return float(min(0.99, decision.price + allowance))
 
 
@@ -1366,56 +1404,96 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
     invented, `settle_due` settles it, and the PnL is fiction.
     """
     status = str(order.get('status', '') or '').strip().lower()
-    if status in ('canceled', 'cancelled', 'killed', 'rejected', 'expired'):
-        return 0, float('nan')
+    dead = status in ('canceled', 'cancelled', 'killed', 'rejected', 'expired')
 
     # `int(...)`, not `int(str)`: V2 returns these as fixed-point decimal strings
     # like "10.00", and `int("10.00")` raises ValueError — which this function
     # caught and turned into "nothing filled". A real, paid-for fill would have
     # been recorded as no fill and the position dropped on the floor, which is the
-    # most expensive way to be wrong here.
-    def count(value) -> Optional[int]:
+    # most expensive way to be wrong here. Float, not int, because the venue fills
+    # fractionally: one live order came back as 0.43 + 0.57 on the same ticket.
+    def count(value) -> Optional[float]:
         try:
-            return int(float(value))
+            return float(value)
         except (TypeError, ValueError):
             return None
 
+    # **`fill_count_fp` first, because it is the only count a V2 order carries.**
+    # Read off the live account: an order has `fill_count_fp`, `initial_count_fp`
+    # and `remaining_count_fp`, and none of the three names below. So this loop
+    # never matched, and every fill was decided by `status` alone — all-or-nothing,
+    # which was harmless only while the client sent `fill_or_kill`. Under
+    # `immediate_or_cancel` a partial fill is `status='canceled'` with a non-zero
+    # `fill_count_fp`, and the status fallback books it as nothing.
     filled = None
-    for key in ('taker_fill_count', 'filled_count', 'fill_count'):
+    for key in ('fill_count_fp', 'taker_fill_count', 'filled_count', 'fill_count'):
         if order.get(key) is not None:
             filled = count(order[key])
             if filled is None:
                 return 0, float('nan')
             break
-    if filled is None and order.get('remaining_count') is not None:
-        remaining = count(order['remaining_count'])
-        if remaining is None:
-            return 0, float('nan')
-        filled = requested - remaining
+
+    # **Never infer a fill from `remaining` on a dead order.** The live kill
+    # reported `remaining_count_fp='0.00'` against `initial_count_fp='5.00'` and
+    # nothing filled: remaining hits zero because the order left the book, not
+    # because it traded, so `requested - remaining` would invent five contracts
+    # out of a total miss. Remaining only means anything while the order is live.
+    if filled is None and not dead:
+        for key in ('remaining_count_fp', 'remaining_count'):
+            if order.get(key) is not None:
+                remaining = count(order[key])
+                if remaining is None:
+                    return 0, float('nan')
+                filled = float(requested) - remaining
+                break
+
     if filled is None:
-        # No fill field at all. Only 'executed'/'filled' justifies believing the
-        # whole order traded; anything else (including an empty body) is unknown,
-        # and unknown must not become a position.
+        # No count at all. Only 'executed'/'filled' justifies believing the whole
+        # order traded; anything else (including an empty body) is unknown, and
+        # unknown must not become a position.
         if status in ('executed', 'filled'):
-            filled = requested
+            filled = float(requested)
         else:
             return 0, float('nan')
 
-    filled = max(0, min(int(filled), requested))
+    filled = max(0, min(int(round(filled)), requested))
+    if filled <= 0:
+        return 0, float('nan')
+
+    # **The price actually paid, not the one we hoped for.** No price key the old
+    # list looked for exists on a V2 order either, so this returned nan every time
+    # and the caller fell back to the decision price. `taker_fill_cost_dollars` is
+    # the money that actually left the account, so cost / count is the true
+    # average fill — and it already accounts for filling better than the limit.
     price = float('nan')
-    for key in ('average_fill_price_dollars', 'avg_price_dollars',
-                'average_fill_price', 'yes_price', 'no_price'):
-        raw = order.get(key)
-        if raw is None:
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        # Integer-cent fields on the same keys as dollar ones; the venue serves
-        # both shapes. Above 1.0 it can only be cents.
-        price = value / 100.0 if value > 1.0 else value
-        break
+    for key in ('taker_fill_cost_dollars', 'fill_cost_dollars'):
+        cost = count(order.get(key))
+        if cost is not None and cost > 0:
+            paid = cost / float(filled)
+            # That cost is denominated in the side actually BOUGHT, while this
+            # function's contract is YES-denominated (the caller inverts for
+            # DOWN). A NO buy at 7c has `taker_fill_cost_dollars=0.07`; returning
+            # it unchanged would have the caller invert it and book 93c.
+            outcome = str(order.get('outcome_side', '') or '').strip().lower()
+            price = (1.0 - paid) if outcome == 'no' else paid
+            break
+
+    if not np.isfinite(price):
+        for key in ('average_fill_price_dollars', 'avg_price_dollars',
+                    'average_fill_price', 'yes_price_dollars', 'yes_price',
+                    'no_price'):
+            raw = order.get(key)
+            if raw is None:
+                continue
+            value = count(raw)
+            if value is None:
+                continue
+            # Integer-cent fields on the same keys as dollar ones; the venue serves
+            # both shapes. Above 1.0 it can only be cents.
+            price = value / 100.0 if value > 1.0 else value
+            if key == 'no_price':
+                price = 1.0 - price
+            break
     return filled, price
 
 
@@ -1762,6 +1840,10 @@ async def main() -> int:
                     ).total_seconds()
                 if not args.loop:
                     return 0
+                # Before sleeping, record what this cycle actually decided —
+                # otherwise the planner refires an offset the cadence already
+                # traded, and the venue refuses the duplicate order_id.
+                mark_decided(fired_targets, decisions)
                 await asyncio.sleep(seconds_until_next_decision(
                     config, args, already_fired=fired_targets))
     except TraderAlreadyRunning as exc:

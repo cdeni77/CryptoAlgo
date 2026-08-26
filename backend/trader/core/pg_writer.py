@@ -658,6 +658,16 @@ class PgWriter:
 
         Tickets count as well as positions: a ticket exists from the moment an
         order is sent, so a crash between sending and booking still shows up.
+        That includes 'unknown' — a POST that failed in flight may well have been
+        accepted, and re-entering on top of it could double the position.
+
+        **A kill is the exception, because the venue has told us it took
+        nothing.** Live on 2026-08-26 two `immediate_or_cancel` orders were
+        cancelled with `fill_count_fp: "0.00"` and no position anywhere, and the
+        next cycle refused the window as already holding $8.55 — which was
+        exactly the two decision stakes. A window with a dead order in it is a
+        window with no exposure, and holding the slot shut costs the entry
+        outright.
         """
         with self._session() as session:
             symbols: set[str] = set()
@@ -666,9 +676,10 @@ class PgWriter:
                         .filter(Position.window_open == window_open)):
                 symbols.add(str(row.symbol))
                 stake += float(row.outlay or 0.0)
+            dead = ('skipped', 'killed')
             for row in (session.query(OrderTicket)
                         .filter(OrderTicket.window_open == window_open)
-                        .filter(OrderTicket.status != 'skipped')):
+                        .filter(OrderTicket.status.notin_(dead))):
                 if str(row.symbol) not in symbols:
                     symbols.add(str(row.symbol))
                     stake += float(row.expected_cost or 0.0)

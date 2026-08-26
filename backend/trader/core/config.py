@@ -403,13 +403,22 @@ class Config:
     max_disagreement_pp: float = 25.0
 
     # ---- order envelope --------------------------------------------------
-    # How much of the claimed edge may be paid away to get filled, and the hard
-    # cap on that in cents. The live path used to send `price + edge` as the
-    # limit — literally the break-even price — so under `fill_or_kill` a thin
-    # book could walk the order to a zero-EV fill and call it a trade. Measured:
-    # 0.7832 sent against a 0.60 ask, 18c of slippage tolerance on a 1c spread.
-    slippage_share_of_edge: float = 0.25
-    max_slippage_cents: float = 1.0
+    # The hard cap, in cents, on how far a live order may cross to get filled.
+    # How far it *actually* crosses is set by `min_edge_pp`: everything above
+    # that gate is spendable, because a fill at the gate is by construction a
+    # trade this system accepts and no fill earns nothing. This replaced
+    # `slippage_share_of_edge = 0.25`, which allowed a 3.68pp edge just 0.92c
+    # against a book that moves ~2c in the seconds before the order lands —
+    # measured, 26 of 42 live attempts failed to fill, and the misses were
+    # priced, not sized.
+    #
+    # Crossing further is close to free for a taker: `taker_at_cross` +
+    # `immediate_or_cancel` fills from the touch outward and stops, so the limit
+    # bounds the worst fill rather than setting the price. The cap is a rail
+    # against a book so thin the order walks it absurdly far, which is the
+    # failure the previous `price + edge` limit actually produced: 0.7832 sent
+    # against a 0.60 ask, 18c of tolerance on a 1c spread.
+    max_slippage_cents: float = 3.0
 
     # ---- freshness -------------------------------------------------------
     # There was no staleness guard of any kind. The feed's last `event_time` was
@@ -519,11 +528,10 @@ class Config:
                 f'from test-period bars, and the HAR target reaches there too. '
                 f'The default of 1440 is deliberately much larger.'
             )
-        if not 0.0 <= self.slippage_share_of_edge < 1.0:
+        if self.max_slippage_cents < 0.0:
             raise ValueError(
-                f'slippage_share_of_edge must lie in [0, 1]; got '
-                f'{self.slippage_share_of_edge}. At 1.0 the limit price is the '
-                f'break-even price and a fill is worth nothing.'
+                f'max_slippage_cents must not be negative; got '
+                f'{self.max_slippage_cents}.'
             )
 
     # ---- derived ---------------------------------------------------------
