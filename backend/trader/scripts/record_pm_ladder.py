@@ -58,7 +58,8 @@ def _levels(raw) -> list:
     Polymarket serves bids ascending and asks descending, so the touch is the
     LAST entry on both sides. Kalshi's ladder is stored best-first, and a schema
     that agrees on columns while disagreeing on order is worse than one that
-    disagrees openly.
+    disagrees openly. The same argument applies to denomination — see
+    `_no_levels`, which is why the ask side is not stored as served.
     """
     out = []
     for entry in raw or []:
@@ -67,6 +68,22 @@ def _levels(raw) -> list:
         except (TypeError, ValueError, KeyError):
             continue
     return list(reversed(out))
+
+
+def _no_levels(raw) -> list:
+    """Polymarket's YES asks as NO-denominated bids, to match Kalshi exactly.
+
+    Kalshi's orderbook is two BID stacks — `yes_dollars` and `no_dollars` — so
+    `no_levels` there is NO-side prices and the YES ask is `1 - best_no_bid`.
+    Polymarket serves `bids`/`asks` on one token, so its asks are YES-denominated.
+    Storing them unchanged would put a 0.51 YES ask in the column that holds a
+    0.51 NO bid on the other venue: same name, opposite meaning, and every shared
+    aggregate silently wrong by the spread with imbalance inverted.
+
+    Converting here rather than at read time means the stored row is correct on
+    its own terms, which is the only version of "uniform" worth having.
+    """
+    return [[round(1.0 - price, 6), size] for price, size in _levels(raw)]
 
 
 async def _get(session, url: str):
@@ -115,7 +132,7 @@ async def run(args) -> int:
                             logger.warning('%s book: %s', slug, str(exc)[:90])
                             continue
                         yes = _levels((book or {}).get('bids'))
-                        no = _levels((book or {}).get('asks'))
+                        no = _no_levels((book or {}).get('asks'))
                         if not yes and not no:
                             continue
                         rows.append({

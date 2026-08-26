@@ -129,12 +129,39 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'yes_levels', 'no_levels', 'yes_total', 'no_total',
         'outcomes', 'token_id_up',
     ),
+    # **The venue's own settlement, which is the only authority on the label.**
+    # Every target in this repository is built from Coinbase one-minute bars
+    # standing in for sixty seconds of CF Benchmarks BRTI. `CLAUDE.md` lists that
+    # basis as an unmeasured risk, and it stayed unmeasured because nothing here
+    # held the venue's answer. Predexon serves `result` per settled market, so the
+    # proxy can finally be scored against the thing it proxies.
+    #
+    # One schema for both venues: Kalshi's `result` ('yes'/'no') and Polymarket's
+    # `winning_side` ('A'/'B') both reduce to `settled_up`, and a disagreement
+    # between the two venues on the same fifteen minutes is itself a measurement.
+    'venue_settlements': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'close_time', 'settlement_time',
+        'result', 'settled_up', 'volume', 'open_interest', 'last_price',
+    ),
+    # **The one summarised book, across both venues and both provenances.**
+    # `scripts/build_depth.py` writes every source into this table at every
+    # minute of the window: Kalshi and Polymarket, live recording and Predexon
+    # backfill. `source` says which, because a row that cannot distinguish a
+    # recorded book from a reconstructed one makes a backfill look like a
+    # measurement — the same argument `price_source` settles for predictions.
+    #
+    # Totals are carried alongside the 1c/5c buckets. The buckets answer one
+    # question (would this order have filled); the totals and level counts are
+    # what imbalance and ladder slope are built from, and those are the
+    # plausible carriers of the information the feature set cannot express.
     'venue_depth': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'offset_minutes',
         'yes_bid', 'yes_ask', 'yes_bid_size', 'yes_ask_size',
         'depth_bid_1c', 'depth_bid_5c', 'depth_ask_1c', 'depth_ask_5c',
-        'levels_bid', 'levels_ask', 'seq', 'gaps',
+        'depth_bid_total', 'depth_ask_total',
+        'levels_bid', 'levels_ask', 'seq', 'gaps', 'source',
     ),
     'book_snapshots': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',

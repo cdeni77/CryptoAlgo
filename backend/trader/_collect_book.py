@@ -138,8 +138,14 @@ async def main() -> int:
                   & (quotes['market_probability'] > 0.05)
                   & (quotes['market_probability'] < 0.95)]
     rows = at12[['symbol', 'window_open', 'market_ticker']].dropna().drop_duplicates()
+    # **Stop two hours back, not a day.** A one-day cutoff meant the backfill
+    # ended exactly where the live ladder recorder began, so the two never
+    # described the same minute and could not be checked against each other.
+    # That cross-check is the only independent evidence that the history every
+    # book feature will be trained on is the same object we record live. Two
+    # hours is enough for the venue's own history to settle.
     rows = rows[rows['window_open']
-                < pd.Timestamp.now(tz='UTC').floor('D') - pd.Timedelta(days=1)]
+                < pd.Timestamp.now(tz='UTC') - pd.Timedelta(hours=2)]
     rows = rows.sort_values('window_open').reset_index(drop=True)
     step = max(1, len(rows) // WINDOW_TARGET)
     rows = rows.iloc[::step].head(WINDOW_TARGET)
