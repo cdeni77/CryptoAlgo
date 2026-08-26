@@ -159,6 +159,29 @@ class GridReport:
         )
 
 
+def coverage_log_level(report: 'GridReport') -> int:
+    """How loudly to report a grid: DEBUG when it is exactly as expected.
+
+    The live loop rebuilds this grid twice a minute and the line read
+    "1,499/1,499 minutes (100.0000%), 99 windows, 0 dropped" every single time.
+    Repeating an unchanging fact around the clock buries the lines that matter,
+    and this log is the only view of an account trading unattended.
+
+    A shortfall in minutes or a dropped boundary is different: a dropped boundary
+    is a window that cannot be scored at all, and missing minutes are how a stale
+    feed announces itself. Those stay visible.
+    """
+    import logging
+
+    if report.minutes_present < report.minutes_expected:
+        return logging.INFO
+    if report.windows_dropped_boundary > 0:
+        return logging.INFO
+    if report.windows_with_interior_gaps > 0:
+        return logging.INFO
+    return logging.DEBUG
+
+
 def build_windows(
     bars: pd.DataFrame,
     symbol: str,
@@ -398,7 +421,7 @@ def build_window_panel(
                                       include_unsettled=include_unsettled)
         tables.append(table)
         reports[symbol] = report
-        logger.info(report.summary())
+        logger.log(coverage_log_level(report), report.summary())
     if not tables:
         raise WindowError('no symbol produced any windows')
     panel = pd.concat(tables, ignore_index=True)

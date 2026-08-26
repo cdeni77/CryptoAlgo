@@ -207,7 +207,7 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
                 'trade_count': getattr(b, 'trade_count', np.nan),
             } for b in bars]).sort_values('event_time', ignore_index=True)
             out[symbol] = frame
-            logger.info('%s: %d bars to %s', symbol, len(frame),
+            logger.debug('%s: %d bars to %s', symbol, len(frame),
                         frame['event_time'].iloc[-1])
     finally:
         close = getattr(client, 'close', None)
@@ -575,7 +575,7 @@ async def fetch_quotes(
                             symbol, ticker, quote.status)
                 continue
             quotes[symbol] = (quote, ticker)
-            logger.info('%s %s: %.2f / %.2f (spread %.0fc, vol %d)',
+            logger.debug('%s %s: %.2f / %.2f (spread %.0fc, vol %d)',
                         symbol, ticker, quote.yes_bid, quote.yes_ask,
                         (quote.spread or 0) * 100, quote.volume)
         except KalshiError as exc:
@@ -701,7 +701,7 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
             continue
         resolved[ticker] = row
     if resolved:
-        logger.info('venue reports %d settlement(s) to reconcile', len(resolved))
+        logger.debug('venue reports %d settlement(s) to reconcile', len(resolved))
 
     # `KalshiClient.position_size` and not `p['position']`: the field is
     # `position_fp`, a fixed-point string, and reading the name from the older
@@ -897,6 +897,34 @@ MISSED_TARGET_GRACE_SECONDS = 60.0
 DECISION_TOLERANCE_SECONDS = 15.0
 
 
+# Refusals that mean something is wrong rather than that the gates are working.
+# A latched breaker, a breached bankroll floor, an unreadable book, or the model
+# disagreeing with the market by an implausible margin are all worth a line; the
+# ordinary "the edge was not there" outcomes are not.
+LOUD_REFUSALS = frozenset({
+    Reason.HALTED, Reason.BANKROLL_FLOOR, Reason.DISAGREEMENT_IMPLAUSIBLE,
+    Reason.NO_QUOTE, Reason.PROBABILITY_INVALID, Reason.NOT_FINITE,
+})
+
+
+def decision_log_level(decision: Decision) -> int:
+    """How loudly to report one decision. Every one is stored either way.
+
+    `offset_not_traded` alone fires three symbols x two non-entry offsets x four
+    windows an hour, forever, by design. Together with the other routine refusals
+    it was the largest single source of noise in the live log, and none of it
+    carries information a human needs — the cycle summary counts them.
+
+    Anything that spends money is always INFO, and so is any refusal that
+    indicates a fault rather than a gate doing its job.
+    """
+    if decision.traded:
+        return logging.INFO
+    if decision.reason in LOUD_REFUSALS:
+        return logging.INFO
+    return logging.DEBUG
+
+
 def decision_offset(elapsed: float, config: Config,
                     forced: Optional[int] = None) -> Optional[int]:
     """The offset this cycle may decide at, or None to settle and reconcile only.
@@ -1078,8 +1106,18 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         adopt_venue_balance(writer, venue_balance)
 
     if offset is None:
-        logger.info('%d minutes into the window; first decision offset is +%dm',
-                    elapsed, min(config.decision_offsets))
+        # This used to read "N minutes into the window; first decision offset is
+        # +3m", which at 8 minutes in was both false and not the reason. There are
+        # three ways to arrive here and they are worth telling apart.
+        reached = [o for o in sorted(config.decision_offsets) if o <= elapsed]
+        if not reached:
+            logger.debug('%.1fm into the window; first offset is +%dm',
+                         elapsed, min(config.decision_offsets))
+        else:
+            logger.debug('%.1fm into the window; offset +%dm is %.0fs behind, over '
+                         'the %.0fs budget — settling and reconciling only',
+                         elapsed, reached[-1], (elapsed - reached[-1]) * 60.0,
+                         DECISION_TOLERANCE_SECONDS)
         return []
 
     scored = score_live(bars, model.scoring, config,
@@ -1253,7 +1291,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             edge=_finite(decision.edge), contracts=decision.contracts or None,
             model_version=getattr(model, 'version', None),
         )
-        logger.info(decision.describe())
+        logger.log(decision_log_level(decision), decision.describe())
         if not decision.traded:
             continue
         # Only count exposure we actually took on. `act_on` returns False when
@@ -1671,7 +1709,10 @@ async def main() -> int:
                     decisions = []
                 if decisions:
                     counts = rejection_histogram(decisions)
-                    logger.info('cycle: %s', counts[counts > 0].to_dict())
+                    noteworthy = any(d.traded or d.reason in LOUD_REFUSALS
+                                     for d in decisions)
+                    logger.log(logging.INFO if noteworthy else logging.DEBUG,
+                               'cycle: %s', counts[counts > 0].to_dict())
                 if not args.loop:
                     return 0
                 await asyncio.sleep(seconds_until_next_decision(

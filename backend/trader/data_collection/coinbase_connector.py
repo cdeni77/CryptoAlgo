@@ -684,7 +684,7 @@ class CoinbaseRESTClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
-        logger.info("Coinbase REST client closed")
+        logger.debug("Coinbase REST client closed")
 
 
 class CoinbaseWebSocketClient:
