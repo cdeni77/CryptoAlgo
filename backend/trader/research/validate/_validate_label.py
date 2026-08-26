@@ -28,6 +28,16 @@ variable, something structural is wrong rather than something marginal.
 
 from __future__ import annotations
 
+# This file moved into research/validate/ during a repo cleanup; `core`/`scripts`
+# are packages rooted at backend/trader/, which Python does not add to
+# sys.path automatically for a script run from a subdirectory (only the
+# script's OWN directory is added). Without this, every `from core...`
+# import below raises ModuleNotFoundError the moment the file is not sitting
+# directly in backend/trader/.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+
 import os
 
 import numpy as np

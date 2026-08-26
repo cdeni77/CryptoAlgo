@@ -238,7 +238,7 @@ section used to also claim `venue_quotes` was folded in; it was not, and
 Predexon backfill at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14),
 written separately by `scripts/backfill_quotes.py`, and roughly a dozen files
 still read it directly (`retro_economics.py`, `refit_market_init.py`,
-`_book_analysis.py`, `_offset_vs_market.py` among them). Folding it into
+`research/analysis/_book_analysis.py`, `research/analysis/_offset_vs_market.py` among them). Folding it into
 `venue_depth` too is real, deliberately deferred work — a different offset
 grid, a different producer, a dozen consumers to repoint — not a rename.
 
@@ -256,7 +256,7 @@ grid, a different producer, a dozen consumers to repoint — not a rename.
 source, at **every minute** — because the offset grid is itself under test and
 a table sampled where the model currently scores would foreclose the question.
 `source` separates a book somebody recorded from the same book reconstructed
-afterwards; `_validate_depth.py` compares them where they overlap, which is the
+afterwards; `research/validate/_validate_depth.py` compares them where they overlap, which is the
 only independent evidence the backfill describes the same object. That check
 needs the backfill to run up to *two hours* ago rather than a day, or the two
 never share a minute.
@@ -371,7 +371,7 @@ forecasts anything. Run the group alone before believing the share either way.
 
   **So the risk is bounded, not absent: ~3% of every training label is wrong.**
   Against a measured log-loss skill of +0.001 that is not negligible, and it
-  belongs in how that skill is read. `_validate_label.py` recomputes it.
+  belongs in how that skill is read. `research/validate/_validate_label.py` recomputes it.
 - **A one-minute OHLC mean stands in for sixty seconds of index prints.** Both
   ends use the same approximation, so most of its bias cancels in the comparison
   — which is the only reason it is tolerable.

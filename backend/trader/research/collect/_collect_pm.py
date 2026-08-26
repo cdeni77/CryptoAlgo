@@ -147,7 +147,7 @@ OFFSETS = (3, 6, 9, 12)
 def pack(book: dict) -> list:
     """One Polymarket snapshot in the SAME thirteen fields as the Kalshi book.
 
-    Deliberately identical to `_collect_book.pack` so the two venues are directly
+    Deliberately identical to `_collect_book.pack` (in this same directory) so the two venues are directly
     comparable — the whole point of collecting Polymarket is to ask whether the
     offset structure replicates, and that question dies if the two datasets are
     shaped differently.

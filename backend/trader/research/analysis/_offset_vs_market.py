@@ -3,7 +3,7 @@
 This is the question the whole offset argument has been stuck on, and it is
 answerable for the first time.
 
-`_offset_resolution.py` measures model-minus-baseline at every minute and finds
+`_offset_resolution.py` (in this same directory) measures model-minus-baseline at every minute and finds
 skill declining with offset, +12m near the bottom. That reproduces a gradient
 already known from the four-offset run and is **not** the trading question. The
 case for +12m rests on two things measured against the market: the baseline's
@@ -36,6 +36,16 @@ An offset that wins here and is badly calibrated is not tradeable.
 """
 
 from __future__ import annotations
+
+# This file moved into research/analysis/ during a repo cleanup; `core`/`scripts`
+# are packages rooted at backend/trader/, which Python does not add to
+# sys.path automatically for a script run from a subdirectory (only the
+# script's OWN directory is added). Without this, every `from core...`
+# import below raises ModuleNotFoundError the moment the file is not sitting
+# directly in backend/trader/.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 import math
 import os
