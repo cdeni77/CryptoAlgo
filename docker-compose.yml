@@ -336,6 +336,7 @@ services:
     restart: unless-stopped
     command: >
       -m scripts.record_pm_ladder
+        --batch-rows 6
 
   trade-live:
     profiles: ["live"]

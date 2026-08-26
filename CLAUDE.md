@@ -220,6 +220,40 @@ scripts.scrape  ->  SQLite  ->  scripts.sync_store  ->  Parquet + DuckDB
                                   scripts.live  ->  Kalshi
 ```
 
+### The market data pipeline: one schema per concept, both venues
+
+Collection used to be four incompatible things — Kalshi live ladders, Polymarket
+live ladders, a Predexon backfill in a JSONL file outside the research store, and
+`venue_quotes` at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14). Nothing
+joined, and no two offset grids agreed with each other or with the model's.
+
+```
+                     live (recorded)          backfill (Predexon / gamma)
+  raw ladder      venue_ladder  (kalshi)      -- (tick series is packed)
+                  pm_ladder     (polymarket)
+  summarised      venue_depth <-------------- venue_depth      every minute 0..15
+  settlement      venue_settlements <-------- venue_settlements  both venues
+  spot bars       minute_bars <-------------- minute_bars        five years
+```
+
+`scripts/build_depth.py` is the one path into `venue_depth`, from every source,
+at **every minute** — because the offset grid is itself under test and a table
+sampled where the model currently scores would foreclose the question.
+`source` separates a book somebody recorded from the same book reconstructed
+afterwards; `_validate_depth.py` compares them where they overlap, which is the
+only independent evidence the backfill describes the same object. That check
+needs the backfill to run up to *two hours* ago rather than a day, or the two
+never share a minute.
+
+`scripts/collect_settlements.py` writes both venues' own results into one table
+and stops at history it already holds, so keeping it current is a page or two
+rather than 200 requests. **Predexon's market metadata reaches much further back
+than its order books** — ~196 days of settlements against ~70 days of book.
+
+Everything Predexon and Polymarket serve refuses a bare `Python-urllib` or
+default `aiohttp` User-Agent with a Cloudflare 1010. The header is not
+decoration.
+
 ### The model predicts a *correction*, not a probability
 
 The baseline's logit enters LightGBM as an `init_score`, so the model fits the
@@ -290,11 +324,38 @@ forecasts anything. Run the group alone before believing the share either way.
   rather than 3. Ignoring it overstates sigma by 13%, and the baseline's fitted
   scale would have quietly absorbed it; a fitted parameter that absorbs a known
   analytic correction stops meaning anything.
-- **The settlement index is CF Benchmarks BRTI, not Coinbase spot.** The target is
-  built from Coinbase bars because that is the history that exists, and Coinbase
-  is a large BRTI constituent — a close proxy, not the same number. Live, the
-  venue publishes `floor_strike` and `scripts/live.py` prefers it, so the basis is
-  only taken in the backtest. It is an **unmeasured risk**.
+- **The settlement index is CF Benchmarks BRTI, not Coinbase spot, and the
+  proxy is now MEASURED.** The target is built from Coinbase bars because that is
+  the history that exists, and Coinbase is a large BRTI constituent — a close
+  proxy, not the same number. This used to say "an **unmeasured risk**", and that
+  was true only because nothing here held the venue's own answer.
+  `venue_settlements` does now: Predexon serves `result` on every settled Kalshi
+  market (56,385 of them, ~196 days) and Polymarket publishes `winning_side`.
+
+  Measured against 56,284 shared windows, **Kalshi's own settlement agrees with
+  our label 96.98% of the time**, and the disagreement is exactly the shape a
+  benign proxy should have — it lives entirely in the near-ties:
+
+  ```
+  move from strike   windows   disagree
+       <1bp             2806     34.85%
+       1-2bp            2826     13.91%
+       2-5bp            7860      3.18%
+       5-10bp          11101      0.32%
+      10-25bp          18147      0.05%
+       >25bp           13472      0.01%
+  ```
+
+  A near-tie on Coinbase is a coin flip on BRTI; a real move is never
+  mislabelled. Polymarket, settling on **Binance**, agrees on 96.96% of its 493
+  windows, and the two venues agree with *each other* on **99.52% of 209 shared
+  windows** — one disagreement. Two independent settlement sources converging
+  that tightly is the strongest available evidence that `core/windows.py` builds
+  the target correctly.
+
+  **So the risk is bounded, not absent: ~3% of every training label is wrong.**
+  Against a measured log-loss skill of +0.001 that is not negligible, and it
+  belongs in how that skill is read. `_validate_label.py` recomputes it.
 - **A one-minute OHLC mean stands in for sixty seconds of index prints.** Both
   ends use the same approximation, so most of its bias cancels in the comparison
   — which is the only reason it is tolerable.
@@ -486,6 +547,26 @@ open, which is what `core/windows.py` builds.
 
 That abstention was the resolution logic working. A ticker built from a pattern
 would have found *something* 15 or 30 minutes away and traded it.
+
+**A Polymarket slug's trailing unix stamp is the window's OPEN, not its close.**
+Read as a close it shifts every window fifteen minutes, and *nothing raises*:
+every window is a valid window and every book is a real book. It surfaced only
+as agreement — Kalshi 96.98% against our label, Polymarket 49.85%, and Kalshi
+against Polymarket exactly 50.0%, which places an alignment error in the mapping
+rather than a quality problem in either venue. The venue states it three ways
+that agree: the slug stamp, the title ("9:30PM-9:45PM ET"), and `end_time`,
+which is the stamp plus fifteen minutes. A live recorder building the slug with
+`ceil` names the *next* window, which already exists and already trades — so the
+request returns a healthy book that is then stamped with the current window's
+open. A wrong answer that looks entirely right.
+
+**`no_levels` is NO-denominated on both venues, and that is a conversion, not a
+convention.** Kalshi's orderbook is two BID stacks (`yes_dollars`, `no_dollars`),
+so the YES ask is `1 - best_no_bid`. Polymarket's CLOB serves `bids`/`asks` on
+one token, so its asks are YES-denominated and are converted at write time in
+`scripts/record_pm_ladder._no_levels`. Storing them as served put a 0.51 YES ask
+in the column holding a 0.51 NO bid on the other venue: same name, opposite
+meaning, wrong by the spread with imbalance inverted, and no exception anywhere.
 
 **Expect ~0.4% of minutes to be missing, and 86% of them were our own bug.** A
 five-year BTC backfill returned 2,617,876 of 2,628,000 minutes. This file used to
