@@ -22,6 +22,9 @@ import pandas as pd
 from core.datastore import ResearchStore
 
 pd.set_option('display.width', 200)
+# Both observations must sit this close to the minute mark, or the
+# comparison measures the time between them rather than the books.
+MAX_AGE = float(os.getenv('MAX_AGE', '15'))
 
 
 def main() -> int:
@@ -34,8 +37,25 @@ def main() -> int:
     print(f'live {len(live):,} rows, backfill {len(back):,} rows')
 
     both = live.merge(back, on=key, suffixes=('_live', '_back'))
-    print(f'overlapping (symbol, window, minute): {len(both):,}\n')
-    if len(both) < 30:
+    print(f'overlapping (symbol, window, minute): {len(both):,}')
+
+    # **Compare like with like, or measure the clock instead of the book.** The
+    # live row is stamped at the poll instant, up to a minute after the mark it
+    # is filed under; the backfill row is the last book CHANGE at or before that
+    # mark. Unfiltered, the two can be sixty seconds apart — and this market
+    # moves a measured ~8.4pp per minute, so a four-cent median difference is
+    # what the clock alone produces. The first run of this reported exactly that
+    # and it says nothing about whether the backfill is the same book.
+    age_live = pd.to_numeric(both['quote_age_seconds_live'], errors='coerce')
+    age_back = pd.to_numeric(both['quote_age_seconds_back'], errors='coerce')
+    print(f'  quote age  live median {age_live.median():.1f}s p90 '
+          f'{age_live.quantile(0.9):.1f}s   backfill median '
+          f'{age_back.median():.1f}s p90 {age_back.quantile(0.9):.1f}s')
+    close = (age_live.abs() <= MAX_AGE) & (age_back.abs() <= MAX_AGE)
+    both = both[close.fillna(False)]
+    print(f'  {len(both):,} pairs where BOTH quotes are within {MAX_AGE:.0f}s '
+          f'of the mark\n')
+    if len(both) < 20:
         print('Not enough overlap yet — the backfill stops a day before the')
         print('recorder started. Re-run once the collection reaches 2026-08-25.')
         return 0

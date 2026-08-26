@@ -208,6 +208,31 @@ TIME_COLUMNS = ('event_time', 'available_time')
 # when each was published. All revisions are kept, so a read at any `as_of` sees
 # exactly the revision that was current then.
 EVENT_KEY = ('venue', 'symbol', 'event_time')
+
+# **Datasets where one event is observed by more than one instrument.**
+#
+# `read` keeps exactly one row per EVENT_KEY — the latest `available_time` — so
+# a corrected figure supersedes the one it corrects. That is right for a revised
+# series and wrong for `venue_depth`, which holds the same minute of the same
+# book recorded live AND reconstructed later from Predexon. Those are
+# independent measurements, not a correction and its predecessor, and comparing
+# them is the only evidence the reconstruction is trustworthy.
+#
+# Without this the live row always won, because its `available_time` is the poll
+# instant while the backfill's is the minute mark itself. Measured: 58
+# (symbol, window) pairs overlapped and the comparison still saw zero rows — the
+# backfill rows were on disk and invisible to every read, silently, on exactly
+# the rows the check needed.
+#
+# Revisions still collapse WITHIN an observer.
+EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
+    'venue_depth': ('source',),
+}
+
+
+def event_key(dataset: str) -> tuple[str, ...]:
+    """The columns that identify one observation of one event."""
+    return EVENT_KEY + EVENT_KEY_EXTRA.get(dataset, ())
 REVISION_KEY = ('venue', 'symbol', 'event_time', 'available_time')
 
 
@@ -318,7 +343,8 @@ class ResearchStore:
             path.parent.mkdir(parents=True, exist_ok=True)
 
             if path.exists() and not overwrite:
-                chunk = self._merge(pd.read_parquet(path), chunk)
+                chunk = self._merge(pd.read_parquet(path), chunk,
+                                    event_key(dataset) + ('available_time',))
 
             chunk = chunk.sort_values('event_time').reset_index(drop=True)
             tmp = path.with_suffix('.parquet.tmp')
@@ -372,14 +398,15 @@ class ResearchStore:
         return out[list(columns)]
 
     @staticmethod
-    def _merge(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    def _merge(existing: pd.DataFrame, incoming: pd.DataFrame,
+               revision_key: Sequence[str] = REVISION_KEY) -> pd.DataFrame:
         """Union two partitions, keeping every distinct revision."""
         for col in TIME_COLUMNS:
             if col in existing.columns:
                 existing[col] = pd.to_datetime(existing[col], utc=True)
         combined = pd.concat([existing, incoming], ignore_index=True)
         combined = combined.sort_values(['event_time', 'available_time'])
-        return combined.drop_duplicates(subset=list(REVISION_KEY), keep='last')
+        return combined.drop_duplicates(subset=list(revision_key), keep='last')
 
     # -- reading ------------------------------------------------------------
 
@@ -455,7 +482,8 @@ class ResearchStore:
             f"SELECT {select} FROM ("
             f"  SELECT * EXCLUDE (_rn) FROM ("
             f"    SELECT *, ROW_NUMBER() OVER ("
-            f"      PARTITION BY {', '.join(EVENT_KEY)} ORDER BY available_time DESC"
+            f"      PARTITION BY {', '.join(event_key(dataset))} "
+            f"ORDER BY available_time DESC"
             f"    ) AS _rn"
             f"    FROM read_parquet(?, hive_partitioning = false) {where}"
             f"  ) WHERE _rn = 1"
