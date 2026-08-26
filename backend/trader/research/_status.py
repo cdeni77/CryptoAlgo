@@ -104,6 +104,7 @@ def main() -> int:
                           ('polymarket backfill', '_collect_pm'),
                           ('settlements', 'collect_settlements'),
                           ('overnight chain', '_overnight.sh'),
+                          ('gap fill (queued/running)', '_gap_fill.sh'),
                           ('depth refresher', '_depth_loop.sh')):
         # `pgrep -f X` run through a shell matches the shell's OWN command
         # line, so every pattern reported "running". Bracketing the first

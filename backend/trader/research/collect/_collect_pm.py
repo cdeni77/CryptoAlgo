@@ -50,20 +50,36 @@ ASSET_PREFIX = os.getenv('PM_ASSET', 'btc-')
 
 
 async def get(session, path, params, *, tries=4):
-    for _ in range(tries):
+    """One request, retried on transient failure.
+
+    429 (rate limit) and 5xx (the venue's own problem, not ours) both get a
+    retry with backoff. A 500 truncated overnight discovery at page 909 of a
+    walk that needed ~4,000 to reach the coverage boundary — `discover()`
+    treated it as fatal and stopped 84 days short, silently, because this
+    function returned it as an ordinary error on the first try. A genuine
+    4xx (400, 404, ...) still fails immediately: retrying a malformed
+    request produces the same malformed request.
+    """
+    last_err = None
+    for attempt in range(tries):
         await asyncio.sleep(PAUSE)
         try:
             async with session.get(f'{BASE}{path}', params=params) as r:
                 if r.status == 429:
                     await asyncio.sleep(2.0)
                     continue
+                if r.status >= 500:
+                    last_err = f'{r.status}:{(await r.text())[:110]}'
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
                 text = await r.text()
                 if r.status >= 400:
                     return None, f'{r.status}:{text[:110]}'
                 return json.loads(text or '{}'), None
         except Exception as exc:                      # noqa: BLE001
-            return None, str(exc)[:110]
-    return None, '429'
+            last_err = str(exc)[:110]
+            await asyncio.sleep(2.0 * (attempt + 1))
+    return None, last_err or '429'
 
 
 def is_short(slug: str) -> bool:
