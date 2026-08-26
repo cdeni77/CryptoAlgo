@@ -44,9 +44,38 @@ MAX_PRICED = int(os.getenv('PM_PRICED', '16000'))
 # Polymarket tick coverage begins 2026-03-02; older markets have no
 # price history, so discovery stops there rather than paging to 2023.
 COVERAGE_START = int(dt.datetime(2026, 3, 2, tzinfo=dt.timezone.utc).timestamp())
-# Only BTC for now: it is the deepest book and the direct counterpart to
-# KXBTC15M. Widening to eth/sol is a matter of this one predicate.
-ASSET_PREFIX = os.getenv('PM_ASSET', 'btc-')
+# Empty means every asset. Verified live: one unfiltered page of
+# `/v2/polymarket/markets?tags=15M` already mixes BTC, ETH, SOL, BNB, DOGE,
+# ZEC, XRP and HYPE — filtering to one asset does not shrink the page count,
+# it just re-walks the identical ~4,000-page stream once per asset, keeping a
+# different eighth of it each time. Set PM_ASSET to narrow it deliberately.
+ASSET_PREFIX = os.getenv('PM_ASSET', '')
+# Where an interrupted walk's pagination_key is parked so a resume can pick
+# up mid-stream instead of re-fetching every already-known page from page 1.
+# Measured cost of not having this: a resume after a bare Predexon 500 took
+# over two hours to re-walk 844 pages it already had, before it could make
+# any forward progress at all.
+CURSOR_FILE = 'data/pm_markets_cursor.json'
+
+
+def _load_cursor():
+    if not os.path.exists(CURSOR_FILE):
+        return None
+    try:
+        with open(CURSOR_FILE) as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_cursor(cursor, pages: int) -> None:
+    with open(CURSOR_FILE, 'w') as handle:
+        json.dump({'cursor': cursor, 'pages': pages}, handle)
+
+
+def _clear_cursor() -> None:
+    if os.path.exists(CURSOR_FILE):
+        os.remove(CURSOR_FILE)
 
 
 async def get(session, path, params, *, tries=4):
@@ -82,8 +111,8 @@ async def get(session, path, params, *, tries=4):
     return None, last_err or '429'
 
 
-def is_short(slug: str) -> bool:
-    return 'updown-15m' in (slug or '') and (slug or '').startswith(ASSET_PREFIX)
+def is_short(slug: str, asset_prefix: str) -> bool:
+    return 'updown-15m' in (slug or '') and (slug or '').startswith(asset_prefix)
 
 
 async def discover(session) -> int:
@@ -97,7 +126,12 @@ async def discover(session) -> int:
                     pass
     print(f'stage 1: discovery ({len(seen):,} already known)', flush=True)
 
-    cursor, pages, kept = None, 0, 0
+    saved = _load_cursor()
+    cursor = saved.get('cursor') if saved else None
+    pages = saved.get('pages') if saved else 0
+    if saved:
+        print(f'  resuming from a saved cursor at page {pages:,}', flush=True)
+    kept = 0
     with open(MARKETS_OUT, 'a') as handle:
         while pages < MAX_PAGES:
             # `tags=15M` returns 50/50 fifteen-minute markets, ~90 minutes of
@@ -109,10 +143,15 @@ async def discover(session) -> int:
                 params['pagination_key'] = cursor
             payload, err = await get(session, '/v2/polymarket/markets', params)
             if err:
+                # `cursor`/`pages` here are still the ones that produced this
+                # request, not the next one — a resume retries this exact
+                # page rather than restarting the whole walk from page 1.
                 print(f'  discovery stopped: {err}', flush=True)
+                _save_cursor(cursor, pages)
                 break
             markets = payload.get('markets') or payload.get('data') or []
             if not markets:
+                _clear_cursor()
                 break
             # Stop once the page has walked back past Polymarket tick coverage
             # (2026-03-02). Anything older has no price history to fetch.
@@ -123,10 +162,11 @@ async def discover(session) -> int:
                 print(f'  reached coverage boundary at '
                       f'{dt.datetime.fromtimestamp(max(stamps), dt.timezone.utc):%Y-%m-%d}',
                       flush=True)
+                _clear_cursor()
                 break
             for m in markets:
                 slug = m.get('market_slug') or ''
-                if is_short(slug) and slug not in seen:
+                if is_short(slug, ASSET_PREFIX) and slug not in seen:
                     seen.add(slug)
                     handle.write(json.dumps({
                         'market_slug': slug,
@@ -146,9 +186,14 @@ async def discover(session) -> int:
             pages += 1
             cursor = (payload.get('pagination') or {}).get('pagination_key')
             if not cursor:
+                _clear_cursor()
                 break
             if pages % 25 == 0:
                 print(f'  page {pages}, {kept:,} short-dated found', flush=True)
+        else:
+            # MAX_PAGES ran out without an error or the boundary — this is
+            # progress, not a finish, so save where to pick back up.
+            _save_cursor(cursor, pages)
     print(f'stage 1 done: {pages} pages, {kept:,} new, {len(seen):,} total',
           flush=True)
     return kept
