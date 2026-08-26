@@ -561,12 +561,26 @@ Two consequences, and the second is the one that bites:
 * `levels_bid` / `levels_ask` are **not comparable across sources** (measured
   ratio 0.579, unchanged by any time filter). A feature built on level counts
   must be source-consistent or it is measuring which pipe the row came through.
-* **The backfill cannot represent a price below 10c to better than a cent**, and
-  the traded band starts at 0.05. Measured on live fills, **41% of contracts are
-  bought under 15c** — so the region where most of the volume sits is exactly the
-  region the backfill rounds. Half a cent of quantisation there is the whole
-  measured half-spread. Any economics computed from backfilled quotes in the
-  tails carries that error; the live path reads Kalshi directly and does not.
+* **The backfill cannot represent a tail price to better than a cent**, and the
+  traded band is [0.05, 0.95]. Measured against 3,680 live top-of-book
+  observations, which carry the venue's true deci-cent precision:
+
+  ```
+  mid band     n      best bid off the cent grid   mean rounding error
+  below 10c    652              90.3%                    0.230c
+  10c - 90c   2474               0.4%                    0.001c
+  above 90c    554              91.2%                    0.250c
+  ```
+
+  **Inside [0.10, 0.90] the backfill is exact** — the tick is a full cent there
+  and there is nothing to round. Outside it roughly nine quotes in ten are
+  rounded, by ~0.24c on average: about half the measured 0.5c half-spread, and
+  15% of the 1.5pp edge gate. Roughly a third of all observations sit in that
+  region, and 41% of live contracts are bought under 15c.
+
+  So economics from backfilled quotes should either restrict to [0.10, 0.90] or
+  carry an explicit +/-0.25c uncertainty in the tails. The live path reads Kalshi
+  directly and is unaffected.
 
 **A Polymarket slug's trailing unix stamp is the window's OPEN, not its close.**
 Read as a close it shifts every window fifteen minutes, and *nothing raises*:
