@@ -5,12 +5,14 @@ and accepted truncation. Re-fetching later costs exactly what fetching properly
 costs now, and the book is the one dataset Kalshi destroys on settlement — so
 this pages to exhaustion and keeps every snapshot.
 
-**Why the whole window and not just +12m.** The model is trained on rows at 3, 6,
-9 and 12 minutes. A book-derived feature that exists only at +12m is null for
-three rows in four and cannot be learned. Even though only +12m currently trades,
-the data has to match the shape the model is fitted on. Keeping the full series
-also answers questions nobody has asked yet — queue position, ladder slope, how
-depth rebuilds after a sweep — which a four-point sample cannot.
+**Why the whole window and not just the offsets that trade.** Measured on the
+five-year Coinbase history at one-minute resolution, log-loss skill over the
+baseline DECLINES with offset and +12m sits near the bottom of the grid: +4m
+scores +0.002486 (6/6 folds) against +12m's +0.001042, and eleven of thirteen
+alternatives beat it. So the offset grid is itself under test, and a book sampled
+only where the model currently scores would foreclose the question. Keeping every
+snapshot also answers ones nobody has asked yet — queue position, ladder slope,
+how depth rebuilds after a sweep — which any fixed sample cannot.
 
 **Storage.** Each snapshot is reduced to thirteen numbers and stored as a packed
 array rather than a dict, with the field order recorded once per row. The raw
@@ -44,7 +46,13 @@ import pandas as pd
 BASE = 'https://api.predexon.com'
 PAUSE = 1.15
 OUT = os.getenv('BOOK_OUT', 'data/book_full.jsonl')
-OFFSETS = tuple(int(x) for x in os.getenv('BOOK_OFFSETS', '3,6,9,12').split(','))
+# Every minute, not the four the model happens to score. The series already
+# holds every book change (~1.8/s), so this index is pure convenience — but a
+# four-entry index implies a privilege the data does not have, and the offset
+# grid is itself under test. Recomputable from `series` for any offset.
+OFFSETS = tuple(int(x) for x in
+                os.getenv('BOOK_OFFSETS', '1,2,3,4,5,6,7,8,9,10,11,12,13,14')
+                .split(','))
 WINDOW_TARGET = int(os.getenv('BOOK_WINDOWS', '25000'))
 REQUEST_BUDGET = int(os.getenv('BOOK_BUDGET', '60000'))
 TAIL_SECONDS = 90
