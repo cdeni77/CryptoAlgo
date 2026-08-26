@@ -41,7 +41,7 @@ def main() -> int:
     print('=' * 96)
     rows = []
     for name in ('minute_bars', 'venue_quotes', 'venue_ladder', 'pm_ladder',
-                 'venue_depth', 'venue_settlements'):
+                 'venue_depth', 'venue_settlements', 'venue_implied_vol'):
         try:
             d = store.read(name)
         except Exception as exc:                          # noqa: BLE001
@@ -60,6 +60,10 @@ def main() -> int:
         if 'offset_minutes' in d:
             off = sorted(int(x) for x in d['offset_minutes'].dropna().unique())
             entry['offsets'] = f'{off[0]}..{off[-1]} ({len(off)})' if off else '-'
+        if name == 'venue_implied_vol' and 'implied_sigma_per_min' in d:
+            entry['note'] = (
+                f"median {1e4 * d['implied_sigma_per_min'].median():.2f}bp/min, "
+                f"R2 {d['r2'].median():.3f}")
         if 'source' in d and d['source'].notna().any():
             entry['note'] = ' '.join(
                 f'{k}={v:,}' for k, v in d['source'].value_counts().items())
