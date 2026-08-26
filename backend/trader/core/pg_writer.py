@@ -837,6 +837,29 @@ class PgWriter:
                     stake += float(row.expected_cost or 0.0)
             return frozenset(symbols), stake, len(symbols)
 
+    def first_position_time(self) -> Optional[datetime]:
+        """When our books start, or None if they hold nothing.
+
+        `sync_venue` needs this to say how much of the P&L gap is simply a
+        shorter book. The venue remembers every settlement it ever made; this
+        store is wiped between experiments on purpose, so the two routinely
+        total over different periods. Measured on the first live run: 365 venue
+        settlements over four days against a store reset the night before, and
+        the entire gap was coverage rather than error.
+
+        Returned tz-aware in UTC. SQLite hands back naive datetimes even for a
+        `DateTime(timezone=True)` column, and comparing one of those against the
+        venue's aware timestamp raises rather than misreporting — which is the
+        better failure, but not one to ship.
+        """
+        with self._session() as session:
+            earliest = session.query(func.min(Position.window_open)).scalar()
+        if earliest is None:
+            return None
+        if earliest.tzinfo is None:
+            return earliest.replace(tzinfo=timezone.utc)
+        return earliest.astimezone(timezone.utc)
+
     def open_positions(self) -> list[Position]:
         with self._session() as session:
             return list(

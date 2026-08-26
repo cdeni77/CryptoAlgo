@@ -273,6 +273,45 @@ def _money(raw: dict, name: str) -> Optional[float]:
         return None
 
 
+def _fee(raw: dict, name: str = 'fee_cost') -> Optional[float]:
+    """A fee, which is **already in dollars** even without the `_dollars` suffix.
+
+    `_money` falls back to multiplying an unsuffixed field by a cent, which is
+    right for `revenue` (the venue serves `revenue: 500` for a $5.00 payout) and
+    wrong here. The venue does not serve `fee_cost_dollars` on a settlement at
+    all, so that fallback fired every time and stored the fee a hundred times too
+    small — and `pnl = revenue - cost - fee_cost` was inflated by the difference.
+    Measured on the live account: 365 settlements reported $0.28 of fees against
+    roughly $28 actually charged, and realised P&L read $40.34 instead of about
+    $12.62.
+
+    The proof is the published schedule. A live row with five NO contracts at
+    $4.515 carried `fee_cost: 0.030700`, and
+    `ceil(0.07 * 5 * p * (1-p) * 10000) / 10000` with `p = 4.515/5` is 0.0307 —
+    the fee in dollars, to the hundredth of a cent, exactly as `core/costs.py`
+    computes it. A fee is never a round number of cents on this venue, so an
+    unsuffixed `fee_cost` that is already fractional cannot be cents.
+
+    The suffixed form still wins where the venue sends one, and zero stays zero:
+    a settlement really can be charged nothing.
+    """
+    dollars = raw.get(f'{name}_dollars')
+    if dollars is not None:
+        try:
+            return float(dollars)
+        except (TypeError, ValueError):
+            logger.warning('%s_dollars was %r, which is not a number', name, dollars)
+            return None
+    value = raw.get(name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning('%s was %r, which is not a number', name, value)
+        return None
+
+
 @dataclass(frozen=True)
 class Fill:
     """One execution, as the venue recorded it. The account of record for entry.
@@ -449,10 +488,13 @@ def parse_fill(raw: dict) -> Fill:
 def parse_settlement(raw: dict) -> Settlement:
     """A settlements row, in dollars, with zeros preserved.
 
-    Every money field goes through `_money`, so a `revenue` of 0 on a lost market
-    stays 0 rather than becoming a missing measurement. `fee_cost` is read the
-    same way; the venue serves it as `fee_cost_dollars` where it serves the suffix
-    at all.
+    Money fields go through `_money`, so a `revenue` of 0 on a lost market stays 0
+    rather than becoming a missing measurement.
+
+    **`fee_cost` does NOT go through `_money`** — see `_fee`. The venue serves
+    `revenue` in integer cents and `fee_cost` in dollars, both unsuffixed, so the
+    one cents fallback cannot serve both. Reading the fee through it divided every
+    fee by a hundred and inflated every settled trade's P&L.
     """
     return Settlement(
         ticker=str(raw.get('ticker') or ''),
@@ -464,7 +506,7 @@ def parse_settlement(raw: dict) -> Settlement:
         yes_cost=_money(raw, 'yes_total_cost'),
         no_cost=_money(raw, 'no_total_cost'),
         revenue=_money(raw, 'revenue'),
-        fee_cost=_money(raw, 'fee_cost'),
+        fee_cost=_fee(raw),
         settled_time=_parse_time(raw.get('settled_time')),
         raw=dict(raw),
     )

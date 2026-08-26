@@ -153,10 +153,29 @@ async def main() -> int:
         if summary.realized_pnl is not None:
             gap = summary.realized_pnl - float(account.realized_pnl)
             print(f'    P&L gap           {gap:+,.2f}  (venue minus ours)')
+
+            # **Say how much of the gap is just a shorter book.** The venue
+            # remembers every settlement; our store gets wiped between
+            # experiments on purpose, so it routinely covers a shorter window
+            # and the totals are then not comparable at all. Measured the first
+            # time this ran: the venue held 365 settlements over four days
+            # against a store reset the previous night, and the whole gap was
+            # coverage rather than error. Listing only proxy/fee/fill causes
+            # sends someone hunting a bug that is not there.
+            ours_from = writer.first_position_time()
+            if ours_from is not None and summary.first_settled is not None:
+                theirs = summary.first_settled
+                if theirs < ours_from - timedelta(hours=1):
+                    print(f'      Coverage differs: the venue settles from '
+                          f'{theirs:%Y-%m-%d %H:%M} and our books only from '
+                          f'{ours_from:%Y-%m-%d %H:%M}, so these totals are '
+                          f'over different periods and the gap is mostly that. '
+                          f'Wiping the store between experiments does this and '
+                          f'is deliberate.')
             if abs(gap) > 0.01:
-                print('      A gap is a settlement our Coinbase proxy called '
-                      'differently, a fee we mispriced, or a fill we never '
-                      'booked. The venue is right.')
+                print('      Beyond coverage, a gap is a settlement our '
+                      'Coinbase proxy called differently, a fee we mispriced, '
+                      'or a fill we never booked. The venue is right.')
 
     check = venue_ledger.balance_check(
         venue_balance=balance, settlements=settlement_rows, fills=fill_rows)
