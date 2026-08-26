@@ -60,11 +60,21 @@ class TestCoverageReporting:
         assert coverage_log_level(
             report(minutes_present=1450)) >= logging.INFO
 
-    def test_dropped_boundaries_are_logged_at_info(self):
-        """A dropped boundary is a window that cannot be scored at all."""
+    def test_the_one_boundary_the_live_grid_always_drops_is_not_news(self):
+        """The in-progress window has no settlement yet, so exactly one boundary
+        drops on every live cycle, forever. Treating that as an anomaly is how the
+        first version of this rule kept the noisiest line at INFO."""
         from core.windows import coverage_log_level
 
-        assert coverage_log_level(report(dropped=3)) >= logging.INFO
+        assert coverage_log_level(report(dropped=1)) == logging.DEBUG
+
+    def test_more_dropped_boundaries_than_the_live_edge_explains_are_news(self):
+        """Two or more means windows are being lost for a reason other than the
+        clock, and each one is a window that cannot be scored at all."""
+        from core.windows import coverage_log_level
+
+        assert coverage_log_level(report(dropped=2)) >= logging.INFO
+        assert coverage_log_level(report(dropped=17)) >= logging.INFO
 
 
 class TestDecisionReporting:

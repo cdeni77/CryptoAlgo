@@ -175,7 +175,12 @@ def coverage_log_level(report: 'GridReport') -> int:
 
     if report.minutes_present < report.minutes_expected:
         return logging.INFO
-    if report.windows_dropped_boundary > 0:
+    # **One dropped boundary is the permanent live steady state**, not an
+    # anomaly. The window currently in progress has no settlement minute yet, so
+    # it is dropped on every single cycle, forever. The first version of this
+    # rule tested `> 0` and therefore kept the noisiest line in the log at INFO —
+    # which was the whole thing it was written to stop.
+    if report.windows_dropped_boundary > 1:
         return logging.INFO
     if report.windows_with_interior_gaps > 0:
         return logging.INFO
