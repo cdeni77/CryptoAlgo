@@ -129,20 +129,82 @@ def test_a_winning_favourite_that_nets_negative_is_still_a_win():
                             no_contracts=1.0) is None
 
 
+# The venue's documented payload for /historical/trades, verbatim. Kept as one
+# literal so the parser is exercised against the real field set rather than
+# against a hand-picked subset of it.
+TAPE_PRINT = {
+    'trade_id': 'x', 'ticker': 'A', 'count_fp': '10.00',
+    'yes_price_dollars': '0.5600', 'no_price_dollars': '0.4400',
+    'taker_outcome_side': 'yes', 'taker_book_side': 'bid',
+    'created_time': '2023-11-07T05:31:56Z', 'is_block_trade': True,
+    'taker_side': 'yes',
+}
+
+
 def test_the_tape_is_anonymous_and_carries_no_side_of_ours():
     """`/historical/trades` is the public tape. It has no account attribution.
 
-    A `Trade` deliberately has no `side`, no position and no P&L. It is the
-    endpoint that looks like the answer and is not: summing it sums the exchange.
+    A `Trade` deliberately has no position and no P&L. It is the endpoint that
+    looks like the answer and is not: summing it sums the exchange.
+
+    The `taker_*` fields are the closest it comes to naming a participant, and
+    what they name is the aggressor of that print — any account, including
+    someone else's. So `taker_side` exists on a `Trade` and is explicitly not a
+    side of ours; nothing may filter the tape by it and call the result a
+    position.
     """
-    trade = parse_trade({'trade_id': 'x', 'ticker': 'A', 'count_fp': '500.00',
-                         'yes_price_dollars': '0.4000',
-                         'no_price_dollars': '0.6000',
-                         'created_time': '2026-08-25T10:00:00Z'})
-    assert trade.price_for('up') == pytest.approx(0.40)
-    assert trade.price_for('down') == pytest.approx(0.60)
+    trade = parse_trade(TAPE_PRINT)
+    assert trade.contracts == pytest.approx(10.0)
+    assert trade.price_for('up') == pytest.approx(0.56)
+    assert trade.price_for('down') == pytest.approx(0.44)
+    assert trade.is_block_trade is True
     assert not hasattr(trade, 'pnl')
-    assert not hasattr(trade, 'side')
+    assert not hasattr(trade, 'contracts_held')
+
+
+def test_the_taker_side_is_translated_and_the_book_side_is_not():
+    """'yes'/'no' become 'up'/'down'; 'bid'/'ask' stay the venue's own language.
+
+    The book side is not a direction — on a single YES-denominated book an `ask`
+    is a sale of YES, which is economically a purchase of NO — so translating it
+    into this project's directional vocabulary would assert something false.
+    """
+    trade = parse_trade(TAPE_PRINT)
+    assert trade.taker_side == 'up'
+    assert trade.taker_book_side == 'bid'
+
+    no_side = parse_trade({**TAPE_PRINT, 'taker_outcome_side': 'no',
+                           'taker_side': 'no', 'taker_book_side': 'ask'})
+    assert no_side.taker_side == 'down'
+    assert no_side.taker_book_side == 'ask'
+
+
+def test_the_renamed_taker_field_wins_over_the_alias():
+    """The payload serves both names; reading the older one goes stale silently."""
+    trade = parse_trade({**TAPE_PRINT, 'taker_outcome_side': 'no',
+                         'taker_side': 'yes'})
+    assert trade.taker_side == 'down'
+    # And the alias alone still works, for a venue that drops the new name.
+    alias_only = parse_trade({'trade_id': 'y', 'ticker': 'A', 'taker_side': 'no'})
+    assert alias_only.taker_side == 'down'
+    # An unfamiliar value is carried through rather than guessed at.
+    assert parse_trade({'trade_id': 'z', 'ticker': 'A',
+                        'taker_side': 'sideways'}).taker_side == 'sideways'
+    assert parse_trade({'trade_id': 'w', 'ticker': 'A'}).taker_side is None
+
+
+def test_a_print_whose_two_prices_do_not_sum_to_a_dollar_is_read_as_served():
+    """Neither price is derived as `1 - the other`.
+
+    The venue's own documented example carries 0.5600 on both sides. Deriving one
+    from the other would turn a payload we do not fully understand into a
+    confident wrong number, which is the failure mode this whole module is built
+    against.
+    """
+    trade = parse_trade({**TAPE_PRINT, 'yes_price_dollars': '0.5600',
+                         'no_price_dollars': '0.5600'})
+    assert trade.price_for('up') == pytest.approx(0.56)
+    assert trade.price_for('down') == pytest.approx(0.56)
 
 
 # ------------------------------------------------------- reading both tiers

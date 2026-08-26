@@ -365,11 +365,20 @@ class Trade:
     so this cannot compute a portfolio, and reading a tape total as a position is
     how a P&L page comes to show someone else's money.
 
+    **The `taker_*` fields do not make it ours.** The payload carries
+    `taker_outcome_side`, `taker_side` and `taker_book_side`, which is the closest
+    this endpoint comes to naming a participant — and what they name is which side
+    the *aggressor of that print* crossed on. Any account could be the aggressor,
+    including someone else's. There is still no account id, so a tape filtered to
+    `taker_outcome_side == 'yes'` is not our buys; it is everybody's.
+
     What it is good for is the two things a portfolio page actually lacks: a
     market-observed last price to mark an open position at (our own forecast must
     never do that job — marking a binary at the probability we believe books
     conviction as profit), and an independent check that a fill printed at the
-    price the venue told us it did. `Fill.trade_id` joins to `trade_id` here.
+    price the venue told us it did. `Fill.trade_id` joins to `trade_id` here, and
+    for a fill where `Fill.is_taker` is true `taker_side` should agree with
+    `Fill.side` — which is what makes the check a check rather than a restatement.
     """
 
     trade_id: str
@@ -379,8 +388,21 @@ class Trade:
     no_price: Optional[float]
     created_time: Optional[datetime]
     is_block_trade: Optional[bool]
+    # Which side the aggressor took, in this project's vocabulary ('up'/'down'),
+    # and which side of the book they hit ('bid'/'ask', kept verbatim because it
+    # is the venue's own single-book language and not a direction).
+    taker_side: Optional[str] = None
+    taker_book_side: Optional[str] = None
 
     def price_for(self, side: str) -> Optional[float]:
+        """What this print paid for `side`.
+
+        Both `yes_price` and `no_price` are read from the payload rather than one
+        being derived as `1 - other`. They are usually complementary and nothing
+        here needs them to be: a venue that quotes them independently, or a
+        documented example where they do not sum to a dollar, must not silently
+        become a wrong number.
+        """
         return self.yes_price if side == 'up' else self.no_price
 
 
@@ -449,6 +471,18 @@ def parse_settlement(raw: dict) -> Settlement:
 
 
 def parse_trade(raw: dict) -> Trade:
+    """A tape print. The taker side is translated; the book side is not.
+
+    `taker_outcome_side` is preferred over `taker_side`: the payload serves both,
+    which is the venue's usual pattern for a field it has renamed, and reading the
+    older name first would go stale silently the day the alias is dropped.
+    """
+    taker = raw.get('taker_outcome_side') or raw.get('taker_side')
+    taker_side = None
+    if taker:
+        text = str(taker).strip().lower()
+        taker_side = {'yes': 'up', 'no': 'down'}.get(text, text)
+    book_side = raw.get('taker_book_side')
     return Trade(
         trade_id=str(raw.get('trade_id') or ''),
         ticker=str(raw.get('ticker') or ''),
@@ -457,6 +491,8 @@ def parse_trade(raw: dict) -> Trade:
         no_price=_money(raw, 'no_price'),
         created_time=_parse_time(raw.get('created_time')),
         is_block_trade=_bool(raw.get('is_block_trade')),
+        taker_side=taker_side,
+        taker_book_side=str(book_side).strip().lower() if book_side else None,
     )
 
 
