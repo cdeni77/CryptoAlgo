@@ -155,6 +155,21 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
     # question (would this order have filled); the totals and level counts are
     # what imbalance and ladder slope are built from, and those are the
     # plausible carriers of the information the feature set cannot express.
+    # **The market's own forward volatility.** `sigma_remaining` is the only
+    # forecast the barrier framing requires, and everything in `core/vol.py`
+    # estimates it from PAST returns. Kalshi's KXBTCD threshold ladder is priced
+    # off a single volatility over an overlapping horizon, published free and
+    # updated every minute; inverting it gives the market's forward estimate of
+    # exactly the quantity the model guesses. No feature group has ever seen it.
+    #
+    # `r2` is the honesty column: it says whether the ladder was internally
+    # consistent enough for the number beside it to mean anything.
+    'venue_implied_vol': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'event_ticker', 'close_time', 'minutes_to_close',
+        'implied_sigma_per_min', 'implied_spot', 'atm_strike', 'n_strikes',
+        'r2',
+    ),
     'venue_depth': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'offset_minutes',

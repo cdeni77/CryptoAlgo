@@ -338,6 +338,27 @@ services:
       -m scripts.record_pm_ladder
         --batch-rows 6
 
+  # The market's own forward volatility, inverted from the KXBTCD strike ladder.
+  #
+  # `sigma_remaining` is the ONLY forecast the barrier framing requires, and
+  # everything in `core/vol.py` estimates it from past returns. This is the
+  # market's forward estimate of the same quantity, published free and updated
+  # every minute, and no feature group has ever seen it. Measured live: ~4.6
+  # bp/min over a 34-minute horizon from 12 strikes at R^2 0.97.
+  #
+  # KXBTCD closes on the hour and carries an explicit strike, so it is NOT the
+  # traded instrument — that is the point. It prices the same underlying's
+  # volatility over an overlapping horizon and says nothing about direction.
+  #
+  # Collection of this stopped on 2026-08-25 and nothing restarted it.
+  implied-vol-recorder:
+    profiles: ["live"]
+    extends:
+      service: trader
+    restart: unless-stopped
+    command: >
+      -m scripts.record_implied_vol
+
   trade-live:
     profiles: ["live"]
     extends:
