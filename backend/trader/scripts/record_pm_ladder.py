@@ -19,7 +19,7 @@ ORG-WIDE bucket, so a live recorder running through it would throttle the
 backfill it is meant to complement. Both refuse a bare `Python-urllib`
 User-Agent with a 403 — the header below is not decoration.
 
-**The slug is verified, not assumed.** `{asset}-updown-15m-{unix_close}` is
+**The slug is verified, not assumed.** `{asset}-updown-15m-{unix_open}` is
 computable from the clock, and this asks the venue for that slug rather than
 trusting it: a market that does not come back is an abstention, and a renamed
 series then records nothing instead of recording the wrong thing.
@@ -50,6 +50,35 @@ ASSETS = {'btc': 'BTC-USD', 'eth': 'ETH-USD', 'sol': 'SOL-USD'}
 # Both hosts answer a browser agent and 403 a bare urllib one.
 HEADERS = {'User-Agent': 'Mozilla/5.0 (quarter research collector)',
            'Accept': 'application/json'}
+
+
+def window_of(slug: str) -> pd.Timestamp:
+    """The window a slug names. Its trailing unix stamp is the OPEN.
+
+    Assumed to be the close at first, which shifted every Polymarket window by
+    fifteen minutes and was invisible: every window is a valid window and
+    nothing raised. It showed up only when the venue's settlement was scored
+    against our Coinbase label — Kalshi agreed 96.98%, Polymarket 49.85%, and
+    Kalshi against Polymarket 50.0%, which places the error in the mapping
+    rather than in either venue's data.
+
+    The venue says it three ways and they agree: the slug stamp, the title
+    ("9:30PM-9:45PM ET"), and `end_time`, which is the stamp plus fifteen
+    minutes.
+    """
+    return pd.Timestamp(int(str(slug).rsplit('-', 1)[-1]), unit='s', tz='UTC')
+
+
+def slug_for(asset: str, now: datetime) -> str:
+    """The slug of the window `now` is INSIDE — floor, never ceil.
+
+    `ceil` names the next window. That market already exists and already trades,
+    so the request succeeded and returned a healthy book, which was then stamped
+    with this window's `window_open`. A wrong answer that looks entirely right.
+    """
+    opened = pd.Timestamp(now).tz_convert('UTC').floor(
+        f'{DEFAULT_CONFIG.window_minutes}min')
+    return f'{asset}-updown-15m-{int(opened.timestamp())}'
 
 
 def _levels(raw) -> list:
@@ -97,7 +126,6 @@ async def run(args) -> int:
 
     config = DEFAULT_CONFIG
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
-    window = timedelta(minutes=config.window_minutes)
     rows: list[dict] = []
 
     while True:
@@ -106,11 +134,11 @@ async def run(args) -> int:
                     timeout=aiohttp.ClientTimeout(total=20)) as session:
                 while True:
                     now = datetime.now(timezone.utc)
-                    close = pd.Timestamp(now).ceil(f'{config.window_minutes}min')
-                    window_open = close - window
+                    window_open = pd.Timestamp(now).tz_convert('UTC').floor(
+                        f'{config.window_minutes}min')
                     minute = (now - window_open.to_pydatetime()).total_seconds() / 60.0
                     for asset, symbol in ASSETS.items():
-                        slug = f'{asset}-updown-15m-{int(close.timestamp())}'
+                        slug = slug_for(asset, now)
                         try:
                             found = await _get(session, f'{GAMMA}/markets?slug={slug}')
                         except Exception as exc:          # noqa: BLE001

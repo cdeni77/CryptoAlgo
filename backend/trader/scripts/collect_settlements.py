@@ -188,7 +188,12 @@ async def polymarket(session, now: pd.Timestamp) -> list[dict]:
             symbol = PM_ASSETS.get(asset)
             if symbol is None:
                 continue
-            close = pd.Timestamp(int(stamp), unit='s', tz='UTC')
+            # The slug's trailing stamp is the window OPEN, not its close —
+            # verified against the venue's own `end_time` and title. Read as a
+            # close it shifts every Polymarket window fifteen minutes and drags
+            # agreement with our label to a coin flip.
+            opened = pd.Timestamp(int(stamp), unit='s', tz='UTC')
+            close = opened + pd.Timedelta(minutes=15)
             # `outcomes` is ordered, and A is the first — "Up". Carried through
             # rather than assumed: a market whose labels are not Up/Down is not
             # the instrument this is about and is dropped.
@@ -198,10 +203,10 @@ async def polymarket(session, now: pd.Timestamp) -> list[dict]:
                 continue
             rows.append({
                 'venue': 'polymarket', 'symbol': symbol,
-                'event_time': close - pd.Timedelta(minutes=15),
+                'event_time': opened,
                 'available_time': now, 'quality': 'valid',
                 'market_ticker': slug,
-                'window_open': close - pd.Timedelta(minutes=15),
+                'window_open': opened,
                 'close_time': close,
                 'settlement_time': _time(market.get('close_time')),
                 'result': 'yes' if side == 'A' else 'no',

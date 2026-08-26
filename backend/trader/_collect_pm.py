@@ -194,8 +194,8 @@ async def price(session) -> int:
     snapshots across the window, which is ample for a mid at each offset, and it
     carries depth and imbalance as well.
 
-    The slug's trailing unix timestamp is the window CLOSE, so the window opens
-    fifteen minutes earlier and offset `m` is `close - 15m + m`.
+    The slug's trailing unix timestamp is the window OPEN, so offset `m` is
+    simply `slug_ts + m` and the market closes at `slug_ts + 15m`.
     """
     if not os.path.exists(MARKETS_OUT):
         print('stage 2: nothing discovered'); return 0
@@ -217,8 +217,12 @@ async def price(session) -> int:
     written = errors = empty = 0
     with open(PRICES_OUT, 'a') as handle:
         for m in todo:
-            close = int(m['market_slug'].split('-')[-1])
-            open_ts = close - 15 * 60
+            # The slug's trailing stamp is the window OPEN — verified against
+            # the venue's `end_time` (stamp + 15 minutes) and its title. Read as
+            # a close, every window shifts by fifteen minutes: the books are
+            # real and the offsets are wrong, which nothing raises on.
+            open_ts = int(m['market_slug'].split('-')[-1])
+            close = open_ts + 15 * 60
             token = (m['outcomes'][0] or {}).get('token_id')
             if not token:
                 errors += 1
