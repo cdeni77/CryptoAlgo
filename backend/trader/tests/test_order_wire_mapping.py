@@ -142,11 +142,20 @@ def test_self_trade_prevention_is_set_to_cross_the_spread(key_pem):
     assert body['self_trade_prevention_type'] == 'taker_at_cross'
 
 
-def test_the_default_time_in_force_is_fill_or_kill(key_pem):
-    """A resting order fills against a barrier probability that has expired."""
+def test_the_default_time_in_force_takes_partial_fills(key_pem):
+    """Neither resting nor all-or-nothing.
+
+    A resting order fills against a barrier probability that has expired, so
+    `good_till_canceled` is wrong on a fifteen-minute market. But `fill_or_kill`
+    is all-or-nothing: nine contracts wanted against five resting returns
+    nothing, which is how `fill_or_kill_insufficient_resting_volume` kept
+    appearing in the live log while the touch held single digits.
+    `immediate_or_cancel` takes the five, and with a positive edge a partial fill
+    strictly beats a kill.
+    """
     body = captured_body(key_pem, ticker='T', side='up', contracts=1,
                          limit_price=0.50)['body']
-    assert body['time_in_force'] == 'fill_or_kill'
+    assert body['time_in_force'] == 'immediate_or_cancel'
 
 
 def test_every_order_carries_the_idempotency_key_it_was_given(key_pem):

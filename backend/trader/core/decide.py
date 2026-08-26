@@ -424,7 +424,10 @@ def decide(
     # resting at the touch, that is the real cap.
     measured_depth = _optional(get, f'depth_{side.value}')
     if measured_depth is not None and measured_depth > 0:
-        stake_target = min(stake_target, measured_depth)
+        # Only a fraction of it: see `Config.depth_fraction`. The quote is read
+        # seconds before the order lands and a quarter of the time the touch has
+        # halved by then.
+        stake_target = min(stake_target, measured_depth * config.depth_fraction)
     # Never stake more than is actually there, whatever the fractions say.
     stake_target = min(stake_target, bankroll)
     room = config.max_window_exposure_fraction * sizing_base - exposure.stake

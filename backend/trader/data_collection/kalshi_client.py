@@ -511,14 +511,20 @@ class KalshiClient:
         contracts: int,
         limit_price: float,
         client_order_id: Optional[str] = None,
-        time_in_force: str = 'fill_or_kill',
+        time_in_force: str = 'immediate_or_cancel',
     ) -> dict:
         """Buy `contracts` of `side` at no worse than `limit_price` (dollars).
 
-        Refuses unless the client was constructed with `live=True`. The default
-        is `fill_or_kill`: a 15-minute market is a wasting asset, and a resting
-        order that fills eight minutes later is filling against a barrier
-        probability that no longer holds — the decision it came from has expired.
+        Refuses unless the client was constructed with `live=True`.
+
+        The default is `immediate_or_cancel`, not `fill_or_kill`. Both refuse to
+        rest — correct on a wasting asset, where an order filling eight minutes
+        later is filling against a barrier probability that no longer holds — but
+        `fill_or_kill` is all-or-nothing. Nine contracts wanted against five
+        resting returns nothing at all; `immediate_or_cancel` takes the five.
+        With a positive edge a partial fill strictly beats a kill, and the
+        accounting already handles partials (16 of the first 323 live fills were
+        partial).
         """
         if not self.live:
             raise NotLiveError(
@@ -575,8 +581,8 @@ class KalshiClient:
             'price': f'{cents / 100.0:.4f}',
             'time_in_force': time_in_force,
             # Required in V2. `taker_at_cross` crosses the spread, which is what a
-            # fill_or_kill on a wasting 15-minute market is for; `maker` would rest
-            # and is the opposite of the intent.
+            # immediate_or_cancel on a wasting 15-minute market is for; `maker`
+            # would rest and is the opposite of the intent.
             'self_trade_prevention_type': 'taker_at_cross',
             # Which exchange holds the market. Omitting it defaults to 0, and a
             # market on another exchange is then simply not found — a 404 that

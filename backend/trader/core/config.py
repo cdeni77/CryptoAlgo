@@ -246,6 +246,20 @@ class Config:
     # account passes about $500 — and without it a backtest compounds a $100
     # account into size no venue could fill and reports the result as a return.
     # Measure the book, then set this from the measurement.
+    # How much of the depth measured at the touch a stake may claim.
+    #
+    # Sizing to 100% of it is sizing to a number that has already moved: the
+    # quote is read ~4s before the order is sent. Measured over 237 windows of
+    # real book at +12m, the size resting at the touch retains a median 1.00x
+    # after 45 seconds but only **0.55x at the 25th percentile**, and shrinks
+    # 35% of the time. Half of what is visible is the part that reliably
+    # survives.
+    #
+    # On the median trade this is free — 241 contracts resting against ~9
+    # wanted, so the cap does not bind. It bites only in the thin tail (p10 is
+    # 6 contracts), which is exactly where `fill_or_kill_insufficient_resting_volume`
+    # was coming from.
+    depth_fraction: float = 0.5
     max_stake_dollars: Optional[float] = 25.0
 
     # Size from the *starting* bankroll rather than the current one.
