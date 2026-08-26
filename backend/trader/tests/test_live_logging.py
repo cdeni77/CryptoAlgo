@@ -115,3 +115,45 @@ class TestDecisionReporting:
         from scripts.live import decision_log_level
 
         assert decision_log_level(decision(reason)) >= logging.INFO
+
+
+class TestHeartbeat:
+    """Quiet is the goal; silent is a different failure.
+
+    After the noise was removed the loop emitted nothing at all in steady state,
+    which means the log cannot distinguish "running normally" from "hung". The
+    container healthcheck only proves the process is alive and can reach the
+    database — not that it is still waking on the offsets and deciding.
+
+    One line per 15-minute window is ~96 a day against the ~40,000 it replaced,
+    and it is the line an operator actually wants: is it cycling, is it deciding,
+    what is the bankroll, how late are the decisions landing.
+    """
+
+    def test_a_heartbeat_is_due_when_the_window_rolls(self):
+        from scripts.live import heartbeat_due
+
+        assert heartbeat_due(pd.Timestamp('2026-08-25 12:15', tz='UTC'),
+                             pd.Timestamp('2026-08-25 12:00', tz='UTC')) is True
+
+    def test_no_heartbeat_inside_the_same_window(self):
+        from scripts.live import heartbeat_due
+
+        assert heartbeat_due(pd.Timestamp('2026-08-25 12:00', tz='UTC'),
+                             pd.Timestamp('2026-08-25 12:00', tz='UTC')) is False
+
+    def test_the_first_cycle_emits_one(self):
+        """With no previous window there is nothing to compare against, and the
+        operator most wants a line right after a restart."""
+        from scripts.live import heartbeat_due
+
+        assert heartbeat_due(pd.Timestamp('2026-08-25 12:00', tz='UTC'), None) is True
+
+    def test_the_summary_names_what_an_operator_checks(self):
+        from scripts.live import heartbeat_summary
+
+        text = heartbeat_summary(
+            window_open=pd.Timestamp('2026-08-25 12:00', tz='UTC'),
+            cycles=14, decisions=6, traded=2, bankroll=108.83, lag_seconds=6.4)
+        for token in ('12:00', '14', '6', '2', '108.83', '6.4'):
+            assert token in text, f'{token!r} missing from {text!r}'

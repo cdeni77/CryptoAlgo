@@ -925,6 +925,27 @@ def decision_log_level(decision: Decision) -> int:
     return logging.DEBUG
 
 
+def heartbeat_due(window_open, last_window) -> bool:
+    """One line per window, so a quiet log still proves the loop is turning.
+
+    Removing the per-cycle noise left the loop emitting nothing at all in steady
+    state, which cannot be distinguished from a hang. The container healthcheck
+    only proves the process is alive and can reach the database — not that it is
+    still waking on the offsets and deciding. A restart emits one immediately,
+    because that is exactly when an operator is watching.
+    """
+    return last_window is None or window_open != last_window
+
+
+def heartbeat_summary(*, window_open, cycles: int, decisions: int, traded: int,
+                      bankroll: float, lag_seconds: float) -> str:
+    """The five things worth checking, on one line."""
+    lag = f'{lag_seconds:.1f}s' if lag_seconds == lag_seconds else 'n/a'
+    return (f'window {window_open:%H:%M} closed: {cycles} cycles, '
+            f'{decisions} decisions, {traded} traded, bankroll ${bankroll:.2f}, '
+            f'decision lag {lag}')
+
+
 def decision_offset(elapsed: float, config: Config,
                     forced: Optional[int] = None) -> Optional[int]:
     """The offset this cycle may decide at, or None to settle and reconcile only.
@@ -1697,7 +1718,25 @@ async def main() -> int:
             # missed and fired late is not fired repeatedly for the whole grace
             # window. Bounded: pruned to the current and next window.
             fired_targets: set = set()
+            # Per-window counters behind the heartbeat. Cheap, and the only proof
+            # a quiet log gives that the loop is still turning.
+            hb_window = None
+            hb_cycles = hb_decisions = hb_traded = 0
+            hb_lag = float('nan')
             while True:
+                now = datetime.now(timezone.utc)
+                window_open, _ = current_window(now, config)
+                if heartbeat_due(window_open, hb_window):
+                    if hb_window is not None:
+                        logger.info(heartbeat_summary(
+                            window_open=hb_window, cycles=hb_cycles,
+                            decisions=hb_decisions, traded=hb_traded,
+                            bankroll=float(writer.account().bankroll),
+                            lag_seconds=hb_lag))
+                    hb_window = window_open
+                    hb_cycles = hb_decisions = hb_traded = 0
+                    hb_lag = float('nan')
+                hb_cycles += 1
                 try:
                     decisions = await run_cycle(args, config, writer, model, kalshi)
                 except DatasetError as exc:
@@ -1713,6 +1752,14 @@ async def main() -> int:
                                      for d in decisions)
                     logger.log(logging.INFO if noteworthy else logging.DEBUG,
                                'cycle: %s', counts[counts > 0].to_dict())
+                    hb_decisions += len(decisions)
+                    hb_traded += sum(1 for d in decisions if d.traded)
+                    # How late this cycle read the book, against the offset it
+                    # was deciding. The last one in the window is representative.
+                    hb_lag = (datetime.now(timezone.utc) - (
+                        decisions[0].window_open.to_pydatetime()
+                        + timedelta(minutes=int(decisions[0].offset)))
+                    ).total_seconds()
                 if not args.loop:
                     return 0
                 await asyncio.sleep(seconds_until_next_decision(
