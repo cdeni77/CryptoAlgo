@@ -115,10 +115,40 @@ def _no_levels(raw) -> list:
     return [[round(1.0 - price, 6), size] for price, size in _levels(raw)]
 
 
-async def _get(session, url: str):
-    async with session.get(url, headers=HEADERS) as response:
-        response.raise_for_status()
-        return json.loads(await response.text() or 'null')
+async def _get(session, url: str, *, tries: int = 3):
+    """One request, retried on a transient failure.
+
+    Observed live, twice: `clob.polymarket.com` returned 403 for all three
+    assets in the same cycle, then recovered within a minute or two on its
+    own — the signature of a Cloudflare edge-level throttle, not a real
+    permission failure, since the identical request against the identical
+    host succeeds seconds later. This had no retry at all, so one blip cost
+    a whole minute of every asset's book with nothing attempted again until
+    the next poll.
+
+    429 and 403 both get a short retry with backoff; a genuine 4xx that is
+    not one of those (404, 400, ...) fails immediately, since retrying a
+    malformed request just produces the same malformed request.
+    """
+    for attempt in range(tries):
+        try:
+            async with session.get(url, headers=HEADERS) as response:
+                # 403/429 get another try, up to the limit; every other
+                # status — 200s included, and a genuine 4xx not on this
+                # list — is decided immediately, once, by raise_for_status.
+                if response.status in (403, 429) and attempt < tries - 1:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                response.raise_for_status()
+                return json.loads(await response.text() or 'null')
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            # A genuine network failure, not an HTTP status — this is the
+            # only case a blanket retry belongs to.
+            if attempt < tries - 1:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(f'unreachable: retries exhausted for {url}')
 
 
 async def run(args, gate=None) -> int:
