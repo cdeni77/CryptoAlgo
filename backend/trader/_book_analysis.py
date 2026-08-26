@@ -18,7 +18,8 @@ the fill assumption is sound and the measured edge stands.
 **3. Book imbalance as a feature.** `CLAUDE.md` lists imbalance, ladder slope,
 depth asymmetry and level counts as "plausible carriers that appear in no feature
 group". Tested here against the market's own residual, controlling for price,
-clustered by day — the same bar the trade tape failed.
+clustered by day — the same bar the trade tape failed at t = -1.90 over sixteen
+cells. One projection, pre-registered, not a sweep over the ladder.
 
 Question 2 is the one to read first. It is the only one that could invalidate
 rather than merely extend.
@@ -26,7 +27,6 @@ rather than merely extend.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 
@@ -41,7 +41,7 @@ from scripts.retro_forecast_test import score_artifact
 pd.set_option('display.width', 220)
 TAKER = 0.07
 HALF = 0.005
-BOOK = 'data/book_at_decision.jsonl'
+OFFSET = int(os.getenv('BOOK_OFFSET', '12'))
 
 
 def fee(p):
@@ -50,14 +50,23 @@ def fee(p):
 
 def main() -> int:
     cfg = DEFAULT_CONFIG
-    books = [json.loads(line) for line in open(BOOK)]
-    b = pd.json_normalize(books)
-    b['window_open'] = pd.to_datetime(b['window_open'], utc=True)
-    print(f'book rows {len(b):,}  '
-          f'{b["window_open"].min().date()} .. {b["window_open"].max().date()}  '
-          f'median snapshots {b["n_snapshots"].median():.0f}')
-
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
+
+    # **Read the unified table, not a JSONL side-archive.** This used to load
+    # `data/book_at_decision.jsonl` — a truncated, +12m-only pull that has since
+    # been retired. `venue_depth` carries every source at every minute with a
+    # `source` column, so the offset is a parameter now and the same analysis
+    # runs against live recording or Predexon backfill without a second reader.
+    depth = store.read('venue_depth')
+    depth = depth[(depth['venue'] == 'kalshi')
+                  & (depth['offset_minutes'] == OFFSET)]
+    b = depth.drop_duplicates(['symbol', 'window_open'], keep='last').copy()
+    b['window_open'] = pd.to_datetime(b['window_open'], utc=True)
+    if not len(b):
+        print(f'no venue_depth rows at +{OFFSET}m'); return 1
+    print(f'book rows {len(b):,} at +{OFFSET}m  '
+          f'{b["window_open"].min().date()} .. {b["window_open"].max().date()}  '
+          f'sources: {b["source"].value_counts().to_dict()}')
     quotes = store.read('venue_quotes')
     quotes['window_open'] = pd.to_datetime(quotes['window_open'], utc=True)
     usable = quotes.loc[quotes['usable'].astype(bool)].copy()
@@ -71,7 +80,8 @@ def main() -> int:
     j = j[(j['offset'] == 12) & j['outcome'].isin([0, 1, True, False])].copy()
     j['outcome'] = j['outcome'].astype(float)
     j['spread'] = j['spread'].fillna(0.01)
-    j = j.merge(b, on=['symbol', 'window_open'], how='inner')
+    j = j.merge(b, on=['symbol', 'window_open'], how='inner',
+                suffixes=('', '_book'))
     print(f'joined with scores: {len(j):,} windows\n')
     if len(j) < 100:
         print('too few joined rows to conclude anything')
@@ -100,10 +110,10 @@ def main() -> int:
     # A YES buy lifts the resting ASK side; a NO buy lifts the resting BID side
     # (selling YES). `ask_at_touch` / `bid_at_touch` are the sizes at the touch,
     # and the 1c figures are what a limit one tick through would reach.
-    j['avail_touch'] = np.where(yes, j['at_decision.ask_at_touch'],
-                                j['at_decision.bid_at_touch']).astype(float)
-    j['avail_1c'] = np.where(yes, j['at_decision.ask_1c'],
-                             j['at_decision.bid_1c']).astype(float)
+    j['avail_touch'] = np.where(yes, j['yes_ask_size'],
+                                j['yes_bid_size']).astype(float)
+    j['avail_1c'] = np.where(yes, j['depth_ask_1c'],
+                             j['depth_bid_1c']).astype(float)
 
     trade = (j['edge'] > cfg.min_edge_pp / 100.0) & (j['wanted'] >= cfg.min_contracts) \
         & (j['price'] >= cfg.min_traded_price) & (j['price'] <= cfg.max_traded_price)
@@ -143,7 +153,14 @@ def main() -> int:
     print('\n' + '=' * 78)
     print('3. BOOK IMBALANCE as a feature — does it beat the market residual?')
     print('=' * 78)
-    imb = j['at_decision.imbalance'].astype(float)
+    # Imbalance is derived here rather than stored: (bid - ask) / (bid + ask)
+    # over the resting totals. Storing a ratio would fix one projection of the
+    # ladder and foreclose the others, which is the whole reason the levels are
+    # kept.
+    bid_tot = j['depth_bid_total'].astype(float)
+    ask_tot = j['depth_ask_total'].astype(float)
+    total = bid_tot + ask_tot
+    imb = ((bid_tot - ask_tot) / total.where(total > 0)).astype(float)
     ok = np.isfinite(imb) & np.isfinite(mid)
     resid = y[ok] - mid[ok]
     x = imb[ok].to_numpy()
