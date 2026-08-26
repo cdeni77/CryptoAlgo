@@ -26,7 +26,8 @@ Established by probing, so it is not rediscovered:
     window is 1,600 to 27,000 snapshots and pagination is mandatory
   * the endpoint reports `zero_credit_endpoint`: free, limited only to 1 req/s on
     an ORG-wide bucket, so nothing else may hit the API concurrently
-  * coverage for KXBTC15M begins ~2026-06-19, not at the series open
+  * coverage for KXBTC15M begins ~2026-06-19, not at the series open — the
+    orderbook endpoint starts months after the market metadata does
 
 Work order is shuffled (seeded) so an interrupted run is a representative sample
 of the 70 days rather than the oldest slice — iterating chronologically made a
@@ -56,6 +57,7 @@ OFFSETS = tuple(int(x) for x in
 WINDOW_TARGET = int(os.getenv('BOOK_WINDOWS', '25000'))
 REQUEST_BUDGET = int(os.getenv('BOOK_BUDGET', '60000'))
 TAIL_SECONDS = 90
+BOOK_COVERAGE_START = os.getenv('BOOK_COVERAGE_START', '2026-06-19')
 MAX_PAGES = 30
 
 FIELDS = ('ts', 'best_bid', 'best_ask', 'bid_at_touch', 'ask_at_touch',
@@ -131,25 +133,60 @@ async def main() -> int:
 
     from core.datastore import ResearchStore
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
-    quotes = store.read('venue_quotes')
-    quotes['window_open'] = pd.to_datetime(quotes['window_open'], utc=True)
-    at12 = quotes[(quotes['offset_minutes'] == 12)
-                  & quotes['usable'].astype(bool)
-                  & (quotes['market_probability'] > 0.05)
-                  & (quotes['market_probability'] < 0.95)]
-    rows = at12[['symbol', 'window_open', 'market_ticker']].dropna().drop_duplicates()
-    # **Stop two hours back, not a day.** A one-day cutoff meant the backfill
-    # ended exactly where the live ladder recorder began, so the two never
-    # described the same minute and could not be checked against each other.
-    # That cross-check is the only independent evidence that the history every
-    # book feature will be trained on is the same object we record live. Two
-    # hours is enough for the venue's own history to settle.
+
+    # **The window list comes from settlements, not quotes.** It used to come
+    # from `venue_quotes` at offset 12, filtered to usable rows inside
+    # [0.05, 0.95] — and that made the live-vs-backfill cross-check IMPOSSIBLE,
+    # not merely empty. `venue_quotes` is itself a backfill that stops before the
+    # live ladder recorder started, so no window it lists can also have been
+    # recorded live, whatever cutoff is used here. Widening the cutoff to two
+    # hours changed nothing until this changed with it.
+    #
+    # `venue_settlements` is the venue's own list of markets that existed and
+    # settled, running to within an hour of now, so the two sources finally
+    # overlap. It also drops the tradeability filter, which is the right call
+    # for training data: selecting windows by the price they happened to quote
+    # is selection on a variable the book features are supposed to explain.
+    settled = store.read('venue_settlements')
+    settled = settled[settled['venue'] == 'kalshi']
+    settled['window_open'] = pd.to_datetime(settled['window_open'], utc=True)
+    rows = settled[['symbol', 'window_open', 'market_ticker']].dropna(
+    ).drop_duplicates()
+
+    # Predexon's ORDERBOOK coverage begins ~2026-06-19, months after the series
+    # opened and long after its market metadata starts. Asking for older windows
+    # costs a request each and returns nothing.
+    rows = rows[rows['window_open'] >= pd.Timestamp(BOOK_COVERAGE_START, tz='UTC')]
+
+    # **Stop two hours back, not a day.** A one-day cutoff ended the backfill
+    # exactly where the live ladder recorder begins, so the two never described
+    # the same minute. That cross-check is the only independent evidence that the
+    # history every book feature will be trained on is the same object we record
+    # live. Two hours is enough for the venue's own history to settle.
     rows = rows[rows['window_open']
                 < pd.Timestamp.now(tz='UTC') - pd.Timedelta(hours=2)]
     rows = rows.sort_values('window_open').reset_index(drop=True)
     step = max(1, len(rows) // WINDOW_TARGET)
     rows = rows.iloc[::step].head(WINDOW_TARGET)
     rows = rows.sample(frac=1.0, random_state=20260826).reset_index(drop=True)
+
+    # **The windows the live recorder also saw go first.** They are the only
+    # rows on which backfill can be checked against an independent observation
+    # of the same book, and a uniform shuffle scatters them through fourteen
+    # thousand others — so the one validation that matters would wait for the
+    # whole run. Everything after them stays shuffled, so any prefix of the
+    # remainder is still a representative sample of the period rather than its
+    # oldest slice.
+    try:
+        recorded = store.read('venue_ladder')
+        first_live = pd.to_datetime(recorded['window_open'], utc=True).min()
+    except Exception:                                     # noqa: BLE001
+        first_live = None
+    if first_live is not None and pd.notna(first_live):
+        overlap = rows['window_open'] >= first_live
+        rows = pd.concat([rows[overlap], rows[~overlap]], ignore_index=True)
+        print(f'{int(overlap.sum())} windows overlap the live recorder and go '
+              f'first, for the live-vs-backfill check', flush=True)
 
     done = set()
     if os.path.exists(OUT):
