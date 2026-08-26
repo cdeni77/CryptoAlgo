@@ -12,6 +12,12 @@ Everything lands in `venue_depth` here, keyed the same way, at **every minute**
 of the window — because the offset grid is itself under test and a table sampled
 where the model currently scores would foreclose the question.
 
+`quote_age_seconds` says how stale each row is. Predexon serves book CHANGES,
+so the state at minute `m` is the last change at or before it and a quiet book
+carries forward; a forward fill that cannot be told from an observation lets a
+fresh forecast "beat" a stale price. That is not hypothetical — see the note in
+`core/datastore.SCHEMAS`.
+
 `source` distinguishes provenance: `live` is a book somebody recorded while the
 market was open; `backfill` is the same book from Predexon after the fact. They
 should agree, and where they overlap the disagreement is a free measurement of
@@ -109,6 +115,7 @@ def _from_ladder(frame: pd.DataFrame, *, source: str) -> list[dict]:
             venue=record.get('venue'), symbol=record.get('symbol'),
             event_time=event_time,
             available_time=max(observed, event_time),
+            quote_age_seconds=max(0.0, (observed - event_time).total_seconds()),
             market_ticker=record.get('market_ticker'), window_open=window_open,
             offset_minutes=offset,
             yes_bid=yes_bid, yes_ask=yes_ask,
@@ -171,6 +178,8 @@ def _from_packed(path: str, *, venue: str, window_minutes: int,
                     return None if raw is None else float(raw)
 
                 bid, ask = value('best_bid'), value('best_ask')
+                stamp = stamps[cursor]
+                age = (mark - stamp) / 1000.0 if stamp else float('nan')
                 rows.append(_row(
                     venue=venue, symbol=symbol,
                     event_time=window_open + pd.Timedelta(minutes=offset),
@@ -190,6 +199,11 @@ def _from_packed(path: str, *, venue: str, window_minutes: int,
                     depth_ask_total=value('ask_vol') or 0.0,
                     levels_bid=value('bid_levels') or 0.0,
                     levels_ask=value('ask_levels') or 0.0,
+                    # How old the snapshot was at this minute mark. The endpoint
+                    # serves changes, so a quiet book carries forward, and an
+                    # un-aged forward fill is indistinguishable from an
+                    # observation.
+                    quote_age_seconds=age,
                     source='backfill'))
     return rows
 

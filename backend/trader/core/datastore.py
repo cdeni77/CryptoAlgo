@@ -155,6 +155,15 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
     # question (would this order have filled); the totals and level counts are
     # what imbalance and ladder slope are built from, and those are the
     # plausible carriers of the information the feature set cannot express.
+    #
+    # **`quote_age_seconds` is not optional.** Predexon serves book CHANGES, so
+    # the state at minute m is the last change at or before it and a quiet book
+    # is carried forward. Without the age, a forward-filled quote is
+    # indistinguishable from an observed one — and comparing a fresh forecast
+    # against a stale price manufactures edge. Measured: a first pass fetched
+    # only to +13.5m, and the resulting minute-14 rows showed the baseline
+    # "beating" the market by 0.246 nats at t = 8.4, which was entirely the
+    # carry-forward.
     # **The market's own forward volatility.** `sigma_remaining` is the only
     # forecast the barrier framing requires, and everything in `core/vol.py`
     # estimates it from PAST returns. Kalshi's KXBTCD threshold ladder is priced
@@ -177,6 +186,7 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'depth_bid_1c', 'depth_bid_5c', 'depth_ask_1c', 'depth_ask_5c',
         'depth_bid_total', 'depth_ask_total',
         'levels_bid', 'levels_ask', 'seq', 'gaps', 'source',
+        'quote_age_seconds',
     ),
     'book_snapshots': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
