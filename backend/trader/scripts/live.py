@@ -77,9 +77,12 @@ from core.decide import (
 from core.dataset import DatasetError
 from core.pg_writer import AccountModeMismatch, PgWriter, TraderAlreadyRunning
 from core.promotion import LIVE_MODEL, MODELS_ROOT, load_live
+from core import venue_ledger
 from core.windows import bar_mean
 from data_collection.coinbase_connector import CoinbaseRESTClient
-from data_collection.kalshi_client import KalshiClient, KalshiError, Quote
+from data_collection.kalshi_client import (
+    KalshiClient, KalshiError, Quote, parse_fill, parse_settlement,
+)
 
 logger = logging.getLogger('live')
 
@@ -595,7 +598,8 @@ class VenueState(NamedTuple):
     balance: float
 
 
-def adopt_venue_balance(writer: PgWriter, venue_balance: float) -> None:
+def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
+                        exchange_index: Optional[int] = None) -> None:
     """Make the venue's balance the one we report. **Call this after settling.**
 
     Our running figure against theirs: a gap that grows is an unrecorded fill, a
@@ -640,6 +644,18 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float) -> None:
             'account of record — writing theirs. A drift that grows means a '
             'fill we did not record, a partial, or a mispriced fee.',
             ours, venue_balance, drift)
+    # Sampled *before* the overwrite, so the row keeps both figures as they stood
+    # at the same instant. Recording it afterwards would store our bankroll as
+    # the venue's and report a drift of zero forever — a self-fulfilling alarm.
+    # A single log line cannot show a trend, and the trend is the diagnosis:
+    # a drift that stays put is a starting-balance mismatch, one that grows is an
+    # unrecorded fill.
+    try:
+        writer.write_venue_balance(
+            timestamp=datetime.now(timezone.utc), balance=venue_balance,
+            exchange_index=exchange_index, our_bankroll=ours)
+    except Exception:  # noqa: BLE001 - telemetry must not stop the loop
+        logger.exception('could not sample the venue balance this cycle')
     writer.update_account(bankroll=venue_balance)
 
 
@@ -670,9 +686,67 @@ def venue_exchange_index(quotes: dict) -> Optional[int]:
     return seen.pop()
 
 
+def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
+                         settlements: list[dict]) -> tuple[int, int]:
+    """Store the venue's own fills and settlements. Idempotent on the venue's keys.
+
+    These arrive on every reconcile and were read, compared, and dropped. That is
+    why the dashboard's P&L was our arithmetic rather than the venue's: nothing
+    kept the rows that would have made the venue's version computable. The account
+    curve is drawn from what this writes.
+
+    Free, in API terms — `reconcile` already fetched both, so this adds no request
+    to the cycle. It covers only what the live tier returned, which for a loop
+    running every minute is everything that has happened since it started;
+    `scripts.sync_venue` does the deep paginated backfill across the historical
+    tier.
+
+    Exceptions are caught and logged rather than raised. A cycle that cannot write
+    telemetry must still trade and settle — the store is a record, not the
+    account — and the previous behaviour of an unhandled write killing the loop
+    was the wrong trade-off in a process that holds positions.
+    """
+    written_fills = written_settlements = 0
+    try:
+        # Two queries, then only the rows that are actually new. The venue returns
+        # the same ~200 fills and ~200 settlements every cycle, and upserting all
+        # of them would be four hundred read-then-write round trips a minute to
+        # change nothing. A settlement already stored with a null `pnl` is *not*
+        # in the skip set, so an incomplete parse is retried and heals.
+        known_fills, known_settlements = writer.venue_ledger_keys()
+    except Exception:  # noqa: BLE001 - telemetry must not stop the loop
+        logger.exception('could not read the stored venue ledger; writing all rows')
+        known_fills, known_settlements = set(), set()
+
+    try:
+        rows = []
+        for raw in fills:
+            parsed = parse_fill(raw)
+            if parsed.trade_id and parsed.trade_id not in known_fills:
+                rows.append(venue_ledger.fill_row(parsed))
+        written_fills = writer.upsert_venue_fills(rows)
+    except Exception:  # noqa: BLE001
+        logger.exception('could not store the venue fills this cycle')
+    try:
+        rows = []
+        for raw in settlements:
+            parsed = parse_settlement(raw)
+            if not parsed.ticker or parsed.ticker in known_settlements:
+                continue
+            rows.append(venue_ledger.settlement_row(
+                parsed, position=writer.position_for_ticker(parsed.ticker)))
+        written_settlements = writer.upsert_venue_settlements(rows)
+    except Exception:  # noqa: BLE001
+        logger.exception('could not store the venue settlements this cycle')
+    if written_fills or written_settlements:
+        logger.debug('venue ledger: %d fill(s), %d settlement(s) stored',
+                     written_fills, written_settlements)
+    return written_fills, written_settlements
+
+
 async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
                                exchange_index: Optional[int] = None) -> VenueState:
-    """Read the venue's ledger. Writes nothing except warnings.
+    """Read the venue's ledger, and keep it.
 
     Three comparisons, each of which has a specific failure it catches:
 
@@ -683,9 +757,16 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
       sometimes disagree.
     * **open positions** — a position we think is open and the venue does not is
       an order that never filled.
+
+    It also **stores** the fills and settlements now, via `persist_venue_ledger`.
+    It used to compare them and drop them, which is why the account page could
+    only ever show our own arithmetic: the venue's numbers passed through this
+    function every cycle and nothing kept them.
     """
     state = await kalshi.reconcile(exchange_index=exchange_index)
     venue_balance = float(state['balance'])
+    persist_venue_ledger(writer, fills=list(state.get('fills') or []),
+                         settlements=list(state.get('settlements') or []))
 
     # Settle from the venue where it knows, keyed on the market ticker we stored.
     # This dict used to be built, logged, and dropped on the floor — `revenue` was
@@ -1133,10 +1214,12 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # for a cycle. `adopt_venue_balance` has the measured log.
     venue_settlements: dict[str, dict] = {}
     venue_balance = float('nan')
+    # Read once and used by both the balance query and the sample it writes, so
+    # the number adopted and the shard it is recorded against cannot disagree.
+    shard = venue_exchange_index(quotes)
     if kalshi is not None and args.reconcile:
         try:
-            venue = await reconcile_with_venue(
-                writer, kalshi, exchange_index=venue_exchange_index(quotes))
+            venue = await reconcile_with_venue(writer, kalshi, exchange_index=shard)
             venue_settlements, venue_balance = venue.settlements, venue.balance
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
@@ -1147,7 +1230,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     settle_predictions(writer, bars)
     # Now that our own credits are in, the drift is a real disagreement.
     if kalshi is not None and args.reconcile:
-        adopt_venue_balance(writer, venue_balance)
+        adopt_venue_balance(writer, venue_balance, exchange_index=shard)
 
     if offset is None:
         # This used to read "N minutes into the window; first decision offset is

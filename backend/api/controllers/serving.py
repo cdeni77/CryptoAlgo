@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from models.serving import (
     Account, CalibrationBin, EquityPoint, MinutePrice, ModelRun, OrderTicket,
-    Outcome, Position, Prediction,
+    Outcome, Position, Prediction, VenueBalance, VenueFill, VenueSettlement,
 )
 
 # Reasons a decision was refused, in funnel order. The dashboard shows them in
@@ -332,3 +332,283 @@ def tickets(db: Session, *, open_only: bool = True, limit: int = 50) -> list[dic
         'filled_contracts': r.filled_contracts, 'filled_price': r.filled_price,
         'filled_at': r.filled_at, 'note': r.note,
     } for r in db.execute(query).scalars().all()]
+
+
+# ---------------------------------------------------------------------------
+# The venue's ledger.
+#
+# Everything above this line reports our own arithmetic: a bankroll debited at
+# the price `decide()` sized at, a fee predicted from the published schedule, and
+# a payout decided by an OHLC mean of Coinbase standing in for sixty seconds of
+# CF Benchmarks BRTI. Live, all three are estimates of numbers Kalshi already
+# holds, and where they disagree the venue is right.
+#
+# These read `venue_fills`, `venue_settlements` and `venue_balance`, which the
+# trader fills from `/portfolio/fills`, `/portfolio/settlements` and
+# `/portfolio/balance`. Two rules follow from "the API serves measurements, never
+# substitutes":
+#
+# * Per-settlement P&L is NOT computed here. It is a stored column, written by
+#   the one process that reads the venue, so the arithmetic has one definition
+#   rather than one per container. What happens here is summation and ordering.
+# * A `None` is counted, not coerced. A settlement whose revenue the venue did
+#   not serve has an unknown P&L; adding it as zero would understate a loss, and
+#   an equity curve must never err in that direction. `incomplete` carries the
+#   count so the frontend can say the total is short.
+#
+# The public tape (`/historical/trades`) is deliberately absent. It carries every
+# print in a market by anyone, with no account attribution, so it cannot produce
+# a portfolio — summing it sums the exchange.
+
+
+def _venue_settlement_payload(row: VenueSettlement) -> dict[str, Any]:
+    return {
+        'ticker': row.ticker,
+        'event_ticker': row.event_ticker,
+        'market_result': row.market_result,
+        'yes_contracts': row.yes_contracts,
+        'no_contracts': row.no_contracts,
+        'contracts': (row.yes_contracts or 0.0) + (row.no_contracts or 0.0),
+        'cost': (None if row.yes_cost is None and row.no_cost is None
+                 else (row.yes_cost or 0.0) + (row.no_cost or 0.0)),
+        'revenue': row.revenue,
+        'fee_cost': row.fee_cost,
+        'pnl': row.pnl,
+        'settled_time': row.settled_time,
+        # Ours beside theirs, on the same row. The gap is a settlement our
+        # Coinbase proxy called differently or a fee we mispriced; a null means
+        # the venue settled a market we have no record of buying.
+        'our_pnl': row.our_pnl,
+        'pnl_gap': (None if row.pnl is None or row.our_pnl is None
+                    else row.pnl - row.our_pnl),
+        'won': _venue_won(row),
+        'synced_at': row.synced_at,
+    }
+
+
+def _venue_won(row: VenueSettlement) -> Optional[bool]:
+    """Did we win, per the venue's own resolution of the market?
+
+    Read off `market_result` against the side we held, not off the sign of the
+    P&L. Those come apart exactly where this system trades: a winner bought at
+    97c and charged a fee can net negative, and calling that a loss would put the
+    win rate at odds with the venue's settlement record.
+
+    Mirrors `core.venue_ledger.won` — deliberately, since the API cannot import
+    the trader. It is a classification of two stored fields rather than
+    arithmetic, which is the line this file draws.
+    """
+    if not row.market_result:
+        return None
+    yes_n = row.yes_contracts or 0.0
+    no_n = row.no_contracts or 0.0
+    if yes_n > 0 and no_n > 0:
+        return None
+    if yes_n > 0:
+        return row.market_result == 'yes'
+    if no_n > 0:
+        return row.market_result == 'no'
+    return None
+
+
+def venue_settlements(db: Session, *, days: Optional[int] = None,
+                      limit: int = 200) -> list[dict[str, Any]]:
+    """Settled markets as the venue paid them, newest first."""
+    query = select(VenueSettlement)
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        query = query.where(VenueSettlement.settled_time >= since)
+    query = query.order_by(VenueSettlement.settled_time.desc()).limit(limit)
+    return [_venue_settlement_payload(r) for r in db.execute(query).scalars().all()]
+
+
+def venue_fills(db: Session, *, days: Optional[int] = None,
+                limit: int = 200) -> list[dict[str, Any]]:
+    """Executions as the venue recorded them, newest first.
+
+    `price` is what was paid for `side`, so a 30c NO fill reads 0.30 rather than
+    the 0.70 the venue's YES-denominated book quotes. The translation happens
+    once, in the trader's parser.
+    """
+    query = select(VenueFill)
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        query = query.where(VenueFill.created_time >= since)
+    query = query.order_by(VenueFill.created_time.desc()).limit(limit)
+    return [{
+        'trade_id': r.trade_id, 'order_id': r.order_id, 'ticker': r.ticker,
+        'side': r.side, 'action': r.action, 'contracts': r.contracts,
+        'price': r.price,
+        'cost': None if r.price is None else r.price * (r.contracts or 0.0),
+        'is_taker': r.is_taker, 'created_time': r.created_time,
+    } for r in db.execute(query).scalars().all()]
+
+
+def venue_account_state(db: Session) -> dict[str, Any]:
+    """The account as the venue's ledger reports it, with ours beside it.
+
+    Returns `available: False` with a reason rather than zeros when the ledger is
+    empty — which is the normal state of a paper account, since a paper account
+    has no venue ledger at all. A dashboard that renders an unsynced ledger as
+    `$0.00 realised` is claiming a measurement it does not have.
+    """
+    rows = db.execute(select(VenueSettlement)).scalars().all()
+    balance = db.execute(
+        select(VenueBalance).order_by(VenueBalance.timestamp.desc())
+    ).scalars().first()
+    account = db.execute(select(Account).order_by(Account.id)).scalars().first()
+
+    if not rows and balance is None:
+        return {
+            'available': False,
+            'reason': ('no venue ledger stored — this account has never traded '
+                       'live, or `python -m scripts.sync_venue` has not run'),
+            'mode': account.mode if account is not None else 'paper',
+            'settlements': 0,
+            'realized_pnl': _missing('no venue settlements stored'),
+            'fees': _missing('no venue settlements stored'),
+            'balance': _missing('no venue balance sampled'),
+            'win_rate': _missing('no venue settlements stored'),
+            'wins': 0, 'losses': 0, 'undecided': 0, 'incomplete': 0,
+            'contracts': 0.0,
+            'first_settled': None, 'last_settled': None,
+            'our_realized_pnl': (_measured(account.realized_pnl)
+                                 if account is not None
+                                 else _missing('no account row yet')),
+            'pnl_gap': _missing('no venue settlements stored'),
+            'balance_drift': _missing('no venue balance sampled'),
+            'balance_at': None,
+            'exchange_index': None,
+        }
+
+    realized = 0.0
+    fees = 0.0
+    contracts = 0.0
+    have_pnl = have_fees = False
+    wins = losses = undecided = incomplete = 0
+    stamps: list[datetime] = []
+    for row in rows:
+        if row.pnl is None:
+            incomplete += 1
+        else:
+            realized += float(row.pnl)
+            have_pnl = True
+        if row.fee_cost is not None:
+            fees += float(row.fee_cost)
+            have_fees = True
+        contracts += (row.yes_contracts or 0.0) + (row.no_contracts or 0.0)
+        verdict = _venue_won(row)
+        if verdict is True:
+            wins += 1
+        elif verdict is False:
+            losses += 1
+        else:
+            undecided += 1
+        if row.settled_time is not None:
+            stamps.append(row.settled_time)
+
+    decided = wins + losses
+    ours = float(account.realized_pnl) if account is not None else None
+    return {
+        'available': True,
+        'reason': None,
+        # Carried on this response too, not just on `/account`. A live figure
+        # that renders identically to a paper one is the worst failure this
+        # surface could permit, and this is the response that holds real money.
+        'mode': account.mode if account is not None else 'paper',
+        'settlements': len(rows),
+        'realized_pnl': (_measured(realized) if have_pnl
+                         else _missing('every settlement was missing a field')),
+        'fees': (_measured(fees) if have_fees
+                 else _missing('the venue served no fee on any settlement')),
+        'balance': (_measured(balance.balance) if balance is not None
+                    else _missing('no venue balance sampled')),
+        'win_rate': (_measured(wins / decided) if decided
+                     else _missing('nothing has settled with a named result')),
+        'wins': wins, 'losses': losses, 'undecided': undecided,
+        # How many settlements are excluded from `realized_pnl` because the venue
+        # left a field absent. Non-zero means the total is short, and by an
+        # unknown amount rather than by zero.
+        'incomplete': incomplete,
+        'contracts': contracts,
+        'first_settled': min(stamps) if stamps else None,
+        'last_settled': max(stamps) if stamps else None,
+        'our_realized_pnl': (_measured(ours) if ours is not None
+                             else _missing('no account row yet')),
+        'pnl_gap': (_measured(realized - ours) if have_pnl and ours is not None
+                    else _missing('one of the two figures is unavailable')),
+        'balance_drift': (_measured(balance.drift)
+                          if balance is not None and balance.drift is not None
+                          else _missing('no drift recorded on the last sample')),
+        'balance_at': balance.timestamp if balance is not None else None,
+        'exchange_index': balance.exchange_index if balance is not None else None,
+    }
+
+
+def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
+    """The account chart: realised P&L stepped by settlement, cash sampled beside it.
+
+    Two series, because they answer different questions and neither one answers
+    both.
+
+    `pnl` is cumulative realised P&L, one step per settled market, and it is what
+    "how is the portfolio doing" means. It is built from settlement P&L and **not**
+    from balance differences, which is the load-bearing choice here: nothing in
+    the ledger distinguishes a deposit from a profit, so a balance-difference
+    curve reports the first deposit as the best day the strategy ever had.
+
+    `balance` is the venue's cash, sampled every cycle. It is the real money and
+    it makes the chart live between settlements, but on its own it sawtooths —
+    entering a position debits it, settling credits it back — so it is the second
+    series rather than the first.
+
+    Both are windowed by `days`, and the cumulative series is therefore
+    **cumulative within the window**: it starts at zero at the left edge rather
+    than carrying the account's lifetime total. `pnl_before_window` says what was
+    excluded, so a caller can shift the series onto a lifetime scale and a reader
+    is never shown a partial total labelled as the whole.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    earlier = db.execute(
+        select(func.sum(VenueSettlement.pnl))
+        .where(VenueSettlement.settled_time < since,
+               VenueSettlement.pnl.is_not(None))
+    ).scalar()
+
+    rows = db.execute(
+        select(VenueSettlement)
+        .where(VenueSettlement.settled_time >= since,
+               VenueSettlement.pnl.is_not(None))
+        .order_by(VenueSettlement.settled_time)
+    ).scalars().all()
+
+    points: list[dict[str, Any]] = []
+    total = 0.0
+    for row in rows:
+        total += float(row.pnl)
+        points.append({
+            'timestamp': row.settled_time,
+            'ticker': row.ticker,
+            'pnl': float(row.pnl),
+            'cumulative_pnl': total,
+        })
+
+    balances = db.execute(
+        select(VenueBalance).where(VenueBalance.timestamp >= since)
+        .order_by(VenueBalance.timestamp)
+    ).scalars().all()
+
+    return {
+        'days': days,
+        'points': points,
+        'balances': [{
+            'timestamp': b.timestamp, 'balance': b.balance,
+            'our_bankroll': b.our_bankroll, 'drift': b.drift,
+            'exchange_index': b.exchange_index,
+        } for b in balances],
+        # What settled before the window opened, so the series can be read on a
+        # lifetime scale. Null when nothing did.
+        'pnl_before_window': None if earlier is None else float(earlier),
+        'realized_pnl_in_window': total if points else None,
+    }

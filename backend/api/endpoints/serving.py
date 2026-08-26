@@ -29,6 +29,51 @@ def get_equity(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db
     return {'days': days, 'points': serving.equity_curve(db, days=days)}
 
 
+@router.get('/account/venue')
+def get_venue_account(db: Session = Depends(get_db)):
+    """The account as the VENUE's ledger reports it, with ours beside it.
+
+    `/account` is our own arithmetic — a bankroll debited at the price `decide()`
+    sized at, a fee predicted from the published schedule, a payout decided by an
+    OHLC mean of Coinbase standing in for CF Benchmarks BRTI. This is the account
+    of record. Both are served, and neither is silently substituted for the
+    other: `pnl_gap` is the disagreement, and it is a measurement rather than an
+    error to hide.
+
+    `available: false` with a reason when no venue ledger has been stored, which
+    is the normal state of a paper account.
+    """
+    return serving.venue_account_state(db)
+
+
+@router.get('/account/venue/equity')
+def get_venue_equity(days: int = Query(30, ge=1, le=365),
+                     db: Session = Depends(get_db)):
+    """The account chart: realised P&L per settlement, venue cash sampled beside it.
+
+    Built from settlement P&L rather than from balance differences, because
+    nothing in the ledger distinguishes a deposit from a profit — see
+    `controllers.serving.venue_equity_curve`.
+    """
+    return serving.venue_equity_curve(db, days=days)
+
+
+@router.get('/venue/settlements')
+def get_venue_settlements(days: Optional[int] = Query(None, ge=1, le=3650),
+                          limit: int = Query(200, ge=1, le=1000),
+                          db: Session = Depends(get_db)):
+    """Every settled market as the venue paid it: cost, revenue, fee, P&L."""
+    return {'settlements': serving.venue_settlements(db, days=days, limit=limit)}
+
+
+@router.get('/venue/fills')
+def get_venue_fills(days: Optional[int] = Query(None, ge=1, le=3650),
+                    limit: int = Query(200, ge=1, le=1000),
+                    db: Session = Depends(get_db)):
+    """Every execution as the venue recorded it — the entry side of the ledger."""
+    return {'fills': serving.venue_fills(db, days=days, limit=limit)}
+
+
 @router.get('/live')
 def get_live(db: Session = Depends(get_db)):
     """The current barrier state per symbol, and the account beside it."""

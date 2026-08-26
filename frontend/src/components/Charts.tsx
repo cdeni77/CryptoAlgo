@@ -12,6 +12,7 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  ComposedChart,
   Line,
   LineChart,
   ReferenceLine,
@@ -23,7 +24,13 @@ import {
   YAxis,
   ZAxis,
 } from 'recharts';
-import type { CalibrationBin, EquityPoint, FunnelStage } from '../types';
+import type {
+  CalibrationBin,
+  EquityPoint,
+  FunnelStage,
+  VenueBalancePoint,
+  VenuePnlPoint,
+} from '../types';
 import { Empty } from './Primitives';
 import { pct, stamp } from '../lib/format';
 
@@ -43,6 +50,157 @@ const TOOLTIP = {
   },
   labelStyle: { color: 'var(--ink-3)', fontSize: 10 },
 };
+
+
+/* ----------------------------------------------------------- venue account */
+
+/** The account chart, drawn from the venue's ledger. Two series, two questions.
+ *
+ *  **Realised P&L** steps once per settled market and is the answer to "how is
+ *  the portfolio doing". It is built from settlement P&L rather than from balance
+ *  differences, and that is the load-bearing choice: nothing in the ledger
+ *  distinguishes a deposit from a profit, so a balance-difference curve reports
+ *  the first deposit as the best day the strategy ever had.
+ *
+ *  **Balance** is the venue's cash, sampled every live cycle. It is the real
+ *  money and it gives the chart a present rather than ending at the last
+ *  settlement — but on its own it sawtooths, because entering a position debits
+ *  it and settling credits it back. So it is the thin second line on its own
+ *  axis, never the headline.
+ *
+ *  The P&L series is forward-filled between settlements. That is not invented
+ *  data: cumulative realised P&L genuinely does not change until something
+ *  settles, which is what a step means.
+ */
+export function VenueAccountChart({
+  points,
+  balances,
+}: {
+  points: VenuePnlPoint[];
+  balances: VenueBalancePoint[];
+}) {
+  if (points.length === 0 && balances.length === 0) {
+    return (
+      <Empty
+        what="No venue ledger yet, so there is no chart. A paper account has none — the venue only has a ledger once real orders fill."
+        next="python -m scripts.sync_venue"
+      />
+    );
+  }
+
+  // One row per instant either series has a reading at, so both can be drawn
+  // against a shared time axis without resampling either onto the other's grid.
+  type Row = { t: number; cumulative_pnl?: number; balance?: number };
+  const rows = new Map<number, Row>();
+  const at = (t: number): Row => {
+    const existing = rows.get(t);
+    if (existing) return existing;
+    const created: Row = { t };
+    rows.set(t, created);
+    return created;
+  };
+  for (const p of points) at(new Date(p.timestamp).getTime()).cumulative_pnl = p.cumulative_pnl;
+  for (const b of balances) at(new Date(b.timestamp).getTime()).balance = b.balance;
+
+  const data = [...rows.values()].sort((a, b) => a.t - b.t);
+  // Forward-fill the P&L only. The balance is left with gaps and `connectNulls`
+  // draws through them, because an unsampled balance is unknown rather than
+  // unchanged — the venue's cash moves whether or not we looked.
+  let carried: number | undefined;
+  for (const row of data) {
+    if (row.cumulative_pnl == null) row.cumulative_pnl = carried;
+    else carried = row.cumulative_pnl;
+  }
+
+  const hasBalance = balances.length > 0;
+
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <ComposedChart data={data} margin={{ top: 8, right: hasBalance ? 8 : 0, bottom: 0, left: 0 }}>
+        <CartesianGrid {...GRID} vertical={false} />
+        <XAxis
+          dataKey="t"
+          type="number"
+          domain={['dataMin', 'dataMax']}
+          tickFormatter={(v) => stamp(new Date(v).toISOString())}
+          tick={TICK}
+          axisLine={AXIS}
+          tickLine={false}
+          minTickGap={48}
+        />
+        <YAxis
+          yAxisId="pnl"
+          tick={TICK}
+          axisLine={false}
+          tickLine={false}
+          width={56}
+          tickFormatter={(v) => `${Number(v) >= 0 ? '+' : ''}$${Number(v).toFixed(0)}`}
+          domain={['auto', 'auto']}
+        />
+        {hasBalance && (
+          <YAxis
+            yAxisId="cash"
+            orientation="right"
+            tick={TICK}
+            axisLine={false}
+            tickLine={false}
+            width={52}
+            tickFormatter={(v) => `$${Number(v).toFixed(0)}`}
+            domain={['auto', 'auto']}
+          />
+        )}
+        {/* Break-even. The line that matters on a P&L chart, and the one a
+            currency axis alone does not make legible. */}
+        <ReferenceLine
+          yAxisId="pnl"
+          y={0}
+          stroke="var(--rule-firm)"
+          strokeDasharray="3 3"
+          label={{
+            value: 'break-even',
+            position: 'insideLeft',
+            fill: 'var(--ink-3)',
+            fontSize: 10,
+          }}
+        />
+        <Tooltip
+          {...TOOLTIP}
+          labelFormatter={(v) => stamp(new Date(Number(v)).toISOString())}
+          formatter={(v: number, name) => [
+            `${name === 'realised p&l' && v >= 0 ? '+' : ''}$${v.toFixed(2)}`,
+            name,
+          ]}
+        />
+        <Area
+          yAxisId="pnl"
+          type="stepAfter"
+          dataKey="cumulative_pnl"
+          name="realised p&l"
+          stroke="var(--accent)"
+          strokeWidth={1.5}
+          fill="var(--accent-wash)"
+          fillOpacity={1}
+          dot={false}
+          isAnimationActive={false}
+          connectNulls
+        />
+        {hasBalance && (
+          <Line
+            yAxisId="cash"
+            type="linear"
+            dataKey="balance"
+            name="venue cash"
+            stroke="var(--ink-3)"
+            strokeWidth={1}
+            dot={false}
+            isAnimationActive={false}
+            connectNulls
+          />
+        )}
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
 
 /* ---------------------------------------------------------------- equity */
 

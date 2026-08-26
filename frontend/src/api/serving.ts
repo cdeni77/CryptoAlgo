@@ -19,6 +19,10 @@ import type {
   Position,
   Prediction,
   PriceSeries,
+  VenueAccountState,
+  VenueEquityCurve,
+  VenueFill,
+  VenueSettlement,
 } from '../types';
 
 export const fetchLive = () => get<LiveState>('/live');
@@ -27,6 +31,24 @@ export const fetchAccount = () => get<AccountState>('/account');
 
 export const fetchEquity = (days = 30) =>
   get<{ days: number; points: EquityPoint[] }>(`/account/equity?days=${days}`);
+
+/** The account as the venue's own ledger reports it. See `VenueAccountState`:
+ *  this is the account of record, `fetchAccount` is our arithmetic, and both are
+ *  shown because the gap between them is worth reading. */
+export const fetchVenueAccount = () => get<VenueAccountState>('/account/venue');
+
+export const fetchVenueEquity = (days = 30) =>
+  get<VenueEquityCurve>(`/account/venue/equity?days=${days}`);
+
+export const fetchVenueSettlements = (limit = 200, days?: number) =>
+  get<{ settlements: VenueSettlement[] }>(
+    `/venue/settlements?limit=${limit}${days == null ? '' : `&days=${days}`}`,
+  );
+
+export const fetchVenueFills = (limit = 200, days?: number) =>
+  get<{ fills: VenueFill[] }>(
+    `/venue/fills?limit=${limit}${days == null ? '' : `&days=${days}`}`,
+  );
 
 export const fetchPredictions = (limit = 100, tradedOnly = false) =>
   get<{ predictions: Prediction[] }>(

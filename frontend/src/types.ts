@@ -156,6 +156,115 @@ export interface EquityPoint {
   realized_pnl: number;
 }
 
+/* ------------------------------------------------------- the venue's ledger */
+
+/** The account as Kalshi's own ledger reports it.
+ *
+ *  `AccountState` above is our arithmetic: a bankroll debited at the price
+ *  `decide()` sized at, a fee predicted from the published schedule, and a payout
+ *  decided by an OHLC mean of Coinbase standing in for sixty seconds of CF
+ *  Benchmarks BRTI. This is the account of record — `/portfolio/settlements` and
+ *  `/portfolio/balance`, stored per settled market.
+ *
+ *  Both are rendered, and neither is substituted for the other. `pnl_gap` is
+ *  where they disagree, which is a measurement (a mispriced fee, a settlement our
+ *  proxy called differently, a fill nobody booked) rather than an error to hide.
+ */
+export interface VenueAccountState {
+  /** False when no venue ledger has been stored — the normal state of a paper
+   *  account, and the reason says so rather than showing $0.00 realised. */
+  available: boolean;
+  reason: string | null;
+  mode: 'paper' | 'live';
+  settlements: number;
+  realized_pnl: Measured<number>;
+  fees: Measured<number>;
+  /** Cash at the venue, from the last sample. Not equity: an open position has
+   *  already left it. */
+  balance: Measured<number>;
+  win_rate: Measured<number>;
+  wins: number;
+  losses: number;
+  /** Settled markets the venue named no result for, or that we held neither side
+   *  of. Not losses. */
+  undecided: number;
+  /** Settlements excluded from `realized_pnl` because the venue left a field
+   *  absent. Non-zero means the total is short by an unknown amount. */
+  incomplete: number;
+  contracts: number;
+  first_settled: string | null;
+  last_settled: string | null;
+  our_realized_pnl: Measured<number>;
+  /** Venue minus ours. */
+  pnl_gap: Measured<number>;
+  balance_drift: Measured<number>;
+  balance_at: string | null;
+  exchange_index: number | null;
+}
+
+/** One step of the realised-P&L curve: a market that settled. */
+export interface VenuePnlPoint {
+  timestamp: string;
+  ticker: string;
+  pnl: number;
+  cumulative_pnl: number;
+}
+
+/** One sample of the venue's cash balance, taken every live cycle. */
+export interface VenueBalancePoint {
+  timestamp: string;
+  balance: number;
+  our_bankroll: number | null;
+  drift: number | null;
+  exchange_index: number | null;
+}
+
+export interface VenueEquityCurve {
+  days: number;
+  points: VenuePnlPoint[];
+  balances: VenueBalancePoint[];
+  /** Realised P&L that settled before the window opened, so the series can be
+   *  read on a lifetime scale rather than mistaken for one. */
+  pnl_before_window: number | null;
+  realized_pnl_in_window: number | null;
+}
+
+export interface VenueSettlement {
+  ticker: string;
+  event_ticker: string | null;
+  /** 'yes' or 'no', as the venue resolved it. */
+  market_result: string | null;
+  yes_contracts: number;
+  no_contracts: number;
+  contracts: number;
+  cost: number | null;
+  revenue: number | null;
+  fee_cost: number | null;
+  pnl: number | null;
+  settled_time: string | null;
+  our_pnl: number | null;
+  pnl_gap: number | null;
+  /** Did we win, per the venue's resolution — not per the sign of the P&L. A
+   *  favourite bought at 97c can win and still net negative after the fee. */
+  won: boolean | null;
+  synced_at: string | null;
+}
+
+export interface VenueFill {
+  trade_id: string;
+  order_id: string | null;
+  ticker: string;
+  side: 'up' | 'down';
+  action: string | null;
+  contracts: number;
+  /** Dollars paid per contract for `side` — a 30c NO fill reads 0.30, not the
+   *  0.70 the venue's YES-denominated book quotes. */
+  price: number | null;
+  cost: number | null;
+  is_taker: boolean | null;
+  created_time: string | null;
+}
+
 export interface FunnelStage {
   reason: Reason;
   count: number;
