@@ -273,105 +273,44 @@ services:
   # Hourly. Both steps are idempotent and resumable: `scrape` fetches only what
   # is missing at either end, `sync_store` rewrites only new partitions.
   # ===========================================================================
-  store-sync:
-    profiles: ["live"]
-    extends:
-      service: trader
-    restart: unless-stopped
-    entrypoint: ["/bin/sh"]
-    command:
-      - "-c"
-      - |
-        while true; do
-          echo "[store-sync] $$(date -u +%FT%TZ) scrape"
-          python -m scripts.scrape --backfill-days 3 || echo "[store-sync] scrape failed"
-          echo "[store-sync] $$(date -u +%FT%TZ) sync_store"
-          python -m scripts.sync_store || echo "[store-sync] sync failed"
-          echo "[store-sync] $$(date -u +%FT%TZ) sleeping 1h"
-          sleep 3600
-        done
-
   # ===========================================================================
-  # Depth recorder — the dataset with the worst backfill, not the impossible one.
+  # Everything the live system runs, in ONE service.
   #
-  # This block used to say depth "cannot be backfilled" at any cost. That is no
-  # longer true and the correction matters, because it was the stated reason
-  # this service was the only source. Predexon serves historical Kalshi order
-  # books, and `_collect_book.py` pulls the full tick series per window.
+  # This was five: the trading loop, three recorders and a shell loop that
+  # scraped and rebuilt the store. They were separate because they were written
+  # one at a time, not because they differ — four are async loops polling an
+  # HTTP API on a sixty-second cadence. One container means one restart policy,
+  # one log stream, and one thing to check.
   #
-  # What remains true is that the VENUE destroys it: `GET
-  # /markets/{ticker}/orderbook` on a settled market returns
-  # `{"no_dollars": [], "yes_dollars": []}` — verified — so anything not
-  # recorded and not held by a third party is gone. And the third party's
-  # coverage is partial: KXBTC15M starts ~2026-06-19, months after the series
-  # opened, on a 1 req/s org-wide bucket. So the rule is what the user put
-  # plainly: take everything live, and backfill whatever can still be had.
+  # **Trading latency is what the arrangement protects.** The threat was never
+  # the polling, which is all `await`; it is `ResearchStore.write`, synchronous
+  # pandas and pyarrow that would block a pending decision. So writes run in a
+  # thread, recorders hold off while a decision is in flight (`TradingGate`),
+  # their cadences are phased to the far side of the minute from the decision
+  # instants, and the store rebuild stays a subprocess because it is minutes of
+  # blocking CPU. See `scripts/run_live.py`.
   #
-  # It is the missing half of the economic question: the retroactive economics can
-  # now price a trade at the venue's real ask, but it must assume the order
-  # filled, and nothing historical can say whether it would have.
+  # A failure in one component no longer hides: `supervise` logs it and restarts
+  # that component with backoff while the rest keep running. Across five
+  # containers a crash-looping recorder was invisible unless someone looked.
+  #
+  # Disable a component without editing this file:
+  #   docker compose run --rm live --disable pm_ladder --trade-args ...
   # ===========================================================================
-  ladder-recorder:
+  live:
     profiles: ["live"]
     extends:
       service: trader
     restart: unless-stopped
     command: >
-      -m scripts.record_ladder
-
-  # The same recorder against Polymarket, which runs the same instrument with
-  # different participants and a different settlement source (Binance rather
-  # than CF Benchmarks BRTI). Every result in this project rests on one venue's
-  # 70 days; this is what makes "does the offset structure replicate" answerable
-  # at all, and it writes `pm_ladder` in `venue_ladder`'s columns so the two
-  # join on (symbol, window_open, minute).
-  #
-  # Public endpoints, no credentials. Deliberately NOT via Predexon: that key is
-  # a 1 req/s ORG-WIDE bucket, so a live recorder there would throttle the
-  # historical backfill it is meant to complement.
-  pm-ladder-recorder:
-    profiles: ["live"]
-    extends:
-      service: trader
-    restart: unless-stopped
-    command: >
-      -m scripts.record_pm_ladder
-        --batch-rows 6
-
-  # The market's own forward volatility, inverted from the KXBTCD strike ladder.
-  #
-  # `sigma_remaining` is the ONLY forecast the barrier framing requires, and
-  # everything in `core/vol.py` estimates it from past returns. This is the
-  # market's forward estimate of the same quantity, published free and updated
-  # every minute, and no feature group has ever seen it. Measured live: ~4.6
-  # bp/min over a 34-minute horizon from 12 strikes at R^2 0.97.
-  #
-  # KXBTCD closes on the hour and carries an explicit strike, so it is NOT the
-  # traded instrument — that is the point. It prices the same underlying's
-  # volatility over an overlapping horizon and says nothing about direction.
-  #
-  # Collection of this stopped on 2026-08-25 and nothing restarted it.
-  implied-vol-recorder:
-    profiles: ["live"]
-    extends:
-      service: trader
-    restart: unless-stopped
-    command: >
-      -m scripts.record_implied_vol
-
-  trade-live:
-    profiles: ["live"]
-    extends:
-      service: trader
-    restart: unless-stopped
-    command: >
-      -m scripts.live
-        --loop
-        --cycle-seconds 60
-        --mode live
-        --place-orders
-        --force
-        --reason "live smoke test on a $100 account"
+      -m scripts.run_live
+        --trade-args
+          --loop
+          --cycle-seconds 60
+          --mode live
+          --place-orders
+          --force
+          --reason "live smoke test on a $100 account"
 
 volumes:
   postgres_data:

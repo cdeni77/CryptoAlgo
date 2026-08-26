@@ -121,7 +121,7 @@ async def _get(session, url: str):
         return json.loads(await response.text() or 'null')
 
 
-async def run(args) -> int:
+async def run(args, gate=None) -> int:
     import aiohttp
 
     config = DEFAULT_CONFIG
@@ -133,6 +133,8 @@ async def run(args) -> int:
             async with aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=20)) as session:
                 while True:
+                    if gate is not None:
+                        await gate.idle()
                     now = datetime.now(timezone.utc)
                     window_open = pd.Timestamp(now).tz_convert('UTC').floor(
                         f'{config.window_minutes}min')
@@ -179,7 +181,8 @@ async def run(args) -> int:
                             'token_id_up': str(tokens[0]),
                         })
                     if len(rows) >= args.batch_rows:
-                        store.write('pm_ladder', pd.DataFrame(rows))
+                        await asyncio.to_thread(
+                            store.write, 'pm_ladder', pd.DataFrame(rows))
                         logger.info('wrote %d ladder rows (%d bid levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()

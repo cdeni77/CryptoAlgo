@@ -173,7 +173,7 @@ def mid_of(market: dict) -> Optional[float]:
     return number('last_price_dollars', 'last_price')
 
 
-async def run(args) -> int:
+async def run(args, gate=None) -> int:
     from data_collection.kalshi_client import KalshiClient
 
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
@@ -186,6 +186,8 @@ async def run(args) -> int:
             async with KalshiClient(key_id=os.environ['KALSHI_KEY_ID'],
                                     private_key_pem=pem) as client:
                 while True:
+                    if gate is not None:
+                        await gate.idle()
                     now = datetime.now(timezone.utc)
                     try:
                         payload = await client._request(  # noqa: SLF001
@@ -236,7 +238,8 @@ async def run(args) -> int:
                         })
 
                     if len(rows) >= args.batch_rows:
-                        store.write('venue_implied_vol', pd.DataFrame(rows))
+                        await asyncio.to_thread(
+                            store.write, 'venue_implied_vol', pd.DataFrame(rows))
                         last = rows[-1]
                         logger.info(
                             'wrote %d fits (last %s: sigma %.2fbp/min over '

@@ -63,7 +63,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -1782,8 +1782,16 @@ def config_from_args(args) -> Config:
     return config.with_overrides(**overrides) if overrides else config
 
 
-async def main() -> int:
-    args = build_parser().parse_args()
+async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
+    """The live loop. `argv` is explicit so `scripts.run_live` can compose it.
+
+    `gate` is a `TradingGate` when this runs alongside the recorders in one
+    process. The loop holds it across each cycle, so a recorder never starts
+    work while a decision is in flight — the decision is the only
+    latency-sensitive thing here, and a Parquet write on the event loop would
+    land directly on it.
+    """
+    args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format='%(asctime)s %(levelname)-7s %(name)-14s %(message)s',
@@ -1899,7 +1907,13 @@ async def main() -> int:
                     hb_lag = float('nan')
                 hb_cycles += 1
                 try:
-                    decisions = await run_cycle(args, config, writer, model, kalshi)
+                    if gate is not None:
+                        async with gate.deciding():
+                            decisions = await run_cycle(
+                                args, config, writer, model, kalshi)
+                    else:
+                        decisions = await run_cycle(
+                            args, config, writer, model, kalshi)
                 except DatasetError as exc:
                     # One unscoreable cycle is not a reason to exit. This used to
                     # be fatal: `score_live` raised on every cycle and the loop

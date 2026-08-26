@@ -48,7 +48,7 @@ def _levels(raw) -> list:
     return out
 
 
-async def run(args) -> int:
+async def run(args, gate=None) -> int:
     from data_collection.kalshi_client import KalshiClient
 
     config = DEFAULT_CONFIG
@@ -61,6 +61,11 @@ async def run(args) -> int:
             async with KalshiClient(key_id=os.environ['KALSHI_KEY_ID'],
                                     private_key_pem=pem) as client:
                 while True:
+                    # Never start a cycle while a trading decision is in flight:
+                    # this is a 60s cadence and a few seconds of deferral
+                    # costs nothing, while a delayed decision costs edge.
+                    if gate is not None:
+                        await gate.idle()
                     now = datetime.now(timezone.utc)
                     for series, symbol in SERIES.items():
                         payload = await client._request(  # noqa: SLF001
@@ -102,7 +107,8 @@ async def run(args) -> int:
                                 'no_total': sum(s for _, s in no),
                             })
                     if len(rows) >= args.batch_rows:
-                        store.write('venue_ladder', pd.DataFrame(rows))
+                        await asyncio.to_thread(
+                            store.write, 'venue_ladder', pd.DataFrame(rows))
                         logger.info('wrote %d ladder rows (%d levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()
