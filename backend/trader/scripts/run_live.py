@@ -190,10 +190,20 @@ COMPONENTS: tuple[Component, ...] = (
 NAMES = tuple(c.name for c in COMPONENTS)
 
 
-def _recorder_args(**over):
-    """The defaults each recorder's own parser would have produced."""
-    ns = argparse.Namespace(interval=60.0, batch_rows=30, min_minutes=2.0,
-                            max_minutes=180.0, min_r2=0.90)
+def _recorder_args(build_parser, **over):
+    """Genuine defaults from a recorder's own `build_parser()`, not a copy.
+
+    This used to hand-build an `argparse.Namespace` with literal defaults
+    captioned "the defaults each recorder's own parser would have produced" —
+    a second, hardcoded copy of numbers that already lived in three other
+    files. The two agreed today; nothing enforced that they would keep
+    agreeing, and a default changed in one recorder's own parser (used when it
+    runs standalone via `python -m scripts.record_X`) would silently diverge
+    from what the supervised `live` service actually uses. Parsing `[]`
+    against the real parser makes that impossible: there is exactly one
+    definition of each default, in the file that owns it.
+    """
+    ns = build_parser().parse_args([])
     for key, value in over.items():
         setattr(ns, key, value)
     return ns
@@ -201,6 +211,13 @@ def _recorder_args(**over):
 
 async def store_sync_loop(*, every: float = 3600.0) -> None:
     """Scrape recent bars and rebuild the store, as an awaited SUBPROCESS.
+
+    `scrape` and `sync_store` used to be one-off `docker compose run` commands,
+    so nothing ran them once the live loop started. Measured 2026-08-25: the
+    research store's newest bar was 2026-08-23 04:17 while live windows ran to
+    2026-08-25 00:00 — so not one traded window could be replayed offline, and
+    the Kalshi quote archive was unusable for comparing a candidate model
+    against the market. That is the one thing the archive exists for.
 
     Deliberately not in-process. This is minutes of blocking CPU — HTTP paging
     then a full Parquet rebuild — and `to_thread` would not save it either,
@@ -237,16 +254,19 @@ def build_factories(args, gate: TradingGate) -> dict:
 
     async def ladder():
         await align_to_phase(25.0)
-        return await record_ladder.run(_recorder_args(), gate=gate)
+        return await record_ladder.run(
+            _recorder_args(record_ladder.build_parser), gate=gate)
 
     async def pm_ladder():
         await align_to_phase(35.0)
-        return await record_pm_ladder.run(_recorder_args(batch_rows=6), gate=gate)
+        return await record_pm_ladder.run(
+            _recorder_args(record_pm_ladder.build_parser, batch_rows=6), gate=gate)
 
     async def implied_vol():
         await align_to_phase(45.0)
-        return await record_implied_vol.run(_recorder_args(batch_rows=10),
-                                            gate=gate)
+        return await record_implied_vol.run(
+            _recorder_args(record_implied_vol.build_parser, batch_rows=10),
+            gate=gate)
 
     async def store_sync():
         await align_to_phase(50.0)

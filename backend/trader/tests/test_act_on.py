@@ -354,3 +354,63 @@ class TestOutlayMatchesTheFill:
         position = writer.open_positions()[0]
         after = float(writer.account().bankroll)
         assert before - after == pytest.approx(float(position.outlay), abs=1e-6)
+
+
+class TestQuoteStaleness:
+    """`max_quote_age_seconds` was declared and never checked anywhere.
+
+    `run_cycle` reads the book once at the top of the cycle and stamps
+    `quote_time`, then does a Coinbase fetch, four authenticated reconcile
+    calls, inference and six 15-second quote calls before any order is sent —
+    and nothing before this compared that elapsed time to anything. A quote
+    that goes stale mid-cycle was traded as though it were still current.
+    """
+
+    def test_a_fresh_quote_places_the_order(self, writer):
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'fresh',
+                             'average_fill_price_dollars': '0.6000'})
+        quote_time = pd.Timestamp.now(tz='UTC')
+        assert run(act_on(args(), writer, kalshi, decision(), None,
+                          quote_time=quote_time)) is True
+        assert len(kalshi.orders) == 1
+
+    def test_a_stale_quote_refuses_without_sending_an_order(self, writer):
+        from core.config import DEFAULT_CONFIG
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'stale',
+                             'average_fill_price_dollars': '0.6000'})
+        quote_time = pd.Timestamp.now(tz='UTC') - timedelta(
+            seconds=DEFAULT_CONFIG.max_quote_age_seconds + 5)
+        booked = run(act_on(args(), writer, kalshi, decision(), None,
+                            quote_time=quote_time))
+        assert booked is False
+        assert len(kalshi.orders) == 0, 'a stale quote must never reach the wire'
+        assert len(writer.open_positions()) == 0
+
+    def test_omitting_quote_time_does_not_refuse(self, writer):
+        """Backward compatible: no timestamp means no staleness claim to check."""
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'untimed',
+                             'average_fill_price_dollars': '0.6000'})
+        assert run(act_on(args(), writer, kalshi, decision(), None)) is True
+
+    def test_a_stale_quote_still_writes_a_ticket_with_a_reason(self, writer):
+        from core.config import DEFAULT_CONFIG
+        kalshi = FakeKalshi({'status': 'executed', 'order_id': 'z'})
+        quote_time = pd.Timestamp.now(tz='UTC') - timedelta(
+            seconds=DEFAULT_CONFIG.max_quote_age_seconds + 5)
+        run(act_on(args(), writer, kalshi, decision(), None, quote_time=quote_time))
+        with writer._session() as session:  # noqa: SLF001
+            from core.pg_writer import OrderTicket
+            row = session.query(OrderTicket).one()
+        assert row.status == 'skipped'
+        assert 'stale' in (row.note or '').lower()
+
+    def test_a_stale_quote_does_not_refuse_a_dry_run(self, writer):
+        """Nothing is sent in dry-run anyway; staleness is not the reason to log."""
+        from core.config import DEFAULT_CONFIG
+        kalshi = FakeKalshi({})
+        quote_time = pd.Timestamp.now(tz='UTC') - timedelta(
+            seconds=DEFAULT_CONFIG.max_quote_age_seconds + 5)
+        booked = run(act_on(args(mode='live', place_orders=False, dry_run=True),
+                            writer, kalshi, decision(), None, quote_time=quote_time))
+        assert booked is False
+        assert len(kalshi.orders) == 0

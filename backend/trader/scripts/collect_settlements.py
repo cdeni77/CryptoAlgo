@@ -39,13 +39,18 @@ from typing import Optional
 import pandas as pd
 
 from core.datastore import ResearchStore
+from core.config import series_to_symbol
 
 logger = logging.getLogger('settlements')
 
 PREDEXON = 'https://api.predexon.com'
 GAMMA = 'https://gamma-api.polymarket.com'
 PAUSE = 1.15
-SERIES = {'KXBTC15M': 'BTC-USD', 'KXETH15M': 'ETH-USD', 'KXSOL15M': 'SOL-USD'}
+# The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
+# This used to hardcode its own copy with no env read, so pointing
+# KALSHI_SERIES_BTC at a demo series moved what the trader traded while
+# this kept scraping production.
+SERIES = series_to_symbol()
 PM_ASSETS = {'btc': 'BTC-USD', 'eth': 'ETH-USD', 'sol': 'SOL-USD'}
 HEADERS = {'Accept': 'application/json',
            'User-Agent': 'Mozilla/5.0 (quarter research collector)'}

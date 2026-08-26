@@ -1,15 +1,18 @@
 """Kalshi's fee schedule, and the shape that decides the strategy.
 
-`fee = ceil(0.07 * contracts * price * (1 - price) * 100) / 100`, per order, and
-settlement is free. The `p(1-p)` term means a confident bet is a cheap bet,
-which is the opposite of a perpetual future's fixed toll — and it is why the
-barrier framing and this venue fit together at all.
+`fee = ceil(0.07 * contracts * price * (1 - price) * 10_000) / 10_000`, per
+order, and settlement is free. The ceiling is to a HUNDREDTH of a cent, not a
+whole cent — this file used to say `* 100) / 100`, which over-charged 7% in
+aggregate and ~17% on the smallest orders before it was corrected against 328
+real fills. The `p(1-p)` term means a confident bet is a cheap bet, which is
+the opposite of a perpetual future's fixed toll — and it is why the barrier
+framing and this venue fit together at all.
 
-Nothing here has been checked against a filled order ticket. The taker formula is
-the published schedule; the maker rate is modelled as a flat per-contract charge
-and is unverified. The last venue this repo priced was wrong in both shape and
-magnitude, and it was settled by reading three real tickets rather than by
-reasoning — so these tests pin the arithmetic, not its truth.
+The taker formula is now measured: all 328 real fills came back `is_taker:
+true`, confirming the published schedule at hundredth-of-a-cent precision. The
+maker rate remains a flat modelled per-contract charge that no order ticket has
+ever confirmed — treat it as provisional, and see `core/costs.py` for the full
+account of what changed and why.
 """
 
 from __future__ import annotations

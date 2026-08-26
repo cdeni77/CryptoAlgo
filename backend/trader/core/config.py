@@ -50,6 +50,35 @@ def find_fee_config(name: str = DEFAULT_FEE_CONFIG_NAME) -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+# **The one Kalshi series mapping.** `scripts/live.py` used to be the only
+# place this read the `KALSHI_SERIES_BTC/ETH/SOL` env vars; four other files
+# each hardcoded the same three tickers with no env read at all. Pointing
+# `KALSHI_SERIES_BTC` at a demo series moved what the trader trades while every
+# recorder kept scraping production, silently — a live account disagreeing with
+# its own data pipeline about which market is real.
+#
+# The traded series carries an explicit strike suffix only on the WRONG series:
+# `KXBTCD-26AUG2317-T86749.99` is the hourly threshold ladder, abstained on for
+# exactly that reason. `KXBTC15M-26AUG230030` is series + date + HHMM with no
+# strike suffix — the strike is the price at the window's open, which is what
+# `core/windows.py` builds a target from.
+SERIES_BY_SYMBOL: dict[str, str] = {
+    'BTC-USD': os.getenv('KALSHI_SERIES_BTC', 'KXBTC15M'),
+    'ETH-USD': os.getenv('KALSHI_SERIES_ETH', 'KXETH15M'),
+    'SOL-USD': os.getenv('KALSHI_SERIES_SOL', 'KXSOL15M'),
+}
+
+
+def series_to_symbol() -> dict[str, str]:
+    """The inverse of `SERIES_BY_SYMBOL`, for a recorder keyed on the ticker.
+
+    Derived rather than duplicated, so an env override reaches both directions
+    — a second hardcoded `{series: symbol}` dict is exactly the trap this
+    replaces.
+    """
+    return {series: symbol for symbol, series in SERIES_BY_SYMBOL.items()}
+
+
 @dataclass(frozen=True)
 class Config:
     # ---- universe and market structure -----------------------------------
@@ -78,11 +107,6 @@ class Config:
     # variance, not 3 — a 22% overstatement if ignored. See
     # `remaining_variance_minutes`.
     settle_average_minutes: float = 1.0
-
-    # A tie resolves YES. `strike_type` on the market is `greater_or_equal`, so a
-    # dead-flat window pays the up side — the opposite of what a strict `>` would
-    # give it, and worth a field because it is a venue fact rather than a choice.
-    tie_resolves_up: bool = True
 
     # Minutes after the window opens at which a decision is scored. Each is a
     # separate row with its own displacement and its own remaining variance,
@@ -321,19 +345,20 @@ class Config:
     # move. The live-honest rule is to walk the offsets in order and take the
     # first that clears every gate; `scripts/evaluate.py` reports edge per
     # offset separately, which is how the offset set gets narrowed on evidence
-    # rather than by taking the best one in hindsight.
-    max_entries_per_window: int = 1
+    # rather than by taking the best one in hindsight. One entry per
+    # (symbol, window) is enforced directly in `decide()` (`ALREADY_ENTERED`)
+    # rather than through a config field — it is an invariant, not a policy
+    # anyone should be tuning.
 
     # Settlement is free; an exit is not. Selling a contract back pays a second
     # fee and crosses the spread a second time, so an early exit at 85c costs
     # 3.8pp against the 1.9pp of holding to settle. And there is no risk reason
     # to override that: a binary's loss is capped at the stake from the instant
     # of entry, so there is no liquidation to avoid and nothing a stop-loss
-    # protects. An exit therefore has to be justified by the forecast flipping
-    # far enough to beat a fresh round of costs, which is a high bar — hence
-    # off by default, and `exit_edge_pp` on top of it when enabled.
-    allow_early_exit: bool = False
-    exit_edge_pp: float = 1.0
+    # protects. So this is unconditional, not a toggle: there is no exit path
+    # in `core/decide.py` or `core/book.py` at all, and `allow_early_exit`/
+    # `exit_edge_pp` config fields that implied a gated mechanism existed were
+    # removed rather than left describing a feature that was never built.
     min_contracts: int = 1                # round down; zero contracts is a skip
     # Surplus over break-even, in probability points, demanded before a trade
     # is considered at all. Abstention is the default action, and this is the
@@ -460,7 +485,11 @@ class Config:
     max_drawdown_fraction: float = 0.35
 
     # ---- provenance ------------------------------------------------------
-    fee_config_path: Optional[str] = None
+    # `fee_config_path` used to sit here too, set by `with_fee_assumptions`
+    # and never read back by anything, including `provenance()` — a
+    # write-only field. `fee_config_version` is the part that is actually
+    # a fact about the fitted numbers; the local path a file happened to
+    # load from is not.
     fee_config_version: str = 'builtin_kalshi_v202608'
     cli_overrides: frozenset[str] = frozenset()
 
@@ -597,7 +626,6 @@ class Config:
             fee_rate=float(fees.get('fee_rate', self.fee_rate)),
             maker_fee_rate=float(fees.get('maker_fee_rate', self.maker_fee_rate)),
             half_spread_cents=float(fees.get('half_spread_cents', self.half_spread_cents)),
-            fee_config_path=str(path),
             fee_config_version=str(payload.get('version', 'unversioned')),
         )
 

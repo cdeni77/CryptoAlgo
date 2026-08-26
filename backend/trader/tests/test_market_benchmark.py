@@ -11,13 +11,17 @@ from __future__ import annotations
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from core.pg_writer import PgWriter
 
-REPO_TRADER = '/home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/backend/trader'
+# tests/ -> backend/trader/. A developer-specific absolute path here failed on
+# any other machine, container or CI runner — this is the same fix already
+# used in test_repo_hygiene.py, just one directory shallower.
+REPO_TRADER = str(Path(__file__).resolve().parents[1])
 NOW = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
 
 

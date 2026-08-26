@@ -218,9 +218,13 @@ function WindowCard({ window: w }: { window: Prediction }) {
       </div>
 
       <div className="mt-4">
+        {/* market_probability is the real quote, null when none was read.
+            price is what WE paid and is null on every refused window — using
+            it as a market fallback drew our own baseline and labelled it
+            "market" on the majority of rows. */}
         <ProbabilityScale
           probability={w.model_probability}
-          price={w.price ?? w.baseline_probability}
+          price={w.market_probability}
           breakEven={w.effective_cost}
         />
       </div>

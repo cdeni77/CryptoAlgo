@@ -4,6 +4,12 @@ The failure these tests exist for is not a crash. It is a plausible number: a
 P&L that renders identically to a real one while being short a tier, double a fee,
 or built from the public tape instead of the account. Every test below names the
 wrong answer it is ruling out.
+
+Settlement fixtures use unsuffixed `fee_cost`, matching the real wire shape —
+the venue does not serve `fee_cost_dollars` on a settlement at all (see
+`kalshi_client._fee`). These fixtures used to invent that suffix, which is
+exactly the shape of bug this file exists to catch: it passed while the real,
+unsuffixed field was read a hundred times too small.
 """
 
 from __future__ import annotations
@@ -83,7 +89,7 @@ def test_settlement_pnl_is_revenue_minus_cost_minus_fee():
     settled = parse_settlement({
         'ticker': 'KXBTC15M-A', 'market_result': 'no', 'no_count_fp': '5.00',
         'no_total_cost_dollars': '1.5000', 'revenue_dollars': '5.0000',
-        'fee_cost_dollars': '0.0700', 'settled_time': '2026-08-25T10:15:00Z',
+        'fee_cost': 0.0700, 'settled_time': '2026-08-25T10:15:00Z',
     })
     assert settled.cost == pytest.approx(1.50)
     assert settled.pnl == pytest.approx(3.43)
@@ -93,7 +99,7 @@ def test_a_loser_settles_at_zero_revenue_and_a_negative_pnl():
     settled = parse_settlement({
         'ticker': 'A', 'market_result': 'yes', 'no_count_fp': '5.00',
         'no_total_cost_dollars': '1.5000', 'revenue_dollars': '0.0000',
-        'fee_cost_dollars': '0.0700',
+        'fee_cost': 0.0700,
     })
     assert settled.revenue == 0.0
     assert settled.pnl == pytest.approx(-1.57)
@@ -274,7 +280,7 @@ def test_a_missing_historical_tier_does_not_lose_the_live_one():
         '/portfolio/settlements': [{'settlements': [
             {'ticker': 'K1', 'market_result': 'yes', 'yes_count_fp': '1.00',
              'yes_total_cost_dollars': '0.50', 'revenue_dollars': '1.00',
-             'fee_cost_dollars': '0.02',
+             'fee_cost': 0.02,
              'settled_time': '2026-08-25T10:15:00Z'},
         ]}],
         # /portfolio/settlements/historical absent -> the stub raises KalshiError
@@ -373,7 +379,7 @@ def test_a_resync_heals_a_row_rather_than_preserving_a_bad_parse():
                           'yes_count_fp': '1.00',
                           'yes_total_cost_dollars': '0.50',
                           'revenue_dollars': '1.00',
-                          'fee_cost_dollars': '0.02'}))])
+                          'fee_cost': 0.02}))])
     rows = writer.venue_settlements()
     assert len(rows) == 1
     assert rows[0].pnl == pytest.approx(0.48)
@@ -401,7 +407,7 @@ def test_the_settlement_total_is_over_everything_by_default():
             parse_settlement({
                 'ticker': f'K{i}', 'market_result': 'yes', 'yes_count_fp': '1.00',
                 'yes_total_cost_dollars': '0.50', 'revenue_dollars': '1.00',
-                'fee_cost_dollars': '0.00',
+                'fee_cost': 0.00,
                 'settled_time': (base + timedelta(minutes=15 * i)).isoformat(),
             }))])
     assert len(writer.venue_settlements()) == 30
@@ -455,7 +461,7 @@ def test_a_settlement_joins_to_our_position_through_the_ticket():
                           'no_count_fp': '5.00',
                           'no_total_cost_dollars': '1.5000',
                           'revenue_dollars': '5.0000',
-                          'fee_cost_dollars': '0.0200',
+                          'fee_cost': 0.0200,
                           'settled_time': settle.isoformat()}),
         position=found)
     assert row['position_id'] == position_id

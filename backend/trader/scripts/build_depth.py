@@ -1,16 +1,24 @@
-"""Every book, from every source, into one table at every minute.
+"""Every BOOK source, into one table at every minute.
 
-**The problem this solves.** Before this, the same measurement lived in four
+**The problem this solves, and the one it does not.** The book lived in three
 incompatible places: Kalshi live in `venue_ladder` (raw levels, every minute),
-Polymarket live in `pm_ladder`, the Kalshi Predexon backfill in a JSONL file
-outside the research store entirely (packed thirteen-number series), and
-`venue_quotes` at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14). Nothing
-could join them, and the offset grids disagreed with each other and with the
-model's own.
-
-Everything lands in `venue_depth` here, keyed the same way, at **every minute**
+Polymarket live in `pm_ladder`, and the Kalshi Predexon backfill in a JSONL file
+outside the research store entirely (packed thirteen-number series). This module
+unifies those three into `venue_depth`, keyed the same way, at **every minute**
 of the window — because the offset grid is itself under test and a table sampled
 where the model currently scores would foreclose the question.
+
+**`venue_quotes` is a fourth, separate table this does NOT read, and an earlier
+version of this docstring claimed it did.** It holds the Kalshi Predexon
+backfill at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14) and is written by
+`scripts/backfill_quotes.py`, not by this module. As of this writing twelve
+files still read it directly — `retro_economics.py`, `refit_market_init.py`,
+`retro_forecast_test.py`, `diagnose_market_mid.py`, `quote_coverage.py`,
+`_status.py`, `_book_analysis.py`, `_offset_vs_market.py`, `_collect_book.py`
+among them — so "one table" was true of the book and not yet true of the whole
+pipeline. Folding `venue_quotes` into `venue_depth` too is a real migration
+(different offset grid, different producer, a dozen consumers to repoint) and
+was deliberately left undone here rather than done under time pressure.
 
 `quote_age_seconds` says how stale each row is. Predexon serves book CHANGES,
 so the state at minute `m` is the last change at or before it and a quiet book

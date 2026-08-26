@@ -47,7 +47,13 @@ python -m scripts.evaluate                      # skill, gates, cost stress
 
 ## Status
 
-The plumbing is complete and tested (207 tests). The **edge is unestablished**:
-there is no scraped data, no trained model, and no measured skill yet. The phase
-gates exist because that is a hypothesis, and `scripts/evaluate.py` failing is
-the expected outcome until proven otherwise.
+This section described an early phase of the project — no scraped data, no
+trained model — and was never updated as the project moved past it. Rather than
+pin another number here that will drift (the test count alone has been wrong
+three times across the other docs), the honest state now lives in one place:
+**`CLAUDE.md`'s "The honest state of things"** section, updated as it changes.
+As of this fix: five years of bars for all three symbols, a model promoted and
+trading live since 2026-08-23, and the edge still treated as a hypothesis under
+continuous measurement rather than something one promotion settled — the phase
+gates exist for exactly that reason and `scripts/evaluate.py` failing remains
+the expected outcome until proven otherwise on the current artifact.

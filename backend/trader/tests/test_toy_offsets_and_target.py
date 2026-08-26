@@ -125,10 +125,14 @@ def test_the_excursion_down_stops_at_the_same_boundary():
 
 
 def test_a_dead_flat_window_resolves_up_not_down():
-    """`strike_type` is `greater_or_equal`. The docstring of
-    `test_windows.py::test_the_base_rate_is_near_a_half` still says "an exactly
-    flat window resolves down", which is the old convention — stated here so the
-    two cannot both be believed."""
+    """`strike_type` is `greater_or_equal`, so a dead-flat window pays UP.
+
+    `test_windows.py::test_the_base_rate_is_near_a_half` used to disagree with
+    this — its docstring claimed "an exactly flat window resolves down", the
+    superseded strict-`>` convention. Both docstrings are now corrected to say
+    the same thing; this test still earns its place as the toy-data version of
+    that check.
+    """
     flat = toy_bars(np.full(N, 100.0))
     table, _ = build_windows(flat, 'TOY', offsets=(3, 6, 9, 12))
     assert not table.empty

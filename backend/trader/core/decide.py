@@ -486,9 +486,11 @@ def decide_window(
     entered = 0
     candidates, _ = stateless_screen(rows, config)
     for _, row in candidates.sort_values(['offset', 'symbol']).iterrows():
-        # `max_entries_per_window` is per (symbol, window) and is enforced by
-        # ALREADY_ENTERED; this cap is on distinct correlated legs in the same
-        # fifteen minutes, which is the exposure that matters at $100.
+        # One entry per (symbol, window) is enforced by ALREADY_ENTERED below
+        # (a hardcoded set-membership check, not a config field — it is an
+        # invariant, not a policy). `max_positions_per_window` is a different
+        # cap: on distinct correlated legs in the same fifteen minutes, which
+        # is the exposure that matters at $100.
         if entered >= config.max_positions_per_window:
             break
         decision = decide(row, config, bankroll=bankroll, exposure=exposure)

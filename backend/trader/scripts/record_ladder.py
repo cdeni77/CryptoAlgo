@@ -31,11 +31,15 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from core.config import DEFAULT_CONFIG
+from core.config import DEFAULT_CONFIG, series_to_symbol
 from core.datastore import ResearchStore
 
 logger = logging.getLogger('ladder')
-SERIES = {'KXBTC15M': 'BTC-USD', 'KXETH15M': 'ETH-USD', 'KXSOL15M': 'SOL-USD'}
+# The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
+# This used to hardcode its own copy with no env read, so pointing
+# KALSHI_SERIES_BTC at a demo series moved what the trader traded while
+# this kept scraping production.
+SERIES = series_to_symbol()
 
 
 def _levels(raw) -> list:
@@ -118,11 +122,15 @@ async def run(args, gate=None) -> int:
             await asyncio.sleep(20)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--interval', type=float, default=60.0)
     parser.add_argument('--batch-rows', type=int, default=30)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-7s %(name)s %(message)s',
                         datefmt='%H:%M:%S')

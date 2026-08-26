@@ -40,6 +40,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.sql import func
 
+from core.book import won as _won
+
 logger = logging.getLogger(__name__)
 
 Base = declarative_base()
@@ -780,7 +782,7 @@ class PgWriter:
             row = session.get(Position, position_id)
             if row is None or row.outcome != Outcome.PENDING.value:
                 return None
-            won = settled_up if row.side == 'up' else not settled_up
+            won = _won(side=row.side, settled_up=settled_up)
             payout = float(row.contracts) if won else 0.0
             row.settled_up = settled_up
             row.payout = payout

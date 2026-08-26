@@ -343,3 +343,43 @@ def test_a_keyboard_interrupt_is_not_treated_as_a_crash():
             await supervise('c', interrupted, backoff=0.0, sleep=_nosleep)
 
     asyncio.run(drive())
+
+
+# ---------------------------------------------------------------------------
+# Recorder defaults come from each recorder's own parser, not a second copy.
+# ---------------------------------------------------------------------------
+
+def test_recorder_args_takes_its_defaults_from_the_real_parser():
+    """This used to be a hand-copied Namespace with literal defaults — a
+    second definition of numbers that already lived in each recorder's own
+    `argparse` setup. Changing a recorder's own default (as it would when run
+    standalone via `python -m scripts.record_ladder`) must be reflected here
+    automatically, because there is now exactly one definition."""
+    from scripts.run_live import _recorder_args
+    from scripts import record_ladder
+
+    ns = _recorder_args(record_ladder.build_parser)
+    assert ns.interval == 60.0
+    assert ns.batch_rows == 30
+
+
+def test_recorder_args_overrides_apply_on_top_of_the_real_defaults():
+    from scripts.run_live import _recorder_args
+    from scripts import record_pm_ladder
+
+    ns = _recorder_args(record_pm_ladder.build_parser, batch_rows=6)
+    assert ns.interval == 60.0, 'interval should be the real default, unchanged'
+    assert ns.batch_rows == 6, 'batch_rows should be the explicit override'
+
+
+def test_a_changed_recorder_default_is_picked_up_without_touching_run_live():
+    """The whole point: bump one recorder's own default and this must follow."""
+    import argparse
+    from scripts.run_live import _recorder_args
+
+    def build_parser():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--interval', type=float, default=99.0)
+        return parser
+
+    assert _recorder_args(build_parser).interval == 99.0

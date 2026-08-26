@@ -100,8 +100,10 @@ def test_a_decision_sees_the_bar_before_it_and_nothing_after():
 def test_a_tie_resolves_up():
     """`strike_type` is `greater_or_equal`, so a dead-flat window pays the up side.
 
-    The opposite of what a strict `>` gives it, and flat windows are not rare on
-    a minute grid — so this is worth a test rather than a comment.
+    The opposite of what a strict `>` gives it. Worth a test rather than a
+    comment even though a real tie is measure-zero (1 in 173,937 real BTC
+    windows, both ends being one-minute OHLC means of a liquid asset) —
+    precisely because it is rare, nothing else exercises this path.
     """
     times = pd.date_range('2025-01-01', periods=46, freq='1min', tz='UTC')
     flat = pd.DataFrame({
@@ -176,8 +178,12 @@ def test_offsets_outside_the_window_are_refused():
 def test_the_base_rate_is_near_a_half():
     """A large departure is a grid bug, not a market fact.
 
-    Slightly *below* 0.5 is expected: an exactly flat window resolves down, and a
-    minute grid produces exact ties more often than a continuous model implies.
+    Slightly *above* 0.5 is expected, not below: `strike_type` is
+    `greater_or_equal`, so a tie pays up rather than losing it. Measured on
+    real data it is 0.5009 (BTC) / 0.5031 (ETH). This docstring used to claim
+    the opposite, describing the superseded strict-`>` rule and the discredited
+    idea that a minute grid produces ties often enough to matter (it does not
+    — 1 in 173,937 real windows).
     """
     bars = make_bars(days=40)
     panel, _ = build_window_panel(bars, Config())

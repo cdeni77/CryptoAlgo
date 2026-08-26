@@ -29,6 +29,7 @@ from core.config import DEFAULT_CONFIG
 from core.dataset import (Dataset, FoldFit, apply_fold, apply_seasonality,
                           load_minute_bars)
 from core.datastore import ResearchStore
+from core.book import won as _won
 from core.decide import Reason, WindowExposure, decide
 from core.market_sim import MarketSimulator
 from core.metrics import DEFAULT_GATES, IMPLAUSIBLE_SHARPE
@@ -68,7 +69,7 @@ def replay(table: pd.DataFrame, config, bankroll: float) -> pd.DataFrame:
                        require_quote=True)
             if d.reason is not Reason.TRADED:
                 continue
-            won = bool(row['outcome']) if d.side.value == 'up' else not bool(row['outcome'])
+            won = _won(side=d.side, settled_up=bool(row['outcome']))
             out.append({'symbol': d.symbol, 'window_open': window, 'offset': d.offset,
                         'contracts': d.contracts, 'stake': d.stake, 'fee': d.fee,
                         'edge': d.edge, 'won': won,

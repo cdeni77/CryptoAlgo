@@ -35,6 +35,7 @@ from core.config import DEFAULT_CONFIG
 from core.dataset import (Dataset, FoldFit, apply_fold, apply_seasonality,
                           load_minute_bars)
 from core.datastore import ResearchStore
+from core.book import won as _won
 from core.decide import Reason, WindowExposure, decide
 from core.promotion import load_live
 
@@ -99,7 +100,7 @@ def main() -> int:
             reasons[d.reason.value] = reasons.get(d.reason.value, 0) + 1
             if d.reason is not Reason.TRADED:
                 continue
-            won = bool(row['outcome']) if d.side.value == 'up' else not bool(row['outcome'])
+            won = _won(side=d.side, settled_up=bool(row['outcome']))
             decisions.append({
                 'symbol': d.symbol, 'window_open': window, 'offset': d.offset,
                 'side': d.side.value, 'contracts': d.contracts, 'price': d.price,

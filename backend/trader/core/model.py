@@ -277,14 +277,16 @@ class ForecastModel:
         return path
 
     def integrity(self) -> dict:
-        """Cheap structural checks a loaded artifact must satisfy.
+        """A snapshot of the artifact's feature shape, for a human or a script.
 
-        `load` is a bare `joblib.load`, so nothing about the object is verified —
-        not the feature list, not the config it was fitted under, not that the
-        booster inside it agrees with the column names beside it. A silently
-        mismatched feature vector is the worst of these: the matrix is built by
-        name from `self.features`, so a booster trained on a different list scores
-        a well-formed matrix of the wrong columns and returns numbers.
+        **This is not the safety check** — `verify()` below is. `verify()` is
+        what `load()` calls and what actually raises on a mismatched feature
+        list; this docstring used to describe that same failure mode as if
+        `integrity()` were the thing guarding against it, while nothing called
+        it and it never raised anything. It is introspection: `load()` logs it
+        at debug level so a mismatch that `verify()` allowed through (no config
+        passed, so no comparison to make) is still visible in the log rather
+        than only inferable from wrong numbers downstream.
         """
         names = list(self.booster.feature_name())
         return {
@@ -360,6 +362,7 @@ class ForecastModel:
         # should fail where the operator is looking, not several minutes into a
         # cycle with a quote in hand.
         model.verify(config)
+        logger.debug('artifact integrity: %s', model.integrity())
         return model
 
 

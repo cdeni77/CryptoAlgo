@@ -110,8 +110,6 @@ services:
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
       - TZ=America/New_York
 
-      # Scraper database (SQLite in the container, persisted via the volume below)
-      - TRADER_DB_PATH=/app/data/trading.db
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
 
       # Research store (Parquet + DuckDB). Absolute, not cwd-relative: a relative
@@ -143,7 +141,6 @@ services:
       # lives inside backend/trader precisely so the build context includes it.
       - FEE_CONFIG=${FEE_CONFIG:-}
 
-      - LOG_LEVEL=INFO
       # Optional: HTTP proxy for exchange API calls
       # - HTTPS_PROXY=http://your-proxy:8080
     depends_on:
@@ -215,9 +212,7 @@ services:
     environment:
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
-      - TRADER_DB_PATH=/app/data/trading.db
       - RESEARCH_STORE=/app/data/research
-      - LOG_LEVEL=INFO
     volumes:
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ./backend/trader:/app
@@ -242,7 +237,6 @@ services:
       - RESEARCH_STORE=/app/data/research
       - MODELS_ROOT=/app/models
       - FEE_CONFIG=${FEE_CONFIG:-}
-      - LOG_LEVEL=INFO
       # `scripts.promote` mirrors each attempt into the serving store so the
       # dashboard's Model and Calibration pages have something to render. Without
       # this it logs "DATABASE_URL is unset, so the dashboard will not show this
@@ -259,20 +253,7 @@ services:
       - ./backend/trader:/app
     command: >
       -m scripts.evaluate
-      
-  # ===========================================================================
-  # Store sync — keeps the research store current with the live period.
-  #
-  # `scrape` and `sync_store` were one-off `docker compose run` commands, so
-  # nothing ran them once the live loop started. Measured 2026-08-25: the
-  # research store's newest bar was 2026-08-23 04:17 while live windows ran to
-  # 2026-08-25 00:00 — so not one traded window could be replayed offline, and
-  # the Kalshi quote archive was unusable for comparing a candidate model against
-  # the market. That is the one thing the archive exists for.
-  #
-  # Hourly. Both steps are idempotent and resumable: `scrape` fetches only what
-  # is missing at either end, `sync_store` rewrites only new partitions.
-  # ===========================================================================
+
   # ===========================================================================
   # Everything the live system runs, in ONE service.
   #

@@ -256,7 +256,7 @@ async def run(args, gate=None) -> int:
             await asyncio.sleep(20)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--interval', type=float, default=60.0)
     parser.add_argument('--batch-rows', type=int, default=10)
@@ -265,7 +265,11 @@ def main() -> int:
     parser.add_argument('--min-r2', type=float, default=0.90,
                         help='below this the ladder is not internally '
                              'consistent and the fit is not a measurement')
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-7s %(name)s %(message)s',
                         datefmt='%H:%M:%S')

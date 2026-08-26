@@ -54,7 +54,12 @@ class PipelineConfig:
     funding_poll_interval: int = 300
     backfill_days: int = 30
     validation_config: ValidationConfig = field(default_factory=ValidationConfig)
-    enable_funding_polling: bool = True
+    # Off by default. Funding/open-interest are perpetual-futures concepts;
+    # this system trades spot bars, and `scrape.py` — the only production
+    # caller — always passed False explicitly. The default disagreed with the
+    # only caller, so any future caller that omitted the flag would silently
+    # start collecting for a strategy already rejected four independent ways.
+    enable_funding_polling: bool = False
 
 
 class DataPipeline:

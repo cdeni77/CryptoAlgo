@@ -250,3 +250,21 @@ def test_the_growth_multiple_is_legible_where_a_percentage_is_not():
     book = Book(config=Config(), bankroll=400.0)
     stats = summarise(book, windows_available=10)
     assert stats.growth_multiple == pytest.approx(4.0)
+
+
+def test_won_is_the_one_rule_four_places_used_to_duplicate():
+    """`Position.payout`, `PgWriter.settle_position`, and both retro-economics
+    scripts each wrote `settled_up if side is up else not settled_up` fresh —
+    exactly the shape of the bug that once left the paper bankroll never
+    credited a win. This is the one place that rule lives now."""
+    from core.book import won
+    from core.decide import Side
+
+    assert won(side=Side.UP, settled_up=True) is True
+    assert won(side=Side.UP, settled_up=False) is False
+    assert won(side=Side.DOWN, settled_up=False) is True
+    assert won(side=Side.DOWN, settled_up=True) is False
+    # Side is a str Enum, so a plain 'up'/'down' string must work identically —
+    # PgWriter stores side as a bare string column, not the enum.
+    assert won(side='up', settled_up=True) is True
+    assert won(side='down', settled_up=False) is True

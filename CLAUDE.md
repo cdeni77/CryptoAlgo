@@ -90,7 +90,7 @@ resulting probabilities are calibrated out of sample.
 Kalshi charges, per order:
 
 ```
-fee = ceil(0.07 * contracts * price * (1 - price) * 100) / 100
+fee = ceil(0.07 * contracts * price * (1 - price) * 10_000) / 10_000
 ```
 
 Settlement is free, so a held-to-expiry binary pays **one** fee, not a round
@@ -120,11 +120,17 @@ prefers a measured depth over that guess whenever the row carries one.
 
 Three consequences worth holding onto:
 
-* **The ceiling is per order, not per contract.** One contract at 50c owes
-  $0.0175 and is charged $0.02 — 14% more. At a $100 account every order is a
-  small order, so this is the dominant correction rather than a rounding detail.
-  `decide()` re-checks expected value against what will actually be charged,
-  after rounding to whole contracts.
+* **The ceiling is per order, not per contract, and it barely bites.** This used
+  to say a contract at 50c owes $0.0175 and is charged $0.02 — 14% more — and
+  called that "the dominant correction rather than a rounding detail". Measured
+  against 328 real fills, the granularity is a hundredth of a cent, not a whole
+  cent: that order pays exactly $0.0175, and the per-order effect is worth under
+  a hundredth of a cent. The old whole-cent assumption over-charged 7% in
+  aggregate and ~17% on the smallest orders, which made every net-edge gate too
+  strict and refused trades that were profitable. `decide()` still re-checks
+  expected value against what will actually be charged, after rounding to whole
+  contracts — rounding is per order, so splitting an order can only cost more,
+  never less.
 * **The half-spread overtakes the fee at 92.26c** at the current 0.5c default,
   where `0.07*p*(1-p)` falls below half a cent. Above that the assumption is the
   larger cost, which is why it is a separate, stressed parameter. This number has
@@ -157,8 +163,10 @@ Three consequences worth holding onto:
 spread again — 3.8pp against 1.9pp at 85c. And unlike a perp there is no risk
 reason to override that: a binary's loss is capped at the stake from the instant
 of entry, so there is no liquidation to avoid and nothing a stop-loss protects.
-`allow_early_exit` exists, defaults off, and is expected to essentially never
-fire.
+There is no early-exit code path at all — not a flag defaulting off, an
+unconditional policy. An earlier `allow_early_exit` config field implied a gated
+mechanism existed; it did not, and was removed rather than left describing a
+feature nothing built.
 
 **One entry per (symbol, window).** The four decision offsets are the same bet
 observed at four moments, not four bets. Letting each fire independently puts 4x
@@ -220,12 +228,19 @@ scripts.scrape  ->  SQLite  ->  scripts.sync_store  ->  Parquet + DuckDB
                                   scripts.live  ->  Kalshi
 ```
 
-### The market data pipeline: one schema per concept, both venues
+### The market data pipeline: one schema per concept for the BOOK — `venue_quotes` is still a fifth, separate thing
 
-Collection used to be four incompatible things — Kalshi live ladders, Polymarket
-live ladders, a Predexon backfill in a JSONL file outside the research store, and
-`venue_quotes` at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14). Nothing
-joined, and no two offset grids agreed with each other or with the model's.
+Collection used to be four incompatible things for the book — Kalshi live
+ladders, Polymarket live ladders, a Predexon backfill in a JSONL file outside
+the research store, and the three were joined into `venue_depth`. **This
+section used to also claim `venue_quotes` was folded in; it was not, and
+`scripts/build_depth.py` never reads it.** `venue_quotes` remains a Kalshi-only
+Predexon backfill at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14),
+written separately by `scripts/backfill_quotes.py`, and roughly a dozen files
+still read it directly (`retro_economics.py`, `refit_market_init.py`,
+`_book_analysis.py`, `_offset_vs_market.py` among them). Folding it into
+`venue_depth` too is real, deliberately deferred work — a different offset
+grid, a different producer, a dozen consumers to repoint — not a rename.
 
 ```
                      live (recorded)          backfill (Predexon / gamma)
@@ -234,11 +249,12 @@ joined, and no two offset grids agreed with each other or with the model's.
   summarised      venue_depth <-------------- venue_depth      every minute 0..15
   settlement      venue_settlements <-------- venue_settlements  both venues
   spot bars       minute_bars <-------------- minute_bars        five years
+  quotes, sparse  --                          venue_quotes      Kalshi only, 7 offsets, NOT unified
 ```
 
-`scripts/build_depth.py` is the one path into `venue_depth`, from every source,
-at **every minute** — because the offset grid is itself under test and a table
-sampled where the model currently scores would foreclose the question.
+`scripts/build_depth.py` is the one path into `venue_depth`, from every BOOK
+source, at **every minute** — because the offset grid is itself under test and
+a table sampled where the model currently scores would foreclose the question.
 `source` separates a book somebody recorded from the same book reconstructed
 afterwards; `_validate_depth.py` compares them where they overlap, which is the
 only independent evidence the backfill describes the same object. That check
@@ -433,31 +449,45 @@ live path tried to score a window.
 
 ## Gates
 
-Fourteen, ordered so the **forecast** is read before the **money** — a candidate
-that fails on skill should not have its Sharpe discussed. On the old perp system
-every gate read a simulated outcome, so a model 34x short of its cost hurdle
-failed all of them without any saying why.
+**Eighteen**, ordered so the **market comparison** is read before the
+**forecast** before the **money** — a candidate that fails on skill should not
+have its Sharpe discussed. This table used to list fourteen; four were added
+later (`market_windows`, `model_minus_market`, `calibration_max_deviation`,
+`non_finite_share`) and the prose was never updated to match. On the old perp
+system every gate read a simulated outcome, so a model 34x short of its cost
+hurdle failed all of them without any saying why.
 
 ```
-log_loss_skill        >= 0        the model must beat F(x/sigma)
-folds_skill_positive  >= 5        (of 6; five agreeing is 10.9% likely by chance)
-calibration_error     <= 0.02     the system trades its confident predictions
-residual_scale        >= 0.25     how much of the correction survives
-control_gain_share    <= 0.30     the clock must not carry the model
-windows_evaluated     >= 20,000
-trades                >= 200
-coverage              >= 0.0005   abstaining on everything passes trivially
-realised_edge_pp      >= 0
-total_return          >= 0
-sharpe                >= 0.5
-sharpe_implausible    == 0        a Sharpe above 5 is a bug signature
-max_drawdown          <= 0.35
-halted                == 0
+market_windows             >= 2,000  enough live-recorded quotes to compare against
+model_minus_market         >= 0      beats the PRICE, not just F(x/sigma) — see below
+log_loss_skill             >= 0      the model must beat F(x/sigma)
+folds_skill_positive       >= 5      (of 6; five agreeing is 10.9% likely by chance)
+calibration_error          <= 0.02   the system trades its confident predictions
+calibration_max_deviation  <= 0.04   worst adequately-populated bin, not the mean
+non_finite_share           <= 0.001  a NaN prediction is a data hole, not a forecast
+residual_scale             >= 0.25   how much of the correction survives
+control_gain_share         <= 0.30   the clock must not carry the model
+windows_evaluated          >= 20,000
+trades                     >= 200
+coverage                   >= 0.0005 abstaining on everything passes trivially
+realised_edge_pp           >= 0
+total_return                >= 0
+sharpe                      >= 0.5
+sharpe_implausible          == 0     a Sharpe above 5 is a bug signature
+max_drawdown                 <= 0.35
+halted                       == 0
 ```
 
-`sharpe_implausible` is the unusual one, and it earned its place immediately: the
-first full run reported +12.6 and every other gate passed it. Every other gate
-asks whether the number is good; this one asks whether it is possible.
+`market_windows` and `model_minus_market` cannot be computed from a backtest,
+which has no book — both read NaN and fail until the live loop has recorded
+enough quotes. That is the honest state of the question rather than an obstacle
+to route around; `--force` with a written reason is the documented way past it,
+and the ledger records that it was used.
+
+`sharpe_implausible` is the unusual one among the rest, and it earned its place
+immediately: the first full run reported +12.6 and every other gate passed it.
+Every other gate asks whether the number is good; this one asks whether it is
+possible.
 
 ## Commands
 
@@ -489,7 +519,11 @@ python -m scripts.live --loop --cycle-seconds 60
 python -m scripts.sync_venue                        # pull the venue's own ledger
 python -m scripts.sync_venue --dry-run              # read and total, write nothing
 
-# Tests. pytest.ini sets -n auto: 381 tests in ~90s (`-m "not slow"` for the fast loop).
+# Tests. pytest.ini sets -n auto: ~650+ tests in ~90s (`-m "not slow"` for the
+# fast loop). The exact count is not pinned here on purpose — this line said
+# 207, then 230, then 381, and each was wrong within days. Run
+# `pytest --collect-only -q` for the true count rather than trusting a number
+# in prose.
 cd backend/trader && pytest
 cd backend/api && pytest
 
@@ -686,19 +720,26 @@ kills two windows (that window's settlement and the next one's strike). At 0.4%
 missing spread across all fifteen positions, that is roughly 0.8% of windows lost —
 `Dataset.coverage()` reports it per symbol and `load_dataset` warns above 2%.
 
-**The honest state of things.** There are now ~2.6M one-minute bars per symbol
-for BTC and ETH (2021-08 to 2026-08); SOL was still scraping at the time of the
-audit. There is still no promoted model. A five-year BTC walk-forward run during
-the audit reported mean log-loss skill +0.000897 +/- 0.000240 over 6/6 positive
-folds — but read `AUDIT_REPORT.md` before believing it: the backtest's
-counterfactual price *is* the baseline the model is fitted to correct, four of six
-folds were scored with an unfitted shrinkage constant, the correction peaks at the
-offset where the null is worst calibrated rather than mid-window as predicted, and
-two of the top four features by gain are the clock control. At rho 0.7 between
-folds, "6 of 6 positive" is a 22% event under the null, not 1.6%. The phase gates exist because the edge is a
-*hypothesis*: `scripts/evaluate.py` failing is the expected outcome until proven
-otherwise, and nothing about the live plumbing existing changes that. Trading
-before Phase 3 passes is risking real money on an unestablished edge.
+**The honest state of things, corrected from the audit's snapshot.** This used
+to say SOL was still scraping and there was no promoted model — both were true
+at the time of the audit and neither is now. All three symbols hold ~2.63M
+one-minute bars each (2021-08 to present), and a model has been promoted and
+trading live on a $100 account since 2026-08-23
+(`models/promotions/20260823T144827Z.json`).
+
+That does not retire the caveat underneath it, which is about how to read any
+one walk-forward run rather than about whether a model exists. The five-year
+BTC run from the audit reported mean log-loss skill +0.000897 +/- 0.000240 over
+6/6 positive folds — read `AUDIT_REPORT.md` before believing a number like that
+at face value: the backtest's counterfactual price *is* the baseline the model
+is fitted to correct, four of six folds were scored with an unfitted shrinkage
+constant, the correction peaks at the offset where the null is worst calibrated
+rather than mid-window as predicted, and two of the top four features by gain
+are the clock control. At rho 0.7 between folds, "6 of 6 positive" is a 22%
+event under the null, not 1.6%. The phase gates exist because the edge is a
+*hypothesis*, and passing `scripts.evaluate` once is not the same claim as the
+edge being established — that is measured continuously, not settled by one
+promotion.
 
 ## Archive: what has already been rejected, so it is not re-run
 

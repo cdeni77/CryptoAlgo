@@ -106,7 +106,7 @@ const columns: Column<Prediction>[] = [
       <div className="py-0.5">
         <ProbabilityScale
           probability={p.model_probability}
-          price={p.price ?? p.baseline_probability}
+          price={p.market_probability}
           breakEven={p.effective_cost}
           height={12}
           showAxis={false}

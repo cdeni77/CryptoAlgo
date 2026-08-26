@@ -54,10 +54,15 @@ from typing import Optional
 import pandas as pd
 
 from core.datastore import ResearchStore
+from core.config import series_to_symbol
 
 logger = logging.getLogger('backfill_quotes')
 
-SERIES = {'KXBTC15M': 'BTC-USD', 'KXETH15M': 'ETH-USD', 'KXSOL15M': 'SOL-USD'}
+# The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
+# This used to hardcode its own copy with no env read, so pointing
+# KALSHI_SERIES_BTC at a demo series moved what the trader traded while
+# this kept scraping production.
+SERIES = series_to_symbol()
 OFFSETS = (3, 6, 9, 12)
 # +14m is not traded. It exists so `DECISION_RULE.md` Appendix A's control can
 # run: at 14 minutes into a 15-minute window the market is nearly settled and must

@@ -68,7 +68,7 @@ from typing import NamedTuple, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from core.config import Config, DEFAULT_CONFIG, find_fee_config
+from core.config import Config, DEFAULT_CONFIG, SERIES_BY_SYMBOL, find_fee_config
 from core.costs import trade_fee
 from core.dataset import score_live
 from core.decide import (
@@ -102,11 +102,9 @@ FETCH_MINUTES = 1_500
 # up/down market. `KXBTC15M-26AUG230030` is series + date + HHMM with no strike
 # suffix, which is the tell — the strike is the price at the window's open, and
 # that is exactly what `core/windows.py` builds a target from.
-SERIES_BY_SYMBOL = {
-    'BTC-USD': os.getenv('KALSHI_SERIES_BTC', 'KXBTC15M'),
-    'ETH-USD': os.getenv('KALSHI_SERIES_ETH', 'KXETH15M'),
-    'SOL-USD': os.getenv('KALSHI_SERIES_SOL', 'KXSOL15M'),
-}
+# SERIES_BY_SYMBOL now lives in core/config.py — this used to be the only
+# place the KALSHI_SERIES_* env vars reached; see core/config.py for why
+# that was a trap once other scripts read a hardcoded copy of the same map.
 
 # Minute prices older than this are dropped from the serving store each cycle.
 PRICE_RETENTION_HOURS = 48
@@ -1423,7 +1421,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             continue
         # Only count exposure we actually took on. `act_on` returns False when
         # the order was refused, killed, or never sent.
-        if await act_on(args, writer, kalshi, decision, row, config=config):
+        if await act_on(args, writer, kalshi, decision, row, config=config,
+                        quote_time=quote_time):
             exposure = exposure.with_(decision)
 
     # Re-read: `account` was loaded before the decisions and is now stale by
@@ -1582,7 +1581,8 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
 
 async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                  decision: Decision, row, *,
-                 config: Config = DEFAULT_CONFIG) -> bool:
+                 config: Config = DEFAULT_CONFIG,
+                 quote_time: Optional[pd.Timestamp] = None) -> bool:
     """Record the ticket, place the order when asked to twice, book the fill.
 
     Returns whether a position was booked, so the caller only counts exposure it
@@ -1594,8 +1594,37 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     did `--mode live --dry-run`. Both produced holdings the venue had never heard
     of, which `settle_due` then settled into invented PnL — the exact failure the
     `price_source` column exists to make visible.
+
+    **`quote_time` is when the book was read, not when this function runs.**
+    `run_cycle` reads it once at the top of the cycle, then does a Coinbase
+    fetch, four authenticated reconcile calls, inference and six 15-second quote
+    calls before any order is sent — none of which revalidates that the book is
+    still the one being traded on. `max_quote_age_seconds` was declared for
+    exactly this and never checked anywhere. `None` (the default, and what every
+    call site had before this) makes no staleness claim and is not refused —
+    only a caller that supplies a timestamp is asking for the check.
     """
     placing = bool(args.place_orders) and kalshi is not None and not args.dry_run
+
+    if placing and quote_time is not None:
+        age = (pd.Timestamp.now(tz='UTC') - pd.Timestamp(quote_time)).total_seconds()
+        if age > config.max_quote_age_seconds:
+            writer.write_ticket(
+                symbol=decision.symbol, window_open=decision.window_open,
+                settle_time=decision.settle_time, offset_minutes=decision.offset,
+                market_ticker=decision.market_ticker, side=decision.side.value,
+                contracts=decision.contracts, limit_price=decision.price,
+                max_price=order_limit_price(decision), expected_cost=decision.stake,
+                model_probability=decision.model_probability, edge=decision.edge,
+                status='skipped',
+                note=(f'stale quote: {age:.0f}s old, over the '
+                     f'{config.max_quote_age_seconds}s limit'))
+            logger.warning(
+                '%s window %s: quote is %.0fs old, over the %ds limit. '
+                'Refusing rather than trading a book that may have moved.',
+                decision.symbol, decision.window_open, age,
+                config.max_quote_age_seconds)
+            return False
 
     if placing and not decision.market_ticker:
         logger.error(

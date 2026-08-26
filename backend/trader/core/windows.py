@@ -33,12 +33,18 @@ would guess:
   therefore chain, which is a real structural dependence and one more reason the
   cross-validation embargo is a day rather than a window.
 * **A tie resolves UP.** `strike_type` is `greater_or_equal`, so the comparison is
-  `>=`. A strict `>` hands every dead-flat window to the down side, and flat
-  windows are not rare on a minute grid.
+  `>=`. A strict `>` hands every dead-flat window to the down side — and a tie
+  is not the common case a "minute grid" framing suggests: both ends are
+  one-minute OHLC means of a liquid asset, so an exact tie is measure-zero,
+  1 in 173,937 real BTC windows. `>=` is right because it matches the venue's
+  `strike_type`, not because ties are frequent enough to matter on their own.
 * The settlement index is **CF Benchmarks BRTI**, not Coinbase spot. This module
   builds the target from Coinbase bars because that is the history available;
   Coinbase is a large BRTI constituent, so it is a close proxy and not the same
-  number. That basis is an unmeasured risk, recorded here rather than hidden.
+  number. That basis is now MEASURED rather than an open risk: `venue_settlements`
+  holds the venue's own settlement on 56,385 Kalshi markets, and the Coinbase
+  label agrees with it on 96.98% of shared windows, with essentially all of the
+  disagreement concentrated in near-ties (see `CLAUDE.md`).
 
 Two conventions that are ours and unchanged:
 
@@ -437,10 +443,17 @@ def build_window_panel(
 def base_rate(panel: pd.DataFrame) -> float:
     """Fraction of windows that settle up.
 
-    Expected to sit slightly below 0.5: a window that does not move is a loss
-    for the up side, and a flat minute-to-minute grid produces exact ties more
-    often than a continuous model would suggest. Any large departure from 0.5
-    is a bug in the grid, not a market fact — check it before reading anything
-    else in a report.
+    Expected to sit slightly ABOVE 0.5, not below: `strike_type` is
+    `greater_or_equal`, so a tie pays the up side rather than losing it. This
+    docstring used to claim the opposite — "expected to sit slightly below
+    0.5... a window that does not move is a loss for the up side" — which
+    described the superseded strict-`>` behaviour and would have flagged
+    correct output as a bug. Measured on real data: 0.5009 (BTC), 0.5031
+    (ETH), both above 0.5, exactly as `>=` implies. Ties are also not the
+    common case a "minute grid" framing suggests — both ends of the target are
+    one-minute OHLC means of a liquid asset, so an exact tie is measure-zero:
+    1 in 173,937 real BTC windows. Any large departure from 0.5 is still a bug
+    in the grid, not a market fact — check it before reading anything else in
+    a report.
     """
     return float(panel.drop_duplicates(['symbol', 'window_open'])['outcome'].mean())

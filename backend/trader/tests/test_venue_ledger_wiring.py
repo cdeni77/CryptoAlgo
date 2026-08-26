@@ -31,9 +31,11 @@ FILLS = [
      'is_taker': True, 'created_time': '2026-08-25T10:03:00Z'},
 ]
 SETTLEMENTS = [
+    # `fee_cost` unsuffixed, already in dollars — the venue does not serve
+    # `fee_cost_dollars` on a settlement at all (see kalshi_client._fee).
     {'ticker': 'KXBTC15M-A', 'market_result': 'no', 'no_count_fp': '5.00',
      'no_total_cost_dollars': '1.5000', 'revenue_dollars': '5.0000',
-     'fee_cost_dollars': '0.0700', 'settled_time': '2026-08-25T10:15:00Z'},
+     'fee_cost': 0.0700, 'settled_time': '2026-08-25T10:15:00Z'},
 ]
 
 

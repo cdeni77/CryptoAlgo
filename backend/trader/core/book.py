@@ -37,6 +37,19 @@ logger = logging.getLogger(__name__)
 SECONDS_PER_YEAR = 365.25 * 24 * 3600
 
 
+def won(*, side: str, settled_up: bool) -> bool:
+    """Did the UP or DOWN side of a binary win, given how the window settled?
+
+    The one rule — `settled_up if side is up else not settled_up` — used to be
+    written out fresh in four places (`Position.payout` here,
+    `PgWriter.settle_position`, and both `retro_economics.py` and
+    `simulated_book_economics.py`), which is exactly the shape of the bug that
+    once left the paper bankroll never credited a win: one of the four copies
+    drifting from the other three. `side` compares equal to the plain string
+    `'up'`/`'down'` because `Side` is a `str, Enum`, so this takes either.
+    """
+    return bool(settled_up) if side == Side.UP else not bool(settled_up)
+
 @dataclass(frozen=True)
 class Position:
     symbol: str
@@ -74,8 +87,7 @@ class Position:
 
     def payout(self, settled_up: bool) -> float:
         """Dollars received at settlement: $1 per contract on the winning side."""
-        won = settled_up if self.side is Side.UP else not settled_up
-        return float(self.contracts) if won else 0.0
+        return float(self.contracts) if won(side=self.side, settled_up=settled_up) else 0.0
 
 
 @dataclass(frozen=True)

@@ -50,7 +50,9 @@ backend/trader/
     promote.py     the only path to models/forecast.joblib
     live.py        score, price, decide, act. paper | live --dry-run | live
     check_venue.py prove the Kalshi key and series, read-only, places nothing
-  tests/           381 tests, ~90s in parallel
+  tests/           ~650+ tests, ~90s in parallel (exact count drifts —
+                   this line has already been wrong three times; trust
+                   `pytest --collect-only -q`, not this number)
   configs/venue/   fee schedules (optional; defaults match the published one)
 
 backend/api/
@@ -105,7 +107,10 @@ sync" in a doc is a hope, and it had already failed once by a factor of ten.
 | `db` | PostgreSQL. `POSTGRES_PASSWORD` is required; compose refuses without it. |
 | `backend` | FastAPI, `uvicorn --workers 4`. Schema bootstrap is in the lifespan hook behind an advisory lock, not at import — four workers racing `create_all` killed the losers before FastAPI existed to log it. |
 | `frontend` | Vite dev server or the built bundle. |
-| `trader` | `scripts.live --loop`. Defaults to paper mode. |
+| `trader` | `scripts.live --loop`. Defaults to paper mode. Starts by default (no profile). |
+| `live` (profile `live`) | `scripts.run_live` — the trading loop plus the ladder, Polymarket-ladder and implied-vol recorders plus a store-sync loop, supervised in ONE process. This replaced five separate containers that were split for no reason better than having been added one at a time; a failure in one component now restarts just that component (`supervise`, with backoff) instead of the whole container. `--place-orders --mode live` — this is the one that trades with real money. `--disable <name>` skips a component; everything after `--trade-args` passes through to `scripts.live` verbatim. |
+| `scrape` (profile `tools`) | One-off: `docker compose run --rm scrape`. Backfills five years of bars, resumable. |
+| `evaluate` (profile `tools`) | One-off: walk-forward skill, funnel, money, cost stress, gates. |
 
 `--backfill-days` in compose is the **first cycle only**. On an empty store it
 *defines* the dataset; every cycle after uses the incremental window.

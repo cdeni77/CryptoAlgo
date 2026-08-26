@@ -93,3 +93,27 @@ def test_verify_without_a_config_still_checks_the_features():
     """The structural check does not need a config to be worth doing."""
     with pytest.raises(ValueError, match='booster was trained on'):
         model(booster_names=['a'], listed=['a', 'b']).verify(None)
+
+
+def test_integrity_reports_the_booster_and_listed_features():
+    """`integrity()` is introspection, not the gate — `verify()` is the gate.
+
+    Its docstring used to describe the feature-mismatch failure mode as the
+    reason it exists, which reads as "this is the check." It is not: `verify()`
+    (above) already raises on exactly that mismatch and is what `load()` calls.
+    `integrity()` has no caller and never raised anything — it returns a
+    snapshot for a human or a script to read, and this pins that shape so it
+    does not silently drift from what `verify()` actually checks.
+    """
+    names = ['z_score', 'log_rv_15', 'hour_sin']
+    report = model(booster_names=names, listed=names).integrity()
+    assert report['features'] == names
+    assert report['booster_features'] == names
+    assert report['n_features'] == 3
+
+
+def test_integrity_surfaces_a_mismatch_verify_would_reject():
+    """It reports the disagreement rather than raising — `verify()` raises."""
+    report = model(booster_names=['a', 'b'], listed=['a', 'c']).integrity()
+    assert report['features'] == ['a', 'c']
+    assert report['booster_features'] == ['a', 'b']

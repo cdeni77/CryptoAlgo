@@ -125,6 +125,50 @@ def test_a_quote_is_converted_to_probabilities_at_the_boundary():
     assert quote.ask_for('up') + quote.ask_for('down') > 1.0
 
 
+def test_a_quote_is_read_from_the_real_wire_shape():
+    """The dollar-string encoding, which is what the venue actually sends.
+
+    Every other test of `_to_quote` here fed it bare integer cents — the
+    legacy fallback, not the live one. `yes_bid_dollars: "0.1900"` is the real
+    shape (`CLAUDE.md`: reading only bare cents parsed every quote as null and
+    reported "no two-sided book on any symbol" against a market quoting
+    0.19/0.20 with 1,594 contracts on the bid). That was the historical
+    incident; this pins the fixture that would have caught it, since none of
+    the other tests in this file exercise the `_dollars` branch of `_price` at
+    all.
+    """
+    quote = _to_quote({
+        'ticker': 'KXBTC15M-A', 'status': 'active',
+        'yes_bid_dollars': '0.1900', 'yes_ask_dollars': '0.2000',
+        'no_bid_dollars': '0.8000', 'no_ask_dollars': '0.8100',
+        'last_price_dollars': '0.1950',
+        'yes_bid_size': '1594', 'yes_ask_size': '820',
+        'volume': 12000, 'open_interest': 40000,
+        'close_time': '2026-08-23T03:15:00Z',
+    })
+    assert quote.yes_bid == pytest.approx(0.19)
+    assert quote.yes_ask == pytest.approx(0.20)
+    assert quote.no_bid == pytest.approx(0.80)
+    assert quote.last_price == pytest.approx(0.195)
+    assert quote.yes_bid_size == pytest.approx(1594)
+    assert quote.tradeable()
+
+
+def test_bare_cent_fields_are_null_on_a_live_response_and_must_not_be_trusted_alone():
+    """The exact historical failure: reading only bare cents on a real payload.
+
+    A live market quoting 0.19/0.20 serves `yes_bid_dollars`/`yes_ask_dollars`
+    and the bare `yes_bid`/`yes_ask` keys are simply ABSENT — not zero, absent.
+    `_price` must still recover a tradeable quote from the dollar-suffixed
+    fields alone.
+    """
+    quote = _to_quote({
+        'ticker': 'KXBTC15M-A', 'status': 'active',
+        'yes_bid_dollars': '0.1900', 'yes_ask_dollars': '0.2000',
+    })
+    assert quote.tradeable(), 'a real dollar-denominated quote read as untradeable'
+
+
 def test_an_empty_book_is_not_tradeable():
     quote = _to_quote({'ticker': 'X', 'status': 'active'})
     assert quote.yes_bid is None and quote.yes_ask is None
