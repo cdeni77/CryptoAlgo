@@ -249,11 +249,22 @@ class Config:
     # How much of the depth measured at the touch a stake may claim.
     #
     # Sizing to 100% of it is sizing to a number that has already moved: the
-    # quote is read ~4s before the order is sent. Measured over 237 windows of
-    # real book at +12m, the size resting at the touch retains a median 1.00x
-    # after 45 seconds but only **0.55x at the 25th percentile**, and shrinks
-    # 35% of the time. Half of what is visible is the part that reliably
-    # survives.
+    # quote is read ~4s before the order is sent.
+    #
+    # Measured on 392 windows of real book at +12m where the two samples are
+    # genuinely 45s apart: the size resting at the touch retains a median 1.00x
+    # but only **0.29x at the 25th percentile** (bid 0.31x). A quarter of the
+    # time, over two thirds of the touch is gone within a minute.
+    #
+    # An earlier reading put that p25 at 0.55x and was contaminated: 30% of
+    # collected rows had `after` equal to `at_decision` — the same snapshot twice,
+    # when every book update in the queried span fell before the decision instant
+    # — each contributing a spurious 1.00x.
+    #
+    # 0.5 is chosen against the ~4s horizon that actually applies, not the 45s
+    # the measurement spans, so it sits between no headroom and the p25 of a
+    # window ten times longer. It is a judgement, and the fuller collection now
+    # running will let it be set from the 4s decay directly.
     #
     # On the median trade this is free — 241 contracts resting against ~9
     # wanted, so the cap does not bind. It bites only in the thin tail (p10 is
