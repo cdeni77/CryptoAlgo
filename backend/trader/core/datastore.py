@@ -114,6 +114,21 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'market_ticker', 'window_open', 'minute_into_window',
         'yes_levels', 'no_levels', 'yes_total', 'no_total',
     ),
+    # The same ladder from Polymarket, in the same columns, so the two venues
+    # join on (symbol, window_open, minute). Two extra fields because the market
+    # is addressed differently: `outcomes` proves which token is "Up", and
+    # `token_id_up` is what the book was actually read from.
+    #
+    # This exists to answer whether the offset structure replicates on a venue
+    # with different participants and a different settlement source. That
+    # question dies if the two datasets are shaped differently, which is why
+    # this is a schema twin rather than whatever Polymarket happens to serve.
+    'pm_ladder': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'minute_into_window',
+        'yes_levels', 'no_levels', 'yes_total', 'no_total',
+        'outcomes', 'token_id_up',
+    ),
     'venue_depth': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'offset_minutes',

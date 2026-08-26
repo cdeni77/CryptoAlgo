@@ -292,13 +292,20 @@ services:
         done
 
   # ===========================================================================
-  # Depth recorder — the one dataset that cannot be backfilled.
+  # Depth recorder — the dataset with the worst backfill, not the impossible one.
   #
-  # Verified: `GET /markets/{ticker}/orderbook` on a settled market returns
-  # `{"no_dollars": [], "yes_dollars": []}`. No ladder, no resting size, no queue
-  # position, ever. The candlestick history gives top-of-book and nothing behind
-  # it. So depth exists only while a market is open and only if something is
-  # listening — every day this is down is a day of fill evidence that is gone.
+  # This block used to say depth "cannot be backfilled" at any cost. That is no
+  # longer true and the correction matters, because it was the stated reason
+  # this service was the only source. Predexon serves historical Kalshi order
+  # books, and `_collect_book.py` pulls the full tick series per window.
+  #
+  # What remains true is that the VENUE destroys it: `GET
+  # /markets/{ticker}/orderbook` on a settled market returns
+  # `{"no_dollars": [], "yes_dollars": []}` — verified — so anything not
+  # recorded and not held by a third party is gone. And the third party's
+  # coverage is partial: KXBTC15M starts ~2026-06-19, months after the series
+  # opened, on a 1 req/s org-wide bucket. So the rule is what the user put
+  # plainly: take everything live, and backfill whatever can still be had.
   #
   # It is the missing half of the economic question: the retroactive economics can
   # now price a trade at the venue's real ask, but it must assume the order
@@ -311,6 +318,24 @@ services:
     restart: unless-stopped
     command: >
       -m scripts.record_ladder
+
+  # The same recorder against Polymarket, which runs the same instrument with
+  # different participants and a different settlement source (Binance rather
+  # than CF Benchmarks BRTI). Every result in this project rests on one venue's
+  # 70 days; this is what makes "does the offset structure replicate" answerable
+  # at all, and it writes `pm_ladder` in `venue_ladder`'s columns so the two
+  # join on (symbol, window_open, minute).
+  #
+  # Public endpoints, no credentials. Deliberately NOT via Predexon: that key is
+  # a 1 req/s ORG-WIDE bucket, so a live recorder there would throttle the
+  # historical backfill it is meant to complement.
+  pm-ladder-recorder:
+    profiles: ["live"]
+    extends:
+      service: trader
+    restart: unless-stopped
+    command: >
+      -m scripts.record_pm_ladder
 
   trade-live:
     profiles: ["live"]
