@@ -548,6 +548,26 @@ open, which is what `core/windows.py` builds.
 That abstention was the resolution logic working. A ticker built from a pattern
 would have found *something* 15 or 30 minutes away and traded it.
 
+**The backfilled book is quantised to whole cents, and the venue's is not.**
+Kalshi's `price_level_structure` is `tapered_deci_cent` — a tenth of a cent below
+10c and above 90c — and `GET /markets/{ticker}/orderbook` returns those levels:
+103 of them on a live BTC market, priced `0.0010, 0.0020, 0.0030 ...`. Predexon's
+snapshot of the same book returns 21, priced as integer cents. It is not a
+truncated ladder — total resting size agrees at a ratio of 1.000 when the two are
+matched to the same instant — it is a **coarser price grid in the tails**.
+
+Two consequences, and the second is the one that bites:
+
+* `levels_bid` / `levels_ask` are **not comparable across sources** (measured
+  ratio 0.579, unchanged by any time filter). A feature built on level counts
+  must be source-consistent or it is measuring which pipe the row came through.
+* **The backfill cannot represent a price below 10c to better than a cent**, and
+  the traded band starts at 0.05. Measured on live fills, **41% of contracts are
+  bought under 15c** — so the region where most of the volume sits is exactly the
+  region the backfill rounds. Half a cent of quantisation there is the whole
+  measured half-spread. Any economics computed from backfilled quotes in the
+  tails carries that error; the live path reads Kalshi directly and does not.
+
 **A Polymarket slug's trailing unix stamp is the window's OPEN, not its close.**
 Read as a close it shifts every window fifteen minutes, and *nothing raises*:
 every window is a valid window and every book is a real book. It surfaced only
