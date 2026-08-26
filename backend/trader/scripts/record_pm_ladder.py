@@ -151,6 +151,59 @@ async def _get(session, url: str, *, tries: int = 3):
     raise RuntimeError(f'unreachable: retries exhausted for {url}')
 
 
+async def _post(session, url: str, payload, *, tries: int = 3):
+    """`_get`'s retry, for the one POST this recorder makes.
+
+    Same retry shape as `_get` — 403/429 get backoff, a genuine 4xx fails
+    immediately — kept as a sibling rather than sharing the loop with `_get`
+    because the two differ only in which `session` method they call.
+    """
+    for attempt in range(tries):
+        try:
+            async with session.post(url, headers=HEADERS, json=payload) as response:
+                if response.status in (403, 429) and attempt < tries - 1:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                response.raise_for_status()
+                return json.loads(await response.text() or 'null')
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            if attempt < tries - 1:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(f'unreachable: retries exhausted for {url}')
+
+
+# A real CTF token id is a ~256-bit number — on live evidence, always in the
+# 70s of decimal digits. Observed live: a market minutes old had gamma
+# serving a 17-digit placeholder in `clobTokenIds` before the real token
+# attached, and `clob.polymarket.com` 403'd on it for the ten-plus minutes it
+# took to be replaced — a request that could never succeed, retried every
+# cycle regardless. 40 sits with wide margin on both sides of the two
+# measured values (17 and 78) without depending on the exact digit count.
+MIN_TOKEN_LEN = 40
+
+
+def _valid_token(token) -> bool:
+    return bool(token) and len(str(token)) >= MIN_TOKEN_LEN
+
+
+def _match_books(wanted: list[tuple[str, str]], books: list[dict]) -> dict[str, dict]:
+    """A batch `/books` response, matched back to the symbol that asked.
+
+    Matched by `asset_id`, which the API echoes back as the exact token_id
+    requested — not by response order, which the batch endpoint does not
+    promise to preserve (verified live against a two-token request).
+    """
+    by_token = {token: symbol for symbol, token in wanted}
+    out = {}
+    for book in books or []:
+        symbol = by_token.get(book.get('asset_id'))
+        if symbol:
+            out[symbol] = book
+    return out
+
+
 async def run(args, gate=None) -> int:
     import aiohttp
 
@@ -169,30 +222,58 @@ async def run(args, gate=None) -> int:
                     window_open = pd.Timestamp(now).tz_convert('UTC').floor(
                         f'{config.window_minutes}min')
                     minute = (now - window_open.to_pydatetime()).total_seconds() / 60.0
+
+                    # One gamma call for all three assets' markets, and one
+                    # CLOB call for all three books, rather than three of
+                    # each — verified live that both hosts accept a batched
+                    # request. `clob.polymarket.com` had been 403ing a
+                    # single window for ten-plus minutes straight; that is
+                    # not a blip a per-request retry can wait out, so the
+                    # only lever left is asking less often.
+                    slugs = {asset: slug_for(asset, now) for asset in ASSETS}
+                    qs = '&'.join(f'slug={slug}' for slug in slugs.values())
+                    try:
+                        found = await _get(session, f'{GAMMA}/markets?{qs}') or []
+                    except Exception as exc:              # noqa: BLE001
+                        logger.warning('gamma batch: %s', str(exc)[:90])
+                        found = []
+                    by_slug = {m.get('slug'): m for m in found}
+
+                    # Token 0 is "Up" and token 1 is "Down"; one book is the
+                    # mirror of the other, so recording the Up side is the
+                    # whole market. `outcomes` is carried to prove it.
+                    wanted: list[tuple[str, str]] = []       # (symbol, token)
+                    market_by_symbol: dict[str, dict] = {}
+                    slug_by_symbol: dict[str, str] = {}
                     for asset, symbol in ASSETS.items():
-                        slug = slug_for(asset, now)
-                        try:
-                            found = await _get(session, f'{GAMMA}/markets?slug={slug}')
-                        except Exception as exc:          # noqa: BLE001
-                            logger.warning('%s: %s', slug, str(exc)[:90])
+                        slug = slugs[asset]
+                        market = by_slug.get(slug)
+                        if not market:
                             continue
-                        if not found:
-                            continue
-                        market = found[0]
                         tokens = json.loads(market.get('clobTokenIds') or '[]')
-                        if not tokens:
+                        if not tokens or not _valid_token(tokens[0]):
                             continue
-                        # Token 0 is "Up" and token 1 is "Down"; one book is the
-                        # mirror of the other, so recording the Up side is the
-                        # whole market. `outcomes` is carried to prove it.
+                        wanted.append((symbol, str(tokens[0])))
+                        market_by_symbol[symbol] = market
+                        slug_by_symbol[symbol] = slug
+
+                    books_by_symbol: dict[str, dict] = {}
+                    if wanted:
                         try:
-                            book = await _get(
-                                session, f'{CLOB}/book?token_id={tokens[0]}')
+                            resp = await _post(
+                                session, f'{CLOB}/books',
+                                [{'token_id': token} for _, token in wanted]) or []
                         except Exception as exc:          # noqa: BLE001
-                            logger.warning('%s book: %s', slug, str(exc)[:90])
+                            logger.warning('books batch: %s', str(exc)[:90])
+                            resp = []
+                        books_by_symbol = _match_books(wanted, resp)
+
+                    for symbol, token in wanted:
+                        book = books_by_symbol.get(symbol)
+                        if not book:
                             continue
-                        yes = _levels((book or {}).get('bids'))
-                        no = _no_levels((book or {}).get('asks'))
+                        yes = _levels(book.get('bids'))
+                        no = _no_levels(book.get('asks'))
                         if not yes and not no:
                             continue
                         rows.append({
@@ -200,15 +281,15 @@ async def run(args, gate=None) -> int:
                             'event_time': pd.Timestamp(now).floor('min'),
                             'available_time': pd.Timestamp(now),
                             'quality': 'valid',
-                            'market_ticker': slug,
+                            'market_ticker': slug_by_symbol[symbol],
                             'window_open': window_open.to_pydatetime(),
                             'minute_into_window': round(minute, 3),
                             'yes_levels': json.dumps(yes),
                             'no_levels': json.dumps(no),
                             'yes_total': sum(s for _, s in yes),
                             'no_total': sum(s for _, s in no),
-                            'outcomes': str(market.get('outcomes') or ''),
-                            'token_id_up': str(tokens[0]),
+                            'outcomes': str(market_by_symbol[symbol].get('outcomes') or ''),
+                            'token_id_up': token,
                         })
                     if len(rows) >= args.batch_rows:
                         await asyncio.to_thread(

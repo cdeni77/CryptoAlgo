@@ -105,6 +105,7 @@ def main() -> int:
                           ('settlements', 'collect_settlements'),
                           ('overnight chain', '_overnight.sh'),
                           ('gap fill (queued/running)', '_gap_fill.sh'),
+                          ('pm eth/sol backfill (queued/running)', '_gap_fill_pm_eth_sol.sh'),
                           ('depth refresher', '_depth_loop.sh')):
         # `pgrep -f X` run through a shell matches the shell's OWN command
         # line, so every pattern reported "running". Bracketing the first
