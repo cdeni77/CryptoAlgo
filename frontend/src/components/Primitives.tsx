@@ -70,7 +70,11 @@ export function Metric({
   value: number | null | Measured<number>;
   unit?: string;
   digits?: number;
-  tone?: 'ink' | 'above' | 'below' | 'accent' | 'muted';
+  // `warn` is for a number that is neither good nor bad but wants looking at:
+  // a reconciliation gap against the venue is the case it was added for. It
+  // borrows the gate palette rather than the directional one, because a drift of
+  // -$0.40 is not "price down".
+  tone?: 'ink' | 'above' | 'below' | 'accent' | 'muted' | 'warn';
   hint?: string;
   size?: 'base' | 'lg' | 'xl';
 }) {
@@ -83,6 +87,7 @@ export function Metric({
     below: 'text-below',
     accent: 'text-accent',
     muted: 'text-ink-3',
+    warn: 'text-warn',
   }[tone];
   const sizeClass = { base: 'text-mid', lg: 'text-xl', xl: 'text-2xl' }[size];
 

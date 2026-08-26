@@ -119,6 +119,7 @@ sync" in a doc is a hope, and it had already failed once by a factor of ten.
 | `KALSHI_PRIVATE_KEY` | live | the PEM itself |
 | `KALSHI_PRIVATE_KEY_PATH` | live | or a file holding it |
 | `KALSHI_BASE_URL` | live | defaults to production; a demo host exists |
+| `KALSHI_HISTORICAL_BASE_URL` | live | host for `/historical/...` only. Defaults to `external-api.kalshi.com`, a *different* host from the trading one — the live tier stops ~3 months back and the rest answers there |
 | `KALSHI_SERIES_BTC/ETH/SOL` | live | series tickers, resolved to markets by close time |
 | `DATABASE_URL` | api, trader | PostgreSQL |
 | `POSTGRES_PASSWORD` | db | compose refuses to start without it |

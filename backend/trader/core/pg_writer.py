@@ -337,6 +337,149 @@ class OrderTicket(Base):
     )
 
 
+class VenueFill(Base):
+    """One execution, as the VENUE recorded it. Not our belief about it.
+
+    `Position` says what we thought we bought: the price `decide()` sized at and
+    the fee it predicted from the published schedule. This says what the account
+    of record actually shows. The two differ on every partial fill, every fill
+    better than the limit, and every fee we mispriced — 16 of the first 323 live
+    fills were partial — and where they differ, this row is right.
+
+    Keyed on the venue's `trade_id`, so a re-sync is idempotent. That matters more
+    here than anywhere else in this schema: the live loop and
+    `scripts/sync_venue.py` both write these, the live and historical tiers
+    overlap around the cutoff, and a fill counted twice doubles a cost basis.
+
+    `raw` keeps the whole payload. A parser reads the fields it knows about, and
+    the fields it does not are the ones a venue change turns out to hinge on —
+    the `position_fp` and `yes_bid_dollars` lessons both cost real money and both
+    would have been visible in a stored payload.
+    """
+
+    __tablename__ = 'venue_fills'
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_id = Column(String, nullable=False, unique=True, index=True)
+    order_id = Column(String, nullable=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+
+    # 'up' or 'down', this project's vocabulary for the venue's yes/no. The
+    # translation happens in the parser, once, because a mislabelled side inverts
+    # a trade's P&L rather than merely mis-displaying it.
+    side = Column(String, nullable=False)
+    action = Column(String, nullable=True)
+    # Fractional because the wire encoding is a fixed-point string (`count_fp`:
+    # "5.00"). Whole contracts in practice; an Integer column would silently
+    # truncate the day that stops being true.
+    contracts = Column(Float, nullable=False)
+    # Dollars paid per contract, for `side`. Nullable: a fill whose price did not
+    # parse is a fill at an unknown price, which is not a fill at zero.
+    price = Column(Float, nullable=True)
+    is_taker = Column(Boolean, nullable=True)
+    created_time = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    raw = Column(JSON, nullable=True)
+    synced_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index('ix_venue_fills_ticker_time', 'ticker', 'created_time'),
+    )
+
+
+class VenueSettlement(Base):
+    """One market resolved, as the venue paid it. **This is the P&L.**
+
+    A binary bought once and held to expiry pays one fee at entry and settles once
+    at $1 or $0, so a settlement row is a position's complete economic history:
+    cost basis, payout, fee. Our own `Position.pnl` recomputes all three — the
+    outcome from an OHLC mean of Coinbase standing in for sixty seconds of CF
+    Benchmarks BRTI, the fee from the published schedule — and both are estimates
+    of the numbers in this row.
+
+    `pnl` is stored rather than derived on read, and that is a deliberate
+    exception to keeping derived values out of this schema. The API runs in another
+    container and cannot import the trader, so a P&L computed at read time would
+    have to be written twice, in two languages' worth of null handling, and
+    `test_orm_parity` cannot compare arithmetic — only columns. Storing it keeps
+    one definition, in the one process that writes here, and leaves the API doing
+    what it is supposed to do: serving a measurement it did not invent.
+
+    Null `pnl` means the venue left one of the three fields absent. That is not
+    break-even, and nothing downstream may read it as zero.
+    """
+
+    __tablename__ = 'venue_settlements'
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, unique=True, index=True)
+    event_ticker = Column(String, nullable=True)
+    # 'yes' or 'no', as the venue resolved it — the answer our bars only estimate.
+    market_result = Column(String, nullable=True)
+
+    yes_contracts = Column(Float, nullable=False, default=0.0)
+    no_contracts = Column(Float, nullable=False, default=0.0)
+    yes_cost = Column(Float, nullable=True)
+    no_cost = Column(Float, nullable=True)
+    revenue = Column(Float, nullable=True)
+    fee_cost = Column(Float, nullable=True)
+    # revenue - (yes_cost + no_cost) - fee_cost. See the class docstring for why
+    # it is a column, and `Settlement.pnl` for why the fee is subtracted.
+    pnl = Column(Float, nullable=True)
+
+    settled_time = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    # Our own books, alongside the venue's, for the one comparison that matters:
+    # a gap that grows is a fee we mispriced or a settlement our Coinbase proxy
+    # got wrong. Null when no position of ours maps to this ticker — which is
+    # itself informative, since it means the venue settled something we never
+    # recorded buying.
+    position_id = Column(Integer, nullable=True, index=True)
+    our_pnl = Column(Float, nullable=True)
+
+    raw = Column(JSON, nullable=True)
+    synced_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index('ix_venue_settlements_settled', 'settled_time'),
+    )
+
+
+class VenueBalance(Base):
+    """The venue's balance, sampled. What makes the account chart live.
+
+    Settlements step the curve every fifteen minutes at most, and only when
+    something settled. This is read every cycle, so the chart has a present
+    rather than ending at the last resolved market.
+
+    It is cash on the shard, not equity: entering a position debits it and
+    settlement credits it back, so on its own it sawtooths. That is why the
+    account curve plots realised P&L as its primary series and carries this
+    beside it — the balance is the real money, and the P&L is how the portfolio
+    is doing. `exchange_index` is recorded because **balances are local to a
+    shard**: a total across shards is not money any single order can draw on, and
+    reading one number as the other is what made every order come back
+    `insufficient_balance` against an apparently healthy $107.96.
+    """
+
+    __tablename__ = 'venue_balance'
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    balance = Column(Float, nullable=False)
+    exchange_index = Column(Integer, nullable=True)
+    # What our own arithmetic thought at the same instant, and the difference.
+    # Stored rather than only logged because a drift that GROWS is the signal —
+    # an unrecorded fill, a partial, a mispriced fee — and a single log line
+    # cannot show a trend.
+    our_bankroll = Column(Float, nullable=True)
+    drift = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index('ix_venue_balance_timestamp_desc', 'timestamp'),
+    )
+
 # Indexes and constraints added after a table first shipped. Applied by
 # `_run_migrations` and asserted identical to the API's list by test_orm_parity —
 # an index that exists in one container and not the other is a query that is
@@ -352,6 +495,15 @@ MIGRATIONS: tuple[str, ...] = (
     'ON minute_prices (symbol, minute DESC)',
     'CREATE INDEX IF NOT EXISTS ix_order_tickets_window '
     'ON order_tickets (window_open DESC)',
+    # The venue ledger. Every read of these is "newest first" or "since a
+    # timestamp", which is one index each; the settlements one carries the P&L
+    # aggregate and the account chart, so it is the hottest query on the surface.
+    'CREATE INDEX IF NOT EXISTS ix_venue_fills_created_desc '
+    'ON venue_fills (created_time DESC)',
+    'CREATE INDEX IF NOT EXISTS ix_venue_settlements_settled_desc '
+    'ON venue_settlements (settled_time DESC)',
+    'CREATE INDEX IF NOT EXISTS ix_venue_balance_recent '
+    'ON venue_balance (timestamp DESC)',
     # NOTE: the market-benchmark columns on `predictions` (market_ask_up,
     # market_ask_down, outcome) deliberately have NO migration here.
     #
@@ -876,6 +1028,181 @@ class PgWriter:
                 .filter(EquityPoint.timestamp >= since)
                 .order_by(EquityPoint.timestamp)
             )
+
+    # ---- the venue ledger -----------------------------------------------
+    #
+    # Written by the live loop every cycle (from the reconcile it already
+    # performs) and by `scripts.sync_venue` for the deep, paginated backfill.
+    # Both paths upsert on the venue's own key, so running them together, or the
+    # same one twice, converges rather than double-counting.
+
+    def upsert_venue_fills(self, rows: Iterable[dict]) -> int:
+        """Upsert fills on `trade_id`. Returns the number of rows written.
+
+        Idempotent because it has to be: the live and historical tiers overlap
+        around the cutoff, so the same fill arrives twice in one sync, and a fill
+        counted twice doubles a cost basis.
+
+        A row's fields are overwritten on conflict rather than skipped. The venue
+        amends its own records — a `_dollars` field appearing where only cents were
+        served before is the documented direction of travel — and a stale row that
+        parsed badly the first time should heal on the next sync instead of being
+        preserved forever by an INSERT ... DO NOTHING.
+        """
+        written = 0
+        with self._session() as session:
+            for row in rows:
+                trade_id = row.get('trade_id')
+                if not trade_id:
+                    logger.warning('a venue fill arrived with no trade_id; '
+                                   'skipping rather than inventing a key')
+                    continue
+                existing = session.query(VenueFill).filter_by(
+                    trade_id=trade_id).one_or_none()
+                if existing is not None:
+                    for key, value in row.items():
+                        setattr(existing, key, value)
+                    existing.synced_at = utcnow()
+                else:
+                    session.add(VenueFill(**row))
+                written += 1
+            session.commit()
+        return written
+
+    def upsert_venue_settlements(self, rows: Iterable[dict]) -> int:
+        """Upsert settlements on `ticker`. Returns the number of rows written."""
+        written = 0
+        with self._session() as session:
+            for row in rows:
+                ticker = row.get('ticker')
+                if not ticker:
+                    continue
+                existing = session.query(VenueSettlement).filter_by(
+                    ticker=ticker).one_or_none()
+                if existing is not None:
+                    for key, value in row.items():
+                        setattr(existing, key, value)
+                    existing.synced_at = utcnow()
+                else:
+                    session.add(VenueSettlement(**row))
+                written += 1
+            session.commit()
+        return written
+
+    def venue_ledger_keys(self) -> tuple[set[str], set[str]]:
+        """What is already stored, as two sets, in two queries.
+
+        The live loop reconciles every cycle and the venue returns up to 200 fills
+        and 200 settlements each time — almost all of them rows it returned last
+        cycle too. Upserting all four hundred means four hundred SELECT-then-write
+        round trips a minute in the steady state, for no change.
+
+        So the caller filters against these first. The settlement set deliberately
+        holds only tickers whose `pnl` is **not** null: a row that parsed
+        incompletely is left out, so it is retried and can heal when the venue
+        fills the gap in. Filtering on mere presence would freeze the first bad
+        parse in place forever.
+        """
+        with self._session() as session:
+            trade_ids = {tid for (tid,) in session.query(VenueFill.trade_id)}
+            tickers = {t for (t,) in session.query(VenueSettlement.ticker)
+                       .filter(VenueSettlement.pnl.is_not(None))}
+        return trade_ids, tickers
+
+    def venue_fills(self, *, since: Optional[datetime] = None,
+                    limit: int = 200) -> list[VenueFill]:
+        with self._session() as session:
+            query = session.query(VenueFill)
+            if since is not None:
+                query = query.filter(VenueFill.created_time >= since)
+            return list(query.order_by(VenueFill.created_time.desc()).limit(limit))
+
+    def venue_settlements(self, *, since: Optional[datetime] = None,
+                          limit: Optional[int] = None) -> list[VenueSettlement]:
+        """Settled markets, newest first. `limit=None` for the whole ledger.
+
+        The default is unlimited because the P&L total is a sum over everything: a
+        limit would silently report the profit of the most recent N trades as the
+        account's profit. Callers drawing a table pass one; callers totalling do
+        not.
+        """
+        with self._session() as session:
+            query = session.query(VenueSettlement)
+            if since is not None:
+                query = query.filter(VenueSettlement.settled_time >= since)
+            query = query.order_by(VenueSettlement.settled_time.desc())
+            if limit is not None:
+                query = query.limit(limit)
+            return list(query)
+
+    def position_for_ticker(self, ticker: str):
+        """Our own position for a venue ticker, via the ticket that placed it.
+
+        `positions` has no ticker column — a position is keyed on (symbol, window)
+        because the paper engine predates the venue client — so the join goes
+        through `order_tickets`, which records the market the order was actually
+        sent to. Returns None when nothing maps, which is what the venue settling
+        a market we never booked looks like.
+        """
+        with self._session() as session:
+            ticket = (session.query(OrderTicket)
+                      .filter(OrderTicket.market_ticker == ticker)
+                      .order_by(OrderTicket.created_at.desc())
+                      .first())
+            if ticket is None:
+                return None
+            return (session.query(Position)
+                    .filter(Position.symbol == ticket.symbol,
+                            Position.window_open == ticket.window_open)
+                    .one_or_none())
+
+    def write_venue_balance(self, *, timestamp: datetime, balance: float,
+                            exchange_index: Optional[int] = None,
+                            our_bankroll: Optional[float] = None) -> int:
+        """Sample the venue's balance. The drift is computed here, once.
+
+        Sampled rather than upserted: the point of the series is the trend, and
+        every cycle's reading is a distinct observation of a moving number.
+        """
+        drift = (None if our_bankroll is None
+                 else float(balance) - float(our_bankroll))
+        with self._session() as session:
+            row = VenueBalance(
+                timestamp=timestamp, balance=float(balance),
+                exchange_index=exchange_index, our_bankroll=our_bankroll,
+                drift=drift,
+            )
+            session.add(row)
+            session.commit()
+            return row.id
+
+    def venue_balances_since(self, since: datetime) -> list[VenueBalance]:
+        with self._session() as session:
+            return list(
+                session.query(VenueBalance)
+                .filter(VenueBalance.timestamp >= since)
+                .order_by(VenueBalance.timestamp)
+            )
+
+    def latest_venue_balance(self) -> Optional[VenueBalance]:
+        with self._session() as session:
+            return (session.query(VenueBalance)
+                    .order_by(VenueBalance.timestamp.desc())
+                    .first())
+
+    def prune_venue_balances(self, before: datetime) -> int:
+        """Drop balance samples that have scrolled off the chart.
+
+        One row a minute is 1,440 a day, the same order as `minute_prices`, and
+        for the same reason it is pruned rather than kept forever: this is a
+        rolling window for a screen. The settlements are the record and they are
+        never pruned.
+        """
+        with self._session() as session:
+            n = (session.query(VenueBalance)
+                 .filter(VenueBalance.timestamp < before).delete())
+            session.commit()
+            return int(n)
 
     # ---- model runs and calibration -------------------------------------
     def record_model_run(self, **fields) -> int:

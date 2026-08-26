@@ -44,6 +44,11 @@ JOBS: dict[str, str] = {
     'scripts.scrape': 'fetch one-minute Coinbase spot bars into SQLite',
     'scripts.sync_store': 'copy SQLite rows into the Parquet research store',
     'scripts.check_venue': 'prove the Kalshi credentials and series, read only',
+    # Safe to expose for the same reason as check_venue: read-only against the
+    # venue, and the only thing it writes is telemetry keyed on the venue's own
+    # ids, so a second copy racing the live loop converges instead of
+    # double-counting.
+    'scripts.sync_venue': "pull the venue's own fills and settlements into the store",
     'scripts.baseline': 'fit and report the barrier baseline',
     'scripts.evaluate': 'walk-forward evaluation with gates and cost stress',
     'scripts.train': 'fit one model for inspection',

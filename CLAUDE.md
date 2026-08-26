@@ -410,6 +410,13 @@ forecasts anything. Run the group alone before believing the share either way.
 - **`account.mode` reaches every surface showing one of its numbers.** A live
   account that renders identically to a paper one is the worst failure the schema
   could permit.
+- **Live P&L is the venue's, and a missing field is not a zero.** Our books
+  estimate all three of the fill price, the fee and the settlement value; the venue
+  holds them. `venue_settlements.pnl` is null when the venue left a field absent,
+  and nothing downstream may read that as break-even — the API counts it as
+  `incomplete` and says the total is short. Stored rather than derived on read
+  because the API cannot import the trader, and one definition of the arithmetic
+  beats two.
 
 ## Three things are fitted, and all three live inside the fold
 
@@ -479,6 +486,8 @@ python -m scripts.live                              # paper
 python -m scripts.live --mode live --dry-run        # real book, no orders
 python -m scripts.live --mode live --place-orders   # real orders
 python -m scripts.live --loop --cycle-seconds 60
+python -m scripts.sync_venue                        # pull the venue's own ledger
+python -m scripts.sync_venue --dry-run              # read and total, write nothing
 
 # Tests. pytest.ini sets -n auto: 381 tests in ~90s (`-m "not slow"` for the fast loop).
 cd backend/trader && pytest
@@ -521,6 +530,55 @@ someone else's ledger, and where they disagree the venue is right:
   that.
 
 `--no-reconcile` turns it off, which is only reasonable for debugging.
+
+**P&L comes from `/portfolio/settlements`, and the endpoint that looks like the
+answer is not.** A binary bought once and held pays one fee at entry and settles
+once at $1 or $0, so a settlement row is a position's complete economic history:
+`yes_total_cost`/`no_total_cost`, `revenue`, `fee_cost`, `market_result`. Realised
+P&L is `revenue - cost - fee_cost` per market, summed. Those rows are stored in
+`venue_settlements`, the fills that opened them in `venue_fills`, and the balance
+sampled every cycle in `venue_balance` — all three written by the reconcile the
+live loop already performs, so the ledger costs no extra request.
+
+`/historical/trades` is **the public tape**: every print in a market, by anyone,
+with no account attribution at all. It is the natural thing to reach for and it
+cannot compute a portfolio — summing it sums the exchange. Its two honest jobs are
+marking an open position at a price the market printed and checking that a fill
+printed where the venue said it did, joined on `trade_id`; both live in
+`KalshiClient.market_trades` and neither is P&L.
+
+Three consequences that were each a plausible wrong answer:
+
+* **Zero is a measurement.** `_price` maps a zero *quote* to None, because a zero
+  level means there is nothing there. A losing position settles at revenue exactly
+  0, so `_money` keeps it — reusing the quote parser would have turned every loser
+  into a null and flattered the curve, the one direction of error an equity curve
+  must never make.
+* **The curve is built from settlement P&L, never from balance differences.**
+  Nothing in the ledger distinguishes a deposit from a profit, so a
+  balance-difference curve reports the first deposit as the best day the strategy
+  ever had. `balance_check` compares the two and reports an `implied_starting_balance`;
+  what matters is whether it *moves* between syncs, which is what a double-counted
+  fee or an unrecorded fill looks like.
+* **The win rate reads `market_result`, not the sign of the P&L.** This system
+  buys favourites: 100 contracts at 97c returns $100 on $97 of cost, and a fee
+  above $3 makes the net negative. Classifying that as a loss would put the win
+  rate at odds with the venue's own settlement record.
+
+**Since 2026-02-19 the ledger has two tiers.** The live endpoints refuse to look
+back past a moving cutoff (~3 months) and everything older answers on
+`/historical/fills` and `/historical/settlements` — on a *different host*,
+`external-api.kalshi.com`, which is why `KalshiClient` carries a separate
+`historical_base_url`. `all_fills` and `all_settlements` query both and
+deduplicate on `trade_id`/`ticker`, because the tiers overlap around the cutoff
+and a fill counted twice doubles a cost basis. `GET /historical/cutoff` is read
+rather than assumed; unreachable, both tiers are queried anyway.
+
+Our own arithmetic is kept beside the venue's rather than replaced: the dashboard
+shows both and `pnl_gap` is the disagreement, which is a mispriced fee, a
+settlement our Coinbase proxy called differently, or a fill nobody booked.
+`scripts/sync_venue.py` prints all of it, and is the tool for a store built before
+these tables existed or a gap while the loop was down.
 
 **Prices arrive as dollar-denominated strings.** The venue serves
 `yes_bid_dollars: "0.1900"`, and the integer-cent fields the older documentation

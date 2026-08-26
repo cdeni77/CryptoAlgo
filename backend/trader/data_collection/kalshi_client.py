@@ -58,13 +58,32 @@ from typing import Any, Iterable, Optional
 
 import aiohttp
 
+from .timeutil import naive_utc_to_epoch_seconds
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
 DEMO_BASE_URL = 'https://demo-api.kalshi.co/trade-api/v2'
 
+# **The historical tier is a different host, and that is not a typo.** Since
+# 2026-02-19 the venue partitions its data: the live endpoints serve roughly the
+# last three months and refuse to look further back, and everything older moved
+# to `/historical/...`. Those routes answer on `external-api.kalshi.com` while
+# this account's trading routes answer on the host above, so a single base URL
+# cannot reach both. Building a complete fill history means querying the live
+# endpoint and the historical one and merging — which is what `all_fills` does.
+#
+# Overridable, because a venue that split its hosts once can merge them again,
+# and the failure mode is a 404 that names a route rather than a wrong number.
+HISTORICAL_BASE_URL = 'https://external-api.kalshi.com/trade-api/v2'
+
 # Kalshi quotes in whole cents, 1..99.
 CENT = 0.01
+
+# Sorts a row the venue gave no timestamp to, without dropping it. `None`
+# is not orderable against a datetime, and a ledger that raises on one
+# missing field is worse than one that puts that row last.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class KalshiError(RuntimeError):
@@ -222,6 +241,261 @@ def _parse_time(value: Any) -> Optional[datetime]:
         return None
 
 
+def _money(raw: dict, name: str) -> Optional[float]:
+    """A dollar amount, from whichever encoding the venue used. **Zero is a value.**
+
+    Same trap as `_price` and a different resolution. The venue serves
+    `revenue_dollars: "21.0000"` alongside a legacy `revenue: 2100` in integer
+    cents, so the suffixed form has to win or the number is 100x wrong.
+
+    But `_price` maps a zero to None deliberately — a zero *quote* means there is
+    no level there, not that a contract is free. On a settlement that reasoning
+    inverts: **a losing position settles at revenue exactly 0**, and the loss is
+    the whole point of recording it. Reusing `_price` here would have turned every
+    loser into a missing measurement, which is the one direction of error an
+    equity curve must never make. So zero is returned as zero, and only a genuinely
+    absent or unparseable field is None.
+    """
+    dollars = raw.get(f'{name}_dollars')
+    if dollars is not None:
+        try:
+            return float(dollars)
+        except (TypeError, ValueError):
+            logger.warning('%s_dollars was %r, which is not a number', name, dollars)
+            return None
+    cents = raw.get(name)
+    if cents is None:
+        return None
+    try:
+        return float(cents) * CENT
+    except (TypeError, ValueError):
+        logger.warning('%s was %r, which is not a number', name, cents)
+        return None
+
+
+@dataclass(frozen=True)
+class Fill:
+    """One execution, as the venue recorded it. The account of record for entry.
+
+    Our own `Position` row says what we *believed* we bought: the price `decide()`
+    sized at and the fee it predicted from the published schedule. This says what
+    happened. They differ whenever an order partially fills, fills better than the
+    limit, or is charged a fee we mispriced — 16 of the first 323 live fills were
+    partial — and where they differ this one is right.
+
+    `price` is what was paid for `side`, on the probability scale, which is the
+    scale everything above this module reasons on. The venue quotes a single
+    YES-denominated book, so a NO fill arrives as `no_price` and the two are not
+    interchangeable: reading `yes_price` on a NO fill books a 30c purchase as 70c.
+    """
+
+    trade_id: str
+    order_id: Optional[str]
+    ticker: str
+    side: str                      # 'up' (YES) or 'down' (NO), our vocabulary
+    action: Optional[str]          # 'buy' or 'sell', as the venue said it
+    contracts: float
+    price: Optional[float]         # dollars paid per contract for `side`
+    is_taker: Optional[bool]
+    created_time: Optional[datetime]
+    raw: dict
+
+
+@dataclass(frozen=True)
+class Settlement:
+    """One market resolved, as the venue paid it. The account of record for PnL.
+
+    This is the row that replaces our arithmetic. We settle from an OHLC mean of
+    Coinbase standing in for sixty seconds of CF Benchmarks BRTI — a close proxy
+    that will sometimes disagree — and we predict the fee from the published
+    schedule. The venue does neither: it knows what it paid and what it charged.
+
+    `pnl` is `revenue - cost - fee_cost` and is `None` when any of the three was
+    absent, rather than treating a missing field as zero. A settlement whose
+    revenue did not parse is not a break-even trade.
+    """
+
+    ticker: str
+    event_ticker: Optional[str]
+    market_result: Optional[str]   # 'yes' or 'no', per the venue
+    yes_contracts: float
+    no_contracts: float
+    yes_cost: Optional[float]
+    no_cost: Optional[float]
+    revenue: Optional[float]
+    fee_cost: Optional[float]
+    settled_time: Optional[datetime]
+    raw: dict
+
+    @property
+    def cost(self) -> Optional[float]:
+        """What the position cost, both sides together, fees excluded."""
+        if self.yes_cost is None and self.no_cost is None:
+            return None
+        return (self.yes_cost or 0.0) + (self.no_cost or 0.0)
+
+    @property
+    def contracts(self) -> float:
+        return self.yes_contracts + self.no_contracts
+
+    @property
+    def pnl(self) -> Optional[float]:
+        """Realised profit on this market. `None` when the venue left a gap.
+
+        The fee is subtracted rather than assumed netted out. Kalshi charges at
+        order time and settlement is free, so `revenue` is the payout and
+        `fee_cost` is a separate debit that already left the balance. Getting that
+        assumption backwards double-counts the fee, which is why
+        `venue_ledger.balance_check` compares the ledger's own cash flows against
+        the venue's balance instead of trusting this arithmetic unattended.
+        """
+        cost = self.cost
+        if self.revenue is None or cost is None:
+            return None
+        return self.revenue - cost - (self.fee_cost or 0.0)
+
+
+@dataclass(frozen=True)
+class Trade:
+    """One print on the public tape. **Anonymous, and not ours.**
+
+    `/historical/trades` and `/markets/trades` serve every trade the exchange
+    printed in a market, by anyone. There is no account field, no side that is
+    "ours", and nothing that distinguishes our 5 contracts from a stranger's 500 —
+    so this cannot compute a portfolio, and reading a tape total as a position is
+    how a P&L page comes to show someone else's money.
+
+    **The `taker_*` fields do not make it ours.** The payload carries
+    `taker_outcome_side`, `taker_side` and `taker_book_side`, which is the closest
+    this endpoint comes to naming a participant — and what they name is which side
+    the *aggressor of that print* crossed on. Any account could be the aggressor,
+    including someone else's. There is still no account id, so a tape filtered to
+    `taker_outcome_side == 'yes'` is not our buys; it is everybody's.
+
+    What it is good for is the two things a portfolio page actually lacks: a
+    market-observed last price to mark an open position at (our own forecast must
+    never do that job — marking a binary at the probability we believe books
+    conviction as profit), and an independent check that a fill printed at the
+    price the venue told us it did. `Fill.trade_id` joins to `trade_id` here, and
+    for a fill where `Fill.is_taker` is true `taker_side` should agree with
+    `Fill.side` — which is what makes the check a check rather than a restatement.
+    """
+
+    trade_id: str
+    ticker: str
+    contracts: float
+    yes_price: Optional[float]
+    no_price: Optional[float]
+    created_time: Optional[datetime]
+    is_block_trade: Optional[bool]
+    # Which side the aggressor took, in this project's vocabulary ('up'/'down'),
+    # and which side of the book they hit ('bid'/'ask', kept verbatim because it
+    # is the venue's own single-book language and not a direction).
+    taker_side: Optional[str] = None
+    taker_book_side: Optional[str] = None
+
+    def price_for(self, side: str) -> Optional[float]:
+        """What this print paid for `side`.
+
+        Both `yes_price` and `no_price` are read from the payload rather than one
+        being derived as `1 - other`. They are usually complementary and nothing
+        here needs them to be: a venue that quotes them independently, or a
+        documented example where they do not sum to a dollar, must not silently
+        become a wrong number.
+        """
+        return self.yes_price if side == 'up' else self.no_price
+
+
+def _bool(value: Any) -> Optional[bool]:
+    """A tri-state read: True, False, or "the venue did not say"."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ('true', 't', '1', 'yes'):
+        return True
+    if text in ('false', 'f', '0', 'no'):
+        return False
+    return None
+
+
+def parse_fill(raw: dict) -> Fill:
+    """A fills row, in this project's vocabulary.
+
+    The side mapping is the load-bearing part. The venue names the YES book:
+    `side: "yes"` is a YES contract and `side: "no"` is a NO contract, which this
+    project calls 'up' and 'down'. Anything else is carried through verbatim
+    rather than guessed at, because a mislabelled side inverts a trade's PnL and
+    an unfamiliar string is not evidence for either direction.
+    """
+    side_raw = str(raw.get('side', '')).strip().lower()
+    side = {'yes': 'up', 'no': 'down'}.get(side_raw, side_raw)
+    price = _money(raw, 'yes_price') if side == 'up' else _money(raw, 'no_price')
+    return Fill(
+        trade_id=str(raw.get('trade_id') or ''),
+        order_id=str(raw['order_id']) if raw.get('order_id') else None,
+        ticker=str(raw.get('ticker') or ''),
+        side=side,
+        action=str(raw['action']).strip().lower() if raw.get('action') else None,
+        contracts=_quantity(raw, 'count'),
+        price=price,
+        is_taker=_bool(raw.get('is_taker')),
+        created_time=_parse_time(raw.get('created_time')),
+        raw=dict(raw),
+    )
+
+
+def parse_settlement(raw: dict) -> Settlement:
+    """A settlements row, in dollars, with zeros preserved.
+
+    Every money field goes through `_money`, so a `revenue` of 0 on a lost market
+    stays 0 rather than becoming a missing measurement. `fee_cost` is read the
+    same way; the venue serves it as `fee_cost_dollars` where it serves the suffix
+    at all.
+    """
+    return Settlement(
+        ticker=str(raw.get('ticker') or ''),
+        event_ticker=str(raw['event_ticker']) if raw.get('event_ticker') else None,
+        market_result=(str(raw['market_result']).strip().lower()
+                       if raw.get('market_result') else None),
+        yes_contracts=_quantity(raw, 'yes_count'),
+        no_contracts=_quantity(raw, 'no_count'),
+        yes_cost=_money(raw, 'yes_total_cost'),
+        no_cost=_money(raw, 'no_total_cost'),
+        revenue=_money(raw, 'revenue'),
+        fee_cost=_money(raw, 'fee_cost'),
+        settled_time=_parse_time(raw.get('settled_time')),
+        raw=dict(raw),
+    )
+
+
+def parse_trade(raw: dict) -> Trade:
+    """A tape print. The taker side is translated; the book side is not.
+
+    `taker_outcome_side` is preferred over `taker_side`: the payload serves both,
+    which is the venue's usual pattern for a field it has renamed, and reading the
+    older name first would go stale silently the day the alias is dropped.
+    """
+    taker = raw.get('taker_outcome_side') or raw.get('taker_side')
+    taker_side = None
+    if taker:
+        text = str(taker).strip().lower()
+        taker_side = {'yes': 'up', 'no': 'down'}.get(text, text)
+    book_side = raw.get('taker_book_side')
+    return Trade(
+        trade_id=str(raw.get('trade_id') or ''),
+        ticker=str(raw.get('ticker') or ''),
+        contracts=_quantity(raw, 'count'),
+        yes_price=_money(raw, 'yes_price'),
+        no_price=_money(raw, 'no_price'),
+        created_time=_parse_time(raw.get('created_time')),
+        is_block_trade=_bool(raw.get('is_block_trade')),
+        taker_side=taker_side,
+        taker_book_side=str(book_side).strip().lower() if book_side else None,
+    )
+
+
 class KalshiClient:
     """Async client. One session, signed requests, and an explicit live flag."""
 
@@ -232,6 +506,7 @@ class KalshiClient:
         private_key_pem: Optional[str] = None,
         private_key_path: Optional[str] = None,
         base_url: Optional[str] = None,
+        historical_base_url: Optional[str] = None,
         live: bool = False,
         timeout_seconds: float = 15.0,
     ):
@@ -243,6 +518,12 @@ class KalshiClient:
         self._pem = pem
         self._key = _load_private_key(pem) if pem else None
         self.base_url = (base_url or os.getenv('KALSHI_BASE_URL') or DEFAULT_BASE_URL).rstrip('/')
+        # The host for `/historical/...` only. Defaults to a different host from
+        # `base_url` on purpose — see HISTORICAL_BASE_URL.
+        self.historical_base_url = (
+            historical_base_url or os.getenv('KALSHI_HISTORICAL_BASE_URL')
+            or HISTORICAL_BASE_URL
+        ).rstrip('/')
         self.live = live
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._session: Optional[aiohttp.ClientSession] = None
@@ -294,14 +575,21 @@ class KalshiClient:
 
     async def _request(self, method: str, path: str, *,
                        params: Optional[dict] = None,
-                       body: Optional[dict] = None) -> dict:
+                       body: Optional[dict] = None,
+                       base: Optional[str] = None) -> dict:
         if self._session is None:
             raise KalshiError('client is not open; use `async with KalshiClient(...)`')
         # The signature covers the path without the query, so build it from the
         # same string that is signed rather than from the final URL.
+        #
+        # `base` names a different HOST, never a different path prefix: the
+        # historical tier answers on `external-api.kalshi.com` under the same
+        # `/trade-api/v2` mount, so the signed string is identical and only the
+        # host changes. Deriving the signature from the URL instead would sign a
+        # different string per host and every historical read would 401.
         signed_path = f'/trade-api/v2{path}'
         headers = self._headers(method, signed_path)
-        url = f'{self.base_url}{path}'
+        url = f'{(base or self.base_url).rstrip("/")}{path}'
         async with self._session.request(
             method, url, params=params,
             data=json.dumps(body) if body is not None else None,
@@ -470,6 +758,176 @@ class KalshiClient:
         payload = await self._request('GET', '/portfolio/settlements',
                                       params=_clean(params))
         return list(payload.get('settlements', []))
+
+    # ---- the venue's own ledger ----------------------------------------
+    #
+    # Everything below reads what the venue recorded, and it exists because our
+    # own arithmetic is not the account of record. The paper engine debits a
+    # bankroll at the price `decide()` sized at and the fee it predicted from the
+    # published schedule; live, both are guesses about someone else's ledger.
+    # Where they disagree the venue is right, and the first live night produced
+    # exactly that disagreement — see `adopt_venue_balance`.
+
+    async def historical_cutoff(self) -> dict[str, Optional[datetime]]:
+        """Where the live tier stops and the historical tier begins.
+
+        Since 2026-02-19 the live endpoints refuse to look past a moving cutoff
+        (roughly three months). Reading it rather than assuming a retention
+        window is the same discipline as resolving a market by asking: a constant
+        keeps working until the venue moves it, and then the ledger is silently
+        short of its oldest rows.
+
+        Returns a dict of whatever timestamps the venue named, parsed to UTC. An
+        unreachable cutoff is not fatal — `all_fills` then queries both tiers
+        unconditionally, which is merely wasteful — so this returns `{}` rather
+        than raising.
+        """
+        try:
+            payload = await self._request('GET', '/historical/cutoff',
+                                         base=self.historical_base_url)
+        except KalshiError as exc:
+            logger.warning('the historical cutoff was unreadable (%s); querying '
+                           'both tiers rather than guessing a retention window', exc)
+            return {}
+        out: dict[str, Optional[datetime]] = {}
+        for key, value in payload.items():
+            when = _parse_time(value)
+            if when is not None:
+                out[str(key)] = when
+        return out
+
+    async def _pages(self, path: str, key: str, *, base: Optional[str] = None,
+                     max_pages: int = 40, **params) -> list[dict]:
+        """Follow the cursor to the end. Bounded, because an unbounded loop is not a read.
+
+        The venue pages at `limit` (200 max on these routes) and returns a
+        `cursor` for the next page; an empty or repeated cursor is the end. The
+        page cap is a circuit breaker rather than a limit anyone should hit — 40
+        pages is 8,000 rows — and it *logs* when it trips instead of silently
+        returning a truncated ledger, because a P&L short of its oldest fills
+        looks exactly like a P&L.
+        """
+        rows: list[dict] = []
+        cursor: Optional[str] = None
+        seen: set[str] = set()
+        for page in range(max_pages):
+            query = dict(params)
+            if cursor:
+                query['cursor'] = cursor
+            payload = await self._request('GET', path, params=_clean(query), base=base)
+            batch = payload.get(key) or []
+            rows.extend(batch)
+            cursor = payload.get('cursor') or None
+            # A cursor the venue repeats is a loop, not a next page. Observed on
+            # other venues at the last page; cheap to defend against.
+            if not cursor or cursor in seen or not batch:
+                return rows
+            seen.add(cursor)
+        logger.error(
+            'stopped paginating %s after %d pages (%d rows) with a cursor still '
+            'outstanding. The ledger below this point is MISSING, not empty.',
+            path, max_pages, len(rows))
+        return rows
+
+    async def all_fills(self, *, since: Optional[datetime] = None,
+                        limit: int = 200) -> list[Fill]:
+        """Every fill, live tier and historical tier merged, newest first.
+
+        Two tiers and one ledger. The live route serves the last ~3 months and the
+        historical route everything before it, so a complete history means asking
+        both and merging — the venue's own documentation says so, and a caller that
+        asks only the live route gets a P&L that begins three months ago and looks
+        complete.
+
+        Deduplicated on `trade_id` because the tiers overlap around the cutoff:
+        the same fill can appear in both, and counting one twice doubles a
+        position's cost basis.
+        """
+        params: dict[str, Any] = {'limit': limit}
+        if since is not None:
+            params['min_ts'] = naive_utc_to_epoch_seconds(since)
+
+        rows = await self._pages('/portfolio/fills', 'fills', **params)
+        try:
+            rows += await self._pages('/portfolio/fills/historical', 'fills',
+                                      base=self.historical_base_url, **params)
+        except KalshiError as exc:
+            # Not fatal, and not hidden. The live tier alone is a correct answer
+            # for a recent window and a wrong one for a lifetime P&L, so the
+            # caller is told which it got.
+            logger.warning(
+                'the historical fills tier was unavailable (%s); this ledger '
+                'covers the live tier only and is short of anything older than '
+                'the cutoff', exc)
+
+        fills: dict[str, Fill] = {}
+        for raw in rows:
+            fill = parse_fill(raw)
+            if not fill.trade_id:
+                logger.warning('a fill arrived with no trade_id (%s); skipping it '
+                               'rather than inventing a key', sorted(raw)[:8])
+                continue
+            fills[fill.trade_id] = fill
+        return sorted(fills.values(),
+                      key=lambda f: (f.created_time or _EPOCH), reverse=True)
+
+    async def all_settlements(self, *, since: Optional[datetime] = None,
+                              limit: int = 200) -> list[Settlement]:
+        """Every settled market, both tiers merged, newest first.
+
+        **This is the P&L.** A binary bought once and held pays exactly one fee at
+        entry and settles once at $1 or $0, so a settlement row is the complete
+        economic history of a position: what it cost, what it returned, what it
+        was charged. Our own books recompute all three from Coinbase bars and the
+        published fee schedule, and both are approximations of this.
+
+        Keyed by ticker, which is unique per settled market.
+        """
+        params: dict[str, Any] = {'limit': limit}
+        if since is not None:
+            params['min_ts'] = naive_utc_to_epoch_seconds(since)
+
+        rows = await self._pages('/portfolio/settlements', 'settlements', **params)
+        try:
+            rows += await self._pages('/portfolio/settlements/historical',
+                                      'settlements',
+                                      base=self.historical_base_url, **params)
+        except KalshiError as exc:
+            logger.warning(
+                'the historical settlements tier was unavailable (%s); this P&L '
+                'covers the live tier only', exc)
+
+        settled: dict[str, Settlement] = {}
+        for raw in rows:
+            row = parse_settlement(raw)
+            if not row.ticker:
+                continue
+            settled[row.ticker] = row
+        return sorted(settled.values(),
+                      key=lambda s: (s.settled_time or _EPOCH), reverse=True)
+
+    async def market_trades(self, *, ticker: Optional[str] = None,
+                            since: Optional[datetime] = None,
+                            limit: int = 100,
+                            historical: bool = False) -> list[Trade]:
+        """The public tape. **Everyone's trades, not ours — see `Trade`.**
+
+        Useful for exactly two jobs, and dangerous for a third. It marks an open
+        position at a price the market printed rather than at the probability we
+        believe, and it verifies that a fill printed where the venue said it did
+        (`Fill.trade_id` joins to `trade_id`). It cannot compute a portfolio: no
+        row here says who traded, so summing the tape sums the exchange.
+
+        `historical=True` reads `/historical/trades` for prints older than the
+        cutoff; the live route is `/markets/trades`.
+        """
+        path = '/historical/trades' if historical else '/markets/trades'
+        base = self.historical_base_url if historical else None
+        params: dict[str, Any] = {'limit': limit, 'ticker': ticker}
+        if since is not None:
+            params['min_ts'] = naive_utc_to_epoch_seconds(since)
+        rows = await self._pages(path, 'trades', base=base, **params)
+        return [parse_trade(raw) for raw in rows]
 
     async def reconcile(self, *, exchange_index: Optional[int] = None) -> dict:
         """Balance, open positions and recent fills, as the venue sees them.
