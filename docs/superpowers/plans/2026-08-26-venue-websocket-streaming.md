@@ -18,6 +18,35 @@ pytest with `-n auto`.
 
 **Spec:** `docs/superpowers/specs/2026-08-26-kalshi-websocket-streaming-design.md`
 
+## Status — executed 2026-08-27
+
+Tasks 1-9 are done and deployed. **Task 10 is deliberately not done:** it is
+gated on 24 hours of paired-transport agreement, and that evidence does not
+exist yet. Both samplers are running side by side; `record_ladder` still makes
+its REST call.
+
+**Where the implementation departed from the plan below, and why.** Each is a
+Phase 0 measurement contradicting an assumption this plan was written on, which
+is what Phase 0 was for. The task text further down is left as written rather
+than retconned, so the difference stays visible.
+
+| planned | actual | why |
+|---|---|---|
+| gap check per market | per **connection** | `seq` is contiguous per subscription (1..34,956) and not within a market (1, 9, 10). The planned check would flag every delta as a gap. |
+| `msg.price` / `msg.delta` | `msg.price_dollars` / `msg.delta_fp` | The documented names are wrong. REST also spells the snapshot differently (`orderbook_fp.yes_dollars` vs `msg.yes_dollars_fp`). |
+| `size > 0` keeps a level | `size > MIN_SIZE` | Signed deltas leave float residue (2.4e-12), which read as a phantom best bid 3c above the truth. |
+| `venue_book_events` stores JSON text | typed columns, one row per level | A Kalshi delta is flat, so typed columns *are* the message, not a projection — and compress ~10x better, which is what makes any retention affordable at 862 frames/s. |
+| `compact` via `store.write` | immutable hour-named Parquet | `write()` rewrites a whole (venue, symbol, month) partition; at this rate that partition reaches tens of GB. |
+| retention "a knob with a comfortable default" | measured 20 B/row, 1.09 GB/day, default 14 days = 15 GB | The plan's arithmetic assumed ~5 frames/s. It is ~150x that. |
+| `BookCache` special-cases `event.venue == 'kalshi'` | `BookEvent.absolute` flag | Caught in plan self-review before execution: branching on the venue breaks the boundary Task 4 exists to draw. |
+
+**Evidence the fold is correct:** replaying 40,759 captured frames against 12
+REST snapshots taken in the same window agrees exactly on the best bid on both
+sides, 11 of 11 times; worst whole-ladder difference is one price out of ~100,
+and that one is a maker toggling an order fourteen times a minute.
+
+---
+
 ## Global Constraints
 
 - **No new dependencies.** `requirements.txt` uses exact pins with a documented
