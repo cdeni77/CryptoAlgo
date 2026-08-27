@@ -65,6 +65,16 @@ def compare(store: ResearchStore | None = None) -> pd.DataFrame:
             for a, b in zip(both[f'{side}_levels_rest'], both[f'{side}_levels_ws'])]
     both['size_ratio'] = (both['yes_total_ws']
                           / both['yes_total_rest'].replace(0, np.nan))
+    # **How far apart the two samples actually were.** This is the number that
+    # makes the comparison honest. The recorder fetches REST and then reads the
+    # cache, so the stream row is up to a round trip FRESHER — and measured
+    # against a captured window, that alone takes top-of-book agreement from
+    # 100% at 0-100ms to 91.7% at 150ms and 66.7% at 500ms. Disagreement at
+    # large skew is the book moving, not the fold being wrong; only disagreement
+    # at small skew would be evidence against the stream.
+    both['skew_ms'] = (
+        (both['available_time_ws'] - both['available_time_rest'])
+        .dt.total_seconds().abs() * 1000.0)
     return both
 
 
@@ -83,6 +93,17 @@ def main() -> int:
               f'   (both empty on {empty})')
     print(f'  median size ratio ws/rest: {both["size_ratio"].median():.4f}')
     print(f'  median book age at sample: {both["book_age_ms_ws"].median():.0f} ms')
+
+    print(f'  median skew between the two samples: '
+          f'{both["skew_ms"].median():.0f} ms')
+
+    print('\nby sampling skew — the two rows are NOT taken at the same instant:')
+    skew = pd.cut(both['skew_ms'], [-1, 25, 100, 250, 1e9],
+                  labels=['<25ms', '25-100ms', '100-250ms', '>250ms'])
+    print(both.groupby(skew, observed=True).agg(
+        minutes=('top_yes_same', 'size'),
+        yes_top_agree=('top_yes_same', 'mean'),
+        no_top_agree=('top_no_same', 'mean')).to_string())
 
     print('\nby cache staleness:')
     buckets = pd.cut(both['book_age_ms_ws'], [-1, 500, 2000, 10000, 1e12],

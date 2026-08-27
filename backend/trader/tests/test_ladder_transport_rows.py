@@ -49,3 +49,23 @@ def test_the_row_is_schema_compatible_with_the_rest_row(tmp_path):
                  open_time=OPEN, minute=0.417)
     store = ResearchStore(tmp_path)
     assert store.write('venue_ladder', pd.DataFrame([row])) == 1
+
+
+def test_available_time_is_when_the_book_was_knowable_not_when_we_looked():
+    """A cache read happens after the REST round trip, so the read instant is
+    later than the frame that produced the book. Stamping the read instant made
+    the two rows look simultaneous when they are ~100-150ms apart — and that
+    skew alone accounts for the whole live agreement shortfall."""
+    read_at = pd.Timestamp('2026-08-26 12:00:25.400', tz='UTC')
+    row = ws_row(_cache(received=99.0, now=100.0), ticker='K', symbol='BTC-USD',
+                 now=NOW, open_time=OPEN, minute=0.417, read_at=read_at)
+    # age is 1.0s, so the frame landed a second before the read.
+    assert row['available_time'] == read_at - pd.Timedelta(seconds=1.0)
+    assert row['event_time'] == NOW.floor('min'), 'still pairs with the REST row'
+
+
+def test_available_time_never_precedes_event_time():
+    """The store rejects a row published before the event it describes."""
+    row = ws_row(_cache(received=0.0, now=100.0), ticker='K', symbol='BTC-USD',
+                 now=NOW, open_time=OPEN, minute=0.417, read_at=NOW)
+    assert row['available_time'] >= row['event_time']

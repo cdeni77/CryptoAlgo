@@ -91,8 +91,34 @@ def _cumulative(levels, *, best: Optional[float], within: float,
     return total
 
 
+def _ladder_source(record: dict, source: str) -> str:
+    """`source`, qualified by the transport that fetched the ladder.
+
+    **Since the WebSocket migration `venue_ladder` holds TWO rows for the same
+    minute** — the REST poll and the stream cache — and both belong there:
+    comparing them is the evidence the stream reproduces the book. Stamping both
+    `source='live'` would produce two `venue_depth` rows with an identical event
+    key, so `read` would keep whichever carried the later `available_time` and
+    `venue_depth` would silently become a mix of the two transports, varying row
+    by row.
+
+    `source` sits in `EVENT_KEY_EXTRA['venue_depth']` for precisely this
+    situation: it already separates a book somebody recorded from the same book
+    reconstructed afterwards, and a second live observer is the same kind of
+    thing. So REST keeps `source='live'` and the existing series stays exactly
+    what it was, while the stream lands beside it as `live_ws`.
+
+    A missing transport means a row written before the column existed, and every
+    one of those was a REST poll.
+    """
+    transport = record.get('transport')
+    if transport is None or not isinstance(transport, str) or transport == 'rest':
+        return source
+    return f'{source}_{transport}'
+
+
 def _from_ladder(frame: pd.DataFrame, *, source: str) -> list[dict]:
-    """Raw recorded ladders -> the summarised row, one per minute."""
+    """Raw recorded ladders -> the summarised row, one per minute per observer."""
     rows: list[dict] = []
     for record in frame.to_dict('records'):
         try:
@@ -136,7 +162,7 @@ def _from_ladder(frame: pd.DataFrame, *, source: str) -> list[dict]:
             depth_bid_total=sum(float(s) for _, s in yes),
             depth_ask_total=sum(float(s) for _, s in no),
             levels_bid=float(len(yes)), levels_ask=float(len(no)),
-            source=source))
+            source=_ladder_source(record, source)))
     return rows
 
 

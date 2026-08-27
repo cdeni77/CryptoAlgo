@@ -43,7 +43,7 @@ logger = logging.getLogger('ladder')
 SERIES = series_to_symbol()
 
 
-def ws_row(cache, *, ticker, symbol, now, open_time, minute):
+def ws_row(cache, *, ticker, symbol, now, open_time, minute, read_at=None):
     """The same ladder, sampled from the stream cache instead of a REST call.
 
     Returns None when the cache holds no book for the ticker. An empty ladder
@@ -61,10 +61,29 @@ def ws_row(cache, *, ticker, symbol, now, open_time, minute):
         return None
     yes = [[p, s] for p, s in ladder.yes]
     no = [[p, s] for p, s in ladder.no]
+    # **`available_time` is when the BOOK was knowable, not when we looked.**
+    # The cache is read after the REST call returns, so the read instant is up
+    # to a round trip later than the book it describes. Stamping the read
+    # instant overstates how late this information arrived, and — because the
+    # REST row is stamped from the same cycle clock — made the two rows look
+    # simultaneous when they are ~100-150ms apart. Measured against the captured
+    # fixture, that much skew alone drops top-of-book agreement from 100% to
+    # ~92%, which is the whole of the shortfall the live comparison was showing.
+    #
+    # The cache knows exactly when its book last changed, so say that.
+    # `read_at` is when the cache was actually consulted (`now` is the cycle's
+    # clock, taken before the REST round trip, and the two are not the same
+    # instant); the age is measured from the read, so the frame landed at
+    # `read_at - age`. `event_time` still comes from `now` so this row pairs
+    # with the REST row for the same minute.
+    read_at = pd.Timestamp(now if read_at is None else read_at)
+    event_time = pd.Timestamp(now).floor('min')
+    observed = read_at - pd.Timedelta(seconds=ladder.age_seconds)
     return {
         'venue': 'kalshi', 'symbol': symbol,
-        'event_time': pd.Timestamp(now).floor('min'),
-        'available_time': pd.Timestamp(now), 'quality': 'valid',
+        'event_time': event_time,
+        'available_time': max(observed, event_time),
+        'quality': 'valid',
         'market_ticker': ticker, 'window_open': open_time,
         'minute_into_window': round(minute, 3),
         'yes_levels': json.dumps(yes), 'no_levels': json.dumps(no),
@@ -124,6 +143,12 @@ async def run(args, gate=None) -> int:
                             except Exception as exc:      # noqa: BLE001
                                 logger.warning('%s: %s', market['ticker'], str(exc)[:90])
                                 continue
+                            # When the response actually landed. The cycle clock
+                            # `now` was taken before the round trip, so using it
+                            # claims this book was knowable earlier than it was
+                            # — and made the REST and stream rows look
+                            # simultaneous when they are ~100-150ms apart.
+                            rest_at = datetime.now(timezone.utc)
                             ladder = (book.get('orderbook_fp')
                                       or book.get('orderbook') or {})
                             yes = _levels(ladder.get('yes_dollars') or ladder.get('yes'))
@@ -133,7 +158,9 @@ async def run(args, gate=None) -> int:
                             rows.append({
                                 'venue': 'kalshi', 'symbol': symbol,
                                 'event_time': pd.Timestamp(now).floor('min'),
-                                'available_time': pd.Timestamp(now),
+                                'available_time': max(
+                                    pd.Timestamp(rest_at),
+                                    pd.Timestamp(now).floor('min')),
                                 'quality': 'valid',
                                 'market_ticker': market['ticker'],
                                 'window_open': open_time,
@@ -153,7 +180,8 @@ async def run(args, gate=None) -> int:
                             # the book, and nothing flips until they agree.
                             paired = ws_row(
                                 CACHE, ticker=market['ticker'], symbol=symbol,
-                                now=now, open_time=open_time, minute=minute)
+                                now=now, open_time=open_time, minute=minute,
+                                read_at=datetime.now(timezone.utc))
                             if paired is not None:
                                 rows.append(paired)
                     if len(rows) >= args.batch_rows:

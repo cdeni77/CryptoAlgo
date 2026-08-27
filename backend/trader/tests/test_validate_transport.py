@@ -9,6 +9,7 @@ evidence the migration is gated on.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from core.datastore import ResearchStore
 from research.validate._validate_transport import compare
@@ -58,3 +59,14 @@ def test_identical_ladders_agree_with_zero_drift(tmp_path):
 
 def test_only_one_transport_present_yields_nothing_to_compare(tmp_path):
     assert compare(_store(tmp_path, [_row('rest')])).empty
+
+
+def test_the_skew_between_the_two_samples_is_measured(tmp_path):
+    """The rows are not taken at the same instant, and pretending they are
+    turns the stream's extra freshness into an apparent disagreement."""
+    store = _store(tmp_path, [
+        _row('rest', available_time=pd.Timestamp('2026-08-26 12:00:25.000', tz='UTC')),
+        _row('ws', available_time=pd.Timestamp('2026-08-26 12:00:25.150', tz='UTC')),
+    ])
+    both = compare(store)
+    assert both['skew_ms'].iloc[0] == pytest.approx(150.0)
