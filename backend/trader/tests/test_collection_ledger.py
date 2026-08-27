@@ -188,3 +188,20 @@ def test_claim_can_be_limited_to_one_month_for_phased_runs(ledger):
                  ('kalshi', 'BTC-USD', dt.datetime(2026, 2, 5, tzinfo=dt.timezone.utc), 'b')])
     got = ledger.claim(10, month='2026-01')
     assert [i.market_id for i in got] == ['a']
+
+
+def test_claim_can_start_from_a_date_so_a_trial_can_target_a_known_overlap(ledger):
+    """Checkpoint 2 compares collected books against the live-recorded
+    ladders, which exist only for a couple of days. Claiming oldest-first
+    would spend the whole trial budget months away from that overlap."""
+    ledger.seed([('kalshi', 'BTC-USD', _w(8), 'early'),
+                 ('kalshi', 'BTC-USD', _w(25), 'late')])
+    got = ledger.claim(10, since=_w(20))
+    assert [i.market_id for i in got] == ['late']
+
+
+def test_since_and_month_compose(ledger):
+    ledger.seed([('kalshi', 'BTC-USD', _w(25), 'jan25'),
+                 ('kalshi', 'BTC-USD', dt.datetime(2026, 2, 25, tzinfo=dt.timezone.utc), 'feb25')])
+    got = ledger.claim(10, month='2026-01', since=_w(20))
+    assert [i.market_id for i in got] == ['jan25']

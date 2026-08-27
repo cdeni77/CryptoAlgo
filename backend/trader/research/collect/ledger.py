@@ -116,7 +116,8 @@ class Ledger:
     # -- scheduling ---------------------------------------------------------
 
     def claim(self, limit: int, *, month: Optional[str] = None,
-              venue: Optional[str] = None) -> list[WorkItem]:
+              venue: Optional[str] = None,
+              since: Optional[dt.datetime] = None) -> list[WorkItem]:
         """The next work items, oldest month first.
 
         Deliberately does NOT mark anything in progress. A claim that is never
@@ -139,6 +140,11 @@ class Ledger:
         if venue:
             sql += ' AND venue = ?'
             args.append(venue)
+        if since is not None:
+            # ISO-8601 in UTC sorts lexicographically, which is why the column
+            # stores it that way rather than as an epoch.
+            sql += ' AND window_open >= ?'
+            args.append(_iso(since))
         sql += ' ORDER BY month, window_open, venue, symbol LIMIT ?'
         args.append(limit)
         return [WorkItem(venue=r['venue'], symbol=r['symbol'],

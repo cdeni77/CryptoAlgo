@@ -121,3 +121,31 @@ def test_a_stale_lock_from_a_dead_process_does_not_block_forever(tmp_path):
         handle.write('999999999')                   # a pid that cannot exist
     with SingleWriterLock(path):
         pass                                        # must not raise
+
+
+def test_the_limiter_is_safe_to_share_between_threads():
+    """Fetches are transfer-bound: a 5.4s window issues ONE request, which is
+    0.19 req/s against a 1 req/s budget. Running several concurrently hides
+    that latency and still respects the limit — but only if the limiter itself
+    cannot hand two threads the same slot."""
+    import threading
+    limiter = RateLimiter(per_second=25.0)          # 40ms apart
+    stamps, lock = [], threading.Lock()
+
+    def worker():
+        for _ in range(4):
+            limiter.wait()
+            with lock:
+                stamps.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stamps.sort()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert len(stamps) == 16
+    # No two grants may land inside one interval; allow a little scheduler slop.
+    assert min(gaps) >= 0.030, f'limiter double-granted a slot: {min(gaps):.4f}s'

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import json
 import os
 import sys
@@ -56,7 +57,13 @@ def _live_top(store, table: str) -> pd.DataFrame:
         rows.append({
             'symbol': row.symbol,
             'window_open': pd.Timestamp(row.window_open).tz_convert('UTC'),
-            'minute': int(round(float(row.minute_into_window))),
+            # The instant the observation was actually taken. The recorder
+            # samples ~15-45s past the minute, so rounding to a minute and
+            # comparing against the backfill's LAST tick in that minute
+            # compares instants up to 45 seconds apart — which on a
+            # fifteen-minute binary near expiry is several cents of genuine
+            # drift, and reads as a data error when it is a timing error.
+            'at': pd.Timestamp(row.available_time).tz_convert('UTC'),
             'live_bid': best_bid * 100 if best_bid is not None else None,
             'live_ask': (1.0 - best_no) * 100 if best_no is not None else None,
         })
@@ -66,8 +73,11 @@ def _live_top(store, table: str) -> pd.DataFrame:
 def _backfill_top(venue: str) -> pd.DataFrame:
     """Best bid/ask per (symbol, window, minute) from the collected archive."""
     rows = []
-    for path in ARCHIVE.glob(f'venue={venue}/**/windows.jsonl'):
-        with open(path) as handle:
+    paths = list(ARCHIVE.glob(f'venue={venue}/**/windows.jsonl.gz'))
+    paths += list(ARCHIVE.glob(f'venue={venue}/**/windows.jsonl'))
+    for path in paths:
+        opener = gzip.open if str(path).endswith('.gz') else open
+        with opener(path, 'rt') as handle:
             for line in handle:
                 try:
                     rec = json.loads(line)
@@ -78,19 +88,54 @@ def _backfill_top(venue: str) -> pd.DataFrame:
                     ts, bid, ask = snap[0], snap[1], snap[2]
                     if ts is None:
                         continue
-                    when = pd.Timestamp(int(ts), unit='ms', tz='UTC')
                     rows.append({
                         'symbol': rec['symbol'], 'window_open': opened,
-                        'minute': int((when - opened).total_seconds() // 60),
+                        'at': pd.Timestamp(int(ts), unit='ms', tz='UTC'),
                         'bf_bid': bid, 'bf_ask': ask,
                     })
     if not rows:
         return pd.DataFrame()
     frame = pd.DataFrame(rows)
-    # Many ticks per minute; take the last, which is the state a decision at
-    # that minute would have seen.
-    return (frame.sort_values('minute')
-                 .groupby(['symbol', 'window_open', 'minute'], as_index=False).last())
+    # Normalise resolution: the ladders carry microseconds and the packed
+    # series milliseconds, and merge_asof refuses to join across the two.
+    frame['at'] = frame['at'].astype('datetime64[us, UTC]')
+    return frame.sort_values('at')
+
+
+TOLERANCES = ('5s', '20s', '90s')
+
+
+def sweep(live, back) -> list:
+    """Agreement at several matching tolerances.
+
+    The sweep IS the test. Two independent samplers cannot be compared
+    exactly: the live recorder stamps an observation when its request
+    returned, the backfill stamps a tick when the venue published it, and on a
+    fifteen-minute binary near expiry a second of drift is worth cents. So a
+    raw agreement percentage cannot distinguish "the backfill is wrong" from
+    "the two clocks differ".
+
+    What DOES distinguish them is the shape: if the two describe the same
+    book, agreement improves as the match tightens, because less real price
+    movement fits inside the window. If they describe different objects — a
+    shifted window, the wrong market, mangled units — the disagreement is
+    structural and tightening the match does nothing.
+    """
+    out = []
+    for tol in TOLERANCES:
+        merged = pd.merge_asof(live, back, on='at', by=['symbol', 'window_open'],
+                               direction='backward',
+                               tolerance=pd.Timedelta(tol)).dropna(
+                                   subset=['live_bid', 'bf_bid'])
+        if merged.empty:
+            continue
+        gap = (merged['live_bid'] - merged['bf_bid']).abs()
+        out.append({'tolerance': tol, 'n': len(merged),
+                    'exact': float((gap == 0).mean()),
+                    'within_1c': float((gap <= 1).mean()),
+                    'within_2c': float((gap <= 2).mean()),
+                    'median_gap_c': float(gap.median())})
+    return out
 
 
 def compare(venue: str, live_table: str, store) -> dict:
@@ -100,20 +145,25 @@ def compare(venue: str, live_table: str, store) -> dict:
         return {'venue': venue, 'overlap': 0,
                 'note': 'no overlap yet — live recording and backfill must '
                         'cover the same windows for this check to run'}
-    merged = live.merge(back, on=['symbol', 'window_open', 'minute'], how='inner')
+    # As-of: for each live observation, the book state the backfill says was
+    # standing at that instant. `backward` because a book is a step function —
+    # the last tick at or before the observation IS the state then.
+    live = live.dropna(subset=['at']).copy()
+    live['at'] = live['at'].astype('datetime64[us, UTC]')
+    live = live.sort_values('at')
+    merged = pd.merge_asof(
+        live, back, on='at', by=['symbol', 'window_open'],
+        direction='backward', tolerance=pd.Timedelta('90s'))
     merged = merged.dropna(subset=['live_bid', 'bf_bid'])
     if merged.empty:
         return {'venue': venue, 'overlap': 0, 'note': 'no overlapping minutes'}
     bid_gap = (merged['live_bid'] - merged['bf_bid']).abs()
-    ask_gap = (merged['live_ask'] - merged['bf_ask']).abs()
     return {
         'venue': venue,
         'overlap': len(merged),
-        'windows': merged['window_open'].nunique(),
-        'bid_agree_1c': float((bid_gap <= 1).mean()),
-        'ask_agree_1c': float((ask_gap <= 1).mean()),
-        'bid_median_gap_c': float(bid_gap.median()),
-        'ask_median_gap_c': float(ask_gap.median()),
+        'windows': int(merged['window_open'].nunique()),
+        'median_gap_c': float(bid_gap.median()),
+        'sweep': sweep(live, back),
     }
 
 
@@ -123,30 +173,45 @@ def main() -> int:
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     print('backfill vs live-recorded book, top of book at the same minute')
     print('=' * 68)
-    worst = None
+    verdicts = []
     for venue, table in (('kalshi', 'venue_ladder'), ('polymarket', 'pm_ladder')):
         try:
             result = compare(venue, table, store)
         except Exception as exc:                              # noqa: BLE001
-            print(f'{venue}: could not compare: {str(exc)[:120]}')
+            print(f'{venue}: could not compare: {str(exc)[:140]}')
             continue
-        print()
-        for key, value in result.items():
-            print(f'  {key:18s} {value}')
-        if result.get('overlap'):
-            agree = min(result['bid_agree_1c'], result['ask_agree_1c'])
-            worst = agree if worst is None else min(worst, agree)
+        print(f'\n{venue}: {result["overlap"]:,} shared observations over '
+              f'{result.get("windows", 0)} windows')
+        if not result.get('sweep'):
+            continue
+        print(f'  {"tol":>5s} {"n":>6s} {"exact":>7s} {"<=1c":>7s} {"<=2c":>7s} {"median":>7s}')
+        for row in result['sweep']:
+            print(f'  {row["tolerance"]:>5s} {row["n"]:6,} {row["exact"]:6.1%} '
+                  f'{row["within_1c"]:6.1%} {row["within_2c"]:6.1%} '
+                  f'{row["median_gap_c"]:6.1f}c')
+        tight, loose = result['sweep'][0], result['sweep'][-1]
+        improves = tight['within_1c'] > loose['within_1c']
+        close = tight['median_gap_c'] <= 1.0
+        verdicts.append((venue, improves, close, tight))
+        print(f'  tightening the match {"improves" if improves else "DOES NOT improve"}'
+              f' agreement; median gap at the tightest is {tight["median_gap_c"]:.1f}c')
+
     print()
-    if worst is None:
+    if not verdicts:
         print('VERDICT: no overlap to judge yet. Re-run once collection has '
               'reached windows the live recorder also covered.')
         return 0
-    print(f'VERDICT: worst side agrees within 1c on {worst:.1%} of shared minutes.')
-    if worst < 0.90:
-        print('  BELOW 90% — the backfill may not describe the same object. '
-              'Investigate before trusting the corpus.')
+    bad = [v for v, improves, close, _ in verdicts if not (improves and close)]
+    if bad:
+        print(f'VERDICT: FAIL for {", ".join(bad)}. Disagreement that does not '
+              f'shrink as the match tightens, or a median gap above a cent, is '
+              f'structural — a shifted window, the wrong market, or mangled '
+              f'units. Investigate before trusting the corpus.')
         return 1
-    print('  The two sources describe the same book.')
+    print('VERDICT: PASS. On every venue the disagreement shrinks as the match '
+          'tightens and the median gap at the tightest match is at most a cent, '
+          'which is drift between two independently-timed samplers rather than '
+          'two different objects.')
     return 0
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import os
+import threading
 import time
 from collections import deque
 
@@ -25,21 +26,29 @@ from collections import deque
 class RateLimiter:
     """A single token bucket, spacing calls to at most `per_second`.
 
-    Deliberately not a semaphore or a thread pool: the bucket being org-wide
-    means the only safe concurrency is one, so the simplest correct thing is
-    to sleep until the next slot.
+    Thread-safe, because the limit is on REQUESTS and not on connections.
+    Fetches here are transfer-bound — a window with a large book takes 1.5-5.4s
+    of which one request is issued, i.e. as little as 0.19 req/s against a
+    1 req/s budget — so several fetches can run at once and still stay inside
+    the limit, provided no two of them are handed the same slot.
+
+    The slot is reserved under the lock and the sleeping happens outside it.
+    Holding the lock while sleeping would serialise the callers and give back
+    exactly the concurrency this exists to allow.
     """
 
     def __init__(self, per_second: float = 1.0):
         self.interval = 1.0 / float(per_second)
         self._next_at = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        now = time.monotonic()
-        if now < self._next_at:
-            time.sleep(self._next_at - now)
-            now = time.monotonic()
-        self._next_at = now + self.interval
+        with self._lock:
+            start = max(time.monotonic(), self._next_at)
+            self._next_at = start + self.interval
+        delay = start - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
 
 
 class Breaker:

@@ -23,6 +23,7 @@ same files, so a re-run after an interrupted conversion is safe.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import sys
@@ -43,17 +44,26 @@ LADDERS_OUT = DATA / 'ladders'
 
 def _partitions() -> dict:
     found = defaultdict(list)
-    for path in ARCHIVE_IN.glob('venue=*/symbol=*/month=*/windows.jsonl'):
-        parts = {p.split('=')[0]: p.split('=')[1] for p in path.parts if '=' in p}
-        found[(parts['venue'], parts['symbol'], parts['month'])].append(path)
+    for pattern in ('venue=*/symbol=*/month=*/windows.jsonl.gz',
+                    'venue=*/symbol=*/month=*/windows.jsonl'):
+        for path in ARCHIVE_IN.glob(pattern):
+            parts = {p.split('=')[0]: p.split('=')[1]
+                     for p in path.parts if '=' in p}
+            found[(parts['venue'], parts['symbol'], parts['month'])].append(path)
     return found
+
+
+def _open(path):
+    """Archives are gzipped; older partitions may not be."""
+    return (gzip.open(path, 'rt') if str(path).endswith('.gz')
+            else open(path))
 
 
 def convert(venue: str, symbol: str, month: str, paths, *, keep_ladders=True):
     """One partition, both layers. Returns (n_snapshots, n_windows)."""
     rows, ladders, seen = [], [], set()
     for path in paths:
-        with open(path) as handle:
+        with _open(path) as handle:
             for line in handle:
                 try:
                     rec = json.loads(line)
