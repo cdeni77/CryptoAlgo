@@ -113,6 +113,14 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'minute_into_window',
         'yes_levels', 'no_levels', 'yes_total', 'no_total',
+        # How this ladder reached us, and how stale the cache was when sampled.
+        # `transport` is part of the EVENT KEY rather than a plain column: a
+        # REST-sampled and a WS-sampled row for the same minute are two
+        # independent observations of one book, not a correction and the thing
+        # it corrects. Level counts are already known to be incomparable across
+        # sources at a measured ratio of 0.579, so an unlabelled row would make
+        # a change of transport look like a change in the market.
+        'transport', 'book_age_ms',
     ),
     # The same ladder from Polymarket, in the same columns, so the two venues
     # join on (symbol, window_open, minute). Two extra fields because the market
@@ -128,6 +136,27 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'market_ticker', 'window_open', 'minute_into_window',
         'yes_levels', 'no_levels', 'yes_total', 'no_total',
         'outcomes', 'token_id_up',
+        # The schema twin stays a twin — see venue_ladder.
+        'transport', 'book_age_ms',
+    ),
+    # **The raw stream, one row per book frame.**
+    #
+    # NOT written through `write()`. That path merges and rewrites a whole
+    # (venue, symbol, month) partition per call, which is right for a revisable
+    # series and impossible here: measured, Kalshi sends 777 frames a second
+    # across three markets, so a month partition would reach tens of gigabytes
+    # and be rewritten on every flush. `core/spool.compact` writes immutable
+    # hour-named Parquet files instead, which `read()` still globs because it
+    # matches `**/*.parquet` and does not depend on the path layout.
+    #
+    # The columns ARE the message. Storing them typed rather than as JSON text
+    # is not the lossy projection `record_ladder` warns about — a Kalshi delta
+    # is flat, and these are all of its fields but the redundant `market_id`.
+    # It also compresses about an order of magnitude better, which is what makes
+    # any retention at this rate affordable.
+    'venue_book_events': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'seq', 'kind', 'side', 'price', 'size', 'absolute',
     ),
     # **The venue's own settlement, which is the only authority on the label.**
     # Every target in this repository is built from Coinbase one-minute bars
@@ -227,6 +256,16 @@ EVENT_KEY = ('venue', 'symbol', 'event_time')
 # Revisions still collapse WITHIN an observer.
 EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
     'venue_depth': ('source',),
+    # Same argument as venue_depth, one layer down. During the WebSocket
+    # migration the REST sampler and the WS sampler both write the same minute,
+    # and comparing them is the only evidence the stream reproduces the book.
+    # Without this the later `available_time` silently wins and the comparison
+    # reads zero rows — which is exactly what happened to venue_depth above.
+    'venue_ladder': ('transport',),
+    'pm_ladder': ('transport',),
+    # Hundreds of frames share one millisecond. Without the ticker and the
+    # sequence in the key, `read` would keep one of them and discard the stream.
+    'venue_book_events': ('market_ticker', 'seq'),
 }
 
 
@@ -476,6 +515,11 @@ class ResearchStore:
             params.extend(acceptable)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        # `union_by_name` because partitions written before a column existed do
+        # not carry it. Verified: without it, a glob spanning an old and a new
+        # partition raises `schema mismatch in glob` and the WHOLE dataset
+        # becomes unreadable the moment a column is added — the 3.2MB of
+        # venue_ladder already on disk has no `transport`.
         # Rank revisions per event and keep the newest one still visible at
         # `as_of`, which the WHERE clause has already bounded.
         sql = (
@@ -485,7 +529,8 @@ class ResearchStore:
             f"      PARTITION BY {', '.join(event_key(dataset))} "
             f"ORDER BY available_time DESC"
             f"    ) AS _rn"
-            f"    FROM read_parquet(?, hive_partitioning = false) {where}"
+            f"    FROM read_parquet(?, hive_partitioning = false, "
+            f"union_by_name = true) {where}"
             f"  ) WHERE _rn = 1"
             f") ORDER BY symbol, event_time"
         )
