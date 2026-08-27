@@ -173,9 +173,17 @@ async def run(args, gate=None, cache=None) -> int:
             while True:
                 symbols = await open_tickers(client)
                 if not symbols:
-                    logger.warning('no open markets; retrying')
+                    # **Retry fast, not on the refresh cadence.** This is the
+                    # window boundary: the market that just settled is filtered
+                    # out and the venue has not yet listed its replacement as
+                    # open. Sleeping the full refresh interval here turned a
+                    # ~15s gap into a measured 45s with no book at all — worse
+                    # than the churn the close_time filter was added to remove.
+                    # The next market appears within seconds, so ask again then.
+                    logger.warning('no open markets; retrying in %.0fs',
+                                   args.empty_retry_seconds)
                     await teardown()
-                    await asyncio.sleep(args.refresh_seconds)
+                    await asyncio.sleep(args.empty_retry_seconds)
                     continue
                 if stream is None or set(symbols) != subscribed:
                     await teardown()
@@ -212,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
     # At ~436 frames/s on a live market, this much silence means the markets
     # settled or the socket died. Both are repaired by resubscribing.
     parser.add_argument('--idle-timeout', type=float, default=15.0)
+    # How long to wait when EVERY market is filtered out. This happens for a few
+    # seconds at each window boundary, between the old market closing and the
+    # venue listing the new one — so it is a fast retry, not a backoff.
+    parser.add_argument('--empty-retry-seconds', type=float, default=3.0)
     return parser
 
 

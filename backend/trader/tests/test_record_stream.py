@@ -215,3 +215,22 @@ async def test_open_tickers_filters_the_settled_market_out():
 
     got = await record_stream.open_tickers(FakeClient(), now=now)
     assert list(got) == ['KXBTC15M-NEW']
+
+
+def test_the_empty_market_retry_is_fast_not_the_refresh_cadence():
+    """At a window boundary every market is briefly filtered out — the old one
+    has closed and the venue has not yet listed its replacement. Sleeping the
+    refresh interval there was measured at 45s with no book, worse than the
+    churn the close_time filter removed."""
+    args = record_stream.build_parser().parse_args([])
+    assert args.empty_retry_seconds <= 5.0
+    assert args.empty_retry_seconds < args.refresh_seconds
+
+
+def test_the_empty_branch_waits_on_the_fast_retry():
+    source = inspect.getsource(record_stream.run)
+    branch = source[source.index('if not symbols:'):]
+    branch = branch[:branch.index('continue')]
+    assert 'empty_retry_seconds' in branch
+    assert 'refresh_seconds' not in branch, (
+        'the boundary gap must not be paid at the refresh cadence')
