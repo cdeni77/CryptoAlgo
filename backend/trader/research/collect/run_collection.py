@@ -281,13 +281,21 @@ def phase_collect(api: Predexon, *, batch: int = 200, month=None,
                 return 2
 
             if done % 100 == 0:
-                rate = done / max(time.monotonic() - start, 1e-9)
+                elapsed = max(time.monotonic() - start, 1e-9)
+                rate = done / elapsed
                 left = max(total_open - done, 0)
                 eta = left / rate / 3600 if rate else 0
                 counts = ledger.counts()
-                log(f'{done:,}/{total_open:,}  {rate:.2f}/s  ETA {eta:.1f}h  '
-                    f'ok={counts.get("ok", 0):,} empty={counts.get("empty", 0):,} '
-                    f'err={counts.get("error", 0):,}')
+                # req/s is the number that matters: the venue's limit is 1 and
+                # a window costs ~2.6 requests, so the window rate is capped
+                # near 0.39/s however many workers run. Printing calls and
+                # throttles makes "are we at the ceiling or wasting slots?"
+                # answerable instead of inferred.
+                log(f'{done:,}/{total_open:,}  {rate:.2f} win/s  '
+                    f'{api.calls / elapsed:.2f} req/s  '
+                    f'({api.throttled:,} throttled of {api.calls:,})  '
+                    f'ETA {eta:.1f}h  ok={counts.get("ok", 0):,} '
+                    f'empty={counts.get("empty", 0):,} err={counts.get("error", 0):,}')
 
 
 def phase_report() -> None:

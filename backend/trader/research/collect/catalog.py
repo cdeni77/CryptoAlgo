@@ -118,13 +118,29 @@ def kalshi_catalog(api: Predexon, out_path: str, *, log=print) -> int:
                         venue_close=_time(m.get('close_time')))
                     if problem:
                         continue
+                    # BOTH field pairs, under unambiguous names. The venue
+                    # serves `volume`/`open_interest` in CONTRACTS and
+                    # `dollar_volume`/`dollar_open_interest` in DOLLARS, and
+                    # they differ by ~2x. Storing the dollar figure under a
+                    # bare `volume` key — as this did — is the same trap as
+                    # putting a YES ask in a column named for a NO bid: the
+                    # name reads right and the number is a different quantity.
+                    #
+                    # `status` is carried because a missing `result` otherwise
+                    # cannot be told apart from a market that simply has not
+                    # settled yet — the empty-vs-error conflation, in the
+                    # catalog rather than the ledger.
                     handle.write(json.dumps({
                         'venue': 'kalshi', 'symbol': symbol,
                         'market_id': ticker,
                         'window_open': opened.isoformat(),
                         'result': str(m.get('result') or '').strip().lower(),
-                        'volume': m.get('dollar_volume'),
-                        'open_interest': m.get('dollar_open_interest'),
+                        'status': str(m.get('status') or '').strip().lower(),
+                        'volume_contracts': m.get('volume'),
+                        'volume_dollars': m.get('dollar_volume'),
+                        'open_interest_contracts': m.get('open_interest'),
+                        'open_interest_dollars': m.get('dollar_open_interest'),
+                        'last_price': m.get('last_price'),
                     }) + '\n')
                     written += 1
                 cursor = ((payload or {}).get('pagination') or {}).get('pagination_key')
@@ -345,7 +361,12 @@ def pm_catalog_by_grid(api: Predexon, out_path: str, *, start=None, end=None,
                     'market_id': slug, 'token_id': str(token),
                     'window_open': opened.isoformat(),
                     'result': str(m.get('winning_side') or ''),
-                    'volume': m.get('total_volume_usd'),
+                    'status': str(m.get('status') or '').strip().lower(),
+                    # Polymarket serves one figure and names its unit, so
+                    # there is no pair to confuse here — but the key says the
+                    # unit anyway, to match Kalshi's.
+                    'volume_dollars': m.get('total_volume_usd'),
+                    'liquidity_dollars': m.get('liquidity_usd'),
                 }) + '\n')
                 written += 1
             handle.flush()
