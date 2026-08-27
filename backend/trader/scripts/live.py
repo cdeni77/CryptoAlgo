@@ -196,10 +196,48 @@ def choose_offset(elapsed: int, config: Config) -> Optional[int]:
     return reached[-1] if reached else None
 
 
+# The rolling window, kept between cycles. See `fetch_bars`.
+_BAR_CACHE: dict[str, pd.DataFrame] = {}
+
+# How far back to re-ask on an incremental fetch. The newest cached bar is the
+# minute still forming, so it is refetched to get its final values; the extra
+# minutes cover a bar the venue revised or filled in late.
+BAR_REFETCH_MINUTES = 3
+
+
+def _merge_bars(cached: pd.DataFrame, fresh: pd.DataFrame,
+                *, floor: pd.Timestamp) -> pd.DataFrame:
+    """Cached bars plus fresh ones, the fresh copy winning on any overlap.
+
+    `keep='last'` matters: the overlap is deliberately the minutes that were
+    still forming when they were last read, and the newer read is the finished
+    one. Keeping the cached copy would freeze a partial candle into the window
+    forever, and every `log_rv_*` feature is built off these closes.
+    """
+    combined = pd.concat([cached, fresh], ignore_index=True)
+    combined = combined.sort_values('event_time', ignore_index=True)
+    combined = combined.drop_duplicates(subset='event_time', keep='last')
+    return combined[combined['event_time'] >= floor].reset_index(drop=True)
+
+
 async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, pd.DataFrame]:
-    """One-minute bars for the universe, straight from the venue."""
+    """One-minute bars for the universe, straight from the venue.
+
+    **Only the tail is fetched.** `log_rv_1440` and `beta_1440` need a day of
+    history, so the window is 1,500 minutes — but the cycle runs every 60
+    seconds, and re-downloading twenty-five hours to learn one new minute was
+    measured at 3.2s, the largest single cost in the cycle. `get_candles_range`
+    pages at 300 candles, so a full window is ~6 sequential round trips per
+    symbol, which is why fetching the three symbols concurrently barely helped.
+
+    The window is kept between cycles and only the newest few minutes are
+    re-asked. A symbol with no usable cache — first cycle, or a gap wider than
+    the window after an outage — falls back to the full fetch, so this is an
+    optimisation and never a source of missing history.
+    """
     end = datetime.now(timezone.utc).replace(tzinfo=None)
     start = end - timedelta(minutes=minutes)
+    floor = pd.Timestamp(start, tz='UTC')
     client = CoinbaseRESTClient(
         api_key=os.getenv('COINBASE_API_KEY'),
         api_secret=os.getenv('COINBASE_API_SECRET'),
@@ -216,8 +254,24 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
         # `return_exceptions` so one symbol's failure costs only that symbol.
         # Losing all three because SOL timed out would turn a partial outage into
         # a total one, and the loop already handles a missing symbol.
+        spans: dict[str, datetime] = {}
+        for symbol in config.symbols:
+            cached = _BAR_CACHE.get(symbol)
+            spans[symbol] = start
+            if cached is None or cached.empty:
+                continue
+            last = pd.Timestamp(cached['event_time'].iloc[-1])
+            gap_start = (last.tz_convert(None).to_pydatetime()
+                         - timedelta(minutes=BAR_REFETCH_MINUTES))
+            # Only incremental if the cache still reaches back far enough to
+            # cover the window on its own; otherwise the tail would leave a hole
+            # in the middle, which no feature would notice and every `rv` would
+            # be computed across.
+            if gap_start > start and pd.Timestamp(cached['event_time'].iloc[0]) <= floor:
+                spans[symbol] = gap_start
+
         results = await asyncio.gather(
-            *(client.get_candles_range(symbol, '1m', start, end)
+            *(client.get_candles_range(symbol, '1m', spans[symbol], end)
               for symbol in config.symbols),
             return_exceptions=True)
         for symbol, bars in zip(config.symbols, results):
@@ -234,9 +288,16 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
                 'volume': b.volume, 'quote_volume': getattr(b, 'quote_volume', np.nan),
                 'trade_count': getattr(b, 'trade_count', np.nan),
             } for b in bars]).sort_values('event_time', ignore_index=True)
+            cached = _BAR_CACHE.get(symbol)
+            if cached is not None and spans[symbol] > start:
+                frame = _merge_bars(cached, frame, floor=floor)
+            else:
+                frame = frame[frame['event_time'] >= floor].reset_index(drop=True)
+            _BAR_CACHE[symbol] = frame
             out[symbol] = frame
-            logger.debug('%s: %d bars to %s', symbol, len(frame),
-                        frame['event_time'].iloc[-1])
+            logger.debug('%s: %d bars to %s (%s)', symbol, len(frame),
+                         frame['event_time'].iloc[-1],
+                         'incremental' if spans[symbol] > start else 'full')
     finally:
         close = getattr(client, 'close', None)
         if close is not None:
