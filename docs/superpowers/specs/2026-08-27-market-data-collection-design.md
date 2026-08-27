@@ -305,3 +305,67 @@ live portion rebuilds from the ladders via `scripts/build_depth.py`.
 * Archive-layer compression ratio is estimated, not measured. Phase 2's first
   month settles it; if the corpus trends past ~100 GB the archive should be
   reconsidered before continuing.
+
+---
+
+## As built (2026-08-27)
+
+Implemented, validated and running. What the design got wrong, and what the
+measurements said instead.
+
+### Estimates that were wrong
+
+| estimate | actual | why |
+|---|---|---|
+| catalog by pagination | replaced entirely | pagination degraded with cursor depth — 1.8 days of history a minute at the start, 0.55 four hundred pages in, extrapolating past 6h. Targeted `market_slug=` lookup (50 per request) does the same corpus in 26 min. |
+| archive "tens of GB" | 202GB raw, ~13GB gzipped | raw ladders are 97% of the bytes and compress 19.5-33x. Uncompressed would have been the largest thing in the repo by two orders of magnitude. |
+| ~47h to collect | ~52h | the trial measured August, and January windows are 2-4x heavier (Kalshi 2,762 snapshots a window against 1,341; Polymarket 1,463 against 358). Kalshi's January average exceeds the 2,000-per-page cap, so those windows legitimately cost two requests. |
+| 1 req/s is the constraint | transfer is | a window with a large book takes 1.5-5.4s while issuing ONE request — 0.19 req/s against a 1 req/s budget. Eight concurrent fetches behind one thread-safe limiter hold 0.84 req/s and cut the run from ~77h to ~52h. |
+
+### Validation results
+
+**Checkpoint 1 — window grid.** Every decoded Kalshi window lands on the
+quarter-hour boundary, evenly across :00/:15/:30/:45. Zero off-grid.
+
+**Cross-check on discovery.** Pagination and grid construction are independent
+methods; on the 10,665 markets both found they agree exactly on token_id,
+window_open and result — zero mismatches. The 288 pagination-only markets are
+all at or after the grid's deliberate end boundary.
+
+**Checkpoint 2 — collected book vs live-recorded book.** The raw agreement
+percentage turned out to be the wrong statistic: the live recorder stamps an
+observation when its request returned and the backfill stamps a tick when the
+venue published it, so a naive minute-level match compared instants up to 45
+seconds apart and reported 26% agreement with a 3c median gap. Matched
+as-of on the actual instant:
+
+```
+kalshi        tol      n   exact    <=1c    <=2c  median
+               5s  1,042  47.9%   88.6%   94.4%    0.0c
+              20s  1,150  44.3%   83.4%   90.4%    0.1c
+              90s  1,216  42.2%   80.3%   87.6%    0.2c
+
+polymarket     5s    336  46.1%   77.1%   87.8%    0.1c
+              20s    546  36.8%   65.0%   76.7%    1.0c
+              90s    627  35.2%   65.1%   76.1%    1.0c
+```
+
+The SHAPE is the test, not the level. Agreement improving as the match
+tightens is what two views of one book look like when their clocks differ; a
+shifted window, the wrong market or mangled units would disagree structurally
+and tightening would not help. The verdict now tests that directly rather than
+against a fixed threshold, which would otherwise have been tuned until it
+passed.
+
+**Independent corroboration of the packing.** The derived layer's average
+spread over 53,427 real snapshots is **1.05 cents**, reproducing the
+one-cent spread `CLAUDE.md` records from a live order book by a completely
+separate path. A units error would have shown a 2x or 100x spread.
+
+### Sizes, measured
+
+| layer | per window | corpus (130,624 windows) |
+|---|---|---|
+| gzipped JSONL, during collection | ~119 KB | ~15 GB |
+| derived Parquet (what features read) | ~56 KB | ~7.4 GB |
+| derived + archived ladders | ~200 KB | ~26 GB |
