@@ -166,7 +166,8 @@ def _load_tokens() -> dict:
     return tokens
 
 
-def phase_collect(api: Predexon, *, batch: int = 200, month=None) -> int:
+def phase_collect(api: Predexon, *, batch: int = 200, month=None,
+                  max_windows: int = 0) -> int:
     ledger = Ledger(LEDGER_PATH)
     breaker = Breaker(threshold=0.25, window=40)
     tokens = _load_tokens()
@@ -175,6 +176,8 @@ def phase_collect(api: Predexon, *, batch: int = 200, month=None) -> int:
 
     total_open = sum(v for k, v in ledger.counts().items()
                      if k in ('pending', 'error'))
+    if max_windows:
+        total_open = min(total_open, max_windows)
     log(f'starting: {total_open:,} windows outstanding')
 
     while True:
@@ -200,6 +203,16 @@ def phase_collect(api: Predexon, *, batch: int = 200, month=None) -> int:
                 ledger.record(item, 'ok', snapshots=len(packed), bytes_=size)
                 breaker.record(ok=True)
             done += 1
+
+            if max_windows and done >= max_windows:
+                rate = done / max(time.monotonic() - start, 1e-9)
+                counts = ledger.counts()
+                log(f'trial limit reached: {done:,} windows at {rate:.2f}/s '
+                    f'({1 / rate:.2f}s each)')
+                log(f'  ok={counts.get("ok", 0):,} empty={counts.get("empty", 0):,} '
+                    f'err={counts.get("error", 0):,} | '
+                    f'{api.throttled:,} throttled of {api.calls:,} calls')
+                return 0
 
             if breaker.tripped:
                 log(f'CIRCUIT BREAKER: {breaker.failure_rate:.0%} of the last '
@@ -238,6 +251,10 @@ def main() -> int:
     parser.add_argument('--batch', type=int, default=200)
     parser.add_argument('--month', default=None,
                         help='limit to one YYYY-MM, for a trial slice')
+    parser.add_argument('--max-windows', type=int, default=0,
+                        help='stop after N windows; for a bounded trial that '
+                             'measures real per-window cost before committing '
+                             'to the full run')
     parser.add_argument('--venue', default='both',
                         choices=('kalshi', 'polymarket', 'both'),
                         help='catalog phase only: which venue to rebuild')
@@ -261,7 +278,8 @@ def main() -> int:
         if args.phase == 'catalog':
             phase_catalog(api, args.venue)
             return 0
-        return phase_collect(api, batch=args.batch, month=args.month)
+        return phase_collect(api, batch=args.batch, month=args.month,
+                             max_windows=args.max_windows)
 
 
 if __name__ == '__main__':
