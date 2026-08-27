@@ -15,7 +15,9 @@ held the venue's answer.
     fixes a mislabelled target. It also bounds the backtest: a window we called
     UP and the venue settled DOWN is a trade the backtest paid us for and the
     venue did not.
-  * **Polymarket vs us** — the same test against a venue settling on Binance.
+  * **Polymarket vs us** — the same test against a venue settling on
+    Chainlink's BTC-USD TWAP-60s data stream (confirmed from a live market's
+    own `resolutionSource`, not Binance as this used to say).
   * **Kalshi vs Polymarket** — two independent settlement sources on the same
     fifteen minutes. Where those two disagree, neither is a clean benchmark and
     the window is genuinely ambiguous rather than mislabelled.

@@ -363,11 +363,20 @@ forecasts anything. Run the group alone before believing the share either way.
   ```
 
   A near-tie on Coinbase is a coin flip on BRTI; a real move is never
-  mislabelled. Polymarket, settling on **Binance**, agrees on 96.96% of its 493
-  windows, and the two venues agree with *each other* on **99.52% of 209 shared
-  windows** — one disagreement. Two independent settlement sources converging
-  that tightly is the strongest available evidence that `core/windows.py` builds
-  the target correctly.
+  mislabelled. Polymarket, settling on **Chainlink's BTC-USD TWAP-60s data
+  stream** — not Binance, which this used to say; a live market's own
+  `description` and `resolutionSource` (`data.chain.link/streams/
+  btc-usd-twap-60s-streams`) name Chainlink directly, and read `>=` against the
+  opening price, the same tie convention as Kalshi's `strike_type` — agrees on
+  96.96% of its 493 windows, and the two venues agree with *each other* on
+  **99.52% of 209 shared windows** — one disagreement. Two independent
+  settlement sources converging that tightly is the strongest available
+  evidence that `core/windows.py` builds the target correctly. That the
+  underlying oracle was misnamed does not change the independence argument —
+  Chainlink's stream and CF Benchmarks' BRTI are still two different
+  aggregations — but it is worth noting Polymarket's own average is also a
+  **60-second TWAP**, the same one-minute-mean shape as Kalshi's BRTI average,
+  just built by a different oracle.
 
   **So the risk is bounded, not absent: ~3% of every training label is wrong.**
   Against a measured log-loss skill of +0.001 that is not negligible, and it

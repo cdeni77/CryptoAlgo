@@ -3,8 +3,10 @@
 **Why this is the most valuable dataset available.** Every result in this project
 rests on 70 days of ONE venue. Polymarket runs the same instrument — 15-minute
 BTC/ETH/SOL up/down — with different participants, a different settlement source
-(Binance rather than CF Benchmarks BRTI), and tick coverage from 2026-03-02,
-which is ~178 days against Kalshi's 70. If the offset structure replicates there,
+(Chainlink's BTC-USD TWAP-60s data stream rather than CF Benchmarks BRTI —
+confirmed from a live market's own `resolutionSource`, not assumed), and tick
+coverage from 2026-03-02, which is ~178 days against Kalshi's 70. If the
+offset structure replicates there,
 the mechanism is about crypto. If it does not, the Kalshi result is about Kalshi.
 
 Two stages, because discovery and pricing have different shapes:

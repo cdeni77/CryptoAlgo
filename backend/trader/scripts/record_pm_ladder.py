@@ -7,8 +7,10 @@ not recorded is a day gone. It writes to `pm_ladder` with the same columns
 
 **Why record a venue we do not trade.** Every result in this project rests on
 one venue's 70 days. Polymarket runs the same instrument — 15-minute BTC/ETH/SOL
-up/down — with different participants and a different settlement source (Binance
-rather than CF Benchmarks BRTI). If the offset structure replicates there, the
+up/down — with different participants and a different settlement source
+(Chainlink's BTC-USD TWAP-60s data stream, confirmed from a live market's own
+`resolutionSource` — rather than CF Benchmarks BRTI). If the offset structure
+replicates there, the
 mechanism is about crypto. If it does not, the Kalshi result is about Kalshi.
 That question cannot be asked at all without the data, and it cannot be asked
 honestly if the two datasets are shaped differently.
