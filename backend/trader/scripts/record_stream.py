@@ -197,9 +197,21 @@ async def run(args, gate=None, cache=None) -> int:
                     subscribed = set(symbols)
                     logger.info('streaming %d markets: %s', len(symbols),
                                 ', '.join(sorted(symbols)))
+                # **An incomplete set is re-checked soon, not on the refresh
+                # cadence.** The venue does not list every series' next market
+                # at the same instant. Measured at the 11:00 boundary: ETH's
+                # replacement was open at +19s and BTC's and SOL's were not, so
+                # the loop subscribed to ETH alone and then waited the full 45s
+                # refresh — BTC and SOL had no book until +65s. Subscribing to
+                # what exists is right; waiting a full cycle to look for the
+                # rest is not.
+                covered = set(symbols.values())
+                wait = (args.empty_retry_seconds
+                        if len(covered) < len(series_to_symbol())
+                        else args.refresh_seconds)
                 reason = await consume(
                     stream, cache, spool, symbols, gate=gate,
-                    until=time.monotonic() + args.refresh_seconds,
+                    until=time.monotonic() + wait,
                     idle_timeout=args.idle_timeout)
                 await asyncio.to_thread(spool.flush)
                 if reason in REBUILD or reason.startswith('silent'):

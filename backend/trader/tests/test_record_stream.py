@@ -234,3 +234,17 @@ def test_the_empty_branch_waits_on_the_fast_retry():
     assert 'empty_retry_seconds' in branch
     assert 'refresh_seconds' not in branch, (
         'the boundary gap must not be paid at the refresh cadence')
+
+
+def test_an_incomplete_market_set_is_rechecked_soon():
+    """The venue does not list every series' next market at the same instant.
+    Measured at the 11:00 boundary: ETH's replacement was open at +19s, BTC's
+    and SOL's were not, and waiting the full refresh left those two without a
+    book until +65s."""
+    source = inspect.getsource(record_stream.run)
+    body = source[source.index('covered = set(symbols.values())'):]
+    body = body[:body.index('reason = await consume')]
+    assert 'empty_retry_seconds' in body and 'refresh_seconds' in body, (
+        'the wait must choose between the fast retry and the normal cadence')
+    assert 'series_to_symbol()' in body, (
+        'completeness is measured against the configured series, not a constant')
