@@ -902,6 +902,20 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                 'levels_bid': float(len(yes_levels)),
                 'levels_ask': float(len(no_levels)),
                 'seq': float('nan'), 'gaps': 0.0,
+                # **Name the observer.** `source` is in
+                # `EVENT_KEY_EXTRA['venue_depth']` so that independent
+                # observations of one minute survive a read instead of
+                # collapsing to whichever was published last. This writer left
+                # it unset, so every row it has ever written sits under a NULL
+                # observer — invisible to `_validate_depth`, which compares by
+                # source, and indistinguishable from a row whose source the
+                # store failed to record.
+                #
+                # It is deliberately NOT 'live': that belongs to the ladder
+                # recorder's REST poll, and this is a different sample at a
+                # different instant — the quote the trading loop actually
+                # decided against. Colliding them would discard one.
+                'source': 'live_touch',
             })
         if rows:
             ResearchStore().write('venue_depth', pd.DataFrame(rows))

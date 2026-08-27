@@ -58,3 +58,22 @@ def test_both_transports_survive_a_venue_depth_read(tmp_path):
     got = store.read('venue_depth')
     assert sorted(got['source']) == ['live', 'live_ws'], (
         'one event key for two observers means one of them disappears')
+
+
+def test_the_trading_loops_own_touch_names_its_observer():
+    """`_record_touch` left `source` unset, so every row it wrote sat under a
+    NULL observer — invisible to `_validate_depth`, which compares by source,
+    and now ambiguous against the two the ladder recorder writes."""
+    import inspect
+
+    from scripts import live
+    source = inspect.getsource(live._record_touch)
+    assert "'source': 'live_touch'" in source
+
+
+def test_the_three_observers_are_distinct(tmp_path):
+    """live (REST poll), live_ws (stream), live_touch (the trading loop)."""
+    from core.datastore import event_key
+    assert 'source' in event_key('venue_depth')
+    names = {'live', 'live_ws', 'live_touch'}
+    assert len(names) == 3, 'each observer must have its own name or one is lost'
