@@ -268,10 +268,12 @@ of 0.579, and the reason for one `decide()` applies identically here.
 Four things were measured off the live socket that the documentation did not
 say, and three of them would have shipped as silent failures:
 
-* **The rate is 777-862 frames/second across three markets**, not the ~5/s the
-  first retention estimate assumed. Typed and zstd-compressed that is 20
-  bytes/row and 1.09 GB/day, so `venue_book_events` is a **bounded tier** —
-  14 days by default, 15 GB — while `venue_ladder` is the one kept forever.
+* **The rate is 777-862 frames/second across three markets** in a burst, ~290/s
+  sustained, against the ~5/s the first retention estimate assumed. Typed and
+  zstd-compressed that is **18.4 bytes/row**, measured over a real compaction of
+  191,238 rows — roughly 0.4-1.1 GB/day depending on activity. So
+  `venue_book_events` is a **bounded tier**, 14 days by default, while
+  `venue_ladder` is the one kept forever.
 * **`seq` is global per SUBSCRIPTION, not per market.** It runs 1..N contiguously
   across every market on one `sid`, and reads 1, 9, 10 within any one of them. A
   per-market gap check — which is what "snapshot then incremental updates"
@@ -296,6 +298,28 @@ sides, 11 times out of 11**, and the worst whole-ladder difference is one price
 out of ~100 — a NO level a maker toggles fourteen times a minute, caught by REST
 in the other state. `research/validate/_validate_transport.py` asks the same
 question continuously in production, where the stream can also go stale or die.
+First live reading: **100% top-of-book agreement on both sides, zero ladder
+drift, size ratio 1.0000, median book age 92ms.** (Its first version scored 33%
+on the NO side because it compared with `==` and `nan != nan`, so a minute where
+BOTH transports saw an empty stack counted as a disagreement — the worst
+direction to be wrong in, on the evidence the migration is gated on.)
+
+Two more were found by running it rather than reading it, and both were silent:
+
+* **A silent socket cannot wake itself.** `consume` originally checked its
+  refresh deadline inside the loop body, so when the subscribed markets settled
+  at a window boundary the venue stopped sending and the loop waited forever for
+  a frame that was never coming. Nothing raised, `supervise` saw a coroutine
+  legitimately awaiting, and the recorder sat dead behind a container reporting
+  healthy. **Every exit condition is now enforced on a timeout**, and fifteen
+  seconds of silence is a condition rather than the absence of one — at 400+
+  frames a second it can mean nothing else.
+* **Every level of a snapshot shares one `seq`.** `venue_book_events` first keyed
+  on `(market_ticker, seq)`, which collapsed each ~200-level snapshot to a single
+  level: 138,878 rows written, 134,313 read back. Deltas name one price and were
+  untouched, so the only frames destroyed were the ones a replay needs to
+  bootstrap from. The key now carries `side` and `price`, and the round trip is
+  lossless on real data.
 
 **`venue_ladder` currently carries BOTH transports for the same minute**, which
 is why `transport` is part of its event key in `EVENT_KEY_EXTRA`. Without that,
