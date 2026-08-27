@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import series_to_symbol
@@ -47,19 +48,41 @@ def retire(cache: BookCache, keep: set[str]) -> None:
         cache.forget(ticker)
 
 
-async def open_tickers(client) -> dict[str, str]:
-    """ticker -> symbol, for every open market on the traded series.
+def _closed(market: dict, now: datetime) -> bool:
+    """Has this market's window already ended?
+
+    **`status: open` is not enough.** Observed live at a 10:30 boundary: the
+    venue still listed the market that had just closed, so the recorder
+    subscribed to it, received nothing, declared the socket silent after fifteen
+    seconds and rebuilt — twice — leaving the book empty for ~30s at every window
+    boundary. `close_time` is the venue's own answer to the question the status
+    field only approximates.
+    """
+    raw = market.get('close_time')
+    if not raw:
+        return False
+    try:
+        closes = datetime.strptime(raw, '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return closes <= now
+
+
+async def open_tickers(client, *, now: datetime | None = None) -> dict[str, str]:
+    """ticker -> symbol, for every market on the traded series still trading.
 
     Asks the venue rather than building a ticker from a pattern — the live
     format has already gained a `-15` suffix that no documented pattern predicts.
     """
+    now = now or datetime.now(timezone.utc)
     out: dict[str, str] = {}
     for series, symbol in series_to_symbol().items():
         payload = await client._request(  # noqa: SLF001
             'GET', '/markets',
             params={'series_ticker': series, 'status': 'open', 'limit': 5})
         for market in payload.get('markets', []):
-            if market.get('ticker'):
+            if market.get('ticker') and not _closed(market, now):
                 out[market['ticker']] = symbol
     return out
 

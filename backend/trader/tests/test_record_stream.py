@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -169,3 +170,48 @@ async def test_a_sequence_gap_stops_the_loop_so_the_caller_resubscribes():
                               idle_timeout=300.0),
         timeout=5.0)
     assert reason == 'sequence gap', reason
+
+
+# -- a market the venue still calls open but has already closed --------------
+
+def _market(ticker, closes):
+    return {'ticker': ticker, 'close_time': closes}
+
+
+def test_a_market_past_its_close_is_not_subscribed():
+    """Observed live at a 10:30 boundary: `status=open` still listed the market
+    that had just settled, so the recorder subscribed to a dead market, heard
+    nothing, declared the socket silent and rebuilt — twice — leaving the book
+    empty for ~30s at every window boundary."""
+    now = datetime(2026, 8, 27, 14, 30, 5, tzinfo=timezone.utc)
+    assert record_stream._closed(_market('OLD', '2026-08-27T14:30:00Z'), now)
+    assert not record_stream._closed(_market('NEW', '2026-08-27T14:45:00Z'), now)
+
+
+def test_a_market_closing_exactly_now_is_treated_as_closed():
+    now = datetime(2026, 8, 27, 14, 30, 0, tzinfo=timezone.utc)
+    assert record_stream._closed(_market('EDGE', '2026-08-27T14:30:00Z'), now)
+
+
+def test_an_unparseable_or_absent_close_time_keeps_the_market():
+    """Dropping a market because its timestamp was odd would be worse than
+    subscribing to one that is about to settle."""
+    now = datetime(2026, 8, 27, 14, 30, 0, tzinfo=timezone.utc)
+    assert not record_stream._closed({'ticker': 'X'}, now)
+    assert not record_stream._closed(_market('X', 'not-a-time'), now)
+    assert not record_stream._closed(_market('X', None), now)
+
+
+@pytest.mark.asyncio
+async def test_open_tickers_filters_the_settled_market_out():
+    now = datetime(2026, 8, 27, 14, 30, 5, tzinfo=timezone.utc)
+
+    class FakeClient:
+        async def _request(self, method, path, params=None):
+            if params['series_ticker'] != 'KXBTC15M':
+                return {'markets': []}
+            return {'markets': [_market('KXBTC15M-OLD', '2026-08-27T14:30:00Z'),
+                                _market('KXBTC15M-NEW', '2026-08-27T14:45:00Z')]}
+
+    got = await record_stream.open_tickers(FakeClient(), now=now)
+    assert list(got) == ['KXBTC15M-NEW']
