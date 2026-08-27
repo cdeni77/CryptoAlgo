@@ -745,6 +745,35 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
     writer.update_account(bankroll=venue_balance)
 
 
+# The last shard actually observed on a book. See `run_cycle`: the balance query
+# needs it, and the book is now read after reconciliation, so it cannot come from
+# this cycle's quotes.
+_LAST_EXCHANGE_INDEX: Optional[int] = None
+
+
+def remember_exchange_index(quotes: dict) -> Optional[int]:
+    """Learn the shard from the book that was just read.
+
+    **A change here is loud, not silent.** Balances are local to a shard, so a
+    stale one reads the wrong balance — and that is exactly the failure that once
+    had every order refused `insufficient_balance` while the funds sat elsewhere.
+    A move is rare (the venue re-categorising a series), costs at most the one
+    cycle that already reconciled, and is corrected before the next.
+    """
+    global _LAST_EXCHANGE_INDEX
+    seen = venue_exchange_index(quotes)
+    if seen is None:
+        return _LAST_EXCHANGE_INDEX
+    if _LAST_EXCHANGE_INDEX is not None and seen != _LAST_EXCHANGE_INDEX:
+        logger.warning(
+            'the venue moved these markets from exchange shard %s to %s. This '
+            'cycle reconciled against the old one; balances are per-shard, so '
+            'treat this cycle\'s balance as suspect.',
+            _LAST_EXCHANGE_INDEX, seen)
+    _LAST_EXCHANGE_INDEX = seen
+    return seen
+
+
 def venue_exchange_index(quotes: dict) -> Optional[int]:
     """Which exchange shard the traded markets live on, per the venue.
 
@@ -759,7 +788,14 @@ def venue_exchange_index(quotes: dict) -> Optional[int]:
     that keeps working until the venue moves, and then it is silently wrong.
     Returns None when no book was read, which means the whole-account total.
     """
-    seen = {int(q.exchange_index) for q in quotes.values()
+    # **`fetch_quotes` stores `(Quote, ticker)`, not a bare Quote**, and reading
+    # `.exchange_index` straight off the tuple silently yielded nothing: this
+    # returned None on every live cycle, so the balance query always fell back to
+    # the whole-account total instead of the shard the crypto markets are on.
+    # The unit test passed because it built `{symbol: Quote}` — a shape the live
+    # path never produces. Accept both, and let the test assert the real one.
+    candidates = [v[0] if isinstance(v, tuple) else v for v in quotes.values()]
+    seen = {int(q.exchange_index) for q in candidates
             if getattr(q, 'exchange_index', None) is not None}
     if not seen:
         return None
@@ -1256,18 +1292,11 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     offset = decision_offset(elapsed, config, forced=args.offset)
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
 
-    # **The book is read FIRST, before bars and reconciliation.**
-    #
-    # The quote has to describe the same instant the model's features do. With the
-    # scheduler waking one second past the offset, the remaining lag is whatever
-    # the cycle does before it reads the book — measured at 5.8s, of which the
-    # Coinbase fetch is ~3s and venue reconciliation ~1s. Reading the book first
-    # takes that to roughly one second.
-    #
-    # Safe for trading as well as honest for measurement: a quote that goes stale
-    # during the cycle can only cost a fill, never an overpay, because the order
-    # is `fill_or_kill` at a limit derived from this price. Not filling is the
-    # direction to be wrong in.
+    # **The book is read LAST of everything that can precede it**, because its age
+    # is the only age paid at the touch. A quote that goes stale during the cycle
+    # can only cost a fill, never an overpay — the order is `immediate_or_cancel`
+    # at a limit derived from this price — so not filling is the direction to be
+    # wrong in, and shortening the interval is how fills are bought back.
     # **Where the cycle spends its time between reading the book and sending the
     # order**, because that interval is what decides whether a fill happens.
     # Measured from the recorded tickets before this existed: median 4.97s, max
@@ -1299,16 +1328,6 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     bars = await fetch_bars(config)
     _phase('bars')
 
-    quotes: dict = {}
-    quote_time = pd.Timestamp.now(tz='UTC')
-    if offset is not None and kalshi is not None:
-        try:
-            quotes = await fetch_quotes(kalshi, list(config.symbols), settle_time)
-            quote_time = pd.Timestamp.now(tz='UTC')
-        except Exception as exc:              # noqa: BLE001 - the cycle still settles
-            logger.error('could not read the book (%s); no decision this cycle', exc)
-            quotes, offset = {}, None
-    _phase('quotes')
     if not bars:
         logger.error('no bars, nothing to do this cycle')
         return []
@@ -1337,6 +1356,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                      len(config.symbols) - len(stale), len(config.symbols))
         offset = None
 
+    _phase('local')
+
     # Read the venue first, where there is one: it knows what actually settled,
     # and bars only fill in what it has not resolved. Its *balance* is adopted
     # after we settle, not here — the venue credits a payout the moment it
@@ -1344,9 +1365,18 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # for a cycle. `adopt_venue_balance` has the measured log.
     venue_settlements: dict[str, dict] = {}
     venue_balance = float('nan')
-    # Read once and used by both the balance query and the sample it writes, so
-    # the number adopted and the shard it is recorded against cannot disagree.
-    shard = venue_exchange_index(quotes)
+    # **The shard is remembered between cycles, because the book is now read
+    # after this.** Kalshi shards its exchange by category and balances are local
+    # to a shard, so the balance query has to name the right one — and the only
+    # place it was ever read from was the quotes, which is what forced the book
+    # to be fetched first and cost ~1s of staleness on every order.
+    #
+    # It is a property of the series, not of a particular quote, so it is stable
+    # between cycles; `remember_exchange_index` re-checks it against every book
+    # actually read and complains if it ever moves. Until one has been seen, this
+    # is None and `balance()` falls back to its own default — the same thing that
+    # happens today on a cycle where no symbol quoted.
+    shard = _LAST_EXCHANGE_INDEX
     if kalshi is not None and args.reconcile:
         try:
             venue = await reconcile_with_venue(writer, kalshi, exchange_index=shard)
@@ -1356,6 +1386,23 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             logger.error('reconciliation failed (%s); falling back to our own '
                          'bookkeeping for this cycle', exc)
     settle_due(writer, bars, venue_settlements=venue_settlements)
+    _phase('settle')
+
+    # **The book, last.** Everything above — bars, local bookkeeping, the venue
+    # reconciliation, settlement — happens before the quote is read, so none of
+    # it is staleness the order pays. Measured going in: 4.55s from book to
+    # order, of which this reordering removes all but scoring.
+    quotes: dict = {}
+    quote_time = pd.Timestamp.now(tz='UTC')
+    if offset is not None and kalshi is not None:
+        try:
+            quotes = await fetch_quotes(kalshi, list(config.symbols), settle_time)
+            quote_time = pd.Timestamp.now(tz='UTC')
+        except Exception as exc:              # noqa: BLE001 - the cycle still settles
+            logger.error('could not read the book (%s); no decision this cycle', exc)
+            quotes, offset = {}, None
+    _phase('quotes')
+    remember_exchange_index(quotes)
     # Independent of whether anything was held: this is what turns the recorded
     # market quotes into a scoreable sample.
     settle_predictions(writer, bars)

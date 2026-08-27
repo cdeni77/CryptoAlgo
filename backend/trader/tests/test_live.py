@@ -174,8 +174,15 @@ def test_the_exchange_shard_is_read_off_the_markets_not_hardcoded():
                      no_ask=0.50, last_price=0.50, volume=1, open_interest=1,
                      close_time=None, status='active', exchange_index=2)
 
-    quotes = {'BTC-USD': quote('a'), 'ETH-USD': quote('b')}
+    # **The shape `fetch_quotes` actually produces: `(Quote, ticker)`.** This
+    # test used to build `{symbol: Quote}`, which the live path never produces —
+    # so it passed while production read `.exchange_index` off a tuple, found
+    # nothing, and fell back to the whole-account balance on every cycle.
+    quotes = {'BTC-USD': (quote('a'), 'a'), 'ETH-USD': (quote('b'), 'b')}
     assert venue_exchange_index(quotes) == 2
+
+    # The bare shape still works, so a caller that already unpacked is not broken.
+    assert venue_exchange_index({'BTC-USD': quote('a')}) == 2
 
 
 def test_with_no_quotes_no_shard_is_claimed():
