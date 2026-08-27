@@ -182,6 +182,10 @@ async def align_to_phase(phase: float, *,
 # the same thread at the same moment.
 COMPONENTS: tuple[Component, ...] = (
     Component('trade', phase=0.0),          # keeps its own schedule
+    # Continuous, not periodic, and never gated: a stream that pauses goes
+    # stale, which is the failure the book cache exists to prevent. Its phase is
+    # meaningless and only the spool flush takes the gate.
+    Component('stream', phase=0.0),
     Component('ladder', phase=25.0),
     Component('pm_ladder', phase=35.0),
     Component('implied_vol', phase=45.0),
@@ -225,6 +229,18 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
     arrangement where a rebuild cannot touch the trading loop's latency.
     """
     while True:
+        # Fold the closed hours of the frame spool into immutable Parquet. This
+        # belongs here rather than in the stream recorder for the same reason
+        # the rest of this loop does: it is blocking Parquet work, and the
+        # stream must not stop reading to do it.
+        try:
+            from core.spool import compact
+            rows = await asyncio.to_thread(
+                compact, 'data/spool', os.getenv('RESEARCH_STORE') or 'data/research')
+            if rows:
+                logger.info('compacted %d book-event rows', rows)
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning('spool compaction: %s', str(exc)[:200])
         for step in (('scripts.scrape', '--backfill-days', '3'),
                      ('scripts.sync_store',)):
             proc = await asyncio.create_subprocess_exec(
@@ -242,7 +258,8 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
 
 def build_factories(args, gate: TradingGate) -> dict:
     """One coroutine factory per component, all sharing the gate."""
-    from scripts import (record_implied_vol, record_ladder, record_pm_ladder)
+    from scripts import (record_implied_vol, record_ladder, record_pm_ladder,
+                         record_stream)
     from scripts import live as live_module
 
     trade_argv = list(args.trade_args)
@@ -251,6 +268,10 @@ def build_factories(args, gate: TradingGate) -> dict:
         # The loop holds the gate across each cycle. It is the only component
         # whose timing matters, so it never waits on anything else.
         return await live_module.main(trade_argv, gate=gate)
+
+    async def stream():
+        return await record_stream.run(
+            _recorder_args(record_stream.build_parser), gate=gate)
 
     async def ladder():
         await align_to_phase(25.0)
@@ -272,8 +293,9 @@ def build_factories(args, gate: TradingGate) -> dict:
         await align_to_phase(50.0)
         return await store_sync_loop()
 
-    return {'trade': trade, 'ladder': ladder, 'pm_ladder': pm_ladder,
-            'implied_vol': implied_vol, 'store_sync': store_sync}
+    return {'trade': trade, 'stream': stream, 'ladder': ladder,
+            'pm_ladder': pm_ladder, 'implied_vol': implied_vol,
+            'store_sync': store_sync}
 
 
 def build_parser() -> argparse.ArgumentParser:
