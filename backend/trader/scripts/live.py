@@ -162,6 +162,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Clear a circuit-breaker halt and exit, placing no '
                              'orders. Requires --reason, because a breaker cleared '
                              'without one recorded is a breaker nobody learns from.')
+    parser.add_argument('--max-daily-loss-fraction', type=float, default=None,
+                        metavar='F',
+                        help='Override the daily-loss breaker, as a fraction of '
+                             'the STARTING bankroll (default 0.15). A flag rather '
+                             'than an edit to the default, so what the loop is '
+                             'actually running with is visible in the deploy '
+                             'config and in `ps`, and reverting is deleting a '
+                             'line. 1.0 or more effectively disables it, leaving '
+                             'only the ruin floor.')
     parser.add_argument('--model', type=str, default=None,
                         help=f'Artifact path (default {MODELS_ROOT}/{LIVE_MODEL})')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -1822,6 +1831,12 @@ def config_from_args(args) -> Config:
     entry = getattr(args, 'entry_offsets', None)
     if entry:
         overrides['entry_offsets'] = tuple(int(o) for o in entry)
+    daily = getattr(args, 'max_daily_loss_fraction', None)
+    if daily is not None:
+        # Deliberately not clamped. A wider bound than the default is the whole
+        # point of the flag, and a silent clamp would mean the loop ran with a
+        # limit nobody asked for — worse than an obviously large number.
+        overrides['max_daily_loss_fraction'] = float(daily)
     return config.with_overrides(**overrides) if overrides else config
 
 

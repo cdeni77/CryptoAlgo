@@ -292,6 +292,7 @@ services:
           --place-orders
           --force
           --reason "live smoke test on a $100 account"
+          --max-daily-loss-fraction 0.50
 
 volumes:
   postgres_data:
