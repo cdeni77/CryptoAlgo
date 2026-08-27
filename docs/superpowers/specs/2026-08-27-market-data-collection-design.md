@@ -1,6 +1,8 @@
 # Market data collection: ledger-driven, two venues, maximum fidelity
 
-**Status:** design approved 2026-08-27, not yet implemented.
+**Status:** approved, implemented and running as of 2026-08-27. See
+**As built** at the foot of this document for the measurements, including
+the four estimates here that turned out wrong.
 **Supersedes:** the ad-hoc collection in `research/collect/_collect_book.py`,
 `research/collect/_collect_pm.py` and the `_gap_fill*.sh` family.
 
