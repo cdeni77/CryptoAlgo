@@ -72,7 +72,20 @@ MAX_PAGES = 30
 # The sample instants are 15 minutes apart, so almost all of those ticks are
 # fetched and discarded. A short window costs ~1 page per strike and yields the
 # shortest-horizon sigma, which is the one the 15-minute markets need.
-TAIL_MINUTES = int(os.getenv('IV_TAIL_MINUTES', '20'))
+# The sampled band, in minutes before the ladder's close. Measured across
+# three ladders: 4/2/5 two-sided rungs at 5 minutes to close, 10/7/14 at 30,
+# and a hard ZERO at 60 -- an hourly ladder does not exist an hour before it
+# closes. 20-50 minutes fitted 23 of 24 cases, so that is where the samples
+# belong. The previous window was the last 20 minutes: the thin end of the
+# curve, and the reason the yield sat near 3%.
+TAIL_MINUTES = int(os.getenv('IV_TAIL_MINUTES', '50'))
+NEAREST_MINUTES = int(os.getenv('IV_NEAREST_MINUTES', '5'))
+# History fetched BEFORE the first instant. `cross_section` takes the last tick
+# at or before an instant, so an instant at the fetch range's left edge has
+# nothing behind it and comes back empty every time -- measured 0 rungs against
+# 6/4/10 for a narrow fetch ending at the same instant, with the full span
+# present and nothing truncated. This is what makes the first sample real.
+LEAD_MINUTES = int(os.getenv('IV_LEAD_MINUTES', '5'))
 # Ladders are HOURLY and overlap, so consecutive ones say almost the same
 # thing. A stride trades sigma's sampling density against API hours: 1 gives
 # hourly sigma, 4 gives it every four hours for a quarter of the cost. Implied
@@ -86,6 +99,14 @@ LADDER_STRIDE = int(os.getenv('IV_LADDER_STRIDE', '1'))
 NEAR_STRIKES = int(os.getenv('IV_NEAR_STRIKES', '24'))
 # Latency, not rate, was the binding constraint: see fetch_rungs.
 WORKERS = int(os.getenv('IV_WORKERS', '12'))
+# How often to invert, inside the window already fetched. Density here is
+# FREE: every strike's tick series is in memory for the whole window, so an
+# extra instant costs no request. It was 15 against a 20-minute window, which
+# asked exactly two questions a ladder -- measured, `minutes_to_close` took
+# exactly two values across the first 89 fits. It is also the grid the feature
+# wants: the trader decides at offsets 3, 6, 9 and 12 of a fifteen-minute
+# window, so sigma is needed at several minutes-to-close, not one.
+SAMPLE_MINUTES = int(os.getenv('IV_SAMPLE_MINUTES', '5'))
 # `limit=100` is the markets endpoint's ceiling — 200 comes back empty, the
 # same behaviour the Polymarket markets endpoint has.
 MARKETS_PAGE = 100
@@ -270,6 +291,28 @@ def book_of(api: Predexon, ticker: str, lo_ms: int, hi_ms: int):
     return out, True
 
 
+def windows_for(opened, closes):
+    """(fetch_from, instants) for one ladder.
+
+    Two separate ranges, and conflating them was the bug: what gets FETCHED
+    must begin earlier than what gets SAMPLED, or the first instant has no
+    tick at or before it and yields nothing. Both are clamped to the ladder's
+    own open, because no book exists before it and asking anyway spends
+    requests to collect zeros.
+    """
+    first = closes - dt.timedelta(minutes=TAIL_MINUTES)
+    last = closes - dt.timedelta(minutes=NEAREST_MINUTES)
+    first = max(first, opened)
+    instants, at = [], first
+    step = dt.timedelta(minutes=SAMPLE_MINUTES)
+    while at <= last:
+        if at >= opened:
+            instants.append(at)
+        at += step
+    fetch_from = max(opened, first - dt.timedelta(minutes=LEAD_MINUTES))
+    return fetch_from, instants
+
+
 def fetch_rungs(api: Predexon, strikes, lo_ms: int, hi_ms: int, *,
                 workers: int = 1) -> dict:
     """One ladder's strikes to packed tick series, fetched concurrently.
@@ -333,15 +376,16 @@ def run(api: Predexon, *, only_series=None, max_ladders: int = 0) -> int:
             log(f'  {series}: {len(found):,} ladders in range, {len(todo):,} to do')
             for n, ev in enumerate(todo, 1):
                 opened, closes = found[ev]
-                # Only the run-up to the close, for the horizon reason above.
-                window_from = max(opened, closes - dt.timedelta(minutes=TAIL_MINUTES))
+                # Fetch earlier than the first instant; sample the band where
+                # rungs actually exist. See windows_for.
+                window_from, instants = windows_for(opened, closes)
                 spot = spot_at(bars, symbol, closes)
                 rungs_by_strike = fetch_rungs(
                     api, near_the_money(strikes_of(api, ev), spot),
                     int(window_from.timestamp() * 1000),
                     int(closes.timestamp() * 1000), workers=WORKERS)
                 fits = 0
-                for at in sample_instants(window_from, closes):
+                for at in instants:
                     rungs = cross_section(rungs_by_strike, int(at.timestamp() * 1000))
                     if len(rungs) < MIN_STRIKES:
                         continue

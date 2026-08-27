@@ -167,3 +167,98 @@ def test_every_strike_is_asked_for_exactly_once():
     api = _FakeApi()
     fetch_rungs(api, _strikes(), 0, 1, workers=4)
     assert sorted(api.asked) == ['T70000', 'T71000', 'T72000']
+
+
+# --- sampling density is free, and the coarse grid was throwing it away -----
+#
+# Measured on the first 150 ladders: 89 fits, and `minutes_to_close` took
+# exactly two values, 5.0 and 20.0. That is not what the ladder offers — it is
+# what a 15-minute step across a 20-minute fetch window asks for. Every
+# strike's tick series is already fetched and in memory for the whole window,
+# so each extra sample instant costs ZERO additional requests.
+#
+# The finer grid is also the correct one rather than merely a denser one: the
+# trader decides at offsets 3, 6, 9 and 12 of a fifteen-minute window, so what
+# the feature needs is sigma at several minutes-to-close, not one.
+
+def test_a_finer_sample_step_asks_more_questions_of_the_same_fetched_books():
+    """Four instants across a 20-minute window instead of two, for free."""
+    o = dt.datetime(2026, 7, 29, 20, 40, tzinfo=UTC)
+    c = dt.datetime(2026, 7, 29, 21, 0, tzinfo=UTC)
+    coarse = sample_instants(o, c, minutes=15)
+    fine = sample_instants(o, c, minutes=5)
+    assert len(coarse) == 2
+    assert [(c - t).total_seconds() / 60 for t in fine] == [20.0, 15.0, 10.0, 5.0]
+
+
+def test_the_sample_step_is_configurable_and_defaults_below_the_window():
+    """A step at or above TAIL_MINUTES collapses the grid to one instant, which
+    is how the two-value histogram happened. The default must stay under it."""
+    from research.collect import implied_vol_backfill as m
+    assert m.SAMPLE_MINUTES < m.TAIL_MINUTES
+
+
+def test_the_finer_grid_still_excludes_the_close():
+    """sqrt(0) minutes remaining is not a sigma at any step size."""
+    o = dt.datetime(2026, 7, 29, 20, 40, tzinfo=UTC)
+    c = dt.datetime(2026, 7, 29, 21, 0, tzinfo=UTC)
+    assert c not in sample_instants(o, c, minutes=1)
+
+
+# --- the fetch window must START before the first instant -------------------
+#
+# Measured, three ladders, at the same instant: a narrow fetch ending AT the
+# instant found 6 / 4 / 10 two-sided rungs; the collector's wide fetch, whose
+# range STARTED at that instant, found 0 / 0 / 0 -- with the full span present
+# and 355-868 ticks per strike, so nothing was truncated.
+#
+# `cross_section` is right: a book is a step function and the state at T is the
+# last tick AT OR BEFORE T. The bug is asking about T when T is the first
+# moment fetched, where by construction almost nothing precedes it. The first
+# instant was therefore empty EVERY time, which is why `minutes_to_close` held
+# only two values and the yield sat near 3%.
+#
+# Separately, rung count grows with time to close until the ladder's open:
+# measured 4/2/5 rungs at 5 minutes, 10/7/14 at 30, and a hard 0 at 60 because
+# an hourly ladder does not exist yet. So the sampled region belongs in the
+# 20-50 minute band, not the last 20.
+
+def test_the_fetch_window_starts_strictly_before_the_first_sampled_instant():
+    """Every instant must have history behind it, the first one included."""
+    from research.collect.implied_vol_backfill import windows_for
+    opened = dt.datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
+    closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
+    fetch_from, instants = windows_for(opened, closes)
+    assert instants, 'no instants to sample'
+    assert fetch_from < instants[0]
+
+
+def test_the_sampled_instants_sit_in_the_band_where_rungs_exist():
+    """20-50 minutes to close fitted 23 of 24 measured cases; the last five
+    minutes fitted 2 of 3 and 60 minutes never, the ladder being unopened."""
+    from research.collect.implied_vol_backfill import windows_for
+    opened = dt.datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
+    closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
+    _, instants = windows_for(opened, closes)
+    mins = [(closes - t).total_seconds() / 60 for t in instants]
+    assert max(mins) <= 50, f'samples an unopened ladder: {max(mins)}'
+    assert min(mins) >= 5, f'samples too close to expiry: {min(mins)}'
+    assert len(instants) >= 8, f'only {len(instants)} instants, density wasted'
+
+
+def test_a_ladder_that_opened_late_is_clamped_not_sampled_before_it_existed():
+    """No book exists before the ladder opens, and asking anyway spends
+    requests to collect zeros."""
+    from research.collect.implied_vol_backfill import windows_for
+    closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
+    opened = closes - dt.timedelta(minutes=25)
+    fetch_from, instants = windows_for(opened, closes)
+    assert fetch_from >= opened
+    assert all(t >= opened for t in instants)
+
+
+def test_the_close_itself_is_never_sampled():
+    from research.collect.implied_vol_backfill import windows_for
+    closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
+    _, instants = windows_for(closes - dt.timedelta(hours=1), closes)
+    assert closes not in instants
