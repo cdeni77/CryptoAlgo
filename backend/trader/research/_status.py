@@ -19,6 +19,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import json
 import os
+import sqlite3
 import subprocess
 
 import pandas as pd
@@ -42,6 +43,36 @@ def lines(path: str) -> int:
             return sum(1 for _ in handle)
     except OSError:
         return 0
+
+
+def _collection_progress() -> None:
+    """Where collection stands, from the ledger rather than from a log tail.
+
+    `empty` is a RESULT (the venue answered, no book) and is never retried;
+    `pending` is work not yet attempted. Keeping them apart is the whole point
+    of the table — conflating them is what produced four wrong coverage claims
+    before it existed.
+    """
+    path = os.path.join('data', 'collection', 'ledger.db')
+    if not os.path.exists(path):
+        return
+    try:
+        con = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+        counts = dict(con.execute(
+            'SELECT status, COUNT(*) FROM collection_ledger GROUP BY status'))
+        con.close()
+    except Exception as exc:                                  # noqa: BLE001
+        print(f'  collection ledger unreadable: {str(exc)[:60]}')
+        return
+    total = sum(counts.values())
+    if not total:
+        return
+    done = counts.get('ok', 0) + counts.get('empty', 0)
+    print(f'\n  collection ledger: {done:,}/{total:,} attempted '
+          f'({100 * done / total:.1f}%)')
+    print(f'    ok {counts.get("ok", 0):,}   empty {counts.get("empty", 0):,}'
+          f'   error {counts.get("error", 0):,}   pending '
+          f'{counts.get("pending", 0):,}')
 
 
 def main() -> int:
@@ -81,15 +112,21 @@ def main() -> int:
     print(pd.DataFrame(rows).fillna('').to_string(index=False))
 
     print('\n' + '=' * 96)
-    print('BACKFILL ARCHIVES (raw, outside the store)')
+    print('COLLECTION ARCHIVES (raw, outside the store)')
     print('=' * 96)
-    for path, what in (('data/book_full.jsonl', 'Kalshi full book, tick series'),
-                       ('data/pm_prices.jsonl', 'Polymarket full book'),
-                       ('data/pm_markets.jsonl', 'Polymarket market discovery'),
+    # book_full.jsonl / pm_prices.jsonl / pm_markets.jsonl are gone: that
+    # backfill was deleted and replaced by the ledger-driven collection, whose
+    # catalogs and gzipped archive live under data/collection/.
+    for path, what in (('data/collection/kalshi_catalog.jsonl', 'Kalshi market catalog'),
+                       ('data/collection/pm_catalog.jsonl', 'Polymarket market catalog'),
                        ('data/iv_ladder.jsonl', 'KXBTCD implied-vol ladder')):
         n = lines(path)
         size = sh(f'du -h {path} 2>/dev/null | cut -f1') or '-'
-        print(f'  {path:32s} {n:>8,} rows  {size:>7s}  {what}')
+        print(f'  {path:38s} {n:>8,} rows  {size:>7s}  {what}')
+    arch = sh('du -sh data/collection/archive 2>/dev/null | cut -f1') or '-'
+    files = sh('find data/collection/archive -name "*.gz" 2>/dev/null | wc -l') or '0'
+    print(f'  {"data/collection/archive":38s} {files:>8s} parts  {arch:>7s}  '
+          f'gzipped tick series, both venues')
 
     print('\n' + '=' * 96)
     print('RUNNING')
@@ -100,20 +137,21 @@ def main() -> int:
         if '|' in line:
             svc, status = line.split('|', 1)
             print(f'  {svc:24s} {status}')
-    for name, pattern in (('kalshi book backfill', '_collect_book'),
-                          ('polymarket backfill', '_collect_pm'),
+    # The `_overnight.sh` / `_gap_fill*.sh` chain is gone: it existed to patch
+    # holes in a collection that could not state its own coverage, and the
+    # ledger replaces the whole category. See the collection design doc.
+    for name, pattern in (('collection (ledger-driven)', 'run_collection'),
                           ('settlements', 'collect_settlements'),
-                          ('overnight chain', '_overnight.sh'),
-                          ('gap fill (queued/running)', '_gap_fill.sh'),
-                          ('pm eth/sol backfill (queued/running)', '_gap_fill_pm_eth_sol.sh'),
-                          ('pm btc resume (queued/running)', '_gap_fill_pm_btc_resume.sh'),
-                          ('depth refresher', '_depth_loop.sh')):
+                          ('depth refresher', '_depth_loop.sh'),
+                          ('stream recorder', 'record_stream')):
         # `pgrep -f X` run through a shell matches the shell's OWN command
         # line, so every pattern reported "running". Bracketing the first
         # character makes the pattern not match itself, which is the same trick
         # `ps | grep [x]` uses.
         alive = bool(sh(f'pgrep -f "[{pattern[0]}]{pattern[1:]}"'))
-        print(f'  {name:24s} {"running" if alive else "not running"}')
+        print(f'  {name:28s} {"running" if alive else "not running"}')
+
+    _collection_progress()
 
     print('\n' + '=' * 96)
     print('LIVE TRADING')
