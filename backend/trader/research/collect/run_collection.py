@@ -225,7 +225,22 @@ def phase_collect(api: Predexon, *, batch: int = 200, month=None,
     # several at once behind the shared limiter and the same 1 req/s budget
     # buys several times the throughput. Serial, the corpus measured ~77h;
     # the rate-limit floor is ~36h.
-    write_lock = threading.Lock()
+    # One lock PER PARTITION FILE, not one globally. Appends to different
+    # (venue, symbol, month) files cannot corrupt each other, and a single
+    # global lock serialises every write — measured 0.04-0.09s each, which at
+    # 5 windows/s is ~45% duty and becomes the binding constraint once the
+    # rate limit stops being one. `defaultdict` under its own lock so two
+    # threads cannot mint two locks for the same path.
+    write_locks: dict = {}
+    locks_guard = threading.Lock()
+
+    def lock_for(path) -> threading.Lock:
+        key = str(path)
+        with locks_guard:
+            lk = write_locks.get(key)
+            if lk is None:
+                lk = write_locks[key] = threading.Lock()
+        return lk
 
     def do(item):
         fetch, pack = FETCHERS[item.venue]
@@ -239,7 +254,7 @@ def phase_collect(api: Predexon, *, batch: int = 200, month=None,
         packed = [pack(s) for s in snapshots]
         # One append per (venue, symbol, month) file, so the workers serialise
         # only at the write, which measured under 0.1s.
-        with write_lock:
+        with lock_for(_archive_path(item)):
             size = write_window(item, snapshots, packed)
         return item, 'ok', len(packed), size, None
 
@@ -343,7 +358,13 @@ def main() -> int:
     if not key:
         print('PREDEXON_API_KEY is not set.')
         return 1
-    api = Predexon(key, RateLimiter(1.0))
+    # Measured after the Dev upgrade: header reports limit 20, burst 40, and a
+    # sweep to 20 req/s drew zero throttling. Kept as an env var rather than a
+    # constant because the free tier is 1 and the difference is 20x — a wrong
+    # default either wastes 19/20ths of the budget or gets the key throttled.
+    rps = float(os.getenv('PREDEXON_RPS', '1'))
+    api = Predexon(key, RateLimiter(rps))
+    log(f'rate limit {rps:g} req/s, {args.workers} workers')
     # One collector at a time: the Predexon bucket is org-wide, and two
     # runners throttle each other into 429s that look exactly like empty books.
     with SingleWriterLock(LOCK_PATH):
