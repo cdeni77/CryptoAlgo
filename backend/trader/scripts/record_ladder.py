@@ -33,6 +33,7 @@ import pandas as pd
 
 from core.config import DEFAULT_CONFIG, series_to_symbol
 from core.datastore import ResearchStore
+from scripts.record_stream import CACHE
 
 logger = logging.getLogger('ladder')
 # The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
@@ -40,6 +41,38 @@ logger = logging.getLogger('ladder')
 # KALSHI_SERIES_BTC at a demo series moved what the trader traded while
 # this kept scraping production.
 SERIES = series_to_symbol()
+
+
+def ws_row(cache, *, ticker, symbol, now, open_time, minute):
+    """The same ladder, sampled from the stream cache instead of a REST call.
+
+    Returns None when the cache holds no book for the ticker. An empty ladder
+    and no ladder are different claims, and writing an empty one would record a
+    dead subscription as a market with nothing resting in it.
+
+    **A STALE book is still recorded, with its age.** For the archive a
+    four-second-old book is data, not a fault: a feature can filter on
+    `book_age_ms` later, and discarding it forecloses that question. The trading
+    path makes the opposite choice — it refuses a book it cannot date — and that
+    asymmetry is deliberate rather than an oversight.
+    """
+    ladder = cache.ladder(ticker)
+    if ladder is None:
+        return None
+    yes = [[p, s] for p, s in ladder.yes]
+    no = [[p, s] for p, s in ladder.no]
+    return {
+        'venue': 'kalshi', 'symbol': symbol,
+        'event_time': pd.Timestamp(now).floor('min'),
+        'available_time': pd.Timestamp(now), 'quality': 'valid',
+        'market_ticker': ticker, 'window_open': open_time,
+        'minute_into_window': round(minute, 3),
+        'yes_levels': json.dumps(yes), 'no_levels': json.dumps(no),
+        'yes_total': sum(s for _, s in yes),
+        'no_total': sum(s for _, s in no),
+        'transport': 'ws',
+        'book_age_ms': round(ladder.age_seconds * 1000.0, 1),
+    }
 
 
 def _levels(raw) -> list:
@@ -109,7 +142,20 @@ async def run(args, gate=None) -> int:
                                 'no_levels': json.dumps(no),
                                 'yes_total': sum(s for _, s in yes),
                                 'no_total': sum(s for _, s in no),
+                                # The REST call is instantaneous by definition:
+                                # it IS the sample, so there is no cache age.
+                                'transport': 'rest', 'book_age_ms': 0.0,
                             })
+                            # The same minute, sampled from the stream. Both
+                            # rows survive a read because `transport` is part of
+                            # the event key — see EVENT_KEY_EXTRA. Comparing
+                            # them is the only evidence the stream reproduces
+                            # the book, and nothing flips until they agree.
+                            paired = ws_row(
+                                CACHE, ticker=market['ticker'], symbol=symbol,
+                                now=now, open_time=open_time, minute=minute)
+                            if paired is not None:
+                                rows.append(paired)
                     if len(rows) >= args.batch_rows:
                         await asyncio.to_thread(
                             store.write, 'venue_ladder', pd.DataFrame(rows))
