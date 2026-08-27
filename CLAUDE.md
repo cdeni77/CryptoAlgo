@@ -321,6 +321,23 @@ Two more were found by running it rather than reading it, and both were silent:
   bootstrap from. The key now carries `side` and `price`, and the round trip is
   lossless on real data.
 
+**The stream is the FRESHER source, and REST is the laggier reference — so the
+two will never agree 100% and should not be expected to.** Measured: a frame
+reaches us **~34ms** after the venue stamps it (`ts_ms`, p50 33.6, p5-p95
+31-43), while a REST `/orderbook` round trip is **~73ms p50**, so its snapshot
+describes the market 40-60ms before we parse it. Folding a captured window to
+`REST_arrival + offset` puts zero ladder drift across -100ms..0ms and *rising*
+drift from +25ms — our fold is already ahead of the REST response when it lands.
+
+So the live comparison reads ~95% on top-of-book and **86.9% byte-identical
+price sets over 1,362 minutes**, and the residual is single levels at the touch,
+not error. The signature of a real fold error is different and would be
+unmistakable: total resting volume drifting off 1.0000, or a one-sided bias.
+Measured, volume ratio is 1.0000 median with 7.3% of minutes low against 8.1%
+high — symmetric, which is timing. The definitive test of the fold is the
+replay in `tests/test_stream_kalshi.py`, where both sides are captured at the
+same instants and the timing question does not arise.
+
 **`venue_ladder` currently carries BOTH transports for the same minute**, which
 is why `transport` is part of its event key in `EVENT_KEY_EXTRA`. Without that,
 `read` keeps one row per `(venue, symbol, event_time)` and the comparison sees

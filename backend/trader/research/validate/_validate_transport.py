@@ -4,17 +4,29 @@ The migration does not flip on an argument. During Phase 1 `venue_ladder` holds
 a REST row AND a WS row for the same minute — both survive a read because
 `transport` is part of the event key — and this prints where they disagree.
 
-**A disagreement is not automatically the stream's fault.** The REST call and
-the cache sample are taken at slightly different instants and this book moves
-hundreds of times a second, so some divergence is the market, not the transport.
-What matters is the shape: small, symmetric, concentrated in prices far from the
-touch, and shrinking as `book_age_ms` falls. Structural disagreement — a
-consistently higher top of book, a level count that scales — is a fold error.
+**REST is the LAGGIER reference, so 100% agreement is not the target and never
+will be reached.** Measured: a stream frame reaches us ~34ms after the venue
+stamps it (p50 33.6, p5-p95 31-43), while a REST orderbook round trip is ~73ms
+p50 — so its snapshot describes the market ~40-60ms before we parse it. Folding
+a captured window to `REST_arrival + offset` puts zero ladder drift across
+-100ms..0ms and RISING drift at +25ms and beyond, which says our fold is already
+ahead of the REST response by the time it lands.
 
-The offline version of this check already passed on a captured window: 11 of 11
-comparisons agreed exactly on the best bid on both sides. This is the same
-question asked continuously, in production, where the stream can also go stale
-or silently die.
+So a disagreement here is the two samples describing different instants, and the
+stream is the one describing the later — which is the point of it. What this
+check is actually for is the SHAPE of the disagreement: it must stay small,
+symmetric, and confined to prices near the touch. The signature of a real fold
+error is different and unmistakable — total resting volume drifting away from
+1.0000, or a consistent one-sided bias. Measured over 1,362 production minutes:
+median volume ratio 1.0000, 7.3% of minutes low against 8.1% high, and 86.9%
+with byte-identical price sets.
+
+The definitive test of the fold is not this one. It is
+`tests/test_stream_kalshi.py`, which replays real frames against REST snapshots
+captured at the same instants, where the question has no timing ambiguity.
+
+What this check IS for in production, which the replay cannot do: catching a
+stream that has gone stale or silently died.
 """
 from __future__ import annotations
 
