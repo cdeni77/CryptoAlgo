@@ -71,12 +71,21 @@ OK/EMPTY split is trustworthy.
 Overall **119/144 = 82.6%** from 2026-01-08 onward. All three assets behave
 identically; SOL is not late.
 
-### Polymarket — partial at time of writing
+### Polymarket — complete
 
-0/18 in 2025-11 and 2025-12; 18/18 in 2026-01, 2026-02, 2026-03. Later months
-were still being sampled when this spec was written. **The remaining rows must
-be filled in before Phase 2 begins**, because checkpoint 3 below validates the
-run against these figures.
+0/18 in 2025-11 and 2025-12. **18/18 in every month from 2026-01 through
+2026-08**, all three assets, with zero errors and zero empties.
+
+Polymarket's book coverage is therefore *better* than Kalshi's — 100% against
+82.6% — and it does **not** share the May/June gap. That gap belongs to
+Predexon's Kalshi ingestion specifically, which is worth knowing: it means
+cross-venue windows in May and June will be bounded by Kalshi alone (50% and
+39%), not by both venues degrading together.
+
+The practical consequence for the plan is that Polymarket's ~17-point
+advantage in yield does not translate into more *paired* windows. Cross-venue
+features exist only where both venues are `ok`, so the joint coverage is
+Kalshi's.
 
 ### Other measured facts
 
@@ -290,8 +299,6 @@ live portion rebuilds from the ladders via `scripts/build_depth.py`.
 
 ## Open questions
 
-* Polymarket density for 2026-04 onward is unmeasured at time of writing and
-  must be completed before Phase 2, since checkpoint 3 depends on it.
 * Whether the May/June Predexon gap is permanent or backfilled by the provider
   later. If it is ever filled, the ledger's `empty` rows for those months would
   need a deliberate re-sweep — `empty` is not retried by design.
