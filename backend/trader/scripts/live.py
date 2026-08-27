@@ -1420,24 +1420,6 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     _phase('score')
     scored['model_probability'] = model.predict(scored)
 
-    # **Record the top of book we already have.** `Quote` parses `yes_bid_size`
-    # and `yes_ask_size` from the same REST response the price comes from, and
-    # `decide()` already uses them to cap the stake — and then they were dropped.
-    #
-    # They are the missing half of the economic question and they cost nothing:
-    # no historical endpoint carries size (candlesticks give top-of-book price and
-    # nothing behind it; the settled orderbook returns empty), so a size not
-    # written down here is gone. Observed at the touch: BTC ~6,900 contracts, ETH
-    # ~109, SOL ~6.9 — against orders of ~7, which makes SOL the case where this
-    # actually decides whether a fill was possible.
-    # Kept behind a flag from the bisect that cleared it: this was the last change
-    # deployed before every order began returning `market_not_found`, so it was the
-    # first suspect. Disabling it changed nothing — the cause was the market's
-    # `exchange_index` moving to 2 while the order body defaulted to 0.
-    if os.getenv('RECORD_TOUCH', '1') == '1':
-        await _record_touch(scored, quotes, window_open, offset, config, kalshi)
-        _phase('touch')
-
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is
     # a one-minute OHLC mean standing in for sixty seconds of CF Benchmarks BRTI,
@@ -1576,6 +1558,31 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         if await act_on(args, writer, kalshi, decision, row, config=config,
                         quote_time=quote_time):
             exposure = exposure.with_(decision)
+
+    # **Record the top of book we already have.** `Quote` parses `yes_bid_size`
+    # and `yes_ask_size` from the same REST response the price comes from, and
+    # `decide()` already uses them to cap the stake — and then they were dropped.
+    #
+    # They are the missing half of the economic question and they cost nothing:
+    # no historical endpoint carries size (candlesticks give top-of-book price and
+    # nothing behind it; the settled orderbook returns empty), so a size not
+    # written down here is gone. Observed at the touch: BTC ~6,900 contracts, ETH
+    # ~109, SOL ~6.9 — against orders of ~7, which makes SOL the case where this
+    # actually decides whether a fill was possible.
+    #
+    # Kept behind a flag from the bisect that cleared it: this was the last change
+    # deployed before every order began returning `market_not_found`, so it was
+    # the first suspect. Disabling it changed nothing — the cause was the market's
+    # `exchange_index` moving to 2 while the order body defaulted to 0.
+    #
+    # **After the orders, not before them.** It costs three REST orderbook calls
+    # and a synchronous Parquet write — measured at 0.29s — and every millisecond
+    # of that was staleness the order paid at the touch, for a row nothing in the
+    # decision reads. Moving it changes only WHEN the archive is written, never
+    # what it contains: `quotes` is the same object the decision priced against.
+    if os.getenv('RECORD_TOUCH', '1') == '1' and offset is not None and quotes:
+        await _record_touch(scored, quotes, window_open, offset, config, kalshi)
+        _phase('touch')
 
     # Re-read: `account` was loaded before the decisions and is now stale by
     # every stake debited this cycle.
