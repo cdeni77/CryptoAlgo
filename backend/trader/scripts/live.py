@@ -1207,6 +1207,20 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         phase[name] = now_ - _mark
         _mark = now_
 
+    # **Bars first, then the book.** Both are needed before a decision, but only
+    # the BOOK's age is paid at the touch: the quote is what the order is priced
+    # against, and every second between reading it and sending the order is a
+    # second the market can move away. Bars are one-minute candles — three
+    # seconds of age on them is nothing.
+    #
+    # Measured with the quote read first: quotes 0.39s, bars 3.17s, reconcile
+    # 0.93s, score 0.14s, touch 0.30s — 4.55s from book to order, of which the
+    # Coinbase call was 70%. Reading the book after the bars removes that 3.17s
+    # from the staleness with no change to anything else: `settle_time` comes
+    # from the clock, not from the bars, so nothing here depends on the order.
+    bars = await fetch_bars(config)
+    _phase('bars')
+
     quotes: dict = {}
     quote_time = pd.Timestamp.now(tz='UTC')
     if offset is not None and kalshi is not None:
@@ -1217,9 +1231,6 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             logger.error('could not read the book (%s); no decision this cycle', exc)
             quotes, offset = {}, None
     _phase('quotes')
-
-    bars = await fetch_bars(config)
-    _phase('bars')
     if not bars:
         logger.error('no bars, nothing to do this cycle')
         return []
@@ -1393,7 +1404,14 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # not this cycle trades, because a cycle that abstains still measures the
     # latency the next one will pay.
     if phase and offset is not None:
-        since_quote = sum(v for k, v in phase.items() if k != 'quotes')
+        # Only what ran AFTER the book was read. `phase` is insertion-ordered, so
+        # this stays correct if the cycle is reordered again — summing "everything
+        # except quotes" would have silently kept counting the bar fetch once the
+        # bars moved ahead of it, and reported no improvement from the change that
+        # produced all of it.
+        names = list(phase)
+        after = names[names.index('quotes') + 1:] if 'quotes' in phase else names
+        since_quote = sum(phase[k] for k in after)
         logger.info('cycle latency: %s | %.2fs between the book and the order',
                     ' '.join(f'{k} {v:.2f}s' for k, v in phase.items()),
                     since_quote)
