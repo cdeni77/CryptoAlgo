@@ -262,3 +262,48 @@ def test_the_close_itself_is_never_sampled():
     closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
     _, instants = windows_for(closes - dt.timedelta(hours=1), closes)
     assert closes not in instants
+
+
+# --- the stride must select from ALL ladders, not from the survivors --------
+#
+# Observed: a run reported "2,480 to do", completed 602, and on resume reported
+# "2,179 to do" -- 301 MORE than the 1,878 that should have remained. The
+# stride was applied after filtering out the finished ladders, so it re-sampled
+# the survivors and pulled in ladders the first pass had deliberately skipped.
+#
+# Nothing collected that way is wrong, but the sampling grid stops being the
+# every-Nth-hour grid it claims to be, and the scope changes on every restart.
+# A stride is a statement about which population is being sampled, so it has
+# to be evaluated against the population.
+
+def test_the_stride_selects_the_same_ladders_regardless_of_what_is_done():
+    from research.collect.implied_vol_backfill import select_ladders
+    every = [f'L{i:03d}' for i in range(10)]
+    fresh = select_ladders(every, done=set(), stride=2)
+    partly = select_ladders(every, done={'L000', 'L002'}, stride=2)
+    assert fresh == ['L000', 'L002', 'L004', 'L006', 'L008']
+    # the same target set, minus what is finished -- never a new selection
+    assert partly == ['L004', 'L006', 'L008']
+
+
+def test_resuming_never_adds_a_ladder_the_stride_had_skipped():
+    """The 301-ladder surprise, asserted away."""
+    from research.collect.implied_vol_backfill import select_ladders
+    every = [f'L{i:03d}' for i in range(100)]
+    target = set(select_ladders(every, done=set(), stride=3))
+    done = set(list(target)[:10])
+    assert set(select_ladders(every, done=done, stride=3)) <= target
+
+
+def test_a_stride_of_one_is_every_ladder():
+    from research.collect.implied_vol_backfill import select_ladders
+    every = [f'L{i:03d}' for i in range(5)]
+    assert select_ladders(every, done=set(), stride=1) == every
+
+
+def test_max_ladders_caps_after_the_stride_not_before():
+    """A cap applied first would collapse the stride to the earliest ladders."""
+    from research.collect.implied_vol_backfill import select_ladders
+    every = [f'L{i:03d}' for i in range(20)]
+    got = select_ladders(every, done=set(), stride=4, max_ladders=3)
+    assert got == ['L000', 'L004', 'L008']

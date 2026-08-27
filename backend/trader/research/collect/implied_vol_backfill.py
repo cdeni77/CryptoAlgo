@@ -291,6 +291,30 @@ def book_of(api: Predexon, ticker: str, lo_ms: int, hi_ms: int):
     return out, True
 
 
+def select_ladders(every, done, stride: int, max_ladders: int = 0) -> list:
+    """Which ladders this run should walk, from the full sorted population.
+
+    Order matters and got it wrong once. The stride must be applied to EVERY
+    ladder before the finished ones are removed: a stride is a statement about
+    which population is being sampled, so applying it to the survivors
+    re-samples on every resume. Measured, that turned "2,480 to do" into
+    "2,179 to do" after 602 were finished -- 301 more than remained, because
+    the second pass pulled in ladders the first had deliberately skipped. The
+    data collected that way is fine; what breaks is that the sampling grid is
+    no longer the every-Nth-hour grid it claims to be, and the scope changes
+    each time the process restarts.
+
+    The cap comes last for the same reason: applied first it would collapse the
+    stride onto the earliest ladders instead of spreading it across the range.
+    """
+    target = sorted(every)
+    if stride > 1:
+        target = target[::stride]
+    if max_ladders:
+        target = target[:max_ladders]
+    return [e for e in target if e not in done]
+
+
 def windows_for(opened, closes):
     """(fetch_from, instants) for one ladder.
 
@@ -368,11 +392,7 @@ def run(api: Predexon, *, only_series=None, max_ladders: int = 0) -> int:
             if only_series and series != only_series:
                 continue
             found = ladders(api, series)
-            todo = [e for e in sorted(found) if e not in done]
-            if LADDER_STRIDE > 1:
-                todo = todo[::LADDER_STRIDE]
-            if max_ladders:
-                todo = todo[:max_ladders]
+            todo = select_ladders(found, done, LADDER_STRIDE, max_ladders)
             log(f'  {series}: {len(found):,} ladders in range, {len(todo):,} to do')
             for n, ev in enumerate(todo, 1):
                 opened, closes = found[ev]
