@@ -22,6 +22,7 @@ defaults to keeping every `*-updown-15m-*` slug regardless of asset;
 from __future__ import annotations
 
 import asyncio
+import json
 
 import research.collect._collect_pm as pm
 
@@ -39,6 +40,83 @@ def test_is_short_can_still_be_narrowed_to_one_asset():
 
 def test_is_short_rejects_a_non_15m_market():
     assert not pm.is_short('btc-daily-market-123', '')
+
+
+# -- the two settlement eras -------------------------------------------------
+#
+# Polymarket has run 15-minute crypto up/down under two DIFFERENT settlement
+# rules, and the slug is the only thing that distinguishes them. Both were read
+# live from the venue's own `description`/`resolutionSource`:
+#
+#   `{asset}-up-or-down-15m-{ts}`  (from 2025-09-12)
+#       "resolve to Up if the Ethereum price AT THE END of the time range ...
+#        is greater than or equal to the price at the beginning"
+#       source: https://data.chain.link/streams/eth-usd        (spot stream)
+#       first market measured: $23.66 volume, $0.00 liquidity
+#
+#   `{asset}-updown-15m-{ts}`      (the current instrument)
+#       "resolve to Up if the TIME-WEIGHTED AVERAGE PRICE (TWAP) ... of the
+#        time range ... is >= the price at the beginning of that range"
+#       source: https://data.chain.link/streams/btc-usd-twap-60s-streams
+#       measured liquidity on a live market: $21,873
+#
+# An endpoint reading and a 60-second TWAP are not the same random variable —
+# per CLAUDE.md's own invariant a time-average over an interval carries a
+# THIRD of its endpoint's variance — so pooling the two eras into one training
+# set would silently mix two instruments. `is_short` used to match only
+# 'updown-15m', which excluded the old era by accident rather than on purpose;
+# that is the right outcome reached for the wrong reason, and it also meant
+# nothing could ever measure where the boundary is. Discovery now keeps both
+# and labels each row, so the choice to use one era is made deliberately
+# downstream instead of by a substring that happens not to match.
+
+def test_the_current_twap_era_is_recognised():
+    assert pm.era_of('btc-updown-15m-1787873400') == pm.TWAP_ERA
+
+
+def test_the_old_endpoint_era_is_recognised():
+    assert pm.era_of('eth-up-or-down-15m-1757724300') == pm.ENDPOINT_ERA
+
+
+def test_the_two_eras_are_not_confused_for_one_another():
+    """The substrings must not overlap — this is the whole distinction."""
+    assert pm.era_of('btc-updown-15m-1') != pm.era_of('btc-up-or-down-15m-1')
+
+
+def test_a_market_that_is_neither_era_has_no_era():
+    assert pm.era_of('btc-daily-market-123') is None
+    assert pm.era_of('') is None
+    assert pm.era_of(None) is None
+
+
+def test_discovery_no_longer_silently_drops_the_old_era():
+    """The bug: 'updown-15m' does not appear in 'up-or-down-15m', so an entire
+    era of real, settled markets was skipped without anything reporting it."""
+    assert pm.is_short('eth-up-or-down-15m-1757724300', '')
+
+
+def test_the_old_era_still_honours_an_asset_filter():
+    assert pm.is_short('eth-up-or-down-15m-1', 'eth-')
+    assert not pm.is_short('eth-up-or-down-15m-1', 'btc-')
+
+
+def test_discover_records_which_era_each_market_belongs_to(tmp_path, monkeypatch):
+    """Era must be stored, not re-derived later by whoever happens to remember
+    the two spellings."""
+    async def fake_get(session, path, params):
+        return {'markets': [
+            {'market_slug': 'btc-updown-15m-9999999999', 'condition_id': 'a'},
+            {'market_slug': 'btc-up-or-down-15m-9999999998', 'condition_id': 'b'},
+        ], 'pagination': {'pagination_key': None}}, None
+
+    _wire_discover(tmp_path, monkeypatch, fake_get=fake_get)
+    asyncio.run(pm.discover(session=None))
+
+    rows = [json.loads(line) for line in
+            open(tmp_path / 'markets.jsonl').read().splitlines() if line.strip()]
+    by_slug = {r['market_slug']: r for r in rows}
+    assert by_slug['btc-updown-15m-9999999999']['era'] == pm.TWAP_ERA
+    assert by_slug['btc-up-or-down-15m-9999999998']['era'] == pm.ENDPOINT_ERA
 
 
 def test_cursor_round_trips(tmp_path, monkeypatch):
