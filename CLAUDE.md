@@ -250,7 +250,66 @@ grid, a different producer, a dozen consumers to repoint — not a rename.
   settlement      venue_settlements <-------- venue_settlements  both venues
   spot bars       minute_bars <-------------- minute_bars        five years
   quotes, sparse  --                          venue_quotes      Kalshi only, 7 offsets, NOT unified
+  raw stream      venue_book_events (kalshi)  --                 every frame, 14-day retention
 ```
+
+**Since 2026-08-27 the Kalshi book also arrives over a WebSocket.**
+`scripts/record_stream.py` holds one subscription to `orderbook_delta`, folds
+frames into a process-wide `core/stream_book.BookCache`, and archives every
+frame. The REST poll still runs beside it — see the paired-transport note below
+— and is retired only once the two are shown to agree. The point
+is not latency — the tape measurement says the market gains nothing measurable
+under 30s — it is that `record_ladder` was sampling the book at +25s past the
+minute while `live._record_touch` issued its own separate REST fetch at the
+decision instant. Two samplers, two clocks, one feature vector. That is the same
+defect already measured for `levels_bid`/`levels_ask` across sources at a ratio
+of 0.579, and the reason for one `decide()` applies identically here.
+
+Four things were measured off the live socket that the documentation did not
+say, and three of them would have shipped as silent failures:
+
+* **The rate is 777-862 frames/second across three markets**, not the ~5/s the
+  first retention estimate assumed. Typed and zstd-compressed that is 20
+  bytes/row and 1.09 GB/day, so `venue_book_events` is a **bounded tier** —
+  14 days by default, 15 GB — while `venue_ladder` is the one kept forever.
+* **`seq` is global per SUBSCRIPTION, not per market.** It runs 1..N contiguously
+  across every market on one `sid`, and reads 1, 9, 10 within any one of them. A
+  per-market gap check — which is what "snapshot then incremental updates"
+  suggests, and what this was first designed as — flags *every* delta as a gap.
+  So a gap condemns every book on the connection and the repair is to
+  resubscribe all of them.
+* **The field names are not the documented ones**, and they differ from REST in
+  a way that fails silently: the stream sends `msg.yes_dollars_fp` and
+  `msg.price_dollars`/`msg.delta_fp`, where REST sends `orderbook_fp.yes_dollars`.
+  Reading one shape against the other yields an empty book and no exception.
+* **`delta_fp` is a signed change**, so a level driven to zero accumulates float
+  residue rather than reaching it. Measured: three BTC levels held 2.4e-12,
+  3.5e-14 and 4.9e-13, all of which `size > 0` kept — and because they sat above
+  the real touch the cache reported a best bid of **0.59 against a true 0.56**.
+  `core/stream_book.MIN_SIZE` is why that cannot recur.
+
+**The fold is verified against the venue's own book, not asserted.**
+`tests/fixtures/ws/kalshi_capture.jsonl.gz` is 65 seconds of live frames (40,759
+of them) paired with 12 REST orderbook snapshots taken during the same window.
+Folding the stream up to each snapshot agrees **exactly on the best bid on both
+sides, 11 times out of 11**, and the worst whole-ladder difference is one price
+out of ~100 — a NO level a maker toggles fourteen times a minute, caught by REST
+in the other state. `research/validate/_validate_transport.py` asks the same
+question continuously in production, where the stream can also go stale or die.
+
+**`venue_ladder` currently carries BOTH transports for the same minute**, which
+is why `transport` is part of its event key in `EVENT_KEY_EXTRA`. Without that,
+`read` keeps one row per `(venue, symbol, event_time)` and the comparison sees
+zero rows — the identical silent failure already recorded there for
+`venue_depth`. The REST sampler is not retired until the paired rows agree over
+a full day.
+
+**A live ticker now carries a suffix: `KXBTC15M-26AUG262330-30`.** The section
+below still describes `KXBTC15M-26AUG230030` and cites the *absence* of a strike
+suffix as the tell for an up/down market. `strike_type` is still
+`greater_or_equal` and the window is still fifteen minutes, so these are the
+right markets — but the tell is now wrong, which is one more reason resolution
+must keep asking the venue instead of matching a shape.
 
 `scripts/build_depth.py` is the one path into `venue_depth`, from every BOOK
 source, at **every minute** — because the offset grid is itself under test and
