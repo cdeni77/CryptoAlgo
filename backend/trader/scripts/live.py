@@ -206,8 +206,25 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
     )
     out: dict[str, pd.DataFrame] = {}
     try:
-        for symbol in config.symbols:
-            bars = await client.get_candles_range(symbol, '1m', start, end)
+        # **Concurrently, not one symbol after another.** Measured at 3.17s for
+        # three symbols — three independent round trips to the same host, run in
+        # series for no reason. This is the largest single cost in the cycle, and
+        # while reordering already moved it off the book-to-order path, it still
+        # sets how stale the bars are at decision time and how long the whole
+        # cycle takes.
+        #
+        # `return_exceptions` so one symbol's failure costs only that symbol.
+        # Losing all three because SOL timed out would turn a partial outage into
+        # a total one, and the loop already handles a missing symbol.
+        results = await asyncio.gather(
+            *(client.get_candles_range(symbol, '1m', start, end)
+              for symbol in config.symbols),
+            return_exceptions=True)
+        for symbol, bars in zip(config.symbols, results):
+            if isinstance(bars, BaseException):
+                logger.error('%s: the venue refused one-minute bars (%s)',
+                             symbol, str(bars)[:120])
+                continue
             if not bars:
                 logger.error('%s: the venue returned no one-minute bars', symbol)
                 continue
