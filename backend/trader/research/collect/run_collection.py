@@ -126,14 +126,22 @@ def write_window(item, snapshots, packed) -> int:
 
 # -- phases ------------------------------------------------------------------
 
-def phase_catalog(api: Predexon) -> None:
+def phase_catalog(api: Predexon, venue: str = 'both') -> None:
+    """Rebuild one or both catalogs.
+
+    Selectable per venue because they are independent and each takes tens of
+    minutes: re-running the pair to redo one of them wastes a walk that
+    already exhausted the venue's pagination.
+    """
     DATA.mkdir(parents=True, exist_ok=True)
-    log('KALSHI catalog')
-    n = kalshi_catalog(api, KALSHI_CATALOG, log=log)
-    log(f'  {n:,} Kalshi markets')
-    log('POLYMARKET catalog')
-    n = pm_catalog(api, PM_CATALOG, log=log)
-    log(f'  {n:,} Polymarket markets')
+    if venue in ('kalshi', 'both'):
+        log('KALSHI catalog')
+        n = kalshi_catalog(api, KALSHI_CATALOG, log=log)
+        log(f'  {n:,} Kalshi markets')
+    if venue in ('polymarket', 'both'):
+        log('POLYMARKET catalog')
+        n = pm_catalog(api, PM_CATALOG, log=log)
+        log(f'  {n:,} Polymarket markets')
 
 
 def phase_seed() -> None:
@@ -227,6 +235,9 @@ def main() -> int:
     parser.add_argument('--batch', type=int, default=200)
     parser.add_argument('--month', default=None,
                         help='limit to one YYYY-MM, for a trial slice')
+    parser.add_argument('--venue', default='both',
+                        choices=('kalshi', 'polymarket', 'both'),
+                        help='catalog phase only: which venue to rebuild')
     args = parser.parse_args()
 
     if args.phase == 'report':
@@ -245,7 +256,7 @@ def main() -> int:
     # runners throttle each other into 429s that look exactly like empty books.
     with SingleWriterLock(LOCK_PATH):
         if args.phase == 'catalog':
-            phase_catalog(api)
+            phase_catalog(api, args.venue)
             return 0
         return phase_collect(api, batch=args.batch, month=args.month)
 

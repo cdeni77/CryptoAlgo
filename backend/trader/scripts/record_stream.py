@@ -65,14 +65,48 @@ async def open_tickers(client) -> dict[str, str]:
 
 
 async def consume(stream, cache, spool, symbols, *, gate=None,
-                  until: float, flush_every: float = 5.0) -> str:
+                  until: float, flush_every: float = 5.0,
+                  idle_timeout: float = 15.0) -> str:
     """Fold frames until the subscription needs rebuilding.
 
     Returns the reason, so the caller logs why rather than reconnecting
-    silently. **Does not await the gate** — see the module docstring.
+    silently. **Does not await the gate** around the read — see the module
+    docstring; only the flush is gated.
+
+    **Every exit condition is enforced on a timeout, not on frame arrival.**
+    The first version checked the refresh deadline inside the loop body, which
+    deadlocks the moment the socket goes quiet: observed live at 23:30:00, a
+    window boundary, when the subscribed markets settled and the venue simply
+    stopped sending. The loop that would have resubscribed to the new window
+    could only run if a frame arrived, and no frame was ever coming. Nothing
+    raised, `supervise` saw a coroutine still legitimately awaiting, and the
+    recorder sat dead behind a healthy container — the exact failure the
+    staleness contract exists to prevent, one layer further down.
+
+    So a silent socket IS a condition: at ~436 frames a second on a live market,
+    fifteen seconds of nothing means the markets settled or the connection died,
+    and both are repaired the same way.
     """
+    iterator = stream.events().__aiter__()
     next_flush = time.monotonic() + flush_every
-    async for event in stream.events():
+    while True:
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return 'subscription refresh'
+        try:
+            event = await asyncio.wait_for(
+                iterator.__anext__(), timeout=min(remaining, idle_timeout))
+        except asyncio.TimeoutError:
+            # The wait is capped by whichever came first. Re-check, so the
+            # reason names the condition that actually fired — an operator
+            # reading "silent for 15s" when it was a scheduled refresh would
+            # go looking for a dead socket that is not there.
+            if time.monotonic() >= until:
+                return 'subscription refresh'
+            return f'silent for {idle_timeout:.0f}s'
+        except StopAsyncIteration:
+            return 'socket closed'
+
         cache.apply(event)
         spool.extend(event_rows(event, symbols.get(event.market_ticker, 'UNKNOWN')))
         now = time.monotonic()
@@ -83,9 +117,6 @@ async def consume(stream, cache, spool, symbols, *, gate=None,
             next_flush = now + flush_every
         if cache.any_gapped():
             return 'sequence gap'
-        if now >= until:
-            return 'subscription refresh'
-    return 'socket closed'
 
 
 async def run(args, gate=None, cache=None) -> int:
@@ -117,7 +148,8 @@ async def run(args, gate=None, cache=None) -> int:
                 try:
                     reason = await consume(
                         stream, cache, spool, symbols, gate=gate,
-                        until=time.monotonic() + args.refresh_seconds)
+                        until=time.monotonic() + args.refresh_seconds,
+                        idle_timeout=args.idle_timeout)
                 finally:
                     await stream.close()
                     spool.flush()
@@ -129,9 +161,13 @@ async def run(args, gate=None, cache=None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--spool-root', default='data/spool')
-    # Shorter than a window, so a new market is picked up well before it is
-    # decided on, and long enough that resubscribing is not the main traffic.
-    parser.add_argument('--refresh-seconds', type=float, default=120.0)
+    # Well under the 3-minute mark of a window, so the next window's market is
+    # subscribed long before anything decides on it. Resubscribing costs one
+    # snapshot per market, which is nothing against 400+ frames a second.
+    parser.add_argument('--refresh-seconds', type=float, default=45.0)
+    # At ~436 frames/s on a live market, this much silence means the markets
+    # settled or the socket died. Both are repaired by resubscribing.
+    parser.add_argument('--idle-timeout', type=float, default=15.0)
     return parser
 
 

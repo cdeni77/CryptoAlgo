@@ -133,7 +133,12 @@ def pm_catalog(api: Predexon, out_path: str, *, max_pages: int = 6000,
     floor = COLLECT_FROM.timestamp()
     with open(out_path, 'w') as handle:
         while pages < max_pages:
-            params = {'limit': 50, 'tags': '15M', 'sort': 'created'}
+            # 100 is the endpoint's ceiling, measured: 100 returns 100, while
+            # 200 and 500 both return zero rather than erroring. At 50 this
+            # walk needed ~3,550 pages to reach the collection floor and ran
+            # at ~1.5 days of history a minute; the page count halves here,
+            # and page count is the whole cost on a 1 req/s bucket.
+            params = {'limit': 100, 'tags': '15M', 'sort': 'created'}
             if cursor:
                 params['pagination_key'] = cursor
             payload, ok = api.get('/polymarket/markets', params)

@@ -6,7 +6,9 @@ and staleness is the failure the book cache exists to prevent.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
+import time
 
 import pytest
 
@@ -78,3 +80,92 @@ def test_the_component_is_wired_into_the_factories():
     gate = run_live.TradingGate()
     args = run_live.build_parser().parse_args([])
     assert 'stream' in run_live.build_factories(args, gate)
+
+
+# -- the silent-socket deadlock ---------------------------------------------
+#
+# Observed live on 2026-08-27 at 23:30:00, a window boundary. The subscribed
+# markets settled, the venue stopped sending, and `consume` sat forever in
+# `async for` — because the refresh deadline was only checked inside the loop
+# body, and the loop body needed a frame that was never coming. Nothing raised,
+# `supervise` saw a coroutine legitimately awaiting, and the recorder was dead
+# behind a container reporting healthy.
+
+class _FakeStream:
+    """A stream that yields `events` then goes quiet forever."""
+
+    def __init__(self, events=(), quiet_forever=True):
+        self._events = list(events)
+        self._quiet = quiet_forever
+
+    async def events(self):
+        for event in self._events:
+            yield event
+        if self._quiet:
+            await asyncio.Event().wait()      # never set
+
+
+class _NullSpool:
+    def extend(self, rows):
+        return sum(1 for _ in rows)
+
+    def flush(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_a_socket_that_never_speaks_does_not_hang_forever():
+    reason = await asyncio.wait_for(
+        record_stream.consume(
+            _FakeStream(), BookCache(now=lambda: 0.0), _NullSpool(), {},
+            until=time.monotonic() + 300.0, idle_timeout=0.05),
+        timeout=5.0)
+    assert reason.startswith('silent'), reason
+
+
+@pytest.mark.asyncio
+async def test_a_socket_that_goes_quiet_after_a_burst_is_still_caught():
+    """The live failure exactly: frames, then settlement, then nothing."""
+    reason = await asyncio.wait_for(
+        record_stream.consume(
+            _FakeStream([snap('A'), snap('B')]), BookCache(now=lambda: 0.0),
+            _NullSpool(), {}, until=time.monotonic() + 300.0,
+            idle_timeout=0.05),
+        timeout=5.0)
+    assert reason.startswith('silent'), reason
+
+
+@pytest.mark.asyncio
+async def test_the_refresh_deadline_is_honoured_without_any_frame():
+    """A deadline that only fires on frame arrival is not a deadline."""
+    reason = await asyncio.wait_for(
+        record_stream.consume(
+            _FakeStream(), BookCache(now=lambda: 0.0), _NullSpool(), {},
+            until=time.monotonic() + 0.05, idle_timeout=300.0),
+        timeout=5.0)
+    assert reason == 'subscription refresh', reason
+
+
+@pytest.mark.asyncio
+async def test_a_closed_socket_ends_the_loop_rather_than_waiting():
+    reason = await asyncio.wait_for(
+        record_stream.consume(
+            _FakeStream([snap('A')], quiet_forever=False),
+            BookCache(now=lambda: 0.0), _NullSpool(), {},
+            until=time.monotonic() + 300.0, idle_timeout=300.0),
+        timeout=5.0)
+    assert reason == 'socket closed', reason
+
+
+@pytest.mark.asyncio
+async def test_a_sequence_gap_stops_the_loop_so_the_caller_resubscribes():
+    cache = BookCache(now=lambda: 0.0)
+    events = [snap('A', seq=1),
+              snap('A', kind='delta', seq=99, absolute=False,
+                   yes=[(0.3, 1.0)], no=[])]
+    reason = await asyncio.wait_for(
+        record_stream.consume(_FakeStream(events, quiet_forever=False), cache,
+                              _NullSpool(), {}, until=time.monotonic() + 300.0,
+                              idle_timeout=300.0),
+        timeout=5.0)
+    assert reason == 'sequence gap', reason
