@@ -342,8 +342,12 @@ same instants and the timing question does not arise.
 is why `transport` is part of its event key in `EVENT_KEY_EXTRA`. Without that,
 `read` keeps one row per `(venue, symbol, event_time)` and the comparison sees
 zero rows — the identical silent failure already recorded there for
-`venue_depth`. The REST sampler is not retired until the paired rows agree over
-a full day.
+`venue_depth`. **The retirement gate is the SHAPE of the disagreement, not a
+percentage** — a headline agreement number cannot reach 100% against a laggier
+reference, so requiring it would keep the REST sampler forever. What must hold
+over a full day: total-volume ratio centred on 1.0000 with the low and high
+sides balanced, ladder drift confined to prices at the touch, and no one-sided
+bias in which transport reports the higher bid.
 
 **A live ticker now carries a suffix: `KXBTC15M-26AUG262330-30`.** The section
 below still describes `KXBTC15M-26AUG230030` and cites the *absence* of a strike
