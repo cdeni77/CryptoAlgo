@@ -248,3 +248,106 @@ def seed_from_catalogs(ledger, paths: Iterable[str], *, log=print) -> int:
     ledger.seed(items)
     log(f'  seeded {len(items):,} work items')
     return len(items)
+
+
+# -- targeted lookup, instead of paging the whole venue ----------------------
+#
+# Pagination degrades with depth (1.8 days of history a minute at the start,
+# 0.55 four hundred pages in) and walks eight-plus assets to extract three.
+# Asking for the windows we actually want is flat and ~15x cheaper.
+#
+# Constructing a slug is safe HERE and nowhere else, for two measured reasons:
+# every one of the 10,762 slugs pagination had already found is reproduced
+# exactly by this grid with zero off-grid windows; and a wrong slug returns
+# nothing rather than something, so the failure mode is a market we miss, not
+# a different market we mistake for this one. Every market that comes back is
+# still cross-checked against the venue's own end_time before it is written.
+SLUGS_PER_REQUEST = 50            # 100 returns HTTP 422; this is a ceiling
+
+
+def window_grid(start: dt.datetime, end: dt.datetime, assets=('btc', 'eth', 'sol')):
+    """(slug, symbol, window_open) for every quarter-hour in [start, end)."""
+    step = dt.timedelta(minutes=15)
+    when = start
+    while when < end:
+        stamp = int(when.timestamp())
+        for asset in assets:
+            yield f'{asset}-updown-15m-{stamp}', PM_ASSETS[asset], when
+        when += step
+
+
+def batched(items, size: int):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def pm_catalog_by_grid(api: Predexon, out_path: str, *, start=None, end=None,
+                       log=print) -> int:
+    """Ask the venue about each window we want, 50 slugs at a time.
+
+    Resumable on the batch index, so a killed run continues rather than
+    re-asking. Windows the venue does not know about are simply absent from
+    the catalog, which is the honest answer: we asked about every window in
+    the grid, so an absence is "no market", not "not looked at".
+    """
+    start = start or COLLECT_FROM
+    end = end or dt.datetime.now(dt.timezone.utc).replace(
+        second=0, microsecond=0, minute=0)
+    grid = list(window_grid(start, end))
+    chunks = list(batched(grid, SLUGS_PER_REQUEST))
+
+    state_path = out_path + '.grid'
+    done_batches, mode = 0, 'w'
+    if os.path.exists(state_path) and os.path.exists(out_path):
+        try:
+            with open(state_path) as sh:
+                done_batches = json.load(sh).get('batches', 0)
+            mode = 'a'
+            log(f'  resuming after batch {done_batches:,}')
+        except (OSError, ValueError):
+            done_batches, mode = 0, 'w'
+
+    log(f'  {len(grid):,} windows in {len(chunks):,} batches of '
+        f'{SLUGS_PER_REQUEST}')
+    written = 0
+    with open(out_path, mode) as handle:
+        for index, chunk in enumerate(chunks):
+            if index < done_batches:
+                continue
+            by_slug = {slug: (symbol, opened) for slug, symbol, opened in chunk}
+            payload, ok = api.get('/polymarket/markets',
+                                  [('market_slug', s) for s in by_slug]
+                                  + [('limit', str(SLUGS_PER_REQUEST))])
+            if not ok:
+                log(f'  batch {index}: request failed, stopping')
+                break
+            for m in (payload or {}).get('markets') or (payload or {}).get('data') or []:
+                slug = str(m.get('market_slug') or '')
+                if slug not in by_slug:
+                    continue
+                symbol, opened = by_slug[slug]
+                outcomes = m.get('outcomes') or []
+                token = (outcomes[0] or {}).get('token_id') if outcomes else None
+                if not token:
+                    continue
+                if verify_window(opened, venue_open=None,
+                                 venue_close=_time(m.get('end_time'))):
+                    continue
+                handle.write(json.dumps({
+                    'venue': 'polymarket', 'symbol': symbol,
+                    'market_id': slug, 'token_id': str(token),
+                    'window_open': opened.isoformat(),
+                    'result': str(m.get('winning_side') or ''),
+                    'volume': m.get('total_volume_usd'),
+                }) + '\n')
+                written += 1
+            handle.flush()
+            with open(state_path, 'w') as sh:
+                json.dump({'batches': index + 1}, sh)
+            if (index + 1) % 100 == 0:
+                log(f'  batch {index + 1:,}/{len(chunks):,}, {written:,} markets, '
+                    f'{api.throttled:,} throttled of {api.calls:,} calls')
+    if os.path.exists(state_path):
+        os.remove(state_path)
+    return written

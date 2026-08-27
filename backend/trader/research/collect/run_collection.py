@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from research.collect.catalog import (                        # noqa: E402
-    COLLECT_FROM, Predexon, kalshi_catalog, pm_catalog, seed_from_catalogs,
+    COLLECT_FROM, Predexon, kalshi_catalog, pm_catalog_by_grid, seed_from_catalogs,
 )
 from research.collect.fetchers import FIELDS, pack_kalshi, pack_pm  # noqa: E402
 from research.collect.ledger import Ledger                    # noqa: E402
@@ -139,8 +139,11 @@ def phase_catalog(api: Predexon, venue: str = 'both') -> None:
         n = kalshi_catalog(api, KALSHI_CATALOG, log=log)
         log(f'  {n:,} Kalshi markets')
     if venue in ('polymarket', 'both'):
+        # Targeted lookup rather than paging the whole venue: pagination walks
+        # eight-plus assets to extract three and degrades with depth, from 1.8
+        # days of history a minute down to 0.55 four hundred pages in.
         log('POLYMARKET catalog')
-        n = pm_catalog(api, PM_CATALOG, log=log)
+        n = pm_catalog_by_grid(api, PM_CATALOG, log=log)
         log(f'  {n:,} Polymarket markets')
 
 
