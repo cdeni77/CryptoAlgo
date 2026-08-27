@@ -82,18 +82,45 @@ def fetch_kalshi(api: Predexon, item, _tokens):
 
 
 def fetch_pm(api: Predexon, item, tokens):
+    """Every snapshot in the window, following pagination to exhaustion.
+
+    This was ONE request, on the assumption that Polymarket returns a whole
+    window at once. That held for the August trial, whose windows averaged 358
+    snapshots, and is false on busy months: 3,097 collected windows came back
+    with EXACTLY 2,000 snapshots and not one above it, while Kalshi — which
+    paginates — had a single window at exactly 2,000 and thousands beyond.
+    That distribution is the shape of a silent truncation, and it cost 44% of
+    the Polymarket windows collected before it was found.
+
+    Confirmed against the endpoint: a January BTC window returns 2,000
+    snapshots with `has_more: true`, and the next page returns 2,000 more with
+    `has_more` still true.
+    """
     token = tokens.get(item.market_id)
     if not token:
         return None, 'no token_id in catalog'
     lo = int(item.window_open.timestamp() * 1000)
     hi = int((item.window_open + dt.timedelta(minutes=15, seconds=TAIL_SECONDS))
              .timestamp() * 1000)
-    payload, ok = api.get('/polymarket/orderbooks', {
-        'token_id': token, 'start_time': lo, 'end_time': hi, 'limit': 2000})
-    if not ok:
-        return None, 'request failed'
-    return ((payload or {}).get('snapshots')
-            or (payload or {}).get('data') or []), None
+    out, cursor, pages = [], None, 0
+    while pages < 30:
+        params = {'token_id': token, 'start_time': lo, 'end_time': hi,
+                  'limit': 2000}
+        if cursor:
+            params['pagination_key'] = cursor
+        payload, ok = api.get('/polymarket/orderbooks', params)
+        if not ok:
+            return None, 'request failed'
+        rows = (payload or {}).get('snapshots') or (payload or {}).get('data') or []
+        out += rows
+        pages += 1
+        page = (payload or {}).get('pagination') or {}
+        cursor = page.get('pagination_key')
+        # `not rows` guards a venue that claims has_more and returns nothing,
+        # which would otherwise spin until the page cap.
+        if not page.get('has_more') or not cursor or not rows:
+            break
+    return out, None
 
 
 FETCHERS = {'kalshi': (fetch_kalshi, pack_kalshi),

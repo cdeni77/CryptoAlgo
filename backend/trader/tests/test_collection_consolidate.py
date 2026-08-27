@@ -142,3 +142,27 @@ def test_converting_twice_is_idempotent(collected, tmp_path):
     consolidate.convert('kalshi', 'BTC-USD', '2026-02', [path])
     consolidate.convert('kalshi', 'BTC-USD', '2026-02', [path])
     assert len(_derived(tmp_path)) == 3
+
+
+def test_a_recollected_window_supersedes_its_truncated_first_copy(collected, tmp_path):
+    """3,099 Polymarket windows were archived truncated at the 2,000-snapshot
+    page cap before `fetch_pm` paginated. They were reset to pending and
+    re-collected, so the archive holds BOTH copies — and keeping the first
+    occurrence would keep the truncated one, making the re-collection
+    pointless. The fuller record wins."""
+    truncated = _record(market_id='pm-1', n=2)
+    complete = _record(market_id='pm-1', n=5)
+    collected([truncated, complete])
+    snaps, windows = consolidate.convert('kalshi', 'BTC-USD', '2026-02',
+                                         [next((tmp_path / 'archive').rglob('*.jsonl'))])
+    assert windows == 1
+    assert snaps == 5, 'must keep the complete copy, not the truncated one'
+
+
+def test_order_does_not_decide_which_copy_wins(collected, tmp_path):
+    """The complete copy may be appended before or after the truncated one
+    depending on when the retry ran."""
+    collected([_record(market_id='pm-2', n=7), _record(market_id='pm-2', n=2)])
+    snaps, _ = consolidate.convert('kalshi', 'BTC-USD', '2026-02',
+                                   [next((tmp_path / 'archive').rglob('*.jsonl'))])
+    assert snaps == 7

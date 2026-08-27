@@ -46,6 +46,12 @@ class Predexon:
         self.session = requests.Session()
         self.session.headers.update({
             'x-api-key': key, 'Accept': 'application/json',
+            # gzip, not brotli. A live probe against a multi-megabyte
+            # orderbook response failed with "brotli: decoder process called
+            # with data when can_accept_more_data() is False"; inside the
+            # collector that would surface only as a silent retry, costing a
+            # rate-limit slot for no data.
+            'Accept-Encoding': 'gzip',
             'User-Agent': 'Mozilla/5.0 (quarter research collector)'})
 
     def get(self, path: str, params: dict, *, tries: int = 6):

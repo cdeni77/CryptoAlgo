@@ -61,7 +61,13 @@ def _open(path):
 
 def convert(venue: str, symbol: str, month: str, paths, *, keep_ladders=True):
     """One partition, both layers. Returns (n_snapshots, n_windows)."""
-    rows, ladders, seen = [], [], set()
+    # Keep the FULLEST copy of each window, not the first. A window can appear
+    # more than once: an `error` retry re-fetches it, and 3,099 Polymarket
+    # windows were archived truncated at the 2,000-snapshot page cap before
+    # `fetch_pm` paginated, then reset and re-collected. Keeping whichever copy
+    # happened to be written first would silently keep the truncated one and
+    # make the re-collection pointless.
+    best: dict = {}
     for path in paths:
         with _open(path) as handle:
             for line in handle:
@@ -70,21 +76,25 @@ def convert(venue: str, symbol: str, month: str, paths, *, keep_ladders=True):
                 except ValueError:
                     continue                     # a torn last line from a kill
                 key = (rec['market_id'], rec['window_open'])
-                if key in seen:
-                    continue                     # a window re-fetched after a retry
-                seen.add(key)
-                opened = pd.Timestamp(rec['window_open'])
-                for snap in rec.get('series') or []:
-                    row = dict(zip(FIELDS, snap))
-                    row.update(venue=venue, symbol=symbol,
-                               market_id=rec['market_id'], window_open=opened)
-                    rows.append(row)
-                if keep_ladders:
-                    ladders.append({
-                        'venue': venue, 'symbol': symbol,
-                        'market_id': rec['market_id'], 'window_open': opened,
-                        'ladders': json.dumps(rec.get('ladders') or []),
-                    })
+                have = best.get(key)
+                if have is None or len(rec.get('series') or []) > len(have.get('series') or []):
+                    best[key] = rec
+
+    rows, ladders = [], []
+    for rec in best.values():
+        opened = pd.Timestamp(rec['window_open'])
+        for snap in rec.get('series') or []:
+            row = dict(zip(FIELDS, snap))
+            row.update(venue=venue, symbol=symbol,
+                       market_id=rec['market_id'], window_open=opened)
+            rows.append(row)
+        if keep_ladders:
+            ladders.append({
+                'venue': venue, 'symbol': symbol,
+                'market_id': rec['market_id'], 'window_open': opened,
+                'ladders': json.dumps(rec.get('ladders') or []),
+            })
+    seen = best
     if not rows:
         return 0, 0
 
