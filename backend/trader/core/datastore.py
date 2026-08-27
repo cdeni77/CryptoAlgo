@@ -263,9 +263,13 @@ EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
     # reads zero rows — which is exactly what happened to venue_depth above.
     'venue_ladder': ('transport',),
     'pm_ladder': ('transport',),
-    # Hundreds of frames share one millisecond. Without the ticker and the
-    # sequence in the key, `read` would keep one of them and discard the stream.
-    'venue_book_events': ('market_ticker', 'seq'),
+    # Hundreds of frames share one millisecond, and every level of a SNAPSHOT
+    # shares one `seq`. `(market_ticker, seq)` alone therefore collapsed each
+    # ~200-level snapshot to a single level — measured, 138,878 rows written and
+    # 134,313 read back, with the loss falling entirely on snapshots. Deltas
+    # name one price and were unaffected, which is what made it invisible: the
+    # only frames destroyed were the ones a replay needs to bootstrap from.
+    'venue_book_events': ('market_ticker', 'seq', 'side', 'price'),
 }
 
 

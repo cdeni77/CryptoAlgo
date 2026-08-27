@@ -111,3 +111,26 @@ def test_pruning_bounds_the_raw_tier(tmp_path):
     import time as _t
     assert prune(store_root, keep_days=1.0, now=_t.time() + 86400 * 10) == 1
     assert not list((store_root / 'venue_book_events').rglob('*.parquet'))
+
+
+def test_every_level_of_a_snapshot_survives_a_read(tmp_path):
+    """A snapshot's levels share one `seq`, so the event key must go further.
+
+    Measured before the key was widened: 138,878 rows written, 134,313 read
+    back, the loss falling entirely on snapshots. Deltas name a single price and
+    were untouched — so the only frames destroyed were the ones a replay needs
+    to bootstrap from, and nothing said so.
+    """
+    spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
+    spool = FrameSpool(spool_root, 'kalshi')
+    event = BookEvent(venue='kalshi', market_ticker='K', kind='snapshot',
+                      received=HOUR, seq=1,
+                      yes=[(0.30, 1.0), (0.31, 2.0), (0.32, 3.0)],
+                      no=[(0.66, 4.0), (0.67, 5.0)])
+    spool.extend(event_rows(event, 'BTC-USD'))
+    spool.close()
+    compact(spool_root, store_root, keep_days=0.0, now=LATER)
+
+    got = ResearchStore(store_root).read('venue_book_events', min_quality=None)
+    assert len(got) == 5, f'expected all five levels, kept {len(got)}'
+    assert sorted(got['price']) == [0.30, 0.31, 0.32, 0.66, 0.67]
