@@ -172,49 +172,75 @@ async def test_a_sequence_gap_stops_the_loop_so_the_caller_resubscribes():
     assert reason == 'sequence gap', reason
 
 
-# -- a market the venue still calls open but has already closed --------------
+# -- the venue's `status` field lags its own clock ---------------------------
 
-def _market(ticker, closes):
-    return {'ticker': ticker, 'close_time': closes}
+def _market(ticker, opens, closes, status='active'):
+    return {'ticker': ticker, 'open_time': opens, 'close_time': closes,
+            'status': status}
+
+
+NOW = datetime(2026, 8, 27, 15, 15, 5, tzinfo=timezone.utc)
 
 
 def test_a_market_past_its_close_is_not_subscribed():
-    """Observed live at a 10:30 boundary: `status=open` still listed the market
-    that had just settled, so the recorder subscribed to a dead market, heard
-    nothing, declared the socket silent and rebuilt — twice — leaving the book
-    empty for ~30s at every window boundary."""
-    now = datetime(2026, 8, 27, 14, 30, 5, tzinfo=timezone.utc)
-    assert record_stream._closed(_market('OLD', '2026-08-27T14:30:00Z'), now)
-    assert not record_stream._closed(_market('NEW', '2026-08-27T14:45:00Z'), now)
+    """The settled market stays listed as open; subscribing to it buys nothing
+    and trips the silence detector."""
+    assert not record_stream._trading(
+        _market('OLD', '2026-08-27T15:00:00Z', '2026-08-27T15:15:00Z'), NOW)
 
 
-def test_a_market_closing_exactly_now_is_treated_as_closed():
-    now = datetime(2026, 8, 27, 14, 30, 0, tzinfo=timezone.utc)
-    assert record_stream._closed(_market('EDGE', '2026-08-27T14:30:00Z'), now)
+def test_the_current_market_is_subscribed_even_while_status_says_initialized():
+    """MEASURED: the replacement market is published with an open_time exactly at
+    the boundary but stays `initialized` for ~40s, so a status=open query cannot
+    see it and the book is empty for the first part of every window."""
+    assert record_stream._trading(
+        _market('NEW', '2026-08-27T15:15:00Z', '2026-08-27T15:30:00Z',
+                status='initialized'), NOW)
 
 
-def test_an_unparseable_or_absent_close_time_keeps_the_market():
-    """Dropping a market because its timestamp was odd would be worse than
-    subscribing to one that is about to settle."""
-    now = datetime(2026, 8, 27, 14, 30, 0, tzinfo=timezone.utc)
-    assert not record_stream._closed({'ticker': 'X'}, now)
-    assert not record_stream._closed(_market('X', 'not-a-time'), now)
-    assert not record_stream._closed(_market('X', None), now)
+def test_a_market_whose_window_has_not_started_is_not_subscribed():
+    assert not record_stream._trading(
+        _market('NEXT', '2026-08-27T15:30:00Z', '2026-08-27T15:45:00Z'), NOW)
+
+
+def test_the_boundary_instant_belongs_to_the_new_window():
+    boundary = datetime(2026, 8, 27, 15, 15, 0, tzinfo=timezone.utc)
+    assert not record_stream._trading(
+        _market('OLD', '2026-08-27T15:00:00Z', '2026-08-27T15:15:00Z'), boundary)
+    assert record_stream._trading(
+        _market('NEW', '2026-08-27T15:15:00Z', '2026-08-27T15:30:00Z'), boundary)
+
+
+def test_a_market_missing_a_timestamp_is_kept():
+    """Dropping a market because its clock looked odd is worse than briefly
+    holding one about to settle."""
+    assert record_stream._trading({'ticker': 'X'}, NOW)
+    assert record_stream._trading(
+        _market('X', 'not-a-time', '2026-08-27T15:30:00Z'), NOW)
 
 
 @pytest.mark.asyncio
-async def test_open_tickers_filters_the_settled_market_out():
-    now = datetime(2026, 8, 27, 14, 30, 5, tzinfo=timezone.utc)
+async def test_open_tickers_queries_by_close_time_not_status():
+    seen = {}
 
     class FakeClient:
         async def _request(self, method, path, params=None):
+            seen.update(params)
             if params['series_ticker'] != 'KXBTC15M':
                 return {'markets': []}
-            return {'markets': [_market('KXBTC15M-OLD', '2026-08-27T14:30:00Z'),
-                                _market('KXBTC15M-NEW', '2026-08-27T14:45:00Z')]}
+            return {'markets': [
+                _market('KXBTC15M-OLD', '2026-08-27T15:00:00Z', '2026-08-27T15:15:00Z'),
+                _market('KXBTC15M-NOW', '2026-08-27T15:15:00Z', '2026-08-27T15:30:00Z',
+                        status='initialized'),
+                _market('KXBTC15M-NEXT', '2026-08-27T15:30:00Z', '2026-08-27T15:45:00Z'),
+            ]}
 
-    got = await record_stream.open_tickers(FakeClient(), now=now)
-    assert list(got) == ['KXBTC15M-NEW']
+    got = await record_stream.open_tickers(FakeClient(), now=NOW)
+    assert list(got) == ['KXBTC15M-NOW'], (
+        'exactly the market whose window contains now, whatever its status')
+    assert 'status' not in seen, "status lags the venue's own clock"
+    assert seen['min_close_ts'] == int(NOW.timestamp())
+    assert seen['max_close_ts'] == int(NOW.timestamp()) + 1800
 
 
 def test_the_empty_market_retry_is_fast_not_the_refresh_cadence():

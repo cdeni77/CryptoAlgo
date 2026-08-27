@@ -48,41 +48,56 @@ def retire(cache: BookCache, keep: set[str]) -> None:
         cache.forget(ticker)
 
 
-def _closed(market: dict, now: datetime) -> bool:
-    """Has this market's window already ended?
-
-    **`status: open` is not enough.** Observed live at a 10:30 boundary: the
-    venue still listed the market that had just closed, so the recorder
-    subscribed to it, received nothing, declared the socket silent after fifteen
-    seconds and rebuilt — twice — leaving the book empty for ~30s at every window
-    boundary. `close_time` is the venue's own answer to the question the status
-    field only approximates.
-    """
-    raw = market.get('close_time')
-    if not raw:
-        return False
+def _stamp(raw) -> datetime | None:
     try:
-        closes = datetime.strptime(raw, '%Y-%m-%dT%H:%M:%SZ').replace(
+        return datetime.strptime(raw, '%Y-%m-%dT%H:%M:%SZ').replace(
             tzinfo=timezone.utc)
     except (TypeError, ValueError):
-        return False
-    return closes <= now
+        return None
+
+
+def _trading(market: dict, now: datetime) -> bool:
+    """Is `now` inside this market's own window?
+
+    Judged on the venue's `open_time`/`close_time` rather than on `status`,
+    because **`status` lags the market by up to forty seconds**. Measured across
+    three boundaries: the settled market stayed listed as open (subscribing to
+    it bought nothing and tripped the silence detector), and the replacement —
+    already published, with an `open_time` exactly at the boundary — was still
+    `initialized` and therefore invisible to a `status=open` query for ~40s. So
+    the book was empty for the first part of every window, for reasons entirely
+    on the venue's side of a field we did not have to trust.
+
+    A market missing either timestamp is kept: dropping one because its clock
+    looked odd is worse than briefly holding one that is about to settle.
+    """
+    opens, closes = _stamp(market.get('open_time')), _stamp(market.get('close_time'))
+    if opens is None or closes is None:
+        return True
+    return opens <= now < closes
 
 
 async def open_tickers(client, *, now: datetime | None = None) -> dict[str, str]:
-    """ticker -> symbol, for every market on the traded series still trading.
+    """ticker -> symbol, for every market on the traded series currently trading.
 
     Asks the venue rather than building a ticker from a pattern — the live
     format has already gained a `-15` suffix that no documented pattern predicts.
+
+    Queried by CLOSE TIME rather than by status. A half-hour window returns
+    exactly the current market and the next one, which is what makes the
+    `status` lag above irrelevant: the market is found the instant its own
+    `open_time` passes.
     """
     now = now or datetime.now(timezone.utc)
+    stamp = int(now.timestamp())
     out: dict[str, str] = {}
     for series, symbol in series_to_symbol().items():
         payload = await client._request(  # noqa: SLF001
             'GET', '/markets',
-            params={'series_ticker': series, 'status': 'open', 'limit': 5})
+            params={'series_ticker': series, 'min_close_ts': stamp,
+                    'max_close_ts': stamp + 1800, 'limit': 10})
         for market in payload.get('markets', []):
-            if market.get('ticker') and not _closed(market, now):
+            if market.get('ticker') and _trading(market, now):
                 out[market['ticker']] = symbol
     return out
 
