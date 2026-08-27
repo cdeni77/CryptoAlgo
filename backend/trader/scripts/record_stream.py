@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 from core.config import series_to_symbol
-from core.spool import FrameSpool, event_rows
+from core.spool import DEFAULT_SPOOL_ROOT, FrameSpool, event_rows
 from core.stream_book import BookCache
 from data_collection.stream.kalshi import VENUE, KalshiStream
 
@@ -181,7 +181,7 @@ async def run(args, gate=None, cache=None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--spool-root', default='data/spool')
+    parser.add_argument('--spool-root', default=str(DEFAULT_SPOOL_ROOT))
     # Well under the 3-minute mark of a window, so the next window's market is
     # subscribed long before anything decides on it. Resubscribing costs one
     # snapshot per market, which is nothing against 400+ frames a second.

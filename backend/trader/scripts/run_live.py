@@ -234,9 +234,10 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
         # the rest of this loop does: it is blocking Parquet work, and the
         # stream must not stop reading to do it.
         try:
-            from core.spool import compact
+            from core.datastore import DEFAULT_ROOT
+            from core.spool import DEFAULT_SPOOL_ROOT, compact
             rows = await asyncio.to_thread(
-                compact, 'data/spool', os.getenv('RESEARCH_STORE') or 'data/research')
+                compact, DEFAULT_SPOOL_ROOT, DEFAULT_ROOT)
             if rows:
                 logger.info('compacted %d book-event rows', rows)
         except Exception as exc:                      # noqa: BLE001

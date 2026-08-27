@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,16 @@ import pandas as pd
 from data_collection.stream.base import BookEvent
 
 logger = logging.getLogger('spool')
+
+# Absolute, not cwd-relative, and for the reason `core/datastore.py` records at
+# length: `data/research` resolved against whatever directory a process happened
+# to start in created a SECOND, empty store that simply went unread. A spool
+# written to a stray `data/spool` would be worse, because nothing downstream
+# reads it directly — the frames would accumulate somewhere nobody compacts and
+# be deleted by whatever cleans that directory. `SPOOL_ROOT` overrides.
+_TRADER_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SPOOL_ROOT = Path(os.getenv('SPOOL_ROOT')
+                          or _TRADER_ROOT / 'data' / 'spool')
 
 COLUMNS = ('venue', 'symbol', 'event_time', 'available_time', 'quality',
            'market_ticker', 'seq', 'kind', 'side', 'price', 'size', 'absolute')
