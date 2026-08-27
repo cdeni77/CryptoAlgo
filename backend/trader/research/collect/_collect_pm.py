@@ -180,6 +180,37 @@ def is_short(slug: str, asset_prefix: str) -> bool:
     return era_of(slug) is not None and (slug or '').startswith(asset_prefix)
 
 
+# The first window whose ORDER BOOK can actually be retrieved, which is a
+# different and much later boundary than when the markets themselves exist.
+# Measured by binary search, counting snapshots rather than trusting the
+# market record: btc markets from 2025-10-10 carry real money ($42,033 traded
+# on that first day) and return ZERO orderbook snapshots; 2025-12-30 returns
+# none and 2025-12-31 returns a book.
+#
+# Discovery is deliberately allowed to run back past this — metadata is ~15
+# pages a day and the settlement record is worth having on its own. Pricing is
+# not: it costs one request per market and a pre-coverage market returns
+# nothing, so pricing everything discovered would spend thousands of requests,
+# hours of a 1 req/s bucket, rediscovering a boundary already measured here.
+BOOK_START = int(dt.datetime(2025, 12, 31, tzinfo=dt.timezone.utc).timestamp())
+
+
+def worth_pricing(market) -> bool:
+    """Whether a discovered market can plausibly return a book.
+
+    Cheap local checks only — the point is to not spend a request. The old
+    `up-or-down` era is excluded outright: a different instrument, and one with
+    no retrievable book either.
+    """
+    slug = (market or {}).get('market_slug') or ''
+    if era_of(slug) != TWAP_ERA:
+        return False
+    stamp = slug.rsplit('-', 1)[-1]
+    if not stamp.isdigit():
+        return False
+    return int(stamp) >= BOOK_START
+
+
 async def discover(session) -> int:
     seen = set()
     if os.path.exists(MARKETS_OUT):
@@ -327,8 +358,17 @@ async def price(session) -> int:
     if not os.path.exists(MARKETS_OUT):
         print('stage 2: nothing discovered'); return 0
     markets = [json.loads(l) for l in open(MARKETS_OUT)]
-    markets = [m for m in markets
+    settled = [m for m in markets
                if m.get('outcomes') and m.get('winning_side') in ('A', 'B')]
+    # Skip what cannot return a book before spending a request on it — see
+    # `worth_pricing`. Reported rather than silent: a large skip count is the
+    # signal that discovery has run well past book coverage, which is fine,
+    # but it should be visible rather than inferred from a low hit rate.
+    markets = [m for m in settled if worth_pricing(m)]
+    if len(settled) != len(markets):
+        print(f'  skipping {len(settled) - len(markets):,} markets with no '
+              f'retrievable book (pre-2025-12-31, or the endpoint era)',
+              flush=True)
     done = set()
     if os.path.exists(PRICES_OUT):
         with open(PRICES_OUT) as handle:

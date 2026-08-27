@@ -26,11 +26,14 @@ Established by probing, so it is not rediscovered:
     window is 1,600 to 27,000 snapshots and pagination is mandatory
   * the endpoint reports `zero_credit_endpoint`: free, limited only to 1 req/s on
     an ORG-wide bucket, so nothing else may hit the API concurrently
-  * coverage for KXBTC15M begins ~2026-06-19, not at the series open — the
-    orderbook endpoint starts months after the market metadata does
+  * coverage for KXBTC15M begins 2026-01-08 (measured — see
+    BOOK_COVERAGE_START), not at the series open: Kalshi's own markets go back
+    to 2025-12-10, so the orderbook endpoint starts about a month after the
+    market metadata does. This note used to say ~2026-06-19, which was wrong
+    by five months and capped the book at ~70 days of a retrievable ~230.
 
 Work order is shuffled (seeded) so an interrupted run is a representative sample
-of the 70 days rather than the oldest slice — iterating chronologically made a
+of the covered span rather than the oldest slice — iterating chronologically made a
 75% hit rate look like 25%, because the early windows are the uncovered ones.
 """
 
@@ -57,7 +60,27 @@ OFFSETS = tuple(int(x) for x in
 WINDOW_TARGET = int(os.getenv('BOOK_WINDOWS', '25000'))
 REQUEST_BUDGET = int(os.getenv('BOOK_BUDGET', '60000'))
 TAIL_SECONDS = 90
-BOOK_COVERAGE_START = os.getenv('BOOK_COVERAGE_START', '2026-06-19')
+# Measured, not assumed: binary search over constructed tickers, counting
+# snapshots that carry at least one resting LEVEL rather than snapshots that
+# merely exist (older windows return degenerate placeholders whose ladders are
+# both empty, which is what makes a naive count read as coverage).
+#
+#     2026-01-06  none        2026-01-07  none
+#     2026-01-08  BOOK        2026-01-10  BOOK
+#
+# Verified by dumping the window directly: KXBTC15M-26JAN081415-15 returns
+# 2,000 snapshots, all 2,000 carrying levels, quoting 44/46 with real sizes.
+#
+# This default was '2026-06-19' and that is wrong by five months. It was also
+# "verified" once and wrongly confirmed, because the check omitted the
+# start_time/end_time pair the endpoint requires — without them even a window
+# that certainly has a book returns nothing, so every probe looked empty and
+# the wrong boundary looked correct. Any future check of this constant must
+# assert a known-good recent window returns a book BEFORE trusting a negative.
+#
+# The cost of the old value was the project's binding constraint: it capped the
+# Kalshi book at ~70 days when ~230 are actually retrievable.
+BOOK_COVERAGE_START = os.getenv('BOOK_COVERAGE_START', '2026-01-08')
 MAX_PAGES = 30
 
 FIELDS = ('ts', 'best_bid', 'best_ask', 'bid_at_touch', 'ask_at_touch',

@@ -55,6 +55,85 @@ says nothing about sequence numbers or how to detect a dropped message. This is
 the single largest unknown in the design and is resolved by measurement, not by
 assumption — see Phase 0.
 
+## Phase 0 findings (measured 2026-08-27, live container, 45s + 200s captures)
+
+Four things the documentation did not say, three of which change the design.
+
+### 1. The rate is ~150x the estimate this spec was written around
+
+**777 frames/second across three markets** — BTC 492/s, ETH 190/s, SOL 95/s —
+measured mid-window (03:09-03:10 UTC on the 03:00-03:15 window). The spec's
+retention arithmetic assumed ~5 msg/s/market and concluded ~200 MB/day was
+affordable. The real figure is ~67M frames/day.
+
+**So "store every frame verbatim, forever" is not affordable** and the retention
+policy becomes a real decision rather than a knob with a comfortable default.
+See "Retention, revised" below.
+
+### 2. `seq` is global per SUBSCRIPTION, not per market
+
+This is the one that would have shipped as a silent, total failure.
+
+Globally the sequence is perfectly contiguous — 1 to 34,956, every step +1,
+across all three markets on one `sid`. Per market it reads `1, 9, 10, ...`.
+
+A per-market gap check — which is what "snapshot then incremental updates"
+naturally suggests and what this design originally specified — would therefore
+flag **every single delta** as a gap, mark every book permanently suspect, and
+either resubscribe in a loop or serve a book it believed was corrupt.
+
+**Gap detection is per-connection.** One missed `seq` means every book on that
+subscription is suspect, so the repair is to resubscribe all of them and take
+fresh snapshots — not to repair one market.
+
+### 3. The field names are not the ones the documentation implies
+
+```
+orderbook_snapshot  msg: market_ticker, market_id, yes_dollars_fp, no_dollars_fp
+orderbook_delta     msg: market_ticker, market_id, price_dollars, delta_fp,
+                         side, ts, ts_ms
+both                top-level: type, sid, seq, msg
+```
+
+Prices and sizes are **fixed-point strings** (`"0.5400"`, `"-5.00"`), matching
+the `_fp`/`_dollars` convention `KalshiClient` already handles for REST. `delta_fp`
+is a **signed change**, not a resulting size — confirming that `BookEvent` needs
+its `absolute` flag rather than a conversion at the adapter.
+
+Non-book frames on the same socket: `{"type": "subscribed", "id": 1, "msg":
+{"channel": ..., "sid": 1}}`, which carries no `seq`. The parser must ignore it
+rather than raise.
+
+### 4. The ticker format has gained a suffix
+
+Live now: `KXBTC15M-26AUG262315-15`, event `KXBTC15M-26AUG262315`. `CLAUDE.md`
+documents `KXBTC15M-26AUG230030` with no suffix and cites the absence of a
+strike suffix as the tell for an up/down market. `strike_type` is still
+`greater_or_equal` and `open_time`/`close_time` are still a 15-minute window, so
+these are the right markets — but the documented tell is now wrong, which is one
+more reason resolution must keep asking the venue rather than matching a shape.
+
+### Retention, revised
+
+The raw stream cannot be kept indefinitely, so the archive has two tiers with
+different lifetimes:
+
+* **`venue_book_events` — bounded retention, default 14 days.** The complete
+  stream, for research that needs intra-second book dynamics.
+* **`venue_ladder` — kept forever, sampled from the cache.** This is the tier
+  features are built on, and it is what the live path will read.
+
+**The "store it verbatim" argument survives in a different form.** It was made
+to stop a projection chosen for one question foreclosing the rest. A Kalshi
+delta is a flat, fully-typed record — ticker, price, signed delta, side, ts_ms,
+seq — with no nested structure. Storing those as typed columns is therefore not
+a projection; it *is* the message, minus a redundant `market_id`. It also
+compresses roughly an order of magnitude better than the same content as JSON
+text, which is what makes even 14 days affordable. The one-applier invariant is
+untouched: replay still folds the same fields through the same function the live
+cache uses.
+
+
 ## Architecture
 
 ```

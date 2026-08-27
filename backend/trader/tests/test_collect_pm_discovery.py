@@ -21,6 +21,7 @@ defaults to keeping every `*-updown-15m-*` slug regardless of asset;
 
 from __future__ import annotations
 
+import datetime as dt
 import asyncio
 import json
 
@@ -98,6 +99,31 @@ def test_discovery_no_longer_silently_drops_the_old_era():
 def test_the_old_era_still_honours_an_asset_filter():
     assert pm.is_short('eth-up-or-down-15m-1', 'eth-')
     assert not pm.is_short('eth-up-or-down-15m-1', 'btc-')
+
+
+def test_a_market_before_book_coverage_is_not_worth_a_request():
+    """Pricing costs one request per market and returns nothing for a window
+    with no book. Measured: Polymarket markets exist from 2025-10-10 carrying
+    real volume ($42k on the first day) but the orderbook endpoint returns zero
+    snapshots for them — the first retrievable book is 2025-12-31. Pricing
+    every discovered market would spend ~8,000 requests, about two hours of a
+    1 req/s bucket, to rediscover that."""
+    before = int(dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc).timestamp())
+    after = int(dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp())
+    assert not pm.worth_pricing({'market_slug': f'btc-updown-15m-{before}'})
+    assert pm.worth_pricing({'market_slug': f'btc-updown-15m-{after}'})
+
+
+def test_the_old_endpoint_era_is_never_worth_pricing():
+    """A different instrument, and one with no retrievable book either."""
+    after = int(dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp())
+    assert not pm.worth_pricing({'market_slug': f'btc-up-or-down-15m-{after}'})
+
+
+def test_a_malformed_slug_is_skipped_rather_than_crashing_the_run():
+    assert not pm.worth_pricing({'market_slug': 'btc-updown-15m-notanumber'})
+    assert not pm.worth_pricing({'market_slug': ''})
+    assert not pm.worth_pricing({})
 
 
 def test_discover_records_which_era_each_market_belongs_to(tmp_path, monkeypatch):
