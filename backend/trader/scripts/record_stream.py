@@ -127,35 +127,56 @@ async def run(args, gate=None, cache=None) -> int:
     pem = (os.getenv('KALSHI_PRIVATE_KEY')
            or open(os.environ['KALSHI_PRIVATE_KEY_PATH']).read())
 
-    async with KalshiClient(key_id=os.environ['KALSHI_KEY_ID'],
-                            private_key_pem=pem) as client:
-        try:
+    # **The socket is kept unless something actually requires a new one.**
+    # Resubscribing is how both failure modes are repaired, but it is not free:
+    # rebuilding on every refresh would open ~80 connections an hour and pull a
+    # fresh snapshot of every market each time, which is the kind of traffic
+    # that gets an API key throttled. So the deadline only prompts a CHECK, and
+    # the connection is rebuilt when the market set changed or the stream told
+    # us it was broken.
+    REBUILD = ('socket closed', 'sequence gap')
+    stream = None
+    subscribed: set[str] = set()
+
+    async def teardown():
+        nonlocal stream, subscribed
+        if stream is not None:
+            await stream.close()
+        stream, subscribed = None, set()
+
+    try:
+        async with KalshiClient(key_id=os.environ['KALSHI_KEY_ID'],
+                                private_key_pem=pem) as client:
             while True:
                 symbols = await open_tickers(client)
-                retire(cache, set(symbols))
                 if not symbols:
                     logger.warning('no open markets; retrying')
+                    await teardown()
                     await asyncio.sleep(args.refresh_seconds)
                     continue
-                stream = KalshiStream(client)
-                await stream.connect()
-                # The venue restarts `seq` at 1 for a new subscription. Without
-                # this the first frame reads as an enormous backwards jump.
-                cache.reset_sequence(VENUE)
-                await stream.subscribe(list(symbols))
-                logger.info('streaming %d markets: %s', len(symbols),
-                            ', '.join(sorted(symbols)))
-                try:
-                    reason = await consume(
-                        stream, cache, spool, symbols, gate=gate,
-                        until=time.monotonic() + args.refresh_seconds,
-                        idle_timeout=args.idle_timeout)
-                finally:
-                    await stream.close()
-                    spool.flush()
-                logger.info('resubscribing (%s)', reason)
-        finally:
-            spool.close()
+                if stream is None or set(symbols) != subscribed:
+                    await teardown()
+                    retire(cache, set(symbols))
+                    stream = KalshiStream(client)
+                    await stream.connect()
+                    # The venue restarts `seq` at 1 for a new subscription.
+                    # Without this the first frame reads as a huge jump back.
+                    cache.reset_sequence(VENUE)
+                    await stream.subscribe(list(symbols))
+                    subscribed = set(symbols)
+                    logger.info('streaming %d markets: %s', len(symbols),
+                                ', '.join(sorted(symbols)))
+                reason = await consume(
+                    stream, cache, spool, symbols, gate=gate,
+                    until=time.monotonic() + args.refresh_seconds,
+                    idle_timeout=args.idle_timeout)
+                await asyncio.to_thread(spool.flush)
+                if reason in REBUILD or reason.startswith('silent'):
+                    logger.info('rebuilding the subscription (%s)', reason)
+                    await teardown()
+    finally:
+        await teardown()
+        spool.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

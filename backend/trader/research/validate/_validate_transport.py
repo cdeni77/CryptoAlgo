@@ -52,8 +52,14 @@ def compare(store: ResearchStore | None = None) -> pd.DataFrame:
     for side in ('yes', 'no'):
         both[f'top_{side}_rest'] = both[f'{side}_levels_rest'].map(_top)
         both[f'top_{side}_ws'] = both[f'{side}_levels_ws'].map(_top)
+        # NaN means "this side of the book was empty", and both empty is
+        # AGREEMENT. `nan == nan` is False, so comparing directly scored every
+        # empty-vs-empty minute as a disagreement and reported 33% agreement on
+        # a side where the two transports never actually differed.
+        rest_top, ws_top = both[f'top_{side}_rest'], both[f'top_{side}_ws']
         both[f'top_{side}_same'] = (
-            both[f'top_{side}_ws'] == both[f'top_{side}_rest'])
+            (rest_top == ws_top) | (rest_top.isna() & ws_top.isna()))
+        both[f'{side}_both_empty'] = rest_top.isna() & ws_top.isna()
         both[f'drift_{side}'] = [
             len(_prices(a) ^ _prices(b))
             for a, b in zip(both[f'{side}_levels_rest'], both[f'{side}_levels_ws'])]
@@ -71,8 +77,10 @@ def main() -> int:
     print(f'paired minutes: {n}')
     for side in ('yes', 'no'):
         agree = both[f'top_{side}_same'].mean()
+        empty = both[f'{side}_both_empty'].sum()
         print(f'  best {side.upper()} bid identical: {agree:>7.2%}   '
-              f'median ladder drift: {both[f"drift_{side}"].median():.0f} prices')
+              f'median ladder drift: {both[f"drift_{side}"].median():.0f} prices'
+              f'   (both empty on {empty})')
     print(f'  median size ratio ws/rest: {both["size_ratio"].median():.4f}')
     print(f'  median book age at sample: {both["book_age_ms_ws"].median():.0f} ms')
 
