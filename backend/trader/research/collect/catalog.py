@@ -37,6 +37,12 @@ COLLECT_FROM = dt.datetime(2026, 1, 8, tzinfo=dt.timezone.utc)
 class Predexon:
     def __init__(self, key: str, limiter: Optional[RateLimiter] = None):
         self.limiter = limiter or RateLimiter(1.0)
+        # Counted, because a walk running at 5s a page when every endpoint
+        # answers in 0.04s is entirely retry backoff — and with no counter
+        # there is no way to tell that from a slow API.
+        self.calls = 0
+        self.throttled = 0
+        self.failed = 0
         self.session = requests.Session()
         self.session.headers.update({
             'x-api-key': key, 'Accept': 'application/json',
@@ -47,16 +53,20 @@ class Predexon:
         with an empty answer."""
         for attempt in range(tries):
             self.limiter.wait()
+            self.calls += 1
             try:
                 r = self.session.get(f'{BASE}{path}', params=params, timeout=45)
                 if r.status_code == 429 or r.status_code >= 500:
+                    self.throttled += 1
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 if r.status_code >= 400:
                     return None, True
                 return r.json(), True
             except Exception:                                 # noqa: BLE001
+                self.throttled += 1
                 time.sleep(1.5 * (attempt + 1))
+        self.failed += 1
         return None, False
 
 
@@ -129,9 +139,22 @@ def pm_catalog(api: Predexon, out_path: str, *, max_pages: int = 6000,
     rather than a 60-second TWAP of it — a different random variable, so
     pooling the two would train on two instruments at once.
     """
+    # Resumable: a killed walk must not cost the whole thing again. The
+    # pagination cursor is parked beside the catalog and the file is appended,
+    # so a restart continues mid-stream instead of re-walking from today.
+    state_path = out_path + '.cursor'
     written, pages, cursor = 0, 0, None
+    mode = 'w'
+    if os.path.exists(state_path) and os.path.exists(out_path):
+        try:
+            with open(state_path) as sh:
+                saved = json.load(sh)
+            cursor, pages, mode = saved.get('cursor'), saved.get('pages', 0), 'a'
+            log(f'  resuming from page {pages:,}')
+        except (OSError, ValueError):
+            cursor, pages, mode = None, 0, 'w'
     floor = COLLECT_FROM.timestamp()
-    with open(out_path, 'w') as handle:
+    with open(out_path, mode) as handle:
         while pages < max_pages:
             # 100 is the endpoint's ceiling, measured: 100 returns 100, while
             # 200 and 500 both return zero rather than erroring. At 50 this
@@ -144,6 +167,8 @@ def pm_catalog(api: Predexon, out_path: str, *, max_pages: int = 6000,
             payload, ok = api.get('/polymarket/markets', params)
             if not ok:
                 log('  request failed, stopping discovery')
+                with open(state_path, 'w') as sh:
+                    json.dump({'cursor': cursor, 'pages': pages}, sh)
                 break
             markets = (payload or {}).get('markets') or (payload or {}).get('data') or []
             if not markets:
@@ -192,8 +217,14 @@ def pm_catalog(api: Predexon, out_path: str, *, max_pages: int = 6000,
             cursor = ((payload or {}).get('pagination') or {}).get('pagination_key')
             if not cursor:
                 break
+            with open(state_path, 'w') as sh:
+                json.dump({'cursor': cursor, 'pages': pages}, sh)
             if pages % 100 == 0:
-                log(f'  page {pages}, {written:,} in-range markets')
+                log(f'  page {pages}, {written:,} in-range markets, '
+                    f'{api.throttled:,} throttled of {api.calls:,} calls')
+    # A clean finish leaves no cursor, so the next run starts fresh.
+    if os.path.exists(state_path):
+        os.remove(state_path)
     return written
 
 
