@@ -62,6 +62,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional, Sequence
 
@@ -1189,6 +1190,23 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # during the cycle can only cost a fill, never an overpay, because the order
     # is `fill_or_kill` at a limit derived from this price. Not filling is the
     # direction to be wrong in.
+    # **Where the cycle spends its time between reading the book and sending the
+    # order**, because that interval is what decides whether a fill happens.
+    # Measured from the recorded tickets before this existed: median 4.97s, max
+    # 5.56s from book-read to order-sent — against a book that moves ~1-1.5c in
+    # that time and order allowances of 0.49c to 3c. Kills occurred even at the
+    # full 3c cap, so this is a latency problem before it is a limit-width one.
+    # `_record_touch` was the obvious suspect and is worth only ~300ms of it;
+    # this says which of the rest actually costs.
+    phase: dict[str, float] = {}
+    _mark = time.perf_counter()
+
+    def _phase(name: str) -> None:
+        nonlocal _mark
+        now_ = time.perf_counter()
+        phase[name] = now_ - _mark
+        _mark = now_
+
     quotes: dict = {}
     quote_time = pd.Timestamp.now(tz='UTC')
     if offset is not None and kalshi is not None:
@@ -1198,8 +1216,10 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         except Exception as exc:              # noqa: BLE001 - the cycle still settles
             logger.error('could not read the book (%s); no decision this cycle', exc)
             quotes, offset = {}, None
+    _phase('quotes')
 
     bars = await fetch_bars(config)
+    _phase('bars')
     if not bars:
         logger.error('no bars, nothing to do this cycle')
         return []
@@ -1242,6 +1262,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         try:
             venue = await reconcile_with_venue(writer, kalshi, exchange_index=shard)
             venue_settlements, venue_balance = venue.settlements, venue.balance
+            _phase('reconcile')
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
                          'bookkeeping for this cycle', exc)
@@ -1307,6 +1328,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # what the audit found. Behaviour is unchanged for the default source: the
     # only thing between the two positions was `settle_time`.
     scored = prepare_init_score(scored, model)
+    _phase('score')
     scored['model_probability'] = model.predict(scored)
 
     # **Record the top of book we already have.** `Quote` parses `yes_bid_size`
@@ -1325,6 +1347,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # `exchange_index` moving to 2 while the order body defaulted to 0.
     if os.getenv('RECORD_TOUCH', '1') == '1':
         await _record_touch(scored, quotes, window_open, offset, config, kalshi)
+        _phase('touch')
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is
@@ -1364,6 +1387,16 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             columns=['baseline_probability', 'baseline_probability_logit'],
             errors='ignore'), model.scoring.baseline)
         scored['model_probability'] = model.predict(scored)
+
+    # Everything above happened AFTER the book was read and BEFORE any order can
+    # go out, so it is all quote staleness paid at the touch. Logged whether or
+    # not this cycle trades, because a cycle that abstains still measures the
+    # latency the next one will pay.
+    if phase and offset is not None:
+        since_quote = sum(v for k, v in phase.items() if k != 'quotes')
+        logger.info('cycle latency: %s | %.2fs between the book and the order',
+                    ' '.join(f'{k} {v:.2f}s' for k, v in phase.items()),
+                    since_quote)
 
     # Depth at the touch caps the stake. Measured, unlike
     # `Config.max_stake_dollars`, which is a standing guess — so when the book
