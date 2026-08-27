@@ -40,6 +40,7 @@ import os
 import sys
 import time
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -83,6 +84,8 @@ LADDER_STRIDE = int(os.getenv('IV_LADDER_STRIDE', '1'))
 # being paid for. Spot comes from the Coinbase bars we already hold, so the
 # selection costs no requests.
 NEAR_STRIKES = int(os.getenv('IV_NEAR_STRIKES', '24'))
+# Latency, not rate, was the binding constraint: see fetch_rungs.
+WORKERS = int(os.getenv('IV_WORKERS', '12'))
 # `limit=100` is the markets endpoint's ceiling — 200 comes back empty, the
 # same behaviour the Polymarket markets endpoint has.
 MARKETS_PAGE = 100
@@ -267,6 +270,44 @@ def book_of(api: Predexon, ticker: str, lo_ms: int, hi_ms: int):
     return out, True
 
 
+def fetch_rungs(api: Predexon, strikes, lo_ms: int, hi_ms: int, *,
+                workers: int = 1) -> dict:
+    """One ladder's strikes to packed tick series, fetched concurrently.
+
+    **Why concurrency and not a higher rate.** The first live run measured
+    1,050 requests in ~6 minutes — 2.8 req/s against a budget of 8. Each
+    strike's book was fetched, awaited, and only then the next one asked for,
+    so the run was bound by round-trip latency and the rate limiter never
+    became the constraint. Raising the nominal rate does nothing to a job
+    that is waiting on the network; issuing the requests in parallel behind
+    the SAME shared limiter does. That is the identical finding as the window
+    collector, which went from 26h to 13.3h on the same change, and at 14,868
+    ladders the serial version is a 59-hour job.
+
+    Ordering must not reach the data: a strike with no book is omitted, never
+    stored blank, so the result is the same dict at any worker count.
+    """
+    out: dict = {}
+    if workers <= 1:
+        for strike, ticker in strikes:
+            snaps, _ = book_of(api, ticker, lo_ms, hi_ms)
+            if snaps:
+                out[strike] = pack_series(snaps)
+        return out
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(book_of, api, ticker, lo_ms, hi_ms): strike
+                   for strike, ticker in strikes}
+        for fut in as_completed(futures):
+            strike = futures[fut]
+            try:
+                snaps, _ = fut.result()
+            except Exception:                                 # noqa: BLE001
+                continue
+            if snaps:
+                out[strike] = pack_series(snaps)
+    return out
+
+
 def run(api: Predexon, *, only_series=None, max_ladders: int = 0) -> int:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     done = set()
@@ -295,13 +336,10 @@ def run(api: Predexon, *, only_series=None, max_ladders: int = 0) -> int:
                 # Only the run-up to the close, for the horizon reason above.
                 window_from = max(opened, closes - dt.timedelta(minutes=TAIL_MINUTES))
                 spot = spot_at(bars, symbol, closes)
-                rungs_by_strike = {}
-                for strike, ticker in near_the_money(strikes_of(api, ev), spot):
-                    snaps, ok = book_of(api, ticker,
-                                        int(window_from.timestamp() * 1000),
-                                        int(closes.timestamp() * 1000))
-                    if snaps:
-                        rungs_by_strike[strike] = pack_series(snaps)
+                rungs_by_strike = fetch_rungs(
+                    api, near_the_money(strikes_of(api, ev), spot),
+                    int(window_from.timestamp() * 1000),
+                    int(closes.timestamp() * 1000), workers=WORKERS)
                 fits = 0
                 for at in sample_instants(window_from, closes):
                     rungs = cross_section(rungs_by_strike, int(at.timestamp() * 1000))

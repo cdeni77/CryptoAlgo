@@ -108,3 +108,62 @@ def test_the_inversion_itself_is_reused_not_reimplemented():
     from research.collect import implied_vol_backfill as m
     from scripts.record_implied_vol import implied_sigma
     assert m.implied_sigma is implied_sigma
+
+
+# --- fetching a ladder's cross-section concurrently -------------------------
+#
+# The first live run measured 1,050 requests in ~6 minutes: 2.8 req/s against
+# a budget of 8. A ladder's ~25 strike books were fetched one at a time, so
+# the run was bound by round-trip latency and not by the rate limit — the
+# identical finding as the window collector, which went from 26h to 13.3h on
+# the same fix. At 14,868 ladders the serial version is a 59-hour job.
+#
+# Concurrency must not change WHAT is collected, only how fast. These two
+# tests pin the part that could silently drift: a dict keyed by strike, with
+# a strike omitted rather than guessed when its book comes back empty.
+
+class _FakeApi:
+    """Answers a book for every strike but one, and records concurrency."""
+
+    def __init__(self, empty_for=()):
+        self.empty_for = set(empty_for)
+        self.asked = []
+        self._lock = __import__('threading').Lock()
+
+    def get(self, path, params, **kw):
+        with self._lock:
+            self.asked.append(params.get('ticker'))
+        if params.get('ticker') in self.empty_for:
+            return {'snapshots': []}, True
+        return {'snapshots': [_snap(1_000, 30, 31)]}, True
+
+
+def _strikes():
+    return [(70000.0, 'T70000'), (71000.0, 'T71000'), (72000.0, 'T72000')]
+
+
+def test_fetching_a_cross_section_concurrently_matches_the_serial_result():
+    """Ordering must not leak into the data. One worker and eight workers
+    describe the same book, or the speed-up changed the measurement."""
+    from research.collect.implied_vol_backfill import fetch_rungs
+    one = fetch_rungs(_FakeApi(), _strikes(), 0, 1, workers=1)
+    many = fetch_rungs(_FakeApi(), _strikes(), 0, 1, workers=8)
+    assert set(one) == set(many) == {70000.0, 71000.0, 72000.0}
+    assert one == many
+
+
+def test_a_strike_whose_book_is_empty_is_omitted_not_stored_blank():
+    """`empty` and `error` are never conflated anywhere else in this
+    collection, and a strike with no book is not a strike priced at zero."""
+    from research.collect.implied_vol_backfill import fetch_rungs
+    got = fetch_rungs(_FakeApi(empty_for={'T71000'}), _strikes(), 0, 1, workers=4)
+    assert set(got) == {70000.0, 72000.0}
+
+
+def test_every_strike_is_asked_for_exactly_once():
+    """A retry loop inside a thread pool is the easy way to double-spend the
+    rate budget without noticing."""
+    from research.collect.implied_vol_backfill import fetch_rungs
+    api = _FakeApi()
+    fetch_rungs(api, _strikes(), 0, 1, workers=4)
+    assert sorted(api.asked) == ['T70000', 'T71000', 'T72000']
