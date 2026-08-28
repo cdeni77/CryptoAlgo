@@ -89,6 +89,14 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     economics.add_argument('--bankroll', type=float, default=None,
                            help=f'Starting account (default ${DEFAULT_CONFIG.starting_bankroll:.0f})')
     economics.add_argument('--kelly-fraction', type=float, default=None)
+    model.add_argument('--init-score-source', choices=('baseline', 'market'),
+                       default=None,
+                       help="Which forecaster the correction is fitted on top "
+                            "of. 'market' inverts the null in the right "
+                            "direction: an untrained model reproduces the PRICE, "
+                            "so model_minus_market >= 0 unless the trees hurt. "
+                            "Needs a quote on every row — pair with "
+                            "--complete-cases.")
     economics.add_argument('--min-edge-pp', type=float, default=None,
                            help='Surplus over break-even demanded before trading, in '
                                 'probability points. Abstention is the default action.')
@@ -131,6 +139,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('recency_half_life_days', 'recency_half_life_days'),
         ('train_window_days', 'train_window_days'),
         ('starting_bankroll', 'bankroll'), ('kelly_fraction', 'kelly_fraction'),
+        ('init_score_source', 'init_score_source'),
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
         ('assume_maker', 'assume_maker'),
     ):

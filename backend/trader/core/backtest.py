@@ -100,6 +100,33 @@ def run_book(
     return book, decisions
 
 
+def skill_null_column(table: pd.DataFrame, init_score_source: str) -> np.ndarray:
+    """The forecaster `log_loss_skill` should be measured against.
+
+    Skill means "better than the thing this model was fitted to correct". A
+    market-initialised model is not trying to beat `F(x/sigma)`; it is fitted on
+    the price, so scoring it against the baseline reports a failure that is a
+    category error. Measured on a real run: `model_minus_market` +0.00078 (it
+    does beat the price) alongside `log_loss_skill` -0.00016 and 3/6 folds — two
+    of four failing gates asking the wrong question, which is worse than an
+    honest failure because it hides whichever failures are real.
+
+    Falls back to the baseline when the market column is absent or entirely
+    NaN. That is the honest fallback, but it is a FALLBACK: a silent swap is how
+    a market-init model comes to be judged as a baseline-init one.
+    """
+    if init_score_source == 'market' and 'market_probability' in table.columns:
+        values = pd.to_numeric(table['market_probability'], errors='coerce')
+        if values.notna().any():
+            return values.to_numpy(dtype=float)
+        logger.warning('init_score_source=market but every market_probability '
+                       'is NaN; skill falls back to the baseline null')
+    elif init_score_source == 'market':
+        logger.warning('init_score_source=market but no market_probability '
+                       'column; skill falls back to the baseline null')
+    return table['baseline_probability'].to_numpy(dtype=float)
+
+
 def settlement_outcomes(scored: pd.DataFrame) -> dict:
     """How each window settled, preferring the VENUE'S own result.
 
@@ -190,7 +217,8 @@ def walk_forward(
         evaluations.append(evaluate_fold(
             fold.index, test_table,
             test_table['model_probability'].to_numpy(),
-            test_table['baseline_probability'].to_numpy(),
+            # The null the model was FITTED on, not always the baseline.
+            skill_null_column(test_table, config.init_score_source),
             residual_scale=model.residual_scale,
             control_gain_share=model.control_importance_share,
             stats=stats,

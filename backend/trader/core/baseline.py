@@ -465,4 +465,12 @@ def attach_baseline(
     if 'market_prob' in out.columns:
         out['market_minus_baseline'] = (
             pd.to_numeric(out['market_prob'], errors='coerce') - out[column])
+    # And the market's own logit, for a market-initialised model. Attached here
+    # because this is where the scored table gains its init_score columns, and
+    # `core.model` raises rather than falling back if it is missing — a
+    # market-init model that silently used the baseline would be a baseline-init
+    # model wearing the other one's provenance.
+    if 'market_probability' in out.columns:
+        from core.model import attach_market_logit
+        out = attach_market_logit(out)
     return out
