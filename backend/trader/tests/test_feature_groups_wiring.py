@@ -19,11 +19,13 @@ def test_the_three_new_families_are_selectable():
         assert feature_columns([group]), f'{group} has no columns'
 
 
-def test_the_clock_control_is_still_the_only_control():
+def test_the_calendar_control_is_still_the_only_control():
     """A survey that quietly loses its control is how the previous project came
-    to rank `seasonality,cost` first and not notice."""
-    assert CONTROL_GROUPS == ('clock',)
-    assert 'clock' in ALL_GROUPS
+    to rank `seasonality,cost` first and not notice. `clock` split into `offset`
+    (the decision position, genuinely informative) and `time_of_day` (the
+    calendar, which cannot forecast direction) — only the latter is the control."""
+    assert CONTROL_GROUPS == ('time_of_day',)
+    assert 'time_of_day' in ALL_GROUPS
 
 
 def test_no_column_is_declared_in_two_groups():
@@ -72,9 +74,10 @@ def test_book_groups_are_selectable_but_not_in_the_default_matrix():
         assert not (set(feature_columns([group])) & default), group
 
 
-def test_the_five_original_groups_are_still_the_default():
+def test_the_bar_only_groups_are_still_the_default():
+    """Six now, not five: `clock` split into `offset` and `time_of_day`."""
     assert set(ALL_GROUPS) == {'vol_state', 'microstructure', 'cross_asset',
-                               'geometry', 'clock'}
+                               'geometry', 'offset', 'time_of_day'}
 
 
 def test_market_minus_baseline_is_populated_after_the_baseline_attaches():

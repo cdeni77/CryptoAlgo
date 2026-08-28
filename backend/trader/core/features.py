@@ -91,9 +91,24 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
         'excursion_span_z', 'excursion_asymmetry', 'path_efficiency',
         'displacement_vs_elapsed', 'touched_opposite',
     ),
-    'clock': (
-        'elapsed_fraction', 'remaining_minutes', 'quarter_of_hour',
-        'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'us_equity_hours',
+    # `clock` was two different things under one name, and measuring them
+    # together made the control look like it carried the model.
+    #
+    # These ARE the decision offset, and they are legitimately informative:
+    # they are why one pooled model can behave like four offset-specific ones,
+    # and why dropping `clock` wholesale used to cost the most in ablation
+    # despite clock-alone contributing exactly nothing.
+    'offset': (
+        'elapsed_fraction', 'remaining_minutes',
+    ),
+    # **The control.** Calendar position cannot forecast direction. Named so a
+    # survey cannot quietly omit it — the previous incarnation of this project
+    # ran a 27-cell grid whose best cell was its own control, and that was the
+    # most useful result it produced. `quarter_of_hour` is which quarter of the
+    # HOUR a window sits in, so it is calendar, not offset.
+    'time_of_day': (
+        'quarter_of_hour', 'hour_sin', 'hour_cos',
+        'dow_sin', 'dow_cos', 'us_equity_hours',
     ),
     # --- the venue's own book, from eight months of collection ---------------
     #
@@ -123,7 +138,7 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
 BOOK_GROUPS = ('market_state', 'cross_venue', 'implied_vol')
 ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in BOOK_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
-CONTROL_GROUPS = ('clock',)
+CONTROL_GROUPS = ('time_of_day',)
 
 
 def feature_columns(groups: Optional[Sequence[str]] = None) -> list[str]:

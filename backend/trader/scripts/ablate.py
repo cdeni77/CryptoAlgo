@@ -39,13 +39,18 @@ import pandas as pd
 from core.baseline import log_loss
 from core.cv import assert_no_leakage, purged_walk_forward
 from core.dataset import apply_fold, fit_fold
-from core.features import FEATURE_GROUPS
+from core.features import CONTROL_GROUPS, FEATURE_GROUPS
 from core.model import fit_model
 from scripts._common import (
     add_data_arguments, config_from_args, load_dataset, print_header, setup_logging,
 )
 
-CONTROL = 'clock'
+# Derived, never spelled out. A hardcoded second copy of the control's name is
+# a definition that agrees with `core.features` until one of them changes — and
+# the failure mode is a survey that quietly runs without a control, which is how
+# the previous incarnation of this project came to rank its own control first
+# and not notice.
+CONTROL = CONTROL_GROUPS[0]
 
 
 def trials(groups: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
