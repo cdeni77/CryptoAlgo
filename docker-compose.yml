@@ -188,10 +188,23 @@ services:
     # `--require-gates` is on by default and refuses to trade an artifact whose
     # promotion was blocked. There is no artifact at all until
     # `python -m scripts.promote` installs one, and the loop exits saying so.
+    # `--mode live --dry-run` reads the REAL book and places nothing.
+    #
+    # It is not optional for the promoted artifact: that model was fitted with
+    # `init_score_source=market`, so its correction is a residual of the PRICE.
+    # Paper mode opens no venue client, `fetch_quotes` returns {}, and every
+    # window would score NaN — `config_for_artifact` refuses that combination at
+    # startup rather than letting it read as a model that abstains.
+    #
+    # Add `--place-orders` to trade for real. It stays a separate flag from
+    # `--mode live` deliberately: one flag guarding an irreversible action is one
+    # typo away from being wrong.
     command: >
       -m scripts.live
         --loop
         --cycle-seconds 60
+        --mode live
+        --dry-run
 
   # ===========================================================================
   # Scrape — one-off, runs to completion then exits

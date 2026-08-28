@@ -63,6 +63,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional, Sequence
 
@@ -636,6 +637,33 @@ def _strike_for(writer: PgWriter, position) -> Optional[float]:
                .order_by(Prediction.offset_minutes)
                .first())
         return float(row.strike) if row is not None else None
+
+
+def config_for_artifact(config, model, *, mode: str):
+    """Adopt the artifact's init-score source, refusing the one mode that cannot
+    supply it.
+
+    The artifact records which forecaster its correction was fitted on top of.
+    Live has no legitimate choice here — scoring a market-fitted residual on the
+    baseline logit is exactly the silent failure `ForecastModel.verify` exists to
+    catch — so the artifact wins and the mismatch becomes impossible rather than
+    merely detected.
+
+    The refusal is the other half. A market-init model needs the book to score:
+    `fetch_quotes` returns {} when no Kalshi client was opened, which is every
+    paper run. Adopting silently would swap a loud crash for a NaN prediction
+    every cycle, which reads as a model that has decided to abstain.
+    """
+    source = getattr(model, 'init_score_source', 'baseline')
+    if source == getattr(config, 'init_score_source', 'baseline'):
+        return config
+    if source == 'market' and mode != 'live':
+        raise SystemExit(
+            f'this artifact was fitted on the market logit, and {mode} mode '
+            f'opens no venue client, so there is no book to read a price from. '
+            f'Every window would score NaN and look like an abstention. Run it '
+            f'with --mode live (add --dry-run to place nothing).')
+    return replace(config, init_score_source=source)
 
 
 async def fetch_quotes(
@@ -2255,9 +2283,18 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
 
     config = config_from_args(args)
 
-    model = (load_live(config=config) if args.model is None
+    # Load WITHOUT the config first. `verify(None)` still checks the things that
+    # are true of the artifact alone — that the booster's columns match the
+    # recorded feature list, and that the init source is one this can score —
+    # but cannot compare against a configuration that does not yet know which
+    # forecaster the artifact corrects. `config_for_artifact` settles that, and
+    # the full check runs below against the config live will actually use.
+    model = (load_live(config=None) if args.model is None
              else __import__('core.model', fromlist=['ForecastModel'])
-             .ForecastModel.load(args.model, config))
+             .ForecastModel.load(args.model, None))
+    if model is not None:
+        config = config_for_artifact(config, model, mode=args.mode)
+        model.verify(config)
     if model is None:
         raise SystemExit(
             f'no artifact at {MODELS_ROOT / LIVE_MODEL}. Run '

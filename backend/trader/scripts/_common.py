@@ -89,6 +89,14 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     economics.add_argument('--bankroll', type=float, default=None,
                            help=f'Starting account (default ${DEFAULT_CONFIG.starting_bankroll:.0f})')
     economics.add_argument('--kelly-fraction', type=float, default=None)
+    # The band the backfilled book can actually represent. Kalshi's tick is a
+    # TENTH of a cent below 10c and above 90c, and Predexon's snapshot of the
+    # same book is whole cents — measured, ~91% of tail quotes are off the cent
+    # grid by ~0.24c, about half the measured half-spread. Inside [0.10, 0.90]
+    # the backfill is exact. So economics from backfilled quotes are only
+    # quantisation-free in that band, and until now it could not be set.
+    economics.add_argument('--min-traded-price', type=float, default=None)
+    economics.add_argument('--max-traded-price', type=float, default=None)
     model.add_argument('--init-score-source', choices=('baseline', 'market'),
                        default=None,
                        help="Which forecaster the correction is fitted on top "
@@ -139,6 +147,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('recency_half_life_days', 'recency_half_life_days'),
         ('train_window_days', 'train_window_days'),
         ('starting_bankroll', 'bankroll'), ('kelly_fraction', 'kelly_fraction'),
+        ('min_traded_price', 'min_traded_price'),
+        ('max_traded_price', 'max_traded_price'),
         ('init_score_source', 'init_score_source'),
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
         ('assume_maker', 'assume_maker'),
