@@ -54,3 +54,40 @@ def test_no_models_at_all_raises_rather_than_returning_none():
     from scripts.promote import choose_candidate
     with pytest.raises(ValueError):
         choose_candidate([], None)
+
+
+def test_the_refit_carries_the_scoring_bundle_or_it_cannot_be_deployed():
+    """The refit was fitted WITHOUT `scoring=fit.bundle(config)`.
+
+    `core/backtest.py` passes it for every fold model, so the folds are
+    deployable and the refit — the thing actually installed — was not. Nothing
+    in `promote` checks, so the artifact installed cleanly, reported all its
+    gates, and then `scripts/live.py` refused it on every cycle:
+
+        this artifact carries no scoring bundle, so it cannot score a window
+        it has never seen
+
+    The volatility model, the seasonality factor and the baseline's scale/tail
+    all live in that bundle. Without them there is nothing to turn a raw window
+    into a feature row, so the artifact can be evaluated and never deployed.
+    """
+    import inspect
+    from scripts.promote import refit_on_all
+
+    source = inspect.getsource(refit_on_all)
+    assert 'scoring=' in source, (
+        'refit_on_all calls fit_model without a scoring bundle, so the model it '
+        'returns is not deployable')
+
+
+def test_promote_refuses_to_install_an_artifact_live_cannot_load():
+    """The bundle bug reached a restart loop because nothing between fitting and
+    installing asked whether the artifact could score. Promotion is the gate;
+    `deployable` is the cheapest possible check and it was not among them."""
+    import inspect
+    from core import promotion
+
+    source = inspect.getsource(promotion.promote)
+    assert 'deployable' in source, (
+        'promote installs without checking that the candidate can score a '
+        'window it has never seen')

@@ -104,7 +104,14 @@ def refit_on_all(dataset, config, *, groups=None):
         from core.dataset import fit_fold
         from core.model import fit_model
         fit, table = fit_fold(dataset, dataset.window_index, config, groups=groups)
-        return fit_model(table, fit.baseline, config, groups=groups)
+        # `scoring=` is not optional. It carries the volatility model, the
+        # intraday seasonality factor and the baseline's scale/tail — the three
+        # fitted things that turn a raw window into a feature row. Every fold
+        # model gets one from `core/backtest.py`; the refit did not, so the
+        # artifact this function returns is the one actually installed and was
+        # the only one in the pipeline that could not score.
+        return fit_model(table, fit.baseline, config, groups=groups,
+                         scoring=fit.bundle(config))
     except Exception as exc:                                  # noqa: BLE001
         logger.warning('refit on all data failed (%s); falling back',
                        str(exc)[:120])

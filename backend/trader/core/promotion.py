@@ -171,6 +171,17 @@ def promote(
             'average forecast does not show — is also the argument that kept a '
             'losing system alive, so it has to be stated and stored.'
         )
+    # An artifact that cannot score is not a candidate, and --force must not
+    # reach past this. Every other gate asks whether the model is GOOD; this one
+    # asks whether `scripts/live.py` can load it at all. It was missing, and a
+    # refit fitted without its scoring bundle installed cleanly, printed a full
+    # gate table, and then failed on every live cycle instead.
+    if not getattr(model, 'deployable', True):
+        raise ValueError(
+            'this candidate carries no scoring bundle, so it cannot score a '
+            'window it has never seen and the live loop will refuse it on every '
+            'cycle. Installing it would replace a working artifact with one that '
+            'cannot trade. This is not a gate --force may override.')
     root = Path(root) if root else MODELS_ROOT
     ledger = root / LEDGER
     ledger.mkdir(parents=True, exist_ok=True)
