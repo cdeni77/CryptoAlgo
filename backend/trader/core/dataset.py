@@ -105,12 +105,25 @@ class Dataset:
         config: Config = DEFAULT_CONFIG,
         *,
         reference: str = REFERENCE_SYMBOL,
+        depth: Optional[pd.DataFrame] = None,
+        ladder_fits: Optional[pd.DataFrame] = None,
     ) -> 'Dataset':
         grids = {s: minute_grid(b) for s, b in bars_by_symbol.items()}
         flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
         states = {s: minute_state(g, flat, config) for s, g in grids.items()}
         states = attach_cross_asset(states, reference, config)
         windows, reports = build_window_panel(bars_by_symbol, config)
+        # Quotes and ladder fits are OBSERVED, not fitted, so they attach here
+        # rather than per fold — unlike the volatility model, the seasonality
+        # factor and the baseline's scale/tail, all three of which must stay
+        # inside the fold. Only the RATIO `iv_minus_realised` is deferred, to
+        # `build_features`, because its denominator is the fitted sigma.
+        if depth is not None and len(depth):
+            from core.quotes import attach_quotes
+            windows = attach_quotes(windows, depth)
+        if ladder_fits is not None and len(ladder_fits):
+            from core.book_features import attach_implied_vol
+            windows = attach_implied_vol(windows, ladder_fits)
         forward = {s: forward_realised_vol(g, config.window_minutes) for s, g in grids.items()}
         return cls(config=config, grids=grids, states=states, windows=windows,
                    reports=reports, forward_vol=forward)

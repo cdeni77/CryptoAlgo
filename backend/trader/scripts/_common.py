@@ -153,7 +153,28 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
         start=pd.Timestamp(args.start, tz='UTC') if getattr(args, 'start', None) else None,
         end=pd.Timestamp(args.end, tz='UTC') if getattr(args, 'end', None) else None,
     )
-    dataset = Dataset.build(bars, config).trailing(config.train_window_days)
+    # The venue's own book and the ladder fits, where they exist. Both are
+    # OBSERVED rather than fitted, so they attach with the panel; passing them
+    # as None simply leaves the columns NaN, which is the correct state for the
+    # four and a half years that predate the venue.
+    depth = ladder_fits = None
+    try:
+        depth = store.read('venue_depth')
+    except Exception as exc:                                  # noqa: BLE001
+        logger.info('no venue_depth (%s); rows will price against the baseline',
+                    str(exc)[:60])
+    try:
+        ladder_fits = store.read('venue_implied_vol')
+    except Exception as exc:                                  # noqa: BLE001
+        logger.info('no venue_implied_vol (%s)', str(exc)[:60])
+    if depth is not None and len(depth):
+        logger.info('venue_depth: %s rows', f'{len(depth):,}')
+    if ladder_fits is not None and len(ladder_fits):
+        logger.info('venue_implied_vol: %s fits', f'{len(ladder_fits):,}')
+
+    dataset = Dataset.build(
+        bars, config, depth=depth, ladder_fits=ladder_fits
+    ).trailing(config.train_window_days)
     coverage = dataset.coverage()
     logger.info('coverage:\n%s', coverage.to_string(index=False))
     worst = coverage['boundary_drop_rate'].max() if len(coverage) else 0.0

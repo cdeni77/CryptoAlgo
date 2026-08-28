@@ -411,6 +411,18 @@ def build_features(
         _geometry_features(table, config),
     ], axis=1)
 
+    # `iv_minus_realised` is the implied-vol mechanism and the only book column
+    # that cannot be attached with the rest: it divides the market's forward
+    # sigma by the baseline's `sigma_per_min`, which is FITTED and therefore
+    # only exists here, inside the fold. Computing it earlier would divide by a
+    # sigma fitted on the whole sample — a leak that makes the baseline stronger
+    # and the model look weaker, the direction nobody audits.
+    if 'implied_sigma_per_min' in table.columns:
+        implied = pd.to_numeric(table['implied_sigma_per_min'], errors='coerce')
+        realised = pd.to_numeric(table.get('sigma_per_min'), errors='coerce')
+        ratio = implied / realised.replace(0.0, np.nan)
+        table['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
+
     wanted = feature_columns(groups)
     for column in wanted:
         if column not in table.columns:

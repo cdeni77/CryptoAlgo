@@ -65,6 +65,19 @@ def _safe_div(num, den):
     return pd.Series(num).astype(float).values / den.values
 
 
+def _column(frame: pd.DataFrame, name: str) -> np.ndarray:
+    """A numeric column, or all-NaN if it is not there yet.
+
+    `sigma_per_min` is FITTED and arrives per fold, so it is absent on a freshly
+    built panel. `DataFrame.get` returns a scalar default there, which then has
+    no `.values` — and silently coercing it would compute a ratio against
+    nothing rather than declining to.
+    """
+    if name not in frame.columns:
+        return np.full(len(frame), np.nan)
+    return pd.to_numeric(frame[name], errors='coerce').to_numpy(dtype=float)
+
+
 def _mid(frame: pd.DataFrame) -> np.ndarray:
     """The two-sided mid as a probability, or NaN.
 
@@ -170,19 +183,18 @@ def implied_vol_features(table: pd.DataFrame, fits: pd.DataFrame) -> pd.DataFram
     is the only quantity the barrier framing says needs forecasting at all.
     """
     out = pd.DataFrame(index=table.index)
-    implied = pd.to_numeric(fits.get('implied_sigma_per_min'), errors='coerce').values
-    realised = pd.to_numeric(table.get('sigma_per_min'), errors='coerce').values
+    implied = _column(fits, 'implied_sigma_per_min')
+    realised = _column(table, 'sigma_per_min')
     ratio = _safe_div(implied, realised)
     with np.errstate(divide='ignore', invalid='ignore'):
         out['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
     out['implied_sigma_per_min'] = implied
-    out['iv_r2'] = pd.to_numeric(fits.get('r2'), errors='coerce').values
-    out['iv_n_strikes'] = pd.to_numeric(fits.get('n_strikes'), errors='coerce').values
+    out['iv_r2'] = _column(fits, 'r2')
+    out['iv_n_strikes'] = _column(fits, 'n_strikes')
     # Carried because coverage is ~15% of the timeline with a five-hour mean
     # gap: a sigma forward-filled from three hours ago is a different claim
     # from a fresh one, and the model has to be able to tell them apart.
-    out['iv_staleness_minutes'] = pd.to_numeric(
-        fits.get('staleness_minutes'), errors='coerce').values
+    out['iv_staleness_minutes'] = _column(fits, 'staleness_minutes')
     return out
 
 
@@ -265,7 +277,7 @@ def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
     fresh = np.isfinite(age) & (age >= 0) & (age <= max_age_minutes)
 
     implied = np.where(fresh, merged['implied_sigma_per_min'].values, np.nan)
-    realised = pd.to_numeric(out.get('sigma_per_min'), errors='coerce').values
+    realised = _column(out, 'sigma_per_min')
     ratio = _safe_div(implied, realised)
     with np.errstate(divide='ignore', invalid='ignore'):
         out['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
