@@ -16,9 +16,14 @@ the same quote object the fill will be priced against, so the two cannot drift.
 
 from __future__ import annotations
 
+import types
+from unittest import mock
+
 import numpy as np
 import pandas as pd
 import pytest
+
+from core.config import Config
 
 from scripts.live import book_feature_row
 
@@ -151,3 +156,50 @@ def test_the_full_feature_set_is_computable_from_a_cached_ladder():
                    'imbalance_touch', 'imbalance_5c', 'depth_ratio',
                    'book_convexity'):
         assert not pd.isna(row[column]), column
+
+
+@pytest.mark.asyncio
+async def test_record_touch_persists_the_resting_totals_it_trades_on():
+    """The live decision reads `depth_bid_total`/`depth_ask_total` through
+    `book_feature_row`, but `_record_touch` wrote only the 1c and 5c cumulants.
+
+    So the loop would trade `depth_ratio` and `book_convexity` while recording
+    NaN for both — and the next retrain, run on live rows, would silently lose
+    the strongest group after `cross_asset`. A feature good enough to size a bet
+    on is good enough to write down.
+    """
+    import pandas as pd
+    from scripts import live
+    from core.quotes import DEPTH_MAP
+
+    captured = []
+
+    class _Store:
+        def write(self, table, frame, **kw):
+            captured.append((table, frame))
+
+    class _Kalshi:
+        async def _request(self, method, path):
+            return {'orderbook_fp': {
+                'yes_dollars': [['0.60', '100'], ['0.59', '250']],
+                'no_dollars': [['0.39', '70'], ['0.38', '130']],
+            }}
+
+    quote = types.SimpleNamespace(
+        yes_bid=0.60, yes_ask=0.61, yes_bid_size=100.0, yes_ask_size=70.0)
+    window_open = pd.Timestamp('2026-08-28 12:00', tz='UTC')
+    scored = pd.DataFrame({'symbol': ['BTC']})
+
+    with mock.patch('core.datastore.ResearchStore', lambda *a, **k: _Store()):
+        await live._record_touch(
+            scored, {'BTC': (quote, 'KXBTC15M-X')}, window_open, 3,
+            Config(), _Kalshi())
+
+    assert captured, 'nothing was written'
+    row = captured[0][1].iloc[0]
+    for column in DEPTH_MAP:
+        assert column in row.index, f'{column} is consumed but never recorded'
+
+    # The totals are the whole ladder, not just the levels near the touch.
+    assert row['depth_bid_total'] == pytest.approx(350.0)
+    assert row['depth_ask_total'] == pytest.approx(200.0)

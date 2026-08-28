@@ -1182,6 +1182,13 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                                             within=0.01, invert=True),
                 'depth_ask_5c': _cumulative(no_levels, best=float(quote.yes_ask),
                                             within=0.05, invert=True),
+                # The whole resting ladder, not just the levels near the
+                # touch. `depth_ratio` and `book_convexity` read these, and
+                # `book_feature_row` already derives them for the DECISION —
+                # recording anything less would trade a feature the next
+                # retrain cannot see.
+                'depth_bid_total': _resting_total(yes_levels),
+                'depth_ask_total': _resting_total(no_levels),
                 'levels_bid': float(len(yes_levels)),
                 'levels_ask': float(len(no_levels)),
                 'seq': float('nan'), 'gaps': 0.0,
