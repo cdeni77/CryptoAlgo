@@ -975,6 +975,119 @@ def _cumulative(levels, *, best: float, within: float, invert: bool) -> float:
     return total
 
 
+def _attach_book_features(scored: pd.DataFrame, quotes: dict) -> None:
+    """Book features onto the scoring rows, in place, from the touch.
+
+    One row per symbol: the quote is the same for every offset in the cycle,
+    and it is the book the order will actually be priced against.
+    """
+    from core.book_features import MARKET_PRICE, MARKET_STATE
+
+    columns = tuple(MARKET_STATE) + tuple(MARKET_PRICE)
+    for column in columns:
+        if column not in scored.columns:
+            scored[column] = np.nan
+    if not len(scored):
+        return
+    base = pd.to_numeric(scored.get('baseline_probability'), errors='coerce')
+    for i, symbol in enumerate(scored['symbol']):
+        entry = quotes.get(symbol)
+        if entry is None:
+            continue
+        try:
+            row = book_feature_row(
+                entry[0], [], [],
+                baseline_probability=float(base.iloc[i]) if len(base) > i else np.nan)
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('%s: book features unavailable (%s)', symbol, str(exc)[:80])
+            continue
+        for column in columns:
+            if column in row:
+                scored.iloc[i, scored.columns.get_loc(column)] = row[column]
+
+
+def _warn_unscoreable_features(scored: pd.DataFrame, model) -> None:
+    """Say loudly when the model wants a feature this row cannot supply.
+
+    A NaN feature does not raise; the booster substitutes the direction it
+    learned in training. So the only signal that a live model is not the model
+    that was measured is this line.
+    """
+    wanted = list(getattr(model, 'features', ()) or ())
+    if not wanted or not len(scored):
+        return
+    missing = [c for c in wanted if c not in scored.columns]
+    empty = [c for c in wanted
+             if c in scored.columns and not pd.to_numeric(
+                 scored[c], errors='coerce').notna().any()]
+    if missing or empty:
+        logger.warning(
+            'scoring with features the row cannot supply — missing %s, all-NaN %s. '
+            'LightGBM will substitute its learned default, so this is a different '
+            'model from the one whose gates were measured.',
+            missing or 'none', empty or 'none')
+
+
+def _resting_total(levels) -> float:
+    """Every resting contract on one side, at any price.
+
+    `depth_bid_total` / `depth_ask_total` were the one thing `_record_touch`
+    never derived, so `depth_ratio` could not be computed live at all.
+    """
+    total, seen = 0.0, False
+    for entry in levels or []:
+        try:
+            total += float(entry[1])
+            seen = True
+        except (TypeError, ValueError, IndexError):
+            continue
+    return total if seen else float('nan')
+
+
+def book_feature_row(quote, yes_levels, no_levels, *,
+                     baseline_probability: float) -> dict:
+    """The model's book features, from the book the fill will price against.
+
+    **Live computed none of these.** `_record_touch` derives the depth every
+    cycle and writes it to the store; the scoring row never saw it. That does
+    not raise — LightGBM scores a NaN feature with the default direction it
+    learned — so the loop would run silently as a DIFFERENT model from the one
+    whose gates were measured.
+
+    Built through `core.book_features.market_state_features`, the same function
+    the backtest uses, off the same quote the order is priced against, so the
+    two cannot drift. Prices go in as CENTS because that is what the snapshot
+    shape uses; a one-sided book yields no probability, exactly as in the
+    backtest.
+    """
+    import numpy as _np
+    import pandas as _pd
+    from core.book_features import market_state_features
+
+    bid = quote.yes_bid if getattr(quote, 'yes_bid', None) is not None else _np.nan
+    ask = quote.yes_ask if getattr(quote, 'yes_ask', None) is not None else _np.nan
+    best_bid = float(bid) * 100.0 if _np.isfinite(_np.float64(bid)) else _np.nan
+    best_ask = float(ask) * 100.0 if _np.isfinite(_np.float64(ask)) else _np.nan
+
+    frame = _pd.DataFrame([{
+        'best_bid': best_bid, 'best_ask': best_ask,
+        'baseline_probability': baseline_probability,
+        'bid_at_touch': float(getattr(quote, 'yes_bid_size', 0.0) or 0.0),
+        'ask_at_touch': float(getattr(quote, 'yes_ask_size', 0.0) or 0.0),
+        'bid_1c': _cumulative(yes_levels, best=float(bid), within=0.01,
+                              invert=False) if _np.isfinite(_np.float64(bid)) else _np.nan,
+        'ask_1c': _cumulative(no_levels, best=float(ask), within=0.01,
+                              invert=True) if _np.isfinite(_np.float64(ask)) else _np.nan,
+        'bid_5c': _cumulative(yes_levels, best=float(bid), within=0.05,
+                              invert=False) if _np.isfinite(_np.float64(bid)) else _np.nan,
+        'ask_5c': _cumulative(no_levels, best=float(ask), within=0.05,
+                              invert=True) if _np.isfinite(_np.float64(ask)) else _np.nan,
+        'bid_vol': _resting_total(yes_levels),
+        'ask_vol': _resting_total(no_levels),
+    }])
+    return market_state_features(frame).iloc[0].to_dict()
+
+
 async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
                         config: Config, kalshi) -> None:
     """Write the venue's book — top of book plus cumulative depth — to the store.
@@ -1463,8 +1576,22 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # runtime failure waiting behind a config flag, which is the shape of most of
     # what the audit found. Behaviour is unchanged for the default source: the
     # only thing between the two positions was `settle_time`.
+    # The book features, from the touch we just read. Without these the model
+    # scores them as NaN — LightGBM uses the default direction it learned, so the
+    # loop would run silently as a DIFFERENT model from the one whose gates were
+    # measured, which is the `price_source` failure one level deeper.
+    #
+    # Touch only, deliberately. `imbalance_5c`, `depth_ratio` and
+    # `book_convexity` need the full ladder, and that fetch costs ~300ms on the
+    # book-read-to-order-sent interval — already a measured median of 4.97s
+    # against a book that moves 1-1.5c in that time, with kills observed at the
+    # full 3c cap. A model needing the ladder must not be deployed until that
+    # fetch is hoisted ahead of scoring; `promote` should refuse it rather than
+    # let it score against NaN.
+    _attach_book_features(scored, quotes)
     scored = prepare_init_score(scored, model)
     _phase('score')
+    _warn_unscoreable_features(scored, model)
     scored['model_probability'] = model.predict(scored)
 
     # The venue publishes the number it will settle against, as `floor_strike`,
