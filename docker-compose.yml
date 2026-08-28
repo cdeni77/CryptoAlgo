@@ -214,19 +214,34 @@ services:
     # init_score_source=market, so its correction is a residual of the PRICE,
     # and paper mode opens no venue client at all.
     #
-    # Add `--place-orders` to trade for real. It stays separate from
+    # `--place-orders` is LIVE MONEY. It stays a separate flag from
     # `--mode live` deliberately: one flag guarding an irreversible action is
-    # one typo away from being wrong.
+    # one typo away from being wrong. Remove it to go back to reading the book
+    # and placing nothing.
+    #
+    # `--bankroll 200` is not cosmetic. Sizing reads
+    # `config.starting_bankroll`, not the account balance, because
+    # `compound=False` makes the equity curve additive so its slope is the
+    # per-trade edge (`core/decide.py`: sizing_base = bankroll if
+    # config.compound else config.starting_bankroll). Left at the $100 default
+    # against a $200 funded account it would trade half size, and the ruin
+    # floor — starting_bankroll * 0.50 — would sit at $50 of real risk rather
+    # than $100.
+    #
+    # Guardrails at $200: halt below $100 (ruin_floor_fraction 0.50), halt on a
+    # $30 daily loss (max_daily_loss_fraction 0.15), $25 max stake per trade,
+    # 3 positions per window.
     command: >
       -m scripts.run_live
         --trade-args
         --loop
         --cycle-seconds 60
         --mode live
-        --dry-run
+        --place-orders
+        --bankroll 200
         --no-require-gates
         --force
-        --reason "Live experiment on a forced promotion: calibration_error 0.0216 and calibration_max_deviation 0.0515 are per-fold instability rather than bias (pooled worst 2.8pp would pass), and max_drawdown 0.402 is a single-path statistic that moved 0.241->0.402 on a marginal sample change. Stable across both samples: log_loss_skill +0.00307 (t=+3.69), 6/6 folds, control gain share 0.0%. Dry-run: reads the real book, places nothing."
+        --reason "REAL ORDERS on a $200 account, artifact 20260828T202438Z, the first promotion measured under the policy this loop actually runs (--entry-offsets 12). Under wait_12: realised_edge_pp +4.17, max_drawdown 0.232 (passing), Sharpe 3.72, 1,107 trades, log_loss_skill +0.00307 (t=+3.69) 6/6 folds, control gain share 0.0%. Two gates fail, both calibration (error 0.0216, max deviation 0.0515) — a property of the forecast, unchanged by the trading policy, and per-fold instability rather than bias since the pooled worst deviation of 2.8pp would pass. The +12m choice is supported independently of this backtest: across 10,025 backfilled windows offsets 1-11 carry no edge against the market and it appears at +12m as a step, and over five years the baseline ECE falls monotonically to its minimum there. The untested risk is FILLS, not forecast: ~30% of live orders previously went unfilled and the failures carried higher claimed edge, which no backfill can measure because settled markets return an empty ladder."
 
   # ===========================================================================
   # Scrape — one-off, runs to completion then exits

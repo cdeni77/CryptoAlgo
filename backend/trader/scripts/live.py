@@ -1194,6 +1194,83 @@ def _spread_cents(bid, ask) -> float:
     return ask - bid
 
 
+# The store-backed implied-vol lookup, refreshed at most this often. The hot
+# path is a decision, and `ResearchStore.read` is a synchronous Parquet read; a
+# value that changes every few minutes does not belong on the event loop every
+# cycle.
+_FIT_CACHE: dict = {}
+_FIT_REFRESH_SECONDS = 120.0
+
+
+def reset_fit_lookup() -> None:
+    """Drop the memoised store read. For tests, and after a store rebuild."""
+    _FIT_CACHE.clear()
+
+
+def _read_recent_fits():
+    """The last few hours of `venue_implied_vol`, or an empty frame."""
+    try:
+        from core.datastore import ResearchStore
+        frame = ResearchStore().read(
+            'venue_implied_vol',
+            columns=['symbol', 'event_time', 'implied_sigma_per_min',
+                     'r2', 'n_strikes'])
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning('implied-vol store read: %s', str(exc)[:110])
+        return pd.DataFrame()
+    if frame is None or not len(frame):
+        return pd.DataFrame()
+    stamp = pd.to_datetime(frame['event_time'], utc=True, errors='coerce')
+    from core.book_features import MAX_FIT_AGE_MINUTES
+    cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(minutes=MAX_FIT_AGE_MINUTES)
+    return frame.assign(_at=stamp)[stamp >= cutoff]
+
+
+def latest_fit(symbol: str, *, now, cache: dict, read=None):
+    """The freshest usable ladder fit for `symbol`, or None.
+
+    The in-process cache first — the recorder runs in this process and its
+    reading is the newest thing that exists. Then the STORE, which is what the
+    backtest reads: `attach_implied_vol` does an as-of join tolerating a fit up
+    to `MAX_FIT_AGE_MINUTES` old, and live consulting only the cache meant every
+    restart blanked all five iv_* features until the recorder next succeeded.
+
+    That gap is not cosmetic. `--complete-cases` fitted the artifact on rows
+    that ALL carry a fit, so it has never seen a NaN there and scoring without
+    one is out of distribution.
+    """
+    from core.book_features import MAX_FIT_AGE_MINUTES
+
+    now = pd.Timestamp(now)
+    live = cache.get(symbol) if cache else None
+    if live is not None:
+        age = (now - pd.Timestamp(live['at'])).total_seconds() / 60.0
+        if 0 <= age <= MAX_FIT_AGE_MINUTES:
+            return live
+
+    reader = read or _read_recent_fits
+    stamp = _FIT_CACHE.get('at')
+    if stamp is None or (now - stamp).total_seconds() >= _FIT_REFRESH_SECONDS:
+        _FIT_CACHE['at'] = now
+        _FIT_CACHE['frame'] = reader()
+    frame = _FIT_CACHE.get('frame')
+    if frame is None or not len(frame):
+        return None
+    if '_at' not in frame.columns:
+        frame = frame.assign(
+            _at=pd.to_datetime(frame['event_time'], utc=True, errors='coerce'))
+    rows = frame[(frame['symbol'] == symbol) & frame['_at'].notna()]
+    if not len(rows):
+        return None
+    row = rows.loc[rows['_at'].idxmax()]
+    age = (now - row['_at']).total_seconds() / 60.0
+    if age < 0 or age > MAX_FIT_AGE_MINUTES:
+        return None
+    return {'implied_sigma_per_min': float(row['implied_sigma_per_min']),
+            'r2': float(row['r2']), 'n_strikes': float(row['n_strikes']),
+            'at': row['_at']}
+
+
 def implied_vol_row(fit: Optional[dict], *, sigma_per_min, now) -> dict:
     """`implied_vol` from the in-process ladder-fit cache.
 
@@ -1268,7 +1345,7 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
         # -0.00023 and folds positive 6/6 -> 3/6.
         row.update(cross_venue_row(pm_cache.get(symbol), entry[0]))
         row.update(implied_vol_row(
-            iv_cache.get(symbol), now=now,
+            latest_fit(symbol, now=now, cache=iv_cache), now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]
             if 'sigma_per_min' in scored.columns else np.nan))
         row['venue_gap_change_5'] = gap_change(
