@@ -77,10 +77,7 @@ def run_book(
     # majority of rows, and grouping five years of minutes into windows to
     # iterate over rows that could never trade is where the runtime went.
     screened, stateless_rejections = stateless_screen(scored, config)
-    outcomes = {
-        (row.symbol, row.window_open): bool(row.outcome)
-        for row in scored.drop_duplicates(['symbol', 'window_open']).itertuples()
-    }
+    outcomes = settlement_outcomes(scored)
     for window_open, rows in screened.groupby('window_open', sort=True):
         # Settle first: a position from the previous window matures at exactly
         # this instant. Deciding before settling would stake the same dollars
@@ -101,6 +98,46 @@ def run_book(
         book.settle(outcomes)
     book.stateless_rejections = stateless_rejections
     return book, decisions
+
+
+def settlement_outcomes(scored: pd.DataFrame) -> dict:
+    """How each window settled, preferring the VENUE'S own result.
+
+    **The leak this closes, measured.** Settling on our Coinbase-derived label
+    while trading against the venue's BRTI-priced quotes, with `market_prob`
+    live as a feature, let the model bet the disagreement between the two
+    indices and win it by construction:
+
+        labels agree on 96.51% of traded windows
+          win rate where they AGREE  : 56.17%
+          win rate where they DIFFER : 72.77%   (n=448)
+
+    Rescoring the same 12,821 trades on the venue's settlement took the win rate
+    from 56.75% to 55.16% and the edge from 8.68% to 4.99% of stake — about 43%
+    of the apparent edge was the label rather than the forecast.
+
+    Ours remains the fallback: Kalshi purges older markets, so their
+    settlements do not reach the whole span, and dropping those windows would
+    discard most of the sample. What must never happen is preferring ours where
+    theirs exists.
+
+    A window with NEITHER label is omitted rather than guessed. `book.settle`
+    skips what it has no outcome for; inventing one would pay or charge for a
+    result nobody holds.
+    """
+    frame = scored.drop_duplicates(['symbol', 'window_open'])
+    ours = pd.to_numeric(frame['outcome'], errors='coerce')
+    if 'venue_outcome' in frame.columns:
+        venue = pd.to_numeric(frame['venue_outcome'], errors='coerce')
+        settled = venue.where(venue.notna(), ours)
+    else:
+        settled = ours
+    keep = settled.notna()
+    return {
+        (symbol, window_open): bool(value)
+        for symbol, window_open, value in zip(
+            frame['symbol'][keep], frame['window_open'][keep], settled[keep])
+    }
 
 
 def walk_forward(

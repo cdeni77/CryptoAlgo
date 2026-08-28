@@ -75,3 +75,29 @@ def test_book_groups_are_selectable_but_not_in_the_default_matrix():
 def test_the_five_original_groups_are_still_the_default():
     assert set(ALL_GROUPS) == {'vol_state', 'microstructure', 'cross_asset',
                                'geometry', 'clock'}
+
+
+def test_market_minus_baseline_is_populated_after_the_baseline_attaches():
+    """It was all-NaN in every run. `market_minus_baseline` is mid minus
+    F(x/sigma), and `baseline_probability` is attached AFTER features are built —
+    so computing it in `build_features` guaranteed a dead column, and the model's
+    empty-feature warning was the only thing that said so."""
+    import pandas as pd
+    from core.baseline import attach_baseline
+
+    class _Flat:
+        def probability_for(self, table):
+            return pd.Series(0.40, index=table.index)
+
+    table = pd.DataFrame({'market_prob': [0.45, 0.30], 'offset': [3, 12]})
+    got = attach_baseline(table, _Flat())
+    assert 'market_minus_baseline' in got.columns
+    assert got['market_minus_baseline'].tolist() == pytest.approx([0.05, -0.10])
+
+
+def test_a_dead_feature_is_removed_rather_than_carried():
+    """`quote_intensity` needed a per-minute snapshot count that venue_depth's
+    summary does not carry. A declared feature nothing can populate is worse
+    than no feature: it dilutes the matrix and reads as a working column."""
+    from core.book_features import MARKET_STATE
+    assert 'quote_intensity' not in MARKET_STATE

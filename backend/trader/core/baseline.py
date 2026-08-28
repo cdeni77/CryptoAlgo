@@ -457,4 +457,12 @@ def attach_baseline(
     out = table.copy()
     out[column] = baseline.probability_for(table)
     out[f'{column}_logit'] = logit(out[column])
+    # The market's own correction to the arithmetic. It belongs here and not in
+    # `build_features`, which runs BEFORE this: computing it there produced an
+    # all-NaN column in every run, and only the model's empty-feature warning
+    # said so. It is the most informative book column and the one that invites
+    # echo, so a silently dead version is the worst of both.
+    if 'market_prob' in out.columns:
+        out['market_minus_baseline'] = (
+            pd.to_numeric(out['market_prob'], errors='coerce') - out[column])
     return out

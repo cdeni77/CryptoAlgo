@@ -304,3 +304,33 @@ def test_the_mechanism_column_is_the_disagreement_not_the_level():
         'sigma_per_min': [0.0003]})
     got = attach_implied_vol(table, fits)
     assert got['iv_minus_realised'].iloc[0] == pytest.approx(np.log(2.0))
+
+
+# --- a missing column must never crash mid-fold ----------------------------
+#
+# Three times now the same shape: `frame.get(name)` returns a SCALAR when the
+# column is absent, `pd.to_numeric` happily makes it a numpy float, and the
+# `.values` a line later raises. It surfaced first for `sigma_per_min`, then
+# again for `baseline_probability` -- eight minutes into a walk-forward, because
+# that column is attached AFTER features are built.
+#
+# These columns are legitimately absent at different points in the pipeline, so
+# the functions have to tolerate it and return NaN rather than raise.
+
+@pytest.mark.parametrize('missing', [
+    'baseline_probability', 'best_bid', 'best_ask', 'bid_at_touch',
+    'bid_5c', 'bid_vol', 'bid_1c',
+])
+def test_market_state_survives_a_missing_column(missing):
+    frame = _snap()
+    got = market_state_features(frame.drop(columns=[missing]))
+    assert len(got) == 1, f'dropping {missing} should not raise'
+
+
+def test_market_state_on_a_frame_with_only_the_index():
+    """The extreme case: a table carrying none of the book columns at all,
+    which is every row that predates the venue."""
+    bare = pd.DataFrame({'symbol': ['BTC-USD'], 'offset': [3]})
+    got = market_state_features(bare)
+    assert len(got) == 1
+    assert got.isna().all(axis=None), 'no book means no features, not a crash'

@@ -46,9 +46,13 @@ import pandas as pd
 # between the backfilled book and the live one, unchanged by any time filter —
 # a model trained on them learns which pipe a row arrived through.
 PRICE_COLUMNS = ('market_prob', 'market_minus_baseline')
+# `quote_intensity` was declared and removed: it needs a per-minute snapshot
+# COUNT, which venue_depth's summary does not carry, so it was all-NaN in every
+# run. A declared feature nothing can populate is worse than no feature — it
+# dilutes the matrix and reads exactly like a working column.
 MARKET_STATE = PRICE_COLUMNS + (
     'spread', 'imbalance_touch', 'imbalance_5c', 'depth_ratio',
-    'book_convexity', 'quote_intensity',
+    'book_convexity',
 )
 # No volume ratio across venues: Kalshi is integer contracts, Polymarket
 # fractional shares, so the quotient would measure the unit.
@@ -84,8 +88,8 @@ def _mid(frame: pd.DataFrame) -> np.ndarray:
     NaN rather than a fallback to whichever side exists: a lone bid says the
     probability is *at least* something, which is not a probability.
     """
-    bid = pd.to_numeric(frame.get('best_bid'), errors='coerce')
-    ask = pd.to_numeric(frame.get('best_ask'), errors='coerce')
+    bid = pd.Series(_column(frame, 'best_bid'), index=frame.index)
+    ask = pd.Series(_column(frame, 'best_ask'), index=frame.index)
     mid = (bid + ask) / 2.0 / CENTS
     return mid.where(bid.notna() & ask.notna()).values
 
@@ -103,13 +107,13 @@ def market_state_features(snap: pd.DataFrame, *,
     """
     out = pd.DataFrame(index=snap.index)
     mid = _mid(snap)
-    bid = pd.to_numeric(snap.get('best_bid'), errors='coerce')
-    ask = pd.to_numeric(snap.get('best_ask'), errors='coerce')
+    bid = pd.Series(_column(snap, 'best_bid'), index=snap.index)
+    ask = pd.Series(_column(snap, 'best_ask'), index=snap.index)
 
     if include_price:
         out['market_prob'] = mid
-        base = pd.to_numeric(snap.get('baseline_probability'), errors='coerce')
-        out['market_minus_baseline'] = mid - base.values
+        # Absent when features are built: `attach_baseline` runs afterwards.
+        out['market_minus_baseline'] = mid - _column(snap, 'baseline_probability')
 
     # Probability units throughout: everything downstream — the edge gate, the
     # fee model, the Kelly stake — is denominated that way.
@@ -117,31 +121,28 @@ def market_state_features(snap: pd.DataFrame, *,
 
     for name, lo, hi in (('imbalance_touch', 'bid_at_touch', 'ask_at_touch'),
                          ('imbalance_5c', 'bid_5c', 'ask_5c')):
-        a = pd.to_numeric(snap.get(lo), errors='coerce')
-        b = pd.to_numeric(snap.get(hi), errors='coerce')
+        a = pd.Series(_column(snap, lo), index=snap.index)
+        b = pd.Series(_column(snap, hi), index=snap.index)
         # Both sides empty means nothing is resting there. Reporting a balanced
         # book would claim knowledge of a book that does not exist.
         out[name] = _safe_div(a - b, a + b)
 
-    bid_vol = pd.to_numeric(snap.get('bid_vol'), errors='coerce')
-    ask_vol = pd.to_numeric(snap.get('ask_vol'), errors='coerce')
+    bid_vol = pd.Series(_column(snap, 'bid_vol'), index=snap.index)
+    ask_vol = pd.Series(_column(snap, 'ask_vol'), index=snap.index)
     # Logged so a 2:1 bid-heavy book and a 1:2 ask-heavy one are equal and
     # opposite, which a raw ratio is not.
     ratio = _safe_div(bid_vol, ask_vol)
     with np.errstate(divide='ignore', invalid='ignore'):
         out['depth_ratio'] = np.where(ratio > 0, np.log(ratio), np.nan)
 
-    bid_1c = pd.to_numeric(snap.get('bid_1c'), errors='coerce')
-    ask_1c = pd.to_numeric(snap.get('ask_1c'), errors='coerce')
-    bid_5c = pd.to_numeric(snap.get('bid_5c'), errors='coerce')
-    ask_5c = pd.to_numeric(snap.get('ask_5c'), errors='coerce')
+    bid_1c = pd.Series(_column(snap, 'bid_1c'), index=snap.index)
+    ask_1c = pd.Series(_column(snap, 'ask_1c'), index=snap.index)
+    bid_5c = pd.Series(_column(snap, 'bid_5c'), index=snap.index)
+    ask_5c = pd.Series(_column(snap, 'ask_5c'), index=snap.index)
     out['book_convexity'] = _safe_div(bid_5c, bid_1c) - _safe_div(ask_5c, ask_1c)
 
     # Produced by `book_at_decision`; carried as NaN when the caller has not
     # joined a book, so the matrix shape never depends on availability.
-    out['quote_intensity'] = pd.to_numeric(
-        snap.get('n_snapshots', pd.Series(np.nan, index=snap.index)),
-        errors='coerce').values
     return out
 
 
@@ -164,8 +165,8 @@ def cross_venue_features(kalshi: pd.DataFrame, pm: pd.DataFrame, *,
         else np.nan)
 
     def _spread(frame):
-        bid = pd.to_numeric(frame.get('best_bid'), errors='coerce')
-        ask = pd.to_numeric(frame.get('best_ask'), errors='coerce')
+        bid = pd.Series(_column(frame, 'best_bid'), index=frame.index)
+        ask = pd.Series(_column(frame, 'best_ask'), index=frame.index)
         return ((ask - bid) / CENTS).where(bid.notna() & ask.notna()).values
 
     ratio = _safe_div(_spread(kalshi), _spread(pm.set_index(kalshi.index)))
@@ -258,10 +259,9 @@ def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
     right = pd.DataFrame({
         'symbol': fits['symbol'].values,
         '_at': pd.to_datetime(fits['event_time'], utc=True).values,
-        'implied_sigma_per_min': pd.to_numeric(
-            fits.get('implied_sigma_per_min'), errors='coerce').values,
-        'iv_r2': pd.to_numeric(fits.get('r2'), errors='coerce').values,
-        'iv_n_strikes': pd.to_numeric(fits.get('n_strikes'), errors='coerce').values,
+        'implied_sigma_per_min': _column(fits, 'implied_sigma_per_min'),
+        'iv_r2': _column(fits, 'r2'),
+        'iv_n_strikes': _column(fits, 'n_strikes'),
     }).dropna(subset=['_at'])
     # Carried through the join so staleness is the gap to the fit ACTUALLY used;
     # merge_asof consumes the right key, so without this there is nothing to
