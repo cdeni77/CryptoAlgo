@@ -975,7 +975,52 @@ def _cumulative(levels, *, best: float, within: float, invert: bool) -> float:
     return total
 
 
-def _attach_book_features(scored: pd.DataFrame, quotes: dict) -> None:
+def ladder_from_cache(cache, ticker: str):
+    """(yes_levels, no_levels) from the stream's in-process book, or empty.
+
+    **This is why the full feature set costs no latency.** `run_live` supervises
+    `stream` and `trade` as asyncio tasks in ONE process, so `record_stream.CACHE`
+    already holds every subscribed ladder folded from the socket — no fetch, and
+    fresher than one: a frame arrives ~34ms after the venue stamps it against
+    ~73ms for a REST round trip, at 100% top-of-book agreement and zero ladder
+    drift against REST snapshots.
+
+    Refused in three cases, all of which mean the book in hand may not be the
+    book on the venue:
+
+      * no cache — `scripts.live` also runs standalone, without the stream task;
+      * stale — ten seconds of silence at 400+ frames a second is a sick
+        transport, not a quiet market, and pricing against it is worse than
+        having no depth;
+      * gapped — `seq` is global per SUBSCRIPTION, so a miss condemns every book
+        on the connection, this one included.
+
+    Empty levels give NaN depth features, which `_warn_unscoreable_features`
+    reports. That is the honest answer, not a silent substitution.
+    """
+    if cache is None or not ticker:
+        return [], []
+    try:
+        if cache.gapped(ticker):
+            return [], []
+        ladder = cache.ladder(ticker)
+    except Exception:                                         # noqa: BLE001
+        return [], []
+    if ladder is None or getattr(ladder, 'stale', True):
+        return [], []
+    return list(ladder.yes or []), list(ladder.no or [])
+
+
+def _stream_cache():
+    """The stream task's cache, when this process is running one."""
+    try:
+        from scripts.record_stream import CACHE
+        return CACHE
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> None:
     """Book features onto the scoring rows, in place, from the touch.
 
     One row per symbol: the quote is the same for every offset in the cycle,
@@ -995,8 +1040,9 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict) -> None:
         if entry is None:
             continue
         try:
+            yes_levels, no_levels = ladder_from_cache(cache, entry[1])
             row = book_feature_row(
-                entry[0], [], [],
+                entry[0], yes_levels, no_levels,
                 baseline_probability=float(base.iloc[i]) if len(base) > i else np.nan)
         except Exception as exc:                              # noqa: BLE001
             logger.warning('%s: book features unavailable (%s)', symbol, str(exc)[:80])
@@ -1581,14 +1627,13 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # loop would run silently as a DIFFERENT model from the one whose gates were
     # measured, which is the `price_source` failure one level deeper.
     #
-    # Touch only, deliberately. `imbalance_5c`, `depth_ratio` and
-    # `book_convexity` need the full ladder, and that fetch costs ~300ms on the
-    # book-read-to-order-sent interval — already a measured median of 4.97s
-    # against a book that moves 1-1.5c in that time, with kills observed at the
-    # full 3c cap. A model needing the ladder must not be deployed until that
-    # fetch is hoisted ahead of scoring; `promote` should refuse it rather than
-    # let it score against NaN.
-    _attach_book_features(scored, quotes)
+    # The ladder comes from the stream's in-process cache, so the depth features
+    # cost no fetch and are fresher than REST would be (~34ms against ~73ms).
+    # An earlier version attached touch-only on the grounds that a ladder fetch
+    # would cost ~300ms against a 4.97s book-to-order budget — but that figure
+    # predates the phase instrumentation, which measures 0.10-0.11s, and the
+    # fetch is not needed at all.
+    _attach_book_features(scored, quotes, _stream_cache())
     scored = prepare_init_score(scored, model)
     _phase('score')
     _warn_unscoreable_features(scored, model)

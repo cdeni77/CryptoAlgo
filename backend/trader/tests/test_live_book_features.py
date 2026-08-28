@@ -77,3 +77,77 @@ def test_every_feature_the_model_expects_is_present():
     row = book_feature_row(_Quote(), _YES, _NO, baseline_probability=0.40)
     for column in tuple(MARKET_STATE) + tuple(MARKET_PRICE):
         assert column in row, column
+
+
+# --- the ladder, from the stream cache, at zero latency cost ----------------
+#
+# `imbalance_5c`, `depth_ratio` and `book_convexity` need the full ladder. I
+# assumed that meant a REST fetch on the critical path and dropped them — on a
+# 4.97s book-to-order figure that turned out to predate the instrumentation.
+# Measured now it is 0.10-0.11s.
+#
+# And the fetch is not needed at all. `run_live` supervises `stream` and `trade`
+# as asyncio tasks in ONE process, and `record_stream.CACHE` already holds every
+# subscribed ladder folded from the socket. It is also FRESHER than REST: a
+# frame arrives ~34ms after the venue stamps it against ~73ms for a REST
+# round trip, at 100% top-of-book agreement with zero ladder drift.
+#
+# So the full feature set costs nothing. What must not happen is trusting a
+# ladder the socket stopped updating.
+
+class _Ladder:
+    def __init__(self, yes, no, age=0.05, stale=False):
+        self.yes, self.no = yes, no
+        self.age_seconds, self.stale = age, stale
+
+
+class _Cache:
+    def __init__(self, ladder=None, gapped=False):
+        self._ladder, self._gapped = ladder, gapped
+
+    def ladder(self, ticker):
+        return self._ladder
+
+    def gapped(self, ticker):
+        return self._gapped
+
+
+def test_the_ladder_comes_from_the_stream_cache_when_it_is_fresh():
+    from scripts.live import ladder_from_cache
+    cache = _Cache(_Ladder(_YES, _NO))
+    yes, no = ladder_from_cache(cache, 'KXBTC15M-1')
+    assert yes == _YES and no == _NO
+
+
+def test_a_stale_ladder_is_refused():
+    """Ten seconds of silence at 400+ frames a second means the transport is
+    sick, not that the market is quiet. Pricing against it would be worse than
+    having no depth at all."""
+    from scripts.live import ladder_from_cache
+    cache = _Cache(_Ladder(_YES, _NO, age=30.0, stale=True))
+    assert ladder_from_cache(cache, 'KXBTC15M-1') == ([], [])
+
+
+def test_a_gapped_book_is_refused():
+    """A gap condemns every book on the connection: `seq` is global per
+    subscription, so a miss means this ladder may be missing levels."""
+    from scripts.live import ladder_from_cache
+    cache = _Cache(_Ladder(_YES, _NO), gapped=True)
+    assert ladder_from_cache(cache, 'KXBTC15M-1') == ([], [])
+
+
+def test_no_cache_at_all_is_not_an_error():
+    """`scripts.live` also runs standalone, without the stream task."""
+    from scripts.live import ladder_from_cache
+    assert ladder_from_cache(None, 'KXBTC15M-1') == ([], [])
+    assert ladder_from_cache(_Cache(None), 'KXBTC15M-1') == ([], [])
+
+
+def test_the_full_feature_set_is_computable_from_a_cached_ladder():
+    from scripts.live import book_feature_row, ladder_from_cache
+    yes, no = ladder_from_cache(_Cache(_Ladder(_YES, _NO)), 'KXBTC15M-1')
+    row = book_feature_row(_Quote(), yes, no, baseline_probability=0.40)
+    for column in ('market_prob', 'market_minus_baseline', 'spread',
+                   'imbalance_touch', 'imbalance_5c', 'depth_ratio',
+                   'book_convexity'):
+        assert not pd.isna(row[column]), column
