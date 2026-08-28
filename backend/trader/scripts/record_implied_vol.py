@@ -51,6 +51,15 @@ logger = logging.getLogger('implied-vol')
 NORMAL = NormalDist()
 SERIES = 'KXBTCD'
 SYMBOL = 'BTC-USD'
+
+# The freshest ladder fit, for the trading loop in this same process. Only BTC
+# has a strike ladder to invert, so ETH and SOL carry NaN implied-vol features
+# live exactly as they do in the backtest — the model was fitted against that
+# same absence.
+#
+# Keyed by symbol for symmetry with the Polymarket cache; the dict holds at most
+# one entry.
+CACHE: dict = {}
 MIN_STRIKES = 4
 PROBABILITY_BAND = (0.01, 0.99)
 
@@ -224,6 +233,16 @@ async def run(args, gate=None) -> int:
                         fit = implied_sigma(rungs, minutes)
                         if fit is None or fit.r2 < args.min_r2:
                             continue
+                        # Freshest wins: several events are fitted per cycle
+                        # and the nearest close is the last one appended.
+                        CACHE[SYMBOL] = {
+                            'implied_sigma_per_min': float(fit.sigma_per_min),
+                            'r2': float(fit.r2),
+                            'n_strikes': float(fit.n_strikes),
+                            'at': pd.Timestamp(now, tz='UTC')
+                                  if pd.Timestamp(now).tzinfo is None
+                                  else pd.Timestamp(now),
+                        }
                         rows.append({
                             'venue': 'kalshi', 'symbol': SYMBOL,
                             'event_time': pd.Timestamp(now).floor('min'),

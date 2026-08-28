@@ -1048,15 +1048,158 @@ def _stream_cache():
         return None
 
 
+def _venue_caches() -> tuple[dict, dict]:
+    """The recorders' in-process caches, empty when they are not running.
+
+    Imported lazily and defensively: `scripts.live` also runs standalone, where
+    neither recorder exists and every feature they feed is honestly unknown.
+    """
+    try:
+        from scripts.record_pm_ladder import CACHE as pm
+    except Exception:                                         # noqa: BLE001
+        pm = {}
+    try:
+        from scripts.record_implied_vol import CACHE as iv
+    except Exception:                                         # noqa: BLE001
+        iv = {}
+    return pm, iv
+
+
+# The venue gap five minutes ago, per symbol. The backtest reads it off the
+# previous row of the same window; live has to remember it, and an entry older
+# than the lookback is not a substitute for one at it.
+_GAP_HISTORY: dict = {}
+_GAP_LOOKBACK_MINUTES = 5.0
+_GAP_TOLERANCE_MINUTES = 2.0
+
+
+def _gap_change(symbol: str, gap, now) -> float:
+    """The five-minute change in the cross-venue gap, or NaN.
+
+    Returns NaN rather than a change against whatever happens to be in hand: a
+    gap differenced against an observation ninety seconds old is not the feature
+    the model was fitted on, and it would be indistinguishable from one that is.
+    """
+    history = _GAP_HISTORY.setdefault(symbol, [])
+    if gap is not None and not (isinstance(gap, float) and np.isnan(gap)):
+        history.append((pd.Timestamp(now), float(gap)))
+        cutoff = pd.Timestamp(now) - pd.Timedelta(minutes=30)
+        _GAP_HISTORY[symbol] = [e for e in history if e[0] >= cutoff]
+        history = _GAP_HISTORY[symbol]
+    if gap is None or (isinstance(gap, float) and np.isnan(gap)):
+        return float('nan')
+    target = pd.Timestamp(now) - pd.Timedelta(minutes=_GAP_LOOKBACK_MINUTES)
+    best, best_age = None, None
+    for stamp, value in history:
+        age = abs((stamp - target).total_seconds()) / 60.0
+        if age <= _GAP_TOLERANCE_MINUTES and (best_age is None or age < best_age):
+            best, best_age = value, age
+    return float(gap - best) if best is not None else float('nan')
+
+
+def cross_venue_row(pm: Optional[dict], quote) -> dict:
+    """`cross_venue` from the in-process Polymarket cache.
+
+    Two independent books on the same fifteen minutes, settling on different
+    oracles — CF Benchmarks BRTI against Chainlink's BTC-USD TWAP-60s — that
+    nonetheless agree on 99.52% of shared windows. So a price gap is information
+    or liquidity, not a different question.
+
+    `best_bid`/`best_ask` are CENTS on both sides, matching `core.book_features`.
+    """
+    from core.book_features import CROSS_VENUE
+
+    out = {name: float('nan') for name in CROSS_VENUE}
+    k_mid = _two_sided_mid(getattr(quote, 'yes_bid', np.nan) * 100.0,
+                           getattr(quote, 'yes_ask', np.nan) * 100.0)
+    p_mid = _two_sided_mid(*(
+        (pm.get('best_bid'), pm.get('best_ask')) if pm else (np.nan, np.nan)))
+    # Absence is not agreement: a zeroed gap would read as two venues concurring.
+    out['pm_available'] = 0.0 if np.isnan(p_mid) else 1.0
+    out['venue_prob_gap'] = k_mid - p_mid
+    k_spread = _spread_cents(getattr(quote, 'yes_bid', np.nan) * 100.0,
+                             getattr(quote, 'yes_ask', np.nan) * 100.0)
+    p_spread = _spread_cents(*(
+        (pm.get('best_bid'), pm.get('best_ask')) if pm else (np.nan, np.nan)))
+    if k_spread > 0 and p_spread > 0:
+        out['venue_spread_ratio'] = float(np.log(k_spread / p_spread))
+    # `venue_gap_change_5` needs the gap five minutes ago, which the backtest
+    # takes from the previous row of the same window. Live carries it per
+    # symbol below; absent a prior observation it is honestly unknown.
+    return out
+
+
+def _two_sided_mid(bid, ask) -> float:
+    """The mid as a probability, or NaN. A lone bid says the probability is at
+    LEAST something, which is not a probability."""
+    try:
+        bid, ask = float(bid), float(ask)
+    except (TypeError, ValueError):
+        return float('nan')
+    if np.isnan(bid) or np.isnan(ask):
+        return float('nan')
+    return (bid + ask) / 2.0 / 100.0
+
+
+def _spread_cents(bid, ask) -> float:
+    try:
+        bid, ask = float(bid), float(ask)
+    except (TypeError, ValueError):
+        return float('nan')
+    if np.isnan(bid) or np.isnan(ask):
+        return float('nan')
+    return ask - bid
+
+
+def implied_vol_row(fit: Optional[dict], *, sigma_per_min, now) -> dict:
+    """`implied_vol` from the in-process ladder-fit cache.
+
+    The baseline scales a BACKWARD-looking realised vol. The strike ladder
+    inverts to a FORWARD-looking one, and where they disagree the baseline's
+    `sigma_remaining` is wrong in a knowable direction — the only quantity the
+    barrier framing says needs forecasting at all.
+
+    Staleness is a FEATURE, not a filter, up to `MAX_FIT_AGE_MINUTES`: coverage
+    is ~15% of the timeline with a five-hour mean gap, so a sigma forward-filled
+    from three hours ago is a different claim from a fresh one and the model has
+    to be able to tell them apart. Beyond the cap it describes a different
+    session and carrying it would be a fabrication.
+    """
+    from core.book_features import IMPLIED_VOL, MAX_FIT_AGE_MINUTES
+
+    out = {name: float('nan') for name in IMPLIED_VOL}
+    if not fit:
+        return out
+    age = (pd.Timestamp(now) - pd.Timestamp(fit['at'])).total_seconds() / 60.0
+    out['iv_staleness_minutes'] = float(age)
+    if age > MAX_FIT_AGE_MINUTES or age < 0:
+        return out
+    implied = float(fit.get('implied_sigma_per_min', np.nan))
+    out['implied_sigma_per_min'] = implied
+    out['iv_r2'] = float(fit.get('r2', np.nan))
+    out['iv_n_strikes'] = float(fit.get('n_strikes', np.nan))
+    try:
+        realised = float(sigma_per_min)
+    except (TypeError, ValueError):
+        return out
+    if implied > 0 and realised > 0:
+        out['iv_minus_realised'] = float(np.log(implied / realised))
+    return out
+
+
 def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> None:
     """Book features onto the scoring rows, in place, from the touch.
 
     One row per symbol: the quote is the same for every offset in the cycle,
     and it is the book the order will actually be priced against.
     """
-    from core.book_features import MARKET_PRICE, MARKET_STATE
+    from core.book_features import (
+        CROSS_VENUE, IMPLIED_VOL, MARKET_PRICE, MARKET_STATE)
 
-    columns = tuple(MARKET_STATE) + tuple(MARKET_PRICE)
+    pm_cache, iv_cache = _venue_caches()
+    now = pd.Timestamp.now(tz='UTC')
+    columns = (tuple(MARKET_STATE) + tuple(MARKET_PRICE)
+               + tuple(CROSS_VENUE) + tuple(IMPLIED_VOL))
     for column in columns:
         if column not in scored.columns:
             scored[column] = np.nan
@@ -1075,6 +1218,18 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
         except Exception as exc:                              # noqa: BLE001
             logger.warning('%s: book features unavailable (%s)', symbol, str(exc)[:80])
             continue
+        # The other two book groups. Both were declared in FEATURE_GROUPS and
+        # fitted into the artifact, and neither was ever attached here — nine of
+        # forty-nine features scored NaN every cycle. Dropping them instead is
+        # not available: refitted without them, log_loss_skill goes +0.00307 ->
+        # -0.00023 and folds positive 6/6 -> 3/6.
+        row.update(cross_venue_row(pm_cache.get(symbol), entry[0]))
+        row.update(implied_vol_row(
+            iv_cache.get(symbol), now=now,
+            sigma_per_min=scored['sigma_per_min'].iloc[i]
+            if 'sigma_per_min' in scored.columns else np.nan))
+        gap = row.get('venue_prob_gap')
+        row['venue_gap_change_5'] = _gap_change(symbol, gap, now)
         for column in columns:
             if column in row:
                 scored.iloc[i, scored.columns.get_loc(column)] = row[column]

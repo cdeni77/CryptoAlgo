@@ -54,6 +54,17 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (quarter research collector)',
            'Accept': 'application/json'}
 
 
+# The latest Polymarket touch per symbol, for the trading loop in this same
+# process. `run_live` supervises this recorder and `scripts.live` as asyncio
+# tasks, so a module-level dict is the whole transport — the `cross_venue`
+# features cost no fetch and no store read.
+#
+# Prices here are DOLLARS best-first, and `no_levels` is NO-denominated, so the
+# YES ask is `1 - best_no_bid`. Published in CENTS because that is what
+# `core.book_features` reads.
+CACHE: dict = {}
+
+
 def window_of(slug: str) -> pd.Timestamp:
     """The window a slug names. Its trailing unix stamp is the OPEN.
 
@@ -278,6 +289,13 @@ async def run(args, gate=None) -> int:
                         no = _no_levels(book.get('asks'))
                         if not yes and not no:
                             continue
+                        CACHE[symbol] = {
+                            'window_open': window_open,
+                            'best_bid': (yes[0][0] * 100.0) if yes else float('nan'),
+                            'best_ask': ((1.0 - no[0][0]) * 100.0) if no else float('nan'),
+                            'at': pd.Timestamp(now, tz='UTC') if pd.Timestamp(now).tzinfo is None
+                                  else pd.Timestamp(now),
+                        }
                         rows.append({
                             'venue': 'polymarket', 'symbol': symbol,
                             'event_time': pd.Timestamp(now).floor('min'),
