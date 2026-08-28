@@ -49,16 +49,23 @@ from core.datastore import ResearchStore
 
 logger = logging.getLogger('implied-vol')
 NORMAL = NormalDist()
-SERIES = 'KXBTCD'
-SYMBOL = 'BTC-USD'
-
-# The freshest ladder fit, for the trading loop in this same process. Only BTC
-# has a strike ladder to invert, so ETH and SOL carry NaN implied-vol features
-# live exactly as they do in the backtest — the model was fitted against that
-# same absence.
+# All three crypto strike ladders. This was `SERIES = 'KXBTCD'` and every row
+# was stamped 'BTC-USD', so ETH and SOL carried NaN for all five implied-vol
+# features on every live cycle — while the BACKFILL already held all three
+# (BTC 22,248 rows, ETH 5,286, SOL 3,110). Live was the half that lagged: the
+# model was fitted against ETH/SOL implied vol that existed and scored against
+# an absence that did not.
 #
-# Keyed by symbol for symmetry with the Polymarket cache; the dict holds at most
-# one entry.
+# The venue serves all three identically: 200 open markets each, every one
+# carrying a strike, `strike_type=greater`.
+LADDERS = (
+    ('KXBTCD', 'BTC-USD'),
+    ('KXETHD', 'ETH-USD'),
+    ('KXSOLD', 'SOL-USD'),
+)
+SERIES, SYMBOL = LADDERS[0]
+
+# The freshest ladder fit per symbol, for the trading loop in this same process.
 CACHE: dict = {}
 MIN_STRIKES = 4
 PROBABILITY_BAND = (0.01, 0.99)
@@ -182,6 +189,68 @@ def mid_of(market: dict) -> Optional[float]:
     return number('last_price_dollars', 'last_price')
 
 
+def fits_for(markets, *, now, symbol: str, min_minutes: float,
+             max_minutes: float, min_r2: float):
+    """Invert one series' open ladders. Returns (rows, freshest_fit).
+
+    Split out of `run` so it can be tested without a venue: the loop around it
+    is a fetch and a sleep, and everything that decides what a row SAYS lives
+    here.
+
+    A ladder is a set of `greater` strikes on one event. Each rung's mid is
+    P(spot > strike), so the set inverts to a single forward sigma — the only
+    forward-looking volatility input this system has.
+    """
+    events: dict[str, list[dict]] = {}
+    for market in markets or []:
+        event = str(market.get('event_ticker') or '')
+        if event:
+            events.setdefault(event, []).append(market)
+
+    rows, latest = [], None
+    for event, group in events.items():
+        closes = [m.get('close_time') for m in group if m.get('close_time')]
+        if not closes:
+            continue
+        close = pd.Timestamp(min(closes))
+        if close.tzinfo is None:
+            close = close.tz_localize('UTC')
+        minutes = (close - pd.Timestamp(now)).total_seconds() / 60.0
+        if not (min_minutes <= minutes <= max_minutes):
+            continue
+        rungs = []
+        for market in group:
+            strike, mid = strike_of(market), mid_of(market)
+            if strike is not None and mid is not None:
+                rungs.append((strike, mid))
+        fit = implied_sigma(rungs, minutes)
+        if fit is None or fit.r2 < min_r2:
+            continue
+        stamp = (pd.Timestamp(now, tz='UTC') if pd.Timestamp(now).tzinfo is None
+                 else pd.Timestamp(now))
+        # Freshest wins: several events are fitted per cycle and the nearest
+        # close is the most informative about the fifteen minutes being traded.
+        if latest is None or minutes < latest['_minutes']:
+            latest = {'implied_sigma_per_min': float(fit.sigma_per_min),
+                      'r2': float(fit.r2), 'n_strikes': float(fit.n_strikes),
+                      'at': stamp, '_minutes': minutes}
+        rows.append({
+            'venue': 'kalshi', 'symbol': symbol,
+            'event_time': pd.Timestamp(now).floor('min'),
+            'available_time': pd.Timestamp(now),
+            'quality': 'valid', 'event_ticker': event,
+            'close_time': close,
+            'minutes_to_close': round(minutes, 3),
+            'implied_sigma_per_min': fit.sigma_per_min,
+            'implied_spot': fit.implied_spot,
+            'atm_strike': fit.atm_strike,
+            'n_strikes': float(fit.n_strikes), 'r2': fit.r2,
+        })
+    if latest is not None:
+        latest.pop('_minutes', None)
+    return rows, latest
+
+
 async def run(args, gate=None) -> int:
     from data_collection.kalshi_client import KalshiClient
 
@@ -198,63 +267,26 @@ async def run(args, gate=None) -> int:
                     if gate is not None:
                         await gate.idle()
                     now = datetime.now(timezone.utc)
-                    try:
-                        payload = await client._request(  # noqa: SLF001
-                            'GET', '/markets',
-                            params={'series_ticker': SERIES, 'status': 'open',
-                                    'limit': 200})
-                    except Exception as exc:              # noqa: BLE001
-                        logger.warning('markets: %s', str(exc)[:110])
-                        await asyncio.sleep(args.interval)
-                        continue
+                    # One pass per ladder. A failure on one series must not cost
+                    # the others their cycle: they are independent books and the
+                    # venue rate-limits per request, not per symbol.
+                    for series, symbol in LADDERS:
+                        try:
+                            payload = await client._request(  # noqa: SLF001
+                                'GET', '/markets',
+                                params={'series_ticker': series,
+                                        'status': 'open', 'limit': 200})
+                        except Exception as exc:              # noqa: BLE001
+                            logger.warning('%s markets: %s', series, str(exc)[:110])
+                            continue
 
-                    events: dict[str, list[dict]] = {}
-                    for market in payload.get('markets', []):
-                        event = str(market.get('event_ticker') or '')
-                        if event:
-                            events.setdefault(event, []).append(market)
-
-                    for event, markets in events.items():
-                        closes = [m.get('close_time') for m in markets
-                                  if m.get('close_time')]
-                        if not closes:
-                            continue
-                        close = pd.Timestamp(min(closes))
-                        if close.tzinfo is None:
-                            close = close.tz_localize('UTC')
-                        minutes = (close - pd.Timestamp(now)).total_seconds() / 60.0
-                        if not (args.min_minutes <= minutes <= args.max_minutes):
-                            continue
-                        rungs = []
-                        for market in markets:
-                            strike, mid = strike_of(market), mid_of(market)
-                            if strike is not None and mid is not None:
-                                rungs.append((strike, mid))
-                        fit = implied_sigma(rungs, minutes)
-                        if fit is None or fit.r2 < args.min_r2:
-                            continue
-                        # Freshest wins: several events are fitted per cycle
-                        # and the nearest close is the last one appended.
-                        CACHE[SYMBOL] = {
-                            'implied_sigma_per_min': float(fit.sigma_per_min),
-                            'r2': float(fit.r2),
-                            'n_strikes': float(fit.n_strikes),
-                            'at': pd.Timestamp(now, tz='UTC')
-                                  if pd.Timestamp(now).tzinfo is None
-                                  else pd.Timestamp(now),
-                        }
-                        rows.append({
-                            'venue': 'kalshi', 'symbol': SYMBOL,
-                            'event_time': pd.Timestamp(now).floor('min'),
-                            'available_time': pd.Timestamp(now),
-                            'quality': 'valid', 'event_ticker': event,
-                            'close_time': close,
-                            'minutes_to_close': round(minutes, 3),
-                            'implied_sigma_per_min': fit.sigma_per_min,
-                            'implied_spot': fit.implied_spot,
-                            'atm_strike': fit.atm_strike,
-                            'n_strikes': float(fit.n_strikes), 'r2': fit.r2,
-                        })
+                        found, latest = fits_for(
+                            payload.get('markets', []), now=now, symbol=symbol,
+                            min_minutes=args.min_minutes,
+                            max_minutes=args.max_minutes, min_r2=args.min_r2)
+                        if latest is not None:
+                            CACHE[symbol] = latest
+                        rows.extend(found)
 
                     if len(rows) >= args.batch_rows:
                         await asyncio.to_thread(
