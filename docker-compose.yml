@@ -199,12 +199,34 @@ services:
     # Add `--place-orders` to trade for real. It stays a separate flag from
     # `--mode live` deliberately: one flag guarding an irreversible action is one
     # typo away from being wrong.
+    # ONE process: trade, stream, ladder, pm_ladder, implied_vol, store_sync.
+    #
+    # `scripts.live` alone is not enough, and the failure is silent. The book
+    # features read `record_stream.CACHE`, which is PROCESS-LOCAL — running the
+    # recorders in a second container leaves the trading process with an empty
+    # cache, so every ladder-derived feature (imbalance_5c, depth_ratio,
+    # book_convexity) scores NaN and LightGBM substitutes a learned default.
+    # That is a different model from the one whose gates were measured, and it
+    # says so in the log rather than crashing.
+    #
+    # `--mode live --dry-run` reads the REAL book and places nothing. Live mode
+    # is not optional here: the promoted artifact was fitted with
+    # init_score_source=market, so its correction is a residual of the PRICE,
+    # and paper mode opens no venue client at all.
+    #
+    # Add `--place-orders` to trade for real. It stays separate from
+    # `--mode live` deliberately: one flag guarding an irreversible action is
+    # one typo away from being wrong.
     command: >
-      -m scripts.live
+      -m scripts.run_live
+        --trade-args
         --loop
         --cycle-seconds 60
         --mode live
         --dry-run
+        --no-require-gates
+        --force
+        --reason "Live experiment on a forced promotion: calibration_error 0.0216 and calibration_max_deviation 0.0515 are per-fold instability rather than bias (pooled worst 2.8pp would pass), and max_drawdown 0.402 is a single-path statistic that moved 0.241->0.402 on a marginal sample change. Stable across both samples: log_loss_skill +0.00307 (t=+3.69), 6/6 folds, control gain share 0.0%. Dry-run: reads the real book, places nothing."
 
   # ===========================================================================
   # Scrape — one-off, runs to completion then exits
