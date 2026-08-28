@@ -23,7 +23,7 @@ from typing import Optional, Sequence
 import pandas as pd
 
 from core.config import Config, DEFAULT_CONFIG, find_fee_config
-from core.dataset import Dataset, load_minute_bars
+from core.dataset import Dataset, DatasetError, load_minute_bars
 from core.datastore import ResearchStore
 from core.features import ALL_GROUPS
 
@@ -47,6 +47,11 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            + ','.join(DEFAULT_CONFIG.symbols))
     data.add_argument('--venue', type=str, default=None,
                       help=f'Research-store venue label (default {DEFAULT_CONFIG.venue})')
+    data.add_argument('--complete-cases', action='store_true',
+                      help='Keep only rows where the venue book, the other '
+                           'venue, a ladder fit and the venue settlement are '
+                           'ALL present. Fewer rows, but each is one the live '
+                           'path could have traded with everything it claims.')
     data.add_argument('--start', type=str, default=None, help='ISO date, inclusive')
     data.add_argument('--end', type=str, default=None, help='ISO date, exclusive')
     data.add_argument('--train-window-days', type=float, default=None,
@@ -210,6 +215,18 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
             'up to %.2f%% of windows are dropped for a missing boundary minute. '
             'Each missing minute kills two windows — the one settling on it and '
             'the one opening on it — so this is twice the gap rate.', worst * 100)
+    if getattr(args, 'complete_cases', False):
+        from core.dataset import complete_cases
+        before = len(dataset.windows)
+        dataset.windows = complete_cases(dataset.windows)
+        logger.info('complete cases only: %s of %s rows kept (%.1f%%)',
+                    f'{len(dataset.windows):,}', f'{before:,}',
+                    len(dataset.windows) / max(before, 1) * 100)
+        if not len(dataset.windows):
+            raise DatasetError(
+                'no rows carry every field; the book, the peer venue, a ladder '
+                'fit and the venue settlement must all be present')
+
     logger.info('%s windows, %s rows, %.0f days',
                 f'{len(dataset.window_index):,}', f'{len(dataset.windows):,}',
                 dataset.span_days)

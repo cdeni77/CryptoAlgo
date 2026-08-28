@@ -182,6 +182,44 @@ class Dataset:
         )
 
 
+# What each book family needs before a row can honestly be said to carry it.
+# One representative column per family: if the join produced anything at all it
+# produced this, and requiring the full list would drop rows for a legitimately
+# absent depth level rather than for a missing book.
+COMPLETE_CASE_COLUMNS = {
+    'market_state': ('ask_up', 'market_probability', 'bid_at_touch'),
+    'cross_venue': ('pm_market_probability',),
+    'implied_vol': ('implied_sigma_per_min',),
+    'label': ('venue_outcome',),
+}
+
+
+def complete_cases(windows: pd.DataFrame,
+                   groups: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """Rows where every field the model claims to use is actually present.
+
+    **Why this is not optional.** Every run before it trained on a mixture: 15
+    of 57 features NaN for most rows, because the venue's book starts
+    2026-01-08 against five years of bars. LightGBM does not skip a NaN — it
+    learns a default direction for it — so the fit is two models blended and the
+    evaluation measures the blend. That answers a question nobody asked.
+
+    `venue_outcome` is required too. Without it the row is graded on our
+    Coinbase label, and that is the leak measured at a 72.77% win rate on the
+    windows where the two indices disagree against 56.17% where they agree.
+    """
+    wanted = tuple(groups) + ('label',) if groups else tuple(COMPLETE_CASE_COLUMNS)
+    needed = [c for g in wanted for c in COMPLETE_CASE_COLUMNS.get(g, ())]
+    present = [c for c in needed if c in windows.columns]
+    missing = sorted(set(needed) - set(present))
+    if missing:
+        logger.warning('complete_cases: %s never joined, so it cannot be required',
+                       ', '.join(missing))
+    if not present or not len(windows):
+        return windows.iloc[0:0] if not len(windows) else windows
+    return windows[windows[present].notna().all(axis=1)]
+
+
 @dataclass
 class ScoringBundle:
     """Everything needed to score a window that has never been seen.
