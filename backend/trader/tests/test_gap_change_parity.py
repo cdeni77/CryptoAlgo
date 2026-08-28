@@ -67,3 +67,28 @@ def test_a_repeated_offset_is_not_differenced_against_itself():
     gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
     gap_change('BTC-USD', 0.05, window_open=W1, offset=6)
     assert gap_change('BTC-USD', 0.05, window_open=W1, offset=6) == pytest.approx(0.03)
+
+
+def test_one_symbol_does_not_evict_another_within_the_same_window():
+    """Three symbols are scored in every cycle of the same window.
+
+    The first version cleared the WHOLE history whenever it met a key it had
+    not seen, so BTC's reading was destroyed by ETH's arrival and ETH's by
+    SOL's. Every symbol then reported NaN on every cycle forever, and the
+    symbols-do-not-bleed test above still passed because it only asserted that
+    ETH saw nothing — never that BTC kept what it had.
+    """
+    for symbol in ('BTC-USD', 'ETH-USD', 'SOL-USD'):
+        gap_change(symbol, 0.02, window_open=W1, offset=3)
+    for symbol in ('BTC-USD', 'ETH-USD', 'SOL-USD'):
+        assert gap_change(symbol, 0.05, window_open=W1, offset=6) == pytest.approx(
+            0.03), f'{symbol} lost its offset-3 reading to another symbol'
+
+
+def test_a_new_window_evicts_only_the_windows_that_ended():
+    """Memory must not grow forever, but eviction is by WINDOW, not by arrival."""
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    gap_change('ETH-USD', 0.02, window_open=W1, offset=3)
+    # BTC moves to the next window; ETH has not been scored there yet.
+    assert np.isnan(gap_change('BTC-USD', 0.01, window_open=W2, offset=3))
+    assert gap_change('BTC-USD', 0.04, window_open=W2, offset=6) == pytest.approx(0.03)

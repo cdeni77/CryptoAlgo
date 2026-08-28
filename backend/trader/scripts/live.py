@@ -1118,12 +1118,15 @@ def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
     against something true.
     """
     key = (str(symbol), pd.Timestamp(window_open))
-    previous = _GAP_HISTORY.get(key)
-    # A new window: forget the last one entirely rather than let it be reached.
-    if previous is None:
-        _GAP_HISTORY.clear()
+    # Evict by WINDOW, never by arrival. Three symbols are scored in every
+    # cycle of the same window, so clearing whenever an unseen key turns up
+    # meant BTC's reading was destroyed by ETH's and ETH's by SOL's — every
+    # symbol then reported NaN on every cycle, forever.
+    if key not in _GAP_HISTORY:
+        for stale in [k for k in _GAP_HISTORY if k[1] != key[1]]:
+            del _GAP_HISTORY[stale]
         _GAP_HISTORY[key] = {}
-        previous = _GAP_HISTORY[key]
+    previous = _GAP_HISTORY[key]
     try:
         value = float(gap)
     except (TypeError, ValueError):

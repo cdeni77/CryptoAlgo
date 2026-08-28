@@ -95,6 +95,15 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     # grid by ~0.24c, about half the measured half-spread. Inside [0.10, 0.90]
     # the backfill is exact. So economics from backfilled quotes are only
     # quantisation-free in that band, and until now it could not be set.
+    # Which offsets may OPEN a position, as against which are SCORED. Only
+    # `scripts/live.py` had this flag, defaulting to 12, so every backtest ran
+    # `entry_offsets=None` — the first-clear policy — while live ran wait_12.
+    # Measured over 70 days, per contract: first_clear 0.040c (t=0.10) against
+    # 3.304c at +12m alone (t=5.98). The gates were describing the weakest of
+    # the three policies and none of them was the deployed one.
+    #
+    # The default stays None so past ledger entries keep their meaning.
+    economics.add_argument('--entry-offsets', type=int, nargs='+', default=None)
     economics.add_argument('--min-traded-price', type=float, default=None)
     economics.add_argument('--max-traded-price', type=float, default=None)
     model.add_argument('--init-score-source', choices=('baseline', 'market'),
@@ -147,6 +156,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('recency_half_life_days', 'recency_half_life_days'),
         ('train_window_days', 'train_window_days'),
         ('starting_bankroll', 'bankroll'), ('kelly_fraction', 'kelly_fraction'),
+        ('entry_offsets', 'entry_offsets'),
         ('min_traded_price', 'min_traded_price'),
         ('max_traded_price', 'max_traded_price'),
         ('init_score_source', 'init_score_source'),
@@ -155,7 +165,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
     ):
         value = getattr(args, attr, None)
         if value is not None:
-            overrides[field] = value
+            # argparse `nargs='+'` yields a list; Config's fields are tuples so
+            # that a run's provenance hashes and compares equal across processes.
+            overrides[field] = tuple(value) if isinstance(value, list) else value
 
     config = DEFAULT_CONFIG.with_overrides(**overrides)
     path = Path(args.fee_config) if getattr(args, 'fee_config', None) else find_fee_config()
