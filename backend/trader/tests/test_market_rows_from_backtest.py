@@ -140,3 +140,48 @@ def test_the_default_bar_is_tight_enough_to_matter():
     from core.metrics import MAX_QUOTE_AGE_SECONDS
     assert MAX_QUOTE_AGE_SECONDS <= 60.0, (
         'at 900s the measured model_minus_market was 9x its fresh-quote value')
+
+
+# --- the label must be the one the MARKET was priced against ---------------
+#
+# The measurement this guards against, and it reversed a headline result:
+#
+#   scored against our Coinbase label      base-mkt  +0.00382
+#   scored against the venue's settlement  base-mkt  -0.00245
+#   on the 96.8% where the two agree       base-mkt  +0.00101
+#
+# The baseline is computed from Coinbase bars and our outcome label is computed
+# from Coinbase bars; the market prices on CF Benchmarks BRTI. Grading the two
+# forecasters on a label that shares a source with one of them hands that one a
+# free advantage worth the label noise -- measured at 2.99% sign flips,
+# concentrated in the near-ties, which is exactly where the whole effect lived.
+#
+# It looked like "a lognormal formula beats a liquid market", which should have
+# been suspicious on its face. Against the venue's own settlement the baseline
+# LOSES, reproducing the live measurement that had the market at 0.333 log loss
+# against the model's 0.430.
+
+def test_the_venue_label_is_preferred_when_present():
+    """`venue_outcome` is what the market settled on. When we hold it, it is
+    the only fair grade for a comparison between our forecast and the price."""
+    frame = _scored()
+    frame['venue_outcome'] = [0, 1, 0, 1]        # deliberately the opposite
+    rows = market_rows_from_scored(frame)
+    outcomes = [r[6] for r in rows]
+    assert outcomes == [0, 1, 0, 1], 'must grade on the venue label, not ours'
+
+
+def test_our_label_is_used_only_where_the_venue_has_none():
+    """The venue's settlements reach back only so far; our label still has to
+    cover the rest, and dropping those rows would discard most of the sample."""
+    frame = _scored()
+    frame['venue_outcome'] = [np.nan, np.nan, 0, 1]
+    rows = market_rows_from_scored(frame)
+    assert [r[6] for r in rows] == [1, 0, 0, 1]
+
+
+def test_a_row_with_neither_label_is_dropped():
+    frame = _scored()
+    frame['outcome'] = [1, np.nan, 1, 0]
+    frame['venue_outcome'] = [np.nan, np.nan, 0, np.nan]
+    assert len(market_rows_from_scored(frame)) == 3

@@ -466,10 +466,22 @@ def market_rows_from_scored(
     if frame is None or not len(frame):
         return []
     needed = ('symbol', 'window_open', 'offset', 'market_probability',
-              'baseline_probability', 'model_probability', 'outcome')
+              'baseline_probability', 'model_probability')
     if any(c not in frame.columns for c in needed):
         return []
-    part = frame.dropna(subset=list(needed))
+    part = frame.copy()
+    # **Grade on the label the MARKET was priced against, wherever we hold it.**
+    # Our outcome comes from Coinbase bars and so does the baseline; the market
+    # prices on CF Benchmarks BRTI. Scoring both forecasters on a label that
+    # shares a source with one of them hands that one the label noise as free
+    # skill. Measured, and it reversed the headline: base-mkt read +0.00382 on
+    # our label and -0.00245 on the venue's, collapsing to +0.00101 on the 96.8%
+    # where the two agree. The whole effect lived in the near-ties.
+    if 'venue_outcome' in part.columns:
+        part['outcome'] = pd.to_numeric(
+            part['venue_outcome'], errors='coerce').fillna(
+                pd.to_numeric(part.get('outcome'), errors='coerce'))
+    part = part.dropna(subset=list(needed) + ['outcome'])
     # Staleness is not skill. A row whose quote predates the decision by minutes
     # is measuring the clock, not the market -- see MAX_QUOTE_AGE_SECONDS.
     # Rows with no age are kept: live-recorded quotes carry none, and they are
