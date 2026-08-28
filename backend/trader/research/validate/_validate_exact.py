@@ -21,6 +21,9 @@ rather than a timing one.
 
 from __future__ import annotations
 
+import gzip
+from pathlib import Path
+
 # This file moved into research/validate/ during a repo cleanup; `core`/`scripts`
 # are packages rooted at backend/trader/, which Python does not add to
 # sys.path automatically for a script run from a subdirectory (only the
@@ -53,15 +56,54 @@ def main() -> int:
     live['window_open'] = pd.to_datetime(live['window_open'], utc=True)
     live['available_time'] = pd.to_datetime(live['available_time'], utc=True)
 
+    # `data/book_full.jsonl` was the old single-file backfill and is long gone;
+    # the collection now writes one gzipped JSONL per (venue, symbol, month)
+    # under data/collection/archive, in the SAME record shape (window_open,
+    # symbol, series).
+    #
+    # Only the windows the live recorder also saw are kept. Loading every
+    # window's series would be 255 million snapshots in a dict — the shape that
+    # froze this machine when `consolidate` held a partition in memory — to
+    # answer a question about a few hundred overlapping windows.
+    wanted = {(r['symbol'], r['window_open'].isoformat()[:19])
+              for r in live.to_dict('records')}
+    archive = Path(os.getenv('COLLECT_DATA', 'data/collection')) / 'archive'
+    # Only the months and symbols the live recorder actually covers. It started
+    # recently, so every match sits in one or two partitions -- scanning all
+    # 7.5 GB to find a few hundred windows costs hours for nothing.
+    def _tags(q):
+        return {t.split('=')[0]: t.split('=')[1] for t in q.parts if '=' in t}
+    months = {k[1][:7] for k in wanted}
+    symbols = {k[0] for k in wanted}
+    paths = [q for q in sorted(
+        archive.glob('venue=*/symbol=*/month=*/windows.jsonl.gz'))
+        if _tags(q).get('month') in months and _tags(q).get('symbol') in symbols]
+    print(f'  scanning {len(paths)} partitions for months {sorted(months)}')
+    if not paths:
+        print(f'no archive under {archive}; nothing to compare')
+        return 0
     series: dict[tuple, list] = {}
-    for line in open('data/book_full.jsonl'):
+    for path in paths:
         try:
-            record = json.loads(line)
-        except ValueError:
+            with gzip.open(path, 'rt') as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    key = (record.get('symbol'), str(record['window_open'])[:19])
+                    if key not in wanted:
+                        continue
+                    # Keep the FULLEST copy: a window can be archived more than
+                    # once, and the first may be a truncated retry.
+                    have = series.get(key)
+                    new = record.get('series') or []
+                    if have is None or len(new) > len(have):
+                        series[key] = new
+        except (OSError, EOFError):
             continue
-        key = (record['symbol'], str(record['window_open'])[:19])
-        series[key] = record['series']
-    print(f'{len(series):,} backfilled windows, {len(live):,} live ladder rows')
+    print(f'{len(series):,} backfilled windows matched, '
+          f'{len(live):,} live ladder rows')
 
     rows = []
     for record in live.to_dict('records'):

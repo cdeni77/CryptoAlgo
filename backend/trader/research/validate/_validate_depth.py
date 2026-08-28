@@ -37,6 +37,41 @@ pd.set_option('display.width', 200)
 MAX_AGE = float(os.getenv('MAX_AGE', '15'))
 
 
+# Staleness bins, in seconds, for the trend the verdict is based on.
+AGE_BINS = ((0, 2), (2, 5), (5, 10), (10, 20), (20, 40), (40, 1e9))
+# One tick. The freshest bin has to land here or the shape does not matter.
+ONE_TICK = 0.0125
+MIN_PAIRS = 40
+
+
+def agreement_verdict(bins):
+    """(ok, why) from [(upper_age_s, n, median_abs_diff)] ordered by freshness.
+
+    The question is the SHAPE, not the level. Two books sampled tens of seconds
+    apart differ by cents on a market that moves ~8.4pp a minute, so a fixed
+    threshold on the level mostly measures the sampling lag. A backfill that
+    describes a DIFFERENT book disagrees regardless of how fresh either quote
+    is — flat in this variable — while the same book sampled at different
+    instants produces a monotone ramp.
+
+    Necessary and not sufficient: the freshest bin must still land near one
+    tick, or a steep trend would excuse a book that is simply wrong.
+    """
+    usable = [b for b in bins if b[1] >= 15]
+    if sum(b[1] for b in usable) < MIN_PAIRS or len(usable) < 3:
+        return False, 'not enough overlapping pairs to judge'
+    fresh, stale = usable[0], usable[-1]
+    if fresh[2] > ONE_TICK:
+        return False, (f'the freshest quotes still differ by '
+                       f'{fresh[2]*100:.2f}c, above one tick')
+    if stale[2] <= fresh[2] * 1.5:
+        return False, ('the gap is flat in staleness, so it is not timing — '
+                       'the backfill may describe a different book')
+    return True, (f'the gap grows {fresh[2]*100:.2f}c -> {stale[2]*100:.2f}c '
+                  f'with staleness, which is timing: the same book sampled at '
+                  f'different instants')
+
+
 def main() -> int:
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     depth = store.read('venue_depth')
@@ -91,9 +126,26 @@ def main() -> int:
         print(f'{field:16s} n={int(ok.sum()):>6}  median backfill/live {ratio.median():.3f}  '
               f'p10 {ratio.quantile(0.10):.3f}  p90 {ratio.quantile(0.90):.3f}')
 
-    print('\nA median price difference above ~1c would mean the backfill is not')
-    print('the same book and nothing trained on it can be trusted.')
-    return 0
+    # The verdict is the SHAPE across staleness, not a threshold on the level.
+    # See `agreement_verdict`: a fixed threshold here failed the backfill at
+    # 1.8c when the two sides were a median 34s apart.
+    print('\nprice gap against how stale the WORSE of the two quotes is:')
+    age_worst = pd.concat([age_live.abs(), age_back.abs()], axis=1).max(axis=1)
+    a = both['yes_bid_live'].astype(float)
+    b = both['yes_bid_back'].astype(float)
+    gap = (a - b).abs()
+    rows = []
+    for lo, hi in AGE_BINS:
+        sel = (age_worst >= lo) & (age_worst < hi) & np.isfinite(gap)
+        n = int(sel.sum())
+        if n:
+            rows.append((hi, n, float(gap[sel].median())))
+            label = f'{lo:.0f}-{hi:.0f}s' if hi < 1e9 else f'{lo:.0f}s+'
+            print(f'  {label:>10} n={n:>6,}  median |bid diff| '
+                  f'{gap[sel].median()*100:>5.2f}c')
+    ok, why = agreement_verdict(rows)
+    print(f'\nVERDICT: {"PASS" if ok else "FAIL"} — {why}')
+    return 0 if ok else 1
 
 
 if __name__ == '__main__':

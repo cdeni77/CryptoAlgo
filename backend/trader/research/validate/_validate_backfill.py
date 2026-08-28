@@ -70,11 +70,28 @@ def _live_top(store, table: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _backfill_top(venue: str) -> pd.DataFrame:
-    """Best bid/ask per (symbol, window, minute) from the collected archive."""
+def _backfill_top(venue: str, wanted=None) -> pd.DataFrame:
+    """Best bid/ask per (symbol, window, minute) from the collected archive.
+
+    `wanted` is the set of (symbol, window_open) the live side actually covers,
+    and it is not an optimisation. Without it this reads EVERY snapshot of every
+    partition — 255 million rows, ~20 GB as Python objects — to answer a question
+    about a few hundred overlapping windows. Measured: 5 GB resident and still
+    climbing after 23 minutes, which is the same shape that froze this machine
+    when `consolidate` held a partition in memory.
+    """
     rows = []
     paths = list(ARCHIVE.glob(f'venue={venue}/**/windows.jsonl.gz'))
     paths += list(ARCHIVE.glob(f'venue={venue}/**/windows.jsonl'))
+    if wanted:
+        months = {w[1].strftime('%Y-%m') for w in wanted}
+        symbols = {w[0] for w in wanted}
+
+        def _tags(q):
+            return {t.split('=')[0]: t.split('=')[1] for t in q.parts if '=' in t}
+        paths = [q for q in paths
+                 if _tags(q).get('month') in months
+                 and _tags(q).get('symbol') in symbols]
     for path in paths:
         opener = gzip.open if str(path).endswith('.gz') else open
         with opener(path, 'rt') as handle:
@@ -84,6 +101,8 @@ def _backfill_top(venue: str) -> pd.DataFrame:
                 except ValueError:
                     continue
                 opened = pd.Timestamp(rec['window_open']).tz_convert('UTC')
+                if wanted and (rec.get('symbol'), opened) not in wanted:
+                    continue
                 for snap in rec.get('series') or []:
                     ts, bid, ask = snap[0], snap[1], snap[2]
                     if ts is None:
@@ -140,7 +159,9 @@ def sweep(live, back) -> list:
 
 def compare(venue: str, live_table: str, store) -> dict:
     live = _live_top(store, live_table)
-    back = _backfill_top(venue)
+    # Only the windows the live recorder covers; see _backfill_top.
+    wanted = set(zip(live['symbol'], live['window_open'])) if len(live) else set()
+    back = _backfill_top(venue, wanted)
     if live.empty or back.empty:
         return {'venue': venue, 'overlap': 0,
                 'note': 'no overlap yet — live recording and backfill must '
