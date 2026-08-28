@@ -48,6 +48,35 @@ def brier_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) ->
     return (base - brier(outcome, model)) / base if base > 0 else float('nan')
 
 
+def resolve_max_deviation(per_fold, pooled) -> tuple:
+    """(value, why) for `calibration_max_deviation`, preferring the per-fold max.
+
+    `worst_deviation` returns NaN when no bin holds its minimum row count, and
+    `max` over folds propagates that — so a run whose folds are individually too
+    small reported NaN and FAILED, indistinguishably from a model that is badly
+    calibrated. Under `--complete-cases` that is the normal case, not an
+    exception.
+
+    Every scored row is out-of-sample whichever fold produced it, so the pooled
+    rows are a legitimate fallback with fold-count times the rows per bin. It
+    stays a FALLBACK: the per-fold maximum is the stricter statistic, and a
+    single badly-calibrated fold is exactly what the gate exists to catch, so
+    one measurable fold beats the pool.
+
+    Nothing measurable anywhere still returns NaN and still fails -- not
+    measured is not measured good -- but the reason names the sample size rather
+    than the model.
+    """
+    values = [float(v) for v in per_fold if v is not None and np.isfinite(v)]
+    if values:
+        return max(values), f'worst adequately-populated bin across {len(values)} fold(s)'
+    if pooled is not None and np.isfinite(pooled):
+        return float(pooled), ('pooled across folds: no single fold had a bin '
+                               'with enough rows to measure')
+    return float('nan'), ('not measurable: no calibration bin reached the '
+                          'minimum row count, in any fold or pooled')
+
+
 @dataclass
 class FoldEvaluation:
     """One fold's out-of-sample measurement."""
@@ -233,10 +262,46 @@ class EvaluationReport:
 
     @property
     def max_calibration_deviation(self) -> float:
+        """The worst adequately-populated calibration bin.
+
+        Per-fold first, pooled as a fallback. `worst_deviation` returns NaN when
+        no bin holds its minimum row count, and `max` propagated that, so a run
+        with small folds reported NaN and FAILED — indistinguishable from a model
+        that is genuinely badly calibrated. Under `--complete-cases` small folds
+        are the normal case. See `resolve_max_deviation`.
+        """
         if not self.folds:
             return float('nan')
-        return float(np.max(np.asarray(
-            [f.model_max_deviation for f in self.folds], dtype=float)))
+        value, why = resolve_max_deviation(
+            [f.model_max_deviation for f in self.folds],
+            self.pooled_max_deviation)
+        self._max_deviation_reason = why
+        return value
+
+    @property
+    def pooled_max_deviation(self) -> float:
+        """The same statistic on every scored row at once.
+
+        Legitimate because each row is out-of-sample whichever fold produced it,
+        and it carries fold-count times the rows per bin — which is the whole
+        reason the per-fold version goes un-measurable on a small sample.
+        """
+        tables = [f.reliability_table for f in self.folds
+                  if getattr(f, 'reliability_table', None) is not None]
+        if not tables:
+            return float('nan')
+        counts = np.sum([t.count for t in tables], axis=0)
+        populated = counts >= 500
+        if not populated.any():
+            return float('nan')
+        # Row-weighted, so a bin's pooled figure is the average an observation
+        # actually saw rather than an average of fold averages.
+        pred = np.sum([t.predicted * t.count for t in tables], axis=0)
+        obs = np.sum([t.observed * t.count for t in tables], axis=0)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            pred = np.where(counts > 0, pred / counts, np.nan)
+            obs = np.where(counts > 0, obs / counts, np.nan)
+        return float(np.nanmax(np.abs(pred[populated] - obs[populated])))
 
     @property
     def total_non_finite(self) -> int:
