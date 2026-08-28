@@ -64,6 +64,14 @@ NEW_YORK = ZoneInfo('America/New_York')
 # this so a saved model always scores against the same matrix — a group that
 # produced nothing arrives as an all-NaN column rather than an absent one, which
 # is a shape the model can be told about instead of a KeyError at scoring time.
+# Column names live with the code that computes them, so a rename cannot
+# leave this dict pointing at a column nothing produces.
+from core.book_features import (                                # noqa: E402
+    CROSS_VENUE as BOOK_CROSS_VENUE,
+    IMPLIED_VOL as BOOK_IMPLIED_VOL,
+    MARKET_STATE as BOOK_MARKET_STATE,
+)
+
 FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     'vol_state': (
         'log_rv_15', 'log_rv_60', 'log_rv_240', 'log_rv_1440',
@@ -87,9 +95,33 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
         'elapsed_fraction', 'remaining_minutes', 'quarter_of_hour',
         'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'us_equity_hours',
     ),
+    # --- the venue's own book, from eight months of collection ---------------
+    #
+    # Declared here rather than inline so `--groups market_state` can run each
+    # ALONE. That is the test that matters: a group which forecasts nothing
+    # scores `alpha 0.000` and reproduces the baseline exactly, which is how
+    # `vol_state` and the `clock` control were both shown to be null despite
+    # `clock` carrying a 27.9% LightGBM gain share. Gain share says where splits
+    # were spent, not what predicts.
+    #
+    # `market_minus_baseline` is the most informative column available AND the
+    # one that invites echo: given a well-calibrated quote, copying it is the
+    # cheapest route to a low log loss, which scores well on `log_loss_skill`
+    # and reads ~0 on `model_minus_market`. It stays in its own PRICE_COLUMNS
+    # subset so the structure-only variant can be run without it.
+    'market_state': BOOK_MARKET_STATE,
+    'cross_venue': BOOK_CROSS_VENUE,
+    'implied_vol': BOOK_IMPLIED_VOL,
 }
 
-ALL_GROUPS = tuple(FEATURE_GROUPS)
+# The venue's book only exists from 2026-01-08, against five years of bars, so
+# these are SELECTABLE but not DEFAULT. In the default matrix they would be
+# all-NaN for ~90% of rows — which `population_report` exists to catch, and
+# which would silently widen every feature matrix the project has ever built.
+# `--groups market_state` selects them explicitly; that is also how each is
+# ablated alone, which is the only test that says whether it forecasts anything.
+BOOK_GROUPS = ('market_state', 'cross_venue', 'implied_vol')
+ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in BOOK_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
 CONTROL_GROUPS = ('clock',)
 

@@ -208,3 +208,69 @@ def book_at_decision(books: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
         by=['symbol', 'window_open'], direction='backward',
         suffixes=('', '_book'))
     return joined.sort_index().reindex(table.index)
+
+
+# A ladder fit older than this is not a forward-looking estimate of anything.
+# Generous, because `iv_staleness_minutes` rides along as a feature and a study
+# can tighten it without re-joining: 60% of ladders yield no fit at all, leaving
+# a ~5-hour mean gap, so a hard filter here would discard most of the dataset.
+MAX_FIT_AGE_MINUTES = 360.0
+
+
+def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
+                       max_age_minutes: float = MAX_FIT_AGE_MINUTES) -> pd.DataFrame:
+    """The last ladder fit AT OR BEFORE each decision, plus its staleness.
+
+    As-of, never nearest: a sigma inverted from a ladder that closed after the
+    decision instant is a forecast made with tomorrow's newspaper, and it would
+    read as skill.
+
+    Staleness is a FEATURE rather than a filter. The fits are irregular — 60% of
+    ladders yield nothing — so almost every decision is priced against a sigma
+    measured minutes or hours earlier. That is usable, because volatility is
+    persistent, but only if the model can tell a fresh estimate from a stale
+    one. Filtering everything stale would discard most of the dataset to avoid a
+    problem the model can simply be told about.
+    """
+    out = table.copy()
+    for column in IMPLIED_VOL:
+        out[column] = np.nan
+    if fits is None or not len(fits) or not len(out):
+        return out
+
+    left = pd.DataFrame({
+        '_order': np.arange(len(out)),
+        'symbol': out['symbol'].values,
+        '_at': pd.to_datetime(out['decision_time'], utc=True).values,
+    })
+    right = pd.DataFrame({
+        'symbol': fits['symbol'].values,
+        '_at': pd.to_datetime(fits['event_time'], utc=True).values,
+        'implied_sigma_per_min': pd.to_numeric(
+            fits.get('implied_sigma_per_min'), errors='coerce').values,
+        'iv_r2': pd.to_numeric(fits.get('r2'), errors='coerce').values,
+        'iv_n_strikes': pd.to_numeric(fits.get('n_strikes'), errors='coerce').values,
+    }).dropna(subset=['_at'])
+    # Carried through the join so staleness is the gap to the fit ACTUALLY used;
+    # merge_asof consumes the right key, so without this there is nothing to
+    # measure the age against.
+    right['_fit_at'] = right['_at']
+
+    merged = pd.merge_asof(
+        left.sort_values('_at'), right.sort_values('_at'),
+        on='_at', by='symbol', direction='backward',
+    ).sort_values('_order')
+
+    age = ((merged['_at'] - merged['_fit_at']).dt.total_seconds() / 60.0).values
+    fresh = np.isfinite(age) & (age >= 0) & (age <= max_age_minutes)
+
+    implied = np.where(fresh, merged['implied_sigma_per_min'].values, np.nan)
+    realised = pd.to_numeric(out.get('sigma_per_min'), errors='coerce').values
+    ratio = _safe_div(implied, realised)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
+    out['implied_sigma_per_min'] = implied
+    out['iv_r2'] = np.where(fresh, merged['iv_r2'].values, np.nan)
+    out['iv_n_strikes'] = np.where(fresh, merged['iv_n_strikes'].values, np.nan)
+    out['iv_staleness_minutes'] = np.where(fresh, age, np.nan)
+    return out

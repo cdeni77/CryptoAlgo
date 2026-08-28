@@ -154,7 +154,12 @@ def test_the_control_group_is_declared_as_one():
 
 def test_selecting_groups_selects_columns():
     assert set(feature_columns(('geometry',))) == set(FEATURE_GROUPS['geometry'])
-    assert len(feature_columns()) == sum(len(v) for v in FEATURE_GROUPS.values())
+    # The DEFAULT matrix is ALL_GROUPS, which is no longer every declared group:
+    # the book families exist only from 2026-01-08 against five years of bars, so
+    # they are selectable but not default. Defaulting them in would make ~90% of
+    # every feature matrix NaN.
+    from core.features import ALL_GROUPS as _DEFAULTS
+    assert len(feature_columns()) == sum(len(FEATURE_GROUPS[g]) for g in _DEFAULTS)
     with pytest.raises(ValueError, match='unknown feature groups'):
         feature_columns(('nonexistent',))
 

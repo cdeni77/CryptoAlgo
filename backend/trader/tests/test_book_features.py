@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from core.book_features import (
     MARKET_STATE, CROSS_VENUE, IMPLIED_VOL,
@@ -203,3 +204,103 @@ def test_the_join_does_not_leak_across_windows():
         'decision_time': pd.to_datetime(['2026-07-01T12:18Z'])})
     got = book_at_decision(books, table)
     assert pd.isna(got['best_bid'].iloc[0]), 'the 12:05 book belongs to another window'
+
+
+# --- joining the ladder fits onto decisions --------------------------------
+#
+# The fits are irregular: 60% of ladders yield nothing, leaving a ~5-hour mean
+# gap, so almost every decision is priced against a sigma measured some time
+# earlier. That is usable -- volatility is persistent -- but only if the model
+# can tell a fresh estimate from a stale one, which is why staleness is a
+# feature and not a filter.
+
+def test_the_fit_is_the_last_one_at_or_before_the_decision():
+    """A sigma inverted from a ladder AFTER the decision instant is a forecast
+    made with tomorrow's newspaper."""
+    from core.book_features import attach_implied_vol
+    fits = pd.DataFrame({
+        'symbol': ['BTC-USD'] * 3,
+        'event_time': pd.to_datetime(['2026-07-01T11:00Z', '2026-07-01T11:40Z',
+                                      '2026-07-01T12:30Z']),
+        'implied_sigma_per_min': [0.0004, 0.0006, 0.0009],
+        'r2': [0.98, 0.97, 0.96], 'n_strikes': [8, 9, 10]})
+    table = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
+        'sigma_per_min': [0.0003]})
+    got = attach_implied_vol(table, fits)
+    assert got['implied_sigma_per_min'].iloc[0] == pytest.approx(0.0006), \
+        'must take 11:40, not the 12:30 fit from the future'
+
+
+def test_staleness_is_measured_from_the_fit_to_the_decision():
+    from core.book_features import attach_implied_vol
+    fits = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'event_time': pd.to_datetime(['2026-07-01T11:40Z']),
+        'implied_sigma_per_min': [0.0006], 'r2': [0.97], 'n_strikes': [9]})
+    table = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
+        'sigma_per_min': [0.0003]})
+    got = attach_implied_vol(table, fits)
+    assert got['iv_staleness_minutes'].iloc[0] == pytest.approx(23.0)
+
+
+def test_a_decision_before_any_fit_gets_nothing():
+    from core.book_features import attach_implied_vol
+    fits = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'event_time': pd.to_datetime(['2026-07-01T13:00Z']),
+        'implied_sigma_per_min': [0.0006], 'r2': [0.97], 'n_strikes': [9]})
+    table = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
+        'sigma_per_min': [0.0003]})
+    got = attach_implied_vol(table, fits)
+    assert pd.isna(got['iv_minus_realised'].iloc[0])
+
+
+def test_the_join_does_not_cross_symbols():
+    """BTC's implied vol is not ETH's, and ETH's is measurably ~1.8x higher."""
+    from core.book_features import attach_implied_vol
+    fits = pd.DataFrame({
+        'symbol': ['ETH-USD'],
+        'event_time': pd.to_datetime(['2026-07-01T11:40Z']),
+        'implied_sigma_per_min': [0.0010], 'r2': [0.97], 'n_strikes': [9]})
+    table = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
+        'sigma_per_min': [0.0003]})
+    got = attach_implied_vol(table, fits)
+    assert pd.isna(got['implied_sigma_per_min'].iloc[0])
+
+
+def test_a_fit_older_than_the_tolerance_is_dropped():
+    """Forward-filling a sigma from yesterday is not a forward-looking estimate
+    of anything."""
+    from core.book_features import attach_implied_vol
+    fits = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'event_time': pd.to_datetime(['2026-06-28T11:40Z']),
+        'implied_sigma_per_min': [0.0006], 'r2': [0.97], 'n_strikes': [9]})
+    table = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
+        'sigma_per_min': [0.0003]})
+    got = attach_implied_vol(table, fits, max_age_minutes=720)
+    assert pd.isna(got['iv_minus_realised'].iloc[0])
+
+
+def test_the_mechanism_column_is_the_disagreement_not_the_level():
+    from core.book_features import attach_implied_vol
+    fits = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'event_time': pd.to_datetime(['2026-07-01T12:00Z']),
+        'implied_sigma_per_min': [0.0006], 'r2': [0.97], 'n_strikes': [9]})
+    table = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
+        'sigma_per_min': [0.0003]})
+    got = attach_implied_vol(table, fits)
+    assert got['iv_minus_realised'].iloc[0] == pytest.approx(np.log(2.0))
