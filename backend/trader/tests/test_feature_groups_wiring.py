@@ -47,12 +47,13 @@ def test_level_counts_never_became_features():
 
 def test_the_price_columns_are_isolated_so_they_can_be_ablated_alone():
     """`market_minus_baseline` is the most informative column available and the
-    one that invites echo. The structure-only variant has to be selectable
-    without it, or the echo question cannot be answered."""
+    one that invites echo. It now lives in its own `market_price` group, so
+    structure-only is a group selection rather than a flag — which is what makes
+    the echo question answerable by running the two separately."""
     from core.book_features import MARKET_STATE, PRICE_COLUMNS
-    structural = [c for c in MARKET_STATE if c not in PRICE_COLUMNS]
-    assert structural, 'structure-only must not be empty'
-    assert set(PRICE_COLUMNS) <= set(feature_columns(['market_state']))
+    assert MARKET_STATE, 'structure-only must not be empty'
+    assert not (set(MARKET_STATE) & set(PRICE_COLUMNS))
+    assert set(PRICE_COLUMNS) <= set(feature_columns(['market_price']))
 
 
 def test_selecting_an_unknown_group_still_raises():
@@ -104,3 +105,38 @@ def test_a_dead_feature_is_removed_rather_than_carried():
     than no feature: it dilutes the matrix and reads as a working column."""
     from core.book_features import MARKET_STATE
     assert 'quote_intensity' not in MARKET_STATE
+
+
+# --- the echo test, as a group selection -----------------------------------
+#
+# `market_state` is the only one of the three new families that beats the
+# control (+0.000122 alone, t +1.5, against the control's +0.000039). It is also
+# the one that invites echo: given a well-calibrated quote, copying it is the
+# cheapest route to a low log loss.
+#
+# Splitting the price columns out makes the echo test a group selection rather
+# than a flag: `market_state` alone is structure only and CANNOT echo, because
+# the price is not in it. Adding `market_price` puts it back.
+
+def test_market_state_is_structure_only():
+    from core.book_features import PRICE_COLUMNS
+    cols = set(FEATURE_GROUPS['market_state'])
+    assert not (cols & set(PRICE_COLUMNS)), 'structure-only must exclude the price'
+    assert 'spread' in cols and 'imbalance_touch' in cols
+
+
+def test_market_price_holds_the_columns_that_can_echo():
+    cols = set(FEATURE_GROUPS['market_price'])
+    assert cols == {'market_prob', 'market_minus_baseline'}
+
+
+def test_the_two_together_are_the_old_market_state():
+    both = set(FEATURE_GROUPS['market_state']) | set(FEATURE_GROUPS['market_price'])
+    assert both == {'market_prob', 'market_minus_baseline', 'spread',
+                    'imbalance_touch', 'imbalance_5c', 'depth_ratio',
+                    'book_convexity'}
+
+
+def test_both_stay_out_of_the_default_matrix():
+    from core.features import BOOK_GROUPS
+    assert 'market_state' in BOOK_GROUPS and 'market_price' in BOOK_GROUPS

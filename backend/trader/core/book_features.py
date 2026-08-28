@@ -50,10 +50,16 @@ PRICE_COLUMNS = ('market_prob', 'market_minus_baseline')
 # COUNT, which venue_depth's summary does not carry, so it was all-NaN in every
 # run. A declared feature nothing can populate is worse than no feature — it
 # dilutes the matrix and reads exactly like a working column.
-MARKET_STATE = PRICE_COLUMNS + (
+# Structure only — it CANNOT echo the market, because the price is not in it.
+# That is the point: `market_state` is the one new family that beats the control
+# (+0.000122 alone, t +1.5, against the control's +0.000039) and also the one
+# that invites echo, so the two have to be separable to tell them apart.
+MARKET_STATE = (
     'spread', 'imbalance_touch', 'imbalance_5c', 'depth_ratio',
     'book_convexity',
 )
+# The columns that can echo. Selected explicitly, never by default.
+MARKET_PRICE = PRICE_COLUMNS
 # No volume ratio across venues: Kalshi is integer contracts, Polymarket
 # fractional shares, so the quotient would measure the unit.
 CROSS_VENUE = ('venue_prob_gap', 'venue_gap_change_5', 'venue_spread_ratio',

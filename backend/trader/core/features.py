@@ -69,6 +69,7 @@ NEW_YORK = ZoneInfo('America/New_York')
 from core.book_features import (                                # noqa: E402
     CROSS_VENUE as BOOK_CROSS_VENUE,
     IMPLIED_VOL as BOOK_IMPLIED_VOL,
+    MARKET_PRICE as BOOK_MARKET_PRICE,
     MARKET_STATE as BOOK_MARKET_STATE,
 )
 
@@ -125,6 +126,7 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     # and reads ~0 on `model_minus_market`. It stays in its own PRICE_COLUMNS
     # subset so the structure-only variant can be run without it.
     'market_state': BOOK_MARKET_STATE,
+    'market_price': BOOK_MARKET_PRICE,
     'cross_venue': BOOK_CROSS_VENUE,
     'implied_vol': BOOK_IMPLIED_VOL,
 }
@@ -135,7 +137,7 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
 # which would silently widen every feature matrix the project has ever built.
 # `--groups market_state` selects them explicitly; that is also how each is
 # ablated alone, which is the only test that says whether it forecasts anything.
-BOOK_GROUPS = ('market_state', 'cross_venue', 'implied_vol')
+BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol')
 ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in BOOK_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
 CONTROL_GROUPS = ('time_of_day',)

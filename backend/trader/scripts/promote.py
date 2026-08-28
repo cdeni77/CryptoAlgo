@@ -90,6 +90,60 @@ def market_measurement(scored=None) -> dict[str, float]:
     return values
 
 
+logger = logging.getLogger('promote')
+
+
+def refit_on_all(dataset, config, *, groups=None):
+    """Fit the same configuration on every window in the dataset.
+
+    Returns None rather than raising if it cannot be built: a failed refit
+    should fall back visibly to the last fold, not abort a promotion whose
+    evidence is already computed.
+    """
+    try:
+        from core.dataset import fit_fold
+        from core.model import fit_model
+        fit, table = fit_fold(dataset, dataset.window_index, config, groups=groups)
+        return fit_model(table, fit.baseline, config, groups=groups)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning('refit on all data failed (%s); falling back',
+                       str(exc)[:120])
+        return None
+
+
+def choose_candidate(fold_models, refit):
+    """The artifact to deploy: the refit on all data, never the last fold's.
+
+    A fold model's training ends where that fold's TEST block begins, so
+    deploying it ships something one test block stale BY CONSTRUCTION. Measured
+    on the artifact that traded live: trained through 2025-12-05, deployed in
+    August, and it had therefore never seen a single Kalshi 15-minute market
+    because they did not exist yet.
+
+    The walk-forward is the EVIDENCE that a configuration works; what ships is
+    that configuration refitted through the present. Conflating the two costs a
+    test block of freshness every single time.
+
+    A refit that is not strictly fresher than the last fold means something went
+    wrong building it, and shipping it silently would hide that.
+    """
+    if not fold_models:
+        raise ValueError('no models to promote: the walk-forward produced none')
+    if refit is None:
+        logger.warning(
+            'no refit model; falling back to the LAST FOLD, which is stale by '
+            'one test block. This is the artifact staleness that promotion is '
+            'meant to avoid, so treat it as a defect rather than a default.')
+        return fold_models[-1]
+    last = getattr(fold_models[-1], 'n_train_windows', 0) or 0
+    fresh = getattr(refit, 'n_train_windows', 0) or 0
+    if fresh <= last:
+        raise ValueError(
+            f'the refit saw {fresh:,} training windows against the last fold\'s '
+            f'{last:,}; it is not fresher, so it was not built on all the data')
+    return refit
+
+
 def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -144,10 +198,14 @@ def main() -> int:
         print('\ndry run: nothing installed, nothing recorded')
         return 0
 
-    # The last fold's model is the candidate: it is the one trained on the most
-    # history, which is what would be deployed. The earlier folds are its
-    # evidence, not alternatives to it.
-    candidate = result.models[-1]
+    # Refit on EVERYTHING through the present, and deploy that. The folds are
+    # the evidence that this configuration works; they are not the artifact.
+    # See `choose_candidate`.
+    refit = refit_on_all(dataset, config, groups=groups)
+    candidate = choose_candidate(result.models, refit)
+    if refit is not None:
+        print(f'  deploying a refit on {refit.n_train_windows:,} windows, '
+              f'against the last fold\'s {result.models[-1].n_train_windows:,}')
     attempt = promote(candidate, result.report, force=args.force,
                       force_reason=args.reason, trades=result.trades(),
                       extra=market)
