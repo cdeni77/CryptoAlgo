@@ -289,3 +289,50 @@ def test_a_fresh_quote_has_near_zero_age(tmp_path):
     got = summarise_partition(_write_parquet(tmp_path, [(300, 44, 46)]))
     row = got[got['offset_minutes'] == 5].iloc[0]
     assert row['quote_age_seconds'] == pytest.approx(0.0)
+
+
+# --- the venue's label has to cover the era we test on ---------------------
+#
+# Kalshi's own API only reaches ~2026-06 (it purges older markets), so a
+# backtest settling on `venue_outcome` fell back to our Coinbase label for
+# folds 2 and 3 and kept the leak: those folds were byte-identical before and
+# after the settlement fix.
+#
+# Predexon's catalog carries `result` for 56,569 markets across 2026-01..08 at
+# 79-94% yield. Loading those closes the gap. Kalshi's own rows still win where
+# both exist: they are the venue speaking directly, and they carry
+# `expiration_value`, which the catalog does not.
+
+def test_catalog_results_become_settlements():
+    from research.collect.load_store import catalog_settlement_rows
+    got = catalog_settlement_rows([
+        {'venue': 'kalshi', 'symbol': 'BTC-USD', 'market_id': 'k1',
+         'window_open': '2026-02-01T12:00:00+00:00', 'result': 'yes'},
+        {'venue': 'kalshi', 'symbol': 'ETH-USD', 'market_id': 'k2',
+         'window_open': '2026-02-01T12:15:00+00:00', 'result': 'no'},
+    ])
+    assert list(got['settled_up']) == [True, False]
+    assert list(got['market_ticker']) == ['k1', 'k2']
+
+
+def test_a_catalog_row_without_a_result_is_skipped():
+    """20% of catalog rows have no result. Storing a blank would rebuild the
+    exact ambiguity the settlement collector exists to remove."""
+    from research.collect.load_store import catalog_settlement_rows
+    got = catalog_settlement_rows([
+        {'venue': 'kalshi', 'symbol': 'BTC-USD', 'market_id': 'k1',
+         'window_open': '2026-02-01T12:00:00+00:00', 'result': ''},
+        {'venue': 'kalshi', 'symbol': 'BTC-USD', 'market_id': 'k2',
+         'window_open': '2026-02-01T12:15:00+00:00', 'result': None},
+    ])
+    assert got.empty
+
+
+def test_only_kalshi_rows_are_taken_from_the_catalog():
+    """The catalog is Kalshi-only by construction, but a venue column that says
+    otherwise must not be silently relabelled."""
+    from research.collect.load_store import catalog_settlement_rows
+    got = catalog_settlement_rows([
+        {'venue': 'polymarket', 'symbol': 'BTC-USD', 'market_id': 'p1',
+         'window_open': '2026-02-01T12:00:00+00:00', 'result': 'yes'}])
+    assert got.empty

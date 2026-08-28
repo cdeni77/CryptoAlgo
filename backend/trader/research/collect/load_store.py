@@ -256,6 +256,41 @@ def implied_vol_rows(records) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def catalog_settlement_rows(records) -> pd.DataFrame:
+    """Predexon catalog rows that carry a `result`, as settlements.
+
+    **Why this and not just Kalshi's own API.** That API purges markets after
+    roughly two months, so its settlements reach only ~2026-06. A backtest
+    settling on the venue's label therefore fell back to our Coinbase label for
+    everything earlier and kept the leak: two of four trading folds were
+    byte-identical before and after the settlement fix. The catalog carries
+    `result` for 56,569 markets across 2026-01..08 at 79-94% yield, which covers
+    the whole book era.
+
+    A row without a result is SKIPPED, not stored blank: 20% of the catalog has
+    none, and a blank would rebuild the exact ambiguity `kalshi_settlements`
+    exists to remove. Kalshi's own rows still win where both exist — they are
+    the venue speaking directly and they carry `expiration_value`, which the
+    catalog does not.
+    """
+    rows = []
+    for r in records:
+        if str(r.get('venue') or 'kalshi').lower() != 'kalshi':
+            continue
+        result = str(r.get('result') or '').strip().lower()
+        if result not in ('yes', 'no'):
+            continue
+        opened = pd.Timestamp(r['window_open'])
+        rows.append({
+            'venue': 'kalshi', 'symbol': r.get('symbol'),
+            'event_time': opened, 'available_time': opened, 'quality': 'valid',
+            'market_ticker': r.get('market_id'), 'window_open': opened,
+            'close_time': pd.NaT, 'result': result,
+            'settled_up': result == 'yes',
+        })
+    return pd.DataFrame(rows)
+
+
 def load_settlements(store, *, log=print) -> int:
     path = DATA / 'kalshi_settlements.jsonl'
     if not path.exists():
@@ -269,7 +304,26 @@ def load_settlements(store, *, log=print) -> int:
                 continue
     frame = settlement_rows(records)
     n = store.write('venue_settlements', frame) if len(frame) else 0
-    log(f'  venue_settlements  {n:>8,} rows')
+    log(f'  venue_settlements  {n:>8,} rows (Kalshi API, with prices)')
+
+    # Then the catalog, which reaches back further. Written second so a genuine
+    # revision key collision keeps whichever `available_time` is later; the two
+    # agree on `settled_up` where they overlap, and only the API rows carry a
+    # settlement price.
+    cat = DATA / 'kalshi_catalog.jsonl'
+    if cat.exists():
+        recs = []
+        with open(cat) as handle:
+            for line in handle:
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    continue
+        extra = catalog_settlement_rows(recs)
+        if len(extra):
+            m = store.write('venue_settlements', extra)
+            log(f'  venue_settlements  {m:>8,} rows (Predexon catalog, 2026-01..08)')
+            n += m
     return n
 
 
