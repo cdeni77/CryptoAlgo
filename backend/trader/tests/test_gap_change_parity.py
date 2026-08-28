@@ -1,0 +1,69 @@
+"""`venue_gap_change_5` live must be the same feature the backtest fitted.
+
+The backtest computes it as `shift(1)` over rows ordered by OFFSET and grouped
+by (symbol, window_open): the previous decision offset within the same window,
+never reaching across a window boundary. Consecutive windows chain — a window's
+strike is the previous window's settlement value — so a difference that crossed
+one would look entirely correct and be wrong.
+
+Two consequences the first live implementation got wrong by using a five-minute
+wall-clock lookback instead: the step is one OFFSET (three minutes on the
+(3,6,9,12) grid, not five), and the first offset of a window has no predecessor
+and must be NaN rather than differenced against the previous window's last.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from scripts.live import gap_change, reset_gap_history
+
+W1 = pd.Timestamp('2026-08-28 19:00', tz='UTC')
+W2 = pd.Timestamp('2026-08-28 19:15', tz='UTC')
+
+
+@pytest.fixture(autouse=True)
+def _clean():
+    reset_gap_history()
+    yield
+    reset_gap_history()
+
+
+def test_the_first_offset_of_a_window_has_no_predecessor():
+    assert np.isnan(gap_change('BTC-USD', 0.02, window_open=W1, offset=3))
+
+
+def test_a_later_offset_differences_against_the_previous_one():
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=6) == pytest.approx(0.03)
+    assert gap_change('BTC-USD', 0.04, window_open=W1, offset=9) == pytest.approx(-0.01)
+
+
+def test_it_never_reaches_across_a_window_boundary():
+    """Consecutive windows chain, so differencing across one is a real error
+    that would look entirely correct."""
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    gap_change('BTC-USD', 0.09, window_open=W1, offset=12)
+    assert np.isnan(gap_change('BTC-USD', 0.01, window_open=W2, offset=3))
+
+
+def test_symbols_do_not_bleed_into_each_other():
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    assert np.isnan(gap_change('ETH-USD', 0.07, window_open=W1, offset=3))
+
+
+def test_a_missing_gap_neither_differences_nor_poisons_the_history():
+    """No Polymarket book gives NaN. The next offset must difference against
+    the last REAL observation, not against the hole."""
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    assert np.isnan(gap_change('BTC-USD', float('nan'), window_open=W1, offset=6))
+    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=9) == pytest.approx(0.03)
+
+
+def test_a_repeated_offset_is_not_differenced_against_itself():
+    """A cycle can score the same offset twice. The second must not report a
+    zero change that reads as two venues holding steady."""
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    gap_change('BTC-USD', 0.05, window_open=W1, offset=6)
+    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=6) == pytest.approx(0.03)

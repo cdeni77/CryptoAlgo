@@ -1090,36 +1090,51 @@ def _venue_caches() -> tuple[dict, dict]:
     return pm, iv
 
 
-# The venue gap five minutes ago, per symbol. The backtest reads it off the
-# previous row of the same window; live has to remember it, and an entry older
-# than the lookback is not a substitute for one at it.
+# The gap at each decision offset of the window in progress, per symbol.
+#
+# The backtest computes `venue_gap_change_5` as `shift(1)` over rows ordered by
+# OFFSET and grouped by (symbol, window_open) — the previous decision offset in
+# the SAME window. Live has to reproduce that exactly or it is fitting one
+# feature and scoring another.
 _GAP_HISTORY: dict = {}
-_GAP_LOOKBACK_MINUTES = 5.0
-_GAP_TOLERANCE_MINUTES = 2.0
 
 
-def _gap_change(symbol: str, gap, now) -> float:
-    """The five-minute change in the cross-venue gap, or NaN.
+def reset_gap_history() -> None:
+    """Drop everything remembered. For tests, and for a clean restart."""
+    _GAP_HISTORY.clear()
 
-    Returns NaN rather than a change against whatever happens to be in hand: a
-    gap differenced against an observation ninety seconds old is not the feature
-    the model was fitted on, and it would be indistinguishable from one that is.
+
+def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
+    """The change in the cross-venue gap since the previous decision offset.
+
+    NaN at the first offset of a window, by construction and not by accident:
+    consecutive windows CHAIN — a window's strike is the previous window's
+    settlement value — so differencing across a boundary produces a number that
+    looks entirely correct and answers a different question. The backtest
+    refuses it with `groupby(['symbol', 'window_open'])`, and so does this.
+
+    A missing gap is a hole, not an observation: it neither differences nor
+    displaces the last real reading, so the following offset still measures
+    against something true.
     """
-    history = _GAP_HISTORY.setdefault(symbol, [])
-    if gap is not None and not (isinstance(gap, float) and np.isnan(gap)):
-        history.append((pd.Timestamp(now), float(gap)))
-        cutoff = pd.Timestamp(now) - pd.Timedelta(minutes=30)
-        _GAP_HISTORY[symbol] = [e for e in history if e[0] >= cutoff]
-        history = _GAP_HISTORY[symbol]
-    if gap is None or (isinstance(gap, float) and np.isnan(gap)):
+    key = (str(symbol), pd.Timestamp(window_open))
+    previous = _GAP_HISTORY.get(key)
+    # A new window: forget the last one entirely rather than let it be reached.
+    if previous is None:
+        _GAP_HISTORY.clear()
+        _GAP_HISTORY[key] = {}
+        previous = _GAP_HISTORY[key]
+    try:
+        value = float(gap)
+    except (TypeError, ValueError):
         return float('nan')
-    target = pd.Timestamp(now) - pd.Timedelta(minutes=_GAP_LOOKBACK_MINUTES)
-    best, best_age = None, None
-    for stamp, value in history:
-        age = abs((stamp - target).total_seconds()) / 60.0
-        if age <= _GAP_TOLERANCE_MINUTES and (best_age is None or age < best_age):
-            best, best_age = value, age
-    return float(gap - best) if best is not None else float('nan')
+    if np.isnan(value):
+        return float('nan')
+    earlier = [(o, g) for o, g in previous.items() if o < int(offset)]
+    previous[int(offset)] = value
+    if not earlier:
+        return float('nan')
+    return float(value - max(earlier, key=lambda item: item[0])[1])
 
 
 def cross_venue_row(pm: Optional[dict], quote) -> dict:
@@ -1253,8 +1268,12 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
             iv_cache.get(symbol), now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]
             if 'sigma_per_min' in scored.columns else np.nan))
-        gap = row.get('venue_prob_gap')
-        row['venue_gap_change_5'] = _gap_change(symbol, gap, now)
+        row['venue_gap_change_5'] = gap_change(
+            symbol, row.get('venue_prob_gap'),
+            window_open=scored['window_open'].iloc[i],
+            offset=int(scored['offset'].iloc[i])
+            if 'offset' in scored.columns
+            else int(scored['offset_minutes'].iloc[i]))
         for column in columns:
             if column in row:
                 scored.iloc[i, scored.columns.get_loc(column)] = row[column]
