@@ -33,8 +33,19 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-QUOTE_COLUMNS = ('ask_up', 'ask_down', 'market_probability',
-                 'quote_age_seconds', 'quote_source')
+# The store's depth columns, renamed to what `core.book_features` expects.
+# Declared here so a rename cannot leave FEATURE_GROUPS pointing at a column
+# nothing joins — which is exactly how a run reported "46 features (12 empty),
+# 2 trees": a quarter of the matrix was all-NaN and only a warning said so.
+DEPTH_MAP = {
+    'yes_bid_size': 'bid_at_touch', 'yes_ask_size': 'ask_at_touch',
+    'depth_bid_1c': 'bid_1c', 'depth_ask_1c': 'ask_1c',
+    'depth_bid_5c': 'bid_5c', 'depth_ask_5c': 'ask_5c',
+    'depth_bid_total': 'bid_vol', 'depth_ask_total': 'ask_vol',
+}
+QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
+                  'quote_age_seconds', 'quote_source')
+                 + tuple(DEPTH_MAP.values()))
 # A book quoted twenty minutes ago is not a price this decision could have
 # taken. Generous by default because `quote_age_seconds` is carried alongside,
 # so a study can tighten it without re-joining.
@@ -43,6 +54,7 @@ DEFAULT_MAX_AGE = 900.0
 
 def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   venue: str = 'kalshi',
+                  other_venue: Optional[str] = 'polymarket',
                   max_age_seconds: float = DEFAULT_MAX_AGE) -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
@@ -98,14 +110,42 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                 .drop_duplicates(['symbol', 'window_open', 'offset_minutes'],
                                  keep='first'))
 
+    for src, dst in DEPTH_MAP.items():
+        book[dst] = pd.to_numeric(book.get(src), errors='coerce').where(keep) \
+            if src in book.columns else np.nan
+
+    take = ['symbol', 'window_open', 'offset_minutes', 'ask_up', 'ask_down',
+            'market_probability', 'quote_age_seconds', 'quote_source']
+    take += list(DEPTH_MAP.values())
     merged = out.drop(columns=list(QUOTE_COLUMNS)).merge(
-        book[['symbol', 'window_open', 'offset_minutes',
-              'ask_up', 'ask_down', 'market_probability',
-              'quote_age_seconds', 'quote_source']],
+        book[take],
         left_on=['symbol', 'window_open', 'offset'],
         right_on=['symbol', 'window_open', 'offset_minutes'],
         how='left')
     merged = merged.drop(columns=['offset_minutes'])
+
+    # The other venue, under its own prefix. `cross_venue` needs both books on
+    # one row and they must never share a column: a Polymarket bid sitting in a
+    # column holding a Kalshi one is the `no_levels` denomination trap wearing a
+    # different name.
+    if other_venue:
+        peer = depth[depth['venue'] == other_venue].copy()
+        merged['pm_market_probability'] = np.nan
+        merged['pm_spread'] = np.nan
+        if len(peer):
+            pbid = pd.to_numeric(peer['yes_bid'], errors='coerce')
+            pask = pd.to_numeric(peer['yes_ask'], errors='coerce')
+            two_sided = pbid.notna() & pask.notna() & (pask >= pbid)
+            peer['pm_market_probability'] = ((pbid + pask) / 2.0).where(two_sided)
+            peer['pm_spread'] = (pask - pbid).where(two_sided)
+            peer = peer.drop_duplicates(
+                ['symbol', 'window_open', 'offset_minutes'], keep='first')
+            merged = merged.drop(columns=['pm_market_probability', 'pm_spread']).merge(
+                peer[['symbol', 'window_open', 'offset_minutes',
+                      'pm_market_probability', 'pm_spread']],
+                left_on=['symbol', 'window_open', 'offset'],
+                right_on=['symbol', 'window_open', 'offset_minutes'],
+                how='left').drop(columns=['offset_minutes'])
     # `how='left'` preserves order and count, but the table is fed to decide()
     # row by row and losing or reordering rows silently changes which windows
     # were traded. Cheap to assert, expensive to discover.

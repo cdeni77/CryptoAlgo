@@ -411,6 +411,51 @@ def build_features(
         _geometry_features(table, config),
     ], axis=1)
 
+    # --- the book families ---------------------------------------------------
+    #
+    # Declared in FEATURE_GROUPS and computed in `core.book_features`, but for a
+    # while nothing CALLED them: a full run reported "46 features (12 empty),
+    # 2 trees, skill +0.00001" because a quarter of the matrix was all-NaN. The
+    # model's own empty-feature warning was the only thing that said so, and a
+    # group that produced nothing arrives with the same shape as one that
+    # worked.
+    if 'ask_up' in table.columns or 'bid_at_touch' in table.columns:
+        from core.book_features import market_state_features
+        # `market_state_features` reads the raw snapshot shape: prices in CENTS
+        # under best_bid/best_ask. The joined table carries dollars under
+        # ask_up/ask_down. Reconstructing here rather than carrying prices in two
+        # units on one row, which is precisely how a 0.51 YES ask ended up in a
+        # column holding a 0.51 NO bid.
+        #   ask_down = 1 - yes_bid  ->  yes_bid = 1 - ask_down
+        snap = table.copy()
+        snap['best_bid'] = (1.0 - pd.to_numeric(
+            table.get('ask_down'), errors='coerce')) * 100.0
+        snap['best_ask'] = pd.to_numeric(
+            table.get('ask_up'), errors='coerce') * 100.0
+        snap['n_snapshots'] = np.nan
+        book = market_state_features(snap)
+        for column in book.columns:
+            table[column] = book[column].values
+        if 'pm_market_probability' in table.columns:
+            gap = (pd.to_numeric(table.get('market_probability'), errors='coerce')
+                   - pd.to_numeric(table['pm_market_probability'], errors='coerce'))
+            table['venue_prob_gap'] = gap
+            table['pm_available'] = np.where(
+                pd.to_numeric(table['pm_market_probability'],
+                              errors='coerce').notna(), 1.0, 0.0)
+            k_spread = pd.to_numeric(table.get('spread'), errors='coerce')
+            p_spread = pd.to_numeric(table.get('pm_spread'), errors='coerce')
+            ratio = k_spread / p_spread.replace(0.0, np.nan)
+            table['venue_spread_ratio'] = np.where(ratio > 0, np.log(ratio), np.nan)
+            # Change over five minutes, within the same window and symbol. The
+            # shift is by OFFSET, so it never reaches across a window boundary —
+            # consecutive windows chain, and a gap that crossed one would look
+            # entirely correct and be wrong.
+            ordered = table.sort_values(['symbol', 'window_open', 'offset'])
+            prev = ordered.groupby(['symbol', 'window_open'])['venue_prob_gap'].shift(1)
+            table['venue_gap_change_5'] = (
+                ordered['venue_prob_gap'] - prev).reindex(table.index)
+
     # `iv_minus_realised` is the implied-vol mechanism and the only book column
     # that cannot be attached with the rest: it divides the market's forward
     # sigma by the baseline's `sigma_per_min`, which is FITTED and therefore

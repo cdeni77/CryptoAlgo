@@ -151,3 +151,52 @@ def test_the_mid_sits_between_the_two_trade_costs():
     """A structural check: ask_up >= mid >= 1 - ask_down, always."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)])).iloc[0]
     assert got['ask_up'] >= got['market_probability'] >= 1.0 - got['ask_down']
+
+
+# --- the depth columns market_state actually needs --------------------------
+#
+# Declared in FEATURE_GROUPS, computed in book_features, and never joined: a
+# full run reported "46 features (12 empty), 2 trees, skill +0.00001" because a
+# quarter of the matrix was all-NaN. `population_report` and the model's own
+# empty-feature warning both said so; nothing failed.
+
+DEPTH_COLUMNS = ('bid_at_touch', 'ask_at_touch', 'bid_1c', 'ask_1c',
+                 'bid_5c', 'ask_5c', 'bid_vol', 'ask_vol')
+
+
+def _rich_depth(venue='kalshi'):
+    return pd.DataFrame([{
+        'venue': venue, 'symbol': 'BTC-USD',
+        'window_open': pd.Timestamp('2026-07-01T12:00Z'),
+        'offset_minutes': 3, 'yes_bid': 0.44, 'yes_ask': 0.46,
+        'quote_age_seconds': 1.0, 'source': 'backfill',
+        'yes_bid_size': 250.0, 'yes_ask_size': 150.0,
+        'depth_bid_1c': 400.0, 'depth_ask_1c': 300.0,
+        'depth_bid_5c': 900.0, 'depth_ask_5c': 600.0,
+        'depth_bid_total': 2000.0, 'depth_ask_total': 1000.0}])
+
+
+def test_the_depth_columns_market_state_needs_are_attached():
+    got = attach_quotes(_windows((3,)), _rich_depth())
+    for column in DEPTH_COLUMNS:
+        assert column in got.columns, column
+    assert got['bid_at_touch'].iloc[0] == pytest.approx(250.0)
+    assert got['bid_5c'].iloc[0] == pytest.approx(900.0)
+    assert got['bid_vol'].iloc[0] == pytest.approx(2000.0)
+
+
+def test_the_other_venue_is_attached_under_its_own_prefix():
+    """cross_venue needs BOTH books on the same row, and they must not collide:
+    a Polymarket bid in the column holding a Kalshi one is the `no_levels`
+    denomination trap with a different name."""
+    depth = pd.concat([_rich_depth('kalshi'),
+                       _rich_depth('polymarket').assign(yes_bid=0.40, yes_ask=0.41)])
+    got = attach_quotes(_windows((3,)), depth, venue='kalshi', other_venue='polymarket')
+    assert got['market_probability'].iloc[0] == pytest.approx(0.45)
+    assert got['pm_market_probability'].iloc[0] == pytest.approx(0.405)
+
+
+def test_a_missing_other_venue_leaves_nan_not_zero():
+    got = attach_quotes(_windows((3,)), _rich_depth('kalshi'),
+                        venue='kalshi', other_venue='polymarket')
+    assert pd.isna(got['pm_market_probability'].iloc[0])

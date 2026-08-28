@@ -172,9 +172,36 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     if ladder_fits is not None and len(ladder_fits):
         logger.info('venue_implied_vol: %s fits', f'{len(ladder_fits):,}')
 
+    # The venue's OWN settlement, where we hold it. The market comparison has to
+    # grade both forecasters on the label the market was priced against:
+    # measured, `baseline_minus_market` reads +0.00382 on our Coinbase label and
+    # -0.00245 on the venue's, because our label and our baseline share a data
+    # source the market does not.
+    settlements = None
+    try:
+        settlements = store.read('venue_settlements')
+    except Exception:                                         # noqa: BLE001
+        settlements = None
+
     dataset = Dataset.build(
         bars, config, depth=depth, ladder_fits=ladder_fits
     ).trailing(config.train_window_days)
+
+    if settlements is not None and len(settlements) and 'settled_up' in settlements.columns:
+        venue = settlements[['symbol', 'window_open', 'settled_up']].dropna()
+        venue = venue.drop_duplicates(['symbol', 'window_open'])
+        venue['window_open'] = pd.to_datetime(venue['window_open'], utc=True)
+        venue = venue.rename(columns={'settled_up': 'venue_outcome'})
+        venue['venue_outcome'] = venue['venue_outcome'].astype(float)
+        before = len(dataset.windows)
+        dataset.windows['window_open'] = pd.to_datetime(
+            dataset.windows['window_open'], utc=True)
+        dataset.windows = dataset.windows.merge(
+            venue, on=['symbol', 'window_open'], how='left')
+        assert len(dataset.windows) == before, 'venue label join changed the row count'
+        got = int(dataset.windows['venue_outcome'].notna().sum())
+        logger.info("venue settlements joined: %s rows carry the venue's own label",
+                    f'{got:,}')
     coverage = dataset.coverage()
     logger.info('coverage:\n%s', coverage.to_string(index=False))
     worst = coverage['boundary_drop_rate'].max() if len(coverage) else 0.0
