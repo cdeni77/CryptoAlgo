@@ -388,6 +388,14 @@ class EvaluationReport:
 # roughly three weeks of one symbol, or a week of three.
 MIN_MARKET_WINDOWS = 2_000
 
+# A quote older than this is not the price at the decision instant, and beating
+# it is not skill. Measured on 132,250 backtest rows: model_minus_market ran
+# +0.0041 at a 5-second bar and +0.0371 at 900 seconds -- nine tenths of the
+# headline was the model out-forecasting a price nobody was quoting any more.
+# Both halves flatter: market_ll worsens with age while model_ll improves,
+# because the rows carrying stale quotes are the easier ones.
+MAX_QUOTE_AGE_SECONDS = 30.0
+
 MARKET_COLUMNS = ('symbol', 'window_open', 'offset', 'market', 'baseline',
                   'model', 'outcome', 'decision_time')
 
@@ -428,6 +436,56 @@ def market_comparison(frame: pd.DataFrame) -> pd.DataFrame:
     for offset, part in frame.groupby('offset'):
         parts.append(market_slice(part, f'offset +{int(offset)}m'))
     return pd.DataFrame(parts)
+
+
+def market_rows_from_scored(
+        frame: pd.DataFrame, *,
+        max_quote_age_seconds: float = MAX_QUOTE_AGE_SECONDS) -> list:
+    """`MARKET_COLUMNS` rows from a backtest that carries recorded quotes.
+
+    **This is the claim `market_gate_values` used to say could not be made.**
+    Its docstring reads "this cannot come from the backtest, and that is the
+    point", because a backtest had no order book and `price_source` stood the
+    calibrated baseline in for the market — collapsing "beat the market" into
+    "beat the baseline" and answering both with one number. That was true when
+    written. Eight months of book have since been collected and validated: 0.70c
+    against the live recording with the clock removed, and a resting-size ratio
+    of 1.000.
+
+    **The market's forecast is the MID.** `model_minus_market` compares log
+    losses — whose probability is better — while the ask is what a trade costs,
+    the mid plus half the spread. Scoring the market at its ask would hand the
+    model a free half-spread of apparent skill on every row, in its own favour,
+    which is the exact self-flattery this gate exists to prevent. The ask belongs
+    in the money numbers, and `decide()` already uses it there.
+
+    Rows without a quote are DROPPED, never defaulted to the baseline: a
+    defaulted row is the circularity this function replaces, reported as if it
+    were a market.
+    """
+    if frame is None or not len(frame):
+        return []
+    needed = ('symbol', 'window_open', 'offset', 'market_probability',
+              'baseline_probability', 'model_probability', 'outcome')
+    if any(c not in frame.columns for c in needed):
+        return []
+    part = frame.dropna(subset=list(needed))
+    # Staleness is not skill. A row whose quote predates the decision by minutes
+    # is measuring the clock, not the market -- see MAX_QUOTE_AGE_SECONDS.
+    # Rows with no age are kept: live-recorded quotes carry none, and they are
+    # the one source needing no reconstruction.
+    if 'quote_age_seconds' in part.columns:
+        age = pd.to_numeric(part['quote_age_seconds'], errors='coerce').abs()
+        part = part[age.isna() | (age <= max_quote_age_seconds)]
+    if not len(part):
+        return []
+    decision = (part['decision_time'] if 'decision_time' in part.columns
+                else part['window_open'])
+    # Positional, matching MARKET_COLUMNS. A column out of order silently swaps
+    # the model's probability with the baseline's and nothing raises.
+    return list(zip(part['symbol'], part['window_open'], part['offset'],
+                    part['market_probability'], part['baseline_probability'],
+                    part['model_probability'], part['outcome'], decision))
 
 
 def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:

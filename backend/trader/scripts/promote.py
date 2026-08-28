@@ -35,30 +35,54 @@ from scripts._common import (
 logger = logging.getLogger('promote')
 
 
-def market_measurement() -> dict[str, float]:
-    """The market comparison, from live-recorded quotes in the serving store.
+def market_measurement(scored=None) -> dict[str, float]:
+    """The market comparison, from recorded quotes.
 
     Returns values that FAIL when there is nothing to read. The gate has to be
     unmeasurable-and-failing rather than absent, because absent is how a
     benchmark quietly stops being applied — and this particular benchmark is the
     one the whole stack exists to satisfy.
+
+    **Two sources now, in that order of preference.** Live-recorded predictions
+    in the serving store are the original and remain first: they are the venue's
+    quote at the instant a decision was actually made. Failing that, a backtest
+    whose rows carry `market_probability` from the collected book — which for
+    most of this project's life did not exist, and is why `market_gate_values`
+    still says the comparison "cannot come from the backtest". Eight months of
+    book have since been collected and validated to 0.70c against the live
+    recording with the clock removed, so it can.
+
+    They are not the same claim and the print says which was used. A backfilled
+    quote is a reconstruction; a recorded one is an observation.
     """
-    from core.metrics import market_gate_values
+    from core.metrics import market_gate_values, market_rows_from_scored
 
     url = os.getenv('DATABASE_URL')
+    def _from_backtest(why: str) -> dict[str, float]:
+        rows = market_rows_from_scored(scored) if scored is not None else []
+        if not rows:
+            print(f'  {why} and the backtest carries no recorded quotes, so the '
+                  f'market gates fail as unmeasured. That is not the same as the '
+                  f'model losing to the price, and the gate line says so.')
+            return market_gate_values([])
+        values = market_gate_values(rows)
+        print(f'  {why}; using BACKFILLED quotes from the backtest: '
+              f'{int(values["market_windows"]):,} windows, model_minus_market '
+              f'{values["model_minus_market"]:+.6f}')
+        print('  (a reconstruction, not an observation — validated to 0.70c '
+              'against the live recording)')
+        return values
+
     if not url:
-        print('  DATABASE_URL is unset, so the market comparison cannot be read. '
-              'The market gates will fail as unmeasured; that is not the same as '
-              'the model losing to the price, and the gate line says so.')
-        return market_gate_values([])
+        return _from_backtest('DATABASE_URL is unset')
     try:
         from core.pg_writer import PgWriter
 
         rows = PgWriter(database_url=url).scored_against_market()
     except Exception as exc:                      # noqa: BLE001 - report and fail closed
-        print(f'  the serving store could not be read ({exc}); the market gates '
-              f'will fail as unmeasured.')
-        return market_gate_values([])
+        return _from_backtest(f'the serving store could not be read ({exc})')
+    if not list(rows):
+        return _from_backtest('the serving store holds no scored quotes')
     values = market_gate_values(rows)
     print(f'  market comparison: {int(values["market_windows"]):,} windows of '
           f'recorded quotes, model_minus_market '
@@ -113,7 +137,7 @@ def main() -> int:
     result = walk_forward(dataset, config, groups=groups, trade=True)
     print('\n' + result.report.summary())
 
-    market = market_measurement()
+    market = market_measurement(getattr(result, 'scored', None))
 
     if args.dry_run:
         print('\n' + gate_report(evaluate_gates(result.report, extra=market)))

@@ -129,3 +129,25 @@ def test_attaching_does_not_reorder_or_drop_window_rows():
     got = attach_quotes(windows, _depth([(6, 0.44, 0.46, 1.0)]))
     assert len(got) == len(windows)
     assert list(got['offset']) == [3, 6, 9, 12]
+
+
+def test_the_market_probability_is_the_mid():
+    """`model_minus_market` compares forecasts, so the market's number is the
+    mid. The ask is what a trade costs and belongs in the money, where decide()
+    already uses it — scoring the market at its ask would credit the model with
+    half the spread as skill on every row."""
+    got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
+    assert got['market_probability'].iloc[0] == pytest.approx(0.45)
+
+
+def test_the_mid_needs_both_sides():
+    """A lone bid says the probability is at LEAST something, which is not a
+    probability — and a one-sided mid would be a fabricated benchmark."""
+    got = attach_quotes(_windows((3,)), _depth([(3, 0.44, np.nan, 1.0)]))
+    assert pd.isna(got['market_probability'].iloc[0])
+
+
+def test_the_mid_sits_between_the_two_trade_costs():
+    """A structural check: ask_up >= mid >= 1 - ask_down, always."""
+    got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)])).iloc[0]
+    assert got['ask_up'] >= got['market_probability'] >= 1.0 - got['ask_down']

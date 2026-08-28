@@ -33,7 +33,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-QUOTE_COLUMNS = ('ask_up', 'ask_down', 'quote_age_seconds', 'quote_source')
+QUOTE_COLUMNS = ('ask_up', 'ask_down', 'market_probability',
+                 'quote_age_seconds', 'quote_source')
 # A book quoted twenty minutes ago is not a price this decision could have
 # taken. Generous by default because `quote_age_seconds` is carried alongside,
 # so a study can tighten it without re-joining.
@@ -81,6 +82,12 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
 
     book['ask_up'] = ask.where(keep)
     book['ask_down'] = (1.0 - bid).where(keep)
+    # The market's FORECAST, which is the mid — not the ask, which is what a
+    # trade costs. `model_minus_market` compares log losses, so scoring the
+    # market at its ask would credit the model with half the spread as skill on
+    # every row, in its own favour.
+    book['market_probability'] = ((bid + ask) / 2.0).where(
+        keep & bid.notna() & ask.notna())
     book['quote_age_seconds'] = age.where(keep)
     book['quote_source'] = np.where(keep, venue, None)
 
@@ -93,7 +100,8 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
 
     merged = out.drop(columns=list(QUOTE_COLUMNS)).merge(
         book[['symbol', 'window_open', 'offset_minutes',
-              'ask_up', 'ask_down', 'quote_age_seconds', 'quote_source']],
+              'ask_up', 'ask_down', 'market_probability',
+              'quote_age_seconds', 'quote_source']],
         left_on=['symbol', 'window_open', 'offset'],
         right_on=['symbol', 'window_open', 'offset_minutes'],
         how='left')

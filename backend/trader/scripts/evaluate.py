@@ -134,7 +134,7 @@ def main() -> int:
     # candidate that promotion then blocks for a reason `evaluate` never mentioned.
     from scripts.promote import market_measurement
 
-    gates = evaluate_gates(report, extra=market_measurement())
+    gates = evaluate_gates(report, extra=market_measurement(result.scored))
     print(gate_report(gates))
 
     if args.out:
