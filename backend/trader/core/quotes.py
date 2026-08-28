@@ -28,6 +28,7 @@ the schema has always insisted on: a backtest and a fill are different claims.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -47,9 +48,15 @@ QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
                   'quote_age_seconds', 'quote_source')
                  + tuple(DEPTH_MAP.values()))
 # A book quoted twenty minutes ago is not a price this decision could have
-# taken. Generous by default because `quote_age_seconds` is carried alongside,
-# so a study can tighten it without re-joining.
-DEFAULT_MAX_AGE = 900.0
+# taken. Measured on the real store, 88.1% of backfilled minute rows are fresher
+# than 30s and 70.8% fresher than 5s, so tightening this costs little coverage.
+#
+# It matters that this MATCHES `core.metrics.MAX_QUOTE_AGE_SECONDS`: trades were
+# priced against quotes up to 900s old while `model_minus_market` counted only
+# those under 30s, so the money and the forecast comparison were measured on
+# different samples — and stale quotes are exactly where fake edge comes from
+# (model_minus_market ran 9x higher at 900s than at 5s).
+DEFAULT_MAX_AGE = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
 
 
 def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
