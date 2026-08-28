@@ -115,7 +115,7 @@ class TestTheCycleKeepsScoringWhileHalted:
 
         calls = {'scored': 0}
 
-        def fake_score(bars_, scoring, config, *, window_open, offset, groups=None):
+        def fake_score(bars_, scoring, config, *, window_open, offset, groups=None, deferred=()):
             calls['scored'] += 1
             calls['offset'] = offset
             return pd.DataFrame({

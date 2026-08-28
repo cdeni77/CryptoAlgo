@@ -654,6 +654,31 @@ def config_for_artifact(config, model, *, mode: str):
     paper run. Adopting silently would swap a loud crash for a NaN prediction
     every cycle, which reads as a model that has decided to abstain.
     """
+    # The economic policy the artifact was EVALUATED under. `scripts/live.py`
+    # has no flag for any of these, so without this the loop traded whatever
+    # Config defaulted to — 0.25 Kelly against the promoted 0.10, a 1.50pp gate
+    # against 3.00pp. `verify` does not catch it because these change what the
+    # strategy DOES, not what the model SAYS, and that is exactly why it went
+    # unnoticed: the model was scored correctly and then acted on wrongly.
+    #
+    # CLAUDE.md measures the cost of getting Kelly wrong: 0.25 -> 0.10 moved
+    # realised edge per contract +0.99pp -> +3.32pp and drawdown 58% -> 21%,
+    # because a smaller fraction also floors marginal trades under one contract
+    # and refuses them. It is an edge filter, not only a size.
+    provenance = dict(getattr(model, 'config_provenance', None) or {})
+    economics = {}
+    for field in ('kelly_fraction', 'min_edge_pp', 'max_stake_dollars',
+                  'max_stake_fraction', 'half_spread_cents', 'compound'):
+        value = provenance.get(field)
+        # None means the promoting run left it at ITS default, which is the
+        # default here too. Adopting a None would erase a real setting.
+        if value is not None and value != getattr(config, field, None):
+            economics[field] = value
+    if economics:
+        logger.info('adopting the economics this artifact was measured under: %s',
+                    ', '.join(f'{k}={v}' for k, v in sorted(economics.items())))
+        config = replace(config, **economics)
+
     source = getattr(model, 'init_score_source', 'baseline')
     if source == getattr(config, 'init_score_source', 'baseline'):
         return config
@@ -1774,7 +1799,15 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                          DECISION_TOLERANCE_SECONDS)
         return []
 
-    scored = score_live(bars, model.scoring, config,
+    # Everything `_attach_book_features` fills after this returns. Declaring it
+    # keeps the warning meaningful: a book feature that is empty because the
+    # book has not been read yet is not the same as one nothing will ever fill,
+    # and nine spurious warnings a cycle made the real case invisible.
+    from core.book_features import (
+        CROSS_VENUE as _CV, IMPLIED_VOL as _IV,
+        MARKET_PRICE as _MP, MARKET_STATE as _MS)
+    deferred = tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV)
+    scored = score_live(bars, model.scoring, config, deferred=deferred,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
 

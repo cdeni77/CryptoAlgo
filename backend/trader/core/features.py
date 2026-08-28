@@ -377,6 +377,7 @@ def build_features(
     config: Config = DEFAULT_CONFIG,
     *,
     groups: Optional[Sequence[str]] = None,
+    deferred: Sequence[str] = (),
 ) -> pd.DataFrame:
     """Join per-minute state onto the window table and add window-level features.
 
@@ -485,10 +486,30 @@ def build_features(
         ratio = implied / realised.replace(0.0, np.nan)
         table['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
 
-    wanted = feature_columns(groups)
+    return reindex_to_features(table, feature_columns(groups), deferred=deferred)
+
+
+def reindex_to_features(table: pd.DataFrame, wanted: Sequence[str], *,
+                        deferred: Sequence[str] = ()) -> pd.DataFrame:
+    """Create every selected column, warning about the ones nobody will fill.
+
+    `deferred` names columns the CALLER attaches after this returns. The live
+    path has to: the book is read at the decision instant, and
+    `iv_minus_realised` needs the FITTED `sigma_per_min`, which only exists
+    inside the fold. Warning about those made every live cycle log nine
+    complaints about features populated a moment later — and a real gap then
+    looked exactly like the noise.
+
+    The column is still created either way. The feature matrix is built by name
+    from the artifact's list, so a missing column and an empty one are different
+    failures and only one of them is recoverable.
+    """
+    deferred = set(deferred or ())
     for column in wanted:
         if column not in table.columns:
-            logger.warning('feature %s was not produced; carried as all-NaN', column)
+            if column not in deferred:
+                logger.warning('feature %s was not produced; carried as all-NaN',
+                               column)
             table[column] = np.nan
     return table
 

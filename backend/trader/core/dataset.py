@@ -356,8 +356,15 @@ def _score_windows(
     config: Config,
     *,
     groups: Optional[Sequence[str]] = None,
+    deferred: Sequence[str] = (),
 ) -> pd.DataFrame:
-    """Attach the volatility forecast, then the features, to a window slice."""
+    """Attach the volatility forecast, then the features, to a window slice.
+
+    `deferred` names feature columns the CALLER will fill after this returns —
+    the live path's book groups, which are read at the decision instant and
+    cannot exist yet. They are created empty and not warned about, so a real
+    gap still shows.
+    """
     if windows.empty:
         raise DatasetError('no windows in this slice')
     parts = []
@@ -403,7 +410,8 @@ def _score_windows(
     if not parts:
         raise DatasetError('every symbol lacked a volatility model')
     scored = pd.concat(parts, ignore_index=True)
-    return build_features(scored, states, config, groups=groups)
+    return build_features(scored, states, config, groups=groups,
+                          deferred=deferred)
 
 
 def score_live(
@@ -414,6 +422,7 @@ def score_live(
     window_open: pd.Timestamp,
     offset: int,
     groups: Optional[Sequence[str]] = None,
+    deferred: Sequence[str] = (),
 ) -> pd.DataFrame:
     """Score exactly one decision point per symbol, from freshly fetched bars.
 
@@ -464,7 +473,7 @@ def score_live(
     dataset = Dataset(config=config, grids=grids, states=states, windows=windows,
                       reports={}, forward_vol={})
     table = _score_windows(dataset, states, bundle.vol_models, bundle.seasonality,
-                           slice_, config, groups=groups)
+                           slice_, config, groups=groups, deferred=deferred)
     scored = attach_baseline(table, bundle.baseline)
     # The window has not settled. Say so rather than carrying the value the
     # window table computed from a settle price that does not exist yet.
