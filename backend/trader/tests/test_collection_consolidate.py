@@ -166,3 +166,84 @@ def test_order_does_not_decide_which_copy_wins(collected, tmp_path):
     snaps, _ = consolidate.convert('kalshi', 'BTC-USD', '2026-02',
                                    [next((tmp_path / 'archive').rglob('*.jsonl'))])
     assert snaps == 7
+
+
+# --- memory: the converter froze the machine twice --------------------------
+#
+# `convert` built a dict of every RECORD in a partition before writing
+# anything, and a record carries its raw ladders -- 97% of the bytes. Measured
+# on the real archive: a single Polymarket record reaches 43 MB of JSON, and
+# the largest partition is 2.0 GB gzipped, roughly 66 GB decompressed, more
+# again as live Python objects. Against 31 GB of RAM that is not an OOM kill;
+# it is a hard lockup with nothing flushed to the journal, which is exactly
+# what the boot history showed both times.
+#
+# The fix is two passes: find WHERE the fullest copy of each window lives,
+# keeping only the location, then re-read and stream those records out in
+# batches. Peak memory then depends on the batch, not on the partition.
+
+def test_selecting_copies_keeps_locations_not_records(collected, tmp_path):
+    """The index must hold a place in a file, never the payload found there."""
+    collected([_record(market_id='m', n=3)])
+    path = next((tmp_path / 'archive').rglob('*.jsonl'))
+    chosen = consolidate.select_copies([path])
+    assert list(chosen) == [('m', '2026-02-01T00:00:00+00:00')]
+    where = next(iter(chosen.values()))
+    assert isinstance(where[1], int), 'second element should be a line number'
+    assert 'series' not in repr(where) and 'ladders' not in repr(where)
+
+
+def test_selecting_copies_points_at_the_fullest_copy(collected, tmp_path):
+    """Same rule as before, decided without holding either record."""
+    collected([_record(market_id='pm', n=2), _record(market_id='pm', n=9),
+               _record(market_id='pm', n=4)])
+    path = next((tmp_path / 'archive').rglob('*.jsonl'))
+    chosen = consolidate.select_copies([path])
+    assert next(iter(chosen.values()))[1] == 1, 'the n=9 copy is on line 1'
+
+
+def test_a_torn_line_is_skipped_by_the_index_too(collected, tmp_path):
+    collected(['{"venue": "kalshi", "sym\n', _record(market_id='ok', n=2)])
+    path = next((tmp_path / 'archive').rglob('*.jsonl'))
+    assert list(consolidate.select_copies([path])) == [
+        ('ok', '2026-02-01T00:00:00+00:00')]
+
+
+def test_peak_memory_does_not_scale_with_the_partition(collected, tmp_path):
+    """The regression test for the crash, stated as the property that failed:
+    doubling the partition must not double the memory. The old converter held
+    every record, so peak tracked the partition exactly -- which is how a 2.0 GB
+    gzipped month took down a 31 GB machine."""
+    import tracemalloc
+
+    def peak_for(count, sub):
+        root = tmp_path / 'archive' / 'venue=kalshi' / 'symbol=BTC-USD' / f'month={sub}'
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / 'windows.jsonl'
+        with open(path, 'w') as handle:
+            for i in range(count):
+                handle.write(json.dumps(_record(market_id=f'm{i}', n=300)) + '\n')
+        tracemalloc.start()
+        consolidate.convert('kalshi', 'BTC-USD', sub, [path],
+                            keep_ladders=False, batch_rows=500)
+        got = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        return got
+
+    small = peak_for(15, '2026-03')
+    large = peak_for(60, '2026-04')          # 4x the partition
+    assert large < small * 1.6, (
+        f'peak went {small/1e6:.2f}MB -> {large/1e6:.2f}MB for 4x the data '
+        f'-- memory is still scaling with the partition')
+
+
+def test_batching_does_not_change_the_output(collected, tmp_path):
+    """Row-group size is a memory knob, never a data one."""
+    collected([_record(market_id=f'm{i}', n=50) for i in range(10)])
+    path = next((tmp_path / 'archive').rglob('*.jsonl'))
+    consolidate.convert('kalshi', 'BTC-USD', '2026-02', [path], batch_rows=7)
+    small = _derived(tmp_path).sort_values(['market_id', 'ts']).reset_index(drop=True)
+    consolidate.convert('kalshi', 'BTC-USD', '2026-02', [path], batch_rows=10_000)
+    big = _derived(tmp_path).sort_values(['market_id', 'ts']).reset_index(drop=True)
+    assert len(small) == len(big) == 500
+    pd.testing.assert_frame_equal(small, big)
