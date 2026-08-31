@@ -1007,6 +1007,31 @@ def _ticket_for(writer: PgWriter, position):
                 .one_or_none())
 
 
+def _ladder_touch(levels, *, invert: bool, fallback: float) -> float:
+    """The best price the LADDER actually shows, in the quote's denomination.
+
+    The depth buckets must be measured against the touch of the same snapshot
+    that supplies the levels. Taking it from a separately-fetched quote made the
+    1c bucket read zero whenever the quote was a cent better than the cached
+    ladder — measured at 31.24% of live rows, against 0.00% in the backfill,
+    which reads both from one snapshot and so cannot produce that state.
+
+    `fallback` is used only when the ladder is empty, where there is nothing to
+    measure and the NaN is the honest answer.
+    """
+    best = None
+    for entry in levels or []:
+        try:
+            price = float(entry[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        effective = (1.0 - price) if invert else price
+        # YES bids: higher is better. YES asks (from NO bids): lower is better.
+        if best is None or (effective < best if invert else effective > best):
+            best = effective
+    return float(fallback) if best is None else best
+
+
 def _cumulative(levels, *, best: float, within: float, invert: bool) -> float:
     """Resting size at prices at least as good as `best +/- within`.
 
@@ -1421,20 +1446,26 @@ def book_feature_row(quote, yes_levels, no_levels, *,
     ask = quote.yes_ask if getattr(quote, 'yes_ask', None) is not None else _np.nan
     best_bid = float(bid) * 100.0 if _np.isfinite(_np.float64(bid)) else _np.nan
     best_ask = float(ask) * 100.0 if _np.isfinite(_np.float64(ask)) else _np.nan
+    _bid_touch = _ladder_touch(yes_levels, invert=False, fallback=bid)
+    _ask_touch = _ladder_touch(no_levels, invert=True, fallback=ask)
 
     frame = _pd.DataFrame([{
         'best_bid': best_bid, 'best_ask': best_ask,
         'baseline_probability': baseline_probability,
         'bid_at_touch': float(getattr(quote, 'yes_bid_size', 0.0) or 0.0),
         'ask_at_touch': float(getattr(quote, 'yes_ask_size', 0.0) or 0.0),
-        'bid_1c': _cumulative(yes_levels, best=float(bid), within=0.01,
-                              invert=False) if _np.isfinite(_np.float64(bid)) else _np.nan,
-        'ask_1c': _cumulative(no_levels, best=float(ask), within=0.01,
-                              invert=True) if _np.isfinite(_np.float64(ask)) else _np.nan,
-        'bid_5c': _cumulative(yes_levels, best=float(bid), within=0.05,
-                              invert=False) if _np.isfinite(_np.float64(bid)) else _np.nan,
-        'ask_5c': _cumulative(no_levels, best=float(ask), within=0.05,
-                              invert=True) if _np.isfinite(_np.float64(ask)) else _np.nan,
+        # ONE sampler. `best` is the ladder's own touch, not the quote's — see
+        # `_ladder_touch`. Mixing the two zeroed the 1c bucket on 31% of rows
+        # while 5c stayed full, which is a NaN convexity from a bookkeeping
+        # mismatch rather than from a thin book.
+        'bid_1c': _cumulative(yes_levels, best=_bid_touch, within=0.01,
+                              invert=False) if yes_levels else _np.nan,
+        'ask_1c': _cumulative(no_levels, best=_ask_touch, within=0.01,
+                              invert=True) if no_levels else _np.nan,
+        'bid_5c': _cumulative(yes_levels, best=_bid_touch, within=0.05,
+                              invert=False) if yes_levels else _np.nan,
+        'ask_5c': _cumulative(no_levels, best=_ask_touch, within=0.05,
+                              invert=True) if no_levels else _np.nan,
         'bid_vol': _resting_total(yes_levels),
         'ask_vol': _resting_total(no_levels),
     }])
@@ -1481,14 +1512,27 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                 'yes_bid': float(quote.yes_bid), 'yes_ask': float(quote.yes_ask),
                 'yes_bid_size': float(quote.yes_bid_size or 0.0),
                 'yes_ask_size': float(quote.yes_ask_size or 0.0),
-                'depth_bid_1c': _cumulative(yes_levels, best=float(quote.yes_bid),
-                                            within=0.01, invert=False),
-                'depth_bid_5c': _cumulative(yes_levels, best=float(quote.yes_bid),
-                                            within=0.05, invert=False),
-                'depth_ask_1c': _cumulative(no_levels, best=float(quote.yes_ask),
-                                            within=0.01, invert=True),
-                'depth_ask_5c': _cumulative(no_levels, best=float(quote.yes_ask),
-                                            within=0.05, invert=True),
+                # ONE sampler, as in `book_feature_row`: the ladder's own
+                # touch, not the quote's. Measured, the mixed version wrote
+                # "1c empty while 5c is full" on 31.24% of these rows against
+                # 0.00% in the backfill, so a third of every recorded row's
+                # convexity was a bookkeeping artifact rather than a thin book.
+                'depth_bid_1c': _cumulative(
+                    yes_levels, within=0.01, invert=False,
+                    best=_ladder_touch(yes_levels, invert=False,
+                                       fallback=float(quote.yes_bid))),
+                'depth_bid_5c': _cumulative(
+                    yes_levels, within=0.05, invert=False,
+                    best=_ladder_touch(yes_levels, invert=False,
+                                       fallback=float(quote.yes_bid))),
+                'depth_ask_1c': _cumulative(
+                    no_levels, within=0.01, invert=True,
+                    best=_ladder_touch(no_levels, invert=True,
+                                       fallback=float(quote.yes_ask))),
+                'depth_ask_5c': _cumulative(
+                    no_levels, within=0.05, invert=True,
+                    best=_ladder_touch(no_levels, invert=True,
+                                       fallback=float(quote.yes_ask))),
                 # The whole resting ladder, not just the levels near the
                 # touch. `depth_ratio` and `book_convexity` read these, and
                 # `book_feature_row` already derives them for the DECISION —
