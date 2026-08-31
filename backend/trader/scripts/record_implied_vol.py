@@ -324,7 +324,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-rows', type=int, default=10)
     parser.add_argument('--min-minutes', type=float, default=2.0)
     parser.add_argument('--max-minutes', type=float, default=180.0)
-    # 0.0, to match the backfill, which gates on nothing but MIN_STRIKES.
+    # 0.90. NOT the backfill's rule, and deliberately so — see below.
+    #
+    # REVERTED 2026-08-31, same day it was set to 0.0. The backfill gates on
+    # nothing, so 0.0 is the parity-correct value in principle; in practice
+    # live and the backfill do not select the same STRIKES, and removing the
+    # gate exposed that rather than fixing it. Live fits the whole open ladder
+    # (17-50 rungs) where Predexon's tick series only carried the liquid ones
+    # (median 5), so the fits that the gate had been hiding were garbage:
+    #
+    #   symbol  training med sigma   live med sigma (gate off)   live med R2
+    #   BTC          5.4 bp/min            7.5                      0.989
+    #   ETH         10.3 bp/min           64.2                      0.827
+    #   SOL          7.8 bp/min        2,243.4                      0.295
+    #
+    # 287x on SOL puts `iv_minus_realised` near log(287) = 5.7 where training
+    # saw ~0. The 0.90 gate is a known train/serve mismatch that costs ETH and
+    # SOL their coverage; a 287x sigma is an unknown one that corrupts the
+    # feature the model actually reads. Prefer the known, smaller error until
+    # the strike selection is matched properly.
+    #
+    # The real fix is upstream: select the same rungs the backfill did. Until
+    # then this stays at 0.90, which is the configuration the measured weekend
+    # run traded.
     #
     # This defaulted to 0.90 and that was a train/serve mismatch, not caution.
     # Measured on what the backfill actually wrote, accepted fits run down to
@@ -340,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     # is ONE OF THE FIVE FEATURES: the model saw R2 from 0.0002 to 1.0 and
     # learned what a weak fit is worth, so discarding weak fits upstream
     # removes the information it was given to make that judgement.
-    parser.add_argument('--min-r2', type=float, default=0.0,
+    parser.add_argument('--min-r2', type=float, default=0.90,
                         help='drop fits below this R2. Default 0.0 to match '
                              'the backfill the model was trained on; iv_r2 is '
                              'a feature, so the model judges fit quality')

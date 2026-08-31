@@ -32,8 +32,28 @@ def _market(strike, price, close):
             'yes_ask_dollars': f'{min(price + 0.01, 1.0):.4f}'}
 
 
-def test_the_live_default_matches_the_backfill_which_gates_on_nothing():
-    assert build_parser().parse_args([]).min_r2 == 0.0
+def test_the_gate_stays_until_the_strike_selection_is_matched():
+    """This asserted 0.0 for part of one day, on the parity argument above, and
+    the parity argument is not wrong — it is incomplete.
+
+    Removing the gate did not make live match the backfill; it revealed that the
+    two never selected the same STRIKES. Live fits the whole open ladder (17-50
+    rungs) where Predexon's tick series carried only the liquid ones (median 5),
+    so the fits the gate had been suppressing were not merely low-R2, they were
+    wrong by orders of magnitude:
+
+        symbol  training med sigma   live med sigma (gate off)   live med R2
+        BTC          5.4 bp/min            7.5                      0.989
+        ETH         10.3 bp/min           64.2                      0.827
+        SOL          7.8 bp/min        2,243.4                      0.295
+
+    287x on SOL puts `iv_minus_realised` near log(287) = 5.7 where training saw
+    about 0. So the choice is between a KNOWN mismatch that costs ETH and SOL
+    their coverage, and an UNKNOWN one that corrupts the feature the model
+    reads. Take the known, smaller error — and note the gate is what the
+    measured weekend run actually traded.
+    """
+    assert build_parser().parse_args([]).min_r2 == 0.90
 
 
 def test_a_noisy_ladder_is_kept_and_its_r2_reported():
