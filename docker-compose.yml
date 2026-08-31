@@ -339,10 +339,12 @@ services:
           --loop
           --cycle-seconds 60
           --mode live
-          --place-orders
+          --dry-run
+          --bankroll 200
+          --no-require-gates
           --force
-          --reason "live smoke test on a $100 account"
-          --max-daily-loss-fraction 0.50
+          --reason "manual run of the live stack; edit before using"
+
 
 volumes:
   postgres_data:

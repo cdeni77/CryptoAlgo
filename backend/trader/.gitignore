@@ -2,3 +2,4 @@
 # Collection working state: ledger, lock, catalogs and the raw archive.
 # Rebuildable by `run_collection --phase catalog`, and far too large to track.
 data/collection/
+.tmp/
