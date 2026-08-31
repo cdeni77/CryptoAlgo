@@ -182,8 +182,37 @@ def mid_of(market: dict) -> Optional[float]:
             return value / 100.0 if value > 1.0 else value
         return None
 
+    def size(*keys):
+        """Resting size, or None when the venue did not say.
+
+        `_fp` fields are fixed-point strings. Absence is NOT emptiness: the
+        backfilled fixtures carry prices without sizes, so a missing field
+        cannot be read as an empty book.
+        """
+        for key in keys:
+            raw = market.get(key)
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     bid = number('yes_bid_dollars', 'yes_bid')
     ask = number('yes_ask_dollars', 'yes_ask')
+    # A price with nothing resting behind it is not a quote. Seen live on SOL:
+    # yes_bid 0.0100 (size 2314) against yes_ask 1.0000 (size 0), which passed
+    # the price checks and contributed a fabricated mid of 0.505 — a coin flip
+    # for a strike with no market, liquidity 0, volume 0, open interest 0.
+    # Eighteen of those in one fit gave R2 0.02 and a 6,371 bp/min sigma.
+    #
+    # This is the analogue of the backfill's `if snaps:`: Predexon recorded no
+    # book for such a strike, so it never entered a fit at all.
+    bid_size = size('yes_bid_size_fp', 'yes_bid_size')
+    ask_size = size('yes_ask_size_fp', 'yes_ask_size')
+    if bid_size == 0 or ask_size == 0:
+        return None
     # BOTH sides, and neither of them zero. `cross_section` in the backfill
     # drops a strike without a two-sided quote — "a one-sided quote is dropped
     # rather than half-invented; the inversion needs P(above), and a single side

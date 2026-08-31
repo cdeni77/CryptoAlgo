@@ -60,3 +60,42 @@ def test_integer_cents_are_still_accepted():
 def test_a_crossed_quote_is_refused():
     assert mid_of({'yes_bid_dollars': '0.6000',
                    'yes_ask_dollars': '0.4000'}) is None
+
+
+def test_a_price_with_no_size_behind_it_is_not_a_quote():
+    """The defect that survived the first fix, seen live on SOL:
+
+        KXSOLD-26AUG3113-T99.7499
+          yes_bid 0.0100  size 2314
+          yes_ask 1.0000  size    0   <- no ask exists
+          liquidity 0.00  volume 0  open_interest 0
+
+    Both prices are non-zero and ask >= bid, so it passed and contributed a
+    fabricated mid of 0.505 — a "coin flip" for a strike with no market.
+    Eighteen of those in one fit produced R2 0.02 and a 6,371 bp/min sigma.
+
+    This is the direct analogue of the backfill's `if snaps:` — Predexon
+    recorded no book for such a strike, so it never entered a fit.
+    """
+    assert mid_of({'yes_bid_dollars': '0.0100', 'yes_ask_dollars': '1.0000',
+                   'yes_bid_size_fp': '2314.00',
+                   'yes_ask_size_fp': '0.00'}) is None
+
+
+def test_no_size_on_the_bid_is_also_refused():
+    assert mid_of({'yes_bid_dollars': '0.4400', 'yes_ask_dollars': '0.4600',
+                   'yes_bid_size_fp': '0.00',
+                   'yes_ask_size_fp': '150.00'}) is None
+
+
+def test_a_genuinely_two_sided_market_is_kept():
+    assert mid_of({'yes_bid_dollars': '0.4400', 'yes_ask_dollars': '0.4600',
+                   'yes_bid_size_fp': '250.00',
+                   'yes_ask_size_fp': '150.00'}) == pytest.approx(0.45)
+
+
+def test_absent_size_fields_do_not_reject_a_two_sided_quote():
+    """The backfilled path and the fixtures carry prices without sizes. Sizes
+    are checked when present; their absence is not evidence of an empty book."""
+    assert mid_of({'yes_bid_dollars': '0.4400',
+                   'yes_ask_dollars': '0.4600'}) == pytest.approx(0.45)
