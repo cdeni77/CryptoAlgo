@@ -313,9 +313,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-rows', type=int, default=10)
     parser.add_argument('--min-minutes', type=float, default=2.0)
     parser.add_argument('--max-minutes', type=float, default=180.0)
-    parser.add_argument('--min-r2', type=float, default=0.90,
-                        help='below this the ladder is not internally '
-                             'consistent and the fit is not a measurement')
+    # 0.0, to match the backfill, which gates on nothing but MIN_STRIKES.
+    #
+    # This defaulted to 0.90 and that was a train/serve mismatch, not caution.
+    # Measured on what the backfill actually wrote, accepted fits run down to
+    # R2 = 0.0367 (BTC), 0.0134 (ETH), 0.0002 (SOL), with 5th percentiles of
+    # 0.85 / 0.72 / 0.56 — so the artifact was FITTED across that whole range
+    # while live kept only the top of it. Over 67 hours live produced 2,805 BTC
+    # fits, 13 ETH and zero SOL, against training coverage of 22,258 / 5,286 /
+    # 3,110.
+    #
+    # Two reasons filtering here is the wrong direction. `--complete-cases`
+    # fitted the artifact on rows that ALL carry a fit, so a symbol with no
+    # fits has no complete rows and is scored out of distribution. And `iv_r2`
+    # is ONE OF THE FIVE FEATURES: the model saw R2 from 0.0002 to 1.0 and
+    # learned what a weak fit is worth, so discarding weak fits upstream
+    # removes the information it was given to make that judgement.
+    parser.add_argument('--min-r2', type=float, default=0.0,
+                        help='drop fits below this R2. Default 0.0 to match '
+                             'the backfill the model was trained on; iv_r2 is '
+                             'a feature, so the model judges fit quality')
     return parser
 
 
