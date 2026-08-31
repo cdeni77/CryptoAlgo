@@ -184,9 +184,20 @@ def mid_of(market: dict) -> Optional[float]:
 
     bid = number('yes_bid_dollars', 'yes_bid')
     ask = number('yes_ask_dollars', 'yes_ask')
-    if bid is not None and ask is not None and ask >= bid:
-        return (bid + ask) / 2.0
-    return number('last_price_dollars', 'last_price')
+    # BOTH sides, and neither of them zero. `cross_section` in the backfill
+    # drops a strike without a two-sided quote — "a one-sided quote is dropped
+    # rather than half-invented; the inversion needs P(above), and a single side
+    # does not give one" — and a zero is not a side. CLAUDE.md states the same
+    # rule for quotes generally: a zero level means there is nothing there.
+    #
+    # Accepting them put every far-OTM strike into the fit: live carried a
+    # median of 50 rungs for ETH and 19 for SOL against the backfill's 5, and
+    # one sigma across half-invented mids collapsed R2 to 0.827 and 0.295
+    # against training's 0.976 and 0.986. BTC is liquid enough to survive it,
+    # which is why this hid.
+    if not bid or not ask or ask < bid:
+        return None
+    return (bid + ask) / 2.0
 
 
 def fits_for(markets, *, now, symbol: str, min_minutes: float,
