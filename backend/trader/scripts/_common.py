@@ -103,6 +103,22 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     # the three policies and none of them was the deployed one.
     #
     # The default stays None so past ledger entries keep their meaning.
+    # Sizing off the running balance instead of the starting bankroll.
+    #
+    # OFF by default, and the default is the load-bearing part: additive sizing
+    # makes the equity curve's slope the per-trade EDGE, while compounding makes
+    # it an exponential of the ESTIMATE of that edge — which is dominated by the
+    # error in the estimate, and is how an earlier incarnation of this repo
+    # turned $100 into $2e17 and reported it as a return.
+    #
+    # The flag exists so the alternative can be MEASURED. "Never tried" and
+    # "tried and rejected" are different claims and only the second is worth
+    # holding. Note the money gates change meaning under it: total_return,
+    # sharpe and max_drawdown are all computed on the compounded curve, and
+    # `sharpe_implausible` will fire on arithmetic rather than on a bug.
+    economics.add_argument('--compound', action='store_true', default=None,
+                           help='size off the running balance (default: off, '
+                                'so the curve stays additive and readable)')
     economics.add_argument('--entry-offsets', type=int, nargs='+', default=None)
     economics.add_argument('--min-traded-price', type=float, default=None)
     economics.add_argument('--max-traded-price', type=float, default=None)
@@ -156,6 +172,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('recency_half_life_days', 'recency_half_life_days'),
         ('train_window_days', 'train_window_days'),
         ('starting_bankroll', 'bankroll'), ('kelly_fraction', 'kelly_fraction'),
+        ('compound', 'compound'),
         ('entry_offsets', 'entry_offsets'),
         ('min_traded_price', 'min_traded_price'),
         ('max_traded_price', 'max_traded_price'),
