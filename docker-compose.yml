@@ -135,6 +135,15 @@ services:
       - KALSHI_SERIES_ETH=${KALSHI_SERIES_ETH:-KXETH15M}
       - KALSHI_SERIES_SOL=${KALSHI_SERIES_SOL:-KXSOL15M}
 
+      # **Predexon, for the settlement LABEL.** `collect_settlements` reads the
+      # venue's own result per market, which is where `venue_outcome` — the only
+      # authority on the target — comes from. The key lived in .env and was
+      # passed to nothing, so the container logged "PREDEXON_API_KEY is not set;
+      # skipping kalshi" once an hour and `venue_settlements` stopped advancing
+      # on 2026-08-27 while every other table stayed current. Nothing failed
+      # loudly: live kept trading and the TRAINING set silently stopped.
+      - PREDEXON_API_KEY=${PREDEXON_API_KEY:-}
+
       # Venue fee schedule, resolved by name out of configs/venue. Unset still
       # prices correctly — the built-in defaults are the published Kalshi
       # schedule — but records no version in a model's provenance. `configs/`

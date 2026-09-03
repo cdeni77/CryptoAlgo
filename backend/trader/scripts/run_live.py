@@ -242,8 +242,27 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
                 logger.info('compacted %d book-event rows', rows)
         except Exception as exc:                      # noqa: BLE001
             logger.warning('spool compaction: %s', str(exc)[:200])
+        # FOUR stages, in dependency order. The first two were here from the
+        # start; the second two were one-off commands nobody ran once the loop
+        # started, which is the same defect this docstring already describes for
+        # `scrape` and `sync_store` — and worse, because it is invisible. Live
+        # keeps trading and recording while the TRAINING set stops advancing.
+        #
+        # Measured six days into the live run: minute_bars, kalshi venue_depth
+        # and venue_implied_vol were all current, while venue_settlements — the
+        # LABEL — was seven days stale and polymarket venue_depth six. So no
+        # window after 2026-08-27 could be trained on, and a fresh walk-forward
+        # reproduced the previous run exactly. That reads like a stable model
+        # and is a stalled pipeline.
+        #
+        # `collect_settlements` stops at history it already holds, so keeping
+        # current is a page or two rather than a full walk. `build_depth` folds
+        # every BOOK source into venue_depth at every minute, which is what
+        # carries the recorded Polymarket ladders across for `cross_venue`.
         for step in (('scripts.scrape', '--backfill-days', '3'),
-                     ('scripts.sync_store',)):
+                     ('scripts.sync_store',),
+                     ('scripts.build_depth',),
+                     ('scripts.collect_settlements', '--venue', 'both')):
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, '-m', *step,
                 stdout=asyncio.subprocess.DEVNULL,
