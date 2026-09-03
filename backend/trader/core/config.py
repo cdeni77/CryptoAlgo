@@ -651,6 +651,24 @@ class Config:
             'fee_rate': self.fee_rate,
             'half_spread_cents': self.half_spread_cents,
             'fee_config_version': self.fee_config_version,
+            # The trading POLICY, not just the forecast. The ledger is the
+            # record of account and the trial count, and 20260828T202438Z exists
+            # specifically to measure `--entry-offsets 12` — it moved realised
+            # edge +2.06 -> +4.17pp and drawdown 0.402 -> 0.232 — while
+            # recording nothing about which policy that was.
+            #
+            # `compound` matters most: sizing off the starting bankroll keeps the
+            # equity curve additive, so its slope IS the per-trade edge, while
+            # compounding makes it an exponential of the ESTIMATE of that edge.
+            # An artifact measured one way and traded the other is a different
+            # strategy, and `scripts/live.config_for_artifact` reads these to
+            # keep the two in step — it was already asking for three of them.
+            'entry_offsets': (list(self.entry_offsets)
+                              if self.entry_offsets is not None else None),
+            'compound': bool(self.compound),
+            'starting_bankroll': self.starting_bankroll,
+            'max_stake_dollars': self.max_stake_dollars,
+            'max_stake_fraction': self.max_stake_fraction,
             'kelly_fraction': self.kelly_fraction,
             'min_edge_pp': self.min_edge_pp,
             'cli_overrides': sorted(self.cli_overrides),
