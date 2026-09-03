@@ -1165,6 +1165,44 @@ def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
     return float(value - max(earlier, key=lambda item: item[0])[1])
 
 
+def depth_dollars(quote, yes_levels, no_levels):
+    """(depth_up, depth_down) in DOLLARS, or (None, None) with no ladder.
+
+    `decide()` caps the stake at `measured_depth * depth_fraction` — "a measured
+    depth beats the standing guess" — but nothing outside the tests ever set
+    `depth_up`/`depth_down`, so the cap never fired and sizing was bounded only
+    by `max_stake_dollars`, an acknowledged guess. Harmless at a $3 stake; at the
+    $25 cap it is ~100 contracts against a median 212 resting at the touch.
+
+    Which side is crossed is the part that inverts. Kalshi's book is two BID
+    stacks: buying YES crosses the YES ask, whose size comes from the NO stack;
+    buying NO crosses the NO ask, whose size comes from the YES stack. Dollars,
+    not contracts, because that is what `decide()` compares against the stake.
+
+    None, not zero, when there is no ladder — zero would refuse every trade,
+    where the honest answer is "unmeasured, fall back to the standing cap".
+    """
+    def _touch(levels):
+        best = None
+        for entry in levels or []:
+            try:
+                price, size = float(entry[0]), float(entry[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if size > 0 and (best is None or price > best[0]):
+                best = (price, size)
+        return best
+
+    if not yes_levels and not no_levels:
+        return None, None
+    ask = float(getattr(quote, 'yes_ask', np.nan))
+    bid = float(getattr(quote, 'yes_bid', np.nan))
+    no_touch, yes_touch = _touch(no_levels), _touch(yes_levels)
+    up = (no_touch[1] * ask) if (no_touch and np.isfinite(ask)) else None
+    down = (yes_touch[1] * (1.0 - bid)) if (yes_touch and np.isfinite(bid)) else None
+    return up, down
+
+
 def cross_venue_row(pm: Optional[dict], quote) -> dict:
     """`cross_venue` from the in-process Polymarket cache.
 
@@ -1344,7 +1382,9 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
     pm_cache, iv_cache = _venue_caches()
     now = pd.Timestamp.now(tz='UTC')
     columns = (tuple(MARKET_STATE) + tuple(MARKET_PRICE)
-               + tuple(CROSS_VENUE) + tuple(IMPLIED_VOL))
+               + tuple(CROSS_VENUE) + tuple(IMPLIED_VOL)
+               # Not features — `decide()` reads these to cap the stake.
+               + ('depth_up', 'depth_down'))
     for column in columns:
         if column not in scored.columns:
             scored[column] = np.nan
@@ -1368,6 +1408,13 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
         # forty-nine features scored NaN every cycle. Dropping them instead is
         # not available: refitted without them, log_loss_skill goes +0.00307 ->
         # -0.00023 and folds positive 6/6 -> 3/6.
+        # The stake cap `decide()` has always had and never received. Both are
+        # dollars at the touch on the side actually crossed.
+        up, down = depth_dollars(entry[0], yes_levels, no_levels)
+        if up is not None:
+            row['depth_up'] = up
+        if down is not None:
+            row['depth_down'] = down
         row.update(cross_venue_row(pm_cache.get(symbol), entry[0]))
         row.update(implied_vol_row(
             latest_fit(symbol, now=now, cache=iv_cache), now=now,
@@ -2184,7 +2231,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     return decisions
 
 
-def order_limit_price(decision: Decision) -> float:
+def order_limit_price(decision: Decision, *, config: Optional[Config] = None) -> float:
     """The worst price still worth paying for this decision.
 
     **Pay down to the gate, not to a fraction.** `min_edge_pp` is the threshold
@@ -2204,11 +2251,17 @@ def order_limit_price(decision: Decision) -> float:
     only binds where the touch was too thin to fill at the old limit — which is
     precisely the case that used to return nothing at all.
 
+    **The gate is the one in force, not the default.** This read
+    `DEFAULT_CONFIG.min_edge_pp` (1.5) while live runs 3.0, so on a 5pp edge it
+    spent 3.5c where the rule allows 2.0c — and a fill at that price leaves less
+    edge than the threshold that admitted the trade, which is the one outcome
+    "pay down to the gate" is meant to exclude.
+
     `max_slippage_cents` stays as a rail against a book so thin the order walks
     it absurdly far. That is not hypothetical: the original `price + edge` limit
     sent 0.7832 against a 0.60 ask, 18c of tolerance on a 1c measured spread.
     """
-    config = DEFAULT_CONFIG
+    config = config if config is not None else DEFAULT_CONFIG
     edge = decision.edge if np.isfinite(decision.edge) else 0.0
     spendable = max(0.0, edge - config.min_edge_pp / 100.0)
     allowance = min(spendable, config.max_slippage_cents / 100.0)
@@ -2358,7 +2411,7 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                 settle_time=decision.settle_time, offset_minutes=decision.offset,
                 market_ticker=decision.market_ticker, side=decision.side.value,
                 contracts=decision.contracts, limit_price=decision.price,
-                max_price=order_limit_price(decision), expected_cost=decision.stake,
+                max_price=order_limit_price(decision, config=config), expected_cost=decision.stake,
                 model_probability=decision.model_probability, edge=decision.edge,
                 status='skipped',
                 note=(f'stale quote: {age:.0f}s old, over the '
@@ -2385,7 +2438,7 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         # The worst price still worth paying. Capped at a fraction of the edge:
         # paying the whole edge away leaves a zero-EV fill, and under
         # fill_or_kill that is what walking the book to break-even buys.
-        max_price=order_limit_price(decision),
+        max_price=order_limit_price(decision, config=config),
         expected_cost=decision.stake, model_probability=decision.model_probability,
         edge=decision.edge,
     )
@@ -2405,7 +2458,7 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                 ticker=decision.market_ticker, side=decision.side.value,
                 exchange_index=exchange_index,
                 contracts=decision.contracts,
-                limit_price=order_limit_price(decision),
+                limit_price=order_limit_price(decision, config=config),
                 # **The offset belongs in this key.** Keyed on (symbol, window)
                 # alone it enforced one order *attempt* per window, while the
                 # policy is one *position* per window — and those differ exactly
