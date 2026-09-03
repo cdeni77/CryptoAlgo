@@ -51,16 +51,26 @@ def test_the_limit_pays_down_to_the_gate_that_admitted_the_trade():
     is 2.18c — and the trade that results still clears the same gate.
     """
     gate = DEFAULT_CONFIG.min_edge_pp / 100.0
-    d = decision(price=0.7574, edge=0.0368)
+    # On the venue's grid: `snap_to_tick` rounds the limit DOWN to a
+    # price Kalshi quotes, so an off-grid input here would measure the
+    # rounding rather than the allowance.
+    d = decision(price=0.75, edge=0.0368)
     allowance = order_limit_price(d) - d.price
-    assert allowance == pytest.approx(0.0368 - gate, abs=1e-9)
+    # Snapped down to the whole-cent grid in the mid range.
+    assert allowance == pytest.approx(
+        __import__('math').floor((0.75 + 0.0368 - gate) * 100) / 100 - 0.75,
+        abs=1e-9)
     assert allowance > 0.0092, 'must be wider than the old share-of-edge rule'
 
 
 def test_a_marginal_edge_is_not_chased():
     """An edge barely above the gate has nothing to spend, and spends nothing."""
     d = decision(price=0.40, edge=DEFAULT_CONFIG.min_edge_pp / 100.0 + 0.0005)
-    assert order_limit_price(d) - d.price == pytest.approx(0.0005, abs=1e-9)
+    # A sub-tick allowance cannot be expressed on a 1c grid, so the limit
+    # sits at the touch. Rounding UP would breach the bound the allowance
+    # exists to set — measured, the venue's own rounding did exactly that
+    # on 4 of 143 fills.
+    assert order_limit_price(d) == pytest.approx(d.price, abs=1e-9)
 
 
 def test_an_edge_at_or_below_the_gate_never_crosses():

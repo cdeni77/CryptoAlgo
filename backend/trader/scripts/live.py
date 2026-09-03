@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import sys
 import time
@@ -2255,6 +2256,31 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     return decisions
 
 
+def snap_to_tick(price: float) -> float:
+    """Round DOWN to a price the venue actually quotes.
+
+    Kalshi's `price_level_structure` is `tapered_deci_cent`: a tenth of a cent
+    below 10c and above 90c, a full cent in between. `order_limit_price` returns
+    `decision.price + allowance`, which lands on arbitrary fractions like 0.373,
+    and the venue snaps an off-grid price for us — sometimes AGAINST us.
+    Measured, 4 of 143 fills came back above `max_price` by 0.08c to 0.71c, each
+    on a round tick.
+
+    DOWN, always. The limit bounds the worst price worth paying, so rounding it
+    up defeats the bound; rounding down gives up at most a fraction of a tick of
+    fill probability and can never pay more than intended.
+
+    The taper matters rather than being a detail: 41% of live contracts are
+    bought under 15c, and forcing a whole-cent grid there would discard nine
+    tenths of the precision the venue offers exactly where the payoff is
+    steepest.
+    """
+    if not np.isfinite(price):
+        return price
+    tick = 0.001 if (price < 0.10 or price > 0.90) else 0.01
+    return math.floor(round(price / tick, 9)) * tick
+
+
 def order_limit_price(decision: Decision, *, config: Optional[Config] = None) -> float:
     """The worst price still worth paying for this decision.
 
@@ -2289,7 +2315,12 @@ def order_limit_price(decision: Decision, *, config: Optional[Config] = None) ->
     edge = decision.edge if np.isfinite(decision.edge) else 0.0
     spendable = max(0.0, edge - config.min_edge_pp / 100.0)
     allowance = min(spendable, config.max_slippage_cents / 100.0)
-    return float(min(0.99, decision.price + allowance))
+    # Never below the price we must actually pay. Real venue prices are on the
+    # grid, so snapping down from `price + allowance` cannot land under `price`
+    # — but an off-grid price would, and a limit below the ask is an order that
+    # cannot fill.
+    limit = snap_to_tick(min(0.99, decision.price + allowance))
+    return float(max(limit, decision.price))
 
 
 def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
