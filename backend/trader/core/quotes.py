@@ -45,7 +45,9 @@ DEPTH_MAP = {
     'depth_bid_total': 'bid_vol', 'depth_ask_total': 'ask_vol',
 }
 QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
-                  'quote_age_seconds', 'quote_source')
+                  'quote_age_seconds', 'quote_source',
+                  # Not features — `decide()` reads these to cap the stake.
+                  'depth_up', 'depth_down')
                  + tuple(DEPTH_MAP.values()))
 # A book quoted twenty minutes ago is not a price this decision could have
 # taken. Measured on the real store, 88.1% of backfilled minute rows are fresher
@@ -107,6 +109,22 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     # every row, in its own favour.
     book['market_probability'] = ((bid + ask) / 2.0).where(
         keep & bid.notna() & ask.notna())
+    # The stake cap `decide()` reads, in DOLLARS on the side actually crossed.
+    # `scripts/live.py` supplies these from the live ladder; without them here
+    # the backtest would size against `max_stake_dollars` alone while live sized
+    # against the book, and "one decide()" is the invariant that stops the two
+    # from drifting. NaN, never zero, when the venue reported no size: zero
+    # refuses every trade where the honest answer is "unmeasured".
+    # The RAW column names: `bid_at_touch`/`ask_at_touch` are the DEPTH_MAP
+    # renames and that loop has not run yet at this point in the function.
+    def _size(name):
+        return (pd.to_numeric(book[name], errors='coerce')
+                if name in book.columns
+                else pd.Series(np.nan, index=book.index))
+
+    bid_size, ask_size = _size('yes_bid_size'), _size('yes_ask_size')
+    book['depth_up'] = (ask_size * book['ask_up']).where(keep)
+    book['depth_down'] = (bid_size * book['ask_down']).where(keep)
     book['quote_age_seconds'] = age.where(keep)
     book['quote_source'] = np.where(keep, venue, None)
 
@@ -122,7 +140,11 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
             if src in book.columns else np.nan
 
     take = ['symbol', 'window_open', 'offset_minutes', 'ask_up', 'ask_down',
-            'market_probability', 'quote_age_seconds', 'quote_source']
+            'market_probability', 'quote_age_seconds', 'quote_source',
+            # The stake cap. Listed here and not derived from QUOTE_COLUMNS
+            # because that tuple is also the drop list above; keeping them in
+            # step is the reason this line exists rather than a comprehension.
+            'depth_up', 'depth_down']
     take += list(DEPTH_MAP.values())
     merged = out.drop(columns=list(QUOTE_COLUMNS)).merge(
         book[take],
