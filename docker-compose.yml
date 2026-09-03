@@ -238,6 +238,7 @@ services:
         --cycle-seconds 60
         --mode live
         --place-orders
+        --compound
         --bankroll 200
         --no-require-gates
         --force

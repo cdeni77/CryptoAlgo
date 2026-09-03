@@ -132,6 +132,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--loop', action='store_true',
                         help='Run every cycle-seconds until interrupted.')
     parser.add_argument('--cycle-seconds', type=int, default=60)
+    # Size off the running balance rather than the starting bankroll.
+    #
+    # Measured on the promoted config over the out-of-sample span: return 1.319
+    # -> 2.497 with FRACTIONAL drawdown essentially unchanged (0.242 -> 0.244),
+    # because drawdown is a ratio and peak and trough scale together. Sharpe
+    # falls 3.72 -> 3.45, so the extra return is bought with proportionally more
+    # risk, and in dollars the same 24% is far more money.
+    #
+    # It does NOT affect how the edge is measured: `model_minus_market` is a
+    # log-loss comparison on predictions, `realised_edge_pp` is per contract,
+    # and daily return-on-cost is a ratio. All three are sizing-independent.
+    # What it costs is the equity curve's slope no longer being the per-trade
+    # edge.
+    #
+    # Explicit here beats the artifact's provenance — see `config_for_artifact`.
+    parser.add_argument('--compound', action='store_true', default=None,
+                        help='size off the running balance (default: off)')
     parser.add_argument('--bankroll', type=float, default=None,
                         help='Starting bankroll, used only when creating the account.')
     parser.add_argument('--offset', type=int, default=None,
@@ -666,9 +683,16 @@ def config_for_artifact(config, model, *, mode: str):
     # because a smaller fraction also floors marginal trades under one contract
     # and refuses them. It is an edge filter, not only a size.
     provenance = dict(getattr(model, 'config_provenance', None) or {})
+    # Anything the command line set explicitly wins. Adoption exists so an
+    # artifact trades under the policy it was MEASURED under, not to overrule
+    # the operator — and silently reverting a deliberate setting at the next
+    # promotion is exactly the failure that would be hardest to notice.
+    explicit = set(getattr(config, 'cli_overrides', None) or ())
     economics = {}
     for field in ('kelly_fraction', 'min_edge_pp', 'max_stake_dollars',
                   'max_stake_fraction', 'half_spread_cents', 'compound'):
+        if field in explicit:
+            continue
         value = provenance.get(field)
         # None means the promoting run left it at ITS default, which is the
         # default here too. Adopting a None would erase a real setting.

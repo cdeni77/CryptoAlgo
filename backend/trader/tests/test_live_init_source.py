@@ -86,3 +86,26 @@ def test_a_field_the_artifact_did_not_record_keeps_the_running_default():
 def test_an_artifact_with_no_provenance_changes_nothing():
     config = config_for_artifact(Config(), _artifact_with(), mode='live')
     assert config.kelly_fraction == Config().kelly_fraction
+
+
+def test_an_explicit_cli_setting_beats_the_artifact_provenance():
+    """Economics adoption exists so an artifact trades under the policy it was
+    MEASURED under. But the operator must still be able to override it — and
+    silently reverting them at the next promotion is the failure mode.
+
+    `cli_overrides` already records which fields the command line set, so
+    adoption skips those and adopts the rest.
+    """
+    from dataclasses import replace
+    config = replace(Config(compound=True, kelly_fraction=0.25),
+                     cli_overrides=frozenset({'compound'}))
+    out = config_for_artifact(
+        config, _artifact_with(compound=False, kelly_fraction=0.10), mode='live')
+    assert out.compound is True, 'the explicit flag was overwritten'
+    assert out.kelly_fraction == 0.10, 'the un-overridden field still adopts'
+
+
+def test_without_an_override_the_artifact_still_wins():
+    config = Config(compound=True)
+    out = config_for_artifact(config, _artifact_with(compound=False), mode='live')
+    assert out.compound is False
