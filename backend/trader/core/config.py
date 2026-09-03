@@ -214,6 +214,11 @@ class Config:
     early_stopping_rounds: int = 40
 
     # ---- cross-validation ------------------------------------------------
+    # How the walk-forward timeline is cut. 'calendar' gives equal spans of
+    # TIME, 'count' equal numbers of windows. Every ledger entry before
+    # 2026-09-03 used 'count' and predates this field, so an entry without it
+    # means 'count'. See `core.cv.purged_walk_forward` for why this changed.
+    fold_scheme: str = 'calendar'
     n_folds: int = 6
     # Purge and embargo, in minutes, applied on both sides of every test
     # block. It must cover the longest feature lookback (1440) as well as the
@@ -663,6 +668,7 @@ class Config:
             # An artifact measured one way and traded the other is a different
             # strategy, and `scripts/live.config_for_artifact` reads these to
             # keep the two in step — it was already asking for three of them.
+            'fold_scheme': self.fold_scheme,
             'entry_offsets': (list(self.entry_offsets)
                               if self.entry_offsets is not None else None),
             'compound': bool(self.compound),
