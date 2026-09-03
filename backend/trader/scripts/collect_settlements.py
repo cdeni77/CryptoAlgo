@@ -85,6 +85,114 @@ async def _get(session, url: str, params: dict, key: Optional[str] = None):
     raise RuntimeError('rate limited')
 
 
+async def kalshi_direct(now, store=None) -> list[dict]:
+    """Settled markets straight from Kalshi, using the trading credential.
+
+    The DEFAULT path for keeping the label current. Predexon remains the only
+    way to reach HISTORY — Kalshi purges older markets — so `--source predexon`
+    is still there for a backfill, and the 196-day 62,097-row archive came
+    through it. But nothing about ongoing collection needs a research key in
+    the container that holds the trading credential.
+
+    Pages until it reaches windows already stored, so an hourly run is a couple
+    of requests rather than a walk.
+    """
+    from core.config import SERIES_BY_SYMBOL
+    from data_collection.kalshi_client import KalshiClient
+
+    known: set = set()
+    if store is not None:
+        try:
+            existing = store.read('venue_settlements')
+            known = set(existing.loc[existing['venue'] == 'kalshi',
+                                     'market_ticker'].astype(str))
+        except Exception:                                     # noqa: BLE001
+            known = set()
+
+    rows: list[dict] = []
+    async with KalshiClient() as client:
+        if not client.configured:
+            logger.error('Kalshi credentials are not configured; '
+                         'cannot collect settlements directly')
+            return []
+        for symbol, series in SERIES_BY_SYMBOL.items():
+            cursor, pages = None, 0
+            while pages < 20:
+                params = {'series_ticker': series, 'status': 'settled',
+                          'limit': 200}
+                if cursor:
+                    params['cursor'] = cursor
+                try:
+                    payload = await client._request(  # noqa: SLF001
+                        'GET', '/markets', params=params)
+                except Exception as exc:                      # noqa: BLE001
+                    logger.warning('%s settled markets: %s', series,
+                                   str(exc)[:120])
+                    break
+                markets = payload.get('markets') or []
+                fresh = [m for m in markets
+                         if str(m.get('ticker') or '') not in known]
+                rows += rows_from_kalshi_markets(fresh, symbol=symbol, now=now)
+                cursor = payload.get('cursor')
+                pages += 1
+                # Every market on this page is already stored, so everything
+                # older is too — the listing is ordered by close.
+                if not cursor or not markets or not fresh:
+                    break
+            logger.info('%s: %d new settlements', series,
+                        sum(1 for r in rows if r['symbol'] == symbol))
+    return rows
+
+
+def rows_from_kalshi_markets(markets, *, symbol: str, now) -> list[dict]:
+    """`venue_settlements` rows from Kalshi's OWN settled-market listing.
+
+    `GET /markets?status=settled` carries `result` per market, so the ongoing
+    label needs no research key — the live container is already authenticated to
+    Kalshi. Predexon was only ever required for HISTORY, because Kalshi purges
+    older markets; that is what the 196-day, 62,097-row backfill went through.
+
+    Removing the extra credential is not cosmetic. `venue_outcome` closes a
+    measured 43% label leak — training on our Coinbase label while pricing
+    against BRTI-based quotes let the model bet the index disagreement (72.77%
+    win rate where the labels differ against 56.17% where they agree). A label
+    path gated on a key nobody remembered to pass is that leak waiting to
+    reopen, which is precisely what happened for the six days after
+    2026-08-27.
+
+    A market without a `result` is SKIPPED, never defaulted: `status=settled`
+    can return one mid-finalisation, and reading a missing result as 'no' would
+    fabricate half the labels it touched.
+    """
+    rows = []
+    for market in markets or []:
+        result = str(market.get('result') or '').strip().lower()
+        if result not in ('yes', 'no'):
+            continue
+        close = _time(market.get('close_time'))
+        if close is None or pd.isna(close):
+            continue
+        # The window opens WINDOW_MINUTES before it closes; the settlement is
+        # keyed on the open, as everywhere else in the store.
+        open_time = close - pd.Timedelta(minutes=15)
+        rows.append({
+            'venue': 'kalshi', 'symbol': symbol,
+            'event_time': open_time, 'available_time': now,
+            'quality': 'valid',
+            'market_ticker': str(market.get('ticker') or ''),
+            'window_open': open_time,
+            'close_time': close,
+            'settlement_time': _time(market.get('settlement_time')),
+            'result': result,
+            'settled_up': result == 'yes',
+            'volume': float(market.get('volume') or 0.0),
+            'open_interest': float(market.get('open_interest') or 0.0),
+            'last_price': float(market.get('last_price') or 0.0),
+            'source': 'kalshi_direct',
+        })
+    return rows
+
+
 async def kalshi(session, key: str, now: pd.Timestamp, store=None,
                  args_full: bool = False) -> list[dict]:
     """One row per settled market, from the venue's own `result`.
@@ -233,10 +341,17 @@ async def run(args) -> int:
     async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60)) as session:
         if args.venue in ('kalshi', 'both'):
-            if not key:
-                logger.error('PREDEXON_API_KEY is not set; skipping kalshi')
+            # Kalshi's own listing by default: it carries `result` per market
+            # and needs no key beyond the trading credential already present.
+            # Predexon is for HISTORY, which Kalshi purges.
+            if args.source == 'predexon':
+                if not key:
+                    logger.error('PREDEXON_API_KEY is not set; skipping kalshi')
+                else:
+                    rows += await kalshi(session, key, now, store,
+                                         args_full=args.full)
             else:
-                rows += await kalshi(session, key, now, store, args_full=args.full)
+                rows += await kalshi_direct(now, store)
         if args.venue in ('polymarket', 'both'):
             rows += await polymarket(session, now)
 
@@ -255,6 +370,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--venue', choices=('kalshi', 'polymarket', 'both'),
                         default='both')
+    parser.add_argument('--source', choices=('kalshi', 'predexon'),
+                        default='kalshi',
+                        help='where Kalshi results come from. `kalshi` uses the '
+                             'venue\'s own settled-market listing and needs no '
+                             'extra key; `predexon` reaches history Kalshi has '
+                             'purged')
     parser.add_argument('--full', action='store_true',
                         help='walk the whole history rather than stopping at '
                              'markets already stored')
