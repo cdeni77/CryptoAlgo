@@ -72,3 +72,69 @@ def test_the_requirement_can_be_narrowed_to_named_groups():
 
 def test_an_empty_panel_returns_empty_rather_than_raising():
     assert complete_cases(_panel().iloc[0:0]).empty
+
+
+# --- the CLI must actually pass the groups through -------------------------
+#
+# `test_the_requirement_can_be_narrowed_to_named_groups` above proves the
+# FUNCTION can narrow, and it passed for as long as the parameter existed —
+# while `scripts/_common.load_dataset`, its only caller, never supplied one. So
+# every run demanded all four requirements including a ladder fit, and a config
+# without `implied_vol` lost rows for a feature it does not have. The
+# 2026-09-03/04 sweep then failed `windows_evaluated` at 16,617 of 20,000
+# partly for that reason.
+#
+# A unit test on the function could not catch a defect in the wiring. These are
+# on the wiring.
+
+def test_the_cli_forwards_its_groups_to_the_filter():
+    """The seam that was broken: --groups must reach `complete_cases`."""
+    import argparse
+    from scripts._common import apply_complete_cases
+
+    class Ds:
+        def __init__(self, windows):
+            self.windows = windows
+
+    # A panel whose ONLY defect is a missing ladder fit.
+    ds = Ds(_panel(implied_sigma_per_min=[np.nan] * 4))
+    args = argparse.Namespace(
+        complete_cases=True,
+        groups='cross_venue,geometry,vol_state,cross_asset,market_state')
+    apply_complete_cases(args, ds)
+    assert len(ds.windows) == 4, (
+        'a config without implied_vol must not be denied rows for want of a '
+        'ladder fit')
+
+
+def test_a_config_that_uses_implied_vol_still_requires_it():
+    """The narrowing must not become a way to smuggle in NaN features."""
+    import argparse
+    import pytest as _pytest
+    from core.dataset import DatasetError
+    from scripts._common import apply_complete_cases
+
+    class Ds:
+        def __init__(self, windows):
+            self.windows = windows
+
+    ds = Ds(_panel(implied_sigma_per_min=[np.nan] * 4))
+    args = argparse.Namespace(complete_cases=True,
+                              groups='cross_venue,implied_vol,market_state')
+    with _pytest.raises(DatasetError):
+        apply_complete_cases(args, ds)
+
+
+def test_no_groups_still_requires_everything():
+    """`--complete-cases` with no `--groups` is the union, as before."""
+    import argparse
+    from scripts._common import apply_complete_cases
+
+    class Ds:
+        def __init__(self, windows):
+            self.windows = windows
+
+    ds = Ds(_panel(implied_sigma_per_min=[0.001, np.nan, 0.001, 0.001]))
+    args = argparse.Namespace(complete_cases=True, groups=None)
+    apply_complete_cases(args, ds)
+    assert len(ds.windows) == 3

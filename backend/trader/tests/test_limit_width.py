@@ -51,26 +51,27 @@ def test_the_limit_pays_down_to_the_gate_that_admitted_the_trade():
     is 2.18c — and the trade that results still clears the same gate.
     """
     gate = DEFAULT_CONFIG.min_edge_pp / 100.0
-    # On the venue's grid: `snap_to_tick` rounds the limit DOWN to a
-    # price Kalshi quotes, so an off-grid input here would measure the
-    # rounding rather than the allowance.
+    # The allowance is spent EXACTLY, not rounded onto the venue's grid.
+    # `snap_to_tick` used to floor it here and gave 2.00c instead of 2.18c; the
+    # grid now belongs to `place_order`, which rounds a bid UP so the limit
+    # stays fillable. See tests/test_tick_grid.py.
     d = decision(price=0.75, edge=0.0368)
     allowance = order_limit_price(d) - d.price
-    # Snapped down to the whole-cent grid in the mid range.
-    assert allowance == pytest.approx(
-        __import__('math').floor((0.75 + 0.0368 - gate) * 100) / 100 - 0.75,
-        abs=1e-9)
+    assert allowance == pytest.approx(0.0368 - gate, abs=1e-9)
     assert allowance > 0.0092, 'must be wider than the old share-of-edge rule'
 
 
-def test_a_marginal_edge_is_not_chased():
-    """An edge barely above the gate has nothing to spend, and spends nothing."""
+def test_a_marginal_edge_spends_only_what_it_has():
+    """An edge barely above the gate spends exactly that sliver — and keeps it.
+
+    This used to assert the limit sat AT the touch, because `snap_to_tick`
+    floored a 0.05c allowance to zero. That is the bug that stopped the loop
+    filling: a limit on the touch cannot survive a one-cent move, and three of
+    the ten kills on 2026-09-04 had a zero-cent allowance. The sliver is small,
+    but it is the trade's own edge and it is not ours to round away.
+    """
     d = decision(price=0.40, edge=DEFAULT_CONFIG.min_edge_pp / 100.0 + 0.0005)
-    # A sub-tick allowance cannot be expressed on a 1c grid, so the limit
-    # sits at the touch. Rounding UP would breach the bound the allowance
-    # exists to set — measured, the venue's own rounding did exactly that
-    # on 4 of 143 fills.
-    assert order_limit_price(d) == pytest.approx(d.price, abs=1e-9)
+    assert order_limit_price(d) == pytest.approx(0.4005, abs=1e-9)
 
 
 def test_an_edge_at_or_below_the_gate_never_crosses():

@@ -204,6 +204,46 @@ def groups_from_args(args: argparse.Namespace) -> Optional[tuple[str, ...]]:
     return _parse_list(getattr(args, 'groups', None))
 
 
+def apply_complete_cases(args: argparse.Namespace, dataset: Dataset) -> Dataset:
+    """Keep only rows carrying every field THIS model claims to use.
+
+    **A named function so the seam can be tested.** `complete_cases` has taken a
+    `groups` argument since it was written, and `load_dataset` — its only caller
+    — never passed one, so every run in the project's history demanded all four
+    requirements including a ladder fit. A config without `implied_vol` was then
+    denied every row missing `implied_sigma_per_min`, for a feature it does not
+    have. The filter's own standard is "every field the model claims to use".
+
+    The unit test on `complete_cases(groups=...)` passed throughout, because the
+    defect was in the wiring and not the function — which is why the test that
+    matters is on this call, not on that one.
+
+    Measured consequence: the 2026-09-03/04 selection sweep kept 51,489 of
+    2,073,272 rows (2.5%) for all 64 cells, and its winner failed
+    `windows_evaluated` at 16,617 against 20,000 — a gate about sample size,
+    failed partly for a requirement the model never imposed.
+
+    **Caveat for sweeps.** The sample now depends on the group set, so configs
+    with different groups are no longer scored on identical rows. That is right
+    for evaluating ONE config for promotion and wrong for ranking configs
+    against each other; a comparison sweep should fix the sample deliberately by
+    asking for the union.
+    """
+    from core.dataset import complete_cases
+    logger = logging.getLogger('dataset')
+    before = len(dataset.windows)
+    dataset.windows = complete_cases(dataset.windows, groups_from_args(args))
+    logger.info('complete cases only: %s of %s rows kept (%.1f%%)',
+                f'{len(dataset.windows):,}', f'{before:,}',
+                len(dataset.windows) / max(before, 1) * 100)
+    if not len(dataset.windows):
+        raise DatasetError(
+            'no rows carry every field the requested groups need; the book, the '
+            'peer venue, a ladder fit and the venue settlement are the four '
+            'requirements and at least one is absent everywhere')
+    return dataset
+
+
 def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     """Read the store, lay the window grid, report coverage."""
     logger = logging.getLogger('dataset')
@@ -271,16 +311,7 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
             'Each missing minute kills two windows — the one settling on it and '
             'the one opening on it — so this is twice the gap rate.', worst * 100)
     if getattr(args, 'complete_cases', False):
-        from core.dataset import complete_cases
-        before = len(dataset.windows)
-        dataset.windows = complete_cases(dataset.windows)
-        logger.info('complete cases only: %s of %s rows kept (%.1f%%)',
-                    f'{len(dataset.windows):,}', f'{before:,}',
-                    len(dataset.windows) / max(before, 1) * 100)
-        if not len(dataset.windows):
-            raise DatasetError(
-                'no rows carry every field; the book, the peer venue, a ladder '
-                'fit and the venue settlement must all be present')
+        apply_complete_cases(args, dataset)
 
     logger.info('%s windows, %s rows, %.0f days',
                 f'{len(dataset.window_index):,}', f'{len(dataset.windows):,}',

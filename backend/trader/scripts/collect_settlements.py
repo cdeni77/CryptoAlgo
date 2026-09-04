@@ -338,6 +338,9 @@ async def run(args) -> int:
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     now = pd.Timestamp.now(tz='UTC')
     rows: list[dict] = []
+    # Which sources actually answered, as against returned nothing new. Without
+    # this the two are indistinguishable and both exit 1 — see below.
+    reached: list[str] = []
     async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60)) as session:
         if args.venue in ('kalshi', 'both'):
@@ -350,13 +353,32 @@ async def run(args) -> int:
                 else:
                     rows += await kalshi(session, key, now, store,
                                          args_full=args.full)
+                    reached.append('predexon')
             else:
                 rows += await kalshi_direct(now, store)
+                reached.append('kalshi')
         if args.venue in ('polymarket', 'both'):
             rows += await polymarket(session, now)
 
     if not rows:
-        logger.error('nothing collected')
+        # **"Nothing new" is success, not failure.** This tool is idempotent and
+        # stops at history it already holds, so a run that finds no new
+        # settlements means the store is CURRENT. Returning 1 made `run_live`
+        # log `scripts.collect_settlements exited 1` on any cycle that happened
+        # to land between settlements — measured 2026-09-04, 15 runs succeeded
+        # and 1 "failed" for exactly this reason.
+        #
+        # It matters because of what a false alarm costs, not what this run
+        # costs: a component that reports failure while working correctly trains
+        # the reader to ignore it, and the next failure will be a real one. The
+        # same argument as `adopt_venue_balance`, where a drift alarm firing on
+        # every settlement hid the drift it existed to catch.
+        if reached:
+            logger.info('no new settlements from %s; the store is already '
+                        'current', ', '.join(reached))
+            return 0
+        logger.error('nothing collected, and no source answered — this is a '
+                     'reachability failure, not an empty result')
         return 1
     frame = pd.DataFrame(rows).drop_duplicates(
         subset=['venue', 'market_ticker'], keep='last')

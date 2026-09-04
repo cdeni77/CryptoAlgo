@@ -44,6 +44,7 @@ milliseconds since the epoch in `KALSHI-ACCESS-TIMESTAMP`.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -51,7 +52,7 @@ import math
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -758,6 +759,70 @@ class KalshiClient:
             return None
         return best
 
+    async def orderbook(self, ticker: str) -> dict:
+        """The full ladder, parsed to the touch. See `parse_orderbook`."""
+        return parse_orderbook(
+            await self._request('GET', f'/markets/{ticker}/orderbook'))
+
+    async def quote_with_live_book(self, ticker: str) -> Quote:
+        """`quote()`, but with the touch taken from the LIVE orderbook.
+
+        **`/markets` serves a CACHED touch, and pricing a decision off it is
+        what stopped the live loop filling.** Measured 2026-09-04 by sampling
+        both endpoints for the same market two seconds apart: `/markets`
+        returned an identical `0.9120/0.9160` on ETH for five consecutive
+        samples across ten seconds while `/orderbook` moved 0.934 -> 0.960 ->
+        0.951 -> 0.950. Across 28 paired samples the two disagreed on 96.4%,
+        mean 0.66c with the ask understated by up to 6.3c.
+
+        That is not a rounding detail, for two reasons:
+
+        * **The order cannot fill.** The captured kill priced a 0.74 ask against
+          a real 0.76 and sent a 74c bid — a cent below the actual BID. Ten of
+          ten orders after the 2026-09-04 restart died this way.
+        * **The MODEL is fed the stale number too.** The promoted artifact is
+          `init_score_source=market`, so its prediction is a correction to the
+          price; `market_probability` is the midpoint of this touch. A quote
+          several cents stale means the model corrects the wrong number, which
+          is a forecast error and not merely a fill error.
+
+        It also fixes a live/training mismatch: the backtest reads
+        `venue_depth`, built by `scripts/build_depth.py` from RECORDED LADDERS —
+        the real book — so `/markets` was a source live used and training never
+        saw. "One `decide()`" guarantees the decision is shared; nothing
+        guaranteed the price reaching it came from the same place.
+
+        An empty book is trusted, because an empty book is a real state. Only a
+        FAILED request falls back to the cached touch, and says so.
+        """
+        quote = await self.quote(ticker)
+        try:
+            book = await self.orderbook(ticker)
+        except (KalshiError, asyncio.TimeoutError, OSError) as exc:
+            logger.warning(
+                '%s: the live orderbook did not answer (%s), so this decision '
+                'is priced off the CACHED /markets touch and may be several '
+                'cents stale. Expect it not to fill.', ticker, exc)
+            return quote
+
+        def finite(value):
+            value = float(value) if value is not None else float('nan')
+            return value if value == value else None
+
+        yes_bid, no_bid = finite(book['yes_bid']), finite(book['no_bid'])
+        return replace(
+            quote,
+            yes_bid=yes_bid,
+            no_bid=no_bid,
+            # Two BID stacks, so both asks are conversions. Buying YES crosses
+            # the NO stack at `1 - best_no_bid`.
+            yes_ask=(1.0 - no_bid) if no_bid is not None else None,
+            no_ask=(1.0 - yes_bid) if yes_bid is not None else None,
+            yes_bid_size=finite(book['yes_bid_size']),
+            # The size behind the YES ask is what rests on the NO bid.
+            yes_ask_size=finite(book['no_bid_size']),
+        )
+
     async def positions(self) -> list[dict]:
         payload = await self._request('GET', '/portfolio/positions')
         return list(payload.get('market_positions', []))
@@ -1094,12 +1159,80 @@ class KalshiClient:
         logger.info('placing %s (%s) %d @ %dc YES on %s',
                     side, book_side, contracts, cents, ticker)
         payload = await self._request('POST', '/portfolio/events/orders', body=body)
+        # **The venue's own answer, in full.** The caller reads `status` and a
+        # count off this reply and reports "did not fill" when neither is
+        # there — and the POST reply's shape is NOT the GET order record's, so
+        # `status` came back None on every attempt and the reason, whatever it
+        # is, was discarded unread. Ten consecutive kills on 2026-09-04 were
+        # diagnosed as a price miss on exactly this missing evidence, against a
+        # book the stream shows our limit was 2c through. Log both sides once
+        # per order: three lines a window is nothing, and the alternative is
+        # inferring a refusal from its absence.
+        logger.info('order request  %s', json.dumps(body, sort_keys=True))
+        logger.info('order reply    %s', json.dumps(payload, sort_keys=True, default=str))
         return dict(payload.get('order', payload))
 
     async def cancel(self, order_id: str) -> dict:
         if not self.live:
             raise NotLiveError('client is not live')
         return await self._request('DELETE', f'/portfolio/orders/{order_id}')
+
+
+NAN = float('nan')
+
+
+def parse_orderbook(payload: dict) -> dict:
+    """The touch of a REST orderbook, in YES-denominated terms.
+
+    **The shape is nested and its own thing.** A live response is
+    `{'orderbook': {'orderbook_fp': {'yes_dollars': [[price, size], ...],
+    'no_dollars': [...]}}}`, with prices AND sizes as decimal strings and the
+    deci-cent grid present in the tails. The stream sends different keys again
+    (`yes_dollars_fp`, `price_dollars`/`delta_fp`), and reading one shape
+    against the other yields an empty book and no exception — which is how a
+    book read can report "nothing there" about a market quoting thousands of
+    contracts. Every known shape is accepted here for exactly that reason.
+
+    Kalshi's book is two BID stacks, so an ask is a conversion and not a field:
+    the YES ask is `1 - best_no_bid`. Sizes stay on the stack they came from —
+    `no_bid_size` is what a YES *buy* crosses.
+
+    NaN, never zero, on an empty stack: a settled market returns empty ladders,
+    and zero would read as a real price at the bottom of the grid.
+    """
+    raw = payload.get('orderbook', payload) if isinstance(payload, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    stacks = raw.get('orderbook_fp') if isinstance(raw.get('orderbook_fp'), dict) else raw
+
+    def touch(*names):
+        for name in names:
+            levels = stacks.get(name)
+            if not levels:
+                continue
+            best = None
+            for entry in levels:
+                try:
+                    price, size = float(entry[0]), float(entry[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if size > 0 and (best is None or price > best[0]):
+                    best = (price, size)
+            if best is not None:
+                return best
+        return None
+
+    yes = touch('yes_dollars', 'yes', 'yes_dollars_fp')
+    no = touch('no_dollars', 'no', 'no_dollars_fp')
+    return {
+        'yes_bid': yes[0] if yes else NAN,
+        'yes_bid_size': yes[1] if yes else NAN,
+        'no_bid': no[0] if no else NAN,
+        'no_bid_size': no[1] if no else NAN,
+        # The conversions. `1 - best_no_bid` is what buying YES costs.
+        'yes_ask': (1.0 - no[0]) if no else NAN,
+        'no_ask': (1.0 - yes[0]) if yes else NAN,
+    }
 
 
 def _clean(params: dict) -> dict:

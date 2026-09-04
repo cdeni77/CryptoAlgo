@@ -472,10 +472,23 @@ def build_features(
             p_spread = pd.to_numeric(table.get('pm_spread'), errors='coerce')
             ratio = k_spread / p_spread.replace(0.0, np.nan)
             table['venue_spread_ratio'] = np.where(ratio > 0, np.log(ratio), np.nan)
-            # Change over five minutes, within the same window and symbol. The
-            # shift is by OFFSET, so it never reaches across a window boundary —
-            # consecutive windows chain, and a gap that crossed one would look
-            # entirely correct and be wrong.
+            # Change since the PREVIOUS DECISION OFFSET, within the same window
+            # and symbol. The shift is by OFFSET, so it never reaches across a
+            # window boundary — consecutive windows chain, and a gap that
+            # crossed one would look entirely correct and be wrong.
+            #
+            # **The `_5` in the name is a misnomer: on the (3, 6, 9, 12) grid
+            # `shift(1)` is a THREE-minute step, not five.** Do not "correct"
+            # this into a real five-minute lookback. Five minutes is not on the
+            # decision grid, `scripts/live.py::gap_change` reproduces this exact
+            # one-offset step, and the artifact carries the name — so changing
+            # the arithmetic silently fits one feature and scores another, which
+            # is the defect `724e9d04` and `68ef2ae9` were already about. Rename
+            # only alongside a refit.
+            #
+            # NaN at the first offset of a window is therefore correct on both
+            # sides: it is the first row of each group. Live logs it as an
+            # all-NaN column at +3m, which is the feature working.
             ordered = table.sort_values(['symbol', 'window_open', 'offset'])
             prev = ordered.groupby(['symbol', 'window_open'])['venue_prob_gap'].shift(1)
             table['venue_gap_change_5'] = (

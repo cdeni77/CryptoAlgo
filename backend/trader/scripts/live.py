@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import math
 import os
@@ -191,6 +192,37 @@ def build_parser() -> argparse.ArgumentParser:
                              'config and in `ps`, and reverting is deleting a '
                              'line. 1.0 or more effectively disables it, leaving '
                              'only the ruin floor.')
+    # **Diagnostic levers.** Both exist so a forced run is visible in the deploy
+    # config and in `ps`, and reverting it is deleting a line — the same reason
+    # `--max-daily-loss-fraction` is a flag rather than an edit to the default.
+    # Explicit here beats the artifact's provenance: `config_for_artifact` skips
+    # any field in `cli_overrides`.
+    parser.add_argument('--min-edge-pp', type=float, default=None, metavar='PP',
+                        help='Override the edge gate, in probability points '
+                             '(promoted policy: 3.0). A NEGATIVE value admits '
+                             'every decision and is a fill test, not a strategy: '
+                             'it trades known-negative expectancy on purpose so '
+                             'the order path can be observed. Kelly still floors '
+                             'marginal trades under one contract, so this does '
+                             'not guarantee an order.')
+    parser.add_argument('--kelly-fraction', type=float, default=None, metavar='F',
+                        help='Override the Kelly fraction (promoted policy: 0.10). '
+                             'Present because it is not only a size: `decide()` '
+                             'floors the stake to whole contracts, so a small '
+                             'fraction pushes marginal trades under one contract '
+                             'and refuses them as `below_min_contracts`. Raising '
+                             'it is therefore how a forced run gets a small-edge '
+                             'decision to actually place an order. Every other '
+                             'script already takes this flag via `_common.py`; '
+                             'live was the only one that could not say it.')
+    parser.add_argument('--max-positions-per-window', type=int, default=None,
+                        metavar='N',
+                        help='How many of the three symbols may open a position '
+                             'in one window (default 3). 1 restricts a forced run '
+                             'to a single order per window — the first symbol '
+                             'alphabetically — without narrowing `symbols`, which '
+                             'would also narrow the bar fetch and NaN out every '
+                             'cross_asset feature.')
     parser.add_argument('--model', type=str, default=None,
                         help=f'Artifact path (default {MODELS_ROOT}/{LIVE_MODEL})')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -784,7 +816,12 @@ async def fetch_quotes(
             if market is None:
                 continue
             ticker = str(market.get('ticker', ''))
-            quote = await kalshi.quote(ticker)
+            # **The LIVE book, not `/markets`' cached touch.** See
+            # `KalshiClient.quote_with_live_book`: the cached fields sat frozen
+            # for ten seconds at a time while the real book moved cents, which
+            # both stopped orders filling and fed the market-initialised model a
+            # stale price to correct.
+            quote = await kalshi.quote_with_live_book(ticker)
             if not quote.tradeable():
                 logger.info('%s %s is not tradeable (%s), abstaining',
                             symbol, ticker, quote.status)
@@ -2397,29 +2434,21 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     return decisions
 
 
-def snap_to_tick(price: float) -> float:
-    """Round DOWN to a price the venue actually quotes.
-
-    Kalshi's `price_level_structure` is `tapered_deci_cent`: a tenth of a cent
-    below 10c and above 90c, a full cent in between. `order_limit_price` returns
-    `decision.price + allowance`, which lands on arbitrary fractions like 0.373,
-    and the venue snaps an off-grid price for us — sometimes AGAINST us.
-    Measured, 4 of 143 fills came back above `max_price` by 0.08c to 0.71c, each
-    on a round tick.
-
-    DOWN, always. The limit bounds the worst price worth paying, so rounding it
-    up defeats the bound; rounding down gives up at most a fraction of a tick of
-    fill probability and can never pay more than intended.
-
-    The taper matters rather than being a detail: 41% of live contracts are
-    bought under 15c, and forcing a whole-cent grid there would discard nine
-    tenths of the precision the venue offers exactly where the payoff is
-    steepest.
-    """
-    if not np.isfinite(price):
-        return price
-    tick = 0.001 if (price < 0.10 or price > 0.90) else 0.01
-    return math.floor(round(price / tick, 9)) * tick
+# `snap_to_tick` used to live here, rounding the limit DOWN onto the venue's
+# tick grid before `place_order` saw it. It is deleted rather than left unused,
+# because the next person to find it would reasonably wire it back in.
+#
+# It was added to stop the venue snapping an off-grid limit against us: 4 of 143
+# fills came back above `max_price` by 0.08c to 0.71c, about 0.011c per
+# contract. It cost far more than it saved. `place_order` already puts the limit
+# on the grid and rounds in the direction that can still fill (`ceil` for a bid,
+# `floor` for an ask); snapping down first turned any sub-tick allowance into
+# exactly zero, so the limit landed on the touch. Three of the ten kills on
+# 2026-09-04 had a zero-cent allowance for that reason, and a kill earns zero
+# against the hundredth of a cent the rail was protecting.
+#
+# The bound that actually matters is the gate in `decide()`, which a fill one
+# tick above `max_price` still clears by `min_edge_pp - 1c`.
 
 
 def order_limit_price(decision: Decision, *, config: Optional[Config] = None) -> float:
@@ -2460,8 +2489,147 @@ def order_limit_price(decision: Decision, *, config: Optional[Config] = None) ->
     # grid, so snapping down from `price + allowance` cannot land under `price`
     # — but an off-grid price would, and a limit below the ask is an order that
     # cannot fill.
-    limit = snap_to_tick(min(0.99, decision.price + allowance))
-    return float(max(limit, decision.price))
+    # **No grid snapping here.** `place_order` already puts the limit on the
+    # venue's grid, and it rounds in the direction that can still FILL — `ceil`
+    # for a bid, `floor` for an ask — because "rounding the wrong way under
+    # fill_or_kill is a guaranteed kill". Snapping DOWN first destroyed the
+    # allowance before that rounding could see it: a sub-cent allowance became
+    # exactly zero, so the limit landed on the touch and any move killed the
+    # order. Measured on the ten kills of 2026-09-04, three had a zero-cent
+    # allowance for this reason.
+    #
+    # What the down-snap was protecting is real but tiny: 4 of 143 fills came
+    # back above `max_price` by 0.08c to 0.71c, about 0.011c per contract. That
+    # buys nothing against a lost fill, which earns zero. And the bound that
+    # matters is not this number — it is the gate in `decide()`, which a fill one
+    # tick above `max_price` still clears by `min_edge_pp - 1c`, at least 2pp at
+    # the 3pp gate in force.
+    return float(max(min(0.99, decision.price + allowance), decision.price))
+
+
+def kill_diagnosis(*, side: str, sent_yes_price: float, book: dict) -> dict:
+    """Name which of the three things a non-fill was.
+
+    A miss cannot be attributed without the book as it stood at the kill, and
+    with it there are only three possibilities:
+
+      * our limit never crossed         -> a price error, ours
+      * it crossed and nothing rested   -> a size race, the venue's
+      * it crossed with size resting    -> the order itself is malformed
+
+    Everything here is **YES-denominated**, because the venue's book is two BID
+    stacks and every previous confusion in this area came from mixing
+    denominations. `sent_yes_price` is the price actually on the wire — what
+    `place_order` puts in the body, and what the venue echoes back as
+    `yes_price_dollars`.
+
+    `side='up'` sends a YES **bid**, which fills at or ABOVE the YES ask, and
+    crosses the NO stack. `side='down'` sends a YES **ask**, which fills at or
+    BELOW the YES bid, and crosses the YES stack. Getting that comparison
+    backwards is the inverted-comparison bug, so both directions are asserted.
+    """
+    up = str(side) == 'up'
+    need = float(book.get('yes_ask', float('nan')) if up
+                 else book.get('yes_bid', float('nan')))
+    size = float(book.get('no_bid_size', float('nan')) if up
+                 else book.get('yes_bid_size', float('nan')))
+    price = float(sent_yes_price)
+    if not np.isfinite(need):
+        crossed = False
+        line = (f'no book on the {"ask" if up else "bid"} side at the kill, so '
+                f'the {price:.4f} YES {"bid" if up else "ask"} had nothing to '
+                f'cross. A settled or halted market looks like this.')
+    else:
+        crossed = bool(price >= need - 1e-9) if up else bool(price <= need + 1e-9)
+        if not crossed:
+            line = (f'our {price:.4f} YES {"bid" if up else "ask"} did not cross: '
+                    f'it needed {need:.4f} {"or more" if up else "or less"}. '
+                    f'The price was ours to get right.')
+        elif not np.isfinite(size) or size <= 0:
+            line = (f'our {price:.4f} YES {"bid" if up else "ask"} crossed '
+                    f'{need:.4f} but nothing was resting there — a size race, '
+                    f'not a price error.')
+        else:
+            line = (f'our {price:.4f} YES {"bid" if up else "ask"} crossed '
+                    f'{need:.4f} with {size:.2f} resting. Not price, not size: '
+                    f'the order itself is being refused.')
+    return {'crossed': crossed, 'needed': need, 'size_available': size,
+            'line': line}
+
+
+def sent_yes_price(order: dict, decision, limit: float) -> float:
+    """The YES price that actually went on the wire.
+
+    The venue echoes it as `yes_price_dollars`, which beats recomputing: it is
+    what the venue read, after `place_order`'s rounding onto the cent grid. The
+    fallback reproduces that conversion — a DOWN order sends `1 - limit`.
+    """
+    raw = order.get('yes_price_dollars') if isinstance(order, dict) else None
+    try:
+        if raw is not None:
+            return float(raw)
+    except (TypeError, ValueError):
+        pass
+    return float(limit) if decision.side is Side.UP else 1.0 - float(limit)
+
+
+async def diagnose_kill(kalshi, decision, order: dict, limit: float) -> str:
+    """Read the book and the venue's own order record, right after a kill.
+
+    A non-fill costs nothing, so it never had to explain itself — and by
+    2026-09-04 that turned into ten consecutive kills with no evidence to
+    reason from. Our log said `status None` because the POST reply's shape is
+    not the GET order record's; the recorded ladder is sampled 1-3s off the
+    order, which is enough for a fast book to move cents, so it could not
+    settle a single case either. Both readable in the second after the kill.
+
+    Never raises. A diagnosis that breaks the loop is worse than no diagnosis,
+    and it runs inside the path that has just failed to buy something.
+    """
+    bits: list[str] = []
+    price = sent_yes_price(order, decision, limit)
+    try:
+        book = await kalshi.orderbook(decision.market_ticker)
+        verdict = kill_diagnosis(side=decision.side.value,
+                                 sent_yes_price=price, book=book)
+        bits.append(verdict['line'])
+        bits.append(f'book at kill: {json.dumps(book, sort_keys=True, default=str)}')
+    except Exception as exc:            # noqa: BLE001 - diagnosis must not raise
+        bits.append(f'orderbook read failed: {type(exc).__name__}: {exc}')
+    try:
+        oid = str(order.get('order_id') or '')
+        # **Filter by TICKER rather than scanning a page.** One 15-minute market
+        # carries at most a handful of our orders, so this is exact and returns
+        # one row instead of fifty.
+        #
+        # It is NOT a fix for paging, which was the first guess and was wrong:
+        # measured against the live account, `/portfolio/orders` is
+        # newest-first and a 50-row page did contain the order. The `null` seen
+        # on the 15:42 kill is therefore most likely a race — the diagnosis
+        # reads the listing in the same second the order was posted. The ticker
+        # filter does not cure that; it just makes the read exact, and the
+        # message below say what happened instead of printing `null`.
+        #
+        # No retry and no sleep. The POST reply already carries the counts this
+        # function needs, so the venue record is corroboration rather than
+        # evidence, and a diagnosis that stalls the trading loop to get it would
+        # cost more than it is worth.
+        candidates = await kalshi.orders(ticker=decision.market_ticker)
+        record = next((o for o in candidates
+                       if str(o.get('order_id')) == oid), None)
+        if record is None:
+            bits.append(
+                f'venue has no order {oid[:18]} on {decision.market_ticker} '
+                f'among {len(candidates)} it lists there — the POST reply gave '
+                f'us an id the listing does not show, which is worth knowing')
+        else:
+            bits.append(f'venue order record: '
+                        f'{json.dumps(record, sort_keys=True, default=str)}')
+    except Exception as exc:            # noqa: BLE001
+        bits.append(f'order record read failed: {type(exc).__name__}: {exc}')
+    for line in bits:
+        logger.warning('kill diagnosis | %s', line)
+    return ' || '.join(bits)
 
 
 def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
@@ -2710,12 +2878,20 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         if np.isfinite(fill_price) and decision.side is not Side.UP:
             fill_price = 1.0 - fill_price
         if filled <= 0:
-            writer.resolve_ticket(
-                ticket_id, status='killed',
-                note=f"status={order.get('status')!r} order_id={str(order.get('order_id',''))[:60]}")
             logger.warning(
                 '%s window %s: the order did not fill (status %r). No position.',
                 decision.symbol, decision.window_open, order.get('status'))
+            # The POST reply in full, then the book and the venue's record.
+            logger.warning('kill diagnosis | post reply: %s',
+                           json.dumps(order, sort_keys=True, default=str))
+            diagnosis = await diagnose_kill(
+                kalshi, decision, order,
+                order_limit_price(decision, config=config))
+            writer.resolve_ticket(
+                ticket_id, status='killed',
+                note=(f"status={order.get('status')!r} "
+                      f"order_id={str(order.get('order_id',''))[:60]} || "
+                      f"{diagnosis}")[:4000])
             return False
         if np.isfinite(fill_price):
             placed_price = fill_price
@@ -2807,6 +2983,18 @@ def config_from_args(args) -> Config:
         # point of the flag, and a silent clamp would mean the loop ran with a
         # limit nobody asked for — worse than an obviously large number.
         overrides['max_daily_loss_fraction'] = float(daily)
+    gate = getattr(args, 'min_edge_pp', None)
+    if gate is not None:
+        # Not clamped at zero on purpose. A negative gate is the documented way
+        # to force the order path open for a fill test, and a silent clamp would
+        # leave the operator watching a loop that quietly refused to trade.
+        overrides['min_edge_pp'] = float(gate)
+    kelly = getattr(args, 'kelly_fraction', None)
+    if kelly is not None:
+        overrides['kelly_fraction'] = float(kelly)
+    cap = getattr(args, 'max_positions_per_window', None)
+    if cap is not None:
+        overrides['max_positions_per_window'] = int(cap)
     return config.with_overrides(**overrides) if overrides else config
 
 
