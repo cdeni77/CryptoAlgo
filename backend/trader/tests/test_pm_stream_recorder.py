@@ -94,3 +94,40 @@ class _Stream:
                 if out is not None:
                     yield out
         return _gen()
+
+
+def test_the_streamed_window_is_the_one_kalshi_settles():
+    """The alignment that "looks entirely right" when wrong.
+
+    Kalshi's ticker is keyed on the SETTLE (KXBTC15M-26SEP032245-45 settles at
+    22:45), Polymarket's slug on the window OPEN. They name the same fifteen
+    minutes only if the slug's stamp is the settle minus the window length. Read
+    the slug as a close instead and every window shifts fifteen minutes, the
+    request still returns a healthy book, and agreement with our label drops to
+    a coin flip — which is how this was found the first time.
+    """
+    import datetime as dt
+    from scripts.record_pm_ladder import slug_for, window_of
+
+    # A decision inside the 22:30-22:45 window, as Kalshi's -2245 ticker names.
+    now = dt.datetime(2026, 9, 3, 22, 37, tzinfo=dt.timezone.utc)
+    opened = window_of(slug_for('btc', now))
+    assert opened == pd.Timestamp('2026-09-03 22:30', tz='UTC'), (
+        'the slug must name the window OPEN that Kalshi settles at 22:45')
+    assert opened + pd.Timedelta(minutes=15) == pd.Timestamp(
+        '2026-09-03 22:45', tz='UTC')
+
+
+def test_a_decision_at_the_boundary_takes_the_window_it_is_inside():
+    """Floor, never ceil. At exactly 22:45 the new window has opened, and
+    naming the NEXT one returns a real book for a market fifteen minutes
+    ahead."""
+    import datetime as dt
+    from scripts.record_pm_ladder import slug_for, window_of
+
+    at_open = dt.datetime(2026, 9, 3, 22, 45, tzinfo=dt.timezone.utc)
+    assert window_of(slug_for('btc', at_open)) == pd.Timestamp(
+        '2026-09-03 22:45', tz='UTC')
+    one_before = dt.datetime(2026, 9, 3, 22, 44, 59, tzinfo=dt.timezone.utc)
+    assert window_of(slug_for('btc', one_before)) == pd.Timestamp(
+        '2026-09-03 22:30', tz='UTC')

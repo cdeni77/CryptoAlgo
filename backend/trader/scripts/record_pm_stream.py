@@ -162,7 +162,24 @@ async def resolve_tokens(session, now) -> dict:
             continue
         if ids:
             tokens[str(ids[0])] = symbol
+            # The WINDOW, not just the symbol. Kalshi logs its exact ticker
+            # (KXBTC15M-26SEP032245-45, keyed on the SETTLE) while this is keyed
+            # on the slug's unix OPEN, so the two align only if both name the
+            # same fifteen minutes — and a misalignment here returns a healthy
+            # book for the wrong window, which is "a wrong answer that looks
+            # entirely right". Logged so it can be checked rather than assumed.
+            _WINDOWS[symbol] = slugs[asset]
     return tokens
+
+
+# symbol -> the slug currently subscribed, for the log line and for tests.
+_WINDOWS: dict = {}
+
+
+def subscribed_windows() -> dict:
+    """{symbol: (slug, window_open)} for what is on the wire right now."""
+    from scripts.record_pm_ladder import window_of
+    return {sym: (slug, window_of(slug)) for sym, slug in _WINDOWS.items()}
 
 
 async def run(args=None, gate=None) -> int:
@@ -190,16 +207,41 @@ async def run(args=None, gate=None) -> int:
                         logger.warning('no Polymarket markets resolved; retrying')
                         await asyncio.sleep(10)
                         continue
-                    # Refresh at the next minute boundary plus a beat, so the
-                    # subscription tracks the window without hammering gamma.
-                    until = REFRESH_SECONDS
-                    logger.info('streaming %d Polymarket book(s): %s',
-                                len(tokens), ', '.join(sorted(tokens.values())))
+                    windows = subscribed_windows()
+                    logger.info(
+                        'streaming %d Polymarket book(s): %s',
+                        len(tokens),
+                        ', '.join(f'{sym}@{w.strftime("%H:%M")}'
+                                  for sym, (_slug, w) in sorted(windows.items())))
+                    # **Hold the socket across window CHECKS, not just across
+                    # frames.** The first version reconnected every
+                    # REFRESH_SECONDS whether or not anything had changed, so
+                    # the book was dropped and re-snapshotted once a minute
+                    # while the window only rolls every fifteen. Between the
+                    # reconnect and the first `book` frame the cache is empty,
+                    # which is the staleness this recorder exists to remove —
+                    # self-inflicted, once a minute, forever.
+                    #
+                    # So the deadline is a moment to RE-CHECK the tokens, and
+                    # only a change tears the socket down.
                     async with _Socket(session, list(tokens)) as sock:
-                        reason = await consume(
-                            sock, until=until, silence_seconds=SILENCE_SECONDS,
-                            book=book, tokens=tokens)
-                    logger.debug('resubscribing: %s', reason)
+                        while True:
+                            reason = await consume(
+                                sock, until=REFRESH_SECONDS,
+                                silence_seconds=SILENCE_SECONDS,
+                                book=book, tokens=tokens)
+                            if 'refresh' not in reason:
+                                logger.info('reconnecting: %s', reason)
+                                break
+                            fresh = await resolve_tokens(
+                                session, datetime.now(timezone.utc))
+                            if fresh and set(fresh) != set(tokens):
+                                logger.info(
+                                    'window rolled to %s; resubscribing',
+                                    ', '.join(
+                                        f'{sym}@{w.strftime("%H:%M")}' for sym, (_s, w)
+                                        in sorted(subscribed_windows().items())))
+                                break
                     backoff = 1.0
         except asyncio.CancelledError:
             raise
