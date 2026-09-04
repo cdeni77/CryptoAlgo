@@ -334,7 +334,23 @@ def test_a_model_miscalibrated_only_where_it_trades_is_refused():
         'the mean ECE is meant to be blind to this; if it is not, the fixture '
         'no longer demonstrates the problem'
     )
-    assert not gates['calibration_max_deviation'].passed
+    # The protection now lives in `calibration_vs_market`, not in an absolute
+    # bar. Measured on the venue's own settlement over 33,126 rows, the MARKET
+    # itself misses by 0.063 in its worst populated bin, so any absolute
+    # threshold tight enough to catch a 5pp band error also rejects every model
+    # that merely tracks the price. Asking whether the model is worse than the
+    # market SEPARATES the two, which an absolute number cannot.
+    extra = {'market_windows': 5_000.0, 'model_minus_market': 0.001,
+             'baseline_minus_market': 0.0,
+             'market_max_deviation': 0.01, 'calibration_vs_market': 0.04}
+    relative = {g.name: g for g in evaluate_gates(report(deviation=0.05),
+                                                 extra=extra)}
+    assert not relative['calibration_vs_market'].passed, (
+        'a model 5pp off where the market is not must still be refused'
+    )
+    # and the loosened absolute bar still catches GROSS miscalibration
+    gross = {g.name: g for g in evaluate_gates(report(deviation=0.15))}
+    assert not gross['calibration_max_deviation'].passed
 
 
 
