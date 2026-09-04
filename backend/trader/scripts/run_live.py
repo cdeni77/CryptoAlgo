@@ -312,7 +312,12 @@ def build_factories(args, gate: TradingGate) -> dict:
             _recorder_args(record_ladder.build_parser), gate=gate)
 
     async def pm_ladder():
-        await align_to_phase(35.0)
+        # Read from the declaration rather than repeated, because they drifted:
+        # `Component('pm_ladder', phase=55.0)` was changed and this line was not,
+        # so the banner printed +55s while the poll ran at +35s and the fix was
+        # cosmetic. `Component.phase` is otherwise read only by that banner.
+        await align_to_phase(
+            next(c for c in COMPONENTS if c.name == 'pm_ladder').phase)
         return await record_pm_ladder.run(
             _recorder_args(record_pm_ladder.build_parser, batch_rows=6), gate=gate)
 

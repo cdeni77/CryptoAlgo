@@ -53,12 +53,21 @@ def test_symbols_do_not_bleed_into_each_other():
     assert np.isnan(gap_change('ETH-USD', 0.07, window_open=W1, offset=3))
 
 
-def test_a_missing_gap_neither_differences_nor_poisons_the_history():
-    """No Polymarket book gives NaN. The next offset must difference against
-    the last REAL observation, not against the hole."""
+def test_a_missing_gap_does_not_reach_back_past_the_hole():
+    """CORRECTED. This test previously asserted that offset 9 differences
+    against offset 3 when offset 6 is a hole — which is what the first
+    implementation did, and is NOT what training does.
+
+    Training is `shift(1)` over a panel carrying all four offsets, so a missing
+    gap at the previous offset propagates as NaN rather than lengthening the
+    horizon. Reaching back returns a six-minute change under a column named for
+    three. The test was written from the same wrong premise as the code, so it
+    passed while both were wrong — which is the failure mode a test is supposed
+    to prevent.
+    """
     gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
     assert np.isnan(gap_change('BTC-USD', float('nan'), window_open=W1, offset=6))
-    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=9) == pytest.approx(0.03)
+    assert np.isnan(gap_change('BTC-USD', 0.05, window_open=W1, offset=9))
 
 
 def test_a_repeated_offset_is_not_differenced_against_itself():
@@ -92,3 +101,32 @@ def test_a_new_window_evicts_only_the_windows_that_ended():
     # BTC moves to the next window; ETH has not been scored there yet.
     assert np.isnan(gap_change('BTC-USD', 0.01, window_open=W2, offset=3))
     assert gap_change('BTC-USD', 0.04, window_open=W2, offset=6) == pytest.approx(0.03)
+
+
+def test_a_hole_at_the_previous_offset_gives_NaN_not_a_longer_horizon():
+    """Training uses `shift(1)` over a panel that always carries all four
+    offsets, so a missing gap at the previous offset propagates as NaN. The
+    first live version took `max(o for o in recorded if o < offset)`, which
+    SKIPS the hole and returns a six- or nine-minute change under a column named
+    for three.
+
+    Measured on the store: of 97,416 decision rows past offset 3 that have a
+    gap, 19,548 (20.1%) are NaN in training because the previous offset had
+    none, and 1,054 of those had an earlier offset with a gap — exactly the rows
+    where live would emit a number training never saw.
+
+    The live exposure is larger than that, because a cycle that misses
+    DECISION_TOLERANCE_SECONDS records nothing for its offset at all.
+    """
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    # offset 6 is a hole: no gap recorded
+    assert np.isnan(gap_change('BTC-USD', 0.05, window_open=W1, offset=9)), (
+        'offset 9 must difference against offset 6, which is missing — not '
+        'reach back to offset 3'
+    )
+
+
+def test_the_immediately_previous_offset_is_the_only_one_used():
+    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
+    gap_change('BTC-USD', 0.04, window_open=W1, offset=6)
+    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=9) == pytest.approx(0.01)

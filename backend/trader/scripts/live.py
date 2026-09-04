@@ -1163,6 +1163,11 @@ def _venue_caches() -> tuple[dict, dict]:
 _GAP_HISTORY: dict = {}
 
 
+def config_offsets() -> tuple:
+    """The decision offsets in force, for the gap-change lookback."""
+    return tuple(DEFAULT_CONFIG.decision_offsets)
+
+
 def reset_gap_history() -> None:
     """Drop everything remembered. For tests, and for a clean restart."""
     _GAP_HISTORY.clear()
@@ -1197,11 +1202,28 @@ def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
         return float('nan')
     if np.isnan(value):
         return float('nan')
-    earlier = [(o, g) for o, g in previous.items() if o < int(offset)]
-    previous[int(offset)] = value
-    if not earlier:
+    # **The IMMEDIATELY previous decision offset, or nothing.** Training is
+    # `shift(1)` over a panel that always carries all four offsets, so a missing
+    # gap at the previous offset propagates as NaN. Taking `max(o < offset)`
+    # instead SKIPS the hole and returns a six- or nine-minute change under a
+    # column named for three — a different feature wearing the same name.
+    #
+    # Measured on the store: of 97,416 decision rows past offset 3 that carry a
+    # gap, 19,548 (20.1%) are NaN in training because the previous offset had
+    # none. Live exposure is larger still, because a cycle that misses
+    # DECISION_TOLERANCE_SECONDS records nothing for its offset at all.
+    offsets = sorted(config_offsets())
+    try:
+        position = offsets.index(int(offset))
+    except ValueError:
+        previous[int(offset)] = value
         return float('nan')
-    return float(value - max(earlier, key=lambda item: item[0])[1])
+    prior = offsets[position - 1] if position > 0 else None
+    before = previous.get(prior) if prior is not None else None
+    previous[int(offset)] = value
+    if before is None:
+        return float('nan')
+    return float(value - before)
 
 
 def depth_dollars(quote, yes_levels, no_levels):
@@ -1276,11 +1298,13 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) ->
     # For those thirty seconds the cache held the previous window's book with a
     # recent stamp — data that is genuinely fresh and about the wrong fifteen
     # minutes. A reading with no window is kept: the REST fallback publishes
-    # none, and refusing it would disable the fallback exactly when the socket
-    # is down.
+    # none under EITHER key — the socket writes `window`, the REST recorder
+    # writes `window_open`, and reading only the first left the guard inert
+    # on the fallback, which is precisely when a rollover is most likely.
     if (pm is not None and window_open is not None
-            and pm.get('window') is not None
-            and pd.Timestamp(pm['window']) != pd.Timestamp(window_open)):
+            and (pm.get('window') or pm.get('window_open')) is not None
+            and pd.Timestamp(pm.get('window') or pm.get('window_open'))
+                != pd.Timestamp(window_open)):
         logger.debug('peer book is for window %s, not %s; gap refused',
                      pm['window'], window_open)
         pm = None

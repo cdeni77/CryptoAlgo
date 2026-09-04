@@ -55,6 +55,7 @@ def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
     lone bid says the probability is at LEAST something, which is not a
     probability — the same rule `_two_sided_mid` applies downstream.
     """
+    windows = window if isinstance(window, dict) else {}
     for token, symbol in tokens.items():
         bid, ask = book.best_bid(token), book.best_ask(token)
         if bid is None or ask is None:
@@ -71,14 +72,27 @@ def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
             # begins when ITS markets settle. For those thirty seconds the cache
             # held the 22:30 book, stamped recently enough to pass the 30s
             # guard — fresh-looking data about the wrong fifteen minutes.
-            'window': pd.Timestamp(window) if window is not None else None,
+            'window': (pd.Timestamp(windows[symbol])
+                       if symbol in windows and windows[symbol] is not None
+                       else (pd.Timestamp(window)
+                             if window is not None and not isinstance(window, dict)
+                             else None)),
         }
 
 
-def _window_of(tokens: dict):
-    """The window the subscribed tokens belong to, or None."""
-    windows = {w for _slug, w in subscribed_windows().values()}
-    return next(iter(windows)) if len(windows) == 1 else None
+def _window_of(tokens: dict) -> dict:
+    """{symbol: window} for the subscribed tokens — PER SYMBOL, not shared.
+
+    The first version returned a single window and `None` unless every entry
+    agreed. `_WINDOWS` is never cleared, so one symbol's gamma lookup failing
+    left a stale slug behind, two windows disagreed, and `publish` wrote
+    `window=None` for ALL THREE symbols — disabling the rollover guard globally
+    at exactly the moment the venues are re-subscribing, which is when a
+    rollover is most likely.
+    """
+    live = {sym for sym in tokens.values()}
+    return {sym: w for sym, (_slug, w) in subscribed_windows().items()
+            if sym in live}
 
 
 async def consume(stream, *, until: Optional[float], silence_seconds: float,

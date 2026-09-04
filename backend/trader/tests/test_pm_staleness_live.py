@@ -120,3 +120,24 @@ def test_a_reading_with_no_window_is_still_accepted():
     row = cross_venue_row(pm, _Quote(), now=NOW,
                           window_open=pd.Timestamp('2026-09-03 12:15', tz='UTC'))
     assert not np.isnan(row['venue_prob_gap'])
+
+
+def test_the_declared_phase_is_the_one_actually_used():
+    """`Component.phase` is read only by the startup banner; the recorder aligns
+    on a separately hardcoded number. So the declaration said +55s, the banner
+    printed +55s, and the poll ran at +35s — a fix that was cosmetic, and looked
+    applied in the log.
+    """
+    import inspect
+    from scripts.run_live import COMPONENTS, build_factories
+
+    source = inspect.getsource(build_factories)
+    body = source.split('async def pm_ladder')[1].split('async def')[0]
+    # Either it reads the declaration, or it repeats the SAME number. A repeated
+    # different number is the drift this test exists for.
+    declared = next(c for c in COMPONENTS if c.name == 'pm_ladder').phase
+    reads_declaration = 'COMPONENTS' in body and 'phase' in body
+    import re
+    literals = [float(x) for x in re.findall(r'align_to_phase\(([0-9.]+)\)', body)]
+    assert reads_declaration or literals == [declared], (
+        f'pm_ladder declares phase={declared} but aligns on {literals}')
