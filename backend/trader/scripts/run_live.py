@@ -186,6 +186,11 @@ COMPONENTS: tuple[Component, ...] = (
     # stale, which is the failure the book cache exists to prevent. Its phase is
     # meaningless and only the spool flush takes the gate.
     Component('stream', phase=0.0),
+    # The Polymarket socket, phase 0 like the Kalshi one: a socket has no
+    # cadence to phase, it holds a subscription. `cross_venue` is the only
+    # load-bearing group in the model and the REST recorder left its peer price
+    # ~30s stale at a decision; this makes the two books contemporaneous.
+    Component('pm_stream', phase=0.0),
     Component('ladder', phase=25.0),
     # +55s, not +35s. Decisions land about two seconds past the minute, so a
     # recorder at +35s left the freshest Polymarket reading ~27s old — inside
@@ -286,6 +291,7 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
 def build_factories(args, gate: TradingGate) -> dict:
     """One coroutine factory per component, all sharing the gate."""
     from scripts import (record_implied_vol, record_ladder, record_pm_ladder,
+                         record_pm_stream,
                          record_stream)
     from scripts import live as live_module
 
@@ -310,6 +316,11 @@ def build_factories(args, gate: TradingGate) -> dict:
         return await record_pm_ladder.run(
             _recorder_args(record_pm_ladder.build_parser, batch_rows=6), gate=gate)
 
+    async def pm_stream():
+        # No phase: a socket holds a subscription rather than polling, so there
+        # is no cadence to align. Same shape as the Kalshi `stream` component.
+        return await record_pm_stream.run(gate=gate)
+
     async def implied_vol():
         await align_to_phase(45.0)
         return await record_implied_vol.run(
@@ -321,7 +332,8 @@ def build_factories(args, gate: TradingGate) -> dict:
         return await store_sync_loop()
 
     return {'trade': trade, 'stream': stream, 'ladder': ladder,
-            'pm_ladder': pm_ladder, 'implied_vol': implied_vol,
+            'pm_ladder': pm_ladder, 'pm_stream': pm_stream,
+            'implied_vol': implied_vol,
             'store_sync': store_sync}
 
 

@@ -1129,10 +1129,24 @@ def _venue_caches() -> tuple[dict, dict]:
     Imported lazily and defensively: `scripts.live` also runs standalone, where
     neither recorder exists and every feature they feed is honestly unknown.
     """
+    # The SOCKET first: it is contemporaneous with the Kalshi book, which is
+    # what training assumes. The REST recorder writes at a median 32s past the
+    # minute against decisions at ~+2s, and measured over 516,680 rows a gap
+    # against a peer one minute stale correlates only 0.672 with the
+    # contemporaneous one. Fall back to it only when the socket has nothing —
+    # `cross_venue_row` refuses a stale reading either way.
+    pm = {}
     try:
-        from scripts.record_pm_ladder import CACHE as pm
+        from scripts.record_pm_stream import CACHE as pm_ws
+        pm = dict(pm_ws)
     except Exception:                                         # noqa: BLE001
         pm = {}
+    if not pm:
+        try:
+            from scripts.record_pm_ladder import CACHE as pm_rest
+            pm = pm_rest
+        except Exception:                                     # noqa: BLE001
+            pm = {}
     try:
         from scripts.record_implied_vol import CACHE as iv
     except Exception:                                         # noqa: BLE001
