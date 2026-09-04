@@ -482,6 +482,13 @@ class Config:
     # interaction is real; if it collapses, the group is contributing an
     # alignment production cannot guarantee.
     peer_lag_minutes: int = 0
+    # Refuse a decision whose cross-venue peer book is missing. OFF by default,
+    # because every ledger entry so far was measured without it. Measured, a
+    # one-minute peer lag costs 70% of the model's skill and dropping the peer
+    # entirely takes it negative, so trading without one trades a model missing
+    # most of its edge — while `--complete-cases` already requires the peer in
+    # training, so this is what makes live agree.
+    require_peer_book: bool = False
     max_quote_age_seconds: int = 45
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted

@@ -59,6 +59,7 @@ class Reason(str, Enum):
     NOT_FINITE = 'not_finite'                  # missing probability or price
     PROBABILITY_INVALID = 'probability_invalid'  # outside [0, 1] after scoring
     NO_QUOTE = 'no_quote'                      # live, and the book was not readable
+    NO_PEER_BOOK = 'no_peer_book'              # cross_venue's peer was unavailable
     PRICE_OUT_OF_BAND = 'price_out_of_band'    # tick and spread dominate here
     DISAGREEMENT_IMPLAUSIBLE = 'disagreement_implausible'  # too far from the quote
     EDGE_BELOW_GATE = 'edge_below_gate'        # the forecast does not pay
@@ -377,6 +378,43 @@ def decide(
     has_book = ask_up is not None and ask_down is not None
     if require_quote and not has_book:
         return refuse(Reason.NO_QUOTE)
+    # **The peer book, when the configuration says the model needs it.**
+    #
+    # Refitting with the TRAINING peer deliberately lagged measured what its
+    # absence costs:
+    #
+    #     peer lag          skill        t     folds+
+    #     0 min (socket)   +0.00294    +4.57    6/6
+    #     1 min (REST)     +0.00087    +1.01    5/6
+    #     dropped          -0.00015    -0.15    4/6
+    #
+    # A one-minute lag costs 70% of the skill, so `cross_venue` contributes
+    # CONTEMPORANEITY rather than a durable interaction — which is why it scores
+    # +0.000030 alone, below the clock control, and is load-bearing under
+    # leave-one-out. Not a leak: both books are readable at the decision
+    # instant over sockets. An infrastructure requirement.
+    #
+    # So an outage does not degrade one feature gracefully, it removes most of
+    # the edge while the loop keeps trading. `--complete-cases` already requires
+    # the peer in TRAINING; refusing the row here is what makes the two paths
+    # agree. A row that never carried the column at all is left alone — absence
+    # of the FEATURE is not absence of the book.
+    if getattr(config, 'require_peer_book', False):
+        # The RAW value, not `_optional`, which maps a NaN to None and so
+        # cannot tell "the column is absent" from "the book was missing" —
+        # and that distinction is the whole point: a configuration without
+        # cross_venue carries no column and must not be refused.
+        try:
+            raw = get('venue_prob_gap')
+        except (KeyError, IndexError):
+            raw = None
+        if raw is not None:
+            try:
+                present = np.isfinite(float(raw))
+            except (TypeError, ValueError):
+                present = False
+            if not present:
+                return refuse(Reason.NO_PEER_BOOK)
     is_up_a, price_a, probability_a, cost_a, edge_a = price_and_edge(
         np.array([q_up]), np.array([p_market]), config,
         ask_up=np.array([ask_up]) if has_book else None,
