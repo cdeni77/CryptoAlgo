@@ -131,3 +131,42 @@ def test_a_decision_at_the_boundary_takes_the_window_it_is_inside():
     one_before = dt.datetime(2026, 9, 3, 22, 44, 59, tzinfo=dt.timezone.utc)
     assert window_of(slug_for('btc', one_before)) == pd.Timestamp(
         '2026-09-03 22:30', tz='UTC')
+
+
+def test_a_rolled_window_does_not_leave_the_old_book_readable():
+    """Observed live: Kalshi rebuilt its subscription at 22:45:16 and
+    Polymarket at 22:45:46 — thirty seconds later, because each venue's
+    silence starts when ITS markets settle.
+
+    In that gap the cache still held the PREVIOUS window's book, stamped with
+    its last frame, which is recent enough to pass the 30s staleness guard. So a
+    decision on the 22:45 window could price against the 22:30 book and nothing
+    would say so: a fresh-looking peer price for the wrong fifteen minutes.
+
+    Staleness alone cannot catch this — the data is fresh, it is simply not
+    about this window. The cache has to carry the window it belongs to.
+    """
+    rec.CACHE.clear()
+    book = rec.PmBookCache()
+    book.apply({'event_type': 'book', 'asset_id': 'OLD', 'timestamp': '1788487941413',
+                'bids': [{'price': '0.44', 'size': '250'}],
+                'asks': [{'price': '0.46', 'size': '150'}]})
+    rec.publish(book, {'OLD': 'BTC-USD'}, window=pd.Timestamp('2026-09-03 22:30', tz='UTC'))
+    assert rec.CACHE['BTC-USD']['window'] == pd.Timestamp('2026-09-03 22:30', tz='UTC')
+
+    # the window rolls; the recorder has not caught up yet
+    entry = rec.CACHE['BTC-USD']
+    assert entry['window'] != pd.Timestamp('2026-09-03 22:45', tz='UTC'), (
+        'the cached reading belongs to the previous window and a consumer must '
+        'be able to tell')
+
+
+def test_publishing_a_new_window_replaces_the_old_reading():
+    rec.CACHE.clear()
+    book = rec.PmBookCache()
+    book.apply({'event_type': 'book', 'asset_id': 'NEW', 'timestamp': '1788487941413',
+                'bids': [{'price': '0.30', 'size': '10'}],
+                'asks': [{'price': '0.32', 'size': '10'}]})
+    rec.publish(book, {'NEW': 'BTC-USD'}, window=pd.Timestamp('2026-09-03 22:45', tz='UTC'))
+    assert rec.CACHE['BTC-USD']['window'] == pd.Timestamp('2026-09-03 22:45', tz='UTC')
+    assert rec.CACHE['BTC-USD']['best_bid'] == pytest.approx(30.0)

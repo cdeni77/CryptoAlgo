@@ -48,7 +48,7 @@ REFRESH_SECONDS = 60.0
 CACHE: dict = {}
 
 
-def publish(book: PmBookCache, tokens: dict) -> None:
+def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
     """Fold the live book into the shape `cross_venue_row` reads.
 
     CENTS, matching `core.book_features`. A one-sided book publishes nothing: a
@@ -65,12 +65,25 @@ def publish(book: PmBookCache, tokens: dict) -> None:
             'best_bid': bid * 100.0,
             'best_ask': ask * 100.0,
             'at': stamp if stamp is not None else pd.Timestamp.now(tz='UTC'),
+            # **Which window this book is FOR.** Staleness alone cannot catch a
+            # rollover: observed live, Kalshi rebuilt its subscription at
+            # 22:45:16 and Polymarket at 22:45:46, because each venue's silence
+            # begins when ITS markets settle. For those thirty seconds the cache
+            # held the 22:30 book, stamped recently enough to pass the 30s
+            # guard — fresh-looking data about the wrong fifteen minutes.
+            'window': pd.Timestamp(window) if window is not None else None,
         }
+
+
+def _window_of(tokens: dict):
+    """The window the subscribed tokens belong to, or None."""
+    windows = {w for _slug, w in subscribed_windows().values()}
+    return next(iter(windows)) if len(windows) == 1 else None
 
 
 async def consume(stream, *, until: Optional[float], silence_seconds: float,
                   book: Optional[PmBookCache] = None,
-                  tokens: Optional[dict] = None) -> str:
+                  tokens: Optional[dict] = None, window=None) -> str:
     """Fold frames until a deadline or a silence. Returns the reason.
 
     `until` is seconds from now, or None for no refresh deadline. Both exits are
@@ -98,7 +111,7 @@ async def consume(stream, *, until: Optional[float], silence_seconds: float,
         if book is not None:
             book.apply(event)
             if tokens:
-                publish(book, tokens)
+                publish(book, tokens, window=window)
 
 
 class _Socket:
@@ -229,7 +242,8 @@ async def run(args=None, gate=None) -> int:
                             reason = await consume(
                                 sock, until=REFRESH_SECONDS,
                                 silence_seconds=SILENCE_SECONDS,
-                                book=book, tokens=tokens)
+                                book=book, tokens=tokens,
+                                window=_window_of(tokens))
                             if 'refresh' not in reason:
                                 logger.info('reconnecting: %s', reason)
                                 break

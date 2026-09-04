@@ -1242,7 +1242,7 @@ def depth_dollars(quote, yes_levels, no_levels):
     return up, down
 
 
-def cross_venue_row(pm: Optional[dict], quote, *, now=None) -> dict:
+def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) -> dict:
     """`cross_venue` from the in-process Polymarket cache.
 
     Two independent books on the same fifteen minutes, settling on different
@@ -1270,6 +1270,20 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None) -> dict:
     #
     # A reading with no stamp is kept, matching `attach_quotes`: absence of a
     # stamp is not evidence of staleness.
+    # **The WINDOW, before the age.** Staleness cannot catch a rollover:
+    # observed live, Kalshi rebuilt its subscription at 22:45:16 and Polymarket
+    # at 22:45:46, because each venue's silence begins when ITS markets settle.
+    # For those thirty seconds the cache held the previous window's book with a
+    # recent stamp — data that is genuinely fresh and about the wrong fifteen
+    # minutes. A reading with no window is kept: the REST fallback publishes
+    # none, and refusing it would disable the fallback exactly when the socket
+    # is down.
+    if (pm is not None and window_open is not None
+            and pm.get('window') is not None
+            and pd.Timestamp(pm['window']) != pd.Timestamp(window_open)):
+        logger.debug('peer book is for window %s, not %s; gap refused',
+                     pm['window'], window_open)
+        pm = None
     if pm is not None and pm.get('at') is not None and now is not None:
         from core.quotes import DEFAULT_MAX_AGE
         age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
@@ -1476,7 +1490,9 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
             row['depth_up'] = up
         if down is not None:
             row['depth_down'] = down
-        row.update(cross_venue_row(pm_cache.get(symbol), entry[0], now=now))
+        row.update(cross_venue_row(
+            pm_cache.get(symbol), entry[0], now=now,
+            window_open=scored['window_open'].iloc[i]))
         row.update(implied_vol_row(
             latest_fit(symbol, now=now, cache=iv_cache), now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]

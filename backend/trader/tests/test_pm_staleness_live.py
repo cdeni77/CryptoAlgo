@@ -84,3 +84,39 @@ def test_the_recorder_is_phased_to_be_fresh_at_a_decision():
     assert staleness_at_decision < 15, (
         f'pm_ladder at +{pm.phase}s leaves a decision reading a '
         f'{staleness_at_decision:.0f}s-old book')
+
+
+def test_a_peer_reading_from_another_window_is_refused():
+    """Staleness cannot catch this and the window must.
+
+    Observed live at a rollover: Kalshi rebuilt at 22:45:16 and Polymarket at
+    22:45:46, so for thirty seconds the cache held the 22:30 book with a recent
+    stamp. It passes any age test — the data really is fresh — but it is about a
+    different fifteen minutes. A gap computed from it prices this window against
+    the last one's book.
+    """
+    pm = {'best_bid': 40.0, 'best_ask': 42.0,
+          'at': NOW - pd.Timedelta(seconds=3),
+          'window': pd.Timestamp('2026-09-03 12:00', tz='UTC')}
+    row = cross_venue_row(pm, _Quote(), now=NOW,
+                          window_open=pd.Timestamp('2026-09-03 12:15', tz='UTC'))
+    assert np.isnan(row['venue_prob_gap'])
+    assert row['pm_available'] == 0.0
+
+
+def test_the_matching_window_is_used():
+    pm = {'best_bid': 40.0, 'best_ask': 42.0,
+          'at': NOW - pd.Timedelta(seconds=3),
+          'window': pd.Timestamp('2026-09-03 12:00', tz='UTC')}
+    row = cross_venue_row(pm, _Quote(), now=NOW,
+                          window_open=pd.Timestamp('2026-09-03 12:00', tz='UTC'))
+    assert not np.isnan(row['venue_prob_gap'])
+
+
+def test_a_reading_with_no_window_is_still_accepted():
+    """The REST fallback publishes no window. Refusing it would disable the
+    fallback entirely at the moment the socket is down."""
+    pm = {'best_bid': 40.0, 'best_ask': 42.0, 'at': NOW - pd.Timedelta(seconds=3)}
+    row = cross_venue_row(pm, _Quote(), now=NOW,
+                          window_open=pd.Timestamp('2026-09-03 12:15', tz='UTC'))
+    assert not np.isnan(row['venue_prob_gap'])
