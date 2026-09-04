@@ -505,7 +505,8 @@ def market_comparison(frame: pd.DataFrame) -> pd.DataFrame:
 
 def market_rows_from_scored(
         frame: pd.DataFrame, *,
-        max_quote_age_seconds: float = MAX_QUOTE_AGE_SECONDS) -> list:
+        max_quote_age_seconds: float = MAX_QUOTE_AGE_SECONDS,
+        entry_offsets=None) -> list:
     """`MARKET_COLUMNS` rows from a backtest that carries recorded quotes.
 
     **This is the claim `market_gate_values` used to say could not be made.**
@@ -551,6 +552,28 @@ def market_rows_from_scored(
     # is measuring the clock, not the market -- see MAX_QUOTE_AGE_SECONDS.
     # Rows with no age are kept: live-recorded quotes carry none, and they are
     # the one source needing no reconstruction.
+    # **Only the offsets that can OPEN a position.**
+    #
+    # This pooled all four while `--entry-offsets 12` means one can trade.
+    # Measured on 5,622 live rows:
+    #
+    #     offset   model - mkt      t     days+
+    #     +3m       -0.00259     -1.11     2/6
+    #     +6m       -0.00644     -1.63     3/6
+    #     +9m       +0.00068     +0.18     3/6
+    #     +12m      +0.00550     +1.09     5/6   <- the only one that trades
+    #     pooled    -0.00072     -0.26     2/6   <- what the gate read
+    #
+    # So it rejected two candidates for losing to the market at offsets they
+    # never trade, while the offset they do trade was the best of the four. Same
+    # defect as the entry-offsets bug: a measurement describing a policy nobody
+    # runs. None still pools, because then every offset really can enter.
+    if entry_offsets is not None and 'offset' in part.columns:
+        wanted = {int(o) for o in entry_offsets}
+        part = part[pd.to_numeric(part['offset'], errors='coerce')
+                    .astype('Int64').isin(wanted)]
+        if part.empty:
+            return []
     if 'quote_age_seconds' in part.columns:
         age = pd.to_numeric(part['quote_age_seconds'], errors='coerce').abs()
         part = part[age.isna() | (age <= max_quote_age_seconds)]

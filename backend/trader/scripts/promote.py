@@ -35,7 +35,7 @@ from scripts._common import (
 logger = logging.getLogger('promote')
 
 
-def market_measurement(scored=None) -> dict[str, float]:
+def market_measurement(scored=None, *, entry_offsets=None) -> dict[str, float]:
     """The market comparison, from recorded quotes.
 
     Returns values that FAIL when there is nothing to read. The gate has to be
@@ -59,7 +59,8 @@ def market_measurement(scored=None) -> dict[str, float]:
 
     url = os.getenv('DATABASE_URL')
     def _from_backtest(why: str) -> dict[str, float]:
-        rows = market_rows_from_scored(scored) if scored is not None else []
+        rows = (market_rows_from_scored(scored, entry_offsets=entry_offsets)
+                if scored is not None else [])
         if not rows:
             print(f'  {why} and the backtest carries no recorded quotes, so the '
                   f'market gates fail as unmeasured. That is not the same as the '
@@ -81,7 +82,16 @@ def market_measurement(scored=None) -> dict[str, float]:
         rows = PgWriter(database_url=url).scored_against_market()
     except Exception as exc:                      # noqa: BLE001 - report and fail closed
         return _from_backtest(f'the serving store could not be read ({exc})')
-    if not list(rows):
+    rows = list(rows)
+    # Same restriction as the backtest path: only offsets that can OPEN a
+    # position. `scored_against_market` returns every scored row, and the loop
+    # records all four offsets while trading one, so pooling here measured a
+    # policy nobody runs — measured, +12m reads +0.00550 against a pooled
+    # -0.00072. Row shape is (symbol, window_open, offset_minutes, ...).
+    if entry_offsets is not None:
+        wanted = {int(o) for o in entry_offsets}
+        rows = [r for r in rows if int(r[2]) in wanted]
+    if not rows:
         return _from_backtest('the serving store holds no scored quotes')
     values = market_gate_values(rows)
     print(f'  market comparison: {int(values["market_windows"]):,} windows of '
@@ -198,7 +208,12 @@ def main() -> int:
     result = walk_forward(dataset, config, groups=groups, trade=True)
     print('\n' + result.report.summary())
 
-    market = market_measurement(getattr(result, 'scored', None))
+    # Score the gate on the offsets that can actually OPEN a position.
+    # Pooling all four rejected two candidates for losing to the market at
+    # offsets they never trade, while +12m — the only one they do — was the
+    # best of the four (+0.00550 against a pooled -0.00072).
+    market = market_measurement(getattr(result, 'scored', None),
+                                entry_offsets=config.entry_offsets)
 
     if args.dry_run:
         print('\n' + gate_report(evaluate_gates(result.report, extra=market)))
