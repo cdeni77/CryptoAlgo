@@ -66,6 +66,7 @@ NEW_YORK = ZoneInfo('America/New_York')
 # is a shape the model can be told about instead of a KeyError at scoring time.
 # Column names live with the code that computes them, so a rename cannot
 # leave this dict pointing at a column nothing produces.
+from core.book_flow import BOOK_FLOW
 from core.book_features import (                                # noqa: E402
     CROSS_VENUE as BOOK_CROSS_VENUE,
     IMPLIED_VOL as BOOK_IMPLIED_VOL,
@@ -129,6 +130,11 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     'market_price': BOOK_MARKET_PRICE,
     'cross_venue': BOOK_CROSS_VENUE,
     'implied_vol': BOOK_IMPLIED_VOL,
+    # Book DYNAMICS, as against the snapshot `market_state` reads. The one
+    # mechanism the archive left open rather than rejected — imbalance went
+    # t=+0.30 to t=+1.84 over 67 days, "positive and strengthening". Off by
+    # default: it is a candidate under test, not part of the deployed model.
+    'book_flow': BOOK_FLOW,
 }
 
 # The venue's book only exists from 2026-01-08, against five years of bars, so
@@ -137,7 +143,8 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
 # which would silently widen every feature matrix the project has ever built.
 # `--groups market_state` selects them explicitly; that is also how each is
 # ablated alone, which is the only test that says whether it forecasts anything.
-BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol')
+BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol',
+               'book_flow')
 ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in BOOK_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
 CONTROL_GROUPS = ('time_of_day',)

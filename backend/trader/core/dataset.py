@@ -121,6 +121,15 @@ class Dataset:
         if depth is not None and len(depth):
             from core.quotes import attach_quotes
             windows = attach_quotes(windows, depth)
+            # Book dynamics from the SAME depth table, which carries a row at
+            # every minute 0..15. Attached here beside the quotes because it is
+            # observed rather than fitted; the lookahead guard lives inside
+            # `book_flow_features`, which reads only minutes at or before the
+            # decision.
+            from core.book_flow import book_flow_features
+            flow = book_flow_features(windows, depth)
+            for col in flow.columns:
+                windows[col] = flow[col].to_numpy()
         if ladder_fits is not None and len(ladder_fits):
             from core.book_features import attach_implied_vol
             windows = attach_implied_vol(windows, ladder_fits)
