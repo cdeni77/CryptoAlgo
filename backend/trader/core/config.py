@@ -214,11 +214,29 @@ class Config:
     early_stopping_rounds: int = 40
 
     # ---- cross-validation ------------------------------------------------
-    # How the walk-forward timeline is cut. 'calendar' gives equal spans of
-    # TIME, 'count' equal numbers of windows. Every ledger entry before
-    # 2026-09-03 used 'count' and predates this field, so an entry without it
-    # means 'count'. See `core.cv.purged_walk_forward` for why this changed.
-    fold_scheme: str = 'calendar'
+    # How the walk-forward timeline is cut. 'count' gives equal numbers of
+    # WINDOWS, 'calendar' equal spans of TIME. Entries before 2026-09-03 predate
+    # this field, so their absence means 'count'.
+    #
+    # **The default is 'count' because the GATES read the worst fold.**
+    # `calibration_error`, `calibration_max_deviation` and
+    # `folds_skill_positive` all take a per-fold extremum, and that only means
+    # something when folds have comparable precision. Complete-case density
+    # varies 8x across the span (30 to 244 windows/day), so calendar blocks come
+    # out at 494 windows against 5,672 — and the worst-fold gate then measures
+    # SAMPLE SIZE rather than calibration:
+    #
+    #                       count      calendar
+    #     pooled skill   +0.00276    +0.00312   <- calendar estimates better
+    #     worst-fold ECE   0.0199      0.0448   <- on a 494-window fold
+    #     median-fold ECE  0.0161      0.0150   <- calendar better here too
+    #
+    # Every calendar fold except the thin one is better calibrated than every
+    # count fold. So: 'calendar' for estimating SKILL, where balanced spans
+    # tighten the standard error (t 3.15 -> 4.18); 'count' for GATING, where
+    # balanced sizes make "the worst fold" a comparison rather than a lottery.
+    # `--fold-scheme calendar` remains available for research.
+    fold_scheme: str = 'count'
     n_folds: int = 6
     # Purge and embargo, in minutes, applied on both sides of every test
     # block. It must cover the longest feature lookback (1440) as well as the
