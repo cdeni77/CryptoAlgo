@@ -477,7 +477,26 @@ class Config:
     # a halt is deliberately manual: an automatic reset makes a circuit breaker a
     # speed bump.
     max_daily_loss_fraction: float = 0.15
-    max_consecutive_losses: int = 12
+    # 25, raised from 12 on 2026-09-03. Twelve is an alarm at even money and
+    # routine at longshot prices, because a longshot is SUPPOSED to lose most of
+    # the time — that is what a 4:1 payoff means:
+    #
+    #     P(12 consecutive losses)
+    #       50c contracts, 50% win rate:  0.024%   <- an alarm
+    #       22c contracts, 25% win rate:  3.168%   <- routine
+    #
+    # Live halted after twelve losses at a mean price of 22c. They cost $13.57
+    # against $96.80 realised, and `max_daily_loss_fraction` (~$43) never came
+    # close: the count breaker fired on the ODDS while the money breaker, which
+    # measures the damage, stayed quiet. The model had drifted from 51c to 19c
+    # contracts over five days as its volatility estimate rose above the
+    # market's — the strategy's documented other half working, not a fault.
+    #
+    # 25 restores roughly the rarity that 12 has at even odds. INTERIM: the
+    # threshold should scale with the price actually paid so it means the same
+    # thing at any odds, and this number will be wrong again if the drift
+    # reverses.
+    max_consecutive_losses: int = 25
     # Peak-to-current drawdown on realised equity, live. Same 0.35 the promotion
     # gate applies to the backtest — a threshold worth enforcing on a simulation
     # is worth enforcing on the account.
