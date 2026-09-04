@@ -1228,7 +1228,7 @@ def depth_dollars(quote, yes_levels, no_levels):
     return up, down
 
 
-def cross_venue_row(pm: Optional[dict], quote) -> dict:
+def cross_venue_row(pm: Optional[dict], quote, *, now=None) -> dict:
     """`cross_venue` from the in-process Polymarket cache.
 
     Two independent books on the same fifteen minutes, settling on different
@@ -1241,6 +1241,28 @@ def cross_venue_row(pm: Optional[dict], quote) -> dict:
     from core.book_features import CROSS_VENUE
 
     out = {name: float('nan') for name in CROSS_VENUE}
+    # **The same staleness bar the backtest applies to BOTH venues.**
+    #
+    # Training aligns them: `event_time` is identical on 100% of 693,805 matched
+    # pairs and Polymarket is 4.0s STALER on average, so `venue_prob_gap` there
+    # is a contemporaneous disagreement. Live it was not — `record_pm_ladder`
+    # wrote at a median 32s past the minute against decisions at ~+2s, so the
+    # freshest reading was ~30s old and nothing checked. A 30s-old peer price
+    # makes the gap partly a measure of KALSHI'S OWN MOVE over that interval,
+    # which is not the quantity the model was fitted on.
+    #
+    # It matters most here: `cross_venue` is the only load-bearing group —
+    # dropping it takes skill +0.00282 -> -0.00015.
+    #
+    # A reading with no stamp is kept, matching `attach_quotes`: absence of a
+    # stamp is not evidence of staleness.
+    if pm is not None and pm.get('at') is not None and now is not None:
+        from core.quotes import DEFAULT_MAX_AGE
+        age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
+        if not (0 <= age <= DEFAULT_MAX_AGE):
+            logger.debug('peer book %.0fs old, past the %.0fs bar; gap refused',
+                         age, DEFAULT_MAX_AGE)
+            pm = None
     k_mid = _two_sided_mid(getattr(quote, 'yes_bid', np.nan) * 100.0,
                            getattr(quote, 'yes_ask', np.nan) * 100.0)
     p_mid = _two_sided_mid(*(
@@ -1440,7 +1462,7 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
             row['depth_up'] = up
         if down is not None:
             row['depth_down'] = down
-        row.update(cross_venue_row(pm_cache.get(symbol), entry[0]))
+        row.update(cross_venue_row(pm_cache.get(symbol), entry[0], now=now))
         row.update(implied_vol_row(
             latest_fit(symbol, now=now, cache=iv_cache), now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]

@@ -164,7 +164,30 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
         if len(peer):
             pbid = pd.to_numeric(peer['yes_bid'], errors='coerce')
             pask = pd.to_numeric(peer['yes_ask'], errors='coerce')
-            two_sided = pbid.notna() & pask.notna() & (pask >= pbid)
+            # **The SAME staleness bar as the traded side.** This block had none,
+            # and Polymarket rows reach 899 seconds in the store. `venue_prob_gap`
+            # is a DIFFERENCE of the two venues, and a difference is exactly where
+            # a timing asymmetry turns into apparent skill.
+            #
+            # It matters here more than anywhere: `cross_venue` is the only
+            # load-bearing group — dropping it takes skill +0.00282 -> -0.00015 —
+            # while scoring +0.000030 ALONE, below the clock control. Useless
+            # alone and essential combined is what an interaction looks like AND
+            # what a leak looks like, and the pattern cannot separate them.
+            # Filtering both sides to one tolerance is what makes the group's
+            # contribution interpretable either way.
+            #
+            # Measured on the 431,198 rows the model sees, Polymarket is 4.0s
+            # STALER on average, so the leak is not the mean case — but it is
+            # fresher by >10s on 6% of rows and nothing bounded it.
+            #
+            # A missing stamp is kept: absence is not evidence of staleness, and
+            # the backfilled fixtures carry rows without one.
+            page = pd.to_numeric(peer.get('quote_age_seconds'), errors='coerce') \
+                if 'quote_age_seconds' in peer.columns \
+                else pd.Series(np.nan, index=peer.index)
+            pfresh = page.isna() | (page.abs() <= max_age_seconds)
+            two_sided = pbid.notna() & pask.notna() & (pask >= pbid) & pfresh
             peer['pm_market_probability'] = ((pbid + pask) / 2.0).where(two_sided)
             peer['pm_spread'] = (pask - pbid).where(two_sided)
             peer = peer.drop_duplicates(

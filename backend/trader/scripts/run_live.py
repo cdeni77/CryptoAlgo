@@ -187,7 +187,14 @@ COMPONENTS: tuple[Component, ...] = (
     # meaningless and only the spool flush takes the gate.
     Component('stream', phase=0.0),
     Component('ladder', phase=25.0),
-    Component('pm_ladder', phase=35.0),
+    # +55s, not +35s. Decisions land about two seconds past the minute, so a
+    # recorder at +35s left the freshest Polymarket reading ~27s old — inside
+    # the 30s bar the backtest applies, but only just, and past it on the tail.
+    # Training has the two venues contemporaneous (Polymarket 4.0s STALER on
+    # average), and `cross_venue` is the only load-bearing group in the model,
+    # so a systematic 27s skew there is the most expensive place to have one.
+    # At +55s the reading is ~7s old at the decision.
+    Component('pm_ladder', phase=55.0),
     Component('implied_vol', phase=45.0),
     Component('store_sync', phase=50.0),
 )
