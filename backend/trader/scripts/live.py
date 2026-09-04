@@ -431,6 +431,54 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
     return None
 
 
+# The longest lookback any feature needs, plus the mean it is taken over.
+# `volume_z_15` is a 1,440-minute z-score of a 15-minute rolling mean, so
+# bit-parity needs 1,440 + 15 = 1,455 contiguous bars; `log_rv_1440` needs
+# 1,441. `FETCH_MINUTES` is 1,500, leaving a 45-bar margin that nothing guarded.
+MIN_USABLE_BARS = 1_455
+
+
+def short_symbols(bars: dict, config: Config) -> dict[str, str]:
+    """Symbols whose history is too SHORT to reproduce the training features.
+
+    `stale_symbols` checks that the newest bar is recent. Nothing checked how
+    many bars came back, and `get_candles_range` returns a short or holed series
+    after logging an ERROR — so a partial Coinbase answer produced confident
+    wrong numbers rather than the NaN that makes `decide()` abstain.
+
+    Measured against the walk-forward value:
+
+        bars   volume_z_15   rv_surprise   rv_slope_long
+        1440        105%          16%           3.5%
+        1200         46x          67x           6.8x
+         800        130x         285x            12x
+
+    Below ~721 bars `log_rv_1440` fails its `min_periods` and the NaN reaches
+    `sigma_remaining`, so the cycle abstains on its own — safe. Between 721 and
+    1,454 it trades on wrong numbers, and that band is exactly where a partial
+    fetch lands.
+
+    Invisible without this: a short-but-unholed grid spans what was RETURNED, so
+    `Dataset.coverage()` reports 100.0000% and logs at DEBUG.
+
+    Rows, not span, because a 1,500-minute span can hold 400 bars — and it is
+    the row count the rolling windows consume.
+    """
+    reasons: dict[str, str] = {}
+    for symbol in config.symbols:
+        frame = bars.get(symbol)
+        if frame is None or not len(frame):
+            reasons[symbol] = 'no bars returned'
+            continue
+        need = int(getattr(config, 'min_usable_bars', MIN_USABLE_BARS))
+        usable = int(pd.to_numeric(frame['close'], errors='coerce').notna().sum())
+        if usable < need:
+            reasons[symbol] = (
+                f'{usable} usable bars, under the {need} needed to reproduce '
+                f'the training features (volume_z_15 needs 1,455)')
+    return reasons
+
+
 def stale_symbols(bars: dict[str, pd.DataFrame], config: Config,
                   *, now: datetime) -> dict[str, str]:
     """Symbols whose feed is too old, or absent, with the reason.
@@ -2008,7 +2056,13 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         logger.error('account halted (%s); scoring and recording continue, '
                      'no new entries', halted)
 
-    stale = stale_symbols(bars, config, now=now)
+    # Fresh AND complete. A symbol can pass the staleness check with 1,200
+    # bars, which reports 100% coverage and puts `rv_surprise` 67x out. Merged
+    # into one refusal because the consequence is identical: a short universe
+    # redefines every cross-asset feature rather than omitting one row.
+    stale = dict(stale_symbols(bars, config, now=now))
+    stale.update({sym: why for sym, why in short_symbols(bars, config).items()
+                  if sym not in stale})
     if stale:
         # Settlement and reconciliation below still run: they read the past, which
         # a short feed does not invalidate, and a matured position should not be
@@ -2172,25 +2226,36 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                 'Ours is an OHLC mean of Coinbase bars; theirs is BRTI. Using '
                 'theirs, but a gap this wide suggests a stale bar feed.',
                 row['symbol'], ours, venue_strike, drift_bps)
+        # **RECORDED, never fed to the model.**
+        #
+        # This used to overwrite `strike` and `displacement` in the scored frame
+        # and then recompute exactly one of the ten features derived from them
+        # (`z_score`), leaving `abs_z_score`, the three excursion-z columns,
+        # `path_efficiency`, `displacement_vs_elapsed`, `touched_opposite` and
+        # `peer_displacement` on the bar-derived basis. `abs_z_score ==
+        # |z_score|` holds by construction in every training row, so the vector
+        # handed to `predict` occupied a state the booster has never seen — and
+        # a tree ensemble does not degrade gracefully outside its training
+        # manifold, it lands in whatever leaf the splits reach.
+        #
+        # It fired on every cycle and every symbol, and was invisible: the only
+        # warning triggers above 25bp while the Coinbase-vs-BRTI basis is of
+        # order 1bp, which at offset 12 moves `z_score` ~0.13 z while its
+        # siblings do not move at all.
+        #
+        # Recomputing all ten would fix the impossible state and not the skew:
+        # training's displacement is `Coinbase_close / Coinbase_OHLC_mean - 1`
+        # and the override makes it `Coinbase_close / BRTI - 1`, injecting the
+        # cross-index basis into a feature fitted without it. The venue strike
+        # is the right reference for SETTLEMENT — which is where `decide()` and
+        # `settle_due` use it — not for features.
         scored.loc[index, 'strike_source'] = 'venue'
-        scored.loc[index, 'strike'] = venue_strike
-        scored.loc[index, 'displacement'] = float(row['last_price']) / venue_strike - 1.0
-        if np.isfinite(row.get('sigma_remaining', np.nan)) and row['sigma_remaining'] > 0:
-            scored.loc[index, 'z_score'] = (
-                scored.loc[index, 'displacement'] / row['sigma_remaining'])
+        scored.loc[index, 'venue_strike'] = venue_strike
+        scored.loc[index, 'venue_strike_drift_bps'] = drift_bps
 
     if 'strike_source' not in scored.columns:
         scored['strike_source'] = 'bars'
     scored['strike_source'] = scored['strike_source'].fillna('bars')
-
-    # The displacement moved, so the barrier probability has to be recomputed
-    # from it rather than carried over from the bar-derived strike.
-    if (scored['strike_source'] == 'venue').any():
-        from core.baseline import attach_baseline
-        scored = attach_baseline(scored.drop(
-            columns=['baseline_probability', 'baseline_probability_logit'],
-            errors='ignore'), model.scoring.baseline)
-        scored['model_probability'] = model.predict(scored)
 
     # Everything above happened AFTER the book was read and BEFORE any order can
     # go out, so it is all quote staleness paid at the touch. Logged whether or

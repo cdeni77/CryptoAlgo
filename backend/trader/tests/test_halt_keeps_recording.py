@@ -92,6 +92,7 @@ class TestTheCycleKeepsScoringWhileHalted:
     def _cycle(self, tmp_path, *, halt: bool):
         import argparse
         import asyncio
+        import dataclasses
 
         import numpy as np
 
@@ -148,7 +149,13 @@ class TestTheCycleKeepsScoringWhileHalted:
         try:
             args = argparse.Namespace(offset=3, reconcile=False, mode='paper',
                                       place_orders=False, dry_run=False)
-            asyncio.run(live_mod.run_cycle(args, DEFAULT_CONFIG, writer,
+            # The fixture carries a handful of synthetic bars, not the 1,455
+            # a live feed must supply — `min_usable_bars` guards the band where
+            # a partial Coinbase answer produces confident wrong features.
+            # Lowered here so the test exercises the halt path rather than the
+            # short-feed refusal.
+            config = dataclasses.replace(DEFAULT_CONFIG, min_usable_bars=1)
+            asyncio.run(live_mod.run_cycle(args, config, writer,
                                            Model(), None))
         finally:
             mp.undo()

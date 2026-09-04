@@ -460,6 +460,14 @@ class Config:
     # before the order went out, with a Coinbase fetch, four authenticated
     # reconcile calls, inference and six 15-second quote calls in between.
     max_bar_age_seconds: int = 150
+    # The longest lookback any feature needs, plus the mean it is taken over:
+    # `volume_z_15` is a 1,440-minute z-score of a 15-minute rolling mean, so
+    # bit-parity needs 1,455 contiguous bars. Live checked that bars were FRESH
+    # and never that they were COMPLETE, and between 721 and 1,454 bars the
+    # features are confidently wrong while the cycle still trades — measured,
+    # `rv_surprise` is 67x out at 1,200 bars. Below 721 the NaN reaches
+    # `sigma_remaining` and the cycle abstains on its own.
+    min_usable_bars: int = 1_455
     max_quote_age_seconds: int = 45
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted
