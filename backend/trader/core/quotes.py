@@ -64,7 +64,8 @@ DEFAULT_MAX_AGE = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
 def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   venue: str = 'kalshi',
                   other_venue: Optional[str] = 'polymarket',
-                  max_age_seconds: float = DEFAULT_MAX_AGE) -> pd.DataFrame:
+                  max_age_seconds: float = DEFAULT_MAX_AGE,
+                  peer_lag_minutes: int = 0) -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
     Joined on (symbol, window_open, offset) EXACTLY. Not as-of across offsets:
@@ -159,6 +160,16 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     # different name.
     if other_venue:
         peer = depth[depth['venue'] == other_venue].copy()
+        # RESEARCH, default off. Shift the peer FORWARD so a row at offset m
+        # carries the peer's book from m - lag: the live condition, where Kalshi
+        # is contemporaneous and Polymarket is a beat behind. Only the PEER
+        # moves — the decision must still price against the Kalshi book it could
+        # actually have taken.
+        if peer_lag_minutes and len(peer):
+            peer = peer.copy()
+            peer['offset_minutes'] = (
+                pd.to_numeric(peer['offset_minutes'], errors='coerce')
+                + int(peer_lag_minutes))
         merged['pm_market_probability'] = np.nan
         merged['pm_spread'] = np.nan
         if len(peer):

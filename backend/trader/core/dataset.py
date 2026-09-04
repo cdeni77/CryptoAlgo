@@ -120,7 +120,9 @@ class Dataset:
         # `build_features`, because its denominator is the fitted sigma.
         if depth is not None and len(depth):
             from core.quotes import attach_quotes
-            windows = attach_quotes(windows, depth)
+            windows = attach_quotes(
+                windows, depth,
+                peer_lag_minutes=getattr(config, 'peer_lag_minutes', 0))
             # Book dynamics from the SAME depth table, which carries a row at
             # every minute 0..15. Attached here beside the quotes because it is
             # observed rather than fitted; the lookahead guard lives inside
