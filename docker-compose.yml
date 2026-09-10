@@ -313,6 +313,52 @@ services:
       -m scripts.evaluate
 
   # ===========================================================================
+  # Retrain — weekly, gated, one-off. Driven by ops/weekly_retrain.sh via cron.
+  #
+  # `scripts.promote` runs the walk-forward, scores the gates and installs ONLY
+  # if they all pass; exit 0 means installed, 1 means refused. There is no
+  # `--force` here on purpose. The deployed artifact was force-promoted past
+  # `calibration_error` 0.0216, and that gate has since been traced to a real
+  # cost: measured live 2026-09-10, the fitted baseline is the worst calibrated
+  # of the three forecasters (over-confidence +0.0362 against the market's
+  # +0.0252, every one of six buckets pushed away from 0.5), and `base - mkt`
+  # at +12m reads -0.0139. An automatic job must not repeat an override that a
+  # human made once with a written reason.
+  #
+  # The config is pinned to what is LIVE so a retrain changes one thing — the
+  # data it saw. Groups are cell 63; the 2026-09-04 sweep's alternative (cell
+  # 21) was measured better on forecast metrics and worse on realised edge and
+  # drawdown, and deliberately not adopted.
+  #
+  # **Promoting does not affect trading until the loop restarts** — `live.py`
+  # calls `load_live` once at startup and never reloads. That is why the cron
+  # wrapper restarts the trader on exit 0 and leaves it alone on exit 1.
+  # ===========================================================================
+  retrain:
+    profiles: ["tools"]
+    build:
+      context: ./backend/trader
+      dockerfile: Dockerfile
+    environment:
+      - RESEARCH_STORE=/app/data/research
+      - MODELS_ROOT=/app/models
+      - FEE_CONFIG=${FEE_CONFIG:-}
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
+    volumes:
+      - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
+      - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
+      - ./backend/trader:/app
+    command: >
+      -m scripts.promote
+        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,market_state,implied_vol
+        --complete-cases
+        --entry-offsets 12
+        --init-score-source market
+        --kelly-fraction 0.10
+        --min-edge-pp 3.0
+        --bankroll 200
+
+  # ===========================================================================
   # Everything the live system runs, in ONE service.
   #
   # This was five: the trading loop, three recorders and a shell loop that

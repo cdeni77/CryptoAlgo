@@ -1,5 +1,18 @@
 {
   "features": [
+    "venue_prob_gap",
+    "venue_gap_change_5",
+    "venue_spread_ratio",
+    "pm_available",
+    "z_score",
+    "abs_z_score",
+    "excursion_up_z",
+    "excursion_down_z",
+    "excursion_span_z",
+    "excursion_asymmetry",
+    "path_efficiency",
+    "displacement_vs_elapsed",
+    "touched_opposite",
     "log_rv_15",
     "log_rv_60",
     "log_rv_240",
@@ -24,15 +37,6 @@
     "lead_residual",
     "beta_1440",
     "universe_dispersion",
-    "z_score",
-    "abs_z_score",
-    "excursion_up_z",
-    "excursion_down_z",
-    "excursion_span_z",
-    "excursion_asymmetry",
-    "path_efficiency",
-    "displacement_vs_elapsed",
-    "touched_opposite",
     "elapsed_fraction",
     "remaining_minutes",
     "spread",
@@ -40,10 +44,6 @@
     "imbalance_5c",
     "depth_ratio",
     "book_convexity",
-    "venue_prob_gap",
-    "venue_gap_change_5",
-    "venue_spread_ratio",
-    "pm_available",
     "iv_minus_realised",
     "implied_sigma_per_min",
     "iv_r2",
@@ -54,36 +54,36 @@
   "n_features_populated": 49,
   "empty_features": [],
   "groups": [
+    "cross_venue",
+    "geometry",
     "vol_state",
     "microstructure",
     "cross_asset",
-    "geometry",
     "offset",
     "market_state",
-    "cross_venue",
     "implied_vol"
   ],
-  "residual_scale": 1.0650271582975792,
+  "residual_scale": 1.0900449678976634,
   "init_score_source": "market",
-  "n_train_rows": 66552,
-  "n_train_windows": 12305,
-  "best_iteration": 111,
-  "train_log_loss": 0.4475796773389851,
-  "inner_log_loss": 0.49339588899542436,
-  "inner_baseline_log_loss": 0.49739679049215574,
-  "inner_log_loss_skill": 0.004000901496731379,
+  "n_train_rows": 68264,
+  "n_train_windows": 12868,
+  "best_iteration": 95,
+  "train_log_loss": 0.45067291716052615,
+  "inner_log_loss": 0.49628622150947316,
+  "inner_baseline_log_loss": 0.5001227900105154,
+  "inner_log_loss_skill": 0.003836568501042248,
   "control_importance_share": 0.0,
   "baseline": {
     "distribution": "student_t",
-    "nu": 4.994722747417515,
+    "nu": 3.783289072905987,
     "scale": {
-      "3": 1.1400955900747338,
-      "6": 1.0850645833417267,
-      "9": 1.0203772186275888,
-      "12": 0.9755015281534625
+      "3": 1.275208698434596,
+      "6": 1.1954334724170539,
+      "9": 1.1258078695855274,
+      "12": 1.0326091202084098
     },
-    "n_fitted": 66538,
-    "fitted_log_loss": 0.4620603667893252
+    "n_fitted": 68250,
+    "fitted_log_loss": 0.46769240708483284
   },
   "deployable": true,
   "config": {
@@ -117,13 +117,22 @@
     "fee_rate": 0.07,
     "half_spread_cents": 0.5,
     "fee_config_version": "builtin_kalshi_v202608",
+    "fold_scheme": "count",
+    "entry_offsets": [
+      12
+    ],
+    "compound": false,
+    "starting_bankroll": 200.0,
+    "max_stake_dollars": 25.0,
+    "max_stake_fraction": 0.05,
     "kelly_fraction": 0.1,
     "min_edge_pp": 3.0,
     "cli_overrides": [
       "entry_offsets",
       "init_score_source",
       "kelly_fraction",
-      "min_edge_pp"
+      "min_edge_pp",
+      "starting_bankroll"
     ]
   }
 }
