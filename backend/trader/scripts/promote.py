@@ -284,15 +284,16 @@ def publish_to_serving(attempt, report) -> None:
         )
         # The reliability table of the fold that produced the candidate — the one
         # trained on the most history, and so the one deployed.
-        table = report.folds[-1].reliability_table if report.folds else None
-        if table is not None:
-            frame = table.frame()
-            writer.write_calibration(
-                attempt.version, 'model',
-                [{'bin_low': float(r.bin_low), 'bin_high': float(r.bin_high),
-                  'predicted': _finite(r.predicted), 'observed': _finite(r.observed),
-                  'count': int(r.count)}
-                 for r in frame.itertuples() if r.count > 0])
+        #
+        # Read from the ATTEMPT, not recomputed from the report: the same rows
+        # now go into the ledger via `core.promotion.reliability_rows`, and two
+        # derivations of one table are two tables. The ledger copy is also what
+        # makes this repairable — before it existed, a promotion whose mirror
+        # failed (no DATABASE_URL, unreachable database) lost its calibration
+        # data permanently while every other number survived on disk.
+        rows = (attempt.payload().get('report') or {}).get('reliability') or []
+        if rows:
+            writer.write_calibration(attempt.version, 'model', rows)
         logger.info('recorded %s in the serving store', attempt.version)
     except Exception as exc:  # noqa: BLE001 - the ledger is authoritative, not this
         logger.warning('could not mirror %s into the serving store (%s); the '

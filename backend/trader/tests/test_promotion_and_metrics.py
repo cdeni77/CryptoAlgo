@@ -446,3 +446,96 @@ class TestTheMarketGates:
         `gate_values` must not pretend to."""
         assert 'model_minus_market' not in report().gate_values()
         assert 'market_windows' not in report().gate_values()
+
+
+# --- the ledger must carry the reliability table ---------------------------
+#
+# It did not, and the Calibration page's only other source was a best-effort
+# mirror into Postgres at promotion time. On 2026-09-10 a retrain ran on a host
+# with no DATABASE_URL: `publish_to_serving` logged one line and returned, and
+# the reliability table for an INSTALLED artifact was gone. Every other number
+# in the attempt survived on disk -- gates, skill, config, fold count -- so the
+# ledger looked complete while being unable to answer the one question the
+# Calibration page asks. A record of account with a hole in it is not one.
+
+def test_the_ledger_carries_the_deployed_folds_reliability_table():
+    import pandas as pd
+    from core.promotion import reliability_rows
+
+    class Table:
+        def frame(self):
+            return pd.DataFrame({
+                'bin_low': [0.0, 0.4, 0.8], 'bin_high': [0.2, 0.6, 1.0],
+                'predicted': [0.10, 0.50, 0.90],
+                'observed': [0.12, 0.48, 0.93], 'count': [40, 0, 25]})
+
+    early = type('F', (), {'reliability_table': None})()
+    deployed = type('F', (), {'reliability_table': Table()})()
+    rows = reliability_rows(type('R', (), {'folds': [early, deployed]})())
+
+    # The LAST fold: trained on the most history, so the one deployed. Same
+    # choice publish_to_serving makes, and they must not diverge.
+    assert len(rows) == 2, 'empty bins are dropped, populated ones kept'
+    assert rows[0] == {'bin_low': 0.0, 'bin_high': 0.2, 'predicted': 0.10,
+                       'observed': 0.12, 'count': 40}
+
+
+def test_reliability_rows_are_strict_json():
+    """`json.dumps` emits a bare NaN, which Python reads back and every strict
+    parser rejects -- including the dashboard's."""
+    import json
+    import pandas as pd
+    from core.promotion import reliability_rows
+
+    class Table:
+        def frame(self):
+            return pd.DataFrame({
+                'bin_low': [0.0], 'bin_high': [0.2],
+                'predicted': [float('nan')], 'observed': [0.12], 'count': [5]})
+
+    rows = reliability_rows(
+        type('R', (), {'folds': [type('F', (), {'reliability_table': Table()})()]})())
+    assert rows[0]['predicted'] is None
+    assert 'NaN' not in json.dumps(rows)
+
+
+def test_a_report_with_no_folds_does_not_raise():
+    """A refused candidate still writes a ledger entry, and a diagnostic that
+    raises inside the writer would destroy the record it exists to keep."""
+    from core.promotion import reliability_rows
+    assert reliability_rows(type('R', (), {'folds': []})()) == []
+    assert reliability_rows(type('R', (), {})()) == []
+
+
+def test_report_provenance_actually_CARRIES_the_reliability_rows():
+    """The wiring, not the helper.
+
+    The three tests above pass with `report_provenance` never calling
+    `reliability_rows` at all — verified by deleting the line and watching them
+    stay green. That is the same defect shape as `complete_cases`, whose
+    `groups` argument was correct, tested, and never passed by its only caller.
+    A helper that works and is not wired in is a helper that does nothing.
+    """
+    import pandas as pd
+    from core.promotion import report_provenance
+
+    class Table:
+        def frame(self):
+            return pd.DataFrame({
+                'bin_low': [0.0], 'bin_high': [0.2], 'predicted': [0.10],
+                'observed': [0.12], 'count': [40]})
+
+    report = type('R', (), {
+        'folds': [type('F', (), {'reliability_table': Table()})()],
+        'folds_total': 6, 'total_windows': 1000, 'mean_skill': 0.001,
+        'skill_standard_error': 0.0002, 'skill_t': 5.0, 'folds_positive': 6,
+        'sign_agreement_p_value': 0.03, 'max_ece': 0.019,
+        'mean_residual_scale': 1.1, 'max_control_gain_share': 0.0,
+        'gate_values': staticmethod(lambda: {}),
+        'config_provenance': {}, 'notes': [],
+    })()
+    payload = report_provenance(report)
+    assert 'reliability' in payload, 'the ledger must carry the table'
+    assert payload['reliability'] == [
+        {'bin_low': 0.0, 'bin_high': 0.2, 'predicted': 0.10,
+         'observed': 0.12, 'count': 40}]

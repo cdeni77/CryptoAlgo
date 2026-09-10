@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -111,8 +112,46 @@ class PromotionAttempt:
         return f'{self.version}: {verdict}{forced}\n' + gate_report(self.gates)
 
 
+def _json_float(value) -> Optional[float]:
+    """NaN and inf are not JSON. `json.dumps` emits bare `NaN`, which Python
+    reads back and every strict parser rejects — including the dashboard's."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def reliability_rows(report: EvaluationReport) -> list[dict]:
+    """The deployed fold's reliability table, as plain rows.
+
+    **The LAST fold**: trained on the most history, so the one whose model is
+    installed. Same choice `scripts/promote.publish_to_serving` makes, and they
+    must not diverge.
+
+    **This belongs in the ledger because the ledger is the record of account.**
+    It was not, and the Calibration page's only other source was a best-effort
+    mirror into Postgres at promotion time. On 2026-09-10 a retrain ran on a
+    host with no `DATABASE_URL`; the mirror logged one line and returned, and
+    the reliability table for an installed artifact was gone — every other
+    number in the attempt survived on disk, that one did not. A record of
+    account with a hole in it is not one.
+    """
+    folds = list(getattr(report, 'folds', None) or ())
+    table = getattr(folds[-1], 'reliability_table', None) if folds else None
+    if table is None:
+        return []
+    return [
+        {'bin_low': _json_float(row.bin_low), 'bin_high': _json_float(row.bin_high),
+         'predicted': _json_float(row.predicted),
+         'observed': _json_float(row.observed), 'count': int(row.count)}
+        for row in table.frame().itertuples() if int(row.count) > 0
+    ]
+
+
 def report_provenance(report: EvaluationReport) -> dict:
     return {
+        'reliability': reliability_rows(report),
         'folds': report.folds_total,
         'windows_evaluated': report.total_windows,
         'log_loss_skill': report.mean_skill,
