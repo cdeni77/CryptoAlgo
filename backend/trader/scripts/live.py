@@ -1007,6 +1007,10 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
         rows = []
         for raw in fills:
             parsed = parse_fill(raw)
+            # Same scope as the settlements below: a fill in a market this
+            # system never traded is somebody's manual punt, not ours.
+            if not _is_ours(getattr(parsed, 'ticker', '') or ''):
+                continue
             if parsed.trade_id and parsed.trade_id not in known_fills:
                 rows.append(venue_ledger.fill_row(parsed))
         written_fills = writer.upsert_venue_fills(rows)
@@ -1018,6 +1022,16 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
             parsed = parse_settlement(raw)
             if not parsed.ticker or parsed.ticker in known_settlements:
                 continue
+            # **Only markets this system traded.** The Kalshi account is a
+            # person's and may hold anything; `core/venue_ledger.py` has no
+            # series filter, so a manually-taken NFL position settling would
+            # add its revenue and fees to `venue_settlements` and land in the
+            # realised P&L the dashboard shows for this strategy. Two
+            # strategies summed into one equity curve is the same class of
+            # error as a balance-difference curve counting a deposit as
+            # profit.
+            if not _is_ours(parsed.ticker):
+                continue
             rows.append(venue_ledger.settlement_row(
                 parsed, position=writer.position_for_ticker(parsed.ticker)))
         written_settlements = writer.upsert_venue_settlements(rows)
@@ -1027,6 +1041,24 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
         logger.debug('venue ledger: %d fill(s), %d settlement(s) stored',
                      written_fills, written_settlements)
     return written_fills, written_settlements
+
+
+def _is_ours(ticker: str) -> bool:
+    """Is this market one this loop trades?
+
+    The Kalshi account belongs to a person and may hold anything — an NFL
+    market, a college football market, a manual punt. Reconciliation must not
+    treat those as unbooked fills of ours.
+
+    Matched on the SERIES PREFIX from `SERIES_BY_SYMBOL`, so a
+    `KALSHI_SERIES_*` override reaches this too and there is no second
+    hardcoded list to drift. A live ticker is `SERIES-YYMMMDDHHMM-MM`, e.g.
+    `KXBTC15M-26SEP041130-30`, so the prefix plus a hyphen is the test — the
+    hyphen matters, or a hypothetical `KXBTC15MINI` would match `KXBTC15M`.
+    """
+    ticker = (ticker or '').strip().upper()
+    return any(ticker.startswith(f'{series.upper()}-')
+               for series in SERIES_BY_SYMBOL.values() if series)
 
 
 async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
@@ -1076,8 +1108,23 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
     # real position "the venue does not report", and the reverse one, for a
     # position the venue holds and we do not, could never fire at all. The
     # reverse is the case the audit called the one that costs money silently.
+    # **Only the series this loop trades.** The Kalshi account is a person's
+    # account and may hold positions nobody here placed — an NFL market, a
+    # college football market, anything. Those are not unbooked fills, and
+    # reporting them as "an order was filled and not booked, reconcile by hand
+    # before trading again" once a minute is the alarm that cries wolf: the
+    # same failure `adopt_venue_balance` records, where a drift alarm firing on
+    # every settlement hid the drift it existed to catch. Measured
+    # 2026-09-10, one manual football position produced that ERROR on every
+    # cycle for hours.
+    #
+    # Scoped by SERIES PREFIX rather than by an ignore-list, so the check stays
+    # strict where it matters: a genuinely unbooked fill in KXBTC15M /
+    # KXETH15M / KXSOL15M still fires, which is the case the audit called the
+    # one that costs money silently.
     venue_open = {str(p.get('ticker', '')) for p in state.get('positions', [])
-                  if KalshiClient.position_size(p) != 0}
+                  if KalshiClient.position_size(p) != 0
+                  and _is_ours(str(p.get('ticker', '')))}
     for position in writer.open_positions():
         ticket = _ticket_for(writer, position)
         ticker = getattr(ticket, 'market_ticker', None) if ticket else None
