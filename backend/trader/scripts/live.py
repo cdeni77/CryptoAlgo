@@ -3042,6 +3042,26 @@ def config_from_args(args) -> Config:
     cap = getattr(args, 'max_positions_per_window', None)
     if cap is not None:
         overrides['max_positions_per_window'] = int(cap)
+    # **`--compound` was parsed and dropped on the floor.** Declared at the
+    # parser since 2026-09-02 and read nowhere: `config.compound` stayed False,
+    # so `decide()` sized off `starting_bankroll` and the running balance was
+    # ignored. Measured 2026-09-13 on a $550 account — a trade that should have
+    # been 9 contracts was 3, because the base in force was the fixed $200.
+    #
+    # `6b288fc9` is titled "Compound live, and let an explicit flag beat the
+    # artifact's provenance" and added `compound` to the adoption loop in
+    # `config_for_artifact`, which skips any field in `cli_overrides`. Nothing
+    # ever put it there, so the flag could never win and the artifact's
+    # provenance (False) always did. The provenance half was built; the flag
+    # half was not.
+    #
+    # Same shape as `--dry-run`, which was "declared and never read, so
+    # `--mode live --dry-run --place-orders` parsed cleanly and placed real
+    # orders". A flag has to be honoured or be a usage error; silently ignored
+    # is the one option that costs money.
+    compound = getattr(args, 'compound', None)
+    if compound is not None:
+        overrides['compound'] = bool(compound)
     return config.with_overrides(**overrides) if overrides else config
 
 

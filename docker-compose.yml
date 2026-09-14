@@ -246,7 +246,7 @@ services:
         --mode live
         --place-orders
         --compound
-        --bankroll 200
+        --bankroll 500
         --no-require-gates
         --force
         --reason "REAL ORDERS on a $200 account, artifact 20260828T202438Z, the first promotion measured under the policy this loop actually runs (--entry-offsets 12). Under wait_12: realised_edge_pp +4.17, max_drawdown 0.232 (passing), Sharpe 3.72, 1,107 trades, log_loss_skill +0.00307 (t=+3.69) 6/6 folds, control gain share 0.0%. Two gates fail, both calibration (error 0.0216, max deviation 0.0515) — a property of the forecast, unchanged by the trading policy, and per-fold instability rather than bias since the pooled worst deviation of 2.8pp would pass. The +12m choice is supported independently of this backtest: across 10,025 backfilled windows offsets 1-11 carry no edge against the market and it appears at +12m as a step, and over five years the baseline ECE falls monotonically to its minimum there. The untested risk is FILLS, not forecast: ~30% of live orders previously went unfilled and the failures carried higher claimed edge, which no backfill can measure because settled markets return an empty ladder."
