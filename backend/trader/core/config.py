@@ -263,7 +263,28 @@ class Config:
     # which is the whole defect the anchoring fixes. 35 days is the block width
     # the previous proportional cut produced at the 248-day span where this was
     # found, so the change is behaviour-preserving at the moment it landed.
-    fold_block_days: float = 21.0
+    #
+    # **SEVEN, because seven days is what the retrain actually does.** Blocks do
+    # not overlap, so this is the step as well as the test span: at 21 the
+    # backtest let a model go three weeks stale before refitting while the
+    # Sunday cron never lets it exceed one, which measured a deployment nobody
+    # runs. Swept 2026-09-16 against 21 with training held expanding:
+    #
+    #     blocks  folds  skill     edge_pp  return  sharpe  maxDD
+    #       21d       8  0.00304    2.79     0.616   2.17   0.202
+    #        7d      25  0.00256    3.37     1.041   3.69   0.091
+    #
+    # So it is a fidelity fix that also reads better, and 25 folds give the
+    # dispersion estimate three times the resolution.
+    #
+    # **It moves `calibration_error`, and that gate's threshold has NOT been
+    # re-derived for it.** Max fold ECE goes 0.0273 -> 0.0653 and the MEDIAN
+    # fold goes 0.0171 -> 0.0304, so it is not merely a max-over-more-folds
+    # artifact: binned ECE is biased upward at small samples and a 7-day fold
+    # holds about a third of the windows. Calibration is therefore not
+    # comparable across block sizes, and the 0.02 bar was set under 21-day
+    # blocks.
+    fold_block_days: float = 7.0
     # A test block that is full on TIME can still be thin on DATA: coverage
     # varies 8x across the history. Below this it is skipped and said so,
     # rather than averaged in as a peer of a block twenty times its size.
