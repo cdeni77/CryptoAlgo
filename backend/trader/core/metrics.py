@@ -234,6 +234,51 @@ class EvaluationReport:
         return len(self.folds)
 
     @property
+    def fold_drawdowns(self) -> list[float]:
+        """Each fold's own worst drawdown, on its own book from the same start.
+
+        A fold is a FIXED 21-day block, so this cannot ratchet with history the
+        way the continuous curve does — see `median_fold_drawdown`.
+        """
+        out = []
+        for fold in self.folds:
+            stats = getattr(fold, 'stats', None)
+            value = getattr(stats, 'max_drawdown', None) if stats else None
+            if value is not None and np.isfinite(value):
+                out.append(float(value))
+        return out
+
+    @property
+    def median_fold_drawdown(self) -> float:
+        """**The drawdown statistic that can be gated, because it holds still.**
+
+        `max_drawdown` on the continuous curve is a running maximum over the
+        whole out-of-sample span. It can only ratchet upward: adding days can
+        never lower it, so against a fixed bar it eventually fails forever
+        whatever the model does. Measured on the SAME configuration three days
+        apart, it went 0.182 -> 0.388 and failed a 0.35 gate it had just
+        passed. That is a property of the statistic, not of the strategy.
+
+        Any max-over-the-sample quantity has this problem, so the fix is not a
+        looser bar — it is a statistic whose expectation does not grow with the
+        sample. The median across folds is one: each fold is a fixed-length
+        block with its own book, so it answers "what does a typical three-week
+        stretch look like" and gives the same answer next week.
+
+        The continuous figure stays in the report as a diagnostic. It is still
+        the honest answer to "what is the worst this has ever been", which is
+        worth knowing and not worth gating.
+        """
+        values = self.fold_drawdowns
+        return float(np.median(values)) if values else float('nan')
+
+    @property
+    def worst_fold_drawdown(self) -> float:
+        """Reported, not gated: a max over folds ratchets as folds accumulate."""
+        values = self.fold_drawdowns
+        return float(np.max(values)) if values else float('nan')
+
+    @property
     def sign_agreement_p_value(self) -> float:
         """P(at least this many folds positive | no skill), each fold a coin flip.
 
@@ -426,6 +471,8 @@ class EvaluationReport:
                 1.0 if (continuous and np.isfinite(continuous.sharpe)
                         and continuous.sharpe > IMPLAUSIBLE_SHARPE) else 0.0),
             'max_drawdown': continuous.max_drawdown if continuous else float('nan'),
+            'median_fold_drawdown': self.median_fold_drawdown,
+            'worst_fold_drawdown': self.worst_fold_drawdown,
             'halted': 1.0 if (continuous and continuous.halted) else 0.0,
         }
 
@@ -729,7 +776,32 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     'total_return': (0.0, 'min'),
     'sharpe': (0.5, 'min'),
     'sharpe_implausible': (0.0, 'max'),
+    # **Two drawdown questions, and they need two statistics.**
+    #
+    # `max_drawdown` is the worst peak-to-trough over the whole out-of-sample
+    # path, held at the SAME number as the live breaker: a drawdown that blocks
+    # promotion should stop the money too, which is why
+    # `Config.max_drawdown_fraction` and this bar are asserted equal.
+    #
+    # It looked unusable when the SAME configuration three days apart went
+    # 0.182 -> 0.388 and failed a bar it had just passed. That was the sliding
+    # fold boundaries re-cutting the equity path, not the strategy, and it is
+    # fixed at the source. With anchored folds this moves only when a genuinely
+    # worse drawdown occurs, which is worth failing on. It still ratchets — a
+    # running maximum cannot do otherwise — just slowly and meaningfully.
+    #
+    # `median_fold_drawdown` is the same risk question asked of a statistic
+    # whose expectation does not grow with the sample: each fold is a fixed
+    # 21-day block with its own book, so this is "what does a typical three-week
+    # stretch look like" and it gives the same answer next week.
+    #
+    # 0.20 against a measured median of 0.080 (folds: 0.0, 2.58, 2.59, 7.60,
+    # 8.41, 12.79, 22.47, 36.11). Deliberately loose — it catches typical
+    # three-week risk more than doubling, not a fine-tuning of it. The bars that
+    # protect real money are the live breakers, the $250 ruin floor and the $75
+    # daily-loss halt, and they are unaffected by anything here.
     'max_drawdown': (0.35, 'max'),
+    'median_fold_drawdown': (0.20, 'max'),
     'halted': (0.0, 'max'),
 }
 
@@ -783,7 +855,15 @@ GATE_NOTES: dict[str, str] = {
                           f'signature, not an edge — every other gate asks '
                           f'whether the number is good, this one asks whether '
                           f'it is possible',
-    'max_drawdown': 'a $100 account has to survive to compound',
+    'max_drawdown': 'the worst this has ever been, held at the live breaker\'s own '
+                    'number so a drawdown that blocks promotion also stops the '
+                    'money. It ratchets, which is meaningful now the folds hold '
+                    'still and was not when they slid',
+    'median_fold_drawdown': 'a typical three-week block, on a statistic that does '
+                            'not grow with the sample the way a running maximum '
+                            'does. The account still has to survive to compound',
+    'worst_fold_drawdown': 'reported, not gated: a max over folds ratchets as '
+                           'folds accumulate',
     'halted': 'the bankroll floor was breached during the run',
 }
 
