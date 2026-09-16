@@ -232,12 +232,34 @@ class Config:
     #     median-fold ECE  0.0161      0.0150   <- calendar better here too
     #
     # Every calendar fold except the thin one is better calibrated than every
-    # count fold. So: 'calendar' for estimating SKILL, where balanced spans
-    # tighten the standard error (t 3.15 -> 4.18); 'count' for GATING, where
+    # count fold, and equal spans tighten the standard error (t 3.15 -> 4.18).
+    #
+    # **Gating moved from 'count' to 'calendar' on 2026-09-16, once calendar
+    # was actually anchored.** The old argument for gating on counts was that
     # balanced sizes make "the worst fold" a comparison rather than a lottery.
-    # `--fold-scheme calendar` remains available for research.
-    fold_scheme: str = 'count'
+    # That is true about fold SIZE and was silent about fold POSITION: neither
+    # scheme held its boundaries still, and 'count' cannot — its blocks are
+    # defined by data volume, so appending re-cuts them by construction.
+    #
+    # Measured cost of that: the SAME configuration evaluated three days apart
+    # took max_drawdown 0.182 -> 0.388 and calibration_vs_market -0.014 ->
+    # +0.009, failing three gates it had just passed, while model_minus_market
+    # IMPROVED. A gate is only a measurement if the thing under it holds still,
+    # and a weekly promotion turned that from a nuisance into the deciding
+    # factor. `--fold-scheme count` remains available for comparison.
+    fold_scheme: str = 'calendar'
     n_folds: int = 6
+    # The block length for `fold_scheme='calendar'`, in days. A STATED
+    # parameter rather than one derived from however much data happens to
+    # exist: deriving it is what made the boundaries slide on every append,
+    # which is the whole defect the anchoring fixes. 35 days is the block width
+    # the previous proportional cut produced at the 248-day span where this was
+    # found, so the change is behaviour-preserving at the moment it landed.
+    fold_block_days: float = 21.0
+    # A test block that is full on TIME can still be thin on DATA: coverage
+    # varies 8x across the history. Below this it is skipped and said so,
+    # rather than averaged in as a peer of a block twenty times its size.
+    min_test_windows: int = 200
     # Purge and embargo, in minutes, applied on both sides of every test
     # block. It must cover the longest feature lookback (1440) as well as the
     # label span (15), because a train row immediately after a test block

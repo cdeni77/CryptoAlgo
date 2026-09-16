@@ -1,0 +1,508 @@
+{
+  "version": "20260913T130731Z",
+  "created_at": "2026-09-13T13:07:31.515781+00:00",
+  "passed": false,
+  "installed": false,
+  "forced": false,
+  "force_reason": null,
+  "gates": [
+    {
+      "name": "market_windows",
+      "value": 4485.0,
+      "threshold": 2000.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "model_minus_market",
+      "value": 0.0013194567996517859,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "log_loss_skill",
+      "value": 0.0026891473500184337,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "folds_skill_positive",
+      "value": 5.0,
+      "threshold": 5.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "calibration_error",
+      "value": 0.021510367413416377,
+      "threshold": 0.02,
+      "direction": "max",
+      "passed": false
+    },
+    {
+      "name": "calibration_max_deviation",
+      "value": 0.056794895176064564,
+      "threshold": 0.1,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "calibration_vs_market",
+      "value": 0.009346325334487482,
+      "threshold": 0.0,
+      "direction": "max",
+      "passed": false
+    },
+    {
+      "name": "non_finite_share",
+      "value": 0.0,
+      "threshold": 0.001,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "residual_scale",
+      "value": 1.0617938289953772,
+      "threshold": 0.25,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "control_gain_share",
+      "value": 0.0,
+      "threshold": 0.3,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "windows_evaluated",
+      "value": 21599.0,
+      "threshold": 20000.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "trades",
+      "value": 1202.0,
+      "threshold": 200.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "coverage",
+      "value": 0.05565072457058197,
+      "threshold": 0.0005,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "realised_edge_pp",
+      "value": 2.6180744432876324,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "total_return",
+      "value": 0.9564939999999995,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "sharpe",
+      "value": 1.954006639146679,
+      "threshold": 0.5,
+      "direction": "min",
+      "passed": "True"
+    },
+    {
+      "name": "sharpe_implausible",
+      "value": 0.0,
+      "threshold": 0.0,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "max_drawdown",
+      "value": 0.38758019476081323,
+      "threshold": 0.35,
+      "direction": "max",
+      "passed": false
+    },
+    {
+      "name": "halted",
+      "value": 0.0,
+      "threshold": 0.0,
+      "direction": "max",
+      "passed": true
+    }
+  ],
+  "failed_gates": [
+    "calibration_error",
+    "calibration_vs_market",
+    "max_drawdown"
+  ],
+  "model": {
+    "features": [
+      "venue_prob_gap",
+      "venue_gap_change_5",
+      "venue_spread_ratio",
+      "pm_available",
+      "z_score",
+      "abs_z_score",
+      "excursion_up_z",
+      "excursion_down_z",
+      "excursion_span_z",
+      "excursion_asymmetry",
+      "path_efficiency",
+      "displacement_vs_elapsed",
+      "touched_opposite",
+      "log_rv_15",
+      "log_rv_60",
+      "log_rv_240",
+      "log_rv_1440",
+      "rv_slope_short",
+      "rv_slope_long",
+      "range_to_return",
+      "vol_of_vol",
+      "log_sigma_per_min",
+      "rv_surprise",
+      "seasonal_ramp",
+      "autocorr_60",
+      "run_length",
+      "body_ratio_15",
+      "volume_z_15",
+      "vwap_gap_15",
+      "signed_volume_15",
+      "zero_return_share_60",
+      "peer_displacement",
+      "peer_return_5",
+      "peer_return_15",
+      "lead_residual",
+      "beta_1440",
+      "universe_dispersion",
+      "elapsed_fraction",
+      "remaining_minutes",
+      "spread",
+      "imbalance_touch",
+      "imbalance_5c",
+      "depth_ratio",
+      "book_convexity",
+      "iv_minus_realised",
+      "implied_sigma_per_min",
+      "iv_r2",
+      "iv_n_strikes",
+      "iv_staleness_minutes"
+    ],
+    "n_features": 49,
+    "n_features_populated": 49,
+    "empty_features": [],
+    "groups": [
+      "cross_venue",
+      "geometry",
+      "vol_state",
+      "microstructure",
+      "cross_asset",
+      "offset",
+      "market_state",
+      "implied_vol"
+    ],
+    "residual_scale": 0.812800250380694,
+    "init_score_source": "market",
+    "n_train_rows": 69244,
+    "n_train_windows": 13009,
+    "best_iteration": 144,
+    "train_log_loss": 0.4516090912462329,
+    "inner_log_loss": 0.49843374158670195,
+    "inner_baseline_log_loss": 0.501585763520759,
+    "inner_log_loss_skill": 0.0031520219340570588,
+    "control_importance_share": 0.0,
+    "baseline": {
+      "distribution": "student_t",
+      "nu": 5.107254429286334,
+      "scale": {
+        "3": 1.1923653966748768,
+        "6": 1.067531135606085,
+        "9": 1.0416684548356276,
+        "12": 0.9515079767148497
+      },
+      "n_fitted": 69230,
+      "fitted_log_loss": 0.46824258242676386
+    },
+    "deployable": true,
+    "config": {
+      "symbols": [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD"
+      ],
+      "venue": "coinbase_spot",
+      "timeframe": "1m",
+      "window_minutes": 15,
+      "decision_offsets": [
+        3,
+        6,
+        9,
+        12
+      ],
+      "vol_lookbacks_minutes": [
+        15,
+        60,
+        240,
+        1440
+      ],
+      "baseline_distribution": "student_t",
+      "baseline_nu": null,
+      "init_score_source": "market",
+      "n_folds": 6,
+      "embargo_minutes": 1440,
+      "recency_half_life_days": null,
+      "train_window_days": null,
+      "fee_rate": 0.07,
+      "half_spread_cents": 0.5,
+      "fee_config_version": "builtin_kalshi_v202608",
+      "fold_scheme": "count",
+      "entry_offsets": [
+        12
+      ],
+      "compound": false,
+      "starting_bankroll": 200.0,
+      "max_stake_dollars": 25.0,
+      "max_stake_fraction": 0.05,
+      "kelly_fraction": 0.1,
+      "min_edge_pp": 3.0,
+      "cli_overrides": [
+        "entry_offsets",
+        "init_score_source",
+        "kelly_fraction",
+        "min_edge_pp",
+        "starting_bankroll"
+      ]
+    }
+  },
+  "report": {
+    "reliability": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.02,
+        "predicted": 0.010742438102446537,
+        "observed": 0.010714285714285714,
+        "count": 280
+      },
+      {
+        "bin_low": 0.02,
+        "bin_high": 0.04,
+        "predicted": 0.029376400008135538,
+        "observed": 0.04430379746835443,
+        "count": 316
+      },
+      {
+        "bin_low": 0.04,
+        "bin_high": 0.06,
+        "predicted": 0.0497457167336576,
+        "observed": 0.08196721311475409,
+        "count": 244
+      },
+      {
+        "bin_low": 0.06,
+        "bin_high": 0.08,
+        "predicted": 0.06983807726206061,
+        "observed": 0.08366533864541832,
+        "count": 251
+      },
+      {
+        "bin_low": 0.08,
+        "bin_high": 0.1,
+        "predicted": 0.08981625113493591,
+        "observed": 0.12121212121212122,
+        "count": 264
+      },
+      {
+        "bin_low": 0.1,
+        "bin_high": 0.15,
+        "predicted": 0.12546469903103508,
+        "observed": 0.12195121951219512,
+        "count": 574
+      },
+      {
+        "bin_low": 0.15,
+        "bin_high": 0.2,
+        "predicted": 0.1749722725221455,
+        "observed": 0.21428571428571427,
+        "count": 602
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.3,
+        "predicted": 0.25030922304021674,
+        "observed": 0.2855917667238422,
+        "count": 1166
+      },
+      {
+        "bin_low": 0.3,
+        "bin_high": 0.4,
+        "predicted": 0.349940338000268,
+        "observed": 0.35810276679841896,
+        "count": 1265
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.5,
+        "predicted": 0.45229361313206107,
+        "observed": 0.45354330708661417,
+        "count": 1270
+      },
+      {
+        "bin_low": 0.5,
+        "bin_high": 0.6,
+        "predicted": 0.5496672261460297,
+        "observed": 0.5488837567359507,
+        "count": 1299
+      },
+      {
+        "bin_low": 0.6,
+        "bin_high": 0.7,
+        "predicted": 0.6488227950740798,
+        "observed": 0.6666666666666666,
+        "count": 1263
+      },
+      {
+        "bin_low": 0.7,
+        "bin_high": 0.8,
+        "predicted": 0.7475452401276856,
+        "observed": 0.7517667844522968,
+        "count": 1132
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 0.85,
+        "predicted": 0.8247775434263143,
+        "observed": 0.8307692307692308,
+        "count": 585
+      },
+      {
+        "bin_low": 0.85,
+        "bin_high": 0.9,
+        "predicted": 0.8750267458873795,
+        "observed": 0.9019264448336253,
+        "count": 571
+      },
+      {
+        "bin_low": 0.9,
+        "bin_high": 0.92,
+        "predicted": 0.9098905269593924,
+        "observed": 0.8803827751196173,
+        "count": 209
+      },
+      {
+        "bin_low": 0.92,
+        "bin_high": 0.94,
+        "predicted": 0.9302379994366485,
+        "observed": 0.9404761904761905,
+        "count": 252
+      },
+      {
+        "bin_low": 0.94,
+        "bin_high": 0.96,
+        "predicted": 0.9507500933485821,
+        "observed": 0.9367588932806324,
+        "count": 253
+      },
+      {
+        "bin_low": 0.96,
+        "bin_high": 0.98,
+        "predicted": 0.9706226984823597,
+        "observed": 0.9696969696969697,
+        "count": 396
+      },
+      {
+        "bin_low": 0.98,
+        "bin_high": 1.0,
+        "predicted": 0.9895986680543943,
+        "observed": 0.9906103286384976,
+        "count": 426
+      }
+    ],
+    "folds": 6,
+    "windows_evaluated": 21599,
+    "log_loss_skill": 0.0026891473500184337,
+    "log_loss_skill_se": 0.0011771260852778734,
+    "log_loss_skill_t": 2.284502385641748,
+    "folds_positive": 5,
+    "sign_agreement_p": 0.109375,
+    "max_calibration_error": 0.021510367413416377,
+    "mean_residual_scale": 1.0636668822448299,
+    "max_control_gain_share": 0.0,
+    "gate_values": {
+      "log_loss_skill": 0.0026891473500184337,
+      "folds_skill_positive": 5.0,
+      "calibration_error": 0.021510367413416377,
+      "calibration_max_deviation": 0.056794895176064564,
+      "non_finite_share": 0.0,
+      "residual_scale": 1.0617938289953772,
+      "control_gain_share": 0.0,
+      "windows_evaluated": 21599.0,
+      "trades": 1202.0,
+      "coverage": 0.05565072457058197,
+      "realised_edge_pp": 2.6180744432876324,
+      "total_return": 0.9564939999999995,
+      "sharpe": 1.954006639146679,
+      "sharpe_implausible": 0.0,
+      "max_drawdown": 0.38758019476081323,
+      "halted": 0.0
+    },
+    "config": {
+      "symbols": [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD"
+      ],
+      "venue": "coinbase_spot",
+      "timeframe": "1m",
+      "window_minutes": 15,
+      "decision_offsets": [
+        3,
+        6,
+        9,
+        12
+      ],
+      "vol_lookbacks_minutes": [
+        15,
+        60,
+        240,
+        1440
+      ],
+      "baseline_distribution": "student_t",
+      "baseline_nu": null,
+      "init_score_source": "market",
+      "n_folds": 6,
+      "embargo_minutes": 1440,
+      "recency_half_life_days": null,
+      "train_window_days": null,
+      "fee_rate": 0.07,
+      "half_spread_cents": 0.5,
+      "fee_config_version": "builtin_kalshi_v202608",
+      "fold_scheme": "count",
+      "entry_offsets": [
+        12
+      ],
+      "compound": false,
+      "starting_bankroll": 200.0,
+      "max_stake_dollars": 25.0,
+      "max_stake_fraction": 0.05,
+      "kelly_fraction": 0.1,
+      "min_edge_pp": 3.0,
+      "cli_overrides": [
+        "entry_offsets",
+        "init_score_source",
+        "kelly_fraction",
+        "min_edge_pp",
+        "starting_bankroll"
+      ]
+    },
+    "notes": []
+  }
+}

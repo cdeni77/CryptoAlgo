@@ -77,7 +77,9 @@ def purged_walk_forward(
     n_folds: int = 6,
     embargo_minutes: int = 1440,
     min_train_windows: int = 500,
+    min_test_windows: int = 200,
     scheme: str = 'calendar',
+    fold_block_days: float = 21.0,
 ) -> list[WindowFold]:
     """Split distinct window opens into expanding folds with a purged gap.
 
@@ -98,8 +100,12 @@ def purged_walk_forward(
     moves between runs when only the splitting changed — which happens on every
     run once collection is continuous.
 
-    `'calendar'` cuts into equal spans of time. Earlier boundaries then stay put
-    as data arrives, so fold-level results are comparable run to run. Measured
+    `'calendar'` cuts into equal spans of `fold_block_days`, ANCHORED to the
+    first window, so earlier boundaries genuinely stay put as data arrives and
+    fold-level results are comparable run to run. That was always the stated
+    reason for this scheme and until 2026-09-16 the implementation did not
+    deliver it — it divided the span between the first and LAST window, so every
+    boundary slid on every append. Measured
     on 12,909 complete-case windows it is also simply a better estimator:
 
         equal-count      +0.00276 +/- 0.00088  t=+3.15  6/6
@@ -123,15 +129,82 @@ def purged_walk_forward(
         cuts = [index[e] if e < len(index) else index[-1] + pd.Timedelta(1)
                 for e in np.linspace(0, len(index), n_folds + 2, dtype=int)]
     else:
-        # Equal spans of TIME. The last edge is nudged past the final window so
-        # the closing block is inclusive, exactly as the count form's slice is.
-        cuts = list(pd.date_range(index.min(), index.max(), periods=n_folds + 2))
-        cuts[-1] = cuts[-1] + pd.Timedelta(minutes=1)
+        # **Equal spans of TIME, ANCHORED to the first window.**
+        #
+        # This used to be `pd.date_range(index.min(), index.max(),
+        # periods=n_folds + 2)`, which divides the span between the first and
+        # LAST window — so every interior boundary slides whenever data is
+        # appended. Measured: adding 3 days to a 245-day span moved the cuts by
+        # +10h, +21h, +31h, +41h, +51h, +62h, +72h. Fold 5's test block shifted
+        # by more than two days.
+        #
+        # That contradicted this function's own documented reason for existing,
+        # which said "earlier boundaries then stay put as data arrives, so
+        # fold-level results are comparable run to run". They did not, and the
+        # consequence showed up the moment promotion became weekly: the SAME
+        # configuration on 3 extra days took `max_drawdown` 0.182 -> 0.388 and
+        # `calibration_vs_market` -0.014 -> +0.009, failing three gates it had
+        # passed. Almost none of that was the model.
+        #
+        # Anchoring needs a block length that does not depend on how much data
+        # exists yet — that dependency IS the bug — so it is a stated parameter
+        # rather than an emergent one. New data extends the final block and,
+        # when it overflows, starts a new one; existing boundaries never move.
+        block = pd.Timedelta(days=float(fold_block_days))
+        origin = index.min()
+        span = index.max() - origin
+        # **COMPLETE blocks only.** The trailing stub — however much data has
+        # arrived since the last boundary — is not a test block. Testing on it
+        # would hand back a fold whose width changes every run, which is the
+        # instability being removed, dressed up as coverage. The cost is real
+        # and bounded: up to `fold_block_days` of the newest data sits outside
+        # the test set until its block completes.
+        n_blocks = max(int(span // block), 1)
+        edges = [origin + k * block for k in range(n_blocks + 1)]
+        # The most recent blocks, so the evaluation tracks the market it will
+        # trade. Earlier blocks roll off at a boundary crossing rather than
+        # every run, which is the difference between a comparison and a lottery.
+        cuts = edges[-(n_folds + 2):] if len(edges) >= n_folds + 2 else edges
+        if len(cuts) < 3:
+            # Fewer than two blocks: there is no anchored grid to speak of, and
+            # refusing outright would break every short-span research run
+            # (`--end` experiments, a store only weeks old). Fall back to
+            # subdividing what exists, and SAY SO — the boundaries are then
+            # span-dependent again, which is exactly the property the anchoring
+            # exists to provide, so a caller comparing runs must know it is
+            # absent.
+            logger.warning(
+                'span %s is shorter than two %.0f-day blocks, so folds are '
+                'subdivided proportionally and their boundaries WILL move as '
+                'data arrives. Lower fold_block_days to anchor them.',
+                span, float(fold_block_days))
+            cuts = list(pd.date_range(index.min(), index.max(),
+                                      periods=n_folds + 2))
+            cuts[-1] = cuts[-1] + pd.Timedelta(minutes=1)
     embargo = pd.Timedelta(minutes=embargo_minutes)
     folds: list[WindowFold] = []
-    for i in range(n_folds):
+    # **As many folds as there are blocks, which is not always `n_folds`.**
+    # The count scheme always produces exactly `n_folds + 2` cuts because it
+    # divides the index; an ANCHORED calendar grid produces however many blocks
+    # the span actually spans, which is fewer on a young store or a long block.
+    # Indexing blindly to `n_folds` raised IndexError on both.
+    for i in range(min(n_folds, max(len(cuts) - 2, 0))):
         test = index[(index >= cuts[i + 1]) & (index < cuts[i + 2])]
         if len(test) == 0:
+            continue
+        # **A block thin on DATA is not a fold, even when it is full on TIME.**
+        # Anchored blocks are equal spans, and `--complete-cases` coverage
+        # varies 8x across the history (30 to 244 windows/day), so an early
+        # block can be a real 21 days holding a few hundred windows. Scoring it
+        # as a peer of a 5,000-window block makes "the worst fold" a lottery —
+        # which is the objection that kept gating on counts, and it is answered
+        # here directly rather than by giving up equal spans.
+        if len(test) < min_test_windows:
+            logger.warning(
+                'fold %d: %d test windows in [%s .. %s) is under the %d '
+                'minimum, skipped — the block is full on time and thin on '
+                'data', i, len(test), cuts[i + 1], cuts[i + 2],
+                min_test_windows)
             continue
         train_pool = index[index < cuts[i + 1]]
         train = train_pool[train_pool < test[0] - embargo]

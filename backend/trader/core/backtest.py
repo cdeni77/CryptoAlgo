@@ -181,7 +181,9 @@ def walk_forward(
     folds = list(folds) if folds is not None else purged_walk_forward(
         window_index, n_folds=config.n_folds,
         embargo_minutes=config.embargo_minutes,
-        scheme=getattr(config, 'fold_scheme', 'calendar'))
+        scheme=getattr(config, 'fold_scheme', 'calendar'),
+        fold_block_days=getattr(config, 'fold_block_days', 21.0),
+        min_test_windows=getattr(config, 'min_test_windows', 200))
 
     evaluations: list[FoldEvaluation] = []
     models: list[ForecastModel] = []
