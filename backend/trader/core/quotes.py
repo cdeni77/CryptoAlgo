@@ -45,10 +45,36 @@ DEPTH_MAP = {
     'depth_bid_total': 'bid_vol', 'depth_ask_total': 'ask_vol',
 }
 QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
-                  'quote_age_seconds', 'quote_source',
+                  'quote_age_seconds', 'quote_source', 'quote_observer',
                   # Not features — `decide()` reads these to cap the stake.
                   'depth_up', 'depth_down')
                  + tuple(DEPTH_MAP.values()))
+# Which observer to believe when several recorded the same minute.
+#
+# **`quote_age_seconds` is NOT comparable across sources, so it cannot be the
+# ranking key.** It means a different thing in each producer: for `backfill` it
+# is time since the last book CHANGE (Predexon serves changes, so a quiet book
+# reads ~0.5s), while for the live recorders it is the sampler's own lag, and
+# `scripts/record_ladder.py` samples at +25s past the minute. Measured at
+# offset 12: backfill 0.52s median, live/live_ws 32.7s, `live_touch` NaN. Rank
+# on that and backfill wins essentially every contested row — not because it is
+# fresher, but because its clock starts later.
+#
+# That is the same defect already recorded for `levels_bid`/`levels_ask` across
+# sources (ratio 0.579), except used as a SELECTOR rather than a feature, so it
+# silently chose a provenance while appearing to choose a freshness.
+#
+# It matters because the model is fitted to correct `market_probability`
+# (`init_score_source=market`) and then trades against whatever `scripts/live.py`
+# reads at the decision instant. Those must be the same object. `live_touch` IS
+# that object — `live._record_touch` writes the quote the loop actually decided
+# on — so it ranks first, ahead of the minute-grid recorders, ahead of the
+# after-the-fact reconstruction. The old ordering put it LAST of the four.
+QUOTE_SOURCE_PRIORITY = tuple(
+    s.strip() for s in os.getenv(
+        'QUOTE_SOURCE_PRIORITY', 'live_touch,live_ws,live,backfill').split(',')
+    if s.strip())
+
 # A book quoted twenty minutes ago is not a price this decision could have
 # taken. Measured on the real store, 88.1% of backfilled minute rows are fresher
 # than 30s and 70.8% fresher than 5s, so tightening this costs little coverage.
@@ -82,6 +108,7 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     for column in QUOTE_COLUMNS:
         out[column] = np.nan
     out['quote_source'] = None
+    out['quote_observer'] = None
     if depth is None or not len(depth) or not len(out):
         return out
 
@@ -128,13 +155,40 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     book['depth_down'] = (bid_size * book['ask_down']).where(keep)
     book['quote_age_seconds'] = age.where(keep)
     book['quote_source'] = np.where(keep, venue, None)
+    # WHICH observer priced the row, as opposed to which venue. `quote_source`
+    # has always held the venue despite its name, so nothing downstream could
+    # tell a reconstruction from an observation — which is precisely why the
+    # ranking defect above survived: the mixture was invisible in every frame
+    # that carried it. `research/validate` and the market gates can now split
+    # on it, and a shift in the mix is a thing that can be seen rather than
+    # inferred from a disagreeing number.
+    book['quote_observer'] = (np.where(keep, book['source'], None)
+                              if 'source' in book.columns else None)
 
     # One row per (symbol, window, offset). `venue_depth` can hold the same
     # minute from more than one observer — that is what `source` is for — so
     # collapse before joining rather than fanning the window table out.
-    book = (book.sort_values('quote_age_seconds', na_position='last')
+    #
+    # Ranked on three keys, in this order:
+    #   1. `_unusable` — a row that failed `sane`/`fresh` must never displace a
+    #      row that passed. The previous version got this for free by NaN-ing
+    #      such a row's age and sorting nulls last; now that age is no longer
+    #      the leading key, it has to be said out loud.
+    #   2. `_source_rank` — see QUOTE_SOURCE_PRIORITY. This is the fix.
+    #   3. age — still the tie-break, but only WITHIN one source, which is the
+    #      only comparison where it means one thing.
+    book['_unusable'] = (~keep).astype(int)
+    if 'source' in book.columns:
+        rank = {name: i for i, name in enumerate(QUOTE_SOURCE_PRIORITY)}
+        book['_source_rank'] = (book['source'].map(rank)
+                                .fillna(len(rank)).astype(int))
+    else:
+        book['_source_rank'] = 0
+    book = (book.sort_values(['_unusable', '_source_rank', 'quote_age_seconds'],
+                             na_position='last')
                 .drop_duplicates(['symbol', 'window_open', 'offset_minutes'],
-                                 keep='first'))
+                                 keep='first')
+                .drop(columns=['_unusable', '_source_rank']))
 
     for src, dst in DEPTH_MAP.items():
         book[dst] = pd.to_numeric(book.get(src), errors='coerce').where(keep) \
@@ -142,6 +196,7 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
 
     take = ['symbol', 'window_open', 'offset_minutes', 'ask_up', 'ask_down',
             'market_probability', 'quote_age_seconds', 'quote_source',
+            'quote_observer',
             # The stake cap. Listed here and not derived from QUOTE_COLUMNS
             # because that tuple is also the drop list above; keeping them in
             # step is the reason this line exists rather than a comprehension.
