@@ -26,7 +26,11 @@ import pytest
 from core.cv import purged_walk_forward
 
 ORIGIN = pd.Timestamp('2026-01-09', tz='UTC')
-BLOCK = 21.0  # matches Config.fold_block_days
+# An explicit block width for these tests. It deliberately does NOT track
+# Config.fold_block_days (now 7.0): what is under test here is that anchored
+# boundaries hold still, which must hold at ANY width. The old comment
+# claimed it matched the Config and silently stopped being true.
+BLOCK = 21.0
 
 
 def _folds(days: float, scheme: str = 'calendar', block: float = BLOCK):

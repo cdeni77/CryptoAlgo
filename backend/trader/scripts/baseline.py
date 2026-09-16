@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 
 from core.baseline import log_loss, reliability
-from core.cv import assert_no_leakage, effective_observations, purged_walk_forward
+from core.cv import assert_no_leakage, effective_observations, folds_for_config
 from core.dataset import apply_fold, fit_fold
 from scripts._common import (
     add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
@@ -54,8 +54,7 @@ def main() -> int:
     print_header('Barrier baseline — the null hypothesis', config)
 
     dataset = load_dataset(args, config)
-    folds = purged_walk_forward(dataset.window_index, n_folds=config.n_folds,
-                                embargo_minutes=config.embargo_minutes)
+    folds = folds_for_config(dataset.window_index, config)
     groups = groups_from_args(args)
 
     distributions = (['normal', 'student_t'] if args.compare_distributions

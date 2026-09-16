@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from core.baseline import log_loss, reliability
-from core.cv import purged_walk_forward, recency_weights
+from core.cv import folds_for_config, recency_weights
 from core.dataset import apply_fold, fit_fold
 from core.features import population_report
 from core.model import fit_model
@@ -52,8 +52,7 @@ def main() -> int:
     print_header('Train one model, for inspection', config)
 
     dataset = load_dataset(args, config)
-    folds = purged_walk_forward(dataset.window_index, n_folds=config.n_folds,
-                                embargo_minutes=config.embargo_minutes)
+    folds = folds_for_config(dataset.window_index, config)
     fold = folds[-1]
     print(f'  {fold.label()}  (the last fold; this is one look, not an evaluation)')
 

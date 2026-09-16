@@ -261,6 +261,36 @@ def purged_walk_forward(
     return folds
 
 
+def folds_for_config(window_index, config) -> list[WindowFold]:
+    """`purged_walk_forward` with EVERY geometry field read off the Config.
+
+    **The single place folds are built from a Config, because the alternative
+    was measured and it diverged.** `purged_walk_forward` carries its own
+    defaults, and `scripts/train.py`, `scripts/baseline.py` and
+    `scripts/ablate.py` each called it passing only `n_folds` and
+    `embargo_minutes`. So `--fold-scheme count` was parsed, echoed in the
+    header, recorded in provenance -- and ignored, while `core/backtest.py`
+    forwarded all seven fields and cut a different experiment.
+
+    That went from latent to live the moment `Config.fold_block_days` became
+    7.0 while this module's default stayed 21.0: the gated numbers were cut
+    into 7-day blocks and the ablation deciding which feature groups survive
+    was cut into 21-day ones. Two different experiments, same run, no warning.
+
+    Adding an argument to three call sites would fix today's instance and leave
+    the fourth caller to be written wrong later. A function that takes the
+    Config cannot be called with half of it.
+    """
+    return purged_walk_forward(
+        window_index,
+        n_folds=config.n_folds,
+        embargo_minutes=config.embargo_minutes,
+        scheme=getattr(config, 'fold_scheme', 'calendar'),
+        fold_block_days=getattr(config, 'fold_block_days', 21.0),
+        min_test_windows=getattr(config, 'min_test_windows', 200),
+        train_days=getattr(config, 'fold_train_days', None))
+
+
 def assert_no_leakage(fold: WindowFold) -> None:
     """Refuse a fold whose sets overlap or whose embargo is not honoured."""
     overlap = fold.train.intersection(fold.test)

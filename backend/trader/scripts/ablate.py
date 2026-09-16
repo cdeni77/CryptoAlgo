@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 
 from core.baseline import log_loss
-from core.cv import assert_no_leakage, purged_walk_forward
+from core.cv import assert_no_leakage, folds_for_config
 from core.dataset import apply_fold, fit_fold
 from core.features import CONTROL_GROUPS, FEATURE_GROUPS
 from core.model import fit_model
@@ -72,13 +72,12 @@ def main() -> int:
     parser.add_argument('--out', type=str, default=None,
                         help='Write the table to ablation.csv in this directory')
     args = parser.parse_args()
-    setup_logging(args)
+    setup_logging(args.verbose)
     config = config_from_args(args)
     print_header('Ablation', config)
 
     dataset = load_dataset(args, config)
-    folds = purged_walk_forward(dataset.window_index, n_folds=config.n_folds,
-                                embargo_minutes=config.embargo_minutes)
+    folds = folds_for_config(dataset.window_index, config)
     for fold in folds:
         assert_no_leakage(fold)
 

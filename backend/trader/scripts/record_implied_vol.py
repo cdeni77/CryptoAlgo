@@ -391,10 +391,20 @@ def build_parser() -> argparse.ArgumentParser:
     # is ONE OF THE FIVE FEATURES: the model saw R2 from 0.0002 to 1.0 and
     # learned what a weak fit is worth, so discarding weak fits upstream
     # removes the information it was given to make that judgement.
+    # **The gate STAYS at 0.90, and the parity argument above is why that is not
+    # obvious.** Removing it was tried and reverted: it did not make live match
+    # the backfill, it revealed that the two never selected the same STRIKES.
+    # Live fits the whole open ladder (17-50 rungs) where Predexon's tick series
+    # carried only the liquid ones (median 5), so the suppressed fits were not
+    # merely low-R2, they were wrong by orders of magnitude -- SOL's median
+    # implied sigma came back 2,243 bp/min against a training median of 7.8.
+    # `tests/test_iv_r2_parity.py` pins this. Lower it only together with
+    # matching the strike selection.
     parser.add_argument('--min-r2', type=float, default=0.90,
-                        help='drop fits below this R2. Default 0.0 to match '
-                             'the backfill the model was trained on; iv_r2 is '
-                             'a feature, so the model judges fit quality')
+                        help='drop fits below this R2 (default 0.90). It does '
+                             'NOT match the backfill, which applies no gate -- '
+                             'that parity is blocked on the strike-selection '
+                             'mismatch; see tests/test_iv_r2_parity.py')
     return parser
 
 
