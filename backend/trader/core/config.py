@@ -176,6 +176,14 @@ class Config:
     # Gaussian barrier overstates confidence at large displacements. Which
     # distribution calibrates better out of sample is measured, not assumed.
     baseline_distribution: str = 'student_t'
+    # Fraction of training rows, most recent by time, held OUT of the baseline's
+    # scale fit and used to fit a single sigma correction afterwards. 0.0 keeps
+    # the historical behaviour. See .
+    # Env-settable so a research run can flip it without a config edit, the
+    # same way QUOTE_MAX_AGE_SECONDS works. Read at import, which is fine
+    # because each evaluation is its own process.
+    baseline_calibration_holdout: float = float(
+        os.getenv('BASELINE_CALIBRATION_HOLDOUT', '0.0'))
     baseline_nu: Optional[float] = None          # fitted when None
     baseline_fit_scale_per_offset: bool = True   # one scale factor per offset
 

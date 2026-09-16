@@ -152,11 +152,25 @@ class BarrierBaseline:
     # fitted, the tail can already have absorbed a scale misspecification, and
     # then these two numbers agree to eight decimals while both are correct.
     unscaled_log_loss: float = float('nan')
+    # **A sigma correction fitted OUT OF SAMPLE, on a held-out tail of the
+    # training rows.** `scale` and `nu` are chosen by minimising log loss on the
+    # rows they are fitted to, and that fit is systematically over-confident on
+    # rows it has not seen: measured live 2026-09-10, the deployed baseline was
+    # over-confident by +0.0362 with ALL SIX probability buckets pushed away
+    # from 0.5, the signature of a sigma fitted too small. In the backtest the
+    # worst fold's model ECE (0.0273) is inherited almost exactly from its
+    # baseline (0.0275) — the head is not adding the error, it is passing it on.
+    #
+    # Above 1.0 this widens sigma and pulls probabilities toward 0.5. It is the
+    # baseline's analogue of `residual_scale`, which does the same job for the
+    # model's correction and has existed for exactly this reason.
+    calibration_scale: float = 1.0
+    n_calibration_rows: int = 0
 
     # ---- prediction -----------------------------------------------------
     def scale_for(self, offsets: np.ndarray) -> np.ndarray:
         lookup = np.vectorize(lambda o: self.scale.get(int(o), self.default_scale))
-        return lookup(np.asarray(offsets)).astype(float)
+        return lookup(np.asarray(offsets)).astype(float) * float(self.calibration_scale)
 
     def z_score(
         self,
@@ -255,6 +269,53 @@ class BarrierBaseline:
             options={'maxiter': 600, 'xatol': 1e-3, 'fatol': 1e-7},
         )
         scales, nu = unpack(result.x)
+
+        # **Calibrate the result on rows the fit did not see.**
+        #
+        # `scale` and `nu` minimise log loss ON THE ROWS THEY ARE FITTED TO, and
+        # that is over-confident out of sample — not from overfitting five
+        # parameters to thousands of rows, but because realised volatility
+        # drifts, so a sigma calibrated to the training period is too small for
+        # a later one. Divide by too small a sigma and |z| is too large and the
+        # probability is pushed toward the tails. Measured live: over-confidence
+        # +0.0362 with all six buckets pushed away from 0.5.
+        #
+        # One parameter, fitted on the most RECENT slice of training, held out
+        # from the scale fit. Recent rather than random because drift is what is
+        # being corrected — a random holdout shares the training period's
+        # volatility and would find nothing to fix.
+        #
+        # Off by default (`baseline_calibration_holdout = 0.0`) so this is
+        # adopted on evidence rather than by assertion.
+        calibration_scale, n_calibration = 1.0, 0
+        holdout = float(getattr(config, 'baseline_calibration_holdout', 0.0) or 0.0)
+        order = (pd.to_datetime(frame['window_open'], utc=True)
+                 if 'window_open' in frame.columns else None)
+        if holdout > 0.0 and order is not None and len(frame) >= 200:
+            # Through pandas, not numpy: `astype('datetime64[ns]')` on a
+            # tz-aware column warns and drops the zone.
+            cut = order.quantile(1.0 - holdout)
+            tail = (order >= cut).to_numpy()
+            if tail.sum() >= 100:
+                d_t, s_t = displacement[tail], sigma[tail]
+                y_t, w_t = outcome[tail], (None if w is None else np.asarray(w)[tail])
+                base_t = s_t * scales[which[tail]]
+
+                def calib_objective(theta: np.ndarray) -> float:
+                    k = float(np.exp(theta[0]))
+                    z = d_t / np.where(base_t * k > 0, base_t * k, np.nan)
+                    return log_loss(y_t, _standardised_cdf(
+                        z, config.baseline_distribution, nu), w_t)
+
+                found = optimize.minimize(
+                    calib_objective, np.zeros(1), method='Nelder-Mead',
+                    options={'maxiter': 200, 'xatol': 1e-3, 'fatol': 1e-7})
+                calibration_scale = float(np.exp(found.x[0]))
+                n_calibration = int(tail.sum())
+                logger.info(
+                    'baseline calibration on %d held-out rows: sigma x %.4f '
+                    '(>1 widens sigma and pulls probabilities toward 0.5)',
+                    n_calibration, calibration_scale)
         unscaled = log_loss(
             outcome,
             _standardised_cdf(displacement / sigma, config.baseline_distribution, nu),
@@ -268,6 +329,8 @@ class BarrierBaseline:
             n_fitted=n_available,
             fitted_log_loss=float(result.fun),
             unscaled_log_loss=float(unscaled),
+            calibration_scale=calibration_scale,
+            n_calibration_rows=n_calibration,
         )
         logger.info(baseline.summary())
         return baseline
