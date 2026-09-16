@@ -268,6 +268,21 @@ class Config:
     # varies 8x across the history. Below this it is skipped and said so,
     # rather than averaged in as a peer of a block twenty times its size.
     min_test_windows: int = 200
+    # **The rolling training window, in days. None means expanding.**
+    #
+    # Expanding is what `scripts/promote.py` actually deploys — the Sunday
+    # retrain fits on all history — so None is the honest default and anything
+    # else must be matched in the retrain before it is traded, or the
+    # evaluation once again describes a system nobody runs.
+    #
+    # The case for a finite window is recency: the venue is eight months old,
+    # coverage improved through 2026, and a model fitted mostly on thin early
+    # history may not describe the book being traded now. The case against is
+    # sample size — at ~54 complete-case windows/day a 35-day window holds
+    # ~1,900 windows against 12,868 expanding, for 49 features. Which wins is
+    # an empirical question and this field exists so it can be asked rather
+    # than assumed.
+    fold_train_days: Optional[float] = None
     # Purge and embargo, in minutes, applied on both sides of every test
     # block. It must cover the longest feature lookback (1440) as well as the
     # label span (15), because a train row immediately after a test block

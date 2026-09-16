@@ -80,6 +80,7 @@ def purged_walk_forward(
     min_test_windows: int = 200,
     scheme: str = 'calendar',
     fold_block_days: float = 21.0,
+    train_days: Optional[float] = None,
 ) -> list[WindowFold]:
     """Split distinct window opens into expanding folds with a purged gap.
 
@@ -234,6 +235,19 @@ def purged_walk_forward(
             continue
         train_pool = index[index < cuts[i + 1]]
         train = train_pool[train_pool < test[0] - embargo]
+        # **A rolling training window, when asked for.** Cut from the embargo's
+        # far edge rather than from the test start, so the window is `train_days`
+        # of USABLE history and does not silently shrink by the embargo — a day
+        # out of 35 is 3% of the sample, and a parameter that means 34 when it
+        # says 35 is the kind of drift this file exists to prevent.
+        #
+        # Expanding stays the default because it is what the Sunday retrain
+        # deploys. Setting this without matching it in the retrain reintroduces
+        # the defect the quote-source work just closed: an evaluation measuring
+        # one system while another trades.
+        if train_days is not None and len(train):
+            floor = (test[0] - embargo) - pd.Timedelta(days=float(train_days))
+            train = train[train >= floor]
         if len(train) < min_train_windows:
             logger.warning(
                 'fold %d: %d training windows is under the %d minimum, skipped',
