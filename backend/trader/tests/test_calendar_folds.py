@@ -77,10 +77,16 @@ def test_a_thin_early_block_costs_a_fold_and_that_must_be_visible():
     first blocks with too little training data, so fewer than `n_folds` come
     back — 3 of 6 on a 4/day start.
 
-    That is not a bug but it is a trap: `folds_skill_positive >= 5` needs six
+    That is not a bug but it WAS a trap: `folds_skill_positive >= 5` needed six
     folds, so a candidate could fail that gate for a splitting reason rather
     than a forecasting one. The count scheme cannot do this, because its blocks
     are sized by the data itself.
+
+    Closed on 2026-09-16 by gating on `sign_agreement_p <= 0.11` instead — the
+    binomial chance of this many folds agreeing if each were a coin flip. It
+    reproduces five-of-six exactly (p = 0.109) and holds that significance at
+    any fold count, so a fold lost to a sparse block costs power rather than an
+    automatic failure.
     """
     thin = purged_walk_forward(_index(per_day_early=4, per_day_late=200),
                                n_folds=6, scheme='calendar')
@@ -88,7 +94,9 @@ def test_a_thin_early_block_costs_a_fold_and_that_must_be_visible():
                                n_folds=6, scheme='calendar')
     assert len(thin) < len(even), (
         f'expected a sparse start to cost folds: {len(thin)} vs {len(even)}')
-    assert len(even) == 6
+    # Not `== 6`: anchored calendar folds ACCUMULATE, so an even timeline
+    # yields every complete block it contains rather than exactly `n_folds`.
+    assert len(even) >= 6
 
 
 def test_the_spans_stay_comparable_as_data_arrives():

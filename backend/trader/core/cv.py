@@ -161,10 +161,23 @@ def purged_walk_forward(
         # the test set until its block completes.
         n_blocks = max(int(span // block), 1)
         edges = [origin + k * block for k in range(n_blocks + 1)]
-        # The most recent blocks, so the evaluation tracks the market it will
-        # trade. Earlier blocks roll off at a boundary crossing rather than
-        # every run, which is the difference between a comparison and a lottery.
-        cuts = edges[-(n_folds + 2):] if len(edges) >= n_folds + 2 else edges
+        # **EVERY complete block, not the most recent `n_folds + 1`.**
+        #
+        # Keeping only the newest blocks looked like tracking the market the
+        # model will trade. It halved the evaluation: measured 2026-09-16 on a
+        # 245-day span, `windows_evaluated` fell 21,307 -> 10,488 and failed its
+        # own 20,000 gate, because six 21-day test blocks cover 126 days where
+        # the count scheme tested six sevenths of everything. Stability is worth
+        # paying for; half the sample is too high a price, and it was not a
+        # trade anyone chose.
+        #
+        # Using all of them costs nothing in stability — the boundaries are
+        # anchored either way — and folds now ACCUMULATE rather than roll off,
+        # so a new block adds a fold instead of evicting the oldest. The fold
+        # count therefore grows with history, which is why the caller treats
+        # `n_folds` as a cap rather than a promise and why gates counting folds
+        # must be proportions.
+        cuts = edges
         if len(cuts) < 3:
             # Fewer than two blocks: there is no anchored grid to speak of, and
             # refusing outright would break every short-span research run
@@ -183,12 +196,25 @@ def purged_walk_forward(
             cuts[-1] = cuts[-1] + pd.Timedelta(minutes=1)
     embargo = pd.Timedelta(minutes=embargo_minutes)
     folds: list[WindowFold] = []
-    # **As many folds as there are blocks, which is not always `n_folds`.**
-    # The count scheme always produces exactly `n_folds + 2` cuts because it
-    # divides the index; an ANCHORED calendar grid produces however many blocks
-    # the span actually spans, which is fewer on a young store or a long block.
-    # Indexing blindly to `n_folds` raised IndexError on both.
-    for i in range(min(n_folds, max(len(cuts) - 2, 0))):
+    # **How many folds there are is a property of the DATA under an anchored
+    # grid, and of `n_folds` under a proportional one.**
+    #
+    # The count scheme divides the index into exactly `n_folds + 2` cuts, so it
+    # always yields `n_folds`. An anchored calendar grid yields however many
+    # complete blocks the span contains — fewer on a young store, more as
+    # history accumulates — and capping that at `n_folds` is what halved the
+    # evaluation: `windows_evaluated` fell 21,307 -> 10,488 and failed its own
+    # 20,000 bar, because six 21-day blocks cover 126 days of a 245-day span.
+    #
+    # So the calendar scheme tests EVERY complete block after the first. Folds
+    # accumulate instead of rolling off, the boundaries still never move, and
+    # `n_folds` is a cap that only binds when someone asks for fewer than the
+    # data supports. Gates that count folds must therefore be proportions —
+    # "5 of 6" is a strong claim and "5 of 12" is a weak one.
+    available = max(len(cuts) - 2, 0)
+    wanted = available if scheme == 'calendar' else min(int(n_folds), available)
+    first = max(available - wanted, 0)
+    for i in range(first, available):
         test = index[(index >= cuts[i + 1]) & (index < cuts[i + 2])]
         if len(test) == 0:
             continue

@@ -356,7 +356,7 @@ services:
         --init-score-source market
         --kelly-fraction 0.10
         --min-edge-pp 3.0
-        --bankroll 200
+        --bankroll 500
 
   # ===========================================================================
   # Everything the live system runs, in ONE service.

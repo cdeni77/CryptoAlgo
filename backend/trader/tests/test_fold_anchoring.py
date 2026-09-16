@@ -68,15 +68,20 @@ def test_every_boundary_sits_on_the_anchored_grid():
             assert abs(offset % BLOCK) < 1e-6, (days, fold.test_start)
 
 
-def test_the_window_rolls_a_whole_block_at_a_time():
-    """Blocks enter and leave at a crossing, not continuously. That is the
-    difference between a comparison and a lottery."""
+def test_a_new_block_ADDS_a_fold_and_evicts_nothing():
+    """Folds accumulate; they do not roll off.
+
+    Capping at the most recent `n_folds` blocks halved the evaluation —
+    `windows_evaluated` 21,307 -> 10,488, failing its own 20,000 bar — because
+    six 21-day blocks cover 126 days of a 245-day span. Testing every complete
+    block costs nothing in stability, since the boundaries are anchored either
+    way, and it is why gates counting folds had to become proportions.
+    """
     # 21-day blocks: 210d is exactly 10 blocks, 231d is 11.
-    starts = {d: [f.test_start for f in _folds(d)] for d in (210, 231)}
-    entered = set(starts[231]) - set(starts[210])
-    assert len(entered) == 1, f'exactly one new block should enter, got {entered}'
-    # every surviving boundary is unchanged
-    assert set(starts[210]) & set(starts[231]) == set(starts[210][1:])
+    before = [f.test_start for f in _folds(210)]
+    after = [f.test_start for f in _folds(231)]
+    assert set(before) < set(after), 'every earlier block must survive'
+    assert len(after) == len(before) + 1, 'exactly one new block should enter'
 
 
 def test_a_longer_block_gives_wider_folds_anchored_the_same_way():

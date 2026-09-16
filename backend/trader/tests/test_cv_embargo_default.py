@@ -63,7 +63,10 @@ def test_folds_built_from_the_config_alone_honour_a_day():
     """No `embargo_minutes=` argument anywhere — this is the production path."""
     config = Config()
     folds = purged_walk_forward(window_index(), n_folds=config.n_folds)
-    assert len(folds) == config.n_folds
+    # `>=`, not `==`: anchored calendar blocks ACCUMULATE, so the fold count is
+    # a property of the span rather than of `n_folds`, which is now a cap that
+    # binds only when someone asks for fewer than the data supports.
+    assert len(folds) >= config.n_folds
     for fold in folds:
         assert_no_leakage(fold)
         gap = fold.test_start - fold.train_end

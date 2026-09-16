@@ -410,6 +410,7 @@ class EvaluationReport:
         return {
             'log_loss_skill': self.mean_skill,
             'folds_skill_positive': float(self.folds_positive),
+            'sign_agreement_p': self.sign_agreement_p_value,
             'calibration_error': self.max_ece,
             'calibration_max_deviation': self.max_calibration_deviation,
             'non_finite_share': self.non_finite_share,
@@ -688,7 +689,18 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     'model_minus_market': (0.0, 'min'),
     # --- the forecast ---
     'log_loss_skill': (0.0, 'min'),
-    'folds_skill_positive': (5.0, 'min'),
+    # **A COUNT of agreeing folds is only meaningful at a fixed fold count.**
+    # This was `folds_skill_positive >= 5`, written when the walk-forward always
+    # produced exactly six. Anchored calendar blocks accumulate — 10 folds on a
+    # 245-day span today and more as history arrives — and "5 of 10" is a 62%
+    # event under the null where "5 of 6" is a 10.9% one. The bar would have
+    # silently weakened every week.
+    #
+    # `sign_agreement_p` is the same claim held at constant significance: the
+    # binomial probability of seeing at least this many positive folds if each
+    # were a coin flip. 0.11 reproduces the old five-of-six exactly (p = 0.109)
+    # and stays that strict at any fold count.
+    'sign_agreement_p': (0.11, 'max'),
     'calibration_error': (0.02, 'max'),
     # The mean ECE is count-weighted over every row, and most rows sit where the
     # barrier is already decided. Measured: a model 5pp overconfident on the
@@ -736,8 +748,13 @@ GATE_NOTES: dict[str, str] = {
                           'the arithmetic null while losing to the quote is the '
                           'failure this whole stack is built to not make',
     'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark',
-    'folds_skill_positive': 'five of six agreeing happens 10.9% of the time by chance, '
-                            'so this is necessary and not sufficient',
+    'folds_skill_positive': 'how many folds agreed, reported not gated — the COUNT '
+                            'is only meaningful at a fixed fold count, and '
+                            'anchored blocks accumulate',
+    'sign_agreement_p': 'the chance this many folds agree if each were a coin flip. '
+                        '0.11 is exactly the old five-of-six bar (p=0.109) and stays '
+                        'that strict as folds accumulate, where ">=5" would have '
+                        'decayed to a 62% event at ten folds and 81% at twelve',
     'calibration_error': 'the system trades its confident predictions, so being wrong '
                          'about how confident it is matters more than the mean',
     'calibration_vs_market': 'the model must be at least as calibrated as the price '
