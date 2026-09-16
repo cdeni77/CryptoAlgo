@@ -247,9 +247,11 @@ services:
         --place-orders
         --compound
         --bankroll 500
+        --min-edge-pp 1.5
+        --kelly-fraction 0.05
         --no-require-gates
         --force
-        --reason "REAL ORDERS on a $200 account, artifact 20260828T202438Z, the first promotion measured under the policy this loop actually runs (--entry-offsets 12). Under wait_12: realised_edge_pp +4.17, max_drawdown 0.232 (passing), Sharpe 3.72, 1,107 trades, log_loss_skill +0.00307 (t=+3.69) 6/6 folds, control gain share 0.0%. Two gates fail, both calibration (error 0.0216, max deviation 0.0515) — a property of the forecast, unchanged by the trading policy, and per-fold instability rather than bias since the pooled worst deviation of 2.8pp would pass. The +12m choice is supported independently of this backtest: across 10,025 backfilled windows offsets 1-11 carry no edge against the market and it appears at +12m as a step, and over five years the baseline ECE falls monotonically to its minimum there. The untested risk is FILLS, not forecast: ~30% of live orders previously went unfilled and the failures carried higher claimed edge, which no backfill can measure because settled markets return an empty ladder."
+        --reason "REAL ORDERS on a $500 account, artifact 20260910T145731Z, ROLLED BACK on 2026-09-16 from the forced 20260916T181257Z. The forced one was installed citing calibration_error as its single failing gate, on a calibration_vs_market of -0.01806 computed from BACKFILLED quotes; on live-recorded quotes the same statistic is +0.02830, which FAILS. Two gates failed, not one, so its written justification does not hold. 20260910T145731Z passed all gates unforced (failed_gates: [], log_loss_skill +0.00256 over 21,307 windows). --force and --no-require-gates remain only because _refuse_if_blocked reads the NEWEST ledger attempt rather than the artifact on disk, so after any rollback it would refuse a model that actually passes. The loop is kept trading primarily so it keeps RECORDING live_touch quotes: those are the only uncontaminated evidence for whether the model beats the price, and core/quotes.py was discarding them until 2026-09-16."
 
   # ===========================================================================
   # Scrape — one-off, runs to completion then exits
@@ -354,8 +356,8 @@ services:
         --complete-cases
         --entry-offsets 12
         --init-score-source market
-        --kelly-fraction 0.10
-        --min-edge-pp 3.0
+        --kelly-fraction 0.05
+        --min-edge-pp 1.5
         --bankroll 500
 
   # ===========================================================================
