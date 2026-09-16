@@ -134,7 +134,19 @@ def main() -> int:
     # candidate that promotion then blocks for a reason `evaluate` never mentioned.
     from scripts.promote import market_measurement
 
-    gates = evaluate_gates(report, extra=market_measurement(result.scored))
+    # **`entry_offsets` MUST be forwarded, and omitting it is not a small
+    # difference.** `scored_against_market` returns every scored row and the loop
+    # records all four offsets while trading one, so pooling here measures a
+    # policy nobody runs. `promote.py` was fixed for exactly this and carries the
+    # note; `evaluate.py` was not, so the two disagreed about the same candidate
+    # on the gate that matters most. Measured 2026-09-16 on 5,468 live rows:
+    #
+    #     offset 12 (what trades)   model_minus_market  +0.000921   PASS
+    #     all four pooled           model_minus_market  -0.000311   FAIL
+    #
+    # `evaluate` reported the second and read as "the model loses to the price".
+    gates = evaluate_gates(report, extra=market_measurement(
+        result.scored, entry_offsets=config.entry_offsets))
     print(gate_report(gates))
 
     if args.out:

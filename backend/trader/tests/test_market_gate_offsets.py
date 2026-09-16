@@ -1,69 +1,74 @@
-"""`model_minus_market` scored every offset while the loop trades one.
+"""The market comparison must score the offset that TRADES, not all four.
 
-The gate asks whether the model beats the PRICE — the thing this whole stack
-exists not to fail. But it pooled all four decision offsets, and
-`--entry-offsets 12` means only +12m can open a position. Measured on 5,622 live
-rows:
+`PgWriter.scored_against_market` returns every scored row, and the live loop
+records a prediction at +3m, +6m, +9m and +12m while `--entry-offsets 12` means
+exactly one of them can open a position. Pooling all four measures a policy
+nobody runs -- and it does not merely add noise, it inverts the verdict.
 
-    offset   model - mkt      t     days+
-    +3m       -0.00259     -1.11     2/6
-    +6m       -0.00644     -1.63     3/6
-    +9m       +0.00068     +0.18     3/6
-    +12m      +0.00550     +1.09     5/6      <- the only offset that trades
-    pooled    -0.00072     -0.26     2/6      <- what the gate read
+Measured 2026-09-16 on 5,468 live rows:
 
-So the gate has now rejected two candidates for losing to the market at offsets
-they never trade, while the offset they DO trade was positive and the best of
-the four. That is the same defect as the entry-offsets bug — a measurement
-describing a policy nobody runs — and it will keep rejecting good candidates
-until it stops.
+    offset 12 (what trades)   model_minus_market  +0.000921   PASS
+    all four pooled           model_minus_market  -0.000311   FAIL
 
-When `entry_offsets` is None every offset can enter, so pooling is correct and
-nothing changes.
+`scripts/promote.py` was fixed for this and carries the note. `scripts/evaluate.py`
+called the same helper WITHOUT `entry_offsets` for as long as it had existed, so
+the two disagreed about the same candidate on the gate the whole stack exists to
+satisfy, and `evaluate` read as "the model loses to the price".
 """
+
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
+import inspect
 
-from core.config import Config
-from core.metrics import market_rows_from_scored
+from scripts.promote import market_measurement
 
 
-def _frame():
-    rows = []
-    for offset, model_p in ((3, 0.20), (6, 0.20), (9, 0.20), (12, 0.80)):
-        rows.append({
-            'symbol': 'BTC-USD',
-            'window_open': pd.Timestamp('2026-09-03 12:00', tz='UTC'),
-            'offset': offset,
-            'market_probability': 0.50,
-            'model_probability': model_p,
-            'baseline_probability': 0.50,
-            'outcome': 1.0,
-            'quote_age_seconds': 2.0,
-        })
-    return pd.DataFrame(rows)
+def _rows(offset, market, model, outcomes):
+    """(symbol, window_open, offset, market, baseline, model, outcome)."""
+    return [('BTC-USD', f'{offset}-{i}', offset, market, 0.5, model, o)
+            for i, o in enumerate(outcomes)]
 
 
-def test_only_the_offsets_that_can_trade_are_scored():
-    rows = market_rows_from_scored(_frame(), entry_offsets=(12,))
-    assert len(rows) == 1
-    assert rows[0][2] == 12
+def test_pooling_the_untraded_offsets_can_invert_the_verdict():
+    """The defect itself, on numbers that make it unambiguous.
+
+    At +12m the model is confident and right; at +3m it is equally confident
+    and wrong. Scored where it trades it beats the price; pooled across offsets
+    it loses to it. Same model, same rows, opposite verdict.
+    """
+    from core.metrics import market_gate_values
+
+    traded = _rows(12, 0.5, 0.9, [1] * 50)
+    untraded = _rows(3, 0.5, 0.9, [0] * 50)
+
+    at_12 = market_gate_values(traded)['model_minus_market']
+    pooled = market_gate_values(traded + untraded)['model_minus_market']
+
+    assert at_12 > 0, 'model beats the price at the offset it trades'
+    assert pooled < 0, 'pooling the untraded offset inverts it'
+    assert at_12 > pooled
 
 
-def test_every_offset_is_scored_when_entries_are_unrestricted():
-    """None means any offset may enter, so pooling is the honest measure."""
-    assert len(market_rows_from_scored(_frame(), entry_offsets=None)) == 4
+def test_evaluate_forwards_entry_offsets_to_the_market_gate():
+    """A seam test, because the bug was a MISSING ARGUMENT at one call site.
+
+    Testing `market_measurement` alone passed the whole time this was broken --
+    the helper was always correct. What was wrong was that `evaluate` did not
+    tell it which offsets trade. So the thing under test is the call, not the
+    callee.
+    """
+    import scripts.evaluate as ev
+
+    src = inspect.getsource(ev)
+    assert 'market_measurement(' in src, 'call site vanished; update this test'
+    call = src[src.index('gates = evaluate_gates('):]
+    call = call[:call.index('\n\n')] if '\n\n' in call else call
+    assert 'entry_offsets' in call, (
+        'evaluate() must forward entry_offsets to market_measurement, or the '
+        'market gate pools offsets the policy never trades')
 
 
-def test_several_entry_offsets_are_all_kept():
-    rows = market_rows_from_scored(_frame(), entry_offsets=(9, 12))
-    assert sorted(r[2] for r in rows) == [9, 12]
-
-
-def test_the_quote_age_bar_still_applies():
-    frame = _frame()
-    frame.loc[frame['offset'] == 12, 'quote_age_seconds'] = 900.0
-    assert market_rows_from_scored(frame, entry_offsets=(12,)) == []
+def test_the_helper_accepts_the_argument_evaluate_now_passes():
+    sig = inspect.signature(market_measurement)
+    assert 'entry_offsets' in sig.parameters
+    assert sig.parameters['entry_offsets'].kind is inspect.Parameter.KEYWORD_ONLY
