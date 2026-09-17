@@ -28,6 +28,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -507,7 +509,14 @@ MIN_MARKET_WINDOWS = 2_000
 # headline was the model out-forecasting a price nobody was quoting any more.
 # Both halves flatter: market_ll worsens with age while model_ll improves,
 # because the rows carrying stale quotes are the easier ones.
-MAX_QUOTE_AGE_SECONDS = 30.0
+# **Read from the same env var `core.quotes` reads, not hardcoded.** These two
+# must move together: trades were once priced against quotes up to 900s old
+# while this comparison counted only those under 30s, so the money and the
+# forecast were measured on different samples. Pinning one to a literal while
+# the other honours `QUOTE_MAX_AGE_SECONDS` re-opens exactly that desync the
+# moment anyone sets it -- silently, and in the direction that manufactures
+# edge.
+MAX_QUOTE_AGE_SECONDS = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
 
 MARKET_COLUMNS = ('symbol', 'window_open', 'offset', 'market', 'baseline',
                   'model', 'outcome', 'decision_time')

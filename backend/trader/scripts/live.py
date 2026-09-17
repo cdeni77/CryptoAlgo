@@ -1044,21 +1044,13 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
 
 
 def _is_ours(ticker: str) -> bool:
-    """Is this market one this loop trades?
+    """Delegates to `core.venue_ledger.is_ours`.
 
-    The Kalshi account belongs to a person and may hold anything — an NFL
-    market, a college football market, a manual punt. Reconciliation must not
-    treat those as unbooked fills of ours.
-
-    Matched on the SERIES PREFIX from `SERIES_BY_SYMBOL`, so a
-    `KALSHI_SERIES_*` override reaches this too and there is no second
-    hardcoded list to drift. A live ticker is `SERIES-YYMMMDDHHMM-MM`, e.g.
-    `KXBTC15M-26SEP041130-30`, so the prefix plus a hyphen is the test — the
-    hyphen matters, or a hypothetical `KXBTC15MINI` would match `KXBTC15M`.
+    Kept as a name because this module and its tests use it widely; the
+    IMPLEMENTATION moved so `scripts/sync_venue.py` filters the same way.
+    Two copies of an ownership test is how one of them stops being applied.
     """
-    ticker = (ticker or '').strip().upper()
-    return any(ticker.startswith(f'{series.upper()}-')
-               for series in SERIES_BY_SYMBOL.values() if series)
+    return venue_ledger.is_ours(ticker)
 
 
 async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,

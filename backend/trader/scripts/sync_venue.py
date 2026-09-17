@@ -105,6 +105,19 @@ async def main() -> int:
     print(f'\n  {len(fills)} fill(s), {len(settlements)} settlement(s) read')
 
     writer = PgWriter(args.database_url or os.getenv('DATABASE_URL'))
+    # **The same ownership filter the live loop applies on every cycle.**
+    # Without it this tool -- the one an operator is told to run after any
+    # downtime -- writes every fill the account holds, undoing `persist_venue_ledger`'s
+    # filter and summing two strategies into one equity curve. One foreign row
+    # (KXMVECROSSCATEGORY) had already reached `venue_fills` this way.
+    foreign_s = [s for s in settlements if not venue_ledger.is_ours(getattr(s, 'ticker', ''))]
+    foreign_f = [f for f in fills if not venue_ledger.is_ours(getattr(f, 'ticker', ''))]
+    if foreign_s or foreign_f:
+        print(f'  skipping {len(foreign_s)} settlement(s) and {len(foreign_f)} fill(s) '
+              f'on markets this loop does not trade')
+    settlements = [s for s in settlements if venue_ledger.is_ours(getattr(s, 'ticker', ''))]
+    fills = [f for f in fills if venue_ledger.is_ours(getattr(f, 'ticker', ''))]
+
     settlement_rows = []
     for settled in settlements:
         # Our own position for the same market, so the store keeps both figures

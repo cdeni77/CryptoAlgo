@@ -256,8 +256,20 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
             two_sided = pbid.notna() & pask.notna() & (pask >= pbid) & pfresh
             peer['pm_market_probability'] = ((pbid + pask) / 2.0).where(two_sided)
             peer['pm_spread'] = (pask - pbid).where(two_sided)
-            peer = peer.drop_duplicates(
-                ['symbol', 'window_open', 'offset_minutes'], keep='first')
+            # Ranked, not taken in store order. `pm_ladder` carries a
+            # `transport` key, so duplicates per (symbol, window, offset) are
+            # real -- and an arbitrary winner that fails `two_sided` sends
+            # `venue_prob_gap` to NaN while a usable duplicate sits beside it.
+            # That changes `pm_available` and, under `--complete-cases`, which
+            # ROWS survive at all. The traded side has been ranked since the
+            # source-priority fix; this is the same rule for the other half of
+            # the same feature.
+            peer['_unusable'] = (~two_sided).astype(int)
+            peer = (peer.sort_values(['_unusable', 'quote_age_seconds'],
+                                     na_position='last')
+                        .drop_duplicates(['symbol', 'window_open',
+                                          'offset_minutes'], keep='first')
+                        .drop(columns=['_unusable']))
             merged = merged.drop(columns=['pm_market_probability', 'pm_spread']).merge(
                 peer[['symbol', 'window_open', 'offset_minutes',
                       'pm_market_probability', 'pm_spread']],

@@ -50,6 +50,34 @@ from typing import Any, Iterable, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 
+def is_ours(ticker: str) -> bool:
+    """Is this market one the loop trades?
+
+    **The Kalshi account belongs to a person and may hold anything** — an NFL
+    market, a college football market, a manual punt. Two strategies summed
+    into one equity curve is the same class of error as a balance-difference
+    curve counting a deposit as profit.
+
+    It lives HERE rather than in `scripts/live.py` because the live loop was
+    not the only writer of this ledger. `scripts/sync_venue.py` — the tool an
+    operator is told to run after any downtime — wrote every fill the venue
+    returned, so the documented recovery procedure undid the filter the loop
+    applies on every cycle. One foreign fill (`KXMVECROSSCATEGORY`) had already
+    reached `venue_fills` that way.
+
+    Matched on the SERIES PREFIX from `SERIES_BY_SYMBOL`, so a `KALSHI_SERIES_*`
+    override reaches this too and there is no second hardcoded list to drift. A
+    live ticker is `SERIES-YYMMMDDHHMM-MM`, e.g. `KXBTC15M-26SEP041130-30`, so
+    the prefix plus a hyphen is the test — the hyphen matters, or a
+    hypothetical `KXBTC15MINI` would match `KXBTC15M`.
+    """
+    from core.config import SERIES_BY_SYMBOL
+
+    ticker = (ticker or '').strip().upper()
+    return any(ticker.startswith(f'{series.upper()}-')
+               for series in SERIES_BY_SYMBOL.values() if series)
+
+
 def fill_row(fill: Any) -> dict[str, Any]:
     """A `Fill` as a `venue_fills` row.
 
