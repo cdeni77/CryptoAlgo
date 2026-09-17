@@ -65,8 +65,35 @@ PM_ASSETS = {'btc': 'BTC-USD', 'eth': 'ETH-USD', 'sol': 'SOL-USD'}
 
 
 def _row(**kw) -> dict:
+    """One `venue_depth` row, with `quality` DERIVED rather than asserted.
+
+    `quality` was the literal 'valid' on every row this module produced, so
+    `min_quality` -- the mechanism that exists precisely so flagged data cannot
+    reach a feature build -- was inert for this dataset. Measured 2026-09-16:
+    all 1,895,986 rows read 'valid', and **37,052 of them are CROSSED**
+    (`yes_bid > yes_ask`), 31,541 in 2026-04 alone, which is 37% of that month.
+    `core/quotes.py` calls a crossed book "not a book" and refuses it; nothing
+    upstream said so, and nothing counted them.
+
+    The defect originates in the packed Predexon series, but this function is
+    the gate into the research store, so this is where it gets named. A crossed
+    or out-of-range quote is written as 'suspicious', which keeps the row for
+    anyone measuring the backfill's quality while removing it from the default
+    `min_quality='valid'` read.
+    """
     base = {'quality': 'valid', 'seq': float('nan'), 'gaps': 0.0}
     base.update(kw)
+    bid, ask = base.get('yes_bid'), base.get('yes_ask')
+    try:
+        bid = float(bid) if bid is not None else None
+        ask = float(ask) if ask is not None else None
+    except (TypeError, ValueError):
+        bid = ask = None
+    bad_range = ((bid is not None and not 0.0 <= bid <= 1.0)
+                 or (ask is not None and not 0.0 <= ask <= 1.0))
+    crossed = bid is not None and ask is not None and ask < bid
+    if bad_range or crossed:
+        base['quality'] = 'suspicious'
     return base
 
 
