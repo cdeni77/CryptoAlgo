@@ -3337,12 +3337,54 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
             await kalshi.close()
 
 
+def _installed_version() -> Optional[str]:
+    """Which staged artifact is the one on disk, by CONTENT.
+
+    **Not "the newest ledger entry".** Those diverge in two ordinary cases: a
+    promotion that fails installs nothing and leaves the previous artifact
+    trading, and a rollback deliberately writes no ledger entry at all (the
+    ledger is the multiple-testing denominator, and a rollback is not a trial).
+    Both happened on 2026-09-16.
+
+    Comparing the bytes is exact and needs no new bookkeeping: `promote` stages
+    each candidate under `models/.staging/<version>/` and then renames it into
+    place, so the installed file is byte-identical to exactly one of them.
+    """
+    import hashlib
+    from pathlib import Path
+
+    root = Path(MODELS_ROOT)
+    live = root / 'forecast.joblib'
+    if not live.exists():
+        return None
+    digest = hashlib.md5(live.read_bytes()).hexdigest()
+    staging = root / '.staging'
+    if not staging.is_dir():
+        return None
+    for candidate in sorted(staging.iterdir(), reverse=True):
+        staged = candidate / 'forecast.joblib'
+        if staged.exists() and hashlib.md5(staged.read_bytes()).hexdigest() == digest:
+            return candidate.name
+    return None
+
+
 def _refuse_if_blocked() -> None:
     from core.promotion import history
 
     frame = history()
     if frame.empty:
         raise SystemExit('no promotion attempt recorded; refusing to trade')
+    # **The artifact ON DISK, not the newest attempt.** Reading `iloc[0]` meant
+    # a promotion that failed on Sunday -- installing nothing, leaving a passing
+    # model trading -- would refuse to start the loop on the next restart, and a
+    # rollback to a passing artifact would too. The question this gate asks is
+    # "did the model I am about to trade pass?", and that is a property of the
+    # file, not of whatever was attempted most recently.
+    installed = _installed_version()
+    if installed is not None:
+        match = frame[frame['version'] == installed]
+        if len(match):
+            frame = match
     latest = frame.iloc[0]
     # `installed` and `passed` are different questions. `--force` installs an
     # artifact whose gates FAILED and records installed=True, so testing
