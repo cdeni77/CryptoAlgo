@@ -378,6 +378,44 @@ def _geometry_features(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
     return out
 
 
+def gap_change_column(table: pd.DataFrame, decision_offsets) -> list:
+    """`venue_prob_gap` differenced against the previous CONFIGURED offset.
+
+    **Not `shift(1)` over the rows that survive.** The two agree only if the
+    panel always carries every offset, which is what this used to assume and
+    what `--complete-cases` makes false: it filters `dataset.windows` ROW-WISE,
+    before features are built, dropping individual offsets wherever `ask_up`,
+    `market_probability`, `bid_at_touch`, `pm_market_probability` or
+    `implied_sigma_per_min` is missing at that exact offset. So at +12m --
+    the only entry offset -- `shift(1)` could step six or nine minutes under a
+    column named for one step, while `scripts/live.py::gap_change` takes
+    `offsets[i-1]` or nothing.
+
+    Training matches live rather than the other way round: live cannot see
+    which rows training dropped, so the configured grid is the only definition
+    both sides can compute.
+
+    Extracted so the parity is testable without standing up a full window
+    table -- the defect was arithmetic, and it sat inside a function that needs
+    a fitted VolModel to call.
+    """
+    grid = sorted(int(o) for o in decision_offsets)
+    back = {o: grid[i - 1] for i, o in enumerate(grid) if i}
+    gap = table['venue_prob_gap']
+    lookup = {(sym, win, int(off)): val for sym, win, off, val in zip(
+        table['symbol'], table['window_open'], table['offset'], gap)}
+    out = []
+    for sym, win, off, val in zip(table['symbol'], table['window_open'],
+                                  table['offset'], gap):
+        key = (sym, win, back.get(int(off)))
+        prior = lookup.get(key)
+        out.append(float(val) - float(prior)
+                   if key[2] is not None and prior is not None
+                   and pd.notna(prior) and pd.notna(val)
+                   else float('nan'))
+    return out
+
+
 def build_features(
     windows: pd.DataFrame,
     minute_states: dict[str, pd.DataFrame],
@@ -489,10 +527,25 @@ def build_features(
             # NaN at the first offset of a window is therefore correct on both
             # sides: it is the first row of each group. Live logs it as an
             # all-NaN column at +3m, which is the feature working.
-            ordered = table.sort_values(['symbol', 'window_open', 'offset'])
-            prev = ordered.groupby(['symbol', 'window_open'])['venue_prob_gap'].shift(1)
-            table['venue_gap_change_5'] = (
-                ordered['venue_prob_gap'] - prev).reindex(table.index)
+            # **Against the immediately previous CONFIGURED offset, not
+            # `shift(1)` over surviving rows.** The comment above says live
+            # "reproduces this exact one-offset step". It did not, and the
+            # reason is one layer up: `--complete-cases` filters `dataset.windows`
+            # ROW-WISE, before `build_features` ever runs, dropping individual
+            # offsets wherever `ask_up`, `market_probability`, `bid_at_touch`,
+            # `pm_market_probability` or `implied_sigma_per_min` is missing at
+            # that exact offset. `shift(1)` over what survives therefore steps
+            # to whatever offset happens to remain -- 6 or 9 minutes back at
+            # +12m -- while `scripts/live.py::gap_change` takes offsets[i-1] or
+            # NaN. Different arithmetic under one name, on the second feature by
+            # importance, in the group the config calls the only load-bearing
+            # one.
+            #
+            # Matching live rather than the other way round: live cannot see
+            # which rows training dropped, so the configured grid is the only
+            # definition both sides can compute.
+            table['venue_gap_change_5'] = gap_change_column(
+                table, config.decision_offsets)
 
     # `iv_minus_realised` is the implied-vol mechanism and the only book column
     # that cannot be attached with the rest: it divides the market's forward

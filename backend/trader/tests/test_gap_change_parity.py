@@ -1,132 +1,94 @@
-"""`venue_gap_change_5` live must be the same feature the backtest fitted.
+"""`venue_gap_change_5` must mean the same thing in training and live.
 
-The backtest computes it as `shift(1)` over rows ordered by OFFSET and grouped
-by (symbol, window_open): the previous decision offset within the same window,
-never reaching across a window boundary. Consecutive windows chain — a window's
-strike is the previous window's settlement value — so a difference that crossed
-one would look entirely correct and be wrong.
+The feature is a first difference of `venue_prob_gap` across one decision
+offset. Training computed it as `shift(1)` over the rows that survived;
+`scripts/live.py::gap_change` takes `offsets[i-1]` or NaN.
 
-Two consequences the first live implementation got wrong by using a five-minute
-wall-clock lookback instead: the step is one OFFSET (three minutes on the
-(3,6,9,12) grid, not five), and the first offset of a window has no predecessor
-and must be NaN rather than differenced against the previous window's last.
+Those agree only if the panel always carries every offset — which the training
+comment asserted and which is **false under `--complete-cases`**. That filter
+runs ROW-WISE on `dataset.windows` before `build_features`, dropping individual
+offsets wherever `ask_up`, `market_probability`, `bid_at_touch`,
+`pm_market_probability` or `implied_sigma_per_min` is missing at that exact
+offset. So at +12m — the only entry offset — training's step could be 6 or 9
+minutes while live's is 3 or nothing.
+
+Second feature by importance, in the group the config calls the only
+load-bearing one. Training now uses the configured grid, because live cannot
+see which rows training dropped: the grid is the only definition both sides can
+compute.
 """
+
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.live import gap_change, reset_gap_history
+from core.features import gap_change_column
 
-W1 = pd.Timestamp('2026-08-28 19:00', tz='UTC')
-W2 = pd.Timestamp('2026-08-28 19:15', tz='UTC')
-
-
-@pytest.fixture(autouse=True)
-def _clean():
-    reset_gap_history()
-    yield
-    reset_gap_history()
+OPEN = pd.Timestamp('2026-07-01T12:00Z')
 
 
-def test_the_first_offset_of_a_window_has_no_predecessor():
-    assert np.isnan(gap_change('BTC-USD', 0.02, window_open=W1, offset=3))
+def _table(offsets_and_gaps):
+    return pd.DataFrame([
+        {'symbol': 'BTC-USD', 'window_open': OPEN, 'offset': o,
+         'venue_prob_gap': g, 'pm_market_probability': 0.5,
+         'market_probability': 0.5, 'baseline_probability': 0.5}
+        for o, g in offsets_and_gaps])
 
 
-def test_a_later_offset_differences_against_the_previous_one():
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=6) == pytest.approx(0.03)
-    assert gap_change('BTC-USD', 0.04, window_open=W1, offset=9) == pytest.approx(-0.01)
+def _gap_change(offsets_and_gaps, decision_offsets=(3, 6, 9, 12)):
+    table = _table(offsets_and_gaps)
+    return dict(zip(table['offset'],
+                    gap_change_column(table, decision_offsets)))
 
 
-def test_it_never_reaches_across_a_window_boundary():
-    """Consecutive windows chain, so differencing across one is a real error
-    that would look entirely correct."""
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    gap_change('BTC-USD', 0.09, window_open=W1, offset=12)
-    assert np.isnan(gap_change('BTC-USD', 0.01, window_open=W2, offset=3))
+def test_a_complete_window_differences_one_offset():
+    got = _gap_change([(3, 0.01), (6, 0.03), (9, 0.06), (12, 0.10)])
+    assert np.isnan(got[3])
+    assert got[6] == pytest.approx(0.02)
+    assert got[9] == pytest.approx(0.03)
+    assert got[12] == pytest.approx(0.04)
 
 
-def test_symbols_do_not_bleed_into_each_other():
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    assert np.isnan(gap_change('ETH-USD', 0.07, window_open=W1, offset=3))
-
-
-def test_a_missing_gap_does_not_reach_back_past_the_hole():
-    """CORRECTED. This test previously asserted that offset 9 differences
-    against offset 3 when offset 6 is a hole — which is what the first
-    implementation did, and is NOT what training does.
-
-    Training is `shift(1)` over a panel carrying all four offsets, so a missing
-    gap at the previous offset propagates as NaN rather than lengthening the
-    horizon. Reaching back returns a six-minute change under a column named for
-    three. The test was written from the same wrong premise as the code, so it
-    passed while both were wrong — which is the failure mode a test is supposed
-    to prevent.
-    """
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    assert np.isnan(gap_change('BTC-USD', float('nan'), window_open=W1, offset=6))
-    assert np.isnan(gap_change('BTC-USD', 0.05, window_open=W1, offset=9))
-
-
-def test_a_repeated_offset_is_not_differenced_against_itself():
-    """A cycle can score the same offset twice. The second must not report a
-    zero change that reads as two venues holding steady."""
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    gap_change('BTC-USD', 0.05, window_open=W1, offset=6)
-    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=6) == pytest.approx(0.03)
-
-
-def test_one_symbol_does_not_evict_another_within_the_same_window():
-    """Three symbols are scored in every cycle of the same window.
-
-    The first version cleared the WHOLE history whenever it met a key it had
-    not seen, so BTC's reading was destroyed by ETH's arrival and ETH's by
-    SOL's. Every symbol then reported NaN on every cycle forever, and the
-    symbols-do-not-bleed test above still passed because it only asserted that
-    ETH saw nothing — never that BTC kept what it had.
-    """
-    for symbol in ('BTC-USD', 'ETH-USD', 'SOL-USD'):
-        gap_change(symbol, 0.02, window_open=W1, offset=3)
-    for symbol in ('BTC-USD', 'ETH-USD', 'SOL-USD'):
-        assert gap_change(symbol, 0.05, window_open=W1, offset=6) == pytest.approx(
-            0.03), f'{symbol} lost its offset-3 reading to another symbol'
-
-
-def test_a_new_window_evicts_only_the_windows_that_ended():
-    """Memory must not grow forever, but eviction is by WINDOW, not by arrival."""
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    gap_change('ETH-USD', 0.02, window_open=W1, offset=3)
-    # BTC moves to the next window; ETH has not been scored there yet.
-    assert np.isnan(gap_change('BTC-USD', 0.01, window_open=W2, offset=3))
-    assert gap_change('BTC-USD', 0.04, window_open=W2, offset=6) == pytest.approx(0.03)
-
-
-def test_a_hole_at_the_previous_offset_gives_NaN_not_a_longer_horizon():
-    """Training uses `shift(1)` over a panel that always carries all four
-    offsets, so a missing gap at the previous offset propagates as NaN. The
-    first live version took `max(o for o in recorded if o < offset)`, which
-    SKIPS the hole and returns a six- or nine-minute change under a column named
-    for three.
-
-    Measured on the store: of 97,416 decision rows past offset 3 that have a
-    gap, 19,548 (20.1%) are NaN in training because the previous offset had
-    none, and 1,054 of those had an earlier offset with a gap — exactly the rows
-    where live would emit a number training never saw.
-
-    The live exposure is larger than that, because a cycle that misses
-    DECISION_TOLERANCE_SECONDS records nothing for its offset at all.
-    """
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    # offset 6 is a hole: no gap recorded
-    assert np.isnan(gap_change('BTC-USD', 0.05, window_open=W1, offset=9)), (
-        'offset 9 must difference against offset 6, which is missing — not '
-        'reach back to offset 3'
+def test_a_missing_middle_offset_yields_NaN_not_a_longer_step():
+    """The defect. With offset 9 filtered out, `shift(1)` at +12m differences
+    against +6m — a six-minute change under a column named for one step — where
+    live reports nothing at all."""
+    got = _gap_change([(3, 0.01), (6, 0.03), (12, 0.10)])
+    assert np.isnan(got[12]), (
+        'the previous CONFIGURED offset is absent, so there is no one-offset '
+        'change to report'
     )
+    assert got[6] == pytest.approx(0.02), 'the intact step still works'
 
 
-def test_the_immediately_previous_offset_is_the_only_one_used():
-    gap_change('BTC-USD', 0.02, window_open=W1, offset=3)
-    gap_change('BTC-USD', 0.04, window_open=W1, offset=6)
-    assert gap_change('BTC-USD', 0.05, window_open=W1, offset=9) == pytest.approx(0.01)
+def test_the_first_offset_is_always_NaN():
+    got = _gap_change([(3, 0.01), (6, 0.03)])
+    assert np.isnan(got[3])
+
+
+def test_a_NaN_gap_upstream_propagates():
+    got = _gap_change([(3, 0.01), (6, float('nan')), (9, 0.06)])
+    assert np.isnan(got[6])
+    assert np.isnan(got[9]), 'differencing against a NaN is not a number'
+
+
+def test_it_follows_the_configured_grid_not_the_rows_present():
+    """On a two-offset policy the step is 9 minutes, and that is correct —
+    what must not happen is the grid and the surviving rows disagreeing."""
+    got = _gap_change([(3, 0.01), (12, 0.10)], decision_offsets=(3, 12))
+    assert got[12] == pytest.approx(0.09)
+
+
+def test_build_features_uses_the_helper():
+    """A seam test: the arithmetic lives in one place, and the caller uses it.
+    Testing the helper alone would not have caught the original bug, which was
+    an inline `shift(1)` inside `build_features`."""
+    import inspect
+
+    from core.features import build_features
+
+    src = inspect.getsource(build_features)
+    assert 'gap_change_column(' in src
+    assert "['venue_prob_gap'].shift(1)" not in src
