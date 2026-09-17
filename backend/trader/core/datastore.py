@@ -618,14 +618,37 @@ class ResearchStore:
         contract, or have I been training on a proxy".
         """
         frame = self.read(
-            dataset, columns=('venue', 'symbol', 'event_time'), min_quality=None
+            dataset, columns=('venue', 'symbol', 'event_time', 'quality'),
+            min_quality=None
         )
         if frame.empty:
-            return pd.DataFrame(columns=['venue', 'symbol', 'rows', 'start', 'end', 'days'])
+            return pd.DataFrame(columns=['venue', 'symbol', 'rows', 'usable',
+                                         'demoted', 'start', 'end', 'days'])
         grouped = frame.groupby(['venue', 'symbol'])['event_time']
         out = grouped.agg(rows='count', start='min', end='max').reset_index()
         out['days'] = (out['end'] - out['start']).dt.total_seconds() / 86400.0
-        return out.sort_values(['venue', 'symbol']).reset_index(drop=True)
+        # **`rows` is every row; `usable` is what a default read returns.**
+        # This counted only the first, while `core/dataset.load_minute_bars`
+        # reads with `min_quality='valid'` -- so a bar demoted to SUSPICIOUS is
+        # invisible to every tool an operator would check. `validator.py`
+        # demotes any bar older than `max_past_days` (1825, the same constant as
+        # `--backfill-days`), and 34,302 bars per symbol already sit past that
+        # line, advancing a day per day: any re-validation demotes them in
+        # place, `find_gaps` reads SQLite and ignores quality, and
+        # `_stored_count` counts rows, so a repair reports "recovered 0 of N".
+        if 'quality' in frame.columns:
+            usable = (frame[frame['quality'].astype(str) == 'valid']
+                      .groupby(['venue', 'symbol'])['event_time'].count()
+                      .rename('usable').reset_index())
+            out = out.merge(usable, on=['venue', 'symbol'], how='left')
+            out['usable'] = out['usable'].fillna(0).astype(int)
+        else:
+            out['usable'] = out['rows']
+        out['demoted'] = out['rows'] - out['usable']
+        cols = ['venue', 'symbol', 'rows', 'usable', 'demoted',
+                'start', 'end', 'days']
+        return (out[cols].sort_values(['venue', 'symbol'])
+                .reset_index(drop=True))
 
     # -- feature matrices ---------------------------------------------------
 
