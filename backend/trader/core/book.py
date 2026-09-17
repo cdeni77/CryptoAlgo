@@ -169,12 +169,59 @@ class Book:
             self.settlements.append(record)
             self.equity_points.append((position.settle_time, self.bankroll))
         self.open_positions = remaining
-        floor = self.config.starting_bankroll * self.config.ruin_floor_fraction
-        if self.halted_at is None and self.bankroll < floor and settled:
-            self.halted_at = settled[-1].position.settle_time
-            logger.warning('bankroll $%.2f fell below the $%.2f floor at %s — halted',
-                           self.bankroll, floor, self.halted_at)
+        # **The same four halts the live account latches on, not just ruin.**
+        # `scripts/live.py` halts on a daily realised loss, on peak-to-current
+        # drawdown, and on consecutive losses -- and a halt there is sticky and
+        # cleared by hand. The backtest latched only on the ruin floor, so a
+        # candidate could pass `halted == 0` and `max_drawdown <= 0.35` on a
+        # simulation that never stops while the live account would have latched
+        # and traded nothing further. A gate measuring a policy the account does
+        # not run is the defect this whole audit is about, and this was the last
+        # instance of it.
+        if self.halted_at is None and settled:
+            reason = self._halt_reason(settled)
+            if reason is not None:
+                self.halted_at = settled[-1].position.settle_time
+                logger.warning('halted at %s — %s', self.halted_at, reason)
         return settled
+
+    def _halt_reason(self, settled) -> Optional[str]:
+        """Why trading should stop, or None. Mirrors `scripts/live.py`."""
+        cfg = self.config
+        floor = cfg.starting_bankroll * cfg.ruin_floor_fraction
+        if self.bankroll < floor:
+            return f'bankroll ${self.bankroll:.2f} fell below the ${floor:.2f} floor'
+
+        # Peak-to-current on REALISED equity, and only below the starting
+        # bankroll — the same condition live applies, so a run that is up and
+        # gives some back is not halted for it.
+        peak = max((b for _, b in self.equity_points),
+                   default=cfg.starting_bankroll)
+        limit = float(getattr(cfg, 'max_drawdown_fraction', 0.35) or 0.0)
+        if (limit > 0 and self.bankroll < cfg.starting_bankroll
+                and peak > 0 and (peak - self.bankroll) / peak >= limit):
+            return (f'drawdown {(peak - self.bankroll) / peak:.1%} from a peak of '
+                    f'${peak:.2f} reached the {limit:.0%} limit')
+
+        run = 0
+        for record in reversed(self.settlements):
+            if record.pnl >= 0:
+                break
+            run += 1
+        cap = int(getattr(cfg, 'max_consecutive_losses', 0) or 0)
+        if cap > 0 and run >= cap:
+            return f'{run} consecutive losing settlements reached the {cap} limit'
+
+        # Daily realised loss, on the settlement day of the newest record.
+        share = float(getattr(cfg, 'max_daily_loss_fraction', 0.0) or 0.0)
+        if share > 0:
+            day = pd.Timestamp(settled[-1].position.settle_time).normalize()
+            today = sum(r.pnl for r in self.settlements
+                        if pd.Timestamp(r.position.settle_time).normalize() == day)
+            if today <= -share * cfg.starting_bankroll:
+                return (f'realised ${today:.2f} on {day.date()}, past the '
+                        f'{share:.0%} daily loss limit')
+        return None
 
     # ---- reading ---------------------------------------------------------
     @property
