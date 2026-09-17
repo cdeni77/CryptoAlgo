@@ -301,8 +301,26 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     ).trailing(config.train_window_days)
 
     if settlements is not None and len(settlements) and 'settled_up' in settlements.columns:
-        venue = settlements[['symbol', 'window_open', 'settled_up']].dropna()
-        venue = venue.drop_duplicates(['symbol', 'window_open'])
+        # **One venue, newest revision.** This dropped `venue` entirely and
+        # deduplicated with no ordering, so whichever row the reader returned
+        # first supplied `venue_outcome` -- the label `settlement_outcomes`
+        # prefers for grading every trade. `collect_settlements` writes
+        # Polymarket rows into the same table, and that venue settles on
+        # Chainlink's TWAP against Kalshi's CF Benchmarks BRTI: two different
+        # oracles silently mixed under one column, with nothing recording which
+        # graded which window. Dormant only because the store holds no
+        # Polymarket settlements yet.
+        venue = settlements
+        if 'venue' in venue.columns:
+            venue = venue[venue['venue'] == 'kalshi']
+        keep = ['symbol', 'window_open', 'settled_up']
+        if 'available_time' in venue.columns:
+            keep = keep + ['available_time']
+        venue = venue[keep].dropna(subset=['symbol', 'window_open', 'settled_up'])
+        if 'available_time' in venue.columns:
+            venue = venue.sort_values('available_time')
+        venue = venue.drop_duplicates(['symbol', 'window_open'], keep='last')
+        venue = venue[['symbol', 'window_open', 'settled_up']]
         venue['window_open'] = pd.to_datetime(venue['window_open'], utc=True)
         venue = venue.rename(columns={'settled_up': 'venue_outcome'})
         venue['venue_outcome'] = venue['venue_outcome'].astype(float)

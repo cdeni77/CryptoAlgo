@@ -45,6 +45,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument('--database-url', type=str, default=None,
                         help='Defaults to $DATABASE_URL')
+    parser.add_argument('--entry-offsets', type=int, nargs='+', default=None,
+                        help='restrict to the offsets that can OPEN a position, '
+                             'e.g. --entry-offsets 12. Unset pools every '
+                             'recorded offset, which is a policy nobody runs: '
+                             'measured, +12m reads +0.000921 against a pooled '
+                             '-0.000311.')
     args = parser.parse_args()
 
     url = args.database_url or os.getenv('DATABASE_URL')
@@ -56,6 +62,25 @@ def main() -> int:
     from core.pg_writer import PgWriter
 
     rows = PgWriter(database_url=url).scored_against_market()
+    # **Only the offsets that can OPEN a position.** The loop records a
+    # prediction at every offset and trades one, so a pooled headline measures a
+    # policy nobody runs -- measured, +12m reads +0.000921 against a pooled
+    # -0.000311, which is the difference between passing and failing the gate of
+    # the same name. This is the third place that restriction was missing;
+    # `promote.py` had it, `evaluate.py` did not until today.
+    if getattr(args, 'entry_offsets', None):
+        wanted = {int(o) for o in args.entry_offsets}
+        rows = [r for r in rows if int(r[2]) in wanted]
+        print(f'Scored at offset(s) {sorted(wanted)} — the ones that can open '
+              f'a position.')
+    else:
+        # **Say so, rather than letting the headline be read as the gate.**
+        # `promote.py` restricts to `entry_offsets`; this tool pooled silently,
+        # and the same omission in `evaluate.py` inverted the sign of the gate
+        # of the same name. The per-offset table below is the honest reading.
+        print('Scored across EVERY recorded offset. The loop records four and '
+              'trades one, so the pooled line below is not the gate — read the '
+              'per-offset rows, or pass --entry-offsets 12.')
     if not rows:
         print('No settled window has both a recorded market quote and an outcome.')
         print()

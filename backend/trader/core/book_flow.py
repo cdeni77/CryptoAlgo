@@ -35,6 +35,9 @@ import logging
 import numpy as np
 import pandas as pd
 
+from core.metrics import MAX_QUOTE_AGE_SECONDS
+from core.quotes import QUOTE_SOURCE_PRIORITY
+
 logger = logging.getLogger(__name__)
 
 BOOK_FLOW = (
@@ -77,10 +80,45 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
                               book['yes_ask_size'].to_numpy())
     book['_total'] = book['yes_bid_size'] + book['yes_ask_size']
     book['_spread'] = (book['yes_ask'] - book['yes_bid']) * 100.0
-    # One row per minute: the same minute can arrive from more than one observer.
-    book = (book.sort_values('offset_minutes')
+    # **A crossed or stale book is not a book, and the observer is chosen, not
+    # taken.** This path applied neither test, and its dedup sorted on
+    # `offset_minutes` -- part of the dedup key itself, so it imposed no order
+    # among duplicates and the winner was whatever the store returned last.
+    # Measured 2026-09-16 on 724,594 selected Kalshi rows: 26.0% carried quotes
+    # older than 30s (the tolerance `core/quotes.py` and
+    # `core/metrics.MAX_QUOTE_AGE_SECONDS` enforce everywhere else, and which
+    # this repo measured as where fake edge comes from), 37,036 were crossed
+    # books, and on 48,350 rows it read a DIFFERENT observer than
+    # `attach_quotes` put on the same row -- so `market_state` and `book_flow`
+    # described two different samples of the same book.
+    #
+    # Ranked the same way `attach_quotes` ranks: unusable last, then by source
+    # preference, then by age within a source. Unusable rows are dropped rather
+    # than merely demoted, because unlike a price a flow feature has no NaN
+    # column to fall back to -- it would silently average a crossed book into a
+    # trend.
+    age = pd.to_numeric(book.get('quote_age_seconds'), errors='coerce') \
+        if 'quote_age_seconds' in book.columns \
+        else pd.Series(np.nan, index=book.index)
+    bid, ask = book['yes_bid'], book['yes_ask']
+    sane = ((bid.isna() | ((bid >= 0.0) & (bid <= 1.0)))
+            & (ask.isna() | ((ask >= 0.0) & (ask <= 1.0)))
+            & (bid.isna() | ask.isna() | (ask >= bid)))
+    fresh = age.isna() | (age.abs() <= MAX_QUOTE_AGE_SECONDS)
+    book = book[sane & fresh]
+    if not len(book):
+        return out
+    if 'source' in book.columns:
+        rank = {name: i for i, name in enumerate(QUOTE_SOURCE_PRIORITY)}
+        book = book.assign(_rank=book['source'].map(rank)
+                           .fillna(len(rank)).astype(int),
+                           _age=age.reindex(book.index))
+    else:
+        book = book.assign(_rank=0, _age=age.reindex(book.index))
+    book = (book.sort_values(['_rank', '_age'], na_position='last')
                 .drop_duplicates(['symbol', 'window_open', 'offset_minutes'],
-                                 keep='last'))
+                                 keep='first')
+                .drop(columns=['_rank', '_age']))
     keyed = {k: g.set_index('offset_minutes')
              for k, g in book.groupby(['symbol', 'window_open'])}
 

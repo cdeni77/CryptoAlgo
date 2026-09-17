@@ -120,7 +120,20 @@ def refit_on_all(dataset, config, *, groups=None):
         # model gets one from `core/backtest.py`; the refit did not, so the
         # artifact this function returns is the one actually installed and was
         # the only one in the pipeline that could not score.
+        # **`weights` too, or the artifact is not the model the gates measured.**
+        # Every fold model is fitted with `recency_weights(...)` in
+        # `core/backtest.py`; this refit omitted them, so under
+        # `--recency-half-life-days` the evidence came from weighted models and
+        # the INSTALLED artifact was an unweighted one. Inert while the
+        # half-life is None -- `recency_weights` returns None -- which is
+        # exactly how it would have shipped unnoticed the day someone set it.
+        # This is the same evidence-versus-artifact seam this function's own
+        # docstring was written to close for `scoring=`.
+        from core.cv import recency_weights
+
         return fit_model(table, fit.baseline, config, groups=groups,
+                         weights=recency_weights(table['window_open'],
+                                                 config.recency_half_life_days),
                          scoring=fit.bundle(config))
     except Exception as exc:                                  # noqa: BLE001
         logger.warning('refit on all data failed (%s); falling back',
