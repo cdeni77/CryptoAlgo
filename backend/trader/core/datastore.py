@@ -754,7 +754,20 @@ def from_sqlite(
             )
             funding = funding.drop(columns=['row_venue'])
             funding['interval_hours'] = 1
-            counts['funding'] = store.write('funding', funding)
+            # **Skipped rather than fatal when the store has no schema for it.**
+            # `store.write` raises `DataStoreError: Unknown dataset` and
+            # `sync_store` reaches this by default, so any database with a
+            # non-empty `funding` table killed the migration AFTER writing
+            # the bars and BEFORE printing counts or coverage -- making the
+            # documented promise (migrate these because SQLite is the only
+            # other copy) unkeepable, and looking like a crash rather than
+            # an unsupported dataset.
+            if 'funding' in SCHEMAS:
+                counts['funding'] = store.write('funding', funding)
+            else:
+                logger.warning('the store has no %s schema, so %d row(s) in '
+                               'the SQLite archive were NOT migrated',
+                               'funding', len(funding))
 
         oi = pd.read_sql_query(
             "SELECT symbol, event_time, available_time, quality, "
@@ -767,7 +780,20 @@ def from_sqlite(
         if not oi.empty:
             oi['venue'] = oi['row_venue'].where(oi['row_venue'] != 'unknown', venue)
             oi = oi.drop(columns=['row_venue'])
-            counts['open_interest'] = store.write('open_interest', oi)
+            # **Skipped rather than fatal when the store has no schema for it.**
+            # `store.write` raises `DataStoreError: Unknown dataset` and
+            # `sync_store` reaches this by default, so any database with a
+            # non-empty `open_interest` table killed the migration AFTER writing
+            # the bars and BEFORE printing counts or coverage -- making the
+            # documented promise (migrate these because SQLite is the only
+            # other copy) unkeepable, and looking like a crash rather than
+            # an unsupported dataset.
+            if 'open_interest' in SCHEMAS:
+                counts['open_interest'] = store.write('open_interest', oi)
+            else:
+                logger.warning('the store has no %s schema, so %d row(s) in '
+                               'the SQLite archive were NOT migrated',
+                               'open_interest', len(oi))
     finally:
         con.close()
 

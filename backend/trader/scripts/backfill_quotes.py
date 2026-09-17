@@ -283,6 +283,18 @@ async def run(args) -> int:
     done: set[str] = set()
     if checkpoint.exists():
         done = set(json.loads(checkpoint.read_text()).get('tickers', []))
+        # **Entries written before the key carried the offsets are discarded.**
+        # A bare ticker records that SOMETHING was pulled for it without saying
+        # which offsets, and treating that as "done" is precisely the bug: a
+        # ticker fetched for the `--offsets 14` control pass was excluded from
+        # the traded pull forever. Re-requesting is cheap and idempotent;
+        # keeping an ambiguous entry is not.
+        stale = {k for k in done if '@' not in k}
+        if stale:
+            logger.warning('discarding %d checkpoint entry/entries written '
+                           'before offsets were part of the key; those tickers '
+                           'will be re-requested', len(stale))
+            done -= stale
         logger.info('resuming: %d markets already pulled', len(done))
 
     throttle = Throttle(args.rate)
@@ -293,7 +305,8 @@ async def run(args) -> int:
         for series, symbol in SERIES.items():
             markets = await enumerate_settled(client, series)
             markets.sort(key=lambda m: m['open_time'])
-            todo = [m for m in markets if m['ticker'] not in done]
+            todo = [m for m in markets
+                    if _checkpoint_key(m['ticker'], args.offsets) not in done]
             if args.limit_per_series:
                 # Evenly spaced across the whole span, not the first N — a control
                 # drawn from one end of the history would be a control of that end.
@@ -336,7 +349,14 @@ async def run(args) -> int:
                 batch.extend(rows_from_candles(
                     candles, symbol=symbol, ticker=ticker, open_time=open_time,
                     offsets=args.offsets))
-                done.add(ticker)
+                # **Keyed on the offsets too.** `done.add(ticker)` marked a
+                # ticker finished regardless of `--offsets`, on one shared
+                # checkpoint file -- so a ticker pulled for the documented
+                # `--offsets 14` control pass was permanently excluded from the
+                # 3/6/9/12 pull, and `--limit-per-series` spaces the control
+                # evenly through history, making the hole a regular comb
+                # through the traded offsets.
+                done.add(_checkpoint_key(ticker, args.offsets))
                 total += 1
                 if len(batch) >= args.batch_rows:
                     written += store.write('venue_quotes', pd.DataFrame(batch))
@@ -353,6 +373,15 @@ async def run(args) -> int:
           f'{straddled} needed both endpoints')
     print('next: python -m scripts.quote_coverage')
     return 0
+
+
+def _checkpoint_key(ticker: str, offsets) -> str:
+    """What "already pulled" means: this ticker AT these offsets.
+
+    A bare ticker conflates a control pass with the traded pull. The offsets are
+    sorted so the key does not depend on argument order.
+    """
+    return f"{ticker}@{','.join(str(int(o)) for o in sorted(offsets))}"
 
 
 def main() -> int:

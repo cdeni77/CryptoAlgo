@@ -323,6 +323,14 @@ async def run(args, gate=None) -> int:
                             'event_time': pd.Timestamp(now).floor('min'),
                             'available_time': pd.Timestamp(now),
                             'quality': 'valid',
+                            # **Set, not left null.** `EVENT_KEY_EXTRA['pm_ladder']`
+                            # is `('transport',)` and the schema comment says "the
+                            # schema twin stays a twin" -- but all 92,988 rows
+                            # carried NULL for both of these, so the key was inert
+                            # and a second PM transport would have collapsed onto
+                            # the first exactly as `venue_depth` once did.
+                            'transport': 'rest',
+                            'book_age_ms': float('nan'),
                             'market_ticker': slug_by_symbol[symbol],
                             'window_open': window_open.to_pydatetime(),
                             'minute_into_window': round(minute, 3),

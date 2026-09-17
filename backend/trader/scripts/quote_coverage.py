@@ -23,7 +23,19 @@ import pandas as pd
 
 from core.datastore import ResearchStore
 
-FOLD_BLOCKS, TEST_BLOCKS = 7, 6      # linspace(0, N, n_folds+2); block 0 is seed
+# **Derived from the geometry that actually runs, not a fixed 7/6.** That pair
+# came from the COUNT scheme's `linspace(0, N, n_folds+2)`, where exactly
+# `n_folds` of `n_folds+1` blocks are tested. Under the anchored calendar scheme
+# -- the default since 2026-09-03 -- folds ACCUMULATE: every complete block
+# after the first is a test block, so the evaluated share is `(B-1)/B` over the
+# whole span, not 6/7. At 7-day blocks over a 245-day span that is ~34/35, so
+# the old constant understated `windows_evaluated` by ~12% -- and this script's
+# projection is what decides whether the 20,000 gate can pass and how many more
+# days of collection are needed.
+def evaluated_share(span_days: float, block_days: float) -> float:
+    """Fraction of windows that land in some test block."""
+    blocks = max(int(float(span_days) // float(block_days)), 1)
+    return (blocks - 1) / blocks if blocks > 1 else 0.0
 # `GET /historical/cutoff` on 2026-08-25. The backfill routes by it, so a
 # difference in how the two endpoints populate bid/ask would concentrate
 # exclusions in the earliest weeks — and a bootstrap that resamples by DAY is hurt

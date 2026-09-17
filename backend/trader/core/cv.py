@@ -212,7 +212,18 @@ def purged_walk_forward(
     # `n_folds` is a cap that only binds when someone asks for fewer than the
     # data supports. Gates that count folds must therefore be proportions —
     # "5 of 6" is a strong claim and "5 of 12" is a weak one.
+    #
+    # `n_folds` is NOT a cap here. See the note at the loop below.
     available = max(len(cuts) - 2, 0)
+    # **`n_folds` does NOT cap the calendar scheme, and that is deliberate.**
+    # The comment above once claimed it "only binds when someone asks for fewer
+    # than the data supports"; that cannot be implemented while `Config.n_folds`
+    # defaults to 6, because an explicit request for 6 is indistinguishable
+    # from the default, and capping there re-halves coverage -- measured,
+    # `windows_evaluated` 21,307 -> 10,488, failing its own 20,000 bar. Capping
+    # was tried on 2026-09-16 and reverted for exactly that. Under `calendar`,
+    # `n_folds` reaches only the minimum-windows guard and the short-span
+    # fallback; to test fewer blocks, widen `fold_block_days`.
     wanted = available if scheme == 'calendar' else min(int(n_folds), available)
     first = max(available - wanted, 0)
     for i in range(first, available):
