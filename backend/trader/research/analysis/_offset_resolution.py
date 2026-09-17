@@ -58,12 +58,30 @@ def main() -> int:
         decision_offsets=GRID, entry_offsets=(INCUMBENT,))
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     bars = load_minute_bars(config, store=store)
-    dataset = Dataset.build(bars, config)
+    # **With depth and the ladder fits, or this scores a different model.**
+    # `Dataset.build(bars, config)` alone leaves `attach_quotes`,
+    # `book_flow_features` and the implied-vol columns entirely NaN, so the
+    # model fitted below is missing `cross_venue`, `market_state` and
+    # `implied_vol` -- three of the eight groups in the deployed artifact --
+    # and says so only as a `fit_model` warning listing all-NaN features. This
+    # is the script whose output selects the incumbent entry offset, so it was
+    # choosing +12m on evidence from a model the project does not run.
+    depth = store.read('venue_depth')
+    try:
+        ladder_fits = store.read('venue_implied_vol')
+    except Exception:                                     # noqa: BLE001
+        ladder_fits = None
+    dataset = Dataset.build(bars, config, depth=depth, ladder_fits=ladder_fits)
     print(f'{len(dataset.window_index):,} windows, '
           f'{dataset.window_index.min().date()} .. '
           f'{dataset.window_index.max().date()}', flush=True)
     print(f'offsets {GRID}, incumbent +{INCUMBENT}m\n', flush=True)
 
+    # NOTE: `groups=` is left unset, so this uses the default feature set
+    # rather than the eight groups the deployed artifact carries. That is a
+    # second, smaller version of the same defect and is NOT fixed here --
+    # naming the deployed set would mean hardcoding a list that drifts. Read
+    # this script's offset ranking as indicative, not as the gate.
     result = walk_forward(dataset, config, trade=False)
     scored = result.scored
     scored = scored[np.isfinite(scored['baseline_probability'])

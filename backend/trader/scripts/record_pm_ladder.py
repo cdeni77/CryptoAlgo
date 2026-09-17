@@ -101,7 +101,14 @@ def _levels(raw) -> list:
     Polymarket serves bids ascending and asks descending, so the touch is the
     LAST entry on both sides. Kalshi's ladder is stored best-first, and a schema
     that agrees on columns while disagreeing on order is worse than one that
-    disagrees openly. The same argument applies to denomination — see
+    disagrees openly.
+
+    **And they DO disagree, measured 2026-09-16.** `venue_ladder.yes_levels`
+    runs ASCENDING (0.001 first); `pm_ladder.yes_levels` runs DESCENDING (best
+    bid first). So `yes_levels[0]` is Polymarket's best bid and Kalshi's worst.
+    Latent only because every consumer traced so far scans (`max`, iterate)
+    rather than indexes -- which is precisely the trap this paragraph claimed
+    was not there. Do not index either by position. The same argument applies to denomination — see
     `_no_levels`, which is why the ask side is not stored as served.
     """
     out = []

@@ -17,9 +17,20 @@ crash-safety on the one dataset with no second chance.
 
 **One row per LEVEL, not per frame.** A delta names one price; a snapshot names
 the whole ladder. Emitting a row per level gives both one flat schema, and a
-replay regroups by `(market_ticker, seq)` to rebuild the original event. That
-keeps the one-applier invariant: replay feeds `BookCache` the same `BookEvent`
-the live path folded.
+replay regroups to rebuild the original event. That keeps the one-applier
+invariant: replay feeds `BookCache` the same `BookEvent` the live path folded.
+
+**Regroup on `(market_ticker, event_time, seq)`, NOT `(market_ticker, seq)`.**
+`seq` restarts at 1 on every resubscription and `record_stream` rebuilds once
+per fifteen-minute boundary, so that pair is not unique across a day. Measured
+over four hours: 13,200 `(market_ticker, seq)` groups span two distinct
+`event_time`s, one snapshot key holding 530 rows — two full ~265-level ladders
+minutes apart. A replay written to the narrower contract merges them into one
+impossible frame, and those are exactly the bootstrap frames a replay needs.
+
+The STORED key is unaffected: `venue_book_events` carries `event_time` with a
+sub-millisecond arrival float, and the full corpus reads 705,864,465 rows
+against 705,864,465 distinct keys — zero collisions.
 """
 from __future__ import annotations
 
