@@ -104,6 +104,28 @@ def _levels(raw) -> list:
     return out
 
 
+def seconds_to_next_mark(now: datetime, period: float, phase: float) -> float:
+    """How long to sleep so the NEXT sample lands on `phase` past the minute.
+
+    `asyncio.sleep(interval)` at the end of a cycle makes the real period
+    `interval + work`, so the sampling phase walks through the minute. Measured
+    on `venue_ladder` over 2026-09-15 it swept 21.0s -> 41.3s, with p5/p50/p95
+    of 5.3/32.9/57.5s -- essentially uniform rather than pinned where
+    `run_live.align_to_phase` put it at startup. Two consequences: the phase
+    table in `run_live.COMPONENTS` stops being true within the first hour, and
+    whole minutes go unsampled (979 two-minute steps and 40 longer ones over
+    seven days).
+
+    Never returns less than a second: a cycle that overran its mark should wait
+    for the NEXT one rather than spin.
+    """
+    period = float(period)
+    phase = float(phase) % period
+    elapsed = (now - now.replace(second=0, microsecond=0)).total_seconds()
+    ahead = (phase - elapsed) % period
+    return ahead if ahead > 1.0 else ahead + period
+
+
 async def run(args, gate=None) -> int:
     from data_collection.kalshi_client import KalshiClient
 
@@ -148,8 +170,23 @@ async def run(args, gate=None) -> int:
                     for series, symbol in SERIES.items():
                         payload = await client._request(  # noqa: SLF001
                             'GET', '/markets',
-                            params={'series_ticker': series, 'status': 'open',
-                                    'limit': 5})
+                            # **NOT `status: 'open'`.** `record_stream._trading`
+                            # documents why and was changed for it: `status`
+                            # lags the market by up to forty seconds, so the
+                            # replacement market -- already published, with an
+                            # `open_time` exactly at the boundary -- is still
+                            # `initialized` and invisible to this query for the
+                            # first part of every window. Measured on the store
+                            # in 10s buckets inside the first minute: 8, 73,
+                            # 170, 323, 332, 324 rows against ~340/bucket in
+                            # minute 1, so the first twenty seconds were ~95%
+                            # and ~78% missing -- the moment the edge is
+                            # largest. Closing time is the honest filter; the
+                            # `0 <= minute <= window_minutes` check below
+                            # already discards anything outside the window.
+                            params={'series_ticker': series,
+                                    'min_close_ts': int(now.timestamp()),
+                                    'limit': 8})
                         for market in payload.get('markets', []):
                             if not market.get('open_time'):
                                 continue
@@ -212,7 +249,18 @@ async def run(args, gate=None) -> int:
                         logger.info('wrote %d ladder rows (%d levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()
-                    await asyncio.sleep(args.interval)
+                    # **Sleep to the next aligned mark, not for a fixed
+                    # interval.** `sleep(interval)` at the end of the cycle
+                    # makes the period `interval + work`, so the sampling phase
+                    # walks through the minute: measured over 2026-09-15 it
+                    # swept 21.0s -> 41.3s, p5/p50/p95 of 5.3/32.9/57.5s --
+                    # essentially uniform rather than pinned where
+                    # `run_live.align_to_phase` put it. That voids the phase
+                    # table `run_live.COMPONENTS` states within the first hour,
+                    # and it is why whole minutes go unsampled: 979 two-minute
+                    # and 40 longer steps over seven days.
+                    await asyncio.sleep(seconds_to_next_mark(
+                        datetime.now(timezone.utc), args.interval, args.phase))
         except asyncio.CancelledError:
             _flush_on_exit()
             raise
@@ -224,6 +272,9 @@ async def run(args, gate=None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--interval', type=float, default=60.0)
+    parser.add_argument('--phase', type=float, default=25.0,
+                        help='seconds past the minute to sample at (default 25). '
+                             'Held by re-aligning every cycle, not just at startup.')
     parser.add_argument('--batch-rows', type=int, default=30)
     return parser
 
