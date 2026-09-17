@@ -197,6 +197,16 @@ def build_parser() -> argparse.ArgumentParser:
     # `--max-daily-loss-fraction` is a flag rather than an edit to the default.
     # Explicit here beats the artifact's provenance: `config_for_artifact` skips
     # any field in `cli_overrides`.
+    parser.add_argument('--require-peer-book', dest='require_peer_book',
+                        action='store_true', default=None,
+                        help='refuse a decision whose cross-venue peer book is '
+                             'missing. `--complete-cases` required the peer on '
+                             'every TRAINING row, so without this live scores '
+                             'rows the artifact never saw. Settable nowhere '
+                             'until now, despite config.py naming it "what '
+                             'makes live agree".')
+    parser.add_argument('--no-require-peer-book', dest='require_peer_book',
+                        action='store_false')
     parser.add_argument('--min-edge-pp', type=float, default=None, metavar='PP',
                         help='Override the edge gate, in probability points '
                              '(promoted policy: 3.0). A NEGATIVE value admits '
@@ -3077,6 +3087,9 @@ def config_from_args(args) -> Config:
         # point of the flag, and a silent clamp would mean the loop ran with a
         # limit nobody asked for — worse than an obviously large number.
         overrides['max_daily_loss_fraction'] = float(daily)
+    peer = getattr(args, 'require_peer_book', None)
+    if peer is not None:
+        overrides['require_peer_book'] = bool(peer)
     gate = getattr(args, 'min_edge_pp', None)
     if gate is not None:
         # Not clamped at zero on purpose. A negative gate is the documented way

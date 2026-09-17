@@ -46,7 +46,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-DATA = Path(os.getenv('COLLECT_DATA', 'data/collection'))
+DATA = Path(os.getenv('COLLECT_DATA')
+            or Path(__file__).resolve().parents[2] / 'data' / 'collection')
 DERIVED = DATA / 'derived'
 WINDOW_MINUTES = 16                      # 0..15 inclusive
 CENTS = 100.0
@@ -352,7 +353,7 @@ def main() -> int:
     args = parser.parse_args()
 
     from core.datastore import ResearchStore
-    store = ResearchStore(os.getenv('RESEARCH_STORE', 'data/research'))
+    store = ResearchStore(os.getenv('RESEARCH_STORE'))
 
     if args.what in ('all', 'depth'):
         print('venue_depth (summarised to one row per minute 0..15)')

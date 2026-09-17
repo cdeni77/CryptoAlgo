@@ -100,7 +100,13 @@ def main() -> int:
             reasons[d.reason.value] = reasons.get(d.reason.value, 0) + 1
             if d.reason is not Reason.TRADED:
                 continue
-            won = _won(side=d.side, settled_up=bool(row['outcome']))
+            # **`bool(NaN)` is True.** These filtered non-finite
+            # `model_probability` and not the outcome, so an unsettled window
+            # was graded as a WIN -- silently, and only ever in one direction.
+            outcome = row['outcome']
+            if outcome is None or outcome != outcome:      # NaN
+                continue
+            won = _won(side=d.side, settled_up=bool(outcome))
             decisions.append({
                 'symbol': d.symbol, 'window_open': window, 'offset': d.offset,
                 'side': d.side.value, 'contracts': d.contracts, 'price': d.price,

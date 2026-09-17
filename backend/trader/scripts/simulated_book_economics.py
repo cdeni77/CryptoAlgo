@@ -69,7 +69,13 @@ def replay(table: pd.DataFrame, config, bankroll: float) -> pd.DataFrame:
                        require_quote=True)
             if d.reason is not Reason.TRADED:
                 continue
-            won = _won(side=d.side, settled_up=bool(row['outcome']))
+            # **`bool(NaN)` is True.** These filtered non-finite
+            # `model_probability` and not the outcome, so an unsettled window
+            # was graded as a WIN -- silently, and only ever in one direction.
+            outcome = row['outcome']
+            if outcome is None or outcome != outcome:      # NaN
+                continue
+            won = _won(side=d.side, settled_up=bool(outcome))
             out.append({'symbol': d.symbol, 'window_open': window, 'offset': d.offset,
                         'contracts': d.contracts, 'stake': d.stake, 'fee': d.fee,
                         'edge': d.edge, 'won': won,
@@ -100,6 +106,18 @@ def main() -> int:
                         & quotes['offset_minutes'].isin(config.decision_offsets)]
 
     # Score the span the simulator is FITTED on, to learn the deviation.
+    # **`--start`/`--end` are honoured here, having been declared and never
+    # read.** Their help says "ISO date for the replay span" and the module
+    # docstring says "Run over any span"; the span was derived from the quotes
+    # themselves and the two flags reached nothing, so a narrower request ran
+    # the whole history and reported it as the requested span.
+    if getattr(args, 'start', None):
+        quotes = quotes[quotes['window_open'] >= pd.Timestamp(args.start, tz='UTC')]
+    if getattr(args, 'end', None):
+        quotes = quotes[quotes['window_open'] < pd.Timestamp(args.end, tz='UTC')]
+    if not len(quotes):
+        print('no recorded quotes in that span')
+        return 1
     lo = (quotes['window_open'].min() - pd.Timedelta(days=3)).tz_convert(None)
     hi = (quotes['window_open'].max() + pd.Timedelta(hours=1)).tz_convert(None)
     ds = Dataset.build(load_minute_bars(config, store=store, start=lo, end=hi), config)

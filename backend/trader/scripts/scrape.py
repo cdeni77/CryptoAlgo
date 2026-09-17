@@ -34,6 +34,7 @@ hour. `tests/test_backfill_windows.py` pins both directions.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import asyncio
 import logging
 import os
@@ -72,7 +73,17 @@ def build_parser() -> argparse.ArgumentParser:
                              'hours, not a day rounded up.')
     parser.add_argument('--start', type=str, default=None, help='YYYY-MM-DD')
     parser.add_argument('--end', type=str, default=None, help='YYYY-MM-DD')
-    parser.add_argument('--db-path', type=str, default='./data/trading.db')
+    # **Anchored to the trader root, not the cwd.** `./data/trading.db` resolves
+    # against wherever the shell happens to be: from the repo root -- where
+    # docker-compose.yml and .env live, the natural place to stand -- it names a
+    # database that does not exist, and `sqlite3.connect` CREATES it, so a scrape
+    # backfills five years from scratch into a second hidden copy while the real
+    # one goes unread. This is the same hidden-second-copy failure
+    # `core/datastore.py` documents for the research store, which was fixed
+    # there and not here.
+    parser.add_argument('--db-path', type=str,
+                        default=str(Path(__file__).resolve().parents[1]
+                                    / 'data' / 'trading.db'))
     parser.add_argument('--venue-label', type=str, default=VENUE_LABEL)
     parser.add_argument('--fill-gaps', action='store_true',
                         help='Find minutes the store is missing and re-request '

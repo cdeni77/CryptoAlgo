@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import datetime as dt                                          # noqa: E402
 
-DATA = Path(os.getenv('COLLECT_DATA', 'data/collection'))
+DATA = Path(os.getenv('COLLECT_DATA')
+            or Path(__file__).resolve().parents[2] / 'data' / 'collection')
 SETTLEMENTS = DATA / 'kalshi_settlements.jsonl'
 WINDOW = dt.timedelta(minutes=15)
 
@@ -122,7 +123,7 @@ def _our_moves(symbols) -> dict:
     from core.datastore import ResearchStore
     from core.windows import build_windows
 
-    store = ResearchStore(os.getenv('RESEARCH_STORE', 'data/research'))
+    store = ResearchStore(os.getenv('RESEARCH_STORE'))
     bars = store.read('minute_bars')
     if bars is None or not len(bars):
         return {}
