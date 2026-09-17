@@ -848,7 +848,8 @@ class VenueState(NamedTuple):
 
 
 def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
-                        exchange_index: Optional[int] = None) -> None:
+                        exchange_index: Optional[int] = None,
+                        credited_this_cycle: float = 0.0) -> None:
     """Make the venue's balance the one we report. **Call this after settling.**
 
     Our running figure against theirs: a gap that grows is an unrecorded fill, a
@@ -887,7 +888,28 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
         return
     ours = float(account.bankroll)
     drift = venue_balance - ours
-    if abs(drift) > 0.01:
+    # **A payout we have booked and the venue has not yet is not a drift.**
+    # `venue_balance` is sampled at the TOP of the cycle by
+    # `reconcile_with_venue`; `settle_due` then credits our side, and the venue's
+    # own balance reflects it a cycle later. So every winning settlement produced
+    # a matched pair of warnings -- measured:
+    #
+    #     15:15:07  ours $527.98, venue $511.98  (-16.00)   <- we credited
+    #     15:16:09  ours $511.98, venue $527.98  (+16.00)   <- venue caught up
+    #
+    # against ETH +$8 and SOL +$8 settling at 19:15 UTC. This function's own
+    # docstring records the same cry-wolf pattern being fixed once before, in the
+    # other direction; moving the call site fixed the sign and not the sample.
+    #
+    # The honest comparison subtracts what we just booked. A drift that survives
+    # THAT is the thing this alarm exists for: an unrecorded fill, a partial, or
+    # a mispriced fee.
+    explained = abs(abs(drift) - abs(float(credited_this_cycle or 0.0))) <= 0.01
+    if abs(drift) > 0.01 and explained:
+        logger.info('balance lags by %+.2f, which is exactly what we credited '
+                    'this cycle — the venue posts settlements one cycle behind. '
+                    'Adopting theirs.', drift)
+    elif abs(drift) > 0.01:
         logger.warning(
             'balance drift: ours $%.2f, venue $%.2f (%+.2f). The venue is the '
             'account of record — writing theirs. A drift that grows means a '
@@ -1656,20 +1678,51 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
                 scored.iloc[i, scored.columns.get_loc(column)] = row[column]
 
 
-def _warn_unscoreable_features(scored: pd.DataFrame, model) -> None:
+# Features that are legitimately absent at a known offset, with the reason. A
+# warning that fires every window is not a warning.
+EXPECTED_NAN = {
+    # `gap_change` is a first difference against the previous offset, so it has
+    # nothing to difference against at the FIRST offset of a window. That is
+    # arithmetic, not a fault.
+    'venue_gap_change_5': lambda offsets: min(offsets) if offsets else None,
+}
+
+
+def _warn_unscoreable_features(scored: pd.DataFrame, model,
+                               *, offsets=()) -> None:
     """Say loudly when the model wants a feature this row cannot supply.
 
     A NaN feature does not raise; the booster substitutes the direction it
     learned in training. So the only signal that a live model is not the model
     that was measured is this line.
+
+    **Which is why it must not cry wolf.** It fired 96 times in 24 hours --
+    once per window, always `venue_gap_change_5`, which is NaN at a window's
+    first offset by construction. A genuine failure, a dead stream leaving
+    `imbalance_5c`, `depth_ratio` and `book_convexity` empty, appends three
+    names to the identical line at the identical rate, and was therefore
+    indistinguishable at a glance from the moment this feature shipped.
+
+    Expected absences are still REPORTED, at debug, rather than dropped: the
+    day one of them stops being expected, silence would be worse than noise.
     """
     wanted = list(getattr(model, 'features', ()) or ())
     if not wanted or not len(scored):
         return
+    offsets = tuple(int(o) for o in (offsets or ()))
+    here = pd.to_numeric(scored.get('offset'), errors='coerce').dropna().unique() \
+        if 'offset' in scored.columns else ()
     missing = [c for c in wanted if c not in scored.columns]
     empty = [c for c in wanted
              if c in scored.columns and not pd.to_numeric(
                  scored[c], errors='coerce').notna().any()]
+    expected = [c for c in empty
+                if c in EXPECTED_NAN and len(here) == 1
+                and EXPECTED_NAN[c](offsets) == int(here[0])]
+    if expected:
+        logger.debug('all-NaN as expected at offset %s: %s',
+                     int(here[0]) if len(here) == 1 else '?', expected)
+        empty = [c for c in empty if c not in expected]
     if missing or empty:
         logger.warning(
             'scoring with features the row cannot supply — missing %s, all-NaN %s. '
@@ -2180,7 +2233,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
                          'bookkeeping for this cycle', exc)
-    settle_due(writer, bars, venue_settlements=venue_settlements)
+    settled = settle_due(writer, bars, venue_settlements=venue_settlements)
     _phase('settle')
 
     # **The book, last.** Everything above — bars, local bookkeeping, the venue
@@ -2203,7 +2256,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     settle_predictions(writer, bars)
     # Now that our own credits are in, the drift is a real disagreement.
     if kalshi is not None and args.reconcile:
-        adopt_venue_balance(writer, venue_balance, exchange_index=shard)
+        adopt_venue_balance(writer, venue_balance, exchange_index=shard,
+                            credited_this_cycle=sum(p for _, p in settled))
 
     if offset is None:
         # This used to read "N minutes into the window; first decision offset is
@@ -2280,7 +2334,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     _attach_book_features(scored, quotes, _stream_cache())
     scored = prepare_init_score(scored, model)
     _phase('score')
-    _warn_unscoreable_features(scored, model)
+    _warn_unscoreable_features(scored, model,
+                               offsets=tuple(config.decision_offsets or ()))
     scored['model_probability'] = model.predict(scored)
 
     # The venue publishes the number it will settle against, as `floor_strike`,
