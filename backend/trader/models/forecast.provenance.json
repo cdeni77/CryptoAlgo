@@ -63,27 +63,27 @@
     "market_state",
     "implied_vol"
   ],
-  "residual_scale": 1.0900449678976634,
+  "residual_scale": 0.9941761592395179,
   "init_score_source": "market",
-  "n_train_rows": 68264,
-  "n_train_windows": 12868,
-  "best_iteration": 95,
-  "train_log_loss": 0.45067291716052615,
-  "inner_log_loss": 0.49628622150947316,
-  "inner_baseline_log_loss": 0.5001227900105154,
-  "inner_log_loss_skill": 0.003836568501042248,
+  "n_train_rows": 71566,
+  "n_train_windows": 13188,
+  "best_iteration": 132,
+  "train_log_loss": 0.45191077291821685,
+  "inner_log_loss": 0.4976820398193404,
+  "inner_baseline_log_loss": 0.5021409916186242,
+  "inner_log_loss_skill": 0.00445895179928385,
   "control_importance_share": 0.0,
   "baseline": {
     "distribution": "student_t",
-    "nu": 3.783289072905987,
+    "nu": 3.491436692711519,
     "scale": {
-      "3": 1.275208698434596,
-      "6": 1.1954334724170539,
-      "9": 1.1258078695855274,
-      "12": 1.0326091202084098
+      "3": 1.3016629037849694,
+      "6": 1.247212419063691,
+      "9": 1.1840414934606327,
+      "12": 1.0742616788434742
     },
-    "n_fitted": 68250,
-    "fitted_log_loss": 0.46769240708483284
+    "n_fitted": 71552,
+    "fitted_log_loss": 0.46876930511349585
   },
   "deployable": true,
   "config": {
@@ -117,18 +117,19 @@
     "fee_rate": 0.07,
     "half_spread_cents": 0.5,
     "fee_config_version": "builtin_kalshi_v202608",
-    "fold_scheme": "count",
+    "fold_scheme": "calendar",
     "entry_offsets": [
       12
     ],
     "compound": false,
-    "starting_bankroll": 200.0,
+    "starting_bankroll": 500.0,
     "max_stake_dollars": 25.0,
     "max_stake_fraction": 0.05,
-    "kelly_fraction": 0.1,
-    "min_edge_pp": 3.0,
+    "kelly_fraction": 0.05,
+    "min_edge_pp": 1.5,
     "cli_overrides": [
       "entry_offsets",
+      "fold_block_days",
       "init_score_source",
       "kelly_fraction",
       "min_edge_pp",

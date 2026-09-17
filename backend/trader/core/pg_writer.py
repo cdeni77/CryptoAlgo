@@ -964,6 +964,49 @@ class PgWriter:
             session.commit()
             return int(n)
 
+    def correct_outcomes_from_venue(self, labels) -> tuple[int, int]:
+        """Overwrite `Prediction.outcome` where the VENUE settled differently.
+
+        **The market gates are scored on this column, and it was filled from
+        Coinbase bars only.** `settle_due` prefers the venue's own settlement
+        for the money; `settle_predictions`, eleven lines away in the same
+        function with the venue data already in scope, did not -- and
+        `scored_against_market()` can return no other label. So
+        `model_minus_market` and `calibration_vs_market` were computed on our
+        proxy while the backtest branch of the same gate substitutes
+        `venue_outcome`. Two label conventions under one gate name.
+
+        Measured 2026-09-16 on 5,471 rows at +12m: the labels disagree on 2.85%,
+        all of it in near-ties as expected, and the statistic moves
+        **+0.000924 -> +0.000188**. Four fifths of the apparent live edge was
+        self-grading.
+
+        `set_window_outcome` deliberately fills only NULLs, so a venue label
+        arriving after ours could never correct it. This one overwrites, and
+        ONLY where the two differ, so a re-run is free and the count is the
+        disagreement rather than the row count.
+
+        `labels` is an iterable of `(symbol, window_open, settled_up)`.
+        Returns `(examined, corrected)`.
+        """
+        examined = corrected = 0
+        with self._session() as session:
+            for symbol, window_open, settled_up in labels:
+                if settled_up is None:
+                    continue
+                examined += 1
+                value = 1 if settled_up else 0
+                n = (session.query(Prediction)
+                     .filter(Prediction.symbol == symbol,
+                             Prediction.window_open == window_open,
+                             Prediction.outcome.isnot(None),
+                             Prediction.outcome != value)
+                     .update({Prediction.outcome: value},
+                             synchronize_session=False))
+                corrected += int(n)
+            session.commit()
+        return examined, corrected
+
     # ---- account --------------------------------------------------------
     def ensure_account(self, starting_bankroll: float,
                        *, mode: str = 'paper') -> Account:

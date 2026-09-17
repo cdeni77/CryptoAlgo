@@ -45,7 +45,26 @@ logger = logging.getLogger(__name__)
 # went unread — the same hidden-second-copy failure as the compose named volume
 # masking the host directory. RESEARCH_STORE still wins.
 _TRADER_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ROOT = Path(os.getenv('RESEARCH_STORE') or _TRADER_ROOT / 'data' / 'research')
+
+
+def default_root() -> Path:
+    """The store root, resolved NOW rather than at import.
+
+    `DEFAULT_ROOT` used to be a module constant computed when this file was
+    first imported. `scripts/_common.py` imports this module at its own top and
+    only then sets `RESEARCH_STORE` from `--research-store`, so by the time the
+    flag was read the constant was already frozen: every `_common`-based script
+    accepted the flag, echoed it in the run header, and read the DEFAULT store.
+    Twenty research scripts that call `ResearchStore(os.getenv('RESEARCH_STORE'))`
+    at call time honoured it, so the flag worked in some tools and was silently
+    ignored in exactly the ones that produce gate numbers.
+    """
+    return Path(os.getenv('RESEARCH_STORE') or _TRADER_ROOT / 'data' / 'research')
+
+
+# Kept as a name because several modules import it. It is the value at import
+# time; anything that must honour a later override goes through `default_root()`.
+DEFAULT_ROOT = default_root()
 
 # Datasets and the columns they must carry. `event_time` and `available_time`
 # are required everywhere — they are what makes a point-in-time read possible.
@@ -354,7 +373,7 @@ class ResearchStore:
     """Parquet-backed research store with point-in-time reads."""
 
     def __init__(self, root: str | Path | None = None):
-        self.root = Path(root or DEFAULT_ROOT)
+        self.root = Path(root or default_root())
         self.root.mkdir(parents=True, exist_ok=True)
 
     # -- writing ------------------------------------------------------------

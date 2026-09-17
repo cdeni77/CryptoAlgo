@@ -274,18 +274,59 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
         for step in (('scripts.scrape', '--backfill-days', '3'),
                      ('scripts.sync_store',),
                      ('scripts.build_depth',),
-                     ('scripts.collect_settlements', '--venue', 'both')):
+                     ('scripts.collect_settlements', '--venue', 'both'),
+                     # **Immediately after the settlements land**, because it
+                     # reads what that step just wrote. `predictions.outcome`
+                     # is the label the market gates score, and it is filled
+                     # from Coinbase bars; the venue's own settlement disagrees
+                     # on ~2.85% of windows and moves model_minus_market from
+                     # +0.000924 to +0.000188. Idempotent, so a re-run is free.
+                     ('scripts.correct_outcomes',)):
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, '-m', *step,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE)
-            _out, err = await proc.communicate()
+            # **Bounded, because an unbounded await here is invisible.**
+            # `communicate()` with no timeout means a child that wedges -- a
+            # stuck HTTP socket inside it, a read on a corrupt partition --
+            # parks this coroutine forever. `supervise` cannot tell that from a
+            # coroutine legitimately awaiting, which is the EXACT failure
+            # `record_stream.consume` was rewritten to eliminate, where every
+            # exit is now enforced on a timeout.
+            #
+            # The consequence is the one the docstring above already names:
+            # trading and recording continue while `minute_bars`, `venue_depth`
+            # and the settlement LABEL stop advancing, and a fresh walk-forward
+            # then reproduces the previous run exactly -- which reads as a
+            # stable model and is a stalled pipeline. The only symptom was the
+            # ABSENCE of four hourly log lines.
+            try:
+                _out, err = await asyncio.wait_for(proc.communicate(),
+                                                   timeout=STEP_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.error('%s exceeded %.0fs and was killed; the store is '
+                             'now BEHIND and a re-run of the evaluation will '
+                             'reproduce the previous one',
+                             step[0], STEP_TIMEOUT_SECONDS)
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                continue
             if proc.returncode:
                 logger.warning('%s exited %s: %s', step[0], proc.returncode,
                                (err or b'').decode(errors='replace')[:300])
             else:
                 logger.info('%s done', step[0])
         await asyncio.sleep(every)
+
+
+# How long one store-sync child may run before it is killed. A full
+# `scripts.scrape --backfill-days 3` plus a store rebuild is minutes, not tens
+# of minutes, and the loop runs hourly -- so a generous ceiling still catches a
+# wedge long before the next pass would overlap it.
+STEP_TIMEOUT_SECONDS = 1800.0
 
 
 def build_factories(args, gate: TradingGate) -> dict:
