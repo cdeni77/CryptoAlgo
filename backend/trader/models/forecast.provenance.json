@@ -63,27 +63,27 @@
     "market_state",
     "implied_vol"
   ],
-  "residual_scale": 0.9941761592395179,
+  "residual_scale": 0.9666894669909913,
   "init_score_source": "market",
-  "n_train_rows": 71566,
-  "n_train_windows": 13188,
+  "n_train_rows": 71652,
+  "n_train_windows": 13197,
   "best_iteration": 132,
-  "train_log_loss": 0.45191077291821685,
-  "inner_log_loss": 0.4976820398193404,
-  "inner_baseline_log_loss": 0.5021409916186242,
-  "inner_log_loss_skill": 0.00445895179928385,
+  "train_log_loss": 0.45231676151016964,
+  "inner_log_loss": 0.49614567297593826,
+  "inner_baseline_log_loss": 0.5005262857724728,
+  "inner_log_loss_skill": 0.0043806127965345665,
   "control_importance_share": 0.0,
   "baseline": {
     "distribution": "student_t",
-    "nu": 3.491436692711519,
+    "nu": 3.915302515300189,
     "scale": {
-      "3": 1.3016629037849694,
-      "6": 1.247212419063691,
-      "9": 1.1840414934606327,
-      "12": 1.0742616788434742
+      "3": 1.2464771073593532,
+      "6": 1.1688483420827822,
+      "9": 1.133713582665292,
+      "12": 1.0231776028933952
     },
-    "n_fitted": 71552,
-    "fitted_log_loss": 0.46876930511349585
+    "n_fitted": 71638,
+    "fitted_log_loss": 0.46792322892492666
   },
   "deployable": true,
   "config": {
@@ -129,7 +129,6 @@
     "min_edge_pp": 1.5,
     "cli_overrides": [
       "entry_offsets",
-      "fold_block_days",
       "init_score_source",
       "kelly_fraction",
       "min_edge_pp",
