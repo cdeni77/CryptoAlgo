@@ -242,6 +242,12 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
     because the GIL is held through much of pandas. A subprocess is the only
     arrangement where a rebuild cannot touch the trading loop's latency.
     """
+    # Stamped on ENTRY as well as after each pass. The period here is an
+    # hour and the first pass takes minutes, so 'never reported' would
+    # hold the container unhealthy through a perfectly normal startup.
+    # Liveness for this component means the loop is alive and
+    # progressing; the staleness limit is what catches a wedge.
+    heartbeat.touch('store_sync')
     while True:
         # Fold the closed hours of the frame spool into immutable Parquet. This
         # belongs here rather than in the stream recorder for the same reason
