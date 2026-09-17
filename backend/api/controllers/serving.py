@@ -46,10 +46,66 @@ def _measured(value: Any) -> dict[str, Any]:
     return {'value': value, 'reason': None}
 
 
+#: The time column each serving table is filtered on for the dashboard epoch.
+#: Named explicitly rather than guessed: `Prediction` alone carries four
+#: DateTimes, and filtering a decision on `created_at` instead of
+#: `decision_time` would hide rows by when they were WRITTEN rather than when
+#: they happened.
+RESET_COLUMN = {
+    'Prediction': 'decision_time',
+    'Position': 'window_open',
+    'EquityPoint': 'timestamp',
+    'OrderTicket': 'created_at',
+    'VenueSettlement': 'settled_time',
+    'VenueFill': 'created_time',
+    'VenueBalance': 'timestamp',
+}
+
+
+def reset_epoch(db: Session):
+    """The instant the dashboard reads from, or None for all of history.
+
+    **This hides; it does not delete.** `predictions` is the only
+    out-of-sample measurement of whether the model beats the PRICE --
+    `PgWriter.scored_against_market` reads nothing else, and both
+    `model_minus_market` and `calibration_vs_market` are computed from it --
+    and `venue_fills`/`venue_settlements` hold windows Kalshi itself no longer
+    serves. Truncating for a clean chart would trade the one number that is not
+    self-graded for a cosmetic reset.
+
+    Research never consults this: `scripts/evaluate` and `scripts/promote` read
+    the store and the full `predictions` table regardless, so a reset cannot
+    silently shrink the sample a gate is computed on.
+
+    Clearing the column restores the full view.
+    """
+    row = db.execute(select(Account).order_by(Account.id)).scalars().first()
+    return getattr(row, 'reset_at', None) if row is not None else None
+
+
+def since_reset(query, model, epoch):
+    """Apply the dashboard epoch to `query`, or return it unchanged.
+
+    A named function so the seam can be TESTED. Eighteen call sites each
+    remembering a filter is the shape of defect this codebase keeps producing --
+    `entry_offsets` reaching `promote` and not `evaluate` inverted a gate, and
+    three scripts silently ignoring the fold geometry cut a different
+    experiment. `tests/test_serving_reset.py` asserts every serving query goes
+    through here.
+    """
+    if epoch is None:
+        return query
+    column = getattr(model, RESET_COLUMN[model.__name__], None)
+    if column is None:
+        return query
+    return query.where(column >= epoch)
+
+
 def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str, Any]:
+    epoch = reset_epoch(db)
     row = db.execute(select(Account).order_by(Account.id)).scalars().first()
     open_rows = db.execute(
-        select(Position).where(Position.outcome == Outcome.PENDING.value)
+        since_reset(select(Position), Position, epoch).where(Position.outcome == Outcome.PENDING.value)
     ).scalars().all()
     staked = sum(p.outlay for p in open_rows)
 
@@ -90,9 +146,10 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
 
 
 def equity_curve(db: Session, *, days: int = 30) -> list[dict[str, Any]]:
+    epoch = reset_epoch(db)
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = db.execute(
-        select(EquityPoint).where(EquityPoint.timestamp >= since)
+        since_reset(select(EquityPoint), EquityPoint, epoch).where(EquityPoint.timestamp >= since)
         .order_by(EquityPoint.timestamp)
     ).scalars().all()
     return [{
@@ -104,14 +161,15 @@ def equity_curve(db: Session, *, days: int = 30) -> list[dict[str, Any]]:
 
 def live_windows(db: Session) -> list[dict[str, Any]]:
     """The most recent decision point per symbol — the barrier state, now."""
+    epoch = reset_epoch(db)
     latest = db.execute(
-        select(Prediction.symbol, func.max(Prediction.decision_time))
+        since_reset(select(Prediction.symbol, func.max(Prediction.decision_time)), Prediction, epoch)
         .group_by(Prediction.symbol)
     ).all()
     out = []
     for symbol, when in latest:
         row = db.execute(
-            select(Prediction)
+            since_reset(select(Prediction), Prediction, epoch)
             .where(Prediction.symbol == symbol, Prediction.decision_time == when)
         ).scalars().first()
         if row is None:
@@ -143,17 +201,19 @@ def _prediction_payload(row: Prediction) -> dict[str, Any]:
 
 def recent_predictions(db: Session, *, limit: int = 100,
                        traded_only: bool = False) -> list[dict[str, Any]]:
-    query = select(Prediction).order_by(Prediction.decision_time.desc()).limit(limit)
+    epoch = reset_epoch(db)
+    query = since_reset(select(Prediction), Prediction, epoch).order_by(Prediction.decision_time.desc()).limit(limit)
     if traded_only:
-        query = select(Prediction).where(Prediction.traded.is_(True)) \
+        query = since_reset(select(Prediction), Prediction, epoch).where(Prediction.traded.is_(True)) \
             .order_by(Prediction.decision_time.desc()).limit(limit)
     return [_prediction_payload(r) for r in db.execute(query).scalars().all()]
 
 
 def funnel(db: Session, *, days: int = 7) -> list[dict[str, Any]]:
+    epoch = reset_epoch(db)
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = db.execute(
-        select(Prediction.reason, func.count(Prediction.id))
+        since_reset(select(Prediction.reason, func.count(Prediction.id)), Prediction, epoch)
         .where(Prediction.window_open >= since)
         .group_by(Prediction.reason)
     ).all()
@@ -172,7 +232,8 @@ def funnel(db: Session, *, days: int = 7) -> list[dict[str, Any]]:
 
 def positions(db: Session, *, open_only: bool = False,
               limit: int = 100) -> list[dict[str, Any]]:
-    query = select(Position)
+    epoch = reset_epoch(db)
+    query = since_reset(select(Position), Position, epoch)
     if open_only:
         query = query.where(Position.outcome == Outcome.PENDING.value) \
             .order_by(Position.settle_time)
@@ -297,10 +358,11 @@ def window_strikes(db: Session, *, minutes: int = 240) -> list[dict[str, Any]]:
     is what makes "above or below" readable at a glance — a single line across the
     whole chart would be wrong, because the strike is reset every fifteen minutes.
     """
+    epoch = reset_epoch(db)
     since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
     rows = db.execute(
-        select(Prediction.symbol, Prediction.window_open, Prediction.settle_time,
-               func.min(Prediction.strike))
+        since_reset(select(Prediction.symbol, Prediction.window_open, Prediction.settle_time,
+               func.min(Prediction.strike)), Prediction, epoch)
         .where(Prediction.window_open >= since)
         .group_by(Prediction.symbol, Prediction.window_open, Prediction.settle_time)
         .order_by(Prediction.window_open)
@@ -318,9 +380,10 @@ def tickets(db: Session, *, open_only: bool = True, limit: int = 50) -> list[dic
     a ticket is the record of the decision either way, so a dry run and a fill
     are distinguishable after the fact.
     """
-    query = select(OrderTicket).order_by(OrderTicket.created_at.desc()).limit(limit)
+    epoch = reset_epoch(db)
+    query = since_reset(select(OrderTicket), OrderTicket, epoch).order_by(OrderTicket.created_at.desc()).limit(limit)
     if open_only:
-        query = (select(OrderTicket).where(OrderTicket.status == 'new')
+        query = (since_reset(select(OrderTicket), OrderTicket, epoch).where(OrderTicket.status == 'new')
                  .order_by(OrderTicket.created_at.desc()).limit(limit))
     return [{
         'id': r.id, 'symbol': r.symbol, 'window_open': r.window_open,
@@ -414,7 +477,8 @@ def _venue_won(row: VenueSettlement) -> Optional[bool]:
 def venue_settlements(db: Session, *, days: Optional[int] = None,
                       limit: int = 200) -> list[dict[str, Any]]:
     """Settled markets as the venue paid them, newest first."""
-    query = select(VenueSettlement)
+    epoch = reset_epoch(db)
+    query = since_reset(select(VenueSettlement), VenueSettlement, epoch)
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=days)
         query = query.where(VenueSettlement.settled_time >= since)
@@ -430,7 +494,8 @@ def venue_fills(db: Session, *, days: Optional[int] = None,
     the 0.70 the venue's YES-denominated book quotes. The translation happens
     once, in the trader's parser.
     """
-    query = select(VenueFill)
+    epoch = reset_epoch(db)
+    query = since_reset(select(VenueFill), VenueFill, epoch)
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=days)
         query = query.where(VenueFill.created_time >= since)
@@ -452,9 +517,10 @@ def venue_account_state(db: Session) -> dict[str, Any]:
     has no venue ledger at all. A dashboard that renders an unsynced ledger as
     `$0.00 realised` is claiming a measurement it does not have.
     """
-    rows = db.execute(select(VenueSettlement)).scalars().all()
+    epoch = reset_epoch(db)
+    rows = db.execute(since_reset(select(VenueSettlement), VenueSettlement, epoch)).scalars().all()
     balance = db.execute(
-        select(VenueBalance).order_by(VenueBalance.timestamp.desc())
+        since_reset(select(VenueBalance), VenueBalance, epoch).order_by(VenueBalance.timestamp.desc())
     ).scalars().first()
     account = db.execute(select(Account).order_by(Account.id)).scalars().first()
 
@@ -568,6 +634,7 @@ def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
     excluded, so a caller can shift the series onto a lifetime scale and a reader
     is never shown a partial total labelled as the whole.
     """
+    epoch = reset_epoch(db)
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
     earlier = db.execute(
@@ -577,7 +644,7 @@ def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
     ).scalar()
 
     rows = db.execute(
-        select(VenueSettlement)
+        since_reset(select(VenueSettlement), VenueSettlement, epoch)
         .where(VenueSettlement.settled_time >= since,
                VenueSettlement.pnl.is_not(None))
         .order_by(VenueSettlement.settled_time)
@@ -595,7 +662,7 @@ def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
         })
 
     balances = db.execute(
-        select(VenueBalance).where(VenueBalance.timestamp >= since)
+        since_reset(select(VenueBalance), VenueBalance, epoch).where(VenueBalance.timestamp >= since)
         .order_by(VenueBalance.timestamp)
     ).scalars().all()
 

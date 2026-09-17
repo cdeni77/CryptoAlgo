@@ -185,6 +185,11 @@ class Account(Base):
     mode = Column(String, nullable=False, default='paper', index=True)
     starting_bankroll = Column(Float, nullable=False, default=100.0)
     bankroll = Column(Float, nullable=False, default=100.0)
+    # The epoch this dashboard reads from. See `controllers.serving.reset_epoch`:
+    # it filters what is SHOWN and deletes nothing, because `predictions` is the
+    # only out-of-sample evidence that the model beats the price and the venue
+    # ledger holds windows Kalshi no longer serves.
+    reset_at = Column(DateTime(timezone=True), nullable=True)
     staked = Column(Float, nullable=False, default=0.0)
     realized_pnl = Column(Float, nullable=False, default=0.0)
     fees_paid = Column(Float, nullable=False, default=0.0)

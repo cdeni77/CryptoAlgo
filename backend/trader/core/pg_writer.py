@@ -206,6 +206,20 @@ class Account(Base):
     bankroll = Column(Float, nullable=False, default=100.0)
     staked = Column(Float, nullable=False, default=0.0)
     realized_pnl = Column(Float, nullable=False, default=0.0)
+    # **The epoch the dashboard reads from. NOT a deletion.**
+    #
+    # Restarting the P&L view must not destroy the evidence. `predictions` is
+    # the only out-of-sample measurement of whether the model beats the PRICE --
+    # `scored_against_market` reads nothing else, and `model_minus_market` and
+    # `calibration_vs_market` are computed from it -- and `venue_fills` /
+    # `venue_settlements` hold windows Kalshi itself no longer serves. Truncating
+    # for a clean chart would trade the one number that is not self-graded for a
+    # cosmetic reset.
+    #
+    # So the API filters on or after this instant and the rows stay. Clearing it
+    # restores the full history, and `scripts/evaluate` and `scripts/promote`
+    # never consult it: research always reads everything.
+    reset_at = Column(DateTime(timezone=True), nullable=True)
     fees_paid = Column(Float, nullable=False, default=0.0)
     halted = Column(Boolean, nullable=False, default=False)
     halted_reason = Column(String, nullable=True)
@@ -540,7 +554,48 @@ class PgWriter:
         self._engine = create_engine(url, pool_pre_ping=True, future=True)
         self._sessions = sessionmaker(bind=self._engine, future=True)
         Base.metadata.create_all(self._engine)
+        self._ensure_columns()
         self._run_migrations()
+
+    #: Columns added to an existing table after it was first created.
+    #: `(table, column, type)`, applied only when genuinely absent.
+    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ('account', 'reset_at', 'TIMESTAMP WITH TIME ZONE'),
+    )
+
+    def _ensure_columns(self) -> None:
+        """Add columns that `create_all` cannot.
+
+        **`create_all` creates missing TABLES, never missing columns**, so a
+        database that predates a field reports `UndefinedColumn` on every read
+        of that table -- loudly, but only at runtime.
+
+        This is NOT in `MIGRATIONS`. That tuple is asserted by
+        `tests/test_orm_parity.py` to hold only portable, idempotent
+        `CREATE INDEX IF NOT EXISTS` statements, for a stated reason: anything
+        else needs a dialect guard, and a guard means the SQLite test suite
+        stops exercising the statement production runs. `ADD COLUMN IF NOT
+        EXISTS` is Postgres-only.
+
+        So the existence check is done in Python via the dialect-neutral
+        inspector, and the `ALTER` that follows is bare `ADD COLUMN`, which
+        SQLite and Postgres both accept. Idempotent by inspection rather than
+        by syntax, and exercised identically on both.
+        """
+        from sqlalchemy import inspect as _inspect
+
+        inspector = _inspect(self._engine)
+        existing = set(inspector.get_table_names())
+        for table, column, type_ in self.ADDED_COLUMNS:
+            if table not in existing:
+                continue
+            have = {c['name'] for c in inspector.get_columns(table)}
+            if column in have:
+                continue
+            with self._engine.begin() as con:
+                con.exec_driver_sql(
+                    f'ALTER TABLE {table} ADD COLUMN {column} {type_}')
+            logger.info('added %s.%s', table, column)
 
     def _run_migrations(self) -> None:
         """Apply the additive migrations, tolerating only SQLite's dialect gaps.
