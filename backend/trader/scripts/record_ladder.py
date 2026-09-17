@@ -197,6 +197,22 @@ async def run(args, gate=None) -> int:
                             minute = (now - open_time).total_seconds() / 60.0
                             if not (0 <= minute <= config.window_minutes):
                                 continue
+                            # **The stream sample is taken FIRST, so a REST
+                            # failure cannot discard it.** Both `continue`s
+                            # below -- the request error and the empty ladder --
+                            # sat before this, so the archive's websocket
+                            # coverage was a strict SUBSET of REST's by
+                            # construction. Measured over seven days:
+                            # rest_only = 30, ws_only = 0. The documented
+                            # retirement gate needs evidence that the stream
+                            # covers a REST outage, and the recorder was built
+                            # so that evidence could never exist.
+                            paired = ws_row(
+                                CACHE, ticker=market['ticker'], symbol=symbol,
+                                now=now, open_time=open_time, minute=minute,
+                                read_at=datetime.now(timezone.utc))
+                            if paired is not None:
+                                rows.append(paired)
                             try:
                                 book = await client._request(  # noqa: SLF001
                                     'GET', f"/markets/{market['ticker']}/orderbook")
@@ -214,6 +230,12 @@ async def run(args, gate=None) -> int:
                             yes = _levels(ladder.get('yes_dollars') or ladder.get('yes'))
                             no = _levels(ladder.get('no_dollars') or ladder.get('no'))
                             if not yes and not no:
+                                # Silent before. The stream row above is
+                                # already kept, so this drops the REST half
+                                # only -- but a run of these is a venue
+                                # problem worth seeing.
+                                logger.debug('%s: empty REST ladder at minute '
+                                             '%.1f', market['ticker'], minute)
                                 continue
                             rows.append({
                                 'venue': 'kalshi', 'symbol': symbol,
@@ -235,15 +257,6 @@ async def run(args, gate=None) -> int:
                             })
                             # The same minute, sampled from the stream. Both
                             # rows survive a read because `transport` is part of
-                            # the event key — see EVENT_KEY_EXTRA. Comparing
-                            # them is the only evidence the stream reproduces
-                            # the book, and nothing flips until they agree.
-                            paired = ws_row(
-                                CACHE, ticker=market['ticker'], symbol=symbol,
-                                now=now, open_time=open_time, minute=minute,
-                                read_at=datetime.now(timezone.utc))
-                            if paired is not None:
-                                rows.append(paired)
                     if len(rows) >= args.batch_rows:
                         await asyncio.to_thread(
                             store.write, 'venue_ladder', pd.DataFrame(rows))
