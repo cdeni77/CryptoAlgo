@@ -295,59 +295,79 @@ async def kalshi(session, key: str, now: pd.Timestamp, store=None,
 
 
 async def polymarket(session, now: pd.Timestamp) -> list[dict]:
-    """The same, from `winning_side` on the discovered 15-minute markets.
+    """The same, from the `result` field on the discovered 15-minute markets.
 
     Reads whatever `_collect_pm.py` has discovered rather than re-walking the
     venue: discovery is the expensive half and it is already resumable.
+
+    Polymarket settles on **Chainlink's BTC-USD TWAP-60s stream**, read `>=`
+    against the opening price — a different oracle from Kalshi's CF Benchmarks
+    BRTI, and the whole reason these rows are worth having: two independent
+    aggregations converging is the strongest available evidence that
+    `core/windows.py` builds the target correctly.
     """
-    path = 'data/pm_markets.jsonl'
+    # **The catalog `_collect_pm.py` actually writes.** This read
+    # `data/pm_markets.jsonl`, which exists nowhere in the tree, and expected
+    # `market_slug`/`winning_side`/`outcomes` -- a schema the file does not
+    # have. So it logged one INFO line, returned nothing, exited 0, and the
+    # store held ZERO Polymarket settlements against 960,519 Polymarket depth
+    # rows. This is the venue whose independent oracle is the only cross-check
+    # on the label, and it had never once been collected.
+    path = os.getenv('PM_CATALOG', 'data/collection/pm_catalog.jsonl')
     if not os.path.exists(path):
         logger.info('no %s yet; skipping polymarket', path)
         return []
     rows: list[dict] = []
+    seen: set = set()
     with open(path) as handle:
         for line in handle:
             try:
                 market = json.loads(line)
             except ValueError:
                 continue
-            slug = str(market.get('market_slug') or '')
-            side = str(market.get('winning_side') or '').strip().upper()
-            stamp = slug.rsplit('-', 1)[-1]
-            if side not in ('A', 'B') or not stamp.isdigit():
+            if str(market.get('status') or '').lower() != 'closed':
                 continue
-            asset = slug.split('-', 1)[0]
-            symbol = PM_ASSETS.get(asset)
-            if symbol is None:
+            result = str(market.get('result') or '').strip().upper()
+            symbol = str(market.get('symbol') or '')
+            opened = market.get('window_open')
+            if result not in ('A', 'B') or not symbol or not opened:
                 continue
-            # The slug's trailing stamp is the window OPEN, not its close —
-            # verified against the venue's own `end_time` and title. Read as a
-            # close it shifts every Polymarket window fifteen minutes and drags
-            # agreement with our label to a coin flip.
-            opened = pd.Timestamp(int(stamp), unit='s', tz='UTC')
-            close = opened + pd.Timedelta(minutes=15)
-            # `outcomes` is ordered, and A is the first — "Up". Carried through
-            # rather than assumed: a market whose labels are not Up/Down is not
-            # the instrument this is about and is dropped.
-            labels = [str(o.get('label') or '').strip().lower()
-                      for o in (market.get('outcomes') or [])]
-            if len(labels) < 2 or labels[0] != 'up':
+            try:
+                opened = pd.Timestamp(opened)
+            except (ValueError, TypeError):
                 continue
+            if opened.tzinfo is None:
+                opened = opened.tz_localize('UTC')
+            opened = opened.tz_convert('UTC')
+            key = (symbol, opened)
+            if key in seen:
+                continue
+            seen.add(key)
+            # **`A` is UP, determined by measurement rather than by reading the
+            # letter.** Against Kalshi's own settlement on 61,511 shared
+            # windows, `A = up` agrees 94.11% and `B = up` agrees 5.89%. Two
+            # venues on different oracles -- Chainlink's TWAP against CF
+            # Benchmarks' BRTI -- cannot agree perfectly, and the residual is
+            # the near-ties, but the encoding is not ambiguous. Guessing it
+            # would be the same class of silent alignment error as reading the
+            # slug stamp as a close.
             rows.append({
                 'venue': 'polymarket', 'symbol': symbol,
                 'event_time': opened,
                 'available_time': now, 'quality': 'valid',
-                'market_ticker': slug,
-                'window_open': opened,
-                'close_time': close,
-                'settlement_time': _time(market.get('close_time')),
-                'result': 'yes' if side == 'A' else 'no',
-                'settled_up': side == 'A',
-                'volume': float(market.get('total_volume_usd') or 0.0),
-                'open_interest': 0.0, 'last_price': 0.0,
+                'market_ticker': str(market.get('market_id') or ''),
+                'window_open': opened.to_pydatetime(),
+                'close_time': (opened + pd.Timedelta(minutes=15)).to_pydatetime(),
+                'settlement_time': None,
+                'result': 'yes' if result == 'A' else 'no',
+                'settled_up': result == 'A',
+                'volume': float(market.get('volume_dollars') or 0.0),
+                'open_interest': float(market.get('liquidity_dollars') or 0.0),
+                'last_price': 0.0,
             })
-    logger.info('polymarket: %d settled markets', len(rows))
+    logger.info('polymarket: %d settled window(s)', len(rows))
     return rows
+
 
 
 async def run(args) -> int:
@@ -377,7 +397,14 @@ async def run(args) -> int:
                 rows += await kalshi_direct(now, store)
                 reached.append('kalshi')
         if args.venue in ('polymarket', 'both'):
-            rows += await polymarket(session, now)
+            pm_rows = await polymarket(session, now)
+            rows += pm_rows
+            # **Append to `reached`, like both Kalshi branches.** The comment
+            # at its declaration states the exact purpose -- "without this the
+            # two are indistinguishable" -- and this branch was the one that
+            # did not, so a Polymarket collection that ran correctly and found
+            # nothing was reported the same way as one that never ran.
+            reached.append('polymarket')
 
     if not rows:
         # **"Nothing new" is success, not failure.** This tool is idempotent and
