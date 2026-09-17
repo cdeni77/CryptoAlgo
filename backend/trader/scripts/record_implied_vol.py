@@ -299,6 +299,28 @@ async def run(args, gate=None) -> int:
            or open(os.environ['KALSHI_PRIVATE_KEY_PATH']).read())
     rows: list[dict] = []
 
+    def _flush_on_exit() -> None:
+        """Write whatever is buffered before this task goes away.
+
+        **`asyncio.CancelledError` is a BaseException, not an Exception**, so
+        the `except Exception` reconnect handler below never saw a shutdown and
+        `run_live`'s `task.cancel()` discarded the buffer -- up to a full batch
+        of rows on every restart, on a dataset whose whole justification is that
+        a minute not recorded is gone for good. Written synchronously rather
+        than through `asyncio.to_thread`: the loop is being torn down and a
+        thread hop is one more thing that can be cancelled.
+        """
+        if not rows:
+            return
+        try:
+            store.write('venue_implied_vol', pd.DataFrame(rows))
+            logger.info('flushed %d buffered row(s) on shutdown', len(rows))
+            rows.clear()
+        except Exception as exc:                          # noqa: BLE001
+            logger.error('could not flush %d buffered row(s): %s',
+                         len(rows), str(exc)[:160])
+
+
     while True:
         try:
             async with KalshiClient(key_id=os.environ['KALSHI_KEY_ID'],
@@ -341,6 +363,9 @@ async def run(args, gate=None) -> int:
                             last['r2'])
                         rows.clear()
                     await asyncio.sleep(args.interval)
+        except asyncio.CancelledError:
+            _flush_on_exit()
+            raise
         except Exception as exc:                          # noqa: BLE001 - reconnect
             logger.error('implied vol recorder: %s; retrying in 20s',
                          str(exc)[:160])

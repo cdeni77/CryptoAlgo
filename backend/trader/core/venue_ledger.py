@@ -50,7 +50,7 @@ from typing import Any, Iterable, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 
-def is_ours(ticker: str) -> bool:
+def is_ours(ticker: str, series: Optional[Iterable[str]] = None) -> bool:
     """Is this market one the loop trades?
 
     **The Kalshi account belongs to a person and may hold anything** — an NFL
@@ -70,12 +70,17 @@ def is_ours(ticker: str) -> bool:
     live ticker is `SERIES-YYMMMDDHHMM-MM`, e.g. `KXBTC15M-26SEP041130-30`, so
     the prefix plus a hyphen is the test — the hyphen matters, or a
     hypothetical `KXBTC15MINI` would match `KXBTC15M`.
-    """
-    from core.config import SERIES_BY_SYMBOL
 
+    `series` is injectable because the CALLER's binding is the authority. A
+    module that did `from core.config import SERIES_BY_SYMBOL` holds the dict
+    as it was at its own import; reading the config module's current attribute
+    instead silently ignores a caller that overrode its own copy.
+    """
+    if series is None:
+        from core.config import SERIES_BY_SYMBOL
+        series = SERIES_BY_SYMBOL.values()
     ticker = (ticker or '').strip().upper()
-    return any(ticker.startswith(f'{series.upper()}-')
-               for series in SERIES_BY_SYMBOL.values() if series)
+    return any(ticker.startswith(f'{s.upper()}-') for s in series if s)
 
 
 def fill_row(fill: Any) -> dict[str, Any]:

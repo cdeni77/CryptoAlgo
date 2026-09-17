@@ -1050,7 +1050,7 @@ def _is_ours(ticker: str) -> bool:
     IMPLEMENTATION moved so `scripts/sync_venue.py` filters the same way.
     Two copies of an ownership test is how one of them stops being applied.
     """
-    return venue_ledger.is_ours(ticker)
+    return venue_ledger.is_ours(ticker, SERIES_BY_SYMBOL.values())
 
 
 async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,

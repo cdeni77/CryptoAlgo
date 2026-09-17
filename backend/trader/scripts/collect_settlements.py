@@ -40,6 +40,7 @@ import pandas as pd
 
 from core.datastore import ResearchStore
 from core.config import series_to_symbol
+from data_collection.kalshi_client import _money, _quantity
 
 logger = logging.getLogger('settlements')
 
@@ -85,7 +86,7 @@ async def _get(session, url: str, params: dict, key: Optional[str] = None):
     raise RuntimeError('rate limited')
 
 
-async def kalshi_direct(now, store=None) -> list[dict]:
+async def kalshi_direct(now, store=None, *, args_full: bool = False) -> list[dict]:
     """Settled markets straight from Kalshi, using the trading credential.
 
     The DEFAULT path for keeping the label current. Predexon remains the only
@@ -116,7 +117,7 @@ async def kalshi_direct(now, store=None) -> list[dict]:
                          'cannot collect settlements directly')
             return []
         for symbol, series in SERIES_BY_SYMBOL.items():
-            cursor, pages = None, 0
+            cursor, pages, stale_pages = None, 0, 0
             while pages < 20:
                 params = {'series_ticker': series, 'status': 'settled',
                           'limit': 200}
@@ -135,9 +136,19 @@ async def kalshi_direct(now, store=None) -> list[dict]:
                 rows += rows_from_kalshi_markets(fresh, symbol=symbol, now=now)
                 cursor = payload.get('cursor')
                 pages += 1
-                # Every market on this page is already stored, so everything
-                # older is too — the listing is ordered by close.
-                if not cursor or not markets or not fresh:
+                # **TWO consecutive stale pages, matching the sibling above.**
+                # This path broke on the FIRST page with nothing fresh, and the
+                # cursor only walks backwards from now -- so once a stale page
+                # sat in front of a hole, the hole was permanent. Measured
+                # 2026-09-16: 2026-09-03 and 2026-09-10 each hold 264 of 288
+                # markets, the latter a single 2h15m gap of 8 consecutive
+                # windows in the settlement LABEL.
+                stale_pages = 0 if fresh else stale_pages + 1
+                if not cursor or not markets:
+                    break
+                if stale_pages >= 2 and not args_full:
+                    logger.info('%s: reached known history after %d pages',
+                                series, pages)
                     break
             logger.info('%s: %d new settlements', series,
                         sum(1 for r in rows if r['symbol'] == symbol))
@@ -185,9 +196,17 @@ def rows_from_kalshi_markets(markets, *, symbol: str, now) -> list[dict]:
             'settlement_time': _time(market.get('settlement_time')),
             'result': result,
             'settled_up': result == 'yes',
-            'volume': float(market.get('volume') or 0.0),
-            'open_interest': float(market.get('open_interest') or 0.0),
-            'last_price': float(market.get('last_price') or 0.0),
+            # **Through the `_fp`/`_dollars` parsers, not the bare names.**
+            # Kalshi serves `volume_fp`, `open_interest_fp` and
+            # `last_price_dollars` with the bare fields NULL -- the same trap
+            # already recorded for `yes_bid_dollars`, where reading only the
+            # integer form parsed every quote as empty. `None or 0.0` is 0.0,
+            # and a stored zero is indistinguishable from a real one. Measured
+            # 2026-09-16: 4,303 of 4,509 rows written in 2026-09 (95.4%) had
+            # volume 0, against 0-98 in most earlier months.
+            'volume': _quantity(market, 'volume') or 0.0,
+            'open_interest': _quantity(market, 'open_interest') or 0.0,
+            'last_price': _money(market, 'last_price') or 0.0,
             'source': 'kalshi_direct',
         })
     return rows
