@@ -645,13 +645,25 @@ def market_rows_from_scored(
                     part['model_probability'], part['outcome'], decision))
 
 
-def _worst_populated_bin(pred, outcome, *, bins: int = 10,
+def _worst_populated_bin(pred, outcome, *, bins: Optional[int] = None,
                         min_count: int = 100) -> float:
     """Largest |actual - predicted| over adequately populated bins, or NaN.
 
-    The same shape as `calibration_max_deviation`, computed on whatever
-    probability column is passed, so the model and the market can be measured on
-    ONE set of rows and compared.
+    **Uses `core.baseline.reliability`'s edges, which is what "the same shape as
+    `calibration_max_deviation`" is supposed to mean.** It did not: this was ten
+    EQUAL-WIDTH bins against that statistic's twenty tail-refined ones, and its
+    single `(0.9, 1.0]` bucket is precisely the aggregation those edges exist to
+    eliminate -- `reliability`'s own docstring records a model 5pp overconfident
+    at 0.94 and 5pp underconfident at 0.86 reporting an ECE of 0.000078 across
+    one wide bin. Two statistics under one description, feeding two different
+    gates, with a narrative comment comparing a number from this one against a
+    threshold belonging to the other.
+
+    `min_count` stays 100 rather than that statistic's 500: this runs on
+    live-recorded rows, of which there are thousands rather than tens of
+    thousands, and a 500 floor would return NaN for want of data and FAIL as
+    though the model were miscalibrated. Pass `bins` to force equal-width
+    bucketing.
     """
     pred = pd.to_numeric(pd.Series(pred), errors='coerce')
     outcome = pd.to_numeric(pd.Series(outcome), errors='coerce')
@@ -660,6 +672,16 @@ def _worst_populated_bin(pred, outcome, *, bins: int = 10,
         return float('nan')
     frame = pd.DataFrame({'p': pred[keep].to_numpy(),
                           'y': outcome[keep].to_numpy()})
+    if bins is None:
+        # `worst_deviation` IS the statistic `calibration_max_deviation` reads,
+        # on `reliability`'s tail-refined edges. Calling it rather than
+        # re-deriving it is the whole point: two implementations of one
+        # description is what produced the divergence this replaces.
+        from core.baseline import reliability as _reliability
+
+        return float(_reliability(frame['y'].to_numpy(),
+                                  frame['p'].to_numpy())
+                     .worst_deviation(min_count=min_count))
     edges = np.linspace(0.0, 1.0, bins + 1)
     frame['bin'] = pd.cut(frame['p'], edges, include_lowest=True)
     grouped = frame.groupby('bin', observed=True).agg(
