@@ -235,6 +235,13 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'depth_bid_total', 'depth_ask_total',
         'levels_bid', 'levels_ask', 'seq', 'gaps', 'source',
         'quote_age_seconds',
+        # Which sampler produced the LADDER half of the row, as against the
+        # `source` that produced the row. `live_touch` used to re-fetch the
+        # ladder over REST AFTER the order was placed, so its depth buckets
+        # described a book our own fill had already eaten into -- and nothing
+        # in the schema could tell that from the stream ladder the decision
+        # actually scored. Null on every row written before 2026-09-16.
+        'transport',
     ),
     'book_snapshots': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
@@ -274,7 +281,25 @@ EVENT_KEY = ('venue', 'symbol', 'event_time')
 #
 # Revisions still collapse WITHIN an observer.
 EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
-    'venue_depth': ('source',),
+    # `offset_minutes` as well as `source`, because `event_time` is
+    # `window_open + offset_minutes` -- so minute 15 of one window and minute 0
+    # of the NEXT are the same instant and collided on one key. They are
+    # different markets with different books: a real colliding pair reads
+    # 0.73/0.98 against 0.49/0.50, and one of them was destroyed at WRITE time
+    # by `_merge`, with the survivor decided by JSONL line order, which
+    # `_collect_book` deliberately shuffles. Measured 2026-09-16: 60 rows
+    # collide today, small only because offset 0 is almost never produced (211
+    # rows against 51,259 at offset 15). Anything that starts populating minute
+    # 0 makes it one silent loss per window.
+    #
+    # `transport` is deliberately NOT in this key, though it is on
+    # `venue_ladder`. Every row written before 2026-09-16 lacks the column, and
+    # a key column absent from the stored parquet makes `read` fail outright --
+    # verified, DuckDB raises `Referenced column "transport" not found`. Adding
+    # it needs a backfill of the existing 1.9M rows first; `source` already
+    # separates `live_touch` from the recorders, and the stream-vs-REST split
+    # within it is a fallback, not a second sampler.
+    'venue_depth': ('source', 'offset_minutes'),
     # Same argument as venue_depth, one layer down. During the WebSocket
     # migration the REST sampler and the WS sampler both write the same minute,
     # and comparing them is the only evidence the stream reproduces the book.

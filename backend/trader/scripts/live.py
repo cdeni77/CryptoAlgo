@@ -1829,8 +1829,29 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
             if quote is None or quote.yes_bid is None or quote.yes_ask is None:
                 continue
             ticker = quotes[symbol][1]
-            yes_levels, no_levels = [], []
-            if kalshi is not None and ticker:
+            # **From the STREAM CACHE, the same ladder scoring read, not a
+            # fresh REST fetch after the order.**
+            #
+            # The call site says moving this "changes only WHEN the archive is
+            # written, never what it contains: `quotes` is the same object the
+            # decision priced against". True of the four touch fields; false of
+            # the six ladder-derived columns below, which were re-fetched --
+            # AFTER `act_on`, so our own fill had already removed resting size
+            # from the side we bought. `depth_bid_1c`, `depth_ask_1c`,
+            # `depth_bid_5c`, `depth_ask_5c` and the totals feed `imbalance_5c`,
+            # `depth_ratio` and `book_convexity`: three of the five
+            # `market_state` features, systematically understated on the traded
+            # side, in rows `QUOTE_SOURCE_PRIORITY` ranks FIRST.
+            #
+            # The cache read is local and free, so this also removes three REST
+            # round trips from the post-order path. The REST fetch stays only as
+            # a fallback for when the stream is not running -- with a flag on
+            # the row saying so, because a reconstruction and an observation are
+            # different claims.
+            yes_levels, no_levels = ladder_from_cache(_stream_cache(), ticker)
+            ladder_source = 'stream'
+            if not yes_levels and not no_levels and kalshi is not None and ticker:
+                ladder_source = 'rest_after_order'
                 try:
                     book = await kalshi._request(  # noqa: SLF001
                         'GET', f'/markets/{ticker}/orderbook')
@@ -1843,6 +1864,11 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
             rows.append({
                 'venue': 'kalshi', 'symbol': symbol, 'event_time': event_time,
                 'available_time': pd.Timestamp.now(tz='UTC'), 'quality': 'valid',
+                # Which sampler produced the LADDER half of this row. A
+                # reconstruction taken after our own fill and an observation
+                # taken at the decision are different claims, and the column
+                # that could not tell them apart is how this went unnoticed.
+                'transport': ladder_source,
                 'market_ticker': quotes[symbol][1], 'window_open': window_open,
                 'offset_minutes': offset,
                 'yes_bid': float(quote.yes_bid), 'yes_ask': float(quote.yes_ask),
