@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from core import heartbeat
 from core.config import DEFAULT_CONFIG, series_to_symbol
 from core.datastore import ResearchStore
 from scripts.record_stream import CACHE
@@ -259,6 +260,11 @@ async def run(args, gate=None) -> int:
                     # table `run_live.COMPONENTS` states within the first hour,
                     # and it is why whole minutes go unsampled: 979 two-minute
                     # and 40 longer steps over seven days.
+                    # Liveness, recorded where the loop has demonstrably done its
+                    # job. A stamp written at startup or by the supervisor would
+                    # prove only that the process exists — which is exactly what
+                    # the old healthcheck proved.
+                    heartbeat.touch('ladder')
                     await asyncio.sleep(seconds_to_next_mark(
                         datetime.now(timezone.utc), args.interval, args.phase))
         except asyncio.CancelledError:

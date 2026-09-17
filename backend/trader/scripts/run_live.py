@@ -52,6 +52,8 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Iterable, Optional, Sequence
 
+from core import heartbeat
+
 logger = logging.getLogger('run-live')
 
 BACKOFF_START = 5.0
@@ -319,6 +321,11 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
                                (err or b'').decode(errors='replace')[:300])
             else:
                 logger.info('%s done', step[0])
+        # Liveness, recorded where the loop has demonstrably done its
+        # job. A stamp written at startup or by the supervisor would
+        # prove only that the process exists — which is exactly what
+        # the old healthcheck proved.
+        heartbeat.touch('store_sync')
         await asyncio.sleep(every)
 
 

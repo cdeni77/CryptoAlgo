@@ -72,6 +72,7 @@ from typing import NamedTuple, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from core import heartbeat
 from core.config import Config, DEFAULT_CONFIG, SERIES_BY_SYMBOL, find_fee_config
 from core.costs import trade_fee
 from core.dataset import score_live
@@ -2344,6 +2345,11 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     _attach_book_features(scored, quotes, _stream_cache())
     scored = prepare_init_score(scored, model)
     _phase('score')
+    # Liveness, at the point the cycle has demonstrably completed. A stamp
+    # written at startup would prove only that the process exists, which is
+    # what the old TCP-connect healthcheck proved.
+    heartbeat.touch('trade')
+
     _warn_unscoreable_features(scored, model,
                                offsets=tuple(config.decision_offsets or ()))
     scored['model_probability'] = model.predict(scored)

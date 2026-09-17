@@ -45,6 +45,7 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
+from core import heartbeat
 from core.datastore import ResearchStore
 
 logger = logging.getLogger('implied-vol')
@@ -362,6 +363,7 @@ async def run(args, gate=None) -> int:
                             last['minutes_to_close'], int(last['n_strikes']),
                             last['r2'])
                         rows.clear()
+                    heartbeat.touch('implied_vol')
                     await asyncio.sleep(args.interval)
         except asyncio.CancelledError:
             _flush_on_exit()

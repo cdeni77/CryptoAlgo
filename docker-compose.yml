@@ -153,16 +153,24 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # **Asserts the loop is WORKING, not that the process exists.** This used to
+    # open a Postgres connection and close it: it never touched the trading
+    # loop, the venue, the stream or the model, so a wedged process — one
+    # abstaining on every window, or scoring all-NaN features — reported
+    # `Up (healthy)` indefinitely. Verified: five hours of it.
+    #
+    # Each component stamps `core.heartbeat` where its loop has demonstrably
+    # done its job; this fails when any of them goes quiet for several times its
+    # own period. `supervise` already restarts a component that raises or
+    # returns — what it cannot see is one that will await forever, which is the
+    # websocket deadlock and the untimed subprocess, both of which looked
+    # exactly like this.
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c \"import os, psycopg2; psycopg2.connect(os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://')).close(); print('ok')\"",
-        ]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "python", "-m", "scripts.healthcheck", "--quiet"]
+      interval: 60s
+      timeout: 15s
       retries: 3
-      start_period: 20s
+      start_period: 180s
     volumes:
       # Persist the scraper DB, the research store, models and logs.
       #

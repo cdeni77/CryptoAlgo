@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core import heartbeat
 from core.config import series_to_symbol
 from core.spool import DEFAULT_SPOOL_ROOT, FrameSpool, event_rows
 from core.stream_book import BookCache
@@ -151,6 +152,7 @@ async def consume(stream, cache, spool, symbols, *, gate=None,
         if now >= next_flush:
             if gate is not None:
                 await gate.idle()
+            heartbeat.touch('stream')
             await asyncio.to_thread(spool.flush)
             next_flush = now + flush_every
         if cache.any_gapped():
@@ -228,6 +230,7 @@ async def run(args, gate=None, cache=None) -> int:
                     stream, cache, spool, symbols, gate=gate,
                     until=time.monotonic() + wait,
                     idle_timeout=args.idle_timeout)
+                heartbeat.touch('stream')
                 await asyncio.to_thread(spool.flush)
                 if reason in REBUILD or reason.startswith('silent'):
                     logger.info('rebuilding the subscription (%s)', reason)

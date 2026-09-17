@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from core import heartbeat
 from core.config import DEFAULT_CONFIG
 from core.datastore import ResearchStore
 
@@ -347,6 +348,7 @@ async def run(args, gate=None) -> int:
                         logger.info('wrote %d ladder rows (%d bid levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()
+                    heartbeat.touch('pm_ladder')
                     await asyncio.sleep(args.interval)
         except asyncio.CancelledError:
             _flush_on_exit()

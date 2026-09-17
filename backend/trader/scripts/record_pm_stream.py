@@ -36,6 +36,7 @@ from typing import Optional
 
 import pandas as pd
 
+from core import heartbeat
 from core.pm_stream_book import PmBookCache
 
 logger = logging.getLogger('pm-stream')
@@ -62,6 +63,7 @@ def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
             CACHE.pop(symbol, None)
             continue
         stamp = book._stamp.get(token)  # noqa: SLF001 — same module family
+        heartbeat.touch('pm_stream')
         CACHE[symbol] = {
             'best_bid': bid * 100.0,
             'best_ask': ask * 100.0,
