@@ -46,11 +46,24 @@ def _snaps(rows):
 
 
 def test_a_minute_takes_the_last_snapshot_at_or_before_it():
-    """A book is a step function. Taking the nearest would let a quote from
-    after the minute mark describe it."""
+    """A book is a step function, and minute 1's mark is t+60s.
+
+    **This test used to assert the leak it is named against.** It required
+    minute 1 to take t+110s -- fifty seconds AFTER its own mark -- because
+    `summarise_window` grouped by minute and took `.last()`, the last tick
+    that fell INSIDE the minute. The production DuckDB path in the same file
+    does `ASOF JOIN ... s.ts <= k.mark_ms`, and its comment names the groupby
+    version as "a lookahead leak... it made `quote_age_seconds` negative".
+
+    At or before t+60s, the answer is t+50s. Corrected 2026-09-16, and
+    `test_the_two_implementations_agree` passes for the first time, which is
+    the evidence for which half of the disagreement was right.
+    """
     got = summarise_window(_snaps([(50, 40, 42), (110, 44, 46), (130, 48, 50)]))
     row = got[got['offset_minutes'] == 1].iloc[0]
-    assert row['yes_bid'] == pytest.approx(0.44), 'must take t+110s, not t+130s'
+    assert row['yes_bid'] == pytest.approx(0.40), 'must take t+50s, not t+110s'
+    # Minute 2's mark is t+120s, so it takes t+110s -- not t+130s.
+    assert got[got['offset_minutes'] == 2].iloc[0]['yes_bid'] == pytest.approx(0.44)
 
 
 def test_cents_become_dollars():
@@ -72,11 +85,20 @@ def test_sizes_and_depths_are_not_rescaled():
 
 
 def test_a_minute_with_no_snapshot_yet_is_omitted_not_carried():
-    """Minute 0 has nothing before it if the first tick is at t+90s. Emitting a
-    row there would date a later book to an earlier minute."""
+    """Nothing at or before a mark means no row for that mark.
+
+    With the only tick at t+90s: minute 0 (mark t+0) and minute 1 (mark
+    t+60) both have nothing at or before them; minute 2 (mark t+120) is the
+    first that can see it.
+
+    This previously required minute 1 to be PRESENT -- the same
+    off-by-one-minute leak as the test above, dating a t+90s book to a t+60s
+    mark.
+    """
     got = summarise_window(_snaps([(90, 44, 46)]))
     assert 0 not in set(got['offset_minutes'])
-    assert 1 in set(got['offset_minutes'])
+    assert 1 not in set(got['offset_minutes'])
+    assert 2 in set(got['offset_minutes'])
 
 
 def test_every_minute_of_the_window_is_kept_not_just_the_decision_offsets():

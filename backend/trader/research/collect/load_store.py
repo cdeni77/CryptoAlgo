@@ -133,11 +133,50 @@ def summarise_window(snaps: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=['offset_minutes'])
     frame = frame.sort_values('offset_seconds')
-    # Last at or before the mark. A minute with nothing before it is OMITTED
-    # rather than carried: emitting one would date a later book to an earlier
-    # minute, which is a leak dressed as coverage.
-    last = frame.groupby(['market_id', 'window_open', 'offset_minutes'],
-                         as_index=False).last()
+    # **Last at or before the MARK, which is what `offset_minutes = m` means.**
+    #
+    # This grouped by minute and took `.last()` — the last tick that fell
+    # INSIDE minute m, i.e. up to 59 seconds AFTER the mark it claims to
+    # describe. The comment above already said "at or before"; the code did
+    # something else, and `tests/test_load_store.py` asserted the leak as the
+    # contract (minute 1 taking t+110s, fifty seconds past a t+60s mark).
+    #
+    # The production DuckDB path in this same file is correct
+    # (`ASOF JOIN ... s.ts <= k.mark_ms`) and its own comment names this version
+    # as "a lookahead leak… it made `quote_age_seconds` negative". Two
+    # implementations of one rule, disagreeing, with the wrong one under test.
+    #
+    # It never reached the store — zero negative ages across 1.9M depth rows —
+    # because the DuckDB path is what runs. This was a loaded gun: a negative
+    # age up to 30s passes `core/quotes.py`'s `abs(age) <= max_age` as FRESH.
+    marks = pd.DataFrame({'offset_minutes': range(int(WINDOW_MINUTES))})
+    marks['mark_seconds'] = (marks['offset_minutes'] * 60).astype(float)
+    keys = [k for k in ('market_id', 'window_open') if k in frame.columns]
+    out = []
+    for key, group in (frame.groupby(keys, as_index=False, sort=False)
+                       if keys else [((), frame)]):
+        group = group.copy()
+        group['offset_seconds'] = pd.to_numeric(
+            group['offset_seconds'], errors='coerce').astype(float)
+        group = group.dropna(subset=['offset_seconds']).sort_values('offset_seconds')
+        if group.empty:
+            continue
+        taken = pd.merge_asof(
+            marks.sort_values('mark_seconds'), group,
+            left_on='mark_seconds', right_on='offset_seconds',
+            direction='backward', suffixes=('', '_snap'))
+        # A minute with nothing at or before it is OMITTED rather than carried:
+        # emitting one would date a later book to an earlier minute, which is a
+        # leak dressed as coverage.
+        taken = taken[taken['offset_seconds'].notna()]
+        if keys:
+            for name, value in zip(keys, key if isinstance(key, tuple) else (key,)):
+                taken[name] = value
+        out.append(taken)
+    last = (pd.concat(out, ignore_index=True) if out
+            else pd.DataFrame(columns=['offset_minutes']))
+    if last.empty:
+        return pd.DataFrame(columns=['offset_minutes'])
     return to_depth_rows(last)
 
 
