@@ -28,6 +28,33 @@ first decision after it   2026-09-17 01:39:02 UTC
 artifact                  20260917T021814Z, installed 02:18 UTC
 ```
 
+### The equity curve kinks on 2026-09-18, and that is a deposit
+
+A $500 deposit landed at ~13:30 UTC on 2026-09-18, taking the account from $526
+to $1,046, and `--max-stake-dollars` went 25 → 40 at the same restart. The
+**model did not change** — same artifact, same epoch, same 40 trades already
+recorded.
+
+Stakes therefore roughly DOUBLE at that instant: the loop runs `--compound`, so
+`sizing_base` is the live balance and the deposit resized every position on its
+own. Two consequences, and only the second is a problem:
+
+* **`realised_edge_pp` is unaffected**, because it is per CONTRACT and so
+  size-independent. That is the metric the decision rule below keys on, chosen
+  before any of this, which is why the four-week measurement survives a deposit
+  in the middle of it.
+* **Cumulative return is NOT comparable across that boundary.** Trades after
+  2026-09-18 13:30 are ~2x the size of those before, so the equity curve mixes
+  two sizings and its slope is not one number. Read edge per contract, not
+  dollars.
+
+The deposit is also why the dashboard shows a base of $1,045.64: `starting_bankroll`
+was rebased so the deposit is not reported as a ~99% return — the balance-difference
+trap this file warns about under "Live, the venue is the account of record".
+`--bankroll` moved 500 → 1045 at the same time, which changes only the HALT
+thresholds (the daily-loss breaker had been firing at 7.2% of the real account
+rather than the intended 15%), not the sizing.
+
 `20260917T021814Z` is the **first artifact in this project's history to pass all
 21 gates unforced** — `passed=True, forced=False, failed_gates=[]`. Every prior
 ledger entry was forced or blocked. Its numbers are LOWER than the forced
