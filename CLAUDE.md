@@ -13,6 +13,52 @@ every 301 for five years. Several claims in *this* file were among the things
 disproved, and are corrected in place below. `AUDIT_FIX_PLAN.md` tracks what
 remains.
 
+## THE START LINE: 2026-09-17 01:38 UTC
+
+**Ignore every trade before this instant.** Not "weight it less" — it is a
+different system. Thirty-two commits on 2026-09-16/17 changed the feature
+definitions, the data collection, the settlement label and the gates, so any
+P&L, edge or calibration number from before that moment describes code that no
+longer exists. Anyone reading the dashboard or querying `predictions` for
+evidence starts here.
+
+```
+dashboard reset epoch     2026-09-17 01:38:15 UTC   (account.reset_at)
+first decision after it   2026-09-17 01:39:02 UTC
+artifact                  20260917T021814Z, installed 02:18 UTC
+```
+
+`20260917T021814Z` is the **first artifact in this project's history to pass all
+21 gates unforced** — `passed=True, forced=False, failed_gates=[]`. Every prior
+ledger entry was forced or blocked. Its numbers are LOWER than the forced
+artifact it replaced (realised edge 3.37 → 2.637pp, live `model_minus_market`
++0.000921 → +0.000195) because the fixes made the measurement more honest, not
+because the model got worse — the earlier figures were graded on our own
+Coinbase label and scored offsets the policy never trades.
+
+### The review is 2026-10-15, and the rule is already written
+
+Four weeks, ~550 trades at the current ~19.5/day. What that can and cannot
+settle:
+
+```
+question                                  needs          verdict
+is the backtest's +2.6pp real?            ~456 trades    YES, ~23 days
+is there a small (~1pp) edge?           ~5,200 trades    NO, ~9 months
+model_minus_market at t=2                  89 days       NO, ~3 months
+```
+
+**Pre-registered 2026-09-17, before seeing any of it:**
+
+* realised edge per contract **≥ +1.5pp** over ≥500 trades → the edge transfers
+* **≈ 0** → the backtest is optimistic; the gap is EXECUTION, not forecast
+* **≤ −1pp** → stop and re-examine before retraining again
+
+The model retrains weekly (`cron 0 5 * * 0`) and **unforced**. It will therefore
+change during the window, and that is correct rather than a confound: the
+backtest's 7-day fold blocks simulate exactly that cadence, so the thing being
+measured is the system *including* its retrain policy.
+
 ## Project in One Sentence
 
 Barrier-probability trading on Kalshi 15-minute BTC/ETH/SOL up-down markets:
