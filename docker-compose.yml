@@ -254,12 +254,10 @@ services:
         --mode live
         --place-orders
         --compound
-        --bankroll 500
+        --bankroll 1045
+        --max-stake-dollars 40
         --min-edge-pp 1.5
         --kelly-fraction 0.05
-        --no-require-gates
-        --force
-        --reason "REAL ORDERS on a $500 account, artifact 20260910T145731Z, ROLLED BACK on 2026-09-16 from the forced 20260916T181257Z. The forced one was installed citing calibration_error as its single failing gate, on a calibration_vs_market of -0.01806 computed from BACKFILLED quotes; on live-recorded quotes the same statistic is +0.02830, which FAILS. Two gates failed, not one, so its written justification does not hold. 20260910T145731Z passed all gates unforced (failed_gates: [], log_loss_skill +0.00256 over 21,307 windows). --force and --no-require-gates remain only because _refuse_if_blocked reads the NEWEST ledger attempt rather than the artifact on disk, so after any rollback it would refuse a model that actually passes. The loop is kept trading primarily so it keeps RECORDING live_touch quotes: those are the only uncontaminated evidence for whether the model beats the price, and core/quotes.py was discarding them until 2026-09-16."
 
   # ===========================================================================
   # Scrape — one-off, runs to completion then exits

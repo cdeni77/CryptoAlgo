@@ -216,6 +216,15 @@ def build_parser() -> argparse.ArgumentParser:
                              'the order path can be observed. Kelly still floors '
                              'marginal trades under one contract, so this does '
                              'not guarantee an order.')
+    parser.add_argument('--max-stake-dollars', type=float, default=None, metavar='D',
+                        help='Hard ceiling on one position, in dollars. It stands '
+                             'in for market DEPTH, so it is a claim about the book '
+                             'rather than about risk appetite — the measured BTC '
+                             '15-minute ladder held thousands of contracts within '
+                             'a few cents and 441 at the touch (~$48). Needed as a '
+                             'flag because `config_for_artifact` otherwise adopts '
+                             "the promoting run's value, so changing the default "
+                             'alone would not reach a running loop.')
     parser.add_argument('--kelly-fraction', type=float, default=None, metavar='F',
                         help='Override the Kelly fraction (promoted policy: 0.10). '
                              'Present because it is not only a size: `decide()` '
@@ -3128,6 +3137,9 @@ def config_from_args(args) -> Config:
         # to force the order path open for a fill test, and a silent clamp would
         # leave the operator watching a loop that quietly refused to trade.
         overrides['min_edge_pp'] = float(gate)
+    cap = getattr(args, 'max_stake_dollars', None)
+    if cap is not None:
+        overrides['max_stake_dollars'] = float(cap)
     kelly = getattr(args, 'kelly_fraction', None)
     if kelly is not None:
         overrides['kelly_fraction'] = float(kelly)
