@@ -234,18 +234,30 @@ services:
     # one typo away from being wrong. Remove it to go back to reading the book
     # and placing nothing.
     #
-    # `--bankroll 200` is not cosmetic. Sizing reads
-    # `config.starting_bankroll`, not the account balance, because
-    # `compound=False` makes the equity curve additive so its slope is the
-    # per-trade edge (`core/decide.py`: sizing_base = bankroll if
-    # config.compound else config.starting_bankroll). Left at the $100 default
-    # against a $200 funded account it would trade half size, and the ruin
-    # floor — starting_bankroll * 0.50 — would sit at $50 of real risk rather
-    # than $100.
+    # `--bankroll 500` must track the funded account, and it is NOT what sizes
+    # positions: the loop runs `--compound`, so `sizing_base = bankroll if
+    # config.compound else config.starting_bankroll` takes the LIVE balance.
+    # What this sets is the BREAKERS — the ruin floor is
+    # `starting_bankroll * ruin_floor_fraction` (0.50), and the daily-loss limit
+    # is `max_daily_loss_fraction * starting_bankroll` (0.15).
     #
-    # Guardrails at $200: halt below $100 (ruin_floor_fraction 0.50), halt on a
-    # $30 daily loss (max_daily_loss_fraction 0.15), $25 max stake per trade,
-    # 3 positions per window.
+    # **Update it whenever money moves.** When a manual withdrawal took the
+    # account $1,046 -> $196 on 2026-09-20 and this still read 1045, the floor
+    # sat at $522 against a real $196: every decision was refused
+    # `bankroll_floor` for four days. From inside the system a withdrawal is
+    # indistinguishable from ruin, which is the right thing for it to assume and
+    # the wrong conclusion there.
+    #
+    # It also sets the effective EDGE gate, through the whole-contract floor.
+    # `decide()` floors the stake to whole contracts, so a bankroll too small to
+    # afford one contract refuses the trade outright — measured at $196, a
+    # mid-priced market needed 2.56pp to afford a single contract against a
+    # configured `--min-edge-pp 1.5`, so the account size was the binding gate
+    # and the trade rate went to zero. At $500 that falls to ~0.96pp, safely
+    # below 1.5, so `min_edge_pp` binds as intended.
+    #
+    # Guardrails at $500: halt below $250, halt on a $75 daily loss, $40 max
+    # stake per trade, 3 positions per window.
     command: >
       -m scripts.run_live
         --trade-args
@@ -254,7 +266,7 @@ services:
         --mode live
         --place-orders
         --compound
-        --bankroll 200
+        --bankroll 500
         --max-stake-dollars 40
         --min-edge-pp 1.5
         --kelly-fraction 0.05

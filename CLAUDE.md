@@ -13,47 +13,21 @@ every 301 for five years. Several claims in *this* file were among the things
 disproved, and are corrected in place below. `AUDIT_FIX_PLAN.md` tracks what
 remains.
 
-## THE START LINE: 2026-09-17 01:38 UTC
+## THE START LINE: 2026-09-24 23:10 UTC
 
-**Ignore every trade before this instant.** Not "weight it less" — it is a
-different system. Thirty-two commits on 2026-09-16/17 changed the feature
-definitions, the data collection, the settlement label and the gates, so any
-P&L, edge or calibration number from before that moment describes code that no
-longer exists. Anyone reading the dashboard or querying `predictions` for
-evidence starts here.
+**Ignore every trade before this instant.** Not "weight it less". The code
+changed underneath the earlier attempts (32 commits on 2026-09-16/17 rewrote
+the feature definitions, the data collection, the settlement label and the
+gates), and the account changed underneath the later ones. Anyone reading the
+dashboard or querying `predictions` for evidence starts here.
 
 ```
-dashboard reset epoch     2026-09-17 01:38:15 UTC   (account.reset_at)
-first decision after it   2026-09-17 01:39:02 UTC
-artifact                  20260917T021814Z, installed 02:18 UTC
+dashboard reset epoch     2026-09-24 23:10:42 UTC   (account.reset_at)
+artifact                  20260917T021814Z, installed 2026-09-17 02:18 UTC
+account                   $498.10, all on exchange_index 2
+config                    --bankroll 500 --max-stake-dollars 40
+                          --min-edge-pp 1.5 --kelly-fraction 0.05 --compound
 ```
-
-### The equity curve kinks on 2026-09-18, and that is a deposit
-
-A $500 deposit landed at ~13:30 UTC on 2026-09-18, taking the account from $526
-to $1,046, and `--max-stake-dollars` went 25 → 40 at the same restart. The
-**model did not change** — same artifact, same epoch, same 40 trades already
-recorded.
-
-Stakes therefore roughly DOUBLE at that instant: the loop runs `--compound`, so
-`sizing_base` is the live balance and the deposit resized every position on its
-own. Two consequences, and only the second is a problem:
-
-* **`realised_edge_pp` is unaffected**, because it is per CONTRACT and so
-  size-independent. That is the metric the decision rule below keys on, chosen
-  before any of this, which is why the four-week measurement survives a deposit
-  in the middle of it.
-* **Cumulative return is NOT comparable across that boundary.** Trades after
-  2026-09-18 13:30 are ~2x the size of those before, so the equity curve mixes
-  two sizings and its slope is not one number. Read edge per contract, not
-  dollars.
-
-The deposit is also why the dashboard shows a base of $1,045.64: `starting_bankroll`
-was rebased so the deposit is not reported as a ~99% return — the balance-difference
-trap this file warns about under "Live, the venue is the account of record".
-`--bankroll` moved 500 → 1045 at the same time, which changes only the HALT
-thresholds (the daily-loss breaker had been firing at 7.2% of the real account
-rather than the intended 15%), not the sizing.
 
 `20260917T021814Z` is the **first artifact in this project's history to pass all
 21 gates unforced** — `passed=True, forced=False, failed_gates=[]`. Every prior
@@ -63,10 +37,47 @@ artifact it replaced (realised edge 3.37 → 2.637pp, live `model_minus_market`
 because the model got worse — the earlier figures were graded on our own
 Coinbase label and scored offsets the policy never trades.
 
-### The review is 2026-10-15, and the rule is already written
+### Two earlier attempts died, and neither was a model failure
 
-Four weeks, ~550 trades at the current ~19.5/day. What that can and cannot
-settle:
+**2026-09-17, killed after 3.5 days by a withdrawal.** A manual withdrawal took
+the account $1,046 → $196 on 2026-09-20. `--bankroll` still read 1045, so the
+ruin floor — `starting_bankroll * 0.50` — sat at $522 against a real $196 and
+every decision was refused `bankroll_floor` for **four days**. From inside the
+system a withdrawal is indistinguishable from ruin. Realised strategy P&L over
+that whole run was **−$26.98 on 76 trades**; the rest of the balance move was
+not the model.
+
+**2026-09-24 13:51, dead on arrival at $196.** Restarted at the post-withdrawal
+balance, it made 111 decisions and traded **zero** times in nine hours. Two
+causes, and the second is the one worth carrying forward:
+
+* the market sat near coin-flip that day (mean market probability 0.498 against
+  0.530 the week before), which is where `0.07 * p(1-p)` fees are highest and
+  where the model disagrees least — 1.9% of decisions cleared the edge gate
+  against 10.2% the week before, like-for-like hours;
+* **both decisions that did clear were refused `below_min_contracts`.**
+
+That second one is structural. `decide()` floors the stake to whole contracts,
+so the bankroll sets an effective edge gate underneath the configured one —
+measured, the edge needed to afford a single contract:
+
+```
+price      $196      $525     $1045
+ 0.30    2.15pp    0.80pp    0.41pp
+ 0.50    2.56pp    0.96pp    0.48pp
+ 0.90    0.92pp    0.35pp    0.18pp
+```
+
+At $196 a mid-priced market needed **2.56pp against a configured 1.5pp**, so the
+account size was the binding gate and the trade population became a
+self-selected high-conviction subset. At ~$500 it falls to ~0.96pp, below 1.5,
+so `min_edge_pp` binds as intended and the sample is the one the rule was
+written for. **Below ~$400 this system cannot be measured**, only kept warm.
+
+### The review is four weeks out, and the rule is already written
+
+~550 trades at the ~19.5/day measured at a comparable bankroll. What that can
+and cannot settle:
 
 ```
 question                                  needs          verdict
@@ -75,11 +86,22 @@ is there a small (~1pp) edge?           ~5,200 trades    NO, ~9 months
 model_minus_market at t=2                  89 days       NO, ~3 months
 ```
 
-**Pre-registered 2026-09-17, before seeing any of it:**
+**Pre-registered 2026-09-17, before seeing any of it, and unchanged since:**
 
 * realised edge per contract **≥ +1.5pp** over ≥500 trades → the edge transfers
 * **≈ 0** → the backtest is optimistic; the gap is EXECUTION, not forecast
 * **≤ −1pp** → stop and re-examine before retraining again
+
+The rule keys on realised edge per CONTRACT precisely because it is
+size-independent, which is why a deposit or a withdrawal mid-window does not
+invalidate it — only the interruption does. Cumulative RETURN is not comparable
+across any bankroll change, so read edge per contract, never dollars.
+
+**Do not set the review date until the trade rate has been observed for a
+week.** It was set to 2026-10-15 on 2026-09-17 assuming 19.5 trades/day, and
+both runs since then produced a fraction of that for reasons unrelated to the
+model. A date derived from an unobserved rate is a guess wearing a
+pre-registration's clothes.
 
 The model retrains weekly (`cron 0 5 * * 0`) and **unforced**. It will therefore
 change during the window, and that is correct rather than a confound: the
