@@ -678,6 +678,33 @@ def market_rows_from_scored(
                     part['model_probability'], part['outcome'], decision))
 
 
+def _pooled_ece(pred, outcome) -> float:
+    """Count-weighted expected calibration error over every populated bin.
+
+    The low-variance alternative to `_worst_populated_bin`. A maximum over bins
+    is dominated by whichever bin got unlucky, which is why the worst-bin
+    version of `calibration_vs_market` passed only 32% of bootstrap resamples of
+    its OWN data with a fixed artifact. This one is ten times tighter (sd 0.0023
+    against 0.0229 on 7,608 live rows) because every bin contributes in
+    proportion to its count rather than one deciding the answer.
+
+    It answers a slightly different question, and the difference is the point: a
+    worst bin bounds the damage anywhere, a pooled ECE describes calibration on
+    average. For comparing two forecasters on the SAME rows -- which is all
+    `calibration_vs_market` does -- the average is the stable comparison and the
+    maximum is a coin flip.
+    """
+    from core.baseline import reliability
+
+    pred = pd.to_numeric(pd.Series(pred), errors='coerce')
+    outcome = pd.to_numeric(pd.Series(outcome), errors='coerce')
+    keep = pred.notna() & outcome.notna()
+    if not keep.any():
+        return float('nan')
+    return float(reliability(outcome[keep].to_numpy(),
+                             pred[keep].to_numpy()).expected_calibration_error)
+
+
 def _worst_populated_bin(pred, outcome, *, bins: Optional[int] = None,
                         min_count: int = 100) -> float:
     """Largest |actual - predicted| over adequately populated bins, or NaN.
@@ -767,13 +794,40 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
     # what it trades against. This one halves the market's deviation
     # (0.0326 against 0.0634), which is the clearest evidence it adds value —
     # and it was coming from the gate that kept rejecting it.
+    # **POOLED ECE, not the worst bin.** A maximum over bins is inherently
+    # high-variance, and on this sample it was pure noise. Bootstrapped over 300
+    # resamples of the 7,608 live rows on 2026-09-24, same artifact throughout:
+    #
+    #     statistic              mean       sd       passes (<=0)
+    #     worst bin            +0.0106   0.0229         32%
+    #     pooled ECE diff      +0.0032   0.0023         10%
+    #
+    # The worst-bin version's standard deviation was TWICE the effect it
+    # measured, and its 90% interval [-0.026, +0.050] spanned both "clearly
+    # better than the market" and "clearly worse" — so it passed or failed a
+    # fixed artifact on which rows happened to arrive. It moved 0.011 in four
+    # hours on 8% more data, and blocked the 2026-09-20 retrain on that basis.
+    #
+    # The pooled difference is TEN TIMES tighter, and it does not make the
+    # problem go away — it makes it legible. The model is slightly but
+    # consistently WORSE calibrated than the price, +0.0032 against a typical
+    # ECE near 0.030, with 90% of resamples above zero. The noisy version was
+    # obscuring a real finding behind an enormous error bar rather than
+    # inventing a false one.
+    #
+    # Gated at <= 0 with no tolerance on purpose. A noise-floor allowance would
+    # let exactly this finding through, and the point of the gate is to report
+    # it while the edge is still unproven.
+    model_ece = _pooled_ece(frame['model'], frame['outcome'])
+    market_ece = _pooled_ece(frame['market'], frame['outcome'])
+    # Kept as a reported diagnostic: it is informative about the venue even
+    # though it is too noisy to gate on.
     market_dev = _worst_populated_bin(frame['market'], frame['outcome'])
-    model_dev = _worst_populated_bin(frame['model'], frame['outcome'])
     return {'market_windows': windows,
             'model_minus_market': float(overall['model_minus_market']),
             'baseline_minus_market': float(overall['baseline_minus_market']),
             'market_max_deviation': market_dev,
-            'calibration_vs_market': float(model_dev - market_dev)}
+            'calibration_vs_market': float(model_ece - market_ece)}
 
 
 # ---- gates ---------------------------------------------------------------
