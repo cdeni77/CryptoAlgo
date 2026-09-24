@@ -942,12 +942,29 @@ class PgWriter:
         summarises. `account.realized_pnl` is the current value of the same
         series, so the pair gives peak and current without a second source of
         truth.
+
+        **Both sides must span the same period, and they did not.**
+        `scripts/reset_dashboard.py --rebase` zeroes `account.realized_pnl` at a
+        new epoch, while this walked every settlement ever recorded — so the
+        drawdown breaker compared a high-water from BEFORE the reset against a
+        P&L counted AFTER it. Measured 2026-09-24: peak $322.38 against a
+        current $173.02, a phantom 46.3% drawdown that halted a live account
+        whose realised P&L since its epoch was -$26.98. A halt is sticky and
+        cleared by hand, so a false one costs real trading days.
+
+        Bounded by `account.reset_at` when one is set, which makes the pair
+        commensurable again. Research never reads this — it is a live-account
+        breaker only.
         """
         with self._session() as session:
+            epoch = (session.query(Account.reset_at)
+                     .order_by(Account.id).limit(1).scalar())
             rows = (session.query(Position.pnl)
                     .filter(Position.outcome != Outcome.PENDING.value)
-                    .filter(Position.settled_at.isnot(None))
-                    .order_by(Position.settled_at.asc()))
+                    .filter(Position.settled_at.isnot(None)))
+            if epoch is not None:
+                rows = rows.filter(Position.settled_at >= epoch)
+            rows = rows.order_by(Position.settled_at.asc())
             peak = running = 0.0
             for (value,) in rows:
                 running += float(value or 0.0)

@@ -254,7 +254,7 @@ services:
         --mode live
         --place-orders
         --compound
-        --bankroll 1045
+        --bankroll 200
         --max-stake-dollars 40
         --min-edge-pp 1.5
         --kelly-fraction 0.05
