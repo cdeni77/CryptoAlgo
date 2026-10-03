@@ -122,13 +122,11 @@ export function AccountPage() {
               <Failed error={venueCurve.error} what="the venue curve" />
             ) : (
               <>
-                <VenueAccountChart
-                  points={venueCurve.data?.points ?? []}
-                  balances={venueCurve.data?.balances ?? []}
-                />
+                <VenueAccountChart points={venueCurve.data?.points ?? []} />
                 <p className="mt-2 text-tiny text-ink-3">
-                  Realised P&amp;L, stepped once per settled market, against the venue’s
-                  cash on the right axis.{' '}
+                  Realised P&amp;L, stepped once per settled market. The venue’s cash
+                  is the figure beside this chart, not a line on it: it moves on
+                  deposits and withdrawals too, and those are not the strategy.{' '}
                   {beforeWindow != null && (
                     <>
                       Cumulative within the last {venueCurve.data?.days ?? 30} days;{' '}

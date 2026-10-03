@@ -28,7 +28,6 @@ import type {
   CalibrationBin,
   EquityPoint,
   FunnelStage,
-  VenueBalancePoint,
   VenuePnlPoint,
 } from '../types';
 import { Empty } from './Primitives';
@@ -72,14 +71,17 @@ const TOOLTIP = {
  *  data: cumulative realised P&L genuinely does not change until something
  *  settles, which is what a step means.
  */
-export function VenueAccountChart({
-  points,
-  balances,
-}: {
-  points: VenuePnlPoint[];
-  balances: VenueBalancePoint[];
-}) {
-  if (points.length === 0 && balances.length === 0) {
+/**
+ * Realised P&L only. The venue's cash used to ride along on a right-hand axis
+ * and was removed deliberately: the balance is shown as a figure beside this
+ * chart, and a cash line answers a different question from the one the page
+ * exists to answer. Worse, it moves for reasons that are not the strategy — a
+ * deposit or a withdrawal steps it without a single trade, which is the
+ * balance-difference trap the trader's own notes warn about. P&L steps only
+ * when a market settles.
+ */
+export function VenueAccountChart({ points }: { points: VenuePnlPoint[] }) {
+  if (points.length === 0) {
     return (
       <Empty
         what="No venue ledger yet, so there is no chart. A paper account has none — the venue only has a ledger once real orders fill."
@@ -90,7 +92,7 @@ export function VenueAccountChart({
 
   // One row per instant either series has a reading at, so both can be drawn
   // against a shared time axis without resampling either onto the other's grid.
-  type Row = { t: number; cumulative_pnl?: number; balance?: number };
+  type Row = { t: number; cumulative_pnl?: number };
   const rows = new Map<number, Row>();
   const at = (t: number): Row => {
     const existing = rows.get(t);
@@ -100,23 +102,18 @@ export function VenueAccountChart({
     return created;
   };
   for (const p of points) at(new Date(p.timestamp).getTime()).cumulative_pnl = p.cumulative_pnl;
-  for (const b of balances) at(new Date(b.timestamp).getTime()).balance = b.balance;
 
   const data = [...rows.values()].sort((a, b) => a.t - b.t);
-  // Forward-fill the P&L only. The balance is left with gaps and `connectNulls`
-  // draws through them, because an unsampled balance is unknown rather than
-  // unchanged — the venue's cash moves whether or not we looked.
+  // Forward-fill: P&L is a step function, flat between settlements.
   let carried: number | undefined;
   for (const row of data) {
     if (row.cumulative_pnl == null) row.cumulative_pnl = carried;
     else carried = row.cumulative_pnl;
   }
 
-  const hasBalance = balances.length > 0;
-
   return (
     <ResponsiveContainer width="100%" height={240}>
-      <ComposedChart data={data} margin={{ top: 8, right: hasBalance ? 8 : 0, bottom: 0, left: 0 }}>
+      <ComposedChart data={data} margin={{ top: 8, right: 0, bottom: 0, left: 0 }}>
         <CartesianGrid {...GRID} vertical={false} />
         <XAxis
           dataKey="t"
@@ -137,18 +134,6 @@ export function VenueAccountChart({
           tickFormatter={(v) => `${Number(v) >= 0 ? '+' : ''}$${Number(v).toFixed(0)}`}
           domain={['auto', 'auto']}
         />
-        {hasBalance && (
-          <YAxis
-            yAxisId="cash"
-            orientation="right"
-            tick={TICK}
-            axisLine={false}
-            tickLine={false}
-            width={52}
-            tickFormatter={(v) => `$${Number(v).toFixed(0)}`}
-            domain={['auto', 'auto']}
-          />
-        )}
         {/* Break-even. The line that matters on a P&L chart, and the one a
             currency axis alone does not make legible. */}
         <ReferenceLine
@@ -184,19 +169,6 @@ export function VenueAccountChart({
           isAnimationActive={false}
           connectNulls
         />
-        {hasBalance && (
-          <Line
-            yAxisId="cash"
-            type="linear"
-            dataKey="balance"
-            name="venue cash"
-            stroke="var(--ink-3)"
-            strokeWidth={1}
-            dot={false}
-            isAnimationActive={false}
-            connectNulls
-          />
-        )}
       </ComposedChart>
     </ResponsiveContainer>
   );
@@ -204,17 +176,29 @@ export function VenueAccountChart({
 
 /* ---------------------------------------------------------------- equity */
 
+/**
+ * P&L against the start of the series, not the equity level.
+ *
+ * The level answers "how much is in the account", which the figure beside this
+ * chart already says, and it moves for reasons that are not the strategy: a
+ * deposit or a withdrawal steps it without a single trade. Plotting the change
+ * makes break-even a line rather than a number to read off an axis.
+ */
 export function EquityChart({ points }: { points: EquityPoint[] }) {
   if (points.length === 0) {
     return (
       <Empty
-        what="No settled positions yet, so there is no equity curve."
+        what="No settled positions yet, so there is no P&L curve."
         next="python -m scripts.live"
       />
     );
   }
   const start = points[0].equity;
-  const data = points.map((p) => ({ ...p, t: new Date(p.timestamp).getTime() }));
+  const data = points.map((p) => ({
+    ...p,
+    t: new Date(p.timestamp).getTime(),
+    pnl: p.equity - start,
+  }));
 
   return (
     <ResponsiveContainer width="100%" height={220}>
@@ -235,25 +219,31 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
           axisLine={false}
           tickLine={false}
           width={52}
-          tickFormatter={(v) => `$${Number(v).toFixed(0)}`}
+          tickFormatter={(v) => `${Number(v) >= 0 ? '+' : ''}$${Number(v).toFixed(0)}`}
           domain={['auto', 'auto']}
         />
-        {/* The starting bankroll, so above and below the line are legible without
-            reading the axis. */}
+        {/* Break-even. The line that matters on a P&L chart, and the one a
+            currency axis alone does not make legible. */}
         <ReferenceLine
-          y={start}
+          y={0}
           stroke="var(--rule-firm)"
           strokeDasharray="3 3"
-          label={{ value: 'start', position: 'insideLeft', fill: 'var(--ink-3)', fontSize: 10 }}
+          label={{
+            value: 'break-even',
+            position: 'insideLeft',
+            fill: 'var(--ink-3)',
+            fontSize: 10,
+          }}
         />
         <Tooltip
           {...TOOLTIP}
           labelFormatter={(v) => stamp(new Date(Number(v)).toISOString())}
-          formatter={(v: number, name) => [`$${v.toFixed(2)}`, name]}
+          formatter={(v: number, name) => [`${v >= 0 ? '+' : ''}$${v.toFixed(2)}`, name]}
         />
         <Area
           type="stepAfter"
-          dataKey="equity"
+          dataKey="pnl"
+          name="p&l"
           stroke="var(--accent)"
           strokeWidth={1.5}
           fill="var(--accent-wash)"
