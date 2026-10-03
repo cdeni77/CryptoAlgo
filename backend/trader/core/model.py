@@ -370,6 +370,8 @@ def _fit_residual_scale(
     baseline_logit: np.ndarray,
     correction: np.ndarray,
     outcome: np.ndarray,
+    *,
+    focus_quantile: float = 0.0,
 ) -> float:
     """One coefficient: how much of the claimed correction survives.
 
@@ -378,6 +380,29 @@ def _fit_residual_scale(
     manufacture skill. Clipped to [0, 2]: a negative alpha would mean the model
     is anti-predictive and the honest response is to report zero skill rather
     than to invert it, which is curve-fitting on the validation split.
+
+    **`focus_quantile` fits it where the money is.** Alpha over ALL rows
+    optimises the average, and the average is fine: measured on 7,611 live
+    rows, the model's pooled ECE is only 0.0032 worse than the market's. But
+    the ~9% of rows that become trades are a selected sample -- `decide()`
+    takes them precisely where the model most disagrees with the price, which
+    is where it is most likely to be wrong -- and there the model claimed 65.07%
+    and delivered 58.53%, a **6.7pp overconfidence** (90% CI [+0.73, +12.55],
+    P(real) 97%) that accounts for essentially the whole gap between a +4.90pp
+    predicted edge and a -1.32pp realised one.
+
+    Alpha had no reason to correct that: it was never shown those rows
+    separately. The shrinkage was fitted where the money is not.
+
+    Set to `q`, the fit runs on rows whose `|correction|` is in the top `1-q`
+    of the distribution. That subset is a proxy for "rows we would trade" and,
+    crucially, is **alpha-invariant**: alpha scales the correction
+    monotonically, so the RANKING does not move and there is no fixed point to
+    chase. 0.0 keeps the historical behaviour.
+
+    This is not free. A smaller sample is a noisier alpha, and over-shrinking
+    is its own error -- so the subset is still held to `MIN_SHRINKAGE_ROWS`,
+    and the quantile backs off rather than raising when there is not enough.
     """
     from scipy import optimize
 
@@ -412,6 +437,30 @@ def _fit_residual_scale(
             f'is under the {MIN_SHRINKAGE_ROWS} needed to fit a shrinkage that '
             f'means anything. That is a data problem, not a model one.'
         )
+
+    # **Restrict to the rows that become trades, if asked.** Done after the
+    # finite filter and the minimum-rows check, so a focus that would leave too
+    # little to fit backs off to the full sample with a line saying so rather
+    # than raising -- a noisy alpha fitted on 40 rows is worse than an honest
+    # one fitted on all of them.
+    if focus_quantile and 0.0 < focus_quantile < 1.0:
+        cut = float(np.quantile(np.abs(correction), focus_quantile))
+        keep = np.abs(correction) >= cut
+        if int(keep.sum()) >= MIN_SHRINKAGE_ROWS:
+            logger.info(
+                'fitting the shrinkage on the %d row(s) above the %.0fth '
+                'percentile of |correction| — the subset that becomes trades, '
+                'where the model is selected for disagreeing with the price',
+                int(keep.sum()), 100 * focus_quantile)
+            baseline_logit = baseline_logit[keep]
+            correction = correction[keep]
+            outcome = outcome[keep]
+        else:
+            logger.warning(
+                'the top %.0f%% of |correction| is only %d row(s), under the %d '
+                'minimum, so the shrinkage is fitted on all %d instead',
+                100 * (1 - focus_quantile), int(keep.sum()),
+                MIN_SHRINKAGE_ROWS, outcome.size)
 
     def objective(alpha: float) -> float:
         return log_loss(outcome, expit(baseline_logit + float(alpha) * correction))
@@ -609,7 +658,9 @@ def fit_model(
     correction = np.asarray(booster.predict(alpha_matrix, raw_score=True), dtype=float)
     base_logit = alpha_rows[init_column].to_numpy(dtype=float)
     outcome = alpha_rows['outcome'].to_numpy(dtype=float)
-    alpha = _fit_residual_scale(base_logit, correction, outcome)
+    alpha = _fit_residual_scale(
+        base_logit, correction, outcome,
+        focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0))
 
     model = ForecastModel(
         booster=booster, features=list(populated), baseline=baseline,

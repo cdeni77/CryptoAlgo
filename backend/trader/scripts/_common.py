@@ -127,6 +127,14 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'the test span AND the step, since blocks do not '
                             'overlap, so 7 makes the walk-forward match the '
                             "weekly retrain's cadence")
+    model.add_argument('--shrinkage-focus-quantile', type=float, default=None,
+                       metavar='Q',
+                       help='fit residual_scale on rows whose |correction| is '
+                            'in the top 1-Q (e.g. 0.90 = top decile), the subset '
+                            'that becomes trades. 0 (default) fits on every row, '
+                            'which optimises the average -- and the average is '
+                            'already fine while the traded rows are 6.7pp '
+                            'overconfident.')
     model.add_argument('--fold-train-days', type=float, default=None,
                        help='roll the TRAINING window to this many days '
                             '(default: expanding, which is what the Sunday '
@@ -192,6 +200,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('fold_scheme', 'fold_scheme'),
         ('fold_block_days', 'fold_block_days'),
         ('fold_train_days', 'fold_train_days'),
+        ('shrinkage_focus_quantile', 'shrinkage_focus_quantile'),
         ('compound', 'compound'),
         ('entry_offsets', 'entry_offsets'),
         ('min_traded_price', 'min_traded_price'),

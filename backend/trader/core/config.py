@@ -289,6 +289,19 @@ class Config:
     # varies 8x across the history. Below this it is skipped and said so,
     # rather than averaged in as a peer of a block twenty times its size.
     min_test_windows: int = 200
+    # **Where the shrinkage is fitted, as a quantile of |model correction|.**
+    #
+    # 0.0 fits it on every validation row, which optimises the AVERAGE -- and
+    # the average is fine: the model's pooled ECE is 0.0032 off the market's.
+    # The ~9% of rows that become trades are a selected sample, taken exactly
+    # where the model most disagrees with the price, and there it claimed
+    # 65.07% and delivered 58.53% over 217 live trades. Alpha never saw those
+    # rows separately, so it had no reason to correct them.
+    #
+    # 0.90 fits on the top decile of |correction|. The ranking is
+    # alpha-invariant, so there is no fixed point to solve. Default 0.0 until
+    # the backtest says it helps -- see the note in `_fit_residual_scale`.
+    shrinkage_focus_quantile: float = 0.0
     # **The rolling training window, in days. None means expanding.**
     #
     # Expanding is what `scripts/promote.py` actually deploys — the Sunday
