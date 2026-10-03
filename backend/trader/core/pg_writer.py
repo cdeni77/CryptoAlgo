@@ -1036,6 +1036,67 @@ class PgWriter:
             session.commit()
             return int(n)
 
+    def correct_positions_from_venue(self, labels) -> tuple[int, int, float]:
+        """Re-settle positions the VENUE graded differently, and fix the P&L.
+
+        **`settle_due` prefers the venue's settlement, but only if it has one
+        at that moment.** When the venue's row has not arrived by the time the
+        window matures it falls back to our Coinbase bars, and nothing ever
+        re-grades it — the same "only fills what is empty" shape that
+        `set_window_outcome` had for predictions.
+
+        Measured 2026-10-03 over 216 settled trades since the epoch: our books
+        showed **130 winners against the venue's 123**, a 3.2% disagreement
+        that matches the documented Coinbase-vs-BRTI rate almost exactly, all
+        of it in near-ties. It was worth $21.06 — our books read +$8.80 where
+        the venue read -$12.26.
+
+        That is not merely a reporting gap. `account.realized_pnl` is what the
+        daily-loss limit and the drawdown breaker read, so both were keyed to a
+        P&L optimistic by that amount: the safety brakes under-react by exactly
+        the margin our own label flatters us.
+
+        **`bankroll` is deliberately NOT adjusted here.** `adopt_venue_balance`
+        writes the venue's balance every cycle and the venue is the account of
+        record; correcting a derived figure the venue already owns would be a
+        second source of truth. `realized_pnl` has no such owner, which is why
+        it drifted.
+
+        `labels` is an iterable of `(symbol, window_open, settled_up)`.
+        Returns `(examined, corrected, pnl_delta)`.
+        """
+        examined = corrected = 0
+        delta_total = 0.0
+        with self._session() as session:
+            for symbol, window_open, settled_up in labels:
+                if settled_up is None:
+                    continue
+                examined += 1
+                rows = (session.query(Position)
+                        .filter(Position.symbol == symbol,
+                                Position.window_open == window_open,
+                                Position.settled_at.isnot(None))
+                        .all())
+                for row in rows:
+                    if bool(row.settled_up) == bool(settled_up):
+                        continue
+                    won = _won(side=row.side, settled_up=bool(settled_up))
+                    payout = float(row.contracts) if won else 0.0
+                    before = float(row.pnl or 0.0)
+                    row.settled_up = bool(settled_up)
+                    row.payout = payout
+                    row.pnl = payout - float(row.outlay or 0.0)
+                    row.outcome = Outcome.WON.value if won else Outcome.LOST.value
+                    delta_total += float(row.pnl) - before
+                    corrected += 1
+            if corrected:
+                session.query(Account).update(
+                    {Account.realized_pnl: Account.realized_pnl + delta_total},
+                    synchronize_session=False,
+                )
+            session.commit()
+        return examined, corrected, delta_total
+
     def correct_outcomes_from_venue(self, labels) -> tuple[int, int]:
         """Overwrite `Prediction.outcome` where the VENUE settled differently.
 

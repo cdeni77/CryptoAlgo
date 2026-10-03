@@ -98,7 +98,8 @@ def main(argv=None) -> int:
         logger.info('--dry-run: %d venue label(s) would be checked', len(labels))
         return 0
 
-    examined, corrected = PgWriter(database_url=url).correct_outcomes_from_venue(labels)
+    writer = PgWriter(database_url=url)
+    examined, corrected = writer.correct_outcomes_from_venue(labels)
     if corrected:
         logger.warning('corrected %d prediction row(s) of %d window(s) checked '
                        '— our Coinbase label disagreed with the venue on these, '
@@ -106,6 +107,21 @@ def main(argv=None) -> int:
                        corrected, examined)
     else:
         logger.info('%d window(s) checked, no disagreement', examined)
+
+    # **Positions too, and this half moves money.** `settle_due` prefers the
+    # venue's settlement only when it already has one; a window that matures
+    # before the venue's row arrives is graded from our Coinbase bars and never
+    # re-graded. Measured 2026-10-03: 130 winners on our books against the
+    # venue's 123 over 216 trades, worth $21.06 — and `account.realized_pnl` is
+    # what the daily-loss and drawdown breakers read, so the brakes were keyed
+    # to a P&L flattered by our own label.
+    seen, fixed, delta = writer.correct_positions_from_venue(labels)
+    if fixed:
+        logger.warning('re-settled %d position(s) the venue graded differently: '
+                       'realised P&L %+.2f. The breakers read this figure, so it '
+                       'was optimistic by that much until now', fixed, delta)
+    else:
+        logger.info('%d window(s) checked, no position disagreement', seen)
     return 0
 
 
