@@ -372,6 +372,7 @@ def _fit_residual_scale(
     outcome: np.ndarray,
     *,
     focus_quantile: float = 0.0,
+    max_scale: float = 2.0,
 ) -> float:
     """One coefficient: how much of the claimed correction survives.
 
@@ -465,14 +466,31 @@ def _fit_residual_scale(
     def objective(alpha: float) -> float:
         return log_loss(outcome, expit(baseline_logit + float(alpha) * correction))
 
-    result = optimize.minimize_scalar(objective, bounds=(0.0, 2.0), method='bounded')
+    # **The ceiling is a claim about what alpha MEANS.** It answers "how much
+    # of the claimed correction survives out of sample", and more than 100%
+    # surviving is not an answer to that question -- it is the validation split
+    # asking to AMPLIFY a correction, which is an overfitting signature rather
+    # than a finding.
+    #
+    # Measured over 28 weekly refits with the ceiling at 2.0: alpha ran 0.532
+    # to 2.000, median 1.231, sd 0.426, and amplified on 19 of 28. It does not
+    # settle with more data (sd 0.49 on the larger folds against 0.35 on the
+    # smaller, correlation with fold size -0.13), so this is not small-sample
+    # noise. And it is the wrong direction where the money is: the rows that
+    # become trades are 6.7pp OVERconfident, so amplifying damages exactly the
+    # subset that pays.
+    #
+    # `max_residual_scale` is the ceiling. 1.0 says a correction may be
+    # discounted but never inflated; 2.0 is the historical behaviour.
+    result = optimize.minimize_scalar(objective, bounds=(0.0, max_scale),
+                                      method='bounded')
     if not result.success or not np.isfinite(result.x):
         raise ValueError(
             f'the shrinkage fit did not converge ({getattr(result, "message", "")!r}). '
             f'Reporting its abandoned bracket point as a fitted alpha is how an '
             f'unfitted constant reaches a gate.'
         )
-    return float(np.clip(result.x, 0.0, 2.0))
+    return float(np.clip(result.x, 0.0, max_scale))
 
 
 def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
@@ -660,7 +678,8 @@ def fit_model(
     outcome = alpha_rows['outcome'].to_numpy(dtype=float)
     alpha = _fit_residual_scale(
         base_logit, correction, outcome,
-        focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0))
+        focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0),
+        max_scale=float(getattr(config, 'max_residual_scale', 2.0) or 2.0))
 
     model = ForecastModel(
         booster=booster, features=list(populated), baseline=baseline,

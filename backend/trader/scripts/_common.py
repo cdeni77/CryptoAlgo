@@ -127,6 +127,12 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'the test span AND the step, since blocks do not '
                             'overlap, so 7 makes the walk-forward match the '
                             "weekly retrain's cadence")
+    model.add_argument('--max-residual-scale', type=float, default=None,
+                       metavar='A',
+                       help='ceiling on residual_scale (default 2.0). 1.0 lets '
+                            'the shrinkage discount a correction but never '
+                            'amplify it -- measured, alpha exceeded 1 on 19 of '
+                            '28 weekly refits and hit the 2.0 ceiling once.')
     model.add_argument('--shrinkage-focus-quantile', type=float, default=None,
                        metavar='Q',
                        help='fit residual_scale on rows whose |correction| is '
@@ -201,6 +207,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('fold_block_days', 'fold_block_days'),
         ('fold_train_days', 'fold_train_days'),
         ('shrinkage_focus_quantile', 'shrinkage_focus_quantile'),
+        ('max_residual_scale', 'max_residual_scale'),
         ('compound', 'compound'),
         ('entry_offsets', 'entry_offsets'),
         ('min_traded_price', 'min_traded_price'),

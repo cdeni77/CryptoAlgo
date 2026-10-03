@@ -302,6 +302,17 @@ class Config:
     # alpha-invariant, so there is no fixed point to solve. Default 0.0 until
     # the backtest says it helps -- see the note in `_fit_residual_scale`.
     shrinkage_focus_quantile: float = 0.0
+    # **Ceiling on `residual_scale`.** Alpha answers "how much of the claimed
+    # correction survives out of sample", so a value above 1 is the validation
+    # split asking to AMPLIFY the correction -- an overfitting signature, not a
+    # finding. Measured over 28 weekly refits at the historical 2.0 ceiling:
+    # 0.532 to 2.000, median 1.231, amplifying on 19 of 28, and NOT settling
+    # with more data. Meanwhile the traded rows are 6.7pp overconfident, so
+    # amplification hurts precisely where the money is.
+    #
+    # 2.0 is the historical behaviour; 1.0 permits discounting but not
+    # inflation. Default unchanged until the backtest rules on it.
+    max_residual_scale: float = 2.0
     # **The rolling training window, in days. None means expanding.**
     #
     # Expanding is what `scripts/promote.py` actually deploys — the Sunday
