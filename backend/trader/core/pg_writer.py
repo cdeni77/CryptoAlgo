@@ -1089,11 +1089,34 @@ class PgWriter:
                     row.outcome = Outcome.WON.value if won else Outcome.LOST.value
                     delta_total += float(row.pnl) - before
                     corrected += 1
-            if corrected:
-                session.query(Account).update(
-                    {Account.realized_pnl: Account.realized_pnl + delta_total},
-                    synchronize_session=False,
-                )
+            # **The invariant, restated every pass rather than only after a
+            # correction.** It is a statement about what `realized_pnl` IS,
+            # so enforcing it only when something changed leaves any drift
+            # already present in place -- which is exactly what happened on
+            # the first run here.
+            # **Recomputed from the positions, not nudged by the delta.**
+            # `account.realized_pnl` covers the period since
+            # `account.reset_at` -- `reset_dashboard --rebase` zeroes it
+            # there and `settle_position` accumulates forward from it. The
+            # labels this walks reach further back than the epoch, so
+            # applying the raw delta leaks pre-epoch corrections into a
+            # post-epoch total: on the first real run that put it at
+            # -$42.20 against post-epoch positions summing to -$12.20.
+            #
+            # Restating the invariant is both the fix and a repair for any
+            # drift already there, from this or anything else:
+            #
+            #     realized_pnl == sum(positions.pnl where settled_at >= epoch)
+            epoch = (session.query(Account.reset_at)
+                     .order_by(Account.id).limit(1).scalar())
+            total = session.query(func.coalesce(func.sum(Position.pnl), 0.0)) \
+                .filter(Position.settled_at.isnot(None))
+            if epoch is not None:
+                total = total.filter(Position.settled_at >= epoch)
+            session.query(Account).update(
+                {Account.realized_pnl: float(total.scalar() or 0.0)},
+                synchronize_session=False,
+            )
             session.commit()
         return examined, corrected, delta_total
 

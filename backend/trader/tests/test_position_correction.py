@@ -64,7 +64,11 @@ def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
 
     assert (seen, fixed) == (1, 1)
     assert delta == pytest.approx(-4.0), 'a 4-contract payout is withdrawn'
-    assert writer.account().realized_pnl == pytest.approx(before - 4.0)
+    # `realized_pnl` is RESTATED from the positions, not nudged by the delta --
+    # see `test_realized_pnl_is_restated_not_nudged` for why. With one settled
+    # position that is now a loss, the total is its own pnl.
+    assert writer.account().realized_pnl == pytest.approx(-outlay)
+    assert before == pytest.approx(0.0), 'sanity: the fixture starts flat'
     with writer._session() as session:                    # noqa: SLF001
         from core.pg_writer import Position
         row = session.query(Position).first()
@@ -73,14 +77,27 @@ def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
         assert row.pnl == pytest.approx(-outlay)
 
 
-def test_agreement_changes_nothing(writer):
+def test_agreement_re_settles_nothing(writer):
+    """No position is re-graded when the venue agrees.
+
+    `realized_pnl` is NOT asserted unchanged, because the restate runs every
+    pass by design — it is a statement about what that field IS, so enforcing
+    it only when something changed would leave existing drift in place. Here it
+    corrects an inconsistency this fixture creates: `_position` inserts rows
+    directly rather than through `settle_position`, which is what would
+    normally accumulate the figure.
+    """
+    from core.pg_writer import Position
+
     writer.ensure_account(500.0, mode='live')
     _position(writer, settled_up=True)
-    before = writer.account().realized_pnl
     seen, fixed, delta = writer.correct_positions_from_venue(
         [('BTC-USD', OPEN, True)])
     assert (fixed, delta) == (0, 0.0)
-    assert writer.account().realized_pnl == pytest.approx(before)
+    with writer._session() as session:                    # noqa: SLF001
+        expected = sum(float(r.pnl) for r in session.query(Position)
+                       .filter(Position.settled_at.isnot(None)).all())
+    assert writer.account().realized_pnl == pytest.approx(expected)
 
 
 def test_it_is_idempotent(writer):
@@ -132,3 +149,50 @@ def test_an_unsettled_position_is_not_touched(writer):
         session.commit()
     _, fixed, _ = writer.correct_positions_from_venue([('BTC-USD', OPEN, False)])
     assert fixed == 0
+
+
+def test_realized_pnl_is_restated_not_nudged(writer):
+    """`account.realized_pnl` covers the period since `account.reset_at`, while
+    the venue labels reach further back — so applying the raw delta leaks
+    pre-epoch corrections into a post-epoch total. On the first real run that
+    put it at -$42.20 against post-epoch positions summing to -$12.20.
+
+    The invariant it restores:
+        realized_pnl == sum(positions.pnl where settled_at >= epoch)
+    """
+    from core.pg_writer import Account
+
+    account = writer.ensure_account(500.0, mode='live')
+    epoch = OPEN - dt.timedelta(hours=1)
+    with writer._session() as session:                    # noqa: SLF001
+        row = session.merge(account)
+        row.reset_at = epoch
+        row.realized_pnl = 0.0
+        session.commit()
+
+    # One position BEFORE the epoch and one after; both graded our way.
+    _position(writer, settled_up=True)                     # at OPEN, post-epoch
+    from core.pg_writer import Outcome, Position
+    with writer._session() as session:                    # noqa: SLF001
+        session.add(Position(
+            symbol='ETH-USD', window_open=epoch - dt.timedelta(days=2),
+            settle_time=epoch - dt.timedelta(days=2), offset_minutes=12,
+            side='up', contracts=4, price=0.5, outlay=2.05, fee=0.05,
+            model_probability=0.6, baseline_probability=0.5, edge=0.02,
+            outcome=Outcome.WON.value, settled_up=True, payout=4.0, pnl=1.95,
+            settled_at=epoch - dt.timedelta(days=2)))
+        session.commit()
+
+    # The venue disagrees with BOTH.
+    writer.correct_positions_from_venue([
+        ('BTC-USD', OPEN, False),
+        ('ETH-USD', epoch - dt.timedelta(days=2), False),
+    ])
+
+    with writer._session() as session:                    # noqa: SLF001
+        post = (session.query(Position)
+                .filter(Position.settled_at >= epoch).all())
+        expected = sum(float(r.pnl) for r in post)
+    assert writer.account().realized_pnl == pytest.approx(expected), (
+        'the pre-epoch correction must not leak into the post-epoch total'
+    )
