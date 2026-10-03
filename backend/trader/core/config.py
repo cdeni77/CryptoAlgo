@@ -310,9 +310,24 @@ class Config:
     # with more data. Meanwhile the traded rows are 6.7pp overconfident, so
     # amplification hurts precisely where the money is.
     #
-    # 2.0 is the historical behaviour; 1.0 permits discounting but not
-    # inflation. Default unchanged until the backtest rules on it.
-    max_residual_scale: float = 2.0
+    # **1.0 since 2026-10-03, and the backtest ruled on it.** Same config,
+    # same data, ceiling 2.0 against 1.0:
+    #
+    #     edge/contract    2.276pp -> 3.410pp   (+50%)
+    #     sharpe              3.42 -> 3.63
+    #     log_loss_skill   0.00270 -> 0.00295
+    #     model_minus_mkt  0.00237 -> 0.00338
+    #     calib vs market  0.00484 -> 0.00226   (halved)
+    #     alpha sd           0.426 -> 0.143     median 1.231 -> 1.000
+    #     amplifying refits  19/28 -> 0/28
+    #
+    # The cost is volume: 2,543 -> 2,054 trades, so total return falls +111% ->
+    # +89%. Fewer and better, which is the right trade when the per-contract
+    # edge is what the live decision rule keys on.
+    #
+    # 2.0 remains available for comparison. Nothing above 1.0 is coherent as a
+    # SHRINKAGE, which is why the default moved.
+    max_residual_scale: float = 1.0
     # **The rolling training window, in days. None means expanding.**
     #
     # Expanding is what `scripts/promote.py` actually deploys — the Sunday

@@ -121,3 +121,31 @@ def test_the_ceiling_does_not_disturb_a_shrinking_fit():
     if free < 1.0:
         assert _fit_residual_scale(base, corr, y, max_scale=1.0) == \
             pytest.approx(free, abs=1e-6)
+
+
+def test_the_default_ceiling_is_one():
+    """A shrinkage that may exceed 1 is not a shrinkage.
+
+    Changed from 2.0 on 2026-10-03 on the backtest, same config and data:
+    edge/contract 2.276 -> 3.410pp, Sharpe 3.42 -> 3.63, alpha sd 0.426 ->
+    0.143, and amplifying refits 19/28 -> 0/28. The cost is volume (2,543 ->
+    2,054 trades, total return +111% -> +89%).
+    """
+    from core.config import Config
+
+    assert Config().max_residual_scale == 1.0
+
+
+def test_a_fitted_alpha_cannot_exceed_the_default_ceiling():
+    """The property the default exists to guarantee, end to end."""
+    rng = np.random.default_rng(2)
+    n = 20000
+    base = np.zeros(n)
+    corr = rng.normal(0, 0.4, n)
+    p = 1.0 / (1.0 + np.exp(-(base + corr * 3.0)))     # truth is 3x the correction
+    y = (rng.random(n) < p).astype(float)
+    from core.config import Config
+
+    alpha = _fit_residual_scale(base, corr, y,
+                                max_scale=Config().max_residual_scale)
+    assert alpha <= 1.0 + 1e-9
