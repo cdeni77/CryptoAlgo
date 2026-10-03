@@ -68,18 +68,42 @@ export function AccountPage() {
   const onVenue = Boolean(ledger?.available);
 
   const settled = (positions.data?.positions ?? []).filter((p) => p.outcome !== 'pending');
-  const paid = settled.reduce((sum, p) => sum + p.outlay, 0);
-  const meanCost = settled.length ? paid / settled.reduce((s, p) => s + p.contracts, 0) : null;
-  // The win rate comes from the venue where there is one — it resolved the
-  // markets, we only estimated them from Coinbase bars.
+  const settledContracts = settled.reduce((s, p) => s + p.contracts, 0);
+
+  // Per TRADE, and displayed as such. The venue resolves markets, not
+  // contracts, so this is the natural unit for "how often were we right" —
+  // it is only wrong when subtracted from a per-contract cost, which is what
+  // `realisedEdge` used to do.
   const winRate = onVenue
     ? ledger!.win_rate.value
     : settled.length
       ? settled.filter((p) => p.outcome === 'won').length / settled.length
       : null;
-  const realisedEdge = winRate != null && meanCost != null ? winRate - meanCost : null;
-  const predictedEdge = settled.length
-    ? settled.reduce((s, p) => s + p.edge, 0) / settled.length
+
+  // **P&L per contract, not `win_rate - mean_cost`.** That subtraction mixed
+  // denominators: the win rate is per TRADE (the venue resolves markets, not
+  // contracts) while the mean cost is per CONTRACT. They only agree if every
+  // trade is the same size, and they are not — measured 2026-10-03, the win
+  // rate was 0.5714 per trade against 0.5853 per contract, because winners
+  // carry more contracts than losers. The gap read as 1.4pp of edge that was
+  // never lost: -2.71pp displayed against a true -1.32pp.
+  //
+  // Dividing realised P&L by contracts has no such ambiguity, and it is the
+  // same quantity `realised_edge_pp` gates on, so the dashboard and the
+  // promotion gate finally mean one thing.
+  const realisedEdge = onVenue
+    ? ledger!.contracts > 0 && ledger!.realized_pnl.value != null
+      ? ledger!.realized_pnl.value / ledger!.contracts
+      : null
+    : settledContracts > 0
+      ? settled.reduce((s, p) => s + (p.pnl ?? 0), 0) / settledContracts
+      : null;
+
+  // Contract-weighted too, or the comparison against realised is
+  // apples-to-oranges: a per-trade mean over-weights the small trades the
+  // whole-contract floor barely admitted.
+  const predictedEdge = settledContracts
+    ? settled.reduce((s, p) => s + p.edge * p.contracts, 0) / settledContracts
     : null;
 
   const venueRows = settlements.data?.settlements ?? [];
