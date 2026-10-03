@@ -58,8 +58,10 @@ def market_measurement(scored=None, *, entry_offsets=None) -> dict[str, float]:
     from core.metrics import market_gate_values, market_rows_from_scored
 
     url = os.getenv('DATABASE_URL')
-    def _from_backtest(why: str) -> dict[str, float]:
-        rows = (market_rows_from_scored(scored, entry_offsets=entry_offsets)
+
+    def _from_backtest(why: str, *, recorded_only: bool = False) -> dict[str, float]:
+        rows = (market_rows_from_scored(scored, entry_offsets=entry_offsets,
+                                        recorded_only=recorded_only)
                 if scored is not None else [])
         if not rows:
             print(f'  {why} and the backtest carries no recorded quotes, so the '
@@ -73,6 +75,41 @@ def market_measurement(scored=None, *, entry_offsets=None) -> dict[str, float]:
         print('  (a reconstruction, not an observation — validated to 0.70c '
               'against the live recording)')
         return values
+
+    # **THE CANDIDATE'S OWN ROWS COME FIRST, against quotes somebody watched.**
+    #
+    # This used to prefer the live `predictions` table, on the stated ground
+    # that those are "the venue's quote at the instant a decision was actually
+    # made". True, and it created a DEADLOCK: those rows were produced by
+    # whatever model was deployed at the time, `model_version` is NULL on all
+    # of them, and a new candidate cannot change a single one. So a candidate
+    # was gated on its predecessor's live track record.
+    #
+    # Measured: the 2026-09-20 and 2026-09-27 retrains were both blocked by
+    # `calibration_vs_market` computed over 8,411 live windows, while their own
+    # numbers passed -- skill +0.0027 over 24,247 windows, every other gate
+    # green. The model froze on 20260917T021814Z for sixteen days and would
+    # have stayed there indefinitely, because the live figures can only improve
+    # if a new model is deployed and no new model could be deployed.
+    #
+    # The reason for preferring the live table also expired. Since the
+    # quote-source fix of 2026-09-16 the backtest prices against the same
+    # `live_touch` quotes where they exist, so the choice is no longer
+    # observation-versus-reconstruction -- `recorded_only` keeps that property
+    # while restoring attribution to the candidate.
+    if scored is not None:
+        rows = market_rows_from_scored(scored, entry_offsets=entry_offsets,
+                                       recorded_only=True)
+        if rows:
+            values = market_gate_values(rows)
+            print(f'  market comparison: {int(values["market_windows"]):,} '
+                  f'windows of RECORDED quotes from this candidate\'s own '
+                  f'out-of-sample rows, model_minus_market '
+                  f'{values["model_minus_market"]:+.6f}')
+            return values
+        print('  this candidate scored no rows against a recorded quote; '
+              'falling back to the DEPLOYED system\'s live record, which it '
+              'cannot influence')
 
     if not url:
         return _from_backtest('DATABASE_URL is unset')

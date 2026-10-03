@@ -593,10 +593,17 @@ def market_comparison(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(parts)
 
 
+#: Observers whose quote was watched rather than reconstructed afterwards.
+#: `quote_observer` carries this per row (see `core/quotes.py`); `backfill` is
+#: Predexon's after-the-fact snapshot and is excluded when `recorded_only`.
+LIVE_OBSERVERS = ('live_touch', 'live_ws', 'live')
+
+
 def market_rows_from_scored(
         frame: pd.DataFrame, *,
         max_quote_age_seconds: float = MAX_QUOTE_AGE_SECONDS,
-        entry_offsets=None) -> list:
+        entry_offsets=None,
+        recorded_only: bool = False) -> list:
     """`MARKET_COLUMNS` rows from a backtest that carries recorded quotes.
 
     **This is the claim `market_gate_values` used to say could not be made.**
@@ -626,6 +633,17 @@ def market_rows_from_scored(
     if any(c not in frame.columns for c in needed):
         return []
     part = frame.copy()
+    # **Only quotes somebody watched, when asked.** `quote_observer` says which
+    # sampler priced the row; `backfill` is Predexon's reconstruction after the
+    # fact. Both are legitimate for pricing a backtest, but only the recorded
+    # ones answer "would this model have beaten the book that existed", which
+    # is what the market gates claim to measure.
+    if recorded_only:
+        if 'quote_observer' not in part.columns:
+            return []
+        part = part[part['quote_observer'].isin(LIVE_OBSERVERS)]
+        if not len(part):
+            return []
     # **Grade on the label the MARKET was priced against, wherever we hold it.**
     # Our outcome comes from Coinbase bars and so does the baseline; the market
     # prices on CF Benchmarks BRTI. Scoring both forecasters on a label that
