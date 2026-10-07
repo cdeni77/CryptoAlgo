@@ -1,0 +1,524 @@
+{
+  "version": "20261003T203432Z",
+  "created_at": "2026-10-03T20:34:32.478326+00:00",
+  "passed": false,
+  "installed": false,
+  "forced": false,
+  "force_reason": null,
+  "gates": [
+    {
+      "name": "market_windows",
+      "value": 2800.0,
+      "threshold": 2000.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "model_minus_market",
+      "value": 0.0023658424467722927,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "log_loss_skill",
+      "value": 0.0026543233448127856,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "sign_agreement_p",
+      "value": 0.00045611709356307983,
+      "threshold": 0.11,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "calibration_error",
+      "value": 0.06643236544248714,
+      "threshold": 0.1,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "calibration_vs_baseline",
+      "value": 0.0005076850547805836,
+      "threshold": 0.005,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "calibration_max_deviation",
+      "value": 0.050612464696399184,
+      "threshold": 0.1,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "calibration_vs_market",
+      "value": 0.004837436274701786,
+      "threshold": 0.0,
+      "direction": "max",
+      "passed": false
+    },
+    {
+      "name": "non_finite_share",
+      "value": 0.0,
+      "threshold": 0.001,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "residual_scale",
+      "value": 1.2311194655582791,
+      "threshold": 0.25,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "control_gain_share",
+      "value": 0.0,
+      "threshold": 0.3,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "windows_evaluated",
+      "value": 25097.0,
+      "threshold": 20000.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "trades",
+      "value": 2543.0,
+      "threshold": 200.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "coverage",
+      "value": 0.10132685181495796,
+      "threshold": 0.0005,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "realised_edge_pp",
+      "value": 2.2760814045515776,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "total_return",
+      "value": 1.1122662000000023,
+      "threshold": 0.0,
+      "direction": "min",
+      "passed": true
+    },
+    {
+      "name": "sharpe",
+      "value": 3.4224767365145654,
+      "threshold": 0.5,
+      "direction": "min",
+      "passed": "True"
+    },
+    {
+      "name": "sharpe_implausible",
+      "value": 0.0,
+      "threshold": 0.0,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "max_drawdown",
+      "value": 0.09191702608781306,
+      "threshold": 0.35,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "median_fold_drawdown",
+      "value": 0.02977869898930878,
+      "threshold": 0.2,
+      "direction": "max",
+      "passed": true
+    },
+    {
+      "name": "halted",
+      "value": 0.0,
+      "threshold": 0.0,
+      "direction": "max",
+      "passed": true
+    }
+  ],
+  "failed_gates": [
+    "calibration_vs_market"
+  ],
+  "model": {
+    "features": [
+      "venue_prob_gap",
+      "venue_gap_change_5",
+      "venue_spread_ratio",
+      "pm_available",
+      "z_score",
+      "abs_z_score",
+      "excursion_up_z",
+      "excursion_down_z",
+      "excursion_span_z",
+      "excursion_asymmetry",
+      "path_efficiency",
+      "displacement_vs_elapsed",
+      "touched_opposite",
+      "log_rv_15",
+      "log_rv_60",
+      "log_rv_240",
+      "log_rv_1440",
+      "rv_slope_short",
+      "rv_slope_long",
+      "range_to_return",
+      "vol_of_vol",
+      "log_sigma_per_min",
+      "rv_surprise",
+      "seasonal_ramp",
+      "autocorr_60",
+      "run_length",
+      "body_ratio_15",
+      "volume_z_15",
+      "vwap_gap_15",
+      "signed_volume_15",
+      "zero_return_share_60",
+      "peer_displacement",
+      "peer_return_5",
+      "peer_return_15",
+      "lead_residual",
+      "beta_1440",
+      "universe_dispersion",
+      "elapsed_fraction",
+      "remaining_minutes",
+      "spread",
+      "imbalance_touch",
+      "imbalance_5c",
+      "depth_ratio",
+      "book_convexity",
+      "iv_minus_realised",
+      "implied_sigma_per_min",
+      "iv_r2",
+      "iv_n_strikes",
+      "iv_staleness_minutes"
+    ],
+    "n_features": 49,
+    "n_features_populated": 49,
+    "empty_features": [],
+    "groups": [
+      "cross_venue",
+      "geometry",
+      "vol_state",
+      "microstructure",
+      "cross_asset",
+      "offset",
+      "market_state",
+      "implied_vol"
+    ],
+    "residual_scale": 1.4280864471217023,
+    "init_score_source": "market",
+    "n_train_rows": 77893,
+    "n_train_windows": 14123,
+    "best_iteration": 105,
+    "train_log_loss": 0.4538598311974243,
+    "inner_log_loss": 0.4663442118570445,
+    "inner_baseline_log_loss": 0.4720245660130674,
+    "inner_log_loss_skill": 0.005680354156022915,
+    "control_importance_share": 0.0,
+    "baseline": {
+      "distribution": "student_t",
+      "nu": 3.6084977351322287,
+      "scale": {
+        "3": 1.3184624571833834,
+        "6": 1.2423903013588653,
+        "9": 1.1633975735318276,
+        "12": 1.0849753594728075
+      },
+      "n_fitted": 77879,
+      "fitted_log_loss": 0.4712116645002441
+    },
+    "deployable": true,
+    "config": {
+      "symbols": [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD"
+      ],
+      "venue": "coinbase_spot",
+      "timeframe": "1m",
+      "window_minutes": 15,
+      "decision_offsets": [
+        3,
+        6,
+        9,
+        12
+      ],
+      "vol_lookbacks_minutes": [
+        15,
+        60,
+        240,
+        1440
+      ],
+      "baseline_distribution": "student_t",
+      "baseline_nu": null,
+      "init_score_source": "market",
+      "n_folds": 6,
+      "embargo_minutes": 1440,
+      "recency_half_life_days": null,
+      "train_window_days": null,
+      "fee_rate": 0.07,
+      "half_spread_cents": 0.5,
+      "fee_config_version": "builtin_kalshi_v202608",
+      "fold_scheme": "calendar",
+      "entry_offsets": [
+        12
+      ],
+      "compound": false,
+      "starting_bankroll": 500.0,
+      "max_stake_dollars": 25.0,
+      "max_stake_fraction": 0.05,
+      "kelly_fraction": 0.05,
+      "min_edge_pp": 1.5,
+      "cli_overrides": [
+        "entry_offsets",
+        "init_score_source",
+        "kelly_fraction",
+        "min_edge_pp",
+        "starting_bankroll"
+      ]
+    }
+  },
+  "report": {
+    "reliability": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.02,
+        "predicted": 0.008870663182691248,
+        "observed": 0.0,
+        "count": 93
+      },
+      {
+        "bin_low": 0.02,
+        "bin_high": 0.04,
+        "predicted": 0.028914699149642193,
+        "observed": 0.014285714285714285,
+        "count": 70
+      },
+      {
+        "bin_low": 0.04,
+        "bin_high": 0.06,
+        "predicted": 0.04931436853886761,
+        "observed": 0.03333333333333333,
+        "count": 60
+      },
+      {
+        "bin_low": 0.06,
+        "bin_high": 0.08,
+        "predicted": 0.06996470627264612,
+        "observed": 0.058823529411764705,
+        "count": 51
+      },
+      {
+        "bin_low": 0.08,
+        "bin_high": 0.1,
+        "predicted": 0.09098524147991481,
+        "observed": 0.09090909090909091,
+        "count": 55
+      },
+      {
+        "bin_low": 0.1,
+        "bin_high": 0.15,
+        "predicted": 0.12699701362918075,
+        "observed": 0.11764705882352941,
+        "count": 136
+      },
+      {
+        "bin_low": 0.15,
+        "bin_high": 0.2,
+        "predicted": 0.17549963136435706,
+        "observed": 0.19444444444444445,
+        "count": 108
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.3,
+        "predicted": 0.25179190629961234,
+        "observed": 0.2096069868995633,
+        "count": 229
+      },
+      {
+        "bin_low": 0.3,
+        "bin_high": 0.4,
+        "predicted": 0.34905060097847584,
+        "observed": 0.3004694835680751,
+        "count": 213
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.5,
+        "predicted": 0.44760824503226865,
+        "observed": 0.35714285714285715,
+        "count": 182
+      },
+      {
+        "bin_low": 0.5,
+        "bin_high": 0.6,
+        "predicted": 0.5505999500945103,
+        "observed": 0.511520737327189,
+        "count": 217
+      },
+      {
+        "bin_low": 0.6,
+        "bin_high": 0.7,
+        "predicted": 0.6507483155285396,
+        "observed": 0.6320346320346321,
+        "count": 231
+      },
+      {
+        "bin_low": 0.7,
+        "bin_high": 0.8,
+        "predicted": 0.7547733224940716,
+        "observed": 0.7399103139013453,
+        "count": 223
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 0.85,
+        "predicted": 0.8233548811284972,
+        "observed": 0.7522935779816514,
+        "count": 109
+      },
+      {
+        "bin_low": 0.85,
+        "bin_high": 0.9,
+        "predicted": 0.8758515139443547,
+        "observed": 0.860655737704918,
+        "count": 122
+      },
+      {
+        "bin_low": 0.9,
+        "bin_high": 0.92,
+        "predicted": 0.9097994532182189,
+        "observed": 0.9090909090909091,
+        "count": 44
+      },
+      {
+        "bin_low": 0.92,
+        "bin_high": 0.94,
+        "predicted": 0.9305881592946331,
+        "observed": 0.8928571428571429,
+        "count": 56
+      },
+      {
+        "bin_low": 0.94,
+        "bin_high": 0.96,
+        "predicted": 0.9496344841500779,
+        "observed": 0.9253731343283582,
+        "count": 67
+      },
+      {
+        "bin_low": 0.96,
+        "bin_high": 0.98,
+        "predicted": 0.9716307510337295,
+        "observed": 0.9487179487179487,
+        "count": 78
+      },
+      {
+        "bin_low": 0.98,
+        "bin_high": 1.0,
+        "predicted": 0.992454323601638,
+        "observed": 0.9874213836477987,
+        "count": 159
+      }
+    ],
+    "folds": 28,
+    "windows_evaluated": 25097,
+    "log_loss_skill": 0.0026543233448127856,
+    "log_loss_skill_se": 0.0008677190950117965,
+    "log_loss_skill_t": 3.058966156295893,
+    "folds_positive": 23,
+    "sign_agreement_p": 0.00045611709356307983,
+    "max_calibration_error": 0.06643236544248714,
+    "mean_residual_scale": 1.2365671879731654,
+    "max_control_gain_share": 0.0,
+    "gate_values": {
+      "log_loss_skill": 0.0026543233448127856,
+      "folds_skill_positive": 23.0,
+      "sign_agreement_p": 0.00045611709356307983,
+      "calibration_error": 0.06643236544248714,
+      "calibration_vs_baseline": 0.0005076850547805836,
+      "calibration_max_deviation": 0.050612464696399184,
+      "non_finite_share": 0.0,
+      "residual_scale": 1.2311194655582791,
+      "control_gain_share": 0.0,
+      "windows_evaluated": 25097.0,
+      "trades": 2543.0,
+      "coverage": 0.10132685181495796,
+      "realised_edge_pp": 2.2760814045515776,
+      "total_return": 1.1122662000000023,
+      "sharpe": 3.4224767365145654,
+      "sharpe_implausible": 0.0,
+      "max_drawdown": 0.09191702608781306,
+      "median_fold_drawdown": 0.02977869898930878,
+      "worst_fold_drawdown": 0.20240561035334742,
+      "halted": 0.0
+    },
+    "config": {
+      "symbols": [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD"
+      ],
+      "venue": "coinbase_spot",
+      "timeframe": "1m",
+      "window_minutes": 15,
+      "decision_offsets": [
+        3,
+        6,
+        9,
+        12
+      ],
+      "vol_lookbacks_minutes": [
+        15,
+        60,
+        240,
+        1440
+      ],
+      "baseline_distribution": "student_t",
+      "baseline_nu": null,
+      "init_score_source": "market",
+      "n_folds": 6,
+      "embargo_minutes": 1440,
+      "recency_half_life_days": null,
+      "train_window_days": null,
+      "fee_rate": 0.07,
+      "half_spread_cents": 0.5,
+      "fee_config_version": "builtin_kalshi_v202608",
+      "fold_scheme": "calendar",
+      "entry_offsets": [
+        12
+      ],
+      "compound": false,
+      "starting_bankroll": 500.0,
+      "max_stake_dollars": 25.0,
+      "max_stake_fraction": 0.05,
+      "kelly_fraction": 0.05,
+      "min_edge_pp": 1.5,
+      "cli_overrides": [
+        "entry_offsets",
+        "init_score_source",
+        "kelly_fraction",
+        "min_edge_pp",
+        "starting_bankroll"
+      ]
+    },
+    "notes": []
+  }
+}
