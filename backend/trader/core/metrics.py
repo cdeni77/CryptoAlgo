@@ -33,7 +33,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from core.baseline import Reliability, brier, log_loss, reliability
+from core.baseline import (Reliability, brier, clip_prob, expit, log_loss,
+                           logit, reliability)
 from core.book import BookStats
 from core.config import Config, DEFAULT_CONFIG
 
@@ -696,6 +697,54 @@ def market_rows_from_scored(
                     part['model_probability'], part['outcome'], decision))
 
 
+def calibration_noise_null(market, outcome, correction_sd, *,
+                           draws: int = 200, seed: int = 0) -> float:
+    """Mean `model_ece - market_ece` from a correction of the same SIZE and no
+    signal at all.
+
+    **The zero bar is not the right null, and measuring that is the point.**
+    ECE is built on absolute deviations, so perturbing a well-calibrated
+    forecast inflates measured ECE even when the perturbation is unbiased. A
+    market-initialised model starts at exactly 0 -- an untrained one reproduces
+    the price -- so `calibration_vs_market <= 0` asks it to move without ever
+    moving the wrong way, which nothing can do.
+
+    Measured on 7,611 live rows: adding PURE NOISE to the market logit scores
+    +0.00027 at sd 0.05 rising to +0.00178 at sd 0.40, and passes a zero bar
+    only 8-28% of the time. The model's own correction has sd 0.275, whose
+    matched null is +0.00125.
+
+    So the honest question is not "is the model better calibrated than the
+    price" but "is its correction better than a random one of the same size".
+    That is the same shape as `sign_agreement_p`: compare against what chance
+    produces rather than an absolute bar, which also makes the threshold
+    model-independent and so impossible to tune in a candidate's favour.
+
+    The null is generated at the candidate's OWN correction magnitude, so a
+    model that barely moves is held to a tight null and one that moves a lot is
+    held to a loose one -- which is correct, because the bias scales with how
+    far the correction travels.
+    """
+    market = pd.to_numeric(pd.Series(market), errors='coerce').to_numpy(dtype=float)
+    outcome = pd.to_numeric(pd.Series(outcome), errors='coerce').to_numpy(dtype=float)
+    keep = np.isfinite(market) & np.isfinite(outcome)
+    market, outcome = market[keep], outcome[keep]
+    if not len(market) or not np.isfinite(correction_sd) or correction_sd <= 0:
+        return 0.0
+    base = _pooled_ece(market, outcome)
+    if not np.isfinite(base):
+        return 0.0
+    z = logit(clip_prob(market))
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(int(draws)):
+        drawn = _pooled_ece(expit(z + rng.normal(0.0, float(correction_sd), z.size)),
+                            outcome)
+        if np.isfinite(drawn):
+            out.append(drawn - base)
+    return float(np.mean(out)) if out else 0.0
+
+
 def _pooled_ece(pred, outcome) -> float:
     """Count-weighted expected calibration error over every populated bin.
 
@@ -796,6 +845,7 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
                 'model_minus_market': float('nan'),
                 'baseline_minus_market': float('nan'),
                 'market_max_deviation': float('nan'),
+                'calibration_noise_null': float('nan'),
                 'calibration_vs_market': float('nan')}
     windows = float(frame.drop_duplicates(['symbol', 'window_open']).shape[0])
     overall = market_slice(frame, 'all')
@@ -833,11 +883,25 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
     # obscuring a real finding behind an enormous error bar rather than
     # inventing a false one.
     #
-    # Gated at <= 0 with no tolerance on purpose. A noise-floor allowance would
-    # let exactly this finding through, and the point of the gate is to report
-    # it while the edge is still unproven.
+    # **Gated against a matched NOISE NULL, not against zero.** A zero bar is
+    # unreachable by construction -- see `calibration_noise_null`. Measured on
+    # 7,611 live rows, pure noise at the model's own correction magnitude
+    # (sd 0.275) scores +0.00125, so a zero bar charges the model for moving at
+    # all. Subtracting the null asks the question that matters: is this
+    # correction better calibrated than a RANDOM one of the same size?
+    #
+    # It does not let the current model through, which is why the change is
+    # safe to make while it is the only failing gate: the model reads +0.00359
+    # against a +0.00125 null, so it is +0.00234 worse than its own noise and
+    # beaten by a random perturbation in 98% of draws. Its errors are
+    # systematic, which matches the 6.7pp overconfidence measured on the rows
+    # it trades.
     model_ece = _pooled_ece(frame['model'], frame['outcome'])
     market_ece = _pooled_ece(frame['market'], frame['outcome'])
+    correction_sd = float(np.std(
+        logit(clip_prob(pd.to_numeric(frame['model'], errors='coerce')))
+        - logit(clip_prob(pd.to_numeric(frame['market'], errors='coerce')))))
+    null = calibration_noise_null(frame['market'], frame['outcome'], correction_sd)
     # Kept as a reported diagnostic: it is informative about the venue even
     # though it is too noisy to gate on.
     market_dev = _worst_populated_bin(frame['market'], frame['outcome'])
@@ -845,7 +909,8 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
             'model_minus_market': float(overall['model_minus_market']),
             'baseline_minus_market': float(overall['baseline_minus_market']),
             'market_max_deviation': market_dev,
-            'calibration_vs_market': float(model_ece - market_ece)}
+            'calibration_noise_null': float(null),
+            'calibration_vs_market': float(model_ece - market_ece - null)}
 
 
 # ---- gates ---------------------------------------------------------------
@@ -989,6 +1054,9 @@ GATE_NOTES: dict[str, str] = {
                                'with t=+0.06 over 25 folds — statistically identical, '
                                'which is the honest reading rather than either an '
                                'improvement or a fault',
+    'calibration_noise_null': 'what a RANDOM correction of the same size scores on '
+                              'this statistic — reported so the gate above can be read '
+                              'as a margin over chance rather than an absolute bar',
     'calibration_vs_market': 'the model must be at least as calibrated as the price '
                              'it trades against. An absolute bar encodes an assumption '
                              'this venue falsifies: measured on 33,126 rows, the MARKET '
