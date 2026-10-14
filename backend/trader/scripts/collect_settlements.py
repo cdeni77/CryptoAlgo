@@ -1,29 +1,11 @@
-"""The venue's own settlement for every 15-minute market, both venues, one table.
+"""Collect the venue's own settlement for every 15-minute market, both venues.
 
-**Why this is the most important thing missing.** Every target in this repository
-is built by `core/windows.py` from Coinbase one-minute bars: the strike is the
-mean over [t0-1min, t0), the settlement value the mean over [t1-1min, t1), and
-`>=` decides. But the market settles on CF Benchmarks BRTI, and `CLAUDE.md` lists
-that basis as an **unmeasured risk** — "a close proxy, not the same number".
+Our labels come from Coinbase bars; the venues settle on other indices. Both
+venues' results reduce to `settled_up` in `venue_settlements`, so each can be
+compared with our label and with the other venue.
 
-It stayed unmeasured because nothing here held the venue's answer. Predexon
-serves `result` on every settled Kalshi market, and Polymarket publishes
-`winning_side`, so the proxy can now be scored against the thing it proxies on
-every window rather than on the ~6% we traded. If the two disagree materially,
-every label in five years of training data carries that error and no amount of
-modelling fixes it.
-
-Uniform by construction. Kalshi's `result` ('yes'/'no') and Polymarket's
-`winning_side` ('A'/'B') both reduce to `settled_up`, and both land in
-`venue_settlements` with the same columns — so the two venues can be compared to
-each other as well as to us. Two independent settlement sources disagreeing on
-the same fifteen minutes is itself a measurement.
-
-Cheap: the markets endpoint caps `limit` at 100, so ~70 days of three series is
-roughly 200 requests. It is not the book — it is one row per market.
-
-Both endpoints refuse a bare `Python-urllib`/`aiohttp` default User-Agent with a
-Cloudflare 1010, which is why the header is set explicitly.
+Predexon and Polymarket refuse a default `Python-urllib`/`aiohttp` User-Agent
+with a Cloudflare 1010, so the header is set explicitly.
 """
 
 from __future__ import annotations
@@ -47,10 +29,7 @@ logger = logging.getLogger('settlements')
 PREDEXON = 'https://api.predexon.com'
 GAMMA = 'https://gamma-api.polymarket.com'
 PAUSE = 1.15
-# The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
-# This used to hardcode its own copy with no env read, so pointing
-# KALSHI_SERIES_BTC at a demo series moved what the trader traded while
-# this kept scraping production.
+# The one series<->symbol mapping: core/config.SERIES_BY_SYMBOL.
 SERIES = series_to_symbol()
 PM_ASSETS = {'btc': 'BTC-USD', 'eth': 'ETH-USD', 'sol': 'SOL-USD'}
 HEADERS = {'Accept': 'application/json',
@@ -87,16 +66,11 @@ async def _get(session, url: str, params: dict, key: Optional[str] = None):
 
 
 async def kalshi_direct(now, store=None, *, args_full: bool = False) -> list[dict]:
-    """Settled markets straight from Kalshi, using the trading credential.
+    """Return settled markets straight from Kalshi, using the trading credential.
 
-    The DEFAULT path for keeping the label current. Predexon remains the only
-    way to reach HISTORY — Kalshi purges older markets — so `--source predexon`
-    is still there for a backfill, and the 196-day 62,097-row archive came
-    through it. But nothing about ongoing collection needs a research key in
-    the container that holds the trading credential.
-
-    Pages until it reaches windows already stored, so an hourly run is a couple
-    of requests rather than a walk.
+    The default path for keeping the label current. Kalshi purges older
+    markets, so history needs `--source predexon`. Pages until it reaches
+    windows already stored.
     """
     from core.config import SERIES_BY_SYMBOL
     from data_collection.kalshi_client import KalshiClient
@@ -136,13 +110,9 @@ async def kalshi_direct(now, store=None, *, args_full: bool = False) -> list[dic
                 rows += rows_from_kalshi_markets(fresh, symbol=symbol, now=now)
                 cursor = payload.get('cursor')
                 pages += 1
-                # **TWO consecutive stale pages, matching the sibling above.**
-                # This path broke on the FIRST page with nothing fresh, and the
-                # cursor only walks backwards from now -- so once a stale page
-                # sat in front of a hole, the hole was permanent. Measured
-                # 2026-09-16: 2026-09-03 and 2026-09-10 each hold 264 of 288
-                # markets, the latter a single 2h15m gap of 8 consecutive
-                # windows in the settlement LABEL.
+                # Stop after two consecutive stale pages, not one. The cursor
+                # walks backwards, so stopping at one stale page in front of a
+                # hole would leave the hole forever.
                 stale_pages = 0 if fresh else stale_pages + 1
                 if not cursor or not markets:
                     break
@@ -156,24 +126,10 @@ async def kalshi_direct(now, store=None, *, args_full: bool = False) -> list[dic
 
 
 def rows_from_kalshi_markets(markets, *, symbol: str, now) -> list[dict]:
-    """`venue_settlements` rows from Kalshi's OWN settled-market listing.
+    """Return `venue_settlements` rows from Kalshi's settled-market listing.
 
-    `GET /markets?status=settled` carries `result` per market, so the ongoing
-    label needs no research key — the live container is already authenticated to
-    Kalshi. Predexon was only ever required for HISTORY, because Kalshi purges
-    older markets; that is what the 196-day, 62,097-row backfill went through.
-
-    Removing the extra credential is not cosmetic. `venue_outcome` closes a
-    measured 43% label leak — training on our Coinbase label while pricing
-    against BRTI-based quotes let the model bet the index disagreement (72.77%
-    win rate where the labels differ against 56.17% where they agree). A label
-    path gated on a key nobody remembered to pass is that leak waiting to
-    reopen, which is precisely what happened for the six days after
-    2026-08-27.
-
-    A market without a `result` is SKIPPED, never defaulted: `status=settled`
-    can return one mid-finalisation, and reading a missing result as 'no' would
-    fabricate half the labels it touched.
+    A market without a `result` is skipped, never defaulted: `status=settled`
+    can return one mid-finalisation.
     """
     rows = []
     for market in markets or []:
@@ -183,8 +139,8 @@ def rows_from_kalshi_markets(markets, *, symbol: str, now) -> list[dict]:
         close = _time(market.get('close_time'))
         if close is None or pd.isna(close):
             continue
-        # The window opens WINDOW_MINUTES before it closes; the settlement is
-        # keyed on the open, as everywhere else in the store.
+        # The settlement is keyed on the window open, WINDOW_MINUTES before
+        # the close.
         open_time = close - pd.Timedelta(minutes=15)
         rows.append({
             'venue': 'kalshi', 'symbol': symbol,
@@ -196,14 +152,9 @@ def rows_from_kalshi_markets(markets, *, symbol: str, now) -> list[dict]:
             'settlement_time': _time(market.get('settlement_time')),
             'result': result,
             'settled_up': result == 'yes',
-            # **Through the `_fp`/`_dollars` parsers, not the bare names.**
-            # Kalshi serves `volume_fp`, `open_interest_fp` and
-            # `last_price_dollars` with the bare fields NULL -- the same trap
-            # already recorded for `yes_bid_dollars`, where reading only the
-            # integer form parsed every quote as empty. `None or 0.0` is 0.0,
-            # and a stored zero is indistinguishable from a real one. Measured
-            # 2026-09-16: 4,303 of 4,509 rows written in 2026-09 (95.4%) had
-            # volume 0, against 0-98 in most earlier months.
+            # Read through the `_fp`/`_dollars` parsers: Kalshi serves
+            # `volume_fp`, `open_interest_fp` and `last_price_dollars` with the
+            # bare fields null.
             'volume': _quantity(market, 'volume') or 0.0,
             'open_interest': _quantity(market, 'open_interest') or 0.0,
             'last_price': _money(market, 'last_price') or 0.0,
@@ -214,11 +165,9 @@ def rows_from_kalshi_markets(markets, *, symbol: str, now) -> list[dict]:
 
 async def kalshi(session, key: str, now: pd.Timestamp, store=None,
                  args_full: bool = False) -> list[dict]:
-    """One row per settled market, from the venue's own `result`.
+    """Return one row per settled market, from the venue's own `result`.
 
-    Writes after each series rather than at the end. Three series against a
-    1 req/s bucket shared with the book backfill is a long job, and a long job
-    that only persists on success loses everything to one timeout.
+    Writes after each series, so one timeout does not lose a long job.
     """
     known = set()
     if store is not None:
@@ -267,13 +216,9 @@ async def kalshi(session, key: str, now: pd.Timestamp, store=None,
                     'last_price': float(market.get('last_price') or 0.0),
                 })
             pages += 1
-            # **Stop once the page is entirely already known.** The endpoint
-            # serves newest first, so a full page of markets we hold means the
-            # rest is older and equally held. Without this, keeping settlements
-            # current means re-walking ~200 pages of a 1 req/s bucket shared with
-            # the book backfill; with it, a routine run is a page or two. Two
-            # consecutive stale pages rather than one, so a single page of
-            # already-seen markets straddling a boundary does not end it early.
+            # Stop once pages are entirely known: the endpoint serves newest
+            # first. Two consecutive stale pages, so one page straddling a
+            # boundary does not end it early.
             fresh = [m for m in markets
                      if str(m.get('ticker') or '') not in known]
             stale_pages = 0 if fresh else stale_pages + 1
@@ -295,24 +240,12 @@ async def kalshi(session, key: str, now: pd.Timestamp, store=None,
 
 
 async def polymarket(session, now: pd.Timestamp) -> list[dict]:
-    """The same, from the `result` field on the discovered 15-minute markets.
+    """Return Polymarket settlement rows from the discovered 15-minute markets.
 
-    Reads whatever `_collect_pm.py` has discovered rather than re-walking the
-    venue: discovery is the expensive half and it is already resumable.
-
-    Polymarket settles on **Chainlink's BTC-USD TWAP-60s stream**, read `>=`
-    against the opening price — a different oracle from Kalshi's CF Benchmarks
-    BRTI, and the whole reason these rows are worth having: two independent
-    aggregations converging is the strongest available evidence that
-    `core/windows.py` builds the target correctly.
+    Reads the catalog `_collect_pm.py` writes instead of re-walking the venue.
+    Polymarket settles on Chainlink's BTC-USD TWAP-60s, `>=` against the open:
+    an oracle independent of Kalshi's BRTI.
     """
-    # **The catalog `_collect_pm.py` actually writes.** This read
-    # `data/pm_markets.jsonl`, which exists nowhere in the tree, and expected
-    # `market_slug`/`winning_side`/`outcomes` -- a schema the file does not
-    # have. So it logged one INFO line, returned nothing, exited 0, and the
-    # store held ZERO Polymarket settlements against 960,519 Polymarket depth
-    # rows. This is the venue whose independent oracle is the only cross-check
-    # on the label, and it had never once been collected.
     path = os.getenv('PM_CATALOG', 'data/collection/pm_catalog.jsonl')
     if not os.path.exists(path):
         logger.info('no %s yet; skipping polymarket', path)
@@ -343,14 +276,8 @@ async def polymarket(session, now: pd.Timestamp) -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            # **`A` is UP, determined by measurement rather than by reading the
-            # letter.** Against Kalshi's own settlement on 61,511 shared
-            # windows, `A = up` agrees 94.11% and `B = up` agrees 5.89%. Two
-            # venues on different oracles -- Chainlink's TWAP against CF
-            # Benchmarks' BRTI -- cannot agree perfectly, and the residual is
-            # the near-ties, but the encoding is not ambiguous. Guessing it
-            # would be the same class of silent alignment error as reading the
-            # slug stamp as a close.
+            # `A` is up. This was measured against Kalshi's settlement, not
+            # read from the letter.
             rows.append({
                 'venue': 'polymarket', 'symbol': symbol,
                 'event_time': opened,
@@ -377,15 +304,13 @@ async def run(args) -> int:
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     now = pd.Timestamp.now(tz='UTC')
     rows: list[dict] = []
-    # Which sources actually answered, as against returned nothing new. Without
-    # this the two are indistinguishable and both exit 1 — see below.
+    # Sources that answered, so "nothing new" can be told from "never ran".
     reached: list[str] = []
     async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60)) as session:
         if args.venue in ('kalshi', 'both'):
-            # Kalshi's own listing by default: it carries `result` per market
-            # and needs no key beyond the trading credential already present.
-            # Predexon is for HISTORY, which Kalshi purges.
+            # Kalshi's own listing by default. Predexon is for history, which
+            # Kalshi purges.
             if args.source == 'predexon':
                 if not key:
                     logger.error('PREDEXON_API_KEY is not set; skipping kalshi')
@@ -399,26 +324,12 @@ async def run(args) -> int:
         if args.venue in ('polymarket', 'both'):
             pm_rows = await polymarket(session, now)
             rows += pm_rows
-            # **Append to `reached`, like both Kalshi branches.** The comment
-            # at its declaration states the exact purpose -- "without this the
-            # two are indistinguishable" -- and this branch was the one that
-            # did not, so a Polymarket collection that ran correctly and found
-            # nothing was reported the same way as one that never ran.
+            # Record that Polymarket answered, as the Kalshi branches do.
             reached.append('polymarket')
 
     if not rows:
-        # **"Nothing new" is success, not failure.** This tool is idempotent and
-        # stops at history it already holds, so a run that finds no new
-        # settlements means the store is CURRENT. Returning 1 made `run_live`
-        # log `scripts.collect_settlements exited 1` on any cycle that happened
-        # to land between settlements — measured 2026-09-04, 15 runs succeeded
-        # and 1 "failed" for exactly this reason.
-        #
-        # It matters because of what a false alarm costs, not what this run
-        # costs: a component that reports failure while working correctly trains
-        # the reader to ignore it, and the next failure will be a real one. The
-        # same argument as `adopt_venue_balance`, where a drift alarm firing on
-        # every settlement hid the drift it existed to catch.
+        # "Nothing new" from a source that answered is success: the store is
+        # current. A false failure trains the reader to ignore real ones.
         if reached:
             logger.info('no new settlements from %s; the store is already '
                         'current', ', '.join(reached))

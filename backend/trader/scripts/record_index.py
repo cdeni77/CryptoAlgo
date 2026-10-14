@@ -5,22 +5,17 @@ folding its own messages into a `core.index_proxy.ExchangeState`, and one
 sampler that every second takes the median fresh mid per symbol, records it in
 `CACHE` for the live process and spools it to `index_proxy_1s`.
 
-**Coinbase gets its own `ticker` socket here rather than reusing
-`record_spot_stream`.** That stream carries trades only — there is no best bid
-or ask on it to take a mid from — and it feeds the bars the trading loop decides
-on. Its own socket means an index failure here can never touch the tape trading
-reads. `ticker` rather than `level2`: each message carries the touch, so there
-is no book to fold on the trading process's event loop and no sequence gap to
-rebuild from.
+Coinbase gets its own `ticker` socket, separate from `record_spot_stream`:
+that stream has no touch, and an index failure must never touch the trade
+tape. `ticker`, not `level2`, because each message carries the touch, so there
+is no book to fold and no sequence gap.
 
-**Fails soft, by construction.** Every exchange task catches its own failures
-and reconnects with backoff; a dead venue is a NaN column, and fewer than two
-fresh venues is a NaN proxy, never a crash. The spool cannot raise into the
-sampler (`SafeSpool`). Nothing here is read by the trading loop today.
+Fails soft. Each exchange task reconnects with backoff; a dead venue is a NaN
+column, and fewer than two fresh venues is a NaN proxy, never a crash. The
+spool cannot raise into the sampler (`SafeSpool`).
 
-**Every exit is on a timeout**, the pattern `record_stream.consume` was rewritten
-around: the connect, and each receive, so a venue that goes silent is noticed
-in `idle_timeout` seconds rather than never.
+Every exit is on a timeout, the connect and each receive, so a silent venue
+is noticed within `idle_timeout` seconds.
 
 Never gated except for the spool flush, which is deferred (not awaited) while a
 decision is in flight.
@@ -48,8 +43,7 @@ from core.spool import DEFAULT_SPOOL_ROOT, SafeSpool, table_spool
 
 logger = logging.getLogger('index')
 
-# Process-wide, like `record_stream.CACHE`: the trading loop reads the proxy
-# this recorder maintains.
+# Process-wide, like `record_stream.CACHE`, so the trading loop reads it.
 CACHE = IndexProxyCache()
 
 VENUE = 'index_proxy'
@@ -67,12 +61,11 @@ def _decode(raw) -> Optional[dict]:
 async def consume(ws, exchange: str, state: ExchangeState, *, idle_timeout: float,
                   large_bytes: int = 1_000_000,
                   now: Callable[[], float] = time.time) -> str:
-    """Fold messages until the connection needs rebuilding; returns why.
+    """Fold messages until the connection needs rebuilding. Returns the reason.
 
-    A message over `large_bytes` (a full-book snapshot) is DECODED in a thread
-    so the parse cannot stall the trading loop's event loop. It is still
-    APPLIED here: folding it in a thread would let the sampler read a book
-    mid-rebuild.
+    A message over `large_bytes` is decoded in a thread, so the parse cannot
+    stall the event loop. It is applied here, so the sampler never reads a
+    book mid-rebuild.
     """
     handler = HANDLERS[exchange]
     try:
@@ -104,7 +97,7 @@ async def consume(ws, exchange: str, state: ExchangeState, *, idle_timeout: floa
 
 
 async def run_exchange(session, exchange: str, state: ExchangeState, args) -> None:
-    """One venue, forever: connect, subscribe, consume, back off, repeat."""
+    """Run one venue forever: connect, subscribe, consume, back off, repeat."""
     backoff = args.backoff_start
     url = (getattr(args, 'urls', None) or {}).get(exchange, URLS[exchange])
     while True:
@@ -137,12 +130,10 @@ async def run_exchange(session, exchange: str, state: ExchangeState, args) -> No
 
 def sample(states: Sequence[ExchangeState], symbols: Sequence[str], now: float, *,
            max_staleness: float, min_exchanges: int) -> list[dict]:
-    """One row per symbol, stamped at the second `now` falls in.
+    """Return one row per symbol, stamped `t = floor(now)`.
 
-    `t` is `floor(now)` and the row describes the books at `now`, so everything
-    in a row stamped `t` was known before `t + 1`. A decision at `d` that reads
-    rows stamped strictly before `d` therefore never sees information from `d`
-    onward.
+    Point-in-time: a row stamped `t` was known before `t + 1`, so a decision at
+    `d` that reads rows stamped strictly before `d` sees nothing from `d` on.
     """
     stamp = float(math.floor(now))
     rows = []
@@ -155,7 +146,7 @@ def sample(states: Sequence[ExchangeState], symbols: Sequence[str], now: float, 
 
 
 def spool_record(row: dict) -> dict:
-    """JSON-safe: NaN becomes null."""
+    """Return a JSON-safe copy of the row, with NaN as null."""
     out = {}
     for key, value in row.items():
         if isinstance(value, float) and not math.isfinite(value):
@@ -183,8 +174,7 @@ async def sample_loop(states, cache: IndexProxyCache, spool, args, *, gate=None,
         for row in rows:
             cache.record(row)
         spool.extend(spool_record(r) for r in rows)
-        # Liveness means a proxy is being PRODUCED, not that the loop ticks:
-        # with every venue down this is exactly the component not doing its job.
+        # Liveness means a proxy is produced, not only that the loop ticks.
         if now >= next_beat and any(r['n_exchanges'] >= args.min_exchanges
                                     for r in rows):
             heartbeat.touch('index')

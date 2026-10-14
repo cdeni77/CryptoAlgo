@@ -1,19 +1,12 @@
-"""Score the model against the venue's own probability. The only test that counts.
+"""Score the model against the venue's own probability.
 
-Everything `scripts/evaluate.py` reports is skill against `F(x/sigma)` — an
-analytic formula we wrote. That is the right *null* and it is not the competition.
-The competition is the price Kalshi is actually quoting, and beating a formula says
-nothing about beating a price: the audit measured a model that knows the truth
-exactly earning +2219% against a baseline-priced counterparty, +191% against a
-half-informed one, and **zero** against an informed one.
+`scripts/evaluate.py` measures skill against `F(x/sigma)`, the null. This
+measures it against the price the venue quotes. It reads what the live loop
+records on every window, traded or not: `market_probability` (the venue's
+mid), `baseline_probability`, `model_probability` and `outcome`.
 
-This reads what the live loop records — `market_probability` (the venue's mid),
-`baseline_probability`, `model_probability` and `outcome`, on every window whether
-it traded or not — and asks the question directly.
-
-**It needs data that does not exist yet.** Run `scripts.live --mode live --dry-run`
-for weeks; it reads the real book, places nothing, and records a row per window.
-Until then this prints how far off it is and exits.
+It needs recorded live rows. Run `scripts.live --mode live --dry-run` to
+collect them; with too few, this prints how many are missing and exits.
 
     python -m scripts.live --mode live --dry-run --loop --cycle-seconds 60
     python -m scripts.market_benchmark
@@ -30,12 +23,8 @@ from core.baseline import reliability
 from core.metrics import (MIN_MARKET_WINDOWS, market_comparison,
                           market_frame)
 
-# Below this there is nothing to say. At 0.5pp of edge the standard error on a
-# win rate needs thousands of windows before a sign is meaningful; this is the
-# point at which the *aggregate* log loss starts to separate, not the point at
-# which a trading decision is justified.
-# One definition, shared with the gate in `core/metrics.py`. Two copies of a
-# threshold is two thresholds.
+# Below this many windows the aggregate log loss cannot separate. Shared with
+# the gate in `core/metrics.py`, so there is one threshold.
 MIN_WINDOWS = MIN_MARKET_WINDOWS
 
 
@@ -62,22 +51,15 @@ def main() -> int:
     from core.pg_writer import PgWriter
 
     rows = PgWriter(database_url=url).scored_against_market()
-    # **Only the offsets that can OPEN a position.** The loop records a
-    # prediction at every offset and trades one, so a pooled headline measures a
-    # policy nobody runs -- measured, +12m reads +0.000921 against a pooled
-    # -0.000311, which is the difference between passing and failing the gate of
-    # the same name. This is the third place that restriction was missing;
-    # `promote.py` had it, `evaluate.py` did not until today.
+    # Only offsets that can open a position. A pooled headline measures a
+    # policy nobody runs.
     if getattr(args, 'entry_offsets', None):
         wanted = {int(o) for o in args.entry_offsets}
         rows = [r for r in rows if int(r[2]) in wanted]
         print(f'Scored at offset(s) {sorted(wanted)} — the ones that can open '
               f'a position.')
     else:
-        # **Say so, rather than letting the headline be read as the gate.**
-        # `promote.py` restricts to `entry_offsets`; this tool pooled silently,
-        # and the same omission in `evaluate.py` inverted the sign of the gate
-        # of the same name. The per-offset table below is the honest reading.
+        # Say the headline is pooled, so it is not read as the gate.
         print('Scored across EVERY recorded offset. The loop records four and '
               'trades one, so the pooled line below is not the gate — read the '
               'per-offset rows, or pass --entry-offsets 12.')
@@ -94,8 +76,8 @@ def main() -> int:
     frame = market_frame(rows)
     windows = frame.drop_duplicates(['symbol', 'window_open']).shape[0]
 
-    # The quote lag, which is a bias and not a curiosity. Features are built for
-    # the nominal offset; the book is read whenever the cycle reached it.
+    # The quote lag is a bias: features are built for the nominal offset, but
+    # the book is read when the cycle reaches it.
     if 'decision_time' in frame.columns:
         lag = ((pd.to_datetime(frame['decision_time'], utc=True)
                 - pd.to_datetime(frame['window_open'], utc=True)).dt.total_seconds() / 60.0
