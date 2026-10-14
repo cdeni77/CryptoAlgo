@@ -734,12 +734,15 @@ class PgWriter:
     def resolve_ticket(self, ticket_id: int, *, status: str,
                        filled_contracts: Optional[int] = None,
                        filled_price: Optional[float] = None,
-                       note: Optional[str] = None) -> None:
+                       note: Optional[str] = None,
+                       venue_order_id: Optional[str] = None) -> None:
         with self._session() as session:
             row = session.get(OrderTicket, ticket_id)
             if row is None:
                 return
             row.status = status
+            if venue_order_id:
+                row.venue_order_id = str(venue_order_id)
             # Only overwrite a recorded fill with another recorded fill. These
             # default to None, so a later call — e.g. the venue rejecting a
             # duplicate submission as `skipped` — used to erase the
