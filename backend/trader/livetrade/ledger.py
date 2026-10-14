@@ -29,6 +29,11 @@ logger = logging.getLogger('live')
 
 # Minute prices older than this are dropped from the serving store each cycle.
 PRICE_RETENTION_HOURS = 48
+# Venue balance samples older than this are dropped on the same cadence. One a
+# cycle is ~1,440 rows a day, so without it `venue_balance` grows forever. Kept
+# as long as the Account page's 30-day chart reads; the settlements are the
+# record and are never pruned.
+BALANCE_RETENTION_DAYS = 30
 
 # The last shard actually observed on a book. The balance query needs it, and
 # the book is read after reconciliation, so it cannot come from this cycle's
@@ -50,9 +55,11 @@ def record_minute_prices(writer: PgWriter, bars: dict[str, pd.DataFrame],
                 'low': float(bar.low), 'close': float(bar.close),
             })
     written = writer.write_minute_prices(rows) if rows else 0
+    now = pd.Timestamp.now(tz='UTC')
     writer.prune_minute_prices(
-        (pd.Timestamp.now(tz='UTC') - pd.Timedelta(hours=PRICE_RETENTION_HOURS))
-        .to_pydatetime())
+        (now - pd.Timedelta(hours=PRICE_RETENTION_HOURS)).to_pydatetime())
+    writer.prune_venue_balances(
+        (now - pd.Timedelta(days=BALANCE_RETENTION_DAYS)).to_pydatetime())
     return written
 
 
