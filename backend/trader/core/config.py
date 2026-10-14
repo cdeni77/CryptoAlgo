@@ -679,6 +679,9 @@ class Config:
     # Once set, `null_quote_age` applies to the peer as well; unset, a peer
     # row with no age stays fresh, as it always has.
     peer_max_quote_age_seconds: Optional[float] = None
+    # Seconds from a decision's minute to the instant live reads the book. A
+    # backtest row may only use a book seen by then; live lands about 3s in.
+    decision_latency_seconds: float = 3.0
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted
     # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
@@ -856,6 +859,9 @@ class Config:
         if int(self.stack_crossfit_blocks) < 2:
             raise ValueError(f'stack_crossfit_blocks must be at least 2; got '
                              f'{self.stack_crossfit_blocks}')
+        if self.decision_latency_seconds < 0.0:
+            raise ValueError(f'decision_latency_seconds must not be negative; '
+                             f'got {self.decision_latency_seconds}')
         if (self.peer_max_quote_age_seconds is not None
                 and self.peer_max_quote_age_seconds <= 0.0):
             raise ValueError(f'peer_max_quote_age_seconds must be positive; got '

@@ -137,6 +137,8 @@ class Dataset:
                 peer_lag_minutes=getattr(config, 'peer_lag_minutes', 0),
                 sources=tuple(getattr(config, 'quote_sources', ()) or ()),
                 null_age=getattr(config, 'null_quote_age', 'fresh'),
+                decision_latency_seconds=float(
+                    getattr(config, 'decision_latency_seconds', 3.0)),
                 **peer_quote_limits(config))
             # Book dynamics from the SAME depth table, which carries a row at
             # every minute 0..15. Attached here beside the quotes because it is
@@ -145,13 +147,20 @@ class Dataset:
             # decision.
             from core.book_flow import book_flow_features
             from core.quotes import filter_sources
-            flow = book_flow_features(windows, filter_sources(
-                depth, tuple(getattr(config, 'quote_sources', ()) or ())))
+            flow = book_flow_features(
+                windows,
+                filter_sources(depth,
+                               tuple(getattr(config, 'quote_sources', ()) or ())),
+                decision_latency_seconds=float(
+                    getattr(config, 'decision_latency_seconds', 3.0)))
             for col in flow.columns:
                 windows[col] = flow[col].to_numpy()
         if ladder_fits is not None and len(ladder_fits):
             from core.book_features import attach_implied_vol
-            windows = attach_implied_vol(windows, ladder_fits)
+            windows = attach_implied_vol(
+                windows, ladder_fits,
+                decision_latency_seconds=float(
+                    getattr(config, 'decision_latency_seconds', 3.0)))
         # The settlement-index proxy, as per-minute summaries
         # (`core.index_features.minute_summary` / `load_proxy_minutes`).
         # Observed, so it attaches here; its z-score waits for the fold.

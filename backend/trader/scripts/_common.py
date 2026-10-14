@@ -66,6 +66,10 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                       help='staleness cap for the cross-venue PEER book only '
                            '(default: follow the Kalshi cap). Setting it also '
                            'applies --null-quote-age to the peer.')
+    data.add_argument('--decision-latency-seconds', type=float, default=None,
+                      metavar='S',
+                      help='seconds after the minute that live reads the book '
+                           '(default 3). A book seen later is not used.')
     data.add_argument('--start', type=str, default=None, help='ISO date, inclusive')
     data.add_argument('--end', type=str, default=None, help='ISO date, exclusive')
     data.add_argument('--train-window-days', type=float, default=None,
@@ -310,6 +314,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('label_source', 'label_source'),
         ('null_quote_age', 'null_quote_age'),
         ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),
+        ('decision_latency_seconds', 'decision_latency_seconds'),
         ('stack_mode', 'stack_mode'), ('stack_l2', 'stack_l2'),
         ('stack_crossfit_blocks', 'stack_crossfit_blocks'),
         ('stack_intercept', 'stack_intercept'),

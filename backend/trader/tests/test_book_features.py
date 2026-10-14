@@ -244,7 +244,8 @@ def test_staleness_is_measured_from_the_fit_to_the_decision():
         'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
         'sigma_per_min': [0.0003]})
     got = attach_implied_vol(table, fits)
-    assert got['iv_staleness_minutes'].iloc[0] == pytest.approx(23.0)
+    # To the decision instant: the minute plus the 3s decision latency.
+    assert got['iv_staleness_minutes'].iloc[0] == pytest.approx(23.05)
 
 
 def test_a_decision_before_any_fit_gets_nothing():

@@ -137,6 +137,33 @@ def filter_sources(book: pd.DataFrame, sources: Sequence[str]) -> pd.DataFrame:
     return book[book['source'].isin(tuple(sources))]
 
 
+# How each producer's `quote_age_seconds` is measured. The backfill counts back
+# from the row's minute. `live_touch` counts back from the decision instant
+# itself. The minute-grid recorders count FORWARD: they sample after the minute,
+# so their age is how long after it the book was seen. Read with one rule, a
+# forward row is a book from after the decision.
+MINUTE_BACKWARD_SOURCES = ('backfill',)
+
+
+def decision_age(book: pd.DataFrame, null_age: str,
+                 latency_seconds: float) -> pd.Series:
+    """Seconds from when each row's book was seen to the decision instant.
+
+    The decision instant is the row's minute plus `latency_seconds`. A negative
+    value is a book seen after the decision, which a decision cannot use.
+    """
+    raw = _effective_age(book, null_age)
+    source = (book['source'] if 'source' in book.columns
+              else pd.Series(None, index=book.index, dtype=object))
+    from_minute = source.isin(MINUTE_BACKWARD_SOURCES)
+    from_decision = source.isin(AGE_BOUNDED_SOURCES)
+    forward = ~(from_minute | from_decision)
+    age = raw.copy()
+    age[from_minute] = raw[from_minute] + latency_seconds
+    age[forward] = latency_seconds - raw[forward]
+    return age
+
+
 def _effective_age(book: pd.DataFrame, null_age: str) -> pd.Series:
     """The age a row is judged on. Under 'stale', a missing age is first bounded
     where the row's own timestamps allow, and stays NaN (dropped) otherwise."""
@@ -157,7 +184,8 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   sources: Sequence[str] = (),
                   null_age: str = 'fresh',
                   peer_max_age_seconds: Optional[float] = None,
-                  peer_null_age: str = 'fresh') -> pd.DataFrame:
+                  peer_null_age: str = 'fresh',
+                  decision_latency_seconds: float = 3.0) -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
     Joined on (symbol, window_open, offset) EXACTLY. Not as-of across offsets:
@@ -181,6 +209,11 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     'fresh' unless the caller asks: only ~5% of live Polymarket rows are 5s
     fresh, so a tight Kalshi cap applied to the peer voids `venue_prob_gap`
     almost everywhere.
+
+    Both venues are point-in-time: a row is usable only if its book was seen at
+    or before the decision instant, the minute plus `decision_latency_seconds`
+    (see `decision_age`). `quote_age_seconds` on the output is that
+    decision-relative age.
     """
     out = windows.copy()
     for column in QUOTE_COLUMNS:
@@ -196,7 +229,7 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
 
     bid = pd.to_numeric(book['yes_bid'], errors='coerce')
     ask = pd.to_numeric(book['yes_ask'], errors='coerce')
-    age = _effective_age(book, null_age)
+    age = decision_age(book, null_age, decision_latency_seconds)
 
     # A price outside [0, 1] is not a probability, and an ask below the bid is
     # not a book — kept, it would show a guaranteed profit and the backtest
@@ -204,7 +237,7 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     sane = ((bid.isna() | ((bid >= 0.0) & (bid <= 1.0)))
             & (ask.isna() | ((ask >= 0.0) & (ask <= 1.0)))
             & (bid.isna() | ask.isna() | (ask >= bid)))
-    fresh = (age.abs() <= max_age_seconds)
+    fresh = (age >= 0.0) & (age <= max_age_seconds)
     if null_age == 'fresh':
         fresh = fresh | age.isna()
     keep = sane & fresh
@@ -332,8 +365,9 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
             # the backfilled fixtures carry rows without one.
             peer_cap = (max_age_seconds if peer_max_age_seconds is None
                         else float(peer_max_age_seconds))
-            page = _effective_age(peer, peer_null_age)
-            pfresh = page.abs() <= peer_cap
+            page = decision_age(peer, peer_null_age, decision_latency_seconds)
+            peer['quote_age_seconds'] = page
+            pfresh = (page >= 0.0) & (page <= peer_cap)
             if peer_null_age == 'fresh':
                 pfresh = pfresh | page.isna()
             two_sided = pbid.notna() & pask.notna() & (pask >= pbid) & pfresh

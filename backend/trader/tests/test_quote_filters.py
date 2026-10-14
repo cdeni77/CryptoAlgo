@@ -50,7 +50,7 @@ class TestSources:
 
     def test_an_allowed_source_wins_even_where_priority_ranks_it_lower(self):
         depth = pd.DataFrame([_row('live_touch', 0.60, 0.62, np.nan),
-                              _row('live', 0.30, 0.32, 5.0)])
+                              _row('live', 0.30, 0.32, 1.0)])
         out = attach_quotes(_windows(), depth, sources=('live',))
         assert out['market_probability'].iloc[0] == pytest.approx(0.31)
         assert out['quote_observer'].iloc[0] == 'live'
@@ -122,8 +122,11 @@ class TestPeerCap:
     nearly everywhere and `--complete-cases` kept 0.1% of rows."""
 
     def _depth(self, kalshi_age, peer_age):
-        return pd.DataFrame([_row('live', 0.30, 0.32, kalshi_age),
-                             _row('live', 0.50, 0.52, peer_age, venue='polymarket')])
+        # Backfill rows: their age counts back from the minute, so each cap
+        # sees age + the 3s decision latency.
+        return pd.DataFrame([_row('backfill', 0.30, 0.32, kalshi_age),
+                             _row('backfill', 0.50, 0.52, peer_age,
+                                  venue='polymarket')])
 
     def test_unset_follows_the_kalshi_cap_as_before(self):
         out = attach_quotes(_windows(), self._depth(1.0, 20.0), max_age_seconds=5)
@@ -160,7 +163,8 @@ class TestPeerCap:
         from tests.stack_fixtures import make_depth
 
         bars = make_bars(days=3)
-        kalshi = make_depth(bars, Config(), quoted_days=1, source='live', age=20.0)
+        kalshi = make_depth(bars, Config(), quoted_days=1, source='backfill',
+                            age=20.0)
         depth = pd.concat([kalshi, kalshi.assign(venue='polymarket')],
                           ignore_index=True)
         tight = Dataset.build(bars, Config(max_quote_age_seconds=5,
@@ -202,7 +206,7 @@ def test_an_unlisted_source_is_excluded_not_merely_ranked_last():
 class TestCoverage:
     def test_quote_coverage_breaks_the_priced_rows_down_by_observer_and_age(self):
         depth = pd.DataFrame([_row('live_touch', 0.3, 0.32, np.nan, offset=3),
-                              _row('live', 0.3, 0.32, 3.0, offset=6),
+                              _row('live', 0.3, 0.32, 0.0, offset=6),
                               _row('backfill', 0.3, 0.32, 12.0, offset=9)])
         out = attach_quotes(_windows((3, 6, 9, 12)), depth)
         cov = quote_coverage(out)

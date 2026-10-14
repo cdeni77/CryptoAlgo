@@ -237,7 +237,8 @@ MAX_FIT_AGE_MINUTES = 360.0
 
 
 def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
-                       max_age_minutes: float = MAX_FIT_AGE_MINUTES) -> pd.DataFrame:
+                       max_age_minutes: float = MAX_FIT_AGE_MINUTES,
+                       decision_latency_seconds: float = 3.0) -> pd.DataFrame:
     """The last ladder fit AT OR BEFORE each decision, plus its staleness.
 
     As-of, never nearest: a sigma inverted from a ladder that closed after the
@@ -260,11 +261,20 @@ def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
     left = pd.DataFrame({
         '_order': np.arange(len(out)),
         'symbol': out['symbol'].values,
-        '_at': pd.to_datetime(out['decision_time'], utc=True).values,
+        '_at': (pd.to_datetime(out['decision_time'], utc=True)
+                + pd.Timedelta(seconds=float(decision_latency_seconds))).values,
     })
+    # The capture time, not the stamp: the live recorder floors `event_time` to
+    # the minute and records the real capture in `available_time`, so a fit
+    # stamped at the decision's minute can be from after the decision. The
+    # backfill sets both to the fit instant.
+    seen = (fits['available_time'] if 'available_time' in fits.columns
+            else fits['event_time'])
+    seen = pd.to_datetime(seen, utc=True).fillna(
+        pd.to_datetime(fits['event_time'], utc=True))
     right = pd.DataFrame({
         'symbol': fits['symbol'].values,
-        '_at': pd.to_datetime(fits['event_time'], utc=True).values,
+        '_at': seen.values,
         'implied_sigma_per_min': _column(fits, 'implied_sigma_per_min'),
         'iv_r2': _column(fits, 'r2'),
         'iv_n_strikes': _column(fits, 'n_strikes'),

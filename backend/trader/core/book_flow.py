@@ -56,7 +56,8 @@ def _imbalance(bid, ask):
 
 def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
                        venue: str = 'kalshi',
-                       lookback: int = LOOKBACK) -> pd.DataFrame:
+                       lookback: int = LOOKBACK,
+                       decision_latency_seconds: float = 3.0) -> pd.DataFrame:
     """One row per window row, from the minutes at or before its decision.
 
     NaN, never zero, where the history is absent: zero says "the book did not
@@ -97,14 +98,15 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
     # than merely demoted, because unlike a price a flow feature has no NaN
     # column to fall back to -- it would silently average a crossed book into a
     # trend.
-    age = pd.to_numeric(book.get('quote_age_seconds'), errors='coerce') \
-        if 'quote_age_seconds' in book.columns \
-        else pd.Series(np.nan, index=book.index)
+    # Decision-relative, so a recorder row seen after its minute's decision is
+    # dropped rather than counted as fresh.
+    from core.quotes import decision_age
+    age = decision_age(book, 'fresh', decision_latency_seconds)
     bid, ask = book['yes_bid'], book['yes_ask']
     sane = ((bid.isna() | ((bid >= 0.0) & (bid <= 1.0)))
             & (ask.isna() | ((ask >= 0.0) & (ask <= 1.0)))
             & (bid.isna() | ask.isna() | (ask >= bid)))
-    fresh = age.isna() | (age.abs() <= MAX_QUOTE_AGE_SECONDS)
+    fresh = age.isna() | ((age >= 0.0) & (age <= MAX_QUOTE_AGE_SECONDS))
     book = book[sane & fresh]
     if not len(book):
         return out
