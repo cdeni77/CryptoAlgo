@@ -1,10 +1,7 @@
 """Tests for `scripts.run_live`, which runs all live loops in one process.
 
-Each component is supervised: an exception is logged and the component
-restarts with exponential backoff while the others keep running, so a broken
-recorder never stops trading. Backoff resets after a long healthy run.
-`store_sync` runs as a subprocess because its blocking work would stall the
-trading loop.
+A failing component restarts with backoff while the others keep running, so a broken
+recorder never stops trading.
 """
 
 from __future__ import annotations
@@ -79,7 +76,6 @@ def test_backoff_is_capped():
 
 
 def test_backoff_resets_after_a_long_healthy_run():
-    """Backoff resets after a long healthy run."""
     waits = []
     clock = {'t': 0.0}
 
@@ -103,7 +99,6 @@ def test_backoff_resets_after_a_long_healthy_run():
 
 
 def test_one_failing_component_does_not_stop_the_others():
-    """A failing component does not stop the others."""
     ticks = []
 
     async def broken():
@@ -179,7 +174,6 @@ def test_disabled_components_are_not_started():
 
 
 def test_an_unknown_component_name_is_refused_not_ignored():
-    """An unknown component name is refused, not ignored."""
     with pytest.raises(ValueError, match='nonsense'):
         Component.selected(['trade'], disable=('nonsense',))
 
@@ -229,7 +223,6 @@ def test_a_recorder_waits_while_a_decision_is_in_flight():
 
 
 def test_the_gate_reopens_even_if_the_decision_raises():
-    """The gate reopens even if the decision raises."""
     async def drive():
         gate = TradingGate()
         try:
@@ -288,8 +281,7 @@ def test_it_does_not_wait_when_already_on_the_phase():
 
 
 def test_the_default_phase_is_far_from_every_decision_instant():
-    """The default recorder phase is far from every decision instant (~1s past the minute).
-    """
+    """The default recorder phase is far from every decision instant (~1s past the minute)."""
     from scripts.live import DECISION_LAG_SECONDS
     decision_second = DECISION_LAG_SECONDS % 60.0
     gap = min(abs(30.0 - decision_second), 60.0 - abs(30.0 - decision_second))
@@ -334,8 +326,8 @@ def test_a_keyboard_interrupt_is_not_treated_as_a_crash():
 # ---------------------------------------------------------------------------
 
 def test_recorder_args_takes_its_defaults_from_the_real_parser():
-    """`_recorder_args` takes its defaults from each recorder's own parser, so there is one
-    definition.
+    """`_recorder_args` takes its defaults from each recorder's own parser, so there is
+    one definition.
     """
     from scripts.run_live import _recorder_args
     from scripts import record_ladder
@@ -355,7 +347,6 @@ def test_recorder_args_overrides_apply_on_top_of_the_real_defaults():
 
 
 def test_a_changed_recorder_default_is_picked_up_without_touching_run_live():
-    """A changed recorder default is picked up without editing run_live."""
     import argparse
     from scripts.run_live import _recorder_args
 

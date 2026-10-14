@@ -1,7 +1,7 @@
 """Tests that buffered recorder rows are written on shutdown.
 
-`asyncio.CancelledError` is a BaseException, so `except Exception` does not
-catch it and a cancelled recorder would drop its buffer.
+`asyncio.CancelledError` is a BaseException, so `except Exception` does not catch it and
+a cancelled recorder would drop its buffer.
 """
 
 from __future__ import annotations

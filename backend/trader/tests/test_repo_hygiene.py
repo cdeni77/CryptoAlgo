@@ -1,7 +1,7 @@
 """Tests that the repository holds every source file the build needs, and no secrets.
 
-A file the build reads but git does not track works locally and fails in a clean
-clone or a Docker build. These tests make that a failure here instead.
+A file the build reads but git does not track works locally and fails in a clean clone
+or a Docker build. These tests make that a failure here instead.
 """
 
 from __future__ import annotations
@@ -78,8 +78,8 @@ def test_every_source_file_is_tracked():
 
 
 def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
-    """Rules naming a directory a source tree might use (`lib/`, `build/`, `bin/`) must be
-    anchored.
+    """Rules naming a directory a source tree might use (`lib/`, `build/`, `bin/`) must
+    be anchored.
     """
     if not (REPO / '.gitignore').exists():
         pytest.skip('no .gitignore')
@@ -106,8 +106,8 @@ def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
 def test_no_secret_bearing_file_is_tracked():
     """No tracked file carries a credential by its name (`.env*`, key files, SSH keys).
 
-    Deleting a committed secret does not remove the blob, so the only working
-    control is never committing it. `*.example` templates are allowed.
+    Deleting a committed secret does not remove the blob, so the only working control is
+    never committing it. `*.example` templates are allowed.
     """
     offenders = []
     for path in sorted(_tracked()):
@@ -176,8 +176,8 @@ REQUIREMENTS = ('backend/trader/requirements.txt', 'backend/api/requirements.txt
 
 @pytest.mark.parametrize('relative', REQUIREMENTS)
 def test_every_dependency_is_pinned(relative):
-    """Every dependency is pinned, since a `.joblib` artifact loads reliably only with the
-    library version that wrote it.
+    """Every dependency is pinned, since a `.joblib` artifact loads reliably only with
+    the library version that wrote it.
     """
     path = REPO / relative
     unpinned = [line for line in _requirement_lines(path) if '==' not in line]

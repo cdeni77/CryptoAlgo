@@ -1,8 +1,7 @@
 """Tests that a decision uses only a book seen at or before the decision instant.
 
-Minute-grid recorders store how long after the minute they sampled; the backfill
-stores how long before. One `abs(age) <= cap` rule would let a book recorded
-after the decision price it.
+Recorders store age after the minute and the backfill before it, so one `abs(age)` rule
+would leak.
 """
 from __future__ import annotations
 
@@ -84,8 +83,7 @@ def test_decision_age_has_one_sign_convention():
 
 
 def test_an_implied_vol_fit_captured_after_the_decision_is_not_used():
-    """An implied-vol fit captured after the decision (by `available_time`) is not used.
-    """
+    """An implied-vol fit captured after the decision (by `available_time`) is not used."""
     from core.book_features import attach_implied_vol
 
     table = pd.DataFrame({'symbol': ['BTC-USD'],

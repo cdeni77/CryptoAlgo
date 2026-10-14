@@ -1,12 +1,6 @@
-"""Timezone and date-slicing invariants on the read path.
+"""Tests for timezone and date-slicing invariants on the research store read path.
 
-Two defects met here. The research store returned `TIMESTAMPTZ` in the process's
-*local* timezone, and nothing downstream re-normalised — while
-`scripts/live.py:fetch_bars` builds its index with an explicit `tz='UTC'`. Since
-`core/features.py` derives minute-of-day straight off that index for the intraday
-seasonality, the measured path indexed a fitted object in local time and the live
-path in UTC. The trader container sets `TZ=America/New_York`, so this was live,
-not hypothetical, and it moves with DST twice a year.
+Reads return UTC whatever the process timezone, since seasonality uses minute-of-day.
 """
 
 from __future__ import annotations
@@ -42,12 +36,7 @@ def store(tmp_path) -> ResearchStore:
 
 
 def test_reads_come_back_in_utc(store):
-    """Whatever the machine's timezone is.
-
-    This box runs in EDT, so before the fix `event_time.min()` came back as
-    `2024-12-31 19:00:00-05:00` — the same instant, a different representation,
-    and a different minute-of-day.
-    """
+    """Reads come back in UTC, whatever the machine's timezone."""
     frame = store.read('minute_bars')
     assert str(frame['event_time'].dt.tz) == 'UTC'
     assert str(frame['available_time'].dt.tz) == 'UTC'
@@ -55,24 +44,14 @@ def test_reads_come_back_in_utc(store):
 
 
 def test_minute_of_day_is_utc_minute_of_day(store):
-    """The quantity the seasonality is indexed by.
-
-    `core/features.py` computes `decision.hour * 60 + decision.minute`. Under a
-    local index that is local minute-of-day, and the fitted seasonal peak moves
-    by the UTC offset — measured elsewhere in this audit at 353 minutes.
-    """
+    """Minute-of-day, which seasonality is indexed by, is UTC minute-of-day."""
     frame = store.read('minute_bars', start='2025-01-01 02:00', end='2025-01-01 03:00')
     minute_of_day = frame['event_time'].dt.hour * 60 + frame['event_time'].dt.minute
     assert minute_of_day.min() == 120 and minute_of_day.max() == 180
 
 
 def test_a_date_limited_read_works_at_all(store):
-    """`--start`/`--end` raised on every run under pandas 3.0.
-
-    `pd.Timestamp` stopped being implicitly convertible by the driver's binder,
-    so a date-limited read — the kind used to check a change quickly — could not
-    be done.
-    """
+    """A read limited by `start`/`end` strings works."""
     sliced = store.read('minute_bars', start='2025-01-01 02:00', end='2025-01-01 03:00')
     assert len(sliced) == 61
     assert sliced['event_time'].min() == pd.Timestamp('2025-01-01 02:00', tz='UTC')
@@ -85,11 +64,9 @@ def test_as_of_excludes_rows_not_yet_available(store):
 
 
 class TestEquityHours:
-    """`us_equity_hours` must mean the session in both daylight regimes.
+    """`us_equity_hours` marks the US session in both EST and EDT.
 
-    Calls the real `_clock_features` rather than reimplementing the comparison —
-    a test that recomputes the thing it is checking cannot fail for the reason it
-    exists.
+    Calls the real `_clock_features` instead of recomputing the comparison.
     """
 
     def flag(self, when: pd.Timestamp) -> float:
@@ -105,14 +82,7 @@ class TestEquityHours:
 
     @pytest.mark.parametrize('day', ('2026-07-15', '2026-01-15'))
     def test_the_session_is_flagged_in_both_regimes(self, day):
-        """The old band was 13:30-20:00 UTC, which is 09:30-16:00 EDT exactly.
-
-        In EST the session is 14:30-21:00 UTC, so for roughly four months a year
-        the flag was on for the hour before the open and off for the last hour of
-        trading — while its comment claimed it covered "both daylight regimes".
-        Verified: 15:59 New York in January is 20:59 UTC, which the old band
-        excluded.
-        """
+        """09:30-15:59 New York is the session in summer and in winter."""
         for hhmm in ('09:30', '12:00', '15:59'):
             assert self.flag(pd.Timestamp(f'{day} {hhmm}', tz=NEW_YORK)) == 1.0, \
                 f'{day} {hhmm} New York should be the session'
@@ -126,7 +96,7 @@ class TestEquityHours:
         assert self.flag(saturday) == 0.0
 
     def test_the_old_utc_band_would_have_failed_in_est(self):
-        """Pin the actual defect, so it cannot be reverted as a simplification."""
+        """A fixed 13:30-20:00 UTC band would miss the last hour of trading in EST."""
         january_close = pd.Timestamp('2026-01-15 15:59', tz=NEW_YORK).tz_convert('UTC')
         utc_minute = january_close.hour * 60 + january_close.minute
         assert not (13 * 60 + 30) <= utc_minute < 20 * 60, (
@@ -137,19 +107,7 @@ class TestEquityHours:
 
 
 def test_a_date_limited_read_accepts_bounds_that_are_already_tz_aware(store):
-    """`--start`/`--end` were still broken, just with a different exception.
-
-    `scripts/_common.load_dataset` builds `pd.Timestamp(args.end, tz='UTC')` and
-    hands it in; `read` then did `pd.Timestamp(end, tz='UTC')` on a value that was
-    already aware, which pandas refuses:
-
-        ValueError: Cannot pass a datetime or Timestamp with tzinfo with the tz
-        parameter. Use tz_convert instead.
-
-    So no `scripts.evaluate --end ...` run could start, which is exactly the run
-    you need to retrain on a chosen window. The boundary should accept either
-    shape rather than requiring callers to guess.
-    """
+    """`start`/`end` bounds that are already tz-aware are accepted."""
     sliced = store.read(
         'minute_bars',
         start=pd.Timestamp('2025-01-01 02:00', tz='UTC'),
@@ -159,7 +117,6 @@ def test_a_date_limited_read_accepts_bounds_that_are_already_tz_aware(store):
 
 
 def test_a_naive_and_an_aware_bound_select_the_same_rows(store):
-    """The two spellings must not mean different windows."""
     naive = store.read('minute_bars', start='2025-01-01 02:00',
                        end='2025-01-01 03:00')
     aware = store.read('minute_bars',
@@ -170,7 +127,9 @@ def test_a_naive_and_an_aware_bound_select_the_same_rows(store):
 
 
 def test_a_bound_in_another_zone_is_converted_not_relabelled(store):
-    """21:00 New York on 2024-12-31 is 02:00 UTC on 2025-01-01."""
+    """A bound in another zone is converted, not relabelled: 21:00 New York is 02:00 UTC
+    next day.
+    """
     aware = store.read(
         'minute_bars',
         start=pd.Timestamp('2024-12-31 21:00', tz=NEW_YORK),

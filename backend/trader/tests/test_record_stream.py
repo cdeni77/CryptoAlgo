@@ -1,7 +1,7 @@
 """Tests for the stream component's contract with the rest of the live process.
 
-Other recorders wait on `TradingGate.idle()`. The stream must not, because a
-paused stream goes stale.
+Other recorders wait on `TradingGate.idle()`. The stream must not, because a paused
+stream goes stale.
 """
 from __future__ import annotations
 
@@ -90,8 +90,7 @@ async def test_a_deferred_flush_runs_once_the_gate_reopens():
 
 
 def test_settled_markets_are_forgotten_rather_than_sampled_as_live():
-    """A settled Kalshi market serves an empty ladder, not an error, so it is forgotten.
-    """
+    """A settled Kalshi market serves an empty ladder, not an error, so it is forgotten."""
     cache = BookCache(now=lambda: 0.0)
     cache.apply(snap('OLD'))
     cache.apply(snap('NEW'))
@@ -169,7 +168,6 @@ async def test_a_socket_that_goes_quiet_after_a_burst_is_still_caught():
 
 @pytest.mark.asyncio
 async def test_the_refresh_deadline_is_honoured_without_any_frame():
-    """The refresh deadline fires with no frame at all."""
     reason = await asyncio.wait_for(
         record_stream.consume(
             _FakeStream(), BookCache(now=lambda: 0.0), _NullSpool(), {},
@@ -214,9 +212,7 @@ NOW = datetime(2026, 8, 27, 15, 15, 5, tzinfo=timezone.utc)
 
 
 def test_a_market_past_its_close_is_not_subscribed():
-    """A market past its close is not subscribed, even while the venue still lists it as
-    open.
-    """
+    """A market past its close is not subscribed, even while the venue still lists it as open."""
     assert not record_stream._trading(
         _market('OLD', '2026-08-27T15:00:00Z', '2026-08-27T15:15:00Z'), NOW)
 
@@ -224,8 +220,8 @@ def test_a_market_past_its_close_is_not_subscribed():
 def test_the_current_market_is_subscribed_even_while_status_says_initialized():
     """The current market is subscribed while its status is still `initialized`.
 
-    The replacement market opens at the boundary but stays `initialized` for about
-    40s, so filtering on status would leave the book empty at the start of a window.
+    The replacement market opens at the boundary but stays `initialized` for about 40s,
+    so filtering on status would leave the book empty at the start of a window.
     """
     assert record_stream._trading(
         _market('NEW', '2026-08-27T15:15:00Z', '2026-08-27T15:30:00Z',
@@ -297,8 +293,8 @@ def test_the_empty_branch_waits_on_the_fast_retry():
 
 
 def test_an_incomplete_market_set_is_rechecked_soon():
-    """An incomplete market set is rechecked soon; the venue lists each series' next market
-    at a different moment.
+    """An incomplete market set is rechecked soon; the venue lists each series' next
+    market at a different moment.
     """
     source = inspect.getsource(record_stream.run)
     body = source[source.index('covered = set(symbols.values())'):]

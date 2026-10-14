@@ -1,8 +1,6 @@
 """Tests that the cycle records the peer book and the implied-vol fit it decided on.
 
-The minute-grid recorders capture about 29s after the minute, so the
-point-in-time joins refuse them for a decision at that minute. These rows record
-what the decision actually read, so the joins accept them.
+These rows record what the decision read, so the point-in-time joins accept them.
 """
 from __future__ import annotations
 

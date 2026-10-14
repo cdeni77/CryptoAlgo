@@ -320,8 +320,7 @@ def test_a_redelivered_trade_is_stored_once(tmp_path):
 
 
 def test_a_receipt_before_the_print_is_never_knowable_early(tmp_path):
-    """A receipt time before the trade time is never used; the store refuses such a row.
-    """
+    """A receipt time before the trade time is never used; the store refuses such a row."""
     spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
     spool = table_spool(spool_root, 'spot_trades', 'coinbase')
     trade = _message()['events'][0]['trades'][0]

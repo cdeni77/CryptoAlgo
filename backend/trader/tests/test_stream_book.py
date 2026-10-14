@@ -1,7 +1,6 @@
-"""The cache holds the state a wrong answer would come from, so it is tested hard.
+"""Tests for `BookCache`, which folds stream frames into books.
 
-The sequence tests encode a MEASURED fact rather than a documented one: Kalshi's
-`seq` is contiguous per subscription and not per market. A per-market check
+Kalshi's `seq` is contiguous per subscription, not per market, so a per-market check
 would flag every delta as a gap.
 """
 from __future__ import annotations
@@ -46,7 +45,7 @@ def test_an_absolute_delta_sets_the_size_at_a_price():
 
 def test_a_signed_delta_adds_to_the_resting_size():
     cache = BookCache(now=Clock())
-    cache.apply(snap())                                    # 0.30 -> 100
+    cache.apply(snap())  # 0.30 -> 100
     cache.apply(snap(kind='delta', seq=2, absolute=False,
                      yes=[(0.30, -40.0)], no=[]))
     assert dict(cache.ladder('K').yes)[0.30] == 60.0
@@ -90,13 +89,11 @@ def test_a_delta_for_a_book_we_never_snapshotted_is_refused():
         'folding a delta into nothing invents a book from one level')
 
 
-# -- sequence: the measured semantics ---------------------------------------
+# -- sequence semantics ------------------------------------------------------
 
 def test_interleaved_markets_on_one_connection_are_not_a_gap():
-    """MEASURED: seq is contiguous across the subscription, not within a market.
-
-    BTC reads 1, 9, 10 while the connection reads 1..N. A per-market check would
-    call every one of these a gap.
+    """Interleaved markets on one connection are not a gap: seq is contiguous across the
+    subscription.
     """
     cache = BookCache(now=Clock())
     cache.apply(snap(market_ticker='BTC', seq=1))

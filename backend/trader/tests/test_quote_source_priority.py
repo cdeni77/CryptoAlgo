@@ -1,10 +1,7 @@
 """Tests for which observer's quote wins when several recorded the same minute.
 
-`quote_age_seconds` is not comparable across sources: for the backfill it is
-time since the last book change, for the live recorders it is the sampler's lag,
-and live_touch has none. So rows are ranked by source first
-(`QUOTE_SOURCE_PRIORITY`), then by age within a source. The quote live decided on
-must win over a reconstruction.
+Ages are not comparable across sources, so rows rank by source first, then by age within
+a source.
 """
 
 from __future__ import annotations
@@ -29,9 +26,7 @@ def _row(source, bid, ask, age, offset=12):
 
 
 def test_the_decision_instant_quote_beats_the_reconstruction():
-    """The live_touch quote beats the backfill, even though the backfill has the smaller
-    age.
-    """
+    """The live_touch quote beats the backfill, even though the backfill has the smaller age."""
     depth = pd.DataFrame([
         _row('backfill', 0.30, 0.32, 0.5),
         _row('live_touch', 0.60, 0.62, np.nan),
@@ -96,7 +91,6 @@ def test_a_stale_preferred_row_does_not_displace_a_fresh_one():
 
 
 def test_age_still_breaks_ties_within_one_source():
-    """Within one source, the smaller age still wins."""
     depth = pd.DataFrame([
         _row('backfill', 0.30, 0.32, 20.0),
         _row('backfill', 0.60, 0.62, 0.5),
@@ -123,9 +117,7 @@ def test_a_depth_frame_with_no_source_column_still_prices():
 
 
 def test_the_winning_observer_is_recorded_on_the_row():
-    """The winning observer is recorded in `quote_observer`; `quote_source` holds the
-    venue.
-    """
+    """The winning observer is recorded in `quote_observer`; `quote_source` holds the venue."""
     depth = pd.DataFrame([
         _row('backfill', 0.30, 0.32, 0.5),
         _row('live_touch', 0.60, 0.62, np.nan),
