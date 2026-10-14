@@ -153,6 +153,11 @@ PEER_USED = 'used'
 
 # window_open -> {verdict: count}, one verdict per symbol per decision cycle.
 _PEER_COUNTS: dict = {}
+# The refusals a stuck stream cache produces. `future` and `one_sided` describe
+# a book that is current, so they do not count toward a resubscribe.
+STUCK_REFUSALS = ('no_book', 'wrong_window', 'too_old')
+# symbol -> consecutive decision cycles refused for a STUCK_REFUSALS reason.
+_PEER_STREAK: dict = {}
 
 
 def peer_refusal(pm: Optional[dict], *, now=None, window_open=None,
@@ -181,12 +186,46 @@ def peer_refusal(pm: Optional[dict], *, now=None, window_open=None,
     return None
 
 
-def _note_peer(window_open, verdict: str) -> None:
-    if window_open is None:
+def _note_peer(window_open, verdict: str, *, symbol=None, config=None) -> None:
+    if window_open is not None:
+        key = pd.Timestamp(window_open)
+        counts = _PEER_COUNTS.setdefault(key, {})
+        counts[verdict] = counts.get(verdict, 0) + 1
+    if symbol is not None:
+        _track_streak(str(symbol), verdict, config)
+
+
+def _track_streak(symbol: str, verdict: str, config=None) -> None:
+    """Ask the stream to resubscribe `symbol` after N stuck refusals in a row.
+
+    N is `peer_resubscribe_after_cycles`. The streak restarts after each
+    request, so a symbol the venue does not list asks at most once per N
+    cycles.
+    """
+    if verdict not in STUCK_REFUSALS:
+        _PEER_STREAK.pop(symbol, None)
         return
-    key = pd.Timestamp(window_open)
-    counts = _PEER_COUNTS.setdefault(key, {})
-    counts[verdict] = counts.get(verdict, 0) + 1
+    streak = _PEER_STREAK.get(symbol, 0) + 1
+    config = config or state._RUNNING_CONFIG or DEFAULT_CONFIG
+    if streak < int(config.peer_resubscribe_after_cycles):
+        _PEER_STREAK[symbol] = streak
+        return
+    _PEER_STREAK.pop(symbol, None)
+    logger.warning('%s: peer book refused %d decision cycles running (last: %s); '
+                   'asking the Polymarket stream to resubscribe',
+                   symbol, streak, verdict)
+    try:
+        from scripts.record_pm_stream import request_resubscribe
+        request_resubscribe(symbol, verdict)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning('%s: could not signal the Polymarket stream (%s)',
+                       symbol, str(exc)[:110])
+
+
+def reset_peer_tracking() -> None:
+    """Drop the refusal counts and streaks. For tests."""
+    _PEER_COUNTS.clear()
+    _PEER_STREAK.clear()
 
 
 def take_peer_counts(window_open) -> dict:
@@ -219,7 +258,7 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None,
 
     out = {name: float('nan') for name in CROSS_VENUE}
     refusal = peer_refusal(pm, now=now, window_open=window_open, config=config)
-    _note_peer(window_open, refusal or PEER_USED)
+    _note_peer(window_open, refusal or PEER_USED, symbol=symbol, config=config)
     if refusal is not None:
         if pm:
             logger.debug('%s: peer book refused (%s): window %s, at %s, %s/%s',

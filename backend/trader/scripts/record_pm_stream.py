@@ -48,15 +48,65 @@ REFRESH_SECONDS = 60.0
 # symbol -> {'best_bid': cents, 'best_ask': cents, 'at': Timestamp}
 CACHE: dict = {}
 
+# symbol -> reason, set by the trading loop (`request_resubscribe`) and read by
+# `consume` on every frame and every timeout.
+_RESUBSCRIBE: dict = {}
 
-def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
+# The heartbeat is a file write. At ~300 frames a second it is written at most
+# this often.
+HEARTBEAT_EVERY_SECONDS = 5.0
+_LAST_BEAT = {'at': 0.0}
+
+
+def request_resubscribe(symbol: str, reason: str = '') -> None:
+    """Ask the recorder to drop `symbol`'s state and subscribe again.
+
+    Safe to call when no recorder runs: nothing reads the request then.
+    """
+    _RESUBSCRIBE[str(symbol)] = str(reason or 'requested')
+
+
+def take_resubscribe_requests() -> dict:
+    """{symbol: reason} requested since the last call, then cleared."""
+    out = dict(_RESUBSCRIBE)
+    _RESUBSCRIBE.clear()
+    return out
+
+
+def forget(symbols) -> None:
+    """Drop the published book and the subscribed slug for each symbol, so
+    neither the trading loop nor the next subscription reuses them."""
+    for symbol in symbols:
+        CACHE.pop(symbol, None)
+        _WINDOWS.pop(symbol, None)
+
+
+def current_window(now=None) -> pd.Timestamp:
+    """The open of the window `now` is inside."""
+    from core.config import DEFAULT_CONFIG
+    now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    return now.floor(f'{int(DEFAULT_CONFIG.window_minutes)}min')
+
+
+def _beat(clock=time.monotonic) -> None:
+    at = clock()
+    if at - _LAST_BEAT['at'] >= HEARTBEAT_EVERY_SECONDS:
+        _LAST_BEAT['at'] = at
+        heartbeat.touch('pm_stream')
+
+
+def publish(book: PmBookCache, tokens: dict, *, window=None, now=None) -> None:
     """Fold the live book into the shape `cross_venue_row` reads.
 
     CENTS, matching `core.book_features`. A one-sided book publishes nothing: a
     lone bid says the probability is at LEAST something, which is not a
     probability — the same rule `_two_sided_mid` applies downstream.
+
+    The heartbeat is touched only for a two-sided book of the CURRENT window,
+    so a recorder stuck on an old window or an empty book goes unhealthy.
     """
     windows = window if isinstance(window, dict) else {}
+    current = None
     for token, symbol in tokens.items():
         bid, ask = book.best_bid(token), book.best_ask(token)
         if bid is None or ask is None:
@@ -67,7 +117,15 @@ def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
         # that one asset's feed is intact: a quiet book and a stopped one look
         # the same. Kalshi's `seq` can vouch for a quiet book; nothing here can.
         stamp = book._stamp.get(token)  # noqa: SLF001 — same module family
-        heartbeat.touch('pm_stream')
+        for_window = (pd.Timestamp(windows[symbol])
+                      if symbol in windows and windows[symbol] is not None
+                      else (pd.Timestamp(window)
+                            if window is not None and not isinstance(window, dict)
+                            else None))
+        if for_window is not None:
+            current = current_window(now) if current is None else current
+            if for_window == current:
+                _beat()
         CACHE[symbol] = {
             'best_bid': bid * 100.0,
             'best_ask': ask * 100.0,
@@ -78,11 +136,7 @@ def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
             # begins when ITS markets settle. For those thirty seconds the cache
             # held the 22:30 book, stamped recently enough to pass the 30s
             # guard — fresh-looking data about the wrong fifteen minutes.
-            'window': (pd.Timestamp(windows[symbol])
-                       if symbol in windows and windows[symbol] is not None
-                       else (pd.Timestamp(window)
-                             if window is not None and not isinstance(window, dict)
-                             else None)),
+            'window': for_window,
         }
 
 
@@ -112,6 +166,9 @@ async def consume(stream, *, until: Optional[float], silence_seconds: float,
     deadline = (time.monotonic() + until) if until is not None else None
     iterator = stream.events().__aiter__()
     while True:
+        if _RESUBSCRIBE:
+            return ('resubscribe requested: ' + ', '.join(
+                f'{sym} ({why})' for sym, why in sorted(_RESUBSCRIBE.items())))
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -122,6 +179,8 @@ async def consume(stream, *, until: Optional[float], silence_seconds: float,
             event = await asyncio.wait_for(
                 iterator.__anext__(), timeout=min(remaining, silence_seconds))
         except asyncio.TimeoutError:
+            if _RESUBSCRIBE:
+                continue
             if deadline is not None and time.monotonic() >= deadline:
                 return 'subscription refresh (window rollover)'
             return (f'silence for {silence_seconds:.0f}s — the market settled '
@@ -226,7 +285,6 @@ async def run(args=None, gate=None) -> int:
     from datetime import datetime, timezone
     from scripts.record_pm_ladder import HEADERS
 
-    book = PmBookCache()
     backoff = 1.0
     while True:
         try:
@@ -234,6 +292,13 @@ async def run(args=None, gate=None) -> int:
                     headers=HEADERS,
                     timeout=aiohttp.ClientTimeout(total=None)) as session:
                 while True:
+                    requested = take_resubscribe_requests()
+                    if requested:
+                        forget(requested)
+                        logger.warning('resubscribing at the trading loop\'s '
+                                       'request: %s', ', '.join(
+                                           f'{sym} ({why})' for sym, why
+                                           in sorted(requested.items())))
                     now = datetime.now(timezone.utc)
                     tokens = await resolve_tokens(session, now)
                     if not tokens:
@@ -257,6 +322,9 @@ async def run(args=None, gate=None) -> int:
                     #
                     # So the deadline is a moment to RE-CHECK the tokens, and
                     # only a change tears the socket down.
+                    # A new connection resends every book; nothing from the
+                    # last one is current.
+                    book = PmBookCache()
                     async with _Socket(session, list(tokens)) as sock:
                         while True:
                             reason = await consume(
