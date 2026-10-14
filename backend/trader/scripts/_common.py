@@ -183,15 +183,6 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     model.add_argument('--mirror-augment', action='store_true', default=None,
                        help='also fit on the up/down mirror of every inner-'
                             'train row')
-    model.add_argument('--model-type', choices=('lgbm', 'logistic'),
-                       default=None,
-                       help="'lgbm' (default) or an L2 'logistic' correction")
-    model.add_argument('--logistic-features', type=str, default=None,
-                       help='comma-separated features for --model-type logistic '
-                            '(default: the top --logistic-top-n by residual '
-                            'correlation, chosen inside each fold)')
-    model.add_argument('--logistic-top-n', type=int, default=None)
-    model.add_argument('--logistic-l2', type=float, default=None)
     model.add_argument('--stack-mode', choices=('off', 'spot_then_market'),
                        default=None,
                        help="'spot_then_market': stage 1 learns spot -> "
@@ -277,9 +268,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
     offsets = _parse_list(getattr(args, 'offsets', None))
     if offsets:
         overrides['decision_offsets'] = tuple(int(o) for o in offsets)
-    logistic_features = _parse_list(getattr(args, 'logistic_features', None))
-    if logistic_features:
-        overrides['logistic_features'] = logistic_features
     for field, attr in (('quote_sources', 'quote_sources'),
                         ('stack_spot_groups', 'stack_spot_groups'),
                         ('stack_book_features', 'stack_book_features')):
@@ -309,8 +297,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('final_layer_intercept', 'final_layer_intercept'),
         ('ensemble_size', 'ensemble_size'),
         ('mirror_augment', 'mirror_augment'),
-        ('model_type', 'model_type'),
-        ('logistic_top_n', 'logistic_top_n'), ('logistic_l2', 'logistic_l2'),
         ('label_source', 'label_source'),
         ('null_quote_age', 'null_quote_age'),
         ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),

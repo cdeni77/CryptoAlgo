@@ -1,4 +1,4 @@
-"""Opt-in model extensions: blend layer, ensemble, mirror, logistic, venue label.
+"""Opt-in model extensions: blend layer, ensemble, mirror, venue label.
 
 Every extension is off by default, so the first tests pin that the defaults
 fit and score exactly as before.
@@ -16,8 +16,7 @@ import pytest
 from core.baseline import BarrierBaseline, clip_prob, expit, log_loss
 from core.config import Config
 from core.model import (
-    BASELINE_LOGIT, MIN_SHRINKAGE_ROWS, ForecastModel, LinearCorrection,
-    _fit_blend, fit_model,
+    BASELINE_LOGIT, MIN_SHRINKAGE_ROWS, _fit_blend, fit_model,
 )
 
 FAST = Config(n_estimators=80, early_stopping_rounds=15, min_child_samples=50,
@@ -72,8 +71,7 @@ def test_table():
 def test_the_defaults_are_the_historical_model(train_table, test_table):
     config = Config()
     assert (config.final_layer, config.ensemble_size, config.mirror_augment,
-            config.model_type, config.label_source) == \
-        ('scale', 1, False, 'lgbm', 'proxy')
+            config.label_source) == ('scale', 1, False, 'proxy')
     assert config.edge_lower_bound_z == 0.0
     assert config.require_member_agreement is False
 
@@ -94,8 +92,7 @@ def test_an_artifact_pickled_before_these_fields_still_predicts(
         train_table, test_table, tmp_path):
     model = fit(train_table)
     expected = model.predict(test_table)
-    for name in ('final_layer', 'init_coefficient', 'intercept', 'members',
-                 'model_type'):
+    for name in ('final_layer', 'init_coefficient', 'intercept', 'members'):
         del model.__dict__[name]
     path = tmp_path / 'old.joblib'
     joblib.dump(model, path)
@@ -236,47 +233,6 @@ def test_a_symmetric_signal_is_learned_at_least_as_well_with_mirroring(test_tabl
     assert mirrored_loss <= plain_loss + 0.002
 
 
-# ------------------------------------------------------------ logistic
-
-def test_the_logistic_challenger_recovers_a_planted_coefficient(train_table, test_table):
-    model = fit(train_table, _config(model_type='logistic', logistic_top_n=1))
-    assert isinstance(model.booster, LinearCorrection)
-    assert model.features == ['z_score'], 'top-1 selection must find the signal'
-    assert model.booster.coef[0] == pytest.approx(0.5, abs=0.08)
-    assert model.model_type == 'logistic'
-    y = test_table['outcome'].to_numpy()
-    assert log_loss(y, model.predict(test_table)) < \
-        log_loss(y, test_table['baseline_probability'].to_numpy())
-
-
-def test_named_logistic_features_override_selection(train_table):
-    model = fit(train_table, _config(model_type='logistic',
-                                     logistic_features=('z_score', 'abs_z_score')))
-    assert model.features == ['z_score', 'abs_z_score']
-    assert abs(model.booster.coef[1]) < 0.1
-
-
-def test_with_no_signal_the_logistic_reproduces_the_init_exactly(test_table):
-    """No intercept: even a biased base rate cannot move a featureless model."""
-    table = synthetic(signal=0.0, seed=8)
-    table['outcome'] = (np.random.default_rng(0).random(len(table)) < 0.7).astype(float)
-    for column in ('z_score',) + NOISE:
-        table[column] = 1.0                # constant: carries nothing
-    model = fit(table, _config(model_type='logistic',
-                               logistic_features=('z_score',) + NOISE))
-    np.testing.assert_array_equal(model.raw_correction(test_table), 0.0)
-    np.testing.assert_array_equal(
-        model.predict(test_table),
-        clip_prob(expit(test_table[BASELINE_LOGIT].to_numpy())))
-
-
-def test_a_logistic_artifact_round_trips_through_joblib(train_table, test_table, tmp_path):
-    model = fit(train_table, _config(model_type='logistic', logistic_top_n=2))
-    path = model.save(tmp_path / 'logistic.joblib')
-    loaded = ForecastModel.load(path)
-    np.testing.assert_array_equal(loaded.predict(test_table), model.predict(test_table))
-
-
 # ------------------------------------------------------------ venue label
 
 def test_label_source_venue_trains_on_the_venue_label():
@@ -288,24 +244,23 @@ def test_label_source_venue_trains_on_the_venue_label():
     table['venue_outcome'] = (rng.random(len(x)) < expit(init + 0.6 * x)).astype(float)
     table['outcome'] = (rng.random(len(x)) < expit(init - 0.6 * x)).astype(float)
     table.loc[table.sample(frac=0.1, random_state=0).index, 'venue_outcome'] = np.nan
-    logistic = dict(model_type='logistic', logistic_features=('z_score',))
-    venue = fit(table, _config(label_source='venue', **logistic))
-    proxy = fit(table, _config(label_source='proxy', **logistic))
-    assert venue.booster.coef[0] > 0.3
-    assert proxy.booster.coef[0] < -0.3
+    venue = fit(table, _config(label_source='venue'))
+    proxy = fit(table, _config(label_source='proxy'))
+    assert np.corrcoef(venue.raw_correction(table), x)[0, 1] > 0.3
+    assert np.corrcoef(proxy.raw_correction(table), x)[0, 1] < -0.3
 
 
 def test_label_source_venue_falls_back_to_the_proxy_where_absent(train_table):
     table = train_table.assign(venue_outcome=np.nan)
-    logistic = dict(model_type='logistic', logistic_features=('z_score',))
-    venue = fit(table, _config(label_source='venue', **logistic))
-    proxy = fit(table, _config(**logistic))
-    np.testing.assert_array_equal(venue.booster.coef, proxy.booster.coef)
+    venue = fit(table, _config(label_source='venue'))
+    proxy = fit(table)
+    np.testing.assert_array_equal(venue.raw_correction(table),
+                                  proxy.raw_correction(table))
 
 
 # ------------------------------------------------------------ config and CLI
 
-@pytest.mark.parametrize('bad', [dict(final_layer='mean'), dict(model_type='xgb'),
+@pytest.mark.parametrize('bad', [dict(final_layer='mean'),
                                  dict(label_source='kalshi'), dict(ensemble_size=0),
                                  dict(edge_lower_bound_z=-1.0)])
 def test_a_bad_setting_is_refused_at_construction(bad):
@@ -318,15 +273,11 @@ def test_every_new_field_reaches_provenance_and_the_cli():
     parser = add_data_arguments(argparse.ArgumentParser())
     args = parser.parse_args([
         '--final-layer', 'blend', '--final-layer-intercept', '--ensemble-size', '5',
-        '--mirror-augment', '--model-type', 'logistic',
-        '--logistic-features', 'z_score,lead_residual', '--logistic-top-n', '4',
-        '--logistic-l2', '2.5', '--label-source', 'venue',
+        '--mirror-augment', '--label-source', 'venue',
         '--edge-lower-bound-z', '1.5', '--require-member-agreement'])
     config = config_from_args(args)
     expected = dict(final_layer='blend', final_layer_intercept=True,
-                    ensemble_size=5, mirror_augment=True, model_type='logistic',
-                    logistic_features=('z_score', 'lead_residual'),
-                    logistic_top_n=4, logistic_l2=2.5, label_source='venue',
+                    ensemble_size=5, mirror_augment=True, label_source='venue',
                     edge_lower_bound_z=1.5, require_member_agreement=True)
     record = config.provenance()
     for name, value in expected.items():

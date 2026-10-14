@@ -127,7 +127,7 @@ BLEND_INIT_BOUNDS = (0.5, 1.5)
 BLEND_INTERCEPT_BOUNDS = (-0.5, 0.5)
 BLEND_RIDGE = 50.0
 
-# Standardized logistic inputs are clipped here so one outlier cannot dominate.
+# Standardized stack-layer inputs are clipped here so one outlier cannot dominate.
 LOGISTIC_CLIP = 5.0
 
 
@@ -136,110 +136,6 @@ def _feature_matrix(table: pd.DataFrame, columns: Sequence[str]) -> np.ndarray:
     if missing:
         raise ValueError(f'feature columns absent from the table: {missing}')
     return table.loc[:, list(columns)].to_numpy(dtype=float)
-
-
-@dataclass
-class LinearCorrection:
-    """An L2 logistic correction exposing the Booster surface ForecastModel uses.
-
-    No intercept: a base-rate shift is not a correction to the forecaster, and
-    an untrained (all-zero) model must reproduce the init exactly.
-    """
-
-    names: list[str]
-    mean: np.ndarray
-    scale: np.ndarray
-    coef: np.ndarray
-    l2: float = 1.0
-    n_iter: int = 0
-    best_iteration: Optional[int] = None
-
-    def _standardize(self, matrix: np.ndarray) -> np.ndarray:
-        z = (np.asarray(matrix, dtype=float) - self.mean) / self.scale
-        z = np.clip(z, -LOGISTIC_CLIP, LOGISTIC_CLIP)
-        return np.where(np.isfinite(z), z, 0.0)
-
-    def predict(self, matrix: np.ndarray, raw_score: bool = True) -> np.ndarray:
-        raw = self._standardize(matrix) @ self.coef
-        return raw if raw_score else expit(raw)
-
-    def feature_name(self) -> list[str]:
-        return list(self.names)
-
-    def num_feature(self) -> int:
-        return len(self.names)
-
-    def feature_importance(self, importance_type: str = 'gain') -> np.ndarray:
-        if importance_type == 'split':
-            return (self.coef != 0).astype(int)
-        return np.abs(self.coef)
-
-    @classmethod
-    def fit(cls, matrix: np.ndarray, names: Sequence[str], init: np.ndarray,
-            outcome: np.ndarray, *, weights: Optional[np.ndarray] = None,
-            l2: float = 1.0) -> 'LinearCorrection':
-        from scipy import optimize
-
-        matrix = np.asarray(matrix, dtype=float)
-        init = np.asarray(init, dtype=float)
-        outcome = np.asarray(outcome, dtype=float)
-        keep = np.isfinite(init) & np.isfinite(outcome)
-        matrix, init, outcome = matrix[keep], init[keep], outcome[keep]
-        w = (np.ones(len(outcome)) if weights is None
-             else np.asarray(weights, dtype=float)[keep])
-        w = w / w.sum()
-        with np.errstate(invalid='ignore'):
-            mean = np.nan_to_num(np.nanmean(matrix, axis=0))
-            scale = np.nan_to_num(np.nanstd(matrix, axis=0))
-        # A constant column standardizes to zero and so contributes nothing.
-        scale = np.where(scale > 0, scale, 1.0)
-        model = cls(names=list(names), mean=mean, scale=scale,
-                    coef=np.zeros(matrix.shape[1]), l2=float(l2))
-        if matrix.shape[1] == 0:
-            return model
-        z = model._standardize(matrix)
-        n = len(outcome)
-
-        def objective(beta: np.ndarray) -> tuple[float, np.ndarray]:
-            eta = init + z @ beta
-            # log(1 + e^eta) - y*eta, stably.
-            loss = float(np.sum(w * (np.logaddexp(0.0, eta) - outcome * eta)))
-            grad = z.T @ (w * (expit(eta) - outcome))
-            return (loss + 0.5 * l2 * float(beta @ beta) / n,
-                    grad + l2 * beta / n)
-
-        result = optimize.minimize(objective, model.coef, jac=True,
-                                   method='L-BFGS-B')
-        if not np.all(np.isfinite(result.x)):
-            raise ValueError(f'the logistic correction did not converge '
-                             f'({result.message!r})')
-        model.coef = np.asarray(result.x, dtype=float)
-        model.n_iter = int(getattr(result, 'nit', 0))
-        return model
-
-
-def _select_logistic_features(frame: pd.DataFrame, columns: Sequence[str],
-                              init_column: str, top_n: int) -> list[str]:
-    """The `top_n` columns most correlated with the residual on the fit rows."""
-    residual = (frame['outcome'].to_numpy(dtype=float)
-                - expit(frame[init_column].to_numpy(dtype=float)))
-    rows = np.isfinite(residual)
-    residual = residual[rows]
-    # Standardized exactly as LinearCorrection will see it: clipped, NaN -> 0.
-    probe = LinearCorrection(names=list(columns), mean=np.zeros(len(columns)),
-                             scale=np.ones(len(columns)), coef=np.zeros(len(columns)))
-    matrix = _feature_matrix(frame, columns)[rows]
-    with np.errstate(invalid='ignore'):
-        probe.mean = np.nan_to_num(np.nanmean(matrix, axis=0))
-        scale = np.nan_to_num(np.nanstd(matrix, axis=0))
-    probe.scale = np.where(scale > 0, scale, 1.0)
-    z = probe._standardize(matrix)
-    scores = {}
-    for i, column in enumerate(columns):
-        if np.std(z[:, i]) > 0 and np.std(residual) > 0:
-            scores[column] = abs(float(np.corrcoef(z[:, i], residual)[0, 1]))
-    ranked = sorted(scores, key=lambda c: -scores[c])
-    return ranked[:max(int(top_n), 0)]
 
 
 @dataclass
@@ -276,7 +172,6 @@ class ForecastModel:
     intercept: float = 0.0
     # Every booster when ensembled (booster is members[0]); empty for one.
     members: tuple = ()
-    model_type: str = 'lgbm'
 
     @property
     def init_score_column(self) -> str:
@@ -411,7 +306,6 @@ class ForecastModel:
             'init_coefficient': float(getattr(self, 'init_coefficient', 1.0)),
             'intercept': float(getattr(self, 'intercept', 0.0)),
             'ensemble_size': self.ensemble_size,
-            'model_type': getattr(self, 'model_type', 'lgbm'),
             # Which forecaster this is a correction to. A promoted artifact that
             # does not say is an artifact whose skill number means one of two
             # different things.
@@ -949,51 +843,30 @@ def fit_model(
             free_raw_data=False,
         )
 
-    model_type = getattr(config, 'model_type', 'lgbm')
     features = list(populated)
-    if model_type == 'logistic':
-        chosen = tuple(getattr(config, 'logistic_features', ()) or ())
-        if chosen:
-            unknown = [c for c in chosen if c not in populated]
-            if unknown:
-                raise ValueError(f'logistic_features not among the populated '
-                                 f'features of these groups: {unknown}')
-            features = list(chosen)
-        else:
-            features = _select_logistic_features(
-                fit_rows, populated, init_column,
-                int(getattr(config, 'logistic_top_n', 8)))
-        logger.info('logistic correction on %d feature(s): %s',
-                    len(features), features)
-        members = [LinearCorrection.fit(
-            _feature_matrix(fit_rows, features), features,
-            fit_rows[init_column].to_numpy(dtype=float),
-            fit_rows['outcome'].to_numpy(dtype=float),
-            weights=fit_weights, l2=float(getattr(config, 'logistic_l2', 1.0)))]
-    else:
-        members = []
-        for k in range(max(int(getattr(config, 'ensemble_size', 1) or 1), 1)):
-            params = {
-                'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-                'learning_rate': config.learning_rate, 'num_leaves': config.num_leaves,
-                'max_depth': config.max_depth,
-                'min_child_samples': config.min_child_samples,
-                'bagging_fraction': config.subsample, 'bagging_freq': 1,
-                'feature_fraction': config.colsample_bytree,
-                'lambda_l2': config.reg_lambda,
-                'deterministic': True, 'seed': 17 + k,
-            }
-            # Fresh datasets per member: a constructed Dataset pins seed-derived
-            # parameters, and the members must differ in their bagging draws.
-            train_set = dataset(fit_rows, fit_weights)
-            valid_set = dataset(inner_valid, frame_weights(inner_valid),
-                                reference=train_set)
-            members.append(lgb.train(
-                params, train_set, num_boost_round=config.n_estimators,
-                valid_sets=[valid_set], valid_names=['inner'],
-                callbacks=[lgb.early_stopping(config.early_stopping_rounds,
-                                              verbose=False)],
-            ))
+    members = []
+    for k in range(max(int(getattr(config, 'ensemble_size', 1) or 1), 1)):
+        params = {
+            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
+            'learning_rate': config.learning_rate, 'num_leaves': config.num_leaves,
+            'max_depth': config.max_depth,
+            'min_child_samples': config.min_child_samples,
+            'bagging_fraction': config.subsample, 'bagging_freq': 1,
+            'feature_fraction': config.colsample_bytree,
+            'lambda_l2': config.reg_lambda,
+            'deterministic': True, 'seed': 17 + k,
+        }
+        # Fresh datasets per member: a constructed Dataset pins seed-derived
+        # parameters, and the members must differ in their bagging draws.
+        train_set = dataset(fit_rows, fit_weights)
+        valid_set = dataset(inner_valid, frame_weights(inner_valid),
+                            reference=train_set)
+        members.append(lgb.train(
+            params, train_set, num_boost_round=config.n_estimators,
+            valid_sets=[valid_set], valid_names=['inner'],
+            callbacks=[lgb.early_stopping(config.early_stopping_rounds,
+                                          verbose=False)],
+        ))
     booster = members[0]
 
     def mean_correction(frame: pd.DataFrame) -> np.ndarray:
@@ -1036,7 +909,6 @@ def fit_model(
         final_layer=final_layer, init_coefficient=init_coefficient,
         intercept=intercept,
         members=tuple(members) if len(members) > 1 else (),
-        model_type=model_type,
     )
     logger.info(model.summary())
     return model
@@ -1376,7 +1248,7 @@ def fit_stacked_model(
                 'this table carries no market_probability at all')
         train = attach_market_logit(train)
     spot_groups = tuple(config.stack_spot_groups)
-    # Stage 1 is an ordinary baseline-init fit; ensemble, mirror, logistic,
+    # Stage 1 is an ordinary baseline-init fit; ensemble, mirror,
     # label and final-layer options reach it unchanged through `fit_model`.
     spot_config = replace(config, init_score_source='baseline', stack_mode='off')
 
@@ -1444,7 +1316,6 @@ def fit_stacked_model(
         inner_baseline_log_loss=spot.inner_baseline_log_loss,
         init_score_source='market', config_provenance=config.provenance(),
         final_layer='stack', init_coefficient=a, intercept=c,
-        model_type=getattr(spot, 'model_type', 'lgbm'),
         spot=spot, stack_features=book_names, stack_mean=mean,
         stack_scale=scale, stack_coef=coef, stack_l2=float(config.stack_l2),
         n_stack_rows=int(rows.sum()), stack_fitted=fitted,

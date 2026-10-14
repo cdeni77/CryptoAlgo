@@ -339,12 +339,6 @@ class Config:
     # Train on each row and its up/down mirror (features negated or swapped per
     # `core.features.FEATURE_PARITY`, label flipped). Inner-train rows only.
     mirror_augment: bool = False
-    # 'logistic' is an L2 logistic correction on a few standardized features:
-    # a low-variance challenger to the trees.
-    model_type: str = 'lgbm'
-    logistic_features: tuple[str, ...] = ()
-    logistic_top_n: int = 8
-    logistic_l2: float = 1.0
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'
@@ -703,11 +697,6 @@ class Config:
     # only while the kill is this fresh. Never after a partial fill.
     kill_retries: int = 1
     kill_retry_window_seconds: float = 2.0
-    # 'taker' crosses with immediate_or_cancel. 'maker' posts a non-crossing
-    # post-only limit, leaves it `maker_rest_seconds`, then cancels. Opt-in:
-    # the maker fee and the venue's post-only path have never been measured.
-    entry_style: str = 'taker'
-    maker_rest_seconds: float = 20.0
 
     # ---- circuit breakers ------------------------------------------------
     # The ruin floor was the only limit that existed, and it only fires after
@@ -822,9 +811,6 @@ class Config:
                 f'from test-period bars, and the HAR target reaches there too. '
                 f'The default of 1440 is deliberately much larger.'
             )
-        if self.entry_style not in ('taker', 'maker'):
-            raise ValueError(
-                f"entry_style={self.entry_style!r}; expected 'taker' or 'maker'.")
         if self.kill_retries < 0:
             raise ValueError(f'kill_retries must not be negative; got '
                              f'{self.kill_retries}.')
@@ -835,7 +821,6 @@ class Config:
             )
         # Typos here would otherwise surface deep inside a fold's fit.
         for name, allowed in (('final_layer', ('scale', 'blend')),
-                              ('model_type', ('lgbm', 'logistic')),
                               ('label_source', ('proxy', 'venue')),
                               ('null_quote_age', ('fresh', 'stale')),
                               ('stack_mode', ('off', 'spot_then_market'))):

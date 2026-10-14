@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import replace
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -28,47 +27,8 @@ from livetrade.util import _db
 logger = logging.getLogger('live')
 
 
-def maker_prices(quote) -> tuple[Optional[float], Optional[float]]:
-    """(up, down) posting prices: one tick inside our side's best bid, or at it.
-
-    One tick better than the best bid on the side being bought, unless that
-    would reach the ask — then at the bid itself, which cannot cross.
-    """
-    from core.costs import tick_at
-
-    def post(bid, ask):
-        if bid is None or ask is None:
-            return None
-        better = round(float(bid) + float(tick_at(float(bid))), 4)
-        return better if better < float(ask) - 1e-9 else float(bid)
-
-    return (post(quote.yes_bid, quote.yes_ask), post(quote.no_bid, quote.no_ask))
-
-
-def entry_decision(row, config: Config, *, quote, bankroll: float,
-                   exposure: WindowExposure, require_quote: bool,
-                   halted: bool) -> tuple[Decision, bool]:
-    """`decide()` as a taker, or — opt-in — as a maker. Returns (decision, maker).
-
-    A maker's price is the one it POSTS and its fee is the maker fee, so the
-    row is priced at the posting prices and `decide()` runs with
-    `assume_maker`. Everything else — gates, sizing, limits — is the same
-    function the backtest calls.
-    """
-    if config.entry_style != 'maker' or quote is None:
-        return decide(row, config, bankroll=bankroll, exposure=exposure,
-                      require_quote=require_quote, halted=halted), False
-    up, down = maker_prices(quote)
-    posted = dict(row)
-    posted['ask_up'] = up if up is not None else np.nan
-    posted['ask_down'] = down if down is not None else np.nan
-    return decide(posted, replace(config, assume_maker=True), bankroll=bankroll,
-                  exposure=exposure, require_quote=require_quote,
-                  halted=halted), True
-
-
 async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row, *,
-                        config: Config, quote, quote_time, maker: bool,
+                        config: Config, quote, quote_time,
                         others: WindowExposure, bankroll: float, halted: bool,
                         require_quote: bool, prediction_id: Optional[int] = None):
     """Send one entry, and resend once if an immediate_or_cancel took nothing.
@@ -83,11 +43,11 @@ async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row,
     """
     result = await place_and_book(args, writer, kalshi, decision, row,
                                   config=config, quote_time=quote_time,
-                                  maker=maker, prediction_id=prediction_id)
+                                  prediction_id=prediction_id)
     kills = [(decision, result)] if result.status == 'killed' else []
     final_decision, final = decision, result
     attempt = 0
-    while (not maker and final.status == 'killed' and final.filled == 0
+    while (final.status == 'killed' and final.filled == 0
            and attempt < int(config.kill_retries) and quote is not None):
         age = time.monotonic() - (final.answered_at or 0.0)
         if age > config.kill_retry_window_seconds:
@@ -370,7 +330,7 @@ class OrderResult(NamedTuple):
 
     booked: bool
     # 'filled', 'partial', 'killed', 'refused', 'unknown', 'stale', 'unresolved',
-    # 'dry_run', 'paper', 'resting_cancelled'
+    # 'dry_run', 'paper'
     status: str
     filled: int = 0
     order: Optional[dict] = None
@@ -417,7 +377,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                          decision: Decision, row, *,
                          config: Config = DEFAULT_CONFIG,
                          quote_time: Optional[pd.Timestamp] = None,
-                         attempt: int = 0, maker: bool = False,
+                         attempt: int = 0,
                          note: Optional[str] = None,
                          prediction_id: Optional[int] = None) -> OrderResult:
     """Record the ticket, place the order when asked to twice, book the fill.
@@ -439,8 +399,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     is the ticket left `unknown`, which still blocks the window.
     """
     placing = bool(args.place_orders) and kalshi is not None and not args.dry_run
-    limit = order_limit_price(decision, config=config) if not maker else decision.price
-    booking_config = replace(config, assume_maker=True) if maker else config
+    limit = order_limit_price(decision, config=config)
 
     if placing and quote_time is not None:
         age = (pd.Timestamp.now(tz='UTC') - pd.Timestamp(quote_time)).total_seconds()
@@ -499,18 +458,13 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     key = client_order_id_for(decision, attempt)
     if placing:
         try:
-            if maker:
-                order = await _rest_as_maker(kalshi, decision, limit=limit,
-                                             exchange_index=exchange_index,
-                                             client_order_id=key, config=config)
-            else:
-                # The offset is in this key, so a kill at one offset does not
-                # lock every later offset of the window out with a 409.
-                order = await kalshi.place_order(
-                    ticker=decision.market_ticker, side=decision.side.value,
-                    exchange_index=exchange_index,
-                    contracts=decision.contracts, limit_price=limit,
-                    client_order_id=key)
+            # The offset is in this key, so a kill at one offset does not
+            # lock every later offset of the window out with a 409.
+            order = await kalshi.place_order(
+                ticker=decision.market_ticker, side=decision.side.value,
+                exchange_index=exchange_index,
+                contracts=decision.contracts, limit_price=limit,
+                client_order_id=key)
             answered_at = time.monotonic()
         except (KalshiError, asyncio.TimeoutError, OSError) as exc:
             ambiguous = (not isinstance(exc, KalshiError)
@@ -557,7 +511,6 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         if np.isfinite(fill_price) and decision.side is not Side.UP:
             fill_price = 1.0 - fill_price
         if filled <= 0:
-            status = 'resting_cancelled' if maker else 'killed'
             logger.warning(
                 '%s window %s: the order did not fill (status %r). No position.',
                 decision.symbol, decision.window_open, order.get('status'))
@@ -567,7 +520,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                       note=(f"status={order.get('status')!r} "
                             f"order_id={str(order.get('order_id', ''))[:60]} "
                             f"key={key}")[:4000])
-            return OrderResult(False, status, 0, order, ticket_id, limit, answered_at)
+            return OrderResult(False, 'killed', 0, order, ticket_id, limit, answered_at)
         if np.isfinite(fill_price):
             placed_price = fill_price
             venue_fill_price = float(fill_price)
@@ -592,7 +545,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     # decision, which in paper mode already carries the half-spread.
     ratio = (filled / decision.contracts) if decision.contracts else 0.0
     if filled and venue_fill_price is not None:
-        fee = float(trade_fee(filled, venue_fill_price, booking_config))
+        fee = float(trade_fee(filled, venue_fill_price, config))
         outlay = float(filled) * float(venue_fill_price) + fee
     else:
         outlay = decision.stake * ratio
@@ -613,44 +566,6 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     status = 'paper' if not placing else (
         'filled' if filled >= decision.contracts else 'partial')
     return OrderResult(True, status, int(filled), order, ticket_id, limit, answered_at)
-
-
-async def _rest_as_maker(kalshi, decision: Decision, *, limit: float,
-                         exchange_index: int, client_order_id: str,
-                         config: Config) -> dict:
-    """Post a non-crossing limit, let it rest, cancel it, read what filled.
-
-    `post_only` makes the venue refuse it rather than cross, and
-    `expiration_time` makes the venue cancel it even if this process dies
-    while it rests. The returned record is the venue's own, after the cancel.
-    """
-    rest = max(0.0, float(config.maker_rest_seconds))
-    settle = pd.Timestamp(decision.settle_time)
-    room = (settle - pd.Timestamp.now(tz='UTC')).total_seconds() - config.min_remaining_seconds
-    rest = max(0.0, min(rest, room))
-    expires = int(time.time() + rest + 5.0)
-    posted = await kalshi.place_order(
-        ticker=decision.market_ticker, side=decision.side.value,
-        exchange_index=exchange_index, contracts=decision.contracts,
-        limit_price=limit, client_order_id=client_order_id,
-        time_in_force='good_till_canceled', post_only=True,
-        expiration_time=expires)
-    order_id = str(posted.get('order_id') or '')
-    if not order_id:
-        return posted
-    await asyncio.sleep(rest)
-    try:
-        await kalshi.cancel(order_id, ticker=decision.market_ticker)
-    except KalshiError as exc:
-        # Most often it filled completely or expired first; the record says.
-        logger.info('maker cancel of %s: %s', order_id, str(exc)[:160])
-    try:
-        record = await kalshi.order(order_id)
-    except Exception as exc:                                  # noqa: BLE001
-        logger.error('could not read maker order %s back (%s); using the POST '
-                     'reply', order_id, str(exc)[:160])
-        return posted
-    return record or posted
 
 
 async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],

@@ -1033,8 +1033,6 @@ class KalshiClient:
         limit_price: float,
         client_order_id: Optional[str] = None,
         time_in_force: str = 'immediate_or_cancel',
-        post_only: bool = False,
-        expiration_time: Optional[int] = None,
     ) -> dict:
         """Buy `contracts` of `side` at no worse than `limit_price` (dollars).
 
@@ -1048,12 +1046,6 @@ class KalshiClient:
         With a positive edge a partial fill strictly beats a kill, and the
         accounting already handles partials (16 of the first 323 live fills were
         partial).
-
-        `post_only=True` is a maker order: the venue refuses it rather than let
-        it cross. Its limit is rounded onto the venue's tapered tick AWAY from
-        the touch, the opposite of the taker rounding below, and
-        `expiration_time` (epoch seconds, with `good_till_canceled`) makes the
-        venue cancel it even if nothing here survives to.
         """
         if not self.live:
             raise NotLiveError(
@@ -1095,14 +1087,11 @@ class KalshiClient:
         # an immediate_or_cancel up to 0.9c of extra reach past the limit
         # `order_limit_price` chose — levels the edge gate never admitted.
         #
-        # A taker rounds toward a fill (up for a bid, down for an ask); a
-        # post-only maker rounds the other way so it can never cross.
-        #
         # Integer tenths of a cent, so the band edges (multiples of the coarse
         # tick) stay exact. The epsilon absorbs binary representation: 0.60 is
         # 599.999... tenths in float.
         step = int(round(float(tick_at(yes_limit)) / DECI_CENT))
-        if (book_side == 'bid') != bool(post_only):
+        if book_side == 'bid':
             ticks = int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
         else:
             ticks = int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step
@@ -1130,15 +1119,10 @@ class KalshiClient:
             # names the market rather than the mismatch.
             'exchange_index': int(exchange_index),
         }
-        if post_only:
-            body['post_only'] = True
-        if expiration_time is not None:
-            body['expiration_time'] = int(expiration_time)
         if client_order_id:
             body['client_order_id'] = client_order_id
-        logger.info('placing %s (%s) %d @ %.4f YES on %s%s',
-                    side, book_side, contracts, price, ticker,
-                    ' [post-only]' if post_only else '')
+        logger.info('placing %s (%s) %d @ %.4f YES on %s',
+                    side, book_side, contracts, price, ticker)
         payload = await self._request('POST', '/portfolio/events/orders', body=body)
         # **The venue's own answer, in full.** The caller reads `status` and a
         # count off this reply and reports "did not fill" when neither is
