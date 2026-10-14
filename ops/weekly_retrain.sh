@@ -7,16 +7,16 @@
 # WHAT IT DOES
 #   1. Runs `scripts.promote` in the one-off `retrain` container: walk-forward,
 #      gates, and install ONLY if every gate passes.
-#   2. Restarts the live trader IF AND ONLY IF a new artifact was installed.
+#   2. Nothing else. The trader is NOT restarted.
 #
-# WHY THE CONDITIONAL RESTART IS THE POINT
-#   `scripts/live.py` calls `load_live` once at startup and never reloads, so
-#   promoting an artifact changes nothing about what is being traded until the
-#   loop restarts. A weekly promote without a restart is a silent no-op.
-#   Equally, restarting when nothing was installed is not free: it resets the
-#   live measurement window and triggers a Coinbase 429 burst while the bar
-#   history refetches. So: exit 0 (installed) restarts, exit 1 (refused) does
-#   not.
+# WHY THERE IS NO RESTART
+#   `scripts/live.py` checks the installed artifact at the first cycle of every
+#   window (`reload_if_changed`) and swaps it in when the file changed, keeping
+#   the old model if the new one fails to load or is gate-blocked. A restart
+#   used to do that job, at an arbitrary instant: it could land on a decision
+#   or an order in flight, and it dropped the book sockets and in-memory state
+#   (the gap-change history, the bar cache). So exit 0 (installed) is picked up
+#   within one window; exit 1 (refused) changes nothing.
 #
 # WHY THERE IS NO --force
 #   The deployed artifact was force-promoted past `calibration_error` 0.0216.
@@ -61,10 +61,8 @@ cd "$REPO" || exit 2
 
   case "$CODE" in
     0)
-      echo "gates PASSED and the artifact was installed; restarting the trader "
-      echo "so the loop picks it up (load_live runs only at startup)"
-      docker compose restart trader
-      echo "trader restarted at $(date -u)"
+      echo "gates PASSED and the artifact was installed; the running trader "
+      echo "reloads it at the next window boundary (no restart)"
       ;;
     1)
       echo "gates REFUSED the candidate; nothing installed and the trader is "

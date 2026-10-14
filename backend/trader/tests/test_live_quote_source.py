@@ -131,15 +131,25 @@ def test_an_empty_book_is_trusted_rather_than_papered_over():
     assert q.ask_for('up') is None
 
 
-def test_a_FAILED_book_request_falls_back_and_says_so(caplog):
-    """A transport failure is not an empty book. Falling back to the cached
-    touch keeps the loop alive, but it must be logged, because a decision priced
-    that way is expected not to fill."""
+def test_a_FAILED_book_request_is_no_quote_not_the_cached_touch():
+    """A transport failure is not an empty book, and the cached touch is up to
+    6.3c wrong — pricing a decision off it is a refusal, not a fallback."""
     c = FakeClient(raise_on_book=KalshiError('503'))
-    with caplog.at_level('WARNING'):
-        q = asyncio.run(c.quote_with_live_book('KXSOL15M-26SEP041145-45'))
-    assert q.yes_ask == pytest.approx(0.74), 'the cached touch, as a fallback'
-    assert 'CACHED' in caplog.text
+    with pytest.raises(KalshiError):
+        asyncio.run(c.quote_with_live_book('KXSOL15M-26SEP041145-45'))
+
+
+def test_a_timed_out_book_request_is_no_quote_either():
+    c = FakeClient(raise_on_book=asyncio.TimeoutError())
+    with pytest.raises(KalshiError):
+        asyncio.run(c.quote_with_live_book('KXSOL15M-26SEP041145-45'))
+
+
+def test_the_rest_quote_says_where_it_came_from_and_carries_its_ladder():
+    c = FakeClient()
+    q = asyncio.run(c.quote_with_live_book('KXSOL15M-26SEP041145-45'))
+    assert q.book_source == 'rest' and q.book_time is not None
+    assert (0.75, 64.0) in q.yes_levels and (0.24, 32.82) in q.no_levels
 
 
 def test_it_reads_the_book_exactly_once_per_quote():

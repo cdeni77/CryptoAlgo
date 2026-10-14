@@ -109,7 +109,7 @@ def _args(**over) -> argparse.Namespace:
 
 
 def _run(writer, venue, monkeypatch):
-    async def fake_fetch(config, minutes=None):
+    async def fake_fetch(config, minutes=None, **_):
         return _stale_bars()
 
     monkeypatch.setattr(live_mod, 'fetch_bars', fake_fetch)
@@ -174,7 +174,7 @@ def test_no_venue_means_no_balance_write(writer, monkeypatch):
     writer.update_account(bankroll=93.8)
     _open_a_winning_position(writer)
 
-    async def fake_fetch(config, minutes=None):
+    async def fake_fetch(config, minutes=None, **_):
         return _stale_bars()
 
     monkeypatch.setattr(live_mod, 'fetch_bars', fake_fetch)

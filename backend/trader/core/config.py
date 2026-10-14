@@ -656,6 +656,28 @@ class Config:
     # Stop trading below this fraction of the starting bankroll.
     ruin_floor_fraction: float = 0.50
 
+    # ---- live execution --------------------------------------------------
+    # Price from the in-process stream book only while its socket delivered a
+    # frame this recently (and the book is not gapped); otherwise one REST
+    # `/orderbook` read. A frame lands ~34ms after the venue stamps it.
+    stream_quote_max_age_seconds: float = 2.0
+    # A one-minute bar built from the Coinbase trade stream is final once the
+    # clock passes its close by this much: trades arrive ~tens of ms late.
+    spot_bar_grace_seconds: float = 0.75
+    # On a decision cycle venue reconciliation runs AFTER the orders, using the
+    # last reconciled balance to size. If that is older than this (or never
+    # happened) the cycle reconciles first, as non-decision cycles do.
+    max_reconcile_age_seconds: float = 300.0
+    # One re-priced resend after an immediate_or_cancel that filled nothing,
+    # only while the kill is this fresh. Never after a partial fill.
+    kill_retries: int = 1
+    kill_retry_window_seconds: float = 2.0
+    # 'taker' crosses with immediate_or_cancel. 'maker' posts a non-crossing
+    # post-only limit, leaves it `maker_rest_seconds`, then cancels. Opt-in:
+    # the maker fee and the venue's post-only path have never been measured.
+    entry_style: str = 'taker'
+    maker_rest_seconds: float = 20.0
+
     # ---- circuit breakers ------------------------------------------------
     # The ruin floor was the only limit that existed, and it only fires after
     # half the account is gone — 96 windows a day x 3 symbols means a broken
@@ -769,6 +791,12 @@ class Config:
                 f'from test-period bars, and the HAR target reaches there too. '
                 f'The default of 1440 is deliberately much larger.'
             )
+        if self.entry_style not in ('taker', 'maker'):
+            raise ValueError(
+                f"entry_style={self.entry_style!r}; expected 'taker' or 'maker'.")
+        if self.kill_retries < 0:
+            raise ValueError(f'kill_retries must not be negative; got '
+                             f'{self.kill_retries}.')
         if self.max_slippage_cents < 0.0:
             raise ValueError(
                 f'max_slippage_cents must not be negative; got '

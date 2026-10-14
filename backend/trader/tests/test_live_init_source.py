@@ -138,3 +138,12 @@ def test_an_explicit_no_require_peer_book_beats_the_artifact():
     out = config_for_artifact(
         config, _artifact_with_groups('cross_venue'), mode='live')
     assert out.require_peer_book is False
+
+
+def test_live_adopts_the_ensemble_gates_the_artifact_was_measured_under():
+    config = config_for_artifact(
+        Config(), _artifact_with(edge_lower_bound_z=1.0,
+                                 require_member_agreement=True),
+        mode='live')
+    assert config.edge_lower_bound_z == 1.0
+    assert config.require_member_agreement is True

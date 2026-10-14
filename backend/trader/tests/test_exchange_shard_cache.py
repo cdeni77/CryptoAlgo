@@ -63,11 +63,13 @@ def test_an_unchanged_shard_is_silent(caplog):
     assert not [r for r in caplog.records if 'exchange shard' in r.getMessage()]
 
 
-def test_the_cycle_reads_the_book_after_reconciling():
-    """Ordering is the whole point: everything that can precede the quote does."""
+def test_reconciliation_never_sits_between_the_book_and_the_order():
+    """On an entry cycle it runs after the orders; elsewhere before the book.
+    The behaviour is tested in `test_decision_first.py`."""
     import inspect
     source = inspect.getsource(live.run_cycle)
-    assert source.index("_phase('reconcile')") < source.index("_phase('quotes')"), (
-        'reconciliation must not sit between the book and the order')
-    assert source.index("_phase('quotes')") < source.index("_phase('score')")
     assert source.index("_phase('bars')") < source.index("_phase('quotes')")
+    assert source.index("_phase('quotes')") < source.index("_phase('score')")
+    assert source.index("_phase('score')") < source.index("_phase('orders')")
+    tail = source[source.index("_phase('orders')"):]
+    assert 'bookkeeping(' in tail, 'an entry cycle must reconcile after the orders'
