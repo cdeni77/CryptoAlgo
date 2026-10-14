@@ -153,7 +153,10 @@ def refit_on_all(dataset, config, *, groups=None):
     """
     try:
         from core.dataset import fit_fold
-        from core.model import fit_model
+        from core.model import fit_for_config, table_groups
+        # The same groups and the same fitter the walk-forward used, so a
+        # stacked configuration ships a stacked artifact.
+        groups = table_groups(config, groups)
         fit, table = fit_fold(dataset, dataset.window_index, config, groups=groups)
         # `scoring=` is not optional. It carries the volatility model, the
         # intraday seasonality factor and the baseline's scale/tail — the three
@@ -172,10 +175,10 @@ def refit_on_all(dataset, config, *, groups=None):
         # docstring was written to close for `scoring=`.
         from core.cv import recency_weights
 
-        return fit_model(table, fit.baseline, config, groups=groups,
-                         weights=recency_weights(table['window_open'],
-                                                 config.recency_half_life_days),
-                         scoring=fit.bundle(config))
+        return fit_for_config(table, fit.baseline, config, groups=groups,
+                              weights=recency_weights(table['window_open'],
+                                                      config.recency_half_life_days),
+                              scoring=fit.bundle(config))
     except Exception as exc:                                  # noqa: BLE001
         logger.warning('refit on all data failed (%s); falling back',
                        str(exc)[:120])

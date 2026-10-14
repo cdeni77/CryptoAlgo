@@ -50,6 +50,21 @@ from scripts._common import (
 )
 
 
+def stack_table(models) -> pd.DataFrame:
+    """One row per fold of a stacked run: a, b, c and the stage-2 sample."""
+    rows = []
+    for i, model in enumerate(models):
+        if not hasattr(model, 'stack_summary'):
+            continue
+        s = model.stack_summary()
+        rows.append({'fold': i, 'a': round(s['a'], 4), 'b': round(s['b'], 4),
+                     'c': round(s['c'], 4), 'n_stage2_rows': s['n_rows'],
+                     'fitted': s['fitted'],
+                     'oof_skill_vs_market': s['inner_market_log_loss']
+                     - s['inner_log_loss']})
+    return pd.DataFrame(rows)
+
+
 def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -79,6 +94,13 @@ def main() -> int:
         print(f'\n  Read the {report.folds_positive}/{report.folds_total} agreement with '
               f'the p-value beside it ({report.sign_agreement_p_value:.3f}): under no '
               f'skill\n  each fold is a coin flip, so this much agreement is not rare.')
+
+    stack = stack_table(result.models)
+    if not stack.empty:
+        print('\n  stage 2 per fold — b is how much of the spot model\'s disagreement '
+              'with the\n  price survives out of fold (0 = the price is right, '
+              '1 = all of it):')
+        print('    ' + stack.to_string(index=False).replace('\n', '\n    '))
 
     per_offset = report.per_offset()
     if not per_offset.empty:
@@ -155,7 +177,10 @@ def main() -> int:
                   'model_minus_market': market.get('model_minus_market'),
                   'market_windows': market.get('market_windows'),
                   'gates_passed': gates_passed(gates),
-                  'failed_gates': [g.name for g in gates if not g.passed]})
+                  'failed_gates': [g.name for g in gates if not g.passed],
+                  **({'stack_b_median': float(stack['b'].median()),
+                      'stack_a_median': float(stack['a'].median())}
+                     if not stack.empty else {})})
 
     if args.out:
         out = Path(args.out)
@@ -172,6 +197,7 @@ def main() -> int:
             'fold_geometry': report.fold_geometry,
             'config': report.config_provenance,
             'per_offset': per_offset.to_dict('records'),
+            'stack': stack.to_dict('records'),
             'rejections': result.rejections.to_dict(),
         }, indent=2, default=str))
         print(f'\nwrote {out}/scored.parquet, trades.parquet, report.json')

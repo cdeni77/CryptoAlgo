@@ -348,6 +348,20 @@ class Config:
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'
+    # Two-stage stacking. 'spot_then_market' fits stage 1 (a baseline-init
+    # correction on `stack_spot_groups`) on every training row of the fold —
+    # five years of clean bars — and stage 2 only on rows carrying a usable
+    # quote: logit p = a*logit(market) + b*(logit(p_spot) - logit(market))
+    # [+ c] [+ L2 linear terms on `stack_book_features`]. `b` is how much of the
+    # spot model's disagreement with the price survives. Stage-2 rows see
+    # stage 1 only out of sample, via `stack_crossfit_blocks` blocked fits.
+    stack_mode: str = 'off'
+    stack_spot_groups: tuple[str, ...] = ('vol_state', 'microstructure',
+                                          'cross_asset', 'geometry', 'offset')
+    stack_book_features: tuple[str, ...] = ()
+    stack_l2: float = 1.0
+    stack_crossfit_blocks: int = 4
+    stack_intercept: bool = False
     # **The rolling training window, in days. None means expanding.**
     #
     # Expanding is what `scripts/promote.py` actually deploys — the Sunday
@@ -649,6 +663,15 @@ class Config:
     # other two, so live traded quotes the evaluation would have discarded.
     # `QUOTE_MAX_AGE_SECONDS` still overrides it, for every reader at once.
     max_quote_age_seconds: float = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
+    # RESEARCH: which `venue_depth` observers may price a row. Empty keeps every
+    # source (ranked by QUOTE_SOURCE_PRIORITY); e.g. ('live_touch', 'live_ws',
+    # 'live') excludes the Predexon backfill, whose >30s-stale asks sit a median
+    # ~13-16c off the contemporaneous live ask.
+    quote_sources: tuple[str, ...] = ()
+    # What a quote with NO recorded age means. 'fresh' keeps it (the historical
+    # behaviour); 'stale' drops it, after deriving an age bound for `live_touch`
+    # rows from `available_time - event_time` (see `core.quotes`).
+    null_quote_age: str = 'fresh'
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted
     # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
@@ -805,10 +828,17 @@ class Config:
         # Typos here would otherwise surface deep inside a fold's fit.
         for name, allowed in (('final_layer', ('scale', 'blend')),
                               ('model_type', ('lgbm', 'logistic')),
-                              ('label_source', ('proxy', 'venue'))):
+                              ('label_source', ('proxy', 'venue')),
+                              ('null_quote_age', ('fresh', 'stale')),
+                              ('stack_mode', ('off', 'spot_then_market'))):
             if getattr(self, name) not in allowed:
                 raise ValueError(f'{name}={getattr(self, name)!r}; expected one '
                                  f'of {allowed}')
+        if int(self.stack_crossfit_blocks) < 2:
+            raise ValueError(f'stack_crossfit_blocks must be at least 2; got '
+                             f'{self.stack_crossfit_blocks}')
+        if self.stack_l2 < 0.0:
+            raise ValueError(f'stack_l2 must not be negative; got {self.stack_l2}')
         if int(self.ensemble_size) < 1:
             raise ValueError(f'ensemble_size must be at least 1; got '
                              f'{self.ensemble_size}')
