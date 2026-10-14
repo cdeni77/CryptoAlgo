@@ -1,28 +1,20 @@
-"""Kalshi's `orderbook_delta`, normalized.
+"""Kalshi's `orderbook_delta` WebSocket channel, normalized to `BookEvent`.
 
-The handshake reuses `KalshiClient._headers` verbatim: that method takes the
-already-prefixed path and signs `timestamp + METHOD + path`, while `_request` is
-what adds `/trade-api/v2`. So the correct WebSocket signature is
-`_headers('GET', '/trade-api/ws/v2')` with no change to the signing code.
-`Content-Type: application/json` is dropped from the handshake headers — it
-describes a body an upgrade request does not have.
+The handshake signs with `KalshiClient._headers('GET', '/trade-api/ws/v2')`.
+It drops `Content-Type`, because an upgrade request has no body.
 
-**Every field name below was read off the live venue, not the documentation.**
-The published guide implies `price` and `delta`; the wire says:
+The wire field names differ from the documentation and from REST:
 
     orderbook_snapshot  msg: market_ticker, market_id, yes_dollars_fp, no_dollars_fp
     orderbook_delta     msg: market_ticker, market_id, price_dollars, delta_fp,
                              side, ts, ts_ms
     both          top-level: type, sid, seq, msg
 
-Note the naming inversion against REST, which is a live trap: REST serves
-`orderbook_fp.yes_dollars`, the stream serves `msg.yes_dollars_fp`. Reading one
-shape against the other yields an empty book and no exception.
+REST serves `orderbook_fp.yes_dollars`; the stream serves `msg.yes_dollars_fp`.
+Reading one shape as the other yields an empty book and no exception.
 
-`delta_fp` is a SIGNED CHANGE ("-5.00"), not a resulting size, so delta events
-carry `absolute=False` and the cache adds them to what is resting. Prices and
-sizes are fixed-point strings, the same convention `KalshiClient` already parses
-for REST quotes.
+`delta_fp` is a signed change, not a resulting size, so delta events carry
+`absolute=False`. Prices and sizes are fixed-point dollar strings.
 """
 from __future__ import annotations
 
@@ -53,11 +45,7 @@ def _levels(raw) -> list[Level]:
 
 
 def rest_levels(book: dict) -> tuple[list[Level], list[Level]]:
-    """The same ladder from `GET /markets/{t}/orderbook`, for cross-checking.
-
-    Note `orderbook_fp` here against `_dollars_fp` on the stream — the two
-    surfaces spell the same content differently.
-    """
+    """The same ladder from `GET /markets/{t}/orderbook`, for cross-checking."""
     ladder = book.get('orderbook_fp') or book.get('orderbook') or {}
     return (_levels(ladder.get('yes_dollars') or ladder.get('yes')),
             _levels(ladder.get('no_dollars') or ladder.get('no')))
@@ -66,9 +54,7 @@ def rest_levels(book: dict) -> tuple[list[Level], list[Level]]:
 def parse_frame(payload: dict, received: float) -> Optional[BookEvent]:
     """A book message as a BookEvent, or None for anything else.
 
-    **Never raises.** A subscribe acknowledgement, a heartbeat and an error
-    frame all arrive on this socket, and a parser that crashed on one would take
-    the whole stream down over a message carrying no book.
+    Never raises: acknowledgements, heartbeats and error frames share the socket.
     """
     if not isinstance(payload, dict):
         return None

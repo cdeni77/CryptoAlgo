@@ -1,45 +1,26 @@
 """The Kalshi trading client: quotes, balance, orders, fills.
 
-**Markets are resolved by asking the venue, never by building a ticker.** A
-15-minute up/down market has a ticker, and it would be easy to construct one
-from a series prefix, a date and a time. That is a guess that keeps working
-until the venue renames a series or changes a format, and then it fails by
-finding *no* market — or, far worse, the wrong one. So `resolve_window_market`
-lists the venue's own markets and picks the one whose close time is the window's
-settlement. It re-derives its answer from the venue every run and fails loudly
-when the venue moves.
+Markets are resolved by asking the venue, never by building a ticker.
+`resolve_window_market` lists the venue's markets and picks the one whose
+`close_time` is the window's settlement. A built ticker can silently match the
+wrong market after a venue rename.
 
-Two measured reasons this is not over-caution. `KXBTCD` looks like the daily
-Bitcoin series and is in fact hourly with an explicit strike in the ticker
-(`KXBTCD-26AUG2317-T86749.99`) — a threshold ladder, not an up/down market;
-pointed at it, every window abstained with the distance printed rather than
-trading a contract 30 minutes away. And the 15-minute tickers are named in
-**Eastern** time while `close_time` is UTC: `KXBTC15M-26AUG230045` closes at
-04:45Z, because 00:45 EDT is 04:45 UTC. Parsing the ticker for its settlement
-would mean hardcoding the venue's timezone and its daylight-saving rule, and
-would be wrong twice a year. `close_time` is unambiguous, so that is what is
-compared.
+Compare `close_time` (UTC), not the ticker. The 15-minute tickers are named in
+Eastern time, so `KXBTC15M-26AUG230045` closes at 04:45Z. `KXBTCD` is an hourly
+strike ladder, not an up/down market.
 
-The venue lists **one open market per series** — the window currently running.
-The next is created when this one settles, so a lookahead resolution correctly
-finds nothing, and the live loop only ever needs the window it is inside.
+The venue lists one open market per series: the window now running.
 
-**Live decisions must be priced against the real book.** The backtest has no
-quote history, so it stands the calibrated baseline in for the market — a
-deliberate, conservative null. A live decision has no such excuse: it reads the
-bid and ask, and `Prediction.price_source` records which of the two priced it.
-A row that cannot tell those apart makes a backtest look like a fill.
+Live decisions are priced against the real book. `Prediction.price_source`
+records whether a decision used the book or the baseline.
 
-**Nothing places an order unless it is asked twice.** `place_order` refuses
-unless the client was constructed with `live=True`, and every caller defaults to
-dry run. The failure mode being designed against is a script that was meant to
-observe and instead traded, which is unrecoverable in a way a missed trade is
-not.
+Safety: `place_order` refuses unless the client was constructed with
+`live=True`, and every caller defaults to dry run.
 
-Authentication is an RSA key, not an HMAC secret: Kalshi signs
-`timestamp + method + path` with RSA-PSS over SHA-256 and sends the signature
-base64 in `KALSHI-ACCESS-SIGNATURE`, the key id in `KALSHI-ACCESS-KEY`, and
-milliseconds since the epoch in `KALSHI-ACCESS-TIMESTAMP`.
+Authentication is RSA, not HMAC. The client signs `timestamp + method + path`
+with RSA-PSS over SHA-256. Headers: the base64 signature in
+`KALSHI-ACCESS-SIGNATURE`, the key id in `KALSHI-ACCESS-KEY`, and epoch
+milliseconds in `KALSHI-ACCESS-TIMESTAMP`.
 """
 
 from __future__ import annotations
@@ -68,16 +49,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
 DEMO_BASE_URL = 'https://demo-api.kalshi.co/trade-api/v2'
 
-# **The historical tier is a different host, and that is not a typo.** Since
-# 2026-02-19 the venue partitions its data: the live endpoints serve roughly the
-# last three months and refuse to look further back, and everything older moved
-# to `/historical/...`. Those routes answer on `external-api.kalshi.com` while
-# this account's trading routes answer on the host above, so a single base URL
-# cannot reach both. Building a complete fill history means querying the live
-# endpoint and the historical one and merging — which is what `all_fills` does.
-#
-# Overridable, because a venue that split its hosts once can merge them again,
-# and the failure mode is a 404 that names a route rather than a wrong number.
+# The historical tier is on a different host. The live endpoints serve about
+# the last three months; older data answers on `/historical/...` at this host.
+# A complete history queries both and merges them (see `all_fills`).
 HISTORICAL_BASE_URL = 'https://external-api.kalshi.com/trade-api/v2'
 
 # Kalshi quotes in whole cents, 1..99, through the middle of the range.
@@ -85,9 +59,7 @@ CENT = 0.01
 # ...and in tenths of a cent below 10c and above 90c (`tapered_deci_cent`).
 DECI_CENT = 0.001
 
-# Sorts a row the venue gave no timestamp to, without dropping it. `None`
-# is not orderable against a datetime, and a ledger that raises on one
-# missing field is worse than one that puts that row last.
+# Sort key for a row with no timestamp. It sorts first instead of raising.
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -121,19 +93,10 @@ def _load_private_key(pem: str | bytes):
 
 @dataclass(frozen=True)
 class Quote:
-    """One side of the book, as probabilities rather than cents.
+    """One market's book, as probabilities in [0, 1], not cents.
 
-    Converted at the boundary on purpose: everything above this module reasons on
-    the probability scale, and a stray factor of 100 between cents and dollars is
-    the classic bug in a binary system.
-
-    **The venue serves prices as dollar-denominated strings**, in fields suffixed
-    `_dollars`: `yes_bid_dollars: "0.1900"`. This module originally read integer
-    cents from `yes_bid`, which is absent — so every quote parsed as null, every
-    book looked empty, and the first live sampling run reported "no two-sided
-    book on any symbol" against a market that was quoting 0.19/0.20 with 1,594
-    contracts on the bid. Both encodings are accepted now, because a venue that
-    changed once can change back.
+    The venue serves prices as dollar strings (`yes_bid_dollars: "0.1900"`).
+    The integer-cent fields (`yes_bid: 19`) come back null. Both are accepted.
     """
 
     ticker: str
@@ -146,27 +109,19 @@ class Quote:
     open_interest: int
     close_time: Optional[datetime]
     status: str
-    # Contracts resting at the touch. The depth assumption
-    # (`Config.max_stake_dollars`) has been an unmeasured guess; these make it
-    # measurable, and the first observation was 59 contracts on the ask at 20c —
-    # about $12, well under the $25 the sizing rules were willing to stake.
+    # Contracts resting at the touch.
     yes_bid_size: Optional[float] = None
     yes_ask_size: Optional[float] = None
-    # **Which exchange the market lives on.** The order body's `exchange_index`
-    # defaults to 0, and on 2026-08-25 every KX*15M market reported 2 — orders
-    # defaulting to 0 came back `404 market_not_found` for a market every read
-    # endpoint confirmed was active. 274 orders had filled earlier the same night,
-    # so the series moved rather than the code breaking. Carrying the market's own
-    # value means a future migration costs nothing.
+    # The exchange the market lives on. An order must carry the market's own
+    # `exchange_index`; the venue answers `404 market_not_found` otherwise.
     exchange_index: int = 0
-    # The number the market settles against, published once the window opens.
-    # The live path should prefer this over anything computed from bars.
+    # The strike the market settles against, published once the window opens.
+    # Prefer it over a strike computed from bars.
     floor_strike: Optional[float] = None
     strike_type: Optional[str] = None
     open_time: Optional[datetime] = None
-    # Where the touch came from ('stream' or 'rest'), when it was read (epoch
-    # seconds), and the full ladder behind it, so depth features and the
-    # archive describe the same snapshot the decision priced.
+    # The touch's source ('stream' or 'rest'), its read time (epoch seconds),
+    # and the full ladder, so depth features describe the priced snapshot.
     book_source: Optional[str] = None
     book_time: Optional[float] = None
     yes_levels: tuple = ()
@@ -205,12 +160,9 @@ class Quote:
 
 
 def _price(raw: dict, name: str) -> Optional[float]:
-    """A price in dollars, from whichever encoding the venue used.
+    """A price in dollars, or None for an absent or zero level.
 
-    Kalshi serves `yes_bid_dollars: "0.1900"` — a string, already in dollars.
-    Older documentation describes `yes_bid: 19`, an integer in cents. Reading only
-    the second gets None from a live market and an empty book from a market that
-    is quoting, so both are tried and the dollar form wins.
+    Reads `{name}_dollars` (a dollar string) first, then `{name}` (integer cents).
     """
     dollars = raw.get(f'{name}_dollars')
     if dollars is not None:
@@ -256,19 +208,10 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 
 def _money(raw: dict, name: str) -> Optional[float]:
-    """A dollar amount, from whichever encoding the venue used. **Zero is a value.**
+    """A dollar amount. Zero is a value; None means absent or unparseable.
 
-    Same trap as `_price` and a different resolution. The venue serves
-    `revenue_dollars: "21.0000"` alongside a legacy `revenue: 2100` in integer
-    cents, so the suffixed form has to win or the number is 100x wrong.
-
-    But `_price` maps a zero to None deliberately — a zero *quote* means there is
-    no level there, not that a contract is free. On a settlement that reasoning
-    inverts: **a losing position settles at revenue exactly 0**, and the loss is
-    the whole point of recording it. Reusing `_price` here would have turned every
-    loser into a missing measurement, which is the one direction of error an
-    equity curve must never make. So zero is returned as zero, and only a genuinely
-    absent or unparseable field is None.
+    Reads `{name}_dollars` first, then `{name}` in integer cents. Unlike `_price`,
+    zero stays zero: a losing position settles at revenue exactly 0.
     """
     dollars = raw.get(f'{name}_dollars')
     if dollars is not None:
@@ -288,26 +231,10 @@ def _money(raw: dict, name: str) -> Optional[float]:
 
 
 def _fee(raw: dict, name: str = 'fee_cost') -> Optional[float]:
-    """A fee, which is **already in dollars** even without the `_dollars` suffix.
+    """A fee in dollars. Zero is a value; None means absent or unparseable.
 
-    `_money` falls back to multiplying an unsuffixed field by a cent, which is
-    right for `revenue` (the venue serves `revenue: 500` for a $5.00 payout) and
-    wrong here. The venue does not serve `fee_cost_dollars` on a settlement at
-    all, so that fallback fired every time and stored the fee a hundred times too
-    small — and `pnl = revenue - cost - fee_cost` was inflated by the difference.
-    Measured on the live account: 365 settlements reported $0.28 of fees against
-    roughly $28 actually charged, and realised P&L read $40.34 instead of about
-    $12.62.
-
-    The proof is the published schedule. A live row with five NO contracts at
-    $4.515 carried `fee_cost: 0.030700`, and
-    `ceil(0.07 * 5 * p * (1-p) * 10000) / 10000` with `p = 4.515/5` is 0.0307 —
-    the fee in dollars, to the hundredth of a cent, exactly as `core/costs.py`
-    computes it. A fee is never a round number of cents on this venue, so an
-    unsuffixed `fee_cost` that is already fractional cannot be cents.
-
-    The suffixed form still wins where the venue sends one, and zero stays zero:
-    a settlement really can be charged nothing.
+    Unsuffixed `fee_cost` is already in dollars, unlike `revenue`, which is in
+    cents. `{name}_dollars` wins when the venue sends it.
     """
     dollars = raw.get(f'{name}_dollars')
     if dollars is not None:
@@ -330,16 +257,11 @@ def _fee(raw: dict, name: str = 'fee_cost') -> Optional[float]:
 class Fill:
     """One execution, as the venue recorded it. The account of record for entry.
 
-    Our own `Position` row says what we *believed* we bought: the price `decide()`
-    sized at and the fee it predicted from the published schedule. This says what
-    happened. They differ whenever an order partially fills, fills better than the
-    limit, or is charged a fee we mispriced — 16 of the first 323 live fills were
-    partial — and where they differ this one is right.
+    Where it differs from our `Position` row (partial fill, price improvement,
+    fee), this one is right.
 
-    `price` is what was paid for `side`, on the probability scale, which is the
-    scale everything above this module reasons on. The venue quotes a single
-    YES-denominated book, so a NO fill arrives as `no_price` and the two are not
-    interchangeable: reading `yes_price` on a NO fill books a 30c purchase as 70c.
+    `price` is what was paid for `side`, in dollars per contract. A NO fill
+    carries its price in `no_price`, not `yes_price`.
     """
 
     trade_id: str
@@ -358,14 +280,8 @@ class Fill:
 class Settlement:
     """One market resolved, as the venue paid it. The account of record for PnL.
 
-    This is the row that replaces our arithmetic. We settle from an OHLC mean of
-    Coinbase standing in for sixty seconds of CF Benchmarks BRTI — a close proxy
-    that will sometimes disagree — and we predict the fee from the published
-    schedule. The venue does neither: it knows what it paid and what it charged.
-
-    `pnl` is `revenue - cost - fee_cost` and is `None` when any of the three was
-    absent, rather than treating a missing field as zero. A settlement whose
-    revenue did not parse is not a break-even trade.
+    It overrides our own settlement, which uses Coinbase as a proxy for CF
+    Benchmarks BRTI, and our predicted fee.
     """
 
     ticker: str
@@ -393,14 +309,10 @@ class Settlement:
 
     @property
     def pnl(self) -> Optional[float]:
-        """Realised profit on this market. `None` when the venue left a gap.
+        """`revenue - cost - fee_cost`, or None when revenue or cost is absent.
 
-        The fee is subtracted rather than assumed netted out. Kalshi charges at
-        order time and settlement is free, so `revenue` is the payout and
-        `fee_cost` is a separate debit that already left the balance. Getting that
-        assumption backwards double-counts the fee, which is why
-        `venue_ledger.balance_check` compares the ledger's own cash flows against
-        the venue's balance instead of trusting this arithmetic unattended.
+        A missing field is not a zero. `revenue` is the payout; `fee_cost` is a
+        separate debit charged at order time.
         """
         cost = self.cost
         if self.revenue is None or cost is None:
@@ -410,28 +322,14 @@ class Settlement:
 
 @dataclass(frozen=True)
 class Trade:
-    """One print on the public tape. **Anonymous, and not ours.**
+    """One print on the public tape, by any account. Never use it for P&L.
 
-    `/historical/trades` and `/markets/trades` serve every trade the exchange
-    printed in a market, by anyone. There is no account field, no side that is
-    "ours", and nothing that distinguishes our 5 contracts from a stranger's 500 —
-    so this cannot compute a portfolio, and reading a tape total as a position is
-    how a P&L page comes to show someone else's money.
+    `/historical/trades` and `/markets/trades` carry no account id. The `taker_*`
+    fields name the aggressor's side, not ours.
 
-    **The `taker_*` fields do not make it ours.** The payload carries
-    `taker_outcome_side`, `taker_side` and `taker_book_side`, which is the closest
-    this endpoint comes to naming a participant — and what they name is which side
-    the *aggressor of that print* crossed on. Any account could be the aggressor,
-    including someone else's. There is still no account id, so a tape filtered to
-    `taker_outcome_side == 'yes'` is not our buys; it is everybody's.
-
-    What it is good for is the two things a portfolio page actually lacks: a
-    market-observed last price to mark an open position at (our own forecast must
-    never do that job — marking a binary at the probability we believe books
-    conviction as profit), and an independent check that a fill printed at the
-    price the venue told us it did. `Fill.trade_id` joins to `trade_id` here, and
-    for a fill where `Fill.is_taker` is true `taker_side` should agree with
-    `Fill.side` — which is what makes the check a check rather than a restatement.
+    Uses: a market price to mark an open position, and a check that a fill
+    printed where the venue said (join on `trade_id`). For a taker fill,
+    `taker_side` matches `Fill.side`.
     """
 
     trade_id: str
@@ -441,9 +339,8 @@ class Trade:
     no_price: Optional[float]
     created_time: Optional[datetime]
     is_block_trade: Optional[bool]
-    # Which side the aggressor took, in this project's vocabulary ('up'/'down'),
-    # and which side of the book they hit ('bid'/'ask', kept verbatim because it
-    # is the venue's own single-book language and not a direction).
+    # The aggressor's side ('up'/'down'), and the book side hit ('bid'/'ask',
+    # verbatim from the venue).
     taker_side: Optional[str] = None
     taker_book_side: Optional[str] = None
 
@@ -463,13 +360,9 @@ def _bool(value: Any) -> Optional[bool]:
 
 
 def parse_fill(raw: dict) -> Fill:
-    """A fills row, in this project's vocabulary.
+    """A fills row, with side 'yes'/'no' mapped to 'up'/'down'.
 
-    The side mapping is the load-bearing part. The venue names the YES book:
-    `side: "yes"` is a YES contract and `side: "no"` is a NO contract, which this
-    project calls 'up' and 'down'. Anything else is carried through verbatim
-    rather than guessed at, because a mislabelled side inverts a trade's PnL and
-    an unfamiliar string is not evidence for either direction.
+    An unknown side passes through verbatim. A guessed side would invert PnL.
     """
     side_raw = str(raw.get('side', '')).strip().lower()
     side = {'yes': 'up', 'no': 'down'}.get(side_raw, side_raw)
@@ -491,13 +384,8 @@ def parse_fill(raw: dict) -> Fill:
 def parse_settlement(raw: dict) -> Settlement:
     """A settlements row, in dollars, with zeros preserved.
 
-    Money fields go through `_money`, so a `revenue` of 0 on a lost market stays 0
-    rather than becoming a missing measurement.
-
-    **`fee_cost` does NOT go through `_money`** — see `_fee`. The venue serves
-    `revenue` in integer cents and `fee_cost` in dollars, both unsuffixed, so the
-    one cents fallback cannot serve both. Reading the fee through it divided every
-    fee by a hundred and inflated every settled trade's P&L.
+    `fee_cost` goes through `_fee`, not `_money`: unsuffixed, it is already in
+    dollars, while unsuffixed `revenue` is in cents.
     """
     return Settlement(
         ticker=str(raw.get('ticker') or ''),
@@ -518,9 +406,7 @@ def parse_settlement(raw: dict) -> Settlement:
 def parse_trade(raw: dict) -> Trade:
     """A tape print. The taker side is translated; the book side is not.
 
-    `taker_outcome_side` is preferred over `taker_side`: the payload serves both,
-    which is the venue's usual pattern for a field it has renamed, and reading the
-    older name first would go stale silently the day the alias is dropped.
+    Prefers `taker_outcome_side`, the newer name, over its alias `taker_side`.
     """
     taker = raw.get('taker_outcome_side') or raw.get('taker_side')
     taker_side = None
@@ -563,8 +449,7 @@ class KalshiClient:
         self._pem = pem
         self._key = _load_private_key(pem) if pem else None
         self.base_url = (base_url or os.getenv('KALSHI_BASE_URL') or DEFAULT_BASE_URL).rstrip('/')
-        # The host for `/historical/...` only. Defaults to a different host from
-        # `base_url` on purpose — see HISTORICAL_BASE_URL.
+        # The host for `/historical/...` only. See HISTORICAL_BASE_URL.
         self.historical_base_url = (
             historical_base_url or os.getenv('KALSHI_HISTORICAL_BASE_URL')
             or HISTORICAL_BASE_URL
@@ -624,14 +509,8 @@ class KalshiClient:
                        base: Optional[str] = None) -> dict:
         if self._session is None:
             raise KalshiError('client is not open; use `async with KalshiClient(...)`')
-        # The signature covers the path without the query, so build it from the
-        # same string that is signed rather than from the final URL.
-        #
-        # `base` names a different HOST, never a different path prefix: the
-        # historical tier answers on `external-api.kalshi.com` under the same
-        # `/trade-api/v2` mount, so the signed string is identical and only the
-        # host changes. Deriving the signature from the URL instead would sign a
-        # different string per host and every historical read would 401.
+        # The signature covers the path without the query or host. `base`
+        # changes only the host; both hosts mount `/trade-api/v2`.
         signed_path = f'/trade-api/v2{path}'
         headers = self._headers(method, signed_path)
         url = f'{(base or self.base_url).rstrip("/")}{path}'
@@ -651,35 +530,16 @@ class KalshiClient:
     async def balance(self, *, exchange_index: Optional[int] = None) -> float:
         """Available balance in dollars, or NaN when the venue did not say.
 
-        Pass `exchange_index` to get the balance **spendable on that shard**,
-        which is the only figure an order against a market on it can draw on.
-        Omit it for the whole-account total.
-
-        Two corrections. It read only the integer-cent `balance` field, while
-        every other number in this file prefers the `_dollars` form — this module
-        already learned that lesson for quotes, where reading only the cents
-        field reported "no two-sided book" against a market quoting 0.19/0.20.
-        A venue that serves `balance_dollars` here would have been read 100x low.
-
-        And a missing or unparseable field defaulted to `0`, silently, producing a
-        plausible-looking $0.00. That is the worst possible failure for this
-        particular number: `reconcile_with_venue` writes it straight onto the
-        account, so a parse change would have overwritten a correct bankroll with
-        zero — and `check_venue.py` treats a zero balance as a legitimate
-        outcome ("a zero balance still proves auth"), so the one script whose job
-        is to catch this would have printed OK. NaN instead, which the callers
-        already treat as unsafe.
+        Pass `exchange_index` for the balance spendable on that shard. Omit it
+        for the whole-account total. Prefers `balance_dollars` over `balance`
+        (cents). Returns NaN, never 0, for a missing field, because callers
+        write the balance onto the account.
         """
         payload = await self._request('GET', '/portfolio/balance')
 
-        # **Balances are local to an exchange shard.** Kalshi shards by category
-        # and `balance_breakdown` carries one entry per `exchange_index`. The
-        # KX*15M crypto series report shard 2, and on 2026-08-25 this account had
-        # $106.61 on shard 0 and $1.35 on shard 2 — so `balance_dollars` of
-        # $107.96 was 80x the capital an order could actually reach, and every
-        # order came back `insufficient_balance` against an apparently healthy
-        # balance. A caller that names the shard gets what it can spend there; a
-        # caller that does not keeps the whole-account meaning.
+        # Balances are local to an exchange shard. `balance_breakdown` has one
+        # entry per `exchange_index`, and an order can spend only its market's
+        # shard.
         if exchange_index is not None:
             breakdown = payload.get('balance_breakdown')
             if isinstance(breakdown, list) and breakdown:
@@ -690,12 +550,9 @@ class KalshiClient:
                     except (TypeError, ValueError):
                         logger.error('balance_breakdown row was %r', row)
                         return float('nan')
-                # A shard the venue does not list holds nothing. Reporting the
-                # total here would be the original bug wearing a new name.
+                # A shard the venue does not list holds nothing.
                 return 0.0
-            # No breakdown at all: an older response shape, or a venue that does
-            # not shard. Falling through to the total is right, and refusing
-            # would halt trading on a venue behaving correctly.
+            # No breakdown: the venue does not shard, so use the total.
 
         dollars = payload.get('balance_dollars')
         if dollars is not None:
@@ -737,9 +594,8 @@ class KalshiClient:
     ) -> Optional[dict]:
         """Find the market for one 15-minute window by its close time.
 
-        Asks the venue for open markets in the series and returns the one closing
-        when this window settles. Returns None rather than guessing — a caller
-        that cannot find its market must abstain, not trade a neighbouring one.
+        Returns the open market in the series that closes when this window
+        settles, or None. A caller that gets None abstains.
         """
         candidates = await self.markets(
             series_ticker=series_ticker, status='open', limit=200)
@@ -787,22 +643,9 @@ class KalshiClient:
     def position_size(row: dict) -> float:
         """Signed contracts held in one market, from a positions row.
 
-        **The field is `position_fp`, and it is a fixed-point string.** The live
-        loop read `row['position']`, which V2 does not send at all, so
-        `int(row.get('position') or 0)` was `int(0)` for every row — every open
-        position looked closed. Measured against a position we had just watched
-        fill:
-
-            {"ticker": "KXBTC15M-26AUG241000-00", "position_fp": "-5.00",
-             "market_exposure_dollars": "2.150000", ...}
-
-        This is the same trap as the quote fields, which arrive as
-        `yes_bid_dollars` strings while the integer-cent fields documented
-        elsewhere come back null. `_quantity` already existed for it; the
-        positions path simply never used it.
-
-        Negative is a short YES, which is how a NO position is held — so callers
-        asking "is anything open here" want `!= 0`, not `> 0`.
+        The venue sends `position_fp`, a fixed-point string such as "-5.00";
+        `position` is absent. Negative is a NO position, so test `!= 0` for
+        "anything open".
         """
         return _quantity(row, 'position')
 
@@ -811,39 +654,22 @@ class KalshiClient:
         return list(payload.get('fills', []))
 
     async def settlements(self, **params) -> list[dict]:
-        """Settled positions, as the venue resolved them.
-
-        The authority on what a position was worth. Settling from our own bars
-        means settling against an OHLC mean of Coinbase standing in for sixty
-        seconds of CF Benchmarks BRTI — a close proxy that will sometimes
-        disagree, and when it does our books are wrong and the venue's are right.
-        """
+        """Settled positions, as the venue resolved them. The venue is authoritative."""
         payload = await self._request('GET', '/portfolio/settlements',
                                       params=_clean(params))
         return list(payload.get('settlements', []))
 
     # ---- the venue's own ledger ----------------------------------------
     #
-    # Everything below reads what the venue recorded, and it exists because our
-    # own arithmetic is not the account of record. The paper engine debits a
-    # bankroll at the price `decide()` sized at and the fee it predicted from the
-    # published schedule; live, both are guesses about someone else's ledger.
-    # Where they disagree the venue is right, and the first live night produced
-    # exactly that disagreement — see `adopt_venue_balance`.
+    # The venue's ledger is the account of record. Where it disagrees with our
+    # own arithmetic, the venue is right.
 
     async def historical_cutoff(self) -> dict[str, Optional[datetime]]:
         """Where the live tier stops and the historical tier begins.
 
-        Since 2026-02-19 the live endpoints refuse to look past a moving cutoff
-        (roughly three months). Reading it rather than assuming a retention
-        window is the same discipline as resolving a market by asking: a constant
-        keeps working until the venue moves it, and then the ledger is silently
-        short of its oldest rows.
-
-        Returns a dict of whatever timestamps the venue named, parsed to UTC. An
-        unreachable cutoff is not fatal — `all_fills` then queries both tiers
-        unconditionally, which is merely wasteful — so this returns `{}` rather
-        than raising.
+        The cutoff moves, so it is read, not assumed. Returns the venue's
+        timestamps parsed to UTC, or `{}` when unreachable; callers then query
+        both tiers.
         """
         try:
             payload = await self._request('GET', '/historical/cutoff',
@@ -861,14 +687,11 @@ class KalshiClient:
 
     async def _pages(self, path: str, key: str, *, base: Optional[str] = None,
                      max_pages: int = 40, **params) -> list[dict]:
-        """Follow the cursor to the end. Bounded, because an unbounded loop is not a read.
+        """Follow the cursor to the end, up to `max_pages`.
 
-        The venue pages at `limit` (200 max on these routes) and returns a
-        `cursor` for the next page; an empty or repeated cursor is the end. The
-        page cap is a circuit breaker rather than a limit anyone should hit — 40
-        pages is 8,000 rows — and it *logs* when it trips instead of silently
-        returning a truncated ledger, because a P&L short of its oldest fills
-        looks exactly like a P&L.
+        An empty or repeated cursor ends the read. `limit` is at most 200 on
+        these routes. Hitting the page cap logs an error, because the ledger is
+        then truncated.
         """
         rows: list[dict] = []
         cursor: Optional[str] = None
@@ -881,8 +704,7 @@ class KalshiClient:
             batch = payload.get(key) or []
             rows.extend(batch)
             cursor = payload.get('cursor') or None
-            # A cursor the venue repeats is a loop, not a next page. Observed on
-            # other venues at the last page; cheap to defend against.
+            # A repeated cursor is a loop, not a next page.
             if not cursor or cursor in seen or not batch:
                 return rows
             seen.add(cursor)
@@ -896,15 +718,7 @@ class KalshiClient:
                         limit: int = 200) -> list[Fill]:
         """Every fill, live tier and historical tier merged, newest first.
 
-        Two tiers and one ledger. The live route serves the last ~3 months and the
-        historical route everything before it, so a complete history means asking
-        both and merging — the venue's own documentation says so, and a caller that
-        asks only the live route gets a P&L that begins three months ago and looks
-        complete.
-
-        Deduplicated on `trade_id` because the tiers overlap around the cutoff:
-        the same fill can appear in both, and counting one twice doubles a
-        position's cost basis.
+        Deduplicated on `trade_id`, because the tiers overlap around the cutoff.
         """
         params: dict[str, Any] = {'limit': limit}
         if since is not None:
@@ -915,9 +729,7 @@ class KalshiClient:
             rows += await self._pages('/portfolio/fills/historical', 'fills',
                                       base=self.historical_base_url, **params)
         except KalshiError as exc:
-            # Not fatal, and not hidden. The live tier alone is a correct answer
-            # for a recent window and a wrong one for a lifetime P&L, so the
-            # caller is told which it got.
+            # Not fatal. The live tier alone is still right for a recent window.
             logger.warning(
                 'the historical fills tier was unavailable (%s); this ledger '
                 'covers the live tier only and is short of anything older than '
@@ -936,15 +748,10 @@ class KalshiClient:
 
     async def all_settlements(self, *, since: Optional[datetime] = None,
                               limit: int = 200) -> list[Settlement]:
-        """Every settled market, both tiers merged, newest first.
+        """Every settled market, both tiers merged, newest first. This is the P&L.
 
-        **This is the P&L.** A binary bought once and held pays exactly one fee at
-        entry and settles once at $1 or $0, so a settlement row is the complete
-        economic history of a position: what it cost, what it returned, what it
-        was charged. Our own books recompute all three from Coinbase bars and the
-        published fee schedule, and both are approximations of this.
-
-        Keyed by ticker, which is unique per settled market.
+        A held binary pays one fee at entry and settles once, so a settlement row
+        holds its cost, revenue and fee. Keyed by ticker.
         """
         params: dict[str, Any] = {'limit': limit}
         if since is not None:
@@ -973,13 +780,7 @@ class KalshiClient:
                             since: Optional[datetime] = None,
                             limit: int = 100,
                             historical: bool = False) -> list[Trade]:
-        """The public tape. **Everyone's trades, not ours — see `Trade`.**
-
-        Useful for exactly two jobs, and dangerous for a third. It marks an open
-        position at a price the market printed rather than at the probability we
-        believe, and it verifies that a fill printed where the venue said it did
-        (`Fill.trade_id` joins to `trade_id`). It cannot compute a portfolio: no
-        row here says who traded, so summing the tape sums the exchange.
+        """The public tape: every account's trades, not ours. See `Trade`.
 
         `historical=True` reads `/historical/trades` for prints older than the
         cutoff; the live route is `/markets/trades`.
@@ -993,15 +794,9 @@ class KalshiClient:
         return [parse_trade(raw) for raw in rows]
 
     async def reconcile(self, *, exchange_index: Optional[int] = None) -> dict:
-        """Balance, open positions and recent fills, as the venue sees them.
+        """Balance, open positions, recent fills and settlements, from the venue.
 
-        One call site for everything authoritative, so the live loop can compare
-        its own arithmetic against the account of record rather than assume the
-        two agree.
-
-        `exchange_index` narrows the balance to the shard the traded markets live
-        on. Without it the cross-shard total is reported, which is not money any
-        single order can draw on — see `balance`.
+        `exchange_index` narrows the balance to one shard. See `balance`.
         """
         balance = await self.balance(exchange_index=exchange_index)
         positions = await self.positions()
@@ -1038,14 +833,8 @@ class KalshiClient:
 
         Refuses unless the client was constructed with `live=True`.
 
-        The default is `immediate_or_cancel`, not `fill_or_kill`. Both refuse to
-        rest — correct on a wasting asset, where an order filling eight minutes
-        later is filling against a barrier probability that no longer holds — but
-        `fill_or_kill` is all-or-nothing. Nine contracts wanted against five
-        resting returns nothing at all; `immediate_or_cancel` takes the five.
-        With a positive edge a partial fill strictly beats a kill, and the
-        accounting already handles partials (16 of the first 323 live fills were
-        partial).
+        Defaults to `immediate_or_cancel`: the order never rests on a wasting
+        market, and a partial fill beats the nothing `fill_or_kill` returns.
         """
         if not self.live:
             raise NotLiveError(
@@ -1058,38 +847,22 @@ class KalshiClient:
         if contracts < 1:
             raise ValueError(f'contracts must be at least 1, got {contracts}')
 
-        # V2. The V1 endpoint returns 410 `deprecated_v1_order_endpoint`, found on
-        # the first real cycle — no amount of testing against our own mocks would
-        # have caught it.
+        # V2 orders (V1 returns 410). V2 quotes one book from the YES side:
+        # `bid` buys YES, `ask` sells YES, and selling YES buys NO at
+        # `1 - price`. There is no `action`, `type` or `yes_price`/`no_price`,
+        # and `self_trade_prevention_type` is required.
         #
-        # This is not a renamed path. V2 quotes a SINGLE book from the YES side:
-        # `bid` means buy YES, `ask` means sell YES, and selling YES is
-        # economically buying NO at `1 - price`. There is no `action`, no `type`,
-        # no `yes_price`/`no_price`, and `self_trade_prevention_type` is required.
-        #
-        # So `limit_price` arrives as what we would PAY for `side` (that is what
-        # `decide` computes) and has to be converted to a YES-denominated limit:
-        # paying 0.30 for NO is selling YES at 0.70. Sending 0.30 as an `ask`
-        # would offer to sell YES at thirty cents — the same class of error as
-        # inverting the side outright, and the mutation that survived all 230
-        # tests before this was written.
+        # `limit_price` is what we pay for `side`. Convert it to a YES limit:
+        # paying 0.30 for NO is selling YES at 0.70.
         book_side = 'bid' if side == 'up' else 'ask'
         yes_limit = limit_price if side == 'up' else 1.0 - limit_price
 
-        # Round so the limit never becomes one that CANNOT fill. A bid fills
-        # against asks at or below it, so round up; an ask fills against bids at
-        # or above it, so round down. Rounding the wrong way under `fill_or_kill`
-        # is a guaranteed kill, which the old code did in the tails by using
-        # banker's rounding on a deci-cent ladder.
+        # Round so the limit can still fill: a bid rounds up, an ask rounds down.
+        # Round onto the venue's tick (a tenth of a cent below 10c and above
+        # 90c), so the order never reaches past the chosen limit by a whole cent.
         #
-        # Round onto the venue's own tick, not a whole cent. Below 10c and above
-        # 90c the tick is a tenth of a cent, and ceiling to a cent there handed
-        # an immediate_or_cancel up to 0.9c of extra reach past the limit
-        # `order_limit_price` chose — levels the edge gate never admitted.
-        #
-        # Integer tenths of a cent, so the band edges (multiples of the coarse
-        # tick) stay exact. The epsilon absorbs binary representation: 0.60 is
-        # 599.999... tenths in float.
+        # Work in integer tenths of a cent. The epsilon absorbs float error:
+        # 0.60 is 599.999... tenths.
         step = int(round(float(tick_at(yes_limit)) / DECI_CENT))
         if book_side == 'bid':
             ticks = int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
@@ -1110,13 +883,11 @@ class KalshiClient:
             'count': f'{int(contracts)}.00',
             'price': f'{price:.4f}',
             'time_in_force': time_in_force,
-            # Required in V2. `taker_at_cross` crosses the spread, which is what a
-            # immediate_or_cancel on a wasting 15-minute market is for; `maker`
-            # would rest and is the opposite of the intent.
+            # Required in V2. `taker_at_cross` crosses the spread; `maker` would
+            # rest.
             'self_trade_prevention_type': 'taker_at_cross',
-            # Which exchange holds the market. Omitting it defaults to 0, and a
-            # market on another exchange is then simply not found — a 404 that
-            # names the market rather than the mismatch.
+            # The market's exchange shard. The default 0 gives a 404 for a
+            # market on another shard.
             'exchange_index': int(exchange_index),
         }
         if client_order_id:
@@ -1124,15 +895,8 @@ class KalshiClient:
         logger.info('placing %s (%s) %d @ %.4f YES on %s',
                     side, book_side, contracts, price, ticker)
         payload = await self._request('POST', '/portfolio/events/orders', body=body)
-        # **The venue's own answer, in full.** The caller reads `status` and a
-        # count off this reply and reports "did not fill" when neither is
-        # there — and the POST reply's shape is NOT the GET order record's, so
-        # `status` came back None on every attempt and the reason, whatever it
-        # is, was discarded unread. Ten consecutive kills on 2026-09-04 were
-        # diagnosed as a price miss on exactly this missing evidence, against a
-        # book the stream shows our limit was 2c through. Log both sides once
-        # per order: three lines a window is nothing, and the alternative is
-        # inferring a refusal from its absence.
+        # Log the request and the full reply. The POST reply's shape differs
+        # from the GET order record, so the reason for a kill is only here.
         logger.info('order request  %s', json.dumps(body, sort_keys=True))
         logger.info('order reply    %s', json.dumps(payload, sort_keys=True, default=str))
         return dict(payload.get('order', payload))
@@ -1142,10 +906,8 @@ class KalshiClient:
                                  max_pages: int = 3) -> Optional[dict]:
         """Find our order by the `client_order_id` we sent, or None.
 
-        `GET /portfolio/orders` has no server-side filter on it, so this lists
-        the market's orders (newest first; one 15-minute market holds a handful
-        of ours) and matches. None means the venue's listing does not show it,
-        which is not proof it was never accepted — the caller decides.
+        `GET /portfolio/orders` cannot filter on it, so this lists the market's
+        orders and matches. None does not prove the order was refused.
         """
         rows = await self._pages('/portfolio/orders', 'orders',
                                  max_pages=max_pages, ticker=ticker, limit=100)
@@ -1161,21 +923,13 @@ NAN = float('nan')
 def parse_orderbook(payload: dict) -> dict:
     """The touch of a REST orderbook, in YES-denominated terms.
 
-    **The shape is nested and its own thing.** A live response is
-    `{'orderbook': {'orderbook_fp': {'yes_dollars': [[price, size], ...],
-    'no_dollars': [...]}}}`, with prices AND sizes as decimal strings and the
-    deci-cent grid present in the tails. The stream sends different keys again
-    (`yes_dollars_fp`, `price_dollars`/`delta_fp`), and reading one shape
-    against the other yields an empty book and no exception — which is how a
-    book read can report "nothing there" about a market quoting thousands of
-    contracts. Every known shape is accepted here for exactly that reason.
+    A live response is `{'orderbook': {'orderbook_fp': {'yes_dollars':
+    [[price, size], ...], 'no_dollars': [...]}}}`, with decimal strings. The
+    stream uses other keys, so every known shape is accepted.
 
-    Kalshi's book is two BID stacks, so an ask is a conversion and not a field:
-    the YES ask is `1 - best_no_bid`. Sizes stay on the stack they came from —
-    `no_bid_size` is what a YES *buy* crosses.
-
-    NaN, never zero, on an empty stack: a settled market returns empty ladders,
-    and zero would read as a real price at the bottom of the grid.
+    The book is two bid stacks, so the YES ask is `1 - best_no_bid`.
+    `no_bid_size` is what a YES buy crosses. An empty stack gives NaN, never
+    zero.
     """
     raw = payload.get('orderbook', payload) if isinstance(payload, dict) else {}
     if not isinstance(raw, dict):
@@ -1249,9 +1003,8 @@ def quote_from_levels(meta: Quote, yes_levels, no_levels, *,
                       source: str, at: float) -> Quote:
     """`meta` (status, shard, strike) with the touch taken from a ladder.
 
-    Kalshi's book is two BID stacks, so both asks are conversions: buying YES
-    crosses the NO stack at `1 - best_no_bid`, and the size behind the YES ask
-    is what rests on the NO bid. An empty stack gives None, never zero.
+    The book is two bid stacks: the YES ask is `1 - best_no_bid`, and its size
+    is the NO bid's size. An empty stack gives None, never zero.
     """
     book = parse_orderbook({'yes': list(yes_levels or []),
                             'no': list(no_levels or [])})
@@ -1277,10 +1030,9 @@ def quote_from_levels(meta: Quote, yes_levels, no_levels, *,
 
 
 def market_meta(raw: dict) -> Quote:
-    """A market's metadata with NO touch: `/markets` caches its price fields.
+    """A market's metadata with the touch blanked.
 
-    Holding the cached touch on a metadata object is how it once got priced
-    against; with the fields blanked, a book read is the only way to a price.
+    `/markets` serves cached prices, so only a book read may price a decision.
     """
     return replace(_to_quote(raw), yes_bid=None, yes_ask=None, no_bid=None,
                    no_ask=None, yes_bid_size=None, yes_ask_size=None)
