@@ -95,7 +95,7 @@ def main() -> int:
               f'the p-value beside it ({report.sign_agreement_p_value:.3f}): under no '
               f'skill\n  each fold is a coin flip, so this much agreement is not rare.')
 
-    stack = stack_table(result.models)
+    stack = stack_table(getattr(result, 'models', ()) or ())
     if not stack.empty:
         print('\n  stage 2 per fold — b is how much of the spot model\'s disagreement '
               'with the\n  price survives out of fold (0 = the price is right, '

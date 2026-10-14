@@ -155,7 +155,9 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   max_age_seconds: float = DEFAULT_MAX_AGE,
                   peer_lag_minutes: int = 0,
                   sources: Sequence[str] = (),
-                  null_age: str = 'fresh') -> pd.DataFrame:
+                  null_age: str = 'fresh',
+                  peer_max_age_seconds: Optional[float] = None,
+                  peer_null_age: str = 'fresh') -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
     Joined on (symbol, window_open, offset) EXACTLY. Not as-of across offsets:
@@ -173,6 +175,12 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     depth. `null_age='stale'` (`Config.null_quote_age`) drops a quote with no
     age instead of treating it as fresh, after bounding `live_touch` ages from
     their own timestamps (`derived_quote_age`).
+
+    The PEER has its own cap, `peer_max_age_seconds` (None follows
+    `max_age_seconds`), and its own null-age rule, `peer_null_age`, which stays
+    'fresh' unless the caller asks: only ~5% of live Polymarket rows are 5s
+    fresh, so a tight Kalshi cap applied to the peer voids `venue_prob_gap`
+    almost everywhere.
     """
     out = windows.copy()
     for column in QUOTE_COLUMNS:
@@ -322,9 +330,11 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
             #
             # A missing stamp is kept: absence is not evidence of staleness, and
             # the backfilled fixtures carry rows without one.
-            page = _effective_age(peer, null_age)
-            pfresh = page.abs() <= max_age_seconds
-            if null_age == 'fresh':
+            peer_cap = (max_age_seconds if peer_max_age_seconds is None
+                        else float(peer_max_age_seconds))
+            page = _effective_age(peer, peer_null_age)
+            pfresh = page.abs() <= peer_cap
+            if peer_null_age == 'fresh':
                 pfresh = pfresh | page.isna()
             two_sided = pbid.notna() & pask.notna() & (pask >= pbid) & pfresh
             peer['pm_market_probability'] = ((pbid + pask) / 2.0).where(two_sided)

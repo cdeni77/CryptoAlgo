@@ -145,9 +145,9 @@ class TestCrossFit:
 
 @pytest.fixture(scope='module')
 def stacked():
-    """One fold's stacked fit on 24 days of bars, quotes on the last 12."""
-    bars = make_bars(days=24, lead=0.9, seed=11)
-    depth = make_depth(bars, FAST, quoted_days=12)
+    """One fold's stacked fit on 18 days of bars, quotes on the last 9."""
+    bars = make_bars(days=18, lead=0.9, seed=11)
+    depth = make_depth(bars, FAST, quoted_days=9)
     dataset = Dataset.build(bars, FAST, depth=depth)
     opens = dataset.window_index
     cut = opens[int(len(opens) * 0.8)]

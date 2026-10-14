@@ -672,6 +672,13 @@ class Config:
     # behaviour); 'stale' drops it, after deriving an age bound for `live_touch`
     # rows from `available_time - event_time` (see `core.quotes`).
     null_quote_age: str = 'fresh'
+    # The cross-venue PEER's staleness cap. None follows
+    # `max_quote_age_seconds`. Separate because only ~5% of live Polymarket
+    # rows are <=5s old: a tight Kalshi cap applied to the peer voided
+    # `venue_prob_gap` on nearly every row and `--complete-cases` kept 0.1%.
+    # Once set, `null_quote_age` applies to the peer as well; unset, a peer
+    # row with no age stays fresh, as it always has.
+    peer_max_quote_age_seconds: Optional[float] = None
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted
     # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
@@ -837,6 +844,10 @@ class Config:
         if int(self.stack_crossfit_blocks) < 2:
             raise ValueError(f'stack_crossfit_blocks must be at least 2; got '
                              f'{self.stack_crossfit_blocks}')
+        if (self.peer_max_quote_age_seconds is not None
+                and self.peer_max_quote_age_seconds <= 0.0):
+            raise ValueError(f'peer_max_quote_age_seconds must be positive; got '
+                             f'{self.peer_max_quote_age_seconds}')
         if self.stack_l2 < 0.0:
             raise ValueError(f'stack_l2 must not be negative; got {self.stack_l2}')
         if int(self.ensemble_size) < 1:

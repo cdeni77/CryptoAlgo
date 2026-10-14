@@ -52,6 +52,16 @@ class DatasetError(RuntimeError):
     pass
 
 
+def peer_quote_limits(config: Config) -> dict:
+    """The peer venue's staleness cap and null-age rule. Unset, the cap follows
+    `max_quote_age_seconds` and a missing peer age stays fresh; `null_quote_age`
+    reaches the peer only once its own cap is set explicitly."""
+    peer = getattr(config, 'peer_max_quote_age_seconds', None)
+    return {'peer_max_age_seconds': peer,
+            'peer_null_age': ('fresh' if peer is None
+                              else getattr(config, 'null_quote_age', 'fresh'))}
+
+
 def load_minute_bars(
     config: Config = DEFAULT_CONFIG,
     *,
@@ -125,7 +135,8 @@ class Dataset:
                 max_age_seconds=float(config.max_quote_age_seconds),
                 peer_lag_minutes=getattr(config, 'peer_lag_minutes', 0),
                 sources=tuple(getattr(config, 'quote_sources', ()) or ()),
-                null_age=getattr(config, 'null_quote_age', 'fresh'))
+                null_age=getattr(config, 'null_quote_age', 'fresh'),
+                **peer_quote_limits(config))
             # Book dynamics from the SAME depth table, which carries a row at
             # every minute 0..15. Attached here beside the quotes because it is
             # observed rather than fitted; the lookahead guard lives inside

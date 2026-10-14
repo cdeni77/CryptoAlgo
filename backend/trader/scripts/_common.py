@@ -61,6 +61,11 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                       help="'fresh' (default) keeps a quote with no recorded "
                            "age; 'stale' drops it, after bounding live_touch "
                            "ages by available_time - event_time.")
+    data.add_argument('--peer-max-quote-age-seconds', type=float, default=None,
+                      metavar='S',
+                      help='staleness cap for the cross-venue PEER book only '
+                           '(default: follow the Kalshi cap). Setting it also '
+                           'applies --null-quote-age to the peer.')
     data.add_argument('--start', type=str, default=None, help='ISO date, inclusive')
     data.add_argument('--end', type=str, default=None, help='ISO date, exclusive')
     data.add_argument('--train-window-days', type=float, default=None,
@@ -304,6 +309,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('logistic_top_n', 'logistic_top_n'), ('logistic_l2', 'logistic_l2'),
         ('label_source', 'label_source'),
         ('null_quote_age', 'null_quote_age'),
+        ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),
         ('stack_mode', 'stack_mode'), ('stack_l2', 'stack_l2'),
         ('stack_crossfit_blocks', 'stack_crossfit_blocks'),
         ('stack_intercept', 'stack_intercept'),
@@ -530,11 +536,14 @@ def log_quote_coverage(depth, dataset: Dataset, config: Config) -> dict:
                         raw.to_string(index=False))
     coverage = quote_coverage(dataset.windows)
     logger.info('quotes priced %s of %s rows (%.1f%%) under sources=%s, '
-                'max age %.0fs, null age %s',
+                'max age %.0fs (peer %s), null age %s',
                 f"{coverage['quoted']:,}", f"{coverage['rows']:,}",
                 100 * coverage['share'],
                 ','.join(config.quote_sources) or 'all',
-                float(config.max_quote_age_seconds), config.null_quote_age)
+                float(config.max_quote_age_seconds),
+                'follows' if config.peer_max_quote_age_seconds is None
+                else f'{config.peer_max_quote_age_seconds:.0f}s',
+                config.null_quote_age)
     if coverage['by_source_age']:
         logger.info('priced rows by observer and age:\n%s',
                     pd.DataFrame(coverage['by_source_age']).to_string(index=False))
