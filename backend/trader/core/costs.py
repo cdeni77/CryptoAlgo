@@ -79,6 +79,8 @@ PRICE_TICKS: tuple[tuple[float, float, float], ...] = (
     (0.9000, 1.0000, 0.0010),
 )
 TICK = 0.01          # the middle band's tick, kept for the fee-rounding maths
+# The venue's maker rate, applied with `Config.maker_fee_multiplier`.
+MAKER_FEE_COEFFICIENT = 0.0175
 MIN_PRICE = 0.0010
 MAX_PRICE = 0.9990
 
@@ -142,11 +144,9 @@ def trade_fee(
     is_maker = config.assume_maker if maker is None else maker
     contracts_arr = np.asarray(contracts, dtype=float)
     price_arr = np.asarray(price, dtype=float)
-    if is_maker:
-        raw = config.maker_fee_rate * contracts_arr
-    else:
-        raw = config.fee_rate * contracts_arr * price_arr * (1.0 - price_arr)
-    return _ceil_fee(raw)
+    rate = (config.maker_fee_multiplier * MAKER_FEE_COEFFICIENT if is_maker
+            else config.fee_rate)
+    return _ceil_fee(rate * contracts_arr * price_arr * (1.0 - price_arr))
 
 
 def fee_per_contract(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
@@ -157,9 +157,9 @@ def fee_per_contract(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric
     the ceiling would make the answer depend on order size.
     """
     price_arr = np.asarray(price, dtype=float)
-    if config.assume_maker:
-        return np.full_like(price_arr, config.maker_fee_rate)
-    return config.fee_rate * price_arr * (1.0 - price_arr)
+    rate = (config.maker_fee_multiplier * MAKER_FEE_COEFFICIENT
+            if config.assume_maker else config.fee_rate)
+    return rate * price_arr * (1.0 - price_arr)
 
 
 def effective_price(price: Numeric, config: Config = DEFAULT_CONFIG) -> Numeric:
@@ -212,7 +212,7 @@ class FeeSchedule:
     """A rendered view of the schedule, for reports and for the API."""
 
     fee_rate: float
-    maker_fee_rate: float
+    maker_fee_multiplier: float
     half_spread_cents: float
     version: str
     verified_against_ticket: bool = False
@@ -221,7 +221,7 @@ class FeeSchedule:
     def of(cls, config: Config = DEFAULT_CONFIG) -> 'FeeSchedule':
         return cls(
             fee_rate=config.fee_rate,
-            maker_fee_rate=config.maker_fee_rate,
+            maker_fee_multiplier=config.maker_fee_multiplier,
             half_spread_cents=config.half_spread_cents,
             version=config.fee_config_version,
         )
@@ -229,7 +229,7 @@ class FeeSchedule:
     def table(self, prices: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95)) -> list[dict]:
         config = Config(
             fee_rate=self.fee_rate,
-            maker_fee_rate=self.maker_fee_rate,
+            maker_fee_multiplier=self.maker_fee_multiplier,
             half_spread_cents=self.half_spread_cents,
         )
         rows = []

@@ -414,3 +414,24 @@ class TestQuoteStaleness:
                             writer, kalshi, decision(), None, quote_time=quote_time))
         assert booked is False
         assert len(kalshi.orders) == 0
+
+
+def _tickets(writer):
+    from core.pg_writer import OrderTicket
+    with writer._session() as session:                      # noqa: SLF001
+        return [(t.status, t.venue_order_id) for t in session.query(OrderTicket)]
+
+
+def test_a_filled_order_records_the_venue_order_id(writer):
+    """The id went only into the free-text note, so tickets could not be joined
+    to the venue's own fills by order id."""
+    kalshi = FakeKalshi({'status': 'executed', 'remaining_count': 0,
+                         'order_id': 'venue-123'})
+    assert run(act_on(args(), writer, kalshi, decision(), None)) is True
+    assert _tickets(writer) == [('filled', 'venue-123')]
+
+
+def test_a_killed_order_records_the_venue_order_id(writer):
+    kalshi = FakeKalshi({'status': 'canceled', 'count': 5, 'order_id': 'venue-k'})
+    assert run(act_on(args(), writer, kalshi, decision(), None)) is False
+    assert _tickets(writer) == [('killed', 'venue-k')]

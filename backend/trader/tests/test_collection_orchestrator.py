@@ -134,9 +134,9 @@ def test_the_limiter_is_safe_to_share_between_threads():
 
     def worker():
         for _ in range(4):
-            limiter.wait()
+            slot = limiter.wait()
             with lock:
-                stamps.append(time.monotonic())
+                stamps.append(slot)
 
     threads = [threading.Thread(target=worker) for _ in range(4)]
     for t in threads:
@@ -147,5 +147,6 @@ def test_the_limiter_is_safe_to_share_between_threads():
     stamps.sort()
     gaps = [b - a for a, b in zip(stamps, stamps[1:])]
     assert len(stamps) == 16
-    # No two grants may land inside one interval; allow a little scheduler slop.
-    assert min(gaps) >= 0.030, f'limiter double-granted a slot: {min(gaps):.4f}s'
+    # The reserved slots, not the wake-up times: a loaded machine can wake two
+    # threads together even when their slots are 40ms apart.
+    assert min(gaps) >= 0.040 - 1e-9, f'limiter double-granted a slot: {min(gaps):.4f}s'

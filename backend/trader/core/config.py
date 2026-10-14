@@ -380,7 +380,10 @@ class Config:
     # fee per contract = ceil(fee_rate * price * (1 - price) * 100) / 100,
     # charged on the trade and never on settlement. See core/costs.py.
     fee_rate: float = 0.07
-    maker_fee_rate: float = 0.0025
+    # Maker fee = ceil(M * 0.0175 * C * P * (1 - P)) per order (venue fee
+    # schedule). M defaults to 0, and the 15-minute crypto series are not on
+    # the schedule's non-standard list, so a resting order pays nothing.
+    maker_fee_multiplier: float = 0.0
     assume_maker: bool = False
     # Half the quoted bid/ask, in cents of a dollar contract.
     #
@@ -912,7 +915,8 @@ class Config:
         return replace(
             self,
             fee_rate=float(fees.get('fee_rate', self.fee_rate)),
-            maker_fee_rate=float(fees.get('maker_fee_rate', self.maker_fee_rate)),
+            maker_fee_multiplier=float(fees.get('maker_fee_multiplier',
+                                                self.maker_fee_multiplier)),
             half_spread_cents=float(fees.get('half_spread_cents', self.half_spread_cents)),
             fee_config_version=str(payload.get('version', 'unversioned')),
         )

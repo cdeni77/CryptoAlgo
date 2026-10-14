@@ -519,7 +519,8 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
             await _db(writer.resolve_ticket, ticket_id, status='killed',
                       note=(f"status={order.get('status')!r} "
                             f"order_id={str(order.get('order_id', ''))[:60]} "
-                            f"key={key}")[:4000])
+                            f"key={key}")[:4000],
+                      venue_order_id=order.get('order_id'))
             return OrderResult(False, 'killed', 0, order, ticket_id, limit, answered_at)
         if np.isfinite(fill_price):
             placed_price = fill_price
@@ -527,7 +528,8 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         await _db(writer.resolve_ticket,
                   ticket_id, status='filled', filled_contracts=filled,
                   filled_price=placed_price,
-                  note=str(order.get('order_id', ''))[:200])
+                  note=str(order.get('order_id', ''))[:200],
+                  venue_order_id=order.get('order_id'))
         if filled < decision.contracts:
             logger.warning('%s window %s: partial fill %d of %d',
                            decision.symbol, decision.window_open,
@@ -601,6 +603,7 @@ async def diagnose_and_note(kalshi, writer: PgWriter, decision: Decision,
             await _db(writer.resolve_ticket, result.ticket_id, status='killed',
                       note=(f"status={order.get('status')!r} "
                             f"order_id={str(order.get('order_id', ''))[:60]} || "
-                            f"{diagnosis}")[:4000])
+                            f"{diagnosis}")[:4000],
+                      venue_order_id=order.get('order_id'))
     except Exception:                                         # noqa: BLE001
         logger.exception('kill diagnosis failed')

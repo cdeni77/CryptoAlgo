@@ -403,7 +403,7 @@ class ForecastModel:
         # Only the fields that change a number. Paths, versions and CLI notes
         # differ legitimately between the run that fitted and the run that scores.
         material = ('window_minutes', 'decision_offsets', 'vol_lookbacks_minutes',
-                    'embargo_minutes', 'fee_rate', 'maker_fee_rate', 'assume_maker',
+                    'embargo_minutes', 'fee_rate', 'maker_fee_multiplier', 'assume_maker',
                     'half_spread_cents', 'min_traded_price', 'max_traded_price')
         drift = {
             key: (stored.get(key), current.get(key))
