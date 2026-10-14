@@ -1,8 +1,7 @@
 """Tests for the promotion gates and the ledger of attempts.
 
-A blocked candidate never reaches `models/forecast.joblib`, the file live loads.
-Every attempt is recorded, passed or blocked, because the ledger is the trial
-count for multiple-testing correction.
+A blocked candidate never reaches `models/forecast.joblib`, and every attempt is
+recorded, since the ledger is the trial count.
 """
 
 from __future__ import annotations
@@ -57,8 +56,8 @@ def fold(index=0, skill=0.002, ece=0.009, alpha=0.7, control=0.18,
 
 def report(skills=(0.002,) * 6, *, deviation=0.02, non_finite=0,
            trade_metrics=None, **over) -> EvaluationReport:
-    """A report: `deviation` and `non_finite` are per fold, `trade_metrics` stands in for
-    traded rows, the rest sizes the book.
+    """A report: `deviation` and `non_finite` are per fold, `trade_metrics` stands in
+    for traded rows, the rest sizes the book.
     """
     return EvaluationReport(
         folds=[fold(i, skill=s, deviation=deviation, non_finite=non_finite)
@@ -116,8 +115,8 @@ def test_skill_is_the_difference_not_the_level():
 def test_the_standard_error_comes_from_fold_dispersion():
     """The standard error comes from fold dispersion, not a breadth formula.
 
-    Offsets share a label and symbols are correlated, so `N/(1+(N-1)rho)` is
-    degenerate here.
+    Offsets share a label and symbols are correlated, so `N/(1+(N-1)rho)` is degenerate
+    here.
     """
     tight = report(skills=(0.002, 0.0021, 0.0019, 0.002, 0.0022, 0.0018))
     loose = report(skills=(0.01, -0.008, 0.012, -0.006, 0.009, -0.005))
@@ -134,7 +133,6 @@ def test_five_of_six_is_reported_with_its_p_value():
 
 
 def test_a_gate_with_no_measurement_fails():
-    """A gate with no measurement fails."""
     gate = Gate(name='x', value=float('nan'), threshold=0.0, direction='min')
     assert not gate.passed
 
@@ -145,7 +143,6 @@ def test_every_gate_carries_a_note_explaining_it():
 
 
 def test_the_forecast_gates_come_before_the_money_gates():
-    """The forecast gates come before the money gates."""
     names = list(DEFAULT_GATES)
     assert names.index('log_loss_skill') < names.index('realised_edge_lcb')
     assert names.index('calibration_error') < names.index('trades')
@@ -265,8 +262,8 @@ def test_the_version_stamp_sorts_chronologically():
 
 
 def test_a_handful_of_unscoreable_rows_is_not_a_failure():
-    """A few unscoreable rows (as from an outage) pass, because the gate is a share, not a
-    count.
+    """A few unscoreable rows (as from an outage) pass, because the gate is a share, not
+    a count.
     """
     gates = {g.name: g for g in evaluate_gates(report(non_finite=4))}
     assert gates['non_finite_share'].passed, (
@@ -278,8 +275,8 @@ def test_a_handful_of_unscoreable_rows_is_not_a_failure():
 
 
 def test_a_large_share_of_unscoreable_rows_does_fail():
-    """A large share of unscoreable rows fails, since that points to a lookback or embargo
-    problem.
+    """A large share of unscoreable rows fails, since that points to a lookback or
+    embargo problem.
     """
     # 8,000 unscoreable per fold against 80,000 rows is 9%, well over the 0.1% limit.
     gates = {g.name: g for g in evaluate_gates(report(non_finite=8_000))}
@@ -331,8 +328,8 @@ def test_a_model_miscalibrated_only_where_it_trades_is_refused():
 def market_rows(n: int, *, model_edge: float = 0.0, windows: int = 4_000):
     """Synthetic `scored_against_market()` rows.
 
-    `model_edge` moves the model toward the truth relative to the price: positive
-    is a better forecaster than the quote, negative a worse one.
+    `model_edge` moves the model toward the truth relative to the price: positive is a
+    better forecaster than the quote, negative a worse one.
     """
     rng = np.random.default_rng(11)
     rows = []
@@ -367,7 +364,6 @@ class TestTheMarketGates:
         assert gates['model_minus_market'] and gates['market_windows']
 
     def test_too_few_windows_fails_however_good_the_comparison_looks(self):
-        """Too few market windows fails, however good the comparison looks."""
         values = market_gate_values(market_rows(300, model_edge=+0.35, windows=100))
         gates = {g.name: g.passed for g in evaluate_gates(report(), extra=values)}
         assert values['model_minus_market'] > 0
@@ -388,7 +384,6 @@ class TestTheMarketGates:
         assert not gates['market_windows']
 
     def test_the_market_gates_are_read_before_the_baseline_ones(self):
-        """The market gates come before the baseline gates."""
         names = list(DEFAULT_GATES)
         assert names.index('model_minus_market') < names.index('log_loss_skill')
         assert names.index('market_windows') < names.index('trades')
@@ -401,8 +396,7 @@ class TestTheMarketGates:
         assert DEFAULT_GATES['market_windows'][0] == float(MIN_MARKET_WINDOWS)
 
     def test_a_backtest_alone_can_never_satisfy_these(self):
-        """A backtest report alone cannot supply the market gates, since it has no book.
-        """
+        """A backtest report alone cannot supply the market gates, since it has no book."""
         assert 'model_minus_market' not in report().gate_values()
         assert 'market_windows' not in report().gate_values()
 
@@ -463,7 +457,6 @@ def test_a_report_with_no_folds_does_not_raise():
 
 
 def test_report_provenance_actually_CARRIES_the_reliability_rows():
-    """`report_provenance` actually includes the reliability rows."""
     import pandas as pd
     from core.promotion import report_provenance
 

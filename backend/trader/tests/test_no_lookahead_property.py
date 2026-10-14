@@ -1,8 +1,7 @@
 """Property test: nothing a decision reads may depend on a bar at or after the decision.
 
-Freeze a decision point, scramble every bar at or after it, and require every
-column the decision reads to be identical. Anything that moves has read the
-future. The randomisation is a seeded loop, since `hypothesis` is not installed.
+Scramble every bar from the decision onward; every column the decision reads must not
+change.
 """
 
 from __future__ import annotations
@@ -24,8 +23,7 @@ OFFSETS = (3, 6, 9, 12)
 
 
 def scramble_from(bars: pd.DataFrame, cutoff: pd.Timestamp, rng) -> pd.DataFrame:
-    """Scramble every bar at or after `cutoff` by up to 5%, far outside float tolerance.
-    """
+    """Scramble every bar at or after `cutoff` by up to 5%, far outside float tolerance."""
     out = bars.copy()
     hit = (out['event_time'] >= cutoff).to_numpy()
     assert hit.any(), 'cutoff is past the end of the sample'

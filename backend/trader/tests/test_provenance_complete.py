@@ -1,9 +1,4 @@
-"""Tests that `Config.provenance()` records every field that changes the money numbers.
-
-The ledger must say which policy produced its results, and
-`config_for_artifact` adopts economics from provenance. `entry_offsets`,
-`compound`, `starting_bankroll` and `max_stake_dollars` must therefore be recorded.
-"""
+"""Tests that `Config.provenance()` records every field that changes the money numbers."""
 from __future__ import annotations
 
 import pytest

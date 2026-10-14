@@ -1,7 +1,7 @@
 """Tests for the `--min-traded-price` and `--max-traded-price` flags.
 
-The backfilled book rounds to whole cents outside [0.10, 0.90], so a cost study
-may need to restrict the band from the command line.
+The backfilled book rounds to whole cents outside [0.10, 0.90], so a cost study may need
+to restrict the band from the command line.
 """
 from scripts._common import add_data_arguments, config_from_args
 import argparse

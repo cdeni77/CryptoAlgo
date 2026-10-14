@@ -1,8 +1,6 @@
 """Tests that the market comparison scores only the offsets that trade.
 
-Live records a prediction at four offsets while `--entry-offsets 12` lets only
-one open a position. Pooling all four measures a policy nobody runs, and can
-invert the verdict.
+Pooling untraded offsets measures a policy nobody runs and can invert the verdict.
 """
 
 from __future__ import annotations

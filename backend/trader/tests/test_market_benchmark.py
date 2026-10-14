@@ -1,9 +1,4 @@
-"""Tests for `scripts/market_benchmark.py`, the comparison of the model with the market
-price.
-
-Skill against `F(x/sigma)` says nothing about beating the price on offer. This
-is the measurement that does.
-"""
+"""Tests for `scripts/market_benchmark.py`, which compares the model with the market price."""
 
 from __future__ import annotations
 
@@ -24,7 +19,8 @@ NOW = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
 
 def seed(writer: PgWriter, *, n: int, market_skill: float, model_skill: float,
          seed_value: int = 0) -> None:
-    """Windows with known truth, where the market and model are each `skill` close to it.
+    """Windows with known truth, where the market and model are each `skill` close to
+    it.
 
     A larger `skill` means closer to the truth.
     """
@@ -78,7 +74,6 @@ def test_a_better_model_reads_positive_against_the_market(tmp_path):
 
 
 def test_a_worse_model_reads_negative_against_the_market(tmp_path):
-    """A model that loses to the price reads negative."""
     url = f'sqlite:///{tmp_path}/worse.db'
     writer = PgWriter(database_url=url)
     seed(writer, n=300, market_skill=0.9, model_skill=0.4)

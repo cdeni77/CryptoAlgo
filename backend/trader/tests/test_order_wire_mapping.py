@@ -1,10 +1,7 @@
 """Tests for the UP/DOWN mapping onto the Kalshi V2 order body.
 
-V2 quotes a single YES book: `bid` buys YES; `ask` sells YES, which is buying NO
-at (1 - price). So DOWN converts the price, not only the label: paying 0.31 for
-NO is an ask at 0.69. Rounding also inverts: a bid rounds up and an ask rounds
-down, so the order can still fill. The tests intercept `_request`, so nothing
-reaches the network.
+V2 has one YES book: UP is a bid at the price; DOWN is an ask at `1 - price`. A bid
+rounds up and an ask rounds down.
 """
 
 from __future__ import annotations
@@ -64,9 +61,7 @@ def test_an_up_decision_bids_on_the_yes_book(key_pem):
 
 
 def test_a_down_decision_asks_on_the_yes_book_at_one_minus_the_price(key_pem):
-    """DOWN is an ask on the YES book at `1 - price`: paying 0.13 for NO is selling YES at
-    0.87.
-    """
+    """DOWN is an ask on the YES book at `1 - price`: paying 0.13 for NO is selling YES at 0.87."""
     seen = captured_body(key_pem, ticker='KXBTC15M-X', side='down',
                          contracts=5, limit_price=0.13)
     body = seen['body']
@@ -77,8 +72,8 @@ def test_a_down_decision_asks_on_the_yes_book_at_one_minus_the_price(key_pem):
 
 
 def test_the_two_sides_are_complements_of_each_other(key_pem):
-    """A half-applied flip shows here: both sides of the same economic trade give the same
-    YES limit.
+    """A half-applied flip shows here: both sides of the same economic trade give the
+    same YES limit.
     """
     up = captured_body(key_pem, ticker='T', side='up', contracts=1,
                        limit_price=0.40)['body']
@@ -134,9 +129,7 @@ def test_the_default_time_in_force_takes_partial_fills(key_pem):
 
 
 def test_every_order_carries_the_idempotency_key_it_was_given(key_pem):
-    """The order carries the `client_order_id` it was given; it prevents duplicate real
-    orders.
-    """
+    """The order carries the `client_order_id` it was given; it prevents duplicate real orders."""
     body = captured_body(key_pem, ticker='T', side='up', contracts=1,
                          limit_price=0.50, client_order_id='BTC-USD-202608230030')['body']
     assert body['client_order_id'] == 'BTC-USD-202608230030'

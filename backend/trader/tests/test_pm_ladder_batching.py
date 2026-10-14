@@ -1,10 +1,7 @@
 """Tests for batching the per-cycle Polymarket requests.
 
-`GET {GAMMA}/markets?slug=A&slug=B` returns all markets in one call, and
-`POST {CLOB}/books` returns every book in one call, each tagged with its
-`asset_id`. The batch reply is unordered, so books are matched by `asset_id`.
-`_valid_token` rejects a short placeholder token, which a newly opened market can
-carry before its real ~78-digit CTF token id is attached.
+Batch replies are unordered, so books match by `asset_id`; `_valid_token` rejects a
+short placeholder token.
 """
 
 from __future__ import annotations

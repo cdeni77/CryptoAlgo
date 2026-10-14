@@ -1,9 +1,7 @@
-"""A stuck Polymarket stream cache is torn down and resubscribed on request.
+"""Tests that a stuck Polymarket stream cache is resubscribed on request.
 
-The trading loop counts consecutive peer refusals per symbol. After
-`peer_resubscribe_after_cycles` of them it asks `record_pm_stream` to drop that
-symbol's state and subscribe again. The heartbeat is touched only for a
-two-sided book of the current window.
+After `peer_resubscribe_after_cycles` refusals the trading loop asks the recorder to
+resubscribe.
 """
 from __future__ import annotations
 

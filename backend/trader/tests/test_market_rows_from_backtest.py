@@ -1,9 +1,7 @@
-"""Tests for `market_rows_from_scored`: the market comparison computed from a backtest with
+"""Tests for `market_rows_from_scored`: the market comparison from a backtest with
 quotes.
 
-The market's forecast is the mid, not the ask: `model_minus_market` compares log
-losses, and the ask would give the model half the spread as free skill. A row
-needs a real quote, a settled label, and a fresh quote age.
+The market's forecast is the mid, and a row needs a quote, a label and a fresh age.
 """
 
 from __future__ import annotations
@@ -33,8 +31,7 @@ def _scored(n=4, **over):
 
 
 def test_the_market_column_is_the_mid_not_the_ask():
-    """The market column is the mid; the ask would credit the model with half the spread.
-    """
+    """The market column is the mid; the ask would credit the model with half the spread."""
     rows = market_rows_from_scored(_scored(market_probability=[0.50] * 4))
     frame = pd.DataFrame(rows, columns=list(MARKET_COLUMNS))
     assert (frame['market'] == 0.50).all()
@@ -89,9 +86,7 @@ def test_an_empty_frame_fails_rather_than_passes():
 # is older than the age limit are dropped.
 
 def test_a_stale_quote_is_not_the_market():
-    """A quote from minutes earlier is not the price at the decision instant, so it is
-    dropped.
-    """
+    """A quote from minutes earlier is not the price at the decision instant, so it is dropped."""
     frame = _scored()
     frame['quote_age_seconds'] = [1.0, 1.0, 600.0, 600.0]
     assert len(market_rows_from_scored(frame)) == 2

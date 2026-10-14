@@ -1,8 +1,6 @@
 """Tests that a Polymarket slug's trailing timestamp is the window open, not its close.
 
-The venue states it three ways that agree: the slug timestamp, the title, and
-`end_time`, which equals the slug timestamp plus 15 minutes. The live recorder
-must ask for the window it is inside.
+The venue's `end_time` is the slug timestamp plus 15 minutes.
 """
 
 from __future__ import annotations
@@ -32,8 +30,8 @@ def test_end_time_is_the_slug_timestamp_plus_one_window():
 def test_the_live_recorder_asks_for_the_window_it_is_inside():
     """Mid-window the slug names this window, not the next one.
 
-    The venue lists the next window early, so a slug built with `ceil` still returns
-    a healthy book, for the wrong window.
+    The venue lists the next window early, so a slug built with `ceil` still returns a
+    healthy book, for the wrong window.
     """
     now = dt.datetime(2026, 8, 26, 1, 37, 12, tzinfo=dt.timezone.utc)
     assert slug_for('btc', now) == 'btc-updown-15m-1787707800'

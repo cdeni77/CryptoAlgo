@@ -1,7 +1,7 @@
 """Tests that the peer venue's quote gets the same staleness filter as the traded venue.
 
-`venue_prob_gap` is the difference of the two venues' prices. If only one side
-were age-filtered, a timing difference could look like skill.
+`venue_prob_gap` is the difference of the two venues' prices. If only one side were
+age-filtered, a timing difference could look like skill.
 """
 from __future__ import annotations
 
@@ -51,9 +51,7 @@ def test_a_fresh_peer_quote_still_attaches():
 
 
 def test_a_peer_row_with_no_age_recorded_is_kept():
-    """A peer row with no recorded age is kept; a missing stamp is not evidence of
-    staleness.
-    """
+    """A peer row with no recorded age is kept; a missing stamp is not evidence of staleness."""
     peer = _row('polymarket', np.nan, bid=0.20, ask=0.22)
     out = attach_quotes(_windows(), pd.DataFrame([_row('kalshi', 2.0), peer]),
                         max_age_seconds=30.0)

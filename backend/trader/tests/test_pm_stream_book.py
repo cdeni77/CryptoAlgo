@@ -1,10 +1,7 @@
 """Tests for `PmBookCache`, which folds the Polymarket CLOB socket into a book.
 
-`price_change.size` is the new absolute size at that price, so a removed level
-arrives as exactly 0 and is deleted (unlike Kalshi's signed deltas). Bids arrive
-ascending and asks descending, so the touch is the last entry on each side. One
-`price_change` message can carry several assets, each with its own `asset_id`.
-Asks are returned NO-denominated to match Kalshi's `no_levels`.
+Sizes are absolute (0 deletes a level), the touch is the last entry, one message can
+carry several assets, and asks are returned NO-denominated.
 """
 from __future__ import annotations
 
@@ -66,8 +63,7 @@ def test_one_message_can_carry_two_markets_and_they_do_not_mix():
 
 
 def test_the_ladder_is_returned_in_kalshis_denomination():
-    """The YES ask 0.46 is returned as the NO level 0.54, matching Kalshi's `no_levels`.
-    """
+    """The YES ask 0.46 is returned as the NO level 0.54, matching Kalshi's `no_levels`."""
     c = PmBookCache()
     c.apply(_book([('0.44', '250')], [('0.46', '150')]))
     yes, no = c.ladder(TOK)
@@ -76,8 +72,7 @@ def test_the_ladder_is_returned_in_kalshis_denomination():
 
 
 def test_a_snapshot_replaces_the_book_rather_than_merging():
-    """A later `book` message replaces the whole book; merging would keep dropped levels.
-    """
+    """A later `book` message replaces the whole book; merging would keep dropped levels."""
     c = PmBookCache()
     c.apply(_book([('0.40', '100'), ('0.44', '250')], [('0.46', '150')]))
     c.apply(_book([('0.42', '10')], [('0.48', '20')]))

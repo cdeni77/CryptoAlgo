@@ -1,9 +1,7 @@
 """Tests for `correct_positions_from_venue`, which re-settles positions the venue graded
 differently.
 
-A window that settles before the venue's result arrives is graded from our
-Coinbase bars. `realized_pnl` feeds the daily-loss limit and the drawdown
-breaker, so it must match the venue's grading.
+`realized_pnl` feeds the daily-loss and drawdown breakers, so it must match the venue.
 """
 
 from __future__ import annotations
@@ -70,8 +68,8 @@ def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
 def test_agreement_re_settles_nothing(writer):
     """No position is re-graded when the venue agrees.
 
-    `realized_pnl` is restated on every pass by design. Here it corrects a
-    mismatch the fixture creates by inserting rows directly.
+    `realized_pnl` is restated on every pass by design. Here it corrects a mismatch the
+    fixture creates by inserting rows directly.
     """
     from core.pg_writer import Position
 
@@ -108,8 +106,7 @@ def test_a_down_side_position_flips_the_other_way(writer):
 
 
 def test_bankroll_is_left_to_the_venue(writer):
-    """The bankroll is left alone; `adopt_venue_balance` already takes it from the venue.
-    """
+    """The bankroll is left alone; `adopt_venue_balance` already takes it from the venue."""
     writer.ensure_account(500.0, mode='live')
     _position(writer, settled_up=True)
     before = writer.account().bankroll

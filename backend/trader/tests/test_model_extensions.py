@@ -1,7 +1,7 @@
 """Tests for opt-in model extensions: the ensemble and the venue label.
 
-Every extension is off by default, so the first tests check that the defaults
-fit and score exactly as before.
+Every extension is off by default, so the first tests check that the defaults fit and
+score exactly as before.
 """
 
 from __future__ import annotations

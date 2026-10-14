@@ -1,10 +1,4 @@
-"""Tests that the live Polymarket price used in `venue_prob_gap` is fresh and from the same
-window.
-
-In training the two venues' books are contemporaneous. Live refuses a peer
-reading older than the backtest's `max_age_seconds`, and the recorder runs late
-in the minute so its reading is fresh at the decision.
-"""
+"""Tests that the live Polymarket price in `venue_prob_gap` is fresh and from the same window."""
 from __future__ import annotations
 
 import types
@@ -35,8 +29,7 @@ def test_a_fresh_peer_reading_is_used():
 
 
 def test_a_stale_peer_reading_is_refused():
-    """A stale peer reading is refused: the gap would include Kalshi's own move since.
-    """
+    """A stale peer reading is refused: the gap would include Kalshi's own move since."""
     row = cross_venue_row(_pm(90), _Quote(), now=NOW)
     assert np.isnan(row['venue_prob_gap'])
     assert row['pm_available'] == 0.0, (
@@ -72,8 +65,8 @@ def test_the_recorder_is_phased_to_be_fresh_at_a_decision():
 def test_a_peer_reading_from_another_window_is_refused():
     """A peer reading from another window is refused, however fresh.
 
-    At a window rollover the cache can briefly hold the previous window's book with
-    a recent timestamp.
+    At a window rollover the cache can briefly hold the previous window's book with a
+    recent timestamp.
     """
     pm = {'best_bid': 40.0, 'best_ask': 42.0,
           'at': NOW - pd.Timedelta(seconds=3),
@@ -102,9 +95,7 @@ def test_a_reading_with_no_window_is_still_accepted():
 
 
 def test_the_declared_phase_is_the_one_actually_used():
-    """The recorder aligns on the declared `Component.phase`, not a separate hardcoded
-    number.
-    """
+    """The recorder aligns on the declared `Component.phase`, not a separate hardcoded number."""
     import inspect
     from scripts.run_live import COMPONENTS, build_factories
 

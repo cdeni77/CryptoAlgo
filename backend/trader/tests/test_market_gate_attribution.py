@@ -1,9 +1,7 @@
 """Tests that the market gates measure the candidate, not the deployed model.
 
-Live `predictions` rows come from whichever model was deployed, so a candidate
-cannot change them. Gating a candidate on them blocks every new model. The
-candidate's own backtest rows priced against recorded quotes (`recorded_only`)
-come first; the live table is the fallback.
+The candidate's own recorded-quote rows come first; the live `predictions` table is the
+fallback.
 """
 
 from __future__ import annotations
@@ -59,8 +57,7 @@ def test_every_live_observer_is_a_real_source():
 
 
 def test_the_candidate_is_preferred_over_the_live_table():
-    """`market_measurement` tries the candidate's recorded rows before the live table.
-    """
+    """`market_measurement` tries the candidate's recorded rows before the live table."""
     from scripts.promote import market_measurement
 
     src = inspect.getsource(market_measurement)

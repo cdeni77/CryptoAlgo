@@ -1,8 +1,6 @@
 """Tests for fitting the correction on the market logit instead of on F(x/sigma).
 
-An untrained market-init model reproduces the price, and the fitted residual is
-how the price is wrong. It needs a quote on every training row, which
-`--complete-cases` guarantees.
+It needs a quote on every training row, which `--complete-cases` guarantees.
 """
 
 from __future__ import annotations

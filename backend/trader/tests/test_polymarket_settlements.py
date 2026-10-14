@@ -1,8 +1,6 @@
-"""Tests for collecting Polymarket's own settlements.
+"""Tests for collecting Polymarket's own settlements, an independent check on our label.
 
-Polymarket settles on Chainlink's BTC-USD TWAP-60s and Kalshi on CF Benchmarks'
-BRTI, so the two are independent checks on our label. Outcome `A` is up: against
-Kalshi's settlements, `A = up` agrees about 94% of the time.
+Polymarket settles on Chainlink's BTC-USD TWAP-60s; outcome `A` is up.
 """
 
 from __future__ import annotations
@@ -78,8 +76,7 @@ def test_a_missing_catalog_is_not_an_error(tmp_path, monkeypatch):
 
 
 def test_the_branch_records_that_it_answered():
-    """The branch appends to `reached`, so "collected nothing" differs from "never ran".
-    """
+    """The branch appends to `reached`, so "collected nothing" differs from "never ran"."""
     src = inspect.getsource(cs.run)
     tail = src[src.index('await polymarket('):]
     # Search up to the next branch, not a fixed slice.

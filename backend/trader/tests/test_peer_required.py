@@ -1,8 +1,7 @@
 """Tests for `require_peer_book`, which refuses a row without the peer venue's book.
 
-Most of the model's skill depends on a contemporaneous peer book, so trading
-without it trades a much weaker model. `--complete-cases` already requires the
-peer in training, so refusing such a row live keeps the two paths consistent.
+Training requires the peer (`--complete-cases`), so live refusing it keeps the two
+consistent.
 """
 from __future__ import annotations
 
@@ -45,8 +44,7 @@ def test_the_guard_is_off_by_default_so_past_entries_keep_their_meaning():
 
 
 def test_a_row_that_never_carried_the_column_is_not_refused():
-    """A row with no `venue_prob_gap` column (a config without cross_venue) is not refused.
-    """
+    """A row with no `venue_prob_gap` column (a config without cross_venue) is not refused."""
     config = Config(require_peer_book=True)
     row = _row()
     row.pop('venue_prob_gap')

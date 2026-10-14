@@ -1,8 +1,6 @@
 """Tests that promotion deploys a model refitted on all data, not the last fold's model.
 
-The walk-forward is the evidence that a configuration works. The shipped model
-is that configuration refitted through the present; the last fold's model is
-always one test block stale.
+The last fold's model is always one test block stale.
 """
 
 from __future__ import annotations
@@ -47,8 +45,7 @@ def test_no_models_at_all_raises_rather_than_returning_none():
 
 
 def test_the_refit_carries_the_scoring_bundle_or_it_cannot_be_deployed():
-    """`refit_on_all` passes the scoring bundle, without which live cannot score a window.
-    """
+    """`refit_on_all` passes the scoring bundle, without which live cannot score a window."""
     import inspect
     from scripts.promote import refit_on_all
 

@@ -1,8 +1,7 @@
 """Tests that `predictions.outcome` is corrected to the venue's settlement.
 
-The live branch of `model_minus_market` reads this column, while the backtest
-uses `venue_outcome`. Grading live rows on our Coinbase label would grade the
-model on our own proxy.
+The live `model_minus_market` reads this column, so it must not hold our own proxy
+label.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ def _frame(rows):
 
 
 def test_the_newest_revision_of_a_window_wins():
-    """The newest revision of a window's settlement wins."""
     store = _Store(_frame([
         {'venue': 'kalshi', 'symbol': 'BTC-USD', 'window_open': OPEN,
          'settled_up': False, 'available_time': pd.Timestamp('2026-09-16T15:20Z')},
@@ -42,8 +40,7 @@ def test_the_newest_revision_of_a_window_wins():
 
 
 def test_only_the_venue_asked_for_is_returned():
-    """Only the requested venue is returned; Polymarket settles on a different oracle.
-    """
+    """Only the requested venue is returned; Polymarket settles on a different oracle."""
     store = _Store(_frame([
         {'venue': 'kalshi', 'symbol': 'BTC-USD', 'window_open': OPEN,
          'settled_up': True, 'available_time': OPEN},
@@ -66,8 +63,8 @@ def test_an_empty_store_is_not_an_error():
 
 
 def test_the_correction_only_touches_rows_that_disagree():
-    """Only rows that disagree are updated, so the reported count is the disagreement and a
-    re-run changes nothing.
+    """Only rows that disagree are updated, so the reported count is the disagreement
+    and a re-run changes nothing.
     """
     from core.pg_writer import PgWriter
 

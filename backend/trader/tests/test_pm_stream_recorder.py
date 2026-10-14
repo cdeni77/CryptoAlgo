@@ -1,9 +1,7 @@
 """Tests for the Polymarket socket recorder `scripts.record_pm_stream`.
 
-Silence is a condition enforced on a timeout, so a socket that stops sending
-returns a reason instead of waiting forever. The window rolls every 15 minutes
-and the token ids change with it, so the recorder resubscribes. It publishes the
-shape `cross_venue_row` reads: best bid and ask in cents with an `at` stamp.
+Silence returns on a timeout, the recorder resubscribes as the window rolls, and it
+publishes the shape `cross_venue_row` reads.
 """
 from __future__ import annotations
 
@@ -57,7 +55,6 @@ def test_publish_matches_the_shape_cross_venue_row_reads():
 
 
 def test_a_one_sided_book_is_not_published_as_a_touch():
-    """A one-sided book is not published as a touch."""
     rec.CACHE.clear()
     book = rec.PmBookCache()
     book.apply({'event_type': 'book', 'asset_id': 'T', 'timestamp': '1788487941413',

@@ -1,8 +1,7 @@
 """Tests that the unscoreable-feature warning fires only for unexpected NaNs.
 
-It is the only signal that live is scoring with NaN features, which LightGBM
-fills with a learned default. `venue_gap_change_5` is NaN at a window's first
-offset by design, so that case logs at DEBUG and real gaps still warn.
+`venue_gap_change_5` is NaN at a window's first offset by design, so that case logs at
+DEBUG.
 """
 
 from __future__ import annotations
@@ -53,7 +52,6 @@ def test_the_same_feature_at_a_later_offset_DOES_warn(caplog):
 
 
 def test_a_dead_stream_still_warns_at_the_first_offset(caplog):
-    """A dead stream still warns at the first offset."""
     caplog.set_level(logging.DEBUG, logger='live')
     dead = _scored(3, imbalance_5c=float('nan'), depth_ratio=float('nan'))
     _warn_unscoreable_features(dead, _Model(), offsets=OFFSETS)

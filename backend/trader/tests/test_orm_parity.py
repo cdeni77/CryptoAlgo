@@ -1,9 +1,7 @@
 """Tests that the trader and API ORM models describe the same tables.
 
-`core/pg_writer.py` and `backend/api/models/` declare the same Postgres tables,
-because the two run in separate containers. The API copy is generated from the
-trader module. This test compares every shared table column by column, including
-defaults, plus the migration lists, so any drift fails here.
+Every shared table is compared column by column, including defaults, plus the migration
+lists.
 """
 
 from __future__ import annotations
@@ -20,7 +18,8 @@ API_ROOT = TRADER_ROOT.parent / 'api'
 
 
 def _load_api_models() -> Any:
-    """Imports the API's declarative Base with the API root on `sys.path`, then removes it.
+    """Imports the API's declarative Base with the API root on `sys.path`, then removes
+    it.
 
     The API uses bare imports (`from models.base import Base`), so its root must lead
     the path for the import.
@@ -195,7 +194,8 @@ def test_the_api_applies_the_migrations_it_declares(monkeypatch):
 
 
 def test_the_migrations_are_dialect_portable():
-    """Every migration is `CREATE INDEX IF NOT EXISTS`, which runs on SQLite and Postgres.
+    """Every migration is `CREATE INDEX IF NOT EXISTS`, which runs on SQLite and
+    Postgres.
 
     The API tests run on SQLite, so a Postgres-only statement would never be tested.
     """
