@@ -1,23 +1,9 @@
 """The account: what was staked, what settled, what the equity did.
 
-Kept separate from `core/decide.py` on purpose. The previous incarnation of
-this repo mixed sizing into the cost model and the fee schedule could not be
-corrected without touching position sizing — so here the decision is a pure
-function and this module only records its consequences.
-
-**Binaries make the accounting genuinely simple, and that is a feature.** A
-position is bought once and settles once. There is no funding accrual, no
-mark-to-market, no margin, no liquidation, and no exit fee, because settlement
-is free and the loss is capped at the stake from the instant of entry. The
-whole account is: subtract the outlay at entry, add $1 per winning contract at
-settlement.
-
-**Annualisation is per trade, not per window.** A strategy that trades 3% of
-available windows and is scored as though it traded all of them reports a
-Sharpe ratio inflated by the reciprocal of its duty cycle. That mistake was
-made in this project before — 2.28 became 1.19 once the 27% duty cycle was
-accounted for — so `trades_per_year` is measured from realised trade count over
-realised elapsed time and nothing here multiplies by a constant.
+`core/decide.py` decides; this module only records the consequences.
+A binary is bought once and settles once: subtract the outlay at entry,
+add $1 per winning contract at settlement. There is no exit fee and no margin.
+Annualisation uses realised trade frequency and calendar time, never a constant.
 """
 
 from __future__ import annotations
@@ -40,13 +26,8 @@ SECONDS_PER_YEAR = 365.25 * 24 * 3600
 def won(*, side: str, settled_up: bool) -> bool:
     """Did the UP or DOWN side of a binary win, given how the window settled?
 
-    The one rule — `settled_up if side is up else not settled_up` — used to be
-    written out fresh in four places (`Position.payout` here,
-    `PgWriter.settle_position`, and two since-deleted economics scripts),
-    which is exactly the shape of the bug that
-    once left the paper bankroll never credited a win: one of the four copies
-    drifting from the other three. `side` compares equal to the plain string
-    `'up'`/`'down'` because `Side` is a `str, Enum`, so this takes either.
+    The single copy of this rule. `side` may be a `Side` or the plain string
+    `'up'`/`'down'`, because `Side` is a `str, Enum`.
     """
     return bool(settled_up) if side == Side.UP else not bool(settled_up)
 
@@ -64,11 +45,8 @@ class Position:
     model_probability: float
     baseline_probability: float
     edge: float
-    # 'quote' when the venue's own ask priced this, 'baseline' when the calibrated
-    # barrier stood in for a market that was not observed. CLAUDE.md states this
-    # must be on every row precisely so a backtest cannot be mistaken for a fill —
-    # and it was on `Decision` and on the `predictions` table but *not* on the
-    # trade ledger, which is the frame anyone actually inspects.
+    # 'quote' when the venue's ask priced this, 'baseline' when the calibrated
+    # barrier stood in for an unobserved market. Keeps a backtest distinct from a fill.
     price_source: str = 'baseline'
 
     @classmethod
@@ -118,9 +96,8 @@ class Book:
     refusals: list[Decision] = field(default_factory=list)
     equity_points: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
     halted_at: Optional[pd.Timestamp] = None
-    # Refusals that `core.decide.stateless_screen` handled vectorised, so they
-    # never became Decision objects. Carried here so the rejection histogram is
-    # complete rather than only counting what reached the scalar loop.
+    # Refusals that `core.decide.stateless_screen` handled vectorised, so the
+    # rejection histogram is complete.
     stateless_rejections: pd.Series = field(default_factory=lambda: pd.Series(dtype=int))
 
     def __post_init__(self) -> None:
@@ -146,10 +123,8 @@ class Book:
                *, at: Optional[pd.Timestamp] = None) -> list[Settlement]:
         """Settle every open position whose outcome is known.
 
-        `outcomes` is keyed on (symbol, window_open) rather than window alone:
-        the three symbols settle at the same instant on different outcomes, and
-        keying on the timestamp alone would settle all three against whichever
-        one was looked up.
+        `outcomes` is keyed on (symbol, window_open): symbols settle at the same
+        instant on different outcomes.
         """
         settled: list[Settlement] = []
         remaining: list[Position] = []
@@ -169,15 +144,8 @@ class Book:
             self.settlements.append(record)
             self.equity_points.append((position.settle_time, self.bankroll))
         self.open_positions = remaining
-        # **The same four halts the live account latches on, not just ruin.**
-        # `scripts/live.py` halts on a daily realised loss, on peak-to-current
-        # drawdown, and on consecutive losses -- and a halt there is sticky and
-        # cleared by hand. The backtest latched only on the ruin floor, so a
-        # candidate could pass `halted == 0` and `max_drawdown <= 0.35` on a
-        # simulation that never stops while the live account would have latched
-        # and traded nothing further. A gate measuring a policy the account does
-        # not run is the defect this whole audit is about, and this was the last
-        # instance of it.
+        # Latch on the same halts as `scripts/live.py`: ruin floor, drawdown,
+        # consecutive losses and daily loss. The gates must measure the policy live runs.
         if self.halted_at is None and settled:
             reason = self._halt_reason(settled)
             if reason is not None:
@@ -192,9 +160,8 @@ class Book:
         if self.bankroll < floor:
             return f'bankroll ${self.bankroll:.2f} fell below the ${floor:.2f} floor'
 
-        # Peak-to-current on REALISED equity, and only below the starting
-        # bankroll — the same condition live applies, so a run that is up and
-        # gives some back is not halted for it.
+        # Peak-to-current on realised equity, only below the starting bankroll,
+        # as live applies it.
         peak = max((b for _, b in self.equity_points),
                    default=cfg.starting_bankroll)
         limit = float(getattr(cfg, 'max_drawdown_fraction', 0.35) or 0.0)
@@ -228,9 +195,7 @@ class Book:
     def equity(self) -> float:
         """Bankroll plus the cost basis of anything still open.
 
-        Deliberately *not* marked to a model probability. Marking an open binary
-        at our own forecast books the edge we believe in as profit we have not
-        received, which is how a losing system reports a rising equity curve.
+        Never marked to our own forecast, which would book believed edge as profit.
         """
         return self.bankroll + sum(p.outlay for p in self.open_positions)
 
@@ -283,18 +248,13 @@ class BookStats:
     sharpe: float
     max_drawdown: float
     halted: bool
-    # The old per-trade figure, kept for continuity because it is what every
-    # historical report contains. `sharpe` is now the account's.
+    # The per-trade Sharpe, kept for comparison with historical reports.
+    # `sharpe` is the account's.
     sharpe_per_trade: float = float('nan')
 
     @property
     def growth_multiple(self) -> float:
-        """Ending equity as a multiple of the start.
-
-        Reported alongside the percentage because a compounding run produces
-        percentages with seventeen digits, and `x2.4` is legible where
-        `+140.3%` and `+2.2e17%` are not comparable at a glance.
-        """
+        """Ending equity as a multiple of the start."""
         return (self.ending_equity / self.starting_bankroll
                 if self.starting_bankroll else float('nan'))
 
@@ -319,11 +279,8 @@ class BookStats:
 def summarise(book: Book, *, windows_available: int) -> BookStats:
     """Reduce a book to comparable numbers.
 
-    `realised_edge_pp` is the honest counterpart of the predicted edge: the
-    actual win rate minus the mean effective cost paid, in probability points.
-    Predicted edge is what the model claimed; realised is what happened. A large
-    gap between them is the winner's curse, and it is the number to look at
-    before any Sharpe ratio.
+    `realised_edge_pp` is the actual win rate minus the mean effective cost paid,
+    in probability points. Its gap to predicted edge is the winner's curse.
     """
     trades = book.trades()
     n = len(trades)
@@ -346,29 +303,14 @@ def summarise(book: Book, *, windows_available: int) -> BookStats:
         (trades['settle_time'].max() - trades['window_open'].min()).total_seconds(), 1.0)
     trades_per_year = n * SECONDS_PER_YEAR / span_seconds
     sd = float(np.std(returns, ddof=1)) if n > 1 else float('nan')
-    # The old number: the mean of per-trade *ratios*, annualised by how often
-    # trades happened to cluster. Kept because every historical report contains
-    # it, and reported separately so the two can be compared.
+    # Per-trade Sharpe: mean of per-trade ratios, annualised by trade frequency.
     sharpe_per_trade = (float(np.mean(returns)) / sd * np.sqrt(trades_per_year)
                         ) if sd and sd > 0 else float('nan')
 
-    # The account's Sharpe: dollars per calendar day, zero days included.
-    #
-    # `sharpe_per_trade` is not the portfolio's risk-adjusted return and can
-    # carry the opposite sign. It equal-weights `pnl / outlay`, while the account
-    # experiences dollars — and stakes range from cents to the cap, so the two
-    # diverge. Measured on constructed books: 900 small wins plus 50 large losses
-    # gives +35.53 per-trade against -37.48 for the account (which lost $214),
-    # and a size-skewed profitable book gives -116.51 per-trade against +68.81
-    # for the account. A gate reading the first is not policing the second, which
-    # matters most for `sharpe_implausible`, whose whole job is to notice a
-    # number that cannot be real.
-    #
-    # Annualising on calendar time rather than on the traded span also stops a
-    # sparse strategy inflating its own frequency: four trades inside one hour of
-    # a five-year evaluation were being annualised as 35,064 trades a year.
-    # Idle days belong in the denominator — with `compound=False` the capital is
-    # committed to the strategy whether or not it fires.
+    # The account's Sharpe: dollars per calendar day, idle days included as zero.
+    # The per-trade figure equal-weights `pnl / outlay` and can carry the opposite
+    # sign when stakes vary. Calendar time stops a sparse strategy inflating its
+    # own frequency. With `compound=False` the capital is committed either way.
     daily = (trades.set_index('settle_time')['pnl'].sort_index()
              .resample('1D').sum())
     if len(daily) > 1:

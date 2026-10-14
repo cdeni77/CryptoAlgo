@@ -6,5 +6,5 @@ import asyncio
 
 
 async def _db(fn, *args, **kwargs):
-    """A synchronous store call, off the event loop."""
+    """Run a synchronous store call off the event loop."""
     return await asyncio.to_thread(fn, *args, **kwargs)

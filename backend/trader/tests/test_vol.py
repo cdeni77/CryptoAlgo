@@ -1,11 +1,5 @@
-"""The volatility layer, and the shift that cancelled itself.
-
-`forward_realised_vol` was written as
-`.shift(-m).rolling(m).mean().shift(m)` — two shifts that cancel, so the
-"forward" target was the *trailing* window. The HAR came back with an R-squared
-of 1.000 and a unit coefficient on `rv_15`, and it would have produced a
-beautifully calibrated baseline that could not be computed live. The first test
-here is that bug, pinned in both directions.
+"""Tests for the volatility layer in `core.vol`, starting with a forward target that
+looks forward.
 """
 
 from __future__ import annotations
@@ -24,12 +18,7 @@ from tests.conftest import make_bars
 
 
 def test_the_forward_target_looks_forward():
-    """Built by construction, so the direction is not a matter of opinion.
-
-    Volatility is low for the first half of the series and high for the second.
-    A genuinely forward-looking target at a point just before the change must
-    already see the high regime; a trailing one cannot.
-    """
+    """A forward target just before a volatility regime change already sees the new regime."""
     n = 4000
     times = pd.date_range('2025-01-01', periods=n, freq='1min', tz='UTC')
     rng = np.random.default_rng(1)
@@ -54,7 +43,7 @@ def test_the_forward_target_looks_forward():
 
 
 def test_the_forward_target_is_not_the_trailing_one():
-    """The exact regression: a unit coefficient on rv_15 was the tell."""
+    """The forward target is not the trailing one; a unit coefficient on rv_15 would show it."""
     bars = make_bars(days=25)['BTC-USD']
     grid = minute_grid(bars)
     config = Config()
@@ -70,12 +59,12 @@ def test_the_forward_target_is_not_the_trailing_one():
 
 
 def test_realised_volatility_only_uses_the_past():
-    """A row stamped `as_of` uses the bar ending at `as_of` and nothing later."""
+    """Realised volatility at `as_of` uses the bar ending at `as_of` and nothing later."""
     bars = make_bars(days=2)['BTC-USD']
     grid = minute_grid(bars)
     returns = log_returns(grid)
     rv = realised_vol(returns, 15)
-    # Corrupt the tail; nothing before the corruption may move.
+    # Corrupt the tail; nothing before the corruption may change.
     corrupted = grid.copy()
     cut = len(corrupted) // 2
     corrupted.iloc[cut:, corrupted.columns.get_loc('close')] *= 4.0
@@ -89,14 +78,14 @@ def test_seasonality_recovers_a_planted_shape():
     bars = make_bars(days=120)['BTC-USD']
     grid = minute_grid(bars)
     seasonality = Seasonality.fit(log_returns(grid), Config())
-    # The generator's shape is 1 +/- 0.5, so the ratio of peak to trough is 3.
+    # The generator's shape is 1 +/- 0.5, so the peak-to-trough ratio is 3.
     assert 2.0 < seasonality.amplitude < 5.0, seasonality.amplitude
     assert seasonality.factor.mean() == pytest.approx(1.0, abs=1e-6)
     assert len(seasonality.factor) == MINUTES_PER_DAY
 
 
 def test_seasonality_falls_back_to_flat_on_a_short_sample():
-    """A factor fitted on three days is noise wearing a shape."""
+    """On too short a sample the seasonal factor is flat."""
     bars = make_bars(days=3)['BTC-USD']
     grid = minute_grid(bars)
     seasonality = Seasonality.fit(log_returns(grid), Config(seasonality_min_days=60))
@@ -105,7 +94,7 @@ def test_seasonality_falls_back_to_flat_on_a_short_sample():
 
 
 def test_the_seasonal_factor_wraps_at_midnight():
-    """23:58 and 00:02 are two minutes apart, not 1,436."""
+    """The seasonal factor wraps at midnight: 23:58 and 00:02 are two minutes apart."""
     factor = np.zeros(MINUTES_PER_DAY)
     factor[0] = 1.0
     seasonality = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=999,
@@ -116,16 +105,15 @@ def test_the_seasonal_factor_wraps_at_midnight():
 
 
 def test_the_volatility_forecast_is_floored():
-    """A dead-quiet stretch otherwise divides the barrier by nearly zero.
+    """The volatility forecast is floored at `min_sigma_bps_per_minute`.
 
-    Tested on the model directly rather than through a degenerate fit: the point
-    is the floor, and a series flat enough to drive the forecast to zero is also
-    a series `VolModel.fit` correctly refuses to fit at all.
+    Tested on the model directly, since a series flat enough to forecast zero is one
+    `VolModel.fit` refuses.
     """
     config = Config(min_sigma_bps_per_minute=0.5)
     floor = config.min_sigma_bps_per_minute / 10_000.0
     lookbacks = tuple(config.vol_lookbacks_minutes)
-    # An intercept far below the floor, and no slope: every prediction is tiny.
+    # An intercept far below the floor and no slope: every prediction is tiny.
     model = VolModel(
         lookbacks=lookbacks,
         coefficients=np.array([-30.0] + [0.0] * (len(lookbacks) + 2)),
@@ -142,7 +130,7 @@ def test_the_volatility_forecast_is_floored():
 
 
 def test_a_degenerate_series_is_refused_rather_than_fitted():
-    """No trades is not a volatility of zero, and the fit says so."""
+    """A series with no price movement is refused instead of fitted."""
     n = 2000
     times = pd.date_range('2025-01-01', periods=n, freq='1min', tz='UTC')
     price = np.full(n, 100.0)

@@ -1,21 +1,7 @@
-"""The Polymarket socket recorder, and the failures the Kalshi one paid for.
+"""Tests for the Polymarket socket recorder `scripts.record_pm_stream`.
 
-**A silent socket cannot wake itself.** `record_stream.consume` first checked
-its refresh deadline inside the loop body, so when the subscribed markets
-settled at a window boundary the venue stopped sending and the loop waited
-forever for a frame that was never coming. Nothing raised, `supervise` saw a
-coroutine legitimately awaiting, and the recorder sat dead behind a container
-reporting healthy. So silence is a CONDITION here, enforced on a timeout — at
-~300 frames a second, fifteen seconds of nothing means the market settled or the
-connection died, and both are repaired by resubscribing.
-
-**The window rolls every fifteen minutes** and the token ids change with it. A
-recorder that subscribes once holds a book for a market that has settled, which
-looks exactly like a quiet market.
-
-**What it publishes is what `cross_venue_row` reads**, in the same shape as
-`record_pm_ladder.CACHE`: best bid and ask in CENTS with an `at` stamp, so the
-staleness guard added today keeps working and the two sources are swappable.
+Silence returns on a timeout, the recorder resubscribes as the window rolls, and it
+publishes the shape `cross_venue_row` reads.
 """
 from __future__ import annotations
 
@@ -28,8 +14,7 @@ from scripts import record_pm_stream as rec
 
 
 def test_silence_is_a_condition_not_a_wait():
-    """The exact deadlock: a socket that goes quiet must return a reason, not
-    block until a frame that is never coming."""
+    """A silent socket returns a reason instead of blocking forever."""
     async def _run():
         async def never():
             await asyncio.sleep(3600)
@@ -43,7 +28,7 @@ def test_silence_is_a_condition_not_a_wait():
 
 
 def test_the_refresh_deadline_fires_even_while_frames_pour_in():
-    """The other half: a busy socket must still hit its window rollover."""
+    """A busy socket still hits its refresh deadline at the window rollover."""
     async def _run():
         async def flood():
             return {'event_type': 'price_change', 'price_changes': []}
@@ -54,8 +39,9 @@ def test_the_refresh_deadline_fires_even_while_frames_pour_in():
 
 
 def test_publish_matches_the_shape_cross_venue_row_reads():
-    """Same keys and units as `record_pm_ladder.CACHE`: cents, plus a stamp for
-    the staleness guard."""
+    """The published entry matches `record_pm_ladder.CACHE`: cents, plus a stamp for the
+    staleness check.
+    """
     rec.CACHE.clear()
     book = rec.PmBookCache()
     book.apply({'event_type': 'book', 'asset_id': 'T', 'timestamp': '1788487941413',
@@ -69,8 +55,6 @@ def test_publish_matches_the_shape_cross_venue_row_reads():
 
 
 def test_a_one_sided_book_is_not_published_as_a_touch():
-    """A lone bid says the probability is at LEAST something, which is not a
-    probability — the same rule `_two_sided_mid` applies."""
     rec.CACHE.clear()
     book = rec.PmBookCache()
     book.apply({'event_type': 'book', 'asset_id': 'T', 'timestamp': '1788487941413',
@@ -97,19 +81,15 @@ class _Stream:
 
 
 def test_the_streamed_window_is_the_one_kalshi_settles():
-    """The alignment that "looks entirely right" when wrong.
+    """The slug names the window open that Kalshi's ticker settles 15 minutes later.
 
-    Kalshi's ticker is keyed on the SETTLE (KXBTC15M-26SEP032245-45 settles at
-    22:45), Polymarket's slug on the window OPEN. They name the same fifteen
-    minutes only if the slug's stamp is the settle minus the window length. Read
-    the slug as a close instead and every window shifts fifteen minutes, the
-    request still returns a healthy book, and agreement with our label drops to
-    a coin flip — which is how this was found the first time.
+    Kalshi's ticker is keyed on the settle time and Polymarket's slug on the window
+    open. Reading the slug as a close would shift every window by 15 minutes.
     """
     import datetime as dt
     from scripts.record_pm_ladder import slug_for, window_of
 
-    # A decision inside the 22:30-22:45 window, as Kalshi's -2245 ticker names.
+    # A decision inside the 22:30-22:45 window, which Kalshi's -2245 ticker names.
     now = dt.datetime(2026, 9, 3, 22, 37, tzinfo=dt.timezone.utc)
     opened = window_of(slug_for('btc', now))
     assert opened == pd.Timestamp('2026-09-03 22:30', tz='UTC'), (
@@ -119,9 +99,7 @@ def test_the_streamed_window_is_the_one_kalshi_settles():
 
 
 def test_a_decision_at_the_boundary_takes_the_window_it_is_inside():
-    """Floor, never ceil. At exactly 22:45 the new window has opened, and
-    naming the NEXT one returns a real book for a market fifteen minutes
-    ahead."""
+    """At the boundary the new window is used (floor, never ceil)."""
     import datetime as dt
     from scripts.record_pm_ladder import slug_for, window_of
 
@@ -134,17 +112,10 @@ def test_a_decision_at_the_boundary_takes_the_window_it_is_inside():
 
 
 def test_a_rolled_window_does_not_leave_the_old_book_readable():
-    """Observed live: Kalshi rebuilt its subscription at 22:45:16 and
-    Polymarket at 22:45:46 — thirty seconds later, because each venue's
-    silence starts when ITS markets settle.
+    """The cache records which window its reading belongs to.
 
-    In that gap the cache still held the PREVIOUS window's book, stamped with
-    its last frame, which is recent enough to pass the 30s staleness guard. So a
-    decision on the 22:45 window could price against the 22:30 book and nothing
-    would say so: a fresh-looking peer price for the wrong fifteen minutes.
-
-    Staleness alone cannot catch this — the data is fresh, it is simply not
-    about this window. The cache has to carry the window it belongs to.
+    At a rollover the cache can still hold the previous window's book with a recent
+    stamp, which passes the staleness check. Only the window tells them apart.
     """
     rec.CACHE.clear()
     book = rec.PmBookCache()
@@ -154,7 +125,7 @@ def test_a_rolled_window_does_not_leave_the_old_book_readable():
     rec.publish(book, {'OLD': 'BTC-USD'}, window=pd.Timestamp('2026-09-03 22:30', tz='UTC'))
     assert rec.CACHE['BTC-USD']['window'] == pd.Timestamp('2026-09-03 22:30', tz='UTC')
 
-    # the window rolls; the recorder has not caught up yet
+    # The window rolls; the recorder has not caught up yet.
     entry = rec.CACHE['BTC-USD']
     assert entry['window'] != pd.Timestamp('2026-09-03 22:45', tz='UTC'), (
         'the cached reading belongs to the previous window and a consumer must '

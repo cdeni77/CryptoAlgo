@@ -1,30 +1,14 @@
 """One row per unit of collection work, and what happened to it.
 
-**Why this exists.** Four separate claims about what market data exists were
-measured, believed and disproved in a single night: Kalshi's book start (wrong
-by five months), Polymarket's book start, Kalshi SOL's book start (wrong by
-five months in the other direction), and a density curve that appeared to fall
-when it does not. Every one conflated *"I got no data"* with *"no data
-exists"*.
+The status column separates three outcomes that look the same from outside:
 
-That confusion was structural rather than careless. Nothing in the old
-pipeline could represent "we never asked", so coverage had to be inferred from
-absence — and absence has three causes that are indistinguishable from
-outside:
-
-    empty     the venue answered, and there is genuinely no book
+    empty     the venue answered, and there is no book
     error     the request failed, so the question was never answered
     pending   nobody has asked yet
 
-This table makes that a column. Everything else it provides — exact resume,
-retry of only real failures, a live coverage map — falls out of having stated
-it.
-
-SQLite rather than Parquet because these rows are *updated*: the research
-store is append-oriented and is the output of collection, not its bookkeeping.
-`scripts/scrape.py` already uses SQLite the same way, for the same reason.
+This gives exact resume, retry of real failures only, and a coverage map.
+SQLite, not Parquet, because these rows are updated in place.
 """
-
 from __future__ import annotations
 
 import datetime as dt
@@ -33,9 +17,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-# After this many failed attempts a window stops being offered. One genuinely
-# broken window must not block a 47-hour queue forever, and a window that has
-# failed five times with backoff between is not a transient problem.
+# After this many failed attempts a window stops being offered, so one broken
+# window cannot block the queue.
 MAX_ATTEMPTS = 5
 
 PENDING, OK, EMPTY, ERROR, SKIPPED = 'pending', 'ok', 'empty', 'error', 'skipped'
@@ -86,9 +69,8 @@ class Ledger:
             os.makedirs(parent, exist_ok=True)
         self._con = sqlite3.connect(path, timeout=30)
         self._con.row_factory = sqlite3.Row
-        # The collector is one process by design (the Predexon bucket is
-        # org-wide), so WAL buys crash-safety rather than concurrency: a
-        # kill -9 mid-write leaves the last committed state intact.
+        # One collector process at a time, so WAL is for crash safety, not
+        # concurrency.
         self._con.execute('PRAGMA journal_mode=WAL')
         self._con.executescript(SCHEMA)
         self._con.commit()
@@ -98,9 +80,7 @@ class Ledger:
     def seed(self, items: Iterable[tuple]) -> int:
         """Create a `pending` row per work item. Safe to re-run.
 
-        `INSERT OR IGNORE` is the important part: Phase 0 may be re-run after
-        Phase 2 has already collected half the corpus, and re-seeding must
-        never reset a finished row back to pending.
+        `INSERT OR IGNORE` never resets a finished row to pending.
         """
         rows = []
         for venue, symbol, window_open, market_id in items:
@@ -120,16 +100,10 @@ class Ledger:
               since: Optional[dt.datetime] = None) -> list[WorkItem]:
         """The next work items, oldest month first.
 
-        Deliberately does NOT mark anything in progress. A claim that is never
-        recorded has to come back on the next call, because the alternative —
-        an `in_progress` state — turns every hard kill into a set of orphaned
-        rows needing a reaper. The cost of not having one is re-fetching at
-        most a batch after a crash.
-
-        Ordering is by month and then window, so the two venues interleave
-        naturally within a month: collecting one venue to completion first
-        would mean that stopping early yields no cross-venue windows at all,
-        which is the pairing the whole exercise is for.
+        Does not mark items in progress, so a hard kill leaves no orphaned rows;
+        an unrecorded claim returns on the next call. Ordering by month, then
+        window, interleaves the two venues, so a partial run still has
+        cross-venue pairs.
         """
         sql = ("SELECT * FROM collection_ledger WHERE status IN ('pending','error') "
                "AND attempts < ?")
@@ -141,8 +115,7 @@ class Ledger:
             sql += ' AND venue = ?'
             args.append(venue)
         if since is not None:
-            # ISO-8601 in UTC sorts lexicographically, which is why the column
-            # stores it that way rather than as an epoch.
+            # ISO-8601 in UTC sorts lexicographically.
             sql += ' AND window_open >= ?'
             args.append(_iso(since))
         sql += ' ORDER BY month, window_open, venue, symbol LIMIT ?'
@@ -185,10 +158,7 @@ class Ledger:
     def coverage(self) -> list[dict]:
         """Per month and venue: what we asked, and what came back.
 
-        `yield_pct` is over ANSWERED windows (ok + empty), never over the whole
-        month — otherwise a run that is half finished reports the same number
-        as a run that half failed, which is the ambiguity this table exists to
-        remove.
+        `yield_pct` is over answered windows (ok + empty), not the whole month.
         """
         out = []
         for r in self._con.execute(

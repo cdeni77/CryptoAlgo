@@ -1,24 +1,7 @@
-"""The calibration gate must be one the arithmetic null can pass.
+"""Tests for the calibration gates.
 
-`calibration_error <= 0.02` was derived under 21-day fold blocks. Under the
-7-day blocks the retrain actually runs, measured over 25 folds:
-
-    folds under 0.02    model 2/25    BASELINE 4/25
-
-`F(x/sigma)` — no features, no fit, the thing the model exists to correct —
-fails that bar on 21 of 25 folds. A gate the null cannot pass does not separate
-a good model from a bad one; it separates a large sample from a small one,
-because binned ECE is biased upward at small n. That is the same conclusion
-`calibration_max_deviation` already reached about its own absolute bar.
-
-The replacement asks the question worth asking: does the correction make
-calibration WORSE than the arithmetic it corrects? Measured, it does not —
-mean +0.00008, sd 0.00707, **t = +0.06** over 25 folds. Statistically
-identical, which is the honest reading rather than either an improvement or a
-fault.
-
-This is a gate being fixed, not loosened to fit a candidate: the argument is
-about the NULL's behaviour and holds whatever the model does.
+The baseline cannot pass a tight absolute ECE bar on 7-day folds, so the absolute bar is
+a sanity floor and the real gate compares the model with the baseline.
 """
 
 from __future__ import annotations
@@ -48,7 +31,7 @@ def test_the_relative_gate_exists_and_can_fail():
 
 
 @pytest.mark.parametrize('value,passes', [
-    (0.00100, True),    # measured today
+    (0.00100, True),  # measured value
     (-0.0050, True),    # the model improves calibration
     (0.00400, True),    # inside fold noise
     (0.00600, False),   # a systematic degradation
@@ -66,9 +49,7 @@ def test_both_calibration_gates_carry_a_note():
 
 
 def test_the_statistic_is_a_median_over_folds():
-    """A max over folds grows with the fold count, so an unchanged model scores
-    worse purely by accumulating history — the reason `median_fold_drawdown`
-    exists beside `max_drawdown`."""
+    """The statistic is a median over folds, since a max grows with the fold count."""
     from core.metrics import EvaluationReport
 
     src = EvaluationReport.calibration_vs_baseline.fget.__doc__ or ''
@@ -79,8 +60,7 @@ def test_the_statistic_is_a_median_over_folds():
 
 
 def test_a_fold_with_no_calibration_does_not_vanish():
-    """`max_ece` documents the NaN-ordering trap that let a fold silently
-    disappear; the median must not reintroduce it by counting NaN as zero."""
+    """The median excludes non-finite folds explicitly instead of counting NaN as zero."""
     import inspect
 
     from core.metrics import EvaluationReport

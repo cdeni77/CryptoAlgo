@@ -1,6 +1,4 @@
-"""
-Coinbase Advanced Trade API Connector.
-"""
+"""Coinbase Advanced Trade REST and WebSocket clients."""
 
 import asyncio
 import hashlib
@@ -63,16 +61,13 @@ class CoinbaseAuth:
         return jwt_token
 
 
-# Waits between attempts on an empty batch. Geometric, because the failure being
-# recovered from is a rate limit — and a rate limit answers an immediate retry
-# exactly as it answered the first request.
+# Waits between attempts on an empty batch. Geometric, because the likely cause
+# is a rate limit, and an immediate retry gets the same answer.
 EMPTY_BATCH_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
 
 
-# The venue's hard cap on candles per request. Both `start` and `end` are
-# inclusive, so a request may span at most this many candle STARTS — see
-# `get_candles_range`, where using the full span instead of `n - 1` silently
-# destroyed one minute in every 301.
+# The venue's cap on candles per request. Both `start` and `end` are inclusive,
+# so a request may span at most this many candle starts.
 MAX_CANDLES_PER_REQUEST = 300
 
 
@@ -171,17 +166,9 @@ class CoinbaseRESTClient:
             except (KeyError, ValueError, TypeError):
                 continue
         bars.sort(key=lambda x: x.event_time)
-        # Drop the candle that has not closed yet. `end` is almost always
-        # `utc_now()` at the call sites, so the newest candle returned was the
-        # one for the minute in progress: a partial bar whose high, low, close
-        # and volume are all wrong, stored permanently because
-        # `DataPipeline._poll` only accepts `event_time > last_known` and so never
-        # re-requests it. Observed directly — a scrape started at 04:17:29Z stored
-        # `04:17:00` for both symbols with 51.9% of a minute's volume.
-        #
-        # `available_time` is already `event_time + timeframe`, i.e. the instant
-        # the bar closes, so this is the same "knowable at close" rule the rest of
-        # the system uses rather than a second convention.
+        # Drop the candle that has not closed yet. It is a partial bar, and the
+        # poller never re-requests a bar it has stored. `available_time` is the
+        # instant the bar closes.
         now = utc_now()
         closed = [b for b in bars if b.available_time <= now]
         if len(closed) != len(bars):
@@ -199,18 +186,9 @@ class CoinbaseRESTClient:
         attempt = 0
         skipped_windows: List[tuple] = []
         tf_seconds = self._granularity_to_seconds(granularity)
-        # `limit - 1`, not `limit`. Coinbase treats both `start` and `end` as
-        # INCLUSIVE, so a span of `limit * tf` names `limit + 1` candle starts.
-        # With `limit=300` the API returned the newest 300 and dropped the oldest
-        # — `current_start` itself — and the loop below then advanced past it.
-        # One minute destroyed in every 301, forever.
-        #
-        # It was not a rounding detail. In the five-year store this produced
-        # 8,721 of BTC's 10,124 missing minutes: 98.9% of the gaps between holes
-        # were exactly 301 minutes, the rate was 0.003318 against 1/301 =
-        # 0.003322, and 5,121 of BTC's holes fell on the identical minute in ETH
-        # against 28.9 expected by chance. Two independent order books do not go
-        # untraded in the same 8,700 minutes.
+        # `limit - 1`, not `limit`. Coinbase treats `start` and `end` as
+        # inclusive, so a span of `limit * tf` names `limit + 1` candle starts.
+        # The API then drops the oldest, and the loop advances past it.
         batch_span = timedelta(seconds=tf_seconds * (MAX_CANDLES_PER_REQUEST - 1))
         while current_start < end:
             batch_end = min(current_start + batch_span, end)
@@ -224,16 +202,8 @@ class CoinbaseRESTClient:
                 attempt = 0
                 current_start = max(next_start, current_start + timedelta(seconds=tf_seconds))
             else:
-                # `get_candles` returns [] for both "no data in this window" and
-                # "the request failed", and advancing past a failure silently
-                # drops 300 bars.
-                #
-                # Retried with BACKOFF, not immediately. The previous version
-                # retried once with no delay, which is the one thing that cannot
-                # recover the most likely cause: a rate limit answers the second
-                # request exactly as it answered the first. On a five-year
-                # backfill of ~8,700 batches per symbol, two gave up this way and
-                # left two five-hour holes in the history.
+                # `get_candles` returns [] both for "no data" and for "the
+                # request failed". Retry with backoff before skipping the batch.
                 if attempt < len(EMPTY_BATCH_BACKOFF_SECONDS):
                     delay = EMPTY_BATCH_BACKOFF_SECONDS[attempt]
                     attempt += 1
@@ -263,8 +233,7 @@ class CoinbaseRESTClient:
                 'recover these with `python -m scripts.scrape --fill-gaps`, which '
                 're-requests only the minutes the store is missing'
             )
-        # Recorded on the client so a caller can act on them rather than parse a
-        # log line. Overwritten per call, which is what a caller wants.
+        # Recorded on the client for the caller to act on. Overwritten per call.
         self.last_skipped_windows = list(skipped_windows)
         unique = {b.event_time: b for b in all_bars}
         return sorted(unique.values(), key=lambda x: x.event_time)

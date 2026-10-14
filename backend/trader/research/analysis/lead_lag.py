@@ -1,38 +1,15 @@
 """Does the Kalshi price lag spot, or Polymarket, at the seconds scale?
 
-The live audit found the model beats `F(x/sigma)` at every offset and does not
-beat the Kalshi price at any. One explanation is that the price already
-contains whatever the spot features see, within seconds. This measures that
-directly, with no model in the way.
+Converts each series to 1-second changes in the barrier z (Kalshi and Polymarket:
+`Phi^-1(mid)`; spot: log return over remaining sigma) and cross-correlates them
+inside each market at lags -max..+max, pooled and bucketed by minutes left.
+Without `spot_trades` it falls back to one-minute bars, which cannot resolve
+seconds; `pm_ladder` is sampled about once a minute. The report says so.
 
-Method, per symbol and per market (one 15-minute window):
-
-* **Kalshi** — the raw `venue_book_events` frames replayed through the same
-  `BookCache` the live path folds, sampled on a 1-second grid. The mid is turned
-  into an implied barrier z, `Phi^-1(mid)`.
-* **Spot** — `spot_trades` (symbol, trade_id, time, price, size), last price per
-  second. Its z change over one second is the log return divided by the
-  remaining sigma, `sigma_1s * sqrt(remaining variance seconds)`, with `sigma_1s`
-  a trailing 15-minute realised volatility. That is `dx / sigma_n`, the change
-  in the barrier's own argument. Without a trades table it falls back to
-  one-minute bars, which move once a minute and CANNOT resolve a seconds-scale
-  lead; the report says so.
-* **Polymarket** — `pm_ladder` mids, as Kalshi's. The archive samples that venue
-  about once a minute (the stream is not archived), so the same caveat applies
-  and the report states the median sampling interval.
-
-Then cross-correlate the 1-second z changes inside each market at lags
--60..+60s, pooled across markets and bucketed by minutes remaining.
-
-**Sign convention: a POSITIVE lag means the other series LEADS Kalshi** —
-corr(dz_kalshi(t), dz_other(t - lag)). A peak at +5 says Kalshi moves five
-seconds after spot.
-
-`lead_share` is an information-share-style summary: the squared correlation at
-positive lags over that at all non-zero lags. 0.5 is symmetric; near 1 the other
-series leads. `delayed_share` is the part of Kalshi's response to the other
-series that arrives AFTER the same second, from the positive correlations at
-lags >= 0 — the fraction a decision taken on the stale price would miss.
+Sign convention: a positive lag means the other series leads Kalshi,
+corr(dz_kalshi(t), dz_other(t - lag)). `lead_share` is the squared correlation
+at positive lags over all non-zero lags (0.5 is symmetric). `delayed_share` is
+the share of Kalshi's positive response that arrives after lag 0.
 
     python research/analysis/lead_lag.py --start 2026-10-12 --end 2026-10-13
     python research/analysis/lead_lag.py --symbols BTC-USD --max-lag 30
@@ -40,8 +17,7 @@ lags >= 0 — the fraction a decision taken on the stale price would miss.
 
 from __future__ import annotations
 
-# `core` is rooted at backend/trader/, which Python does not add to sys.path for
-# a script run from a subdirectory.
+# Put backend/trader on sys.path, so `core` imports when run as a script.
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
@@ -77,12 +53,11 @@ def _seconds(values) -> pd.Series:
 def kalshi_mid_series(events: pd.DataFrame) -> pd.DataFrame:
     """Replay `venue_book_events` rows into a mid per market per second.
 
-    Frames are regrouped on (market_ticker, event_time, seq) — `core/spool`
-    explains why seq alone is not unique — and folded through `BookCache`, the
-    one applier. Sequence checking is skipped (seq=None): a replay of a subset
-    of markets is not a connection, and every market would read as gapped.
-    Returns symbol, market_ticker, time (whole seconds), mid; one-sided seconds
-    are left out rather than guessed.
+    Frames regroup on (market_ticker, event_time, seq), because every level of
+    a snapshot shares one seq, and fold through `BookCache`. Sequence checking
+    is off (seq=None): a replay of some markets would read as gapped.
+    Returns symbol, market_ticker, time (whole seconds), mid; one-sided
+    seconds are left out.
     """
     from core.stream_book import BookCache
     from data_collection.stream.base import BookEvent

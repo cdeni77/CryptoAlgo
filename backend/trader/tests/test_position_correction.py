@@ -1,19 +1,7 @@
-"""Positions must be re-settled when the venue graded them differently.
+"""Tests for `correct_positions_from_venue`, which re-settles positions the venue graded
+differently.
 
-`settle_due` prefers the venue's settlement — but only if it already has one.
-A window that matures before the venue's row arrives is graded from our
-Coinbase bars, and nothing ever re-grades it: the same "only fills what is
-empty" shape `set_window_outcome` had for predictions.
-
-Measured 2026-10-03 over 216 settled trades: our books showed **130 winners
-against the venue's 123**, a 3.2% disagreement matching the documented
-Coinbase-vs-BRTI rate, all in near-ties. Worth $21.06 — our books read +$8.80
-where the venue read -$12.26.
-
-That is not just reporting. `account.realized_pnl` is what the daily-loss limit
-and the drawdown breaker read, so both were keyed to a P&L optimistic by that
-margin: the safety brakes under-react by exactly the amount our own label
-flatters us.
+`realized_pnl` feeds the daily-loss and drawdown breakers, so it must match the venue.
 """
 
 from __future__ import annotations
@@ -34,7 +22,7 @@ def writer(tmp_path):
 
 def _position(writer, *, side='up', contracts=4, price=0.5, fee=0.05,
               settled_up=True):
-    """One settled position, graded OUR way."""
+    """One settled position, graded our way."""
     from core.pg_writer import Outcome, Position
     from core.book import won as _won
 
@@ -56,7 +44,7 @@ def _position(writer, *, side='up', contracts=4, price=0.5, fee=0.05,
 
 def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
     account = writer.ensure_account(500.0, mode='live')
-    outlay = _position(writer, settled_up=True)       # we said UP, +$1.95
+    outlay = _position(writer, settled_up=True)  # we said UP, +$1.95
     before = writer.account().realized_pnl
 
     seen, fixed, delta = writer.correct_positions_from_venue(
@@ -64,9 +52,9 @@ def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
 
     assert (seen, fixed) == (1, 1)
     assert delta == pytest.approx(-4.0), 'a 4-contract payout is withdrawn'
-    # `realized_pnl` is RESTATED from the positions, not nudged by the delta --
-    # see `test_realized_pnl_is_restated_not_nudged` for why. With one settled
-    # position that is now a loss, the total is its own pnl.
+    # `realized_pnl` is restated from the positions, not adjusted by the delta (see
+    # `test_realized_pnl_is_restated_not_nudged`). With one settled losing position,
+    # the total is its own pnl.
     assert writer.account().realized_pnl == pytest.approx(-outlay)
     assert before == pytest.approx(0.0), 'sanity: the fixture starts flat'
     with writer._session() as session:                    # noqa: SLF001
@@ -80,12 +68,8 @@ def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
 def test_agreement_re_settles_nothing(writer):
     """No position is re-graded when the venue agrees.
 
-    `realized_pnl` is NOT asserted unchanged, because the restate runs every
-    pass by design — it is a statement about what that field IS, so enforcing
-    it only when something changed would leave existing drift in place. Here it
-    corrects an inconsistency this fixture creates: `_position` inserts rows
-    directly rather than through `settle_position`, which is what would
-    normally accumulate the figure.
+    `realized_pnl` is restated on every pass by design. Here it corrects a mismatch the
+    fixture creates by inserting rows directly.
     """
     from core.pg_writer import Position
 
@@ -101,8 +85,7 @@ def test_agreement_re_settles_nothing(writer):
 
 
 def test_it_is_idempotent(writer):
-    """The reported count IS the disagreement, so a re-run must correct
-    nothing."""
+    """A second run corrects nothing."""
     writer.ensure_account(500.0, mode='live')
     _position(writer, settled_up=True)
     writer.correct_positions_from_venue([('BTC-USD', OPEN, False)])
@@ -114,8 +97,7 @@ def test_it_is_idempotent(writer):
 
 
 def test_a_down_side_position_flips_the_other_way(writer):
-    """`_won` is side-aware: a DOWN holding wins when the window settles
-    down, so a venue 'up' must turn it into a loss."""
+    """A DOWN position flips the other way: a venue 'up' makes it a loss."""
     writer.ensure_account(500.0, mode='live')
     _position(writer, side='down', settled_up=False)   # we said DOWN won
     _, fixed, delta = writer.correct_positions_from_venue(
@@ -124,9 +106,7 @@ def test_a_down_side_position_flips_the_other_way(writer):
 
 
 def test_bankroll_is_left_to_the_venue(writer):
-    """`adopt_venue_balance` writes the venue's balance every cycle and the
-    venue is the account of record. Correcting a figure it already owns would
-    be a second source of truth."""
+    """The bankroll is left alone; `adopt_venue_balance` already takes it from the venue."""
     writer.ensure_account(500.0, mode='live')
     _position(writer, settled_up=True)
     before = writer.account().bankroll
@@ -135,7 +115,7 @@ def test_bankroll_is_left_to_the_venue(writer):
 
 
 def test_an_unsettled_position_is_not_touched(writer):
-    """Only `settle_due` may grade a window the first time; this re-grades."""
+    """An unsettled position is not touched; only `settle_due` grades a window first."""
     from core.pg_writer import Outcome, Position
 
     writer.ensure_account(500.0, mode='live')
@@ -152,13 +132,10 @@ def test_an_unsettled_position_is_not_touched(writer):
 
 
 def test_realized_pnl_is_restated_not_nudged(writer):
-    """`account.realized_pnl` covers the period since `account.reset_at`, while
-    the venue labels reach further back — so applying the raw delta leaks
-    pre-epoch corrections into a post-epoch total. On the first real run that
-    put it at -$42.20 against post-epoch positions summing to -$12.20.
+    """`realized_pnl` is restated from post-epoch positions, so pre-epoch corrections do
+    not leak in.
 
-    The invariant it restores:
-        realized_pnl == sum(positions.pnl where settled_at >= epoch)
+    Invariant: realized_pnl == sum(positions.pnl where settled_at >= epoch).
     """
     from core.pg_writer import Account
 
@@ -170,8 +147,8 @@ def test_realized_pnl_is_restated_not_nudged(writer):
         row.realized_pnl = 0.0
         session.commit()
 
-    # One position BEFORE the epoch and one after; both graded our way.
-    _position(writer, settled_up=True)                     # at OPEN, post-epoch
+    # One position before the epoch and one after; both graded our way.
+    _position(writer, settled_up=True)  # at OPEN, post-epoch
     from core.pg_writer import Outcome, Position
     with writer._session() as session:                    # noqa: SLF001
         session.add(Position(
@@ -183,7 +160,7 @@ def test_realized_pnl_is_restated_not_nudged(writer):
             settled_at=epoch - dt.timedelta(days=2)))
         session.commit()
 
-    # The venue disagrees with BOTH.
+    # The venue disagrees with both.
     writer.correct_positions_from_venue([
         ('BTC-USD', OPEN, False),
         ('ETH-USD', epoch - dt.timedelta(days=2), False),

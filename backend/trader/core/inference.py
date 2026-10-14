@@ -1,39 +1,13 @@
-"""Significance tests for correlated samples, written before the numbers exist.
+"""Significance tests for correlated samples.
 
-**Two established methods are unavailable here, and that is why this module is
-its own file.**
+Fold dispersion cannot carry inference over a short calendar span, and the
+breadth formula `N/(1+(N-1)rho)` is degenerate on this structure.
+So the forecast test is a circular block bootstrap over whole UTC days.
+A day holds all symbols and offsets, so their correlation is absorbed, not assumed.
+Circular, so every day is drawn with equal probability.
+Block lengths of 1 and 5 days both run, and the more conservative result governs.
 
-`core/metrics.py` gets its standard errors from fold dispersion, and explicitly
-rejects the breadth formula `N/(1+(N-1)rho)` as degenerate on this structure —
-four offsets share one label and three symbols are ~0.62 correlated within a
-window. That rejection stands.
-
-But fold dispersion cannot carry an inference over a short calendar span either.
-The Kalshi series are 69 days old; six expanding folds are ~11.4 days each and
-adjacent in one regime. Measured by simulation at rho = 0.7 between folds,
-"5 of 6 folds positive" is a **34.6%** event under the null and "6 of 6" is
-**22.4%** — against 10.9% and 1.6% if they were independent. Fold agreement is
-worth almost nothing on that span.
-
-So neither method works, and the replacement has to be structural rather than
-parametric:
-
-**A circular block bootstrap over whole UTC days.** A day carries all three
-symbols and all four offsets together, so cross-symbol and cross-offset
-correlation are absorbed by construction instead of assumed at some rho. Intra-day
-chaining — one window's strike is the previous window's settlement — survives
-inside a block; only the midnight boundary is cut. Circular rather than moving,
-because a moving-block scheme samples interior days more often than the endpoints
-and wrapping costs nothing.
-
-The block length is the one free parameter, so it is not free: both 1 day and 5
-days are run and **the more conservative governs**, fixed in
-`DECISION_RULE.md` Appendix A before any result was seen.
-
-The second test here is the economic one the body of `DECISION_RULE.md` is
-defined in terms of, which had never been written down as code — it existed only
-as a description and as an ad-hoc script. Writing it now, while nobody knows the
-answer, is the whole point.
+The economic test asks whether realised P&L is unusual if the market is priced correctly.
 """
 
 from __future__ import annotations
@@ -51,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RESAMPLES = 10_000
 DEFAULT_BLOCK_DAYS = (1, 5)
-MIN_USABLE_DAYS = 30          # DECISION_RULE.md Appendix A voids the test below this
+MIN_USABLE_DAYS = 30          # the test is void below this
 
 
 def _log_loss(outcome: np.ndarray, probability: np.ndarray) -> float:
@@ -90,8 +64,7 @@ def circular_block_bootstrap(
     """Resample whole day-blocks with replacement, recomputing `statistic`.
 
     `groups` is one array of row indices per day, in calendar order. Blocks wrap
-    past the end so every day is drawn with equal probability — the reason for
-    circular rather than moving.
+    past the end, so every day is drawn with equal probability.
     """
     n_days = len(groups)
     if n_days == 0:
@@ -131,8 +104,7 @@ def model_minus_market(
 ) -> dict[int, BootstrapResult]:
     """The retroactive forecast test. Positive means the model beats the price.
 
-    One result per block length; the caller takes the more conservative, which
-    `governing()` does.
+    Returns one result per block length. `governing()` picks the conservative one.
     """
     y = frame[outcome_column].to_numpy(dtype=float)
     q = frame[model_column].to_numpy(dtype=float)
@@ -161,8 +133,9 @@ def model_minus_market(
 
 
 def governing(results: dict[int, BootstrapResult]) -> BootstrapResult:
-    """The conservative one: the largest p-value. Fixed in advance so the block
-    length cannot be chosen after seeing which is kinder."""
+    """The conservative result: the largest p-value.
+
+    Fixed in advance, so the block length cannot be chosen after the result."""
     return max(results.values(), key=lambda r: r.p_value)
 
 
@@ -192,16 +165,14 @@ def pnl_against_market_null(
     seed: int = 20260825,
     window_column: str = 'window_open',
 ) -> PnlNullResult:
-    """The economic test: is realised P&L unusual if the market is correctly priced?
+    """The economic test: is realised P&L unusual if the market is priced correctly?
 
     Each trade keeps its real price, size and fee. The market's de-spread mid is
-    taken as the true probability. Outcomes are drawn from a Gaussian copula with
-    a per-window common factor, so the three symbols in one window move together
-    — which is what makes a naive per-trade binomial far too confident.
+    the true probability. Outcomes come from a Gaussian copula with a per-window
+    common factor, so symbols in one window move together.
 
-    `trades` needs `contracts`, `outlay`, `pnl`, `p_win_market` and a window
-    key. `outlay` is everything paid, fee INCLUDED — what `decide()` books as
-    the stake and live records as the cost — so the fee is not added again.
+    `trades` needs `contracts`, `outlay`, `pnl`, `p_win_market` and a window key.
+    `outlay` includes the fee, so the fee is not added again.
     """
     from scipy.stats import norm
 

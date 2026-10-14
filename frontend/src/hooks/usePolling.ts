@@ -2,29 +2,18 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError } from '../api/client';
 
 /**
- * Poll an endpoint, with the three things every screen here was missing.
+ * Poll an endpoint.
  *
- * **It stops when nobody is looking.** Every page set up its own `setInterval`
- * and left it running forever. A dashboard on a background tab was hitting six
- * endpoints every three seconds, indefinitely — which on this stack means the
- * wallet endpoint calling Coinbase on a timer for a screen nobody is reading.
- *
- * **It reports failure.** The old handlers were `.catch(() => {})`. A backend
- * that had stopped responding looked exactly like a market that had stopped
- * moving: the last values simply stayed on screen. An error now surfaces, and
- * the stale data stays visible alongside it rather than being blanked, because
- * the last known price is still worth more than an empty panel.
- *
- * **It distinguishes "loading" from "empty".** `loading` is true only until the
- * first settled response, so an empty array after a successful fetch renders as
- * "nothing here" rather than as a spinner that never resolves.
+ * Stops while the tab is hidden. Reports a failure as `error`, and keeps the
+ * last data on screen beside it. `loading` is true only until the first
+ * response settles, so an empty result renders as empty, not as a spinner.
  */
 
 export interface PollingState<T> {
   data: T | null;
   error: ApiError | Error | null;
-  /** True until the first response settles, and never again — a refresh in the
-   *  background must not blank a populated screen. */
+  /** True until the first response settles, and never again, so a background
+   *  refresh never blanks the screen. */
   loading: boolean;
   /** True while a refresh is in flight over existing data. */
   refreshing: boolean;
@@ -50,19 +39,13 @@ export function usePolling<T>(
 
   const mounted = useRef(true);
   const inFlight = useRef(false);
-  // Which set of `deps` the in-flight request belongs to. Without this, changing
-  // the selection left the previous subject's response to land under the new
-  // subject's label: the effect re-ran, `void load()` hit the in-flight guard
-  // and returned, then the old request resolved and called setData — so the
-  // Trading page plotted the previous coin's candles under "{coin} / USD", and
-  // computed its range change from them, until the next interval tick.
+  // Which set of `deps` the in-flight request belongs to, so a response for a
+  // previous subject is dropped instead of shown under the new one.
   const generation = useRef(0);
   const firstRun = useRef(true);
 
   const load = useCallback(async () => {
-    // Skip if a request is already out. A slow endpoint on a short interval
-    // otherwise stacks requests until one of them wins arbitrarily, and the
-    // value that lands is whichever finished last, not whichever is newest.
+    // Skip if a request is already out, so requests never stack up.
     if (inFlight.current) return;
     const requested = generation.current;
     inFlight.current = true;
@@ -88,16 +71,15 @@ export function usePolling<T>(
 
   useEffect(() => {
     mounted.current = true;
-    // A new generation invalidates any in-flight response and frees the guard so
-    // the new subject is fetched immediately rather than at the next tick.
+    // A new generation invalidates any in-flight response and frees the guard,
+    // so the new subject is fetched at once.
     generation.current += 1;
     inFlight.current = false;
 
     if (firstRun.current) {
       firstRun.current = false;
     } else {
-      // The previous value describes a different subject. Showing "no data yet"
-      // is honest; showing the last subject's numbers is not.
+      // The previous value describes a different subject: clear it.
       setData(null);
       setError(null);
       setLoading(true);
@@ -120,8 +102,7 @@ export function usePolling<T>(
       if (document.hidden) {
         stop();
       } else {
-        // Refresh immediately on return: the interval alone would leave a stale
-        // value on screen for up to one full period after the tab is focused.
+        // Refresh at once on return, not at the next interval.
         void load();
         start();
       }

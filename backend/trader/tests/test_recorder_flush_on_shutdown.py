@@ -1,12 +1,7 @@
-"""Buffered rows must survive a shutdown.
+"""Tests that buffered recorder rows are written on shutdown.
 
-Three recorders accumulate into a local list and write when it reaches
-`--batch-rows`. Their only handler was `except Exception`, and
-`asyncio.CancelledError` is a **BaseException** -- so `run_live`'s
-`task.cancel()` discarded whatever was buffered. Up to a full batch per restart,
-on datasets whose entire justification is that a minute not recorded is gone.
-
-`record_stream` was already correct; these three were not.
+`asyncio.CancelledError` is a BaseException, so `except Exception` does not catch it and
+a cancelled recorder would drop its buffer.
 """
 
 from __future__ import annotations

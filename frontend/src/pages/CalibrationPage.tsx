@@ -1,15 +1,8 @@
 /** Is the forecast honest about its own confidence?
  *
- * This page exists because the system only trades its confident predictions. A
- * model can hit the base rate exactly while being wrong at every level of
- * confidence, and a headline accuracy would not show it. What matters is the
- * 0.85–0.95 band, where the fee is cheapest and the trades actually happen.
- *
- * Both curves are shown, because the model's calibration is only interesting
- * relative to the baseline's: the residual architecture means the model is
- * fitting a correction, so if the baseline is already straight the model has
- * nothing to add, and if the baseline is bent the model's apparent skill is
- * partly the baseline's error.
+ * Shows the reliability curves for the model and the baseline. The model fits
+ * a correction to the baseline, so its calibration is read against the
+ * baseline's.
  */
 import { usePolling } from '../hooks/usePolling';
 import { fetchCalibration, fetchModel } from '../api/serving';

@@ -1,26 +1,14 @@
 """Measurement, and the gates a candidate has to clear.
 
-Everything here is *incremental against the baseline*. A log loss, an accuracy
-or a Brier score quoted on its own is uninterpretable in this system, because
-the barrier arithmetic alone takes log loss from 0.693 to about 0.513 — a 26%
-improvement over a coin flip using nothing but a clock and a volatility
-estimate. Reported against 50% that reads as a large edge. It is not an edge at
-all, and the only number that means anything is the difference.
+Everything is incremental against the baseline. The barrier arithmetic alone
+beats a coin flip by a wide margin, so only the difference means anything.
 
-**Standard errors come from fold dispersion.** Not from `N/(1+(N-1)rho)`: four
-decision offsets share one label, the three symbols are ~0.7 correlated within
-a window, and a breadth formula on that structure is not merely optimistic but
-degenerate. Folds are weighted by their window count (they vary ~10x in size)
-and the error bar uses the Kish effective number of folds, so a thin fold
-neither moves the mean as much as a thick one nor buys a full degree of freedom.
+Standard errors come from fold dispersion, not `N/(1+(N-1)rho)`: offsets share a
+label and symbols are correlated within a window, so a breadth formula is
+degenerate. Folds are weighted by window count, and the error bar uses the Kish
+effective number of folds.
 
-**The gates exist because a Sharpe ratio is the wrong first question.** On the
-perp system a model 34x short of its cost hurdle failed every gate without any
-of them saying why, because they all read simulated outcomes. Here the first
-four gates read the *forecast* — skill, fold agreement, calibration, and how
-much of the model's claimed correction survives out of sample — and only then
-does the money get looked at. A weak forecast and an expensive venue are the
-same ratio and opposite fixes.
+The gates read the market comparison first, then the forecast, then the money.
 """
 
 from __future__ import annotations
@@ -181,21 +169,11 @@ def brier_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) ->
 def resolve_max_deviation(per_fold, pooled) -> tuple:
     """(value, why) for `calibration_max_deviation`, preferring the per-fold max.
 
-    `worst_deviation` returns NaN when no bin holds its minimum row count, and
-    `max` over folds propagates that — so a run whose folds are individually too
-    small reported NaN and FAILED, indistinguishably from a model that is badly
-    calibrated. Under `--complete-cases` that is the normal case, not an
-    exception.
-
-    Every scored row is out-of-sample whichever fold produced it, so the pooled
-    rows are a legitimate fallback with fold-count times the rows per bin. It
-    stays a FALLBACK: the per-fold maximum is the stricter statistic, and a
-    single badly-calibrated fold is exactly what the gate exists to catch, so
-    one measurable fold beats the pool.
-
-    Nothing measurable anywhere still returns NaN and still fails -- not
-    measured is not measured good -- but the reason names the sample size rather
-    than the model.
+    `worst_deviation` is NaN when no bin reaches its minimum row count, which
+    is normal for small folds. Every scored row is out of sample, so the pooled
+    rows are a valid fallback. The per-fold maximum stays preferred: it is
+    stricter. With nothing measurable, the value is NaN and fails, and the
+    reason names the sample size.
     """
     values = [float(v) for v in per_fold if v is not None and np.isfinite(v)]
     if values:
@@ -227,11 +205,11 @@ class FoldEvaluation:
     reliability_table: Optional[Reliability] = None
     stats: Optional[BookStats] = None
     per_offset: Optional[pd.DataFrame] = None
-    # Rows whose prediction or outcome was not finite. Reported so a data hole
-    # says "data hole" instead of "no skill" — see `n_non_finite` in the gates.
+    # Rows whose prediction or outcome was not finite. Counted, so a data hole
+    # reads as a data hole, not as no skill.
     n_non_finite: int = 0
-    # The worst deviation in any adequately-populated reliability bin. The mean
-    # ECE cannot see the traded band; this can.
+    # The worst deviation in any adequately-populated reliability bin. Mean ECE
+    # cannot see the traded band; this can.
     model_max_deviation: float = float('nan')
 
     @property
@@ -268,16 +246,10 @@ def evaluate_fold(
 
     outcome = test['outcome'].to_numpy(dtype=float)
 
-    # A row with no volatility estimate has no forecast, so it cannot be scored —
-    # and it is not an error. Measured on real bars: a 6.5-hour Coinbase outage
-    # leaves the 240-minute lookback unfillable for about two hours afterwards, so
-    # ~83 rows in 53,200 come back with a NaN sigma. Live, `decide` refuses those
-    # as NOT_FINITE; here they must leave the metric rather than poison it.
-    #
-    # They are *excluded and counted*, not dropped silently. Silence was the
-    # original defect: `np.mean` propagated the NaN into every fold statistic
-    # while `np.digitize` filed the rows in the 0.95-1.00 reliability bin, and one
-    # of the two readers then failed open. The count reaches a gate as a share.
+    # A row with no volatility estimate has no forecast (e.g. after a data
+    # outage). Live refuses it as NOT_FINITE; here it is excluded and counted,
+    # and the count reaches a gate as a share. Left in, NaN would poison every
+    # fold statistic.
     finite = (np.isfinite(outcome) & np.isfinite(model_probability)
               & np.isfinite(baseline_probability))
     n_non_finite = int((~finite).sum())
@@ -334,7 +306,7 @@ class EvaluationReport:
     config_provenance: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     # How the folds were actually cut. `config_provenance['n_folds']` is the
-    # configured value, which the calendar scheme does not honour as a count.
+    # configured value, which the calendar scheme does not treat as a count.
     fold_geometry: dict = field(default_factory=dict)
     # Daily P&L moments of the continuous book, for the deflated Sharpe ratio.
     sharpe_moments: dict = field(default_factory=dict)
@@ -348,8 +320,8 @@ class EvaluationReport:
 
     @property
     def fold_weights(self) -> np.ndarray:
-        """Window counts. Folds vary ~10x in size, so equal weights let a thin
-        fold move the mean as much as one ten times its precision."""
+        """Window counts. Folds vary in size, so equal weights would let a thin
+        fold move the mean as much as a thick one."""
         return np.array([max(int(getattr(f, 'n_windows', 0) or 0), 0)
                          for f in self.folds], dtype=float)
 
@@ -362,7 +334,7 @@ class EvaluationReport:
 
     @property
     def unweighted_skill(self) -> WeightedMean:
-        """Every fold equal, as every ledger entry before gate definition v2."""
+        """Every fold weighted equally."""
         return weighted_fold_mean(self.skills)
 
     @property
@@ -386,9 +358,8 @@ class EvaluationReport:
     def skill_p_value(self) -> float:
         """One-sided p of the weighted mean skill against zero.
 
-        `log_loss_skill >= 0` is a point estimate, and half of all nulls clear
-        it. This is the gate that asks whether the skill is distinguishable
-        from fold noise.
+        A point estimate `>= 0` is cleared by half of all nulls; this asks
+        whether the skill is distinguishable from fold noise.
         """
         return self.weighted_skill.p_value
 
@@ -404,8 +375,7 @@ class EvaluationReport:
     def fold_drawdowns(self) -> list[float]:
         """Each fold's own worst drawdown, on its own book from the same start.
 
-        A fold is a FIXED 21-day block, so this cannot ratchet with history the
-        way the continuous curve does — see `median_fold_drawdown`.
+        A fold is a fixed block, so this does not ratchet with history.
         """
         out = []
         for fold in self.folds:
@@ -417,24 +387,11 @@ class EvaluationReport:
 
     @property
     def median_fold_drawdown(self) -> float:
-        """**The drawdown statistic that can be gated, because it holds still.**
+        """The gated drawdown statistic, because it holds still.
 
-        `max_drawdown` on the continuous curve is a running maximum over the
-        whole out-of-sample span. It can only ratchet upward: adding days can
-        never lower it, so against a fixed bar it eventually fails forever
-        whatever the model does. Measured on the SAME configuration three days
-        apart, it went 0.182 -> 0.388 and failed a 0.35 gate it had just
-        passed. That is a property of the statistic, not of the strategy.
-
-        Any max-over-the-sample quantity has this problem, so the fix is not a
-        looser bar — it is a statistic whose expectation does not grow with the
-        sample. The median across folds is one: each fold is a fixed-length
-        block with its own book, so it answers "what does a typical three-week
-        stretch look like" and gives the same answer next week.
-
-        The continuous figure stays in the report as a diagnostic. It is still
-        the honest answer to "what is the worst this has ever been", which is
-        worth knowing and not worth gating.
+        `max_drawdown` on the continuous curve is a running maximum and can only
+        grow as days are added. The median over fixed-length fold blocks does
+        not grow with the sample. The continuous figure stays as a diagnostic.
         """
         values = self.fold_drawdowns
         return float(np.median(values)) if values else float('nan')
@@ -447,13 +404,7 @@ class EvaluationReport:
 
     @property
     def sign_agreement_p_value(self) -> float:
-        """P(at least this many folds positive | no skill), each fold a coin flip.
-
-        With six folds, five or more positive happens 10.9% of the time by
-        chance. That is the number to hold against any "five of six" claim, and
-        it is why the gate asks for five *and* a positive aggregate rather than
-        treating agreement as proof.
-        """
+        """P(at least this many folds positive | no skill), each fold a coin flip."""
         from scipy import stats as sstats
         n, k = self.folds_total, self.folds_positive
         if n == 0:
@@ -464,27 +415,10 @@ class EvaluationReport:
     def calibration_vs_baseline(self) -> float:
         """Median fold (model ECE - baseline ECE). Positive means worse.
 
-        **Replaces an absolute bar that the arithmetic null itself fails.**
-        `calibration_error <= 0.02` was set under 21-day fold blocks. Under the
-        7-day blocks the retrain actually runs, measured over 25 folds:
-
-            folds under 0.02    model 2/25    BASELINE 4/25
-
-        `F(x/sigma)` — the thing the model exists to correct, with no features
-        and no fit — fails that bar on 21 of 25 folds. A gate the null cannot
-        pass is not measuring the model; it is measuring binned ECE on a 7-day
-        sample, which is biased upward at small n. Exactly the conclusion
-        `calibration_max_deviation` already reached about its own absolute bar:
-        "an absolute bar encodes an assumption this venue falsifies".
-
-        The question worth gating is whether the correction makes calibration
-        WORSE than the arithmetic it corrects. Measured, it does not: the
-        per-fold difference is mean +0.00008, sd 0.00707, **t = +0.06** over 25
-        folds — statistically identical, neither better nor worse.
-
-        MEDIAN, not max, for the same reason `median_fold_drawdown` exists: a
-        max over folds grows with the fold count, so an unchanged model scores
-        worse on it purely by accumulating history.
+        Asks whether the correction makes calibration worse than the arithmetic
+        it corrects. An absolute ECE bar on short folds measures sample size,
+        because binned ECE is biased upward at small n.
+        Median, not max: a max over folds grows with the fold count.
         """
         pairs = [(f.model_ece, f.baseline_ece) for f in self.folds
                  if np.isfinite(f.model_ece) and np.isfinite(f.baseline_ece)]
@@ -494,12 +428,8 @@ class EvaluationReport:
 
     @property
     def max_ece(self) -> float:
-        # `np.max`, not the builtin. Builtin `max` with a NaN in the sequence is
-        # order-dependent — `max([0.015, nan])` is 0.015 and `max([nan, 0.015])`
-        # is nan — so a fold whose calibration could not be computed silently
-        # vanished and the gate passed on the folds that worked. `Gate.passed`
-        # already fails closed on a non-finite value; the aggregation has to let
-        # it get there.
+        # `np.max`, not the builtin: builtin `max` with a NaN is order-dependent,
+        # so a NaN fold could vanish. `Gate.passed` fails closed on NaN.
         if not self.folds:
             return float('nan')
         return float(np.max(np.asarray([f.model_ece for f in self.folds], dtype=float)))
@@ -508,11 +438,7 @@ class EvaluationReport:
     def max_calibration_deviation(self) -> float:
         """The worst adequately-populated calibration bin.
 
-        Per-fold first, pooled as a fallback. `worst_deviation` returns NaN when
-        no bin holds its minimum row count, and `max` propagated that, so a run
-        with small folds reported NaN and FAILED — indistinguishable from a model
-        that is genuinely badly calibrated. Under `--complete-cases` small folds
-        are the normal case. See `resolve_max_deviation`.
+        Per fold first, pooled as a fallback. See `resolve_max_deviation`.
         """
         if not self.folds:
             return float('nan')
@@ -526,9 +452,7 @@ class EvaluationReport:
     def pooled_max_deviation(self) -> float:
         """The same statistic on every scored row at once.
 
-        Legitimate because each row is out-of-sample whichever fold produced it,
-        and it carries fold-count times the rows per bin — which is the whole
-        reason the per-fold version goes un-measurable on a small sample.
+        Valid because every row is out of sample, whichever fold produced it.
         """
         tables = [f.reliability_table for f in self.folds
                   if getattr(f, 'reliability_table', None) is not None]
@@ -538,8 +462,7 @@ class EvaluationReport:
         populated = counts >= 500
         if not populated.any():
             return float('nan')
-        # Row-weighted, so a bin's pooled figure is the average an observation
-        # actually saw rather than an average of fold averages.
+        # Row-weighted, so a bin's pooled figure is the average an observation saw.
         pred = np.sum([t.predicted * t.count for t in tables], axis=0)
         obs = np.sum([t.observed * t.count for t in tables], axis=0)
         with np.errstate(invalid='ignore', divide='ignore'):
@@ -555,13 +478,9 @@ class EvaluationReport:
     def non_finite_share(self) -> float:
         """Unscoreable rows as a fraction of all rows offered.
 
-        Gated as a share rather than a count. Zero is the wrong threshold: a
-        venue outage leaves a couple of hours of windows without a volatility
-        estimate afterwards, and refusing to evaluate at all because Coinbase went
-        down for six hours in May is not a judgement about the model. A *rate*
-        catches what actually matters — an embargo or lookback mistake that makes
-        a large fraction unscoreable — while an outage passes and is still
-        reported.
+        A share, not a count: an outage leaves some windows without a volatility
+        estimate and should pass. A large share means a lookback or embargo
+        mistake.
         """
         rows = sum(f.n_rows for f in self.folds) + self.total_non_finite
         return (self.total_non_finite / rows) if rows else float('nan')
@@ -575,25 +494,10 @@ class EvaluationReport:
     def median_residual_scale(self) -> float:
         """What the `residual_scale` gate reads.
 
-        The mean was the wrong aggregation for an overfitting detector. Measured
-        on a provably zero-signal null across three folds: two folds correctly
-        returned alpha ~0 and one ran to the 2.0 clip on a handful of trees, so
-        the **mean was 0.667** and cleared the 0.25 gate while two thirds of the
-        evidence said there was nothing there. The question the gate asks is
-        whether the correction survives out of sample *typically*, and one
-        runaway fold should not answer it.
-
-        A fold sitting exactly on a clip boundary is also not a fit — it means the
-        optimiser wanted more than the parameterisation allows, which on a null is
-        noise — so those are called out.
-
-        Two honest limits. With an even number of folds the median averages the two
-        middle values, so at two folds it *is* the mean and buys nothing. And at a
-        small sample alpha is noisy either way: measured on a 30-day two-fold null
-        it came back `[1.305, 0.0]`, while on a 70-day slice it reads 0.0000. This
-        gate is therefore a backstop and not the thing that catches a null —
-        `log_loss_skill` and `folds_skill_positive` are, and they did on the same
-        run. Do not treat a passing `residual_scale` as evidence of anything.
+        The median, not the mean, so one runaway fold cannot clear the gate for
+        the rest. A fold on a clip boundary is the optimiser giving up, not a
+        fit, so it is logged. With two folds the median is the mean. This gate is
+        a backstop; `log_loss_skill` and the fold tests catch a null.
         """
         if not self.folds:
             return float('nan')
@@ -695,20 +599,12 @@ class EvaluationReport:
 
 # ---- the market as the benchmark -----------------------------------------
 
-# Below this the comparison is an anecdote. Two thousand windows at ~96 a day is
-# roughly three weeks of one symbol, or a week of three.
+# Below this the comparison is an anecdote.
 MIN_MARKET_WINDOWS = 2_000
 
-# A quote older than this is not the price at the decision instant, and beating
-# it is not skill. Measured on 132,250 backtest rows: model_minus_market ran
-# +0.0041 at a 5-second bar and +0.0371 at 900 seconds -- nine tenths of the
-# headline was the model out-forecasting a price nobody was quoting any more.
-# Both halves flatter: market_ll worsens with age while model_ll improves,
-# because the rows carrying stale quotes are the easier ones.
-# **One limit, read from `Config`.** Trades were once priced against quotes up
-# to 900s old while this comparison counted only those under 30s, so the money
-# and the forecast were measured on different samples. `core.quotes` and the
-# live order check read the same field.
+# A quote older than this is not the price at the decision instant, and
+# beating it is not skill. Shares `Config.max_quote_age_seconds` with
+# `core.quotes` and the live order check, so money and forecast use one sample.
 MAX_QUOTE_AGE_SECONDS = float(DEFAULT_CONFIG.max_quote_age_seconds)
 
 # `fold` is the walk-forward fold of a backtest row. `venue_labelled` is True
@@ -738,8 +634,7 @@ def market_slice(part: pd.DataFrame, label: str) -> dict:
         p = part[name].to_numpy(dtype=float)
         out[f'{name}_ll'] = log_loss(y, p)
         out[f'{name}_brier'] = brier(y, p)
-    # The number that decides everything: positive means our probability is a
-    # better forecast than the price we would have to pay.
+    # Positive means our probability is a better forecast than the price.
     out['model_minus_market'] = out['market_ll'] - out['model_ll']
     out['baseline_minus_market'] = out['market_ll'] - out['baseline_ll']
     return out
@@ -770,25 +665,9 @@ def market_rows_from_scored(
         recorded_only: bool = False) -> list:
     """`MARKET_COLUMNS` rows from a backtest that carries recorded quotes.
 
-    **This is the claim `market_gate_values` used to say could not be made.**
-    Its docstring reads "this cannot come from the backtest, and that is the
-    point", because a backtest had no order book and `price_source` stood the
-    calibrated baseline in for the market — collapsing "beat the market" into
-    "beat the baseline" and answering both with one number. That was true when
-    written. Eight months of book have since been collected and validated: 0.70c
-    against the live recording with the clock removed, and a resting-size ratio
-    of 1.000.
-
-    **The market's forecast is the MID.** `model_minus_market` compares log
-    losses — whose probability is better — while the ask is what a trade costs,
-    the mid plus half the spread. Scoring the market at its ask would hand the
-    model a free half-spread of apparent skill on every row, in its own favour,
-    which is the exact self-flattery this gate exists to prevent. The ask belongs
-    in the money numbers, and `decide()` already uses it there.
-
-    Rows without a quote are DROPPED, never defaulted to the baseline: a
-    defaulted row is the circularity this function replaces, reported as if it
-    were a market.
+    The market's forecast is the mid. Scoring the market at its ask would hand
+    the model half the spread as apparent skill.
+    Rows without a quote are dropped, never defaulted to the baseline.
     """
     if frame is None or not len(frame):
         return []
@@ -797,24 +676,17 @@ def market_rows_from_scored(
     if any(c not in frame.columns for c in needed):
         return []
     part = frame.copy()
-    # **Only quotes somebody watched, when asked.** `quote_observer` says which
-    # sampler priced the row; `backfill` is Predexon's reconstruction after the
-    # fact. Both are legitimate for pricing a backtest, but only the recorded
-    # ones answer "would this model have beaten the book that existed", which
-    # is what the market gates claim to measure.
+    # Only quotes somebody watched, when asked. `backfill` is a reconstruction;
+    # only recorded quotes answer "would this model have beaten the live book".
     if recorded_only:
         if 'quote_observer' not in part.columns:
             return []
         part = part[part['quote_observer'].isin(LIVE_OBSERVERS)]
         if not len(part):
             return []
-    # **Grade on the label the MARKET was priced against, wherever we hold it.**
-    # Our outcome comes from Coinbase bars and so does the baseline; the market
-    # prices on CF Benchmarks BRTI. Scoring both forecasters on a label that
-    # shares a source with one of them hands that one the label noise as free
-    # skill. Measured, and it reversed the headline: base-mkt read +0.00382 on
-    # our label and -0.00245 on the venue's, collapsing to +0.00101 on the 96.8%
-    # where the two agree. The whole effect lived in the near-ties.
+    # Grade on the venue's label wherever we hold it. Our outcome and the
+    # baseline both come from Coinbase bars, so our label would hand the
+    # baseline its noise as free skill.
     part['_venue_labelled'] = False
     if 'venue_outcome' in part.columns:
         venue = pd.to_numeric(part['venue_outcome'], errors='coerce')
@@ -822,26 +694,10 @@ def market_rows_from_scored(
         part['outcome'] = venue.fillna(
             pd.to_numeric(part.get('outcome'), errors='coerce'))
     part = part.dropna(subset=list(needed) + ['outcome'])
-    # Staleness is not skill. A row whose quote predates the decision by minutes
-    # is measuring the clock, not the market -- see MAX_QUOTE_AGE_SECONDS.
-    # Rows with no age are kept: live-recorded quotes carry none, and they are
-    # the one source needing no reconstruction.
-    # **Only the offsets that can OPEN a position.**
-    #
-    # This pooled all four while `--entry-offsets 12` means one can trade.
-    # Measured on 5,622 live rows:
-    #
-    #     offset   model - mkt      t     days+
-    #     +3m       -0.00259     -1.11     2/6
-    #     +6m       -0.00644     -1.63     3/6
-    #     +9m       +0.00068     +0.18     3/6
-    #     +12m      +0.00550     +1.09     5/6   <- the only one that trades
-    #     pooled    -0.00072     -0.26     2/6   <- what the gate read
-    #
-    # So it rejected two candidates for losing to the market at offsets they
-    # never trade, while the offset they do trade was the best of the four. Same
-    # defect as the entry-offsets bug: a measurement describing a policy nobody
-    # runs. None still pools, because then every offset really can enter.
+    # Staleness is not skill: drop rows whose quote is older than the limit.
+    # Rows with no age are kept.
+    # Only the offsets that can open a position, so the gate measures the
+    # policy that trades. None pools every offset.
     if entry_offsets is not None and 'offset' in part.columns:
         wanted = {int(o) for o in entry_offsets}
         part = part[pd.to_numeric(part['offset'], errors='coerce')
@@ -857,8 +713,8 @@ def market_rows_from_scored(
                 else part['window_open'])
     fold = (part['fold'] if 'fold' in part.columns
             else pd.Series(None, index=part.index, dtype=object))
-    # Positional, matching MARKET_COLUMNS. A column out of order silently swaps
-    # the model's probability with the baseline's and nothing raises.
+    # Positional, matching MARKET_COLUMNS. Out of order would silently swap
+    # the model's probability with the baseline's.
     return list(zip(part['symbol'], part['window_open'], part['offset'],
                     part['market_probability'], part['baseline_probability'],
                     part['model_probability'], part['outcome'], decision,
@@ -901,31 +757,12 @@ def market_fold_test(frame: pd.DataFrame) -> tuple[float, int]:
 
 def calibration_noise_null(market, outcome, correction_sd, *,
                            draws: int = 200, seed: int = 0) -> float:
-    """Mean `model_ece - market_ece` from a correction of the same SIZE and no
-    signal at all.
+    """Mean `model_ece - market_ece` for a correction of the same size and no signal.
 
-    **The zero bar is not the right null, and measuring that is the point.**
-    ECE is built on absolute deviations, so perturbing a well-calibrated
-    forecast inflates measured ECE even when the perturbation is unbiased. A
-    market-initialised model starts at exactly 0 -- an untrained one reproduces
-    the price -- so `calibration_vs_market <= 0` asks it to move without ever
-    moving the wrong way, which nothing can do.
-
-    Measured on 7,611 live rows: adding PURE NOISE to the market logit scores
-    +0.00027 at sd 0.05 rising to +0.00178 at sd 0.40, and passes a zero bar
-    only 8-28% of the time. The model's own correction has sd 0.275, whose
-    matched null is +0.00125.
-
-    So the honest question is not "is the model better calibrated than the
-    price" but "is its correction better than a random one of the same size".
-    That is the same shape as `sign_agreement_p`: compare against what chance
-    produces rather than an absolute bar, which also makes the threshold
-    model-independent and so impossible to tune in a candidate's favour.
-
-    The null is generated at the candidate's OWN correction magnitude, so a
-    model that barely moves is held to a tight null and one that moves a lot is
-    held to a loose one -- which is correct, because the bias scales with how
-    far the correction travels.
+    ECE uses absolute deviations, so any unbiased perturbation of a calibrated
+    forecast raises measured ECE. A zero bar would charge the model for moving
+    at all. The gate subtracts this null, which is generated at the candidate's
+    own correction magnitude.
     """
     market = pd.to_numeric(pd.Series(market), errors='coerce').to_numpy(dtype=float)
     outcome = pd.to_numeric(pd.Series(outcome), errors='coerce').to_numpy(dtype=float)
@@ -950,18 +787,8 @@ def calibration_noise_null(market, outcome, correction_sd, *,
 def _pooled_ece(pred, outcome) -> float:
     """Count-weighted expected calibration error over every populated bin.
 
-    The low-variance alternative to `_worst_populated_bin`. A maximum over bins
-    is dominated by whichever bin got unlucky, which is why the worst-bin
-    version of `calibration_vs_market` passed only 32% of bootstrap resamples of
-    its OWN data with a fixed artifact. This one is ten times tighter (sd 0.0023
-    against 0.0229 on 7,608 live rows) because every bin contributes in
-    proportion to its count rather than one deciding the answer.
-
-    It answers a slightly different question, and the difference is the point: a
-    worst bin bounds the damage anywhere, a pooled ECE describes calibration on
-    average. For comparing two forecasters on the SAME rows -- which is all
-    `calibration_vs_market` does -- the average is the stable comparison and the
-    maximum is a coin flip.
+    Far lower variance than a worst-bin statistic, so it is the stable way to
+    compare two forecasters on the same rows.
     """
     from core.baseline import reliability
 
@@ -978,21 +805,10 @@ def _worst_populated_bin(pred, outcome, *, bins: Optional[int] = None,
                         min_count: int = 100) -> float:
     """Largest |actual - predicted| over adequately populated bins, or NaN.
 
-    **Uses `core.baseline.reliability`'s edges, which is what "the same shape as
-    `calibration_max_deviation`" is supposed to mean.** It did not: this was ten
-    EQUAL-WIDTH bins against that statistic's twenty tail-refined ones, and its
-    single `(0.9, 1.0]` bucket is precisely the aggregation those edges exist to
-    eliminate -- `reliability`'s own docstring records a model 5pp overconfident
-    at 0.94 and 5pp underconfident at 0.86 reporting an ECE of 0.000078 across
-    one wide bin. Two statistics under one description, feeding two different
-    gates, with a narrative comment comparing a number from this one against a
-    threshold belonging to the other.
-
-    `min_count` stays 100 rather than that statistic's 500: this runs on
-    live-recorded rows, of which there are thousands rather than tens of
-    thousands, and a 500 floor would return NaN for want of data and FAIL as
-    though the model were miscalibrated. Pass `bins` to force equal-width
-    bucketing.
+    Uses `core.baseline.reliability`'s tail-refined edges, the same statistic as
+    `calibration_max_deviation`. `min_count` is 100, not 500: live-recorded rows
+    are fewer, and a 500 floor would return NaN and fail.
+    Pass `bins` to force equal-width bucketing.
     """
     pred = pd.to_numeric(pd.Series(pred), errors='coerce')
     outcome = pd.to_numeric(pd.Series(outcome), errors='coerce')
@@ -1002,10 +818,8 @@ def _worst_populated_bin(pred, outcome, *, bins: Optional[int] = None,
     frame = pd.DataFrame({'p': pred[keep].to_numpy(),
                           'y': outcome[keep].to_numpy()})
     if bins is None:
-        # `worst_deviation` IS the statistic `calibration_max_deviation` reads,
-        # on `reliability`'s tail-refined edges. Calling it rather than
-        # re-deriving it is the whole point: two implementations of one
-        # description is what produced the divergence this replaces.
+        # `worst_deviation` is the statistic `calibration_max_deviation` reads;
+        # reuse it rather than re-deriving it.
         from core.baseline import reliability as _reliability
 
         return float(_reliability(frame['y'].to_numpy(),
@@ -1022,24 +836,11 @@ def _worst_populated_bin(pred, outcome, *, bins: Optional[int] = None,
 
 
 def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
-    """What `DEFAULT_GATES` reads about the market, from live-recorded quotes.
+    """What `DEFAULT_GATES` reads about the market, from recorded quotes.
 
-    **This cannot come from the backtest, and that is the point.** A backtest has
-    no order book, so `price_source` stands the calibrated baseline in for the
-    market — which makes "beat the market" and "beat the baseline" the same
-    question and answers both with the same number. The comparison is only
-    available from quotes the live loop actually recorded.
-
-    Measured on the first day of live quotes, and this is why the gate exists:
-    the market's log loss was 0.333 against the model's 0.430 and the baseline's
-    0.429, on every symbol and every offset. A candidate can pass all twelve
-    other gates — `log_loss_skill` beats `F(x/sigma)` by construction — while
-    being a materially worse forecaster than the price it has to trade against.
-
-    Empty or short input returns values that fail rather than values that pass:
-    `market_windows` counts what there is and `model_minus_market` is NaN, and
-    `Gate.passed` is False for both. Not measured is not the same as measured
-    good, and promotion is the wrong place to blur them.
+    A backtest priced at the baseline cannot answer "beat the market"; only
+    recorded quotes can. Empty input returns values that fail: `market_windows`
+    is 0 and `model_minus_market` is NaN.
     """
     frame = market_frame(rows)
     if frame.empty:
@@ -1053,61 +854,18 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
                 'calibration_vs_market': float('nan')}
     windows = float(frame.drop_duplicates(['symbol', 'window_open']).shape[0])
     overall = market_slice(frame, 'all')
-    # **Calibration RELATIVE to the price, on the same rows.**
-    #
-    # The absolute bar demanded better than this market achieves. Measured on
-    # the venue's own settlement, 33,126 rows at +12m, the worst populated bin
-    # (0.6, 0.7] has the MARKET predicting 0.654 against an actual 0.717 — a
-    # 0.063 miss, 5.4 sigma on 1,531 windows. So nothing tracking the price can
-    # reach 0.040, and every candidate since 2026-08-28 failed at a stable
-    # ~0.0515 regardless of features, folds or groups.
-    #
-    # What is worth requiring is that the model be at least as calibrated as
-    # what it trades against. This one halves the market's deviation
-    # (0.0326 against 0.0634), which is the clearest evidence it adds value —
-    # and it was coming from the gate that kept rejecting it.
-    # **POOLED ECE, not the worst bin.** A maximum over bins is inherently
-    # high-variance, and on this sample it was pure noise. Bootstrapped over 300
-    # resamples of the 7,608 live rows on 2026-09-24, same artifact throughout:
-    #
-    #     statistic              mean       sd       passes (<=0)
-    #     worst bin            +0.0106   0.0229         32%
-    #     pooled ECE diff      +0.0032   0.0023         10%
-    #
-    # The worst-bin version's standard deviation was TWICE the effect it
-    # measured, and its 90% interval [-0.026, +0.050] spanned both "clearly
-    # better than the market" and "clearly worse" — so it passed or failed a
-    # fixed artifact on which rows happened to arrive. It moved 0.011 in four
-    # hours on 8% more data, and blocked the 2026-09-20 retrain on that basis.
-    #
-    # The pooled difference is TEN TIMES tighter, and it does not make the
-    # problem go away — it makes it legible. The model is slightly but
-    # consistently WORSE calibrated than the price, +0.0032 against a typical
-    # ECE near 0.030, with 90% of resamples above zero. The noisy version was
-    # obscuring a real finding behind an enormous error bar rather than
-    # inventing a false one.
-    #
-    # **Gated against a matched NOISE NULL, not against zero.** A zero bar is
-    # unreachable by construction -- see `calibration_noise_null`. Measured on
-    # 7,611 live rows, pure noise at the model's own correction magnitude
-    # (sd 0.275) scores +0.00125, so a zero bar charges the model for moving at
-    # all. Subtracting the null asks the question that matters: is this
-    # correction better calibrated than a RANDOM one of the same size?
-    #
-    # It does not let the current model through, which is why the change is
-    # safe to make while it is the only failing gate: the model reads +0.00359
-    # against a +0.00125 null, so it is +0.00234 worse than its own noise and
-    # beaten by a random perturbation in 98% of draws. Its errors are
-    # systematic, which matches the 6.7pp overconfidence measured on the rows
-    # it trades.
+    # Calibration relative to the price, on the same rows: the model must be at
+    # least as calibrated as what it trades against. An absolute bar fails the
+    # market itself.
+    # Pooled ECE, not the worst bin: the worst bin is too noisy to gate.
+    # Gated against a matched noise null, not zero (see `calibration_noise_null`).
     model_ece = _pooled_ece(frame['model'], frame['outcome'])
     market_ece = _pooled_ece(frame['market'], frame['outcome'])
     correction_sd = float(np.std(
         logit(clip_prob(pd.to_numeric(frame['model'], errors='coerce')))
         - logit(clip_prob(pd.to_numeric(frame['market'], errors='coerce')))))
     null = calibration_noise_null(frame['market'], frame['outcome'], correction_sd)
-    # Kept as a reported diagnostic: it is informative about the venue even
-    # though it is too noisy to gate on.
+    # Reported only: informative about the venue, too noisy to gate.
     market_dev = _worst_populated_bin(frame['market'], frame['outcome'])
     p_value, n_folds = market_fold_test(frame)
     return {'market_windows': windows,
@@ -1126,10 +884,9 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
 class GateSpec:
     """One gate as frozen in `gate_spec.lock.json`.
 
-    `definition_version` names the COMPUTATION behind `name`. Bump it whenever
-    what the value means changes — a new aggregation, a new filter, a new
-    estimator — even if the threshold does not move, so the spec hash changes
-    and promotion refuses until the change is accepted with a reason.
+    `definition_version` names the computation behind `name`. Bump it whenever
+    the value's meaning changes, even if the threshold does not, so the spec
+    hash changes and promotion refuses until the change is accepted.
     """
 
     name: str
@@ -1138,94 +895,52 @@ class GateSpec:
     definition_version: int = 1
 
 
-# The canonical gate list. Ordered as the gates should be read: the forecast
-# first, the money second. A candidate that fails a forecast gate should not
-# have its Sharpe discussed. `log_loss_skill` is v2: the fold mean became
-# window-weighted.
+# The canonical gate list, in reading order: the market, the forecast, the money.
+# A candidate that fails a forecast gate should not have its Sharpe discussed.
 GATE_SPEC: tuple[GateSpec, ...] = (
-    # --- the benchmark that decides whether any of the rest pays ---
+    # --- the market: the price is the counterparty, not F(x/sigma) ---
     #
-    # These two come first because the benchmark below them is the wrong one to
-    # stop at. `log_loss_skill` asks whether the model beats `F(x/sigma)`, and it
-    # does — but the arithmetic null is not the counterparty. The price is.
-    # Measured on the first day of live quotes: market log loss 0.333, baseline
-    # 0.429, model 0.430, with the same sign on all three symbols and all four
-    # offsets. Every other gate would have passed that.
-    #
-    # Neither can be computed from a backtest, which has no book, so both read
-    # NaN and fail until the live loop has recorded enough quotes. That is the
-    # honest state of the question rather than an obstacle to route around;
-    # `--force` with a written reason is the documented way past it, and the
-    # ledger records that it was used.
+    # A backtest priced at the baseline cannot compute these, so they read NaN
+    # and fail until enough quotes are recorded. `--force` with a written reason
+    # is the way past, and the ledger records it.
     GateSpec('market_windows', float(MIN_MARKET_WINDOWS), 'min', 1),
     GateSpec('model_minus_market', 0.0, 'min', 1),
     # One-sided t-test of the window-weighted fold mean of model_minus_market
-    # against zero, on venue-labelled rows. A point estimate >= 0 is passed by
-    # half of all nulls.
+    # against zero, on venue-labelled rows. A point estimate >= 0 passes half of all nulls.
     GateSpec('model_minus_market_p', 0.05, 'max', 1),
-    # The sample-size requirement: weekly folds that carry market rows. The
-    # p-value above has n_eff - 1 degrees of freedom, so it needs folds.
+    # Weekly folds that carry market rows. The p-value above has n_eff - 1
+    # degrees of freedom, so it needs folds.
     GateSpec('min_folds', 6.0, 'min', 1),
     # --- the forecast ---
     GateSpec('log_loss_skill', 0.0, 'min', 2),
-    # **Significance, not just sign.** `log_loss_skill >= 0` is a point
-    # estimate, and a zero-signal null clears it about half the time
-    # (measured on the synthetic null: two of four seeds, t = +0.69 and
-    # +0.77). One-sided Student-t on the window-weighted fold mean, with
-    # n_eff - 1 degrees of freedom. Every ledger entry since 2026-09-10 read
-    # t >= 2.6 on 25-28 folds (unweighted), i.e. p < 0.01.
+    # Significance, not just sign: one-sided Student-t on the window-weighted
+    # fold mean, n_eff - 1 degrees of freedom.
     GateSpec('log_loss_skill_p', 0.05, 'max', 1),
-    # **A COUNT of agreeing folds is only meaningful at a fixed fold count.**
-    # This was `folds_skill_positive >= 5`, written when the walk-forward always
-    # produced exactly six. Anchored calendar blocks accumulate — 10 folds on a
-    # 245-day span today and more as history arrives — and "5 of 10" is a 62%
-    # event under the null where "5 of 6" is a 10.9% one. The bar would have
-    # silently weakened every week.
-    #
-    # `sign_agreement_p` is the same claim held at constant significance: the
-    # binomial probability of seeing at least this many positive folds if each
-    # were a coin flip. 0.11 reproduces the old five-of-six exactly (p = 0.109)
-    # and stays that strict at any fold count.
+    # Fold agreement at constant significance: the binomial probability of at
+    # least this many positive folds if each were a coin flip. A fixed count
+    # would weaken as folds accumulate. 0.11 equals five of six (p = 0.109).
     GateSpec('sign_agreement_p', 0.11, 'max', 1),
-    # **A SANITY floor, not a quality bar.** 0.02 was derived under 21-day fold
-    # blocks, and under the 7-day blocks the retrain actually runs the
-    # ARITHMETIC NULL fails it on 21 of 25 folds (model 2/25 under the bar,
-    # baseline 4/25). A gate `F(x/sigma)` cannot pass does not separate a good
-    # model from a bad one — it separates a large sample from a small one,
-    # because binned ECE is biased upward at small n. 0.10 still fails a
-    # catastrophically miscalibrated candidate (the baseline's own worst fold is
-    # 0.0802) and leaves the discrimination to the two relative gates.
+    # A sanity floor, not a quality bar: binned ECE on short folds is biased
+    # upward, and the baseline itself fails a tight absolute bar. The relative
+    # gates do the discriminating.
     GateSpec('calibration_error', 0.10, 'max', 1),
-    # **Does the correction make calibration worse than the arithmetic it
-    # corrects?** Median over folds, so it does not drift as folds accumulate.
-    # 0.005 sits below the one-sd fold-to-fold spread of 0.00707 and well above
-    # the standard error of the median, so it catches a systematic degradation —
-    # 0.005 against a typical fold ECE of 0.030 is 17% worse — without rejecting
-    # a model for fold noise. Measured 2026-09-17: +0.00100, t = +0.06.
+    # Does the correction make calibration worse than the arithmetic it corrects?
+    # Median over folds. 0.005 sits below the fold-to-fold spread, so it catches
+    # a systematic degradation without rejecting fold noise.
     GateSpec('calibration_vs_baseline', 0.005, 'max', 1),
-    # The mean ECE is count-weighted over every row, and most rows sit where the
-    # barrier is already decided. Measured: a model 5pp overconfident on the
-    # 5% of rows it trades scores 0.0044 and passes. This bounds the worst
-    # adequately-populated bin instead. It cannot resolve `min_edge_pp` (0.5pp) —
-    # 500 rows at p=0.9 carry a 1.3pp standard error — so it bounds the damage
-    # rather than certifying the edge.
-    # A loose sanity rail now, not the binding claim — see
-    # `calibration_vs_market`, which asks the question that can be met.
+    # The worst adequately-populated bin; mean ECE averages away the traded band.
+    # A loose rail: 500 rows at p=0.9 carry a 1.3pp standard error, so it bounds
+    # damage and cannot certify the edge. `calibration_vs_market` is the binding claim.
     GateSpec('calibration_max_deviation', 0.10, 'max', 1),
     GateSpec('calibration_vs_market', 0.0, 'max', 1),
-    # A data hole must report as a data hole. 31 non-finite rows in 99,388 turned
-    # five of six folds' metrics into NaN while `scripts/baseline.py` printed
-    # "gate passed", because `nan > 0.02` is False and pandas' max skips NaN.
-    # A share rather than a count, because an outage is not a defect: measured,
-    # one 6.5-hour Coinbase outage accounts for 0.02% of rows. A large share means
-    # a lookback or embargo mistake, which is.
+    # A data hole must report as a data hole (`nan > x` is False). A share, not a
+    # count: an outage is not a defect, a large share is.
     GateSpec('non_finite_share', 0.001, 'max', 1),
     GateSpec('residual_scale', 0.25, 'min', 1),
     GateSpec('control_gain_share', 0.30, 'max', 1),
     # --- the money ---
     # `windows_evaluated`, `total_return`, `sharpe` and `max_drawdown` are
-    # reported, not gated: on live-era data the first cannot be met and the
-    # others add nothing to the per-contract edge gates below.
+    # reported, not gated.
     GateSpec('trades', 200.0, 'min', 1),
     GateSpec('coverage', 0.0005, 'min', 1),
     GateSpec('realised_edge_pp', 0.0, 'min', 1),
@@ -1249,8 +964,10 @@ GATE_SPEC_LOCK = Path(__file__).with_name('gate_spec.lock.json')
 
 
 def gate_spec(gates: Optional[dict[str, tuple[float, str]]] = None) -> list[dict]:
-    """The spec as plain rows. With `gates`, the spec of THOSE gates, taking
-    definition versions from `GATE_SPEC` (0 for a name it does not know)."""
+    """The spec as plain rows.
+
+    With `gates`, the spec of those gates, taking definition versions from
+    `GATE_SPEC` (0 for an unknown name)."""
     if gates is None:
         return [asdict(g) for g in GATE_SPEC]
     versions = {g.name: g.definition_version for g in GATE_SPEC}
@@ -1266,8 +983,8 @@ def gate_spec_hash(gates: Optional[dict[str, tuple[float, str]]] = None) -> str:
 
 
 def load_gate_lock(path: Optional[Path] = None) -> dict:
-    """The committed lock, or {} when it is missing or unreadable — which fails
-    every comparison rather than passing one."""
+    """The committed lock, or {} when it is missing or unreadable, which fails
+    every comparison."""
     try:
         return json.loads(Path(path or GATE_SPEC_LOCK).read_text())
     except (OSError, ValueError):
@@ -1275,8 +992,8 @@ def load_gate_lock(path: Optional[Path] = None) -> dict:
 
 
 def write_gate_lock(path: Optional[Path] = None) -> dict:
-    """Regenerate the lock from the code. Run it in the same commit as the gate
-    change: `python -c "from core.metrics import write_gate_lock; write_gate_lock()"`."""
+    """Regenerate the lock from the code, in the same commit as the gate change:
+    `python -c "from core.metrics import write_gate_lock; write_gate_lock()"`."""
     payload = {'gate_spec_hash': gate_spec_hash(), 'gates': gate_spec()}
     Path(path or GATE_SPEC_LOCK).write_text(json.dumps(payload, indent=2) + '\n')
     return payload
@@ -1293,11 +1010,7 @@ def gate_spec_diff(old: Sequence[dict], new: Sequence[dict]) -> dict:
             'removed': [before[n] for n in before if n not in after],
             'changed': dict(sorted(changed.items()))}
 
-# Above this, a Sharpe ratio is evidence of a defect rather than of an edge.
-# Nothing trading a public venue at 30,000 trades a year earns a Sharpe of 12;
-# the first run of this stack reported 12.6 and every other gate passed it,
-# because they all asked whether the number was good and none asked whether it
-# was possible.
+# Above this, a Sharpe ratio is evidence of a defect, not an edge.
 IMPLAUSIBLE_SHARPE = 5.0
 
 GATE_NOTES: dict[str, str] = {
@@ -1387,7 +1100,7 @@ class Gate:
     @property
     def passed(self) -> bool:
         if not np.isfinite(self.value):
-            return False          # not measured fails, like every other gate here
+            return False          # not measured fails
         return (self.value >= self.threshold if self.direction == 'min'
                 else self.value <= self.threshold)
 
@@ -1406,10 +1119,8 @@ def evaluate_gates(
 ) -> list[Gate]:
     """Score a report against every gate. Missing values fail.
 
-    `extra` carries measurements the report structurally cannot produce — at
-    present the market comparison, which needs an order book the backtest does
-    not have. Anything absent stays NaN and therefore fails, so forgetting to
-    pass it cannot turn into a pass.
+    `extra` carries measurements the report cannot produce (the market
+    comparison). Anything absent stays NaN and fails.
     """
     gates = gates or DEFAULT_GATES
     values = report.gate_values()
@@ -1441,7 +1152,7 @@ DAYS_PER_YEAR = 365.25
 
 
 def daily_pnl(trades: Optional[pd.DataFrame]) -> np.ndarray:
-    """Dollars per calendar day, idle days as zero — the series `BookStats.sharpe`
+    """Dollars per calendar day, idle days as zero: the series `BookStats.sharpe`
     annualises, so the moments below describe the same number."""
     if trades is None or trades.empty or 'pnl' not in trades.columns:
         return np.empty(0)

@@ -1,24 +1,7 @@
-"""Folds must be built from the WHOLE Config, in one place.
+"""Tests for `folds_for_config`, which builds folds from the whole Config.
 
-`purged_walk_forward` carries its own defaults, and three scripts called it
-passing only `n_folds` and `embargo_minutes`:
-
-    scripts/train.py:55   scripts/baseline.py:57   scripts/ablate.py:80
-
-So `--fold-scheme`, `--fold-block-days` and `--fold-train-days` were parsed,
-folded into the Config, echoed in the run header and recorded in provenance --
-and then ignored, while `core/backtest.py` forwarded all of them. Two different
-experiments from one command line, with the header describing the one that did
-not run.
-
-It went from latent to live when `Config.fold_block_days` became 7.0 while this
-module's default stayed 21.0: every gated number was cut into 7-day blocks
-while `scripts/ablate.py` -- the tool that decides which feature groups survive
--- cut 21-day ones.
-
-Adding an argument at three call sites fixes today and leaves the fourth caller
-to be written wrong later. `folds_for_config` takes the Config, so it cannot be
-called with half of it.
+Callers that pass only some fields to `purged_walk_forward` silently use its other
+defaults. Taking the Config makes that impossible.
 """
 
 from __future__ import annotations
@@ -39,8 +22,7 @@ def _cfg(**kw):
 
 
 def test_the_block_width_comes_from_the_config_not_the_function_default():
-    """The live instance of the bug: Config says 7, the function default says
-    21, and a caller that forwards neither gets 21."""
+    """The block width comes from the Config (7), not the function default (21)."""
     sig = inspect.signature(purged_walk_forward)
     assert sig.parameters['fold_block_days'].default == 21.0
     assert Config().fold_block_days == 7.0
@@ -72,11 +54,7 @@ def test_the_rolling_train_window_is_honoured():
 
 
 def test_every_fold_building_script_uses_the_helper():
-    """A seam test. The bug was three call sites each passing a SUBSET, and
-    `purged_walk_forward` was correct throughout -- so testing it proved
-    nothing. What must be asserted is that nobody builds folds from a Config by
-    hand again.
-    """
+    """The scripts build folds through `folds_for_config`, not `purged_walk_forward` directly."""
     import scripts.ablate, scripts.baseline, scripts.train, core.backtest
 
     for mod in (scripts.ablate, scripts.baseline, scripts.train):

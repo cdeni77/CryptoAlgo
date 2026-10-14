@@ -1,22 +1,7 @@
-"""Discovery must not restart from page 1 every time it is resumed.
+"""Tests for Polymarket market discovery in `research.collect._collect_pm`.
 
-Measured tonight: the discovery walk stopped on a bare Predexon 500 at page
-909, then again at page 844 on the very next attempt — both past `get()`'s own
-retry budget. Every resume re-walked from page 1, re-fetching every page it
-already knew (skipped by slug, but still a full request each) before making
-any forward progress. Going from page 0 to page 844 took over two hours; the
-walk needs roughly 4,000 pages to reach the 2026-03-02 coverage boundary, so
-every resume was paying most of an hour's worth of requests just to relearn
-what it already had.
-
-A second, independent inefficiency, verified live before writing this: one
-unfiltered page of `/v2/polymarket/markets?tags=15M` mixes BTC, ETH, SOL,
-BNB, DOGE, ZEC, XRP and HYPE. Filtering discovery to one asset via
-`PM_ASSET` (as the three separate BTC/ETH/SOL backfill runs did tonight) does
-not reduce the page count at all — it walks the identical page stream three
-times over, keeping a different eighth of each page each time. Discovery now
-defaults to keeping every `*-updown-15m-*` slug regardless of asset;
-`PM_ASSET` still narrows it when that is genuinely wanted.
+A saved cursor lets a resumed walk continue from the failing page. Every asset is kept
+by default, since filtering by asset does not reduce the page count.
 """
 
 from __future__ import annotations
@@ -45,31 +30,14 @@ def test_is_short_rejects_a_non_15m_market():
 
 # -- the two settlement eras -------------------------------------------------
 #
-# Polymarket has run 15-minute crypto up/down under two DIFFERENT settlement
-# rules, and the slug is the only thing that distinguishes them. Both were read
-# live from the venue's own `description`/`resolutionSource`:
+# Polymarket has run 15-minute up/down markets under two settlement rules, and
+# the slug is the only way to tell them apart:
 #
-#   `{asset}-up-or-down-15m-{ts}`  (from 2025-09-12)
-#       "resolve to Up if the Ethereum price AT THE END of the time range ...
-#        is greater than or equal to the price at the beginning"
-#       source: https://data.chain.link/streams/eth-usd        (spot stream)
-#       first market measured: $23.66 volume, $0.00 liquidity
+#   `{asset}-up-or-down-15m-{ts}`  price at the end of the range (spot stream)
+#   `{asset}-updown-15m-{ts}`      60-second TWAP over the range (current)
 #
-#   `{asset}-updown-15m-{ts}`      (the current instrument)
-#       "resolve to Up if the TIME-WEIGHTED AVERAGE PRICE (TWAP) ... of the
-#        time range ... is >= the price at the beginning of that range"
-#       source: https://data.chain.link/streams/btc-usd-twap-60s-streams
-#       measured liquidity on a live market: $21,873
-#
-# An endpoint reading and a 60-second TWAP are not the same random variable —
-# per CLAUDE.md's own invariant a time-average over an interval carries a
-# THIRD of its endpoint's variance — so pooling the two eras into one training
-# set would silently mix two instruments. `is_short` used to match only
-# 'updown-15m', which excluded the old era by accident rather than on purpose;
-# that is the right outcome reached for the wrong reason, and it also meant
-# nothing could ever measure where the boundary is. Discovery now keeps both
-# and labels each row, so the choice to use one era is made deliberately
-# downstream instead of by a substring that happens not to match.
+# An endpoint price and a 60-second average are different random variables, so
+# the two eras must not be pooled. Discovery keeps both and labels each row.
 
 def test_the_current_twap_era_is_recognised():
     assert pm.era_of('btc-updown-15m-1787873400') == pm.TWAP_ERA
@@ -80,7 +48,7 @@ def test_the_old_endpoint_era_is_recognised():
 
 
 def test_the_two_eras_are_not_confused_for_one_another():
-    """The substrings must not overlap — this is the whole distinction."""
+    """The era substrings do not overlap."""
     assert pm.era_of('btc-updown-15m-1') != pm.era_of('btc-up-or-down-15m-1')
 
 
@@ -91,8 +59,7 @@ def test_a_market_that_is_neither_era_has_no_era():
 
 
 def test_discovery_no_longer_silently_drops_the_old_era():
-    """The bug: 'updown-15m' does not appear in 'up-or-down-15m', so an entire
-    era of real, settled markets was skipped without anything reporting it."""
+    """`is_short` accepts the old era; 'updown-15m' is not a substring of 'up-or-down-15m'."""
     assert pm.is_short('eth-up-or-down-15m-1757724300', '')
 
 
@@ -102,12 +69,9 @@ def test_the_old_era_still_honours_an_asset_filter():
 
 
 def test_a_market_before_book_coverage_is_not_worth_a_request():
-    """Pricing costs one request per market and returns nothing for a window
-    with no book. Measured: Polymarket markets exist from 2025-10-10 carrying
-    real volume ($42k on the first day) but the orderbook endpoint returns zero
-    snapshots for them — the first retrievable book is 2025-12-31. Pricing
-    every discovered market would spend ~8,000 requests, about two hours of a
-    1 req/s bucket, to rediscover that."""
+    """Markets before the first retrievable Polymarket book are not priced, which saves
+    a request each.
+    """
     before = int(dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc).timestamp())
     after = int(dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp())
     assert not pm.worth_pricing({'market_slug': f'btc-updown-15m-{before}'})
@@ -115,7 +79,7 @@ def test_a_market_before_book_coverage_is_not_worth_a_request():
 
 
 def test_the_old_endpoint_era_is_never_worth_pricing():
-    """A different instrument, and one with no retrievable book either."""
+    """The old era is never priced: it is a different instrument with no retrievable book."""
     after = int(dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp())
     assert not pm.worth_pricing({'market_slug': f'btc-up-or-down-15m-{after}'})
 
@@ -127,8 +91,7 @@ def test_a_malformed_slug_is_skipped_rather_than_crashing_the_run():
 
 
 def test_discover_records_which_era_each_market_belongs_to(tmp_path, monkeypatch):
-    """Era must be stored, not re-derived later by whoever happens to remember
-    the two spellings."""
+    """Discovery stores the era on each row."""
     async def fake_get(session, path, params):
         return {'markets': [
             {'market_slug': 'btc-updown-15m-9999999999', 'condition_id': 'a'},

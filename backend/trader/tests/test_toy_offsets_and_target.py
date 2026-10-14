@@ -1,14 +1,7 @@
-"""PROPOSED. Candle boundaries, offset indexing and the target, on hand-computed toy data.
+"""Tests for candle boundaries, offset indexing and the target on hand-computed toy
+data.
 
-Drop into `backend/trader/tests/`.
-
-Every existing window test asserts a *relationship* between the table and the
-bars (`row.strike == means.loc[...]`) — which is a re-statement of the
-implementation, and passes if both sides move together. These assert **literal
-numbers worked out by hand**, so an indexing change has to be argued with, not
-just re-derived.
-
-The bars are constructed so every quantity is exact in binary floating point.
+They assert literal numbers, exact in binary floating point.
 """
 
 from __future__ import annotations
@@ -20,9 +13,9 @@ import pytest
 from core.config import Config
 from core.windows import bar_mean, build_windows
 
-# Three windows of 15 one-minute bars, starting on a quarter-hour boundary.
-# Prices are chosen so that the one-minute OHLC mean of bar k is exactly
-# 100 + k/4, making every average and every ratio hand-checkable.
+# Three windows of 15 one-minute bars, starting on a quarter-hour boundary. The
+# one-minute OHLC mean of bar k is exactly 100 + k/4, so every value can be
+# checked by hand.
 N = 45
 START = pd.Timestamp('2025-03-01 00:00', tz='UTC')
 
@@ -40,7 +33,7 @@ def toy_bars(closes=None) -> pd.DataFrame:
 
 
 def test_the_bar_mean_is_the_ohlc_mean_of_that_minute():
-    """Both ends of the target are built from this, so it is worth pinning flat."""
+    """The bar mean is the OHLC mean of that minute; both ends of the target use it."""
     bars = toy_bars()
     means = bar_mean(bars.set_index('event_time'))
     assert float(means.iloc[0]) == pytest.approx(100.0)
@@ -49,10 +42,10 @@ def test_the_bar_mean_is_the_ohlc_mean_of_that_minute():
 
 
 def test_the_strike_is_the_previous_windows_last_minute_and_nothing_else():
-    """Window 2 opens at 00:15. Its strike is the mean of the 00:14 bar.
+    """Window 2 opens at 00:15. Its strike is the mean of the 00:14 bar (index 14):
+    103.5.
 
-    00:14 is index 14, so the mean is 100 + 14/4 = 103.5. Not the 00:15 open
-    (103.75), which is what an earlier version used.
+    Not the 00:15 open (103.75).
     """
     table, _ = build_windows(toy_bars(), 'TOY', offsets=(3,))
     row = table.loc[table['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
@@ -61,8 +54,7 @@ def test_the_strike_is_the_previous_windows_last_minute_and_nothing_else():
 
 
 def test_the_settlement_value_is_the_last_minute_of_the_settling_window():
-    """Window 2 settles at 00:30; the settling minute is 00:29, index 29,
-    mean 100 + 29/4 = 107.25."""
+    """Window 2 settles at 00:30; the settling minute is 00:29 (index 29), mean 107.25."""
     table, _ = build_windows(toy_bars(), 'TOY', offsets=(3,))
     row = table.loc[table['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
     assert float(row['settle_price']) == pytest.approx(107.25)
@@ -75,10 +67,9 @@ def test_the_settlement_value_is_the_last_minute_of_the_settling_window():
 ])
 def test_last_price_is_the_close_of_the_bar_before_the_decision(offset,
                                                                 expected_close_index):
-    """Window 2 opens at index 15. A decision at offset m sees the close of the
-    bar covering [m-1, m), i.e. absolute index 15 + m - 1.
+    """A decision at offset m sees the close of the bar covering [m-1, m), index 14 + m.
 
-    Hand-checked: at offset 3 that is index 17, close 100 + 17/4 = 104.25.
+    At offset 3 that is index 17, close 100 + 17/4 = 104.25.
     """
     table, _ = build_windows(toy_bars(), 'TOY', offsets=(offset,))
     row = table.loc[table['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
@@ -92,16 +83,11 @@ def test_last_price_is_the_close_of_the_bar_before_the_decision(offset,
 
 
 def test_the_excursion_stops_at_the_bar_before_the_decision():
-    """The gap the suite has: `excursion_up`/`excursion_down` are never asserted.
-
-    A spike planted in the bar *at* the decision minute must be invisible. With
-    `highs[:, :offset+1]` instead of `highs[:, :offset]` it is visible, and all
-    230 existing tests still pass.
-    """
+    """`excursion_up` ignores a spike in the bar at the decision minute."""
     closes = 100.0 + np.arange(N, dtype=float) / 4.0
     bars = toy_bars(closes)
-    # Window 2 is indices 15..29. Offset 6 sees window-minutes 0..5, i.e. indices
-    # 15..20. Plant a huge high at index 21 — window-minute 6, the decision minute.
+    # Window 2 is indices 15..29. Offset 6 sees window-minutes 0..5 (indices 15..20).
+    # Plant a large high at index 21, the decision minute.
     bars.loc[21, 'high'] = 500.0
     table, _ = build_windows(bars, 'TOY', offsets=(6,))
     row = table.loc[table['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
@@ -110,7 +96,7 @@ def test_the_excursion_stops_at_the_bar_before_the_decision():
         f'excursion_up is {row["excursion_up"]}; a spike planted in the decision '
         f'minute itself leaked into it'
     )
-    # And the same spike must be visible at a later offset, or the test is vacuous.
+    # The same spike is visible at a later offset, so the check is not vacuous.
     later, _ = build_windows(bars, 'TOY', offsets=(9,))
     later_row = later.loc[later['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
     assert float(later_row['excursion_up']) == pytest.approx(500.0 / 103.5 - 1.0)
@@ -125,14 +111,7 @@ def test_the_excursion_down_stops_at_the_same_boundary():
 
 
 def test_a_dead_flat_window_resolves_up_not_down():
-    """`strike_type` is `greater_or_equal`, so a dead-flat window pays UP.
-
-    `test_windows.py::test_the_base_rate_is_near_a_half` used to disagree with
-    this — its docstring claimed "an exactly flat window resolves down", the
-    superseded strict-`>` convention. Both docstrings are now corrected to say
-    the same thing; this test still earns its place as the toy-data version of
-    that check.
-    """
+    """A dead-flat window resolves UP, since `strike_type` is `greater_or_equal`."""
     flat = toy_bars(np.full(N, 100.0))
     table, _ = build_windows(flat, 'TOY', offsets=(3, 6, 9, 12))
     assert not table.empty
@@ -144,17 +123,18 @@ def test_a_dead_flat_window_resolves_up_not_down():
 
 
 def test_one_tick_below_the_strike_resolves_down():
-    """The other side of the tie, so the `>=` is pinned from both directions."""
+    """One tick below the strike resolves DOWN, so `>=` is pinned from both sides."""
     closes = np.full(N, 100.0)
-    closes[29] = 100.0 - 1e-6      # the settling minute of window 2
+    closes[29] = 100.0 - 1e-6  # the settling minute of window 2
     table, _ = build_windows(toy_bars(closes), 'TOY', offsets=(3,))
     row = table.loc[table['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
     assert row['outcome'] == 0
 
 
 def test_a_missing_averaging_minute_kills_exactly_the_two_windows_it_feeds():
-    """Index 29 is the settling minute of window 2 and the strike minute of
-    window 3, so both die and nothing else does."""
+    """Index 29 is window 2's settling minute and window 3's strike minute, so exactly
+    those two windows drop.
+    """
     bars = toy_bars().drop(index=[29]).reset_index(drop=True)
     table, report = build_windows(bars, 'TOY', offsets=(3,))
     kept = set(table['window_open'])
@@ -164,8 +144,8 @@ def test_a_missing_averaging_minute_kills_exactly_the_two_windows_it_feeds():
 
 
 def test_a_missing_interior_minute_forward_fills_rather_than_inventing_a_price():
-    """A minute with no trades carries no new price; the last trade still holds."""
-    bars = toy_bars().drop(index=[20]).reset_index(drop=True)   # window-minute 5
+    """A missing interior minute is forward-filled; the last trade price still holds."""
+    bars = toy_bars().drop(index=[20]).reset_index(drop=True)  # window-minute 5
     table, report = build_windows(bars, 'TOY', offsets=(9,))
     row = table.loc[table['window_open'] == START + pd.Timedelta(minutes=15)].iloc[0]
     # Offset 9 reads window-minute 8 = index 23, which is present: 105.75.
@@ -176,9 +156,9 @@ def test_a_missing_interior_minute_forward_fills_rather_than_inventing_a_price()
 
 
 def test_the_remaining_variance_at_each_offset_is_the_hand_computed_number():
-    """`(W - delta - m) + delta/3` with W=15, delta=1: 2.33 minutes at m=12,
-    not 3. Asserted as literals, because the existing test recomputes the same
-    expression it is checking."""
+    """Remaining variance is `(W - delta - m) + delta/3`: 2.33 minutes at m=12 with W=15
+    and delta=1.
+    """
     config = Config()
     assert config.window_minutes == 15
     assert config.settle_average_minutes == pytest.approx(1.0)

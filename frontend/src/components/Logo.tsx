@@ -1,14 +1,7 @@
 /** The mark: a window, its strike, and price sitting above it.
  *
- * Every element means something, which is the test for whether a mark is a mark
- * or a decoration. The square is the fifteen-minute window. The rule across it
- * at 62% height is the strike — the price the venue recorded when the window
- * opened. The filled block above the rule and to the right is where price is
- * now: above the strike, late in the window. That is the system's whole subject
- * in three shapes, and it survives being 16 pixels wide in a browser tab.
- *
- * The block takes the `above` pole colour, so the mark is literally reporting a
- * settle-up state rather than being tinted for looks.
+ * The square is the fifteen-minute window, the rule is the strike, and the
+ * block, in the `above` pole colour, is price late in the window.
  */
 export function Mark({ size = 22 }: { size?: number }) {
   return (

@@ -1,10 +1,6 @@
-"""The live path's refusals, which mostly did not exist.
+"""Tests for live risk controls: circuit breakers, stale data, and `decide()` refusals.
 
-`Account.halted` and `halted_reason` were columns on the serving table, rendered
-on the dashboard as a safety chip, and written by nothing — the only code that
-set them was `core/book.py`, the *backtest's* in-memory account. So the
-indicator could never turn on, and the only live limit was the ruin floor, which
-fires after half the account is gone.
+The halt state lives on the serving account, so it survives a restart.
 """
 
 from __future__ import annotations
@@ -45,8 +41,8 @@ def settle(w: PgWriter, *, index: int, pnl: float, when: datetime) -> None:
         side='up', contracts=10, price=0.5, outlay=abs(pnl) if pnl < 0 else 10 - pnl,
         fee=0.02, model_probability=0.6, baseline_probability=0.5, edge=0.01)
     assert position_id is not None
-    # `settle_position` derives the payout from the side and the outcome, so
-    # steer it with the outcome rather than by writing pnl directly.
+    # `settle_position` derives the payout from side and outcome, so the outcome steers
+    # the PnL.
     w.settle_position(position_id, settled_up=pnl > 0)
 
 
@@ -56,8 +52,8 @@ class TestCircuitBreakers:
         assert not writer.account().halted
 
     def test_a_losing_day_halts_the_account(self, writer):
-        # Each loss is the full outlay. Twelve $2 losses is 24% of a $100 start,
-        # over the 15% daily limit.
+        # Each loss is the full outlay. Twelve $2 losses is 24% of a $100 start, over
+        # the 15% daily limit.
         for i in range(12):
             settle(writer, index=i, pnl=-2.0, when=NOW)
         reason = check_circuit_breakers(writer, CONFIG, now=NOW)
@@ -77,25 +73,21 @@ class TestCircuitBreakers:
         config = Config(max_daily_loss_fraction=0.99, max_consecutive_losses=3)
         for i in range(3):
             settle(writer, index=i, pnl=-0.10, when=NOW)
-        settle(writer, index=99, pnl=+0.10, when=NOW)     # most recent
+        settle(writer, index=99, pnl=+0.10, when=NOW)  # most recent
         assert check_circuit_breakers(writer, config, now=NOW) is None
 
     def test_a_halt_survives_a_restart(self, writer, url):
-        """The whole point of putting it on the account rather than in memory."""
+        """A halt is stored on the account, so it survives a restart."""
         writer.update_account(halted=True, halted_reason='set by hand')
         restarted = PgWriter(database_url=url)
         assert check_circuit_breakers(restarted, CONFIG, now=NOW) == 'set by hand'
         assert restarted.account().halted
 
     def test_a_non_finite_bankroll_halts(self, writer):
-        """Reachable on Postgres, not through SQLite.
+        """A non-finite bankroll halts.
 
-        `double precision NOT NULL` accepts NaN; SQLite coerces it to NULL and
-        rejects it, so the column cannot hold the value this guard is for. The
-        route in is `reconcile_with_venue` writing the venue's balance —
-        `KalshiClient.balance()` returns 0.0 on a missing field and parses the
-        string "nan" happily. So the guard is checked against the account object
-        directly rather than through a store that cannot represent the problem.
+        Postgres can store NaN but SQLite cannot, so the guard is checked on the account
+        object directly.
         """
         real = writer.account()
 
@@ -132,9 +124,7 @@ class TestStaleness:
         assert 'old' in stale[first]
 
     def test_a_missing_symbol_is_named(self):
-        """Not merely one fewer row — the universe defines every cross-asset
-        feature, so a short universe is a different model. Measured: dropping a
-        symbol moved `beta_1440` 7.7x with no error and no NaN."""
+        """A missing symbol is named: the symbol set defines every cross-asset feature."""
         newest = pd.Timestamp(NOW) - pd.Timedelta(minutes=1)
         bars = {s: self._bars(newest) for s in CONFIG.symbols}
         dropped = sorted(CONFIG.symbols)[-1]
@@ -155,23 +145,22 @@ class TestDecideRefusals:
 
     @pytest.mark.parametrize('q', (1.02, 1.20, -0.05, 2.0))
     def test_a_probability_outside_zero_one_is_refused(self, q):
-        """Kelly does not object to q > 1: q=1.20 sized at 7.1x bankroll, and
-        only `max_stake_fraction` stood between that and an order."""
+        """A probability outside [0, 1] is refused before Kelly sizes it."""
         d = decide(self.row(model_probability=q), CONFIG, bankroll=100.0,
                    exposure=WindowExposure())
         assert d.reason is Reason.PROBABILITY_INVALID
         assert d.contracts == 0
 
     def test_a_non_finite_bankroll_is_refused(self):
-        """`nan < floor` is False, so a NaN bankroll used to be sized."""
+        """A NaN bankroll is refused (`nan < floor` is False)."""
         d = decide(self.row(), CONFIG, bankroll=float('nan'),
                    exposure=WindowExposure())
         assert d.reason is Reason.BANKROLL_FLOOR
 
     def test_live_refuses_to_price_from_our_own_baseline(self):
-        """With no book, `decide` falls back to the counterfactual price. That is
-        right in a backtest and wrong live, where it booked a position for an
-        order that could not be sent."""
+        """With `require_quote=True` a row with no book is refused instead of priced at
+        the baseline.
+        """
         without = decide(self.row(), CONFIG, bankroll=100.0,
                          exposure=WindowExposure(), require_quote=True)
         assert without.reason is Reason.NO_QUOTE
@@ -182,9 +171,7 @@ class TestDecideRefusals:
         assert withbook.traded and withbook.price_source == 'quote'
 
     def test_the_half_spread_is_not_charged_on_top_of_a_real_ask(self):
-        """The ask already includes the spread. Charging it again debited
-        $0.005/contract that never left the account, which is exactly the balance
-        drift the operator is told to read as an unrecorded fill."""
+        """No half-spread is charged on top of a real ask, which already includes the spread."""
         from core.costs import trade_fee
 
         quoted = decide(self.row(ask_up=0.60, ask_down=0.40), CONFIG,
@@ -203,8 +190,6 @@ class TestDecideRefusals:
             + float(trade_fee(counterfactual.contracts, counterfactual.price, CONFIG)))
 
     def test_both_probabilities_are_reported_on_the_traded_side(self):
-        """A DOWN trade stored P(down) beside P(up), so their difference — which
-        reads like the disagreement being traded — was meaningless."""
         d = decide(self.row(model_probability=0.28, baseline_probability=0.40),
                    CONFIG, bankroll=100.0, exposure=WindowExposure())
         assert d.side is Side.DOWN
@@ -213,13 +198,9 @@ class TestDecideRefusals:
 
 
 class TestMarketBenchmark:
-    """The recorded quote is worthless without the answer beside it.
+    """`settle_predictions` writes the outcome on every prediction, traded or not.
 
-    `market_probability` was written on every decision and read by nothing, there
-    was no `outcome` column on `predictions` at all, and `positions` — the only
-    place an outcome existed — covers just the windows that traded. So the one
-    economically meaningful question, "is the market's probability better than
-    ours", could not be asked of an unselected sample.
+    The unselected sample is what the market comparison needs.
     """
 
     def prediction(self, w: PgWriter, *, symbol: str, window: datetime,
@@ -241,7 +222,6 @@ class TestMarketBenchmark:
             'low': value, 'close': value, 'volume': 1.0}])}
 
     def test_a_refused_window_still_gets_its_outcome(self, writer):
-        """The whole point: the unselected sample is the useful one."""
         from scripts.live import settle_predictions
 
         window = NOW - timedelta(minutes=30)
@@ -260,12 +240,10 @@ class TestMarketBenchmark:
             assert {r.market_probability for r in rows} == {0.52}
 
     def test_the_outcome_uses_the_trained_rule(self, writer):
-        """`>=` on the mean of the minute ENDING at settle_time.
+        """The outcome uses the training rule: `>=` on the mean of the minute ending at
+        settle_time.
 
-        A window that lands exactly on its strike pays the up side, and the bar
-        read must be the one before `settle_time` — not the one starting there.
-        `resolve_window` is shared with `settle_due` so the two cannot drift, which
-        is how they drifted before.
+        `resolve_window` is shared with `settle_due` so the two cannot drift.
         """
         from scripts.live import settle_predictions
 
@@ -295,7 +273,7 @@ class TestMarketBenchmark:
             assert session.query(Prediction).one().outcome is None
 
     def test_an_unsettled_window_is_not_touched(self, writer):
-        """`settle_time` in the future must not be resolved from a stray bar."""
+        """A window whose `settle_time` is in the future is not resolved."""
         from scripts.live import settle_predictions
 
         future = NOW + timedelta(minutes=30)
@@ -317,20 +295,14 @@ class TestMarketBenchmark:
 
 
 class TestClearingAHalt:
-    """A sticky breaker with no way to clear it is a trap.
-
-    The breakers are deliberately sticky — one that resets itself at midnight is a
-    speed bump rather than a breaker — but for a while there was no CLI to clear
-    one, so a halt overnight left no documented recovery short of hand-editing the
-    database. `--clear-halt` closes that, and requires a reason.
-    """
+    """`--clear-halt` clears a sticky breaker and requires a reason."""
 
     def parser(self):
         from scripts.live import build_parser
         return build_parser()
 
     def test_clearing_requires_a_reason(self):
-        """A breaker cleared without a recorded cause is one nobody learns from."""
+        """`--clear-halt` needs `--reason`."""
         args = self.parser().parse_args(['--clear-halt'])
         assert args.clear_halt and args.reason is None
 
@@ -341,7 +313,7 @@ class TestClearingAHalt:
         assert args.reason == 'investigated the streak'
 
     def test_a_halt_can_be_cleared_and_the_previous_reason_survives(self, writer):
-        """The account must come back tradeable, and say what stopped it."""
+        """A cleared account is tradeable again, and the previous reason is returned."""
         writer.update_account(halted=True, halted_reason='12 consecutive losses')
         assert writer.account().halted
 
@@ -351,37 +323,29 @@ class TestClearingAHalt:
         assert previous == '12 consecutive losses'
         assert not writer.account().halted
         assert writer.account().halted_reason is None
-        # And the breakers must not immediately re-halt a clean account.
+        # The breakers do not re-halt a clean account.
         assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
 
     def test_clearing_does_not_touch_the_bankroll(self, writer):
-        """Clearing a breaker is not a reset. The money stays where it is."""
+        """Clearing a halt leaves the bankroll unchanged."""
         writer.update_account(bankroll=61.25, halted=True, halted_reason='daily loss')
         writer.update_account(halted=False, halted_reason=None)
         assert writer.account().bankroll == pytest.approx(61.25)
 
 
 class TestTheDrawdownBreaker:
-    """Peak-to-current drawdown on realised equity.
+    """Tests the peak-to-current drawdown breaker on realised equity.
 
-    **The daily rule cannot see this shape, and it is the shape that happened.**
-    Over the first two live days equity ran $100 -> $166.86 by 13:00 UTC and gave
-    back $63.92 over the next ten hours — all inside one UTC day, so that day's
-    realised was **+$3.81** against a -$15.00 limit. The daily rule saw a good day
-    while the account sat 38.3% below its high, and nothing else was watching:
-    `max_drawdown <= 0.35` was a promotion gate on the *backtest* only.
+    The daily rule cannot see a run-up and give-back within one UTC day, so a separate
+    breaker watches drawdown from the peak.
     """
 
     def _run_up_then_give_back(self, w: PgWriter, up: float, down: float,
                                when: datetime, *, legs: int = 6) -> None:
-        """Win `up` dollars, then lose `down`, in a FEW large settlements.
+        """Win `up` dollars, then lose `down`, in a few large settlements.
 
-        Few on purpose. The first version used $2 steps, which meant giving back
-        $64 took 32 consecutive losses — and that trips
-        `max_consecutive_losses = 12` on its own. Two of these tests then passed
-        while the drawdown breaker did nothing, which mutation testing caught:
-        blanking the peak calculation left them green. Keeping every streak under
-        the limit is what isolates the breaker under test.
+        Few legs keep the loss streak under `max_consecutive_losses`, so only the
+        drawdown breaker can fire.
         """
         assert legs < CONFIG.max_consecutive_losses, (
             'the loss streak would trip the consecutive-loss breaker and mask '
@@ -394,12 +358,9 @@ class TestTheDrawdownBreaker:
             settle(w, index=i, pnl=-down / legs, when=when); i += 1
 
     def test_a_deep_drawdown_that_is_still_above_water_does_not_halt(self, writer):
-        """+$66 then -$64 on a $100 start. 38% below the peak, and up 8% on the
-        stake — which is the real case that fired first time and should not have.
+        """A deep drawdown while still above the starting bankroll does not halt.
 
-        Halting here protects banked gains, which is a fund's job. This account
-        exists to find out whether an edge is real, and the stake is already
-        guarded by the ruin floor and the daily limit.
+        The stake is already guarded by the ruin floor and the daily limit.
         """
         self._run_up_then_give_back(writer, up=66.0, down=64.0, when=NOW)
         account = writer.account()
@@ -409,12 +370,10 @@ class TestTheDrawdownBreaker:
         )
 
     def test_the_same_drawdown_below_the_stake_does_halt(self, writer):
-        """+$40 then -$50: 35.7% off the peak AND $10 of real capital gone.
+        """+$40 then -$50 is 35.7% off the peak with $10 of capital lost, so it halts.
 
-        The numbers are chosen so the *daily* rule cannot fire — -$10 is inside
-        its -$15 limit — because the first version used -$60 and the daily rule
-        caught it first, which would have let this test pass without the
-        drawdown breaker doing anything. Same masking as the loss-streak one.
+        The -$10 day stays inside the daily limit, so only the drawdown breaker can
+        fire.
         """
         self._run_up_then_give_back(writer, up=40.0, down=50.0, when=NOW)
         assert float(writer.account().realized_pnl) == pytest.approx(-10.0, abs=0.5)
@@ -423,13 +382,11 @@ class TestTheDrawdownBreaker:
         assert writer.account().halted
 
     def test_a_shallow_giveback_does_not_halt(self, writer):
-        """+$20 then -$4 is 3.3% off the peak. Nowhere near the limit."""
+        """+$20 then -$4 is 3.3% off the peak, well under the limit."""
         self._run_up_then_give_back(writer, up=20.0, down=4.0, when=NOW)
         assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
 
     def test_it_measures_from_the_peak_and_not_from_the_start(self, writer):
-        """The whole point. An account back at its starting bankroll has lost
-        nothing by the start-based view and everything it gained by the peak."""
         self._run_up_then_give_back(writer, up=60.0, down=60.0, when=NOW)
         account = writer.account()
         assert float(account.realized_pnl) == pytest.approx(0.0, abs=0.5)
@@ -439,8 +396,7 @@ class TestTheDrawdownBreaker:
         )
 
     def test_a_steadily_winning_account_is_never_halted(self, writer):
-        """The high-water mark must track upward, or every win looks like a
-        drawdown from some earlier lower peak."""
+        """The high-water mark tracks upward, so steady wins never halt."""
         for i in range(20):
             settle(writer, index=i, pnl=+2.0, when=NOW)
         assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
@@ -455,8 +411,7 @@ class TestTheHighWaterMark:
         assert float(writer.account().realized_pnl) == pytest.approx(5.0, abs=0.5)
 
     def test_an_account_that_only_ever_lost_has_a_peak_of_zero(self, writer):
-        """Not a negative peak — the drawdown is measured from the starting
-        bankroll, which is the highest the account has ever been."""
+        """An account that only lost has a peak of zero, the starting bankroll."""
         settle(writer, index=0, pnl=-5.0, when=NOW)
         assert writer.realised_high_water() == pytest.approx(0.0, abs=1e-6)
 

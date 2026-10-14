@@ -1,18 +1,7 @@
-"""PROPOSED. The embargo default, and a leakage check that is not self-referential.
+"""Tests that the default embargo covers the longest feature lookback.
 
-Drop into `backend/trader/tests/`.
-
-Measured: setting `core/config.py` `embargo_minutes = 1440` -> `0` and
-`core/cv.py`'s own default to `0` leaves all 230 tests passing. Every existing
-embargo test passes `embargo_minutes=` explicitly, so the default that
-`core/backtest.py`, `scripts/train.py`, `scripts/baseline.py` and
-`scripts/evaluate.py` actually use is unguarded.
-
-Worse, `assert_no_leakage` compares `fold.gap_minutes` against
-`fold.embargo_minutes` — the same number that built the fold — so it is
-structurally incapable of catching a too-small embargo. The check below is
-against the *feature lookback*, which is the quantity that determines what the
-embargo has to be.
+`assert_no_leakage` checks a fold against its own embargo, so it cannot catch an embargo
+that is too small.
 """
 
 from __future__ import annotations
@@ -30,12 +19,7 @@ def window_index(days=200):
 
 
 def test_the_configured_embargo_covers_the_longest_feature_lookback():
-    """`log_rv_1440` needs a day of bars, so a training row inside a day of the
-    test block computes a feature from test-period data.
-
-    Stated against `vol_lookbacks_minutes` rather than against the literal 1440,
-    so adding a longer lookback fails here instead of silently leaking.
-    """
+    """The configured embargo covers the longest lookback in `vol_lookbacks_minutes`."""
     config = Config()
     longest = max(config.vol_lookbacks_minutes)
     assert config.embargo_minutes >= longest, (
@@ -47,11 +31,7 @@ def test_the_configured_embargo_covers_the_longest_feature_lookback():
 
 
 def test_the_module_default_matches_the_configured_default():
-    """Two defaults that can drift are one silent leak.
-
-    `purged_walk_forward` is also called directly, so its own default has to be
-    the safe one too.
-    """
+    """The `purged_walk_forward` default matches the config default."""
     default = inspect.signature(purged_walk_forward).parameters['embargo_minutes'].default
     assert default == Config().embargo_minutes, (
         f'core.cv default is {default}, core.config default is '
@@ -60,12 +40,11 @@ def test_the_module_default_matches_the_configured_default():
 
 
 def test_folds_built_from_the_config_alone_honour_a_day():
-    """No `embargo_minutes=` argument anywhere — this is the production path."""
+    """Folds built without an explicit embargo (the production path) have at least a day's gap."""
     config = Config()
     folds = purged_walk_forward(window_index(), n_folds=config.n_folds)
-    # `>=`, not `==`: anchored calendar blocks ACCUMULATE, so the fold count is
-    # a property of the span rather than of `n_folds`, which is now a cap that
-    # binds only when someone asks for fewer than the data supports.
+    # `>=`, not `==`: anchored calendar blocks accumulate, so `n_folds` is a cap, not a
+    # count.
     assert len(folds) >= config.n_folds
     for fold in folds:
         assert_no_leakage(fold)
@@ -77,17 +56,12 @@ def test_folds_built_from_the_config_alone_honour_a_day():
 
 
 def test_the_leakage_check_is_measured_against_the_lookback_not_the_fold():
-    """A fold that carries its own too-small embargo must still be refused.
-
-    `assert_no_leakage` reads `fold.embargo_minutes`, so a fold built with an
-    embargo of zero passes it. The requirement is absolute, and this is where it
-    is stated.
-    """
+    """A fold built with a zero embargo passes `assert_no_leakage` but fails the lookback check."""
     config = Config()
     folds = purged_walk_forward(window_index(), n_folds=4, embargo_minutes=0)
     lookback = pd.Timedelta(minutes=max(config.vol_lookbacks_minutes))
     offenders = [f.index for f in folds if (f.test_start - f.train_end) <= lookback]
     assert offenders, 'a zero embargo produced no offending fold; the fixture is wrong'
-    # Every one of them passes the module's own check, which is the point.
+    # Every one passes the module's own check, which is why this test exists.
     for fold in folds:
         assert_no_leakage(fold)

@@ -1,15 +1,7 @@
-"""The venue's ledger: parsing it, storing it, and totalling it.
+"""Tests for parsing, storing and totalling the venue's ledger.
 
-The failure these tests exist for is not a crash. It is a plausible number: a
-P&L that renders identically to a real one while being short a tier, double a fee,
-or built from the public tape instead of the account. Every test below names the
-wrong answer it is ruling out.
-
-Settlement fixtures use unsuffixed `fee_cost`, matching the real wire shape —
-the venue does not serve `fee_cost_dollars` on a settlement at all (see
-`kalshi_client._fee`). These fixtures used to invent that suffix, which is
-exactly the shape of bug this file exists to catch: it passed while the real,
-unsuffixed field was read a hundred times too small.
+Each test rules out a plausible but wrong P&L. Fixtures use unsuffixed `fee_cost`, as on
+the wire.
 """
 
 from __future__ import annotations
@@ -34,12 +26,10 @@ def _writer() -> PgWriter:
 # ---------------------------------------------------------------- parsing
 
 def test_a_zero_revenue_is_a_measurement_and_not_a_missing_field():
-    """The one place `_price`'s "zero means absent" rule would have been fatal.
+    """A zero revenue is a measurement (a losing position), not a missing field.
 
-    A quote of zero means there is no level there. A *settlement* of zero means the
-    position lost, which is the whole reason for recording it. Reusing the quote
-    parser here would have turned every loser into a null and flattered the curve
-    — the one direction of error an equity curve must never make.
+    Reusing the quote parser, where zero means absent, would turn every loser into a
+    null.
     """
     assert _money({'revenue': 0}, 'revenue') == 0.0
     assert _money({'revenue_dollars': '0.0000'}, 'revenue') == 0.0
@@ -48,19 +38,14 @@ def test_a_zero_revenue_is_a_measurement_and_not_a_missing_field():
 
 
 def test_dollars_win_over_cents_so_the_ledger_is_not_a_hundred_times_wrong():
-    """`revenue_dollars: "21.0000"` beside `revenue: 2100` is the same number."""
+    """`revenue_dollars: "21.0000"` and `revenue: 2100` are the same number; dollars win."""
     assert _money({'revenue_dollars': '21.0000', 'revenue': 2100}, 'revenue') == 21.0
-    # Cents only, which is the legacy encoding.
+    # Cents only, the legacy encoding.
     assert _money({'revenue': 2100}, 'revenue') == 21.0
 
 
 def test_a_no_fill_is_priced_from_the_no_side():
-    """The venue quotes ONE book, from YES. Reading the wrong field inverts cost.
-
-    A 30c NO purchase arrives with `no_price_dollars: 0.30` and
-    `yes_price_dollars: 0.70`. Booking it at 0.70 more than doubles the cost basis
-    and turns a winning trade into a losing one on the page.
-    """
+    """A NO fill is priced from `no_price_dollars`; the YES price would invert the cost basis."""
     fill = parse_fill({
         'trade_id': 't1', 'ticker': 'KXBTC15M-A', 'side': 'no', 'action': 'buy',
         'count_fp': '5.00', 'yes_price_dollars': '0.7000',
@@ -78,7 +63,6 @@ def test_a_no_fill_is_priced_from_the_no_side():
 
 
 def test_an_unfamiliar_side_is_carried_through_rather_than_guessed():
-    """A string we do not recognise is not evidence for either direction."""
     fill = parse_fill({'trade_id': 't', 'ticker': 'A', 'side': 'sideways'})
     assert fill.side == 'sideways'
     assert fill.price is None
@@ -106,7 +90,7 @@ def test_a_loser_settles_at_zero_revenue_and_a_negative_pnl():
 
 
 def test_a_missing_field_leaves_the_pnl_unknown_rather_than_break_even():
-    """`None`, not `0.0`. A row the venue left a gap in is not a flat trade."""
+    """A missing field leaves P&L as None, not 0.0."""
     settled = parse_settlement({'ticker': 'A', 'no_count_fp': '5.00',
                                 'no_total_cost_dollars': '1.5000'})
     assert settled.revenue is None
@@ -116,28 +100,24 @@ def test_a_missing_field_leaves_the_pnl_unknown_rather_than_break_even():
 def test_a_winning_favourite_that_nets_negative_is_still_a_win():
     """The win rate reads `market_result`, never the sign of the P&L.
 
-    This system buys favourites, so this is where most of its trades live: 100
-    contracts at 97c returns $100 on $97 of cost, and a fee above $3 makes the net
-    negative. Classifying that as a loss would put the win rate at odds with the
-    venue's own settlement record.
+    A favourite bought at 97c can win and still net negative after fees.
     """
     assert venue_ledger.won(market_result='yes', yes_contracts=100.0,
                             no_contracts=0.0) is True
     assert venue_ledger.won(market_result='no', yes_contracts=100.0,
                             no_contracts=0.0) is False
-    # No result named, or neither side held: no answer, and not a loss.
+    # No result named, or neither side held: no answer, not a loss.
     assert venue_ledger.won(market_result=None, yes_contracts=5.0,
                             no_contracts=0.0) is None
     assert venue_ledger.won(market_result='yes', yes_contracts=0.0,
                             no_contracts=0.0) is None
-    # Both sides of one market has no single answer.
+    # Holding both sides of one market has no single answer.
     assert venue_ledger.won(market_result='yes', yes_contracts=1.0,
                             no_contracts=1.0) is None
 
 
-# The venue's documented payload for /historical/trades, verbatim. Kept as one
-# literal so the parser is exercised against the real field set rather than
-# against a hand-picked subset of it.
+# The venue's documented `/historical/trades` payload, as one literal, so the
+# parser sees the real field set.
 TAPE_PRINT = {
     'trade_id': 'x', 'ticker': 'A', 'count_fp': '10.00',
     'yes_price_dollars': '0.5600', 'no_price_dollars': '0.4400',
@@ -148,16 +128,10 @@ TAPE_PRINT = {
 
 
 def test_the_tape_is_anonymous_and_carries_no_side_of_ours():
-    """`/historical/trades` is the public tape. It has no account attribution.
+    """`/historical/trades` is the public tape, with no account attribution.
 
-    A `Trade` deliberately has no position and no P&L. It is the endpoint that
-    looks like the answer and is not: summing it sums the exchange.
-
-    The `taker_*` fields are the closest it comes to naming a participant, and
-    what they name is the aggressor of that print — any account, including
-    someone else's. So `taker_side` exists on a `Trade` and is explicitly not a
-    side of ours; nothing may filter the tape by it and call the result a
-    position.
+    A `Trade` has no position and no P&L. `taker_side` names the aggressor of a print
+    from any account, so it is not a side of ours.
     """
     trade = parse_trade(TAPE_PRINT)
     assert trade.contracts == pytest.approx(10.0)
@@ -169,11 +143,8 @@ def test_the_tape_is_anonymous_and_carries_no_side_of_ours():
 
 
 def test_the_taker_side_is_translated_and_the_book_side_is_not():
-    """'yes'/'no' become 'up'/'down'; 'bid'/'ask' stay the venue's own language.
-
-    The book side is not a direction — on a single YES-denominated book an `ask`
-    is a sale of YES, which is economically a purchase of NO — so translating it
-    into this project's directional vocabulary would assert something false.
+    """'yes'/'no' become 'up'/'down'; 'bid'/'ask' stay in the venue's terms, since a
+    book side is not a direction.
     """
     trade = parse_trade(TAPE_PRINT)
     assert trade.taker_side == 'up'
@@ -186,27 +157,21 @@ def test_the_taker_side_is_translated_and_the_book_side_is_not():
 
 
 def test_the_renamed_taker_field_wins_over_the_alias():
-    """The payload serves both names; reading the older one goes stale silently."""
+    """`taker_outcome_side` takes priority over the older `taker_side` alias."""
     trade = parse_trade({**TAPE_PRINT, 'taker_outcome_side': 'no',
                          'taker_side': 'yes'})
     assert trade.taker_side == 'down'
-    # And the alias alone still works, for a venue that drops the new name.
+    # The alias alone still works.
     alias_only = parse_trade({'trade_id': 'y', 'ticker': 'A', 'taker_side': 'no'})
     assert alias_only.taker_side == 'down'
-    # An unfamiliar value is carried through rather than guessed at.
+    # An unrecognised value is carried through, not guessed.
     assert parse_trade({'trade_id': 'z', 'ticker': 'A',
                         'taker_side': 'sideways'}).taker_side == 'sideways'
     assert parse_trade({'trade_id': 'w', 'ticker': 'A'}).taker_side is None
 
 
 def test_a_print_whose_two_prices_do_not_sum_to_a_dollar_is_read_as_served():
-    """Neither price is derived as `1 - the other`.
-
-    The venue's own documented example carries 0.5600 on both sides. Deriving one
-    from the other would turn a payload we do not fully understand into a
-    confident wrong number, which is the failure mode this whole module is built
-    against.
-    """
+    """Neither price is derived as `1 - the other`; both are read as served."""
     trade = parse_trade({**TAPE_PRINT, 'yes_price_dollars': '0.5600',
                          'no_price_dollars': '0.5600'})
     assert trade.yes_price == pytest.approx(0.56)
@@ -236,11 +201,10 @@ class _Recorder:
 
 
 def test_both_tiers_are_read_and_the_overlap_is_deduplicated():
-    """The live and historical tiers overlap, and a doubled fill doubles a cost.
+    """Both ledger tiers are read and their overlap is deduplicated.
 
-    Since 2026-02-19 the live routes refuse to look past a moving cutoff and the
-    rest lives on `/historical/...`. A complete history means asking both — and
-    the same fill can come back from each, keyed identically.
+    The live routes cover only a recent window and older records are on
+    `/historical/...`. The same fill can come back from both.
     """
     client = KalshiClient(key_id='k', private_key_pem='')
     recorder = _Recorder({
@@ -251,7 +215,7 @@ def test_both_tiers_are_read_and_the_overlap_is_deduplicated():
              'no_price_dollars': '0.30', 'created_time': '2026-08-24T10:00:00Z'},
         ]}],
         '/portfolio/fills/historical': [{'fills': [
-            # 'b' again — the overlap. And one only the historical tier has.
+            # 'b' again (the overlap), and one only the historical tier has.
             {'trade_id': 'b', 'ticker': 'K', 'side': 'no', 'count_fp': '2.00',
              'no_price_dollars': '0.30', 'created_time': '2026-08-24T10:00:00Z'},
             {'trade_id': 'c', 'ticker': 'K', 'side': 'yes', 'count_fp': '4.00',
@@ -266,15 +230,13 @@ def test_both_tiers_are_read_and_the_overlap_is_deduplicated():
     paths = [c[0] for c in recorder.calls]
     assert '/portfolio/fills' in paths and '/portfolio/fills/historical' in paths
 
-    # The historical tier is a different HOST, and the live one must not be sent
-    # there — a base of None means "the trading host".
+    # The historical tier is on a different host; a base of None means the trading host.
     by_path = {c[0]: c[2] for c in recorder.calls}
     assert by_path['/portfolio/fills'] is None
     assert by_path['/portfolio/fills/historical'] == HISTORICAL_BASE_URL
 
 
 def test_a_missing_historical_tier_does_not_lose_the_live_one():
-    """A route that moves must not take the whole ledger down with it."""
     client = KalshiClient(key_id='k', private_key_pem='')
     _Recorder({
         '/portfolio/settlements': [{'settlements': [
@@ -292,14 +254,13 @@ def test_a_missing_historical_tier_does_not_lose_the_live_one():
 
 
 def test_pagination_follows_the_cursor_and_stops_when_it_repeats():
-    """An unbounded loop is not a read, and a repeated cursor is not a next page."""
     client = KalshiClient(key_id='k', private_key_pem='')
     recorder = _Recorder({
         '/portfolio/fills': [
             {'fills': [{'trade_id': '1', 'ticker': 'K', 'side': 'yes'}],
              'cursor': 'page2'},
             {'fills': [{'trade_id': '2', 'ticker': 'K', 'side': 'yes'}],
-             'cursor': 'page2'},          # the venue repeats itself
+             'cursor': 'page2'},  # the venue repeats itself
         ],
         '/portfolio/fills/historical': [{'fills': []}],
     })
@@ -333,7 +294,7 @@ def test_the_tape_reads_the_historical_route_on_the_historical_host():
 
 
 def test_an_unreadable_cutoff_is_not_fatal():
-    """Better to query both tiers than to guess a retention window."""
+    """An unreadable cutoff returns {}, so both tiers are queried."""
     client = KalshiClient(key_id='k', private_key_pem='')
     _Recorder({}).attach(client)
     assert asyncio.run(client.historical_cutoff()) == {}
@@ -342,10 +303,8 @@ def test_an_unreadable_cutoff_is_not_fatal():
 # ----------------------------------------------------------------- storing
 
 def test_a_resynced_fill_does_not_double_the_cost_basis():
-    """Idempotent on the venue's own `trade_id`. Both writers rely on it.
-
-    The live loop stores every cycle and `sync_venue` stores the deep history, so
-    the same fill is written repeatedly by design.
+    """Fills are idempotent on the venue's `trade_id`, since both writers store the same
+    fill repeatedly.
     """
     writer = _writer()
     fill = parse_fill({'trade_id': 't1', 'ticker': 'K', 'side': 'no',
@@ -363,12 +322,7 @@ def test_a_resynced_fill_does_not_double_the_cost_basis():
 
 
 def test_a_resync_heals_a_row_rather_than_preserving_a_bad_parse():
-    """Overwrite on conflict, not DO NOTHING.
-
-    The venue amends its own records — a `_dollars` field appearing where only
-    cents were served is the documented direction of travel — so a row that parsed
-    badly once must not be preserved forever.
-    """
+    """On conflict the row is overwritten, so a later, better parse replaces a bad one."""
     writer = _writer()
     writer.upsert_venue_settlements([venue_ledger.settlement_row(
         parse_settlement({'ticker': 'K1', 'yes_count_fp': '1.00'}))])
@@ -394,11 +348,8 @@ def test_a_fill_without_a_trade_id_is_skipped_rather_than_keyed_on_nothing():
 
 
 def test_the_settlement_total_is_over_everything_by_default():
-    """A limit on the P&L query reports the last N trades' profit as the account's.
-
-    `venue_settlements(limit=None)` is the default for that reason: a total is a
-    sum over the whole ledger, and a silently truncated one is a different number
-    that looks the same.
+    """The settlement total covers the whole ledger by default; a truncated total would
+    look the same.
     """
     writer = _writer()
     base = datetime(2026, 8, 20, tzinfo=timezone.utc)
@@ -432,7 +383,7 @@ def test_the_balance_sample_records_both_figures_and_their_difference():
 
 
 def test_the_minute_price_cycle_also_prunes_old_balance_samples():
-    """`venue_balance` gains a row a cycle and nothing else ever deletes one."""
+    """The minute price cycle also prunes old `venue_balance` rows."""
     from livetrade.ledger import BALANCE_RETENTION_DAYS, record_minute_prices
 
     writer = _writer()
@@ -452,11 +403,9 @@ def test_the_minute_price_cycle_also_prunes_old_balance_samples():
 
 
 def test_a_settlement_joins_to_our_position_through_the_ticket():
-    """`positions` has no ticker column, so the join runs through `order_tickets`.
+    """A settlement joins to our position through `order_tickets`.
 
-    A null `our_pnl` is informative rather than missing data: it means the venue
-    settled a market we have no record of buying, which is what an order POST that
-    timed out after being accepted leaves behind.
+    A null `our_pnl` means the venue settled a market we have no record of buying.
     """
     writer = _writer()
     window = datetime(2026, 8, 25, 10, 0, tzinfo=timezone.utc)
@@ -492,7 +441,7 @@ def test_a_settlement_joins_to_our_position_through_the_ticket():
 # --------------------------------------------------------------- totalling
 
 def test_an_incomplete_settlement_is_counted_and_not_added_as_zero():
-    """The count is surfaced because the total is short by an unknown amount."""
+    """An incomplete settlement is counted, not added as zero, since the total is short."""
     rows = [
         {'pnl': 1.0, 'fee_cost': 0.02, 'revenue': 2.0, 'yes_cost': 1.0,
          'no_cost': None, 'yes_contracts': 2.0, 'no_contracts': 0.0,
@@ -511,7 +460,6 @@ def test_an_incomplete_settlement_is_counted_and_not_added_as_zero():
 
 
 def test_a_ledger_of_nothing_but_gaps_totals_to_none_not_to_zero():
-    """"We cannot say" and "you made nothing" are different claims."""
     summary = venue_ledger.summarise([
         {'pnl': None, 'fee_cost': None, 'revenue': None, 'yes_cost': None,
          'no_cost': None, 'yes_contracts': 1.0, 'no_contracts': 0.0,
@@ -523,7 +471,6 @@ def test_a_ledger_of_nothing_but_gaps_totals_to_none_not_to_zero():
 
 
 def test_the_curve_skips_a_gap_rather_than_drawing_a_flat_step():
-    """A step of zero looks like a measurement. An absent point does not."""
     t0 = datetime(2026, 8, 25, 10, 15, tzinfo=timezone.utc)
     rows = [
         {'ticker': 'A', 'pnl': 3.0, 'settled_time': t0},
@@ -538,10 +485,9 @@ def test_the_curve_skips_a_gap_rather_than_drawing_a_flat_step():
 
 
 def test_the_curve_is_pnl_by_default_rather_than_a_back_projected_equity():
-    """Without a starting balance the series is P&L and says so with a null.
+    """Without a starting balance the curve is P&L, with a null equity.
 
-    Back-projecting today's balance through the P&L assumes no deposit ever
-    happened, and the ledger cannot know that.
+    Back-projecting the balance would assume no deposits.
     """
     points = venue_ledger.cumulative_curve(
         [{'ticker': 'A', 'pnl': 3.0,
@@ -551,10 +497,10 @@ def test_the_curve_is_pnl_by_default_rather_than_a_back_projected_equity():
 
 
 def test_the_cash_flow_check_recovers_the_starting_balance():
-    """The smoke alarm for a double-counted fee or a fill nobody saw.
+    """The cash-flow check recovers the starting balance.
 
-    $100 in, one 5-contract NO fill at 30c ($1.50 out), settled for $5.00 with a
-    7c fee: the balance must be $103.43 and the implied start exactly $100.
+    $100 in, one 5-contract NO fill at 30c ($1.50 out), settled for $5.00 with a 7c fee:
+    the balance is $103.43 and the implied start is exactly $100.
     """
     check = venue_ledger.balance_check(
         venue_balance=103.43,
@@ -567,12 +513,7 @@ def test_the_cash_flow_check_recovers_the_starting_balance():
 
 
 def test_a_double_counted_fee_shows_up_in_the_implied_start():
-    """If `revenue` were already net of the fee, every trade is understated by it.
-
-    The gap is small per trade and cumulative, which is exactly the shape of error
-    that a per-trade eyeball misses. Charged twice on 100 trades at 2c, the implied
-    start drifts $2 from the truth — and drift, not magnitude, is the signal.
-    """
+    """A double-counted fee moves the implied starting balance by the full fee bill."""
     settlements = [{'revenue': 1.0, 'fee_cost': 0.02} for _ in range(100)]
     fills = [{'price': 0.50, 'contracts': 1.0} for _ in range(100)]
     honest = venue_ledger.balance_check(
@@ -580,8 +521,8 @@ def test_a_double_counted_fee_shows_up_in_the_implied_start():
         settlements=settlements, fills=fills)
     assert honest['implied_starting_balance'] == pytest.approx(100.0)
 
-    # The same ledger read against a balance where the fee never left: the implied
-    # start moves by the full fee bill rather than staying put.
+    # The same ledger against a balance where the fee never left: the implied start
+    # moves by the full fee bill.
     doubled = venue_ledger.balance_check(
         venue_balance=100.0 + 100 * (1.0 - 0.50),
         settlements=settlements, fills=fills)

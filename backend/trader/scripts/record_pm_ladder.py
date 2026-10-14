@@ -1,33 +1,13 @@
 """Archive Polymarket's raw order book every minute, in Kalshi's schema.
 
-The counterpart to `scripts/record_ladder.py`, and it exists for the same
-reason: resting size at a price is not served historically by anyone, so a day
-not recorded is a day gone. It writes to `pm_ladder` with the same columns
-`venue_ladder` uses, so the two venues join on (symbol, window_open, minute).
+Writes `pm_ladder` with the columns `venue_ladder` uses, so the venues join on
+(symbol, window_open, minute). No venue serves historical depth, so a minute
+not recorded is lost.
 
-**Why record a venue we do not trade.** Every result in this project rests on
-one venue's 70 days. Polymarket runs the same instrument — 15-minute BTC/ETH/SOL
-up/down — with different participants and a different settlement source
-(Chainlink's BTC-USD TWAP-60s data stream, confirmed from a live market's own
-`resolutionSource` — rather than CF Benchmarks BRTI). If the offset structure
-replicates there, the
-mechanism is about crypto. If it does not, the Kalshi result is about Kalshi.
-That question cannot be asked at all without the data, and it cannot be asked
-honestly if the two datasets are shaped differently.
-
-**Public endpoints, not Predexon.** `gamma-api.polymarket.com` and
-`clob.polymarket.com` need no key. That matters: Predexon's 1 req/s is an
-ORG-WIDE bucket, so a live recorder running through it would throttle the
-backfill it is meant to complement. Both refuse a bare `Python-urllib`
-User-Agent with a 403 — the header below is not decoration.
-
-**The slug is verified, not assumed.** `{asset}-updown-15m-{unix_open}` is
-computable from the clock, and this asks the venue for that slug rather than
-trusting it: a market that does not come back is an abstention, and a renamed
-series then records nothing instead of recording the wrong thing.
-
-Cost: 3 assets x 2 calls a minute is ~8,600 calls a day, unauthenticated and
-unmetered.
+Uses the public gamma and CLOB endpoints, which need no key. Both refuse a
+bare `Python-urllib` User-Agent with a 403. The slug
+`{asset}-updown-15m-{unix_open}` is asked of the venue, not trusted: a market
+that does not come back is an abstention.
 """
 
 from __future__ import annotations
@@ -55,40 +35,26 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (quarter research collector)',
            'Accept': 'application/json'}
 
 
-# The latest Polymarket touch per symbol, for the trading loop in this same
-# process. `run_live` supervises this recorder and `scripts.live` as asyncio
-# tasks, so a module-level dict is the whole transport — the `cross_venue`
-# features cost no fetch and no store read.
-#
-# Prices here are DOLLARS best-first, and `no_levels` is NO-denominated, so the
-# YES ask is `1 - best_no_bid`. Published in CENTS because that is what
-# `core.book_features` reads.
+# The latest Polymarket touch per symbol, for the trading loop in this process.
+# Published in cents, as `core.book_features` reads. The YES ask is
+# `1 - best_no_bid`, because `no_levels` is NO-denominated.
 CACHE: dict = {}
 
 
 def window_of(slug: str) -> pd.Timestamp:
-    """The window a slug names. Its trailing unix stamp is the OPEN.
+    """Return the window a slug names. Its trailing unix stamp is the open.
 
-    Assumed to be the close at first, which shifted every Polymarket window by
-    fifteen minutes and was invisible: every window is a valid window and
-    nothing raised. It showed up only when the venue's settlement was scored
-    against our Coinbase label — Kalshi agreed 96.98%, Polymarket 49.85%, and
-    Kalshi against Polymarket 50.0%, which places the error in the mapping
-    rather than in either venue's data.
-
-    The venue says it three ways and they agree: the slug stamp, the title
-    ("9:30PM-9:45PM ET"), and `end_time`, which is the stamp plus fifteen
-    minutes.
+    The title and `end_time` (the stamp plus fifteen minutes) agree. Reading
+    the stamp as the close shifts every window silently.
     """
     return pd.Timestamp(int(str(slug).rsplit('-', 1)[-1]), unit='s', tz='UTC')
 
 
 def slug_for(asset: str, now: datetime) -> str:
-    """The slug of the window `now` is INSIDE — floor, never ceil.
+    """Return the slug of the window `now` is inside: floor, never ceil.
 
-    `ceil` names the next window. That market already exists and already trades,
-    so the request succeeded and returned a healthy book, which was then stamped
-    with this window's `window_open`. A wrong answer that looks entirely right.
+    `ceil` names the next window, which already trades and returns a healthy
+    book under the wrong window.
     """
     opened = pd.Timestamp(now).tz_convert('UTC').floor(
         f'{DEFAULT_CONFIG.window_minutes}min')
@@ -96,20 +62,11 @@ def slug_for(asset: str, now: datetime) -> str:
 
 
 def _levels(raw) -> list:
-    """`[{price, size}, ...]` as `[[price, size], ...]`, ordered best first.
+    """Convert `[{price, size}, ...]` to `[[price, size], ...]`, best first.
 
-    Polymarket serves bids ascending and asks descending, so the touch is the
-    LAST entry on both sides. Kalshi's ladder is stored best-first, and a schema
-    that agrees on columns while disagreeing on order is worse than one that
-    disagrees openly.
-
-    **And they DO disagree, measured 2026-09-16.** `venue_ladder.yes_levels`
-    runs ASCENDING (0.001 first); `pm_ladder.yes_levels` runs DESCENDING (best
-    bid first). So `yes_levels[0]` is Polymarket's best bid and Kalshi's worst.
-    Latent only because every consumer traced so far scans (`max`, iterate)
-    rather than indexes -- which is precisely the trap this paragraph claimed
-    was not there. Do not index either by position. The same argument applies to denomination — see
-    `_no_levels`, which is why the ask side is not stored as served.
+    Polymarket serves the touch last on both sides. Stored order differs by
+    venue: `venue_ladder.yes_levels` is ascending, `pm_ladder.yes_levels` is
+    best first. Never index either by position.
     """
     out = []
     for entry in raw or []:
@@ -121,50 +78,33 @@ def _levels(raw) -> list:
 
 
 def _no_levels(raw) -> list:
-    """Polymarket's YES asks as NO-denominated bids, to match Kalshi exactly.
+    """Convert Polymarket's YES asks to NO-denominated bids, as Kalshi stores them.
 
-    Kalshi's orderbook is two BID stacks — `yes_dollars` and `no_dollars` — so
-    `no_levels` there is NO-side prices and the YES ask is `1 - best_no_bid`.
-    Polymarket serves `bids`/`asks` on one token, so its asks are YES-denominated.
-    Storing them unchanged would put a 0.51 YES ask in the column that holds a
-    0.51 NO bid on the other venue: same name, opposite meaning, and every shared
-    aggregate silently wrong by the spread with imbalance inverted.
-
-    Converting here rather than at read time means the stored row is correct on
-    its own terms, which is the only version of "uniform" worth having.
+    Kalshi's book is two bid stacks, so its `no_levels` holds NO prices.
+    Polymarket's asks are YES prices on one token. Converting at write time
+    keeps `no_levels` meaning the same on both venues.
     """
     return [[round(1.0 - price, 6), size] for price, size in _levels(raw)]
 
 
 async def _get(session, url: str, *, tries: int = 3):
-    """One request, retried on a transient failure.
+    """Send one GET, retried on a transient failure.
 
-    Observed live, twice: `clob.polymarket.com` returned 403 for all three
-    assets in the same cycle, then recovered within a minute or two on its
-    own — the signature of a Cloudflare edge-level throttle, not a real
-    permission failure, since the identical request against the identical
-    host succeeds seconds later. This had no retry at all, so one blip cost
-    a whole minute of every asset's book with nothing attempted again until
-    the next poll.
-
-    429 and 403 both get a short retry with backoff; a genuine 4xx that is
-    not one of those (404, 400, ...) fails immediately, since retrying a
-    malformed request just produces the same malformed request.
+    403 and 429 get a short retry with backoff: the CLOB host returns a
+    transient 403 under an edge throttle. Any other 4xx fails at once.
     """
     for attempt in range(tries):
         try:
             async with session.get(url, headers=HEADERS) as response:
-                # 403/429 get another try, up to the limit; every other
-                # status — 200s included, and a genuine 4xx not on this
-                # list — is decided immediately, once, by raise_for_status.
+                # 403/429 retry up to the limit; any other status is decided
+                # at once by raise_for_status.
                 if response.status in (403, 429) and attempt < tries - 1:
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 response.raise_for_status()
                 return json.loads(await response.text() or 'null')
         except (asyncio.TimeoutError, ConnectionError, OSError):
-            # A genuine network failure, not an HTTP status — this is the
-            # only case a blanket retry belongs to.
+            # A network failure, not an HTTP status: always retry.
             if attempt < tries - 1:
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
@@ -173,12 +113,7 @@ async def _get(session, url: str, *, tries: int = 3):
 
 
 async def _post(session, url: str, payload, *, tries: int = 3):
-    """`_get`'s retry, for the one POST this recorder makes.
-
-    Same retry shape as `_get` — 403/429 get backoff, a genuine 4xx fails
-    immediately — kept as a sibling rather than sharing the loop with `_get`
-    because the two differ only in which `session` method they call.
-    """
+    """Send one POST with the same retry rules as `_get`."""
     for attempt in range(tries):
         try:
             async with session.post(url, headers=HEADERS, json=payload) as response:
@@ -195,13 +130,9 @@ async def _post(session, url: str, payload, *, tries: int = 3):
     raise RuntimeError(f'unreachable: retries exhausted for {url}')
 
 
-# A real CTF token id is a ~256-bit number — on live evidence, always in the
-# 70s of decimal digits. Observed live: a market minutes old had gamma
-# serving a 17-digit placeholder in `clobTokenIds` before the real token
-# attached, and `clob.polymarket.com` 403'd on it for the ten-plus minutes it
-# took to be replaced — a request that could never succeed, retried every
-# cycle regardless. 40 sits with wide margin on both sides of the two
-# measured values (17 and 78) without depending on the exact digit count.
+# A real CTF token id is a ~256-bit number (70+ decimal digits). A new market
+# can briefly serve a short placeholder id, which the CLOB always refuses.
+# 40 sits well between the two.
 MIN_TOKEN_LEN = 40
 
 
@@ -210,11 +141,10 @@ def _valid_token(token) -> bool:
 
 
 def _match_books(wanted: list[tuple[str, str]], books: list[dict]) -> dict[str, dict]:
-    """A batch `/books` response, matched back to the symbol that asked.
+    """Match a batch `/books` response back to each symbol.
 
-    Matched by `asset_id`, which the API echoes back as the exact token_id
-    requested — not by response order, which the batch endpoint does not
-    promise to preserve (verified live against a two-token request).
+    Matches on the echoed `asset_id`, never on response order, which is not
+    guaranteed.
     """
     by_token = {token: symbol for symbol, token in wanted}
     out = {}
@@ -233,15 +163,11 @@ async def run(args, gate=None) -> int:
     rows: list[dict] = []
 
     def _flush_on_exit() -> None:
-        """Write whatever is buffered before this task goes away.
+        """Write the buffer before this task is cancelled.
 
-        **`asyncio.CancelledError` is a BaseException, not an Exception**, so
-        the `except Exception` reconnect handler below never saw a shutdown and
-        `run_live`'s `task.cancel()` discarded the buffer -- up to a full batch
-        of rows on every restart, on a dataset whose whole justification is that
-        a minute not recorded is gone for good. Written synchronously rather
-        than through `asyncio.to_thread`: the loop is being torn down and a
-        thread hop is one more thing that can be cancelled.
+        `asyncio.CancelledError` is a BaseException, so `except Exception`
+        never sees a shutdown. Writes synchronously, because the event loop is
+        shutting down.
         """
         if not rows:
             return
@@ -266,13 +192,8 @@ async def run(args, gate=None) -> int:
                         f'{config.window_minutes}min')
                     minute = (now - window_open.to_pydatetime()).total_seconds() / 60.0
 
-                    # One gamma call for all three assets' markets, and one
-                    # CLOB call for all three books, rather than three of
-                    # each — verified live that both hosts accept a batched
-                    # request. `clob.polymarket.com` had been 403ing a
-                    # single window for ten-plus minutes straight; that is
-                    # not a blip a per-request retry can wait out, so the
-                    # only lever left is asking less often.
+                    # One batched gamma call and one batched CLOB call for all
+                    # assets, to ask the throttled CLOB host less often.
                     slugs = {asset: slug_for(asset, now) for asset in ASSETS}
                     qs = '&'.join(f'slug={slug}' for slug in slugs.values())
                     try:
@@ -282,9 +203,9 @@ async def run(args, gate=None) -> int:
                         found = []
                     by_slug = {m.get('slug'): m for m in found}
 
-                    # Token 0 is "Up" and token 1 is "Down"; one book is the
-                    # mirror of the other, so recording the Up side is the
-                    # whole market. `outcomes` is carried to prove it.
+                    # Token 0 is "Up" and token 1 is "Down". One book mirrors
+                    # the other, so the Up side is the whole market. `outcomes`
+                    # is carried to prove it.
                     wanted: list[tuple[str, str]] = []       # (symbol, token)
                     market_by_symbol: dict[str, dict] = {}
                     slug_by_symbol: dict[str, str] = {}
@@ -331,12 +252,8 @@ async def run(args, gate=None) -> int:
                             'event_time': pd.Timestamp(now).floor('min'),
                             'available_time': pd.Timestamp(now),
                             'quality': 'valid',
-                            # **Set, not left null.** `EVENT_KEY_EXTRA['pm_ladder']`
-                            # is `('transport',)` and the schema comment says "the
-                            # schema twin stays a twin" -- but all 92,988 rows
-                            # carried NULL for both of these, so the key was inert
-                            # and a second PM transport would have collapsed onto
-                            # the first exactly as `venue_depth` once did.
+                            # Never null: `transport` is part of the `pm_ladder`
+                            # event key, so each transport's rows stay distinct.
                             'transport': 'rest',
                             'book_age_ms': float('nan'),
                             'market_ticker': slug_by_symbol[symbol],

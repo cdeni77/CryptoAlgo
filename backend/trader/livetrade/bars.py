@@ -21,7 +21,7 @@ logger = logging.getLogger('live')
 # the seasonal factor is a fitted lookup, so a day plus a margin suffices.
 FETCH_MINUTES = 1_500
 
-# The rolling window, kept between cycles. See `fetch_bars`.
+# The rolling window of bars per symbol, kept between cycles.
 _BAR_CACHE: dict[str, pd.DataFrame] = {}
 
 # How far back to re-ask on an incremental fetch. The newest cached bar is the
@@ -30,21 +30,19 @@ _BAR_CACHE: dict[str, pd.DataFrame] = {}
 BAR_REFETCH_MINUTES = 3
 
 # When each symbol's REST cache was last asked for (epoch seconds), and how long
-# after its close a REST candle must have been read to count as settled. Only a
-# settled candle can anchor the trade tape: one read a second after its minute
-# closed may still be missing that minute's last prints.
+# after its close a REST candle must be read to count as settled. Only a
+# settled candle can anchor the trade tape, because an earlier read can miss
+# the minute's last prints.
 _BAR_FETCHED_AT: dict[str, float] = {}
 BAR_SETTLED_SECONDS = 10.0
 
 
 def _merge_bars(cached: pd.DataFrame, fresh: pd.DataFrame,
                 *, floor: pd.Timestamp) -> pd.DataFrame:
-    """Cached bars plus fresh ones, the fresh copy winning on any overlap.
+    """Merge cached and fresh bars; the fresh copy wins on any overlap.
 
-    `keep='last'` matters: the overlap is deliberately the minutes that were
-    still forming when they were last read, and the newer read is the finished
-    one. Keeping the cached copy would freeze a partial candle into the window
-    forever, and every `log_rv_*` feature is built off these closes.
+    The overlap holds minutes that were still forming at the last read, so the
+    newer read is the final one.
     """
     combined = pd.concat([cached, fresh], ignore_index=True)
     combined = combined.sort_values('event_time', ignore_index=True)
@@ -54,18 +52,11 @@ def _merge_bars(cached: pd.DataFrame, fresh: pd.DataFrame,
 
 async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES, *,
                      prefer_stream: bool = False) -> dict[str, pd.DataFrame]:
-    """One-minute bars for the universe, straight from the venue.
+    """Return one-minute bars for the universe from the venue.
 
-    **Only the tail is fetched.** The window is kept between cycles and only the
-    newest few minutes are re-asked; a full 1,500-minute window is ~6
-    sequential 300-candle pages per symbol (measured 3.2s). A symbol with no
-    usable cache — first cycle, or a gap wider than the window — falls back to
-    the full fetch, so this never loses history.
-
-    `prefer_stream` (decision cycles) first tries the Coinbase trade tape for
-    the newest minutes — see `stream_bars` — and asks REST only for symbols
-    the tape cannot vouch for. That takes the REST round trip off the decision
-    path, and with it the risk of reading a candle Coinbase has not finished.
+    Only the newest minutes are re-fetched; a symbol with no usable cache gets
+    the full window. With `prefer_stream`, the Coinbase trade tape supplies
+    the newest minutes and REST serves only the symbols the tape cannot verify.
     """
     out: dict[str, pd.DataFrame] = {}
     symbols = list(config.symbols)
@@ -94,8 +85,8 @@ async def _fetch_rest_bars(config: Config, minutes: int,
     )
     out: dict[str, pd.DataFrame] = {}
     try:
-        # Symbols concurrently; `return_exceptions` so one symbol's failure
-        # costs only that symbol — the loop already handles a missing one.
+        # Fetch symbols concurrently. One symbol's failure costs only that
+        # symbol.
         spans: dict[str, datetime] = {}
         for symbol in symbols:
             cached = _BAR_CACHE.get(symbol)
@@ -105,10 +96,8 @@ async def _fetch_rest_bars(config: Config, minutes: int,
             last = pd.Timestamp(cached['event_time'].iloc[-1])
             gap_start = (last.tz_convert(None).to_pydatetime()
                          - timedelta(minutes=BAR_REFETCH_MINUTES))
-            # Only incremental if the cache still reaches back far enough to
-            # cover the window on its own; otherwise the tail would leave a hole
-            # in the middle, which no feature would notice and every `rv` would
-            # be computed across.
+            # Fetch incrementally only if the cache covers the window start.
+            # Otherwise the result has a silent hole in the middle.
             if gap_start > start and pd.Timestamp(cached['event_time'].iloc[0]) <= floor:
                 spans[symbol] = gap_start
 
@@ -151,7 +140,7 @@ async def _fetch_rest_bars(config: Config, minutes: int,
 
 
 def _spot_tape():
-    """The trade-stream recorder's tape, when this process is running one."""
+    """Return the trade-stream recorder's tape, if this process runs one."""
     try:
         from scripts.record_spot_stream import TAPE
         return TAPE
@@ -177,19 +166,13 @@ def _same_bar(rest_row, bar: dict) -> bool:
 def stream_bars(rest: Optional[pd.DataFrame], tape, symbol: str, *,
                 fetched_at: Optional[float], now: float,
                 floor: pd.Timestamp) -> Optional[pd.DataFrame]:
-    """REST bars up to a verified anchor and the trade tape after it, or None.
+    """Return REST bars up to a verified anchor and tape bars after it, or None.
 
     The anchor is the newest REST candle read at least `BAR_SETTLED_SECONDS`
-    after it closed. The tape is used only when it
-
-      * covered every minute from the anchor through the newest closed minute,
-        continuously and untainted (`TradeTape.reliable`), and
-      * reproduces every settled REST candle inside that coverage — same OHLC,
-        same volume, and no bar where REST has none.
-
-    Anything less returns None and the caller uses REST exactly as before. The
-    frame has REST's shape and its newest row is still the minute before the
-    decision, so no feature definition moves.
+    after its close. The tape is used only when it covers every minute from the
+    anchor to the newest closed minute (`TradeTape.reliable`), and reproduces
+    every settled REST candle in that span. Otherwise returns None and the
+    caller uses REST. The frame has the REST shape.
     """
     if tape is None or rest is None or rest.empty or fetched_at is None:
         return None
@@ -250,8 +233,8 @@ async def _bars_from_stream(config: Config, minutes: int) -> dict[str, pd.DataFr
 
     tape.grace_seconds = float(config.spot_bar_grace_seconds)
     now = time.time()
-    # The decision wakes ~1s past the minute and the newest bar it needs is
-    # final `grace` after its close: wait out any remainder rather than refuse.
+    # The newest bar is final `grace` seconds after its close. Wait out the
+    # remainder instead of refusing.
     wait = minute_of(now) + config.spot_bar_grace_seconds - now
     if 0 < wait <= config.spot_bar_grace_seconds:
         await asyncio.sleep(wait)

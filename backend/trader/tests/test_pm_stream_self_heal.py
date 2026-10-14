@@ -1,9 +1,7 @@
-"""A stuck Polymarket stream cache is torn down and resubscribed on request.
+"""Tests that a stuck Polymarket stream cache is resubscribed on request.
 
-The trading loop counts consecutive peer refusals per symbol. After
-`peer_resubscribe_after_cycles` of them it asks `record_pm_stream` to drop that
-symbol's state and subscribe again. The heartbeat is touched only for a
-two-sided book of the current window.
+After `peer_resubscribe_after_cycles` refusals the trading loop asks the recorder to
+resubscribe.
 """
 from __future__ import annotations
 
@@ -126,8 +124,11 @@ def _ms(ts: pd.Timestamp) -> str:
 
 
 def _run_recorder(monkeypatch, *, fresh: bool) -> int:
-    """Run `record_pm_stream.run` against fakes; return how many times it
-    resolved tokens. The live side decides three times in between."""
+    """Run `record_pm_stream.run` against fakes and return how many times it resolved
+    tokens.
+
+    The live side decides three times in between.
+    """
     from scripts.record_pm_ladder import slug_for
 
     resolved = {'n': 0}

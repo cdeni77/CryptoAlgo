@@ -1,17 +1,13 @@
 """One-minute OHLCV bars folded from a trade stream, on REST candle semantics.
 
-The bar for minute `m` is stamped at `m`'s start, opens at its first trade,
-closes at its last, and its volume is the summed trade size — what Coinbase's
-`/candles` serves. A minute with no trades has no bar, as in REST.
+The bar for minute `m` is stamped at its start. It opens at the first trade,
+closes at the last, and sums trade size, as Coinbase `/candles` does.
+A minute with no trades has no bar, as in REST.
 
-**A bar is only as good as the coverage under it.** A minute is served only
-when the stream was connected, gap-free and untainted for the whole of it, and
-the clock has passed its close by `grace_seconds` (trades arrive tens of ms
-after they print). Anything else is `None`, and the caller falls back to REST.
-An empty minute inside coverage is a real "no trades"; outside it, it is
-nothing at all — conflating the two would invent quiet minutes.
-
-Pure and synchronous: no sockets, no clock unless one is passed in.
+A minute is served only when the stream covered all of it, gap-free and
+untainted, and the clock passed its close by `grace_seconds`. Otherwise the
+result is None and the caller falls back to REST. An empty minute outside
+coverage is not a quiet minute.
 """
 from __future__ import annotations
 
@@ -42,7 +38,7 @@ def parse_time(value: Union[str, float, int, datetime]) -> float:
         return datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
     except ValueError:
         # Coinbase can send nine fractional digits, which `fromisoformat`
-        # refuses below Python 3.11's tolerance; pandas reads them exactly.
+        # refuses on older Pythons; pandas reads them exactly.
         import pandas as pd
         return pd.Timestamp(text).value / 1e9
 
@@ -77,8 +73,7 @@ class _Minute:
 class TradeTape:
     """Bars for every product on ONE connection, plus that connection's coverage.
 
-    Coverage is per connection because a sequence gap or a reconnect cannot be
-    attributed to a product: the missing message could have carried any of them.
+    Coverage is per connection: a lost message could have carried any product.
     """
 
     def __init__(self, *, grace_seconds: float = 0.75,
@@ -88,8 +83,7 @@ class TradeTape:
         self.grace_seconds = float(grace_seconds)
         self.retain_minutes = int(retain_minutes)
         # A trade printed just before we subscribed can carry a timestamp a
-        # little after our clock's `connected` instant; the first covered minute
-        # must start clear of that.
+        # little after `connected`. The first covered minute starts clear of that.
         self.clock_margin_seconds = float(clock_margin_seconds)
         self._now = now
         self._minutes: dict[str, dict[int, _Minute]] = {}
@@ -127,11 +121,10 @@ class TradeTape:
 
     def add(self, product: str, trade_id, price, size, when,
             *, received: Optional[float] = None, snapshot: bool = False) -> bool:
-        """Fold one trade. False when it was a duplicate or unparseable.
+        """Fold one trade. Returns False for a duplicate or an unparseable trade.
 
-        `snapshot` trades are the recent history a subscription opens with.
-        Arriving late is their nature, so they taint a minute only when that
-        minute was already being served — a new trade there means one was lost.
+        `snapshot` trades are the history a subscription opens with. They taint
+        a minute only if that minute was already being served.
         """
         try:
             trade_id = str(trade_id)
@@ -151,7 +144,7 @@ class TradeTape:
         if late and snapshot:
             late = self.reliable(product, minute, now=received)
         if late:
-            # Late: whatever was served for this minute may have missed it.
+            # Late: whatever was served for this minute may have missed this trade.
             self.late_trades += 1
             self._tainted.setdefault(product, set()).add(minute)
             logger.warning('%s: trade %s for %s arrived %.2fs after the minute '
@@ -195,7 +188,7 @@ class TradeTape:
             return False
         if minute in self._tainted.get(product, ()):
             return False
-        # Older than what is retained: its bar may have been pruned, and an
+        # Older than the retention window: its bar may be pruned, and an
         # absent bar must never read as a quiet minute.
         if minute < minute_of(now) - (self.retain_minutes - 1) * MINUTE:
             return False
@@ -217,10 +210,9 @@ class TradeTape:
 
     def span(self, product: str, first: int, last: int, *,
              now: Optional[float] = None) -> Optional[list[dict]]:
-        """Bars for every minute in [first, last], or None unless ALL are reliable.
+        """Bars for every minute in [first, last], or None unless all are reliable.
 
-        Minutes without trades are absent from the list, exactly as REST omits
-        them — which is only a claim because every minute was covered.
+        Minutes without trades are absent from the list, as REST omits them.
         """
         now = self._now() if now is None else float(now)
         out: list[dict] = []

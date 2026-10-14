@@ -1,21 +1,4 @@
-"""`score_live` must score the window it is inside, not the one before it.
-
-This is the defect that meant live and paper trading had never worked. `score_live`
-asks `build_windows` for the window currently being decided; `build_windows`
-trimmed the grid to whole windows (`// window`) and read the settlement from
-`means[:, window - 1]`, so a window three minutes old was absent twice over. The
-slice came back empty, `DatasetError` was raised, and `scripts/live.py`'s loop
-catches only `KeyboardInterrupt` — so the process exited on its first cycle,
-every cycle, under `restart: unless-stopped`.
-
-The two tests that named this case could not fail for it: both
-`test_score_live_*` in `test_features_and_model.py` pass `window_index[-3]`, a
-window that settled long ago, with bars running well past it. One of them is
-literally called `test_score_live_reports_no_outcome_for_an_unsettled_window`.
-
-So these feed exactly what a live cycle has: bars ending at the decision minute
-and nothing after.
-"""
+"""Tests that `score_live` scores the window it is inside, from bars up to the decision only."""
 
 from __future__ import annotations
 
@@ -48,7 +31,7 @@ def truncate(bars: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dict:
 
 @pytest.mark.parametrize('offset', (3, 6, 9, 12))
 def test_the_window_being_decided_can_be_scored(fitted, offset):
-    """A live cycle at +offset has bars up to offset-1 and must get a row."""
+    """A live cycle at +offset has bars up to offset-1 and gets a row per symbol."""
     bars, bundle, index = fitted
     window = index[-6]
     feed = truncate(bars, window + pd.Timedelta(minutes=offset))
@@ -65,10 +48,8 @@ def test_the_window_being_decided_can_be_scored(fitted, offset):
 
 @pytest.mark.parametrize('offset', (3, 6, 9, 12))
 def test_the_decision_reads_the_close_of_the_bar_before_it(fitted, offset):
-    """`last_price` is `close(window_open + offset - 1)`, exactly.
-
-    The whole barrier rests on this one number, and a one-minute slip is 7% of a
-    fifteen-minute question — which reads exactly like skill.
+    """`last_price` is exactly `close(window_open + offset - 1)`; a one-minute slip
+    reads like skill.
     """
     bars, bundle, index = fitted
     window = index[-6]
@@ -87,10 +68,8 @@ def test_the_decision_reads_the_close_of_the_bar_before_it(fitted, offset):
 
 
 def test_an_unsettled_window_reports_no_outcome(fitted):
-    """The label must be absent, not zero.
-
-    `(nan >= x)` is False, so an in-progress window filed as `outcome=0` is an
-    unresolved bet recorded as a loss.
+    """An unsettled window reports NaN outcome, not zero (which would book an open bet
+    as a loss).
     """
     bars, bundle, index = fitted
     window = index[-6]
@@ -100,18 +79,13 @@ def test_an_unsettled_window_reports_no_outcome(fitted):
     assert scored['outcome'].isna().all()
     assert scored['settle_price'].isna().all()
     assert scored['settle_return'].isna().all()
-    # The strike, by contrast, is real: it is the previous window's settlement
-    # average, which has already happened.
+    # The strike is real: it is the previous window's settlement mean, already known.
     assert np.isfinite(scored['strike']).all()
 
 
 def test_a_feed_that_has_not_reached_the_decision_minute_abstains(fitted):
-    """Withheld, not forward-filled.
-
-    The interior forward-fill is right for a minute in which nothing traded, but
-    it cannot tell that from a minute not yet fetched — and ffilling a stale feed
-    invents a `last_price` and hands it to the barrier as a measurement. The
-    honest answer is to abstain, so this must raise rather than return a row.
+    """A feed that has not reached the decision minute raises instead of forward-filling
+    a price.
     """
     bars, bundle, index = fitted
     window = index[-6]
@@ -122,12 +96,7 @@ def test_a_feed_that_has_not_reached_the_decision_minute_abstains(fitted):
 
 
 def test_the_backtest_never_sees_an_unsettled_window(fitted):
-    """`include_unsettled` must stay off everywhere the label is used.
-
-    An unsettled row carries `outcome=NaN`. In a training or scoring frame that
-    is either a crash or, worse, a row silently dropped from a metric's
-    denominator.
-    """
+    """The measured panel never contains an unsettled window."""
     bars, _, _ = fitted
     dataset = Dataset.build(bars, FAST)
     assert dataset.windows['outcome'].notna().all(), (

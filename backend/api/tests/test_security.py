@@ -1,8 +1,4 @@
-"""The cross-origin policy.
-
-The CORS list used to end with `"*"`, which made every other entry decorative:
-any page the browser had open could call the API with credentials.
-"""
+"""The cross-origin policy never admits `*`."""
 
 from __future__ import annotations
 
@@ -10,13 +6,13 @@ from security import allowed_origins
 
 
 def test_read_only_routes_stay_open(client):
-    """The dashboard polls these. Gating them buys nothing the origin policy does not."""
+    """The dashboard polls these routes without credentials."""
     assert client.get('/').status_code == 200
     assert client.get('/model/').status_code == 200
 
 
 def test_wildcard_origin_is_filtered_out(monkeypatch):
-    """`*` made every other entry in the list decorative."""
+    """`*` would admit any page the browser has open."""
     monkeypatch.setenv('CORS_ALLOW_ORIGINS', 'http://localhost:3000,*')
 
     origins = allowed_origins()

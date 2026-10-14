@@ -1,13 +1,6 @@
-"""`core/backtest.py` end to end, because nothing imported it.
+"""End-to-end tests for `core.backtest.walk_forward`.
 
-158 statements at **0% coverage**: no test in the suite imported this module, so
-the walk-forward — the thing that produces every number a promotion decision is
-made on — was exercised only by running a script by hand. `pytest.ini`'s own
-comment claimed the suite was "dominated by four promotion and walk-forward
-evaluations", which described a suite that did not exist; no test carried the
-`slow` marker either, so `-m "not slow"` was a no-op.
-
-Marked `slow` because it fits real models. `pytest -m "not slow"` skips it.
+Marked `slow` because they fit real models; `pytest -m "not slow"` skips them.
 """
 
 from __future__ import annotations
@@ -30,45 +23,37 @@ FAST = Config(n_estimators=40, early_stopping_rounds=8, n_folds=2,
 
 @pytest.fixture(scope='module')
 def null_run():
-    """A world with nothing to find. `lead=0.0` plants no cross-asset signal."""
+    """A world with nothing to find: `lead=0.0` plants no cross-asset signal."""
     dataset = Dataset.build(make_bars(days=30, lead=0.0, seed=5), FAST)
     return walk_forward(dataset, FAST, trade=True)
 
 
-# A 30-day synthetic run places no trades even with `min_edge_pp` at zero: the
-# Kelly stake on a near-zero edge rounds below one contract, so `decide` returns
-# BELOW_MIN_CONTRACTS. That is the machinery working, and it means this file cannot
-# exercise the *populated* accounting path — `test_sizing_fees_and_pnl.py` and
-# `test_cv_and_book.py` do that, driving `Book` directly with known positions.
-# What is unique here is that `walk_forward` runs end to end at all, which nothing
-# tested: 158 statements at 0% coverage.
+# A 30-day synthetic run places no trades even with `min_edge_pp` at zero: Kelly
+# on a near-zero edge rounds below one contract. So this file checks that
+# `walk_forward` runs end to end; `test_sizing_fees_and_pnl.py` and
+# `test_cv_and_book.py` cover the populated accounting path.
 TRADING = FAST
 
 
 @pytest.fixture(scope='module')
 def signal_run():
-    """The same machinery where BTC genuinely leads the others."""
+    """The same machinery where BTC leads the other symbols."""
     dataset = Dataset.build(make_bars(days=30, lead=0.9, seed=5), TRADING)
     return walk_forward(dataset, TRADING, trade=True)
 
 
 class TestTheNull:
     def test_a_null_does_not_produce_skill(self, null_run):
-        """The single most important property of the whole apparatus.
-
-        If this fails, no positive result anywhere in the system means anything.
-        """
         assert null_run.report.mean_skill < 0.001, (
             f'skill {null_run.report.mean_skill:+.6f} on data with no signal'
         )
 
     def test_a_null_does_not_pass_the_gates(self, null_run):
-        """A null must fail on EVIDENCE, not only on sample size or a missing book.
+        """A null fails on a forecast or money gate, not only on sample size or a
+        missing book.
 
-        `sign_agreement_p` is left out of the set on purpose: at three folds its
-        best possible value is p = 0.125 against a 0.11 bar, so it fails every
-        three-fold run whatever the data says, and counting it would let this
-        test pass for the same reason `windows_evaluated` does.
+        `sign_agreement_p` is excluded: at three folds its best value (0.125) fails the
+        0.11 bar whatever the data.
         """
         gates = evaluate_gates(null_run.report)
         assert not gates_passed(gates)
@@ -80,24 +65,11 @@ class TestTheNull:
         )
 
     def test_the_forecast_gates_and_not_the_shrinkage_are_what_catch_a_null(self, null_run):
-        """Which gate does the work, stated rather than assumed.
+        """The forecast gates reject the null.
 
-        `residual_scale` is described as the overfitting detector, and two real
-        defects made it useless — early stopping shared rows with the shrinkage
-        fit, and a NaN made `minimize_scalar` return its bracket seed 0.7639. Both
-        are fixed, and on a 70-day slice alpha now reads 0.0000 on a null
-        (`test_features_and_model.py::test_the_shrinkage_reads_near_zero_on_a_null`).
-
-        But it is **not** a reliable standalone signal at a small sample. Measured
-        on this 30-day, 2-fold null: alpha came back `[1.305, 0.0]`. With few trees
-        and a short alpha block, a spurious correlation gets amplified, and at two
-        folds the median degenerates to the mean. So this test asserts what
-        actually holds — the *forecast* gates reject the null — and does not
-        pretend alpha alone would.
-
-        Nor does `log_loss_skill >= 0` alone: a point estimate clears zero on
-        about half of all nulls, and this one does (+0.00028, t = +0.69). The
-        significance gate is what rejects it.
+        On a small sample `residual_scale` alone is not a reliable signal, and
+        `log_loss_skill >= 0` alone clears on about half of all nulls. The significance
+        gate is what rejects it.
         """
         gates = {g.name: g for g in evaluate_gates(null_run.report)}
         assert not gates['log_loss_skill'].passed or not gates['log_loss_skill_p'].passed, (
@@ -109,8 +81,9 @@ class TestTheNull:
 
 class TestStructure:
     def test_every_fold_is_measured(self, signal_run):
-        """Against the folds the Config actually cuts. Under the calendar scheme
-        `n_folds` is not a count, so comparing to it asserted the wrong thing."""
+        """Every fold the Config cuts is measured; under the calendar scheme `n_folds`
+        is not the count.
+        """
         from core.cv import folds_for_config
 
         dataset = Dataset.build(make_bars(days=30, lead=0.9, seed=5), TRADING)
@@ -135,22 +108,14 @@ class TestStructure:
             assert later > earlier, 'two folds test the same windows'
 
     def test_scored_rows_carry_no_settled_label_gaps(self, signal_run):
-        """An unsettled window must never reach a metric's denominator."""
+        """No unsettled window reaches a metric."""
         scored = signal_run.scored
         assert not scored.empty
         assert scored['outcome'].notna().all()
         assert scored['settle_price'].notna().all()
 
     def test_the_trade_ledger_records_where_its_price_came_from(self, signal_run):
-        """`price_source` exists so a backtest cannot be mistaken for a fill.
-
-        It was on `Decision` and on the `predictions` table but **not** on the
-        trade ledger, which is the frame anyone actually inspects — so the
-        invariant CLAUDE.md states ("`price_source` on every row") did not hold
-        where it mattered most. Asserted on the schema, because an empty ledger is
-        the normal outcome of a short synthetic run and a column that only appears
-        when populated is not an invariant.
-        """
+        """The trade ledger has a `price_source` column, even when it is empty."""
         trades = signal_run.trades()
         assert 'price_source' in trades.columns
         if not trades.empty:
@@ -159,7 +124,7 @@ class TestStructure:
 
 class TestMoney:
     def test_pnl_reconciles_with_the_equity_curve(self, signal_run):
-        """True whether or not anything traded: zero trades is zero PnL."""
+        """P&L reconciles with the equity curve, also when nothing traded."""
         stats = signal_run.report.continuous
         assert stats is not None
         assert stats.total_pnl == pytest.approx(
@@ -168,23 +133,15 @@ class TestMoney:
         )
 
     def test_one_entry_per_symbol_and_window(self, signal_run):
-        """The backtest's own invariant, and the one the live path did not have.
-
-        Vacuous on an empty ledger, which is why `decide_window`'s first-clearing
-        behaviour is also pinned directly in `test_decide.py`.
+        """One entry per symbol and window. Vacuous on an empty ledger, so
+        `test_decide.py` also pins it.
         """
         trades = signal_run.trades()
         duplicated = trades.duplicated(['symbol', 'window_open']).sum() if not trades.empty else 0
         assert duplicated == 0, f'{duplicated} windows were entered twice'
 
     def test_the_funnel_accounts_for_every_row(self, signal_run):
-        """Every scored row ends in exactly one bucket.
-
-        `decide_window`'s `break` bypasses `decide` once the per-window position
-        cap binds, so those rows reached no reason at all and the histogram did not
-        add up — measured at 5.3% of rows missing, against a coverage figure that
-        divides by the full total.
-        """
+        """Every scored row lands in exactly one funnel bucket."""
         histogram = signal_run.rejections
         if histogram is None or histogram.empty:
             pytest.skip('this run reported no funnel')

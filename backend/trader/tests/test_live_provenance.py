@@ -1,10 +1,7 @@
-"""What the live loop writes must say what produced it.
+"""Tests that live rows record what produced them.
 
-Audited on the production store since 2026-09-24: `predictions.model_version`
-was NULL on every row, `prediction_id` NULL on every ticket and position (so
-they joined back to a prediction only on symbol/window/offset), and the
-`live_touch` quote rows carried no `quote_age_seconds` — which the backtest's
-staleness filter reads as FRESH.
+`model_version`, `prediction_id` and `quote_age_seconds` must be set; a missing age
+reads as fresh.
 """
 from __future__ import annotations
 
@@ -62,8 +59,7 @@ class TestModelVersion:
         monkeypatch.setattr(live_artifact, 'config_for_artifact', lambda c, m, mode: c)
         args = argparse.Namespace(model=None, mode='live', require_gates=False,
                                   force=False)
-        # `_load_artifact` is what both startup's reload path and
-        # `reload_if_changed` go through.
+        # `_load_artifact` is the path for both startup and `reload_if_changed`.
         model, _ = live_artifact._load_artifact(args, DEFAULT_CONFIG)
         assert model.version == '20261018T050000Z'
 

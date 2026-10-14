@@ -1,18 +1,7 @@
-"""Pricing a backtest row against the venue's real book.
+"""Tests for `attach_quotes`: pricing a backtest row against the recorded book.
 
-**This is the circularity the audit named.** `core/decide.py` falls back to
-`p_market = baseline_probability` when a row carries no `ask_up`/`ask_down`,
-which is every backtest row — so the simulated counterparty is the model's own
-training target, and `model_minus_market` cannot be computed at all. Both of the
-gates that were supposed to answer "does this beat the market" read NaN.
-
-Attaching the recorded book fixes that, and the denomination is the part that
-kills you quietly. A Kalshi YES book quotes what YES costs; the price of the
-DOWN side is `1 - yes_bid`, because buying NO means taking the other side of
-what YES bidders will pay. Using `yes_bid` directly, or the mid, is wrong by the
-spread with the sign inverted on one side — the same class of error as the
-`no_levels` denomination trap that put a 0.51 YES ask in a column holding a
-0.51 NO bid.
+UP costs the YES ask and DOWN costs `1 - yes_bid`; the mid or the raw bid is wrong by
+the spread.
 """
 
 from __future__ import annotations
@@ -33,7 +22,7 @@ def _windows(offsets=(3, 12), symbol='BTC-USD'):
 
 
 def _depth(rows, venue='kalshi', symbol='BTC-USD'):
-    """rows: (offset_minutes, yes_bid, yes_ask, age)"""
+    """Rows are (offset_minutes, yes_bid, yes_ask, age)."""
     return pd.DataFrame([
         {'venue': venue, 'symbol': symbol,
          'window_open': pd.Timestamp('2026-07-01T12:00Z'),
@@ -43,53 +32,48 @@ def _depth(rows, venue='kalshi', symbol='BTC-USD'):
 
 
 def test_the_up_price_is_the_yes_ask():
-    """Buying UP means lifting the YES offer, so it costs the ask — never the
-    mid, which is a price nobody will sell you."""
+    """Buying UP lifts the YES offer, so it costs the ask, never the mid."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
     assert got['ask_up'].iloc[0] == pytest.approx(0.46)
 
 
 def test_the_down_price_is_one_minus_the_yes_bid():
-    """Buying DOWN is taking the other side of what YES bidders will pay."""
+    """Buying DOWN takes the other side of what YES bidders pay."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
     assert got['ask_down'].iloc[0] == pytest.approx(0.56)
 
 
 def test_the_two_sides_sum_to_more_than_one_by_the_spread():
-    """A sanity property that catches a denomination slip immediately: the two
-    costs must sum to 1 + spread, never to 1."""
+    """The two costs sum to 1 + spread, never to 1. This catches a denomination error."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
     total = got['ask_up'].iloc[0] + got['ask_down'].iloc[0]
     assert total == pytest.approx(1.02), 'should be 1 + the 2c spread'
 
 
 def test_a_one_sided_book_prices_only_the_side_that_exists():
-    """A missing ask means nobody is offering UP. Inventing one would let the
-    backtest buy at a price that was never available."""
+    """A missing ask leaves UP unpriced, so the backtest cannot buy at a price that did
+    not exist.
+    """
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, np.nan, 1.0)]))
     assert pd.isna(got['ask_up'].iloc[0])
     assert got['ask_down'].iloc[0] == pytest.approx(0.56)
 
 
 def test_a_window_with_no_quote_keeps_nan_so_decide_falls_back():
-    """Most of five years predates the venue. Those rows must price against the
-    baseline as before, not against a fabricated quote."""
+    """Rows with no recorded quote price against the baseline, not a fabricated quote."""
     got = attach_quotes(_windows((3, 12)), _depth([(3, 0.44, 0.46, 1.0)]))
     late = got[got['offset'] == 12].iloc[0]
     assert pd.isna(late['ask_up']) and pd.isna(late['ask_down'])
 
 
 def test_the_offset_must_match_exactly():
-    """A decision at +3m may not be priced with the book at +12m: nine minutes
-    of a fifteen-minute window is most of the question."""
+    """A decision at +3m is never priced with the book at +12m."""
     got = attach_quotes(_windows((3,)), _depth([(12, 0.80, 0.82, 1.0)]))
     assert pd.isna(got['ask_up'].iloc[0])
 
 
 def test_only_the_venue_we_trade_is_used():
-    """Polymarket is a cross-venue FEATURE, not the book we execute against.
-    Pricing a Kalshi trade off a Polymarket quote would book a fill at a price
-    the venue never showed."""
+    """Only the traded venue prices the trade. Polymarket is a feature, not the execution book."""
     depth = pd.concat([_depth([(3, 0.10, 0.12, 1.0)], venue='polymarket'),
                        _depth([(3, 0.44, 0.46, 1.0)], venue='kalshi')])
     got = attach_quotes(_windows((3,)), depth, venue='kalshi')
@@ -97,28 +81,23 @@ def test_only_the_venue_we_trade_is_used():
 
 
 def test_quote_age_rides_along_so_staleness_is_visible():
-    """Predexon serves book CHANGES, so a quiet book carries forward. A
-    forecast that cannot be told from a stale price 'beats' it for free."""
-    # 12s, not 47s: the default bar is now 30 seconds, matching
-    # `core.metrics.MAX_QUOTE_AGE_SECONDS`. Trades used to price against quotes
-    # up to 900s old while the forecast comparison counted only those under 30,
-    # so the money and the gate were measured on different samples.
+    """Quote age is attached so a stale price is visible."""
+    # 12s is under the 30-second default, which matches
+    # `core.metrics.MAX_QUOTE_AGE_SECONDS`.
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 12.0)]))
-    # Measured to the decision instant: 12s before the minute plus the 3s
-    # decision latency.
+    # Age at the decision instant: 12s before the minute plus the 3s decision latency.
     assert got['quote_age_seconds'].iloc[0] == pytest.approx(15.0)
 
 
 def test_a_stale_quote_can_be_refused_outright():
-    """Above the tolerance the row is priced as if there were no book at all —
-    which is the honest state, not a cheap fill."""
+    """Above the age limit the row is priced as if there were no book."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 600.0)]),
                         max_age_seconds=120.0)
     assert pd.isna(got['ask_up'].iloc[0])
 
 
 def test_crossed_or_nonsense_quotes_are_dropped():
-    """ask below bid is not a book. Kept, it would show a guaranteed profit."""
+    """A crossed book (ask below bid) is dropped. Kept, it would show a guaranteed profit."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.60, 0.40, 1.0)]))
     assert pd.isna(got['ask_up'].iloc[0]) and pd.isna(got['ask_down'].iloc[0])
 
@@ -129,8 +108,9 @@ def test_prices_outside_zero_to_one_are_dropped():
 
 
 def test_attaching_does_not_reorder_or_drop_window_rows():
-    """The table is fed to decide() row by row; losing or reordering rows
-    silently changes which windows were traded."""
+    """`decide()` reads the table row by row, so dropping or reordering rows changes
+    which windows trade.
+    """
     windows = _windows((3, 6, 9, 12))
     got = attach_quotes(windows, _depth([(6, 0.44, 0.46, 1.0)]))
     assert len(got) == len(windows)
@@ -138,33 +118,28 @@ def test_attaching_does_not_reorder_or_drop_window_rows():
 
 
 def test_the_market_probability_is_the_mid():
-    """`model_minus_market` compares forecasts, so the market's number is the
-    mid. The ask is what a trade costs and belongs in the money, where decide()
-    already uses it — scoring the market at its ask would credit the model with
-    half the spread as skill on every row."""
+    """The market probability is the mid.
+
+    `model_minus_market` compares forecasts. Scoring the market at its ask would credit
+    the model with half the spread on every row.
+    """
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
     assert got['market_probability'].iloc[0] == pytest.approx(0.45)
 
 
 def test_the_mid_needs_both_sides():
-    """A lone bid says the probability is at LEAST something, which is not a
-    probability — and a one-sided mid would be a fabricated benchmark."""
+    """A one-sided book has no mid, so the market probability is NaN."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, np.nan, 1.0)]))
     assert pd.isna(got['market_probability'].iloc[0])
 
 
 def test_the_mid_sits_between_the_two_trade_costs():
-    """A structural check: ask_up >= mid >= 1 - ask_down, always."""
+    """Structural check: ask_up >= mid >= 1 - ask_down."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)])).iloc[0]
     assert got['ask_up'] >= got['market_probability'] >= 1.0 - got['ask_down']
 
 
-# --- the depth columns market_state actually needs --------------------------
-#
-# Declared in FEATURE_GROUPS, computed in book_features, and never joined: a
-# full run reported "46 features (12 empty), 2 trees, skill +0.00001" because a
-# quarter of the matrix was all-NaN. `population_report` and the model's own
-# empty-feature warning both said so; nothing failed.
+# --- depth columns that market_state needs ---------------------------------
 
 DEPTH_COLUMNS = ('bid_at_touch', 'ask_at_touch', 'bid_1c', 'ask_1c',
                  'bid_5c', 'ask_5c', 'bid_vol', 'ask_vol')
@@ -192,9 +167,7 @@ def test_the_depth_columns_market_state_needs_are_attached():
 
 
 def test_the_other_venue_is_attached_under_its_own_prefix():
-    """cross_venue needs BOTH books on the same row, and they must not collide:
-    a Polymarket bid in the column holding a Kalshi one is the `no_levels`
-    denomination trap with a different name."""
+    """The other venue's book is attached under its own prefix so the columns do not collide."""
     depth = pd.concat([_rich_depth('kalshi'),
                        _rich_depth('polymarket').assign(yes_bid=0.40, yes_ask=0.41)])
     got = attach_quotes(_windows((3,)), depth, venue='kalshi', other_venue='polymarket')

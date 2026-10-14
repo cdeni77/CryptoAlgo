@@ -1,16 +1,7 @@
-"""Every source file the build needs must be in the repository.
+"""Tests that the repository holds every source file the build needs, and no secrets.
 
-This exists because a blanket `lib/` in `.gitignore` — a Python venv rule —
-matched at any depth and silently swallowed `frontend/src/lib/format.ts`. The
-file was on the machine that wrote it, so every local typecheck, lint and test
-passed. The Docker build copies from the repository, and failed with "Cannot find
-module '../lib/format'" in seven files at once.
-
-That is the second time a blanket rule here has hidden a real source file from a
-clean clone (the first swallowed a `.gitkeep` that a test depended on). A comment
-was not enough either time, so this is the mechanism: a file that the build reads
-and git does not know about is a test failure, not a surprise on someone else's
-machine.
+A file the build reads but git does not track works locally and fails in a clean clone
+or a Docker build. These tests make that a failure here instead.
 """
 
 from __future__ import annotations
@@ -23,11 +14,11 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 
-# Extensions that are source rather than artefact. Anything the build imports.
+# Extensions that are source rather than artefact: anything the build imports.
 SOURCE_SUFFIXES = {'.py', '.ts', '.tsx', '.js', '.jsx', '.css', '.json',
                    '.html', '.yml', '.yaml', '.md', '.sql'}
 
-# Directories that are genuinely generated or vendored.
+# Directories that are generated or vendored.
 SKIP_PARTS = {'node_modules', '__pycache__', 'dist', 'build', '.pytest_cache',
               '.git', '.venv', 'venv', 'data', 'models', '.mypy_cache',
               'coverage', '.ruff_cache'}
@@ -87,10 +78,8 @@ def test_every_source_file_is_tracked():
 
 
 def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
-    """Anchor rules that name a directory a source tree might also use.
-
-    `lib/`, `build/` and `bin/` are all venv or artefact names *and* plausible
-    source directory names. Unanchored, they match everywhere.
+    """Rules naming a directory a source tree might use (`lib/`, `build/`, `bin/`) must
+    be anchored.
     """
     if not (REPO / '.gitignore').exists():
         pytest.skip('no .gitignore')
@@ -104,7 +93,7 @@ def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
         if not rule or rule.startswith('#') or rule.startswith('!'):
             continue
         if rule.startswith('/') or '/' in rule.rstrip('/'):
-            continue          # already anchored, or a path rather than a name
+            continue  # already anchored, or a path rather than a name
         name = rule.rstrip('/')
         if name in risky:
             offenders.append(f'  .gitignore:{number}: {rule!r} — anchor it as /{rule}')
@@ -115,16 +104,10 @@ def test_no_gitignore_rule_matches_a_source_directory_at_any_depth():
 
 
 def test_no_secret_bearing_file_is_tracked():
-    """Nothing that carries a credential may be in the repository.
+    """No tracked file carries a credential by its name (`.env*`, key files, SSH keys).
 
-    `.gitignore` matched `.env` by basename only, so it covered
-    `backend/api/.env` and missed `frontend/.env` and `frontend/.env.local`. Both
-    misses were used: a live Coinbase key and an EC private key were committed in
-    b70c78c (deleted the next commit, still reachable on origin/main), and an API
-    token in 6097ed1. Deleting a file does not remove the blob, so the only
-    control that works is never committing it — which is what this asserts.
-
-    `*.example` files are the templates and are meant to be tracked.
+    Deleting a committed secret does not remove the blob, so the only working control is
+    never committing it. `*.example` templates are allowed.
     """
     offenders = []
     for path in sorted(_tracked()):
@@ -147,16 +130,9 @@ def test_no_secret_bearing_file_is_tracked():
 
 
 def test_no_tracked_file_contains_a_private_key_block():
-    """A PEM block in any tracked file, whatever the filename.
-
-    The leak that happened was in a file named `.env`, but the pattern above only
-    catches names. This catches content, so a key pasted into a config, a
-    notebook or a test fixture is caught too.
-    """
-    # A header alone is not a key. `scripts/check_venue.py` names the PEM header
-    # in a diagnostic message and this file quotes it to build the pattern, so
-    # matching the header would report both forever and the test would be
-    # switched off. Require a header line followed by an actual base64 body.
+    """No tracked file contains a private-key block, whatever its name."""
+    # A header alone is not a key: some files name the header in text. Require a
+    # header followed by a base64 body.
     header = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
     body = re.compile(r'^[A-Za-z0-9+/=]{40,}\s*$', re.MULTILINE)
 
@@ -177,7 +153,6 @@ def test_no_tracked_file_contains_a_private_key_block():
         f'these tracked files contain a private-key block: {offenders}. '
         f'Rotate the key immediately — a commit is permanent even after deletion.'
     )
-
 
 
 def _pins(path: Path) -> dict[str, str]:
@@ -201,13 +176,8 @@ REQUIREMENTS = ('backend/trader/requirements.txt', 'backend/api/requirements.txt
 
 @pytest.mark.parametrize('relative', REQUIREMENTS)
 def test_every_dependency_is_pinned(relative):
-    """A build that cannot be reproduced cannot be audited.
-
-    `scikit-learn`, `lightgbm`, `scipy` and `joblib` carried no version at all and
-    `coinbase-advanced-py` no constraint whatsoever, so `pip install` at
-    image-build time pulled whatever was newest that day — in exactly the packages
-    that deserialize the promoted model and sign live orders. A `.joblib` artifact
-    is only reliably loadable by the library version that wrote it.
+    """Every dependency is pinned, since a `.joblib` artifact loads reliably only with
+    the library version that wrote it.
     """
     path = REPO / relative
     unpinned = [line for line in _requirement_lines(path) if '==' not in line]
@@ -218,11 +188,8 @@ def test_every_dependency_is_pinned(relative):
 
 
 def test_the_two_requirement_files_agree_on_shared_packages():
-    """Every package both containers pin must be pinned to one version.
-
-    `sqlalchemy` is the one that matters most: `backend/api/models/serving.py` is
-    a hand-maintained mirror of `core/pg_writer.py`, and two ORM versions is a way
-    for that mirror to drift while `test_orm_parity.py` still passes.
+    """Packages pinned in both containers use the same version; ORM versions especially
+    must match.
     """
     trader, api = (_pins(REPO / relative) for relative in REQUIREMENTS)
     shared = sorted(set(trader) & set(api))

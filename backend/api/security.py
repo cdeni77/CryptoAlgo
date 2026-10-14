@@ -10,11 +10,9 @@ import os
 
 
 def allowed_origins() -> list[str]:
-    """CORS origins, from the environment, never `*`.
+    """CORS origins from `CORS_ALLOW_ORIGINS`, never `*`.
 
-    `*` with `allow_credentials=True` is rejected by browsers anyway, but the
-    real problem was that its presence in the list made every other entry
-    decorative — the API accepted requests from any page the browser had open.
+    `*` would let any page the browser has open call the API.
     """
     raw = os.getenv('CORS_ALLOW_ORIGINS', '').strip()
     if not raw:

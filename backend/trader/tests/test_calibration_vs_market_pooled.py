@@ -1,29 +1,6 @@
-"""`calibration_vs_market` must be a statistic you can act on.
+"""Tests that `calibration_vs_market` uses the pooled ECE difference, not the worst bin.
 
-It compared the WORST POPULATED BIN of the model against the market's. A
-maximum over bins is inherently high-variance, and on this sample it was pure
-noise. Bootstrapped over 300 resamples of the same 7,608 live rows, with the
-artifact held fixed (2026-09-24):
-
-    statistic           mean       sd      passes (<=0)
-    worst bin         +0.0106   0.0229        32%
-    pooled ECE diff   +0.0032   0.0023        10%
-
-The worst-bin standard deviation was TWICE the effect it measured, and its 90%
-interval [-0.026, +0.050] spanned both "clearly better than the market" and
-"clearly worse". It passed or failed an unchanged artifact on which rows
-happened to arrive — moving 0.011 in four hours on 8% more data, and blocking
-the 2026-09-20 retrain on that basis.
-
-**Switching to the pooled difference does not make the failure go away; it makes
-it legible.** The model is slightly but consistently worse calibrated than the
-price — +0.0032 against a typical ECE near 0.030, with 90% of resamples above
-zero. The noisy version was hiding a real finding behind an enormous error bar,
-not inventing a false one.
-
-Gated at <= 0 with no tolerance, deliberately. A noise-floor allowance would let
-exactly this finding through, and reporting it is the point while the edge is
-unproven.
+The worst bin is too noisy to gate on; the pooled difference is stable.
 """
 
 from __future__ import annotations
@@ -35,7 +12,7 @@ from core.metrics import _pooled_ece, _worst_populated_bin, market_gate_values
 
 
 def _rows(model, market, outcomes):
-    """(symbol, window_open, offset, market, baseline, model, outcome)."""
+    """Rows are (symbol, window_open, offset, market, baseline, model, outcome)."""
     return [('BTC-USD', f'w{i}', 12, market, 0.5, model, y)
             for i, y in enumerate(outcomes)]
 
@@ -54,8 +31,6 @@ def test_a_worse_calibrated_model_fails():
 
 
 def test_it_is_the_pooled_statistic_not_the_worst_bin():
-    """The whole point of the change. These differ, and the gate must read the
-    stable one."""
     import inspect
 
     from core import metrics
@@ -67,16 +42,13 @@ def test_it_is_the_pooled_statistic_not_the_worst_bin():
 
 
 def test_the_worst_bin_is_still_reported():
-    """It is informative about the venue even though it is too noisy to gate
-    on — the market's own worst bin is ~6pp, which is why an absolute
-    calibration bar was never reachable."""
+    """The worst bin is still reported, as information about the venue."""
     v = market_gate_values(_rows(0.6, 0.6, [1] * 300 + [0] * 300))
     assert 'market_max_deviation' in v
 
 
 def test_pooled_is_lower_variance_than_the_worst_bin():
-    """Demonstrated rather than asserted: resample the same data and compare
-    the spread of the two statistics."""
+    """Resampling shows the pooled statistic has lower variance than the worst bin."""
     rng = np.random.default_rng(0)
     y = np.array([1] * 500 + [0] * 500, dtype=float)
     p = np.clip(rng.normal(0.5, 0.2, y.size), 0.01, 0.99)

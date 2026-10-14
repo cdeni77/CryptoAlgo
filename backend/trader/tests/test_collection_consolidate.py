@@ -1,10 +1,7 @@
-"""Turning collected JSONL into the two stored layers.
+"""Tests for converting collected JSONL into the derived and ladder Parquet layers.
 
-The properties that matter here are all about surviving how collection
-actually ends: a 47-hour job gets killed, retried and re-run, so the converter
-meets torn lines and duplicate windows as a matter of course rather than as an
-exception. Losing a partition to either would mean re-collecting it, which is
-the one cost this whole design is arranged to avoid.
+Collection jobs get killed and retried, so the converter must handle torn lines and
+duplicate windows without losing a partition.
 """
 
 from __future__ import annotations
@@ -71,8 +68,7 @@ def test_the_packed_fields_are_restored_under_their_names(collected, tmp_path):
 
 
 def test_a_snapshot_carries_its_offset_into_the_window(collected, tmp_path):
-    """Features are defined at an offset, so the converter computes it once
-    rather than making every reader rediscover the unit of `ts`."""
+    """The converter computes each snapshot's offset into the window."""
     collected([_record(n=2)])
     consolidate.convert('kalshi', 'BTC-USD', '2026-02',
                         [next((tmp_path / 'archive').rglob('*.jsonl'))])
@@ -81,9 +77,7 @@ def test_a_snapshot_carries_its_offset_into_the_window(collected, tmp_path):
 
 
 def test_a_torn_final_line_does_not_lose_the_partition(collected, tmp_path):
-    """A kill -9 mid-write leaves half a line. That must cost one window, not
-    the month — the whole reason collection appends JSONL instead of writing
-    Parquet as it goes."""
+    """A torn final line costs one window, not the whole partition."""
     collected([_record(market_id='good', n=2), '{"venue": "kalshi", "sym'])
     snaps, windows = consolidate.convert('kalshi', 'BTC-USD', '2026-02',
                                          [next((tmp_path / 'archive').rglob('*.jsonl'))])
@@ -91,8 +85,7 @@ def test_a_torn_final_line_does_not_lose_the_partition(collected, tmp_path):
 
 
 def test_a_window_collected_twice_is_kept_once(collected, tmp_path):
-    """`error` rows are retried, so a window can legitimately be written more
-    than once. Counting it twice would inflate every per-window statistic."""
+    """A window written twice (after a retry) is kept once."""
     collected([_record(market_id='dup', n=2), _record(market_id='dup', n=2)])
     snaps, windows = consolidate.convert('kalshi', 'BTC-USD', '2026-02',
                                          [next((tmp_path / 'archive').rglob('*.jsonl'))])
@@ -136,7 +129,7 @@ def test_an_empty_partition_produces_no_files_rather_than_an_empty_one(collected
 
 
 def test_converting_twice_is_idempotent(collected, tmp_path):
-    """A re-run after an interrupted conversion must not double the rows."""
+    """A second conversion does not double the rows."""
     collected([_record(n=3)])
     path = next((tmp_path / 'archive').rglob('*.jsonl'))
     consolidate.convert('kalshi', 'BTC-USD', '2026-02', [path])
@@ -145,11 +138,7 @@ def test_converting_twice_is_idempotent(collected, tmp_path):
 
 
 def test_a_recollected_window_supersedes_its_truncated_first_copy(collected, tmp_path):
-    """3,099 Polymarket windows were archived truncated at the 2,000-snapshot
-    page cap before `fetch_pm` paginated. They were reset to pending and
-    re-collected, so the archive holds BOTH copies — and keeping the first
-    occurrence would keep the truncated one, making the re-collection
-    pointless. The fuller record wins."""
+    """When a window has two copies, the fuller record wins."""
     truncated = _record(market_id='pm-1', n=2)
     complete = _record(market_id='pm-1', n=5)
     collected([truncated, complete])
@@ -160,30 +149,22 @@ def test_a_recollected_window_supersedes_its_truncated_first_copy(collected, tmp
 
 
 def test_order_does_not_decide_which_copy_wins(collected, tmp_path):
-    """The complete copy may be appended before or after the truncated one
-    depending on when the retry ran."""
+    """The fuller copy wins whichever order the copies were appended in."""
     collected([_record(market_id='pm-2', n=7), _record(market_id='pm-2', n=2)])
     snaps, _ = consolidate.convert('kalshi', 'BTC-USD', '2026-02',
                                    [next((tmp_path / 'archive').rglob('*.jsonl'))])
     assert snaps == 7
 
 
-# --- memory: the converter froze the machine twice --------------------------
+# --- memory ------------------------------------------------------------------
 #
-# `convert` built a dict of every RECORD in a partition before writing
-# anything, and a record carries its raw ladders -- 97% of the bytes. Measured
-# on the real archive: a single Polymarket record reaches 43 MB of JSON, and
-# the largest partition is 2.0 GB gzipped, roughly 66 GB decompressed, more
-# again as live Python objects. Against 31 GB of RAM that is not an OOM kill;
-# it is a hard lockup with nothing flushed to the journal, which is exactly
-# what the boot history showed both times.
-#
-# The fix is two passes: find WHERE the fullest copy of each window lives,
-# keeping only the location, then re-read and stream those records out in
-# batches. Peak memory then depends on the batch, not on the partition.
+# A record carries its raw ladders, so one partition can be far larger than RAM.
+# `convert` makes two passes: first it records where the fullest copy of each
+# window lives, then it streams those records out in batches. Peak memory then
+# depends on the batch size, not on the partition size.
 
 def test_selecting_copies_keeps_locations_not_records(collected, tmp_path):
-    """The index must hold a place in a file, never the payload found there."""
+    """The index holds a file location, never the record payload."""
     collected([_record(market_id='m', n=3)])
     path = next((tmp_path / 'archive').rglob('*.jsonl'))
     chosen = consolidate.select_copies([path])
@@ -194,7 +175,6 @@ def test_selecting_copies_keeps_locations_not_records(collected, tmp_path):
 
 
 def test_selecting_copies_points_at_the_fullest_copy(collected, tmp_path):
-    """Same rule as before, decided without holding either record."""
     collected([_record(market_id='pm', n=2), _record(market_id='pm', n=9),
                _record(market_id='pm', n=4)])
     path = next((tmp_path / 'archive').rglob('*.jsonl'))
@@ -210,10 +190,7 @@ def test_a_torn_line_is_skipped_by_the_index_too(collected, tmp_path):
 
 
 def test_peak_memory_does_not_scale_with_the_partition(collected, tmp_path):
-    """The regression test for the crash, stated as the property that failed:
-    doubling the partition must not double the memory. The old converter held
-    every record, so peak tracked the partition exactly -- which is how a 2.0 GB
-    gzipped month took down a 31 GB machine."""
+    """Peak memory does not grow in proportion to the partition size."""
     import tracemalloc
 
     def peak_for(count, sub):
@@ -231,14 +208,14 @@ def test_peak_memory_does_not_scale_with_the_partition(collected, tmp_path):
         return got
 
     small = peak_for(15, '2026-03')
-    large = peak_for(60, '2026-04')          # 4x the partition
+    large = peak_for(60, '2026-04')  # 4x the partition
     assert large < small * 1.6, (
         f'peak went {small/1e6:.2f}MB -> {large/1e6:.2f}MB for 4x the data '
         f'-- memory is still scaling with the partition')
 
 
 def test_batching_does_not_change_the_output(collected, tmp_path):
-    """Row-group size is a memory knob, never a data one."""
+    """Batch size changes memory use only, never the output."""
     collected([_record(market_id=f'm{i}', n=50) for i in range(10)])
     path = next((tmp_path / 'archive').rglob('*.jsonl'))
     consolidate.convert('kalshi', 'BTC-USD', '2026-02', [path], batch_rows=7)

@@ -15,31 +15,33 @@ WINDOWS = 8
 
 
 def _scenario(seed=0):
-    """Each window: the index ends a known distance from its strike, and
-    Coinbase sees the same path plus a basis that flips near-ties."""
+    """Each window ends a known distance from its strike; Coinbase sees the same path
+    plus a basis that flips near-ties.
+    """
     rng = np.random.default_rng(seed)
     seconds, bars, settled = [], [], []
-    # moves (bp) chosen to land one window in each bucket, twice over
+    # Moves (bp) chosen to land one window in each bucket, twice over.
     moves = [0.5, 1.5, 3.0, 7.0, 20.0, -0.5, -1.5, -20.0]
     level = 100.0
     for w in range(WINDOWS):
         open_ = T0 + pd.Timedelta(minutes=15 * w)
         strike = level
         settle = strike * (1 + moves[w] / 1e4)
-        # A window's strike minute IS the previous window's settlement minute,
-        # so only the first window writes one.
+        # A window's strike minute is the previous window's settlement minute, so only
+        # the first window writes one.
         ends = [(open_ + pd.Timedelta(minutes=14), settle)]
         if w == 0:
             ends.insert(0, (open_ - pd.Timedelta(minutes=1), strike))
-        # proxy: flat at strike in the strike minute, flat at settle in the last
+        # Proxy: flat at the strike in the strike minute, flat at the settle in the last
+        # minute.
         for minute, value in ends:
             times = pd.date_range(minute, minute + pd.Timedelta(minutes=1),
                                   freq='1s', inclusive='left')
             seconds.append(pd.DataFrame({'symbol': 'BTC-USD', 'event_time': times,
                                          'proxy': value, 'n_exchanges': 3}))
-        # Coinbase: a +1bp basis in window 5's settlement minute, which flips
-        # that sub-1bp DOWN window (and only moves window 6's strike, whose
-        # -1.5bp move survives it).
+        # Coinbase: a +1bp basis in window 5's settlement minute, which flips that
+        # sub-1bp
+        # DOWN window (and only moves window 6's strike, whose -1.5bp move survives).
         basis = 1.0001 if w == 5 else 1.0
         for minute, value in [(m, v * (basis if m > open_ else 1.0))
                               for m, v in ends]:
@@ -81,7 +83,7 @@ def test_a_window_without_a_proxy_is_dropped_from_both_columns():
                       | (seconds['event_time'] >= cut + pd.Timedelta(minutes=1))]
     joined = compare(settled, coinbase_ends({'BTC-USD': bars}),
                      proxy_ends(minute_summary(seconds)))
-    # That minute settles window 0 AND strikes window 1.
+    # That minute settles window 0 and is the strike of window 1.
     assert len(joined) == WINDOWS - 2
     assert not {T0, T0 + pd.Timedelta(minutes=15)} & set(joined['window_open'])
 

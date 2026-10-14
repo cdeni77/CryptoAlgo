@@ -1,17 +1,7 @@
-"""The live path must build the same book features the backtest scored.
+"""Tests that live builds the same book features the backtest scored.
 
-The model's features include `market_prob`, `market_minus_baseline`, `spread`,
-`imbalance_touch`, `imbalance_5c`, `depth_ratio` and `book_convexity`. Live
-computed none of them: `_record_touch` derives the depth every cycle and writes
-it to the store, and the scoring row never saw it.
-
-That does not raise. LightGBM scores a NaN feature using the default direction
-it learned, so the live loop would run silently as a DIFFERENT model from the
-one whose gates were measured — which is the whole class of failure the
-`price_source` distinction exists to prevent, one level deeper.
-
-The columns come from the same `market_state_features` the backtest uses, off
-the same quote object the fill will be priced against, so the two cannot drift.
+A missing feature silently scores NaN with LightGBM's learned default, which is a
+different model.
 """
 
 from __future__ import annotations
@@ -34,7 +24,7 @@ class _Quote:
         self.yes_bid_size, self.yes_ask_size = bid_size, ask_size
 
 
-# yes side: (price, size) bids; no side: (price, size) quoted in NO terms
+# YES side: (price, size) bids; NO side: (price, size) in NO terms.
 _YES = [(0.44, 250.0), (0.43, 150.0), (0.40, 500.0)]
 _NO = [(0.54, 150.0), (0.53, 150.0), (0.50, 300.0)]
 
@@ -53,52 +43,41 @@ def test_imbalance_uses_the_resting_size_at_the_touch():
 
 
 def test_depth_ratio_needs_the_totals_that_live_was_not_computing():
-    """`depth_bid_total`/`depth_ask_total` were the one thing `_record_touch`
-    never derived, so `depth_ratio` could not exist live at all."""
+    """`depth_ratio` uses the bid and ask totals, which live now computes."""
     row = book_feature_row(_Quote(), _YES, _NO, baseline_probability=0.40)
     assert np.isfinite(row['depth_ratio'])
-    # bids total 900, asks total 600 -> log(900/600)
+    # Bids total 900, asks total 600 -> log(900/600).
     assert row['depth_ratio'] == pytest.approx(np.log(900.0 / 600.0), rel=1e-6)
 
 
 def test_a_one_sided_book_yields_no_probability():
-    """The same rule as the backtest: a lone bid is not a probability."""
+    """A one-sided book gives no probability, as in the backtest."""
     row = book_feature_row(_Quote(ask=None), _YES, _NO, baseline_probability=0.40)
     assert pd.isna(row['market_prob'])
     assert pd.isna(row['market_minus_baseline'])
 
 
 def test_an_empty_ladder_does_not_raise():
-    """The ladder fetch is best-effort — top of book still lands when it fails,
-    and a decision must still be scoreable."""
+    """An empty ladder does not raise; top-of-book features are still computed."""
     row = book_feature_row(_Quote(), [], [], baseline_probability=0.40)
     assert row['market_prob'] == pytest.approx(0.45)
     assert pd.isna(row['depth_ratio'])
 
 
 def test_every_feature_the_model_expects_is_present():
-    """Absent is the dangerous case: it scores as NaN rather than failing."""
+    """Every market_state and market_price column is present, since an absent one scores as NaN."""
     from core.book_features import MARKET_PRICE, MARKET_STATE
     row = book_feature_row(_Quote(), _YES, _NO, baseline_probability=0.40)
     for column in tuple(MARKET_STATE) + tuple(MARKET_PRICE):
         assert column in row, column
 
 
-# --- the ladder, from the stream cache, at zero latency cost ----------------
+# --- the ladder from the stream cache ----------------------------------------
 #
-# `imbalance_5c`, `depth_ratio` and `book_convexity` need the full ladder. I
-# assumed that meant a REST fetch on the critical path and dropped them — on a
-# 4.97s book-to-order figure that turned out to predate the instrumentation.
-# Measured now it is 0.10-0.11s.
-#
-# And the fetch is not needed at all. `run_live` supervises `stream` and `trade`
-# as asyncio tasks in ONE process, and `record_stream.CACHE` already holds every
-# subscribed ladder folded from the socket. It is also FRESHER than REST: a
-# frame arrives ~34ms after the venue stamps it against ~73ms for a REST
-# round trip, at 100% top-of-book agreement with zero ladder drift.
-#
-# So the full feature set costs nothing. What must not happen is trusting a
-# ladder the socket stopped updating.
+# The stream recorder and the trading loop run in one process, so
+# `record_stream.CACHE` already holds every subscribed ladder. It is fresher than
+# a REST fetch and costs no request. A ladder the socket stopped updating is
+# never used.
 
 class _Ladder:
     def __init__(self, yes, no, age=0.05, stale=False):
@@ -125,24 +104,23 @@ def test_the_ladder_comes_from_the_stream_cache_when_it_is_fresh():
 
 
 def test_a_stale_ladder_is_refused():
-    """Ten seconds of silence at 400+ frames a second means the transport is
-    sick, not that the market is quiet. Pricing against it would be worse than
-    having no depth at all."""
+    """A stale ladder is refused: silence at this frame rate means the transport is unhealthy."""
     from scripts.live import ladder_from_cache
     cache = _Cache(_Ladder(_YES, _NO, age=30.0, stale=True))
     assert ladder_from_cache(cache, 'KXBTC15M-1') == ([], [])
 
 
 def test_a_gapped_book_is_refused():
-    """A gap condemns every book on the connection: `seq` is global per
-    subscription, so a miss means this ladder may be missing levels."""
+    """A gapped book is refused: `seq` is global per subscription, so a gap may drop
+    levels anywhere.
+    """
     from scripts.live import ladder_from_cache
     cache = _Cache(_Ladder(_YES, _NO), gapped=True)
     assert ladder_from_cache(cache, 'KXBTC15M-1') == ([], [])
 
 
 def test_no_cache_at_all_is_not_an_error():
-    """`scripts.live` also runs standalone, without the stream task."""
+    """No cache is not an error: `scripts.live` can run without the stream task."""
     from scripts.live import ladder_from_cache
     assert ladder_from_cache(None, 'KXBTC15M-1') == ([], [])
     assert ladder_from_cache(_Cache(None), 'KXBTC15M-1') == ([], [])
@@ -160,13 +138,10 @@ def test_the_full_feature_set_is_computable_from_a_cached_ladder():
 
 @pytest.mark.asyncio
 async def test_record_touch_persists_the_resting_totals_it_trades_on():
-    """The live decision reads `depth_bid_total`/`depth_ask_total` through
-    `book_feature_row`, but `_record_touch` wrote only the 1c and 5c cumulants.
+    """`_record_touch` writes every depth column that live trades on, including the
+    totals.
 
-    So the loop would trade `depth_ratio` and `book_convexity` while recording
-    NaN for both — and the next retrain, run on live rows, would silently lose
-    the strongest group after `cross_asset`. A feature good enough to size a bet
-    on is good enough to write down.
+    The next retrain uses these rows, so a column used for trading must be recorded.
     """
     import pandas as pd
     from scripts import live
@@ -200,6 +175,6 @@ async def test_record_touch_persists_the_resting_totals_it_trades_on():
     for column in DEPTH_MAP:
         assert column in row.index, f'{column} is consumed but never recorded'
 
-    # The totals are the whole ladder, not just the levels near the touch.
+    # The totals cover the whole ladder, not just levels near the touch.
     assert row['depth_bid_total'] == pytest.approx(350.0)
     assert row['depth_ask_total'] == pytest.approx(200.0)

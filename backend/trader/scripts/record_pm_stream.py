@@ -1,30 +1,14 @@
 """Hold one Polymarket CLOB subscription and keep a live book per symbol.
 
-The counterpart to `scripts/record_stream.py`, written to the same discipline
-because the Kalshi port paid for these lessons:
+Keeps the peer book contemporaneous with Kalshi's, as training assumes.
 
-**A silent socket cannot wake itself.** `record_stream.consume` originally
-checked its refresh deadline inside the loop body, so when the subscribed
-markets settled at a window boundary the venue stopped sending and the loop
-waited forever for a frame that was never coming. Nothing raised, `supervise`
-saw a coroutine legitimately awaiting, and the recorder sat dead behind a
-container reporting healthy. Here every exit is enforced on a TIMEOUT: at ~300
-frames a second, fifteen seconds of silence means the market settled or the
-connection died, and both are repaired by resubscribing.
-
-**The window rolls every fifteen minutes** and the token ids change with it, so
-the subscription is refreshed on a deadline rather than held.
-
-**What this publishes is what `cross_venue_row` reads** — the same shape as
-`record_pm_ladder.CACHE`: best bid and ask in CENTS with an `at` stamp, so the
-staleness guard keeps working and the two sources are swappable.
-
-Why it exists at all: `cross_venue` is the only load-bearing group in the model
-(leave-one-out takes skill +0.00282 -> -0.00015), and the REST recorder wrote at
-a median 32s past the minute against decisions at ~+2s. Measured over 516,680
-rows, a gap computed against a peer one minute stale correlates only 0.672 with
-the contemporaneous one, and 59.2% of its variance is the peer's own drift. The
-socket makes the two books contemporaneous, which is what training assumes.
+* Every exit from `consume` is a timeout. A silent socket cannot wake itself:
+  silence means the market settled or the connection died, and both are
+  repaired by resubscribing.
+* Token ids change with each fifteen-minute window, so the tokens are
+  re-checked on a deadline.
+* `CACHE` has the shape `cross_venue_row` reads, the same as
+  `record_pm_ladder.CACHE`: best bid and ask in cents with an `at` stamp.
 """
 from __future__ import annotations
 
@@ -52,8 +36,7 @@ CACHE: dict = {}
 # `consume` on every frame and every timeout.
 _RESUBSCRIBE: dict = {}
 
-# The heartbeat is a file write. At ~300 frames a second it is written at most
-# this often.
+# The heartbeat is a file write, so it is written at most this often.
 HEARTBEAT_EVERY_SECONDS = 5.0
 _LAST_BEAT = {'at': 0.0}
 
@@ -67,22 +50,21 @@ def request_resubscribe(symbol: str, reason: str = '') -> None:
 
 
 def take_resubscribe_requests() -> dict:
-    """{symbol: reason} requested since the last call, then cleared."""
+    """Return and clear the {symbol: reason} requests since the last call."""
     out = dict(_RESUBSCRIBE)
     _RESUBSCRIBE.clear()
     return out
 
 
 def forget(symbols) -> None:
-    """Drop the published book and the subscribed slug for each symbol, so
-    neither the trading loop nor the next subscription reuses them."""
+    """Drop the published book and subscribed slug for each symbol."""
     for symbol in symbols:
         CACHE.pop(symbol, None)
         _WINDOWS.pop(symbol, None)
 
 
 def current_window(now=None) -> pd.Timestamp:
-    """The open of the window `now` is inside."""
+    """Return the open of the window `now` is inside."""
     from core.config import DEFAULT_CONFIG
     now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
     return now.floor(f'{int(DEFAULT_CONFIG.window_minutes)}min')
@@ -96,14 +78,10 @@ def _beat(clock=time.monotonic) -> None:
 
 
 def publish(book: PmBookCache, tokens: dict, *, window=None, now=None) -> None:
-    """Fold the live book into the shape `cross_venue_row` reads.
+    """Publish the live book in the shape `cross_venue_row` reads.
 
-    CENTS, matching `core.book_features`. A one-sided book publishes nothing: a
-    lone bid says the probability is at LEAST something, which is not a
-    probability — the same rule `_two_sided_mid` applies downstream.
-
-    The heartbeat is touched only for a two-sided book of the CURRENT window,
-    so a recorder stuck on an old window or an empty book goes unhealthy.
+    Prices are in cents. A one-sided book publishes nothing. The heartbeat is
+    touched only for a two-sided book of the current window.
     """
     windows = window if isinstance(window, dict) else {}
     current = None
@@ -112,10 +90,9 @@ def publish(book: PmBookCache, tokens: dict, *, window=None, now=None) -> None:
         if bid is None or ask is None:
             CACHE.pop(symbol, None)
             continue
-        # The book's own last change, not the socket's last frame. The market
-        # channel carries no sequence number, so a live connection cannot show
-        # that one asset's feed is intact: a quiet book and a stopped one look
-        # the same. Kalshi's `seq` can vouch for a quiet book; nothing here can.
+        # Stamp with the book's own last change, not the socket's last frame.
+        # The channel has no sequence number, so a quiet book and a stopped
+        # feed look the same.
         stamp = book._stamp.get(token)  # noqa: SLF001 — same module family
         for_window = (pd.Timestamp(windows[symbol])
                       if symbol in windows and windows[symbol] is not None
@@ -130,25 +107,17 @@ def publish(book: PmBookCache, tokens: dict, *, window=None, now=None) -> None:
             'best_bid': bid * 100.0,
             'best_ask': ask * 100.0,
             'at': stamp if stamp is not None else pd.Timestamp.now(tz='UTC'),
-            # **Which window this book is FOR.** Staleness alone cannot catch a
-            # rollover: observed live, Kalshi rebuilt its subscription at
-            # 22:45:16 and Polymarket at 22:45:46, because each venue's silence
-            # begins when ITS markets settle. For those thirty seconds the cache
-            # held the 22:30 book, stamped recently enough to pass the 30s
-            # guard — fresh-looking data about the wrong fifteen minutes.
+            # The window this book is for. An age check alone cannot catch a
+            # rollover: just after a boundary the previous window's book still
+            # looks fresh.
             'window': for_window,
         }
 
 
 def _window_of(tokens: dict) -> dict:
-    """{symbol: window} for the subscribed tokens — PER SYMBOL, not shared.
+    """Return {symbol: window} for the subscribed tokens, per symbol.
 
-    The first version returned a single window and `None` unless every entry
-    agreed. `_WINDOWS` is never cleared, so one symbol's gamma lookup failing
-    left a stale slug behind, two windows disagreed, and `publish` wrote
-    `window=None` for ALL THREE symbols — disabling the rollover guard globally
-    at exactly the moment the venues are re-subscribing, which is when a
-    rollover is most likely.
+    Per symbol, so one failed lookup cannot disable the rollover guard for all.
     """
     live = {sym for sym in tokens.values()}
     return {sym: w for sym, (_slug, w) in subscribed_windows().items()
@@ -160,8 +129,8 @@ async def consume(stream, *, until: Optional[float], silence_seconds: float,
                   tokens: Optional[dict] = None, window=None) -> str:
     """Fold frames until a deadline or a silence. Returns the reason.
 
-    `until` is seconds from now, or None for no refresh deadline. Both exits are
-    timeouts — see the module docstring for why frame-driven exits deadlock.
+    `until` is seconds from now, or None for no deadline. Both exits are
+    timeouts, because a silent socket never delivers a frame to check on.
     """
     deadline = (time.monotonic() + until) if until is not None else None
     iterator = stream.events().__aiter__()
@@ -226,12 +195,10 @@ class _Socket:
 
 
 async def resolve_tokens(session, now) -> dict:
-    """{token_id: symbol} for the window `now` is inside.
+    """Return {token_id: symbol} for the window `now` is inside.
 
-    Reuses `record_pm_ladder`'s resolution rather than restating it: the slug's
-    trailing stamp is the window OPEN and reading it as a close shifts every
-    window fifteen minutes, which this repo has already been bitten by once.
-    Token 0 is "Up"; one book is the mirror of the other.
+    Reuses `record_pm_ladder`'s slug resolution. Token 0 is "Up"; one book
+    mirrors the other.
     """
     from scripts.record_pm_ladder import ASSETS, GAMMA, slug_for, _get
 
@@ -254,12 +221,8 @@ async def resolve_tokens(session, now) -> dict:
             continue
         if ids:
             tokens[str(ids[0])] = symbol
-            # The WINDOW, not just the symbol. Kalshi logs its exact ticker
-            # (KXBTC15M-26SEP032245-45, keyed on the SETTLE) while this is keyed
-            # on the slug's unix OPEN, so the two align only if both name the
-            # same fifteen minutes — and a misalignment here returns a healthy
-            # book for the wrong window, which is "a wrong answer that looks
-            # entirely right". Logged so it can be checked rather than assumed.
+            # Record the window too, and log it, so alignment with the Kalshi
+            # ticker (keyed on the settle) can be checked.
             _WINDOWS[symbol] = slugs[asset]
     return tokens
 
@@ -269,7 +232,7 @@ _WINDOWS: dict = {}
 
 
 def subscribed_windows() -> dict:
-    """{symbol: (slug, window_open)} for what is on the wire right now."""
+    """Return {symbol: (slug, window_open)} for the current subscription."""
     from scripts.record_pm_ladder import window_of
     return {sym: (slug, window_of(slug)) for sym, slug in _WINDOWS.items()}
 
@@ -277,9 +240,9 @@ def subscribed_windows() -> dict:
 async def run(args=None, gate=None) -> int:
     """Hold a subscription, refreshing it as the window rolls.
 
-    A failure here must never stop trading: the loop logs, backs off and
-    reconnects, and `cross_venue_row` already refuses a stale reading, so an
-    outage degrades the feature to absent rather than to wrong.
+    A failure never stops trading: the loop logs, backs off and reconnects.
+    `cross_venue_row` refuses a stale reading, so an outage makes the feature
+    absent, not wrong.
     """
     import aiohttp
     from datetime import datetime, timezone
@@ -311,19 +274,10 @@ async def run(args=None, gate=None) -> int:
                         len(tokens),
                         ', '.join(f'{sym}@{w.strftime("%H:%M")}'
                                   for sym, (_slug, w) in sorted(windows.items())))
-                    # **Hold the socket across window CHECKS, not just across
-                    # frames.** The first version reconnected every
-                    # REFRESH_SECONDS whether or not anything had changed, so
-                    # the book was dropped and re-snapshotted once a minute
-                    # while the window only rolls every fifteen. Between the
-                    # reconnect and the first `book` frame the cache is empty,
-                    # which is the staleness this recorder exists to remove —
-                    # self-inflicted, once a minute, forever.
-                    #
-                    # So the deadline is a moment to RE-CHECK the tokens, and
-                    # only a change tears the socket down.
-                    # A new connection resends every book; nothing from the
-                    # last one is current.
+                    # Hold the socket across token checks. The deadline only
+                    # re-checks the tokens; only a change reconnects, because a
+                    # reconnect empties the cache until the first `book` frame.
+                    # A new connection resends every book.
                     book = PmBookCache()
                     async with _Socket(session, list(tokens)) as sock:
                         while True:

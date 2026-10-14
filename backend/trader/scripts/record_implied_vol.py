@@ -1,34 +1,13 @@
-"""The market's own forward volatility, inverted from the KXBTCD strike ladder.
+"""Record the market's forward volatility, inverted from the Kalshi strike ladders.
 
-**Why this is worth a service of its own.** The barrier reframing says the
-displacement is known exactly and `sigma_remaining` is the *only* forecast the
-system requires. Everything in `core/vol.py` estimates it from past returns —
-HAR over 15/60/240/1440 minutes plus an intraday seasonal. Kalshi publishes a
-threshold ladder on BTC (`KXBTCD`: "BTC above K at time T", nine or so strikes
-on one expiry) which is priced off a single volatility, forward-looking, free,
-and updated every minute. Nothing in the model has ever seen it.
-
-**The inversion.** Under the same zero-drift barrier model the baseline already
-uses,
-
-    P(S_T > K) = F( ln(S/K) / (sigma * sqrt(t)) )
-
-so applying the inverse CDF to every quote makes the ladder linear in `ln K`:
+Under the zero-drift barrier model, P(S_T > K) = F(ln(S/K) / (sigma*sqrt(t))).
+So F^-1 of each quote is linear in ln K:
 
     F^-1(p_k) = ln(S)/(sigma*sqrt(t))  -  ln(K_k)/(sigma*sqrt(t))
 
-One regression across the strikes gives sigma from the slope, and the implied
-spot falls out of the intercept — so no external spot is needed and the fit is
-self-contained. R^2 says whether the ladder was internally consistent enough to
-believe; measured on 29,776 archived fits it runs above 0.99.
-
-**It is not the same instrument.** KXBTCD closes on the hour and carries an
-explicit strike; the traded markets are 15-minute up/down. That is the point —
-it prices the same underlying's volatility over an overlapping horizon, which is
-what `sigma_remaining` needs, and it says nothing about direction.
-
-Collection of this stopped on 2026-08-25 and nothing restarted it. A day not
-recorded is a day gone, exactly as for depth.
+One regression across the strikes gives sigma from the slope and the implied
+spot from the intercept. R^2 says how consistent the ladder is. The ladders
+close on the hour, but they price the same underlying's volatility.
 """
 
 from __future__ import annotations
@@ -50,15 +29,7 @@ from core.datastore import ResearchStore
 
 logger = logging.getLogger('implied-vol')
 NORMAL = NormalDist()
-# All three crypto strike ladders. This was `SERIES = 'KXBTCD'` and every row
-# was stamped 'BTC-USD', so ETH and SOL carried NaN for all five implied-vol
-# features on every live cycle — while the BACKFILL already held all three
-# (BTC 22,248 rows, ETH 5,286, SOL 3,110). Live was the half that lagged: the
-# model was fitted against ETH/SOL implied vol that existed and scored against
-# an absence that did not.
-#
-# The venue serves all three identically: 200 open markets each, every one
-# carrying a strike, `strike_type=greater`.
+# The three crypto strike ladders, each `strike_type=greater`.
 LADDERS = (
     ('KXBTCD', 'BTC-USD'),
     ('KXETHD', 'ETH-USD'),
@@ -85,12 +56,10 @@ class VolFit:
 
 def implied_sigma(rungs: Sequence[tuple[float, float]],
                   minutes_to_close: float) -> Optional[VolFit]:
-    """Sigma per minute implied by `(strike, P(above))` pairs, or None.
+    """Return the fit implied by `(strike, P(above))` pairs, or None.
 
-    Returns None rather than a number whenever the ladder cannot support one:
-    fewer than four usable strikes, no time left to divide by, or a slope that
-    is not negative — price must FALL as the strike rises, and a ladder that
-    does otherwise is not the instrument this assumes.
+    Returns None with fewer than four usable strikes, no time left, or a slope
+    that is not negative (price must fall as the strike rises).
     """
     if not minutes_to_close or minutes_to_close <= 0:
         return None
@@ -103,13 +72,9 @@ def implied_sigma(rungs: Sequence[tuple[float, float]],
             continue
         if not (math.isfinite(strike) and strike > 0):
             continue
-        # **Drop the far rungs, not just the impossible ones.** The inverse CDF
-        # is infinite at 0 and 1, but the real problem starts well before that:
-        # the tick is a tenth of a cent below 10c, so a 1c quote carries ~0.05c
-        # of quantisation, and at |z| ~ 3 that is worth a large fraction of a
-        # sigma. Those rungs then dominate an unweighted fit in z-space. Keeping
-        # the band where the ladder is actually informative is cheaper than
-        # weighting and does not pretend to a precision the tick cannot carry.
+        # Drop the far rungs too. Near 0 and 1 tick quantisation is a large
+        # fraction of a sigma in z-space, and those rungs would dominate an
+        # unweighted fit.
         if not (PROBABILITY_BAND[0] < probability < PROBABILITY_BAND[1]):
             continue
         points.append((math.log(strike), NORMAL.inv_cdf(probability), strike,
@@ -139,8 +104,7 @@ def implied_sigma(rungs: Sequence[tuple[float, float]],
     residual = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
     r2 = 1.0 - residual / syy if syy > 0 else float('nan')
 
-    # The intercept is ln(S)/(sigma*sqrt(t)), so the spot the ladder implies
-    # falls straight out of the same fit — no external price needed.
+    # The intercept is ln(S)/(sigma*sqrt(t)), which gives the implied spot.
     implied_spot = math.exp(-intercept / slope)
     atm = min(points, key=lambda p: abs(p[3] - 0.5))[2]
     return VolFit(sigma_per_min=sigma, r2=r2, atm_strike=atm,
@@ -148,7 +112,7 @@ def implied_sigma(rungs: Sequence[tuple[float, float]],
 
 
 def strike_of(market: dict) -> Optional[float]:
-    """The market's threshold, preferring what the venue states over the ticker."""
+    """Return the market's strike, preferring the venue's field over the ticker."""
     for key in ('floor_strike', 'cap_strike', 'strike'):
         value = market.get(key)
         if value is not None:
@@ -168,7 +132,7 @@ def strike_of(market: dict) -> Optional[float]:
 
 
 def mid_of(market: dict) -> Optional[float]:
-    """The ladder's own P(above), from the two-sided quote where there is one."""
+    """Return P(above) as the two-sided mid, or None."""
     def number(*keys):
         for key in keys:
             raw = market.get(key)
@@ -184,11 +148,10 @@ def mid_of(market: dict) -> Optional[float]:
         return None
 
     def size(*keys):
-        """Resting size, or None when the venue did not say.
+        """Return resting size, or None when the venue omits it.
 
-        `_fp` fields are fixed-point strings. Absence is NOT emptiness: the
-        backfilled fixtures carry prices without sizes, so a missing field
-        cannot be read as an empty book.
+        `_fp` fields are fixed-point strings. A missing size is not an empty
+        book.
         """
         for key in keys:
             raw = market.get(key)
@@ -202,29 +165,14 @@ def mid_of(market: dict) -> Optional[float]:
 
     bid = number('yes_bid_dollars', 'yes_bid')
     ask = number('yes_ask_dollars', 'yes_ask')
-    # A price with nothing resting behind it is not a quote. Seen live on SOL:
-    # yes_bid 0.0100 (size 2314) against yes_ask 1.0000 (size 0), which passed
-    # the price checks and contributed a fabricated mid of 0.505 — a coin flip
-    # for a strike with no market, liquidity 0, volume 0, open interest 0.
-    # Eighteen of those in one fit gave R2 0.02 and a 6,371 bp/min sigma.
-    #
-    # This is the analogue of the backfill's `if snaps:`: Predexon recorded no
-    # book for such a strike, so it never entered a fit at all.
+    # A price with nothing resting behind it is not a quote. This matches the
+    # backfill, which has no book for such a strike.
     bid_size = size('yes_bid_size_fp', 'yes_bid_size')
     ask_size = size('yes_ask_size_fp', 'yes_ask_size')
     if bid_size == 0 or ask_size == 0:
         return None
-    # BOTH sides, and neither of them zero. `cross_section` in the backfill
-    # drops a strike without a two-sided quote — "a one-sided quote is dropped
-    # rather than half-invented; the inversion needs P(above), and a single side
-    # does not give one" — and a zero is not a side. CLAUDE.md states the same
-    # rule for quotes generally: a zero level means there is nothing there.
-    #
-    # Accepting them put every far-OTM strike into the fit: live carried a
-    # median of 50 rungs for ETH and 19 for SOL against the backfill's 5, and
-    # one sigma across half-invented mids collapsed R2 to 0.827 and 0.295
-    # against training's 0.976 and 0.986. BTC is liquid enough to survive it,
-    # which is why this hid.
+    # Both sides, neither zero, as in the backfill's `cross_section`. A zero
+    # level means nothing is there, and one side does not give P(above).
     if not bid or not ask or ask < bid:
         return None
     return (bid + ask) / 2.0
@@ -234,13 +182,8 @@ def fits_for(markets, *, now, symbol: str, min_minutes: float,
              max_minutes: float, min_r2: float):
     """Invert one series' open ladders. Returns (rows, freshest_fit).
 
-    Split out of `run` so it can be tested without a venue: the loop around it
-    is a fetch and a sleep, and everything that decides what a row SAYS lives
-    here.
-
-    A ladder is a set of `greater` strikes on one event. Each rung's mid is
-    P(spot > strike), so the set inverts to a single forward sigma — the only
-    forward-looking volatility input this system has.
+    A ladder is the set of `greater` strikes on one event. Each rung's mid is
+    P(spot > strike), so the set inverts to one forward sigma.
     """
     events: dict[str, list[dict]] = {}
     for market in markets or []:
@@ -269,14 +212,13 @@ def fits_for(markets, *, now, symbol: str, min_minutes: float,
             continue
         stamp = (pd.Timestamp(now, tz='UTC') if pd.Timestamp(now).tzinfo is None
                  else pd.Timestamp(now))
-        # Freshest wins: several events are fitted per cycle and the nearest
-        # close is the most informative about the fifteen minutes being traded.
+        # The nearest close wins: it says most about the traded fifteen minutes.
         if latest is None or minutes < latest['minutes_to_close']:
             latest = {'implied_sigma_per_min': float(fit.sigma_per_min),
                       'r2': float(fit.r2), 'n_strikes': float(fit.n_strikes),
                       'at': stamp, 'minutes_to_close': round(minutes, 3),
                       # The rest of the stored row, so live can record the
-                      # exact fit a decision used.
+                      # fit a decision used.
                       'event_ticker': event, 'close_time': close,
                       'implied_spot': float(fit.implied_spot),
                       'atm_strike': float(fit.atm_strike)}
@@ -304,15 +246,11 @@ async def run(args, gate=None) -> int:
     rows: list[dict] = []
 
     def _flush_on_exit() -> None:
-        """Write whatever is buffered before this task goes away.
+        """Write the buffer before this task is cancelled.
 
-        **`asyncio.CancelledError` is a BaseException, not an Exception**, so
-        the `except Exception` reconnect handler below never saw a shutdown and
-        `run_live`'s `task.cancel()` discarded the buffer -- up to a full batch
-        of rows on every restart, on a dataset whose whole justification is that
-        a minute not recorded is gone for good. Written synchronously rather
-        than through `asyncio.to_thread`: the loop is being torn down and a
-        thread hop is one more thing that can be cancelled.
+        `asyncio.CancelledError` is a BaseException, so `except Exception`
+        never sees a shutdown. Writes synchronously, because the event loop is
+        shutting down.
         """
         if not rows:
             return
@@ -333,9 +271,8 @@ async def run(args, gate=None) -> int:
                     if gate is not None:
                         await gate.idle()
                     now = datetime.now(timezone.utc)
-                    # One pass per ladder. A failure on one series must not cost
-                    # the others their cycle: they are independent books and the
-                    # venue rate-limits per request, not per symbol.
+                    # One pass per ladder. A failure on one series does not cost
+                    # the others their cycle.
                     for series, symbol in LADDERS:
                         try:
                             payload = await client._request(  # noqa: SLF001
@@ -383,51 +320,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-rows', type=int, default=10)
     parser.add_argument('--min-minutes', type=float, default=2.0)
     parser.add_argument('--max-minutes', type=float, default=180.0)
-    # 0.90. NOT the backfill's rule, and deliberately so — see below.
-    #
-    # REVERTED 2026-08-31, same day it was set to 0.0. The backfill gates on
-    # nothing, so 0.0 is the parity-correct value in principle; in practice
-    # live and the backfill do not select the same STRIKES, and removing the
-    # gate exposed that rather than fixing it. Live fits the whole open ladder
-    # (17-50 rungs) where Predexon's tick series only carried the liquid ones
-    # (median 5), so the fits that the gate had been hiding were garbage:
-    #
-    #   symbol  training med sigma   live med sigma (gate off)   live med R2
-    #   BTC          5.4 bp/min            7.5                      0.989
-    #   ETH         10.3 bp/min           64.2                      0.827
-    #   SOL          7.8 bp/min        2,243.4                      0.295
-    #
-    # 287x on SOL puts `iv_minus_realised` near log(287) = 5.7 where training
-    # saw ~0. The 0.90 gate is a known train/serve mismatch that costs ETH and
-    # SOL their coverage; a 287x sigma is an unknown one that corrupts the
-    # feature the model actually reads. Prefer the known, smaller error until
-    # the strike selection is matched properly.
-    #
-    # The real fix is upstream: select the same rungs the backfill did. Until
-    # then this stays at 0.90, which is the configuration the measured weekend
-    # run traded.
-    #
-    # This defaulted to 0.90 and that was a train/serve mismatch, not caution.
-    # Measured on what the backfill actually wrote, accepted fits run down to
-    # R2 = 0.0367 (BTC), 0.0134 (ETH), 0.0002 (SOL), with 5th percentiles of
-    # 0.85 / 0.72 / 0.56 — so the artifact was FITTED across that whole range
-    # while live kept only the top of it. Over 67 hours live produced 2,805 BTC
-    # fits, 13 ETH and zero SOL, against training coverage of 22,258 / 5,286 /
-    # 3,110.
-    #
-    # Two reasons filtering here is the wrong direction. `--complete-cases`
-    # fitted the artifact on rows that ALL carry a fit, so a symbol with no
-    # fits has no complete rows and is scored out of distribution. And `iv_r2`
-    # is ONE OF THE FIVE FEATURES: the model saw R2 from 0.0002 to 1.0 and
-    # learned what a weak fit is worth, so discarding weak fits upstream
-    # removes the information it was given to make that judgement.
-    # **The gate STAYS at 0.90, and the parity argument above is why that is not
-    # obvious.** Removing it was tried and reverted: it did not make live match
-    # the backfill, it revealed that the two never selected the same STRIKES.
-    # Live fits the whole open ladder (17-50 rungs) where Predexon's tick series
-    # carried only the liquid ones (median 5), so the suppressed fits were not
-    # merely low-R2, they were wrong by orders of magnitude -- SOL's median
-    # implied sigma came back 2,243 bp/min against a training median of 7.8.
+    # 0.90 does not match the backfill, which applies no gate. Live fits the
+    # whole open ladder while the backfill held only the liquid strikes, so
+    # without the gate live fits are wrong by orders of magnitude.
     # `tests/test_iv_r2_parity.py` pins this. Lower it only together with
     # matching the strike selection.
     parser.add_argument('--min-r2', type=float, default=0.90,

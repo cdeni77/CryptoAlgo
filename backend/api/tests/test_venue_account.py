@@ -1,9 +1,6 @@
 """The venue-ledger routes: what they serve, and what they refuse to invent.
 
-The failure being designed against is not a 500. It is `$0.00 realised` on a
-paper account that has never traded, rendering identically to a measured zero —
-the same class of error as the `pr_auc = holdout_auc - 0.06` this whole surface
-was rewritten to remove.
+A missing figure must come back as null with a reason, never as a zero.
 """
 
 from __future__ import annotations
@@ -77,10 +74,7 @@ def test_the_ledger_totals_what_the_venue_paid(client):
 def test_a_winning_favourite_that_nets_negative_still_counts_as_a_win(client):
     """The win rate reads `market_result`, not the sign of the P&L.
 
-    100 contracts at 97c returns $100 on $97 of cost; a fee above $3 makes the net
-    negative. This system buys favourites, so this is where most of its trades are,
-    and classifying them by P&L sign would put the win rate at odds with the
-    venue's own settlement record.
+    100 contracts at 97c return $100 on $97; a fee above $3 makes the net negative.
     """
     _clear()
     with _session() as db:
@@ -134,7 +128,7 @@ def test_every_field_null_totals_to_null_rather_than_to_zero(client):
 
 
 def test_the_gap_against_our_own_books_is_served_as_a_measurement(client):
-    """Ours and theirs, side by side. The disagreement is the point."""
+    """Our P&L and the venue's are served side by side, with the gap."""
     from models.serving import Account, VenueBalance
 
     _clear()

@@ -14,10 +14,9 @@ from core.pg_writer import PgWriter
 
 logger = logging.getLogger('live')
 
-# The longest lookback any feature needs, plus the mean it is taken over.
-# `volume_z_15` is a 1,440-minute z-score of a 15-minute rolling mean, so
-# bit-parity needs 1,440 + 15 = 1,455 contiguous bars; `log_rv_1440` needs
-# 1,441. `FETCH_MINUTES` (1,500) leaves a 45-bar margin.
+# The longest lookback any feature needs. `volume_z_15` is a 1,440-minute
+# z-score of a 15-minute rolling mean, so parity with training needs
+# 1,440 + 15 = 1,455 contiguous bars.
 MIN_USABLE_BARS = 1_455
 
 
@@ -25,12 +24,8 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
                            *, now: datetime) -> Optional[str]:
     """Halt the account on a bad day or a bad streak. Returns the reason, or None.
 
-    Writes `Account.halted` / `halted_reason`, which the dashboard shows. The
-    ruin floor in `decide` is the only other live limit, and it fires only after
-    half the account is gone.
-
-    A halt is sticky. Clearing it is a manual decision (`--clear-halt`), because
-    a breaker that resets itself at midnight is a speed bump.
+    Writes `Account.halted` and `halted_reason`. A halt is sticky: only
+    `--clear-halt` clears it.
     """
     account = writer.account()
     if account is None:
@@ -58,10 +53,9 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
                         f'({config.max_daily_loss_fraction:.0%} of the starting '
                         f'bankroll) over {len(today)} settlements')
 
-    # Peak-to-current drawdown on realised equity. The daily rule cannot see a
-    # run-up given back within one UTC day. Realised basis on both sides:
-    # `realised_high_water()` is the running maximum of the series
-    # `account.realized_pnl` holds, derived from settlements, not stored.
+    # Peak-to-current drawdown on realised equity. Both sides use the realised
+    # basis: `realised_high_water()` is the running maximum of
+    # `account.realized_pnl`.
     peak_realised = writer.realised_high_water()
     start = float(config.starting_bankroll)
     peak_equity = start + max(peak_realised, 0.0)
@@ -69,9 +63,8 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
     if peak_equity > 0:
         drawdown = (peak_equity - current_equity) / peak_equity
         if drawdown >= config.max_drawdown_fraction:
-            # Only a halt once it is also a loss of the starting stake. Above
-            # water this is a signal, not a stop: the stake is already guarded
-            # by `ruin_floor_fraction` and the daily rule.
+            # Halt only below the starting stake. Above it, the ruin floor and
+            # the daily rule guard the stake, so this is only a warning.
             if current_equity < start:
                 return halt(
                     f'drawdown {drawdown:.1%} from a peak of ${peak_equity:.2f} '
@@ -102,17 +95,10 @@ def check_circuit_breakers(writer: PgWriter, config: Config,
 
 
 def short_symbols(bars: dict, config: Config) -> dict[str, str]:
-    """Symbols whose history is too SHORT to reproduce the training features.
+    """Symbols whose history is too short to reproduce the training features.
 
-    `get_candles_range` can return a short or holed series after only logging an
-    ERROR. Below ~721 bars `log_rv_1440` goes NaN and the cycle abstains on its
-    own; between 721 and 1,454 the features are confidently wrong (e.g.
-    `volume_z_15` 46x off at 1,200 bars) — exactly where a partial fetch lands.
-    `Dataset.coverage()` cannot see it, because a short grid spans only what was
-    returned.
-
-    Counts rows, not span: a 1,500-minute span can hold 400 bars, and it is the
-    row count the rolling windows consume.
+    A short history gives finite but wrong features, so the cycle must refuse
+    it. Counts rows, not span, because the rolling windows consume rows.
     """
     reasons: dict[str, str] = {}
     for symbol in config.symbols:
@@ -133,12 +119,9 @@ def stale_symbols(bars: dict[str, pd.DataFrame], config: Config,
                   *, now: datetime) -> dict[str, str]:
     """Symbols whose feed is too old, or absent, with the reason.
 
-    * **An old feed.** The forward-fill inside `build_windows` cannot tell a
-      minute in which nothing traded from one not yet fetched, so a stale feed
-      becomes a fabricated `last_price` the barrier treats as a measurement.
-    * **A missing symbol.** The universe is part of the feature definition: a
-      missing symbol silently redefines the others' `cross_asset` features
-      (`beta_1440` moved 7.7x with no error and no NaN).
+    A stale feed becomes a forward-filled `last_price` that the barrier treats
+    as a measurement. A missing symbol changes the `cross_asset` features of
+    the others.
     """
     reasons: dict[str, str] = {}
     cutoff = pd.Timestamp(now).tz_convert('UTC') - pd.Timedelta(

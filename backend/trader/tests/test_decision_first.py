@@ -1,10 +1,6 @@
-"""An entry cycle decides first and keeps its books afterwards.
+"""Tests that an entry cycle places orders first and does its bookkeeping afterwards.
 
-Every second between reading the book and the order reaching the venue is a
-second the market can move away; the old cycle spent ~5s there on a REST bar
-fetch, four authenticated reconcile calls and one order at a time. These drive
-the real `run_cycle` against a recording venue and assert on WHEN each call
-happened, not on the source text.
+They drive the real `run_cycle` against a recording venue and assert the order of calls.
 """
 from __future__ import annotations
 
@@ -123,8 +119,8 @@ def run(tmp_path, monkeypatch, venue, *, offset=12, reconciled=True,
     monkeypatch.setattr(live, 'fetch_bars', fake_bars)
     monkeypatch.setattr(live, 'fetch_quotes', fake_quotes)
     monkeypatch.setattr(live, 'score_live', fake_score)
-    # Looked up where they live: `prewarm_fit_lookup`/`latest_fit` in
-    # livetrade.features, the reconcile clock in livetrade.state.
+    # Patched where they live: the fit lookup in livetrade.features and the reconcile
+    # clock in livetrade.state.
     monkeypatch.setattr(live_features, '_read_recent_fits', lambda: pd.DataFrame())
     monkeypatch.setenv('RECORD_TOUCH', '1' if record_touch else '0')
     monkeypatch.setattr(live_state, '_LAST_RECONCILED',
@@ -171,8 +167,7 @@ class TestOrdering:
         assert first(venue.events, 'order') > first(venue.events, 'quotes')
 
     def test_a_successful_reconcile_records_its_time(self, tmp_path, monkeypatch):
-        """The entry-cycle staleness guard reads this clock. If bookkeeping
-        stopped recording it, every entry cycle would reconcile first again."""
+        """A successful reconcile records its time, which the entry-cycle staleness guard reads."""
         before = time.monotonic()
         run(tmp_path, monkeypatch, Venue(), offset=9, reconciled=False)
         assert live_state._LAST_RECONCILED is not None
@@ -260,8 +255,8 @@ class TestOneResendAfterAKill:
 
     def test_the_resend_respects_the_window_exposure_of_the_others(
             self, tmp_path, monkeypatch):
-        # Room for exactly three $25 positions: the resend may take only what
-        # the other two in-flight orders left.
+        # Room for exactly three $25 positions: the resend may take only what the other
+        # two in-flight orders left.
         venue = self.KillOnce(fresh_ask=0.61)
         writer, _ = run(tmp_path, monkeypatch, venue,
                         max_window_exposure_fraction=0.06)

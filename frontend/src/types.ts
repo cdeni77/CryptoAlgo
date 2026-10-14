@@ -1,17 +1,11 @@
-/** Shapes the API actually returns.
+/** Shapes the API returns.
  *
- * Two conventions run through all of this and they are the point:
+ * `Measured<T>` is a value that may be absent with a reason: a missing number
+ * arrives as `{ value: null, reason: '...' }`, never as a zero. The UI renders
+ * an em-dash with the reason on hover.
  *
- * `Measured<T>` is a value that may be absent *with a reason*. The API serves
- * measurements and never substitutes, so a missing number arrives as
- * `{ value: null, reason: '...' }` rather than as a zero, and the UI renders an
- * em-dash with the reason on hover. The previous version of this surface
- * reported `pr_auc` as `holdout_auc - 0.06` and a hardcoded table of feature
- * importances, all of which rendered identically to real data.
- *
- * Probabilities are the app's native unit. A binary's price *is* a probability,
- * so price, forecast and break-even are all on one dimensionless scale and are
- * directly comparable — no basis points, no notional.
+ * Probabilities are the native unit. A binary's price is a probability, so
+ * price, forecast and break-even share one scale.
  */
 
 export interface Measured<T> {
@@ -103,8 +97,8 @@ export interface Prediction {
   /** The venue's implied probability, when a real book was read. */
   market_probability: number | null;
   /** 'quote' when the venue's ask priced this decision, 'baseline' when the
-   *  calibrated barrier stood in for a market that was not observed. Those are
-   *  different claims and the UI must not render them identically. */
+   *  calibrated barrier stood in for an unobserved market. Render them
+   *  differently. */
   price_source: 'quote' | 'baseline';
   reason: Reason;
   traded: boolean;
@@ -143,8 +137,7 @@ export interface AccountState {
   mode: 'paper' | 'live';
   starting_bankroll: number;
   bankroll: Measured<number>;
-  /** Bankroll plus open stake carried at COST — never marked to our own
-   *  forecast, which would book unrealised belief as profit. */
+  /** Bankroll plus open stake at cost, never marked to our own forecast. */
   equity: Measured<number>;
   staked: Measured<number>;
   open_positions: number;
@@ -166,21 +159,13 @@ export interface EquityPoint {
 
 /* ------------------------------------------------------- the venue's ledger */
 
-/** The account as Kalshi's own ledger reports it.
+/** The account as Kalshi's ledger reports it: the account of record.
  *
- *  `AccountState` above is our arithmetic: a bankroll debited at the price
- *  `decide()` sized at, a fee predicted from the published schedule, and a payout
- *  decided by an OHLC mean of Coinbase standing in for sixty seconds of CF
- *  Benchmarks BRTI. This is the account of record — `/portfolio/settlements` and
- *  `/portfolio/balance`, stored per settled market.
- *
- *  Both are rendered, and neither is substituted for the other. `pnl_gap` is
- *  where they disagree, which is a measurement (a mispriced fee, a settlement our
- *  proxy called differently, a fill nobody booked) rather than an error to hide.
+ *  `AccountState` is our own arithmetic. Both are rendered; `pnl_gap` is where
+ *  they disagree.
  */
 export interface VenueAccountState {
-  /** False when no venue ledger has been stored — the normal state of a paper
-   *  account, and the reason says so rather than showing $0.00 realised. */
+  /** False when no venue ledger is stored, as for a paper account. */
   available: boolean;
   reason: string | null;
   mode: 'paper' | 'live';
@@ -231,8 +216,7 @@ export interface VenueEquityCurve {
   days: number;
   points: VenuePnlPoint[];
   balances: VenueBalancePoint[];
-  /** Realised P&L that settled before the window opened, so the series can be
-   *  read on a lifetime scale rather than mistaken for one. */
+  /** Realised P&L that settled before the window opened. */
   pnl_before_window: number | null;
   realized_pnl_in_window: number | null;
 }
@@ -252,8 +236,8 @@ export interface VenueSettlement {
   settled_time: string | null;
   our_pnl: number | null;
   pnl_gap: number | null;
-  /** Did we win, per the venue's resolution — not per the sign of the P&L. A
-   *  favourite bought at 97c can win and still net negative after the fee. */
+  /** Did we win, per the venue's resolution, not the sign of the P&L. A
+   *  favourite can win and still net negative after the fee. */
   won: boolean | null;
   synced_at: string | null;
 }

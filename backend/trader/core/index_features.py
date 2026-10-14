@@ -1,30 +1,19 @@
-"""The `index_proxy` feature group: where the settlement index is, not Coinbase.
+"""The `index_proxy` feature group: displacement measured on the settlement index.
 
-The window's strike and settlement are both one-minute means of the INDEX
-(BRTI and its siblings). Our displacement is measured on Coinbase, and the two
-disagree most exactly where this system trades: near the strike. These columns
-re-measure the displacement on the per-second constituent median recorded by
+Strike and settlement are one-minute means of the index (BRTI and siblings),
+not Coinbase. These columns use the per-second constituent median from
 `scripts/record_index.py`:
 
-* `proxy_displacement_z` — proxy-based displacement from the proxy strike, in
-  units of `sigma_remaining`. The barrier's own input, measured on the index.
-* `proxy_minus_spot_bps` — how far the index sits from Coinbase right now. A
-  persistent basis is exactly what flips a near-tie.
-* `proxy_n_exchanges` — how many venues the newest proxy row was built from;
-  a two-venue median deserves less trust than a four-venue one.
+* `proxy_displacement_z`: displacement from the proxy strike, in units of `sigma_remaining`.
+* `proxy_minus_spot_bps`: how far the index sits from Coinbase now.
+* `proxy_n_exchanges`: how many venues the newest proxy row was built from.
 
-**Point in time.** The strike is the mean of proxy rows stamped in
-`[window_open - 60s, window_open)`; the current value is the newest row stamped
-STRICTLY before `decision_time`, and only within `max_age_seconds` of it. A row
-stamped `t` was computed before `t + 1` (`record_index.sample`), so nothing a
-decision reads was known at or after the decision instant.
+Point-in-time: the strike is the mean of rows stamped in `[window_open - 60s, window_open)`.
+The current value is the newest row stamped strictly before `decision_time`,
+within `max_age_seconds`. A row stamped `t` was computed before `t + 1`.
 
-**Both paths go through one function.** The backtest reduces a year of
-one-second rows to per-minute summaries (`minute_summary`, or the same
-aggregation in DuckDB for the store), and `index_features_row` reduces the live
-cache's rolling history with the SAME `minute_summary` and the same
-`attach_index_proxy`. The decision instant is always on a minute boundary, so a
-minute summary is lossless for both quantities.
+The backtest and the live path both go through `minute_summary` and
+`attach_index_proxy`. Decisions fall on minute boundaries, so the summary is lossless.
 """
 from __future__ import annotations
 
@@ -38,12 +27,12 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 INDEX_PROXY = ('proxy_displacement_z', 'proxy_minus_spot_bps', 'proxy_n_exchanges')
-# Raw columns `attach_index_proxy` adds; the z-score needs the FITTED
-# `sigma_remaining`, so it is finished in `build_features`, inside the fold.
+# Raw columns `attach_index_proxy` adds. The z-score needs the fitted
+# `sigma_remaining`, so `build_features` finishes it inside the fold.
 RAW_COLUMNS = ('proxy_strike', 'proxy_last', 'proxy_displacement',
                'proxy_minus_spot_bps', 'proxy_n_exchanges')
-# The strike is a 60-second mean; fewer valid seconds than this and it is not
-# the same quantity the venue averages.
+# The strike is a 60-second mean. With fewer valid seconds it is not the
+# quantity the venue averages.
 MIN_STRIKE_SAMPLES = 30
 SUMMARY_COLUMNS = ('symbol', 'minute', 'mean', 'samples', 'last', 'last_time',
                    'last_n')
@@ -58,8 +47,8 @@ def _valid(frame: pd.DataFrame) -> pd.DataFrame:
 def minute_summary(proxy_1s: pd.DataFrame) -> pd.DataFrame:
     """Per (symbol, minute): mean, valid-sample count, and the newest valid row.
 
-    `minute` is the minute's START, so the summary for `[t - 60s, t)` is the
-    row with `minute == t - 1min`.
+    `minute` is the minute's start, so the summary for `[t - 60s, t)` has
+    `minute == t - 1min`.
     """
     if proxy_1s is None or not len(proxy_1s):
         return pd.DataFrame(columns=list(SUMMARY_COLUMNS))
@@ -81,9 +70,7 @@ def load_proxy_minutes(store_root: Path | str, *, symbols: Optional[Sequence[str
                        start=None, end=None) -> pd.DataFrame:
     """`minute_summary` over the stored table, aggregated in DuckDB.
 
-    A year of one-second rows is ~95M; the summary is 1/60th of that and is all
-    the features need. Duplicate stamps are collapsed to the newest revision,
-    as `ResearchStore.read` does.
+    Duplicate stamps collapse to the newest revision, as `ResearchStore.read` does.
     """
     import duckdb
 
@@ -154,7 +141,7 @@ def attach_index_proxy(windows: pd.DataFrame, minutes: pd.DataFrame, *,
         pd.to_numeric(strike['mean'], errors='coerce').to_numpy(dtype=float), np.nan)
     age = (last['decision_time'] - last['last_time']).dt.total_seconds().to_numpy()
     # `last_time < decision_time` holds by construction (the row is from the
-    # minute BEFORE the decision); the age bound keeps a stalled recorder out.
+    # minute before the decision). The age bound excludes a stalled recorder.
     usable = np.isfinite(age) & (age > 0) & (age <= float(max_age_seconds))
     last_value = np.where(usable, pd.to_numeric(last['last'], errors='coerce')
                           .to_numpy(dtype=float), np.nan)
@@ -173,7 +160,7 @@ def attach_index_proxy(windows: pd.DataFrame, minutes: pd.DataFrame, *,
 
 
 def proxy_displacement_z(proxy_displacement, sigma_remaining) -> np.ndarray:
-    """Displacement over the remaining sigma — `z_score`, measured on the index."""
+    """Displacement over the remaining sigma: `z_score`, measured on the index."""
     displacement = pd.to_numeric(pd.Series(proxy_displacement), errors='coerce')
     sigma = pd.to_numeric(pd.Series(sigma_remaining), errors='coerce')
     sigma = sigma.where(sigma > 0)
@@ -184,11 +171,10 @@ def index_features_row(cache_snapshot: pd.DataFrame, window_open, decision_time,
                        sigma_remaining: float, *, last_price: float = float('nan'),
                        symbol: Optional[str] = None,
                        max_age_seconds: float = 5.0) -> dict:
-    """The `index_proxy` group for ONE live decision, from the in-process cache.
+    """The `index_proxy` group for one live decision, from the in-process cache.
 
-    `cache_snapshot` is `record_index.CACHE.snapshot(symbol)` — the stored
-    table's shape. Rows at or after `decision_time` are dropped here as well as
-    excluded by the join, so a snapshot taken a moment late cannot leak.
+    `cache_snapshot` is `record_index.CACHE.snapshot(symbol)`, in the stored
+    table's shape. Rows at or after `decision_time` are dropped, so a late snapshot cannot leak.
     """
     window_open = pd.Timestamp(window_open)
     decision_time = pd.Timestamp(decision_time)

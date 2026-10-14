@@ -1,15 +1,8 @@
-"""The single door into storage.
+"""The single path into storage, and the only place that sets `quality`.
 
-Every record that reaches the database goes through here, and here is the only
-place that sets `quality`. `DataQuality.UNVALIDATED` is the default on every
-record, so anything that still finds its way around this module is visible in
-the data rather than indistinguishable from a verified row:
-
-    SELECT COUNT(*) FROM ohlcv WHERE quality = 'unvalidated'
-
-Rejection policy matches what the pipeline already did for bars: VALID and
-SUSPICIOUS are stored, INVALID is dropped. Suspicious data is usable with a
-caveat; invalid data is not usable at all.
+Every record defaults to `DataQuality.UNVALIDATED`, so a record that bypasses
+this module stays visible in the data. VALID and SUSPICIOUS records are stored;
+INVALID records are dropped.
 """
 
 from __future__ import annotations
@@ -23,8 +16,7 @@ from .validator import DataQualityTracker, DataValidator, ValidationConfig
 
 logger = logging.getLogger(__name__)
 
-# Quality levels that are worth keeping. SUSPICIOUS is stored so a downstream
-# consumer can decide, rather than being silently discarded here.
+# SUSPICIOUS is stored so that a downstream consumer can decide.
 STORABLE = (DataQuality.VALID, DataQuality.SUSPICIOUS)
 
 
@@ -37,8 +29,8 @@ class IngestResult:
     rejected: int = 0
     suspicious: int = 0
     issues: list[str] = field(default_factory=list)
-    # The records that passed and were written, in order. Callers use these to
-    # advance watermarks; a rejected record must not move a watermark.
+    # The records written, in order. Callers advance watermarks from these only;
+    # a rejected record must not move a watermark.
     stored: list = field(default_factory=list)
 
     @property
@@ -57,8 +49,7 @@ class IngestResult:
 class Ingestor:
     """Validates and stores market data.
 
-    Hold one per run so the quality tracker accumulates across batches; its
-    summary is the answer to "how good was today's data".
+    Hold one per run, so that the quality tracker accumulates across batches.
     """
 
     def __init__(
@@ -84,8 +75,7 @@ class Ingestor:
     ) -> IngestResult:
         """Validate and store bars, stamping the venue they came from.
 
-        `venue` is required rather than defaulted: a bar whose origin is unknown
-        is the problem this parameter exists to solve.
+        `venue` has no default, because every bar must record its origin.
         """
         result = IngestResult(received=len(bars))
         if not bars:
@@ -104,9 +94,8 @@ class Ingestor:
                 keep.append(bar)
                 if outcome.quality == DataQuality.SUSPICIOUS:
                     result.suspicious += 1
-                # Only a stored bar becomes the reference for the next gap and
-                # price-jump check; comparing against a rejected bar would
-                # cascade one bad record into rejecting the good ones after it.
+                # Only a stored bar is the reference for the next gap and jump
+                # check, so one bad record cannot reject the good ones after it.
                 prior = bar
             else:
                 result.rejected += 1
@@ -137,9 +126,7 @@ class Ingestor:
 def unvalidated_row_counts(database) -> dict[str, int]:
     """Rows that reached storage without passing through `Ingestor`.
 
-    Should be zero on a database written entirely by the current code. A non-zero
-    count is either legacy data or a new bypass; either way it is a fact about
-    the data rather than a hidden assumption.
+    A non-zero count is legacy data or a bypass of this module.
     """
     counts: dict[str, int] = {}
     connection = getattr(database, '_connection', None) or getattr(database, 'conn', None)

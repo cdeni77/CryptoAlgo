@@ -1,22 +1,7 @@
-"""The trader and API ORM models describe the same tables. Prove it.
+"""Tests that the trader and API ORM models describe the same tables.
 
-`backend/trader/core/pg_writer.py` and `backend/api/models/` declare the same
-Postgres tables twice, on purpose: the two run in separate containers and neither
-imports the other's package. That duplication is a deliberate isolation choice,
-but "keep both in sync" written in a doc is not a mechanism — it is a hope, and
-it had already failed. `wallet.balance` defaulted to 10,000 on the trader side and
-100,000 on the API side, so whichever container created the row decided the
-account's starting balance, and the equity curve began from a different number
-than the dashboard reported.
-
-The API copy is now *generated* from the trader's module rather than transcribed,
-which removes the transcription failure mode — but not this test's job. A
-generated copy can still fall out of date, and the migration lists are written by
-hand on both sides.
-
-This test is the mechanism. It compares every shared table column by column,
-including nullability and defaults, and fails on the next divergence rather than
-leaving it to be discovered from a wrong number on a screen.
+Every shared table is compared column by column, including defaults, plus the migration
+lists.
 """
 
 from __future__ import annotations
@@ -33,12 +18,11 @@ API_ROOT = TRADER_ROOT.parent / 'api'
 
 
 def _load_api_models() -> Any:
-    """Import the API's declarative Base with its own module search path.
+    """Imports the API's declarative Base with the API root on `sys.path`, then removes
+    it.
 
-    The API package uses bare imports (`from models.base import Base`), so its
-    root has to be on `sys.path` for the duration. It is inserted ahead of the
-    trader root and removed afterwards, so the trader's own `core`/`scripts`
-    imports are unaffected in the rest of the session.
+    The API uses bare imports (`from models.base import Base`), so its root must lead
+    the path for the import.
     """
     if not API_ROOT.exists():
         pytest.skip(f'API package not present at {API_ROOT}')
@@ -55,11 +39,7 @@ def _load_api_models() -> Any:
 
 
 def _load_api_module(dotted: str) -> Any:
-    """Import an API module with the API root on `sys.path`, then restore it.
-
-    Same mechanism as `_load_api_models`: the API package uses bare imports, so
-    its root has to lead the path for the duration and be removed afterwards.
-    """
+    """Imports an API module with the API root on `sys.path`, then restores the path."""
     if not API_ROOT.exists():
         pytest.skip(f'API package not present at {API_ROOT}')
 
@@ -77,21 +57,14 @@ def _tables(base: Any) -> dict[str, Any]:
 
 
 def _column_shape(column: Any) -> dict[str, Any]:
-    """The parts of a column definition that a divergence would actually break.
+    """The parts of a column definition whose divergence would matter.
 
-    Three earlier blind spots, each demonstrated by mutation:
-
-    - `server_default` was compared as a boolean, so `text('100000')` against
-      `text('10000')` produced identical shapes — the exact `wallet.balance`
-      drift this file exists to catch, expressed server-side instead.
-    - callable defaults collapsed to the string `'<callable>'`, so
-      `default=list` and `default=dict` were interchangeable.
-    - `index` was not compared at all, so an index on one side only passed.
+    Compares `server_default` by value, callable defaults by name, and `index`.
     """
     default = getattr(column.default, 'arg', None) if column.default is not None else None
     if callable(default):
-        # The function's identity, not the fact that it is one. `list` and `dict`
-        # are both callables and produce very different columns.
+        # Compare the function's name: `list` and `dict` are both callables but give
+        # different columns.
         default = f'<callable:{getattr(default, "__name__", repr(default))}>'
 
     server_default = column.server_default
@@ -120,11 +93,8 @@ def schemas() -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def test_the_shared_tables_are_the_same_set(schemas):
-    """Neither side should own a table the other does not know about.
-
-    A table only one side declares is not automatically a bug — but it is always
-    worth knowing about, because `create_all` on the other container will not
-    create it and a read against it fails at runtime rather than at startup.
+    """Every table is declared on both sides, since `create_all` on the other container
+    would not create it.
     """
     trader, api = schemas
     shared = set(trader) & set(api)
@@ -162,12 +132,7 @@ def test_every_shared_table_has_the_same_columns(schemas):
 
 
 def test_shared_columns_have_the_same_definition(schemas):
-    """Same name is not enough — the default is what bit us.
-
-    `wallet.balance` existed on both sides with the same type and nullability,
-    and still produced two different starting balances, because the defaults
-    differed by a factor of ten.
-    """
+    """Shared columns have the same definition, including defaults."""
     trader, api = schemas
 
     problems: list[str] = []
@@ -188,18 +153,10 @@ def test_shared_columns_have_the_same_definition(schemas):
 
 
 def test_the_migration_lists_match(schemas):
-    """The two containers must apply exactly the same migrations.
+    """Both containers apply the same migrations, in the same order.
 
-    Compared by *value*, not by parsing the two source files for string literals.
-    That earlier version was fragile in the way that matters: it broke when the
-    quoting style changed and it could not see through the API now referencing
-    the mirror's list instead of restating it — so it would have failed on a
-    change that made divergence structurally impossible.
-
-    What is asserted is the invariant itself: whatever the API applies is
-    character-for-character what the trader applies, in the same order. Order
-    counts because an index created before the table it names is an error, not a
-    no-op.
+    Compared by value. Order matters because an index created before its table is an
+    error.
     """
     trader, api = schemas
     from core.pg_writer import MIGRATIONS as trader_migrations
@@ -223,17 +180,11 @@ def test_the_migration_lists_match(schemas):
 
 
 def test_the_api_applies_the_migrations_it_declares(monkeypatch):
-    """`app.py` must run the same list the mirror holds, not a copy of it.
-
-    The failure this rules out is a second literal list in `app.py` that drifts
-    from the mirror's — which is exactly the shape of the bug the whole module
-    exists for, one level up.
-    """
+    """`app.py` runs the mirror's migration list, not a separate copy."""
     from core.pg_writer import MIGRATIONS as trader_migrations
 
-    # `app.py` imports `database`, which refuses to import without a URL.
-    # A URL nothing is listening on is fine: `create_engine` is lazy, and this
-    # test never opens a connection.
+    # `app.py` imports `database`, which needs a URL. Nothing listens on this one, but
+    # `create_engine` is lazy and the test never connects.
     monkeypatch.setenv('DATABASE_URL', 'postgresql://nobody:nothing@127.0.0.1:1/absent')
     app_module = _load_api_module('app')
     applied = list(getattr(app_module, 'POSTGRES_MIGRATIONS', ()))
@@ -243,13 +194,10 @@ def test_the_api_applies_the_migrations_it_declares(monkeypatch):
 
 
 def test_the_migrations_are_dialect_portable():
-    """Every migration must run on SQLite as well as Postgres.
+    """Every migration is `CREATE INDEX IF NOT EXISTS`, which runs on SQLite and
+    Postgres.
 
-    Not a portability nicety: the API test suite runs on SQLite, so a
-    Postgres-only statement is a migration the tests never execute. The previous
-    list was all `ADD COLUMN IF NOT EXISTS`, which meant a dialect guard skipped
-    the whole thing under test and the migrations production ran had never been
-    run anywhere else.
+    The API tests run on SQLite, so a Postgres-only statement would never be tested.
     """
     from core.pg_writer import MIGRATIONS
 
@@ -262,12 +210,8 @@ def test_the_migrations_are_dialect_portable():
 
 
 def test_every_index_migration_names_a_column_the_model_indexes(schemas):
-    """A migration index and a model index have to be the same index.
-
-    Two ways this goes wrong: the migration names a column the model does not
-    mark `index=True`, so a fresh database lacks the index an upgraded one has;
-    or the name does not follow SQLAlchemy's `ix_<table>_<column>` convention,
-    so `create_all` and the migration each create their own copy of it.
+    """Each migration index matches a model column with `index=True` and SQLAlchemy's
+    `ix_<table>_<column>` name.
     """
     import re
 
@@ -298,20 +242,13 @@ def test_every_index_migration_names_a_column_the_model_indexes(schemas):
 
 
 # ---------------------------------------------------------------------------
-# Contract sizes
+# Tables without a writer
 # ---------------------------------------------------------------------------
 
 
 def test_no_table_is_declared_without_a_writer(schemas):
-    """A table nothing writes is a surface that serves fabricated aggregates.
-
-    `trades` was declared on both sides, exposed at `/trades` with a
-    `/trades/stats` that computed win rate over an empty table and reported
-    `0.0` — indistinguishable from a measured 0% — while the only writers,
-    `PgWriter.open_trade` and `.close_trade`, had no callers. The paper engine
-    keeps its ledger in `paper_positions`. When live execution lands it should
-    extend those tables (which carry funding, exit reason and TP/SL) rather
-    than resurrect a parallel schema.
+    """The `trades` table is not declared: nothing writes it, so it would serve empty
+    aggregates.
     """
     trader, api = schemas
     assert 'trades' not in trader and 'trades' not in api, (

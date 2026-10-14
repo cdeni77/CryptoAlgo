@@ -1,8 +1,4 @@
-"""
-Data validation for the Crypto Perpetual Futures Trading System.
-
-Validates incoming data for quality and integrity before storage.
-"""
+"""Quality and integrity checks on market data before storage."""
 
 import logging
 
@@ -50,12 +46,7 @@ class ValidationConfig:
 
 
 class DataValidator:
-    """
-    Validates incoming market data for quality and integrity.
-    
-    All validation is performed BEFORE data is stored to ensure
-    data quality from the start.
-    """
+    """Validates market data before it is stored."""
     
     def __init__(self, config: Optional[ValidationConfig] = None):
         self.config = config or ValidationConfig()
@@ -67,9 +58,7 @@ class DataValidator:
         bar: OHLCVBar,
         previous_bar: Optional[OHLCVBar] = None
     ) -> DataValidationResult:
-        """
-        Validate OHLCV bar data.
-        """
+        """Validate one OHLCV bar."""
         result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
         
         # 1. Basic price validation
@@ -150,9 +139,7 @@ class DataValidator:
         return result
     
     def validate_orderbook(self, book: OrderBookSnapshot) -> DataValidationResult:
-        """
-        Validate order book snapshot.
-        """
+        """Validate one order book snapshot."""
         result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
         
         # Check non-empty
@@ -200,9 +187,7 @@ class DataValidator:
         return result
     
     def validate_ticker(self, ticker: TickerUpdate) -> DataValidationResult:
-        """
-        Validate ticker update.
-        """
+        """Validate one ticker update."""
         result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
         
         # Price validation
@@ -235,20 +220,15 @@ class DataValidator:
         event_time: datetime,
         available_time: datetime
     ) -> DataValidationResult:
-        """
-        Validate timestamps.
-        
-        Rules:
-        1. available_time >= event_time (can't know about event before it happens)
-        2. Neither too far in future
-        3. Neither too far in past
+        """Validate timestamps.
+
+        Requires available_time >= event_time, and event_time inside the
+        configured future and past limits. Naive values are read as UTC.
         """
         result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
         
-        # FIX: Make 'now' timezone-aware (UTC) to match incoming data
         now = datetime.now(timezone.utc)
-        
-        # Safety check: Ensure inputs are aware before comparing
+
         if event_time.tzinfo is None:
             event_time = event_time.replace(tzinfo=timezone.utc)
         if available_time.tzinfo is None:
@@ -285,9 +265,7 @@ class DataValidator:
         curr_time: datetime,
         timeframe: str
     ) -> Optional[int]:
-        """
-        Detect data gaps.
-        """
+        """The gap in minutes, or None if it is within tolerance."""
         # Ensure aware comparison
         if prev_time.tzinfo is None:
             prev_time = prev_time.replace(tzinfo=timezone.utc)
@@ -324,9 +302,7 @@ class DataValidator:
 
 
 class DataQualityTracker:
-    """
-    Tracks data quality metrics over time.
-    """
+    """Counts validation outcomes across batches."""
     
     def __init__(self):
         self.total_records: int = 0

@@ -1,22 +1,15 @@
 """Prove the Kalshi credentials and the series tickers, before any money moves.
 
-Four questions, in the order they can fail, and each one answered separately so
-a failure names itself:
+Four checks, in the order they can fail, each reported separately:
 
-1. **Are the credentials loadable?** A key id and an RSA private key. This step
-   needs no network, so a malformed PEM is caught here rather than as a 401.
-2. **Does the venue accept the signature?** `GET /portfolio/balance` is the
-   cheapest authenticated call, and it also tells you what you have to trade
-   with.
-3. **Do the series tickers exist?** The defaults in `.env.example` are
-   **unverified**. This lists what the venue actually returns for each one.
-4. **Can a market be resolved for the next window?** The real test. Markets are
-   found by close time, not by pattern, so this is the step that proves the whole
-   chain — series, clock alignment, and market status — and it prints the book so
-   the assumed 0.5c half-spread can be checked against a real one.
+1. The credentials load (key id and RSA private key). No network needed.
+2. The venue accepts the signature (`GET /portfolio/balance`).
+3. The series tickers exist on the venue.
+4. A market resolves for the next window, found by close time. Prints the book,
+   so the assumed half-spread can be checked.
 
-Read-only throughout. It constructs the client without `live=True`, so it
-*cannot* place an order even if something in it tried.
+Read-only. The client is built without `live=True`, so it cannot place an
+order.
 
     python -m scripts.check_venue
     python -m scripts.check_venue --demo          # against the demo host
@@ -122,8 +115,8 @@ async def main() -> int:
         except KalshiError as exc:
             bad(f'the request failed: {exc}')
             message = str(exc)
-            # A network policy and a rejected signature both surface here as an
-            # HTTP error, and the fix is completely different. Say which.
+            # A network policy and a rejected signature both surface as an HTTP
+            # error, and the fixes differ. Say which.
             if 'allowlist' in message or 'egress' in message or '407' in message:
                 note('this is a NETWORK policy, not an authentication failure: '
                      'something between here and Kalshi refused the connection. '
@@ -174,11 +167,9 @@ async def main() -> int:
                 'against')
             return 1
 
-        # The venue lists exactly one open market per series: the window
-        # currently running. The next one is created when this one settles. So
-        # step 1 is the live window and anything beyond it is expected to be
-        # absent — which is worth stating, because the abstention message reads
-        # like a failure and is not one.
+        # The venue lists one open market per series, the current window. The
+        # next one appears when this one settles, so later steps are expected
+        # to be absent; that abstention is not a failure.
         now = datetime.now(timezone.utc)
         window = now.replace(second=0, microsecond=0)
         window -= timedelta(minutes=window.minute % DEFAULT_CONFIG.window_minutes)
@@ -220,11 +211,8 @@ async def main() -> int:
                 note(f'book {quote.yes_bid:.2f} / {quote.yes_ask:.2f}  '
                      f'spread {spread_cents:.0f}c  volume {quote.volume:,}  '
                      f'OI {quote.open_interest:,}')
-                # `.1f`, not `.0f`: the default is 0.5c and `.0f` printed it as
-                # "0c", so the one line whose job is to check the cost assumption
-                # was misreporting it as zero. And the ask is what you pay, so the
-                # all-in figure must not add a half-spread on top of it — that is
-                # the same double-charge `core/decide.py` had.
+                # `.1f`, because the half-spread is fractional. The ask already
+                # crosses the spread, so the all-in cost adds no half-spread.
                 note(f'buying "up" at {quote.yes_ask:.2f} costs '
                      f'{quote.yes_ask + fee:.4f} all-in (the ask already crossed '
                      f'the spread); the backtest assumes '

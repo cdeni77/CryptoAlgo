@@ -16,8 +16,10 @@ START = pd.Timestamp('2026-08-03', tz='UTC')
 
 def scored(weeks: int, *, model_edge: float, venue: bool = True, seed: int = 3,
            per_week: int = 672) -> pd.DataFrame:
-    """Backtest rows, one fold per week of 15-minute windows. `model_edge`
-    moves the model toward the truth (positive) or away from it (negative)."""
+    """Backtest rows, one fold per week of 15-minute windows.
+
+    `model_edge` moves the model toward the truth (positive) or away from it (negative).
+    """
     rng = np.random.default_rng(seed)
     n = weeks * per_week
     outcome = rng.integers(0, 2, n).astype(float)
@@ -74,7 +76,7 @@ def test_only_venue_labelled_rows_enter_the_significance_test():
 def test_rows_without_a_fold_take_weekly_blocks():
     rows = [r[:8] for r in market_rows_from_scored(scored(7, model_edge=0.2))]
     values = market_gate_values(rows)
-    assert values['min_folds'] in (7, 8)          # calendar blocks, not folds
+    assert values['min_folds'] in (7, 8)  # calendar blocks, not folds
     assert values['model_minus_market_p'] < 0.01
 
 
@@ -113,7 +115,9 @@ def test_no_edge_has_a_lower_bound_below_zero():
 
 
 def test_resampling_whole_windows_widens_the_interval():
-    """Three trades that settle together are one observation, not three."""
+    """Resampling whole windows widens the interval: trades that settle together are one
+    observation.
+    """
     frame = trades(400, win_rate=0.6, cost=0.55, predicted=0.6)
     won = (frame['payout'] > 0).astype(float).to_numpy()
     by_window = bootstrap_interval(block_bootstrap_means(won, frame['window_open']))

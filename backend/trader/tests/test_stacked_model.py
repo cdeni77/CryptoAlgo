@@ -1,10 +1,7 @@
-"""The two-stage stack: spot -> probability on all bars, the market-relative
-part on quoted rows only, with stage 1 seen out of sample by stage 2.
+"""Tests for the two-stage stacked model (spot model, then a market-relative stage).
 
-`b` is the headline: how much of the spot model's disagreement with the price
-survives. The tests that matter most are the ones that could make it lie — a
-stage-1 overfit read in-sample inflates b toward its ceiling, and the cross-fit
-exists so it cannot.
+`b` is how much spot-model disagreement with the price survives; the cross-fit keeps a
+stage-1 overfit from inflating it.
 """
 
 from __future__ import annotations
@@ -67,7 +64,7 @@ class TestStageTwo:
         assert b == pytest.approx(1.0)
 
     def test_a_book_term_is_recovered_and_shrunk_by_l2(self):
-        # A different seed from `_planted`'s, or z would replay m's draws.
+        # A different seed from `_planted`'s, or z would repeat m's draws.
         rng = np.random.default_rng(99)
         m, s, _ = _planted(seed=3)
         z = rng.normal(0, 1, (len(m), 1))
@@ -81,8 +78,7 @@ class TestStageTwo:
 # ---- the cross-fit -------------------------------------------------------------
 
 class Memorizer:
-    """A stage 1 that memorises its training rows' outcomes and knows nothing
-    about anything else: the purest possible overfit."""
+    """A stage 1 that memorises its training outcomes and knows nothing else: a pure overfit."""
 
     def __init__(self, rows: pd.DataFrame):
         self.seen = dict(zip(rows['key'], rows['outcome']))
@@ -137,7 +133,7 @@ class TestCrossFit:
             lo, hi = pd.Timestamp(record['start']), pd.Timestamp(record['end'])
             inside = (fitted >= lo - embargo) & (fitted <= hi + embargo)
             assert not inside.any()
-            # Rows before stage 2 begins are always available to every fit.
+            # Rows before stage 2 begins are available to every fit.
             assert (fitted < table['window_open'].iloc[1500]).any()
 
 
@@ -145,7 +141,7 @@ class TestCrossFit:
 
 @pytest.fixture(scope='module')
 def stacked():
-    """One fold's stacked fit on 18 days of bars, quotes on the last 9."""
+    """One fold's stacked fit on 18 days of bars, with quotes on the last 9."""
     bars = make_bars(days=18, lead=0.9, seed=11)
     depth = make_depth(bars, FAST, quoted_days=9)
     dataset = Dataset.build(bars, FAST, depth=depth)
@@ -204,7 +200,7 @@ class TestPackaged:
         assert isinstance(loaded, StackedForecastModel)
         np.testing.assert_array_equal(loaded.predict(test), model.predict(test))
         loaded.verify(FAST)
-        # Live adopts the artifact's init source, and a market config verifies.
+        # Live adopts the artifact's init source, so a market config verifies.
         loaded.verify(Config(init_score_source='market'))
         with pytest.raises(ValueError):
             loaded.verify(Config())
@@ -250,7 +246,7 @@ def test_walk_forward_in_stack_mode():
     quoted = scored['market_probability'].notna()
     assert scored.loc[quoted, 'model_probability'].notna().all()
     assert scored.loc[~quoted, 'model_probability'].isna().all()
-    # Every tested window carries a quote; training reached back before them.
+    # Every tested window carries a quote; training reaches back before them.
     first_quote = dataset.windows.loc[
         dataset.windows['market_probability'].notna(), 'window_open'].min()
     assert result.models[0].n_train_windows > 0
@@ -261,8 +257,9 @@ def test_walk_forward_in_stack_mode():
 
 @pytest.mark.slow
 def test_scripts_evaluate_runs_end_to_end_in_stack_mode(tmp_path, monkeypatch, capsys):
-    """`python -m scripts.evaluate --stack-mode spot_then_market --quote-sources
-    live_touch` against a store holding bars and recorded quotes."""
+    """Runs `scripts.evaluate --stack-mode spot_then_market --quote-sources live_touch`
+    on a store with bars and recorded quotes.
+    """
     from core import promotion
     from core.datastore import ResearchStore
     import scripts._common as common
@@ -276,7 +273,7 @@ def test_scripts_evaluate_runs_end_to_end_in_stack_mode(tmp_path, monkeypatch, c
             quality='valid'))
     depth = make_depth(bars, FAST, quoted_days=15)
     store.write('venue_depth', depth.assign(quality='valid'))
-    # A backfill row on every quoted minute, which the filter must keep out.
+    # A backfill row on every quoted minute, which the source filter must exclude.
     store.write('venue_depth', depth.assign(quality='valid', source='backfill',
                                             yes_bid=0.01, yes_ask=0.99))
 

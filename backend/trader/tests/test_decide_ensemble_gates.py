@@ -1,7 +1,7 @@
-"""The ensemble-aware gates: EDGE_UNCERTAIN and MEMBERS_DISAGREE.
+"""Tests for the ensemble gates EDGE_UNCERTAIN and MEMBERS_DISAGREE.
 
-Both are off by default and both pass a row that does not carry the
-ensemble's columns, so a single model decides exactly as it always has.
+Both are off by default and pass a row without ensemble columns, so a single model
+decides as before.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ def test_a_wide_spread_is_refused_as_uncertain():
 
 
 def test_the_lower_bound_reads_the_chosen_side():
-    """A DOWN trade's probability is 1 - q; the spread is the same either way."""
+    """For a DOWN trade the probability is 1 - q; the spread is the same either way."""
     config = Config(edge_lower_bound_z=1.0)
     down = row(model_probability=0.70)
     assert decide(down, config, bankroll=100.0).traded

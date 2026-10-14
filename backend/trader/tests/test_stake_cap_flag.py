@@ -1,19 +1,4 @@
-"""`--max-stake-dollars` must reach the loop and survive artifact adoption.
-
-`config_for_artifact` adopts `kelly_fraction`, `min_edge_pp`,
-`max_stake_dollars`, `max_stake_fraction`, `half_spread_cents` and `compound`
-from the promoting run, so an artifact trades under the policy it was MEASURED
-under. That means changing `Config.max_stake_dollars`' default would NOT reach
-a running loop — the artifact's stored 25.0 would win.
-
-Adoption explicitly yields to anything the command line set, via
-`cli_overrides`, and its own comment says why: adoption exists so the artifact
-trades under its measured policy, "not to overrule the operator — and silently
-reverting a deliberate setting at the next promotion is exactly the failure
-that would be hardest to notice."
-
-So the cap needs a flag, and the flag needs to be recorded as explicit.
-"""
+"""Tests for `--max-stake-dollars`, which overrides the cap the artifact would supply."""
 
 from __future__ import annotations
 
@@ -35,8 +20,6 @@ def test_omitting_it_leaves_the_default():
 
 
 def test_it_is_recorded_as_an_explicit_override():
-    """Without this, `config_for_artifact` would silently restore the
-    artifact's value at the next promotion."""
     cfg = _config(['--max-stake-dollars', '40'])
     assert 'max_stake_dollars' in (cfg.cli_overrides or ())
 
@@ -54,8 +37,7 @@ def test_adoption_does_not_overrule_the_flag():
 
 
 def test_adoption_still_wins_when_the_flag_is_absent():
-    """The cap is a claim about DEPTH, so an artifact measured under a
-    different one should carry it when nobody said otherwise."""
+    """Without the flag, the artifact's cap is adopted."""
     class _Model:
         config_provenance = {'max_stake_dollars': 12.0}
         init_score_source = 'baseline'

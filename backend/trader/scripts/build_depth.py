@@ -1,42 +1,17 @@
-"""Every BOOK source, into one table at every minute.
+"""Fold every book source into `venue_depth`, at every minute of the window.
 
-**The problem this solves, and the one it does not.** The book lived in three
-incompatible places: Kalshi live in `venue_ladder` (raw levels, every minute),
-Polymarket live in `pm_ladder`, and the Kalshi Predexon backfill in a JSONL file
-outside the research store entirely (packed thirteen-number series). This module
-unifies those three into `venue_depth`, keyed the same way, at **every minute**
-of the window — because the offset grid is itself under test and a table sampled
-where the model currently scores would foreclose the question.
+Sources: Kalshi `venue_ladder`, Polymarket `pm_ladder`, and packed backfill
+series. Every minute is kept because the offset grid is itself under test.
+`venue_quotes` is a separate table that this module does not read.
 
-**`venue_quotes` is a fourth, separate table this does NOT read, and an earlier
-version of this docstring claimed it did.** It holds the Kalshi Predexon
-backfill at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14) and is written by
-`scripts/backfill_quotes.py`, not by this module. Other files still read it
-directly — `retro_forecast_test.py`, `_status.py` and `_collect_book.py` among
-them — so "one table" was true of the book and not yet true of the whole
-pipeline. Folding `venue_quotes` into `venue_depth` too is a real migration
-(different offset grid, different producer, consumers to repoint) and
-was deliberately left undone here rather than done under time pressure.
+`quote_age_seconds` says how stale each row is: the backfill serves book
+changes, so a quiet book carries forward. `source` separates a book recorded
+live from the same book reconstructed later.
 
-`quote_age_seconds` says how stale each row is. Predexon serves book CHANGES,
-so the state at minute `m` is the last change at or before it and a quiet book
-carries forward; a forward fill that cannot be told from an observation lets a
-fresh forecast "beat" a stale price. That is not hypothetical — see the note in
-`core/datastore.SCHEMAS`.
+On both venues `no_levels` prices are NO-denominated, so `1 - price` is the
+YES ask. Packed backfill prices are integer cents.
 
-`source` distinguishes provenance: `live` is a book somebody recorded while the
-market was open; `backfill` is the same book from Predexon after the fact. They
-should agree, and where they overlap the disagreement is a free measurement of
-both. A table that could not tell them apart would make a reconstruction look
-like an observation.
-
-**Denomination is the invariant, not the schema.** On both venues `no_levels`
-prices are NO-denominated, so `1 - price` is the YES ask. Kalshi serves that
-natively (its orderbook is two bid stacks); Polymarket's asks are converted at
-write time in `scripts/record_pm_ladder._no_levels`. The packed backfill series
-stores integer cents, so it is divided by 100 here.
-
-Idempotent: the store merges partitions on write, so re-running only adds.
+Idempotent: the store merges partitions on write.
 """
 
 from __future__ import annotations
@@ -63,21 +38,10 @@ PM_ASSETS = {'btc': 'BTC-USD', 'eth': 'ETH-USD', 'sol': 'SOL-USD'}
 
 
 def _row(**kw) -> dict:
-    """One `venue_depth` row, with `quality` DERIVED rather than asserted.
+    """Return one `venue_depth` row, with `quality` derived from the quote.
 
-    `quality` was the literal 'valid' on every row this module produced, so
-    `min_quality` -- the mechanism that exists precisely so flagged data cannot
-    reach a feature build -- was inert for this dataset. Measured 2026-09-16:
-    all 1,895,986 rows read 'valid', and **37,052 of them are CROSSED**
-    (`yes_bid > yes_ask`), 31,541 in 2026-04 alone, which is 37% of that month.
-    `core/quotes.py` calls a crossed book "not a book" and refuses it; nothing
-    upstream said so, and nothing counted them.
-
-    The defect originates in the packed Predexon series, but this function is
-    the gate into the research store, so this is where it gets named. A crossed
-    or out-of-range quote is written as 'suspicious', which keeps the row for
-    anyone measuring the backfill's quality while removing it from the default
-    `min_quality='valid'` read.
+    A crossed or out-of-range quote is 'suspicious': kept in the store, but
+    out of the default `min_quality='valid'` read.
     """
     base = {'quality': 'valid', 'seq': float('nan'), 'gaps': 0.0}
     base.update(kw)
@@ -97,10 +61,9 @@ def _row(**kw) -> dict:
 
 def _cumulative(levels, *, best: Optional[float], within: float,
                 invert: bool) -> float:
-    """Resting size at prices at least as good as `best +/- within`.
+    """Return resting size at prices at least as good as `best +/- within`.
 
-    The same rule `scripts/live._cumulative` applies, kept identical on purpose:
-    the live path and this one must agree or the joined table is not one table.
+    Must match the live path's `_cumulative`.
     """
     if best is None or not math.isfinite(best):
         return 0.0
@@ -117,24 +80,12 @@ def _cumulative(levels, *, best: Optional[float], within: float,
 
 
 def _ladder_source(record: dict, source: str) -> str:
-    """`source`, qualified by the transport that fetched the ladder.
+    """Return `source`, qualified by the transport that fetched the ladder.
 
-    **Since the WebSocket migration `venue_ladder` holds TWO rows for the same
-    minute** — the REST poll and the stream cache — and both belong there:
-    comparing them is the evidence the stream reproduces the book. Stamping both
-    `source='live'` would produce two `venue_depth` rows with an identical event
-    key, so `read` would keep whichever carried the later `available_time` and
-    `venue_depth` would silently become a mix of the two transports, varying row
-    by row.
-
-    `source` sits in `EVENT_KEY_EXTRA['venue_depth']` for precisely this
-    situation: it already separates a book somebody recorded from the same book
-    reconstructed afterwards, and a second live observer is the same kind of
-    thing. So REST keeps `source='live'` and the existing series stays exactly
-    what it was, while the stream lands beside it as `live_ws`.
-
-    A missing transport means a row written before the column existed, and every
-    one of those was a REST poll.
+    `venue_ladder` holds a REST row and a stream row for one minute. `source`
+    is part of the `venue_depth` event key, so REST stays 'live' and the stream
+    becomes 'live_ws'; otherwise one would overwrite the other. A missing
+    transport means a REST poll.
     """
     transport = record.get('transport')
     if transport is None or not isinstance(transport, str) or transport == 'rest':
@@ -143,7 +94,7 @@ def _ladder_source(record: dict, source: str) -> str:
 
 
 def _from_ladder(frame: pd.DataFrame, *, source: str) -> list[dict]:
-    """Raw recorded ladders -> the summarised row, one per minute per observer."""
+    """Summarise raw recorded ladders: one row per minute per observer."""
     rows: list[dict] = []
     for record in frame.to_dict('records'):
         try:
@@ -159,12 +110,8 @@ def _from_ladder(frame: pd.DataFrame, *, source: str) -> list[dict]:
         minute = record.get('minute_into_window')
         if minute is None or not math.isfinite(float(minute)):
             continue
-        # **Floor, never round.** The recorder polls on its own cadence and lands
-        # at 9m59s as often as at 10m00s. Rounding that to minute 10 stamps the
-        # row as describing a moment AFTER it was observed, and the store
-        # rejects it — correctly, because a point-in-time read at t would then
-        # return a book nobody had yet seen. Flooring says what is true: nine
-        # minutes had elapsed when this was recorded.
+        # Floor, never round. Rounding up stamps a row after it was observed,
+        # which breaks point-in-time reads.
         offset = int(math.floor(float(minute)))
         window_open = pd.Timestamp(record['window_open'])
         event_time = window_open + pd.Timedelta(minutes=offset)
@@ -193,13 +140,10 @@ def _from_ladder(frame: pd.DataFrame, *, source: str) -> list[dict]:
 
 def _from_packed(path: str, *, venue: str, window_minutes: int,
                  symbol_of=None) -> list[dict]:
-    """A packed tick series -> the state at each minute of the window.
+    """Return the book state at each minute of the window from a packed series.
 
-    The row for minute `m` is the last snapshot at or before `window_open + m`,
-    which is the book a decision there would actually have priced against. A
-    minute with no prior snapshot is skipped rather than forward-filled from
-    nothing: Polymarket books often begin mid-window, and inventing a quote for
-    the minutes before that would be fabricating the very thing under test.
+    Minute `m` uses the last snapshot at or before `window_open + m`. A minute
+    with no prior snapshot is skipped, never filled.
     """
     if not os.path.exists(path):
         # The research/collect pipeline does not write this file; its books
@@ -263,10 +207,8 @@ def _from_packed(path: str, *, venue: str, window_minutes: int,
                     depth_ask_total=value('ask_vol') or 0.0,
                     levels_bid=value('bid_levels') or 0.0,
                     levels_ask=value('ask_levels') or 0.0,
-                    # How old the snapshot was at this minute mark. The endpoint
-                    # serves changes, so a quiet book carries forward, and an
-                    # un-aged forward fill is indistinguishable from an
-                    # observation.
+                    # The snapshot's age at this minute. A quiet book carries
+                    # forward, so the age separates a fill from an observation.
                     quote_age_seconds=age,
                     source='backfill'))
     return rows

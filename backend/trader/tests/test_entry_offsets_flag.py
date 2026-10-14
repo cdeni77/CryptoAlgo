@@ -1,19 +1,7 @@
-"""The backtest measured a policy the live loop does not run.
+"""Tests for `--entry-offsets` on the evaluate/promote side.
 
-`Config.entry_offsets` restricts which decision offsets may OPEN a position,
-and `core/decide.py` honours it — but only `scripts/live.py` had a flag for it,
-defaulting to 12. The evaluate/promote side had none, so `entry_offsets` stayed
-None, every offset was tradeable, and the backtest ran the first-clear policy.
-
-Those are not close. Measured over 70 days of quotes, per contract after fees
-and a 0.5c half-spread:
-
-    first_clear (what the gates measured)   0.040c   t=0.10
-    wait_12     (what live trades)          3.304c   t=5.98
-
-So `realised_edge_pp`, `total_return`, `sharpe` and `max_drawdown` described a
-strategy nobody deployed — and the one they described is the weakest of the
-three.
+Without it the backtest trades the first offset that clears, while live enters only at
++12m. The gates would then measure a policy that is not deployed.
 """
 from __future__ import annotations
 
@@ -41,14 +29,10 @@ def test_several_offsets_are_allowed():
 
 
 def test_the_default_is_unrestricted_so_existing_runs_are_unchanged():
-    """None means every decision offset may enter — the first-clear policy the
-    gates have always measured. Changing that default silently would rewrite
-    the meaning of every past ledger entry."""
+    """The default is None (every offset may enter), so past ledger entries keep their meaning."""
     assert _config([]).entry_offsets is None
 
 
 def test_an_entry_offset_outside_the_decision_grid_is_refused():
-    """Entering at an offset that is never scored is not a policy, it is a
-    typo that would silently abstain forever."""
     with pytest.raises(ValueError, match='entry_offsets'):
         _config(['--offsets', '3,6,9,12', '--entry-offsets', '7'])

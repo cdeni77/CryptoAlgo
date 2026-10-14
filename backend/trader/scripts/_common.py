@@ -1,14 +1,7 @@
-"""Arguments every script shares, so no two scripts can disagree about the data.
+"""Arguments shared by the research scripts, so no two can disagree about the data.
 
-Seven scripts read the research store, and every one of them can change an
-answer by loading a different universe, a different span, a different offset
-set or a different fee schedule. They take those arguments from here, so a run
-cannot silently differ from the run it is being compared against — and the
-`Config` that comes back records which fields the command line moved.
-
-The operational scripts (`scrape`, `sync_store`, `paper`, `orchestrator`) take a
-different set and roll their own, because they are about moving bytes rather
-than about measurement.
+The returned `Config` records which fields the command line moved. The
+operational scripts define their own arguments.
 """
 
 from __future__ import annotations
@@ -40,7 +33,7 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Every argument that changes which rows a run sees, or how it treats them."""
+    """Add every argument that changes which rows a run sees or how it treats them."""
     data = parser.add_argument_group('data')
     data.add_argument('--symbols', type=str, default=None,
                       help='Comma-separated spot products. Default: '
@@ -117,33 +110,6 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     economics.add_argument('--bankroll', type=float, default=None,
                            help=f'Starting account (default ${DEFAULT_CONFIG.starting_bankroll:.0f})')
     economics.add_argument('--kelly-fraction', type=float, default=None)
-    # The band the backfilled book can actually represent. Kalshi's tick is a
-    # TENTH of a cent below 10c and above 90c, and Predexon's snapshot of the
-    # same book is whole cents — measured, ~91% of tail quotes are off the cent
-    # grid by ~0.24c, about half the measured half-spread. Inside [0.10, 0.90]
-    # the backfill is exact. So economics from backfilled quotes are only
-    # quantisation-free in that band, and until now it could not be set.
-    # Which offsets may OPEN a position, as against which are SCORED. Only
-    # `scripts/live.py` had this flag, defaulting to 12, so every backtest ran
-    # `entry_offsets=None` — the first-clear policy — while live ran wait_12.
-    # Measured over 70 days, per contract: first_clear 0.040c (t=0.10) against
-    # 3.304c at +12m alone (t=5.98). The gates were describing the weakest of
-    # the three policies and none of them was the deployed one.
-    #
-    # The default stays None so past ledger entries keep their meaning.
-    # Sizing off the running balance instead of the starting bankroll.
-    #
-    # OFF by default, and the default is the load-bearing part: additive sizing
-    # makes the equity curve's slope the per-trade EDGE, while compounding makes
-    # it an exponential of the ESTIMATE of that edge — which is dominated by the
-    # error in the estimate, and is how an earlier incarnation of this repo
-    # turned $100 into $2e17 and reported it as a return.
-    #
-    # The flag exists so the alternative can be MEASURED. "Never tried" and
-    # "tried and rejected" are different claims and only the second is worth
-    # holding. Note the money gates change meaning under it: total_return,
-    # sharpe and max_drawdown are all computed on the compounded curve, and
-    # `sharpe_implausible` will fire on arithmetic rather than on a bug.
     model.add_argument('--fold-scheme', choices=('calendar', 'count'),
                        default=None,
                        help="how the walk-forward timeline is cut: 'calendar' "
@@ -209,10 +175,17 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'retrain deploys). Changing it here without '
                             'matching it in the retrain evaluates one system '
                             'and trades another')
+    # Off by default: additive sizing keeps the equity curve's slope equal to
+    # the per-trade edge. Under compounding the money gates read the
+    # compounded curve.
     economics.add_argument('--compound', action='store_true', default=None,
                            help='size off the running balance (default: off, '
                                 'so the curve stays additive and readable)')
+    # Which offsets may open a position; every offset is still scored. The
+    # default None keeps past ledger entries' meaning.
     economics.add_argument('--entry-offsets', type=int, nargs='+', default=None)
+    # The backfilled book is exact only inside [0.10, 0.90]: outside it the
+    # venue tick is a tenth of a cent and the backfill rounds to whole cents.
     economics.add_argument('--min-traded-price', type=float, default=None)
     economics.add_argument('--max-traded-price', type=float, default=None)
     model.add_argument('--init-score-source', choices=('baseline', 'market'),
@@ -297,8 +270,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
     ):
         value = getattr(args, attr, None)
         if value is not None:
-            # argparse `nargs='+'` yields a list; Config's fields are tuples so
-            # that a run's provenance hashes and compares equal across processes.
+            # argparse yields a list; Config fields are tuples so provenance
+            # hashes and compares equal across processes.
             overrides[field] = tuple(value) if isinstance(value, list) else value
 
     config = DEFAULT_CONFIG.with_overrides(**overrides)
@@ -313,29 +286,11 @@ def groups_from_args(args: argparse.Namespace) -> Optional[tuple[str, ...]]:
 
 
 def apply_complete_cases(args: argparse.Namespace, dataset: Dataset) -> Dataset:
-    """Keep only rows carrying every field THIS model claims to use.
+    """Keep only rows carrying every field this config's groups use.
 
-    **A named function so the seam can be tested.** `complete_cases` has taken a
-    `groups` argument since it was written, and `load_dataset` — its only caller
-    — never passed one, so every run in the project's history demanded all four
-    requirements including a ladder fit. A config without `implied_vol` was then
-    denied every row missing `implied_sigma_per_min`, for a feature it does not
-    have. The filter's own standard is "every field the model claims to use".
-
-    The unit test on `complete_cases(groups=...)` passed throughout, because the
-    defect was in the wiring and not the function — which is why the test that
-    matters is on this call, not on that one.
-
-    Measured consequence: the 2026-09-03/04 selection sweep kept 51,489 of
-    2,073,272 rows (2.5%) for all 64 cells, and its winner failed
-    `windows_evaluated` at 16,617 against 20,000 — a gate about sample size,
-    failed partly for a requirement the model never imposed.
-
-    **Caveat for sweeps.** The sample now depends on the group set, so configs
-    with different groups are no longer scored on identical rows. That is right
-    for evaluating ONE config for promotion and wrong for ranking configs
-    against each other; a comparison sweep should fix the sample deliberately by
-    asking for the union.
+    The sample depends on the group set, so configs with different groups are
+    not scored on identical rows. A sweep that ranks configs should request the
+    union of groups.
     """
     from core.dataset import complete_cases
     logger = logging.getLogger('dataset')
@@ -387,11 +342,10 @@ def resolve_holdout(args: argparse.Namespace, config: Config) -> dict:
 
 
 def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
-    """Read the store, lay the window grid, report coverage.
+    """Read the store, lay the window grid, and report coverage.
 
-    **The one place the sealed holdout is enforced.** Bars are cut at
-    `holdout_start` so nothing fitted inside a fold (volatility, seasonality,
-    baseline) sees them, and windows opening at or after it are dropped.
+    This is the one place the sealed holdout is enforced. Bars are cut at
+    `holdout_start`, and windows opening at or after it are dropped.
     """
     logger = logging.getLogger('dataset')
     holdout = resolve_holdout(args, config)
@@ -407,10 +361,8 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
         start=_utc(args.start) if getattr(args, 'start', None) else None,
         end=end,
     )
-    # The venue's own book and the ladder fits, where they exist. Both are
-    # OBSERVED rather than fitted, so they attach with the panel; passing them
-    # as None simply leaves the columns NaN, which is the correct state for the
-    # four and a half years that predate the venue.
+    # The venue's book and the ladder fits, where they exist. Both are observed,
+    # not fitted, so they attach with the panel. None leaves the columns NaN.
     depth = ladder_fits = None
     try:
         depth = store.read('venue_depth')
@@ -426,19 +378,16 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     if ladder_fits is not None and len(ladder_fits):
         logger.info('venue_implied_vol: %s fits', f'{len(ladder_fits):,}')
 
-    # The venue's OWN settlement, where we hold it. The market comparison has to
-    # grade both forecasters on the label the market was priced against:
-    # measured, `baseline_minus_market` reads +0.00382 on our Coinbase label and
-    # -0.00245 on the venue's, because our label and our baseline share a data
-    # source the market does not.
+    # The venue's own settlement, where we hold it. The market comparison grades
+    # both forecasters on the label the market was priced against, because our
+    # label and our baseline share a data source the market does not.
     settlements = None
     try:
         settlements = store.read('venue_settlements')
     except Exception:                                         # noqa: BLE001
         settlements = None
 
-    # The index proxy is read only when its group is asked for: a year of it
-    # is ~95M one-second rows, reduced to minute summaries in DuckDB.
+    # Read the index proxy only when its group is asked for, because it is large.
     index_proxy = None
     if 'index_proxy' in (groups_from_args(args) or ()):
         try:
@@ -459,15 +408,8 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
         dataset.windows = dataset.windows.loc[(opens < cutoff).to_numpy()].reset_index(drop=True)
 
     if settlements is not None and len(settlements) and 'settled_up' in settlements.columns:
-        # **One venue, newest revision.** This dropped `venue` entirely and
-        # deduplicated with no ordering, so whichever row the reader returned
-        # first supplied `venue_outcome` -- the label `settlement_outcomes`
-        # prefers for grading every trade. `collect_settlements` writes
-        # Polymarket rows into the same table, and that venue settles on
-        # Chainlink's TWAP against Kalshi's CF Benchmarks BRTI: two different
-        # oracles silently mixed under one column, with nothing recording which
-        # graded which window. Dormant only because the store holds no
-        # Polymarket settlements yet.
+        # Kalshi only, newest revision. The table also holds Polymarket rows,
+        # which settle on a different oracle.
         venue = settlements
         if 'venue' in venue.columns:
             venue = venue[venue['venue'] == 'kalshi']
@@ -516,8 +458,7 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
 
 
 def log_quote_coverage(depth, dataset: Dataset, config: Config) -> dict:
-    """Which observers the store holds, how old their quotes were, and which
-    of them actually priced a row once the source/age filters ran."""
+    """Log which quote observers the store holds, their ages, and which priced rows."""
     from core.quotes import quote_coverage, source_age_table
 
     logger = logging.getLogger('dataset')
@@ -543,7 +484,7 @@ def log_quote_coverage(depth, dataset: Dataset, config: Config) -> dict:
 
 
 def data_span(dataset: Optional[Dataset], args: Optional[argparse.Namespace] = None) -> dict:
-    """What the run actually read, for the trial log."""
+    """Return the span the run read, for the trial log."""
     span: dict = {}
     if args is not None:
         span.update({'start_arg': getattr(args, 'start', None),
@@ -565,8 +506,7 @@ def log_trial(script: str, args: argparse.Namespace, config: Config, *,
               dataset: Optional[Dataset] = None, report=None,
               metrics: Optional[dict] = None, trial_id: Optional[str] = None,
               extra: Optional[dict] = None) -> dict:
-    """One line in `trials.jsonl` for this run. Every research script calls it,
-    because the ledger alone counted only promotions."""
+    """Append one line for this run to `trials.jsonl`."""
     from core.promotion import record_trial, trial_metrics
 
     return record_trial(

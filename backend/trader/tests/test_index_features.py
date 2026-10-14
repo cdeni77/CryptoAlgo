@@ -46,7 +46,7 @@ def test_nothing_at_or_after_the_decision_is_read():
                        value=lambda t: 200.0 if t >= decision else 100.0)
     out = _attach(seconds)
     assert out['proxy_last'].iloc[0] == 100.0
-    # And the live path agrees, even handed a snapshot taken late.
+    # The live path agrees, even when the snapshot is taken late.
     live = index_features_row(seconds, OPEN, decision, 0.001)
     assert live['proxy_displacement_z'] == 0.0
 

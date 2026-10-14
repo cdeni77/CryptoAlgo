@@ -1,23 +1,7 @@
-"""Two instruments observing one event are not two revisions of it.
+"""Tests that two observers of one `venue_depth` minute are both kept.
 
-The research store is a point-in-time revision store: `read` keeps exactly one
-row per `(venue, symbol, event_time)` — the one with the latest
-`available_time` — so a corrected figure supersedes the one it corrects. That is
-right for a revised series like funding or open interest.
-
-It is wrong for `venue_depth`, which holds the SAME minute of the SAME book
-observed two ways: recorded live while the market was open, and reconstructed
-afterwards from Predexon. Those are independent measurements, not a correction
-and its predecessor, and the whole point of holding both is to compare them.
-
-Under the plain key the live row always won, because its `available_time` is the
-poll instant while the backfill's is the minute mark itself. Measured: 58
-(symbol, window) pairs overlapped and `_validate_depth.py` still reported zero
-comparable rows — the backfill row existed on disk and was invisible to every
-read. Silently, with no error, on exactly the rows the comparison needed.
-
-So `source` joins the event key for this dataset: same event, two observers.
-Revisions still collapse WITHIN an observer.
+`source` is part of the event key here, so a recording and a backfill coexist; revisions
+still collapse within one source.
 """
 
 from __future__ import annotations
@@ -60,7 +44,6 @@ def test_live_and_backfill_of_the_same_minute_both_survive(store):
 
 
 def test_they_survive_across_separate_writes(store):
-    """The overwrite happened on the second write, not only within one frame."""
     store.write('venue_depth', pd.DataFrame([row('live', W + pd.Timedelta(seconds=3), 0.41)]))
     store.write('venue_depth', pd.DataFrame([row('backfill', W, 0.40)]))
     got = store.read('venue_depth')
@@ -69,7 +52,7 @@ def test_they_survive_across_separate_writes(store):
 
 
 def test_a_revision_within_one_source_still_supersedes(store):
-    """Two backfill reads of the same minute: the later one wins, as before."""
+    """Within one source, the later revision still wins."""
     store.write('venue_depth', pd.DataFrame([row('backfill', W, 0.40)]))
     store.write('venue_depth', pd.DataFrame([
         row('backfill', W + pd.Timedelta(minutes=5), 0.44)]))
@@ -79,7 +62,7 @@ def test_a_revision_within_one_source_still_supersedes(store):
 
 
 def test_a_dataset_without_a_source_column_is_unaffected(store):
-    """`bars` and the rest keep the plain one-row-per-event contract."""
+    """A dataset without a `source` column keeps one row per event."""
     base = {'venue': 'coinbase_spot', 'symbol': 'BTC-USD', 'event_time': W,
             'quality': 'valid', 'open': 1.0, 'high': 1.0, 'low': 1.0,
             'close': 1.0, 'volume': 1.0}

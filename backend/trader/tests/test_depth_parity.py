@@ -1,14 +1,6 @@
-"""`decide()` caps the stake on measured depth — but only live could supply it.
+"""Tests that the backtest gets the same depth columns live uses to cap the stake.
 
-Wiring `depth_up`/`depth_down` into `scripts/live.py` closed one gap and opened
-another: the live path began sizing against the book while the backtest, which
-calls the SAME `decide()`, still sized against `max_stake_dollars` alone. "One
-decide()" is the invariant that stops the two from drifting, and a cap that
-applies to only one of them breaks it exactly where it matters — at size, where
-the backtest would claim fills the book could not support.
-
-`venue_depth` already carries what is needed (`yes_bid_size`, `yes_ask_size` via
-DEPTH_MAP), so this is a projection, not new data.
+Both call the same `decide()`, so both must supply `depth_up`/`depth_down`.
 """
 from __future__ import annotations
 
@@ -49,9 +41,7 @@ def test_the_backtest_carries_the_same_depth_cap_live_does():
 
 
 def test_depth_is_dollars_on_the_side_being_crossed():
-    """Buying UP pays the YES ask against the size resting there; buying DOWN
-    pays 1 - yes_bid against the YES bid stack. Same convention as
-    `scripts.live.depth_dollars`."""
+    """Depth is dollars on the side being crossed, as in `scripts.live.depth_dollars`."""
     out = attach_quotes(_windows(), _depth(bid=0.40, ask=0.42,
                                            bid_size=100.0, ask_size=80.0))
     row = out.iloc[0]
@@ -60,8 +50,7 @@ def test_depth_is_dollars_on_the_side_being_crossed():
 
 
 def test_a_row_with_no_size_gives_nan_not_zero():
-    """Zero would refuse every trade. Unmeasured means fall back to the standing
-    cap, which is what the backtest did before the book was joined."""
+    """A row with no size gives NaN, so `decide()` falls back to the standing dollar cap."""
     d = _depth()
     d['yes_bid_size'] = np.nan
     d['yes_ask_size'] = np.nan

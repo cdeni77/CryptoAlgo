@@ -1,26 +1,12 @@
 /** The account, as the venue's ledger reports it.
  *
- * **This page used to report our own arithmetic and call it P&L.** The bankroll
- * was debited at the price `decide()` sized at, the fee was predicted from the
- * published schedule, and the payout was decided by an OHLC mean of Coinbase
- * standing in for sixty seconds of CF Benchmarks BRTI. Live, every one of those
- * three is an estimate of a number Kalshi already holds, and the audit found the
- * paper bankroll had never once been credited a win.
+ * Headline numbers come from `/portfolio/settlements` and `/portfolio/balance`,
+ * the account of record. Our own figures sit beside them; the reconciliation
+ * panel shows the gap, and a growing drift is the alarm.
  *
- * So the headline numbers here come from `/portfolio/settlements` and
- * `/portfolio/balance` — what the account of record shows. Our own figures are
- * kept beside them rather than thrown away, because the gap is a measurement in
- * its own right: a mispriced fee, a settlement our proxy called differently, or a
- * fill nobody booked. The reconciliation panel is that gap, and a drift that
- * grows is the alarm.
- *
- * Two things are deliberately not here. Open positions are not marked to
- * anything — not to our forecast, which would book conviction as profit, and not
- * to the tape either, because a 15-minute binary held to expiry has one price
- * that matters and it is the settlement. And the public trade tape
- * (`/historical/trades`) contributes nothing: it carries every print in a market
- * by anyone, with no account attribution, so summing it sums the exchange rather
- * than the portfolio.
+ * Open positions are never marked: a binary held to expiry has one price that
+ * matters, the settlement. The public trade tape is not used: it has no
+ * account attribution.
  */
 import { usePolling } from '../hooks/usePolling';
 import {
@@ -48,8 +34,7 @@ import type { Position, VenueSettlement } from '../types';
 
 export function AccountPage() {
   const account = usePolling(fetchAccount, 30_000);
-  // Faster than the internal figures, because this is the series that moves: the
-  // live loop samples the venue's balance every cycle.
+  // Polled faster: the live loop samples the venue's balance every cycle.
   const venue = usePolling(fetchVenueAccount, 20_000);
   const venueCurve = usePolling(() => fetchVenueEquity(30), 30_000);
   const equity = usePolling(() => fetchEquity(90), 60_000);
@@ -63,34 +48,23 @@ export function AccountPage() {
 
   const ledger = venue.data;
   // The venue has a ledger only once real orders have filled. Until then this
-  // page shows our arithmetic and says so, rather than drawing a $0.00 P&L that
-  // looks like a measurement.
+  // page shows our arithmetic and says so.
   const onVenue = Boolean(ledger?.available);
 
   const settled = (positions.data?.positions ?? []).filter((p) => p.outcome !== 'pending');
   const settledContracts = settled.reduce((s, p) => s + p.contracts, 0);
 
-  // Per TRADE, and displayed as such. The venue resolves markets, not
-  // contracts, so this is the natural unit for "how often were we right" —
-  // it is only wrong when subtracted from a per-contract cost, which is what
-  // `realisedEdge` used to do.
+  // Per trade: the venue resolves markets, not contracts. Never subtract a
+  // per-contract cost from it.
   const winRate = onVenue
     ? ledger!.win_rate.value
     : settled.length
       ? settled.filter((p) => p.outcome === 'won').length / settled.length
       : null;
 
-  // **P&L per contract, not `win_rate - mean_cost`.** That subtraction mixed
-  // denominators: the win rate is per TRADE (the venue resolves markets, not
-  // contracts) while the mean cost is per CONTRACT. They only agree if every
-  // trade is the same size, and they are not — measured 2026-10-03, the win
-  // rate was 0.5714 per trade against 0.5853 per contract, because winners
-  // carry more contracts than losers. The gap read as 1.4pp of edge that was
-  // never lost: -2.71pp displayed against a true -1.32pp.
-  //
-  // Dividing realised P&L by contracts has no such ambiguity, and it is the
-  // same quantity `realised_edge_pp` gates on, so the dashboard and the
-  // promotion gate finally mean one thing.
+  // Realised P&L per contract, not `win_rate - mean_cost`, which mixes a
+  // per-trade rate with a per-contract cost. This is the quantity the
+  // `realised_edge_pp` gate uses.
   const realisedEdge = onVenue
     ? ledger!.contracts > 0 && ledger!.realized_pnl.value != null
       ? ledger!.realized_pnl.value / ledger!.contracts
@@ -99,9 +73,7 @@ export function AccountPage() {
       ? settled.reduce((s, p) => s + (p.pnl ?? 0), 0) / settledContracts
       : null;
 
-  // Contract-weighted too, or the comparison against realised is
-  // apples-to-oranges: a per-trade mean over-weights the small trades the
-  // whole-contract floor barely admitted.
+  // Contract-weighted, to compare like with like against `realisedEdge`.
   const predictedEdge = settledContracts
     ? settled.reduce((s, p) => s + p.edge * p.contracts, 0) / settledContracts
     : null;
@@ -260,7 +232,7 @@ export function AccountPage() {
               unit="pp"
               digits={2}
               tone={(realisedEdge ?? 0) >= 0 ? 'above' : 'below'}
-              hint="win rate minus mean cost paid. The gap against predicted is the winner's curse."
+              hint="settled P&L per contract, fees included. The gap against predicted is the winner's curse."
             />
           </div>
           {onVenue && ledger!.incomplete > 0 && (
@@ -373,10 +345,8 @@ export function AccountPage() {
         </Panel>
       </section>
 
-      {/* Kept alongside the venue table rather than replaced by it. The venue
-          knows what a position paid; only our own row knows what the model
-          claimed at entry, and the forecast against the outcome is the whole
-          research question. */}
+      {/* Kept beside the venue table: only our own rows hold what the model
+          claimed at entry. */}
       {onVenue && settled.length > 0 && (
         <section>
           <SectionHead
@@ -398,8 +368,8 @@ export function AccountPage() {
   );
 }
 
-/** The venue's own settlement rows. Money only — every column is a number Kalshi
- *  served, and `ours` is the one comparison against our books. */
+/** The venue's settlement rows. Every column is a number Kalshi served, except
+ *  `vs ours`, the gap against our books. */
 const venueColumns: Column<VenueSettlement>[] = [
   {
     key: 'settled',

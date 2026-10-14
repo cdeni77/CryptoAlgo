@@ -1,36 +1,9 @@
 """Rebuild forward-looking sigma from the historical strike ladders.
 
-    python -m research.collect.implied_vol_backfill --rps 5
-    python -m research.collect.implied_vol_backfill --report
-
-**Why this is worth its own collector.** The barrier framing says the
-displacement is known exactly and `sigma_remaining` is the ONE quantity that
-must be forecast. Every volatility feature in `core/features.py` is
-backward-looking realised vol. A threshold ladder inverts to the market's own
-FORWARD-looking sigma at R² > 0.95, which is a different kind of input
-entirely.
-
-The collection plan listed this as a feature family and marked it "already
-recorded live". That was wrong, and it is the one real error the plan review
-found: `venue_implied_vol` held 1,256 rows across 3 days, BTC only. Three days
-trains nothing. The ladders reach January, so the history exists — it just was
-never collected.
-
-**Measured shape of the data.** A ladder (`KXBTCD-26JUL3017`) is one event
-holding ~80 strike markets, opens 20:00 and closes 21:00 the following day —
-about 25 hours. Each strike's historical book is a tick series carrying a
-two-sided quote, e.g. bid 38 / ask 39 at a $63,999.99 strike, which is
-P(above) = 0.385. Predexon and Kalshi's own API agree exactly on the ladder's
-size (80 markets each).
-
-**The inversion is imported, not rewritten.** `record_implied_vol.implied_sigma`
-is the single definition and the live path calls it; a second copy would be two
-definitions that agree until one is changed. What is genuinely new here is
-assembling the cross-section, because the live recorder sees every strike's
-current quote at once while history arrives as one series per strike that must
-be aligned onto a common instant.
+Fits `record_implied_vol.implied_sigma` to each hourly KXBTCD/ETHD/SOLD ladder's
+cross-section near its close, from Predexon tick series.
+Run: `python -m research.collect.implied_vol_backfill [--rps 5] [--report]`.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -56,59 +29,31 @@ DATA = Path(os.getenv('COLLECT_DATA', 'data/collection'))
 OUT = DATA / 'implied_vol.jsonl'
 STATE = DATA / 'implied_vol.state.json'
 LOCK = DATA / 'implied_vol.lock'
-# The ladders reach January, the same floor the 15-minute books have.
+# The same floor as the 15-minute books.
 COLLECT_FROM = dt.datetime(2026, 1, 8, tzinfo=dt.timezone.utc)
 MAX_PAGES = 30
-# Ladders are HOURLY, not daily: 4,960 for BTC alone in range. At ~80 strikes
-# each that is ~400k requests per asset, so two economies are needed and both
-# are principled rather than arbitrary.
+# Ladders are hourly with ~80 strikes each, so the fetch is limited two ways.
 #
-# TAIL_MINUTES — only the run-up to the close is fetched. A ladder lives ~25
-# hours, but sigma from a ladder closing a day out is a 25-hour-horizon vol;
-# the 15-minute markets need a SHORT horizon. The final stretch is the part
-# that answers the question, and it is also where the ladder is liquid.
-# Measured: a near-the-money strike generates ~14,000 ticks in 120 minutes, so
-# a 120-minute window costs ~7 pages PER STRIKE and ~179 requests per ladder.
-# The sample instants are 15 minutes apart, so almost all of those ticks are
-# fetched and discarded. A short window costs ~1 page per strike and yields the
-# shortest-horizon sigma, which is the one the 15-minute markets need.
-# The sampled band, in minutes before the ladder's close. Measured across
-# three ladders: 4/2/5 two-sided rungs at 5 minutes to close, 10/7/14 at 30,
-# and a hard ZERO at 60 -- an hourly ladder does not exist an hour before it
-# closes. 20-50 minutes fitted 23 of 24 cases, so that is where the samples
-# belong. The previous window was the last 20 minutes: the thin end of the
-# curve, and the reason the yield sat near 3%.
+# The sampled band, in minutes before the ladder's close: only the run-up is
+# fetched. It gives the short-horizon sigma the 15-minute markets need, and it
+# is where two-sided rungs exist. An hourly ladder has no quotes an hour out.
 TAIL_MINUTES = int(os.getenv('IV_TAIL_MINUTES', '50'))
 NEAREST_MINUTES = int(os.getenv('IV_NEAREST_MINUTES', '5'))
-# History fetched BEFORE the first instant. `cross_section` takes the last tick
-# at or before an instant, so an instant at the fetch range's left edge has
-# nothing behind it and comes back empty every time -- measured 0 rungs against
-# 6/4/10 for a narrow fetch ending at the same instant, with the full span
-# present and nothing truncated. This is what makes the first sample real.
+# History fetched before the first instant. `cross_section` takes the last tick
+# at or before an instant, so the first instant needs ticks behind it.
 LEAD_MINUTES = int(os.getenv('IV_LEAD_MINUTES', '5'))
-# Ladders are HOURLY and overlap, so consecutive ones say almost the same
-# thing. A stride trades sigma's sampling density against API hours: 1 gives
-# hourly sigma, 4 gives it every four hours for a quarter of the cost. Implied
-# vol moves slowly, so a stride is a cheap way to test whether the feature
-# earns its place before paying for full density.
+# Take every Nth hourly ladder. Consecutive ladders overlap, and implied vol
+# moves slowly, so a stride trades density for API cost.
 LADDER_STRIDE = int(os.getenv('IV_LADDER_STRIDE', '1'))
-# NEAR_STRIKES — only strikes bracketing spot. Far from spot a rung sits at
-# P ~ 0 or 1, outside implied_sigma's 0.01-0.99 band, so it is discarded after
-# being paid for. Spot comes from the Coinbase bars we already hold, so the
-# selection costs no requests.
+# Only strikes near spot. A far rung sits outside implied_sigma's 0.01-0.99
+# band and is discarded. Spot comes from local Coinbase bars.
 NEAR_STRIKES = int(os.getenv('IV_NEAR_STRIKES', '24'))
-# Latency, not rate, was the binding constraint: see fetch_rungs.
+# Latency, not rate, binds: see fetch_rungs.
 WORKERS = int(os.getenv('IV_WORKERS', '12'))
-# How often to invert, inside the window already fetched. Density here is
-# FREE: every strike's tick series is in memory for the whole window, so an
-# extra instant costs no request. It was 15 against a 20-minute window, which
-# asked exactly two questions a ladder -- measured, `minutes_to_close` took
-# exactly two values across the first 89 fits. It is also the grid the feature
-# wants: the trader decides at offsets 3, 6, 9 and 12 of a fifteen-minute
-# window, so sigma is needed at several minutes-to-close, not one.
+# How often to invert inside the fetched window. Extra instants cost no
+# request, and sigma is needed at several minutes-to-close.
 SAMPLE_MINUTES = int(os.getenv('IV_SAMPLE_MINUTES', '5'))
-# `limit=100` is the markets endpoint's ceiling — 200 comes back empty, the
-# same behaviour the Polymarket markets endpoint has.
+# The markets endpoint's ceiling. A larger limit returns zero rows.
 MARKETS_PAGE = 100
 
 
@@ -117,11 +62,9 @@ def log(*parts):
 
 
 def sample_instants(opened: dt.datetime, closes: dt.datetime, minutes: int = 15):
-    """Where to evaluate sigma: the quarter-hour grid inside the ladder's life.
+    """The quarter-hour grid inside the ladder's life, excluding the close.
 
-    The same grid the 15-minute up/down windows decide on, so the feature lines
-    up with the rows that consume it. The close itself is excluded: with no
-    time remaining sigma is a division by sqrt(0).
+    At the close no time remains, so sigma is undefined.
     """
     step = dt.timedelta(minutes=minutes)
     out, when = [], opened
@@ -134,12 +77,8 @@ def sample_instants(opened: dt.datetime, closes: dt.datetime, minutes: int = 15)
 def cross_section(series: dict, at_ms: int):
     """[(strike, P_above)] as the ladder stood at `at_ms`, sorted by strike.
 
-    The last tick AT OR BEFORE the instant, never the nearest: a book is a step
-    function, and letting a later tick inform an earlier instant is lookahead —
-    exactly the leak this project treats as its worst failure mode.
-
-    A one-sided quote is dropped rather than half-invented. The inversion needs
-    P(above), and a single side does not give one.
+    Point-in-time: uses the last tick at or before the instant, never a later
+    one. Drops a one-sided quote, which gives no P(above).
     """
     rungs = []
     for strike, snaps in series.items():
@@ -176,11 +115,7 @@ def pack_series(snapshots):
 def near_the_money(strikes: list, spot) -> list:
     """The NEAR_STRIKES rungs closest to spot, or all of them if spot is unknown.
 
-    Rungs far from spot price at ~0 or ~1 and are dropped by the inversion's
-    probability band, so fetching them is a request spent on a rung that is
-    discarded. When spot is unknown the selection is skipped rather than
-    guessed — paying for extra strikes is better than silently fitting sigma to
-    an arbitrary subset.
+    With spot unknown, keeps every strike rather than an arbitrary subset.
     """
     if spot is None or len(strikes) <= NEAR_STRIKES:
         return strikes
@@ -262,9 +197,7 @@ def ladders(api: Predexon, series: str) -> dict:
 def strikes_of(api: Predexon, event_ticker: str) -> list:
     """Every strike market in one ladder, asked for by event.
 
-    Asked directly rather than filtered out of a series walk: paging the series
-    returns the ladders spread across pages, which made a full 80-strike ladder
-    look like it held one strike.
+    Queried by event, because a series walk spreads one ladder across pages.
     """
     payload, ok = api.get('/kalshi/markets',
                           {'event_ticker': event_ticker, 'limit': MARKETS_PAGE})
@@ -303,22 +236,12 @@ def select_ladders(every, done, stride: int, max_ladders: int = 0, *,
                    since=None, until=None) -> list:
     """Which ladders this run should walk, from the full sorted population.
 
-    Order matters and got it wrong once. The stride must be applied to EVERY
-    ladder before the finished ones are removed: a stride is a statement about
-    which population is being sampled, so applying it to the survivors
-    re-samples on every resume. Measured, that turned "2,480 to do" into
-    "2,179 to do" after 602 were finished -- 301 more than remained, because
-    the second pass pulled in ladders the first had deliberately skipped. The
-    data collected that way is fine; what breaks is that the sampling grid is
-    no longer the every-Nth-hour grid it claims to be, and the scope changes
-    each time the process restarts.
+    Order matters. The stride applies to every ladder before finished ones are
+    removed, so a resume keeps the same grid. `since`/`until` filter by close
+    time after the stride. The cap applies last.
 
-    The cap comes last for the same reason: applied first it would collapse the
-    stride onto the earliest ladders instead of spreading it across the range.
-
-    `every` as {ticker: (open, close)} orders by close time. Ticker text sorts
-    by month NAME (26APR before 26AUG), so it is not a time order. `since` and
-    `until` restrict by close time after the stride, so the grid stays the same.
+    `every` as {ticker: (open, close)} orders by close time; ticker text sorts
+    by month name, which is not time order.
     """
     if isinstance(every, dict):
         target = sorted(every, key=lambda e: (every[e][1], e))
@@ -338,11 +261,8 @@ def select_ladders(every, done, stride: int, max_ladders: int = 0, *,
 def windows_for(opened, closes):
     """(fetch_from, instants) for one ladder.
 
-    Two separate ranges, and conflating them was the bug: what gets FETCHED
-    must begin earlier than what gets SAMPLED, or the first instant has no
-    tick at or before it and yields nothing. Both are clamped to the ladder's
-    own open, because no book exists before it and asking anyway spends
-    requests to collect zeros.
+    The fetch starts LEAD_MINUTES before the first instant, so that instant
+    has a tick behind it. Both are clamped to the ladder's open.
     """
     first = closes - dt.timedelta(minutes=TAIL_MINUTES)
     last = closes - dt.timedelta(minutes=NEAREST_MINUTES)
@@ -361,18 +281,9 @@ def fetch_rungs(api: Predexon, strikes, lo_ms: int, hi_ms: int, *,
                 workers: int = 1) -> dict:
     """One ladder's strikes to packed tick series, fetched concurrently.
 
-    **Why concurrency and not a higher rate.** The first live run measured
-    1,050 requests in ~6 minutes — 2.8 req/s against a budget of 8. Each
-    strike's book was fetched, awaited, and only then the next one asked for,
-    so the run was bound by round-trip latency and the rate limiter never
-    became the constraint. Raising the nominal rate does nothing to a job
-    that is waiting on the network; issuing the requests in parallel behind
-    the SAME shared limiter does. That is the identical finding as the window
-    collector, which went from 26h to 13.3h on the same change, and at 14,868
-    ladders the serial version is a 59-hour job.
-
-    Ordering must not reach the data: a strike with no book is omitted, never
-    stored blank, so the result is the same dict at any worker count.
+    Concurrent behind the shared limiter, because round-trip latency binds,
+    not the rate. A strike with no book is omitted, so the result is the same
+    at any worker count.
     """
     out: dict = {}
     if workers <= 1:
@@ -418,8 +329,7 @@ def run(api: Predexon, *, only_series=None, max_ladders: int = 0,
             log(f'  {series}: {len(found):,} ladders in range, {len(todo):,} to do')
             for n, ev in enumerate(todo, 1):
                 opened, closes = found[ev]
-                # Fetch earlier than the first instant; sample the band where
-                # rungs actually exist. See windows_for.
+                # See windows_for.
                 window_from, instants = windows_for(opened, closes)
                 spot = spot_at(bars, symbol, closes)
                 rungs_by_strike = fetch_rungs(
@@ -502,9 +412,8 @@ def main() -> int:
     if not key:
         print('PREDEXON_API_KEY is not set.')
         return 1
-    # Its OWN lock, not the collector's: this shares the Predexon rate bucket
-    # with the book collection, so the two rates must be chosen to sum under
-    # the plan's limit — but they are separate jobs and either may run alone.
+    # Its own lock: a separate job from the book collection. The two share
+    # the Predexon bucket, so their rates must sum under the plan's limit.
     with SingleWriterLock(str(LOCK)):
         log(f'implied vol backfill at {args.rps:g} req/s')
         api = Predexon(key, RateLimiter(args.rps))
