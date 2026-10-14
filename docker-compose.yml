@@ -148,6 +148,20 @@ services:
       # lives inside backend/trader precisely so the build context includes it.
       - FEE_CONFIG=${FEE_CONFIG:-}
 
+      # Raw-tier retention (`core/spool.py`), applied on each hourly
+      # compaction. Book frames and Coinbase trades are the big ones (~0.4-1.1
+      # GB/day for the book); the per-second index proxy is tiny and kept a year.
+      - RAW_RETENTION_DAYS=${RAW_RETENTION_DAYS:-60}
+      - INDEX_PROXY_RETENTION_DAYS=${INDEX_PROXY_RETENTION_DAYS:-365}
+      # Free-disk guard on the store volume: below max(fraction x volume, GB)
+      # the oldest raw partitions are deleted (book frames first, the index
+      # proxy last, never the newest day), logged at ERROR.
+      - DISK_GUARD_MIN_FREE_FRACTION=${DISK_GUARD_MIN_FREE_FRACTION:-0.15}
+      - DISK_GUARD_MIN_FREE_GB=${DISK_GUARD_MIN_FREE_GB:-20}
+      # Venues the `index` component (scripts/record_index.py) connects to.
+      # Disable the component entirely with `--disable index`.
+      - INDEX_PROXY_EXCHANGES=${INDEX_PROXY_EXCHANGES:-coinbase,kraken,bitstamp,gemini}
+
       # Optional: HTTP proxy for exchange API calls
       # - HTTPS_PROXY=http://your-proxy:8080
     depends_on:

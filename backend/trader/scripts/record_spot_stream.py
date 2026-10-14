@@ -25,7 +25,13 @@ counts per connection or per channel is not something the documentation
 settles, so a gap is declared only when the number jumps BOTH across the
 connection and within the channel — which is the correct test under either.
 
-Never gated: it writes nothing to the store, and a reader that pauses goes stale.
+**Every trade is also archived** to the research store's `spot_trades`
+(through `core.spool`, like the Kalshi frames), so the tape the live bars were
+built from can be replayed. The spool is a `SafeSpool`: a full disk costs rows,
+never the tape.
+
+Never gated: a reader that pauses goes stale. Only the spool flush looks at the
+gate, and it defers rather than waits.
 """
 from __future__ import annotations
 
@@ -40,7 +46,8 @@ import aiohttp
 
 from core import heartbeat
 from core.config import DEFAULT_CONFIG
-from core.trade_bars import TradeTape
+from core.spool import DEFAULT_SPOOL_ROOT, SafeSpool, table_spool
+from core.trade_bars import TradeTape, parse_time
 
 logger = logging.getLogger('spot-stream')
 
@@ -79,8 +86,35 @@ class SequenceTracker:
         return across and within
 
 
+def trade_record(trade: dict, *, received: float, sequence_num) -> Optional[dict]:
+    """One `spot_trades` spool line; None for a trade without an id or a time."""
+    product = str(trade.get('product_id') or '')
+    trade_id = trade.get('trade_id')
+    if not product or trade_id in (None, ''):
+        return None
+    try:
+        printed = parse_time(trade.get('time'))
+    except (TypeError, ValueError):
+        return None
+
+    def number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    try:
+        seq = int(sequence_num) if sequence_num is not None else None
+    except (TypeError, ValueError):
+        seq = None
+    return {'t': received, 'venue': 'coinbase', 'symbol': product,
+            'product_id': product, 'trade_id': str(trade_id), 'time': printed,
+            'price': number(trade.get('price')), 'size': number(trade.get('size')),
+            'side': trade.get('side'), 'sequence_num': seq}
+
+
 def handle(payload: dict, tape: TradeTape, seqs: SequenceTracker, *,
-           received: float, last_received: Optional[float]) -> Optional[str]:
+           received: float, last_received: Optional[float],
+           spool=None) -> Optional[str]:
     """Fold one message. Returns a reason when the connection must be rebuilt."""
     if not isinstance(payload, dict):
         return None
@@ -107,15 +141,27 @@ def handle(payload: dict, tape: TradeTape, seqs: SequenceTracker, *,
             tape.add(str(trade.get('product_id') or ''), trade.get('trade_id'),
                      trade.get('price'), trade.get('size'), trade.get('time'),
                      received=received, snapshot=snapshot)
+            # Snapshot trades too: a reconnect replays recent prints, and the
+            # store's (product_id, trade_id) key collapses the repeats.
+            if spool is not None:
+                try:
+                    record = trade_record(
+                        trade, received=received,
+                        sequence_num=payload.get('sequence_num'))
+                    if record is not None:
+                        spool.append(record)
+                except Exception as exc:                  # noqa: BLE001
+                    # Archiving must never cost the tape a trade.
+                    logger.debug('trade not archived: %s', exc)
     return None
 
 
 async def consume(ws, tape: TradeTape, *, idle_timeout: float,
-                  now=time.time) -> str:
+                  now=time.time, spool=None, gate=None) -> str:
     """Read until the connection needs rebuilding; every exit is on a timeout."""
     seqs = SequenceTracker()
     last: Optional[float] = None
-    next_beat = 0.0
+    next_beat = next_flush = 0.0
     try:
         while True:
             try:
@@ -135,13 +181,18 @@ async def consume(ws, tape: TradeTape, *, idle_timeout: float,
             except (TypeError, ValueError):
                 continue
             reason = handle(payload, tape, seqs, received=received,
-                            last_received=last)
+                            last_received=last, spool=spool)
             last = received
             if reason:
                 return reason
             if received >= next_beat:
                 heartbeat.touch('spot_stream')
                 next_beat = received + 5.0
+            # Deferred while a decision is in flight, never awaited.
+            if (spool is not None and received >= next_flush
+                    and (gate is None or gate.is_idle)):
+                spool.flush()
+                next_flush = received + 5.0
     finally:
         # The last instant we KNOW we were receiving, not the moment we noticed.
         tape.disconnected(at=last if last is not None else now())
@@ -151,6 +202,21 @@ async def run(args, gate=None, tape: Optional[TradeTape] = None) -> int:
     tape = TAPE if tape is None else tape
     products = list(args.products)
     backoff = args.backoff_start
+    spool = None
+    if getattr(args, 'archive', True):
+        spool = SafeSpool(
+            lambda: table_spool(args.spool_root, 'spot_trades', 'coinbase'),
+            name='spot_trades spool')
+    try:
+        await _run(args, tape, products, backoff, spool, gate)
+    finally:
+        if spool is not None:
+            spool.flush()
+            spool.close()
+    return 0
+
+
+async def _run(args, tape: TradeTape, products, backoff, spool, gate) -> None:
     async with aiohttp.ClientSession(
             headers={'User-Agent': 'quarter-spot-stream/1.0'}) as session:
         while True:
@@ -164,7 +230,8 @@ async def run(args, gate=None, tape: Optional[TradeTape] = None) -> int:
                                             'channel': channel})
                     logger.info('streaming trades for %s', ', '.join(products))
                     reason = await consume(ws, tape,
-                                           idle_timeout=args.idle_timeout)
+                                           idle_timeout=args.idle_timeout,
+                                           spool=spool, gate=gate)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:                          # noqa: BLE001
@@ -188,6 +255,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--idle-timeout', type=float, default=10.0)
     parser.add_argument('--backoff-start', type=float, default=1.0)
     parser.add_argument('--backoff-max', type=float, default=30.0)
+    parser.add_argument('--spool-root', default=str(DEFAULT_SPOOL_ROOT))
+    # Archiving is on by default; off keeps the tape in memory only, as before.
+    parser.add_argument('--no-archive', dest='archive', action='store_false')
     return parser
 
 

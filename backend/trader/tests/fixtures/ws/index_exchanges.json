@@ -1,0 +1,45 @@
+{
+  "_source": "Hand-written in the shapes of each venue's public market-data WebSocket, NOT live captures. Kraken: the v2 field set from krakenfx/kraken-cli crates/kraken-core (ticker/book/trade structs and their round-trip tests, which cite docs.kraken.com/api/docs/websocket-v2). Coinbase: coinbase/coinbase-advanced-py websocket types (L2Update: side/event_time/price_level/new_quantity on channel l2_data; side names bid/offer per ccxt). Bitstamp and Gemini: no official SDK reachable; shapes from ccxt.pro's bitstamp.py and gemini.py example payloads, which cite bitstamp.net/websocket/v2 and docs.gemini.com.",
+  "coinbase": [
+    {"channel": "subscriptions", "client_id": "", "timestamp": "2026-10-14T12:30:00.000000Z", "sequence_num": 0,
+     "events": [{"subscriptions": {"level2": ["BTC-USD"], "heartbeats": ["BTC-USD"]}}]},
+    {"channel": "l2_data", "client_id": "", "timestamp": "2026-10-14T12:30:00.100000Z", "sequence_num": 1,
+     "events": [{"type": "snapshot", "product_id": "BTC-USD", "updates": [
+       {"side": "bid", "event_time": "1970-01-01T00:00:00Z", "price_level": "62000.00", "new_quantity": "0.5"},
+       {"side": "bid", "event_time": "1970-01-01T00:00:00Z", "price_level": "61999.50", "new_quantity": "1.2"},
+       {"side": "offer", "event_time": "1970-01-01T00:00:00Z", "price_level": "62001.00", "new_quantity": "0.3"},
+       {"side": "offer", "event_time": "1970-01-01T00:00:00Z", "price_level": "62002.00", "new_quantity": "2.0"}]}]},
+    {"channel": "l2_data", "client_id": "", "timestamp": "2026-10-14T12:30:00.200000Z", "sequence_num": 2,
+     "events": [{"type": "update", "product_id": "BTC-USD", "updates": [
+       {"side": "bid", "event_time": "2026-10-14T12:30:00.190000Z", "price_level": "62000.00", "new_quantity": "0"},
+       {"side": "offer", "event_time": "2026-10-14T12:30:00.190000Z", "price_level": "62000.80", "new_quantity": "0.1"}]}]},
+    {"channel": "market_trades", "client_id": "", "timestamp": "2026-10-14T12:30:00.300000Z", "sequence_num": 3,
+     "events": [{"type": "update", "trades": [
+       {"trade_id": "9001", "product_id": "BTC-USD", "price": "62000.80", "size": "0.01", "side": "BUY", "time": "2026-10-14T12:30:00.290000Z"}]}]},
+    {"channel": "heartbeats", "client_id": "", "timestamp": "2026-10-14T12:30:01.000000Z", "sequence_num": 4,
+     "events": [{"current_time": "2026-10-14 12:30:01.000 +0000 UTC", "heartbeat_counter": 7}]}
+  ],
+  "kraken": [
+    {"channel": "status", "type": "update", "data": [{"version": "2.0.10", "system": "online", "api_version": "v2", "connection_id": 1, "status": "online"}]},
+    {"method": "subscribe", "result": {"channel": "ticker", "event_trigger": "bbo", "snapshot": true, "symbol": "BTC/USD"}, "success": true, "time_in": "2026-10-14T12:30:00.000000Z", "time_out": "2026-10-14T12:30:00.000100Z"},
+    {"channel": "ticker", "type": "snapshot", "data": [{"symbol": "BTC/USD", "bid": 61999.9, "bid_qty": 0.5, "ask": 62000.1, "ask_qty": 0.93, "last": 62000.0, "volume": 1691.3, "vwap": 62538.9, "low": 61700.0, "high": 63200.0, "change": 220.1, "change_pct": 0.35, "timestamp": "2026-10-14T12:30:00.100000Z"}]},
+    {"channel": "ticker", "type": "update", "data": [{"symbol": "BTC/USD", "bid": 62000.3, "bid_qty": 0.01, "ask": 62000.5, "ask_qty": 0.2, "last": 62000.0, "volume": 1691.4, "vwap": 62538.9, "low": 61700.0, "high": 63200.0, "change": 220.1, "change_pct": 0.35, "timestamp": "2026-10-14T12:30:00.200000Z"}]},
+    {"channel": "trade", "type": "update", "data": [{"symbol": "BTC/USD", "side": "buy", "price": 62000.5, "qty": 0.5, "ord_type": "market", "trade_id": 42, "timestamp": "2026-10-14T12:30:00.300000Z"}]},
+    {"channel": "heartbeat"}
+  ],
+  "bitstamp": [
+    {"event": "bts:subscription_succeeded", "channel": "order_book_btcusd", "data": {}},
+    {"event": "data", "channel": "order_book_btcusd", "data": {"timestamp": "1791981000", "microtimestamp": "1791981000100000",
+      "bids": [["61999.00", "0.40000000"], ["61998.00", "1.00000000"]],
+      "asks": [["62001.00", "0.25000000"], ["62003.00", "3.00000000"]]}},
+    {"event": "trade", "channel": "live_trades_btcusd", "data": {"id": 108637852, "amount": 0.01, "amount_str": "0.01000000", "price": 62001.0, "price_str": "62001", "type": 0, "timestamp": "1791981000", "microtimestamp": "1791981000200000", "buy_order_id": 1, "sell_order_id": 2}}
+  ],
+  "gemini": [
+    {"type": "l2_updates", "symbol": "BTCUSD", "changes": [["buy", "61998.00", "0.5"], ["buy", "61997.00", "1.0"], ["sell", "62002.00", "0.2"], ["sell", "62004.00", "0.7"]],
+     "trades": [{"type": "trade", "symbol": "BTCUSD", "event_id": 122258166738, "timestamp": 1791981000000, "price": "62000.00", "quantity": "0.001", "side": "buy"}],
+     "auction_events": []},
+    {"type": "l2_updates", "symbol": "BTCUSD", "changes": [["sell", "62002.00", "0"], ["buy", "61999.00", "0.3"]]},
+    {"type": "trade", "symbol": "BTCUSD", "event_id": 122258166739, "timestamp": 1791981000500, "price": "62003.00", "quantity": "0.002", "side": "sell"},
+    {"type": "heartbeat", "timestamp": 1791981001000}
+  ]
+}
