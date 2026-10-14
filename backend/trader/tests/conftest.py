@@ -25,6 +25,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _no_peer_state_between_tests():
+    """Peer refusal streaks and resubscribe requests are process state. A test
+    that scores three cycles without a peer book must not leave a request for
+    the next test's `record_pm_stream.consume` to act on."""
+    yield
+    features = sys.modules.get('livetrade.features')
+    if features is not None:
+        features.reset_peer_tracking()
+    stream = sys.modules.get('scripts.record_pm_stream')
+    if stream is not None:
+        stream._RESUBSCRIBE.clear()
+
+
 @pytest.fixture(scope='session')
 def repo_root() -> Path:
     """Where `configs/` lives.
