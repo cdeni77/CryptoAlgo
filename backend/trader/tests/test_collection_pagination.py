@@ -1,15 +1,7 @@
-"""Both venues paginate. Assuming one of them does not truncated 44% of it.
+"""Tests that both Kalshi and Polymarket fetchers follow pagination.
 
-`fetch_pm` was written as a single request because the August trial windows
-averaged 358 snapshots and never approached the 2,000-per-page cap. On busy
-months they do: 3,097 collected Polymarket windows had EXACTLY 2,000 snapshots
-and none had more, while Kalshi — which paginates — had one at exactly 2,000
-and thousands above it. That distribution is what a silent truncation looks
-like.
-
-Verified against the live endpoint: a January BTC window returns 2,000
-snapshots with `has_more: true` and a pagination_key, and the second page
-returns 2,000 more with `has_more` still true.
+Busy Polymarket windows exceed the 2,000-snapshot page size, so reading only the
+first page truncates them.
 """
 
 from __future__ import annotations
@@ -73,7 +65,7 @@ def test_polymarket_stops_when_the_venue_says_there_is_no_more():
 
 
 def test_polymarket_stops_on_an_empty_page_even_if_more_is_claimed():
-    """A venue that says has_more but returns nothing would loop forever."""
+    """An empty page stops the loop even if the venue claims `has_more`."""
     api = FakeApi([_page(2000, more=True), _page(0, more=True)])
     snaps, _ = fetch_pm(api, Item(), TOKENS)
     assert len(snaps) == 2000

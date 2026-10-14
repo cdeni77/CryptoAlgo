@@ -1,10 +1,7 @@
-"""`build_features` warned about columns the caller was about to attach.
+"""Tests that `build_features` does not warn about columns the caller will attach later.
 
-The live path builds features from bars first and fills the book groups
-afterwards from the in-process recorder caches — it cannot do otherwise, since
-`iv_minus_realised` needs the FITTED `sigma_per_min` and the book is read at the
-decision instant. So every cycle logged nine warnings about features that were
-populated a moment later, and a real gap looked exactly like the noise.
+The live path fills the book groups after building features from bars. Only
+columns nobody promised to attach are warned about.
 """
 from __future__ import annotations
 
@@ -30,7 +27,7 @@ def test_a_deferred_column_is_created_but_not_warned_about(caplog):
 
 
 def test_a_column_nobody_promised_to_attach_is_still_warned_about(caplog):
-    """Silencing everything would hide the real gap the warning exists for."""
+    """A column not listed as deferred is still warned about."""
     with caplog.at_level(logging.WARNING, logger='core.features'):
         reindex_to_features(_table(), ('spread', 'venue_prob_gap'),
                             deferred=('spread',))

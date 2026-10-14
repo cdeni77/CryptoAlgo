@@ -1,20 +1,8 @@
-"""Which offsets may open a position — measured, not assumed.
+"""Tests for `entry_offsets`, which limits the offsets that may open a position.
 
-Over 70 days and 19,339 symbol-windows, per-contract edge after the measured fee
-and a 0.5c half-spread, one entry per (symbol, window), 1pp gate:
-
-    earliest offset that clears (what ran)   0.040c   t=0.10
-    +9m or +12m                              1.206c   t=2.68
-    +12m only                                3.304c   t=5.98
-
-The live loop books one position per symbol-window and takes whichever offset the
-clock has passed, so the earliest one that clears wins and `already_entered`
-locks out the rest. In production 250 of 277 settled entries — 90% — landed at
-+3m, the weakest cell, and exactly one landed at +12m.
-
-`decision_offsets` stays (3, 6, 9, 12): every offset must keep being *scored*,
-because that is the sample `market_benchmark` and the retroactive forecast test
-read. What narrows is which offsets may *enter*.
+Every offset in `decision_offsets` is still scored, since that is the
+measurement sample. Only entry is restricted. Live defaults to +12m, the offset
+with the best measured per-contract edge.
 """
 
 from __future__ import annotations
@@ -37,14 +25,12 @@ def row(offset: int, **over):
 
 
 def test_every_offset_is_still_scored():
-    """Narrowing entries must not narrow the measurement sample."""
+    """Restricting entries does not restrict the scored offsets."""
     assert Config().decision_offsets == (3, 6, 9, 12)
 
 
 def test_the_research_default_trades_every_scored_offset():
-    """None, not (12,). `scripts.evaluate` has to be able to measure every cell,
-    so the narrowing is a deployment choice rather than a library default — see
-    `scripts.live --entry-offsets`."""
+    """The library default is None, so `scripts.evaluate` can measure every offset."""
     assert Config().entry_offsets is None
 
 
@@ -64,24 +50,21 @@ def test_the_permitted_offset_still_trades():
 
 
 def test_the_entry_set_must_be_a_subset_of_the_scored_offsets():
-    """An entry offset that is never scored can never fire — a silent no-trade."""
+    """An entry offset that is never scored is refused, since it could never fire."""
     with pytest.raises(ValueError, match='entry_offsets'):
         Config(decision_offsets=(3, 6), entry_offsets=(12,))
 
 
 def test_widening_the_entry_set_is_one_line():
-    """The conservative fallback from the same table: 1.206c against 3.304c."""
+    """The entry set can be widened, for example to (9, 12)."""
     config = Config(entry_offsets=(9, 12))
     assert decide(row(9), config, bankroll=100.0).reason is not Reason.OFFSET_NOT_TRADED
     assert decide(row(3), config, bankroll=100.0).reason is Reason.OFFSET_NOT_TRADED
 
 
 def test_the_live_script_defaults_to_entering_only_at_the_offset_that_pays():
-    """The narrowing lives at the deployment boundary, not in the library.
-
-    `scripts.evaluate` must keep measuring every offset; only the trading loop
-    restricts entries. Putting it on the CLI means `docker-compose.yml` shows the
-    policy the account is actually running.
+    """`scripts.live` defaults to entering only at +12m, so the deploy config shows the
+    policy.
     """
     from scripts.live import build_parser
 
@@ -97,7 +80,7 @@ def test_the_live_entry_offsets_can_be_widened_from_the_command_line():
 
 
 def test_the_live_config_carries_the_entry_offsets_it_was_given():
-    """The flag must reach `decide()`, not just the namespace."""
+    """The flag reaches the Config that `decide()` reads."""
     from scripts.live import build_parser, config_from_args
 
     config = config_from_args(build_parser().parse_args([]))
@@ -105,9 +88,7 @@ def test_the_live_config_carries_the_entry_offsets_it_was_given():
 
 
 def test_a_refused_row_with_a_book_is_labelled_as_quoted():
-    """`price_source` was only set on the trading path, so every refused row --
-    including the three scored-not-traded offsets -- read 'baseline' in the
-    predictions table even with a real two-sided book."""
+    """A refused row with a real book is labelled `price_source='quote'`."""
     config = Config(entry_offsets=(12,))
     quoted = decide(row(3, ask_up=0.90, ask_down=0.12), config, bankroll=100.0)
     assert quoted.reason is Reason.OFFSET_NOT_TRADED

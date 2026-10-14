@@ -1,10 +1,8 @@
-"""Synthetic `venue_depth` for the stacking and quote-filter tests.
+"""Synthetic `venue_depth` rows for the stacking and quote-filter tests.
 
-The "market" is the barrier probability from each row's own displacement at a
-fixed sigma, plus logit noise. It cannot see the other symbols, so when the bars
-carry a planted BTC lead (`make_bars(lead=...)`) a spot model reading
-`cross_asset` knows something the price does not — which is what stage 2's `b`
-exists to measure.
+The market price is the barrier probability at a fixed sigma plus logit noise. It
+cannot see other symbols, so a planted BTC lead gives a `cross_asset` model
+information the price does not have.
 """
 
 from __future__ import annotations

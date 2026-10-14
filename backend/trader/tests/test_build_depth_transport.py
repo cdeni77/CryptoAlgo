@@ -1,10 +1,8 @@
-"""venue_ladder now holds two observers per minute; venue_depth must keep both.
+"""Tests that `venue_depth` keeps both ladder transports for the same minute.
 
-Without this, both transports stamp `source='live'`, the two rows collide on
-venue_depth's event key, and `read` keeps whichever carried the later
-`available_time`. venue_depth would silently become a mix of the two transports,
-varying row by row — and the comparison that gates the migration would be
-comparing a table against itself.
+REST and stream rows get different `source` values. Otherwise they collide on
+the event key and `read` keeps only one, so the transport comparison would
+compare a table against itself.
 """
 from __future__ import annotations
 
@@ -61,9 +59,8 @@ def test_both_transports_survive_a_venue_depth_read(tmp_path):
 
 
 def test_the_trading_loops_own_touch_names_its_observer():
-    """`_record_touch` left `source` unset, so every row it wrote sat under a
-    NULL observer — invisible to `_validate_depth`, which compares by source,
-    and now ambiguous against the two the ladder recorder writes."""
+    """`_record_touch` writes `source='live_touch'`, so its rows have a named observer.
+    """
     import inspect
 
     from livetrade import quotes
@@ -72,7 +69,9 @@ def test_the_trading_loops_own_touch_names_its_observer():
 
 
 def test_the_three_observers_are_distinct(tmp_path):
-    """live (REST poll), live_ws (stream), live_touch (the trading loop)."""
+    """live (REST poll), live_ws (stream) and live_touch (trading loop) are distinct
+    sources.
+    """
     from core.datastore import event_key
     assert 'source' in event_key('venue_depth')
     names = {'live', 'live_ws', 'live_touch'}

@@ -1,14 +1,7 @@
-"""Rate limiting, the circuit breaker, and the single-writer lock.
+"""Tests for the collection rate limiter, circuit breaker and single-writer lock.
 
-Each of these exists because of a specific way the previous night's collection
-went wrong:
-
-  * Concurrent probes and a backfill competed for Predexon's ORG-WIDE 1 req/s
-    bucket. The resulting 429s were counted as "no book", which is one of the
-    four reasons the coverage numbers were wrong. Hence one process, enforced.
-  * Nothing stopped a run from converting thousands of pending rows into
-    errors at full speed during an outage, which would destroy the ability to
-    tell "the venue was down" from "these windows are broken".
+Predexon's rate limit is org-wide, so only one process may collect. The breaker
+pauses a run during an outage, so an outage does not turn pending windows into errors.
 """
 
 from __future__ import annotations
@@ -24,7 +17,7 @@ from research.collect.orchestrator import Breaker, RateLimiter, SingleWriterLock
 # -- rate limiter ------------------------------------------------------------
 
 def test_the_limiter_spaces_requests_by_the_configured_interval():
-    limiter = RateLimiter(per_second=20.0)          # 50ms apart
+    limiter = RateLimiter(per_second=20.0)  # 50ms apart
     started = time.monotonic()
     for _ in range(3):
         limiter.wait()
@@ -49,11 +42,10 @@ def test_a_healthy_run_never_trips():
 
 
 def test_empty_results_do_not_trip_the_breaker():
-    """`empty` is an ANSWER, not a failure. The measured empty rate is ~17%
-    on Kalshi and would trip a naive breaker within a single month."""
+    """`empty` is an answer, not a failure, so it never trips the breaker."""
     breaker = Breaker(threshold=0.25, window=40)
     for _ in range(100):
-        breaker.record(ok=True)                     # empty is recorded as ok
+        breaker.record(ok=True)  # empty is recorded as ok
     assert not breaker.tripped
 
 
@@ -65,8 +57,7 @@ def test_a_sustained_outage_trips_the_breaker():
 
 
 def test_a_short_burst_of_errors_does_not_trip_it():
-    """A handful of 429s in an otherwise healthy run is normal; pausing the
-    whole job for them would make a 47-hour run impossible to finish."""
+    """A short burst of errors in a healthy run does not trip the breaker."""
     breaker = Breaker(threshold=0.25, window=40)
     for _ in range(40):
         breaker.record(ok=True)
@@ -76,8 +67,8 @@ def test_a_short_burst_of_errors_does_not_trip_it():
 
 
 def test_the_breaker_only_considers_the_trailing_window():
-    """Errors from an outage two hours ago must not keep the breaker tripped
-    once the venue has recovered."""
+    """Only the trailing window counts, so the breaker resets after the venue recovers.
+    """
     breaker = Breaker(threshold=0.25, window=20)
     for _ in range(20):
         breaker.record(ok=False)
@@ -88,7 +79,7 @@ def test_the_breaker_only_considers_the_trailing_window():
 
 
 def test_the_breaker_needs_a_full_window_before_it_can_trip():
-    """Otherwise the first two requests failing ends the run."""
+    """The breaker needs a full window of results before it can trip."""
     breaker = Breaker(threshold=0.25, window=40)
     breaker.record(ok=False)
     breaker.record(ok=False)
@@ -110,26 +101,22 @@ def test_the_lock_is_released_on_exit(tmp_path):
     with SingleWriterLock(path):
         pass
     with SingleWriterLock(path):
-        pass                                        # must not raise
+        pass  # must not raise
 
 
 def test_a_stale_lock_from_a_dead_process_does_not_block_forever(tmp_path):
-    """A kill -9 leaves the file behind. Resume must not require a human to
-    delete it, or the overnight run stops at the first crash."""
+    """A lock file left by a dead process does not block a new run."""
     path = str(tmp_path / 'collect.lock')
     with open(path, 'w') as handle:
-        handle.write('999999999')                   # a pid that cannot exist
+        handle.write('999999999')  # a pid that cannot exist
     with SingleWriterLock(path):
-        pass                                        # must not raise
+        pass  # must not raise
 
 
 def test_the_limiter_is_safe_to_share_between_threads():
-    """Fetches are transfer-bound: a 5.4s window issues ONE request, which is
-    0.19 req/s against a 1 req/s budget. Running several concurrently hides
-    that latency and still respects the limit — but only if the limiter itself
-    cannot hand two threads the same slot."""
+    """The limiter never gives two threads the same slot."""
     import threading
-    limiter = RateLimiter(per_second=25.0)          # 40ms apart
+    limiter = RateLimiter(per_second=25.0)  # 40ms apart
     stamps, lock = [], threading.Lock()
 
     def worker():
@@ -147,6 +134,6 @@ def test_the_limiter_is_safe_to_share_between_threads():
     stamps.sort()
     gaps = [b - a for a, b in zip(stamps, stamps[1:])]
     assert len(stamps) == 16
-    # The reserved slots, not the wake-up times: a loaded machine can wake two
-    # threads together even when their slots are 40ms apart.
+    # Checks the reserved slots, not wake-up times: a loaded machine can wake two
+    # threads together.
     assert min(gaps) >= 0.040 - 1e-9, f'limiter double-granted a slot: {min(gaps):.4f}s'

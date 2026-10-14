@@ -1,8 +1,6 @@
-"""The daily-loss breaker can be widened, and only by saying so explicitly.
+"""Tests for `--max-daily-loss-fraction`, which widens the daily-loss breaker explicitly.
 
-A flag rather than an edit to the dataclass default, so what the loop is running
-with shows up in the deploy config and in `ps`, and reverting is deleting a line
-rather than remembering to change a number back.
+A flag, not a changed default, so the running value shows in the deploy config.
 """
 from __future__ import annotations
 
@@ -30,7 +28,7 @@ def test_a_value_at_or_above_one_leaves_only_the_ruin_floor():
 
 
 def test_the_value_is_not_silently_clamped():
-    """A clamp would run the loop with a limit nobody asked for."""
+    """The value is not clamped."""
     assert _config(['--max-daily-loss-fraction', '3.0']).max_daily_loss_fraction == 3.0
 
 

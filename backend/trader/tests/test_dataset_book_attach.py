@@ -1,15 +1,8 @@
-"""Attaching observed book data to the window panel, and where the ratio lives.
+"""Tests for attaching observed book data to the window panel.
 
-Quotes and ladder fits are OBSERVED, not fitted, so they attach when the panel
-is built — unlike the volatility model, the seasonality factor and the
-baseline's scale/tail, all three of which must be fitted inside the fold.
-
-But `iv_minus_realised` divides the market's implied sigma by the baseline's
-`sigma_per_min`, and that denominator IS fitted. So the observed columns attach
-at build time and the ratio is computed in `build_features`, where the fitted
-sigma exists. Computing it at build time would use a sigma fitted on the whole
-sample — a leak that makes the baseline stronger and the model look weaker,
-which is the direction nobody audits.
+Quotes and ladder fits are observed, so they attach when the panel is built.
+`iv_minus_realised` divides by the fitted `sigma_per_min`, so it is computed per
+fold. Computing it at build time would use a sigma fitted on the whole sample.
 """
 
 from __future__ import annotations
@@ -33,7 +26,7 @@ def _panel():
 
 
 def test_the_observed_columns_survive_both_attachments():
-    """Order must not matter: each attach adds columns and touches no others."""
+    """Each attach adds its own columns and touches no others."""
     depth = pd.DataFrame([{
         'venue': 'kalshi', 'symbol': 'BTC-USD',
         'window_open': pd.Timestamp('2026-07-01T12:00Z'),
@@ -51,8 +44,7 @@ def test_the_observed_columns_survive_both_attachments():
 
 
 def test_the_ratio_is_not_computed_before_a_fitted_sigma_exists():
-    """`sigma_per_min` is absent on a freshly built panel — it is attached per
-    fold. The ratio must be NaN then, not silently computed against nothing."""
+    """The ratio is NaN until a fold supplies `sigma_per_min`."""
     fits = pd.DataFrame({
         'symbol': ['BTC-USD'],
         'event_time': pd.to_datetime(['2026-07-01T11:50Z']),
@@ -60,7 +52,7 @@ def test_the_ratio_is_not_computed_before_a_fitted_sigma_exists():
     table = attach_implied_vol(_panel(), fits)
     assert 'sigma_per_min' not in _panel().columns
     assert table['iv_minus_realised'].isna().all()
-    # ...but the OBSERVED part is present and usable
+    # The observed column is still present.
     assert table['implied_sigma_per_min'].iloc[0] == pytest.approx(0.0006)
 
 

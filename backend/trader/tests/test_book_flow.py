@@ -1,23 +1,7 @@
-"""Book DYNAMICS: how the ladder is changing, not how it stands.
+"""Tests for `book_flow`: how the book changes over the window, not its state at one
+instant.
 
-`market_state` reads the book as a snapshot at the decision instant — spread,
-imbalance, depth ratios. Nothing reads the direction it is moving, and
-`venue_depth` carries a row at every minute 0..15 (16,345 of 18,321 windows have
-ten or more), so the history is there and unused.
-
-This is the one mechanism the archive left open rather than rejected:
-
-    "Book imbalance: still fails, but it moved. Daily corr went +0.0074
-     (t=+0.30) to +0.0253 (t=+1.84) over 67 days as the sample grew. Does not
-     clear the bar the trade tape failed at, but unlike the tape it is positive
-     and strengthening. Re-test when the backfill completes."
-
-The trade tape IS rejected — sixteen cells, not one significant, largest
-t=-1.90 on 1,800 windows — and nothing here touches it.
-
-**The lookahead guard is the whole risk.** A decision at +12m may read minutes
-0..12 and nothing after. A one-minute leak in a fifteen-minute window is 7% of
-the question and reads exactly like skill.
+The main risk is lookahead. A decision at +12m may read minutes 0..12 and nothing after.
 """
 from __future__ import annotations
 
@@ -47,8 +31,7 @@ def _windows(offset=12):
 
 
 def test_a_decision_never_reads_a_minute_after_itself():
-    """The invariant. Minutes 13 and 14 carry a wild imbalance swing; a decision
-    at +12m must be identical with and without them."""
+    """A decision at +12m is unchanged when minutes 13 and 14 are added."""
     early = _depth(list(range(13)), [100] * 13, [100] * 13)
     late = pd.concat([early, _depth([13, 14], [1, 1], [9999, 9999])],
                      ignore_index=True)
@@ -60,7 +43,7 @@ def test_a_decision_never_reads_a_minute_after_itself():
 
 
 def test_imbalance_change_reads_the_direction_the_book_moved():
-    """Bid size doubling while the ask holds is buying pressure building."""
+    """Bid size rising while the ask holds gives a positive imbalance change."""
     off = list(range(13))
     bids = [100] * 9 + [150, 200, 250, 300]
     row = book_flow_features(_windows(12), _depth(off, bids, [100] * 13)).iloc[0]
@@ -75,15 +58,15 @@ def test_a_draining_book_reads_negative_depth_trend():
 
 
 def test_a_window_with_no_history_is_nan_not_zero():
-    """Zero would say 'the book did not move', which is a claim. Absent is
-    absent — the model was fitted with these missing on some rows."""
+    """A window with no history gives NaN, not zero, since zero claims the book did not
+    move.
+    """
     row = book_flow_features(_windows(12), _depth([12], [100], [100])).iloc[0]
     assert np.isnan(row['imbalance_change_3'])
 
 
 def test_the_other_venue_is_not_mixed_in():
-    """A Polymarket ladder in a Kalshi flow feature is the `no_levels`
-    denomination trap wearing a different name."""
+    """Polymarket rows never enter a Kalshi flow feature."""
     k = _depth(list(range(13)), [100] * 13, [100] * 13)
     pm = _depth(list(range(13)), [9999] * 13, [1] * 13)
     pm['venue'] = 'polymarket'

@@ -1,20 +1,9 @@
-"""The balance-drift alarm must not fire on the payouts we just booked.
+"""Tests that the balance-drift alarm ignores payouts we booked before the venue posts
+them.
 
-`venue_balance` is sampled at the TOP of the cycle by `reconcile_with_venue`.
-`settle_due` then credits our side, and the venue posts the same settlement a
-cycle later — so every winning window produced a matched pair of warnings:
-
-    15:15:07  ours $527.98, venue $511.98  (-16.00)   <- we credited
-    15:16:09  ours $511.98, venue $527.98  (+16.00)   <- venue caught up
-
-against ETH +$8 and SOL +$8 settling at 19:15 UTC. `adopt_venue_balance`'s own
-docstring records this cry-wolf pattern being fixed once before in the other
-direction; moving the call site corrected the sign and not the sample.
-
-The cost is not money — entries fire at +12m, three minutes from any settlement
-— it is the alarm's credibility. This is the designated detector for an
-unrecorded fill, a partial, or a mispriced fee, and a real one was hiding inside
-a stream of benign pairs.
+`venue_balance` is sampled at the top of the cycle and `settle_due` credits our
+side afterwards, so the venue lags by one cycle. That lag is not drift. A real
+drift (unrecorded fill, partial, mispriced fee) must still warn.
 """
 
 from __future__ import annotations
@@ -32,9 +21,9 @@ class _Account:
 
 
 class _Writer:
-    """Only what `adopt_venue_balance` actually touches. `account` is a METHOD
-    on the real PgWriter, not an attribute — getting that wrong made every test
-    here fail with "'_Account' object is not callable"."""
+    """Fake writer with only what `adopt_venue_balance` uses. `account` is a method, as on
+    PgWriter.
+    """
 
     def __init__(self, bankroll):
         self._account = _Account(bankroll)
@@ -70,14 +59,14 @@ def test_a_drift_equal_to_what_we_just_credited_is_not_a_warning(caplog):
 
 def test_an_unexplained_drift_still_warns(caplog):
     caplog.set_level(logging.INFO, logger='live')
-    # Nothing settled, and the venue disagrees by $16. THAT is the alarm.
+    # Nothing settled, and the venue disagrees by $16. That must warn.
     adopt_venue_balance(_Writer(527.98), 511.98, credited_this_cycle=0.0)
     assert any(lvl >= logging.WARNING for lvl, _ in _levels(caplog)), (
         'an unrecorded fill, a partial or a mispriced fee must still fire')
 
 
 def test_a_drift_larger_than_the_credit_still_warns(caplog):
-    """The dangerous case: a real discrepancy hiding behind a settlement."""
+    """A real discrepancy larger than the pending credit still warns."""
     caplog.set_level(logging.INFO, logger='live')
     adopt_venue_balance(_Writer(527.98), 501.98, credited_this_cycle=16.0)
     assert any(lvl >= logging.WARNING for lvl, _ in _levels(caplog))

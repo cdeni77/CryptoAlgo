@@ -1,21 +1,9 @@
-"""Features computed from the venue's own order book.
+"""Tests for features computed from the venue order book.
 
-Everything here answers one question: **in what way is `F(x/sigma)` wrong?**
-A column that cannot answer it does not get built, which is the rule that kept
-the previous incarnation of this project from a 27-cell grid whose best cell was
-its own control.
-
-Three properties run through all of them:
-
-  * **Cents, not dollars.** Both venues store integer cents in these fields
-    (measured: Kalshi best_bid median 55, Polymarket 47). A probability is
-    therefore price/100, and getting that wrong scales every edge by 100.
-  * **A missing side is NaN, never zero.** A one-sided book has no mid, and
-    inventing one fabricates a probability. This is the same rule `_price` in
-    the live client already follows for quotes.
-  * **No lookahead.** A feature at offset m may only see snapshots at or before
-    that decision instant — a book is a step function, so the state at T is the
-    last tick AT OR BEFORE T, never the nearest.
+Rules that apply to all of them:
+- Prices in these fields are integer cents; a probability is price / 100.
+- A missing side is NaN, never zero. A one-sided book has no mid.
+- No lookahead: a feature at offset m sees only books at or before that instant.
 """
 
 from __future__ import annotations
@@ -33,7 +21,7 @@ from livetrade.features import cross_venue_row
 
 
 class _Quote:
-    """The touch `cross_venue_row` reads, in dollars."""
+    """The touch that `cross_venue_row` reads, in dollars."""
 
     def __init__(self, bid, ask):
         self.yes_bid, self.yes_ask = bid, ask
@@ -56,8 +44,7 @@ def test_the_market_probability_is_the_mid_in_cents_converted_to_a_fraction():
 
 
 def test_market_minus_baseline_is_the_markets_correction_to_the_arithmetic():
-    """The single most informative column: where the market disagrees with
-    F(x/sigma), which is exactly what the model is trying to learn."""
+    """`market_minus_baseline` is where the market disagrees with F(x/sigma)."""
     got = market_state_features(_snap(baseline_probability=0.40))
     assert abs(got['market_minus_baseline'].iloc[0] - 0.05) < 1e-9
 
@@ -69,9 +56,7 @@ def test_a_one_sided_book_has_no_probability_rather_than_a_guessed_one():
 
 
 def test_the_spread_is_in_probability_units_not_cents():
-    """Everything downstream — the edge gate, the fee model — is in probability
-    units. A spread left in cents is a hundredfold error in the same direction
-    every time."""
+    """The spread is in probability units, like the edge gate and the fee model."""
     got = market_state_features(_snap(best_bid=44.0, best_ask=46.0))
     assert abs(got['spread'].iloc[0] - 0.02) < 1e-9
 
@@ -84,29 +69,27 @@ def test_imbalance_is_signed_and_bounded():
 
 
 def test_an_empty_book_gives_no_imbalance_rather_than_zero():
-    """Zero size on both sides means nothing is resting there. Reporting a
-    balanced book would claim knowledge of a book that does not exist."""
+    """Zero size on both sides means no book, so imbalance is NaN, not zero."""
     got = market_state_features(_snap(bid_at_touch=0.0, ask_at_touch=0.0))
     assert pd.isna(got['imbalance_touch'].iloc[0])
 
 
 def test_depth_ratio_is_logged_so_it_is_symmetric():
-    """A 2:1 bid-heavy book and a 1:2 ask-heavy one should be equal and
-    opposite, which a raw ratio is not."""
+    """The log ratio makes 2:1 and 1:2 books equal and opposite."""
     a = market_state_features(_snap(bid_vol=2000.0, ask_vol=1000.0))['depth_ratio'].iloc[0]
     b = market_state_features(_snap(bid_vol=1000.0, ask_vol=2000.0))['depth_ratio'].iloc[0]
     assert abs(a + b) < 1e-9 and a > 0
 
 
 def test_level_counts_are_not_features():
-    """Measured ratio 0.579 between backfilled and live level counts. A feature
-    built on them measures which pipe the row arrived through."""
+    """Level counts differ between backfilled and live sources, so they are not features.
+    """
     assert not any('levels' in c for c in MARKET_STATE)
 
 
 def test_the_price_free_variant_cannot_echo_the_market():
-    """Structure-only exists so an edge can be claimed that provably is not a
-    copy of a well-calibrated quote."""
+    """The price-free variant has no price columns, so its edge cannot copy the quote.
+    """
     structural = market_state_features(_snap(), include_price=False)
     assert 'market_prob' not in structural.columns
     assert 'market_minus_baseline' not in structural.columns
@@ -122,7 +105,7 @@ def test_the_venue_gap_is_kalshi_minus_polymarket_in_probability_units():
 
 
 def test_a_missing_polymarket_book_is_flagged_not_zeroed():
-    """Polymarket coverage differs from Kalshi's, and absence is not agreement."""
+    """A missing Polymarket book is flagged; absence is not agreement."""
     got = cross_venue_row({'best_bid': np.nan, 'best_ask': np.nan},
                           _Quote(0.44, 0.46))
     assert pd.isna(got['venue_prob_gap'])
@@ -130,8 +113,9 @@ def test_a_missing_polymarket_book_is_flagged_not_zeroed():
 
 
 def test_volumes_never_cross_the_venue_boundary():
-    """Kalshi is integer contracts, Polymarket fractional shares. A ratio of the
-    two would measure the unit, not the market."""
+    """Kalshi counts contracts and Polymarket counts fractional shares, so volumes are
+    never compared across venues.
+    """
     assert not any(c.startswith('venue_vol') or c.endswith('_vol_ratio')
                    for c in CROSS_VENUE)
 
@@ -139,9 +123,7 @@ def test_volumes_never_cross_the_venue_boundary():
 # --- implied_vol -----------------------------------------------------------
 
 def test_iv_minus_realised_is_the_mechanism_and_is_logged():
-    """The baseline's sigma is a BACKWARD-looking realised-vol forecast. Where
-    the market's forward-looking sigma disagrees, the baseline is wrong in a
-    knowable direction — that disagreement is the feature, not the level."""
+    """`iv_minus_realised` is the log ratio of implied to realised sigma."""
     table = _iv_table(sigma_per_min=0.0005)
     got = attach_implied_vol(table, _iv_fits(0.0010))
     assert abs(got['iv_minus_realised'].iloc[0] - np.log(2.0)) < 1e-9
@@ -169,17 +151,14 @@ def _iv_fits(implied):
 
 
 def test_staleness_is_carried_because_coverage_is_15_percent():
-    """60% of ladders yield no fit at all, leaving a 5-hour mean gap. A sigma
-    forward-filled from three hours ago is a different claim from a fresh one,
-    and the model has to be able to tell them apart."""
+    """Implied-vol fits are sparse, so staleness is a feature the model can use."""
     assert 'iv_staleness_minutes' in IMPLIED_VOL
 
 
 # --- the book at the decision ----------------------------------------------
 #
-# The production join is `core.quotes.attach_quotes`: EXACT on
-# (symbol, window, offset), never as-of across offsets, and point-in-time on
-# when each book was seen.
+# The production join is `core.quotes.attach_quotes`: exact on (symbol, window,
+# offset), and point-in-time on when each book was seen.
 
 def _depth_row(window_open, offset, bid, ask):
     return {'venue': 'kalshi', 'symbol': 'BTC-USD',
@@ -195,8 +174,7 @@ def _decision(window_open, offset):
 
 
 def test_the_book_is_the_one_at_the_decision_offset_not_a_later_one():
-    """A book from AFTER the decision would inform it, which reads exactly like
-    skill."""
+    """A book from after the decision instant is never used."""
     depth = pd.DataFrame([_depth_row('2026-07-01T12:00Z', 5, 0.44, 0.46),
                           _depth_row('2026-07-01T12:00Z', 9, 0.48, 0.50)])
     got = attach_quotes(_decision('2026-07-01T12:00Z', 5), depth)
@@ -210,9 +188,7 @@ def test_a_decision_with_no_book_yet_gets_nothing_rather_than_a_later_one():
 
 
 def test_the_join_does_not_leak_across_windows():
-    """Consecutive windows chain — one window's strike is the previous one's
-    settlement — so a join that spilled across the boundary would look correct
-    and be wrong."""
+    """The join never crosses a window boundary."""
     depth = pd.DataFrame([_depth_row('2026-07-01T12:00Z', 3, 0.44, 0.46)])
     got = attach_quotes(_decision('2026-07-01T12:15Z', 3), depth)
     assert pd.isna(got['ask_up'].iloc[0]), 'the 12:00 book belongs to another window'
@@ -220,15 +196,11 @@ def test_the_join_does_not_leak_across_windows():
 
 # --- joining the ladder fits onto decisions --------------------------------
 #
-# The fits are irregular: 60% of ladders yield nothing, leaving a ~5-hour mean
-# gap, so almost every decision is priced against a sigma measured some time
-# earlier. That is usable -- volatility is persistent -- but only if the model
-# can tell a fresh estimate from a stale one, which is why staleness is a
-# feature and not a filter.
+# Fits are irregular, so most decisions use a sigma measured earlier. Staleness
+# is a feature, not a filter, so the model can tell fresh from stale.
 
 def test_the_fit_is_the_last_one_at_or_before_the_decision():
-    """A sigma inverted from a ladder AFTER the decision instant is a forecast
-    made with tomorrow's newspaper."""
+    """The fit used is the last one at or before the decision instant."""
     from core.book_features import attach_implied_vol
     fits = pd.DataFrame({
         'symbol': ['BTC-USD'] * 3,
@@ -275,7 +247,7 @@ def test_a_decision_before_any_fit_gets_nothing():
 
 
 def test_the_join_does_not_cross_symbols():
-    """BTC's implied vol is not ETH's, and ETH's is measurably ~1.8x higher."""
+    """The join never crosses symbols."""
     from core.book_features import attach_implied_vol
     fits = pd.DataFrame({
         'symbol': ['ETH-USD'],
@@ -290,8 +262,7 @@ def test_the_join_does_not_cross_symbols():
 
 
 def test_a_fit_older_than_the_tolerance_is_dropped():
-    """Forward-filling a sigma from yesterday is not a forward-looking estimate
-    of anything."""
+    """A fit older than `max_age_minutes` is dropped."""
     from core.book_features import attach_implied_vol
     fits = pd.DataFrame({
         'symbol': ['BTC-USD'],
@@ -321,14 +292,8 @@ def test_the_mechanism_column_is_the_disagreement_not_the_level():
 
 # --- a missing column must never crash mid-fold ----------------------------
 #
-# Three times now the same shape: `frame.get(name)` returns a SCALAR when the
-# column is absent, `pd.to_numeric` happily makes it a numpy float, and the
-# `.values` a line later raises. It surfaced first for `sigma_per_min`, then
-# again for `baseline_probability` -- eight minutes into a walk-forward, because
-# that column is attached AFTER features are built.
-#
-# These columns are legitimately absent at different points in the pipeline, so
-# the functions have to tolerate it and return NaN rather than raise.
+# These columns are absent at different points in the pipeline. `frame.get` then
+# returns a scalar, not a Series, so the functions must return NaN, not raise.
 
 @pytest.mark.parametrize('missing', [
     'baseline_probability', 'best_bid', 'best_ask', 'bid_at_touch',
@@ -341,8 +306,7 @@ def test_market_state_survives_a_missing_column(missing):
 
 
 def test_market_state_on_a_frame_with_only_the_index():
-    """The extreme case: a table carrying none of the book columns at all,
-    which is every row that predates the venue."""
+    """A table with no book columns at all returns all-NaN features."""
     bare = pd.DataFrame({'symbol': ['BTC-USD'], 'offset': [3]})
     got = market_state_features(bare)
     assert len(got) == 1

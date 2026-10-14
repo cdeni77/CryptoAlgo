@@ -1,14 +1,7 @@
-"""The backtest must stop where the live account would stop.
+"""Tests that the backtest halts on the same conditions as the live account.
 
-`scripts/live.py` latches a halt on four conditions — the ruin floor, a daily
-realised loss, peak-to-current drawdown below the starting bankroll, and a run
-of consecutive losses — and a halt there is sticky, cleared by hand. The
-backtest latched only on the ruin floor.
-
-So a candidate could pass `halted == 0` and `max_drawdown <= 0.35` on a
-simulation that never stops, while the live account would have latched and
-traded nothing further. A gate measuring a policy the account does not run is
-the defect this whole audit is about; this was the last instance.
+Live latches a halt on the ruin floor, a daily realised loss, drawdown below the
+starting bankroll, and a run of consecutive losses. The backtest must apply all four.
 """
 
 from __future__ import annotations
@@ -69,7 +62,7 @@ def test_a_win_resets_the_run():
 
 def test_the_daily_loss_limit_halts():
     book = _book(max_daily_loss_fraction=0.10, max_consecutive_losses=0)
-    made = _settle(book, [-60.0, -50.0])      # -110 on a 1000 bankroll
+    made = _settle(book, [-60.0, -50.0])  # -110 on a 1000 bankroll
     assert 'daily loss' in (book._halt_reason(made) or '')
 
 
@@ -81,8 +74,7 @@ def test_losses_on_a_different_day_do_not_add_up():
 
 
 def test_drawdown_only_counts_below_the_starting_bankroll():
-    """Up 500 then giving back 200 is not a halt — the same condition live
-    applies, so a run that is ahead is not stopped for volatility."""
+    """Drawdown from a peak above the starting bankroll does not halt, as in live."""
     book = _book(max_drawdown_fraction=0.20, max_consecutive_losses=0,
                  max_daily_loss_fraction=0.0)
     made = _settle(book, [+500.0, -200.0])
@@ -93,7 +85,7 @@ def test_drawdown_only_counts_below_the_starting_bankroll():
 def test_drawdown_below_the_start_halts():
     book = _book(max_drawdown_fraction=0.20, max_consecutive_losses=0,
                  max_daily_loss_fraction=0.0)
-    made = _settle(book, [+100.0, -400.0])    # peak 1100 -> 700, 36%
+    made = _settle(book, [+100.0, -400.0])  # peak 1100 -> 700, 36%
     assert 'drawdown' in (book._halt_reason(made) or '')
 
 

@@ -1,9 +1,7 @@
-"""The two ways the candle fetcher used to lose data, pinned.
+"""Tests that the Coinbase candle fetcher loses no minute and stores no partial bar.
 
-Both were invisible for five years because they fail *quietly*: one dropped a
-single minute per request and the other stored a bar whose numbers were merely
-wrong rather than absent. Neither has a natural symptom, so they need a test that
-counts.
+Both failures are silent: a dropped minute per request, and a bar whose values are
+incomplete. Only a test that counts can catch them.
 """
 
 from __future__ import annotations
@@ -18,12 +16,10 @@ from data_collection.coinbase_connector import (
 
 
 class FakeVenue:
-    """Coinbase's candles endpoint, with its actual boundary semantics.
+    """Fake Coinbase candles endpoint with the venue's boundary rules.
 
-    `start` and `end` are both **inclusive**, and when more candles fall in the
-    range than `limit` allows the venue returns the **newest** `limit` of them.
-    That combination is what the off-by-one fell into: asking for a `limit`-wide
-    span names `limit + 1` candles, so the oldest is silently dropped.
+    `start` and `end` are both inclusive. When more candles fall in the range than
+    `limit`, the venue returns the newest `limit` and drops the oldest.
     """
 
     def __init__(self, *, first: datetime, last: datetime, step_seconds: int = 60):
@@ -39,7 +35,7 @@ class FakeVenue:
         first = int(self.first.replace(tzinfo=timezone.utc).timestamp())
         last = int(self.last.replace(tzinfo=timezone.utc).timestamp())
         stamps = [t for t in range(first, last + 1, self.step) if start <= t <= end]
-        stamps = stamps[-limit:]                      # newest `limit`, as the venue does
+        stamps = stamps[-limit:]  # newest `limit`, as the venue does
         return 200, {'candles': [
             {'start': str(t), 'open': '100', 'high': '101', 'low': '99',
              'close': '100.5', 'volume': '1'} for t in reversed(stamps)
@@ -54,12 +50,7 @@ def client_with(venue: FakeVenue) -> CoinbaseRESTClient:
 
 @pytest.mark.asyncio
 async def test_a_request_never_spans_more_candles_than_its_limit_allows():
-    """The root cause, stated directly.
-
-    `batch_duration = tf_seconds * 300` over an inclusive range names 301 candle
-    starts for a limit of 300. This asserts the arithmetic, so the bug cannot
-    come back by way of someone "simplifying" the `- 1`.
-    """
+    """No request spans more candle starts than its limit, counting both ends."""
     first = datetime(2025, 1, 1, 0, 0)
     venue = FakeVenue(first=first, last=first + timedelta(minutes=5000))
     await client_with(venue).get_candles_range(
@@ -67,7 +58,7 @@ async def test_a_request_never_spans_more_candles_than_its_limit_allows():
 
     assert venue.requests, 'the fetcher made no request at all'
     for start, end, limit in venue.requests:
-        spanned = (end - start) // 60 + 1               # inclusive on both ends
+        spanned = (end - start) // 60 + 1  # inclusive on both ends
         assert spanned <= limit, (
             f'asked for {spanned} candle starts with limit {limit}; the venue '
             f'returns the newest {limit} and the rest are lost'
@@ -76,12 +67,7 @@ async def test_a_request_never_spans_more_candles_than_its_limit_allows():
 
 @pytest.mark.asyncio
 async def test_a_multi_batch_range_comes_back_with_no_holes():
-    """The symptom: one minute in 301, forever.
-
-    5,000 minutes spans several batches, so a boundary error shows up as missing
-    minutes rather than as an exception. Before the fix this returned 4,984 of
-    5,000 with the holes exactly 301 apart.
-    """
+    """A multi-batch range returns every minute, with no holes at batch boundaries."""
     first = datetime(2025, 1, 1, 0, 0)
     minutes = 5000
     last = first + timedelta(minutes=minutes)
@@ -98,11 +84,7 @@ async def test_a_multi_batch_range_comes_back_with_no_holes():
 
 @pytest.mark.asyncio
 async def test_the_span_is_exactly_one_short_of_the_limit():
-    """Pin the constant, not just the inequality.
-
-    `spanned <= limit` would also pass for a fetcher that requested one candle
-    at a time. The intent is to use the whole allowance and no more.
-    """
+    """Each request uses exactly the full limit, not just at most the limit."""
     first = datetime(2025, 1, 1, 0, 0)
     venue = FakeVenue(first=first, last=first + timedelta(minutes=5000))
     await client_with(venue).get_candles_range(
@@ -114,13 +96,10 @@ async def test_the_span_is_exactly_one_short_of_the_limit():
 
 @pytest.mark.asyncio
 async def test_the_minute_still_in_progress_is_never_returned():
-    """A bar is data only once it has closed.
+    """The bar for the minute in progress is never returned, since its values are partial.
 
-    Every call site passes `utc_now()` as `end`, so the newest candle the venue
-    offers is the one for the minute in progress — partial high, low, close and
-    volume. It was stored, and `DataPipeline` only accepts `event_time >
-    last_known`, so it was never corrected. Observed in the real store: a scrape
-    started at 04:17:29Z stored `04:17:00` holding 51.9% of a minute's volume.
+    The pipeline only accepts bars newer than the last stored one, so a stored
+    partial bar is never corrected.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None, second=30, microsecond=0)
     in_progress = now.replace(second=0)

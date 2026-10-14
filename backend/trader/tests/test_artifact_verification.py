@@ -1,15 +1,8 @@
-"""An artifact must not be scored under a configuration it was not fitted for.
+"""Tests for `ForecastModel.verify`: an artifact is not scored under a config it was not
+fitted for.
 
-`ForecastModel.load` was a bare `joblib.load`: nothing checked the feature list,
-nothing checked the config, and nothing checked that the booster inside agreed
-with the column names beside it. `scripts/live.py` never read
-`config_provenance` at all, so a model promoted under one set of economics traded
-under whatever the defaults happened to be — worth up to the whole `min_edge_pp`
-gate in probability terms, silently.
-
-The feature mismatch is the worst of the three. `_feature_matrix` selects by name
-from `model.features`, so a booster trained on a different list is handed a
-well-formed matrix of the wrong columns and returns numbers rather than raising.
+A booster trained on a different feature list still returns numbers on a
+well-formed matrix of the wrong columns, so the feature check must raise.
 """
 
 from __future__ import annotations
@@ -52,12 +45,8 @@ def test_a_feature_list_the_booster_disagrees_with_is_refused():
 
 
 def test_a_reordered_feature_list_is_refused():
-    """Same names, same count, different order.
-
-    `booster.predict` on a numpy matrix validates only the width, so a reordered
-    list is accepted and silently scores the wrong column against each split.
-    Measured elsewhere in this audit: swapping the two highest-gain entries moved
-    probabilities by up to 0.0174 with no exception.
+    """A reordered list is refused: `booster.predict` checks only width, so it would score
+    the wrong columns.
     """
     names = ['z_score', 'log_rv_15', 'hour_sin']
     with pytest.raises(ValueError, match='booster was trained on'):
@@ -81,8 +70,7 @@ def test_a_config_that_changes_an_answer_is_refused(field, value):
 
 
 def test_an_artifact_without_provenance_is_allowed_with_a_warning(caplog):
-    """Old artifacts predate the field. Refusing them outright would be a
-    different kind of surprise, so say so loudly and continue."""
+    """An artifact with no provenance loads with a warning instead of a refusal."""
     names = ['z_score']
     with caplog.at_level('WARNING'):
         model(booster_names=names, listed=names, provenance={}).verify(Config())
@@ -90,20 +78,13 @@ def test_an_artifact_without_provenance_is_allowed_with_a_warning(caplog):
 
 
 def test_verify_without_a_config_still_checks_the_features():
-    """The structural check does not need a config to be worth doing."""
     with pytest.raises(ValueError, match='booster was trained on'):
         model(booster_names=['a'], listed=['a', 'b']).verify(None)
 
 
 def test_integrity_reports_the_booster_and_listed_features():
-    """`integrity()` is introspection, not the gate — `verify()` is the gate.
-
-    Its docstring used to describe the feature-mismatch failure mode as the
-    reason it exists, which reads as "this is the check." It is not: `verify()`
-    (above) already raises on exactly that mismatch and is what `load()` calls.
-    `integrity()` has no caller and never raised anything — it returns a
-    snapshot for a human or a script to read, and this pins that shape so it
-    does not silently drift from what `verify()` actually checks.
+    """`integrity()` is a read-only snapshot; `verify()` is the gate. This pins the
+    snapshot's shape.
     """
     names = ['z_score', 'log_rv_15', 'hour_sin']
     report = model(booster_names=names, listed=names).integrity()
@@ -113,7 +94,7 @@ def test_integrity_reports_the_booster_and_listed_features():
 
 
 def test_integrity_surfaces_a_mismatch_verify_would_reject():
-    """It reports the disagreement rather than raising — `verify()` raises."""
+    """It reports the disagreement instead of raising."""
     report = model(booster_names=['a', 'b'], listed=['a', 'c']).integrity()
     assert report['features'] == ['a', 'c']
     assert report['booster_features'] == ['a', 'b']

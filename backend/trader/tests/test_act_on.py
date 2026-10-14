@@ -1,12 +1,7 @@
-"""`act_on` is where money moves, and nothing tested it.
+"""Tests for `act_on`, the step that sends orders and books positions.
 
-`scripts/live.py` sat at ~19% coverage and `act_on` at none of it, which is how
-four defects lived here at once: an unresolved market booked a position without
-sending an order, `--mode live --dry-run` did the same, a killed `fill_or_kill` was
-recorded as a full fill, and a later refusal erased the record of a real one.
-
-Every case below is asserted on the three things that matter — did an order go to
-the wire, what position exists afterwards, and what happened to the bankroll.
+Each case checks three things: whether an order reached the wire, which position
+exists afterwards, and what happened to the bankroll.
 """
 
 from __future__ import annotations
@@ -76,7 +71,7 @@ def state(writer: PgWriter) -> tuple[int, float]:
 
 
 class TestFillReadback:
-    """`filled = int(order.get('count', contracts))` read the size *requested*."""
+    """The filled size comes from the venue reply, never from the size requested."""
 
     @pytest.mark.parametrize('reply,expected', [
         ({'status': 'executed', 'order_id': 'a'}, 5),
@@ -110,12 +105,11 @@ class TestFillReadback:
         positions = writer.open_positions()
         assert len(positions) == 1
         assert positions[0].contracts == 2
-        # And the debit is scaled to what was actually bought.
+        # The debit scales to the contracts actually bought.
         assert float(positions[0].outlay) == pytest.approx(
             decision().stake * 2 / 5, abs=1e-9)
 
     def test_an_empty_body_is_not_a_fill(self, writer):
-        """HTTP 200 with nothing in it used to record a complete fill."""
         before = state(writer)
         kalshi = FakeKalshi({})
         assert run(act_on(args(), writer, kalshi, decision(), None)) is False
@@ -124,12 +118,7 @@ class TestFillReadback:
 
 class TestNoOrderNoPosition:
     def test_an_unresolved_market_books_nothing(self, writer):
-        """`market_ticker=None` used to fall through to `open_position`.
-
-        Measured before the fix: 0 orders sent, a 5-contract position written,
-        $3.10 debited — a holding the venue had never heard of, which `settle_due`
-        then settled into invented PnL.
-        """
+        """An order with no resolved market books no position and sends nothing."""
         before = state(writer)
         kalshi = FakeKalshi({'status': 'executed'})
         assert run(act_on(args(), writer, kalshi,
@@ -138,7 +127,6 @@ class TestNoOrderNoPosition:
         assert state(writer) == before
 
     def test_a_dry_run_books_nothing(self, writer):
-        """`--dry-run` was declared and never read."""
         before = state(writer)
         kalshi = FakeKalshi({'status': 'executed'})
         assert run(act_on(args(place_orders=False, dry_run=True), writer, kalshi,
@@ -155,9 +143,9 @@ class TestNoOrderNoPosition:
         assert state(writer) == before
 
     def test_an_in_flight_failure_books_nothing_and_does_not_retry(self, writer):
-        """The request may have been accepted. Booking or retrying both risk a
-        duplicate; the honest response is to record nothing and let
-        reconciliation surface a venue position we do not hold."""
+        """A timeout books nothing and does not retry, since the venue may have accepted
+        the order.
+        """
         before = state(writer)
         kalshi = FakeKalshi(raises=asyncio.TimeoutError())
         assert run(act_on(args(), writer, kalshi, decision(), None)) is False
@@ -179,8 +167,6 @@ class TestPaperMode:
 
 class TestIdempotency:
     def test_a_second_call_for_the_same_window_books_once(self, writer):
-        """The DB constraint used to raise *after* the order was on the wire, and
-        the loop caught only KeyboardInterrupt."""
         kalshi = FakeKalshi({'status': 'executed', 'order_id': 'x'})
         assert run(act_on(args(), writer, kalshi, decision(), None)) is True
         after_first = state(writer)
@@ -190,12 +176,11 @@ class TestIdempotency:
         assert state(writer)[0] == after_first[0]
 
     def test_a_later_refusal_does_not_erase_a_recorded_fill(self, writer):
-        """`resolve_ticket` nulled filled_contracts/filled_price/filled_at,
-        destroying the only local record of a real order."""
+        """Resolving a ticket as skipped keeps its recorded fill."""
         kalshi = FakeKalshi({'status': 'executed', 'order_id': 'x'})
         run(act_on(args(), writer, kalshi, decision(), None))
         tickets = [t for t in writer.open_tickets(limit=50)] or None
-        # Re-resolve as skipped, the way a duplicate submission would.
+        # Re-resolve as skipped, as a duplicate submission does.
         with writer._session() as session:  # noqa: SLF001
             from core.pg_writer import OrderTicket
             row = session.query(OrderTicket).one()
@@ -211,8 +196,9 @@ class TestIdempotency:
 
 class TestLimitPrice:
     def test_the_limit_never_gives_away_the_whole_edge(self):
-        """It was `price + edge` — the break-even price. Under fill_or_kill that
-        lets a thin book walk the order to a zero-EV fill and call it a trade."""
+        """The limit price stays below break-even, so a thin book cannot fill at zero
+        expected value.
+        """
         d = decision(price=0.60)
         limit = order_limit_price(d)
         assert limit > d.price
@@ -236,18 +222,10 @@ class TestLimitPrice:
 
 
 class TestTheIdempotencyKey:
-    """The venue-side key must not enforce a stricter rule than the policy.
+    """The venue-side idempotency key matches the policy: one position per window.
 
-    Keyed on (symbol, window) alone it meant one order *attempt* per window,
-    while the policy is one *position* per window. Those differ exactly when an
-    order does not fill — and a fill_or_kill that kills still consumes the id, so
-    the first thin-volume kill locked every later offset out of the window with
-    `409 order_already_exists`.
-
-    Measured over the first live night: 57 of 69 unfilled attempts were our own
-    duplicate key rather than the venue refusing us, at a *higher* average
-    claimed edge (8.37pp) than the attempts that filled (5.77pp). Only 9 were
-    genuine `fill_or_kill_insufficient_resting_volume`, at 3.94pp.
+    A killed fill_or_kill still consumes its key. A key per (symbol, window) would
+    block every later offset in that window, so the key includes the offset.
     """
 
     def _key(self, writer, offset: int) -> str:
@@ -259,13 +237,12 @@ class TestTheIdempotencyKey:
         return kalshi.orders[-1]['client_order_id']
 
     def test_two_offsets_in_one_window_are_two_different_orders(self, writer):
-        """The regression. These were the same string, so the second was refused
-        by the venue no matter how good the price had become."""
         assert self._key(writer, 3) != self._key(writer, 6)
 
     def test_the_same_offset_twice_is_the_same_order(self, writer):
-        """Still idempotent where it matters: a cycle that runs twice, or a retry
-        after a response we never saw, must not buy twice."""
+        """The same offset produces the same key, so a repeated cycle or a retry cannot buy
+        twice.
+        """
         assert self._key(writer, 9) == self._key(writer, 9)
 
     def test_the_key_names_the_symbol_the_window_and_the_offset(self, writer):
@@ -275,10 +252,9 @@ class TestTheIdempotencyKey:
         assert f'{WINDOW:%Y%m%d%H%M}' in key, key
 
     def test_a_refused_order_leaves_the_window_open_to_the_next_offset(self, writer):
-        """The other half of the mechanism, and it already worked: `skipped`
-        means nothing was bought, so `entries_for_window` must not count it.
-        Without this the new key would change nothing — the decision would never
-        be made a second time."""
+        """A refused (`skipped`) order does not count as an entry, so a later offset can
+        still try.
+        """
         kalshi = FakeKalshi(raises=KalshiError('409 fill_or_kill_insufficient_resting_volume'))
         assert run(act_on(args(), writer, kalshi, decision(), None)) is False
         symbols, staked, count = writer.entries_for_window(pd.Timestamp(WINDOW))
@@ -287,8 +263,9 @@ class TestTheIdempotencyKey:
         )
 
     def test_a_crash_before_booking_still_blocks_the_window(self, writer):
-        """The guard the old key was accidentally providing, which must survive
-        the change. A ticket left in any status but `skipped` is an entry."""
+        """A ticket in any status except `skipped` counts as an entry, even without a
+        position.
+        """
         writer.write_ticket(
             symbol='BTC-USD', window_open=pd.Timestamp(WINDOW),
             settle_time=pd.Timestamp(WINDOW + timedelta(minutes=15)),
@@ -302,16 +279,10 @@ class TestTheIdempotencyKey:
 
 
 class TestOutlayMatchesTheFill:
-    """The bankroll must be debited what the venue charged, not what we intended.
+    """The bankroll is debited what the venue charged, not what the decision intended.
 
-    `outlay` and `fee` were pro-rated from `decision.stake` and `decision.fee`,
-    both computed at the *decision* price. But `price` is booked from the fill,
-    and a `fill_or_kill` fills at or better than its limit — so actual cash out is
-    always <= the booked outlay and our bankroll read systematically low.
-
-    Observed live 2026-08-25: `placing down 1 @ 0.08` then `filled 1 @ 0.0530`.
-    The position recorded price 0.0530 and an outlay computed from 0.08, and the
-    reconciler logged the difference as unexplained "balance drift".
+    A fill_or_kill fills at or better than its limit. Outlay and fee therefore come
+    from the fill price, not the decision price.
     """
 
     def test_the_outlay_is_the_price_actually_paid(self, writer):
@@ -325,7 +296,7 @@ class TestOutlayMatchesTheFill:
                                                           price=0.60), None)) is True
         position = writer.open_positions()[0]
         assert float(position.price) == pytest.approx(0.50), 'fill price not booked'
-        # `outlay` is fee-inclusive, matching `decide()`'s `stake`.
+        # `outlay` includes the fee, as `decide()`'s `stake` does.
         expected = 5 * 0.50 + float(trade_fee(5, 0.50, Config()))
         assert float(position.outlay) == pytest.approx(expected, abs=1e-6), (
             'outlay was pro-rated from the decision stake at 0.60 rather than '
@@ -333,7 +304,6 @@ class TestOutlayMatchesTheFill:
         )
 
     def test_the_fee_is_charged_on_the_fill_not_the_decision(self, writer):
-        """A fee at the decision price is the wrong fee once the fill differs."""
         from core.costs import trade_fee
         from core.config import Config
 
@@ -357,13 +327,8 @@ class TestOutlayMatchesTheFill:
 
 
 class TestQuoteStaleness:
-    """`max_quote_age_seconds` was declared and never checked anywhere.
-
-    `run_cycle` reads the book once at the top of the cycle and stamps
-    `quote_time`, then does a Coinbase fetch, four authenticated reconcile
-    calls, inference and six 15-second quote calls before any order is sent —
-    and nothing before this compared that elapsed time to anything. A quote
-    that goes stale mid-cycle was traded as though it were still current.
+    """`act_on` refuses to send an order when the quote is older than
+    `max_quote_age_seconds`.
     """
 
     def test_a_fresh_quote_places_the_order(self, writer):
@@ -387,7 +352,7 @@ class TestQuoteStaleness:
         assert len(writer.open_positions()) == 0
 
     def test_omitting_quote_time_does_not_refuse(self, writer):
-        """Backward compatible: no timestamp means no staleness claim to check."""
+        """No `quote_time` means no staleness check."""
         kalshi = FakeKalshi({'status': 'executed', 'order_id': 'untimed',
                              'average_fill_price_dollars': '0.6000'})
         assert run(act_on(args(), writer, kalshi, decision(), None)) is True
@@ -405,7 +370,7 @@ class TestQuoteStaleness:
         assert 'stale' in (row.note or '').lower()
 
     def test_a_stale_quote_does_not_refuse_a_dry_run(self, writer):
-        """Nothing is sent in dry-run anyway; staleness is not the reason to log."""
+        """Dry-run sends nothing, so staleness is not reported as the refusal reason."""
         from core.config import DEFAULT_CONFIG
         kalshi = FakeKalshi({})
         quote_time = pd.Timestamp.now(tz='UTC') - timedelta(
@@ -423,8 +388,8 @@ def _tickets(writer):
 
 
 def test_a_filled_order_records_the_venue_order_id(writer):
-    """The id went only into the free-text note, so tickets could not be joined
-    to the venue's own fills by order id."""
+    """The ticket stores the venue order id, so it can be joined to the venue's fills.
+    """
     kalshi = FakeKalshi({'status': 'executed', 'remaining_count': 0,
                          'order_id': 'venue-123'})
     assert run(act_on(args(), writer, kalshi, decision(), None)) is True
