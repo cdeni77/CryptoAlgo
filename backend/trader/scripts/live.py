@@ -681,7 +681,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     from core.book_features import (
         CROSS_VENUE as _CV, IMPLIED_VOL as _IV,
         MARKET_PRICE as _MP, MARKET_STATE as _MS)
-    deferred = tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV)
+    from core.index_features import INDEX_PROXY as _IP
+    deferred = tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV) + tuple(_IP)
     scored = score_live(bars, model.scoring, config, deferred=deferred,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
@@ -701,7 +702,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # The book features, from the same snapshot the order is priced against.
     # Without these LightGBM substitutes learned defaults and the loop runs as
     # a different model from the one whose gates were measured.
-    _attach_book_features(scored, quotes, _stream_cache(), config=config)
+    _attach_book_features(scored, quotes, _stream_cache(), config=config,
+                          groups=model.groups or None)
     scored = prepare_init_score(scored, model)
     _phase('score')
     # Liveness, at the point the cycle has demonstrably scored.

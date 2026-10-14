@@ -472,15 +472,67 @@ def book_feature_row(quote, yes_levels, no_levels, *,
     return market_state_features(frame).iloc[0].to_dict()
 
 
+def _index_cache():
+    """The index recorder's in-process cache, or None when it is not running."""
+    try:
+        from scripts.record_index import CACHE
+        return CACHE
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _attach_index_proxy(scored: pd.DataFrame, config=None, cache=None) -> None:
+    """The `index_proxy` group onto the scoring rows, in place.
+
+    `core.index_features.index_features_row` over the recorder's rolling
+    history: the same `attach_index_proxy` the backtest runs. The decision
+    instant is the row's `decision_time`, the minute boundary the backtest
+    uses. With no recorder the columns stay NaN, which
+    `_warn_unscoreable_features` reports.
+    """
+    from core.index_features import INDEX_PROXY, index_features_row
+
+    for column in INDEX_PROXY:
+        if column not in scored.columns:
+            scored[column] = np.nan
+    cache = _index_cache() if cache is None else cache
+    if cache is None or not len(scored):
+        return
+    config = config or state._RUNNING_CONFIG or DEFAULT_CONFIG
+    for i, symbol in enumerate(scored['symbol']):
+        window_open = pd.Timestamp(scored['window_open'].iloc[i])
+        if 'decision_time' in scored.columns:
+            decided = pd.Timestamp(scored['decision_time'].iloc[i])
+        else:
+            decided = window_open + pd.Timedelta(minutes=int(scored['offset'].iloc[i]))
+        try:
+            row = index_features_row(
+                cache.snapshot(symbol), window_open, decided,
+                float(scored['sigma_remaining'].iloc[i]),
+                last_price=float(scored['last_price'].iloc[i]),
+                symbol=symbol,
+                max_age_seconds=float(config.index_proxy_max_age_seconds))
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('%s: index proxy features unavailable (%s)',
+                           symbol, str(exc)[:80])
+            continue
+        for column, value in row.items():
+            scored.iloc[i, scored.columns.get_loc(column)] = value
+
+
 def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None, *,
-                          config=None) -> None:
+                          config=None, groups=None) -> None:
     """Book features onto the scoring rows, in place, from the touch.
 
     One row per symbol: the quote is the same for every offset in the cycle,
-    and it is the book the order will actually be priced against.
+    and it is the book the order will actually be priced against. The
+    `index_proxy` group is attached too when `groups` names it.
     """
     from core.book_features import (
         CROSS_VENUE, IMPLIED_VOL, MARKET_PRICE, MARKET_STATE)
+
+    if groups and 'index_proxy' in groups:
+        _attach_index_proxy(scored, config)
 
     pm_cache, iv_cache = _venue_caches()
     now = pd.Timestamp.now(tz='UTC')
