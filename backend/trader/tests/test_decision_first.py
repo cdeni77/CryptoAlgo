@@ -87,7 +87,8 @@ class Model:
                             index=table.index)
 
 
-def run(tmp_path, monkeypatch, venue, *, offset=12, reconciled=True, **config_over):
+def run(tmp_path, monkeypatch, venue, *, offset=12, reconciled=True,
+        record_touch=False, **config_over):
     writer = PgWriter(database_url=f'sqlite:///{tmp_path}/serving.db')
     writer.ensure_account(1000.0, mode='live')
     now = pd.Timestamp.now('UTC').floor('min')
@@ -120,7 +121,7 @@ def run(tmp_path, monkeypatch, venue, *, offset=12, reconciled=True, **config_ov
     monkeypatch.setattr(live, 'fetch_quotes', fake_quotes)
     monkeypatch.setattr(live, 'score_live', fake_score)
     monkeypatch.setattr(live, '_read_recent_fits', lambda: pd.DataFrame())
-    monkeypatch.setenv('RECORD_TOUCH', '0')
+    monkeypatch.setenv('RECORD_TOUCH', '1' if record_touch else '0')
     monkeypatch.setattr(live, '_LAST_RECONCILED',
                         time.monotonic() if reconciled else None)
     config = dataclasses.replace(
