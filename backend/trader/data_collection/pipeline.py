@@ -21,7 +21,7 @@ from .timeutil import (
     naive_utc_to_epoch_seconds,
     utc_now,
 )
-from .models import OHLCVBar, FundingRate, TickerUpdate, DataQuality, OrderBookSnapshot
+from .models import OHLCVBar, TickerUpdate, OrderBookSnapshot
 from .validator import DataValidator, ValidationConfig, DataQualityTracker
 from .queue import MessageQueueBase, InMemoryQueue, Channels, QueueMessage
 from .ingest import Ingestor
@@ -51,15 +51,8 @@ class PipelineConfig:
     # a working feature. Scrape spot with `--venue-label coinbase_spot`.
     venue_label: Optional[str] = None
     ohlcv_poll_interval: int = 60
-    funding_poll_interval: int = 300
     backfill_days: int = 30
     validation_config: ValidationConfig = field(default_factory=ValidationConfig)
-    # Off by default. Funding/open-interest are perpetual-futures concepts;
-    # this system trades spot bars, and `scrape.py` — the only production
-    # caller — always passed False explicitly. The default disagreed with the
-    # only caller, so any future caller that omitted the flag would silently
-    # start collecting for a strategy already rejected four independent ways.
-    enable_funding_polling: bool = False
 
 
 class DataPipeline:
@@ -80,8 +73,6 @@ class DataPipeline:
         self._first_ohlcv_times: Dict[str, Dict[str, datetime]] = {}
         self._on_ohlcv_callbacks: List[Callable[[OHLCVBar], None]] = []
         self._on_ticker_callbacks: List[Callable[[TickerUpdate], None]] = []
-        self._on_funding_callbacks: List[Callable[[FundingRate], None]] = []
-        self._funding_failed_symbols = set()
 
     async def initialize(self):
         logger.info("Initializing data pipeline...")
@@ -155,9 +146,6 @@ class DataPipeline:
             asyncio.create_task(self._validation_loop()),
             asyncio.create_task(self._health_check_loop()),
         ]
-
-        if self.config.enable_funding_polling and self.config.coinbase_api_key:
-            self._tasks.append(asyncio.create_task(self._funding_poll_loop()))
 
         logger.info("Data pipeline started")
 
@@ -420,35 +408,6 @@ class DataPipeline:
         except Exception as e:
             logger.error(f"Error polling OHLCV {symbol} {timeframe}: {e}")
 
-    async def _funding_poll_loop(self):
-        while self._running:
-            try:
-                for symbol in self.config.symbols:
-                    await self._poll_funding(symbol)
-                await asyncio.sleep(self.config.funding_poll_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Funding poll loop error: {e}")
-                await asyncio.sleep(10)
-
-    async def _poll_funding(self, symbol: str):
-        try:
-            funding = await self._rest_client.get_funding_rate(symbol)
-            if funding:
-                await self._queue.publish(Channels.RAW_FUNDING, funding.to_dict())
-                if symbol in self._funding_failed_symbols:
-                    logger.info(f"Funding rate now available for {symbol}")
-                    self._funding_failed_symbols.remove(symbol)
-            else:
-                if symbol not in self._funding_failed_symbols:
-                    logger.info(f"No funding rate available for {symbol} – likely no open position")
-                    self._funding_failed_symbols.add(symbol)
-        except Exception as e:
-            if symbol not in self._funding_failed_symbols:
-                logger.info(f"Funding rate polling failed for {symbol} (will retry silently): {e}")
-                self._funding_failed_symbols.add(symbol)
-
     async def _validation_loop(self):
         while self._running:
             try:
@@ -459,21 +418,6 @@ class DataPipeline:
                     if outcome.stored:
                         await self._queue.publish(Channels.VALIDATED_OHLCV, bar.to_dict())
                         self._last_ohlcv_times.setdefault(bar.symbol, {})[bar.timeframe] = ensure_naive_utc(bar.event_time)
-                funding_messages = await self._queue.get_batch(Channels.RAW_FUNDING, max_messages=100, timeout_ms=100)
-                for msg in funding_messages:
-                    funding = FundingRate(
-                        symbol=msg.data["symbol"],
-                        event_time=datetime.fromisoformat(msg.data["event_time"]),
-                        available_time=datetime.fromisoformat(msg.data["available_time"]),
-                        rate=float(msg.data["rate"]),
-                        mark_price=float(msg.data["mark_price"]),
-                        index_price=float(msg.data["index_price"]),
-                    )
-                    outcome = self._ingest().ingest_funding(
-                        [funding], venue=getattr(funding, 'funding_source', 'coinbase')
-                    )
-                    if outcome.stored:
-                        await self._queue.publish(Channels.VALIDATED_FUNDING, funding.to_dict())
                 await asyncio.sleep(0.01)
             except asyncio.CancelledError:
                 break
@@ -526,27 +470,11 @@ class DataPipeline:
     def on_ticker(self, callback: Callable[[TickerUpdate], None]):
         self._on_ticker_callbacks.append(callback)
 
-    def on_funding(self, callback: Callable[[FundingRate], None]):
-        self._on_funding_callbacks.append(callback)
-
     def get_ohlcv(self, symbol: str, timeframe: str, start: datetime, end: datetime, as_of: Optional[datetime] = None):
         start = ensure_naive_utc(start)
         end = ensure_naive_utc(end)
         as_of = ensure_naive_utc(as_of)
         return self._database.get_ohlcv(symbol, timeframe, start, end, as_of)
 
-    def get_funding_rates(self, symbol: str, start: datetime, end: datetime, as_of: Optional[datetime] = None):
-        start = ensure_naive_utc(start)
-        end = ensure_naive_utc(end)
-        as_of = ensure_naive_utc(as_of)
-        return self._database.get_funding_rates(symbol, start, end, as_of)
-
     def get_quality_summary(self) -> Dict[str, Any]:
         return self._quality_tracker.get_summary()
-
-
-async def create_pipeline(config: Optional[PipelineConfig] = None) -> DataPipeline:
-    config = config or PipelineConfig()
-    pipeline = DataPipeline(config)
-    await pipeline.initialize()
-    return pipeline

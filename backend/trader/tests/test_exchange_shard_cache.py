@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from livetrade import ledger as live_ledger
 from scripts import live
 
 
@@ -19,9 +20,9 @@ class _Q:
 
 @pytest.fixture(autouse=True)
 def _clear():
-    live._LAST_EXCHANGE_INDEX = None
+    live_ledger._LAST_EXCHANGE_INDEX = None
     yield
-    live._LAST_EXCHANGE_INDEX = None
+    live_ledger._LAST_EXCHANGE_INDEX = None
 
 
 def _quotes(index):
@@ -29,20 +30,20 @@ def _quotes(index):
 
 
 def test_nothing_is_known_before_a_book_has_been_read():
-    assert live._LAST_EXCHANGE_INDEX is None, (
+    assert live_ledger._LAST_EXCHANGE_INDEX is None, (
         'until a book is seen the balance query falls back to its own default, '
         'which is what already happens on a cycle where no symbol quoted')
 
 
 def test_the_shard_is_learned_from_the_book_and_kept():
     assert live.remember_exchange_index(_quotes(2)) == 2
-    assert live._LAST_EXCHANGE_INDEX == 2
+    assert live_ledger._LAST_EXCHANGE_INDEX == 2
 
 
 def test_an_empty_book_does_not_erase_what_was_learned():
     live.remember_exchange_index(_quotes(2))
     assert live.remember_exchange_index({}) == 2
-    assert live._LAST_EXCHANGE_INDEX == 2, (
+    assert live_ledger._LAST_EXCHANGE_INDEX == 2, (
         'a cycle where nothing quoted must not reset the shard to unknown')
 
 
@@ -53,7 +54,7 @@ def test_a_moved_shard_is_logged_loudly_and_adopted(caplog):
     with caplog.at_level('WARNING'):
         assert live.remember_exchange_index(_quotes(2)) == 2
     assert any('exchange shard 0 to 2' in r.getMessage() for r in caplog.records), caplog.text
-    assert live._LAST_EXCHANGE_INDEX == 2, 'the new shard is adopted, not just logged'
+    assert live_ledger._LAST_EXCHANGE_INDEX == 2, 'the new shard is adopted, not just logged'
 
 
 def test_an_unchanged_shard_is_silent(caplog):
@@ -63,11 +64,13 @@ def test_an_unchanged_shard_is_silent(caplog):
     assert not [r for r in caplog.records if 'exchange shard' in r.getMessage()]
 
 
-def test_the_cycle_reads_the_book_after_reconciling():
-    """Ordering is the whole point: everything that can precede the quote does."""
+def test_reconciliation_never_sits_between_the_book_and_the_order():
+    """On an entry cycle it runs after the orders; elsewhere before the book.
+    The behaviour is tested in `test_decision_first.py`."""
     import inspect
     source = inspect.getsource(live.run_cycle)
-    assert source.index("_phase('reconcile')") < source.index("_phase('quotes')"), (
-        'reconciliation must not sit between the book and the order')
-    assert source.index("_phase('quotes')") < source.index("_phase('score')")
     assert source.index("_phase('bars')") < source.index("_phase('quotes')")
+    assert source.index("_phase('quotes')") < source.index("_phase('score')")
+    assert source.index("_phase('score')") < source.index("_phase('orders')")
+    tail = source[source.index("_phase('orders')"):]
+    assert 'bookkeeping(' in tail, 'an entry cycle must reconcile after the orders'

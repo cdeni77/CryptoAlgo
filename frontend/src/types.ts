@@ -23,15 +23,23 @@ export interface Measured<T> {
 export type Reason =
   | 'traded'
   | 'not_finite'
+  | 'probability_invalid'
+  | 'no_quote'
+  | 'no_peer_book'
   | 'price_out_of_band'
   | 'disagreement_implausible'
   | 'edge_below_gate'
+  | 'edge_uncertain'
+  | 'members_disagree'
   | 'below_min_contracts'
   | 'fee_ceiling'
   | 'window_exposure'
   | 'position_limit'
   | 'already_entered'
-  | 'bankroll_floor';
+  | 'offset_not_traded'
+  | 'bankroll_floor'
+  | 'halted'
+  | 'model_not_pinned';
 
 export type Side = 'up' | 'down';
 export type PositionOutcome = 'pending' | 'won' | 'lost';
@@ -250,21 +258,6 @@ export interface VenueSettlement {
   synced_at: string | null;
 }
 
-export interface VenueFill {
-  trade_id: string;
-  order_id: string | null;
-  ticker: string;
-  side: 'up' | 'down';
-  action: string | null;
-  contracts: number;
-  /** Dollars paid per contract for `side` — a 30c NO fill reads 0.30, not the
-   *  0.70 the venue's YES-denominated book quotes. */
-  price: number | null;
-  cost: number | null;
-  is_taker: boolean | null;
-  created_time: string | null;
-}
-
 export interface FunnelStage {
   reason: Reason;
   count: number;
@@ -334,9 +327,4 @@ export interface LiveState {
   account: AccountState;
   open_positions: Position[];
   tickets: OrderTicket[];
-}
-
-export interface JobDescriptor {
-  module: string;
-  description: string;
 }

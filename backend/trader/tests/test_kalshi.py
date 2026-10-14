@@ -17,7 +17,7 @@ import pytest
 
 from data_collection.kalshi_client import (
     CENT, DEFAULT_BASE_URL, DEMO_BASE_URL, KalshiClient, KalshiError, NotLiveError,
-    Quote, _cents, _parse_time, _to_quote,
+    Quote, _parse_time, _price, _to_quote,
 )
 
 
@@ -105,6 +105,49 @@ def test_an_order_validates_its_own_arguments(key_pem):
                                            limit_price=bad_price))
 
 
+def _sent_price(key_pem, side, limit_price):
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem=key_pem, live=True)
+    sent = {}
+
+    async def _request(method, path, *, body=None, **kw):
+        sent.update(body or {})
+        return {'order': {'status': 'executed'}}
+
+    client._request = _request
+    asyncio.run(client.place_order(ticker='X', side=side, contracts=1,
+                                   limit_price=limit_price))
+    return sent['side'], sent['price']
+
+
+@pytest.mark.parametrize('side, limit, expected', [
+    # Middle band: whole-cent tick, rounded toward a fill as before.
+    ('up', 0.6, ('bid', '0.6000')),
+    ('up', 0.603, ('bid', '0.6100')),
+    ('down', 0.397, ('ask', '0.6000')),       # YES 0.603, floored for an ask
+    # Tails: deci-cent tick, so the limit is not widened by up to 0.9c.
+    ('up', 0.0632, ('bid', '0.0640')),
+    ('up', 0.9213, ('bid', '0.9220')),
+    ('down', 0.0632, ('ask', '0.9360')),      # YES 0.9368 -> floor 0.936
+    ('down', 0.9213, ('ask', '0.0780')),      # YES 0.0787 -> floor 0.078
+    # Exactly on a deci-cent level stays put.
+    ('up', 0.064, ('bid', '0.0640')),
+    # Crossing a band edge lands on a level valid in the band it lands in.
+    ('up', 0.0995, ('bid', '0.1000')),
+    ('down', 0.8995, ('ask', '0.1000')),      # YES 0.1005 -> floor to 0.10
+])
+def test_a_limit_is_rounded_onto_the_venue_tick_toward_a_fill(
+        key_pem, side, limit, expected):
+    """`tapered_deci_cent`: a tenth of a cent below 10c and above 90c.
+
+    Ceiling to a whole cent there gave an immediate_or_cancel up to 0.9c more
+    reach than `order_limit_price` chose. Still rounded in the direction that
+    can fill: up for a bid, down for an ask.
+    """
+    assert _sent_price(key_pem, side, limit) == expected
+
+
 def test_a_quote_is_converted_to_probabilities_at_the_boundary():
     """Everything above this module reasons on the probability scale.
 
@@ -183,10 +226,11 @@ def test_a_settled_market_is_not_tradeable():
 
 
 def test_a_zero_price_reads_as_absent_not_as_free():
-    assert _cents(0) is None
-    assert _cents(None) is None
-    assert _cents('nonsense') is None
-    assert _cents(45) == pytest.approx(0.45)
+    """The legacy integer-cent encoding, through the parser quotes use."""
+    assert _price({'yes_bid': 0}, 'yes_bid') is None
+    assert _price({'yes_bid': None}, 'yes_bid') is None
+    assert _price({'yes_bid': 'nonsense'}, 'yes_bid') is None
+    assert _price({'yes_bid': 45}, 'yes_bid') == pytest.approx(0.45)
 
 
 def test_times_parse_to_utc():
@@ -279,32 +323,6 @@ def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
         'the auth branch is checked first, so a network block is reported as an '
         'auth failure'
     )
-
-
-def test_the_preflight_is_launchable_from_the_dashboard():
-    """It is read-only, so the job allow-list should include it."""
-    import sys
-    from pathlib import Path
-
-    api_root = Path(__file__).resolve().parents[2] / 'api'
-    if not api_root.exists():
-        pytest.skip('API package not present')
-    sys.path.insert(0, str(api_root))
-    try:
-        for name in list(sys.modules):
-            if name.startswith(('endpoints', 'security')):
-                del sys.modules[name]
-        from endpoints.jobs import JOBS
-
-        assert 'scripts.check_venue' in JOBS
-        # And the live loop is deliberately NOT launchable from a web request:
-        # two copies racing over one account.
-        assert 'scripts.live' not in JOBS
-    finally:
-        sys.path.remove(str(api_root))
-        for name in list(sys.modules):
-            if name.startswith(('endpoints', 'security')):
-                del sys.modules[name]
 
 
 def test_the_series_are_the_fifteen_minute_ones():

@@ -135,7 +135,11 @@ class TestTheCycleKeepsScoringWhileHalted:
             def predict(self, table):
                 return np.array([0.72] * len(table))
 
-        async def fake_bars(config, minutes=None):
+            def score(self, table):
+                return pd.DataFrame({'model_probability': self.predict(table)},
+                                    index=table.index)
+
+        async def fake_bars(config, minutes=None, **_):
             return bars
 
         async def fake_quotes(kalshi, symbols, settle_time):
@@ -154,7 +158,10 @@ class TestTheCycleKeepsScoringWhileHalted:
             # a partial Coinbase answer produces confident wrong features.
             # Lowered here so the test exercises the halt path rather than the
             # short-feed refusal.
-            config = dataclasses.replace(DEFAULT_CONFIG, min_usable_bars=1)
+            # `min_remaining_seconds=0` too: on the real clock, a run in the
+            # last 45s of a quarter-hour otherwise stops before any decision.
+            config = dataclasses.replace(DEFAULT_CONFIG, min_usable_bars=1,
+                                         min_remaining_seconds=0)
             asyncio.run(live_mod.run_cycle(args, config, writer,
                                            Model(), None))
         finally:

@@ -34,21 +34,10 @@ services:
       context: ./backend/api
       dockerfile: Dockerfile
     ports:
-      # Loopback only: the API serves a local dashboard and has one endpoint
-      # that starts a process.
+      # Loopback only: the API serves a local dashboard.
       - "127.0.0.1:8000:8000"
     environment:
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
-      - COINBASE_API_KEY=${COINBASE_API_KEY:-}
-      - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
-      - TRADER_DIR=/trader
-      # No quotes around the default: `json.loads("'[]'")` raises, and the
-      # exception is swallowed, so a quoted default was indistinguishable from
-      # "not configured" — as would be a typo in a real wallet list.
-      # Shared secret for POST /research/launch, which starts a process in a
-      # container holding the exchange keys. Unset means that route returns 503
-      # — it fails closed rather than running unauthenticated.
-      - API_TOKEN=${API_TOKEN:-}
       # Comma-separated. `*` is filtered out: it made every other entry
       # decorative and let any open page call the API with credentials.
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
@@ -57,7 +46,6 @@ services:
         condition: service_healthy
     volumes:
       - ./backend/api:/app
-      - ./backend/trader:/trader
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 
   # ===========================================================================
@@ -74,7 +62,6 @@ services:
         # Default to the relative path nginx already proxies to the backend,
         # which makes the bundle host-agnostic.
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
-        VITE_API_TOKEN: ${API_TOKEN:-}
     ports:
       - "127.0.0.1:3000:80"
     depends_on:
@@ -82,8 +69,8 @@ services:
     # No runtime environment. Vite inlines `import.meta.env.VITE_*` at BUILD
     # time, so values set here on an nginx image serving a finished bundle are
     # silently ignored — what actually got baked in was the committed
-    # `frontend/.env`, which is why every deployment pointed at localhost:8000
-    # and the API token was always absent. They are `build.args` above now.
+    # `frontend/.env`, which is why every deployment pointed at localhost:8000.
+    # It is a `build.args` entry above now.
     # The default `/api` is a relative path that `nginx.conf` already proxies to
     # the backend, so the bundle no longer hardcodes a host at all.
     # `frontend/.env` still applies to `npm run dev`.
@@ -147,6 +134,20 @@ services:
       # schedule — but records no version in a model's provenance. `configs/`
       # lives inside backend/trader precisely so the build context includes it.
       - FEE_CONFIG=${FEE_CONFIG:-}
+
+      # Raw-tier retention (`core/spool.py`), applied on each hourly
+      # compaction. Book frames and Coinbase trades are the big ones (~0.4-1.1
+      # GB/day for the book); the per-second index proxy is tiny and kept a year.
+      - RAW_RETENTION_DAYS=${RAW_RETENTION_DAYS:-60}
+      - INDEX_PROXY_RETENTION_DAYS=${INDEX_PROXY_RETENTION_DAYS:-365}
+      # Free-disk guard on the store volume: below max(fraction x volume, GB)
+      # the oldest raw partitions are deleted (book frames first, the index
+      # proxy last, never the newest day), logged at ERROR.
+      - DISK_GUARD_MIN_FREE_FRACTION=${DISK_GUARD_MIN_FREE_FRACTION:-0.15}
+      - DISK_GUARD_MIN_FREE_GB=${DISK_GUARD_MIN_FREE_GB:-20}
+      # Venues the `index` component (scripts/record_index.py) connects to.
+      # Disable the component entirely with `--disable index`.
+      - INDEX_PROXY_EXCHANGES=${INDEX_PROXY_EXCHANGES:-coinbase,kraken,bitstamp,gemini}
 
       # Optional: HTTP proxy for exchange API calls
       # - HTTPS_PROXY=http://your-proxy:8080
@@ -377,47 +378,6 @@ services:
         --kelly-fraction 0.05
         --min-edge-pp 1.5
         --bankroll 500
-
-  # ===========================================================================
-  # Everything the live system runs, in ONE service.
-  #
-  # This was five: the trading loop, three recorders and a shell loop that
-  # scraped and rebuilt the store. They were separate because they were written
-  # one at a time, not because they differ — four are async loops polling an
-  # HTTP API on a sixty-second cadence. One container means one restart policy,
-  # one log stream, and one thing to check.
-  #
-  # **Trading latency is what the arrangement protects.** The threat was never
-  # the polling, which is all `await`; it is `ResearchStore.write`, synchronous
-  # pandas and pyarrow that would block a pending decision. So writes run in a
-  # thread, recorders hold off while a decision is in flight (`TradingGate`),
-  # their cadences are phased to the far side of the minute from the decision
-  # instants, and the store rebuild stays a subprocess because it is minutes of
-  # blocking CPU. See `scripts/run_live.py`.
-  #
-  # A failure in one component no longer hides: `supervise` logs it and restarts
-  # that component with backoff while the rest keep running. Across five
-  # containers a crash-looping recorder was invisible unless someone looked.
-  #
-  # Disable a component without editing this file:
-  #   docker compose run --rm live --disable pm_ladder --trade-args ...
-  # ===========================================================================
-  live:
-    profiles: ["live"]
-    extends:
-      service: trader
-    restart: unless-stopped
-    command: >
-      -m scripts.run_live
-        --trade-args
-          --loop
-          --cycle-seconds 60
-          --mode live
-          --dry-run
-          --bankroll 200
-          --no-require-gates
-          --force
-          --reason "manual run of the live stack; edit before using"
 
 
 volumes:

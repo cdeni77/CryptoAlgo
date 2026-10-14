@@ -160,13 +160,45 @@ class TestTheEconomicNull:
             price = float(rng.uniform(0.15, 0.6))
             contracts = int(rng.integers(3, 15))
             fee = 0.07 * price * (1 - price) * contracts
-            outlay = price * contracts
+            # As `Book` records it: the outlay already carries the fee.
+            outlay = price * contracts + fee
             won = rng.random() < (price + edge)
             rows.append({'window_open': f'w{i // 2}', 'contracts': contracts,
                          'outlay': outlay, 'fee': fee,
                          'p_win_market': price,
-                         'pnl': (contracts - outlay - fee) if won else -(outlay + fee)})
+                         'pnl': (contracts - outlay) if won else -outlay})
         return pd.DataFrame(rows)
+
+    def test_the_fee_is_charged_once(self):
+        """`outlay` already includes the fee, so the null's expected P&L is
+        sum(p * contracts - outlay). Adding `fee` again made every real book look
+        better than its null by the whole fee bill."""
+        t = self._trades()
+        r = pnl_against_market_null(t, n_resamples=20_000)
+        analytic = float((t['p_win_market'] * t['contracts'] - t['outlay']).sum())
+        assert r.expected == pytest.approx(analytic, abs=4 * r.sd / np.sqrt(20_000))
+        assert abs(r.expected - (analytic - t['fee'].sum())) > 0.5 * t['fee'].sum()
+
+    def test_a_real_book_trade_ledger_is_accepted_as_is(self):
+        """The columns `Book.trades()` writes, unchanged: outlay includes the fee."""
+        from core.book import Book
+        from core.config import Config
+        from core.decide import Decision, Reason, Side
+
+        config = Config()
+        book = Book(config=config)
+        window = pd.Timestamp('2026-01-01', tz='UTC')
+        decision = Decision(
+            symbol='BTC-USD', window_open=window,
+            settle_time=window + pd.Timedelta(minutes=15), offset=12,
+            reason=Reason.TRADED, model_probability=0.6, baseline_probability=0.5,
+            side=Side.UP, price=0.5, contracts=10, stake=5.0 + 0.175, fee=0.175)
+        book.record(decision)
+        book.settle({('BTC-USD', window): True})
+        trades = book.trades().assign(p_win_market=0.5)
+        assert trades['outlay'].iloc[0] == pytest.approx(5.175)
+        r = pnl_against_market_null(trades, n_resamples=4_000)
+        assert r.expected == pytest.approx(0.5 * 10 - 5.175, abs=0.3)
 
     def test_a_fairly_priced_book_is_not_significant(self):
         """Trades won at exactly the market's implied rate. p should be ordinary."""

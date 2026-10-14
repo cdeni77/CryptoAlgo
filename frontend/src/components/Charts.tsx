@@ -13,8 +13,6 @@ import {
   CartesianGrid,
   Cell,
   ComposedChart,
-  Line,
-  LineChart,
   ReferenceLine,
   ResponsiveContainer,
   Scatter,
@@ -397,35 +395,6 @@ export function FunnelChart({ stages }: { stages: FunnelStage[] }) {
           ))}
         </Bar>
       </BarChart>
-    </ResponsiveContainer>
-  );
-}
-
-/* ------------------------------------------------------------ skill by fold */
-
-export function FoldSkillChart({
-  folds,
-}: {
-  folds: { fold: number; skill: number }[];
-}) {
-  if (folds.length === 0) return <Empty what="No per-fold skill recorded." />;
-  return (
-    <ResponsiveContainer width="100%" height={160}>
-      <LineChart data={folds} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-        <CartesianGrid {...GRID} vertical={false} />
-        <XAxis dataKey="fold" tick={TICK} axisLine={AXIS} tickLine={false} />
-        <YAxis tick={TICK} axisLine={false} tickLine={false} width={62} />
-        <ReferenceLine y={0} stroke="var(--rule-firm)" />
-        <Tooltip {...TOOLTIP} formatter={(v: number) => [v.toFixed(5), 'log loss skill']} />
-        <Line
-          type="linear"
-          dataKey="skill"
-          stroke="var(--accent)"
-          strokeWidth={1.5}
-          dot={{ r: 2.5, fill: 'var(--accent)', strokeWidth: 0 }}
-          isAnimationActive={false}
-        />
-      </LineChart>
     </ResponsiveContainer>
   );
 }

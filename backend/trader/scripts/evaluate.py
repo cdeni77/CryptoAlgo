@@ -43,11 +43,26 @@ from pathlib import Path
 import pandas as pd
 
 from core.backtest import cost_stress, edge_curve, walk_forward
-from core.metrics import evaluate_gates, gate_report, gates_passed
+from core.metrics import evaluate_gates, gate_report, gate_spec_hash, gates_passed
 from scripts._common import (
-    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
-    setup_logging,
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, log_trial,
+    print_header, setup_logging,
 )
+
+
+def stack_table(models) -> pd.DataFrame:
+    """One row per fold of a stacked run: a, b, c and the stage-2 sample."""
+    rows = []
+    for i, model in enumerate(models):
+        if not hasattr(model, 'stack_summary'):
+            continue
+        s = model.stack_summary()
+        rows.append({'fold': i, 'a': round(s['a'], 4), 'b': round(s['b'], 4),
+                     'c': round(s['c'], 4), 'n_stage2_rows': s['n_rows'],
+                     'fitted': s['fitted'],
+                     'oof_skill_vs_market': s['inner_market_log_loss']
+                     - s['inner_log_loss']})
+    return pd.DataFrame(rows)
 
 
 def main() -> int:
@@ -79,6 +94,13 @@ def main() -> int:
         print(f'\n  Read the {report.folds_positive}/{report.folds_total} agreement with '
               f'the p-value beside it ({report.sign_agreement_p_value:.3f}): under no '
               f'skill\n  each fold is a coin flip, so this much agreement is not rare.')
+
+    stack = stack_table(getattr(result, 'models', ()) or ())
+    if not stack.empty:
+        print('\n  stage 2 per fold — b is how much of the spot model\'s disagreement '
+              'with the\n  price survives out of fold (0 = the price is right, '
+              '1 = all of it):')
+        print('    ' + stack.to_string(index=False).replace('\n', '\n    '))
 
     per_offset = report.per_offset()
     if not per_offset.empty:
@@ -145,9 +167,21 @@ def main() -> int:
     #     all four pooled           model_minus_market  -0.000311   FAIL
     #
     # `evaluate` reported the second and read as "the model loses to the price".
-    gates = evaluate_gates(report, extra=market_measurement(
-        result.scored, entry_offsets=config.entry_offsets))
+    market = market_measurement(result.scored, entry_offsets=config.entry_offsets)
+    gates = evaluate_gates(report, extra=market)
     print(gate_report(gates))
+
+    # Every evaluation is a trial, whether or not anything is promoted after it.
+    log_trial('evaluate', args, config, groups=groups, dataset=dataset,
+              report=report, metrics={
+                  **{name: market.get(name) for name in (
+                      'model_minus_market', 'model_minus_market_p', 'min_folds',
+                      'market_windows')},
+                  'gates_passed': gates_passed(gates),
+                  'failed_gates': [g.name for g in gates if not g.passed],
+                  **({'stack_b_median': float(stack['b'].median()),
+                      'stack_a_median': float(stack['a'].median())}
+                     if not stack.empty else {})})
 
     if args.out:
         out = Path(args.out)
@@ -160,8 +194,11 @@ def main() -> int:
             'gate_values': report.gate_values(),
             'gates': [{'name': g.name, 'value': g.value, 'threshold': g.threshold,
                        'passed': g.passed} for g in gates],
+            'gate_spec_hash': gate_spec_hash(),
+            'fold_geometry': report.fold_geometry,
             'config': report.config_provenance,
             'per_offset': per_offset.to_dict('records'),
+            'stack': stack.to_dict('records'),
             'rejections': result.rejections.to_dict(),
         }, indent=2, default=str))
         print(f'\nwrote {out}/scored.parquet, trades.parquet, report.json')

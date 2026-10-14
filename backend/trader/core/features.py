@@ -67,6 +67,7 @@ NEW_YORK = ZoneInfo('America/New_York')
 # Column names live with the code that computes them, so a rename cannot
 # leave this dict pointing at a column nothing produces.
 from core.book_flow import BOOK_FLOW
+from core.index_features import INDEX_PROXY                       # noqa: E402
 from core.book_features import (                                # noqa: E402
     CROSS_VENUE as BOOK_CROSS_VENUE,
     IMPLIED_VOL as BOOK_IMPLIED_VOL,
@@ -135,6 +136,10 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     # t=+0.30 to t=+1.84 over 67 days, "positive and strengthening". Off by
     # default: it is a candidate under test, not part of the deployed model.
     'book_flow': BOOK_FLOW,
+    # The settlement INDEX, estimated live from its constituent exchanges
+    # (`core/index_proxy.py`), as against the Coinbase bars every other group
+    # reads. Recorded only from the day `record_index` started, so opt-in.
+    'index_proxy': INDEX_PROXY,
 }
 
 # The venue's book only exists from 2026-01-08, against five years of bars, so
@@ -145,7 +150,9 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
 # ablated alone, which is the only test that says whether it forecasts anything.
 BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol',
                'book_flow')
-ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in BOOK_GROUPS)
+# Selectable, never default: everything with a short history.
+OPT_IN_GROUPS = BOOK_GROUPS + ('index_proxy',)
+ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in OPT_IN_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
 CONTROL_GROUPS = ('time_of_day',)
 
@@ -558,6 +565,14 @@ def build_features(
         realised = pd.to_numeric(table.get('sigma_per_min'), errors='coerce')
         ratio = implied / realised.replace(0.0, np.nan)
         table['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
+
+    # `proxy_displacement_z` is the index-proxy twin of `z_score`, and for the
+    # same reason as `iv_minus_realised` it is finished here: its denominator is
+    # the FITTED `sigma_remaining`.
+    if 'proxy_displacement' in table.columns:
+        from core.index_features import proxy_displacement_z
+        table['proxy_displacement_z'] = proxy_displacement_z(
+            table['proxy_displacement'], table['sigma_remaining'])
 
     return reindex_to_features(table, feature_columns(groups), deferred=deferred)
 

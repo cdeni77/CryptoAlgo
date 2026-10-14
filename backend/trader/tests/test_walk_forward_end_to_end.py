@@ -63,11 +63,18 @@ class TestTheNull:
         )
 
     def test_a_null_does_not_pass_the_gates(self, null_run):
+        """A null must fail on EVIDENCE, not only on sample size or a missing book.
+
+        `sign_agreement_p` is left out of the set on purpose: at three folds its
+        best possible value is p = 0.125 against a 0.11 bar, so it fails every
+        three-fold run whatever the data says, and counting it would let this
+        test pass for the same reason `windows_evaluated` does.
+        """
         gates = evaluate_gates(null_run.report)
         assert not gates_passed(gates)
         failed = {g.name for g in gates if not g.passed}
-        assert failed & {'log_loss_skill', 'folds_skill_positive',
-                         'realised_edge_pp', 'total_return'}, (
+        assert failed & {'log_loss_skill', 'log_loss_skill_p',
+                         'realised_edge_pp', 'total_return', 'sharpe'}, (
             f'the null failed only {failed}, none of which is a forecast or money '
             f'gate — so nothing is actually testing the hypothesis'
         )
@@ -87,18 +94,30 @@ class TestTheNull:
         folds the median degenerates to the mean. So this test asserts what
         actually holds — the *forecast* gates reject the null — and does not
         pretend alpha alone would.
+
+        Nor does `log_loss_skill >= 0` alone: a point estimate clears zero on
+        about half of all nulls, and this one does (+0.00028, t = +0.69). The
+        significance gate is what rejects it.
         """
         gates = {g.name: g for g in evaluate_gates(null_run.report)}
-        assert not gates['log_loss_skill'].passed or not gates['folds_skill_positive'].passed, (
-            f'skill {null_run.report.mean_skill:+.6f} over '
+        assert not gates['log_loss_skill'].passed or not gates['log_loss_skill_p'].passed, (
+            f'skill {null_run.report.mean_skill:+.6f} (p = '
+            f'{null_run.report.skill_p_value:.3f}) over '
             f'{null_run.report.folds_positive}/{null_run.report.folds_total} folds '
             f'positive: neither forecast gate objected to data with no signal'
         )
 
-
 class TestStructure:
     def test_every_fold_is_measured(self, signal_run):
-        assert len(signal_run.report.folds) == TRADING.n_folds
+        """Against the folds the Config actually cuts. Under the calendar scheme
+        `n_folds` is not a count, so comparing to it asserted the wrong thing."""
+        from core.cv import folds_for_config
+
+        dataset = Dataset.build(make_bars(days=30, lead=0.9, seed=5), TRADING)
+        expected = folds_for_config(dataset.window_index, TRADING)
+        assert len(signal_run.report.folds) == len(expected)
+        assert signal_run.report.fold_geometry['n_folds_actual'] == len(expected)
+        assert signal_run.report.fold_geometry['n_folds_config'] == TRADING.n_folds
         for fold in signal_run.report.folds:
             assert fold.n_rows > 0 and fold.n_windows > 0
             assert np.isfinite(fold.model_log_loss)

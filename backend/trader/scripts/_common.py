@@ -52,6 +52,24 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            'venue, a ladder fit and the venue settlement are '
                            'ALL present. Fewer rows, but each is one the live '
                            'path could have traded with everything it claims.')
+    data.add_argument('--quote-sources', type=str, default=None,
+                      help='Comma-separated venue_depth observers allowed to '
+                           'price a row, e.g. live_touch,live_ws,live. Default: '
+                           'every source, ranked by QUOTE_SOURCE_PRIORITY.')
+    data.add_argument('--null-quote-age', choices=('fresh', 'stale'),
+                      default=None,
+                      help="'fresh' (default) keeps a quote with no recorded "
+                           "age; 'stale' drops it, after bounding live_touch "
+                           "ages by available_time - event_time.")
+    data.add_argument('--peer-max-quote-age-seconds', type=float, default=None,
+                      metavar='S',
+                      help='staleness cap for the cross-venue PEER book only '
+                           '(default: follow the Kalshi cap). Setting it also '
+                           'applies --null-quote-age to the peer.')
+    data.add_argument('--decision-latency-seconds', type=float, default=None,
+                      metavar='S',
+                      help='seconds after the minute that live reads the book '
+                           '(default 3). A book seen later is not used.')
     data.add_argument('--start', type=str, default=None, help='ISO date, inclusive')
     data.add_argument('--end', type=str, default=None, help='ISO date, exclusive')
     data.add_argument('--train-window-days', type=float, default=None,
@@ -60,6 +78,16 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            'both are useful and neither substitutes for the other.')
     data.add_argument('--research-store', type=str, default=None,
                       help='Override RESEARCH_STORE')
+    data.add_argument('--holdout-start', type=str, default=None, metavar='DATE',
+                      help='Seal every window opening at or after this ISO date. '
+                           'No research script sees it until --unseal-holdout.')
+    data.add_argument('--unseal-holdout', type=str, default=None, metavar='REASON',
+                      help='Read the sealed holdout. Recorded in the trial log, the '
+                           'ledger and models/holdout_unsealed.jsonl; refused on a '
+                           'second unseal of the same date without --force-unseal.')
+    data.add_argument('--force-unseal', action='store_true',
+                      help='Allow a repeat unseal of a holdout already read. '
+                           'Separate from promote --force, which installs past gates.')
 
     market = parser.add_argument_group('market structure')
     market.add_argument('--window-minutes', type=int, default=None,
@@ -141,6 +169,40 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'which optimises the average -- and the average is '
                             'already fine while the traded rows are 6.7pp '
                             'overconfident.')
+    model.add_argument('--ensemble-size', type=int, default=None, metavar='K',
+                       help='average K boosters (default 1); their spread '
+                            'feeds --edge-lower-bound-z and '
+                            '--require-member-agreement')
+    model.add_argument('--stack-mode', choices=('off', 'spot_then_market'),
+                       default=None,
+                       help="'spot_then_market': stage 1 learns spot -> "
+                            "probability on every bar, stage 2 fits "
+                            "a*logit(market) + b*(logit(spot) - logit(market)) "
+                            "only on rows with a usable quote")
+    model.add_argument('--stack-spot-groups', type=str, default=None,
+                       help='comma-separated stage-1 feature groups (default: '
+                            + ','.join(DEFAULT_CONFIG.stack_spot_groups) + ')')
+    model.add_argument('--stack-book-features', type=str, default=None,
+                       help='comma-separated book columns entering stage 2 '
+                            'linearly (L2-penalised, standardized)')
+    model.add_argument('--stack-l2', type=float, default=None)
+    model.add_argument('--stack-crossfit-blocks', type=int, default=None,
+                       help='contiguous blocks used to give stage-2 rows an '
+                            'out-of-sample stage-1 prediction (default 4)')
+    model.add_argument('--stack-intercept', action='store_true', default=None,
+                       help='let stage 2 fit an intercept c in [-0.5, 0.5]')
+    model.add_argument('--label-source', choices=('proxy', 'venue'),
+                       default=None,
+                       help="'venue' trains on the venue's own settlement "
+                            "where held, the Coinbase proxy elsewhere")
+    economics.add_argument('--edge-lower-bound-z', type=float, default=None,
+                           metavar='Z',
+                           help='also require the edge to clear the gate at the '
+                                'probability minus Z ensemble standard deviations')
+    economics.add_argument('--require-member-agreement', action='store_true',
+                           default=None,
+                           help='refuse unless every ensemble member still '
+                                'beats the cost on the chosen side')
     model.add_argument('--fold-train-days', type=float, default=None,
                        help='roll the TRAINING window to this many days '
                             '(default: expanding, which is what the Sunday '
@@ -196,6 +258,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
     offsets = _parse_list(getattr(args, 'offsets', None))
     if offsets:
         overrides['decision_offsets'] = tuple(int(o) for o in offsets)
+    for field, attr in (('quote_sources', 'quote_sources'),
+                        ('stack_spot_groups', 'stack_spot_groups'),
+                        ('stack_book_features', 'stack_book_features')):
+        listed = _parse_list(getattr(args, attr, None))
+        if listed:
+            overrides[field] = listed
     for field, attr in (
         ('venue', 'venue'), ('window_minutes', 'window_minutes'),
         ('baseline_distribution', 'baseline_distribution'), ('n_folds', 'n_folds'),
@@ -215,6 +283,17 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('init_score_source', 'init_score_source'),
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
         ('assume_maker', 'assume_maker'),
+        ('ensemble_size', 'ensemble_size'),
+        ('label_source', 'label_source'),
+        ('null_quote_age', 'null_quote_age'),
+        ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),
+        ('decision_latency_seconds', 'decision_latency_seconds'),
+        ('stack_mode', 'stack_mode'), ('stack_l2', 'stack_l2'),
+        ('stack_crossfit_blocks', 'stack_crossfit_blocks'),
+        ('stack_intercept', 'stack_intercept'),
+        ('edge_lower_bound_z', 'edge_lower_bound_z'),
+        ('require_member_agreement', 'require_member_agreement'),
+        ('holdout_start', 'holdout_start'),
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -273,14 +352,60 @@ def apply_complete_cases(args: argparse.Namespace, dataset: Dataset) -> Dataset:
     return dataset
 
 
+def _utc(value) -> pd.Timestamp:
+    stamp = pd.Timestamp(value)
+    return stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
+
+
+def resolve_holdout(args: argparse.Namespace, config: Config) -> dict:
+    """Decide whether this run may read past `config.holdout_start`.
+
+    Records an unseal (once per date, refusing a repeat without
+    `--force-unseal`) and returns the state the trial log and ledger carry.
+    """
+    reason = getattr(args, 'unseal_holdout', None)
+    start = getattr(config, 'holdout_start', None)
+    if start is None:
+        if reason:
+            raise SystemExit('--unseal-holdout without --holdout-start: there is '
+                             'no seal to lift')
+        return {'start': None, 'sealed': False}
+    if not reason:
+        return {'start': str(start), 'sealed': True}
+    from core.promotion import HoldoutError, unseal_holdout
+
+    script = Path(sys.argv[0]).stem if sys.argv and sys.argv[0] else ''
+    try:
+        record = unseal_holdout(str(start), reason,
+                                force=bool(getattr(args, 'force_unseal', False)),
+                                script=script)
+    except HoldoutError as exc:
+        raise SystemExit(str(exc)) from exc
+    logging.getLogger('dataset').warning(
+        'HOLDOUT UNSEALED from %s: %s', start, reason)
+    return {'start': str(start), 'sealed': False, 'unsealed': record}
+
+
 def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
-    """Read the store, lay the window grid, report coverage."""
+    """Read the store, lay the window grid, report coverage.
+
+    **The one place the sealed holdout is enforced.** Bars are cut at
+    `holdout_start` so nothing fitted inside a fold (volatility, seasonality,
+    baseline) sees them, and windows opening at or after it are dropped.
+    """
     logger = logging.getLogger('dataset')
+    holdout = resolve_holdout(args, config)
+    args.holdout_state = holdout
+    cutoff = _utc(holdout['start']) if holdout.get('sealed') else None
+    end = _utc(args.end) if getattr(args, 'end', None) else None
+    if cutoff is not None:
+        end = cutoff if end is None else min(end, cutoff)
+        logger.info('holdout sealed: nothing at or after %s is read', cutoff)
     store = ResearchStore()
     bars = load_minute_bars(
         config, store=store,
-        start=pd.Timestamp(args.start, tz='UTC') if getattr(args, 'start', None) else None,
-        end=pd.Timestamp(args.end, tz='UTC') if getattr(args, 'end', None) else None,
+        start=_utc(args.start) if getattr(args, 'start', None) else None,
+        end=end,
     )
     # The venue's own book and the ladder fits, where they exist. Both are
     # OBSERVED rather than fitted, so they attach with the panel; passing them
@@ -312,9 +437,26 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     except Exception:                                         # noqa: BLE001
         settlements = None
 
+    # The index proxy is read only when its group is asked for: a year of it
+    # is ~95M one-second rows, reduced to minute summaries in DuckDB.
+    index_proxy = None
+    if 'index_proxy' in (groups_from_args(args) or ()):
+        try:
+            from core.index_features import load_proxy_minutes
+            index_proxy = load_proxy_minutes(store.root, end=end)
+            logger.info('index_proxy_1s: %s minute summaries',
+                        f'{len(index_proxy):,}')
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('no index_proxy_1s (%s); the group will be NaN',
+                           str(exc)[:80])
+
     dataset = Dataset.build(
-        bars, config, depth=depth, ladder_fits=ladder_fits
+        bars, config, depth=depth, ladder_fits=ladder_fits,
+        index_proxy=index_proxy,
     ).trailing(config.train_window_days)
+    if cutoff is not None and len(dataset.windows):
+        opens = pd.to_datetime(dataset.windows['window_open'], utc=True)
+        dataset.windows = dataset.windows.loc[(opens < cutoff).to_numpy()].reset_index(drop=True)
 
     if settlements is not None and len(settlements) and 'settled_up' in settlements.columns:
         # **One venue, newest revision.** This dropped `venue` entirely and
@@ -349,6 +491,7 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
         got = int(dataset.windows['venue_outcome'].notna().sum())
         logger.info("venue settlements joined: %s rows carry the venue's own label",
                     f'{got:,}')
+    log_quote_coverage(depth, dataset, config)
     coverage = dataset.coverage()
     logger.info('coverage:\n%s', coverage.to_string(index=False))
     worst = coverage['boundary_drop_rate'].max() if len(coverage) else 0.0
@@ -358,12 +501,79 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
             'Each missing minute kills two windows — the one settling on it and '
             'the one opening on it — so this is twice the gap rate.', worst * 100)
     if getattr(args, 'complete_cases', False):
+        if getattr(config, 'stack_mode', 'off') != 'off':
+            raise SystemExit(
+                '--complete-cases contradicts --stack-mode: stage 1 is fitted '
+                'on every bar, and stage 2 already admits only rows carrying a '
+                'usable quote. Filter the quotes with --quote-sources and '
+                '--null-quote-age instead.')
         apply_complete_cases(args, dataset)
 
     logger.info('%s windows, %s rows, %.0f days',
                 f'{len(dataset.window_index):,}', f'{len(dataset.windows):,}',
                 dataset.span_days)
     return dataset
+
+
+def log_quote_coverage(depth, dataset: Dataset, config: Config) -> dict:
+    """Which observers the store holds, how old their quotes were, and which
+    of them actually priced a row once the source/age filters ran."""
+    from core.quotes import quote_coverage, source_age_table
+
+    logger = logging.getLogger('dataset')
+    if depth is not None and len(depth) and 'venue' in depth.columns:
+        raw = source_age_table(depth[depth['venue'] == 'kalshi'])
+        if len(raw):
+            logger.info('venue_depth (kalshi) rows by source and recorded age:\n%s',
+                        raw.to_string(index=False))
+    coverage = quote_coverage(dataset.windows)
+    logger.info('quotes priced %s of %s rows (%.1f%%) under sources=%s, '
+                'max age %.0fs (peer %s), null age %s',
+                f"{coverage['quoted']:,}", f"{coverage['rows']:,}",
+                100 * coverage['share'],
+                ','.join(config.quote_sources) or 'all',
+                float(config.max_quote_age_seconds),
+                'follows' if config.peer_max_quote_age_seconds is None
+                else f'{config.peer_max_quote_age_seconds:.0f}s',
+                config.null_quote_age)
+    if coverage['by_source_age']:
+        logger.info('priced rows by observer and age:\n%s',
+                    pd.DataFrame(coverage['by_source_age']).to_string(index=False))
+    return coverage
+
+
+def data_span(dataset: Optional[Dataset], args: Optional[argparse.Namespace] = None) -> dict:
+    """What the run actually read, for the trial log."""
+    span: dict = {}
+    if args is not None:
+        span.update({'start_arg': getattr(args, 'start', None),
+                     'end_arg': getattr(args, 'end', None),
+                     'complete_cases': bool(getattr(args, 'complete_cases', False))})
+    if dataset is not None:
+        index = dataset.window_index
+        span.update({
+            'first_window': str(index.min()) if len(index) else None,
+            'last_window': str(index.max()) if len(index) else None,
+            'windows': int(len(index)), 'rows': int(len(dataset.windows)),
+            'symbols': list(dataset.symbols),
+        })
+    return span
+
+
+def log_trial(script: str, args: argparse.Namespace, config: Config, *,
+              groups: Optional[Sequence[str]] = None,
+              dataset: Optional[Dataset] = None, report=None,
+              metrics: Optional[dict] = None, trial_id: Optional[str] = None,
+              extra: Optional[dict] = None) -> dict:
+    """One line in `trials.jsonl` for this run. Every research script calls it,
+    because the ledger alone counted only promotions."""
+    from core.promotion import record_trial, trial_metrics
+
+    return record_trial(
+        script, trial_id=trial_id, config=config, groups=groups,
+        data_span=data_span(dataset, args),
+        metrics=trial_metrics(report, metrics),
+        holdout=getattr(args, 'holdout_state', None), extra=extra)
 
 
 def print_header(title: str, config: Config) -> None:
@@ -379,6 +589,17 @@ def print_header(title: str, config: Config) -> None:
           f'{config.half_spread_cents:.1f}c half-spread [{config.fee_config_version}]')
     print(f'account           ${config.starting_bankroll:.2f}, '
           f'{config.kelly_fraction:.2f} Kelly, gate {config.min_edge_pp:.2f}pp')
+    if config.quote_sources or config.null_quote_age != 'fresh':
+        print(f'quotes            sources {",".join(config.quote_sources) or "all"}, '
+              f'null age {config.null_quote_age}, max age '
+              f'{config.max_quote_age_seconds:.0f}s')
+    if config.stack_mode != 'off':
+        print(f'stack             {config.stack_mode}: stage 1 on '
+              f'{",".join(config.stack_spot_groups)}; stage 2 book terms '
+              f'{",".join(config.stack_book_features) or "none"}, '
+              f'{config.stack_crossfit_blocks} cross-fit blocks')
     if config.cli_overrides:
         print(f'cli overrides     {", ".join(sorted(config.cli_overrides))}')
+    if getattr(config, 'holdout_start', None):
+        print(f'holdout           sealed from {config.holdout_start}')
     print()

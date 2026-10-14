@@ -57,21 +57,30 @@ def test_the_decision_instant_quote_beats_the_reconstruction():
     assert out['ask_up'].iloc[0] == 0.62
 
 
-def test_the_recorders_beat_the_reconstruction_despite_a_worse_age():
-    """`record_ladder` samples at +25s, so a live row's age is ~33s against
-    backfill's 0.5s. It is still the better evidence of what was quotable."""
+def test_a_recorder_seen_before_the_decision_beats_the_reconstruction():
     depth = pd.DataFrame([
         _row('backfill', 0.30, 0.32, 0.5),
-        _row('live', 0.60, 0.62, 29.0),
+        _row('live', 0.60, 0.62, 2.0),
     ])
     out = attach_quotes(_windows(), depth)
     assert out['market_probability'].iloc[0] == 0.61
 
 
+def test_a_recorder_seen_after_the_decision_never_prices_it():
+    """A recorder's age counts forward from the minute. At 29s the book was
+    seen 26s after the decision, so the reconstruction prices the row."""
+    depth = pd.DataFrame([
+        _row('backfill', 0.30, 0.32, 0.5),
+        _row('live', 0.60, 0.62, 29.0),
+    ])
+    out = attach_quotes(_windows(), depth)
+    assert out['market_probability'].iloc[0] == 0.31
+
+
 def test_the_priority_order_is_honoured_between_the_two_live_recorders():
     depth = pd.DataFrame([
         _row('live', 0.30, 0.32, 1.0),
-        _row('live_ws', 0.60, 0.62, 29.0),
+        _row('live_ws', 0.60, 0.62, 2.0),
     ])
     out = attach_quotes(_windows(), depth)
     assert QUOTE_SOURCE_PRIORITY.index('live_ws') < \

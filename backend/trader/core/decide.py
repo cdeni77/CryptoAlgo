@@ -63,6 +63,8 @@ class Reason(str, Enum):
     PRICE_OUT_OF_BAND = 'price_out_of_band'    # tick and spread dominate here
     DISAGREEMENT_IMPLAUSIBLE = 'disagreement_implausible'  # too far from the quote
     EDGE_BELOW_GATE = 'edge_below_gate'        # the forecast does not pay
+    EDGE_UNCERTAIN = 'edge_uncertain'          # clears only at the ensemble's mean
+    MEMBERS_DISAGREE = 'members_disagree'      # a member does not beat the cost
     BELOW_MIN_CONTRACTS = 'below_min_contracts'  # Kelly stake under one contract
     FEE_CEILING = 'fee_ceiling'                # negative EV once the order fee rounds up
     WINDOW_EXPOSURE = 'window_exposure'        # too much already at risk this window
@@ -71,6 +73,7 @@ class Reason(str, Enum):
     OFFSET_NOT_TRADED = 'offset_not_traded'    # scored, but not an entry offset
     BANKROLL_FLOOR = 'bankroll_floor'          # stop-trading floor breached
     HALTED = 'halted'                          # a circuit breaker is latched
+    MODEL_NOT_PINNED = 'model_not_pinned'      # not the model pinned for trading
 
 
 @dataclass(frozen=True)
@@ -236,6 +239,42 @@ def price_and_edge(
     )
 
 
+def ensemble_gates(
+    is_up: np.ndarray,
+    probability: np.ndarray,
+    cost: np.ndarray,
+    sd: Optional[np.ndarray],
+    lo: Optional[np.ndarray],
+    hi: Optional[np.ndarray],
+    config: Config = DEFAULT_CONFIG,
+) -> tuple[np.ndarray, np.ndarray]:
+    """`(uncertain, disagree)` masks for the two ensemble gates. Vectorised.
+
+    A row missing the column (NaN, or no column at all) passes, so a single
+    model and an ensemble row that could not be scored per member behave as
+    they did before these gates existed.
+    """
+    n = np.shape(probability)[0]
+    uncertain = np.zeros(n, dtype=bool)
+    disagree = np.zeros(n, dtype=bool)
+    z = float(getattr(config, 'edge_lower_bound_z', 0.0) or 0.0)
+    if z > 0 and sd is not None:
+        sd = np.asarray(sd, dtype=float)
+        lower = probability - z * sd - cost
+        uncertain = np.isfinite(sd) & (lower < config.min_edge_pp / 100.0)
+    if getattr(config, 'require_member_agreement', False) \
+            and lo is not None and hi is not None:
+        lo = np.asarray(lo, dtype=float)
+        hi = np.asarray(hi, dtype=float)
+        worst = np.where(is_up, lo, 1.0 - hi)
+        disagree = np.isfinite(worst) & (worst - cost <= 0.0)
+    return uncertain, disagree
+
+
+def _column_or_none(rows: pd.DataFrame, name: str) -> Optional[np.ndarray]:
+    return rows[name].to_numpy(dtype=float) if name in rows.columns else None
+
+
 def stateless_screen(
     rows: pd.DataFrame,
     config: Config = DEFAULT_CONFIG,
@@ -266,7 +305,7 @@ def stateless_screen(
     # vectorised path and the scalar path would disagree about which rows can
     # trade, and the histogram would not add up to the decisions.
     has_book = 'ask_up' in rows.columns and 'ask_down' in rows.columns
-    _, price, probability, _, edge = price_and_edge(
+    is_up, price, probability, cost, edge = price_and_edge(
         np.where(finite, q, 0.5), m, config,
         ask_up=rows['ask_up'].to_numpy(dtype=float) if has_book else None,
         ask_down=rows['ask_down'].to_numpy(dtype=float) if has_book else None,
@@ -274,15 +313,25 @@ def stateless_screen(
     in_band = (price >= config.min_traded_price) & (price <= config.max_traded_price)
     plausible = np.abs(probability - price) * 100.0 <= config.max_disagreement_pp
     clears = edge >= config.min_edge_pp / 100.0
+    uncertain, disagree = ensemble_gates(
+        is_up, probability, cost,
+        _column_or_none(rows, 'model_probability_sd'),
+        _column_or_none(rows, 'model_probability_min'),
+        _column_or_none(rows, 'model_probability_max'), config)
 
     stage_band = finite & ~in_band
     stage_disagree = finite & in_band & ~plausible
     stage_edge = finite & in_band & plausible & ~clears
+    passed_edge = finite & in_band & plausible & clears
+    stage_uncertain = passed_edge & uncertain
+    stage_members = passed_edge & ~uncertain & disagree
     counts[Reason.PRICE_OUT_OF_BAND.value] = int(stage_band.sum())
     counts[Reason.DISAGREEMENT_IMPLAUSIBLE.value] = int(stage_disagree.sum())
     counts[Reason.EDGE_BELOW_GATE.value] = int(stage_edge.sum())
+    counts[Reason.EDGE_UNCERTAIN.value] = int(stage_uncertain.sum())
+    counts[Reason.MEMBERS_DISAGREE.value] = int(stage_members.sum())
 
-    survivors = finite & in_band & plausible & clears
+    survivors = passed_edge & ~uncertain & ~disagree
     return rows.loc[survivors], pd.Series(counts, dtype=int)
 
 
@@ -320,6 +369,10 @@ def decide(
         reason=Reason.NOT_FINITE,
         model_probability=float(get('model_probability')),
         baseline_probability=float(get('baseline_probability')),
+        # Set before any refusal: a refused row with a real book was being
+        # labelled 'baseline', which reads as "no quote" in the predictions table.
+        price_source=('quote' if _optional(get, 'ask_up') is not None
+                      and _optional(get, 'ask_down') is not None else 'baseline'),
     )
 
     def refuse(reason: Reason, **extra) -> Decision:
@@ -361,6 +414,9 @@ def decide(
     # money moves.
     if halted:
         return refuse(Reason.HALTED)
+    pinned = getattr(config, 'require_model_version', None)
+    if pinned and _optional_str(get, 'model_version') != pinned:
+        return refuse(Reason.MODEL_NOT_PINNED)
     # Scored but not tradeable. Every offset is still measured — that sample is
     # what the forecast tests read — but only `entry_offsets` may open a position.
     # See `Config.entry_offsets`: the earliest offset that cleared was taking 90%
@@ -445,6 +501,17 @@ def decide(
         return refuse(Reason.DISAGREEMENT_IMPLAUSIBLE, **common)
     if edge < config.min_edge_pp / 100.0:
         return refuse(Reason.EDGE_BELOW_GATE, **common)
+    member = {}
+    for k in ('sd', 'min', 'max'):
+        value = _optional(get, f'model_probability_{k}')
+        member[k] = np.array([np.nan if value is None else value])
+    uncertain, disagree = ensemble_gates(
+        is_up_a, probability_a, cost_a, member['sd'], member['min'],
+        member['max'], config)
+    if bool(uncertain[0]):
+        return refuse(Reason.EDGE_UNCERTAIN, **common)
+    if bool(disagree[0]):
+        return refuse(Reason.MEMBERS_DISAGREE, **common)
 
     kelly = kelly_fraction_for(probability, cost)
     # The base the fractions apply to. Compounding is opt-in: sizing off the

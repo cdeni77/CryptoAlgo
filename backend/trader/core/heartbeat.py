@@ -47,6 +47,8 @@ MAX_AGE: dict[str, float] = {
     'trade': 300.0,        # a 60s cycle; five missed is not a blip
     'stream': 180.0,       # continuous, flushes often
     'pm_stream': 300.0,
+    'spot_stream': 180.0,  # heartbeats every second; stamps every ~5s
+    'index': 180.0,        # stamps every ~5s while a proxy is being produced
     'ladder': 300.0,       # 60s cadence
     'pm_ladder': 300.0,
     'implied_vol': 600.0,  # slower, and tolerant of venue gaps

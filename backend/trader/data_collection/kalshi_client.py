@@ -59,6 +59,8 @@ from typing import Any, Iterable, Optional
 
 import aiohttp
 
+from core.costs import tick_at
+
 from .timeutil import naive_utc_to_epoch_seconds
 
 logger = logging.getLogger(__name__)
@@ -78,8 +80,10 @@ DEMO_BASE_URL = 'https://demo-api.kalshi.co/trade-api/v2'
 # and the failure mode is a 404 that names a route rather than a wrong number.
 HISTORICAL_BASE_URL = 'https://external-api.kalshi.com/trade-api/v2'
 
-# Kalshi quotes in whole cents, 1..99.
+# Kalshi quotes in whole cents, 1..99, through the middle of the range.
 CENT = 0.01
+# ...and in tenths of a cent below 10c and above 90c (`tapered_deci_cent`).
+DECI_CENT = 0.001
 
 # Sorts a row the venue gave no timestamp to, without dropping it. `None`
 # is not orderable against a datetime, and a ledger that raises on one
@@ -88,7 +92,20 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class KalshiError(RuntimeError):
-    """The venue refused, or the response was not what the caller assumed."""
+    """The venue refused, or the response was not what the caller assumed.
+
+    `status` is the HTTP status when the venue answered at all. A 5xx on an
+    order POST is ambiguous — the order may have been accepted — so callers
+    look the order up rather than treat it as a refusal.
+    """
+
+    def __init__(self, *args, status: Optional[int] = None) -> None:
+        super().__init__(*args)
+        self.status = status
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.status is not None and self.status >= 500
 
 
 class NotLiveError(KalshiError):
@@ -147,6 +164,13 @@ class Quote:
     floor_strike: Optional[float] = None
     strike_type: Optional[str] = None
     open_time: Optional[datetime] = None
+    # Where the touch came from ('stream' or 'rest'), when it was read (epoch
+    # seconds), and the full ladder behind it, so depth features and the
+    # archive describe the same snapshot the decision priced.
+    book_source: Optional[str] = None
+    book_time: Optional[float] = None
+    yes_levels: tuple = ()
+    no_levels: tuple = ()
 
     @property
     def mid(self) -> Optional[float]:
@@ -219,17 +243,6 @@ def _quantity(raw: dict, *names: str) -> float:
             except (TypeError, ValueError):
                 continue
     return 0.0
-
-
-def _cents(value: Any) -> Optional[float]:
-    """Integer cents to dollars. Retained for the legacy encoding and tests."""
-    if value is None:
-        return None
-    try:
-        cents = float(value)
-    except (TypeError, ValueError):
-        return None
-    return cents * CENT if cents > 0 else None
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
@@ -434,17 +447,6 @@ class Trade:
     taker_side: Optional[str] = None
     taker_book_side: Optional[str] = None
 
-    def price_for(self, side: str) -> Optional[float]:
-        """What this print paid for `side`.
-
-        Both `yes_price` and `no_price` are read from the payload rather than one
-        being derived as `1 - other`. They are usually complementary and nothing
-        here needs them to be: a venue that quotes them independently, or a
-        documented example where they do not sum to a dollar, must not silently
-        become a wrong number.
-        """
-        return self.yes_price if side == 'up' else self.no_price
-
 
 def _bool(value: Any) -> Optional[bool]:
     """A tri-state read: True, False, or "the venue did not say"."""
@@ -641,7 +643,8 @@ class KalshiClient:
             text = await response.text()
             if response.status >= 400:
                 raise KalshiError(
-                    f'{method} {path} -> {response.status}: {text[:400]}')
+                    f'{method} {path} -> {response.status}: {text[:400]}',
+                    status=response.status)
             return json.loads(text) if text else {}
 
     # ---- reading --------------------------------------------------------
@@ -764,64 +767,17 @@ class KalshiClient:
         return parse_orderbook(
             await self._request('GET', f'/markets/{ticker}/orderbook'))
 
-    async def quote_with_live_book(self, ticker: str) -> Quote:
-        """`quote()`, but with the touch taken from the LIVE orderbook.
+    async def book_quote(self, meta: 'Quote') -> 'Quote':
+        """`meta` with its touch and ladder replaced by one `/orderbook` read.
 
-        **`/markets` serves a CACHED touch, and pricing a decision off it is
-        what stopped the live loop filling.** Measured 2026-09-04 by sampling
-        both endpoints for the same market two seconds apart: `/markets`
-        returned an identical `0.9120/0.9160` on ETH for five consecutive
-        samples across ten seconds while `/orderbook` moved 0.934 -> 0.960 ->
-        0.951 -> 0.950. Across 28 paired samples the two disagreed on 96.4%,
-        mean 0.66c with the ask understated by up to 6.3c.
-
-        That is not a rounding detail, for two reasons:
-
-        * **The order cannot fill.** The captured kill priced a 0.74 ask against
-          a real 0.76 and sent a 74c bid — a cent below the actual BID. Ten of
-          ten orders after the 2026-09-04 restart died this way.
-        * **The MODEL is fed the stale number too.** The promoted artifact is
-          `init_score_source=market`, so its prediction is a correction to the
-          price; `market_probability` is the midpoint of this touch. A quote
-          several cents stale means the model corrects the wrong number, which
-          is a forecast error and not merely a fill error.
-
-        It also fixes a live/training mismatch: the backtest reads
-        `venue_depth`, built by `scripts/build_depth.py` from RECORDED LADDERS —
-        the real book — so `/markets` was a source live used and training never
-        saw. "One `decide()`" guarantees the decision is shared; nothing
-        guaranteed the price reaching it came from the same place.
-
-        An empty book is trusted, because an empty book is a real state. Only a
-        FAILED request falls back to the cached touch, and says so.
+        Raises `KalshiError` when the book cannot be read; the caller abstains.
         """
-        quote = await self.quote(ticker)
         try:
-            book = await self.orderbook(ticker)
-        except (KalshiError, asyncio.TimeoutError, OSError) as exc:
-            logger.warning(
-                '%s: the live orderbook did not answer (%s), so this decision '
-                'is priced off the CACHED /markets touch and may be several '
-                'cents stale. Expect it not to fill.', ticker, exc)
-            return quote
-
-        def finite(value):
-            value = float(value) if value is not None else float('nan')
-            return value if value == value else None
-
-        yes_bid, no_bid = finite(book['yes_bid']), finite(book['no_bid'])
-        return replace(
-            quote,
-            yes_bid=yes_bid,
-            no_bid=no_bid,
-            # Two BID stacks, so both asks are conversions. Buying YES crosses
-            # the NO stack at `1 - best_no_bid`.
-            yes_ask=(1.0 - no_bid) if no_bid is not None else None,
-            no_ask=(1.0 - yes_bid) if yes_bid is not None else None,
-            yes_bid_size=finite(book['yes_bid_size']),
-            # The size behind the YES ask is what rests on the NO bid.
-            yes_ask_size=finite(book['no_bid_size']),
-        )
+            payload = await self._request('GET', f'/markets/{meta.ticker}/orderbook')
+        except (asyncio.TimeoutError, OSError, aiohttp.ClientError) as exc:
+            raise KalshiError(f'{meta.ticker}: orderbook read failed ({exc!r})') from exc
+        yes, no = book_levels(payload)
+        return quote_from_levels(meta, yes, no, source='rest', at=time.time())
 
     async def positions(self) -> list[dict]:
         payload = await self._request('GET', '/portfolio/positions')
@@ -1126,15 +1082,24 @@ class KalshiClient:
         # is a guaranteed kill, which the old code did in the tails by using
         # banker's rounding on a deci-cent ladder.
         #
-        # The epsilon absorbs binary representation: 0.60 is 59.999...c in float.
+        # Round onto the venue's own tick, not a whole cent. Below 10c and above
+        # 90c the tick is a tenth of a cent, and ceiling to a cent there handed
+        # an immediate_or_cancel up to 0.9c of extra reach past the limit
+        # `order_limit_price` chose — levels the edge gate never admitted.
+        #
+        # Integer tenths of a cent, so the band edges (multiples of the coarse
+        # tick) stay exact. The epsilon absorbs binary representation: 0.60 is
+        # 599.999... tenths in float.
+        step = int(round(float(tick_at(yes_limit)) / DECI_CENT))
         if book_side == 'bid':
-            cents = int(math.ceil(yes_limit / CENT - 1e-9))
+            ticks = int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
         else:
-            cents = int(math.floor(yes_limit / CENT + 1e-9))
-        if not 1 <= cents <= 99:
+            ticks = int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step
+        price = ticks * DECI_CENT
+        if not CENT - 1e-9 <= price <= 1.0 - CENT + 1e-9:
             raise ValueError(
                 f'limit {limit_price} on the {side} side is a YES limit of '
-                f'{yes_limit:.4f} ({cents}c), outside 1c..99c'
+                f'{yes_limit:.4f} ({price:.4f}), outside 1c..99c'
             )
 
         body = {
@@ -1143,7 +1108,7 @@ class KalshiClient:
             # Decimal strings, not integers. `count` accepts up to 2 decimals and
             # `price` 2-4; a bare int for count is rejected.
             'count': f'{int(contracts)}.00',
-            'price': f'{cents / 100.0:.4f}',
+            'price': f'{price:.4f}',
             'time_in_force': time_in_force,
             # Required in V2. `taker_at_cross` crosses the spread, which is what a
             # immediate_or_cancel on a wasting 15-minute market is for; `maker`
@@ -1156,8 +1121,8 @@ class KalshiClient:
         }
         if client_order_id:
             body['client_order_id'] = client_order_id
-        logger.info('placing %s (%s) %d @ %dc YES on %s',
-                    side, book_side, contracts, cents, ticker)
+        logger.info('placing %s (%s) %d @ %.4f YES on %s',
+                    side, book_side, contracts, price, ticker)
         payload = await self._request('POST', '/portfolio/events/orders', body=body)
         # **The venue's own answer, in full.** The caller reads `status` and a
         # count off this reply and reports "did not fill" when neither is
@@ -1172,10 +1137,22 @@ class KalshiClient:
         logger.info('order reply    %s', json.dumps(payload, sort_keys=True, default=str))
         return dict(payload.get('order', payload))
 
-    async def cancel(self, order_id: str) -> dict:
-        if not self.live:
-            raise NotLiveError('client is not live')
-        return await self._request('DELETE', f'/portfolio/orders/{order_id}')
+    async def order_by_client_id(self, client_order_id: str, *,
+                                 ticker: Optional[str] = None,
+                                 max_pages: int = 3) -> Optional[dict]:
+        """Find our order by the `client_order_id` we sent, or None.
+
+        `GET /portfolio/orders` has no server-side filter on it, so this lists
+        the market's orders (newest first; one 15-minute market holds a handful
+        of ours) and matches. None means the venue's listing does not show it,
+        which is not proof it was never accepted — the caller decides.
+        """
+        rows = await self._pages('/portfolio/orders', 'orders',
+                                 max_pages=max_pages, ticker=ticker, limit=100)
+        for row in rows:
+            if str(row.get('client_order_id') or '') == str(client_order_id):
+                return dict(row)
+        return None
 
 
 NAN = float('nan')
@@ -1233,6 +1210,80 @@ def parse_orderbook(payload: dict) -> dict:
         'yes_ask': (1.0 - no[0]) if no else NAN,
         'no_ask': (1.0 - yes[0]) if yes else NAN,
     }
+
+
+def _stacks(payload: dict) -> dict:
+    raw = payload.get('orderbook', payload) if isinstance(payload, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    return raw.get('orderbook_fp') if isinstance(raw.get('orderbook_fp'), dict) else raw
+
+
+def book_levels(payload: dict) -> tuple[list, list]:
+    """(YES bids, NO bids) as sorted `(price, size)` from a REST orderbook.
+
+    Same nesting and spellings `parse_orderbook` accepts; empty or zero-size
+    levels are dropped.
+    """
+    stacks = _stacks(payload)
+
+    def levels(*names):
+        for name in names:
+            out = []
+            for entry in stacks.get(name) or []:
+                try:
+                    price, size = float(entry[0]), float(entry[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if size > 0:
+                    out.append((price, size))
+            if out:
+                return sorted(out)
+        return []
+
+    return (levels('yes_dollars', 'yes', 'yes_dollars_fp'),
+            levels('no_dollars', 'no', 'no_dollars_fp'))
+
+
+def quote_from_levels(meta: Quote, yes_levels, no_levels, *,
+                      source: str, at: float) -> Quote:
+    """`meta` (status, shard, strike) with the touch taken from a ladder.
+
+    Kalshi's book is two BID stacks, so both asks are conversions: buying YES
+    crosses the NO stack at `1 - best_no_bid`, and the size behind the YES ask
+    is what rests on the NO bid. An empty stack gives None, never zero.
+    """
+    book = parse_orderbook({'yes': list(yes_levels or []),
+                            'no': list(no_levels or [])})
+
+    def finite(value):
+        value = float(value) if value is not None else float('nan')
+        return value if value == value else None
+
+    yes_bid, no_bid = finite(book['yes_bid']), finite(book['no_bid'])
+    return replace(
+        meta,
+        yes_bid=yes_bid,
+        no_bid=no_bid,
+        yes_ask=(1.0 - no_bid) if no_bid is not None else None,
+        no_ask=(1.0 - yes_bid) if yes_bid is not None else None,
+        yes_bid_size=finite(book['yes_bid_size']),
+        yes_ask_size=finite(book['no_bid_size']),
+        book_source=source,
+        book_time=float(at),
+        yes_levels=tuple(tuple(level) for level in (yes_levels or [])),
+        no_levels=tuple(tuple(level) for level in (no_levels or [])),
+    )
+
+
+def market_meta(raw: dict) -> Quote:
+    """A market's metadata with NO touch: `/markets` caches its price fields.
+
+    Holding the cached touch on a metadata object is how it once got priced
+    against; with the fields blanked, a book read is the only way to a price.
+    """
+    return replace(_to_quote(raw), yes_bid=None, yes_ask=None, no_bid=None,
+                   no_ask=None, yes_bid_size=None, yes_ask_size=None)
 
 
 def _clean(params: dict) -> dict:

@@ -28,11 +28,16 @@ the schema has always insisted on: a backtest and a fill are different claims.
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+from core.config import DEFAULT_CONFIG
+
+logger = logging.getLogger(__name__)
 
 # The store's depth columns, renamed to what `core.book_features` expects.
 # Declared here so a rename cannot leave FEATURE_GROUPS pointing at a column
@@ -79,19 +84,107 @@ QUOTE_SOURCE_PRIORITY = tuple(
 # taken. Measured on the real store, 88.1% of backfilled minute rows are fresher
 # than 30s and 70.8% fresher than 5s, so tightening this costs little coverage.
 #
-# It matters that this MATCHES `core.metrics.MAX_QUOTE_AGE_SECONDS`: trades were
-# priced against quotes up to 900s old while `model_minus_market` counted only
-# those under 30s, so the money and the forecast comparison were measured on
-# different samples — and stale quotes are exactly where fake edge comes from
-# (model_minus_market ran 9x higher at 900s than at 5s).
-DEFAULT_MAX_AGE = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
+# Read from `Config.max_quote_age_seconds`, the one limit `core.metrics` and the
+# live order check also read: trades were once priced against quotes up to 900s
+# old while `model_minus_market` counted only those under 30s, and stale quotes
+# are exactly where fake edge comes from (9x higher at 900s than at 5s).
+DEFAULT_MAX_AGE = float(DEFAULT_CONFIG.max_quote_age_seconds)
+
+# The one observer whose `available_time` bounds its quote's age. `live_touch`
+# rows are written by the trading cycle itself: the cycle starts at or after
+# `event_time` (the decision instant), reads the book, and stamps
+# `available_time` when it writes the row afterwards. So the book it priced was
+# read inside [event_time, available_time] and is at most that far from the
+# decision instant. No other source has that property — the backfill's
+# `available_time` is when the backfill RAN, weeks later.
+AGE_BOUNDED_SOURCES = ('live_touch',)
+
+# Buckets for the source/age coverage report, in seconds.
+AGE_BUCKETS = ((2.0, '<=2s'), (5.0, '2-5s'), (30.0, '5-30s'),
+               (float('inf'), '>30s'))
+
+
+def derived_quote_age(book: pd.DataFrame) -> pd.Series:
+    """`available_time - event_time` in seconds on age-bounded rows, else NaN.
+
+    An UPPER bound on how far the priced book can be from the decision instant,
+    for rows that recorded no age of their own (every `live_touch` row before
+    2026-10-14). It includes the cycle's post-decision latency, so it
+    overstates the true age — the conservative direction for a staleness filter.
+    """
+    out = pd.Series(np.nan, index=book.index, dtype=float)
+    if not {'source', 'event_time', 'available_time'} <= set(book.columns):
+        return out
+    bounded = book['source'].isin(AGE_BOUNDED_SOURCES)
+    if not bounded.any():
+        return out
+    event = pd.to_datetime(book.loc[bounded, 'event_time'], utc=True, errors='coerce')
+    available = pd.to_datetime(book.loc[bounded, 'available_time'], utc=True,
+                               errors='coerce')
+    seconds = (available - event).dt.total_seconds()
+    out.loc[bounded] = seconds.clip(lower=0.0).to_numpy(dtype=float)
+    return out
+
+
+def filter_sources(book: pd.DataFrame, sources: Sequence[str]) -> pd.DataFrame:
+    if not sources:
+        return book
+    if 'source' not in book.columns:
+        logger.warning('quote_sources=%s asked for, but the depth table records '
+                       'no observer; nothing can be shown to qualify',
+                       list(sources))
+        return book.iloc[0:0]
+    return book[book['source'].isin(tuple(sources))]
+
+
+# How each producer's `quote_age_seconds` is measured. The backfill counts back
+# from the row's minute. `live_touch` counts back from the decision instant
+# itself. The minute-grid recorders count FORWARD: they sample after the minute,
+# so their age is how long after it the book was seen. Read with one rule, a
+# forward row is a book from after the decision.
+MINUTE_BACKWARD_SOURCES = ('backfill',)
+
+
+def decision_age(book: pd.DataFrame, null_age: str,
+                 latency_seconds: float) -> pd.Series:
+    """Seconds from when each row's book was seen to the decision instant.
+
+    The decision instant is the row's minute plus `latency_seconds`. A negative
+    value is a book seen after the decision, which a decision cannot use.
+    """
+    raw = _effective_age(book, null_age)
+    source = (book['source'] if 'source' in book.columns
+              else pd.Series(None, index=book.index, dtype=object))
+    from_minute = source.isin(MINUTE_BACKWARD_SOURCES)
+    from_decision = source.isin(AGE_BOUNDED_SOURCES)
+    forward = ~(from_minute | from_decision)
+    age = raw.copy()
+    age[from_minute] = raw[from_minute] + latency_seconds
+    age[forward] = latency_seconds - raw[forward]
+    return age
+
+
+def _effective_age(book: pd.DataFrame, null_age: str) -> pd.Series:
+    """The age a row is judged on. Under 'stale', a missing age is first bounded
+    where the row's own timestamps allow, and stays NaN (dropped) otherwise."""
+    age = (pd.to_numeric(book['quote_age_seconds'], errors='coerce')
+           if 'quote_age_seconds' in book.columns
+           else pd.Series(np.nan, index=book.index, dtype=float))
+    if null_age == 'stale':
+        bound = derived_quote_age(book)
+        age = age.where(age.notna(), bound)
+    return age
 
 
 def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   venue: str = 'kalshi',
                   other_venue: Optional[str] = 'polymarket',
                   max_age_seconds: float = DEFAULT_MAX_AGE,
-                  peer_lag_minutes: int = 0) -> pd.DataFrame:
+                  sources: Sequence[str] = (),
+                  null_age: str = 'fresh',
+                  peer_max_age_seconds: Optional[float] = None,
+                  peer_null_age: str = 'fresh',
+                  decision_latency_seconds: float = 3.0) -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
     Joined on (symbol, window_open, offset) EXACTLY. Not as-of across offsets:
@@ -103,6 +196,23 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     Only `venue` is used. Polymarket is a cross-venue FEATURE, never the book we
     execute against — pricing a Kalshi trade off a Polymarket quote would book a
     fill at a price the venue never showed.
+
+    `sources` (`Config.quote_sources`), when non-empty, admits only those
+    observers on BOTH venues — an excluded row does not price, rank or supply
+    depth. `null_age='stale'` (`Config.null_quote_age`) drops a quote with no
+    age instead of treating it as fresh, after bounding `live_touch` ages from
+    their own timestamps (`derived_quote_age`).
+
+    The PEER has its own cap, `peer_max_age_seconds` (None follows
+    `max_age_seconds`), and its own null-age rule, `peer_null_age`, which stays
+    'fresh' unless the caller asks: only ~5% of live Polymarket rows are 5s
+    fresh, so a tight Kalshi cap applied to the peer voids `venue_prob_gap`
+    almost everywhere.
+
+    Both venues are point-in-time: a row is usable only if its book was seen at
+    or before the decision instant, the minute plus `decision_latency_seconds`
+    (see `decision_age`). `quote_age_seconds` on the output is that
+    decision-relative age.
     """
     out = windows.copy()
     for column in QUOTE_COLUMNS:
@@ -112,13 +222,13 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     if depth is None or not len(depth) or not len(out):
         return out
 
-    book = depth[depth['venue'] == venue].copy()
+    book = filter_sources(depth[depth['venue'] == venue], sources).copy()
     if not len(book):
         return out
 
     bid = pd.to_numeric(book['yes_bid'], errors='coerce')
     ask = pd.to_numeric(book['yes_ask'], errors='coerce')
-    age = pd.to_numeric(book.get('quote_age_seconds'), errors='coerce')
+    age = decision_age(book, null_age, decision_latency_seconds)
 
     # A price outside [0, 1] is not a probability, and an ask below the bid is
     # not a book — kept, it would show a guaranteed profit and the backtest
@@ -126,7 +236,9 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     sane = ((bid.isna() | ((bid >= 0.0) & (bid <= 1.0)))
             & (ask.isna() | ((ask >= 0.0) & (ask <= 1.0)))
             & (bid.isna() | ask.isna() | (ask >= bid)))
-    fresh = age.isna() | (age.abs() <= max_age_seconds)
+    fresh = (age >= 0.0) & (age <= max_age_seconds)
+    if null_age == 'fresh':
+        fresh = fresh | age.isna()
     keep = sane & fresh
 
     book['ask_up'] = ask.where(keep)
@@ -214,17 +326,8 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     # column holding a Kalshi one is the `no_levels` denomination trap wearing a
     # different name.
     if other_venue:
-        peer = depth[depth['venue'] == other_venue].copy()
-        # RESEARCH, default off. Shift the peer FORWARD so a row at offset m
-        # carries the peer's book from m - lag: the live condition, where Kalshi
-        # is contemporaneous and Polymarket is a beat behind. Only the PEER
-        # moves — the decision must still price against the Kalshi book it could
-        # actually have taken.
-        if peer_lag_minutes and len(peer):
-            peer = peer.copy()
-            peer['offset_minutes'] = (
-                pd.to_numeric(peer['offset_minutes'], errors='coerce')
-                + int(peer_lag_minutes))
+        peer = filter_sources(depth[depth['venue'] == other_venue],
+                              sources).copy()
         merged['pm_market_probability'] = np.nan
         merged['pm_spread'] = np.nan
         if len(peer):
@@ -249,10 +352,13 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
             #
             # A missing stamp is kept: absence is not evidence of staleness, and
             # the backfilled fixtures carry rows without one.
-            page = pd.to_numeric(peer.get('quote_age_seconds'), errors='coerce') \
-                if 'quote_age_seconds' in peer.columns \
-                else pd.Series(np.nan, index=peer.index)
-            pfresh = page.isna() | (page.abs() <= max_age_seconds)
+            peer_cap = (max_age_seconds if peer_max_age_seconds is None
+                        else float(peer_max_age_seconds))
+            page = decision_age(peer, peer_null_age, decision_latency_seconds)
+            peer['quote_age_seconds'] = page
+            pfresh = (page >= 0.0) & (page <= peer_cap)
+            if peer_null_age == 'fresh':
+                pfresh = pfresh | page.isna()
             two_sided = pbid.notna() & pask.notna() & (pask >= pbid) & pfresh
             peer['pm_market_probability'] = ((pbid + pask) / 2.0).where(two_sided)
             peer['pm_spread'] = (pask - pbid).where(two_sided)
@@ -285,6 +391,39 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     return merged
 
 
+def age_bucket(age: pd.Series) -> pd.Series:
+    """Label each age with its AGE_BUCKETS bucket; a missing age is 'null'."""
+    age = pd.to_numeric(age, errors='coerce').abs()
+    out = pd.Series('null', index=age.index, dtype=object)
+    lower = -np.inf
+    for upper, name in AGE_BUCKETS:
+        out[(age > lower) & (age <= upper)] = name
+        lower = upper
+    return out
+
+
+def source_age_table(frame: pd.DataFrame, *, source_column: str = 'source',
+                     age_column: str = 'quote_age_seconds') -> pd.DataFrame:
+    """Row counts by observer x age bucket, one row per observer.
+
+    Run on the raw depth table it shows what a source/age filter is about to
+    discard; on the joined window table, what actually priced the rows.
+    """
+    if frame is None or not len(frame):
+        return pd.DataFrame()
+    source = (frame[source_column].fillna('none').astype(str)
+              if source_column in frame.columns
+              else pd.Series('none', index=frame.index))
+    age = (frame[age_column] if age_column in frame.columns
+           else pd.Series(np.nan, index=frame.index))
+    table = pd.crosstab(source.rename('source'), age_bucket(age).rename('age'))
+    order = [name for _, name in AGE_BUCKETS] + ['null']
+    table = table.reindex(columns=[c for c in order if c in table.columns],
+                          fill_value=0)
+    table['total'] = table.sum(axis=1)
+    return table.reset_index()
+
+
 def quote_coverage(table: pd.DataFrame) -> dict:
     """How many rows a real price actually reached.
 
@@ -292,7 +431,12 @@ def quote_coverage(table: pd.DataFrame) -> dict:
     inferring from a gate that failed.
     """
     if not len(table) or 'ask_up' not in table.columns:
-        return {'rows': 0, 'quoted': 0, 'share': 0.0}
-    quoted = int(table['ask_up'].notna().sum())
-    return {'rows': int(len(table)), 'quoted': quoted,
-            'share': quoted / max(len(table), 1)}
+        return {'rows': 0, 'quoted': 0, 'share': 0.0, 'by_source_age': []}
+    quoted = table['ask_up'].notna()
+    # Which observer priced the quoted rows, and how old its quote was: the
+    # mix is the thing a source or age filter changes, and a headline share
+    # cannot show it.
+    by_source = source_age_table(table.loc[quoted], source_column='quote_observer')
+    return {'rows': int(len(table)), 'quoted': int(quoted.sum()),
+            'share': int(quoted.sum()) / max(len(table), 1),
+            'by_source_age': by_source.to_dict('records')}

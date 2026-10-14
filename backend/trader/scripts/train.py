@@ -30,10 +30,10 @@ from core.baseline import log_loss, reliability
 from core.cv import folds_for_config, recency_weights
 from core.dataset import apply_fold, fit_fold
 from core.features import population_report
-from core.model import fit_model
+from core.model import fit_for_config, table_groups
 from scripts._common import (
-    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
-    setup_logging,
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, log_trial,
+    print_header, setup_logging,
 )
 
 
@@ -52,7 +52,13 @@ def main() -> int:
     print_header('Train one model, for inspection', config)
 
     dataset = load_dataset(args, config)
-    folds = folds_for_config(dataset.window_index, config)
+    stacked = config.stack_mode != 'off'
+    if stacked:
+        from core.backtest import stack_folds
+        folds = stack_folds(dataset, config)
+    else:
+        folds = folds_for_config(dataset.window_index, config)
+    groups = table_groups(config, groups)
     fold = folds[-1]
     print(f'  {fold.label()}  (the last fold; this is one look, not an evaluation)')
 
@@ -60,17 +66,25 @@ def main() -> int:
     print('\n' + fit.summary())
 
     weights = recency_weights(train['window_open'], config.recency_half_life_days)
-    model = fit_model(train, fit.baseline, config, groups=groups, weights=weights)
+    model = fit_for_config(train, fit.baseline, config, groups=groups, weights=weights)
     print('\n' + model.summary())
 
     test = apply_fold(dataset, fit, fold.test, config, groups=groups)
-    y = test['outcome'].to_numpy(dtype=float)
     p = model.predict(test)
-    pb = test['baseline_probability'].to_numpy(dtype=float)
-    print(f'\n  held-out: log loss {log_loss(y, p):.5f} vs baseline {log_loss(y, pb):.5f} '
+    # A stacked model is market-relative and scores NaN without a quote, so
+    # its null is the price and only quoted rows can be compared.
+    null = 'market' if stacked else 'baseline'
+    pb = test[f'{null}_probability'].to_numpy(dtype=float)
+    y = test['outcome'].to_numpy(dtype=float)
+    keep = np.isfinite(p) & np.isfinite(pb) & np.isfinite(y)
+    if not keep.all():
+        print(f'\n  {int((~keep).sum()):,} of {len(keep):,} held-out rows carry no '
+              f'forecast and are left out')
+    y, p, pb = y[keep], p[keep], pb[keep]
+    print(f'\n  held-out: log loss {log_loss(y, p):.5f} vs {null} {log_loss(y, pb):.5f} '
           f'(skill {log_loss(y, pb) - log_loss(y, p):+.5f})')
     print(f'  held-out calibration error {reliability(y, p).expected_calibration_error:.5f} '
-          f'vs baseline {reliability(y, pb).expected_calibration_error:.5f}')
+          f'vs {null} {reliability(y, pb).expected_calibration_error:.5f}')
     print('\n  held-out reliability:')
     print(reliability(y, p).table())
 
@@ -94,6 +108,14 @@ def main() -> int:
         path = model.save(Path(args.save))
         print(f'\n  wrote {path} and {path.with_suffix(".provenance.json")}')
         print('  this is NOT promoted — run `python -m scripts.promote` for that')
+
+    # One look at one fold is still a look, so it counts as a trial.
+    log_trial('train', args, config, groups=groups, dataset=dataset, metrics={
+        'held_out_skill': log_loss(y, pb) - log_loss(y, p),
+        'held_out_fold': int(fold.index),
+        'residual_scale': model.residual_scale,
+        'control_gain_share': model.control_importance_share,
+    })
     return 0
 
 

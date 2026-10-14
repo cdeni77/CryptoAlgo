@@ -4,13 +4,6 @@ Two stores, two jobs. SQLite is what the scraper writes: mutable, row-oriented,
 one file. The research store is what everything else reads: immutable Parquet
 partitioned by dataset, venue, symbol and month, queried through DuckDB, and
 fast enough that a five-year feature build is not an afternoon.
-
-**Funding and open interest are migrated even though nothing reads them.** They
-are archive — the binary system has no use for either — but no Coinbase endpoint
-serves either historically, so unlike bars they cannot be re-fetched at any
-price. The SQLite file is the only other copy, and a sync that skipped them
-followed by a cleanup of the database would destroy the only irreplaceable data
-in this repo. Pass `--no-archive` to skip them deliberately.
 """
 
 from __future__ import annotations
@@ -33,9 +26,6 @@ def main() -> int:
     parser.add_argument('--timeframe', type=str, default=DEFAULT_CONFIG.timeframe)
     parser.add_argument('--symbols', type=str, default=None)
     parser.add_argument('--research-store', type=str, default=None)
-    parser.add_argument('--no-archive', action='store_true',
-                        help='Skip funding and open interest. They cannot be '
-                             're-fetched, so only do this deliberately.')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -53,7 +43,7 @@ def main() -> int:
     print(f'{db} -> {store.root}  (timeframe {args.timeframe} -> dataset {dataset})')
 
     counts = from_sqlite(store, db, venue=args.venue, timeframe=args.timeframe,
-                         symbols=symbols, include_archive=not args.no_archive)
+                         symbols=symbols)
     if not counts:
         print('nothing written — is the timeframe right?')
         return 1

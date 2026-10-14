@@ -104,7 +104,9 @@ def test_quote_age_rides_along_so_staleness_is_visible():
     # up to 900s old while the forecast comparison counted only those under 30,
     # so the money and the gate were measured on different samples.
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 12.0)]))
-    assert got['quote_age_seconds'].iloc[0] == pytest.approx(12.0)
+    # Measured to the decision instant: 12s before the minute plus the 3s
+    # decision latency.
+    assert got['quote_age_seconds'].iloc[0] == pytest.approx(15.0)
 
 
 def test_a_stale_quote_can_be_refused_outright():

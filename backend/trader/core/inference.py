@@ -199,13 +199,14 @@ def pnl_against_market_null(
     a per-window common factor, so the three symbols in one window move together
     — which is what makes a naive per-trade binomial far too confident.
 
-    `trades` needs `contracts`, `outlay`, `fee`, `pnl`, `p_win_market` and a
-    window key.
+    `trades` needs `contracts`, `outlay`, `pnl`, `p_win_market` and a window
+    key. `outlay` is everything paid, fee INCLUDED — what `decide()` books as
+    the stake and live records as the cost — so the fee is not added again.
     """
     from scipy.stats import norm
 
     c = trades['contracts'].to_numpy(dtype=float)
-    cost = trades['outlay'].to_numpy(dtype=float) + trades['fee'].to_numpy(dtype=float)
+    cost = trades['outlay'].to_numpy(dtype=float)
     p = np.clip(trades['p_win_market'].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
     win, lose = c - cost, -cost
     actual = float(trades['pnl'].to_numpy(dtype=float).sum())

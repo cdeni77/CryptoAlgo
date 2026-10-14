@@ -3,9 +3,9 @@
 The app runs against SQLite here rather than Postgres. That is a real limitation
 — the `ADD COLUMN IF NOT EXISTS` migrations in `app.py` are Postgres syntax and
 are skipped — but the alternative is no API tests at all, which is where this
-started. What these tests cover is the layer above SQL: authentication, argument
-validation, response shapes, and whether a missing measurement comes back as null
-instead of an invented number. Those are the behaviours that were broken.
+started. What these tests cover is the layer above SQL: response shapes, and
+whether a missing measurement comes back as null instead of an invented number.
+Those are the behaviours that were broken.
 """
 
 from __future__ import annotations
@@ -26,20 +26,7 @@ def sqlite_database(tmp_path_factory):
     """Point the app at a throwaway SQLite file before anything imports it."""
     path = tmp_path_factory.mktemp('api') / 'test.db'
     os.environ['DATABASE_URL'] = f'sqlite:///{path}'
-    os.environ.setdefault('TRADER_DIR', str(API_ROOT.parent / 'trader'))
     yield path
-
-
-@pytest.fixture
-def clean_token(monkeypatch):
-    """No API token configured — the fail-closed state."""
-    monkeypatch.delenv('API_TOKEN', raising=False)
-
-
-@pytest.fixture
-def with_token(monkeypatch):
-    monkeypatch.setenv('API_TOKEN', 'test-token-value')
-    return 'test-token-value'
 
 
 @pytest.fixture

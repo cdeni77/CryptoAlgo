@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from models.serving import (
     Account, CalibrationBin, EquityPoint, MinutePrice, ModelRun, OrderTicket,
-    Outcome, Position, Prediction, VenueBalance, VenueFill, VenueSettlement,
+    Outcome, Position, Prediction, VenueBalance, VenueSettlement,
 )
 
 # Reasons a decision was refused, in funnel order. The dashboard shows them in
@@ -32,9 +32,11 @@ from models.serving import (
 # dominating means the forecast does not cover the fee, so it declines. On the
 # previous perp system that single number said what no Sharpe ratio said.
 FUNNEL_ORDER = (
-    'traded', 'not_finite', 'price_out_of_band', 'disagreement_implausible',
-    'edge_below_gate', 'below_min_contracts', 'fee_ceiling', 'window_exposure',
-    'position_limit', 'already_entered', 'bankroll_floor',
+    'traded', 'not_finite', 'probability_invalid', 'no_quote', 'no_peer_book',
+    'price_out_of_band', 'disagreement_implausible', 'edge_below_gate',
+    'edge_uncertain', 'members_disagree', 'below_min_contracts',
+    'fee_ceiling', 'window_exposure', 'position_limit', 'already_entered',
+    'offset_not_traded', 'bankroll_floor', 'halted', 'model_not_pinned',
 )
 
 
@@ -484,29 +486,6 @@ def venue_settlements(db: Session, *, days: Optional[int] = None,
         query = query.where(VenueSettlement.settled_time >= since)
     query = query.order_by(VenueSettlement.settled_time.desc()).limit(limit)
     return [_venue_settlement_payload(r) for r in db.execute(query).scalars().all()]
-
-
-def venue_fills(db: Session, *, days: Optional[int] = None,
-                limit: int = 200) -> list[dict[str, Any]]:
-    """Executions as the venue recorded them, newest first.
-
-    `price` is what was paid for `side`, so a 30c NO fill reads 0.30 rather than
-    the 0.70 the venue's YES-denominated book quotes. The translation happens
-    once, in the trader's parser.
-    """
-    epoch = reset_epoch(db)
-    query = since_reset(select(VenueFill), VenueFill, epoch)
-    if days is not None:
-        since = datetime.now(timezone.utc) - timedelta(days=days)
-        query = query.where(VenueFill.created_time >= since)
-    query = query.order_by(VenueFill.created_time.desc()).limit(limit)
-    return [{
-        'trade_id': r.trade_id, 'order_id': r.order_id, 'ticker': r.ticker,
-        'side': r.side, 'action': r.action, 'contracts': r.contracts,
-        'price': r.price,
-        'cost': None if r.price is None else r.price * (r.contracts or 0.0),
-        'is_taker': r.is_taker, 'created_time': r.created_time,
-    } for r in db.execute(query).scalars().all()]
 
 
 def venue_account_state(db: Session) -> dict[str, Any]:

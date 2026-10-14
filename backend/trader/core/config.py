@@ -328,6 +328,26 @@ class Config:
     # 2.0 remains available for comparison. Nothing above 1.0 is coherent as a
     # SHRINKAGE, which is why the default moved.
     max_residual_scale: float = 1.0
+    # Number of boosters averaged. Their spread is what `edge_lower_bound_z` and
+    # `require_member_agreement` read; 1 is the single-model behaviour.
+    ensemble_size: int = 1
+    # 'venue' trains on the venue's own settlement where it exists, falling back
+    # to the Coinbase-built proxy elsewhere.
+    label_source: str = 'proxy'
+    # Two-stage stacking. 'spot_then_market' fits stage 1 (a baseline-init
+    # correction on `stack_spot_groups`) on every training row of the fold —
+    # five years of clean bars — and stage 2 only on rows carrying a usable
+    # quote: logit p = a*logit(market) + b*(logit(p_spot) - logit(market))
+    # [+ c] [+ L2 linear terms on `stack_book_features`]. `b` is how much of the
+    # spot model's disagreement with the price survives. Stage-2 rows see
+    # stage 1 only out of sample, via `stack_crossfit_blocks` blocked fits.
+    stack_mode: str = 'off'
+    stack_spot_groups: tuple[str, ...] = ('vol_state', 'microstructure',
+                                          'cross_asset', 'geometry', 'offset')
+    stack_book_features: tuple[str, ...] = ()
+    stack_l2: float = 1.0
+    stack_crossfit_blocks: int = 4
+    stack_intercept: bool = False
     # **The rolling training window, in days. None means expanding.**
     #
     # Expanding is what `scripts/promote.py` actually deploys — the Sunday
@@ -350,6 +370,11 @@ class Config:
     embargo_minutes: int = 1440
     recency_half_life_days: Optional[float] = None
     train_window_days: Optional[float] = None
+    # **The sealed holdout.** ISO date; every research script drops windows
+    # opening at or after it, in `scripts._common.load_dataset`. Reading past it
+    # takes `--unseal-holdout "<reason>"`, which is recorded and allowed once per
+    # date — a holdout looked at twice is a validation set.
+    holdout_start: Optional[str] = None
 
     # ---- costs (Kalshi) --------------------------------------------------
     # fee per contract = ceil(fee_rate * price * (1 - price) * 100) / 100,
@@ -363,8 +388,8 @@ class Config:
     # and 0.10/0.11 — a one-cent spread, so half a cent. The previous default of
     # 1.0 was twice too pessimistic, which made every backtested required-edge
     # figure too high rather than too low. Still a single observation on one
-    # symbol at one time of day, so `scripts/measure_book.py` samples it properly
-    # and `scripts/evaluate.py` stresses it either way.
+    # symbol at one time of day; the recorded `venue_ladder`/`venue_depth` books
+    # sample it properly and `scripts/evaluate.py` stresses it either way.
     half_spread_cents: float = 0.5
 
     # ---- sizing and risk (a $100 account) --------------------------------
@@ -510,6 +535,12 @@ class Config:
     # capital at risk is right under both hypotheses, since if the edge turns out
     # to be negative it loses 40% less.
     min_edge_pp: float = 1.5
+    # Ensemble-aware gates, both off by default and inert on rows without the
+    # ensemble's columns. With z > 0 the edge must also clear the gate at the
+    # probability minus z member standard deviations; with member agreement on,
+    # the least favourable member must still beat the cost.
+    edge_lower_bound_z: float = 0.0
+    require_member_agreement: bool = False
     # Traded-price band, and it must be symmetric. The edge here is a
     # disagreement about sigma_remaining, and that disagreement points both
     # ways: a smaller sigma than the market assumes makes the probability more
@@ -591,20 +622,6 @@ class Config:
     # `rv_surprise` is 67x out at 1,200 bars. Below 721 the NaN reaches
     # `sigma_remaining` and the cycle abstains on its own.
     min_usable_bars: int = 1_455
-    # RESEARCH ONLY, default 0. Lags the PEER venue's book by this many minutes
-    # when building `cross_venue`, to answer whether that group's contribution
-    # is a genuine interaction or is contemporaneity.
-    #
-    # `cross_venue` is the only load-bearing group — leave-one-out takes skill
-    # +0.00282 -> -0.00015 — while scoring +0.000030 alone, below the clock
-    # control. Useless alone and essential combined is what an interaction looks
-    # like AND what a timing leak looks like. Training's gap is sub-second
-    # simultaneous (median |age difference| 0.56s); live admits up to 30s, and a
-    # stale peer converts the feature into Kalshi's own recent move (induced
-    # error correlates 0.724 with its 60s return). If skill survives a lag the
-    # interaction is real; if it collapses, the group is contributing an
-    # alignment production cannot guarantee.
-    peer_lag_minutes: int = 0
     # Refuse a decision whose cross-venue peer book is missing. OFF by default,
     # because every ledger entry so far was measured without it. Measured, a
     # one-minute peer lag costs 70% of the model's skill and dropping the peer
@@ -612,13 +629,74 @@ class Config:
     # most of its edge — while `--complete-cases` already requires the peer in
     # training, so this is what makes live agree.
     require_peer_book: bool = False
-    max_quote_age_seconds: int = 45
+    # Place orders only while this exact artifact version is loaded. A row
+    # scored by any other model is refused `model_not_pinned`, so a failed
+    # reload or an unreviewed retrain cannot trade. None disables the check.
+    require_model_version: Optional[str] = None
+    # **The one quote-staleness limit.** `core.quotes` prices backtests with it,
+    # `core.metrics` filters the market comparison with it, and `scripts.live`
+    # refuses an order and a peer book past it. It was 45 here and 30 in the
+    # other two, so live traded quotes the evaluation would have discarded.
+    # `QUOTE_MAX_AGE_SECONDS` still overrides it, for every reader at once.
+    max_quote_age_seconds: float = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
+    # RESEARCH: which `venue_depth` observers may price a row. Empty keeps every
+    # source (ranked by QUOTE_SOURCE_PRIORITY); e.g. ('live_touch', 'live_ws',
+    # 'live') excludes the Predexon backfill, whose >30s-stale asks sit a median
+    # ~13-16c off the contemporaneous live ask.
+    quote_sources: tuple[str, ...] = ()
+    # What a quote with NO recorded age means. 'fresh' keeps it (the historical
+    # behaviour); 'stale' drops it, after deriving an age bound for `live_touch`
+    # rows from `available_time - event_time` (see `core.quotes`).
+    null_quote_age: str = 'fresh'
+    # The cross-venue PEER's staleness cap. None follows
+    # `max_quote_age_seconds`. Separate because only ~5% of live Polymarket
+    # rows are <=5s old: a tight Kalshi cap applied to the peer voided
+    # `venue_prob_gap` on nearly every row and `--complete-cases` kept 0.1%.
+    # Once set, `null_quote_age` applies to the peer as well; unset, a peer
+    # row with no age stays fresh, as it always has.
+    peer_max_quote_age_seconds: Optional[float] = None
+    # Seconds from a decision's minute to the instant live reads the book. A
+    # backtest row may only use a book seen by then; live lands about 3s in.
+    decision_latency_seconds: float = 3.0
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted
     # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
     min_remaining_seconds: int = 45
     # Stop trading below this fraction of the starting bankroll.
     ruin_floor_fraction: float = 0.50
+
+    # ---- live execution --------------------------------------------------
+    # Price from the in-process stream book only while its socket delivered a
+    # frame this recently (and the book is not gapped); otherwise one REST
+    # `/orderbook` read. A frame lands ~34ms after the venue stamps it.
+    stream_quote_max_age_seconds: float = 2.0
+    # After this many consecutive decision cycles with the peer book refused
+    # for one symbol (no book, wrong window, too old), live asks
+    # `record_pm_stream` to drop that symbol's state and resubscribe.
+    peer_resubscribe_after_cycles: int = 3
+    # A one-minute bar built from the Coinbase trade stream is final once the
+    # clock passes its close by this much: trades arrive ~tens of ms late.
+    spot_bar_grace_seconds: float = 0.75
+
+    # ---- the settlement-index proxy (`core/index_proxy.py`) --------------
+    # An exchange's mid counts toward the per-second median only while its
+    # connection delivered something this recently. Applied at RECORD time, so
+    # changing it changes what `index_proxy_1s` holds from then on.
+    index_proxy_max_staleness_seconds: float = 5.0
+    # Fewer fresh exchanges than this is a NaN proxy: one venue is the very
+    # proxy this replaces.
+    index_proxy_min_exchanges: int = 2
+    # The `index_proxy` feature group reads the newest proxy row stamped
+    # strictly before the decision, and only if it is at most this old.
+    index_proxy_max_age_seconds: float = 5.0
+    # On a decision cycle venue reconciliation runs AFTER the orders, using the
+    # last reconciled balance to size. If that is older than this (or never
+    # happened) the cycle reconciles first, as non-decision cycles do.
+    max_reconcile_age_seconds: float = 300.0
+    # One re-priced resend after an immediate_or_cancel that filled nothing,
+    # only while the kill is this fresh. Never after a partial fill.
+    kill_retries: int = 1
+    kill_retry_window_seconds: float = 2.0
 
     # ---- circuit breakers ------------------------------------------------
     # The ruin floor was the only limit that existed, and it only fires after
@@ -733,18 +811,52 @@ class Config:
                 f'from test-period bars, and the HAR target reaches there too. '
                 f'The default of 1440 is deliberately much larger.'
             )
+        if self.kill_retries < 0:
+            raise ValueError(f'kill_retries must not be negative; got '
+                             f'{self.kill_retries}.')
         if self.max_slippage_cents < 0.0:
             raise ValueError(
                 f'max_slippage_cents must not be negative; got '
                 f'{self.max_slippage_cents}.'
             )
+        # Typos here would otherwise surface deep inside a fold's fit.
+        for name, allowed in (('label_source', ('proxy', 'venue')),
+                              ('null_quote_age', ('fresh', 'stale')),
+                              ('stack_mode', ('off', 'spot_then_market'))):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f'{name}={getattr(self, name)!r}; expected one '
+                                 f'of {allowed}')
+        if int(self.stack_crossfit_blocks) < 2:
+            raise ValueError(f'stack_crossfit_blocks must be at least 2; got '
+                             f'{self.stack_crossfit_blocks}')
+        if self.decision_latency_seconds < 0.0:
+            raise ValueError(f'decision_latency_seconds must not be negative; '
+                             f'got {self.decision_latency_seconds}')
+        if self.peer_resubscribe_after_cycles < 1:
+            raise ValueError(f'peer_resubscribe_after_cycles must be at least 1; '
+                             f'got {self.peer_resubscribe_after_cycles}')
+        if (self.peer_max_quote_age_seconds is not None
+                and self.peer_max_quote_age_seconds <= 0.0):
+            raise ValueError(f'peer_max_quote_age_seconds must be positive; got '
+                             f'{self.peer_max_quote_age_seconds}')
+        if self.stack_l2 < 0.0:
+            raise ValueError(f'stack_l2 must not be negative; got {self.stack_l2}')
+        if int(self.ensemble_size) < 1:
+            raise ValueError(f'ensemble_size must be at least 1; got '
+                             f'{self.ensemble_size}')
+        if self.edge_lower_bound_z < 0.0:
+            raise ValueError(f'edge_lower_bound_z must not be negative; got '
+                             f'{self.edge_lower_bound_z}')
+        if self.holdout_start is not None:
+            from datetime import datetime
+            try:
+                datetime.fromisoformat(str(self.holdout_start))
+            except ValueError as exc:
+                raise ValueError(
+                    f'holdout_start={self.holdout_start!r} is not an ISO date; a '
+                    f'seal that cannot be parsed would seal nothing.') from exc
 
     # ---- derived ---------------------------------------------------------
-    @property
-    def settle_offset(self) -> int:
-        """Minutes from window open to settlement."""
-        return self.window_minutes
-
     def remaining_minutes(self, offset: int) -> int:
         """Wall-clock minutes from the decision to settlement.
 
@@ -806,50 +918,36 @@ class Config:
         )
 
     def provenance(self) -> dict[str, Any]:
-        """The fields that change an answer, for the model artifact."""
-        return {
-            'symbols': list(self.symbols),
-            'venue': self.venue,
-            'timeframe': self.timeframe,
-            'window_minutes': self.window_minutes,
-            'decision_offsets': list(self.decision_offsets),
-            'vol_lookbacks_minutes': list(self.vol_lookbacks_minutes),
-            'baseline_distribution': self.baseline_distribution,
-            'baseline_nu': self.baseline_nu,
-            # Which forecaster the correction sits on. Without it in the ledger,
-            # two attempts with the same `log_loss_skill` could be measuring
-            # skill over two different benchmarks.
-            'init_score_source': self.init_score_source,
-            'n_folds': self.n_folds,
-            'embargo_minutes': self.embargo_minutes,
-            'recency_half_life_days': self.recency_half_life_days,
-            'train_window_days': self.train_window_days,
-            'fee_rate': self.fee_rate,
-            'half_spread_cents': self.half_spread_cents,
-            'fee_config_version': self.fee_config_version,
-            # The trading POLICY, not just the forecast. The ledger is the
-            # record of account and the trial count, and 20260828T202438Z exists
-            # specifically to measure `--entry-offsets 12` — it moved realised
-            # edge +2.06 -> +4.17pp and drawdown 0.402 -> 0.232 — while
-            # recording nothing about which policy that was.
-            #
-            # `compound` matters most: sizing off the starting bankroll keeps the
-            # equity curve additive, so its slope IS the per-trade edge, while
-            # compounding makes it an exponential of the ESTIMATE of that edge.
-            # An artifact measured one way and traded the other is a different
-            # strategy, and `scripts/live.config_for_artifact` reads these to
-            # keep the two in step — it was already asking for three of them.
-            'fold_scheme': self.fold_scheme,
-            'entry_offsets': (list(self.entry_offsets)
-                              if self.entry_offsets is not None else None),
-            'compound': bool(self.compound),
-            'starting_bankroll': self.starting_bankroll,
-            'max_stake_dollars': self.max_stake_dollars,
-            'max_stake_fraction': self.max_stake_fraction,
-            'kelly_fraction': self.kelly_fraction,
-            'min_edge_pp': self.min_edge_pp,
-            'cli_overrides': sorted(self.cli_overrides),
-        }
+        """EVERY field, JSON-ready, for the artifact, the ledger and the trial log.
+
+        A hand-picked subset let two ledger entries that differed in a knob
+        (block length, shrinkage ceiling, LightGBM depth, price band) read as
+        the same experiment. Tuples become lists, sets sorted lists; `None` is
+        kept as `None` (`entry_offsets=None` means every offset may enter, and
+        `scripts/live.config_for_artifact` reads `None` as "left at default").
+        """
+        return {f.name: _jsonable(getattr(self, f.name)) for f in fields(self)}
+
+    def provenance_hash(self) -> str:
+        """Identity of the configuration under test. `cli_overrides` is left out:
+        it says how the values were reached, not what they are."""
+        import hashlib
+        import json
+
+        material = {k: v for k, v in self.provenance().items() if k != 'cli_overrides'}
+        canonical = json.dumps(material, sort_keys=True, separators=(',', ':'),
+                               default=str)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (frozenset, set)):
+        return sorted(_jsonable(v) for v in value)
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 DEFAULT_CONFIG = Config()

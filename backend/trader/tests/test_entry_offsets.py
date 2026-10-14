@@ -102,3 +102,15 @@ def test_the_live_config_carries_the_entry_offsets_it_was_given():
 
     config = config_from_args(build_parser().parse_args([]))
     assert config.entry_offsets == (12,)
+
+
+def test_a_refused_row_with_a_book_is_labelled_as_quoted():
+    """`price_source` was only set on the trading path, so every refused row --
+    including the three scored-not-traded offsets -- read 'baseline' in the
+    predictions table even with a real two-sided book."""
+    config = Config(entry_offsets=(12,))
+    quoted = decide(row(3, ask_up=0.90, ask_down=0.12), config, bankroll=100.0)
+    assert quoted.reason is Reason.OFFSET_NOT_TRADED
+    assert quoted.price_source == 'quote'
+    bare = decide(row(3), config, bankroll=100.0)
+    assert bare.price_source == 'baseline'

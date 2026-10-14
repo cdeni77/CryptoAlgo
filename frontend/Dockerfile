@@ -12,17 +12,13 @@ RUN npm ci
 # breaks the build that follows.
 COPY . .
 
-# Vite inlines `import.meta.env.VITE_*` at BUILD time, so these have to arrive as
-# build arguments. Supplying them as runtime `environment:` entries on an nginx
+# Vite inlines `import.meta.env.VITE_*` at BUILD time, so this has to arrive as
+# a build argument. Supplying it as a runtime `environment:` entry on an nginx
 # container serving a static bundle did nothing: whatever was in the committed
 # `frontend/.env` got baked in instead, which meant every deployment pointed at
-# http://localhost:8000 and `hasApiToken()` was permanently false — so the
-# Research and Model pages' run buttons were disabled behind "No API token is
-# configured in this build" no matter what API_TOKEN the operator set.
+# http://localhost:8000.
 ARG VITE_API_BASE_URL=/api
-ARG VITE_API_TOKEN=
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
-ENV VITE_API_TOKEN=$VITE_API_TOKEN
 
 # Build for production
 RUN npm run build

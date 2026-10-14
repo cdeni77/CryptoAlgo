@@ -65,10 +65,10 @@ def test_the_ratio_is_not_computed_before_a_fitted_sigma_exists():
 
 
 def test_the_ratio_appears_once_the_fold_supplies_sigma():
-    from core.book_features import implied_vol_features
     table = _panel().assign(sigma_per_min=[0.0003, 0.0003])
-    fits = pd.DataFrame({'implied_sigma_per_min': [0.0006, 0.0006],
-                         'r2': [0.97, 0.97], 'n_strikes': [9, 9],
-                         'staleness_minutes': [10.0, 10.0]})
-    got = implied_vol_features(table, fits)
+    fits = pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'event_time': pd.to_datetime(['2026-07-01T11:50Z']),
+        'implied_sigma_per_min': [0.0006], 'r2': [0.97], 'n_strikes': [9]})
+    got = attach_implied_vol(table, fits)
     assert got['iv_minus_realised'].iloc[0] == pytest.approx(np.log(2.0))

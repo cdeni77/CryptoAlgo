@@ -5,23 +5,20 @@
  * `fetchWithError` drifted in the previous version until a failing request said
  * something different depending on which screen you were on.
  */
-import { get, post } from './client';
+import { get } from './client';
 import type {
   AccountState,
   CalibrationTable,
   EquityPoint,
   FunnelStage,
-  JobDescriptor,
   LiveState,
   ModelAttempt,
   ModelState,
-  OrderTicket,
   Position,
   Prediction,
   PriceSeries,
   VenueAccountState,
   VenueEquityCurve,
-  VenueFill,
   VenueSettlement,
 } from '../types';
 
@@ -45,11 +42,6 @@ export const fetchVenueSettlements = (limit = 200, days?: number) =>
     `/venue/settlements?limit=${limit}${days == null ? '' : `&days=${days}`}`,
   );
 
-export const fetchVenueFills = (limit = 200, days?: number) =>
-  get<{ fills: VenueFill[] }>(
-    `/venue/fills?limit=${limit}${days == null ? '' : `&days=${days}`}`,
-  );
-
 export const fetchPredictions = (limit = 100, tradedOnly = false) =>
   get<{ predictions: Prediction[] }>(
     `/predictions?limit=${limit}&traded_only=${tradedOnly}`,
@@ -66,9 +58,6 @@ export const fetchPositions = (openOnly = false, limit = 100) =>
 export const fetchPrices = (symbol: string, minutes = 240) =>
   get<PriceSeries>(`/prices/${encodeURIComponent(symbol)}?minutes=${minutes}`);
 
-export const fetchTickets = (openOnly = true, limit = 50) =>
-  get<{ tickets: OrderTicket[] }>(`/tickets?open_only=${openOnly}&limit=${limit}`);
-
 export const fetchModel = () => get<ModelState>('/model');
 
 export const fetchModelHistory = (limit = 50) =>
@@ -77,15 +66,4 @@ export const fetchModelHistory = (limit = 50) =>
 export const fetchCalibration = (version?: string) =>
   get<CalibrationTable>(
     version ? `/model/calibration?version=${encodeURIComponent(version)}` : '/model/calibration',
-  );
-
-export const fetchJobs = () => get<{ jobs: JobDescriptor[] }>('/jobs');
-
-/** Authenticated, and fails closed: without API_TOKEN on the backend this is a
- *  503, which the client turns into "set VITE_API_TOKEN" rather than a generic
- *  failure. */
-export const launchJob = (module: string, args: string[] = []) =>
-  post<{ job: string; pid: number; args: string[]; note: string }>(
-    `/jobs/${module}`,
-    { args },
   );

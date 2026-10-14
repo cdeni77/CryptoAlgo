@@ -25,10 +25,18 @@ import pandas as pd
 import pytest
 
 from core.book_features import (
-    MARKET_STATE, CROSS_VENUE, IMPLIED_VOL,
-    book_at_decision, cross_venue_features, implied_vol_features,
+    MARKET_STATE, CROSS_VENUE, IMPLIED_VOL, attach_implied_vol,
     market_state_features,
 )
+from core.quotes import attach_quotes
+from livetrade.features import cross_venue_row
+
+
+class _Quote:
+    """The touch `cross_venue_row` reads, in dollars."""
+
+    def __init__(self, bid, ask):
+        self.yes_bid, self.yes_ask = bid, ask
 
 
 def _snap(**over):
@@ -108,20 +116,17 @@ def test_the_price_free_variant_cannot_echo_the_market():
 # --- cross_venue -----------------------------------------------------------
 
 def test_the_venue_gap_is_kalshi_minus_polymarket_in_probability_units():
-    k = pd.DataFrame([{'best_bid': 44.0, 'best_ask': 46.0}])
-    p = pd.DataFrame([{'best_bid': 40.0, 'best_ask': 42.0}])
-    got = cross_venue_features(k, p)
-    assert abs(got['venue_prob_gap'].iloc[0] - 0.04) < 1e-9
-    assert got['pm_available'].iloc[0] == 1.0
+    got = cross_venue_row({'best_bid': 40.0, 'best_ask': 42.0}, _Quote(0.44, 0.46))
+    assert abs(got['venue_prob_gap'] - 0.04) < 1e-9
+    assert got['pm_available'] == 1.0
 
 
 def test_a_missing_polymarket_book_is_flagged_not_zeroed():
     """Polymarket coverage differs from Kalshi's, and absence is not agreement."""
-    k = pd.DataFrame([{'best_bid': 44.0, 'best_ask': 46.0}])
-    p = pd.DataFrame([{'best_bid': np.nan, 'best_ask': np.nan}])
-    got = cross_venue_features(k, p)
-    assert pd.isna(got['venue_prob_gap'].iloc[0])
-    assert got['pm_available'].iloc[0] == 0.0
+    got = cross_venue_row({'best_bid': np.nan, 'best_ask': np.nan},
+                          _Quote(0.44, 0.46))
+    assert pd.isna(got['venue_prob_gap'])
+    assert got['pm_available'] == 0.0
 
 
 def test_volumes_never_cross_the_venue_boundary():
@@ -137,20 +142,30 @@ def test_iv_minus_realised_is_the_mechanism_and_is_logged():
     """The baseline's sigma is a BACKWARD-looking realised-vol forecast. Where
     the market's forward-looking sigma disagrees, the baseline is wrong in a
     knowable direction — that disagreement is the feature, not the level."""
-    table = pd.DataFrame([{'sigma_per_min': 0.0005}])
-    fits = pd.DataFrame([{'implied_sigma_per_min': 0.0010, 'r2': 0.98,
-                          'n_strikes': 9, 'staleness_minutes': 12.0}])
-    got = implied_vol_features(table, fits)
+    table = _iv_table(sigma_per_min=0.0005)
+    got = attach_implied_vol(table, _iv_fits(0.0010))
     assert abs(got['iv_minus_realised'].iloc[0] - np.log(2.0)) < 1e-9
 
 
 def test_a_missing_fit_is_nan_and_its_staleness_says_why():
-    table = pd.DataFrame([{'sigma_per_min': 0.0005}])
-    fits = pd.DataFrame([{'implied_sigma_per_min': np.nan, 'r2': np.nan,
-                          'n_strikes': np.nan, 'staleness_minutes': np.nan}])
-    got = implied_vol_features(table, fits)
+    table = _iv_table(sigma_per_min=0.0005)
+    got = attach_implied_vol(table, _iv_fits(np.nan))
     assert pd.isna(got['iv_minus_realised'].iloc[0])
     assert 'iv_staleness_minutes' in got.columns
+
+
+def _iv_table(**over):
+    row = {'symbol': 'BTC-USD',
+           'decision_time': pd.Timestamp('2026-07-01T12:03Z')}
+    row.update(over)
+    return pd.DataFrame([row])
+
+
+def _iv_fits(implied):
+    return pd.DataFrame({
+        'symbol': ['BTC-USD'],
+        'event_time': pd.to_datetime(['2026-07-01T11:51Z']),
+        'implied_sigma_per_min': [implied], 'r2': [0.98], 'n_strikes': [9]})
 
 
 def test_staleness_is_carried_because_coverage_is_15_percent():
@@ -160,50 +175,47 @@ def test_staleness_is_carried_because_coverage_is_15_percent():
     assert 'iv_staleness_minutes' in IMPLIED_VOL
 
 
-# --- the as-of join --------------------------------------------------------
+# --- the book at the decision ----------------------------------------------
+#
+# The production join is `core.quotes.attach_quotes`: EXACT on
+# (symbol, window, offset), never as-of across offsets, and point-in-time on
+# when each book was seen.
 
-def test_the_book_state_is_the_last_snapshot_at_or_before_the_decision():
-    """A nearest-match would let a quote from AFTER the decision inform it,
-    which reads exactly like skill."""
-    books = pd.DataFrame({
-        'symbol': ['BTC-USD'] * 3,
-        'window_open': pd.to_datetime(['2026-07-01T12:00Z'] * 3),
-        'event_time': pd.to_datetime(['2026-07-01T12:02Z', '2026-07-01T12:05Z',
-                                      '2026-07-01T12:09Z']),
-        'best_bid': [40.0, 44.0, 48.0], 'best_ask': [42.0, 46.0, 50.0]})
-    table = pd.DataFrame({
-        'symbol': ['BTC-USD'], 'window_open': pd.to_datetime(['2026-07-01T12:00Z']),
-        'decision_time': pd.to_datetime(['2026-07-01T12:06Z'])})
-    got = book_at_decision(books, table)
-    assert got['best_bid'].iloc[0] == 44.0, 'must take 12:05, not 12:09'
+def _depth_row(window_open, offset, bid, ask):
+    return {'venue': 'kalshi', 'symbol': 'BTC-USD',
+            'window_open': pd.Timestamp(window_open), 'offset_minutes': offset,
+            'yes_bid': bid, 'yes_ask': ask, 'quote_age_seconds': 2.0,
+            'source': 'backfill'}
 
 
-def test_a_decision_before_any_snapshot_gets_nothing_rather_than_the_first():
-    books = pd.DataFrame({
-        'symbol': ['BTC-USD'], 'window_open': pd.to_datetime(['2026-07-01T12:00Z']),
-        'event_time': pd.to_datetime(['2026-07-01T12:09Z']),
-        'best_bid': [48.0], 'best_ask': [50.0]})
-    table = pd.DataFrame({
-        'symbol': ['BTC-USD'], 'window_open': pd.to_datetime(['2026-07-01T12:00Z']),
-        'decision_time': pd.to_datetime(['2026-07-01T12:03Z'])})
-    got = book_at_decision(books, table)
-    assert pd.isna(got['best_bid'].iloc[0])
+def _decision(window_open, offset):
+    return pd.DataFrame({'symbol': ['BTC-USD'],
+                         'window_open': [pd.Timestamp(window_open)],
+                         'offset': [offset]})
+
+
+def test_the_book_is_the_one_at_the_decision_offset_not_a_later_one():
+    """A book from AFTER the decision would inform it, which reads exactly like
+    skill."""
+    depth = pd.DataFrame([_depth_row('2026-07-01T12:00Z', 5, 0.44, 0.46),
+                          _depth_row('2026-07-01T12:00Z', 9, 0.48, 0.50)])
+    got = attach_quotes(_decision('2026-07-01T12:00Z', 5), depth)
+    assert got['ask_up'].iloc[0] == pytest.approx(0.46), 'must take +5, not +9'
+
+
+def test_a_decision_with_no_book_yet_gets_nothing_rather_than_a_later_one():
+    depth = pd.DataFrame([_depth_row('2026-07-01T12:00Z', 9, 0.48, 0.50)])
+    got = attach_quotes(_decision('2026-07-01T12:00Z', 3), depth)
+    assert pd.isna(got['ask_up'].iloc[0])
 
 
 def test_the_join_does_not_leak_across_windows():
     """Consecutive windows chain — one window's strike is the previous one's
     settlement — so a join that spilled across the boundary would look correct
     and be wrong."""
-    books = pd.DataFrame({
-        'symbol': ['BTC-USD'] * 2,
-        'window_open': pd.to_datetime(['2026-07-01T12:00Z', '2026-07-01T12:15Z']),
-        'event_time': pd.to_datetime(['2026-07-01T12:05Z', '2026-07-01T12:20Z']),
-        'best_bid': [44.0, 60.0], 'best_ask': [46.0, 62.0]})
-    table = pd.DataFrame({
-        'symbol': ['BTC-USD'], 'window_open': pd.to_datetime(['2026-07-01T12:15Z']),
-        'decision_time': pd.to_datetime(['2026-07-01T12:18Z'])})
-    got = book_at_decision(books, table)
-    assert pd.isna(got['best_bid'].iloc[0]), 'the 12:05 book belongs to another window'
+    depth = pd.DataFrame([_depth_row('2026-07-01T12:00Z', 3, 0.44, 0.46)])
+    got = attach_quotes(_decision('2026-07-01T12:15Z', 3), depth)
+    assert pd.isna(got['ask_up'].iloc[0]), 'the 12:00 book belongs to another window'
 
 
 # --- joining the ladder fits onto decisions --------------------------------
@@ -244,7 +256,8 @@ def test_staleness_is_measured_from_the_fit_to_the_decision():
         'decision_time': pd.to_datetime(['2026-07-01T12:03Z']),
         'sigma_per_min': [0.0003]})
     got = attach_implied_vol(table, fits)
-    assert got['iv_staleness_minutes'].iloc[0] == pytest.approx(23.0)
+    # To the decision instant: the minute plus the 3s decision latency.
+    assert got['iv_staleness_minutes'].iloc[0] == pytest.approx(23.05)
 
 
 def test_a_decision_before_any_fit_gets_nothing():

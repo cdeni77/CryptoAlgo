@@ -1,11 +1,8 @@
 """Storage ingest invariants.
 
 `data_collection.ingest` is the only door into the database, and the only place
-that sets `quality`. Before it existed there were two ingest paths: OHLCV went
-through the validated pipeline, while funding and open interest were inserted
-directly. Open interest was constructed with `quality=DataQuality.VALID` written
-in by hand, so the column claimed the data was checked when nothing had checked
-it, and `DataValidator.validate_open_interest` had zero callers.
+that sets `quality`. Records default to `DataQuality.UNVALIDATED`, so a column
+cannot claim data was checked when nothing checked it.
 
 These tests pin the properties that stop that from recurring.
 """
@@ -19,7 +16,7 @@ import pandas as pd
 import pytest
 
 from data_collection.ingest import Ingestor, unvalidated_row_counts
-from data_collection.models import DataQuality, FundingRate, OHLCVBar, OpenInterest
+from data_collection.models import DataQuality, OHLCVBar
 from data_collection.storage import SQLiteDatabase
 
 T0 = datetime(2026, 1, 1)
@@ -46,30 +43,12 @@ def _bar(hour: int, close: float = 100.0) -> OHLCVBar:
     )
 
 
-def _funding(hour: int, rate: float) -> FundingRate:
-    return FundingRate(
-        event_time=T0 + timedelta(hours=hour),
-        available_time=T0 + timedelta(hours=hour),
-        symbol='BIP', rate=rate, mark_price=100.0, index_price=100.0,
-    )
-
-
-def _open_interest(hour: int, contracts: float) -> OpenInterest:
-    return OpenInterest(
-        event_time=T0 + timedelta(hours=hour),
-        available_time=T0 + timedelta(hours=hour),
-        symbol='BIP', open_interest_contracts=contracts, open_interest_usd=contracts * 100,
-    )
-
-
 def test_quality_defaults_to_unvalidated():
     """The default must not claim the data was checked.
 
     This is what let hand-constructed records masquerade as validated ones.
     """
     assert _bar(0).quality is DataQuality.UNVALIDATED
-    assert _funding(0, 0.0001).quality is DataQuality.UNVALIDATED
-    assert _open_interest(0, 100.0).quality is DataQuality.UNVALIDATED
 
 
 def test_ingest_stamps_quality_and_venue(ingestor):
@@ -107,35 +86,8 @@ def test_rejected_bar_does_not_poison_the_next_comparison(ingestor):
     assert result.inserted == 2, 'a healthy bar was rejected because of its neighbour'
 
 
-def test_open_interest_is_validated(ingestor):
-    """validate_open_interest had no callers; a negative figure went straight in."""
-    result = ingestor.ingest_open_interest(
-        [_open_interest(1, 5000.0), _open_interest(2, -100.0)], venue='bybit'
-    )
-
-    assert result.inserted == 1
-    assert result.rejected == 1
-
-
-def test_implausible_funding_is_flagged_not_silently_accepted(ingestor):
-    """A 50%-per-hour rate is stored, but marked, so a reader can exclude it.
-
-    The validator flags rather than drops, which is the right call for storage —
-    but it means the quality column has to survive into the research store, or
-    the carry features average it in regardless.
-    """
-    result = ingestor.ingest_funding([_funding(1, 0.00001), _funding(2, 0.5)], venue='coinbase')
-
-    assert result.inserted == 2
-    assert result.suspicious == 1
-    qualities = {rate.quality for rate in result.stored}
-    assert DataQuality.SUSPICIOUS in qualities
-
-
 def test_nothing_reaches_storage_unvalidated(ingestor, database):
     ingestor.ingest_bars([_bar(i) for i in range(5)], venue='coinbase')
-    ingestor.ingest_funding([_funding(1, 0.00001)], venue='coinbase')
-    ingestor.ingest_open_interest([_open_interest(1, 5000.0)], venue='bybit')
 
     assert all(count == 0 for count in unvalidated_row_counts(database).values())
 
@@ -223,48 +175,6 @@ def test_the_same_venue_still_deduplicates(tmp_path):
     assert round(rows[0]['close']) == 60_500, 'the revision did not replace the original'
 
 
-def test_funding_and_open_interest_are_venue_keyed(tmp_path):
-    """Funding differs materially between venues, so a proxy must not overwrite it.
-
-    Funding is the mechanism this system is mostly betting on — 2bp/hour is
-    48bp/day against a ~23-30bp round trip — so a Binance rate silently stored as
-    Coinbase's own is not a labelling nit.
-    """
-    from datetime import datetime, timedelta, timezone
-
-    from data_collection.models import DataQuality, FundingRate, OpenInterest
-    from data_collection.storage import SQLiteDatabase
-
-    db = SQLiteDatabase(str(tmp_path / 'venue_keys.db'))
-    db.initialize()
-    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-    for venue, rate in (('coinbase', 2e-5), ('binance', 5e-5)):
-        db.insert_funding_rate(FundingRate(
-            symbol='BIP', event_time=stamp, available_time=stamp,
-            rate=rate, mark_price=60_000.0, index_price=60_000.0,
-            venue=venue, quality=DataQuality.VALID,
-        ))
-        db.insert_open_interest(OpenInterest(
-            symbol='BIP', event_time=stamp, available_time=stamp,
-            open_interest_contracts=1_000.0, venue=venue,
-            quality=DataQuality.VALID,
-        ))
-
-    with db._get_connection() as conn:
-        funding = conn.execute(
-            'SELECT venue, rate FROM funding_rates WHERE symbol = ?', ('BIP',)
-        ).fetchall()
-        oi = conn.execute(
-            'SELECT venue FROM open_interest WHERE symbol = ?', ('BIP',)
-        ).fetchall()
-
-    assert {r['venue'] for r in funding} == {'coinbase', 'binance'}, (
-        f'funding rates collapsed across venues: {[dict(r) for r in funding]}'
-    )
-    assert {r['venue'] for r in oi} == {'coinbase', 'binance'}
-
-
 def test_a_legacy_database_is_rebuilt_onto_the_venue_key(tmp_path):
     """An existing database keyed without venue must be migrated, not left broken.
 
@@ -336,72 +246,12 @@ def _bars_at(db, symbol: str, stamp) -> list[dict]:
         ]
 
 
-def test_the_ingestor_stamps_the_venue_on_funding(database):
-    """The code path, not just the schema key.
-
-    `test_funding_and_open_interest_are_venue_keyed` constructs
-    `FundingRate(..., venue=venue)` by hand and calls `db.insert_funding_rate`
-    directly, so it proves the unique key works and says nothing about whether
-    anything sets the field. `ingest_funding` did not: it set `funding_source` and
-    left `venue` at its `'unknown'` default, so every rate collided on
-    `(symbol, 'unknown', event_time)` and `INSERT OR REPLACE` kept the last
-    writer — a Binance proxy rate overwriting Coinbase's own, then read back as
-    Coinbase's. Removing the stamp again left all 13 tests in this file passing.
-    """
-    ingestor = Ingestor(database)
-    for rate, venue in ((0.0001, 'coinbase'), (0.0009, 'binance_proxy')):
-        ingestor.ingest_funding([FundingRate(
-            symbol='BIP-20DEC30-CDE', event_time=T0, available_time=T0,
-            rate=rate, mark_price=1.0, index_price=1.0,
-        )], venue=venue)
-
-    with database._get_connection() as connection:
-        rows = connection.execute(
-            'SELECT venue, rate FROM funding_rates ORDER BY venue'
-        ).fetchall()
-
-    stamped = {row[0]: row[1] for row in rows}
-    assert 'unknown' not in stamped, 'ingest_funding did not stamp the venue'
-    assert stamped == {'binance_proxy': 0.0009, 'coinbase': 0.0001}, (
-        f'a proxy rate overwrote the venue\'s own: {stamped}'
-    )
-
-
-def test_the_ingestor_stamps_the_venue_on_open_interest(database):
-    """Same property for the third dataset, so all three are covered."""
-    ingestor = Ingestor(database)
-    for value, venue in ((1000.0, 'bybit'), (2000.0, 'binance')):
-        ingestor.ingest_open_interest([OpenInterest(
-            symbol='BIP-20DEC30-CDE', event_time=T0, available_time=T0,
-            open_interest_contracts=value,
-        )], venue=venue)
-
-    with database._get_connection() as connection:
-        venues = {
-            row[0] for row in
-            connection.execute('SELECT venue FROM open_interest').fetchall()
-        }
-
-    assert 'unknown' not in venues and len(venues) == 2, venues
-
-
-# ---------------------------------------------------------------------------
-# The funding snapshot is not a gap fill
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
 def test_no_module_imports_ccxt():
     """The dependency is gone, not merely unused.
 
-    CCXT served three purposes and every one is now native: perp bars and spot
-    bars come from Coinbase (`coinbase` and `coinbase_spot`), open interest comes
-    from the product endpoint, and cross-venue funding was never permissible —
-    `proxy_funding_symbols` is a promotion gate with a threshold of zero, so the
-    fallback could only ever write rows the gates then refused.
+    CCXT served purposes that are all gone or native now: spot bars come from
+    Coinbase (`coinbase_spot`), and the perp funding and open-interest paths it
+    once fed have been deleted.
     """
     from pathlib import Path
 
@@ -427,68 +277,6 @@ def test_no_module_imports_ccxt():
         ]
         assert not declared, f'{requirements.name} still declares {declared}'
 
-
-
-def test_the_open_interest_snapshot_is_keyed_on_the_hour():
-    """A microsecond stamp broke dedup, alignment and the pairing with funding.
-
-    The store's key is (symbol, venue, event_time). `utc_now()` mints a new one
-    every call, so a second run inside one hour appended duplicate rows instead of
-    upserting — funding, keyed on the settlement hour, did not have that problem,
-    and the two halves of a single request disagreeing about their timestamp is
-    what fetching them together exists to prevent.
-
-    `_align` also reindexes onto the hourly bar grid with `method='ffill'`, so a
-    reading at 21:21:06 landed on the 22:00 bar rather than 21:00.
-    """
-    import asyncio
-    from unittest import mock
-
-    from data_collection.coinbase_connector import CoinbaseRESTClient
-
-    client = CoinbaseRESTClient('k', 's')
-    body = {'price': '77105', 'future_product_details': {
-        'funding_rate': '0.000009', 'funding_interval': '3600s',
-        'funding_time': '2026-08-21T22:00:00Z', 'open_interest': '268164'}}
-
-    with mock.patch.object(client, '_request', mock.AsyncMock(return_value=(200, body))):
-        first = asyncio.run(client.get_contract_snapshot('BIP-20DEC30-CDE'))
-        second = asyncio.run(client.get_contract_snapshot('BIP-20DEC30-CDE'))
-
-    for funding, interest in (first, second):
-        assert interest.event_time.minute == 0
-        assert interest.event_time.second == 0
-        assert interest.event_time.microsecond == 0
-        # available_time keeps the real instant: known at 21:21, describes hour 21.
-        assert interest.available_time >= interest.event_time
-        assert funding.event_time.minute == 0
-
-    # Two reads in the same hour must produce the same key, or they accumulate.
-    assert first[1].event_time == second[1].event_time, (
-        'repeat reads inside one hour produce different keys, so they duplicate '
-        'instead of upserting'
-    )
-
-
-def test_repeat_snapshots_in_one_hour_upsert(database):
-    """The consequence of the above, at the storage layer."""
-    from data_collection.models import OpenInterest
-
-    ingestor = Ingestor(database)
-    stamp = datetime(2026, 8, 21, 21, 0, 0)
-    for contracts in (268164.0, 268900.0, 269500.0):
-        ingestor.ingest_open_interest([OpenInterest(
-            symbol='BIP-20DEC30-CDE', event_time=stamp,
-            available_time=stamp + timedelta(minutes=21),
-            open_interest_contracts=contracts,
-        )], venue='coinbase')
-
-    with database._get_connection() as conn:
-        rows = [dict(r) for r in conn.cursor().execute(
-            'SELECT event_time, open_interest_contracts FROM open_interest')]
-
-    assert len(rows) == 1, f'three reads in one hour produced {len(rows)} rows'
-    assert rows[0]['open_interest_contracts'] == 269500.0, 'the latest read must win'
 
 
 def test_the_minute_bar_dataset_rejects_a_flagged_row_by_default():
