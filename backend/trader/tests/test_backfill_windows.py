@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from data_collection.ingest import Ingestor
-from data_collection.models import FundingRate, OHLCVBar
+from data_collection.models import OHLCVBar
 from data_collection.storage import SQLiteDatabase
 
 T0 = datetime(2026, 1, 1)
@@ -39,15 +39,6 @@ def _bars(hours, symbol='BTC-PERP'):
         OHLCVBar(symbol=symbol, timeframe='1h', event_time=T0 + timedelta(hours=h),
                  available_time=T0 + timedelta(hours=h + 1),
                  open=100.0, high=101.0, low=99.0, close=100.0, volume=10.0)
-        for h in hours
-    ]
-
-
-def _rates(hours, symbol='BIP'):
-    return [
-        FundingRate(symbol=symbol, event_time=T0 + timedelta(hours=h),
-                    available_time=T0 + timedelta(hours=h),
-                    rate=1e-5, mark_price=1.0, index_price=1.0)
         for h in hours
     ]
 
@@ -74,17 +65,6 @@ def test_an_unscoped_watermark_still_answers_for_any_venue(database):
     assert database.get_latest_ohlcv_time('BTC-PERP', '1h') is not None
 
 
-@pytest.mark.parametrize('getter,venue_present', [
-    ('get_latest_funding_time', 'coinbase'),
-    ('get_earliest_funding_time', 'coinbase'),
-])
-def test_funding_watermarks_are_venue_scoped(database, getter, venue_present):
-    Ingestor(database).ingest_funding(_rates(range(30)), venue=venue_present)
-
-    assert getattr(database, getter)('BIP', venue=venue_present) is not None
-    assert getattr(database, getter)('BIP', venue='binance_proxy') is None
-
-
 # ---------------------------------------------------------------------------
 # Interior gaps
 # ---------------------------------------------------------------------------
@@ -92,11 +72,11 @@ def test_funding_watermarks_are_venue_scoped(database, getter, venue_present):
 
 def test_an_interior_hole_is_found(database):
     """MIN/MAX bracketing could not see this, so it stayed a hole forever."""
-    Ingestor(database).ingest_funding(
-        _rates(list(range(10)) + list(range(20, 30))), venue='coinbase')
+    Ingestor(database).ingest_bars(
+        _bars(list(range(10)) + list(range(20, 30))), venue='coinbase')
 
     gaps = database.find_gaps(
-        'funding_rates', 'BIP', T0, T0 + timedelta(hours=30), step_seconds=3600)
+        'ohlcv', 'BTC-PERP', T0, T0 + timedelta(hours=30), step_seconds=3600)
 
     assert len(gaps) == 1
     start, end = gaps[0]
@@ -106,24 +86,24 @@ def test_an_interior_hole_is_found(database):
 
 def test_a_complete_range_reports_no_gaps(database):
     """Otherwise every cycle refetches everything."""
-    Ingestor(database).ingest_funding(_rates(range(30)), venue='coinbase')
+    Ingestor(database).ingest_bars(_bars(range(30)), venue='coinbase')
 
     assert database.find_gaps(
-        'funding_rates', 'BIP', T0, T0 + timedelta(hours=30), step_seconds=3600) == []
+        'ohlcv', 'BTC-PERP', T0, T0 + timedelta(hours=30), step_seconds=3600) == []
 
 
 def test_an_empty_table_is_one_whole_gap(database):
     gaps = database.find_gaps(
-        'funding_rates', 'BIP', T0, T0 + timedelta(hours=30), step_seconds=3600)
+        'ohlcv', 'BTC-PERP', T0, T0 + timedelta(hours=30), step_seconds=3600)
 
     assert gaps == [(T0, T0 + timedelta(hours=30))]
 
 
 def test_leading_and_trailing_gaps_are_both_found(database):
-    Ingestor(database).ingest_funding(_rates(range(10, 20)), venue='coinbase')
+    Ingestor(database).ingest_bars(_bars(range(10, 20)), venue='coinbase')
 
     gaps = database.find_gaps(
-        'funding_rates', 'BIP', T0, T0 + timedelta(hours=30), step_seconds=3600)
+        'ohlcv', 'BTC-PERP', T0, T0 + timedelta(hours=30), step_seconds=3600)
 
     assert len(gaps) == 2
     assert gaps[0][0] == T0
@@ -133,12 +113,12 @@ def test_leading_and_trailing_gaps_are_both_found(database):
 def test_gaps_are_venue_scoped(database):
     """A hole in the reference venue must not be hidden by the trade venue."""
     ingestor = Ingestor(database)
-    ingestor.ingest_funding(_rates(range(30)), venue='coinbase')
-    ingestor.ingest_funding(_rates(range(10)), venue='binance_proxy')
+    ingestor.ingest_bars(_bars(range(30)), venue='coinbase')
+    ingestor.ingest_bars(_bars(range(10)), venue='binance_proxy')
 
-    assert database.find_gaps('funding_rates', 'BIP', T0, T0 + timedelta(hours=30),
+    assert database.find_gaps('ohlcv', 'BTC-PERP', T0, T0 + timedelta(hours=30),
                               step_seconds=3600, venue='coinbase') == []
-    assert database.find_gaps('funding_rates', 'BIP', T0, T0 + timedelta(hours=30),
+    assert database.find_gaps('ohlcv', 'BTC-PERP', T0, T0 + timedelta(hours=30),
                               step_seconds=3600, venue='binance_proxy')
 
 

@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from .models import (
     OHLCVBar,
     Trade,
-    FundingRate,
-    OpenInterest,
     OrderBookSnapshot,
     TickerUpdate,
     DataQuality,
@@ -47,9 +45,6 @@ class ValidationConfig:
     # Order book specific
     max_spread_pct: float = 10.0  # Max spread as % of mid
     require_sorted_book: bool = True
-    
-    # Funding rate specific
-    max_funding_rate: float = 0.01  # 1% max funding rate (100 bps)
     
     # Gap detection
     max_gap_minutes: int = 5
@@ -188,44 +183,6 @@ class DataValidator:
         trade.quality = result.quality
         return result
     
-    def validate_funding_rate(self, funding: FundingRate) -> DataValidationResult:
-        """
-        Validate funding rate data.
-        """
-        result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
-        
-        # Rate bounds
-        if abs(funding.rate) > self.config.max_funding_rate:
-            result.add_issue(
-                f"Extreme funding rate: {funding.rate_bps:.2f} bps",
-                severity="warning"
-            )
-        
-        # Price validation
-        if not self._is_valid_price(funding.mark_price):
-            result.add_issue(f"Invalid mark price: {funding.mark_price}", severity="error")
-        
-        if not self._is_valid_price(funding.index_price):
-            result.add_issue(f"Invalid index price: {funding.index_price}", severity="error")
-        
-        # Mark-index divergence check
-        if funding.index_price > 0:
-            basis_pct = abs(funding.basis) * 100
-            if basis_pct > 5.0:  # More than 5% basis is suspicious
-                result.add_issue(
-                    f"Large basis: {basis_pct:.2f}%",
-                    severity="warning"
-                )
-        
-        # Timestamp validation
-        ts_result = self._validate_timestamp(funding.event_time, funding.available_time)
-        if not ts_result.is_valid:
-            result.issues.extend(ts_result.issues)
-            result.is_valid = False
-        
-        funding.quality = result.quality
-        return result
-    
     def validate_orderbook(self, book: OrderBookSnapshot) -> DataValidationResult:
         """
         Validate order book snapshot.
@@ -274,27 +231,6 @@ class DataValidator:
                 result.add_issue(f"Negative size in book: {level.size}", severity="error")
         
         book.quality = result.quality
-        return result
-    
-    def validate_open_interest(self, oi: OpenInterest) -> DataValidationResult:
-        """
-        Validate open interest data.
-        """
-        result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
-        
-        if oi.open_interest_contracts < 0:
-            result.add_issue(
-                f"Negative OI: {oi.open_interest_contracts}",
-                severity="error"
-            )
-        
-        # Timestamp validation
-        ts_result = self._validate_timestamp(oi.event_time, oi.available_time)
-        if not ts_result.is_valid:
-            result.issues.extend(ts_result.issues)
-            result.is_valid = False
-        
-        oi.quality = result.quality
         return result
     
     def validate_ticker(self, ticker: TickerUpdate) -> DataValidationResult:

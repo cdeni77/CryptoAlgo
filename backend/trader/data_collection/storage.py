@@ -16,11 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
-from .models import (
-    OHLCVBar,
-    FundingRate,
-    OpenInterest,
-)
+from .models import OHLCVBar
 
 logger = logging.getLogger(__name__)
 
@@ -63,27 +59,6 @@ class DatabaseBase(ABC):
         as_of: Optional[datetime] = None
     ) -> pd.DataFrame:
         """Get OHLCV data."""
-        pass
-    
-    @abstractmethod
-    def insert_funding_rate(self, funding: FundingRate) -> bool:
-        """Insert funding rate."""
-        pass
-    
-    @abstractmethod
-    def insert_funding_rate_batch(self, rates: List[FundingRate]) -> int:
-        """Insert batch of funding rates."""
-        pass
-    
-    @abstractmethod
-    def get_funding_rates(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        """Get funding rate history."""
         pass
     
     @abstractmethod
@@ -164,26 +139,6 @@ class SQLiteDatabase(DatabaseBase):
                 ON ohlcv(available_time)
             """)
             
-            # Funding rates table - ENHANCED
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS funding_rates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    event_time TIMESTAMP NOT NULL,
-                    available_time TIMESTAMP NOT NULL,
-                    rate REAL NOT NULL,
-                    mark_price REAL,
-                    index_price REAL,
-                    is_settlement INTEGER DEFAULT 0,
-                    quality TEXT DEFAULT 'valid',
-                    source TEXT DEFAULT 'unknown',
-                    funding_source TEXT DEFAULT 'unknown',
-                    venue TEXT DEFAULT 'unknown',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, venue, event_time)
-                )
-            """)
-
             # Lightweight migration for existing DBs.
             # Pre-existing bars keep 'unknown': the backfill tried Coinbase first
             # and filled gaps from CCXT (which itself falls back across six
@@ -191,51 +146,10 @@ class SQLiteDatabase(DatabaseBase):
             self._add_missing_columns(cursor, "ohlcv", {
                 "venue": "TEXT DEFAULT 'unknown'",
             })
-            self._add_missing_columns(cursor, "funding_rates", {
-                "funding_source": "TEXT DEFAULT 'unknown'",
-                "venue": "TEXT DEFAULT 'unknown'",
-            })
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_funding_symbol_event 
-                ON funding_rates(symbol, event_time)
-            """)
-            
-            # Open interest table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS open_interest (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    event_time TIMESTAMP NOT NULL,
-                    available_time TIMESTAMP NOT NULL,
-                    open_interest_contracts REAL NOT NULL,
-                    open_interest_base REAL,
-                    open_interest_usd REAL,
-                    quality TEXT DEFAULT 'valid',
-                    source TEXT DEFAULT 'unknown',
-                    venue TEXT DEFAULT 'unknown',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, venue, event_time)
-                )
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_oi_symbol_event 
-                ON open_interest(symbol, event_time)
-            """)
-
-            self._add_missing_columns(cursor, "open_interest", {
-                "venue": "TEXT DEFAULT 'unknown'",
-            })
-
             # Databases created before venue was part of the key still carry the
             # old constraint, and SQLite cannot alter one in place.
             self._rebuild_for_venue_key(cursor, "ohlcv",
                                         "UNIQUE(symbol, timeframe, venue, event_time)")
-            self._rebuild_for_venue_key(cursor, "funding_rates",
-                                        "UNIQUE(symbol, venue, event_time)")
-            self._rebuild_for_venue_key(cursor, "open_interest",
-                                        "UNIQUE(symbol, venue, event_time)")
 
             conn.commit()
             logger.info(f"Database initialized at {self.db_path}")
@@ -442,221 +356,6 @@ class SQLiteDatabase(DatabaseBase):
             
             return df
     
-    def insert_funding_rate(self, funding: FundingRate) -> bool:
-        """Insert funding rate."""
-        with self._get_connection() as conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT OR REPLACE INTO funding_rates
-                    (symbol, event_time, available_time, rate, 
-                     mark_price, index_price, is_settlement, quality, source,
-                     funding_source, venue)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    funding.symbol,
-                    funding.event_time,
-                    funding.available_time,
-                    funding.rate,
-                    funding.mark_price,
-                    funding.index_price,
-                    1 if funding.is_settlement else 0,
-                    funding.quality.value,
-                    # Was hardcoded "coinbase", which labelled a Binance proxy
-                    # rate as Coinbase's own.
-                    getattr(funding, 'venue', 'unknown'),
-                    funding.funding_source,
-                    getattr(funding, 'venue', 'unknown'),
-                ))
-                conn.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Failed to insert funding rate: {e}")
-                return False
-    
-    def insert_funding_rate_batch(self, rates: List[FundingRate]) -> int:
-        """Insert batch of funding rates."""
-        if not rates:
-            return 0
-        
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            inserted = 0
-            
-            for funding in rates:
-                try:
-                    cursor.execute("""
-                    INSERT OR REPLACE INTO funding_rates
-                        (symbol, event_time, available_time, rate,
-                         mark_price, index_price, is_settlement, quality, source,
-                         funding_source, venue)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        funding.symbol,
-                        funding.event_time,
-                        funding.available_time,
-                        funding.rate,
-                        funding.mark_price,
-                        funding.index_price,
-                        1 if funding.is_settlement else 0,
-                        funding.quality.value,
-                        # `source` defaulted to 'ccxt', which names the client
-                        # library rather than the exchange. The venue is the thing
-                        # the research store partitions on.
-                        getattr(funding, 'venue', 'unknown'),
-                        getattr(funding, 'funding_source', 'unknown'),
-                        getattr(funding, 'venue', 'unknown'),
-                    ))
-                    inserted += 1
-                except Exception as e:
-                    logger.error(f"Failed to insert funding rate: {e}")
-            
-            conn.commit()
-            return inserted
-    
-    def get_funding_rates(
-        self,
-        symbol: str,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        """Get funding rate history for a symbol."""
-        query = """
-            SELECT event_time, rate
-            FROM funding_rates
-            WHERE symbol = ?
-        """
-        params: List[Any] = [symbol]
-        
-        if start is not None:
-            query += " AND event_time >= ?"
-            params.append(start)
-        
-        if end is not None:
-            query += " AND event_time < ?"
-            params.append(end)
-        
-        if as_of is not None:
-            query += " AND available_time <= ?"
-            params.append(as_of)
-        
-        query += " ORDER BY event_time ASC"
-        
-        with self._get_connection() as conn:
-            df = pd.read_sql_query(
-                query,
-                conn,
-                params=params,
-                parse_dates=["event_time"]
-            )
-        
-        if not df.empty:
-            df.set_index("event_time", inplace=True)
-        
-        return df
-    
-    def insert_open_interest(self, oi: OpenInterest) -> bool:
-        """Insert open interest snapshot."""
-        with self._get_connection() as conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT OR REPLACE INTO open_interest
-                    (symbol, event_time, available_time, open_interest_contracts,
-                     open_interest_base, open_interest_usd, quality, source, venue)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    oi.symbol,
-                    oi.event_time,
-                    oi.available_time,
-                    oi.open_interest_contracts,
-                    oi.open_interest_base,
-                    oi.open_interest_usd,
-                    oi.quality.value,
-                    # Was hardcoded "ccxt", which is the client library, not the
-                    # exchange. Which proxy matters: Bybit and Binance report
-                    # open interest in different units.
-                    getattr(oi, 'venue', 'unknown'),
-                    getattr(oi, 'venue', 'unknown'),
-                ))
-                conn.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Failed to insert open interest: {e}")
-                return False
-    
-    def insert_open_interest_batch(self, oi_list: List[OpenInterest]) -> int:
-        """Insert batch of open interest records."""
-        if not oi_list:
-            return 0
-        
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            inserted = 0
-            
-            for oi in oi_list:
-                try:
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO open_interest
-                        (symbol, event_time, available_time, open_interest_contracts,
-                         open_interest_base, open_interest_usd, quality, source, venue)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        oi.symbol,
-                        oi.event_time,
-                        oi.available_time,
-                        oi.open_interest_contracts,
-                        oi.open_interest_base,
-                        oi.open_interest_usd,
-                        oi.quality.value,
-                        getattr(oi, 'venue', 'unknown'),
-                        getattr(oi, 'venue', 'unknown'),
-                    ))
-                    inserted += 1
-                except Exception as e:
-                    logger.error(f"Failed to insert OI: {e}")
-            
-            conn.commit()
-            return inserted
-    
-    def get_open_interest(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        as_of: Optional[datetime] = None
-    ) -> pd.DataFrame:
-        """Get open interest history."""
-        with self._get_connection() as conn:
-            query = """
-                SELECT event_time, open_interest_contracts, 
-                       open_interest_base, open_interest_usd, quality
-                FROM open_interest
-                WHERE symbol = ?
-                  AND event_time >= ?
-                  AND event_time < ?
-            """
-            params: List[Any] = [symbol, start, end]
-            
-            if as_of is not None:
-                query += " AND available_time <= ?"
-                params.append(as_of)
-            
-            query += " ORDER BY event_time ASC"
-            
-            df = pd.read_sql_query(
-                query,
-                conn,
-                params=params,
-                parse_dates=["event_time"]
-            )
-            
-            if not df.empty:
-                df.set_index("event_time", inplace=True)
-            
-            return df
-    
     def find_gaps(
         self,
         table: str,
@@ -676,7 +375,7 @@ class SQLiteDatabase(DatabaseBase):
         a hole for the life of the store, and the features computed straight
         across it.
         """
-        allowed = {'ohlcv', 'funding_rates', 'open_interest'}
+        allowed = {'ohlcv'}
         if table not in allowed:
             raise ValueError(f'unknown table {table!r}')
 
@@ -768,140 +467,6 @@ class SQLiteDatabase(DatabaseBase):
             value = row["min_time"] if row else None
             return datetime.fromisoformat(value) if value else None
 
-    def get_latest_funding_time(
-        self, symbol: str, venue: Optional[str] = None
-    ) -> Optional[datetime]:
-        """MAX event_time for this instrument, optionally scoped to one venue.
-
-        `venue` is not optional in spirit. Without it the watermark answers "has
-        anyone covered this range" rather than "has THIS venue covered it", so
-        once Coinbase filled a span the CCXT prepend was skipped and the
-        reference-venue bars the cross-venue basis and lead-lag features need
-        were never collected at all.
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            sql = (
-                "SELECT MAX(event_time) as max_time FROM funding_rates "
-                "WHERE symbol = ?"
-            )
-            params: list = [symbol]
-            if venue is not None:
-                sql += " AND venue = ?"
-                params.append(venue)
-            cursor.execute(sql, params)
-            row = cursor.fetchone()
-            value = row["max_time"] if row else None
-            return datetime.fromisoformat(value) if value else None
-
-    def get_earliest_funding_time(
-        self, symbol: str, venue: Optional[str] = None
-    ) -> Optional[datetime]:
-        """MIN event_time for this instrument, optionally scoped to one venue.
-
-        `venue` is not optional in spirit. Without it the watermark answers "has
-        anyone covered this range" rather than "has THIS venue covered it", so
-        once Coinbase filled a span the CCXT prepend was skipped and the
-        reference-venue bars the cross-venue basis and lead-lag features need
-        were never collected at all.
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            sql = (
-                "SELECT MIN(event_time) as min_time FROM funding_rates "
-                "WHERE symbol = ?"
-            )
-            params: list = [symbol]
-            if venue is not None:
-                sql += " AND venue = ?"
-                params.append(venue)
-            cursor.execute(sql, params)
-            row = cursor.fetchone()
-            value = row["min_time"] if row else None
-            return datetime.fromisoformat(value) if value else None
-
-    def get_latest_oi_time(
-        self, symbol: str, venue: Optional[str] = None
-    ) -> Optional[datetime]:
-        """MAX event_time for this instrument, optionally scoped to one venue.
-
-        `venue` is not optional in spirit. Without it the watermark answers "has
-        anyone covered this range" rather than "has THIS venue covered it", so
-        once Coinbase filled a span the CCXT prepend was skipped and the
-        reference-venue bars the cross-venue basis and lead-lag features need
-        were never collected at all.
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            sql = (
-                "SELECT MAX(event_time) as max_time FROM open_interest "
-                "WHERE symbol = ?"
-            )
-            params: list = [symbol]
-            if venue is not None:
-                sql += " AND venue = ?"
-                params.append(venue)
-            cursor.execute(sql, params)
-            row = cursor.fetchone()
-            value = row["max_time"] if row else None
-            return datetime.fromisoformat(value) if value else None
-
-    def get_earliest_oi_time(
-        self, symbol: str, venue: Optional[str] = None
-    ) -> Optional[datetime]:
-        """MIN event_time for this instrument, optionally scoped to one venue.
-
-        `venue` is not optional in spirit. Without it the watermark answers "has
-        anyone covered this range" rather than "has THIS venue covered it", so
-        once Coinbase filled a span the CCXT prepend was skipped and the
-        reference-venue bars the cross-venue basis and lead-lag features need
-        were never collected at all.
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            sql = (
-                "SELECT MIN(event_time) as min_time FROM open_interest "
-                "WHERE symbol = ?"
-            )
-            params: list = [symbol]
-            if venue is not None:
-                sql += " AND venue = ?"
-                params.append(venue)
-            cursor.execute(sql, params)
-            row = cursor.fetchone()
-            value = row["min_time"] if row else None
-            return datetime.fromisoformat(value) if value else None
-
-    def get_funding_stats(self) -> Dict[str, Any]:
-        """Get statistics about stored funding data."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT symbol, 
-                       COUNT(*) as count,
-                       MIN(event_time) as earliest,
-                       MAX(event_time) as latest,
-                       AVG(rate) as avg_rate,
-                       MIN(rate) as min_rate,
-                       MAX(rate) as max_rate
-                FROM funding_rates
-                GROUP BY symbol
-            """)
-            
-            results = {}
-            for row in cursor.fetchall():
-                results[row["symbol"]] = {
-                    "count": row["count"],
-                    "earliest": row["earliest"],
-                    "latest": row["latest"],
-                    "avg_rate_bps": row["avg_rate"] * 10000 if row["avg_rate"] else 0,
-                    "min_rate_bps": row["min_rate"] * 10000 if row["min_rate"] else 0,
-                    "max_rate_bps": row["max_rate"] * 10000 if row["max_rate"] else 0,
-                }
-            
-            return results
-    
     def close(self) -> None:
         """Close database (no-op for SQLite with context manager pattern)."""
         logger.info("SQLite database closed")

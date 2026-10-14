@@ -1,19 +1,11 @@
 """The single door into storage.
 
 Every record that reaches the database goes through here, and here is the only
-place that sets `quality`. That matters because the previous arrangement had two
-ingest paths: OHLCV went through the async `DataPipeline`, which validated it,
-while funding and open interest were inserted directly by `run_pipeline`. Open
-interest was constructed with `quality=DataQuality.VALID` by hand, so the column
-asserted the data had been checked when nothing had checked it.
+place that sets `quality`. `DataQuality.UNVALIDATED` is the default on every
+record, so anything that still finds its way around this module is visible in
+the data rather than indistinguishable from a verified row:
 
-`DataValidator` already implements `validate_funding_rate` and
-`validate_open_interest`. Neither was ever called. This module calls them, and
-`DataQuality.UNVALIDATED` is now the default on every record, so anything that
-still finds its way around this module is visible in the data rather than
-indistinguishable from a verified row:
-
-    SELECT COUNT(*) FROM open_interest WHERE quality = 'unvalidated'
+    SELECT COUNT(*) FROM ohlcv WHERE quality = 'unvalidated'
 
 Rejection policy matches what the pipeline already did for bars: VALID and
 SUSPICIOUS are stored, INVALID is dropped. Suspicious data is usable with a
@@ -26,7 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
-from .models import DataQuality, FundingRate, OHLCVBar, OpenInterest
+from .models import DataQuality, OHLCVBar
 from .validator import DataQualityTracker, DataValidator, ValidationConfig
 
 logger = logging.getLogger(__name__)
@@ -125,89 +117,6 @@ class Ingestor:
             result.inserted = self.database.insert_ohlcv_batch(keep)
         return self._log('bars', venue, result)
 
-    # -- funding ------------------------------------------------------------
-
-    def ingest_funding(
-        self,
-        rates: Sequence[FundingRate],
-        *,
-        venue: str,
-    ) -> IngestResult:
-        """Validate and store funding rates.
-
-        This is the path `run_pipeline.backfill_funding_rates` skipped, so an
-        implausible rate — the validator's ceiling is 1% per interval — went
-        straight into the carry features.
-        """
-        result = IngestResult(received=len(rates))
-        if not rates:
-            return result
-
-        keep: list[FundingRate] = []
-        for rate in rates:
-            # Both fields, and `venue` is the one that matters: it is in the
-            # unique key, so without it every venue's rate for an instrument-hour
-            # collided and `INSERT OR REPLACE` kept whichever arrived last. A
-            # Binance proxy rate would overwrite Coinbase's own and then be read
-            # back as Coinbase's, which is the one substitution the carry features
-            # cannot survive. Bars and open interest already did this correctly;
-            # funding was the outlier.
-            rate.venue = venue
-            rate.funding_source = venue
-            outcome = self.validator.validate_funding_rate(rate)
-            self.tracker.record_validation(outcome)
-            rate.quality = outcome.quality
-
-            if outcome.quality in STORABLE:
-                keep.append(rate)
-                if outcome.quality == DataQuality.SUSPICIOUS:
-                    result.suspicious += 1
-            else:
-                result.rejected += 1
-                result.issues.extend(outcome.issues)
-
-        result.stored = keep
-        if keep:
-            result.inserted = self.database.insert_funding_rate_batch(keep)
-        return self._log('funding', venue, result)
-
-    # -- open interest ------------------------------------------------------
-
-    def ingest_open_interest(
-        self,
-        records: Sequence[OpenInterest],
-        *,
-        venue: str,
-    ) -> IngestResult:
-        """Validate and store open interest.
-
-        `validate_open_interest` had zero callers before this. Records were built
-        with `quality=DataQuality.VALID` written in by hand.
-        """
-        result = IngestResult(received=len(records))
-        if not records:
-            return result
-
-        keep: list[OpenInterest] = []
-        for record in records:
-            record.venue = venue
-            outcome = self.validator.validate_open_interest(record)
-            self.tracker.record_validation(outcome)
-            record.quality = outcome.quality
-
-            if outcome.quality in STORABLE:
-                keep.append(record)
-                if outcome.quality == DataQuality.SUSPICIOUS:
-                    result.suspicious += 1
-            else:
-                result.rejected += 1
-                result.issues.extend(outcome.issues)
-
-        result.stored = keep
-        if keep:
-            result.inserted = self.database.insert_open_interest_batch(keep)
-        return self._log('open_interest', venue, result)
-
     # -- reporting ----------------------------------------------------------
 
     def quality_summary(self) -> dict:
@@ -236,7 +145,7 @@ def unvalidated_row_counts(database) -> dict[str, int]:
     connection = getattr(database, '_connection', None) or getattr(database, 'conn', None)
     if connection is None:
         return counts
-    for table in ('ohlcv', 'funding_rates', 'open_interest'):
+    for table in ('ohlcv',):
         try:
             cursor = connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE quality = ?",

@@ -434,16 +434,12 @@ class Channels:
     RAW_TRADES = "raw:trades"
     RAW_TICKER = "raw:ticker"
     RAW_ORDERBOOK = "raw:orderbook"
-    RAW_FUNDING = "raw:funding"
-    RAW_OPEN_INTEREST = "raw:oi"
     
     # Validated data channels (after validation)
     VALIDATED_OHLCV = "validated:ohlcv"
     VALIDATED_TRADES = "validated:trades"
     VALIDATED_TICKER = "validated:ticker"
     VALIDATED_ORDERBOOK = "validated:orderbook"
-    VALIDATED_FUNDING = "validated:funding"
-    VALIDATED_OPEN_INTEREST = "validated:oi"
     
     # Error/alert channels
     VALIDATION_ERRORS = "alerts:validation"
