@@ -24,7 +24,7 @@ override reaches it and there is no second hardcoded list to drift out of step.
 """
 from __future__ import annotations
 
-from scripts.live import _is_ours
+from livetrade.ledger import _is_ours
 
 
 # --- what the loop trades --------------------------------------------------

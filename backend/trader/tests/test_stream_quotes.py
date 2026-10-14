@@ -16,6 +16,7 @@ import pytest
 from core.stream_book import BookCache
 from data_collection.kalshi_client import KalshiError, market_meta
 from data_collection.stream.base import BookEvent
+from livetrade import quotes as live_quotes
 from scripts import live
 
 SETTLE = pd.Timestamp('2026-10-14 12:15', tz='UTC')
@@ -63,9 +64,9 @@ def _cache(clock, tickers):
 
 @pytest.fixture(autouse=True)
 def _fresh_markets():
-    live._MARKETS.clear()
+    live_quotes._MARKETS.clear()
     yield
-    live._MARKETS.clear()
+    live_quotes._MARKETS.clear()
 
 
 class TestBookCacheFreshness:

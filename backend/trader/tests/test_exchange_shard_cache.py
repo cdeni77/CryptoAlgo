@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from livetrade import ledger as live_ledger
 from scripts import live
 
 
@@ -19,9 +20,9 @@ class _Q:
 
 @pytest.fixture(autouse=True)
 def _clear():
-    live._LAST_EXCHANGE_INDEX = None
+    live_ledger._LAST_EXCHANGE_INDEX = None
     yield
-    live._LAST_EXCHANGE_INDEX = None
+    live_ledger._LAST_EXCHANGE_INDEX = None
 
 
 def _quotes(index):
@@ -29,20 +30,20 @@ def _quotes(index):
 
 
 def test_nothing_is_known_before_a_book_has_been_read():
-    assert live._LAST_EXCHANGE_INDEX is None, (
+    assert live_ledger._LAST_EXCHANGE_INDEX is None, (
         'until a book is seen the balance query falls back to its own default, '
         'which is what already happens on a cycle where no symbol quoted')
 
 
 def test_the_shard_is_learned_from_the_book_and_kept():
     assert live.remember_exchange_index(_quotes(2)) == 2
-    assert live._LAST_EXCHANGE_INDEX == 2
+    assert live_ledger._LAST_EXCHANGE_INDEX == 2
 
 
 def test_an_empty_book_does_not_erase_what_was_learned():
     live.remember_exchange_index(_quotes(2))
     assert live.remember_exchange_index({}) == 2
-    assert live._LAST_EXCHANGE_INDEX == 2, (
+    assert live_ledger._LAST_EXCHANGE_INDEX == 2, (
         'a cycle where nothing quoted must not reset the shard to unknown')
 
 
@@ -53,7 +54,7 @@ def test_a_moved_shard_is_logged_loudly_and_adopted(caplog):
     with caplog.at_level('WARNING'):
         assert live.remember_exchange_index(_quotes(2)) == 2
     assert any('exchange shard 0 to 2' in r.getMessage() for r in caplog.records), caplog.text
-    assert live._LAST_EXCHANGE_INDEX == 2, 'the new shard is adopted, not just logged'
+    assert live_ledger._LAST_EXCHANGE_INDEX == 2, 'the new shard is adopted, not just logged'
 
 
 def test_an_unchanged_shard_is_silent(caplog):

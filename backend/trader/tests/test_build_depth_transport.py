@@ -66,8 +66,8 @@ def test_the_trading_loops_own_touch_names_its_observer():
     and now ambiguous against the two the ladder recorder writes."""
     import inspect
 
-    from scripts import live
-    source = inspect.getsource(live._record_touch)
+    from livetrade import quotes
+    source = inspect.getsource(quotes._record_touch)
     assert "'source': 'live_touch'" in source
 
 
