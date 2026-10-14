@@ -1,25 +1,11 @@
 """Configuration for the 15-minute binary system.
 
-One frozen dataclass, one source of truth. Everything a run can disagree
-about is a field here, and every script exposes the fields that change an
-answer as CLI arguments — so a run that used a different offset set, a
-different fee assumption or a different bankroll says so in its own
-provenance rather than being reconstructed later from a shell history.
+One frozen dataclass, one source of truth. Every field a run can disagree about
+is here, and the fields that change an answer are CLI arguments, so each run
+records them in its provenance.
 
-The fields group into five decisions, and they are independent:
-
-* **What is traded.** Three Coinbase spot series, 15-minute windows, and a
-  handful of decision offsets inside each window.
-* **What volatility is.** The remaining-variance forecast is the only input the
-  barrier baseline needs, so its lookbacks and its seasonality live here.
-* **What the null is.** ``baseline_*`` describes the arithmetic a clock and a
-  volatility estimate can already do. Beating it is the entire question.
-* **What a trade costs.** Kalshi's fee is a function of price, not a spread in
-  basis points, and the half-spread is a separate field because it is an
-  assumption rather than a measurement.
-* **How much is staked.** A $100 account makes the integer-contract minimum a
-  real gate rather than a rounding detail, and it makes correlation across the
-  three symbols a sizing problem rather than a footnote.
+Field groups: what is traded, how volatility is estimated, the null (`baseline_*`),
+what a trade costs, and how much is staked.
 """
 
 from __future__ import annotations
@@ -37,10 +23,8 @@ DEFAULT_FEE_CONFIG_NAME = 'kalshi_v202608.json'
 def find_fee_config(name: str = DEFAULT_FEE_CONFIG_NAME) -> Optional[Path]:
     """Locate a venue fee schedule, or return None.
 
-    Deliberately returns None rather than raising: the caller decides whether
-    an unversioned run is acceptable. The hardcoded defaults below reproduce
-    the published Kalshi schedule, so an unconfigured run prices correctly but
-    records no schedule version — which is the remaining reason to load one.
+    Returns None, not an error: the defaults reproduce the published Kalshi
+    schedule, so an unconfigured run prices correctly but records no schedule version.
     """
     explicit = os.getenv('FEE_CONFIG')
     if explicit:
@@ -50,18 +34,11 @@ def find_fee_config(name: str = DEFAULT_FEE_CONFIG_NAME) -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
-# **The one Kalshi series mapping.** `scripts/live.py` used to be the only
-# place this read the `KALSHI_SERIES_BTC/ETH/SOL` env vars; four other files
-# each hardcoded the same three tickers with no env read at all. Pointing
-# `KALSHI_SERIES_BTC` at a demo series moved what the trader trades while every
-# recorder kept scraping production, silently — a live account disagreeing with
-# its own data pipeline about which market is real.
-#
-# The traded series carries an explicit strike suffix only on the WRONG series:
-# `KXBTCD-26AUG2317-T86749.99` is the hourly threshold ladder, abstained on for
-# exactly that reason. `KXBTC15M-26AUG230030` is series + date + HHMM with no
-# strike suffix — the strike is the price at the window's open, which is what
-# `core/windows.py` builds a target from.
+# The one Kalshi series mapping. Every reader uses it, so a `KALSHI_SERIES_*`
+# override moves the trader and the recorders together.
+# The 15-minute up/down series have no strike suffix on the ticker; the strike is
+# the price at the window's open. A strike suffix (`KXBTCD-...-T86749.99`)
+# marks the hourly threshold ladder, which is the wrong series.
 SERIES_BY_SYMBOL: dict[str, str] = {
     'BTC-USD': os.getenv('KALSHI_SERIES_BTC', 'KXBTC15M'),
     'ETH-USD': os.getenv('KALSHI_SERIES_ETH', 'KXETH15M'),
@@ -72,9 +49,7 @@ SERIES_BY_SYMBOL: dict[str, str] = {
 def series_to_symbol() -> dict[str, str]:
     """The inverse of `SERIES_BY_SYMBOL`, for a recorder keyed on the ticker.
 
-    Derived rather than duplicated, so an env override reaches both directions
-    — a second hardcoded `{series: symbol}` dict is exactly the trap this
-    replaces.
+    Derived, so an env override reaches both directions.
     """
     return {series: symbol for symbol, series in SERIES_BY_SYMBOL.items()}
 
@@ -86,129 +61,67 @@ class Config:
     venue: str = 'coinbase_spot'
     timeframe: str = '1m'
 
-    # A Kalshi crypto up/down market opens on a quarter-hour boundary and
-    # settles on the next one. `window_minutes` is therefore a property of the
-    # venue, not a tunable — it is a field so a test can build a 4-minute
-    # window without monkeypatching a module constant.
+    # A property of the venue (quarter-hour windows), not a tunable. A field so
+    # a test can build a short window.
     window_minutes: int = 15
 
-    # The venue settles on an *average*, not a point price. From the market's own
-    # rules: "the simple average of the sixty seconds of CF Benchmarks' BRTI
-    # before 12:45 AM EDT ... is at least the simple average of the sixty seconds
-    # ... before 12:30 AM EDT". So both the strike and the settlement value are
-    # one-minute means, and the strike of a window is exactly the settlement
-    # value of the window before it — consecutive markets chain.
-    #
-    # This has a real consequence for the barrier: averaging *reduces* variance.
-    # The unresolved quantity at offset m is the mean over the last minute, whose
-    # variance about the last observed price is
+    # The venue settles on an average, not a point price: the strike and the
+    # settlement value are both one-minute means of CF Benchmarks' BRTI, and a
+    # window's strike is the previous window's settlement value.
+    # Averaging reduces variance: remaining variance at offset m is
     #     sigma^2 * ((window - delta - m) + delta/3)
-    # rather than sigma^2 * (window - m). At m=12 that is 2.33 minutes of
-    # variance, not 3 — a 22% overstatement if ignored. See
-    # `remaining_variance_minutes`.
+    # not sigma^2 * (window - m). See `remaining_variance_minutes`.
     settle_average_minutes: float = 1.0
 
     # Minutes after the window opens at which a decision is scored. Each is a
-    # separate row with its own displacement and its own remaining variance,
-    # and they share a label — so folds split on the *window*, never the row.
-    # Four offsets spread across the window cover the barrier geometry from
-    # near-coin-flip to nearly-settled without carrying fourteen near-copies
-    # of every observation.
+    # row with its own displacement and remaining variance, and they share one
+    # label, so folds split on the window, never the row.
     decision_offsets: tuple[int, ...] = (3, 6, 9, 12)
 
-    # Which of those offsets may actually OPEN a position.
-    #
-    # Every offset above is still scored — that sample is what `market_benchmark`
-    # and the retroactive forecast test read, and narrowing it would destroy the
-    # measurement. This narrows only entries.
-    #
-    # Measured over 70 days and 19,339 symbol-windows, per-contract edge after the
-    # measured fee and a 0.5c half-spread, one entry per (symbol, window), 1pp
-    # gate:
-    #
-    #     earliest offset that clears (what ran)   0.040c   t=0.10
-    #     +9m or +12m                              1.206c   t=2.68
-    #     +12m only                                3.304c   t=5.98
-    #
-    # The loop books one position per symbol-window and takes whichever offset the
-    # clock has passed, so the earliest that clears wins and `already_entered`
-    # locks out the rest. In production 250 of 277 settled entries — 90% — landed
-    # at +3m, the weakest cell, and exactly one landed at +12m. At +3m the plain
-    # barrier baseline is genuinely *worse* than the market (-0.00065 log loss),
-    # so the trades clearing there are disproportionately false positives, and
-    # taking one forfeits the +12m opportunity in the same window.
-    #
-    # Robust on every split: all three symbols, both calendar halves (4.475c vs
-    # 4.282c at a 2pp gate), all three months, 80% of days positive, and
-    # strongest at spreads <= 1c (t=5.95) — i.e. in the most tradeable books.
-    #
-    # **None means every scored offset may enter**, which is what a backtest
-    # and every evaluation sweep need — narrowing the research default would
-    # make `scripts.evaluate` unable to measure the very cells this comment
-    # cites. The narrowing is a *deployment* choice: `scripts.live` defaults
-    # `--entry-offsets` to 12, so the trading policy is explicit at the
-    # command line and visible in `docker-compose.yml` rather than buried in a
-    # library default.
-    #
-    # (9, 12) is the conservative widening if the coverage loss matters.
+    # Which scored offsets may open a position. Every decision offset is still
+    # scored, so measurement is unaffected; this narrows only entries.
+    # The live loop takes the earliest offset that clears, and the late offsets
+    # carry the measured per-contract edge, so live narrows entries to +12m via
+    # `scripts.live --entry-offsets`. None (every scored offset may enter) is
+    # the research default, so evaluation can measure every cell.
+    # (9, 12) is the conservative widening if coverage matters.
     entry_offsets: Optional[tuple[int, ...]] = None
 
     # ---- volatility ------------------------------------------------------
     # Trailing realised-volatility lookbacks, in minutes, blended HAR-style.
-    # 15 and 60 carry the state, 240 and 1440 carry the level; a single
-    # lookback is either too noisy or too slow and there is no setting that is
-    # both.
+    # Short lookbacks carry the state, long ones the level.
     vol_lookbacks_minutes: tuple[int, ...] = (15, 60, 240, 1440)
 
-    # Intraday seasonality is a multiplicative minute-of-day factor, smoothed,
-    # because a per-minute factor from a finite sample is mostly noise. Set
-    # `seasonality_smooth_minutes` to 0 to disable seasonality entirely.
+    # Intraday seasonality: a smoothed multiplicative minute-of-day factor.
+    # A per-minute factor from a finite sample is mostly noise.
+    # Set `seasonality_smooth_minutes` to 0 to disable seasonality.
     seasonality_smooth_minutes: int = 31
     seasonality_min_days: int = 60
 
-    # A floor under the per-minute volatility forecast, in basis points. A
-    # dead-quiet minute otherwise divides by ~0 and the baseline returns 0 or 1
-    # with total confidence.
+    # A floor under the per-minute volatility forecast, in basis points. Without
+    # it a dead-quiet minute divides by ~0 and the baseline returns 0 or 1.
     min_sigma_bps_per_minute: float = 0.5
 
     # ---- the baseline (the null hypothesis) ------------------------------
     # 'normal' or 'student_t'. One-minute crypto returns are fat-tailed, so a
-    # Gaussian barrier overstates confidence at large displacements. Which
-    # distribution calibrates better out of sample is measured, not assumed.
+    # Gaussian barrier is overconfident at large displacements.
     baseline_distribution: str = 'student_t'
-    # Fraction of training rows, most recent by time, held OUT of the baseline's
-    # scale fit and used to fit a single sigma correction afterwards. 0.0 keeps
-    # the historical behaviour. See .
-    # Env-settable so a research run can flip it without a config edit, the
-    # same way QUOTE_MAX_AGE_SECONDS works. Read at import, which is fine
-    # because each evaluation is its own process.
+    # Fraction of training rows, most recent first, held out of the baseline's
+    # scale fit and used to fit one sigma correction. 0.0 disables it.
+    # Env-settable (read at import; each evaluation is its own process).
     baseline_calibration_holdout: float = float(
         os.getenv('BASELINE_CALIBRATION_HOLDOUT', '0.0'))
     baseline_nu: Optional[float] = None          # fitted when None
     baseline_fit_scale_per_offset: bool = True   # one scale factor per offset
 
-    # The baseline's drift is structurally zero and is not fitted. A non-zero
-    # drift *is* the alpha; it belongs to the model under test, and putting it
-    # in the null would hide exactly what the null exists to expose.
+    # The baseline has no drift and never fits one: a drift is the alpha under test.
 
     # ---- model -----------------------------------------------------------
-    # The classifier predicts a correction to the baseline: the baseline's
-    # logit enters as an init_score offset, so an untrained model reproduces
-    # the baseline exactly and every parameter it fits is incremental skill.
-    # Which forecaster the LightGBM correction is fitted on top of: 'baseline'
-    # for `F(x/sigma)`, 'market' for the recorded quote's implied probability.
-    #
-    # 'baseline' is the default and the only one currently fittable. 'market' is
-    # the better objective and is blocked on data, not on code: over 1,109
-    # live-recorded rows the market's log loss was 0.331 against the baseline's
-    # 0.428, so a baseline-init model spends itself correcting the forecaster
-    # that is already 0.10 nats behind the price. It also inverts the null in the
-    # right direction — an untrained market-init model reproduces the price, so
-    # nothing trades, where an untrained baseline-init model disagrees with the
-    # price by 5.79pp on average and trades on it.
-    #
-    # 285 symbol-windows of quotes exist against a `windows_evaluated >= 20,000`
-    # gate. `core/model.py` refuses clearly rather than substituting.
+    # The classifier predicts a correction: the init forecaster's logit is the
+    # LightGBM init_score, so an untrained model reproduces it exactly.
+    # 'baseline' fits on top of `F(x/sigma)`; 'market' on the recorded quote's
+    # implied probability. 'market' needs enough recorded quotes;
+    # `core/model.py` refuses rather than substituting.
     init_score_source: str = 'baseline'
 
     learning_rate: float = 0.03
@@ -222,125 +135,44 @@ class Config:
     early_stopping_rounds: int = 40
 
     # ---- cross-validation ------------------------------------------------
-    # How the walk-forward timeline is cut. 'count' gives equal numbers of
-    # WINDOWS, 'calendar' equal spans of TIME. Entries before 2026-09-03 predate
-    # this field, so their absence means 'count'.
-    #
-    # **The default is 'count' because the GATES read the worst fold.**
-    # `calibration_error`, `calibration_max_deviation` and
-    # `folds_skill_positive` all take a per-fold extremum, and that only means
-    # something when folds have comparable precision. Complete-case density
-    # varies 8x across the span (30 to 244 windows/day), so calendar blocks come
-    # out at 494 windows against 5,672 — and the worst-fold gate then measures
-    # SAMPLE SIZE rather than calibration:
-    #
-    #                       count      calendar
-    #     pooled skill   +0.00276    +0.00312   <- calendar estimates better
-    #     worst-fold ECE   0.0199      0.0448   <- on a 494-window fold
-    #     median-fold ECE  0.0161      0.0150   <- calendar better here too
-    #
-    # Every calendar fold except the thin one is better calibrated than every
-    # count fold, and equal spans tighten the standard error (t 3.15 -> 4.18).
-    #
-    # **Gating moved from 'count' to 'calendar' on 2026-09-16, once calendar
-    # was actually anchored.** The old argument for gating on counts was that
-    # balanced sizes make "the worst fold" a comparison rather than a lottery.
-    # That is true about fold SIZE and was silent about fold POSITION: neither
-    # scheme held its boundaries still, and 'count' cannot — its blocks are
-    # defined by data volume, so appending re-cuts them by construction.
-    #
-    # Measured cost of that: the SAME configuration evaluated three days apart
-    # took max_drawdown 0.182 -> 0.388 and calibration_vs_market -0.014 ->
-    # +0.009, failing three gates it had just passed, while model_minus_market
-    # IMPROVED. A gate is only a measurement if the thing under it holds still,
-    # and a weekly promotion turned that from a nuisance into the deciding
-    # factor. `--fold-scheme count` remains available for comparison.
+    # How the walk-forward timeline is cut: 'count' gives equal numbers of
+    # windows, 'calendar' equal anchored spans of time.
+    # 'calendar' is the default: its boundaries do not move when data is
+    # appended, so gate values compare across runs. 'count' re-cuts every
+    # boundary on append. `--fold-scheme count` remains for comparison.
     fold_scheme: str = 'calendar'
     n_folds: int = 6
-    # The block length for `fold_scheme='calendar'`, in days. A STATED
-    # parameter rather than one derived from however much data happens to
-    # exist: deriving it is what made the boundaries slide on every append,
-    # which is the whole defect the anchoring fixes. 35 days is the block width
-    # the previous proportional cut produced at the 248-day span where this was
-    # found, so the change is behaviour-preserving at the moment it landed.
-    #
-    # **SEVEN, because seven days is what the retrain actually does.** Blocks do
-    # not overlap, so this is the step as well as the test span: at 21 the
-    # backtest let a model go three weeks stale before refitting while the
-    # Sunday cron never lets it exceed one, which measured a deployment nobody
-    # runs. Swept 2026-09-16 against 21 with training held expanding:
-    #
-    #     blocks  folds  skill     edge_pp  return  sharpe  maxDD
-    #       21d       8  0.00304    2.79     0.616   2.17   0.202
-    #        7d      25  0.00256    3.37     1.041   3.69   0.091
-    #
-    # So it is a fidelity fix that also reads better, and 25 folds give the
-    # dispersion estimate three times the resolution.
-    #
-    # **It moves `calibration_error`, and that gate's threshold has NOT been
-    # re-derived for it.** Max fold ECE goes 0.0273 -> 0.0653 and the MEDIAN
-    # fold goes 0.0171 -> 0.0304, so it is not merely a max-over-more-folds
-    # artifact: binned ECE is biased upward at small samples and a 7-day fold
-    # holds about a third of the windows. Calibration is therefore not
-    # comparable across block sizes, and the 0.02 bar was set under 21-day
-    # blocks.
+    # The calendar block length, in days. A stated parameter, so boundaries do
+    # not slide as data arrives. Seven matches the weekly retrain: blocks do not
+    # overlap, so this is both the test span and the refit step.
+    # Smaller blocks raise per-fold ECE (binned ECE is biased up at small
+    # samples), so calibration gates are not comparable across block sizes.
     fold_block_days: float = 7.0
-    # A test block that is full on TIME can still be thin on DATA: coverage
-    # varies 8x across the history. Below this it is skipped and said so,
-    # rather than averaged in as a peer of a block twenty times its size.
+    # A block full on time can be thin on data. Below this many windows it is
+    # skipped, with a warning.
     min_test_windows: int = 200
-    # **Where the shrinkage is fitted, as a quantile of |model correction|.**
-    #
-    # 0.0 fits it on every validation row, which optimises the AVERAGE -- and
-    # the average is fine: the model's pooled ECE is 0.0032 off the market's.
-    # The ~9% of rows that become trades are a selected sample, taken exactly
-    # where the model most disagrees with the price, and there it claimed
-    # 65.07% and delivered 58.53% over 217 live trades. Alpha never saw those
-    # rows separately, so it had no reason to correct them.
-    #
-    # 0.90 fits on the top decile of |correction|. The ranking is
-    # alpha-invariant, so there is no fixed point to solve. Default 0.0 until
-    # the backtest says it helps -- see the note in `_fit_residual_scale`.
+    # Where the shrinkage is fitted, as a quantile of |model correction|.
+    # 0.0 fits on every validation row (the average). A higher value fits on
+    # the rows where the model disagrees most, which is where trades come from.
+    # See `_fit_residual_scale`.
     shrinkage_focus_quantile: float = 0.0
-    # **Ceiling on `residual_scale`.** Alpha answers "how much of the claimed
-    # correction survives out of sample", so a value above 1 is the validation
-    # split asking to AMPLIFY the correction -- an overfitting signature, not a
-    # finding. Measured over 28 weekly refits at the historical 2.0 ceiling:
-    # 0.532 to 2.000, median 1.231, amplifying on 19 of 28, and NOT settling
-    # with more data. Meanwhile the traded rows are 6.7pp overconfident, so
-    # amplification hurts precisely where the money is.
-    #
-    # **1.0 since 2026-10-03, and the backtest ruled on it.** Same config,
-    # same data, ceiling 2.0 against 1.0:
-    #
-    #     edge/contract    2.276pp -> 3.410pp   (+50%)
-    #     sharpe              3.42 -> 3.63
-    #     log_loss_skill   0.00270 -> 0.00295
-    #     model_minus_mkt  0.00237 -> 0.00338
-    #     calib vs market  0.00484 -> 0.00226   (halved)
-    #     alpha sd           0.426 -> 0.143     median 1.231 -> 1.000
-    #     amplifying refits  19/28 -> 0/28
-    #
-    # The cost is volume: 2,543 -> 2,054 trades, so total return falls +111% ->
-    # +89%. Fewer and better, which is the right trade when the per-contract
-    # edge is what the live decision rule keys on.
-    #
-    # 2.0 remains available for comparison. Nothing above 1.0 is coherent as a
-    # SHRINKAGE, which is why the default moved.
+    # Ceiling on `residual_scale`. Alpha is how much of the claimed correction
+    # survives out of sample; a value above 1 amplifies the correction, which is
+    # an overfitting signature, not shrinkage.
     max_residual_scale: float = 1.0
-    # Number of boosters averaged. Their spread is what `edge_lower_bound_z` and
-    # `require_member_agreement` read; 1 is the single-model behaviour.
+    # Number of boosters averaged. Their spread feeds `edge_lower_bound_z` and
+    # `require_member_agreement`; 1 is a single model.
     ensemble_size: int = 1
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'
     # Two-stage stacking. 'spot_then_market' fits stage 1 (a baseline-init
-    # correction on `stack_spot_groups`) on every training row of the fold —
-    # five years of clean bars — and stage 2 only on rows carrying a usable
-    # quote: logit p = a*logit(market) + b*(logit(p_spot) - logit(market))
-    # [+ c] [+ L2 linear terms on `stack_book_features`]. `b` is how much of the
-    # spot model's disagreement with the price survives. Stage-2 rows see
-    # stage 1 only out of sample, via `stack_crossfit_blocks` blocked fits.
+    # correction on `stack_spot_groups`) on every training row, and stage 2
+    # only on rows with a usable quote:
+    #   logit p = a*logit(market) + b*(logit(p_spot) - logit(market))
+    #             [+ c] [+ L2 linear terms on `stack_book_features`]
+    # `b` is how much of the spot model's disagreement with the price survives.
+    # Stage 2 sees stage 1 only out of sample, via `stack_crossfit_blocks` blocked fits.
     stack_mode: str = 'off'
     stack_spot_groups: tuple[str, ...] = ('vol_state', 'microstructure',
                                           'cross_asset', 'geometry', 'offset')
@@ -348,353 +180,176 @@ class Config:
     stack_l2: float = 1.0
     stack_crossfit_blocks: int = 4
     stack_intercept: bool = False
-    # **The rolling training window, in days. None means expanding.**
-    #
-    # Expanding is what `scripts/promote.py` actually deploys — the Sunday
-    # retrain fits on all history — so None is the honest default and anything
-    # else must be matched in the retrain before it is traded, or the
-    # evaluation once again describes a system nobody runs.
-    #
-    # The case for a finite window is recency: the venue is eight months old,
-    # coverage improved through 2026, and a model fitted mostly on thin early
-    # history may not describe the book being traded now. The case against is
-    # sample size — at ~54 complete-case windows/day a 35-day window holds
-    # ~1,900 windows against 12,868 expanding, for 49 features. Which wins is
-    # an empirical question and this field exists so it can be asked rather
-    # than assumed.
+    # The rolling training window, in days. None means expanding.
+    # The weekly retrain deploys expanding, so any other value must also be
+    # applied in the retrain before it is traded.
     fold_train_days: Optional[float] = None
-    # Purge and embargo, in minutes, applied on both sides of every test
-    # block. It must cover the longest feature lookback (1440) as well as the
-    # label span (15), because a train row immediately after a test block
-    # computes its features from test-period bars.
+    # Purge and embargo, in minutes, on both sides of every test block. It must
+    # cover the longest feature lookback (1440) as well as the label span,
+    # because a training row just after a test block uses test-period bars.
     embargo_minutes: int = 1440
     recency_half_life_days: Optional[float] = None
     train_window_days: Optional[float] = None
-    # **The sealed holdout.** ISO date; every research script drops windows
-    # opening at or after it, in `scripts._common.load_dataset`. Reading past it
-    # takes `--unseal-holdout "<reason>"`, which is recorded and allowed once per
-    # date — a holdout looked at twice is a validation set.
+    # The sealed holdout, as an ISO date. Research scripts drop windows opening
+    # at or after it (`scripts._common.load_dataset`). Reading past it needs
+    # `--unseal-holdout "<reason>"`, recorded and allowed once per date.
     holdout_start: Optional[str] = None
 
     # ---- costs (Kalshi) --------------------------------------------------
-    # fee per contract = ceil(fee_rate * price * (1 - price) * 100) / 100,
-    # charged on the trade and never on settlement. See core/costs.py.
+    # Taker fee per order = ceil(fee_rate * C * P * (1 - P) * 10_000) / 10_000,
+    # charged on the trade, never on settlement. See core/costs.py.
     fee_rate: float = 0.07
-    # Maker fee = ceil(M * 0.0175 * C * P * (1 - P)) per order (venue fee
-    # schedule). M defaults to 0, and the 15-minute crypto series are not on
-    # the schedule's non-standard list, so a resting order pays nothing.
+    # Maker fee = ceil(M * 0.0175 * C * P * (1 - P)) per order. M defaults to 0:
+    # the 15-minute crypto series are not on the non-standard list.
     maker_fee_multiplier: float = 0.0
     assume_maker: bool = False
-    # Half the quoted bid/ask, in cents of a dollar contract.
-    #
-    # MEASURED, no longer assumed: the live BTC 15-minute book quoted 0.19/0.20
-    # and 0.10/0.11 — a one-cent spread, so half a cent. The previous default of
-    # 1.0 was twice too pessimistic, which made every backtested required-edge
-    # figure too high rather than too low. Still a single observation on one
-    # symbol at one time of day; the recorded `venue_ladder`/`venue_depth` books
-    # sample it properly and `scripts/evaluate.py` stresses it either way.
+    # Half the quoted bid/ask, in cents. The live BTC 15-minute book showed a
+    # one-cent spread. `scripts/evaluate.py` stresses this value.
     half_spread_cents: float = 0.5
 
     # ---- sizing and risk (a $100 account) --------------------------------
     starting_bankroll: float = 100.0
-    # Fraction of full Kelly. Full Kelly on a binary at an extreme price asks
-    # for a third of the account on a 5pp edge; a quarter is the largest value
-    # that survives being wrong about the edge by a factor of two.
-    # Fractional Kelly. **This is also an edge filter, and that is not obvious.**
-    #
-    # `decide` floors the stake to whole contracts, so a lower Kelly fraction does
-    # not merely stake less — it pushes marginal trades below one contract and
-    # refuses them as BELOW_MIN_CONTRACTS. Measured on 326 days, dropping 0.25 to
-    # 0.10 left `edge_below_gate` *identical* at 242,571 while
-    # `below_min_contracts` went 1,813 -> 8,218 and trades fell 3,221 -> 1,941.
-    # Realised edge per contract rose from +0.99pp to +3.32pp and the drawdown fell
-    # from 58% to 21%, not because the sizing was safer but because the surviving
-    # trades were the higher-edge ones.
-    #
-    # So `kelly_fraction` and `min_edge_pp` are coupled: anyone lowering Kelly to
-    # control drawdown is also raising the effective edge threshold, and anyone
-    # reading the two as independent knobs will be surprised. `max_stake_fraction`
-    # below, by contrast, is close to inert at this edge size — Kelly binds first,
-    # and cutting that cap 5x barely moved the drawdown.
+    # Fraction of full Kelly. This is also an edge filter: `decide` floors the
+    # stake to whole contracts, so a lower fraction pushes marginal trades below
+    # one contract and refuses them. `kelly_fraction` and `min_edge_pp` are coupled.
+    # `max_stake_fraction` is close to inert at this edge size: Kelly binds first.
     kelly_fraction: float = 0.25
     max_stake_fraction: float = 0.05      # of bankroll, per position
 
-    # A hard dollar cap per position, standing in for market depth. This is an
-    # ASSUMPTION and an unmeasured one: nobody has read the depth of a Kalshi
-    # 15-minute crypto book at a given price. It matters because it binds long
-    # before a percentage cap does — at $25 it starts constraining as soon as the
-    # account passes about $500 — and without it a backtest compounds a $100
-    # account into size no venue could fill and reports the result as a return.
-    # Measure the book, then set this from the measurement.
-    # How much of the depth measured at the touch a stake may claim.
-    #
-    # Sizing to 100% of it is sizing to a number that has already moved: the
-    # quote is read ~4s before the order is sent.
-    #
-    # Measured on 392 windows of real book at +12m where the two samples are
-    # genuinely 45s apart: the size resting at the touch retains a median 1.00x
-    # but only **0.29x at the 25th percentile** (bid 0.31x). A quarter of the
-    # time, over two thirds of the touch is gone within a minute.
-    #
-    # An earlier reading put that p25 at 0.55x and was contaminated: 30% of
-    # collected rows had `after` equal to `at_decision` — the same snapshot twice,
-    # when every book update in the queried span fell before the decision instant
-    # — each contributing a spurious 1.00x.
-    #
-    # 0.5 is chosen against the ~4s horizon that actually applies, not the 45s
-    # the measurement spans, so it sits between no headroom and the p25 of a
-    # window ten times longer. It is a judgement, and the fuller collection now
-    # running will let it be set from the 4s decay directly.
-    #
-    # On the median trade this is free — 241 contracts resting against ~9
-    # wanted, so the cap does not bind. It bites only in the thin tail (p10 is
-    # 6 contracts), which is exactly where `fill_or_kill_insufficient_resting_volume`
-    # was coming from.
+    # How much of the depth measured at the touch a stake may claim. The quote is
+    # read seconds before the order is sent, and the touch often shrinks in that
+    # time. A judgement between no headroom and the measured lower-quartile decay.
     depth_fraction: float = 0.5
+    # A hard dollar cap per position, used when no measured depth is available.
+    # It binds once the account grows, and keeps a backtest from trading size
+    # no venue could fill.
     max_stake_dollars: Optional[float] = 25.0
 
-    # Size from the *starting* bankroll rather than the current one.
-    #
-    # Default off — meaning additive, non-compounding — because compounding turns
-    # a per-trade edge estimate into an exponential, and an exponential is
-    # dominated by the error in that estimate rather than by the estimate. On a
-    # 2.8pp edge over 28,000 trades the compounded figure came out at 2e17
-    # percent, which is arithmetic rather than a finding. With this off, the
-    # equity curve's slope *is* the per-trade edge and can be read directly.
-    #
+    # Compound off the current bankroll instead of the starting one. Off by
+    # default: compounding turns an edge estimate into an exponential dominated
+    # by the estimate's error. Off, the equity curve's slope is the per-trade edge.
     # Turn it on to project deployment, and label the output as a projection.
     compound: bool = False
     max_window_exposure_fraction: float = 0.08
-    # How many of the three symbols may hold a position in one window.
-    #
-    # This was 2, justified as "the three symbols' 15-minute returns are ~0.7
-    # correlated, so three simultaneous same-direction positions are one position
-    # at three times the size." **Measured, that overstates it.** On 122 live
-    # windows where all three settled, the pairwise correlation of settle
-    # direction is BTC-ETH +0.607, BTC-SOL +0.590, ETH-SOL +0.656 — mean +0.618,
-    # with all three agreeing 71.3% of the time against 25% under independence.
-    #
-    # High, but not one bet. The variance of n unit bets at rho = 0.618:
-    #
-    #   1 leg   sd 1.00x   2 legs  sd 1.80x   3 legs  sd 2.59x
-    #
-    # so the third leg adds 50% of the stake for 44% more risk. Per unit of risk
-    # that is 1.16 against 1.11 for two — slightly *better*, provided the edge is
-    # real and roughly even across symbols.
-    #
-    # The reason it is 3 now is measurement, not that argument. `decide()` walks
-    # symbols alphabetically and refuses at the exposure gates *before* computing
-    # an edge, so a binding cap dropped whoever came last in the alphabet and
-    # recorded no edge for them: SOL was blocked 184 times against BTC's 104 and
-    # ETH's 95. Per-symbol performance cannot be compared when one symbol is
-    # structurally starved of entries, and the cap was the thing making the
-    # comparison unfair. At 3 it stops binding, so the ordering bias mostly
-    # disappears with it.
-    #
-    # `max_window_exposure_fraction` still caps the notional, which is the limit
-    # that was actually doing the work.
+    # How many symbols may hold a position in one window. The symbols' settle
+    # directions are correlated (about 0.6), so each extra leg adds less than
+    # proportional risk. At 3 the cap does not bind, so `decide()`'s alphabetical
+    # walk does not starve the last symbol of entries.
+    # `max_window_exposure_fraction` caps the notional.
     max_positions_per_window: int = 3
 
-    # One entry per (symbol, window). The four decision offsets are the same
-    # bet observed at four moments, not four bets, so letting each fire
-    # independently would put four times the intended size on one 15-minute
-    # move. The live-honest rule is to walk the offsets in order and take the
-    # first that clears every gate; `scripts/evaluate.py` reports edge per
-    # offset separately, which is how the offset set gets narrowed on evidence
-    # rather than by taking the best one in hindsight. One entry per
-    # (symbol, window) is enforced directly in `decide()` (`ALREADY_ENTERED`)
-    # rather than through a config field — it is an invariant, not a policy
-    # anyone should be tuning.
-
-    # Settlement is free; an exit is not. Selling a contract back pays a second
-    # fee and crosses the spread a second time, so an early exit at 85c costs
-    # 3.8pp against the 1.9pp of holding to settle. And there is no risk reason
-    # to override that: a binary's loss is capped at the stake from the instant
-    # of entry, so there is no liquidation to avoid and nothing a stop-loss
-    # protects. So this is unconditional, not a toggle: there is no exit path
-    # in `core/decide.py` or `core/book.py` at all, and `allow_early_exit`/
-    # `exit_edge_pp` config fields that implied a gated mechanism existed were
-    # removed rather than left describing a feature that was never built.
-    min_contracts: int = 1                # round down; zero contracts is a skip
-    # Surplus over break-even, in probability points, demanded before a trade
-    # is considered at all. Abstention is the default action, and this is the
-    # dial that decides how often it is overridden. It guards against
-    # calibration error rather than against fees — the fee is already inside
-    # break-even — so the right value is whatever the measured calibration
-    # error turns out to be, and `scripts/evaluate.py` reports the whole curve
-    # rather than assuming one.
-    # Raised from 0.5 on the out-of-sample edge curve, five years and six folds.
-    # `realised_edge_pp` is monotone in the gate across all three sweep cells
-    # (0.85 -> 2.80, 0.99 -> 2.68, 1.11 -> 2.95), which is only true if the edge
-    # estimate carries signal — filtering on a noise estimate would not raise
-    # realised edge. Live agreed independently: the two lowest edge buckets lost
-    # and the two highest won.
+    # One entry per (symbol, window): the decision offsets are one bet observed
+    # at several moments. `decide()` enforces it (`ALREADY_ENTERED`); it is an
+    # invariant, not a config field.
     #
-    # 1.5 rather than the argmax of total return, because that argmax is noise —
-    # the same curve computed three ways peaks at 0.25, 1.00 and 1.50. What the
-    # data supports is "tighter is better per trade"; where to stop is a judgment.
-    # At 1.5 total expected edge is flat against 0.5 (-2%) for 40% less exposure,
-    # so it is the same money at 26% better return per unit of risk — and 40% less
-    # capital at risk is right under both hypotheses, since if the edge turns out
-    # to be negative it loses 40% less.
+    # Hold to settlement, always. Settlement is free; an exit pays a second fee
+    # and crosses the spread again. A binary's loss is capped at the stake, so no
+    # stop-loss is needed. There is no exit path in `core/decide.py` or `core/book.py`.
+    min_contracts: int = 1                # round down; zero contracts is a skip
+    # Surplus over break-even, in probability points, required before a trade.
+    # It guards against calibration error; the fee is already in break-even.
+    # Realised edge rises with this gate out of sample, so the estimate carries
+    # signal. 1.5 is a judgement on per-trade quality, not the argmax of return.
+    # Do not choose it from `edge_curve`: that is in-sample selection.
     min_edge_pp: float = 1.5
-    # Ensemble-aware gates, both off by default and inert on rows without the
-    # ensemble's columns. With z > 0 the edge must also clear the gate at the
-    # probability minus z member standard deviations; with member agreement on,
-    # the least favourable member must still beat the cost.
+    # Ensemble gates, both off by default and inert without ensemble columns.
+    # With z > 0 the edge must clear the gate at the probability minus z member
+    # standard deviations. With member agreement on, the least favourable member
+    # must still beat the cost.
     edge_lower_bound_z: float = 0.0
     require_member_agreement: bool = False
-    # Traded-price band, and it must be symmetric. The edge here is a
-    # disagreement about sigma_remaining, and that disagreement points both
-    # ways: a smaller sigma than the market assumes makes the probability more
-    # extreme than the quote, so buy the favourite; a larger sigma makes the
-    # favourite overpriced, so buy the longshot. A one-sided band such as
-    # [0.55, 0.95] permits only the first and silently discards half the
-    # strategy.
-    #
-    # What the ends exclude is where the *microstructure* becomes the dominant
-    # uncertainty, not where the forecast is weak.
-    #
-    # The original justification for the low end was wrong and is worth
-    # recording: "below 10c a one-cent tick is a 10% relative price error". The
-    # venue's `price_level_structure` is `tapered_deci_cent` — the tick is a
-    # *tenth* of a cent below 10c and above 90c, and a cent only in between. So
-    # quantisation is finer in the tails, not coarser, and the real reason for
-    # care at a low price is that the payoff is 50:1 and a small calibration
-    # error dominates the expected value.
-    #
-    # Symmetric about 0.5, deliberately. It was [0.05, 0.97], and 1 - 0.97 is
-    # 0.03, not 0.05 — so the band admitted 96-97c favourites (the smaller-sigma
-    # view) while refusing 3-4c longshots (the larger-sigma view), silently
-    # clipping half the thesis. The asymmetry also ran the wrong way on cost: at
-    # 96c a 1pp calibration error destroys ~43% of the gross edge, at 4c about
-    # 1%. Keep `max_traded_price == 1 - min_traded_price`; the invariant is
-    # asserted in `__post_init__`.
+    # Traded-price band. It must be symmetric about 0.5 (`__post_init__` checks).
+    # The edge is a sigma disagreement, which points both ways: buy the favourite
+    # or buy the longshot. A one-sided band discards half the strategy.
+    # The ends exclude prices where the payoff is so skewed that a small
+    # calibration error dominates the expected value. The tick is finer there,
+    # not coarser (`tapered_deci_cent`).
     min_traded_price: float = 0.05
     max_traded_price: float = 0.95
 
-    # An outlier guard, not an economic gate. A sigma disagreement produces
-    # modest departures from the quote; a 40-point departure is a bug, a stale
-    # price, or a signal that is not the one under test. Rejecting it loudly is
-    # better than sizing it.
-    # Kept at 25.0 deliberately, having tried 8.0 and measured what it costs. A
-    # sigma disagreement at an extreme price moves the probability a long way:
-    # at a 0.88 quote, believing sigma is much larger takes P(up) to 0.70, an
-    # 18-point departure that is the strategy working rather than a bug. Several
-    # tests encode exactly that, and tightening this gate silently deletes the
-    # buy-the-longshot half of the thesis — the same failure the asymmetric band
-    # caused. The misparsed-quote risk this looked like it was guarding is
-    # actually handled by the price band (a cents-as-dollars quote reads 20.0 and
-    # is out of band; a 100x-low one reads 0.002 and is too) and by refusing to
-    # trade live without a real two-sided quote.
+    # An outlier guard, not an economic gate: a very large departure from the
+    # quote is a bug or a stale price. Kept wide, because at an extreme quote a
+    # real sigma disagreement moves the probability far (0.88 to 0.70 is the
+    # strategy working). The price band and the two-sided-quote rule catch misparsed quotes.
     max_disagreement_pp: float = 25.0
 
     # ---- order envelope --------------------------------------------------
-    # The hard cap, in cents, on how far a live order may cross to get filled.
-    # How far it *actually* crosses is set by `min_edge_pp`: everything above
-    # that gate is spendable, because a fill at the gate is by construction a
-    # trade this system accepts and no fill earns nothing. This replaced
-    # `slippage_share_of_edge = 0.25`, which allowed a 3.68pp edge just 0.92c
-    # against a book that moves ~2c in the seconds before the order lands —
-    # measured, 26 of 42 live attempts failed to fill, and the misses were
-    # priced, not sized.
-    #
-    # Crossing further is close to free for a taker: `taker_at_cross` +
-    # `immediate_or_cancel` fills from the touch outward and stops, so the limit
-    # bounds the worst fill rather than setting the price. The cap is a rail
-    # against a book so thin the order walks it absurdly far, which is the
-    # failure the previous `price + edge` limit actually produced: 0.7832 sent
-    # against a 0.60 ask, 18c of tolerance on a 1c spread.
+    # The hard cap, in cents, on how far a live order may cross to fill. The
+    # actual crossing is bounded by `min_edge_pp`: a fill at the gate is still a
+    # trade this system accepts. `taker_at_cross` + `immediate_or_cancel` fills
+    # from the touch outward, so the limit bounds the worst fill, not the price.
+    # The cap guards against a book so thin the order walks it far.
     max_slippage_cents: float = 3.0
 
     # ---- freshness -------------------------------------------------------
-    # There was no staleness guard of any kind. The feed's last `event_time` was
-    # logged and never asserted against the wall clock or against the decision
-    # minute, so a delayed or partial fetch was scored as though it were current:
-    # ten missing minutes moved the displacement from +4.93bp to +2.41bp and the
-    # cycle traded anyway. A quote is worse — the book moves within the window,
-    # and `now` was read once at the top of the cycle and never revalidated
-    # before the order went out, with a Coinbase fetch, four authenticated
-    # reconcile calls, inference and six 15-second quote calls in between.
+    # Maximum age of the newest bar at decision time. A delayed or partial fetch
+    # would otherwise be scored as current.
     max_bar_age_seconds: int = 150
-    # The longest lookback any feature needs, plus the mean it is taken over:
-    # `volume_z_15` is a 1,440-minute z-score of a 15-minute rolling mean, so
-    # bit-parity needs 1,455 contiguous bars. Live checked that bars were FRESH
-    # and never that they were COMPLETE, and between 721 and 1,454 bars the
-    # features are confidently wrong while the cycle still trades — measured,
-    # `rv_surprise` is 67x out at 1,200 bars. Below 721 the NaN reaches
-    # `sigma_remaining` and the cycle abstains on its own.
+    # Contiguous bars required. `volume_z_15` is a 1,440-minute z-score of a
+    # 15-minute mean, so feature parity needs 1,455 bars. With fewer, some
+    # features are wrong while the cycle would still trade.
     min_usable_bars: int = 1_455
-    # Refuse a decision whose cross-venue peer book is missing. OFF by default,
-    # because every ledger entry so far was measured without it. Measured, a
-    # one-minute peer lag costs 70% of the model's skill and dropping the peer
-    # entirely takes it negative, so trading without one trades a model missing
-    # most of its edge — while `--complete-cases` already requires the peer in
-    # training, so this is what makes live agree.
+    # Refuse a decision whose cross-venue peer book is missing. Off by default.
+    # Without the peer, the model loses most of its skill; `--complete-cases`
+    # already requires the peer in training, so this makes live agree.
     require_peer_book: bool = False
     # Place orders only while this exact artifact version is loaded. A row
     # scored by any other model is refused `model_not_pinned`, so a failed
     # reload or an unreviewed retrain cannot trade. None disables the check.
     require_model_version: Optional[str] = None
-    # **The one quote-staleness limit.** `core.quotes` prices backtests with it,
+    # The one quote-staleness limit. `core.quotes` prices backtests with it,
     # `core.metrics` filters the market comparison with it, and `scripts.live`
-    # refuses an order and a peer book past it. It was 45 here and 30 in the
-    # other two, so live traded quotes the evaluation would have discarded.
-    # `QUOTE_MAX_AGE_SECONDS` still overrides it, for every reader at once.
+    # refuses an order and a peer book past it. `QUOTE_MAX_AGE_SECONDS` overrides
+    # it for every reader at once.
     max_quote_age_seconds: float = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
-    # RESEARCH: which `venue_depth` observers may price a row. Empty keeps every
-    # source (ranked by QUOTE_SOURCE_PRIORITY); e.g. ('live_touch', 'live_ws',
-    # 'live') excludes the Predexon backfill, whose >30s-stale asks sit a median
-    # ~13-16c off the contemporaneous live ask.
+    # Research: which `venue_depth` observers may price a row. Empty keeps every
+    # source (ranked by QUOTE_SOURCE_PRIORITY). ('live_touch', 'live_ws', 'live')
+    # excludes the Predexon backfill.
     quote_sources: tuple[str, ...] = ()
-    # What a quote with NO recorded age means. 'fresh' keeps it (the historical
-    # behaviour); 'stale' drops it, after deriving an age bound for `live_touch`
-    # rows from `available_time - event_time` (see `core.quotes`).
+    # What a quote with no recorded age means. 'fresh' keeps it; 'stale' drops
+    # it, after bounding `live_touch` ages from `available_time - event_time`
+    # (see `core.quotes`).
     null_quote_age: str = 'fresh'
-    # The cross-venue PEER's staleness cap. None follows
-    # `max_quote_age_seconds`. Separate because only ~5% of live Polymarket
-    # rows are <=5s old: a tight Kalshi cap applied to the peer voided
-    # `venue_prob_gap` on nearly every row and `--complete-cases` kept 0.1%.
-    # Once set, `null_quote_age` applies to the peer as well; unset, a peer
-    # row with no age stays fresh, as it always has.
+    # The cross-venue peer's staleness cap. None follows `max_quote_age_seconds`.
+    # Separate because few live Polymarket rows are very fresh: a tight Kalshi
+    # cap on the peer would void `venue_prob_gap` almost everywhere.
+    # Once set, `null_quote_age` applies to the peer too; unset, a peer row with
+    # no age stays fresh.
     peer_max_quote_age_seconds: Optional[float] = None
     # Seconds from a decision's minute to the instant live reads the book. A
-    # backtest row may only use a book seen by then; live lands about 3s in.
+    # backtest row may only use a book seen by then.
     decision_latency_seconds: float = 3.0
-    # Refuse to enter when this little of the window remains. `choose_offset`
-    # floors to whole minutes, so a row built as "minute 12" could be submitted
-    # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
+    # Refuse to enter when less than this remains in the window. `choose_offset`
+    # floors to whole minutes, so a late submission would carry stale sigma.
     min_remaining_seconds: int = 45
     # Stop trading below this fraction of the starting bankroll.
     ruin_floor_fraction: float = 0.50
 
     # ---- live execution --------------------------------------------------
     # Price from the in-process stream book only while its socket delivered a
-    # frame this recently (and the book is not gapped); otherwise one REST
-    # `/orderbook` read. A frame lands ~34ms after the venue stamps it.
+    # frame this recently and the book is not gapped; otherwise read REST
+    # `/orderbook` once.
     stream_quote_max_age_seconds: float = 2.0
     # After this many consecutive decision cycles with the peer book refused
     # for one symbol (no book, wrong window, too old), live asks
     # `record_pm_stream` to drop that symbol's state and resubscribe.
     peer_resubscribe_after_cycles: int = 3
     # A one-minute bar built from the Coinbase trade stream is final once the
-    # clock passes its close by this much: trades arrive ~tens of ms late.
+    # clock passes its close by this much: trades arrive tens of ms late.
     spot_bar_grace_seconds: float = 0.75
 
     # ---- the settlement-index proxy (`core/index_proxy.py`) --------------
     # An exchange's mid counts toward the per-second median only while its
-    # connection delivered something this recently. Applied at RECORD time, so
-    # changing it changes what `index_proxy_1s` holds from then on.
+    # connection delivered something this recently. Applied at record time.
     index_proxy_max_staleness_seconds: float = 5.0
-    # Fewer fresh exchanges than this is a NaN proxy: one venue is the very
-    # proxy this replaces.
+    # Fewer fresh exchanges than this gives a NaN proxy.
     index_proxy_min_exchanges: int = 2
     # The `index_proxy` feature group reads the newest proxy row stamped
     # strictly before the decision, and only if it is at most this old.
     index_proxy_max_age_seconds: float = 5.0
-    # On a decision cycle venue reconciliation runs AFTER the orders, using the
-    # last reconciled balance to size. If that is older than this (or never
-    # happened) the cycle reconciles first, as non-decision cycles do.
+    # On a decision cycle, venue reconciliation runs after the orders and sizing
+    # uses the last reconciled balance. If that is older than this (or missing),
+    # the cycle reconciles first.
     max_reconcile_age_seconds: float = 300.0
     # One re-priced resend after an immediate_or_cancel that filled nothing,
     # only while the kill is this fresh. Never after a partial fill.
@@ -702,61 +357,26 @@ class Config:
     kill_retry_window_seconds: float = 2.0
 
     # ---- circuit breakers ------------------------------------------------
-    # The ruin floor was the only limit that existed, and it only fires after
-    # half the account is gone — 96 windows a day x 3 symbols means a broken
-    # model bleeds continuously, and the nominal worst case was $768/day against
-    # a $100 bankroll. These bound the day and the streak instead, and unlike the
-    # floor they are recorded on the account so they survive a restart. Clearing
-    # a halt is deliberately manual: an automatic reset makes a circuit breaker a
-    # speed bump.
+    # Circuit breakers. They bound the day, the streak and the drawdown, and are
+    # recorded on the account so they survive a restart. Clearing a halt is manual.
     max_daily_loss_fraction: float = 0.15
-    # 25, raised from 12 on 2026-09-03. Twelve is an alarm at even money and
-    # routine at longshot prices, because a longshot is SUPPOSED to lose most of
-    # the time — that is what a 4:1 payoff means:
-    #
-    #     P(12 consecutive losses)
-    #       50c contracts, 50% win rate:  0.024%   <- an alarm
-    #       22c contracts, 25% win rate:  3.168%   <- routine
-    #
-    # Live halted after twelve losses at a mean price of 22c. They cost $13.57
-    # against $96.80 realised, and `max_daily_loss_fraction` (~$43) never came
-    # close: the count breaker fired on the ODDS while the money breaker, which
-    # measures the damage, stayed quiet. The model had drifted from 51c to 19c
-    # contracts over five days as its volatility estimate rose above the
-    # market's — the strategy's documented other half working, not a fault.
-    #
-    # 25 restores roughly the rarity that 12 has at even odds. INTERIM: the
-    # threshold should scale with the price actually paid so it means the same
-    # thing at any odds, and this number will be wrong again if the drift
-    # reverses.
+    # Consecutive losses mean different things at different prices: a longshot
+    # is meant to lose most of the time. 25 is roughly as rare at longshot prices
+    # as 12 is at even money. Interim: this should scale with the price paid.
     max_consecutive_losses: int = 25
-    # Peak-to-current drawdown on realised equity, live. Same 0.35 the promotion
-    # gate applies to the backtest — a threshold worth enforcing on a simulation
-    # is worth enforcing on the account.
-    #
-    # It exists because the daily-loss rule cannot see this shape. Measured on the
-    # first two days: equity ran $100 -> $166.86 by 13:00 UTC and gave back $63.92
-    # over the next ten hours, all inside one UTC day. Realised for that day was
-    # **+$3.81** against a -$15.00 limit, so the daily rule saw a good day while
-    # the account was down 38.3% from its high and nothing was watching.
+    # Peak-to-current drawdown on realised equity, live. The same 0.35 as the
+    # promotion gate. It catches an intraday give-back that the daily-loss rule
+    # cannot see.
     max_drawdown_fraction: float = 0.35
 
     # ---- provenance ------------------------------------------------------
-    # `fee_config_path` used to sit here too, set by `with_fee_assumptions`
-    # and never read back by anything, including `provenance()` — a
-    # write-only field. `fee_config_version` is the part that is actually
-    # a fact about the fitted numbers; the local path a file happened to
-    # load from is not.
+    # The fee schedule version, a fact about the fitted numbers.
     fee_config_version: str = 'builtin_kalshi_v202608'
     cli_overrides: frozenset[str] = frozenset()
 
     # ---- invariants ------------------------------------------------------
     def __post_init__(self) -> None:
-        """Refuse a configuration whose numbers contradict each other.
-
-        These were all comments before, and every one of them was violated by the
-        shipped defaults or reachable from a CLI flag.
-        """
+        """Refuse a configuration whose numbers contradict each other."""
         stray = tuple(o for o in (self.entry_offsets or ())
                       if o not in tuple(self.decision_offsets))
         if stray:
@@ -789,23 +409,12 @@ class Config:
                 f'a disagreement about sigma and it points both ways — an '
                 f'asymmetric band silently permits only one direction of it.'
             )
-        # What the embargo must actually cover, for the *expanding* scheme this
-        # repo uses. Features are all trailing, so a training row's lookback
-        # extends backwards, away from the test block — the feature lookback
-        # length is NOT the binding constraint, and requiring the embargo to
-        # exceed it would be superstition. What genuinely reaches forward is:
-        #   - the label, which settles `window_minutes` after the window opens;
-        #   - `core/vol.py:forward_realised_vol`, the HAR target, which reads to
-        #     `window_open + window_minutes`.
-        # Both need `window_minutes`. The 1440 default is deliberately far
-        # larger, and becomes load-bearing only if the scheme ever goes rolling,
-        # where a training block *follows* a test block and `log_rv_1440` would
-        # then read across it.
-        #
-        # This check exists because `core/cv.py:assert_no_leakage` cannot do it:
-        # it compares each fold's gap against the *configured* embargo, which the
-        # fold was built from, so it passes at every value — measured, it passes
-        # at `--embargo-minutes 0`.
+        # The embargo must cover what reaches forward from a training row under
+        # the expanding scheme: the label and the HAR target, both
+        # `window_minutes` long. Feature lookbacks extend backwards, away from
+        # the test block. The 1440 default matters only for a rolling scheme.
+        # `core/cv.py:assert_no_leakage` cannot check this: it compares against
+        # the configured embargo.
         if self.embargo_minutes < self.window_minutes:
             raise ValueError(
                 f'embargo_minutes {self.embargo_minutes} is under window_minutes '
@@ -863,30 +472,20 @@ class Config:
     def remaining_minutes(self, offset: int) -> int:
         """Wall-clock minutes from the decision to settlement.
 
-        Reported, not used for scaling volatility — `remaining_variance_minutes`
-        is what the barrier divides by, and the two differ because the settlement
-        value is an average.
+        Reported only. The barrier divides by `remaining_variance_minutes`.
         """
         return self.window_minutes - offset
 
     def remaining_variance_minutes(self, offset: float) -> float:
-        """Minutes of *variance* left between the last observed price and settlement.
+        """Minutes of variance left between the last observed price and settlement.
 
-        The settlement value is the mean over the final `settle_average_minutes`,
-        not the price at the boundary. For a diffusion, the variance of that mean
-        about a price observed at offset `m` is
+        The settlement value is the mean over the final `settle_average_minutes`.
+        For a diffusion, its variance about a price observed at offset `m` is
 
             sigma^2 * ((window - delta - m) + delta / 3)
 
-        The first term is the drift to the start of the averaging window; the
-        `delta/3` is the variance of a time-average over an interval of length
-        `delta`, which is a third of the variance of its endpoint. Ignoring the
-        averaging overstates remaining variance — at offset 12 of a 15-minute
-        window, by 3 minutes against 2.33, which is 13% on sigma.
-
-        The baseline's fitted per-offset scale would absorb most of this, but
-        absorbing a known analytic correction into a fitted nuisance parameter is
-        how a fitted parameter stops meaning anything.
+        The `delta/3` term is the variance of a time-average over an interval of
+        length `delta`. Kept analytic so the baseline's fitted scale does not absorb it.
         """
         delta = float(self.settle_average_minutes)
         return max(0.0, (self.window_minutes - delta - float(offset)) + delta / 3.0)
@@ -922,19 +521,17 @@ class Config:
         )
 
     def provenance(self) -> dict[str, Any]:
-        """EVERY field, JSON-ready, for the artifact, the ledger and the trial log.
+        """Every field, JSON-ready, for the artifact, the ledger and the trial log.
 
-        A hand-picked subset let two ledger entries that differed in a knob
-        (block length, shrinkage ceiling, LightGBM depth, price band) read as
-        the same experiment. Tuples become lists, sets sorted lists; `None` is
-        kept as `None` (`entry_offsets=None` means every offset may enter, and
-        `scripts/live.config_for_artifact` reads `None` as "left at default").
+        Tuples become lists, sets sorted lists, and `None` stays `None`
+        (`entry_offsets=None` means every offset may enter).
         """
         return {f.name: _jsonable(getattr(self, f.name)) for f in fields(self)}
 
     def provenance_hash(self) -> str:
-        """Identity of the configuration under test. `cli_overrides` is left out:
-        it says how the values were reached, not what they are."""
+        """Identity of the configuration under test.
+
+        `cli_overrides` is left out: it says how values were reached, not what they are."""
         import hashlib
         import json
 

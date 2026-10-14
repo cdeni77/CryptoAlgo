@@ -1,42 +1,17 @@
 """An append-only sink for the raw frame stream, and its compaction.
 
-**This deliberately does not use `ResearchStore.write`.** That path reads a
-whole `(venue, symbol, month)` partition, concatenates, sorts and rewrites it
-under zstd. `run_live.py` names it as the latency threat the entire live process
-is arranged around, and it is right for a revisable series — but measured, this
-stream runs at 777-862 frames a second across three markets, so a month
-partition would reach tens of gigabytes and be rewritten on every flush.
-Appending is O(what was appended) and never reads back. Compaction then writes
-IMMUTABLE hour-named Parquet files, which `ResearchStore.read` still finds
-because it globs `**/*.parquet` and does not depend on the path layout.
+Does not use `ResearchStore.write`: that rewrites a whole partition per flush,
+which the frame rate cannot afford. Appending JSONL is O(appended) and survives
+a crash. Compaction writes immutable hour-named Parquet files, which
+`ResearchStore.read` finds by globbing `**/*.parquet`.
 
-**JSONL rather than an in-memory buffer, on purpose.** A crash loses whatever is
-buffered, and `record_ladder` already argues this book cannot be rebuilt later at
-any cost. Appending a line costs an extra pass over the data and buys
-crash-safety on the one dataset with no second chance.
+One row per level, not per frame. A replay regroups rows into the original
+`BookEvent`, so replay and live fold through the same `BookCache`.
+Regroup on `(market_ticker, event_time, seq)`: `seq` restarts on every
+resubscription, so `(market_ticker, seq)` is not unique.
 
-**One row per LEVEL, not per frame.** A delta names one price; a snapshot names
-the whole ladder. Emitting a row per level gives both one flat schema, and a
-replay regroups to rebuild the original event. That keeps the one-applier
-invariant: replay feeds `BookCache` the same `BookEvent` the live path folded.
-
-**Regroup on `(market_ticker, event_time, seq)`, NOT `(market_ticker, seq)`.**
-`seq` restarts at 1 on every resubscription and `record_stream` rebuilds once
-per fifteen-minute boundary, so that pair is not unique across a day. Measured
-over four hours: 13,200 `(market_ticker, seq)` groups span two distinct
-`event_time`s, one snapshot key holding 530 rows — two full ~265-level ladders
-minutes apart. A replay written to the narrower contract merges them into one
-impossible frame, and those are exactly the bootstrap frames a replay needs.
-
-The STORED key is unaffected: `venue_book_events` carries `event_time` with a
-sub-millisecond arrival float, and the full corpus reads 705,864,465 rows
-against 705,864,465 distinct keys — zero collisions.
-
-**Three raw tables share this machinery** (`RAW_TABLES`): the Kalshi book
-frames, the Coinbase trade tape (`spot_trades`) and the per-second index proxy
-(`index_proxy_1s`). Each is bounded by its own retention, and all three by one
-free-disk guard, because a raw tier that fills the volume takes the Parquet
-store, the Postgres bind and the trading process's logs down with it.
+Three raw tables share this machinery (`RAW_TABLES`). Each has its own
+retention, and one free-disk guard bounds all three.
 """
 from __future__ import annotations
 
@@ -57,12 +32,8 @@ from data_collection.stream.base import BookEvent
 
 logger = logging.getLogger('spool')
 
-# Absolute, not cwd-relative, and for the reason `core/datastore.py` records at
-# length: `data/research` resolved against whatever directory a process happened
-# to start in created a SECOND, empty store that simply went unread. A spool
-# written to a stray `data/spool` would be worse, because nothing downstream
-# reads it directly — the frames would accumulate somewhere nobody compacts and
-# be deleted by whatever cleans that directory. `SPOOL_ROOT` overrides.
+# Absolute, not cwd-relative: a cwd-relative spool would land where nothing
+# compacts it. `SPOOL_ROOT` overrides.
 _TRADER_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPOOL_ROOT = Path(os.getenv('SPOOL_ROOT')
                           or _TRADER_ROOT / 'data' / 'spool')
@@ -70,14 +41,13 @@ DEFAULT_SPOOL_ROOT = Path(os.getenv('SPOOL_ROOT')
 COLUMNS = ('venue', 'symbol', 'event_time', 'available_time', 'quality',
            'market_ticker', 'seq', 'kind', 'side', 'price', 'size', 'absolute')
 
-# Retention and the disk guard. Read from the environment at CALL time, so a
-# compose change takes effect on the next pass without a code path to forget.
+# Retention and the disk guard. Read from the environment at call time.
 DEFAULT_RAW_RETENTION_DAYS = 60.0
 DEFAULT_INDEX_RETENTION_DAYS = 365.0
 DEFAULT_MIN_FREE_FRACTION = 0.15
 DEFAULT_MIN_FREE_GB = 20.0
 # The guard never deletes the newest day of any table: a disk filled by
-# something else must not cost the data the live system is writing right now.
+# something else must not cost the data being written now.
 GUARD_FLOOR_DAYS = 1.0
 
 
@@ -253,10 +223,8 @@ def _book_row(rec: dict) -> dict:
 
 
 def _trade_row(rec: dict) -> Optional[dict]:
-    # `event_time` is the venue's print time, so a trade re-delivered after a
-    # reconnect lands on the same key; `available_time` is when we saw it, never
-    # earlier than the print (a skewed local clock must not make a row knowable
-    # before it happened).
+    # `event_time` is the venue's print time, so a re-delivered trade lands on
+    # the same key. `available_time` is when we saw it, never before the print.
     printed = _finite(rec.get('time'))
     if printed is None or rec.get('trade_id') in (None, ''):
         return None
@@ -289,13 +257,13 @@ def _index_row(rec: dict) -> dict:
 class RawTable:
     dataset: str
     to_row: Callable[[dict], Optional[dict]]
-    # Columns a within-file duplicate is recognised by. A reconnect replays a
-    # trade snapshot, so the same print can sit twice in one hour's file.
+    # Columns that identify a within-file duplicate. A reconnect replays a
+    # trade snapshot, so one print can appear twice in an hour's file.
     dedupe: tuple[str, ...] = ()
     retention_env: str = 'RAW_RETENTION_DAYS'
     default_retention: float = DEFAULT_RAW_RETENTION_DAYS
-    # The disk guard sheds the lowest rank first: the biggest and most
-    # replaceable tier, never the tiny one that took a year to accumulate.
+    # The disk guard sheds the lowest rank first: the biggest, most
+    # replaceable tier first.
     shed_rank: int = 0
 
 
@@ -330,8 +298,8 @@ def retention_days(dataset: str) -> float:
 
 def _spool_files(spool_root: Path, dataset: str) -> list[Path]:
     if dataset == 'venue_book_events':
-        # Legacy layout, one level down. The other tables' directories are
-        # skipped by name so their files are never read as book frames.
+        # Legacy layout, one level down. Other tables' directories are skipped
+        # by name so their files are never read as book frames.
         return sorted(p for p in spool_root.glob('*/*.jsonl')
                       if p.parent.name not in RAW_TABLES)
     return sorted((spool_root / dataset).glob('*/*.jsonl'))
@@ -342,8 +310,8 @@ def compact_table(spool_root: Path | str, store_root: Path | str, dataset: str,
                   now: float | None = None) -> int:
     """Fold one table's closed hourly files into immutable Parquet, then remove them.
 
-    A file whose hour has not yet ended is SKIPPED: compacting it would archive
-    a prefix of the stream and then delete the rest.
+    A file whose hour has not ended is skipped: compacting it would archive a
+    prefix of the stream and then delete the rest.
     """
     table = RAW_TABLES[dataset]
     spool_root, store_root = Path(spool_root), Path(store_root)
@@ -382,8 +350,7 @@ def compact_table(spool_root: Path | str, store_root: Path | str, dataset: str,
         path.unlink()
 
     keep = retention_days(dataset) if keep_days is None else keep_days
-    # Pruning counts FILES; this returns ROWS. Keeping them separate stops a
-    # caller reading "compacted 40,000" as anything but rows.
+    # `prune` counts files; this returns rows.
     prune(store_root, keep_days=keep, now=stamp, dataset=dataset)
     return written
 
@@ -392,9 +359,7 @@ def compact(spool_root: Path | str, store_root: Path | str, *,
             keep_days: float | None = None, now: float | None = None) -> int:
     """The Kalshi book frames. `keep_days` defaults to `RAW_RETENTION_DAYS`.
 
-    At a measured ~862 frames a second the raw stream is not affordable
-    indefinitely, so this tier is bounded and `venue_ladder` is the one kept
-    forever.
+    The raw stream is too large to keep forever; `venue_ladder` is the permanent tier.
     """
     return compact_table(spool_root, store_root, 'venue_book_events',
                          keep_days=keep_days, now=now)
@@ -418,7 +383,7 @@ def compact_all(spool_root: Path | str, store_root: Path | str, *,
 
 
 def _file_hour(path: Path) -> float:
-    """The epoch START of the hour a compacted file holds; mtime as a fallback."""
+    """The epoch start of the hour a compacted file holds; mtime as a fallback."""
     try:
         return datetime.strptime(path.stem, '%Y%m%dT%H').replace(
             tzinfo=timezone.utc).timestamp()
@@ -436,8 +401,8 @@ def prune(store_root: Path | str, *, keep_days: float, now: float | None = None,
           dataset: str = 'venue_book_events') -> int:
     """Delete compacted Parquet older than `keep_days`. Returns files removed.
 
-    Judged on the hour in the file's NAME, not its mtime: a restored or copied
-    store would otherwise look brand new and never age out.
+    Judged on the hour in the file's name, not its mtime: a restored or copied
+    store would otherwise never age out.
     """
     if keep_days <= 0:
         return 0
@@ -471,9 +436,8 @@ def guard_disk(store_root: Path | str, *, min_free_fraction: float | None = None
     """Shed the oldest raw files until the volume has room again.
 
     Order: `shed_rank` (book frames, then trades, then the index proxy), oldest
-    hour first within a table, and never the newest `floor_days`. Returns files
-    removed. Every deletion is logged at ERROR: this is retention being cut
-    short, and somebody should find out why the disk filled.
+    hour first within a table, never the newest `floor_days`. Returns files
+    removed. Every deletion logs at ERROR, because retention is being cut short.
     """
     store_root = Path(store_root)
     usage = disk_usage(store_root)

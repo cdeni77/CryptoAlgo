@@ -1,59 +1,18 @@
-"""The null hypothesis, stated precisely enough to lose to.
+"""The null hypothesis: `F(x / sigma_n)`, not 50%.
 
-**The benchmark is not 50%. It is `F(x / sigma_n)`.**
+Mid-window state alone makes outcomes predictable, so every measurement is
+incremental against this baseline: log-loss skill, Brier skill, edge in
+probability points.
 
-This is the single most important line in the project, and getting it wrong
-would have produced the most convincing false positive it has ever generated.
-A model fed mid-window state will report 70-90% accuracy on 15-minute up/down
-windows. None of that is alpha. At nine minutes into a window with three
-minutes of movement left, a displacement of twenty basis points against a
-remaining sigma of eight is already 99% settled — anyone with a clock and a
-volatility estimate knows it, and the market prices it. Measuring such a model
-against a 50% coin flip would show a 40-point edge that does not exist.
+The baseline has no drift and never fits one: a drift is the alpha under test.
+It fits only arithmetic corrections:
 
-So the baseline here is not a constant. It is the best probability obtainable
-from the barrier arithmetic alone: displacement, remaining time, and a
-volatility forecast. Every measurement in this system is *incremental* against
-it — log loss skill, Brier skill, edge in probability points — and a model that
-cannot beat it has found nothing.
+* a scale per decision offset (bid-ask bounce, stale last price, `sqrt(n)` error);
+* a tail thickness, because one-minute returns are fat-tailed.
 
-**Scale and tail are jointly fitted and are not separately identified.** This is
-worth stating because the obvious reading of the two parameters is wrong. From
-binary outcomes alone only the composite mapping `z -> P(up)` is determined, and
-a thicker tail with a larger scale mimics a thinner tail with a smaller one
-through the bulk of the distribution. Measured: against a sigma inflated by
-1.2-1.4x, the fit returned `scale ~ 1.001` and `nu = 2.93` — it absorbed the
-whole inflation into the tail parameter and left the scale alone.
-
-So do not read `scale` as "the sigma inflation" or `nu` as "the tail thickness of
-returns". Read the pair as one calibration of the barrier map, and judge it the
-only way it can be judged: by whether the resulting probabilities are calibrated
-out of sample. `tests/test_baseline.py` asserts that property rather than either
-parameter's value.
-
-**What the baseline deliberately does not contain.** Its drift is structurally
-zero and is never fitted. A non-zero drift is exactly the alpha under test; if
-the null were allowed to fit one, the null would absorb the finding and report
-no skill. What the baseline *does* fit is the two things that are pure
-arithmetic:
-
-* **A scale factor per decision offset.** One-minute returns carry bid-ask
-  bounce, which inflates realised variance; the last observed price is up to a
-  minute stale; and the `sqrt(n)` law is an approximation at n = 3. All three
-  bias `sigma_remaining` by roughly a constant per offset, and correcting a
-  known bias against realised outcomes is not skill, it is calibration. Leaving
-  it uncorrected would hand the model an easy win that says nothing about
-  forecasting. (Which parameter the correction lands in is not determined — see
-  above — only that the composite is corrected.)
-* **The tail thickness.** One-minute crypto returns are fat-tailed, so a
-  Gaussian barrier is overconfident at large displacements — it would assign
-  0.999 where 0.99 is right, and a model that merely knew this would look
-  skilful. Which distribution calibrates better is measured out of sample, not
-  assumed.
-
-Both are fitted on training folds only. A scale factor fitted on the whole
-sample is a leak, and it leaks in the direction that makes the baseline look
-strong and the model look weak — which is the one direction nobody checks.
+Scale and tail are not separately identified from binary outcomes; only the
+composite map `z -> P(up)` is. Judge the pair by out-of-sample calibration,
+never read either parameter alone. Fit on training folds only.
 """
 
 from __future__ import annotations
@@ -70,19 +29,14 @@ from core.config import Config, DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
 
-# Rows used to fit the scale and tail. Five parameters do not need millions of
-# observations: at 40,000 rows the standard error on a fitted probability is
-# about 0.0025, an order of magnitude finer than the calibration error the fit is
-# correcting. Nelder-Mead evaluates the objective several hundred times, so this
-# cap is the difference between three seconds and twenty per fold — and at five
-# years of history, between minutes and an hour. Sampled deterministically so
-# two runs of the same configuration agree exactly.
+# Rows used to fit scale and tail. At 40,000 rows the standard error on a fitted
+# probability is ~0.0025, far finer than the calibration error being corrected.
+# Sampled deterministically, so two runs of one configuration agree.
 MAX_FIT_ROWS = 40_000
 FIT_SEED = 23
 
-# Probabilities are clipped before any log is taken. A single 0-or-1 prediction
-# that turns out wrong makes log loss infinite and every comparison meaningless,
-# and a clip at 1e-6 caps the penalty for one such row at 13.8 nats.
+# Probabilities are clipped before any log. A clip at 1e-6 caps the penalty for
+# one wrong 0-or-1 prediction at 13.8 nats.
 PROB_EPS = 1e-6
 MIN_NU = 2.05          # below this a Student-t has no finite variance
 MAX_NU = 200.0         # above this it is a Gaussian in every measurable respect
@@ -119,20 +73,14 @@ def expit(z: np.ndarray) -> np.ndarray:
 def _standardised_cdf(z: np.ndarray, distribution: str, nu: float) -> np.ndarray:
     """CDF of a zero-mean, unit-variance distribution evaluated at `z`.
 
-    Unit variance is the whole point: `z` is already `displacement / sigma`, so
-    the distribution must not carry a scale of its own. A raw Student-t has
-    variance `nu / (nu - 2)`, and forgetting that inflates every probability
-    toward 0.5 — which reads as a well-behaved conservative baseline rather than
-    as a bug.
+    `z` is already `displacement / sigma`, so the distribution carries no scale.
+    A raw Student-t has variance `nu / (nu - 2)` and is rescaled here.
     """
     if distribution == 'normal':
         return stats.norm.cdf(z)
     if distribution == 'student_t':
         nu = float(np.clip(nu, MIN_NU, MAX_NU))
-        # `special.stdtr` is the same CDF as `stats.t.cdf` without the frozen
-        # distribution machinery, worth about 20%. The cost that mattered was
-        # never the call — it was making it 921 times, which is what MAX_FIT_ROWS
-        # and the tolerances below address.
+        # `special.stdtr` is `stats.t.cdf` without the frozen-distribution overhead.
         return special.stdtr(nu, z * np.sqrt(nu / (nu - 2.0)))
     raise ValueError(f'unknown baseline distribution {distribution!r}')
 
@@ -147,23 +95,13 @@ class BarrierBaseline:
     default_scale: float = 1.0
     n_fitted: int = 0
     fitted_log_loss: float = float('nan')
-    # The same fit with every scale pinned at one, at the *fitted* tail. Reported
-    # for context and not as a fair baseline: because scale and tail are jointly
-    # fitted, the tail can already have absorbed a scale misspecification, and
-    # then these two numbers agree to eight decimals while both are correct.
+    # The same fit with every scale pinned at one, at the fitted tail. Context
+    # only: the tail can absorb a scale error, so this is not a fair baseline.
     unscaled_log_loss: float = float('nan')
-    # **A sigma correction fitted OUT OF SAMPLE, on a held-out tail of the
-    # training rows.** `scale` and `nu` are chosen by minimising log loss on the
-    # rows they are fitted to, and that fit is systematically over-confident on
-    # rows it has not seen: measured live 2026-09-10, the deployed baseline was
-    # over-confident by +0.0362 with ALL SIX probability buckets pushed away
-    # from 0.5, the signature of a sigma fitted too small. In the backtest the
-    # worst fold's model ECE (0.0273) is inherited almost exactly from its
-    # baseline (0.0275) — the head is not adding the error, it is passing it on.
-    #
-    # Above 1.0 this widens sigma and pulls probabilities toward 0.5. It is the
-    # baseline's analogue of `residual_scale`, which does the same job for the
-    # model's correction and has existed for exactly this reason.
+    # A sigma multiplier fitted out of sample, on a held-out recent tail of the
+    # training rows. The in-sample fit is over-confident on later rows because
+    # volatility drifts. Above 1.0 it widens sigma and pulls probabilities toward 0.5.
+    # The baseline's analogue of `residual_scale`.
     calibration_scale: float = 1.0
     n_calibration_rows: int = 0
 
@@ -210,8 +148,7 @@ class BarrierBaseline:
     ) -> 'BarrierBaseline':
         """Fit scale (per offset) and tail thickness by minimising log loss.
 
-        Both parameters are calibration, not skill — see the module docstring.
-        Fit this on training rows only.
+        Calibration, not skill. Fit on training rows only.
         """
         needed = {'displacement', 'sigma_remaining', 'offset', 'outcome'}
         missing = needed - set(table.columns)
@@ -261,32 +198,17 @@ class BarrierBaseline:
         theta0 = np.zeros(n_scale + (1 if fit_nu else 0))
         if fit_nu:
             theta0[n_scale] = np.log(4.0 - MIN_NU)   # start near nu = 4
-        # The parameters are log-scales, so 1e-3 is a tenth of a percent on the
-        # scale factor — far finer than anything downstream can distinguish, and
-        # a third of the function evaluations of the tolerances this had before.
+        # Parameters are log-scales, so 1e-3 is a tenth of a percent on the scale.
         result = optimize.minimize(
             objective, theta0, method='Nelder-Mead',
             options={'maxiter': 600, 'xatol': 1e-3, 'fatol': 1e-7},
         )
         scales, nu = unpack(result.x)
 
-        # **Calibrate the result on rows the fit did not see.**
-        #
-        # `scale` and `nu` minimise log loss ON THE ROWS THEY ARE FITTED TO, and
-        # that is over-confident out of sample — not from overfitting five
-        # parameters to thousands of rows, but because realised volatility
-        # drifts, so a sigma calibrated to the training period is too small for
-        # a later one. Divide by too small a sigma and |z| is too large and the
-        # probability is pushed toward the tails. Measured live: over-confidence
-        # +0.0362 with all six buckets pushed away from 0.5.
-        #
-        # One parameter, fitted on the most RECENT slice of training, held out
-        # from the scale fit. Recent rather than random because drift is what is
-        # being corrected — a random holdout shares the training period's
-        # volatility and would find nothing to fix.
-        #
-        # Off by default (`baseline_calibration_holdout = 0.0`) so this is
-        # adopted on evidence rather than by assertion.
+        # Calibrate on rows the fit did not see: the most recent slice of
+        # training, held out from the scale fit. Recent, not random, because
+        # volatility drift is what is being corrected.
+        # Off by default (`baseline_calibration_holdout = 0.0`).
         calibration_scale, n_calibration = 1.0, 0
         holdout = float(getattr(config, 'baseline_calibration_holdout', 0.0) or 0.0)
         order = (pd.to_datetime(frame['window_open'], utc=True)
@@ -361,29 +283,23 @@ class BarrierBaseline:
 class Reliability:
     """Observed frequency against predicted probability, in bins.
 
-    The one diagnostic that cannot be faked by a good average: a model can hit
-    the base rate exactly while being wrong at every level of confidence, and
-    since this system only trades its confident predictions, a miscalibration
-    concentrated in the 85-95% band matters far more than the headline number.
+    The system trades its confident predictions, so miscalibration in a band
+    matters more than the average.
     """
 
     edges: np.ndarray
     predicted: np.ndarray
     observed: np.ndarray
     count: np.ndarray
-    # Rows excluded because the prediction or the outcome was not finite. These
-    # used to be *counted*, in the top bin — see `reliability`.
+    # Rows excluded because the prediction or the outcome was not finite.
     n_non_finite: int = 0
 
     @property
     def expected_calibration_error(self) -> float:
         """Count-weighted mean |predicted - observed| over populated bins.
 
-        Restricted to populated bins because an empty one carries `predicted =
-        nan` and `count = 0`, and `0 * nan` is `nan` — so a single unvisited bin
-        turned the whole metric into NaN, which then passed a `<= 0.02` max-gate
-        because `nan > 0.02` is False. That was reachable before and is close to
-        certain now that the tails are binned at 2pp.
+        Empty bins carry `predicted = nan`; including them would make the metric
+        NaN, and `nan > 0.02` is False, so a max-gate would pass.
         """
         populated = self.count > 0
         total = self.count[populated].sum()
@@ -401,15 +317,10 @@ class Reliability:
         return float(np.max(np.abs(self.predicted[populated] - self.observed[populated])))
 
     def worst_deviation(self, *, min_count: int = 500) -> float:
-        """The largest bin deviation, over bins with enough rows to mean anything.
+        """The largest bin deviation, over bins with at least `min_count` rows.
 
-        `max_deviation` over every populated bin is dominated by whichever bin
-        holds three rows. This is the gateable version: a bin of `min_count`
-        observations at p=0.9 has a binomial standard error near 1.3pp, so
-        anything much below that is noise and a threshold has to sit above it.
-        Worth saying plainly — no calibration gate computed this way can resolve
-        the 0.5pp that `min_edge_pp` requires. The gate bounds the damage; it
-        cannot certify the edge.
+        A bin of `min_count` rows at p=0.9 has a standard error near 1.3pp, so
+        this gate bounds damage; it cannot certify a sub-pp edge.
         """
         populated = self.count >= int(min_count)
         if not populated.any():
@@ -442,29 +353,19 @@ def reliability(
 ) -> Reliability:
     """Bin predictions and compare to realised frequency.
 
-    Fixed edges rather than quantiles, because the bands that matter are the
-    ones the trading gate uses — a quantile binning moves the boundaries when
-    the prediction distribution shifts, and then two runs' calibration tables
-    are not comparable.
+    Fixed edges, not quantiles, so two runs' tables stay comparable.
     """
     if edges is None:
-        # Symmetric, and 2pp wide in the tails. The old ladder was 10pp wide
-        # everywhere, which averages away exactly what it is for: a model 5pp
-        # overconfident at 0.94 and 5pp underconfident at 0.86 reported an ECE of
-        # 0.000078 across a single [0.85, 0.95] bin — passing a 0.02 gate by 256x
-        # while every trade it took at 0.94 lost 5pp. Fixed edges rather than
-        # quantiles, still, so two runs' tables stay comparable.
+        # Symmetric, and 2pp wide in the tails: wide bins average away opposite
+        # errors in the band this system trades.
         edges = np.array([
             0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50,
             0.60, 0.70, 0.80, 0.85, 0.90, 0.92, 0.94, 0.96, 0.98, 1.0,
         ])
     raw = np.asarray(probability, dtype=float)
     y_all = np.asarray(outcome, dtype=float)
-    # `np.digitize(nan, ...)` returns the last index, so a NaN prediction was
-    # counted in the most-confident bin — the band this system trades. On real
-    # data 31 non-finite rows in 99,388 put `predicted nan / observed 0.9813 /
-    # n 57,890` in the 0.95-1.00 row of the reliability table and turned every
-    # calibration number into NaN. Exclude them, and say how many.
+    # `np.digitize(nan, ...)` returns the last index, which would count a NaN
+    # prediction in the most confident bin. Exclude non-finite rows and count them.
     finite = np.isfinite(raw) & np.isfinite(y_all)
     n_non_finite = int((~finite).sum())
     p = clip_prob(raw[finite])
@@ -491,26 +392,19 @@ def attach_baseline(
 ) -> pd.DataFrame:
     """Return `table` with the baseline probability and its logit attached.
 
-    The logit is what the classifier consumes as an `init_score` offset, so an
-    untrained model reproduces the baseline exactly and every tree it grows is
-    incremental skill by construction.
+    The logit is the classifier's `init_score`, so an untrained model reproduces
+    the baseline exactly and every tree is incremental skill.
     """
     out = table.copy()
     out[column] = baseline.probability_for(table)
     out[f'{column}_logit'] = logit(out[column])
-    # The market's own correction to the arithmetic. It belongs here and not in
-    # `build_features`, which runs BEFORE this: computing it there produced an
-    # all-NaN column in every run, and only the model's empty-feature warning
-    # said so. It is the most informative book column and the one that invites
-    # echo, so a silently dead version is the worst of both.
+    # The market's correction to the arithmetic. Computed here, not in
+    # `build_features`, because that runs before the baseline exists.
     if 'market_prob' in out.columns:
         out['market_minus_baseline'] = (
             pd.to_numeric(out['market_prob'], errors='coerce') - out[column])
-    # And the market's own logit, for a market-initialised model. Attached here
-    # because this is where the scored table gains its init_score columns, and
-    # `core.model` raises rather than falling back if it is missing — a
-    # market-init model that silently used the baseline would be a baseline-init
-    # model wearing the other one's provenance.
+    # The market's own logit, for a market-initialised model. `core.model`
+    # raises if it is missing, rather than silently using the baseline.
     if 'market_probability' in out.columns:
         from core.model import attach_market_logit
         out = attach_market_logit(out)

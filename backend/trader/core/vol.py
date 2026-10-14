@@ -1,37 +1,15 @@
-"""The remaining-variance forecast — the one quantity the barrier needs.
+"""The remaining-volatility forecast: the one quantity the barrier needs.
 
-The barrier probability is `F(displacement / sigma_remaining)`. The
-displacement is known exactly, so everything this system can be right or wrong
-about lives in `sigma_remaining`. That is a deliberate concentration of risk:
-one estimand, measurable against realised outcomes, rather than a return
-forecast that five years of this project failed to find.
+The barrier probability is `F(displacement / sigma_remaining)`, and the
+displacement is known exactly.
 
-It is also the one thing already known to be forecastable here. The previous
-formulation's dispersion head scored an out-of-sample IC of +0.34 while every
-direction head sat at +0.02. Volatility clusters, mean-reverts, and has a
-strong and stable time-of-day shape; returns do none of those things.
+Point-in-time: everything is indexed by `as_of`, not bar time. A row stamped
+10:04 uses bars up to `[10:03, 10:04)` and nothing later, so a decision joins on equality.
 
-**Everything is indexed by `as_of`, not by bar time.** A row stamped 10:04 uses
-bars up to and including the one covering `[10:03, 10:04)` and nothing later,
-so a decision at 10:04 joins on equality. Indexing by bar time and shifting at
-the join site is the same information organised so that one forgotten shift
-leaks a minute of the future — and a one-minute leak in a fifteen-minute
-window is enormous.
-
-**The model is HAR, not GARCH.** A heterogeneous autoregression on log realised
-volatility at 15/60/240/1440-minute lookbacks captures the long-memory
-clustering that matters at this horizon, fits by least squares on millions of
-rows in seconds, and cannot silently diverge the way a fitted GARCH can. It is
-refitted inside every cross-validation fold, seasonality included, because a
-seasonal factor estimated on the whole sample is a leak that looks like skill.
-
-**Scaling to the remaining span is `sqrt(n)`, and the error is absorbed
-downstream.** One-minute returns carry bid-ask bounce, which inflates realised
-variance, and the last observed price is up to a minute stale — both bias
-`sigma_remaining` by roughly a constant factor. `core/baseline.py` fits one
-scale per decision offset against realised outcomes, which is the honest place
-to put a bias correction: it is measured against what actually happened rather
-than assumed away here.
+The model is HAR on log realised volatility at several lookbacks, fitted by
+least squares. It and the seasonality are refitted inside every fold.
+Scaling to the remaining span is `sqrt(n)`. `core/baseline.py` fits a per-offset
+scale that absorbs the bias from bid-ask bounce and stale prices.
 """
 
 from __future__ import annotations
@@ -48,17 +26,14 @@ from core.config import Config, DEFAULT_CONFIG
 logger = logging.getLogger(__name__)
 
 MINUTES_PER_DAY = 1440
-# Sub-annualised throughout: everything here is per-minute standard deviation
-# of log return, in natural units. Annualising a 15-minute quantity and then
-# de-annualising it is two chances to lose a sqrt.
+# Units: per-minute standard deviation of log return, never annualised.
 
 
 def log_returns(grid: pd.DataFrame) -> pd.Series:
     """One-minute log returns on a gap-free minute grid, indexed by `as_of`.
 
-    A missing minute yields NaN rather than a two-minute return stitched
-    together, because a two-minute return in a squared-return average reads as
-    a volatility spike that never happened.
+    A missing minute yields NaN, not a stitched two-minute return, which would
+    read as a false volatility spike.
     """
     close = grid['close']
     step = np.log(close / close.shift(1))
@@ -75,9 +50,9 @@ def realised_vol(returns: pd.Series, lookback: int, *, min_fraction: float = 0.5
 
 
 def parkinson_vol(grid: pd.DataFrame, lookback: int) -> pd.Series:
-    """Range-based per-minute volatility, five times more efficient than
-    squared returns for the same sample — and blind to the bid-ask bounce that
-    inflates them, which is why it is carried alongside rather than instead."""
+    """Range-based per-minute volatility.
+
+    Blind to the bid-ask bounce that inflates squared returns, so it is carried alongside them."""
     span = np.log(grid['high'] / grid['low'])
     var = span.pow(2) / (4.0 * np.log(2.0))
     out = np.sqrt(var.rolling(lookback, min_periods=max(2, lookback // 2)).mean())
@@ -99,13 +74,9 @@ def _circular_smooth(values: np.ndarray, window: int) -> np.ndarray:
 class Seasonality:
     """A multiplicative minute-of-day volatility factor, mean one.
 
-    Estimated as the average of `log|r|` per minute of day, de-meaned, smoothed
-    circularly and exponentiated. Log space because volatility is multiplicative
-    and a mean of absolute returns is dominated by its largest few; smoothing
-    because a per-minute factor from even five years of data is mostly noise —
-    1,440 bins over 1,825 days is 1,825 observations per bin, and the standard
-    error of a mean log-absolute-return on that is not small next to the
-    seasonal amplitude it is trying to measure.
+    The mean of `log|r|` per minute of day, de-meaned, smoothed circularly and
+    exponentiated. Log space because volatility is multiplicative; smoothing
+    because a per-minute factor is mostly noise.
     """
 
     factor: np.ndarray                    # length 1440, mean 1
@@ -124,8 +95,8 @@ class Seasonality:
                     days, config.seasonality_min_days,
                 )
             return cls(factor=flat, days_observed=days, smoothed_over=0)
-        # `as_of` is the minute after the return, so shift back to attribute the
-        # move to the minute it happened in.
+        # `as_of` is the minute after the return, so shift back to attribute
+        # the move to the minute it happened in.
         minute = ((clean.index - pd.Timedelta(minutes=1)).hour * 60
                   + (clean.index - pd.Timedelta(minutes=1)).minute)
         log_abs = np.log(clean.abs().clip(lower=1e-12))
@@ -146,10 +117,8 @@ class Seasonality:
     def mean_over(self, start: pd.DatetimeIndex, minutes: int) -> np.ndarray:
         """Root-mean-square factor over the `minutes` starting at each timestamp.
 
-        The remaining span of a window can straddle a seasonal ramp — a window
-        opening at 13:28 covers the New York equity open — and variance adds, so
-        the correct aggregate is the root mean of the squared factors over the
-        minutes actually remaining, not the factor at the decision minute.
+        The remaining span can straddle a seasonal ramp, and variance adds, so this
+        averages squared factors over the remaining minutes.
         """
         if minutes <= 0:
             return np.ones(len(start))
@@ -176,9 +145,8 @@ def _design(features: pd.DataFrame, lookbacks: tuple[int, ...]) -> tuple[np.ndar
 class VolModel:
     """HAR regression for log per-minute volatility over the next window.
 
-    `fit` and `predict` take the per-minute feature frame produced by
-    `vol_features`, so the seasonality and the regression are fitted on exactly
-    the rows a fold is allowed to see.
+    `fit` and `predict` take the frame from `vol_features`, so the fit sees only
+    the rows a fold may see.
     """
 
     lookbacks: tuple[int, ...]
@@ -197,9 +165,8 @@ class VolModel:
     ) -> 'VolModel':
         matrix, names = _design(features, tuple(config.vol_lookbacks_minutes))
         raw = target.to_numpy(dtype=float)
-        # A zero realised volatility is a stretch with no trades, not a
-        # measurement of calm. Excluded before the log rather than after, so a
-        # degenerate series is dropped rather than warned about once per fit.
+        # A zero realised volatility is a stretch with no trades, not calm.
+        # Drop it before the log.
         positive = np.isfinite(raw) & (raw > 0)
         y = np.full_like(raw, np.nan)
         y[positive] = np.log(raw[positive])
@@ -225,10 +192,8 @@ class VolModel:
     def predict(self, features: pd.DataFrame) -> pd.Series:
         """Per-minute volatility forecast, floored.
 
-        The floor is not cosmetic: a dead-quiet stretch drives the forecast to
-        zero, the barrier then divides by it, and the baseline returns 0 or 1
-        with total confidence on a window that is genuinely a coin flip. One
-        such row can dominate a log loss.
+        Without the floor, a dead-quiet stretch drives sigma to zero and the
+        baseline returns 0 or 1 with full confidence.
         """
         if self.coefficients is None:
             raise ValueError('vol model is not fitted')
@@ -251,8 +216,7 @@ def vol_features(
 ) -> pd.DataFrame:
     """Per-minute volatility state, indexed by `as_of`.
 
-    Every column is knowable at its own index: a row stamped 10:04 uses the bar
-    covering `[10:03, 10:04)` and everything before it.
+    A row stamped 10:04 uses the bar covering `[10:03, 10:04)` and everything before it.
     """
     returns = log_returns(grid)
     parts = {f'rv_{lb}': realised_vol(returns, lb) for lb in config.vol_lookbacks_minutes}
@@ -268,27 +232,16 @@ def vol_features(
 
 
 def forward_realised_vol(grid: pd.DataFrame, minutes: int) -> pd.Series:
-    """Per-minute realised volatility over the *next* `minutes`, indexed by `as_of`.
+    """Per-minute realised volatility over the next `minutes`, indexed by `as_of`.
 
-    The vol model's target. It overlaps across adjacent rows, which inflates any
-    in-sample statistic computed on it — that is tolerable here and nowhere
-    else, because the quantity that matters is the calibration of the resulting
-    barrier probability, and that is measured against realised binary outcomes
-    out of sample rather than against this.
+    The vol model's target. Rows overlap, which inflates in-sample statistics;
+    calibration is judged out of sample on binary outcomes instead.
     """
     returns = log_returns(grid)
     squared = returns.pow(2)
-    # `returns` is indexed by `as_of`, so the minute after `a` sits at `a + 1`
-    # and the span this looks forward over is `(a, a + minutes]`. A trailing
-    # rolling mean lands that span at index `a + minutes`, so one backward
-    # shift of exactly `minutes` puts it at `a`.
-    #
-    # This was written as `.shift(-minutes).rolling(...).mean().shift(minutes)`
-    # and the two shifts cancelled: the "forward" target was the *trailing*
-    # window, the HAR fit came back with R2 1.000 and a unit coefficient on
-    # rv_15, and it would have produced a beautifully calibrated baseline that
-    # could not have been computed live. Assert the direction rather than
-    # reading it off the expression — `tests/test_vol.py` pins it.
+    # `returns` is indexed by `as_of`, so the span after `a` is `(a, a + minutes]`.
+    # A trailing rolling mean lands it at `a + minutes`; one backward shift of
+    # `minutes` puts it at `a`. `tests/test_vol.py` pins the direction.
     forward = squared.rolling(minutes, min_periods=minutes).mean().shift(-minutes)
     return np.sqrt(forward).rename('forward_vol')
 
@@ -300,11 +253,8 @@ def sigma_remaining(
 ) -> np.ndarray:
     """Scale a per-minute volatility to the span left in the window.
 
-    `sqrt(n)`, times the root-mean seasonal factor over those n minutes when one
-    is supplied. Any systematic bias in this scaling — microstructure inflation,
-    the sub-minute staleness of the last observed price, the sqrt law itself
-    being wrong at this horizon — is corrected by the per-offset scale factor
-    that `core/baseline.py` fits against realised outcomes.
+    `sqrt(n)`, times the root-mean seasonal factor when one is supplied.
+    `core/baseline.py` fits a per-offset scale that corrects bias in this scaling.
     """
     n = np.asarray(remaining_minutes, dtype=float)
     scaled = np.asarray(sigma_per_min, dtype=float) * np.sqrt(np.maximum(n, 0.0))

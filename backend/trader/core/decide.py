@@ -1,33 +1,17 @@
 """The only place a trade is chosen.
 
-The backtest, the live signal writer and the paper engine all call `decide`.
-That is not tidiness — it is the reason they cannot drift. The previous
-incarnation of this project had per-family strategy classes, and the backtest
-and the live path disagreed about entry price for months without anything
-failing.
+The backtest, the live signal writer and the paper engine all call `decide`,
+so they cannot drift apart.
 
-**Abstention is the default action, and every refusal is named.** `decide`
-returns a `Decision` whose `reason` is one of a fixed set, so a run reports a
-rejection histogram rather than a trade count. On the perp system the single
-most informative number ever produced was `edge_below_cost rejected 61,750 of
-75,545` — it said the forecast did not cover the fee, which no Sharpe ratio
-said. The equivalent here is `edge_below_gate`, and it is expected to dominate.
+Abstention is the default. Every refusal carries a named `Reason`, so a run
+reports a rejection histogram, not only a trade count.
 
-**The counterfactual price is the baseline.** This system does not use Kalshi
-data to forecast, and it has no Kalshi price history to backtest against, so
-the market price is assumed to be the calibrated barrier baseline rounded to
-the nearest cent. That is the conservative choice and it is the right null: the
-market is at least as smart as the arithmetic a clock and a volatility estimate
-can do. If the model cannot beat that after fees, there is no trade — and if it
-can, the live path will find out whether the real quote is better or worse.
-Assuming a *worse* market would be assuming an edge.
+Without a quote, the counterfactual price is the calibrated barrier baseline,
+rounded to the tick. Assuming a worse market would be assuming an edge.
 
-**Sizing is fractional Kelly on the account, then floored to whole contracts.**
-At a $100 bankroll one contract at 90c is 0.9% of the account, so the integer
-floor is a gate rather than a rounding detail — and the fee's per-order ceiling
-means a one-contract order pays a higher rate than the schedule implies, which
-can flip a marginal trade negative. Both are checked after rounding, not
-before.
+Sizing is fractional Kelly on the account, floored to whole contracts. The floor
+is a gate, and the per-order fee rounding can flip a marginal trade negative,
+so both are checked after rounding.
 """
 
 from __future__ import annotations
@@ -96,7 +80,7 @@ class Decision:
     fee: float = 0.0
     kelly_fraction: float = float('nan')
     # 'quote' when the venue's own ask priced this, 'baseline' when the
-    # calibrated barrier stood in for a market that was not observed.
+    # calibrated barrier stood in for an unobserved market.
     price_source: str = 'baseline'
     market_ticker: Optional[str] = None
 
@@ -122,8 +106,7 @@ class Decision:
 class WindowExposure:
     """What is already at risk in the window being decided.
 
-    Passed in rather than looked up, so `decide` stays a pure function of its
-    arguments — which is what lets the backtest and the live path share it.
+    Passed in, not looked up, so `decide` stays a pure function of its arguments.
     """
 
     stake: float = 0.0
@@ -164,12 +147,7 @@ def _optional_str(get, key: str) -> Optional[str]:
 
 
 def round_to_tick_array(price: np.ndarray) -> np.ndarray:
-    """Snap to the venue's tick ladder — a tenth of a cent in the tails.
-
-    Delegates to `core.costs.round_to_tick` so there is one ladder. This used to
-    round everything to a whole cent, which moved every tail price by up to half
-    a cent: at 2c that is a 25% relative error on the price being traded.
-    """
+    """Snap to the venue's tapered tick ladder, via `core.costs.round_to_tick`."""
     return np.asarray(_round_to_tick(np.asarray(price, dtype=float)), dtype=float)
 
 
@@ -180,11 +158,9 @@ def round_to_tick(price: float) -> float:
 def kelly_fraction_for(probability: float, cost: float) -> float:
     """Full-Kelly fraction of the bankroll for a binary paying $1.
 
-    `f* = (q - c) / (1 - c)` where `c` is the all-in cost per contract. Derived
-    from net odds `b = (1 - c)/c`: staking `f` buys `f/c` contracts, so a win
-    multiplies the stake by `1/c`. Note the denominator is `1 - c`, not `1 - q`
-    — the classic slip, and it under-sizes cheap contracts and over-sizes dear
-    ones.
+    `f* = (q - c) / (1 - c)`, where `c` is the all-in cost per contract.
+    Staking `f` buys `f/c` contracts, so a win multiplies the stake by `1/c`.
+    The denominator is `1 - c`, not `1 - q`.
     """
     if not (0.0 < cost < 1.0):
         return 0.0
@@ -202,22 +178,15 @@ def price_and_edge(
     """Choose the better side, and price it. Vectorised, and the only copy.
 
     Returns `(is_up, price, probability, cost, edge)`. `decide` calls this for
-    one row and `stateless_screen` calls it for millions; there is deliberately
-    no second implementation of this arithmetic, because the last time this repo
-    had the backtest and the live path price a trade separately they disagreed
-    about the entry for months.
+    one row and `stateless_screen` for many; there is no second implementation.
 
-    Buying "down" at `1 - p` is the same trade as selling "up" at `p`, so both
-    sides are always evaluated. The edge here is a disagreement about
-    sigma_remaining and that points both ways: a smaller sigma than the market
-    assumes makes the probability more extreme than the quote, so buy the
-    favourite; a larger sigma makes the favourite overpriced, so buy the
-    longshot.
+    Both sides are always evaluated: buying DOWN at `1 - p` is selling UP at `p`.
+    A sigma disagreement points both ways, toward the favourite or the longshot.
     """
     q_up = np.asarray(q_up, dtype=float)
     if ask_up is not None and ask_down is not None:
-        # A real book. The ask already includes the spread, so adding an assumed
-        # half-spread on top would charge for crossing it twice.
+        # A real book. The ask already includes the spread, so no assumed
+        # half-spread is added.
         price_up = round_to_tick_array(np.asarray(ask_up, dtype=float))
         price_down = round_to_tick_array(np.asarray(ask_down, dtype=float))
         cost_up = price_up + np.asarray(fee_per_contract(price_up, config), dtype=float)
@@ -250,9 +219,7 @@ def ensemble_gates(
 ) -> tuple[np.ndarray, np.ndarray]:
     """`(uncertain, disagree)` masks for the two ensemble gates. Vectorised.
 
-    A row missing the column (NaN, or no column at all) passes, so a single
-    model and an ensemble row that could not be scored per member behave as
-    they did before these gates existed.
+    A row without the member columns (missing or NaN) passes both gates.
     """
     n = np.shape(probability)[0]
     uncertain = np.zeros(n, dtype=bool)
@@ -281,16 +248,11 @@ def stateless_screen(
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Apply the gates that do not depend on account state, vectorised.
 
-    Four of the ten refusal reasons are pure functions of the row —
-    `not_finite`, `price_out_of_band`, `disagreement_implausible` and
-    `edge_below_gate` — and on real data they account for almost every row. The
-    remaining six need the bankroll and the window's existing exposure, so they
-    stay in the scalar loop.
-
-    This is an optimisation and nothing else: the survivors are re-decided by
-    `decide` itself, so the arithmetic that admits a trade is the same
-    arithmetic in both paths and this function can only ever *narrow* what
-    reaches it.
+    `not_finite`, `price_out_of_band`, `disagreement_implausible`, `edge_below_gate`
+    and the ensemble gates are pure functions of the row. The rest need the
+    bankroll and exposure, so they stay in `decide`.
+    An optimisation only: survivors are re-decided by `decide`, so this can only
+    narrow what reaches it.
     """
     if rows.empty:
         return rows, pd.Series(dtype=int)
@@ -301,9 +263,8 @@ def stateless_screen(
     finite = np.isfinite(q) & np.isfinite(m)
     counts[Reason.NOT_FINITE.value] = int((~finite).sum())
 
-    # If the frame carries a real book, screen against it — otherwise the
-    # vectorised path and the scalar path would disagree about which rows can
-    # trade, and the histogram would not add up to the decisions.
+    # Screen against a real book when the frame carries one, so the vectorised
+    # and scalar paths agree.
     has_book = 'ask_up' in rows.columns and 'ask_down' in rows.columns
     is_up, price, probability, cost, edge = price_and_edge(
         np.where(finite, q, 0.5), m, config,
@@ -349,14 +310,8 @@ def decide(
     `row` needs `symbol`, `window_open`, `settle_time`, `offset`,
     `model_probability` and `baseline_probability`.
 
-    `require_quote` is for the live path. Without it, a row carrying no
-    `ask_up`/`ask_down` falls back to the backtest's counterfactual price — the
-    calibrated baseline — and can still return TRADED. That is right in a
-    backtest, which has no market to ask, and wrong live: it priced against our
-    own forecast, and the caller then booked a position for an order it could not
-    send. Measured with an unresolved market: 0 orders placed, a 5-contract
-    position written, $3.10 debited. Measured with a one-sided book: a claimed
-    +8.04pp when the truth against the real 0.90 ask was -11.10pp.
+    `require_quote` is for the live path: it refuses a row without
+    `ask_up`/`ask_down`, instead of pricing it against our own baseline.
     """
     exposure = exposure or WindowExposure()
     get = row.get if hasattr(row, 'get') else row.__getitem__
@@ -369,8 +324,7 @@ def decide(
         reason=Reason.NOT_FINITE,
         model_probability=float(get('model_probability')),
         baseline_probability=float(get('baseline_probability')),
-        # Set before any refusal: a refused row with a real book was being
-        # labelled 'baseline', which reads as "no quote" in the predictions table.
+        # Set before any refusal, so a refused row with a real book reads 'quote'.
         price_source=('quote' if _optional(get, 'ask_up') is not None
                       and _optional(get, 'ask_down') is not None else 'baseline'),
     )
@@ -383,44 +337,25 @@ def decide(
     p_market = base.baseline_probability
     if not (np.isfinite(q_up) and np.isfinite(p_market)):
         return base
-    # A probability outside [0, 1] is not a confident forecast, it is a broken
-    # one. `clip_prob` guards the scoring path, but nothing guarded `decide`, and
-    # Kelly does not object: q=1.02 against a 0.90 baseline sized at 1.225x
-    # bankroll and q=1.20 at 7.128x. Only `max_stake_fraction` stood between that
-    # and the order.
+    # A probability outside [0, 1] is broken, not confident. Kelly would size it
+    # above the bankroll.
     if not (0.0 <= q_up <= 1.0 and 0.0 <= p_market <= 1.0):
         return refuse(Reason.PROBABILITY_INVALID)
 
-    # `nan < x` is False, so a NaN bankroll used to sail past the floor and get
-    # sized. It reaches here whenever the venue's balance could not be parsed —
-    # `balance()` returns 0.0 on a missing field and a `"nan"` string parses.
+    # A NaN bankroll is refused: `nan < x` is False, so test finiteness explicitly.
     if not np.isfinite(bankroll) or (
             bankroll < config.starting_bankroll * config.ruin_floor_fraction):
         return refuse(Reason.BANKROLL_FLOOR)
-    # A latched circuit breaker refuses the entry and nothing else.
-    #
-    # It used to short-circuit the whole cycle: `run_cycle` set `offset = None` on
-    # a halt, which returns before `score_live`, so a halted account wrote no
-    # predictions and recorded no quotes. The breaker exists to stop risking
-    # money, and stopping the measurement was collateral damage nobody chose —
-    # and the expensive kind, because the market benchmark needs windows and a
-    # halt froze the count. On a $100 account with a 15% daily-loss breaker
-    # sitting almost exactly on the expected burn rate, that meant the recording
-    # run could not reach its own sample-size target.
-    #
-    # Refusing here instead keeps the row honest: it is scored, priced against
-    # the real book, written with `reason='halted'`, and settled like any other,
-    # so `market_benchmark` and the calibration history keep accruing while no
-    # money moves.
+    # A latched circuit breaker refuses the entry only. The row is still scored,
+    # priced, written with `reason='halted'` and settled, so measurement continues
+    # while no money moves.
     if halted:
         return refuse(Reason.HALTED)
     pinned = getattr(config, 'require_model_version', None)
     if pinned and _optional_str(get, 'model_version') != pinned:
         return refuse(Reason.MODEL_NOT_PINNED)
-    # Scored but not tradeable. Every offset is still measured — that sample is
-    # what the forecast tests read — but only `entry_offsets` may open a position.
-    # See `Config.entry_offsets`: the earliest offset that cleared was taking 90%
-    # of windows at 0.040c per contract, against 3.304c at +12m alone.
+    # Every offset is scored and measured, but only `entry_offsets` may open a
+    # position. See `Config.entry_offsets`.
     tradeable = config.entry_offsets
     if tradeable is not None and int(base.offset) not in tuple(tradeable):
         return refuse(Reason.OFFSET_NOT_TRADED)
@@ -434,32 +369,13 @@ def decide(
     has_book = ask_up is not None and ask_down is not None
     if require_quote and not has_book:
         return refuse(Reason.NO_QUOTE)
-    # **The peer book, when the configuration says the model needs it.**
-    #
-    # Refitting with the TRAINING peer deliberately lagged measured what its
-    # absence costs:
-    #
-    #     peer lag          skill        t     folds+
-    #     0 min (socket)   +0.00294    +4.57    6/6
-    #     1 min (REST)     +0.00087    +1.01    5/6
-    #     dropped          -0.00015    -0.15    4/6
-    #
-    # A one-minute lag costs 70% of the skill, so `cross_venue` contributes
-    # CONTEMPORANEITY rather than a durable interaction — which is why it scores
-    # +0.000030 alone, below the clock control, and is load-bearing under
-    # leave-one-out. Not a leak: both books are readable at the decision
-    # instant over sockets. An infrastructure requirement.
-    #
-    # So an outage does not degrade one feature gracefully, it removes most of
-    # the edge while the loop keeps trading. `--complete-cases` already requires
-    # the peer in TRAINING; refusing the row here is what makes the two paths
-    # agree. A row that never carried the column at all is left alone — absence
-    # of the FEATURE is not absence of the book.
+    # The peer book, when the configuration requires it. `cross_venue` skill
+    # depends on a contemporaneous peer book, and training already requires it
+    # under `--complete-cases`; refusing here makes live match.
+    # A row without the column at all is not refused: absent feature, not absent book.
     if getattr(config, 'require_peer_book', False):
-        # The RAW value, not `_optional`, which maps a NaN to None and so
-        # cannot tell "the column is absent" from "the book was missing" —
-        # and that distinction is the whole point: a configuration without
-        # cross_venue carries no column and must not be refused.
+        # The raw value, not `_optional`: NaN-to-None would hide whether the
+        # column is absent (not refused) or the book is missing (refused).
         try:
             raw = get('venue_prob_gap')
         except (KeyError, IndexError):
@@ -482,12 +398,7 @@ def decide(
     cost = float(cost_a[0])
     edge = float(edge_a[0])
 
-    # `model_probability` is the probability of the side actually taken, so the
-    # baseline has to be too. It was not: a DOWN trade stored P(down) beside
-    # P(up), and their difference — which reads like the disagreement being
-    # traded — was meaningless for every DOWN row. With model 0.28 and baseline
-    # 0.40 the stored pair was (0.72, 0.40), a gap of 0.32 against a real
-    # disagreement of 0.12.
+    # `model_probability` is for the side taken, so the baseline is too.
     common = dict(side=side, price=price, effective_cost=cost,
                   model_probability=probability,
                   baseline_probability=p_market if side is Side.UP else 1.0 - p_market,
@@ -514,9 +425,8 @@ def decide(
         return refuse(Reason.MEMBERS_DISAGREE, **common)
 
     kelly = kelly_fraction_for(probability, cost)
-    # The base the fractions apply to. Compounding is opt-in: sizing off the
-    # starting bankroll makes the equity curve additive, so its slope is the
-    # per-trade edge rather than an exponential of it.
+    # The sizing base. Compounding is opt-in: sizing off the starting bankroll
+    # keeps the equity curve additive, so its slope is the per-trade edge.
     sizing_base = bankroll if config.compound else config.starting_bankroll
     stake_target = min(
         config.kelly_fraction * kelly * sizing_base,
@@ -524,16 +434,13 @@ def decide(
     )
     if config.max_stake_dollars is not None:
         stake_target = min(stake_target, config.max_stake_dollars)
-    # A measured depth beats the standing guess. `max_stake_dollars` exists
-    # because nobody had read the book; when a row carries what is actually
-    # resting at the touch, that is the real cap.
+    # A measured depth at the touch replaces the `max_stake_dollars` guess.
     measured_depth = _optional(get, f'depth_{side.value}')
     if measured_depth is not None and measured_depth > 0:
-        # Only a fraction of it: see `Config.depth_fraction`. The quote is read
-        # seconds before the order lands and a quarter of the time the touch has
-        # halved by then.
+        # Only a fraction of it (`Config.depth_fraction`): the touch can shrink
+        # between the quote and the order.
         stake_target = min(stake_target, measured_depth * config.depth_fraction)
-    # Never stake more than is actually there, whatever the fractions say.
+    # Never stake more than the bankroll holds.
     stake_target = min(stake_target, bankroll)
     room = config.max_window_exposure_fraction * sizing_base - exposure.stake
     if room <= 0:
@@ -544,25 +451,16 @@ def decide(
     if contracts < config.min_contracts:
         return refuse(Reason.BELOW_MIN_CONTRACTS, kelly_fraction=kelly, **common)
 
-    # The order fee rounds up to a whole cent *per order*, so the realised cost
-    # of a small order exceeds the schedule. Re-check expected value against
-    # what will actually be charged rather than against the continuous formula.
+    # The fee rounds up per order, so re-check expected value against what will
+    # actually be charged.
     fee = float(trade_fee(contracts, price, config))
-    # The crossing cost belongs only to the counterfactual price. When `price` is
-    # a real ask it already includes the spread, which `price_and_edge` gets
-    # right — but this line added the half-spread unconditionally, so live
-    # recorded a stake $0.005/contract above the cash actually paid ($4.98 booked
-    # against $4.94 charged). That debited a phantom loss on every trade and
-    # manufactured exactly the balance drift the operator is told to read as an
-    # unrecorded fill. It also made the live EV re-check 0.5c/contract stricter
-    # than the backtest's, so the two paths abstained differently.
+    # The crossing cost applies only to the counterfactual price: a real ask
+    # already includes the spread.
     crossing = 0.0 if has_book else config.half_spread_cents / 100.0
     outlay = contracts * (price + crossing) + fee
     realised_cost = outlay / contracts
-    # `> min_edge_pp`, not `> 0`. Clearing the continuous gate and then landing at
-    # break-even once the per-order fee rounds up is not a trade worth taking:
-    # measured at 0.90 with one contract, a +0.505pp continuous edge is +0.107pp
-    # after rounding, and it was accepted.
+    # `<= min_edge_pp`, not `<= 0`: a trade that clears the continuous gate and
+    # lands near break-even after fee rounding is refused.
     if probability - realised_cost <= config.min_edge_pp / 100.0:
         return refuse(Reason.FEE_CEILING, kelly_fraction=kelly, **common)
 
@@ -581,21 +479,17 @@ def decide_window(
 ) -> list[Decision]:
     """Walk one window's rows in offset order and take the first that clears.
 
-    Offset order, not best-of: at offset 3 you cannot know what offset 12 will
-    look like, so choosing the best offset in hindsight is not a strategy that
-    can be run. `scripts/evaluate.py` reports edge per offset separately, which
-    is how the offset set gets narrowed on evidence instead.
+    Offset order, not best-of: at offset 3 you cannot know offset 12, so a
+    hindsight best offset cannot be run.
     """
     exposure = WindowExposure()
     decisions: list[Decision] = []
     entered = 0
     candidates, _ = stateless_screen(rows, config)
     for _, row in candidates.sort_values(['offset', 'symbol']).iterrows():
-        # One entry per (symbol, window) is enforced by ALREADY_ENTERED below
-        # (a hardcoded set-membership check, not a config field — it is an
-        # invariant, not a policy). `max_positions_per_window` is a different
-        # cap: on distinct correlated legs in the same fifteen minutes, which
-        # is the exposure that matters at $100.
+        # One entry per (symbol, window) is an invariant, enforced by
+        # ALREADY_ENTERED. `max_positions_per_window` caps distinct correlated
+        # legs in the same window.
         if entered >= config.max_positions_per_window:
             break
         decision = decide(row, config, bankroll=bankroll, exposure=exposure)
@@ -608,9 +502,8 @@ def decide_window(
 
 def rejection_histogram(decisions: list[Decision]) -> pd.Series:
     """Counts by reason, in funnel order. The most informative single output."""
-    # Keyed on the enum's *value*, not the member: `Reason` subclasses `str`, so
-    # a dict keyed on members already indexes by string and re-mapping the index
-    # afterwards fails on the strings it produced.
+    # Keyed on the enum's value: `Reason` subclasses `str`, so member keys
+    # would already index by string.
     counts = pd.Series({r.value: 0 for r in Reason}, dtype=int)
     for decision in decisions:
         counts[decision.reason.value] += 1

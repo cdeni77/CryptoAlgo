@@ -1,23 +1,14 @@
-"""Walk-forward: fit, score, trade, measure — six times, in order.
+"""Walk-forward: fit, score, trade and measure, fold by fold, in order.
 
-The loop is deliberately boring, because everything interesting has already
-been decided elsewhere. Each fold fits its own seasonality, volatility model,
-baseline and classifier on training windows only, scores the test block through
-`core.dataset.apply_fold`, and runs the resulting probabilities through the same
-`decide()` the live path calls. Nothing in here chooses a trade or prices one.
+Each fold fits seasonality, the volatility model, the baseline and the
+classifier on training windows only, scores the test block with
+`core.dataset.apply_fold`, and trades through the same `decide()` live uses.
 
-**Two books, and they answer different questions.** A per-fold book starts fresh
-at the configured bankroll, so the six folds are comparable to each other. One
-continuous book runs the whole out-of-sample span with a single bankroll, so
-fold 0's losses shrink fold 1's stakes — which is what deployment actually does
-to a $100 account. The per-fold numbers are the measurement; the continuous one
-is the answer.
+Two books: a per-fold book starts fresh each fold, so folds compare; one
+continuous book runs the whole out-of-sample span on a single bankroll.
 
-**Settlement is processed before the next window's decision.** A position opened
-in the window starting at 10:00 settles at 10:15, which is the instant the next
-window opens. Deciding first and settling afterwards would let the bankroll be
-staked twice over, and at a $100 account with a 5% cap that is the difference
-between a real constraint and none.
+Settlement runs before the next window's decision. A position settles at the
+instant the next window opens; deciding first would stake the bankroll twice.
 """
 
 from __future__ import annotations
@@ -66,25 +57,18 @@ def run_book(
 ) -> tuple[Book, list[Decision]]:
     """Walk scored windows in chronological order, deciding and settling.
 
-    `scored` needs `model_probability` alongside the window columns. One pass,
-    no lookahead: the only thing available when a window is decided is the row
-    itself and the bankroll, and the bankroll depends only on windows that have
-    already settled.
+    `scored` needs `model_probability` alongside the window columns. No lookahead:
+    the bankroll depends only on windows that have already settled.
     """
     book = book or Book(config=config)
     decisions: list[Decision] = []
-    # Screen the whole span once, vectorised, before touching the per-window
-    # loop. On real data the state-independent gates reject the overwhelming
-    # majority of rows, and grouping five years of minutes into windows to
-    # iterate over rows that could never trade is where the runtime went.
+    # Screen the whole span once, vectorised: the state-independent gates
+    # reject most rows before the per-window loop.
     screened, stateless_rejections = stateless_screen(scored, config)
     outcomes = settlement_outcomes(scored)
     for window_open, rows in screened.groupby('window_open', sort=True):
-        # Settle first: a position from the previous window matures at exactly
-        # this instant. Deciding before settling would stake the same dollars
-        # twice, which at a $100 account with a 5% cap is the difference between
-        # a real constraint and none. Matured positions are found by settle_time
-        # rather than by scanning the outcome map, which would be quadratic.
+        # Settle first: a position from the previous window matures at this
+        # instant. Matured positions are found by settle_time, not by scanning outcomes.
         matured = [p for p in book.open_positions if p.settle_time <= window_open]
         if matured:
             book.settle({(p.symbol, p.window_open): outcomes[(p.symbol, p.window_open)]
@@ -102,19 +86,11 @@ def run_book(
 
 
 def skill_null_column(table: pd.DataFrame, init_score_source: str) -> np.ndarray:
-    """The forecaster `log_loss_skill` should be measured against.
+    """The forecaster `log_loss_skill` is measured against.
 
-    Skill means "better than the thing this model was fitted to correct". A
-    market-initialised model is not trying to beat `F(x/sigma)`; it is fitted on
-    the price, so scoring it against the baseline reports a failure that is a
-    category error. Measured on a real run: `model_minus_market` +0.00078 (it
-    does beat the price) alongside `log_loss_skill` -0.00016 and 3/6 folds — two
-    of four failing gates asking the wrong question, which is worse than an
-    honest failure because it hides whichever failures are real.
-
-    Falls back to the baseline when the market column is absent or entirely
-    NaN. That is the honest fallback, but it is a FALLBACK: a silent swap is how
-    a market-init model comes to be judged as a baseline-init one.
+    Skill means beating what the model was fitted to correct: the market for a
+    market-initialised model, else the baseline. Falls back to the baseline,
+    with a warning, when the market column is absent or all NaN.
     """
     if init_score_source == 'market' and 'market_probability' in table.columns:
         values = pd.to_numeric(table['market_probability'], errors='coerce')
@@ -129,15 +105,11 @@ def skill_null_column(table: pd.DataFrame, init_score_source: str) -> np.ndarray
 
 
 def stack_folds(dataset: Dataset, config: Config) -> list[WindowFold]:
-    """Folds whose TEST blocks are cut over the quoted windows only, and whose
-    TRAINING sets are every window before the embargo.
+    """Folds with test blocks cut over quoted windows only, and training sets
+    of every window before the embargo.
 
-    Stage 2 can only be scored where a usable quote exists, so cutting test
-    blocks over five years of bars would fit dozens of folds that test nothing.
-    Stage 1 still trains on all history: the training set is widened back to
-    every window of the dataset ahead of the test block (or `fold_train_days`
-    of them), which is the point of stacking. Unquoted rows inside a tested
-    window stay in the test table and score NaN.
+    Stage 2 scores only where a usable quote exists. Stage 1 still trains on all
+    history (or `fold_train_days` of it). Unquoted rows in a tested window score NaN.
     """
     windows = dataset.windows
     market = (pd.to_numeric(windows['market_probability'], errors='coerce')
@@ -166,29 +138,12 @@ def stack_folds(dataset: Dataset, config: Config) -> list[WindowFold]:
 
 
 def settlement_outcomes(scored: pd.DataFrame) -> dict:
-    """How each window settled, preferring the VENUE'S own result.
+    """How each window settled, preferring the venue's own result.
 
-    **The leak this closes, measured.** Settling on our Coinbase-derived label
-    while trading against the venue's BRTI-priced quotes, with `market_prob`
-    live as a feature, let the model bet the disagreement between the two
-    indices and win it by construction:
-
-        labels agree on 96.51% of traded windows
-          win rate where they AGREE  : 56.17%
-          win rate where they DIFFER : 72.77%   (n=448)
-
-    Rescoring the same 12,821 trades on the venue's settlement took the win rate
-    from 56.75% to 55.16% and the edge from 8.68% to 4.99% of stake — about 43%
-    of the apparent edge was the label rather than the forecast.
-
-    Ours remains the fallback: Kalshi purges older markets, so their
-    settlements do not reach the whole span, and dropping those windows would
-    discard most of the sample. What must never happen is preferring ours where
-    theirs exists.
-
-    A window with NEITHER label is omitted rather than guessed. `book.settle`
-    skips what it has no outcome for; inventing one would pay or charge for a
-    result nobody holds.
+    Settling on our Coinbase label while trading venue-priced quotes lets the
+    model bet the disagreement between the two indices. Our label is the
+    fallback only where the venue's is missing (older markets are purged).
+    A window with neither label is omitted, never guessed.
     """
     frame = scored.drop_duplicates(['symbol', 'window_open'])
     ours = pd.to_numeric(frame['outcome'], errors='coerce')
@@ -262,9 +217,8 @@ def walk_forward(
         evaluations.append(evaluate_fold(
             fold.index, test_table,
             test_table['model_probability'].to_numpy(),
-            # The null the model was FITTED on, not always the baseline. Read
-            # off the model: a stacked one is market-relative whatever the
-            # config's own init source says.
+            # The null the model was fitted on, not always the baseline. Read
+            # from the model: a stacked one is market-relative whatever the config says.
             skill_null_column(test_table, getattr(model, 'init_score_source',
                                                   config.init_score_source)),
             residual_scale=model.residual_scale,
@@ -288,8 +242,7 @@ def walk_forward(
             f'universe is {len(dataset.symbols)} symbols; the cross_asset group '
             f'is thinner than its column count suggests')
 
-    # The fold count actually cut. Under the calendar scheme `n_folds` is not a
-    # count at all, so recording only the config value put "6" beside 28 folds.
+    # The fold count actually cut. Under the calendar scheme `n_folds` is not a count.
     geometry = {
         'n_folds_actual': len(evaluations),
         'n_folds_config': int(config.n_folds),
@@ -326,12 +279,8 @@ def cost_stress(
 ) -> pd.DataFrame:
     """Re-run the book under worse cost assumptions.
 
-    The half-spread is an assumption, not a measurement — no Kalshi order ticket
-    has been read against `core/costs.py` — and it is larger than the fee at
-    price above 83c, where 0.07*p(1-p) falls below a cent. So it is the parameter
-    most likely to be wrong
-    and the one that moves the answer most. A strategy that survives only at the
-    assumed spread has not been demonstrated.
+    The half-spread is an assumption, and above the fee crossover it is the
+    larger cost. A strategy that survives only at the assumed spread is not demonstrated.
     """
     scenarios = scenarios or {
         'baseline': {},
@@ -362,30 +311,12 @@ def edge_curve(
     *,
     gates_pp: Sequence[float] = (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0),
 ) -> pd.DataFrame:
-    """How the book behaves as the abstention gate tightens. A DIAGNOSTIC.
+    """How the book behaves as the abstention gate tightens. A diagnostic.
 
-    **Do not choose `min_edge_pp` from this curve.** The docstring here used to say
-    "the right value of `min_edge_pp` is measured, not guessed", which invites
-    exactly the thing that cannot be done: every row is scored on the *same*
-    out-of-sample rows, so a value picked by reading them is no longer out of
-    sample. It is the selection bias the archive section of `CLAUDE.md` was written
-    about, one level up.
-
-    Measured on 326 days, the money on a run this size is not stable enough to
-    choose anything with. Across six configurations, forecast skill and realised
-    return came apart completely: `(3,6)` with all groups had *higher* skill than
-    the shipped configuration (+0.000365 against +0.000287) and lost half the
-    account, and at essentially constant skill the return spanned -50% to +303%.
-    The curve below moved non-monotonically over the same rows — 2.24, 2.12, 2.12,
-    2.65, 2.61, 2.24, 1.63 — which by its own reading below means the tail is
-    noise, and by the same token so is the peak.
-
-    What the shape is still good for is a sanity check on *concentration*: a curve
-    that improves as the gate tightens says the forecast is real and concentrated;
-    one that peaks and falls says the tail is noise. Read the shape, not the
-    argmax. Narrowing a configuration on skill and on a named mechanism is
-    defensible — `scripts/ablate.py` is for that — and narrowing it on return is
-    not.
+    Do not choose `min_edge_pp` from this curve: every row is scored on the same
+    out-of-sample rows, so a value picked from them is no longer out of sample.
+    Read the shape, not the argmax: improvement as the gate tightens means a
+    concentrated forecast; a peak then a fall means the tail is noise.
     """
     rows = []
     for gate in gates_pp:

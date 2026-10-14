@@ -1,38 +1,16 @@
 """Features built from the venues' own order books and strike ladders.
 
-Every column here names a way `F(x/sigma)` is wrong. A feature that cannot
-answer that question does not get built — the rule that saved the previous
-incarnation of this project, whose 27-cell survey found its best cell was its
-own control.
+Every column names a way `F(x/sigma)` is wrong. Three families:
 
-Three families, in descending order of prior support:
+    market_state   Kalshi's book at the decision instant.
+    cross_venue    Kalshi against Polymarket: two books on nearly the same outcome.
+    implied_vol    the strike ladder inverted to a forward-looking sigma.
 
-    market_state   Kalshi's book at the decision instant. The market's own
-                   correction to the arithmetic, plus the shape of the book
-                   producing it.
-    cross_venue    Kalshi against Polymarket — two independent books on very
-                   nearly the same random variable. Their settlements agree
-                   99.52%, so a gap in PRICE is information or liquidity, not
-                   a different question.
-    implied_vol    the strike ladder inverted to a FORWARD-looking sigma. The
-                   barrier framing says sigma_remaining is the only quantity
-                   requiring a forecast, and every volatility feature in
-                   `core/features.py` is backward-looking realised vol.
+Invariants:
 
-Three invariants run through all of it:
-
-* **Cents, not dollars.** Both venues store integer cents in these fields
-  (measured: Kalshi best_bid median 55, Polymarket 47). A probability is
-  price/100, and getting that wrong scales every edge by one hundred in the
-  same direction every time.
-* **A missing side is NaN, never zero.** A one-sided book has no mid, and an
-  invented one fabricates a probability. `_price` in the live client already
-  follows this rule for quotes; `_money` deliberately does not, because a
-  settlement of zero is a real observation. Books are the first case.
-* **No lookahead.** A book is a step function, so its state at T is the last
-  tick AT OR BEFORE T — never the nearest. A one-minute leak in a
-  fifteen-minute window is 7% of the whole question and reads exactly like
-  skill.
+* Book prices are in integer cents. A probability is price / 100.
+* A missing side is NaN, never zero. A one-sided book has no mid.
+* No lookahead. A book's state at T is the last tick at or before T, never the nearest.
 """
 
 from __future__ import annotations
@@ -40,26 +18,19 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# Deliberately NOT features: `bid_levels` / `ask_levels`. Measured ratio 0.579
-# between the backfilled book and the live one, unchanged by any time filter —
-# a model trained on them learns which pipe a row arrived through.
+# Not features: `bid_levels` / `ask_levels`. The backfilled and live books use
+# different price grids, so a model would learn which source a row came from.
 PRICE_COLUMNS = ('market_prob', 'market_minus_baseline')
-# `quote_intensity` was declared and removed: it needs a per-minute snapshot
-# COUNT, which venue_depth's summary does not carry, so it was all-NaN in every
-# run. A declared feature nothing can populate is worse than no feature — it
-# dilutes the matrix and reads exactly like a working column.
-# Structure only — it CANNOT echo the market, because the price is not in it.
-# That is the point: `market_state` is the one new family that beats the control
-# (+0.000122 alone, t +1.5, against the control's +0.000039) and also the one
-# that invites echo, so the two have to be separable to tell them apart.
+# Structure only: it cannot echo the market, because the price is not in it.
+# This keeps a structure edge separable from a copy of the quoted price.
 MARKET_STATE = (
     'spread', 'imbalance_touch', 'imbalance_5c', 'depth_ratio',
     'book_convexity',
 )
 # The columns that can echo. Selected explicitly, never by default.
 MARKET_PRICE = PRICE_COLUMNS
-# No volume ratio across venues: Kalshi is integer contracts, Polymarket
-# fractional shares, so the quotient would measure the unit.
+# No volume ratio across venues: Kalshi counts integer contracts, Polymarket
+# fractional shares, so the quotient measures the unit.
 CROSS_VENUE = ('venue_prob_gap', 'venue_gap_change_5', 'venue_spread_ratio',
                'pm_available')
 IMPLIED_VOL = ('iv_minus_realised', 'implied_sigma_per_min', 'iv_r2',
@@ -74,12 +45,9 @@ def _safe_div(num, den):
 
 
 def _column(frame: pd.DataFrame, name: str) -> np.ndarray:
-    """A numeric column, or all-NaN if it is not there yet.
+    """A numeric column, or all-NaN if it is absent.
 
-    `sigma_per_min` is FITTED and arrives per fold, so it is absent on a freshly
-    built panel. `DataFrame.get` returns a scalar default there, which then has
-    no `.values` — and silently coercing it would compute a ratio against
-    nothing rather than declining to.
+    `sigma_per_min` is fitted per fold, so it is absent on a fresh panel.
     """
     if name not in frame.columns:
         return np.full(len(frame), np.nan)
@@ -87,11 +55,7 @@ def _column(frame: pd.DataFrame, name: str) -> np.ndarray:
 
 
 def _mid(frame: pd.DataFrame) -> np.ndarray:
-    """The two-sided mid as a probability, or NaN.
-
-    NaN rather than a fallback to whichever side exists: a lone bid says the
-    probability is *at least* something, which is not a probability.
-    """
+    """The two-sided mid as a probability, or NaN if either side is missing."""
     bid = pd.Series(_column(frame, 'best_bid'), index=frame.index)
     ask = pd.Series(_column(frame, 'best_ask'), index=frame.index)
     mid = (bid + ask) / 2.0 / CENTS
@@ -102,12 +66,8 @@ def market_state_features(snap: pd.DataFrame, *,
                           include_price: bool = True) -> pd.DataFrame:
     """Kalshi's book at the decision instant.
 
-    `include_price=False` is the structure-only variant, and it exists for a
-    specific reason: given the quoted probability, the cheapest path to a low
-    log loss is to copy a well-calibrated market. That scores beautifully on
-    `log_loss_skill` and then reads ~0 on `model_minus_market`, which is the
-    gate that pays. Structure-only physically cannot do that, so an edge it
-    finds is provably not an echo.
+    `include_price=False` is the structure-only variant. It cannot copy the
+    quoted price, so an edge it finds is not an echo of the market.
     """
     out = pd.DataFrame(index=snap.index)
     mid = _mid(snap)
@@ -119,22 +79,19 @@ def market_state_features(snap: pd.DataFrame, *,
         # Absent when features are built: `attach_baseline` runs afterwards.
         out['market_minus_baseline'] = mid - _column(snap, 'baseline_probability')
 
-    # Probability units throughout: everything downstream — the edge gate, the
-    # fee model, the Kelly stake — is denominated that way.
+    # Probability units: the edge gate, the fee model and the Kelly stake use them.
     out['spread'] = ((ask - bid) / CENTS).where(bid.notna() & ask.notna()).values
 
     for name, lo, hi in (('imbalance_touch', 'bid_at_touch', 'ask_at_touch'),
                          ('imbalance_5c', 'bid_5c', 'ask_5c')):
         a = pd.Series(_column(snap, lo), index=snap.index)
         b = pd.Series(_column(snap, hi), index=snap.index)
-        # Both sides empty means nothing is resting there. Reporting a balanced
-        # book would claim knowledge of a book that does not exist.
+        # Both sides empty means nothing rests there: NaN, not a balanced book.
         out[name] = _safe_div(a - b, a + b)
 
     bid_vol = pd.Series(_column(snap, 'bid_vol'), index=snap.index)
     ask_vol = pd.Series(_column(snap, 'ask_vol'), index=snap.index)
-    # Logged so a 2:1 bid-heavy book and a 1:2 ask-heavy one are equal and
-    # opposite, which a raw ratio is not.
+    # Log ratio, so 2:1 and 1:2 books are equal and opposite.
     ratio = _safe_div(bid_vol, ask_vol)
     with np.errstate(divide='ignore', invalid='ignore'):
         out['depth_ratio'] = np.where(ratio > 0, np.log(ratio), np.nan)
@@ -147,28 +104,19 @@ def market_state_features(snap: pd.DataFrame, *,
     return out
 
 
-# A ladder fit older than this is not a forward-looking estimate of anything.
-# Generous, because `iv_staleness_minutes` rides along as a feature and a study
-# can tighten it without re-joining: 60% of ladders yield no fit at all, leaving
-# a ~5-hour mean gap, so a hard filter here would discard most of the dataset.
+# A ladder fit older than this is not a forward-looking estimate.
+# Generous, because `iv_staleness_minutes` is a feature and most ladders yield no fit;
+# a tight filter would discard most of the dataset.
 MAX_FIT_AGE_MINUTES = 360.0
 
 
 def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
                        max_age_minutes: float = MAX_FIT_AGE_MINUTES,
                        decision_latency_seconds: float = 3.0) -> pd.DataFrame:
-    """The last ladder fit AT OR BEFORE each decision, plus its staleness.
+    """The last ladder fit at or before each decision, plus its staleness.
 
-    As-of, never nearest: a sigma inverted from a ladder that closed after the
-    decision instant is a forecast made with tomorrow's newspaper, and it would
-    read as skill.
-
-    Staleness is a FEATURE rather than a filter. The fits are irregular — 60% of
-    ladders yield nothing — so almost every decision is priced against a sigma
-    measured minutes or hours earlier. That is usable, because volatility is
-    persistent, but only if the model can tell a fresh estimate from a stale
-    one. Filtering everything stale would discard most of the dataset to avoid a
-    problem the model can simply be told about.
+    As-of, never nearest: a fit from after the decision is lookahead.
+    Staleness is a feature, not a filter, so the model can tell a fresh fit from a stale one.
     """
     out = table.copy()
     for column in IMPLIED_VOL:
@@ -182,10 +130,9 @@ def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
         '_at': (pd.to_datetime(out['decision_time'], utc=True)
                 + pd.Timedelta(seconds=float(decision_latency_seconds))).values,
     })
-    # The capture time, not the stamp: the live recorder floors `event_time` to
-    # the minute and records the real capture in `available_time`, so a fit
-    # stamped at the decision's minute can be from after the decision. The
-    # backfill sets both to the fit instant.
+    # Use the capture time, not the stamp. The live recorder floors `event_time`
+    # to the minute and stores the real capture in `available_time`.
+    # The backfill sets both to the fit instant.
     seen = (fits['available_time'] if 'available_time' in fits.columns
             else fits['event_time'])
     seen = pd.to_datetime(seen, utc=True).fillna(
@@ -198,13 +145,11 @@ def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
         'iv_n_strikes': _column(fits, 'n_strikes'),
         '_close': _column(fits, 'minutes_to_close'),
     }).dropna(subset=['_at'])
-    # Carried through the join so staleness is the gap to the fit ACTUALLY used;
-    # merge_asof consumes the right key, so without this there is nothing to
-    # measure the age against.
+    # Keep the fit time through the join: merge_asof consumes the right key,
+    # and staleness is the gap to the fit actually used.
     right['_fit_at'] = right['_at']
-    # Among fits seen at the same instant, the nearest close is the one live
-    # uses (`record_implied_vol.fits_for`). merge_asof takes the LAST match, so
-    # it sorts last.
+    # Among fits seen at the same instant, live uses the nearest close
+    # (`record_implied_vol.fits_for`). merge_asof takes the last match, so it sorts last.
     right = right.sort_values(['_at', '_close'], ascending=[True, False],
                               na_position='first', kind='mergesort')
 

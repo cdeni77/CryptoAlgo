@@ -1,23 +1,9 @@
 """The live book, folded from a stream, and dated on every read.
 
-**A cached book that quietly stops updating is worse than a REST call**, because
-it looks healthy. So there is no way to read a ladder here without also reading
-its age: `Ladder` carries `age_seconds` and `stale`, and an unknown ticker
-returns None rather than an empty book. An empty ladder and no ladder are
-different claims, and conflating them would let a dead subscription read as a
-market with nothing resting in it.
-
-**Sequence gaps are detected per CONNECTION, not per market.** Measured against
-the live venue: Kalshi's `seq` is contiguous across a whole subscription
-(1..34,956, every step +1, three markets on one `sid`) and is NOT contiguous
-within any one market (BTC reads 1, 9, 10, ...). Checking per market — which is
-what "snapshot then incremental updates" naturally suggests — would flag every
-single delta as a gap and mark every book permanently corrupt. So one missed
-`seq` means every book on that connection is suspect, and the repair is to
-resubscribe all of them.
-
-Pure and synchronous on purpose. This holds the state a wrong answer would come
-from, so it must be exhaustively testable without a network.
+Every ladder read carries its age. An unknown ticker returns None, not an empty book.
+Sequence gaps are per connection, not per market: Kalshi's `seq` is contiguous
+across a subscription, not within a market. One missed `seq` marks every book on
+that connection, and the repair is to resubscribe all of them.
 """
 from __future__ import annotations
 
@@ -30,17 +16,9 @@ from data_collection.stream.base import BookEvent, Level
 
 logger = logging.getLogger(__name__)
 
-# **Anything smaller than this is floating-point residue, not resting size.**
-#
-# Sizes arrive as 2-decimal fixed-point strings and a signed delta is applied by
-# addition, so a level driven to exactly zero accumulates error instead: measured
-# on a real capture, three BTC levels held 2.4e-12, 3.5e-14 and 4.9e-13 after
-# being emptied. `size > 0` kept all three, and because they sat ABOVE the real
-# touch the cache reported a phantom best bid of 0.59 against a true 0.56 — a
-# three-cent error, on the one number every book feature is built from, with
-# nothing raised anywhere.
-#
-# A tenth of the smallest representable size. No real level can be this small.
+# Sizes below this are floating-point residue from summed signed deltas, not resting size.
+# A residue level above the real touch would report a phantom best bid.
+# A tenth of the smallest representable size (sizes have 2 decimals).
 MIN_SIZE = 1e-3
 
 
@@ -59,21 +37,16 @@ class _Book:
     last_received: float = 0.0
     gapped: bool = False
     venue: str = ''
-    # Set when the connection that built this book went away; only a fresh
-    # snapshot on the new subscription makes it current again.
+    # Set when the connection that built this book is gone. Only a fresh
+    # snapshot on the new subscription makes the book current again.
     awaiting_snapshot: bool = False
 
 
 class BookCache:
     """Per-market ladders folded from a normalized event stream.
 
-    `max_age_seconds` defaults to 10, and the number is derived rather than
-    picked. The tape measurement in the latency work puts the market's
-    information gain below the noise floor out to about 30 seconds, so anything
-    under that costs nothing. Meanwhile a book more than a few seconds old means
-    the transport is sick, not that the market is quiet. Ten seconds sits inside
-    the free region with room, and a breach reads as a fault rather than as a
-    slow market.
+    `max_age_seconds` is 10: the market gains no measurable information under
+    about 30s, and a book older than a few seconds means a sick transport.
     """
 
     def __init__(self, max_age_seconds: float = 10.0,
@@ -81,12 +54,10 @@ class BookCache:
         self.max_age_seconds = max_age_seconds
         self._now = now
         self._books: dict[str, _Book] = {}
-        # Sequence state is per CONNECTION — keyed by venue, because there is
-        # one socket per venue. This is a grouping, not a per-venue rule.
+        # Sequence state is per connection, keyed by venue (one socket per venue).
         self._last_seq: dict[str, int] = {}
-        # When each connection last delivered ANY frame. `seq` is contiguous
-        # across the subscription, so a live, gap-free connection vouches for
-        # every book on it — a quiet market's book is unchanged, not stale.
+        # When each connection last delivered any frame. A live, gap-free
+        # connection vouches for every book on it: a quiet book is unchanged, not stale.
         self._last_frame: dict[str, float] = {}
 
     # -- writing ------------------------------------------------------------
@@ -96,8 +67,7 @@ class BookCache:
         book = self._books.get(event.market_ticker)
         if book is None:
             if event.is_delta:
-                # Folding a delta into nothing would invent a whole book out of
-                # whichever level happened to change first.
+                # A delta without a snapshot would invent a book from one level.
                 logger.debug('%s: delta before snapshot, dropped',
                              event.market_ticker)
                 return
@@ -114,8 +84,7 @@ class BookCache:
             for side, levels in (('yes', event.yes), ('no', event.no)):
                 target = getattr(book, side)
                 for price, size in levels:
-                    # `absolute` rides on the event precisely so this line never
-                    # has to know which venue sent it.
+                    # `absolute` rides on the event, so this line stays venue-blind.
                     if not event.absolute:
                         size = target.get(price, 0.0) + size
                     if size > MIN_SIZE:
@@ -130,8 +99,8 @@ class BookCache:
     def _note_sequence(self, event: BookEvent) -> bool:
         """Advance the connection's sequence; True if a frame was missed.
 
-        A gap marks EVERY book on the connection, because the missed frame could
-        have belonged to any of them.
+        A gap marks every book on the connection: the missed frame could
+        belong to any of them.
         """
         if event.seq is None:
             return False
@@ -140,8 +109,8 @@ class BookCache:
         if previous is None or event.seq == previous + 1:
             return False
         if event.seq <= previous:
-            # A resubscribe restarts the sequence at 1. That is not a gap; the
-            # snapshots that follow rebuild every book anyway.
+            # A resubscribe restarts the sequence at 1. That is not a gap:
+            # the snapshots that follow rebuild every book.
             logger.info('%s: sequence restarted at %s (was %s)',
                         event.venue, event.seq, previous)
             return False
@@ -171,9 +140,8 @@ class BookCache:
     def current(self, ticker: str, max_age_seconds: float) -> Optional[Ladder]:
         """The ladder, only if it can be priced against right now.
 
-        Present, not gapped, not stale on its own clock, and on a connection
-        that delivered a frame within `max_age_seconds`. None otherwise — the
-        caller reads the venue instead.
+        Requires: present, not gapped, not stale, and a connection frame within
+        `max_age_seconds`. Returns None otherwise, and the caller reads the venue.
         """
         book = self._books.get(ticker)
         if book is None or book.gapped or book.awaiting_snapshot:
@@ -200,10 +168,10 @@ class BookCache:
         self._books.pop(ticker, None)
 
     def invalidate(self, venue: str) -> None:
-        """The connection is gone: its books missed whatever happened since.
+        """Mark the venue's books as awaiting a snapshot after the connection is lost.
 
-        Not `gapped`, which makes the recorder rebuild: these are rebuilt by
-        the snapshots the new subscription opens with.
+        Not `gapped`, which makes the recorder rebuild: the new subscription's
+        snapshots rebuild these books.
         """
         for book in self._books.values():
             if book.venue == venue:

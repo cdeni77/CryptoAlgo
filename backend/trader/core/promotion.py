@@ -1,20 +1,11 @@
 """Promotion is the gate, and rejections are kept.
 
-A candidate is trained, walk-forward evaluated, gated, and only then installed.
-The staging directory is renamed into place atomically, so `models/forecast.joblib`
-is either the old model or the new one and never a half-written file that the
-live path loads at the wrong moment.
+A candidate is trained, evaluated walk-forward, gated, and only then installed.
+The install is an atomic rename, so `models/forecast.joblib` is never half-written.
 
-**Rejections stay on disk, and that is not sentiment.** The trial count is what
-a deflated Sharpe discounts by, and a project that deletes its failures cannot
-compute its own multiple-testing correction. `models/promotions/` is the ledger:
-every attempt, its gates, and — if forced — the written reason.
-
-**`--force` needs a reason and records it.** There is one genuinely good argument
-for overriding a gate here: a model can be right on a high-conviction tail while
-its average forecast is not, and the gates read averages. That argument is real,
-and it is also exactly the argument that kept a losing perp system alive for
-months. So it is available, it is written down, and it travels with the artifact.
+Rejections stay on disk in `models/promotions/`: the ledger is the trial count,
+which the multiple-testing correction needs.
+`--force` needs a written reason, and the reason travels with the artifact.
 """
 
 from __future__ import annotations
@@ -46,8 +37,8 @@ MODELS_ROOT = Path(os.getenv('MODELS_ROOT') or _TRADER_ROOT / 'models')
 LIVE_MODEL = 'forecast.joblib'
 STAGING = '.staging'
 LEDGER = 'promotions'
-# One line per research run, beside the ledger: the trial count the ledger
-# alone undercounts, because evaluations, ablations and dry runs never reach it.
+# One line per research run, beside the ledger. Evaluations, ablations and dry
+# runs never reach the ledger, so it alone undercounts trials.
 TRIALS = 'trials.jsonl'
 # Which sealed holdouts have been read, when and why.
 HOLDOUT_MARKER = 'holdout_unsealed.jsonl'
@@ -65,12 +56,8 @@ def version_stamp(now: Optional[datetime] = None) -> str:
 def _unique_version(ledger: Path, now: Optional[datetime] = None) -> str:
     """A version no ledger entry already uses.
 
-    The stamp has second resolution, so two candidates evaluated in the same
-    second collided and the second overwrote the first — which silently lost an
-    attempt from the ledger. That matters more than it sounds: the ledger *is*
-    the trial count, and a trial count that undercounts makes every
-    multiple-testing correction computed from it too generous. Found by a test
-    that promoted three candidates in a loop and got one row back.
+    The stamp has second resolution, so a suffix keeps two same-second attempts
+    from overwriting each other. The ledger is the trial count.
     """
     base = version_stamp(now)
     if not (ledger / f'{base}.json').exists():
@@ -141,8 +128,8 @@ class PromotionAttempt:
 
 
 def _json_float(value) -> Optional[float]:
-    """NaN and inf are not JSON. `json.dumps` emits bare `NaN`, which Python
-    reads back and every strict parser rejects — including the dashboard's."""
+    """A finite float, or None. `json.dumps` writes bare `NaN`, which strict
+    parsers (including the dashboard's) reject."""
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -153,17 +140,9 @@ def _json_float(value) -> Optional[float]:
 def reliability_rows(report: EvaluationReport) -> list[dict]:
     """The deployed fold's reliability table, as plain rows.
 
-    **The LAST fold**: trained on the most history, so the one whose model is
-    installed. Same choice `scripts/promote.publish_to_serving` makes, and they
-    must not diverge.
-
-    **This belongs in the ledger because the ledger is the record of account.**
-    It was not, and the Calibration page's only other source was a best-effort
-    mirror into Postgres at promotion time. On 2026-09-10 a retrain ran on a
-    host with no `DATABASE_URL`; the mirror logged one line and returned, and
-    the reliability table for an installed artifact was gone — every other
-    number in the attempt survived on disk, that one did not. A record of
-    account with a hole in it is not one.
+    The last fold: trained on the most history, so its model is the one installed.
+    `scripts/promote.publish_to_serving` makes the same choice; keep them aligned.
+    Stored in the ledger because the ledger is the record of account.
     """
     folds = list(getattr(report, 'folds', None) or ())
     table = getattr(folds[-1], 'reliability_table', None) if folds else None
@@ -182,8 +161,8 @@ def report_provenance(report: EvaluationReport) -> dict:
     geometry = dict(getattr(report, 'fold_geometry', None) or {})
     return {
         'reliability': reliability_rows(report),
-        # The fold count actually evaluated; `config.n_folds` is only a cap
-        # under the count scheme and is ignored by the calendar one.
+        # The fold count actually evaluated; under the calendar scheme
+        # `config.n_folds` is not a count.
         'folds': report.folds_total,
         'fold_geometry': geometry,
         'windows_evaluated': report.total_windows,
@@ -218,9 +197,8 @@ def evaluate_candidate(
 ) -> PromotionAttempt:
     """Score a candidate without touching the filesystem.
 
-    `extra` is for measurements the report cannot produce — the market
-    comparison, which needs live-recorded quotes. Omitting it leaves those gates
-    NaN, and NaN fails, so a caller that forgets cannot promote by accident.
+    `extra` carries measurements the report cannot produce (the market
+    comparison). Without it those gates are NaN, and NaN fails.
     """
     return PromotionAttempt(
         version=version or version_stamp(),
@@ -236,11 +214,8 @@ def gate_lock_status(gates: Optional[dict[str, tuple[float, str]]] = None,
                      lock_path: Optional[Path] = None) -> dict:
     """The running gate spec against the committed lock.
 
-    The lock lives in the code (`core/gate_spec.lock.json`), not under the
-    models volume, and a test pins it to `GATE_SPEC`. What this catches is a
-    gate edited on a host that runs the mounted source — the shape of every
-    threshold change in this ledger's history, each made while that gate was
-    the one blocking.
+    The lock lives in the code (`core/gate_spec.lock.json`), and a test pins it
+    to `GATE_SPEC`. This catches a gate edited on a host that runs mounted source.
     """
     lock = load_gate_lock(lock_path)
     current = gate_spec(gates)
@@ -268,9 +243,9 @@ def promote(
 ) -> PromotionAttempt:
     """Gate, then install atomically. Records the attempt either way.
 
-    Refuses outright — no install, `--force` or not — when the gate spec
-    differs from the committed lock, unless `accept_gate_change` gives a reason;
-    the reason and the spec diff then travel with the ledger entry.
+    Refuses outright (no install, even with `force`) when the gate spec differs
+    from the committed lock, unless `accept_gate_change` gives a reason. The
+    reason and the spec diff then go into the ledger entry.
     """
     if force and not force_reason:
         raise ValueError(
@@ -279,11 +254,8 @@ def promote(
             'average forecast does not show — is also the argument that kept a '
             'losing system alive, so it has to be stated and stored.'
         )
-    # An artifact that cannot score is not a candidate, and --force must not
-    # reach past this. Every other gate asks whether the model is GOOD; this one
-    # asks whether `scripts/live.py` can load it at all. It was missing, and a
-    # refit fitted without its scoring bundle installed cleanly, printed a full
-    # gate table, and then failed on every live cycle instead.
+    # An artifact that cannot score is not a candidate, and `force` cannot
+    # override this: the live loop could not load it.
     if not getattr(model, 'deployable', True):
         raise ValueError(
             'this candidate carries no scoring bundle, so it cannot score a '
@@ -328,10 +300,9 @@ def promote(
         if trades is not None and not trades.empty:
             trades.to_parquet(staging / 'trades.parquet', index=False)
 
-        # Stage the whole directory, then move one file into place. The live
-        # path opens `forecast.joblib` by name, so a partially written file at
-        # that path is a loaded model with a truncated booster — which fails
-        # somewhere else entirely, hours later.
+        # Stage the whole directory, then move one file into place. Live opens
+        # `forecast.joblib` by name, so a partial file there would load a
+        # truncated booster.
         destination = root / LIVE_MODEL
         temporary = root / f'.{LIVE_MODEL}.incoming'
         shutil.copy2(staging / LIVE_MODEL, temporary)
@@ -353,9 +324,7 @@ def promote(
 def load_live(root: Optional[Path] = None, config=None) -> Optional[ForecastModel]:
     """The promoted artifact, verified against `config` when one is given.
 
-    `scripts/live.py` never read `config_provenance`, so a model promoted under
-    one set of economics traded under whatever the current defaults happened to
-    be — worth up to the whole `min_edge_pp` gate in probability terms, silently.
+    The check keeps a model from trading under economics it was not promoted with.
     """
     path = (Path(root) if root else MODELS_ROOT) / LIVE_MODEL
     if not path.exists():
@@ -394,10 +363,9 @@ def ledger_entry(version: str, root: Optional[Path] = None) -> Optional[dict]:
 
 
 def history(root: Optional[Path] = None) -> pd.DataFrame:
-    """Every attempt, newest first. What has been tried, and why not.
+    """Every attempt, newest first: what has been tried, and why it failed.
 
-    The trial count is the point: a deflated Sharpe needs it, and so does anyone
-    reading a passing result and wondering how many candidates it took.
+    The row count is the trial count a deflated Sharpe needs.
     """
     ledger = (Path(root) if root else MODELS_ROOT) / LEDGER
     if not ledger.exists():
@@ -539,8 +507,8 @@ def record_trial(
     holdout: Optional[dict] = None,
     extra: Optional[dict] = None,
 ) -> dict:
-    """Append one line to `trials.jsonl`. Never raises: a run whose result is
-    computed must not die on its own bookkeeping, but the failure is logged."""
+    """Append one line to `trials.jsonl`. Never raises, but logs a failure:
+    a computed result must not die on bookkeeping."""
     import sys
 
     record = {
@@ -588,8 +556,8 @@ def read_trials(root: Optional[Path] = None) -> list[dict]:
 def distinct_trials(root: Optional[Path] = None) -> dict[str, dict]:
     """trial_id -> {'sharpe': ...}, from the trial log and the ledger together.
 
-    A promotion writes both, under one trial id, and counts once. A ledger entry
-    from before the trial log carries no id and counts as its own trial.
+    A promotion writes both under one trial id, and counts once. A ledger entry
+    without an id counts as its own trial.
     """
     out: dict[str, dict] = {}
     skipped: set[str] = set()
@@ -621,7 +589,8 @@ def distinct_trials(root: Optional[Path] = None) -> dict[str, dict]:
 
 
 def trial_count(root: Optional[Path] = None, *, including: Optional[str] = None) -> int:
-    """Distinct trials: the trial log and the ledger, deduplicated by trial id.
+    """Distinct trials in the trial log and the ledger, deduplicated by trial id.
+
     The multiple-testing denominator. `including` adds a run not yet written."""
     trials = distinct_trials(root)
     return len(trials) + (1 if including and including not in trials else 0)
@@ -669,8 +638,8 @@ def unseal_holdout(holdout_start: str, reason: str, *, force: bool = False,
                    root: Optional[Path] = None) -> dict:
     """Record that `holdout_start` is being read. Once per date unless forced.
 
-    A holdout that has been looked at is a validation set: the second look is
-    selected on the first. The refusal is the default; `force` is recorded.
+    A holdout that has been looked at is a validation set: a second look is
+    selected on the first. Refusal is the default; `force` is recorded.
     """
     import sys
 

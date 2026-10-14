@@ -1,32 +1,6 @@
-"""Book DYNAMICS — how the ladder is moving, not how it stands.
+"""Book dynamics features: how the ladder moves, not how it stands.
 
-`core/book_features.py` reads the book as a snapshot at the decision instant:
-spread, imbalance, depth ratios, convexity. Nothing reads the DIRECTION it is
-moving, and `venue_depth` carries a row at every minute 0..15 — 16,345 of 18,321
-windows have ten or more — so the history is there and unused.
-
-**The mechanism.** A resting book is a claim about where the price should be;
-a book whose bid side is building while the ask thins is a claim being revised.
-The barrier framing says the only forecastable quantity is `sigma_remaining`,
-and a book draining fast is a market that expects to move. That is a different
-statement from the level of imbalance, which `market_state` already carries.
-
-**Why this and not the trade tape.** The tape is REJECTED and stays rejected:
-sixteen cells across four projections and four offsets, orthogonalised against
-price and price-squared, clustered on the UTC day — not one significant, largest
-t=-1.90 on 1,800 windows. Book imbalance is the one thing that survived as
-open rather than closed:
-
-    "Daily corr went +0.0074 (t=+0.30) to +0.0253 (t=+1.84) over 67 days as the
-     sample grew. Does not clear the bar the trade tape failed at, but unlike
-     the tape it is positive and strengthening. Re-test when the backfill
-     completes rather than filing as rejected."
-
-**The lookahead guard is the whole risk.** A decision at offset `m` may read
-minutes 0..m and nothing after. A one-minute leak in a fifteen-minute window is
-7% of the question and reads exactly like skill, which is why the first test in
-`tests/test_book_flow.py` plants a wild swing in minutes 13-14 and asserts a
-+12m decision is bit-identical without them.
+Point-in-time: a decision at offset `m` reads book minutes 0..m and nothing after.
 """
 from __future__ import annotations
 
@@ -44,7 +18,7 @@ BOOK_FLOW = (
     'imbalance_change_3',    # touch imbalance now minus three minutes ago
     'depth_trend_3',         # log ratio of total resting size over three minutes
     'spread_change_3',       # spread now minus three minutes ago, in cents
-    'imbalance_persistence',  # mean imbalance so far — standing pressure, not a blip
+    'imbalance_persistence',  # mean imbalance so far: standing pressure, not a blip
 )
 LOOKBACK = 3
 
@@ -58,11 +32,9 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
                        venue: str = 'kalshi',
                        lookback: int = LOOKBACK,
                        decision_latency_seconds: float = 3.0) -> pd.DataFrame:
-    """One row per window row, from the minutes at or before its decision.
+    """One row per window row, from the book minutes at or before its decision.
 
-    NaN, never zero, where the history is absent: zero says "the book did not
-    move", which is a claim, and the model is fitted with these missing on the
-    rows that have no history.
+    NaN, never zero, where history is absent: zero claims "the book did not move".
     """
     out = pd.DataFrame(index=windows.index)
     for col in BOOK_FLOW:
@@ -81,25 +53,10 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
                               book['yes_ask_size'].to_numpy())
     book['_total'] = book['yes_bid_size'] + book['yes_ask_size']
     book['_spread'] = (book['yes_ask'] - book['yes_bid']) * 100.0
-    # **A crossed or stale book is not a book, and the observer is chosen, not
-    # taken.** This path applied neither test, and its dedup sorted on
-    # `offset_minutes` -- part of the dedup key itself, so it imposed no order
-    # among duplicates and the winner was whatever the store returned last.
-    # Measured 2026-09-16 on 724,594 selected Kalshi rows: 26.0% carried quotes
-    # older than 30s (the tolerance `core/quotes.py` and
-    # `core/metrics.MAX_QUOTE_AGE_SECONDS` enforce everywhere else, and which
-    # this repo measured as where fake edge comes from), 37,036 were crossed
-    # books, and on 48,350 rows it read a DIFFERENT observer than
-    # `attach_quotes` put on the same row -- so `market_state` and `book_flow`
-    # described two different samples of the same book.
-    #
-    # Ranked the same way `attach_quotes` ranks: unusable last, then by source
-    # preference, then by age within a source. Unusable rows are dropped rather
-    # than merely demoted, because unlike a price a flow feature has no NaN
-    # column to fall back to -- it would silently average a crossed book into a
-    # trend.
-    # Decision-relative, so a recorder row seen after its minute's decision is
-    # dropped rather than counted as fresh.
+    # Drop crossed and stale books, then pick one observer per minute.
+    # The ranking matches `attach_quotes`: source preference, then age within a source.
+    # Unusable rows are dropped, not demoted: a flow feature has no NaN fallback.
+    # Age is decision-relative, so a row seen after its minute's decision is stale.
     from core.quotes import decision_age
     age = decision_age(book, 'fresh', decision_latency_seconds)
     bid, ask = book['yes_bid'], book['yes_ask']
@@ -131,7 +88,7 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
         g = keyed.get((sym, open_at))
         if g is None or not np.isfinite(off):
             continue
-        # AT OR BEFORE the decision. Never after — see the module docstring.
+        # At or before the decision, never after.
         past = g[g.index <= int(off)]
         if not len(past):
             continue
