@@ -8,7 +8,8 @@ replaces.
 **Never gated.** Every other recorder awaits `TradingGate.idle()` before a cycle
 because their work is a bursty Parquet write. A stream reader that pauses is a
 stream reader that goes stale, and staleness is precisely the failure the cache
-exists to prevent. Only the spool flush takes the gate.
+exists to prevent. Only the spool flush looks at the gate, and it skips rather
+than waits: awaiting the gate inside the read loop pauses the read loop.
 
 **Resubscribing is the repair for everything.** Kalshi's `seq` is contiguous per
 SUBSCRIPTION, so one missed frame makes every book on the socket suspect and
@@ -109,8 +110,8 @@ async def consume(stream, cache, spool, symbols, *, gate=None,
     """Fold frames until the subscription needs rebuilding.
 
     Returns the reason, so the caller logs why rather than reconnecting
-    silently. **Does not await the gate** around the read — see the module
-    docstring; only the flush is gated.
+    silently. **Never awaits the gate** — see the module docstring; a flush
+    that comes due while a decision is in flight is deferred, not waited for.
 
     **Every exit condition is enforced on a timeout, not on frame arrival.**
     The first version checked the refresh deadline inside the loop body, which
@@ -149,9 +150,11 @@ async def consume(stream, cache, spool, symbols, *, gate=None,
         cache.apply(event)
         spool.extend(event_rows(event, symbols.get(event.market_ticker, 'UNKNOWN')))
         now = time.monotonic()
-        if now >= next_flush:
-            if gate is not None:
-                await gate.idle()
+        # Defer the flush while a decision is in flight; never wait for it. The
+        # gate is held for a whole trading cycle, so awaiting it here stopped
+        # the fold for that long and the decision read a frozen book. Frames
+        # stay in the spool until the next frame after the gate reopens.
+        if now >= next_flush and (gate is None or gate.is_idle):
             heartbeat.touch('stream')
             await asyncio.to_thread(spool.flush)
             next_flush = now + flush_every

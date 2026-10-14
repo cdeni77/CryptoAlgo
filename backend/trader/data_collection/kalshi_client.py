@@ -59,6 +59,8 @@ from typing import Any, Iterable, Optional
 
 import aiohttp
 
+from core.costs import tick_at
+
 from .timeutil import naive_utc_to_epoch_seconds
 
 logger = logging.getLogger(__name__)
@@ -78,8 +80,10 @@ DEMO_BASE_URL = 'https://demo-api.kalshi.co/trade-api/v2'
 # and the failure mode is a 404 that names a route rather than a wrong number.
 HISTORICAL_BASE_URL = 'https://external-api.kalshi.com/trade-api/v2'
 
-# Kalshi quotes in whole cents, 1..99.
+# Kalshi quotes in whole cents, 1..99, through the middle of the range.
 CENT = 0.01
+# ...and in tenths of a cent below 10c and above 90c (`tapered_deci_cent`).
+DECI_CENT = 0.001
 
 # Sorts a row the venue gave no timestamp to, without dropping it. `None`
 # is not orderable against a datetime, and a ledger that raises on one
@@ -1126,15 +1130,24 @@ class KalshiClient:
         # is a guaranteed kill, which the old code did in the tails by using
         # banker's rounding on a deci-cent ladder.
         #
-        # The epsilon absorbs binary representation: 0.60 is 59.999...c in float.
+        # Round onto the venue's own tick, not a whole cent. Below 10c and above
+        # 90c the tick is a tenth of a cent, and ceiling to a cent there handed
+        # an immediate_or_cancel up to 0.9c of extra reach past the limit
+        # `order_limit_price` chose — levels the edge gate never admitted.
+        #
+        # Integer tenths of a cent, so the band edges (multiples of the coarse
+        # tick) stay exact. The epsilon absorbs binary representation: 0.60 is
+        # 599.999... tenths in float.
+        step = int(round(float(tick_at(yes_limit)) / DECI_CENT))
         if book_side == 'bid':
-            cents = int(math.ceil(yes_limit / CENT - 1e-9))
+            ticks = int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
         else:
-            cents = int(math.floor(yes_limit / CENT + 1e-9))
-        if not 1 <= cents <= 99:
+            ticks = int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step
+        price = ticks * DECI_CENT
+        if not CENT - 1e-9 <= price <= 1.0 - CENT + 1e-9:
             raise ValueError(
                 f'limit {limit_price} on the {side} side is a YES limit of '
-                f'{yes_limit:.4f} ({cents}c), outside 1c..99c'
+                f'{yes_limit:.4f} ({price:.4f}), outside 1c..99c'
             )
 
         body = {
@@ -1143,7 +1156,7 @@ class KalshiClient:
             # Decimal strings, not integers. `count` accepts up to 2 decimals and
             # `price` 2-4; a bare int for count is rejected.
             'count': f'{int(contracts)}.00',
-            'price': f'{cents / 100.0:.4f}',
+            'price': f'{price:.4f}',
             'time_in_force': time_in_force,
             # Required in V2. `taker_at_cross` crosses the spread, which is what a
             # immediate_or_cancel on a wasting 15-minute market is for; `maker`
@@ -1156,8 +1169,8 @@ class KalshiClient:
         }
         if client_order_id:
             body['client_order_id'] = client_order_id
-        logger.info('placing %s (%s) %d @ %dc YES on %s',
-                    side, book_side, contracts, cents, ticker)
+        logger.info('placing %s (%s) %d @ %.4f YES on %s',
+                    side, book_side, contracts, price, ticker)
         payload = await self._request('POST', '/portfolio/events/orders', body=body)
         # **The venue's own answer, in full.** The caller reads `status` and a
         # count off this reply and reports "did not fill" when neither is

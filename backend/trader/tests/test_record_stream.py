@@ -1,6 +1,6 @@
 """The stream component's contract with the rest of the live process.
 
-The gate assertion is the load-bearing one. Every other recorder waits on
+The gate assertions are the load-bearing ones. Every other recorder waits on
 `TradingGate.idle()`; this one must not, because a stream that pauses goes stale
 and staleness is the failure the book cache exists to prevent.
 """
@@ -39,21 +39,61 @@ def test_an_unknown_component_is_still_refused():
         run_live.Component.selected(run_live.NAMES, disable=['strem'])
 
 
-def test_the_stream_never_waits_on_the_trading_gate():
-    """Exactly one gate wait, and it sits inside the flush branch.
+@pytest.mark.asyncio
+async def test_the_stream_keeps_folding_while_a_decision_holds_the_gate():
+    """A held gate defers the flush; it never pauses the read loop.
 
-    Every other recorder gates its whole cycle. Gating the read loop here would
-    let frames queue in the socket while a decision runs, and the book would be
-    stale by exactly the amount the gate held — which is the failure the cache
-    exists to prevent.
+    The first version awaited the gate inside the loop. That passed a test
+    which only checked the wait sat in the flush branch, and still froze the
+    book for the length of every trading cycle, because the flush branch is
+    inside the loop.
     """
-    lines = inspect.getsource(record_stream.consume).splitlines()
-    waits = [i for i, line in enumerate(lines) if 'gate.idle()' in line]
-    assert len(waits) == 1, f'expected one gate wait, found {len(waits)}'
-    branch = [i for i, line in enumerate(lines) if 'next_flush' in line and 'if' in line]
-    assert branch and branch[0] < waits[0], 'the gate wait must be inside the flush branch'
-    following = '\n'.join(lines[waits[0]:waits[0] + 3])
-    assert 'flush' in following, 'the gate must guard the flush and nothing else'
+    gate = run_live.TradingGate()
+    cache = BookCache(now=lambda: 0.0)
+    flushes = []
+
+    class Spool(_NullSpool):
+        def flush(self):
+            flushes.append(cache.tickers())
+
+    async with gate.deciding():
+        reason = await asyncio.wait_for(
+            record_stream.consume(
+                _FakeStream([snap('A'), snap('B'), snap('C')],
+                            quiet_forever=False),
+                cache, Spool(), {}, gate=gate, flush_every=0.0,
+                until=time.monotonic() + 300.0, idle_timeout=300.0),
+            timeout=5.0)
+    assert reason == 'socket closed', reason
+    assert cache.tickers() == ['A', 'B', 'C'], 'every frame folded under the gate'
+    assert flushes == [], 'no flush while a decision is in flight'
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_flush_runs_once_the_gate_reopens():
+    gate = run_live.TradingGate()
+    flushed = []
+
+    class Spool(_NullSpool):
+        def flush(self):
+            flushed.append(True)
+
+    async def frames():
+        async with gate.deciding():
+            yield snap('A')
+        yield snap('B')
+
+    class Stream:
+        def events(self):
+            return frames()
+
+    await asyncio.wait_for(
+        record_stream.consume(
+            Stream(), BookCache(now=lambda: 0.0), Spool(), {}, gate=gate,
+            flush_every=0.0, until=time.monotonic() + 300.0,
+            idle_timeout=300.0),
+        timeout=5.0)
+    assert flushed == [True]
 
 
 def test_settled_markets_are_forgotten_rather_than_sampled_as_live():

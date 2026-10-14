@@ -105,6 +105,49 @@ def test_an_order_validates_its_own_arguments(key_pem):
                                            limit_price=bad_price))
 
 
+def _sent_price(key_pem, side, limit_price):
+    import asyncio
+
+    client = KalshiClient(key_id='k', private_key_pem=key_pem, live=True)
+    sent = {}
+
+    async def _request(method, path, *, body=None, **kw):
+        sent.update(body or {})
+        return {'order': {'status': 'executed'}}
+
+    client._request = _request
+    asyncio.run(client.place_order(ticker='X', side=side, contracts=1,
+                                   limit_price=limit_price))
+    return sent['side'], sent['price']
+
+
+@pytest.mark.parametrize('side, limit, expected', [
+    # Middle band: whole-cent tick, rounded toward a fill as before.
+    ('up', 0.6, ('bid', '0.6000')),
+    ('up', 0.603, ('bid', '0.6100')),
+    ('down', 0.397, ('ask', '0.6000')),       # YES 0.603, floored for an ask
+    # Tails: deci-cent tick, so the limit is not widened by up to 0.9c.
+    ('up', 0.0632, ('bid', '0.0640')),
+    ('up', 0.9213, ('bid', '0.9220')),
+    ('down', 0.0632, ('ask', '0.9360')),      # YES 0.9368 -> floor 0.936
+    ('down', 0.9213, ('ask', '0.0780')),      # YES 0.0787 -> floor 0.078
+    # Exactly on a deci-cent level stays put.
+    ('up', 0.064, ('bid', '0.0640')),
+    # Crossing a band edge lands on a level valid in the band it lands in.
+    ('up', 0.0995, ('bid', '0.1000')),
+    ('down', 0.8995, ('ask', '0.1000')),      # YES 0.1005 -> floor to 0.10
+])
+def test_a_limit_is_rounded_onto_the_venue_tick_toward_a_fill(
+        key_pem, side, limit, expected):
+    """`tapered_deci_cent`: a tenth of a cent below 10c and above 90c.
+
+    Ceiling to a whole cent there gave an immediate_or_cancel up to 0.9c more
+    reach than `order_limit_price` chose. Still rounded in the direction that
+    can fill: up for a bid, down for an ask.
+    """
+    assert _sent_price(key_pem, side, limit) == expected
+
+
 def test_a_quote_is_converted_to_probabilities_at_the_boundary():
     """Everything above this module reasons on the probability scale.
 

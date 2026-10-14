@@ -109,3 +109,32 @@ def test_without_an_override_the_artifact_still_wins():
     config = Config(compound=True)
     out = config_for_artifact(config, _artifact_with(compound=False), mode='live')
     assert out.compound is False
+
+
+def _artifact_with_groups(*groups):
+    return types.SimpleNamespace(init_score_source='market',
+                                 config_provenance={}, groups=tuple(groups))
+
+
+def test_an_artifact_that_reads_cross_venue_requires_the_peer_book():
+    """`--complete-cases` put the peer on every training row, and the deployed
+    command never passed `--require-peer-book`, so live traded rows with no peer
+    through NaN branches the model was never fitted on."""
+    out = config_for_artifact(
+        Config(), _artifact_with_groups('cross_venue', 'geometry'), mode='live')
+    assert out.require_peer_book is True
+
+
+def test_an_artifact_without_cross_venue_does_not_require_the_peer_book():
+    out = config_for_artifact(
+        Config(), _artifact_with_groups('geometry', 'vol_state'), mode='live')
+    assert out.require_peer_book is False
+
+
+def test_an_explicit_no_require_peer_book_beats_the_artifact():
+    from dataclasses import replace
+    config = replace(Config(require_peer_book=False),
+                     cli_overrides=frozenset({'require_peer_book'}))
+    out = config_for_artifact(
+        config, _artifact_with_groups('cross_venue'), mode='live')
+    assert out.require_peer_book is False

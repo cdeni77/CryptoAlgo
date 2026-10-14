@@ -804,6 +804,17 @@ def config_for_artifact(config, model, *, mode: str):
                     ', '.join(f'{k}={v}' for k, v in sorted(economics.items())))
         config = replace(config, **economics)
 
+    # An artifact that reads the cross-venue group refuses a row without the
+    # peer book. `--complete-cases` put the peer on every training row, so a
+    # missing one sends LightGBM down NaN branches it never fitted — and the
+    # flag that guards this was off in the deployed command. Explicit wins.
+    if ('cross_venue' in tuple(getattr(model, 'groups', ()) or ())
+            and 'require_peer_book' not in explicit
+            and not getattr(config, 'require_peer_book', False)):
+        logger.info('this artifact reads cross_venue, so a decision without '
+                    'the peer book is refused (--no-require-peer-book overrides)')
+        config = replace(config, require_peer_book=True)
+
     source = getattr(model, 'init_score_source', 'baseline')
     if source == getattr(config, 'init_score_source', 'baseline'):
         return config
@@ -2706,7 +2717,7 @@ def sent_yes_price(order: dict, decision, limit: float) -> float:
     """The YES price that actually went on the wire.
 
     The venue echoes it as `yes_price_dollars`, which beats recomputing: it is
-    what the venue read, after `place_order`'s rounding onto the cent grid. The
+    what the venue read, after `place_order`'s rounding onto the tick grid. The
     fallback reproduces that conversion — a DOWN order sends `1 - limit`.
     """
     raw = order.get('yes_price_dollars') if isinstance(order, dict) else None
