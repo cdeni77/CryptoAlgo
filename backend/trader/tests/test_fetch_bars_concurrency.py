@@ -11,7 +11,7 @@ import time
 import pytest
 
 from core.config import DEFAULT_CONFIG
-from scripts import live
+from livetrade import bars as live_bars
 
 
 class _Client:
@@ -35,7 +35,7 @@ class _Client:
 @pytest.fixture
 def patched(monkeypatch):
     def _install(client):
-        monkeypatch.setattr(live, 'CoinbaseRESTClient', lambda **kw: client)
+        monkeypatch.setattr(live_bars, 'CoinbaseRESTClient', lambda **kw: client)
         return client
     return _install
 
@@ -44,7 +44,7 @@ def patched(monkeypatch):
 async def test_the_symbols_are_fetched_concurrently(patched):
     client = patched(_Client(delay=0.15))
     started = time.perf_counter()
-    out = await live.fetch_bars(DEFAULT_CONFIG)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG)
     elapsed = time.perf_counter() - started
 
     n = len(DEFAULT_CONFIG.symbols)
@@ -58,7 +58,7 @@ async def test_one_symbol_failing_does_not_lose_the_others(patched):
     """A partial outage must not become a total one."""
     failed = DEFAULT_CONFIG.symbols[0]
     patched(_Client(delay=0.01, fail=[failed]))
-    out = await live.fetch_bars(DEFAULT_CONFIG)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG)
     assert failed not in out
     assert len(out) == len(DEFAULT_CONFIG.symbols) - 1
 
@@ -70,10 +70,10 @@ async def test_every_symbol_failing_returns_empty_rather_than_raising():
         async def get_candles_range(self, symbol, timeframe, start, end):
             raise RuntimeError('venue down')
 
-    import scripts.live as mod
+    import livetrade.bars as mod
     original = mod.CoinbaseRESTClient
     mod.CoinbaseRESTClient = lambda **kw: AllFail()
     try:
-        assert await live.fetch_bars(DEFAULT_CONFIG) == {}
+        assert await live_bars.fetch_bars(DEFAULT_CONFIG) == {}
     finally:
         mod.CoinbaseRESTClient = original

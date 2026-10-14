@@ -20,6 +20,7 @@ import pytest
 
 from core.config import DEFAULT_CONFIG
 from core.pg_writer import OrderTicket, Position, Prediction
+from livetrade import artifact as live_artifact
 from scripts import live
 from tests import test_decision_first as fx
 from tests.test_decision_first import Venue, make_quote, run
@@ -33,19 +34,19 @@ class TestModelVersion:
         assert versions == {'m1'}
 
     def test_the_version_is_the_promotion_ledgers(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(live, 'MODELS_ROOT', tmp_path)
+        monkeypatch.setattr(live_artifact, 'MODELS_ROOT', tmp_path)
         installed = tmp_path / 'forecast.joblib'
         installed.write_bytes(b'artifact-bytes')
         staged = tmp_path / '.staging' / '20261011T050000Z'
         staged.mkdir(parents=True)
         (staged / 'forecast.joblib').write_bytes(b'artifact-bytes')
-        assert live.artifact_version(installed) == '20261011T050000Z'
+        assert live_artifact.artifact_version(installed) == '20261011T050000Z'
         other = tmp_path / 'elsewhere.joblib'
         other.write_bytes(b'something else')
-        assert live.artifact_version(other).startswith('md5:')
+        assert live_artifact.artifact_version(other).startswith('md5:')
 
     def test_a_loaded_or_reloaded_artifact_is_stamped(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(live, 'MODELS_ROOT', tmp_path)
+        monkeypatch.setattr(live_artifact, 'MODELS_ROOT', tmp_path)
         (tmp_path / 'forecast.joblib').write_bytes(b'v2')
         staged = tmp_path / '.staging' / '20261018T050000Z'
         staged.mkdir(parents=True)
@@ -57,13 +58,13 @@ class TestModelVersion:
             def verify(self, config):
                 pass
 
-        monkeypatch.setattr(live, 'load_live', lambda config=None: M())
-        monkeypatch.setattr(live, 'config_for_artifact', lambda c, m, mode: c)
+        monkeypatch.setattr(live_artifact, 'load_live', lambda config=None: M())
+        monkeypatch.setattr(live_artifact, 'config_for_artifact', lambda c, m, mode: c)
         args = argparse.Namespace(model=None, mode='live', require_gates=False,
                                   force=False)
         # `_load_artifact` is what both startup's reload path and
         # `reload_if_changed` go through.
-        model, _ = live._load_artifact(args, DEFAULT_CONFIG)
+        model, _ = live_artifact._load_artifact(args, DEFAULT_CONFIG)
         assert model.version == '20261018T050000Z'
 
 

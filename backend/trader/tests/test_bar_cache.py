@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from core.config import DEFAULT_CONFIG
-from scripts import live
+from livetrade import bars as live_bars
 
 
 class _Bar:
@@ -44,21 +44,21 @@ class _Client:
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    live._BAR_CACHE.clear()
+    live_bars._BAR_CACHE.clear()
     yield
-    live._BAR_CACHE.clear()
+    live_bars._BAR_CACHE.clear()
 
 
 @pytest.fixture
 def client(monkeypatch):
     c = _Client()
-    monkeypatch.setattr(live, 'CoinbaseRESTClient', lambda **kw: c)
+    monkeypatch.setattr(live_bars, 'CoinbaseRESTClient', lambda **kw: c)
     return c
 
 
 @pytest.mark.asyncio
 async def test_the_first_cycle_fetches_the_whole_window(client):
-    out = await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     symbol = DEFAULT_CONFIG.symbols[0]
     _, start, end = next(s for s in client.spans if s[0] == symbol)
     assert (end - start) >= timedelta(minutes=99)
@@ -67,23 +67,23 @@ async def test_the_first_cycle_fetches_the_whole_window(client):
 
 @pytest.mark.asyncio
 async def test_the_second_cycle_asks_only_for_the_tail(client):
-    await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     client.spans.clear()
-    await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
 
     symbol = DEFAULT_CONFIG.symbols[0]
     _, start, end = next(s for s in client.spans if s[0] == symbol)
-    assert (end - start) <= timedelta(minutes=live.BAR_REFETCH_MINUTES + 2), (
+    assert (end - start) <= timedelta(minutes=live_bars.BAR_REFETCH_MINUTES + 2), (
         'the second cycle re-downloaded the whole window'
     )
 
 
 @pytest.mark.asyncio
 async def test_the_window_still_spans_the_full_period_after_an_incremental(client):
-    first = await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    first = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     symbol = DEFAULT_CONFIG.symbols[0]
     n_first = len(first[symbol])
-    second = await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    second = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     assert len(second[symbol]) >= n_first - 2, 'the window shrank'
     times = second[symbol]['event_time']
     assert times.is_monotonic_increasing and not times.duplicated().any()
@@ -94,23 +94,23 @@ async def test_a_refetched_minute_takes_the_newer_value(client):
     """The newest cached bar is the minute still forming; the later read is the
     finished one. Keeping the cached copy would freeze a partial candle into the
     window, and every log_rv_* feature is built off these closes."""
-    await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     symbol = DEFAULT_CONFIG.symbols[0]
-    stale_last = live._BAR_CACHE[symbol]['event_time'].iloc[-1]
+    stale_last = live_bars._BAR_CACHE[symbol]['event_time'].iloc[-1]
 
     client.close_price = 999.0
-    out = await live.fetch_bars(DEFAULT_CONFIG, minutes=100)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     row = out[symbol].loc[out[symbol]['event_time'] == stale_last]
     assert float(row['close'].iloc[0]) == 999.0, 'the partial candle was frozen in'
 
 
 @pytest.mark.asyncio
 async def test_a_cache_too_short_for_the_window_falls_back_to_a_full_fetch(client):
-    await live.fetch_bars(DEFAULT_CONFIG, minutes=50)
+    await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=50)
     client.spans.clear()
     # A wider window than the cache covers: an incremental tail would leave a
     # hole in the middle that no feature would notice.
-    await live.fetch_bars(DEFAULT_CONFIG, minutes=400)
+    await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=400)
     symbol = DEFAULT_CONFIG.symbols[0]
     _, start, end = next(s for s in client.spans if s[0] == symbol)
     assert (end - start) >= timedelta(minutes=399), 'left a hole in the window'
@@ -123,8 +123,8 @@ def test_merge_prefers_the_fresh_copy_and_trims_to_the_floor():
     fresh = pd.DataFrame({'event_time': [base + pd.Timedelta(minutes=1),
                                          base + pd.Timedelta(minutes=2)],
                           'close': [99.0, 3.0]})
-    merged = live._merge_bars(cached, fresh, floor=base)
+    merged = live_bars._merge_bars(cached, fresh, floor=base)
     assert list(merged['close']) == [1.0, 99.0, 3.0]
 
-    trimmed = live._merge_bars(cached, fresh, floor=base + pd.Timedelta(minutes=1))
+    trimmed = live_bars._merge_bars(cached, fresh, floor=base + pd.Timedelta(minutes=1))
     assert list(trimmed['close']) == [99.0, 3.0]

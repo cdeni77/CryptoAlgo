@@ -14,7 +14,7 @@ import pytest
 
 from core.config import DEFAULT_CONFIG
 from core.trade_bars import MINUTE, TradeTape, minute_of, parse_time
-from scripts import live
+from livetrade import bars as live_bars
 from scripts.record_spot_stream import SequenceTracker, handle
 
 A = 1_700_000_040          # a minute boundary
@@ -182,7 +182,7 @@ class TestStreamBars:
     def test_rest_then_stream_equals_the_rest_candles_it_replaces(self):
         now = minute_of(time.time()) + 1.0
         tape, rest, fetched_at, minutes = _scenario(now)
-        out = live.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
+        out = live_bars.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
                                now=now, floor=pd.Timestamp(0, unit='s', tz='UTC'))
         assert out is not None
         expected = pd.DataFrame([_rest_row(m, _trades_for(m, k))
@@ -199,7 +199,7 @@ class TestStreamBars:
         tape, rest, fetched_at, minutes = _scenario(now, fetched_ago=55.0)
         # The newest REST candle was read seconds after it closed and is short.
         rest.loc[rest.index[-1], 'volume'] -= 0.25
-        out = live.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
+        out = live_bars.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
                                now=now, floor=pd.Timestamp(0, unit='s', tz='UTC'))
         assert out is not None
         row = out[out['event_time'] == rest['event_time'].iloc[-1]].iloc[0]
@@ -210,7 +210,7 @@ class TestStreamBars:
         tape, rest, fetched_at, _ = _scenario(now)
         rest.loc[rest.index[2], 'high'] += 1.0
         with caplog.at_level('WARNING'):
-            assert live.stream_bars(
+            assert live_bars.stream_bars(
                 rest, tape, 'BTC-USD', fetched_at=fetched_at, now=now,
                 floor=pd.Timestamp(0, unit='s', tz='UTC')) is None
         assert 'disagrees with REST' in caplog.text
@@ -219,14 +219,14 @@ class TestStreamBars:
         now = minute_of(time.time()) + 1.0
         tape, rest, fetched_at, minutes = _scenario(now)
         tape.gap(since=minutes[-2] + 10, at=minutes[-2] + 11)
-        assert live.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
+        assert live_bars.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
                                 now=now,
                                 floor=pd.Timestamp(0, unit='s', tz='UTC')) is None
 
     def test_the_newest_minute_not_yet_final_refuses(self):
         now = minute_of(time.time()) + 0.2
         tape, rest, fetched_at, _ = _scenario(now)
-        assert live.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
+        assert live_bars.stream_bars(rest, tape, 'BTC-USD', fetched_at=fetched_at,
                                 now=now,
                                 floor=pd.Timestamp(0, unit='s', tz='UTC')) is None
 
@@ -252,11 +252,11 @@ class _Client:
 
 @pytest.fixture
 def _clean_caches():
-    live._BAR_CACHE.clear()
-    live._BAR_FETCHED_AT.clear()
+    live_bars._BAR_CACHE.clear()
+    live_bars._BAR_FETCHED_AT.clear()
     yield
-    live._BAR_CACHE.clear()
-    live._BAR_FETCHED_AT.clear()
+    live_bars._BAR_CACHE.clear()
+    live_bars._BAR_FETCHED_AT.clear()
 
 
 @pytest.mark.asyncio
@@ -270,13 +270,13 @@ async def test_a_covered_universe_needs_no_rest_call(monkeypatch, _clean_caches)
         for minute, acc in tape_i._minutes['BTC-USD'].items():
             tape._minutes.setdefault(symbol, {})[minute] = acc
         tape._coverage = tape_i._coverage
-        live._BAR_CACHE[symbol] = rest
-        live._BAR_FETCHED_AT[symbol] = fetched_at
+        live_bars._BAR_CACHE[symbol] = rest
+        live_bars._BAR_FETCHED_AT[symbol] = fetched_at
         frames[symbol] = rest
     client = _Client(frames)
-    monkeypatch.setattr(live, 'CoinbaseRESTClient', lambda **kw: client)
-    monkeypatch.setattr(live, '_spot_tape', lambda: tape)
-    out = await live.fetch_bars(DEFAULT_CONFIG, minutes=60, prefer_stream=True)
+    monkeypatch.setattr(live_bars, 'CoinbaseRESTClient', lambda **kw: client)
+    monkeypatch.setattr(live_bars, '_spot_tape', lambda: tape)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=60, prefer_stream=True)
     assert set(out) == set(DEFAULT_CONFIG.symbols)
     assert client.calls == [], 'the decision path still went to REST'
 
@@ -291,15 +291,15 @@ async def test_a_gap_falls_back_to_rest_for_that_symbol(monkeypatch, _clean_cach
         for minute, acc in tape_i._minutes['BTC-USD'].items():
             tape._minutes.setdefault(symbol, {})[minute] = acc
         tape._coverage = tape_i._coverage
-        live._BAR_CACHE[symbol] = rest
-        live._BAR_FETCHED_AT[symbol] = fetched_at
+        live_bars._BAR_CACHE[symbol] = rest
+        live_bars._BAR_FETCHED_AT[symbol] = fetched_at
         frames[symbol] = rest
     gapped = DEFAULT_CONFIG.symbols[1]
     tape._tainted[gapped] = {minutes[-1]}
     client = _Client(frames)
-    monkeypatch.setattr(live, 'CoinbaseRESTClient', lambda **kw: client)
-    monkeypatch.setattr(live, '_spot_tape', lambda: tape)
-    out = await live.fetch_bars(DEFAULT_CONFIG, minutes=60, prefer_stream=True)
+    monkeypatch.setattr(live_bars, 'CoinbaseRESTClient', lambda **kw: client)
+    monkeypatch.setattr(live_bars, '_spot_tape', lambda: tape)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=60, prefer_stream=True)
     assert set(out) == set(DEFAULT_CONFIG.symbols)
     assert client.calls == [gapped]
 
@@ -309,8 +309,8 @@ async def test_no_stream_means_rest_exactly_as_before(monkeypatch, _clean_caches
     now = time.time()
     frames = {s: _scenario(now)[1] for s in DEFAULT_CONFIG.symbols}
     client = _Client(frames)
-    monkeypatch.setattr(live, 'CoinbaseRESTClient', lambda **kw: client)
-    monkeypatch.setattr(live, '_spot_tape', lambda: None)
-    out = await live.fetch_bars(DEFAULT_CONFIG, minutes=60, prefer_stream=True)
+    monkeypatch.setattr(live_bars, 'CoinbaseRESTClient', lambda **kw: client)
+    monkeypatch.setattr(live_bars, '_spot_tape', lambda: None)
+    out = await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=60, prefer_stream=True)
     assert sorted(client.calls) == sorted(DEFAULT_CONFIG.symbols)
     assert set(out) == set(DEFAULT_CONFIG.symbols)

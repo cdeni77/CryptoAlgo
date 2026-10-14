@@ -20,6 +20,9 @@ import pytest
 from core.config import DEFAULT_CONFIG
 from core.pg_writer import OrderTicket, PgWriter
 from data_collection.kalshi_client import KalshiError, Quote
+from livetrade import artifact as live_artifact
+from livetrade import features as live_features
+from livetrade import state as live_state
 from scripts import live
 
 TICKERS = {'BTC-USD': 'KXBTC15M-T1', 'ETH-USD': 'KXETH15M-T1', 'SOL-USD': 'KXSOL15M-T1'}
@@ -120,9 +123,11 @@ def run(tmp_path, monkeypatch, venue, *, offset=12, reconciled=True,
     monkeypatch.setattr(live, 'fetch_bars', fake_bars)
     monkeypatch.setattr(live, 'fetch_quotes', fake_quotes)
     monkeypatch.setattr(live, 'score_live', fake_score)
-    monkeypatch.setattr(live, '_read_recent_fits', lambda: pd.DataFrame())
+    # Looked up where they live: `prewarm_fit_lookup`/`latest_fit` in
+    # livetrade.features, the reconcile clock in livetrade.state.
+    monkeypatch.setattr(live_features, '_read_recent_fits', lambda: pd.DataFrame())
     monkeypatch.setenv('RECORD_TOUCH', '1' if record_touch else '0')
-    monkeypatch.setattr(live, '_LAST_RECONCILED',
+    monkeypatch.setattr(live_state, '_LAST_RECONCILED',
                         time.monotonic() if reconciled else None)
     config = dataclasses.replace(
         DEFAULT_CONFIG, min_usable_bars=1, min_remaining_seconds=0,
@@ -443,8 +448,11 @@ class TestTheLoop:
             def summary(self):
                 return ''
 
-        monkeypatch.setattr(live, 'load_live', lambda config=None: M())
-        monkeypatch.setattr(live, 'config_for_artifact', lambda c, m, mode: c)
+        # `main` loads through scripts.live; a hot reload goes through
+        # livetrade.artifact._load_artifact, so both are patched.
+        for module in (live, live_artifact):
+            monkeypatch.setattr(module, 'load_live', lambda config=None: M())
+            monkeypatch.setattr(module, 'config_for_artifact', lambda c, m, mode: c)
         monkeypatch.setattr(live, 'PgWriter', lambda: writer)
         monkeypatch.setattr(live, 'seconds_until_next_decision', lambda *a, **k: 0.0)
         monkeypatch.setattr(live, 'run_cycle', cycle)
@@ -479,7 +487,7 @@ class TestHotReload:
         path.write_bytes(b'one')
         signature = live.artifact_signature(path)
         loads = []
-        monkeypatch.setattr(live, '_load_artifact',
+        monkeypatch.setattr(live_artifact, '_load_artifact',
                             lambda a, c: loads.append(1) or ('new', 'cfg'))
         out = asyncio.run(live.reload_if_changed(None, None, path, 'old', 'old_cfg',
                                                  signature))
@@ -504,7 +512,7 @@ class TestHotReload:
         def refuse(a, c):
             raise SystemExit('the newest attempt was blocked')
 
-        monkeypatch.setattr(live, '_load_artifact', refuse)
+        monkeypatch.setattr(live_artifact, '_load_artifact', refuse)
         with caplog.at_level('ERROR'):
             model, config, sig = asyncio.run(live.reload_if_changed(
                 None, None, path, 'old', 'old_cfg', signature))
@@ -514,7 +522,7 @@ class TestHotReload:
 
 
 def test_config_offsets_are_the_running_configs(monkeypatch):
-    monkeypatch.setattr(live, '_RUNNING_CONFIG', dataclasses.replace(
+    monkeypatch.setattr(live_state, '_RUNNING_CONFIG', dataclasses.replace(
         DEFAULT_CONFIG, decision_offsets=(4, 8, 12), entry_offsets=None))
     assert live.config_offsets() == (4, 8, 12)
     live.reset_gap_history()
