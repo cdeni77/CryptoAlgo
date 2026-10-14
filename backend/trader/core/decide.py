@@ -368,6 +368,10 @@ def decide(
         reason=Reason.NOT_FINITE,
         model_probability=float(get('model_probability')),
         baseline_probability=float(get('baseline_probability')),
+        # Set before any refusal: a refused row with a real book was being
+        # labelled 'baseline', which reads as "no quote" in the predictions table.
+        price_source=('quote' if _optional(get, 'ask_up') is not None
+                      and _optional(get, 'ask_down') is not None else 'baseline'),
     )
 
     def refuse(reason: Reason, **extra) -> Decision:
