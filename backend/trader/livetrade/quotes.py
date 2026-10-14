@@ -324,7 +324,8 @@ def quote_age_seconds(quote, decided_at) -> float:
 
 async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
                         config: Config, kalshi, *, decided_at=None) -> None:
-    """Write the venue's book — top of book plus cumulative depth — to the store.
+    """Write the venue's book — top of book plus cumulative depth — to the store,
+    with the peer book and implied-vol fit the same decision read.
 
     Best effort: a failure here must never stop a trading cycle, because this is
     measurement and the cycle is money.
@@ -409,10 +410,20 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                 # different sample at a different instant.
                 'source': 'live_touch',
             })
+        # The peer book and the implied-vol fit the same decision read, so
+        # the backtest can join the inputs live actually used.
+        from livetrade.features import decision_input_rows, mark_fits_written
+        peer_rows, fit_rows = decision_input_rows(
+            list(scored['symbol']), window_open, offset, decided_at=decided_at)
+        rows.extend(peer_rows)
+        store = ResearchStore()
         if rows:
             # Synchronous Parquet work: off the event loop, so the stream
             # readers sharing it keep folding frames meanwhile.
-            await asyncio.to_thread(ResearchStore().write, 'venue_depth',
-                                    pd.DataFrame(rows))
+            await asyncio.to_thread(store.write, 'venue_depth', pd.DataFrame(rows))
+        if fit_rows:
+            await asyncio.to_thread(store.write, 'venue_implied_vol',
+                                    pd.DataFrame(fit_rows))
+            mark_fits_written(fit_rows)
     except Exception as exc:                       # noqa: BLE001 - never break a cycle
         logger.warning('could not record top of book (%s)', str(exc)[:120])

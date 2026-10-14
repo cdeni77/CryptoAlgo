@@ -47,16 +47,20 @@ def _venue_caches() -> tuple[dict, dict]:
     # as training assumes. The REST recorder writes ~32s past the minute, and a
     # gap against a minute-stale peer correlates only 0.672 with the
     # contemporaneous one. `cross_venue_row` refuses a stale reading either way.
+    # Each entry is copied and tagged with its `transport`, which the
+    # recorded peer row carries.
     pm = {}
     try:
         from scripts.record_pm_stream import CACHE as pm_ws
-        pm = dict(pm_ws)
+        pm = {sym: dict(entry, transport='stream')
+              for sym, entry in dict(pm_ws).items()}
     except Exception:                                         # noqa: BLE001
         pm = {}
     if not pm:
         try:
             from scripts.record_pm_ladder import CACHE as pm_rest
-            pm = pm_rest
+            pm = {sym: dict(entry, transport='rest')
+                  for sym, entry in dict(pm_rest).items()}
         except Exception:                                     # noqa: BLE001
             pm = {}
     try:
@@ -349,7 +353,7 @@ def latest_fit(symbol: str, *, now, cache: dict, read=None):
     if live is not None:
         age = (now - pd.Timestamp(live['at'])).total_seconds() / 60.0
         if 0 <= age <= MAX_FIT_AGE_MINUTES:
-            return live
+            return dict(live, source='recorder')
 
     reader = read or _read_recent_fits
     stamp = _FIT_CACHE.get('at')
@@ -371,7 +375,7 @@ def latest_fit(symbol: str, *, now, cache: dict, read=None):
         return None
     return {'implied_sigma_per_min': float(row['implied_sigma_per_min']),
             'r2': float(row['r2']), 'n_strikes': float(row['n_strikes']),
-            'at': row['_at']}
+            'at': row['_at'], 'source': 'store'}
 
 
 async def prewarm_fit_lookup(*, horizon: float = 75.0) -> None:
@@ -513,23 +517,142 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None, *,
             row['depth_up'] = up
         if down is not None:
             row['depth_down'] = down
+        window_open = scored['window_open'].iloc[i]
+        offset = (int(scored['offset'].iloc[i]) if 'offset' in scored.columns
+                  else int(scored['offset_minutes'].iloc[i]))
+        peer = pm_cache.get(symbol)
+        fit = latest_fit(symbol, now=now, cache=iv_cache)
+        DECISION_INPUTS[symbol] = {
+            'window_open': window_open, 'offset': offset, 'peer': peer,
+            'refusal': peer_refusal(peer, now=now, window_open=window_open,
+                                    config=config),
+            'fit': fit}
         row.update(cross_venue_row(
-            pm_cache.get(symbol), entry[0], now=now,
-            window_open=scored['window_open'].iloc[i], config=config,
+            peer, entry[0], now=now, window_open=window_open, config=config,
             symbol=symbol))
         row.update(implied_vol_row(
-            latest_fit(symbol, now=now, cache=iv_cache), now=now,
+            fit, now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]
             if 'sigma_per_min' in scored.columns else np.nan))
         row['venue_gap_change_5'] = gap_change(
-            symbol, row.get('venue_prob_gap'),
-            window_open=scored['window_open'].iloc[i],
-            offset=int(scored['offset'].iloc[i])
-            if 'offset' in scored.columns
-            else int(scored['offset_minutes'].iloc[i]))
+            symbol, row.get('venue_prob_gap'), window_open=window_open,
+            offset=offset)
         for column in columns:
             if column in row:
                 scored.iloc[i, scored.columns.get_loc(column)] = row[column]
+
+
+# symbol -> what the last decision cycle read for it: the peer book (or its
+# absence), the refusal reason, and the implied-vol fit. `_record_touch` writes
+# them beside the Kalshi row.
+DECISION_INPUTS: dict = {}
+# symbol -> fit times this process has already written to `venue_implied_vol`.
+_FITS_WRITTEN: dict = {}
+_FITS_KEPT = 32
+
+
+def _cents_to_probability(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float('nan')
+    return value / 100.0 if np.isfinite(value) else float('nan')
+
+
+def peer_depth_row(symbol: str, inputs: dict, *, decided_at,
+                   written_at=None) -> dict:
+    """The `venue_depth` row for the peer book one decision used or refused.
+
+    `source='live_touch'`, so `core.quotes.decision_age` reads
+    `quote_age_seconds` backward from the decision instant. A used book is
+    'valid'. A refused one is kept for research but out of the default read:
+    'invalid' when it does not describe this window (no book, wrong window),
+    'suspicious' otherwise (too old, future stamp, one-sided, crossed).
+    """
+    pm = inputs.get('peer') or {}
+    refusal = inputs.get('refusal')
+    window_open = pd.Timestamp(inputs['window_open'])
+    offset = int(inputs['offset'])
+    bid = _cents_to_probability(pm.get('best_bid'))
+    ask = _cents_to_probability(pm.get('best_ask'))
+    at = pm.get('at')
+    age = (max(0.0, (pd.Timestamp(decided_at) - pd.Timestamp(at)).total_seconds())
+           if at is not None and decided_at is not None else float('nan'))
+    if refusal in ('no_book', 'wrong_window'):
+        quality = 'invalid'
+    elif (refusal is not None
+          or not (0.0 <= bid <= 1.0 and 0.0 <= ask <= 1.0 and ask >= bid)):
+        quality = 'suspicious'
+    else:
+        quality = 'valid'
+    return {
+        'venue': 'polymarket', 'symbol': symbol,
+        'event_time': window_open + pd.Timedelta(minutes=offset),
+        'available_time': (pd.Timestamp.now(tz='UTC') if written_at is None
+                           else pd.Timestamp(written_at)),
+        'quality': quality, 'market_ticker': pm.get('slug'),
+        'window_open': window_open, 'offset_minutes': offset,
+        'yes_bid': bid, 'yes_ask': ask,
+        'yes_bid_size': float('nan'), 'yes_ask_size': float('nan'),
+        'depth_bid_1c': float('nan'), 'depth_bid_5c': float('nan'),
+        'depth_ask_1c': float('nan'), 'depth_ask_5c': float('nan'),
+        'depth_bid_total': float('nan'), 'depth_ask_total': float('nan'),
+        'levels_bid': float('nan'), 'levels_ask': float('nan'),
+        'seq': float('nan'), 'gaps': 0.0, 'source': 'live_touch',
+        'quote_age_seconds': age, 'transport': pm.get('transport'),
+    }
+
+
+def fit_row(symbol: str, fit: Optional[dict]) -> Optional[dict]:
+    """The `venue_implied_vol` row for the fit one decision used, or None.
+
+    None when there is no fit, when it came from the store (already there), or
+    when this process wrote it already. `event_time` and `available_time` are
+    both the fit's capture time: the point-in-time join then accepts it for
+    any decision after the capture, and `iv_staleness_minutes` in the backtest
+    measures the same age live used.
+    """
+    if not fit or fit.get('source') == 'store' or fit.get('at') is None:
+        return None
+    at = pd.Timestamp(fit['at'])
+    if at in _FITS_WRITTEN.get(symbol, ()):
+        return None
+    return {
+        'venue': 'kalshi', 'symbol': symbol, 'event_time': at,
+        'available_time': at, 'quality': 'valid',
+        'event_ticker': fit.get('event_ticker'),
+        'close_time': fit.get('close_time'),
+        'minutes_to_close': float(fit.get('minutes_to_close', np.nan)),
+        'implied_sigma_per_min': float(fit.get('implied_sigma_per_min', np.nan)),
+        'implied_spot': float(fit.get('implied_spot', np.nan)),
+        'atm_strike': float(fit.get('atm_strike', np.nan)),
+        'n_strikes': float(fit.get('n_strikes', np.nan)),
+        'r2': float(fit.get('r2', np.nan)),
+    }
+
+
+def mark_fits_written(rows) -> None:
+    """Remember written fits, so a fit used by several decisions is written once."""
+    for row in rows:
+        seen = _FITS_WRITTEN.setdefault(row['symbol'], [])
+        seen.append(pd.Timestamp(row['event_time']))
+        del seen[:-_FITS_KEPT]
+
+
+def decision_input_rows(symbols, window_open, offset, *, decided_at):
+    """(peer depth rows, fit rows) for the decision at (window_open, offset)."""
+    depth, fits = [], []
+    for symbol in symbols:
+        inputs = DECISION_INPUTS.get(symbol)
+        if (not inputs or inputs.get('window_open') is None
+                or pd.Timestamp(inputs['window_open']) != pd.Timestamp(window_open)
+                or int(inputs['offset']) != int(offset)):
+            continue
+        depth.append(peer_depth_row(symbol, inputs, decided_at=decided_at))
+        row = fit_row(symbol, inputs.get('fit'))
+        if row is not None:
+            fits.append(row)
+    return depth, fits
 
 
 # Features that are legitimately absent at a known offset, with the reason. A

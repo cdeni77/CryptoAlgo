@@ -196,14 +196,20 @@ def attach_implied_vol(table: pd.DataFrame, fits: pd.DataFrame, *,
         'implied_sigma_per_min': _column(fits, 'implied_sigma_per_min'),
         'iv_r2': _column(fits, 'r2'),
         'iv_n_strikes': _column(fits, 'n_strikes'),
+        '_close': _column(fits, 'minutes_to_close'),
     }).dropna(subset=['_at'])
     # Carried through the join so staleness is the gap to the fit ACTUALLY used;
     # merge_asof consumes the right key, so without this there is nothing to
     # measure the age against.
     right['_fit_at'] = right['_at']
+    # Among fits seen at the same instant, the nearest close is the one live
+    # uses (`record_implied_vol.fits_for`). merge_asof takes the LAST match, so
+    # it sorts last.
+    right = right.sort_values(['_at', '_close'], ascending=[True, False],
+                              na_position='first', kind='mergesort')
 
     merged = pd.merge_asof(
-        left.sort_values('_at'), right.sort_values('_at'),
+        left.sort_values('_at'), right.drop(columns=['_close']),
         on='_at', by='symbol', direction='backward',
     ).sort_values('_order')
 

@@ -271,10 +271,15 @@ def fits_for(markets, *, now, symbol: str, min_minutes: float,
                  else pd.Timestamp(now))
         # Freshest wins: several events are fitted per cycle and the nearest
         # close is the most informative about the fifteen minutes being traded.
-        if latest is None or minutes < latest['_minutes']:
+        if latest is None or minutes < latest['minutes_to_close']:
             latest = {'implied_sigma_per_min': float(fit.sigma_per_min),
                       'r2': float(fit.r2), 'n_strikes': float(fit.n_strikes),
-                      'at': stamp, '_minutes': minutes}
+                      'at': stamp, 'minutes_to_close': round(minutes, 3),
+                      # The rest of the stored row, so live can record the
+                      # exact fit a decision used.
+                      'event_ticker': event, 'close_time': close,
+                      'implied_spot': float(fit.implied_spot),
+                      'atm_strike': float(fit.atm_strike)}
         rows.append({
             'venue': 'kalshi', 'symbol': symbol,
             'event_time': pd.Timestamp(now).floor('min'),
@@ -287,8 +292,6 @@ def fits_for(markets, *, now, symbol: str, min_minutes: float,
             'atm_strike': fit.atm_strike,
             'n_strikes': float(fit.n_strikes), 'r2': fit.r2,
         })
-    if latest is not None:
-        latest.pop('_minutes', None)
     return rows, latest
 
 
