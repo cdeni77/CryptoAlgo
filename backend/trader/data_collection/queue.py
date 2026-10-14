@@ -403,28 +403,6 @@ class RedisQueue(MessageQueueBase):
         logger.info("Redis connection closed")
 
 
-def create_queue(
-    queue_type: str = "memory",
-    **kwargs
-) -> MessageQueueBase:
-    """
-    Factory function to create appropriate queue implementation.
-    
-    Args:
-        queue_type: "memory" or "redis"
-        **kwargs: Additional arguments for the queue implementation
-    
-    Returns:
-        MessageQueueBase instance
-    """
-    if queue_type == "memory":
-        return InMemoryQueue(**kwargs)
-    elif queue_type == "redis":
-        return RedisQueue(**kwargs)
-    else:
-        raise ValueError(f"Unknown queue type: {queue_type}")
-
-
 # Channel names for the data pipeline
 class Channels:
     """Standard channel names for the data pipeline."""
@@ -434,27 +412,13 @@ class Channels:
     RAW_TRADES = "raw:trades"
     RAW_TICKER = "raw:ticker"
     RAW_ORDERBOOK = "raw:orderbook"
-    RAW_FUNDING = "raw:funding"
-    RAW_OPEN_INTEREST = "raw:oi"
     
     # Validated data channels (after validation)
     VALIDATED_OHLCV = "validated:ohlcv"
     VALIDATED_TRADES = "validated:trades"
     VALIDATED_TICKER = "validated:ticker"
     VALIDATED_ORDERBOOK = "validated:orderbook"
-    VALIDATED_FUNDING = "validated:funding"
-    VALIDATED_OPEN_INTEREST = "validated:oi"
     
     # Error/alert channels
     VALIDATION_ERRORS = "alerts:validation"
     CONNECTION_ERRORS = "alerts:connection"
-    
-    @classmethod
-    def raw_for_type(cls, data_type: str) -> str:
-        """Get raw channel for data type."""
-        return f"raw:{data_type}"
-    
-    @classmethod
-    def validated_for_type(cls, data_type: str) -> str:
-        """Get validated channel for data type."""
-        return f"validated:{data_type}"

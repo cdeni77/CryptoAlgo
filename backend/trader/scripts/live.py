@@ -76,7 +76,7 @@ from core.config import (                                          # noqa: F401
 )
 from core.dataset import score_live
 from core.decide import (
-    Decision, Reason, WindowExposure, rejection_histogram,
+    Decision, Reason, WindowExposure, decide, rejection_histogram,
 )
 from core.dataset import DatasetError
 from core.pg_writer import AccountModeMismatch, PgWriter, TraderAlreadyRunning
@@ -99,8 +99,8 @@ from livetrade.bars import (                                        # noqa: F401
 )
 from livetrade.execution import (                                   # noqa: F401
     OrderResult, act_on, client_order_id_for, diagnose_and_note, diagnose_kill,
-    entry_decision, execute_entry, filled_from_order, kill_diagnosis,
-    lookup_after_ambiguity, maker_prices, order_limit_price, place_and_book,
+    execute_entry, filled_from_order, kill_diagnosis,
+    lookup_after_ambiguity, order_limit_price, place_and_book,
     sent_yes_price,
 )
 from livetrade.features import (                                    # noqa: F401
@@ -271,10 +271,6 @@ def build_parser() -> argparse.ArgumentParser:
                              'alphabetically — without narrowing `symbols`, which '
                              'would also narrow the bar fetch and NaN out every '
                              'cross_asset feature.')
-    parser.add_argument('--entry-style', choices=['taker', 'maker'], default=None,
-                        help='taker (default): cross with immediate_or_cancel. '
-                             'maker: post a non-crossing post-only limit, rest it '
-                             'for maker_rest_seconds, then cancel. Unmeasured.')
     parser.add_argument('--model', type=str, default=None,
                         help=f'Artifact path (default {MODELS_ROOT}/{LIVE_MODEL})')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -781,7 +777,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     exposure = base_exposure
     decisions: list[Decision] = []
     rows: dict[str, object] = {}
-    pending: list[tuple[Decision, object, bool]] = []
+    pending: list[tuple[Decision, object]] = []
 
     # Live prices from the book or not at all: without a quote `decide()` would
     # fall back to our own baseline and could return TRADED.
@@ -795,8 +791,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                 row['symbol'], remaining, config.min_remaining_seconds, settle_time)
             break
         quote = quotes.get(row['symbol'], (None, None))[0]
-        decision, maker = entry_decision(
-            row, config, quote=quote, bankroll=bankroll, exposure=exposure,
+        decision = decide(
+            row, config, bankroll=bankroll, exposure=exposure,
             require_quote=require_quote, halted=bool(halted))
         decisions.append(decision)
         rows[decision.symbol] = row
@@ -804,7 +800,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         if decision.traded:
             # Reserved before the order goes out: every order is in flight at
             # once, so no later decision may assume an earlier one failed.
-            pending.append((decision, row, maker))
+            pending.append((decision, row))
             exposure = exposure.with_(decision)
 
     # The instant the decisions were taken: what every quote's age is
@@ -843,9 +839,9 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # written first (in a thread, all in parallel) so its ticket and position
     # carry the id of the prediction that produced them.
     async def _one(index: int):
-        decision, row, maker = pending[index]
+        decision, row = pending[index]
         others = base_exposure
-        for j, (other, _, _) in enumerate(pending):
+        for j, (other, _) in enumerate(pending):
             if j != index:
                 others = others.with_(other)
         try:
@@ -858,7 +854,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         return await execute_entry(
             args, writer, kalshi, decision, row, config=config,
             quote=quotes.get(decision.symbol, (None, None))[0],
-            quote_time=quote_times.get(decision.symbol, read_at), maker=maker,
+            quote_time=quote_times.get(decision.symbol, read_at),
             others=others, bankroll=bankroll, halted=bool(halted),
             require_quote=require_quote, prediction_id=prediction_id)
 
@@ -868,7 +864,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         _phase('orders')
     finals: dict[str, Decision] = {}
     kills: list[tuple[Decision, OrderResult, bool]] = []
-    for (decision, _, _), outcome in zip(pending, outcomes):
+    for (decision, _), outcome in zip(pending, outcomes):
         if isinstance(outcome, BaseException):
             logger.error('%s: the order path raised (%s); see the traceback',
                          decision.symbol, outcome, exc_info=outcome)
@@ -984,9 +980,6 @@ def config_from_args(args) -> Config:
     compound = getattr(args, 'compound', None)
     if compound is not None:
         overrides['compound'] = bool(compound)
-    style = getattr(args, 'entry_style', None)
-    if style is not None:
-        overrides['entry_style'] = str(style)
     return config.with_overrides(**overrides) if overrides else config
 
 

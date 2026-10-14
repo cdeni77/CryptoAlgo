@@ -227,29 +227,9 @@ def test_the_balance_series_rides_along_for_the_live_end_of_the_chart(client):
     assert body['points'] == []
 
 
-def test_a_no_fill_is_served_at_what_it_cost_and_not_at_the_yes_price(client):
-    """0.30 for a 30c NO, not the 0.70 the venue's single YES book quotes."""
-    from models.serving import VenueFill
-
-    _clear()
-    with _session() as db:
-        db.add(VenueFill(trade_id='f1', order_id='o1', ticker='KXBTC15M-A',
-                         side='down', action='buy', contracts=5.0, price=0.30,
-                         is_taker=True,
-                         created_time=datetime.now(timezone.utc)))
-        db.commit()
-
-    row = client.get('/venue/fills').json()['fills'][0]
-    assert row['side'] == 'down'
-    assert row['price'] == 0.30
-    assert row['cost'] == 1.5
-
-
 def test_the_venue_routes_validate_their_arguments(client):
     assert client.get('/account/venue/equity?days=0').status_code == 422
     assert client.get('/account/venue/equity?days=400').status_code == 422
     assert client.get('/venue/settlements?limit=0').status_code == 422
-    assert client.get('/venue/fills?limit=5000').status_code == 422
     # `days` is optional on the table routes: the whole ledger is the default.
     assert client.get('/venue/settlements').status_code == 200
-    assert client.get('/venue/fills').status_code == 200

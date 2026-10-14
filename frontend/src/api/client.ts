@@ -6,13 +6,9 @@
  * threw `API error 404` with the body discarded, two included it. So a failing
  * request told you different things depending on which screen you were on.
  *
- * It also centralises the API token. `POST /research/launch` is authenticated and
- * fails closed, so a mutating call without the header gets a 401 that needs to
- * read as "set VITE_API_TOKEN", not as a generic failure.
  */
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
-const API_TOKEN = import.meta.env.VITE_API_TOKEN || '';
 
 /** Milliseconds before a request is abandoned. A hung fetch never resolves,
  *  which leaves a polling screen stuck on its last value with no indication. */
@@ -27,21 +23,10 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
   }
-
-  /** True when the problem is a missing or wrong API token rather than the request. */
-  get isAuthProblem(): boolean {
-    return this.status === 401 || this.status === 503;
-  }
 }
 
 function describe(status: number, body: string, url: string): string {
   const detail = extractDetail(body);
-  if (status === 401) {
-    return detail || 'Not authorised. Set VITE_API_TOKEN to the API_TOKEN the backend was started with.';
-  }
-  if (status === 503) {
-    return detail || 'This action is disabled until API_TOKEN is set on the backend.';
-  }
   if (status === 404) {
     return detail || `Not found: ${url}`;
   }
@@ -76,7 +61,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (init?.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  if (API_TOKEN) headers.set('X-API-Token', API_TOKEN);
 
   try {
     const response = await fetch(url, { ...init, headers, signal: controller.signal });
@@ -112,17 +96,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 // redirect resolve.
 export function get<T>(path: string): Promise<T> {
   return request<T>(path);
-}
-
-export function post<T>(path: string, body?: unknown): Promise<T> {
-  return request<T>(path, {
-    method: 'POST',
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-}
-
-export function hasApiToken(): boolean {
-  return Boolean(API_TOKEN);
 }
 
 export { API_BASE };

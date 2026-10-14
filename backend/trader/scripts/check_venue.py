@@ -209,8 +209,9 @@ async def main() -> int:
                         'simply nobody quoting it right now. A spread cannot be '
                         'crossed that does not exist, so the live loop abstains.')
                     note('This is the assumption most likely to sink the whole '
-                         'idea, and it is measurable: '
-                         '`python -m scripts.measure_book --hours 24`')
+                         'idea, and it is measured: the ladder recorders write '
+                         'every book to `venue_ladder`, and '
+                         '`python -m scripts.build_depth` summarises it')
                     failures += 1
                     continue
                 spread_cents = (quote.spread or 0) * 100

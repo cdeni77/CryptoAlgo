@@ -134,7 +134,6 @@ class Dataset:
             windows = attach_quotes(
                 windows, depth,
                 max_age_seconds=float(config.max_quote_age_seconds),
-                peer_lag_minutes=getattr(config, 'peer_lag_minutes', 0),
                 sources=tuple(getattr(config, 'quote_sources', ()) or ()),
                 null_age=getattr(config, 'null_quote_age', 'fresh'),
                 decision_latency_seconds=float(

@@ -24,8 +24,6 @@ been published yet. Funding and OI in particular are revised.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 from datetime import datetime
@@ -242,10 +240,6 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         # in the schema could tell that from the stream ladder the decision
         # actually scored. Null on every row written before 2026-09-16.
         'transport',
-    ),
-    'book_snapshots': (
-        'venue', 'symbol', 'event_time', 'available_time', 'quality',
-        'bid', 'ask', 'bid_size', 'ask_size', 'depth_1pct_bid', 'depth_1pct_ask',
     ),
     # Every Coinbase trade the spot stream saw, written by `core/spool` like
     # `venue_book_events` (never through `write()`). `event_time` is the print,
@@ -670,61 +664,11 @@ class ResearchStore:
         return (out[cols].sort_values(['venue', 'symbol'])
                 .reset_index(drop=True))
 
-    # -- feature matrices ---------------------------------------------------
-
-    def write_features(
-        self,
-        frame: pd.DataFrame,
-        *,
-        name: str,
-        meta: Optional[dict[str, Any]] = None,
-    ) -> tuple[Path, str]:
-        """Materialise a feature matrix alongside a content hash.
-
-        The hash covers the column names and the values, so a model artifact can
-        record exactly which feature matrix it trained on. When a feature
-        definition changes, the hash changes, and a stale model is detectable
-        instead of quietly scoring against different inputs.
-        """
-        directory = self.root / 'features' / name
-        directory.mkdir(parents=True, exist_ok=True)
-
-        digest = feature_hash(frame)
-        path = directory / f"{digest}.parquet"
-        if not path.exists():
-            tmp = path.with_suffix('.parquet.tmp')
-            frame.to_parquet(tmp, compression='zstd')
-            os.replace(tmp, path)
-
-        payload = {
-            'name': name,
-            'hash': digest,
-            'rows': int(len(frame)),
-            'columns': list(map(str, frame.columns)),
-            **(meta or {}),
-        }
-        (directory / f"{digest}.json").write_text(json.dumps(payload, indent=2, default=str))
-        return path, digest
-
-    def read_features(self, name: str, digest: str) -> pd.DataFrame:
-        path = self.root / 'features' / name / f"{digest}.parquet"
-        if not path.exists():
-            raise DataStoreError(f"No feature matrix {name}/{digest}")
-        return pd.read_parquet(path)
-
     def drop(self, dataset: str) -> None:
         """Remove a dataset entirely. Used by tests and rebuilds."""
         target = self.root / dataset
         if target.exists():
             shutil.rmtree(target)
-
-
-def feature_hash(frame: pd.DataFrame) -> str:
-    """Stable content hash of a feature matrix (columns + values)."""
-    hasher = hashlib.sha256()
-    hasher.update(json.dumps(list(map(str, frame.columns))).encode())
-    hasher.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
-    return hasher.hexdigest()[:16]
 
 
 # Which research dataset a scraped timeframe belongs in. The 15-minute binary
@@ -739,7 +683,6 @@ def from_sqlite(
     venue: str,
     timeframe: str = '1m',
     symbols: Optional[Iterable[str]] = None,
-    include_archive: bool = True,
 ) -> dict[str, int]:
     """Migrate the scraper's SQLite tables into the research store.
 
@@ -754,13 +697,7 @@ def from_sqlite(
     import sqlite3
 
     def venue_expression(table: str, fallbacks: tuple[str, ...]) -> str:
-        """`venue` where the table has it, else the best legacy proxy.
-
-        Funding and open interest gained a venue column late. Before that,
-        funding's origin was inferred from `funding_source` and open interest's
-        from `source` — which held the *client library* ('ccxt'), not an exchange.
-        Older databases still read from those, so the fallback chain stays.
-        """
+        """`venue` where the table has it, else 'unknown'."""
         cursor = con.execute(f'PRAGMA table_info({table})')
         present = {row[1] for row in cursor.fetchall()}
         candidates = [c for c in ('venue', *fallbacks) if c in present]
@@ -794,74 +731,6 @@ def from_sqlite(
             bars = bars.drop(columns=['row_venue'])
             dataset = BARS_DATASET_BY_TIMEFRAME.get(timeframe, 'bars')
             counts[dataset] = store.write(dataset, bars)
-
-        # Funding and open interest are archive: nothing in the binary system
-        # reads them, and no endpoint serves either historically, so they cannot
-        # be re-fetched at any price. They are migrated anyway, because the
-        # SQLite database is the only other copy and deleting it after a sync
-        # that skipped them would destroy the only irreplaceable data here.
-        def has_table(name: str) -> bool:
-            row = con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-            ).fetchone()
-            return row is not None
-
-        if not include_archive:
-            return counts
-
-        funding = pd.read_sql_query(
-            "SELECT symbol, event_time, available_time, quality, rate, mark_price, "
-            "index_price, is_settlement, "
-            + venue_expression('funding_rates', ('funding_source',))
-            + " FROM funding_rates",
-            con,
-        ) if has_table('funding_rates') else pd.DataFrame()
-        if not funding.empty:
-            funding['venue'] = funding['row_venue'].where(
-                funding['row_venue'] != 'unknown', venue
-            )
-            funding = funding.drop(columns=['row_venue'])
-            funding['interval_hours'] = 1
-            # **Skipped rather than fatal when the store has no schema for it.**
-            # `store.write` raises `DataStoreError: Unknown dataset` and
-            # `sync_store` reaches this by default, so any database with a
-            # non-empty `funding` table killed the migration AFTER writing
-            # the bars and BEFORE printing counts or coverage -- making the
-            # documented promise (migrate these because SQLite is the only
-            # other copy) unkeepable, and looking like a crash rather than
-            # an unsupported dataset.
-            if 'funding' in SCHEMAS:
-                counts['funding'] = store.write('funding', funding)
-            else:
-                logger.warning('the store has no %s schema, so %d row(s) in '
-                               'the SQLite archive were NOT migrated',
-                               'funding', len(funding))
-
-        oi = pd.read_sql_query(
-            "SELECT symbol, event_time, available_time, quality, "
-            "open_interest_contracts AS oi_contracts, open_interest_base AS oi_base, "
-            "open_interest_usd AS oi_usd, "
-            + venue_expression('open_interest', ('source',))
-            + " FROM open_interest",
-            con,
-        ) if has_table('open_interest') else pd.DataFrame()
-        if not oi.empty:
-            oi['venue'] = oi['row_venue'].where(oi['row_venue'] != 'unknown', venue)
-            oi = oi.drop(columns=['row_venue'])
-            # **Skipped rather than fatal when the store has no schema for it.**
-            # `store.write` raises `DataStoreError: Unknown dataset` and
-            # `sync_store` reaches this by default, so any database with a
-            # non-empty `open_interest` table killed the migration AFTER writing
-            # the bars and BEFORE printing counts or coverage -- making the
-            # documented promise (migrate these because SQLite is the only
-            # other copy) unkeepable, and looking like a crash rather than
-            # an unsupported dataset.
-            if 'open_interest' in SCHEMAS:
-                counts['open_interest'] = store.write('open_interest', oi)
-            else:
-                logger.warning('the store has no %s schema, so %d row(s) in '
-                               'the SQLite archive were NOT migrated',
-                               'open_interest', len(oi))
     finally:
         con.close()
 

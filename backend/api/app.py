@@ -1,4 +1,3 @@
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,8 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from database import engine
-from security import TOKEN_ENV, allowed_origins, token_configured
-from endpoints.jobs import router as jobs_router
+from security import allowed_origins
 from endpoints.serving import router as serving_router
 from models.base import Base
 
@@ -117,25 +115,16 @@ app = FastAPI(
 
 # Origins come from CORS_ALLOW_ORIGINS, and `*` is filtered out. The previous
 # list ended with "*", which made every other entry decorative: the API accepted
-# credentialed requests from any page the browser had open, including the one
-# endpoint that starts a process.
+# credentialed requests from any page the browser had open.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins(),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Token"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
-if not token_configured():
-    logging.getLogger("api").warning(
-        "%s is not set: POST /jobs/{job} is disabled and returns 503. Set it to "
-        "enable launching research scripts from the dashboard.",
-        TOKEN_ENV,
-    )
-
 app.include_router(serving_router)
-app.include_router(jobs_router)
 
 
 @app.get("/")
@@ -145,5 +134,5 @@ def root():
         "what": "15-minute binary barrier system telemetry",
         "routes": ["/live", "/account", "/account/equity", "/predictions",
                    "/funnel", "/positions", "/model", "/model/history",
-                   "/model/calibration", "/jobs"],
+                   "/model/calibration"],
     }

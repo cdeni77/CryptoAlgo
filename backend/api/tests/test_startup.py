@@ -66,7 +66,6 @@ def test_importing_the_app_does_not_connect(tmp_path, monkeypatch, fresh_app):
     opens a connection. It fails the moment `create_all()` or a migration moves
     back to module scope.
     """
-    monkeypatch.setenv('API_TOKEN', 'x')
     module = fresh_app('postgresql://nobody:nothing@127.0.0.1:1/absent')
     assert module.app is not None
 
@@ -78,7 +77,6 @@ def test_importing_the_app_does_not_connect(tmp_path, monkeypatch, fresh_app):
 
 
 def test_startup_creates_the_tables(tmp_path, monkeypatch, fresh_app):
-    monkeypatch.setenv('API_TOKEN', 'x')
     database = tmp_path / 'startup.db'
     module = fresh_app(f'sqlite:///{database}')
 
@@ -99,7 +97,6 @@ def test_startup_creates_the_tables(tmp_path, monkeypatch, fresh_app):
 
 def test_bootstrap_is_idempotent(tmp_path, monkeypatch, fresh_app):
     """Every worker runs it. Running it twice must be a no-op, not an error."""
-    monkeypatch.setenv('API_TOKEN', 'x')
     database = tmp_path / 'twice.db'
     module = fresh_app(f'sqlite:///{database}')
 

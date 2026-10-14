@@ -17,7 +17,7 @@ import pytest
 
 from data_collection.kalshi_client import (
     CENT, DEFAULT_BASE_URL, DEMO_BASE_URL, KalshiClient, KalshiError, NotLiveError,
-    Quote, _cents, _parse_time, _to_quote,
+    Quote, _parse_time, _price, _to_quote,
 )
 
 
@@ -226,10 +226,11 @@ def test_a_settled_market_is_not_tradeable():
 
 
 def test_a_zero_price_reads_as_absent_not_as_free():
-    assert _cents(0) is None
-    assert _cents(None) is None
-    assert _cents('nonsense') is None
-    assert _cents(45) == pytest.approx(0.45)
+    """The legacy integer-cent encoding, through the parser quotes use."""
+    assert _price({'yes_bid': 0}, 'yes_bid') is None
+    assert _price({'yes_bid': None}, 'yes_bid') is None
+    assert _price({'yes_bid': 'nonsense'}, 'yes_bid') is None
+    assert _price({'yes_bid': 45}, 'yes_bid') == pytest.approx(0.45)
 
 
 def test_times_parse_to_utc():
@@ -322,32 +323,6 @@ def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
         'the auth branch is checked first, so a network block is reported as an '
         'auth failure'
     )
-
-
-def test_the_preflight_is_launchable_from_the_dashboard():
-    """It is read-only, so the job allow-list should include it."""
-    import sys
-    from pathlib import Path
-
-    api_root = Path(__file__).resolve().parents[2] / 'api'
-    if not api_root.exists():
-        pytest.skip('API package not present')
-    sys.path.insert(0, str(api_root))
-    try:
-        for name in list(sys.modules):
-            if name.startswith(('endpoints', 'security')):
-                del sys.modules[name]
-        from endpoints.jobs import JOBS
-
-        assert 'scripts.check_venue' in JOBS
-        # And the live loop is deliberately NOT launchable from a web request:
-        # two copies racing over one account.
-        assert 'scripts.live' not in JOBS
-    finally:
-        sys.path.remove(str(api_root))
-        for name in list(sys.modules):
-            if name.startswith(('endpoints', 'security')):
-                del sys.modules[name]
 
 
 def test_the_series_are_the_fifteen_minute_ones():

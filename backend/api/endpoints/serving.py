@@ -2,8 +2,7 @@
 
 Left unauthenticated on purpose: they serve a local dashboard, expose no
 credentials, and gating them would break the frontend's polling for no gain the
-origin policy does not already provide. The mutating surface — there is one
-route that starts a process — is gated in `endpoints/research.py`.
+origin policy does not already provide. There is no mutating surface.
 """
 
 from __future__ import annotations
@@ -66,14 +65,6 @@ def get_venue_settlements(days: Optional[int] = Query(None, ge=1, le=3650),
     return {'settlements': serving.venue_settlements(db, days=days, limit=limit)}
 
 
-@router.get('/venue/fills')
-def get_venue_fills(days: Optional[int] = Query(None, ge=1, le=3650),
-                    limit: int = Query(200, ge=1, le=1000),
-                    db: Session = Depends(get_db)):
-    """Every execution as the venue recorded it — the entry side of the ledger."""
-    return {'fills': serving.venue_fills(db, days=days, limit=limit)}
-
-
 @router.get('/live')
 def get_live(db: Session = Depends(get_db)):
     """The current barrier state per symbol, and the account beside it."""
@@ -120,12 +111,6 @@ def get_prices(symbol: str, minutes: int = Query(240, ge=15, le=2880),
         'strikes': [s for s in serving.window_strikes(db, minutes=minutes)
                     if s['symbol'] == symbol],
     }
-
-
-@router.get('/tickets')
-def get_tickets(open_only: bool = True, limit: int = Query(50, ge=1, le=200),
-                db: Session = Depends(get_db)):
-    return {'tickets': serving.tickets(db, open_only=open_only, limit=limit)}
 
 
 @router.get('/model')

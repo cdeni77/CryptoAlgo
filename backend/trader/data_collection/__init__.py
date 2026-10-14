@@ -5,8 +5,6 @@ Data Collection Module for Crypto Perpetual Futures Trading System.
 from .models import (
     OHLCVBar,
     Trade,
-    FundingRate,
-    OpenInterest,
     OrderBookSnapshot,
     OrderBookLevel,
     TickerUpdate,
@@ -26,8 +24,6 @@ __all__ = [
     # Models
     "OHLCVBar",
     "Trade", 
-    "FundingRate",
-    "OpenInterest",
     "OrderBookSnapshot",
     "OrderBookLevel",
     "TickerUpdate",

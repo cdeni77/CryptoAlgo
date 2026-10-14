@@ -161,8 +161,8 @@ def test_the_tape_is_anonymous_and_carries_no_side_of_ours():
     """
     trade = parse_trade(TAPE_PRINT)
     assert trade.contracts == pytest.approx(10.0)
-    assert trade.price_for('up') == pytest.approx(0.56)
-    assert trade.price_for('down') == pytest.approx(0.44)
+    assert trade.yes_price == pytest.approx(0.56)
+    assert trade.no_price == pytest.approx(0.44)
     assert trade.is_block_trade is True
     assert not hasattr(trade, 'pnl')
     assert not hasattr(trade, 'contracts_held')
@@ -209,8 +209,8 @@ def test_a_print_whose_two_prices_do_not_sum_to_a_dollar_is_read_as_served():
     """
     trade = parse_trade({**TAPE_PRINT, 'yes_price_dollars': '0.5600',
                          'no_price_dollars': '0.5600'})
-    assert trade.price_for('up') == pytest.approx(0.56)
-    assert trade.price_for('down') == pytest.approx(0.56)
+    assert trade.yes_price == pytest.approx(0.56)
+    assert trade.no_price == pytest.approx(0.56)
 
 
 # ------------------------------------------------------- reading both tiers
@@ -429,6 +429,26 @@ def test_the_balance_sample_records_both_figures_and_their_difference():
 
     writer.prune_venue_balances(now + timedelta(minutes=1))
     assert writer.latest_venue_balance() is None
+
+
+def test_the_minute_price_cycle_also_prunes_old_balance_samples():
+    """`venue_balance` gains a row a cycle and nothing else ever deletes one."""
+    from livetrade.ledger import BALANCE_RETENTION_DAYS, record_minute_prices
+
+    writer = _writer()
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(days=BALANCE_RETENTION_DAYS + 1)
+    fresh = now - timedelta(hours=1)
+    for stamp in (stale, fresh):
+        writer.write_venue_balance(timestamp=stamp, balance=100.0,
+                                   exchange_index=2, our_bankroll=100.0)
+
+    record_minute_prices(writer, {})
+
+    kept = writer.venue_balances_since(now - timedelta(days=365))
+    assert len(kept) == 1, 'the stale sample survived the cycle'
+    assert abs((kept[0].timestamp.replace(tzinfo=timezone.utc) - fresh)
+               .total_seconds()) < 1
 
 
 def test_a_settlement_joins_to_our_position_through_the_ticket():

@@ -245,17 +245,6 @@ def _quantity(raw: dict, *names: str) -> float:
     return 0.0
 
 
-def _cents(value: Any) -> Optional[float]:
-    """Integer cents to dollars. Retained for the legacy encoding and tests."""
-    if value is None:
-        return None
-    try:
-        cents = float(value)
-    except (TypeError, ValueError):
-        return None
-    return cents * CENT if cents > 0 else None
-
-
 def _parse_time(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -457,17 +446,6 @@ class Trade:
     # is the venue's own single-book language and not a direction).
     taker_side: Optional[str] = None
     taker_book_side: Optional[str] = None
-
-    def price_for(self, side: str) -> Optional[float]:
-        """What this print paid for `side`.
-
-        Both `yes_price` and `no_price` are read from the payload rather than one
-        being derived as `1 - other`. They are usually complementary and nothing
-        here needs them to be: a venue that quotes them independently, or a
-        documented example where they do not sum to a dollar, must not silently
-        become a wrong number.
-        """
-        return self.yes_price if side == 'up' else self.no_price
 
 
 def _bool(value: Any) -> Optional[bool]:
@@ -789,41 +767,6 @@ class KalshiClient:
         return parse_orderbook(
             await self._request('GET', f'/markets/{ticker}/orderbook'))
 
-    async def quote_with_live_book(self, ticker: str) -> Quote:
-        """`quote()`, but with the touch taken from the LIVE orderbook.
-
-        **`/markets` serves a CACHED touch, and pricing a decision off it is
-        what stopped the live loop filling.** Measured 2026-09-04 by sampling
-        both endpoints for the same market two seconds apart: `/markets`
-        returned an identical `0.9120/0.9160` on ETH for five consecutive
-        samples across ten seconds while `/orderbook` moved 0.934 -> 0.960 ->
-        0.951 -> 0.950. Across 28 paired samples the two disagreed on 96.4%,
-        mean 0.66c with the ask understated by up to 6.3c.
-
-        That is not a rounding detail, for two reasons:
-
-        * **The order cannot fill.** The captured kill priced a 0.74 ask against
-          a real 0.76 and sent a 74c bid — a cent below the actual BID. Ten of
-          ten orders after the 2026-09-04 restart died this way.
-        * **The MODEL is fed the stale number too.** The promoted artifact is
-          `init_score_source=market`, so its prediction is a correction to the
-          price; `market_probability` is the midpoint of this touch. A quote
-          several cents stale means the model corrects the wrong number, which
-          is a forecast error and not merely a fill error.
-
-        It also fixes a live/training mismatch: the backtest reads
-        `venue_depth`, built by `scripts/build_depth.py` from RECORDED LADDERS —
-        the real book — so `/markets` was a source live used and training never
-        saw. "One `decide()`" guarantees the decision is shared; nothing
-        guaranteed the price reaching it came from the same place.
-
-        An empty book is trusted, because an empty book is a real state. A
-        FAILED book request raises: the cached touch can be several cents wrong,
-        so pricing a decision off it is a refusal, not a fallback.
-        """
-        quote = await self.quote(ticker)
-        return await self.book_quote(quote)
-
     async def book_quote(self, meta: 'Quote') -> 'Quote':
         """`meta` with its touch and ladder replaced by one `/orderbook` read.
 
@@ -1090,8 +1033,6 @@ class KalshiClient:
         limit_price: float,
         client_order_id: Optional[str] = None,
         time_in_force: str = 'immediate_or_cancel',
-        post_only: bool = False,
-        expiration_time: Optional[int] = None,
     ) -> dict:
         """Buy `contracts` of `side` at no worse than `limit_price` (dollars).
 
@@ -1105,12 +1046,6 @@ class KalshiClient:
         With a positive edge a partial fill strictly beats a kill, and the
         accounting already handles partials (16 of the first 323 live fills were
         partial).
-
-        `post_only=True` is a maker order: the venue refuses it rather than let
-        it cross. Its limit is rounded onto the venue's tapered tick AWAY from
-        the touch, the opposite of the taker rounding below, and
-        `expiration_time` (epoch seconds, with `good_till_canceled`) makes the
-        venue cancel it even if nothing here survives to.
         """
         if not self.live:
             raise NotLiveError(
@@ -1152,14 +1087,11 @@ class KalshiClient:
         # an immediate_or_cancel up to 0.9c of extra reach past the limit
         # `order_limit_price` chose — levels the edge gate never admitted.
         #
-        # A taker rounds toward a fill (up for a bid, down for an ask); a
-        # post-only maker rounds the other way so it can never cross.
-        #
         # Integer tenths of a cent, so the band edges (multiples of the coarse
         # tick) stay exact. The epsilon absorbs binary representation: 0.60 is
         # 599.999... tenths in float.
         step = int(round(float(tick_at(yes_limit)) / DECI_CENT))
-        if (book_side == 'bid') != bool(post_only):
+        if book_side == 'bid':
             ticks = int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
         else:
             ticks = int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step
@@ -1187,15 +1119,10 @@ class KalshiClient:
             # names the market rather than the mismatch.
             'exchange_index': int(exchange_index),
         }
-        if post_only:
-            body['post_only'] = True
-        if expiration_time is not None:
-            body['expiration_time'] = int(expiration_time)
         if client_order_id:
             body['client_order_id'] = client_order_id
-        logger.info('placing %s (%s) %d @ %.4f YES on %s%s',
-                    side, book_side, contracts, price, ticker,
-                    ' [post-only]' if post_only else '')
+        logger.info('placing %s (%s) %d @ %.4f YES on %s',
+                    side, book_side, contracts, price, ticker)
         payload = await self._request('POST', '/portfolio/events/orders', body=body)
         # **The venue's own answer, in full.** The caller reads `status` and a
         # count off this reply and reports "did not fill" when neither is

@@ -252,21 +252,6 @@ export interface VenueSettlement {
   synced_at: string | null;
 }
 
-export interface VenueFill {
-  trade_id: string;
-  order_id: string | null;
-  ticker: string;
-  side: 'up' | 'down';
-  action: string | null;
-  contracts: number;
-  /** Dollars paid per contract for `side` — a 30c NO fill reads 0.30, not the
-   *  0.70 the venue's YES-denominated book quotes. */
-  price: number | null;
-  cost: number | null;
-  is_taker: boolean | null;
-  created_time: string | null;
-}
-
 export interface FunnelStage {
   reason: Reason;
   count: number;
@@ -336,9 +321,4 @@ export interface LiveState {
   account: AccountState;
   open_positions: Position[];
   tickets: OrderTicket[];
-}
-
-export interface JobDescriptor {
-  module: string;
-  description: string;
 }

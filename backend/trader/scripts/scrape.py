@@ -292,9 +292,6 @@ async def main() -> int:
         coinbase_api_secret=os.environ.get('COINBASE_API_SECRET'),
         db_path=args.db_path,
         venue_label=args.venue_label,
-        # Spot products have no funding and no open interest. The poller would
-        # ask anyway, get nothing, and log a failure per symbol per cycle.
-        enable_funding_polling=False,
     )
     pipeline = DataPipeline(config)
     failures: list[str] = []

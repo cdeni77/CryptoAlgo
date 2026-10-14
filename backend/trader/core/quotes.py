@@ -180,7 +180,6 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   venue: str = 'kalshi',
                   other_venue: Optional[str] = 'polymarket',
                   max_age_seconds: float = DEFAULT_MAX_AGE,
-                  peer_lag_minutes: int = 0,
                   sources: Sequence[str] = (),
                   null_age: str = 'fresh',
                   peer_max_age_seconds: Optional[float] = None,
@@ -329,16 +328,6 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     if other_venue:
         peer = filter_sources(depth[depth['venue'] == other_venue],
                               sources).copy()
-        # RESEARCH, default off. Shift the peer FORWARD so a row at offset m
-        # carries the peer's book from m - lag: the live condition, where Kalshi
-        # is contemporaneous and Polymarket is a beat behind. Only the PEER
-        # moves — the decision must still price against the Kalshi book it could
-        # actually have taken.
-        if peer_lag_minutes and len(peer):
-            peer = peer.copy()
-            peer['offset_minutes'] = (
-                pd.to_numeric(peer['offset_minutes'], errors='coerce')
-                + int(peer_lag_minutes))
         merged['pm_market_probability'] = np.nan
         merged['pm_spread'] = np.nan
         if len(peer):
