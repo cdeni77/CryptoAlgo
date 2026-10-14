@@ -363,6 +363,36 @@ def load_live(root: Optional[Path] = None, config=None) -> Optional[ForecastMode
     return ForecastModel.load(path, config)
 
 
+def installed_version(root: Optional[Path] = None) -> Optional[str]:
+    """The ledger version of the installed artifact, by content.
+
+    `promote` stages each candidate under `.staging/<version>/`, so the
+    installed file is byte-identical to one staged copy. None when there is no
+    installed file or no staged copy matches.
+    """
+    import hashlib
+
+    root = models_root(root)
+    path = root / LIVE_MODEL
+    staging = root / STAGING
+    if not path.exists() or not staging.is_dir():
+        return None
+    digest = hashlib.md5(path.read_bytes()).hexdigest()
+    for candidate in sorted(staging.iterdir(), reverse=True):
+        staged = candidate / LIVE_MODEL
+        if staged.exists() and hashlib.md5(staged.read_bytes()).hexdigest() == digest:
+            return candidate.name
+    return None
+
+
+def ledger_entry(version: str, root: Optional[Path] = None) -> Optional[dict]:
+    """The ledger payload of one attempt, or None."""
+    try:
+        return json.loads((models_root(root) / LEDGER / f'{version}.json').read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def history(root: Optional[Path] = None) -> pd.DataFrame:
     """Every attempt, newest first. What has been tried, and why not.
 
