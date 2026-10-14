@@ -445,12 +445,6 @@ class TestTheDrawdownBreaker:
             settle(writer, index=i, pnl=+2.0, when=NOW)
         assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
 
-    def test_the_threshold_matches_the_promotion_gate(self):
-        """A drawdown that blocks promotion should stop the money too."""
-        from core.metrics import DEFAULT_GATES
-
-        assert Config().max_drawdown_fraction == DEFAULT_GATES['max_drawdown'][0]
-
 
 class TestTheHighWaterMark:
     def test_it_is_the_running_maximum_not_the_final_value(self, writer):

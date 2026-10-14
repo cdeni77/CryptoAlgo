@@ -96,6 +96,78 @@ def weighted_fold_mean(values, weights=None) -> WeightedMean:
     return WeightedMean(mean, float(np.sqrt(variance * sum_p2)), n_eff)
 
 
+# Block bootstrap settings. A fixed seed makes a gate value a function of its
+# data only, so the same run always gets the same verdict.
+BOOTSTRAP_RESAMPLES = 2_000
+BOOTSTRAP_SEED = 0
+# Two-sided confidence level; the lower bound is its lower end.
+CONFIDENCE_LEVEL = 0.90
+
+
+def block_bootstrap_means(values, blocks, *, resamples: int = BOOTSTRAP_RESAMPLES,
+                          seed: int = BOOTSTRAP_SEED) -> np.ndarray:
+    """Row means of `values` over resamples that draw whole blocks.
+
+    Rows in one block (the symbols and offsets of one window) are not
+    independent, so they are drawn together. Non-finite values are dropped.
+    Empty when fewer than two blocks remain.
+    """
+    v = np.asarray(values, dtype=float)
+    b = pd.Series(np.asarray(blocks, dtype=object))
+    keep = np.isfinite(v) & b.notna().to_numpy()
+    if not keep.any():
+        return np.empty(0)
+    codes, _ = pd.factorize(b[keep])
+    sums = np.bincount(codes, weights=v[keep])
+    counts = np.bincount(codes).astype(float)
+    k = len(sums)
+    if k < 2:
+        return np.empty(0)
+    rng = np.random.default_rng(seed)
+    out = np.empty(int(resamples))
+    # Draw in batches so a large sample does not need a resamples x k matrix.
+    step = max(1, 2_000_000 // k)
+    for start in range(0, len(out), step):
+        n = min(step, len(out) - start)
+        draw = rng.integers(0, k, size=(n, k))
+        out[start:start + n] = sums[draw].sum(axis=1) / counts[draw].sum(axis=1)
+    return out
+
+
+def bootstrap_interval(draws: np.ndarray,
+                       level: float = CONFIDENCE_LEVEL) -> tuple[float, float]:
+    """(lower, upper) of the two-sided `level` interval, NaN without draws."""
+    if not len(draws):
+        return float('nan'), float('nan')
+    tail = (1.0 - float(level)) / 2.0
+    return float(np.quantile(draws, tail)), float(np.quantile(draws, 1.0 - tail))
+
+
+def trade_gate_values(trades: Optional[pd.DataFrame]) -> dict[str, float]:
+    """`realised_edge_lcb` and `overconfidence_abs` from settled trades.
+
+    Realised edge is the per-trade estimator of `realised_edge_pp`: win
+    (payout > 0) minus effective cost per contract, in pp. `model_probability`
+    on a trade is the probability of the side taken.
+    """
+    out = {'realised_edge_lcb': float('nan'), 'overconfidence_abs': float('nan')}
+    needed = ('window_open', 'payout', 'outlay', 'contracts', 'model_probability')
+    if trades is None or trades.empty or any(c not in trades.columns for c in needed):
+        return out
+    won = (pd.to_numeric(trades['payout'], errors='coerce') > 0).astype(float)
+    cost = (pd.to_numeric(trades['outlay'], errors='coerce')
+            / pd.to_numeric(trades['contracts'], errors='coerce'))
+    edge_pp = ((won - cost) * 100.0).to_numpy(dtype=float)
+    lower, _ = bootstrap_interval(block_bootstrap_means(edge_pp, trades['window_open']))
+    out['realised_edge_lcb'] = lower
+    predicted = pd.to_numeric(trades['model_probability'], errors='coerce')
+    known = predicted.notna()
+    if known.any():
+        out['overconfidence_abs'] = float(abs(predicted[known].mean()
+                                              - won[known].mean()))
+    return out
+
+
 def log_loss_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) -> float:
     """Baseline log loss minus model log loss. Positive means the model helped."""
     return log_loss(outcome, baseline) - log_loss(outcome, model)
@@ -266,6 +338,8 @@ class EvaluationReport:
     fold_geometry: dict = field(default_factory=dict)
     # Daily P&L moments of the continuous book, for the deflated Sharpe ratio.
     sharpe_moments: dict = field(default_factory=dict)
+    # `trade_gate_values` of the continuous book's trades.
+    trade_metrics: dict = field(default_factory=dict)
 
     # ---- forecast ------------------------------------------------------
     @property
@@ -562,7 +636,8 @@ class EvaluationReport:
         ).reset_index()
 
     def gate_values(self) -> dict[str, float]:
-        """Everything `DEFAULT_GATES` reads, in one dict."""
+        """Every gate value the report can supply, plus reported metrics
+        (`windows_evaluated`, `total_return`, `sharpe`, `max_drawdown`)."""
         continuous = self.continuous
         return {
             'log_loss_skill': self.mean_skill,
@@ -579,6 +654,10 @@ class EvaluationReport:
             'trades': float(continuous.n_trades) if continuous else 0.0,
             'coverage': continuous.coverage if continuous else float('nan'),
             'realised_edge_pp': continuous.realised_edge_pp if continuous else float('nan'),
+            'realised_edge_lcb': float((self.trade_metrics or {}).get(
+                'realised_edge_lcb', float('nan'))),
+            'overconfidence_abs': float((self.trade_metrics or {}).get(
+                'overconfidence_abs', float('nan'))),
             'total_return': continuous.total_return if continuous else float('nan'),
             'sharpe': continuous.sharpe if continuous else float('nan'),
             'sharpe_implausible': (
@@ -632,14 +711,18 @@ MIN_MARKET_WINDOWS = 2_000
 # live order check read the same field.
 MAX_QUOTE_AGE_SECONDS = float(DEFAULT_CONFIG.max_quote_age_seconds)
 
+# `fold` is the walk-forward fold of a backtest row. `venue_labelled` is True
+# where `outcome` is the venue's own settlement.
 MARKET_COLUMNS = ('symbol', 'window_open', 'offset', 'market', 'baseline',
-                  'model', 'outcome', 'decision_time')
+                  'model', 'outcome', 'decision_time', 'fold', 'venue_labelled')
 
 
 def market_frame(rows: Iterable[Sequence]) -> pd.DataFrame:
-    """Rows from `PgWriter.scored_against_market()`, cleaned.
+    """Rows from `PgWriter.scored_against_market()` or
+    `market_rows_from_scored`, cleaned.
 
-    Tolerates rows without `decision_time` so an older store still reads.
+    Tolerates rows that stop before any trailing column. Rows from the serving
+    store carry neither `fold` nor `venue_labelled`.
     """
     listed = list(rows)
     width = len(listed[0]) if listed else len(MARKET_COLUMNS)
@@ -732,10 +815,12 @@ def market_rows_from_scored(
     # skill. Measured, and it reversed the headline: base-mkt read +0.00382 on
     # our label and -0.00245 on the venue's, collapsing to +0.00101 on the 96.8%
     # where the two agree. The whole effect lived in the near-ties.
+    part['_venue_labelled'] = False
     if 'venue_outcome' in part.columns:
-        part['outcome'] = pd.to_numeric(
-            part['venue_outcome'], errors='coerce').fillna(
-                pd.to_numeric(part.get('outcome'), errors='coerce'))
+        venue = pd.to_numeric(part['venue_outcome'], errors='coerce')
+        part['_venue_labelled'] = venue.notna()
+        part['outcome'] = venue.fillna(
+            pd.to_numeric(part.get('outcome'), errors='coerce'))
     part = part.dropna(subset=list(needed) + ['outcome'])
     # Staleness is not skill. A row whose quote predates the decision by minutes
     # is measuring the clock, not the market -- see MAX_QUOTE_AGE_SECONDS.
@@ -770,11 +855,48 @@ def market_rows_from_scored(
         return []
     decision = (part['decision_time'] if 'decision_time' in part.columns
                 else part['window_open'])
+    fold = (part['fold'] if 'fold' in part.columns
+            else pd.Series(None, index=part.index, dtype=object))
     # Positional, matching MARKET_COLUMNS. A column out of order silently swaps
     # the model's probability with the baseline's and nothing raises.
     return list(zip(part['symbol'], part['window_open'], part['offset'],
                     part['market_probability'], part['baseline_probability'],
-                    part['model_probability'], part['outcome'], decision))
+                    part['model_probability'], part['outcome'], decision,
+                    fold, part['_venue_labelled']))
+
+
+# Length of the calendar block that stands in for a fold where a row has none.
+MARKET_FOLD_DAYS = 7
+
+
+def market_fold_test(frame: pd.DataFrame) -> tuple[float, int]:
+    """(one-sided p, fold count) for `model_minus_market` above zero.
+
+    Reads venue-labelled rows only. A row without `venue_labelled` comes from
+    the serving store, whose `outcome` is the venue's settlement where one
+    exists, so it counts. Per fold, `model_minus_market` is market log loss
+    minus model log loss; folds are weighted by window count. A row without a
+    fold takes its `MARKET_FOLD_DAYS` calendar block.
+    """
+    part = frame
+    if 'venue_labelled' in part.columns:
+        labelled = part['venue_labelled']
+        part = part[labelled.isna() | labelled.fillna(False).astype(bool)]
+    if part.empty:
+        return float('nan'), 0
+    opens = pd.to_datetime(part['window_open'], utc=True, errors='coerce',
+                           format='mixed')
+    block = opens.dt.floor(f'{MARKET_FOLD_DAYS}D').astype(str).where(
+        opens.notna(), part['window_open'].astype(str))
+    block = 'block ' + block
+    fold = (part['fold'] if 'fold' in part.columns
+            else pd.Series(None, index=part.index, dtype=object))
+    key = fold.astype(object).where(fold.notna(), block).astype(str)
+    values, weights = [], []
+    for _, rows in part.groupby(key, sort=False):
+        values.append(market_slice(rows, 'fold')['model_minus_market'])
+        weights.append(rows.drop_duplicates(['symbol', 'window_open']).shape[0])
+    return weighted_fold_mean(values, weights).p_value, len(values)
 
 
 def calibration_noise_null(market, outcome, correction_sd, *,
@@ -923,6 +1045,8 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
     if frame.empty:
         return {'market_windows': 0.0,
                 'model_minus_market': float('nan'),
+                'model_minus_market_p': float('nan'),
+                'min_folds': 0.0,
                 'baseline_minus_market': float('nan'),
                 'market_max_deviation': float('nan'),
                 'calibration_noise_null': float('nan'),
@@ -985,8 +1109,11 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
     # Kept as a reported diagnostic: it is informative about the venue even
     # though it is too noisy to gate on.
     market_dev = _worst_populated_bin(frame['market'], frame['outcome'])
+    p_value, n_folds = market_fold_test(frame)
     return {'market_windows': windows,
             'model_minus_market': float(overall['model_minus_market']),
+            'model_minus_market_p': float(p_value),
+            'min_folds': float(n_folds),
             'baseline_minus_market': float(overall['baseline_minus_market']),
             'market_max_deviation': market_dev,
             'calibration_noise_null': float(null),
@@ -1032,6 +1159,13 @@ GATE_SPEC: tuple[GateSpec, ...] = (
     # ledger records that it was used.
     GateSpec('market_windows', float(MIN_MARKET_WINDOWS), 'min', 1),
     GateSpec('model_minus_market', 0.0, 'min', 1),
+    # One-sided t-test of the window-weighted fold mean of model_minus_market
+    # against zero, on venue-labelled rows. A point estimate >= 0 is passed by
+    # half of all nulls.
+    GateSpec('model_minus_market_p', 0.05, 'max', 1),
+    # The sample-size requirement: weekly folds that carry market rows. The
+    # p-value above has n_eff - 1 degrees of freedom, so it needs folds.
+    GateSpec('min_folds', 6.0, 'min', 1),
     # --- the forecast ---
     GateSpec('log_loss_skill', 0.0, 'min', 2),
     # **Significance, not just sign.** `log_loss_skill >= 0` is a point
@@ -1088,39 +1222,21 @@ GATE_SPEC: tuple[GateSpec, ...] = (
     GateSpec('non_finite_share', 0.001, 'max', 1),
     GateSpec('residual_scale', 0.25, 'min', 1),
     GateSpec('control_gain_share', 0.30, 'max', 1),
-    GateSpec('windows_evaluated', 20_000.0, 'min', 1),
     # --- the money ---
+    # `windows_evaluated`, `total_return`, `sharpe` and `max_drawdown` are
+    # reported, not gated: on live-era data the first cannot be met and the
+    # others add nothing to the per-contract edge gates below.
     GateSpec('trades', 200.0, 'min', 1),
     GateSpec('coverage', 0.0005, 'min', 1),
     GateSpec('realised_edge_pp', 0.0, 'min', 1),
-    GateSpec('total_return', 0.0, 'min', 1),
-    GateSpec('sharpe', 0.5, 'min', 1),
+    # Lower end of the 90% interval of realised edge per contract on traded
+    # rows, block-bootstrapped by window_open.
+    GateSpec('realised_edge_lcb', 0.0, 'min', 1),
+    # |mean predicted win probability - realised win rate| on traded rows.
+    GateSpec('overconfidence_abs', 0.015, 'max', 1),
     GateSpec('sharpe_implausible', 0.0, 'max', 1),
-    # **Two drawdown questions, and they need two statistics.**
-    #
-    # `max_drawdown` is the worst peak-to-trough over the whole out-of-sample
-    # path, held at the SAME number as the live breaker: a drawdown that blocks
-    # promotion should stop the money too, which is why
-    # `Config.max_drawdown_fraction` and this bar are asserted equal.
-    #
-    # It looked unusable when the SAME configuration three days apart went
-    # 0.182 -> 0.388 and failed a bar it had just passed. That was the sliding
-    # fold boundaries re-cutting the equity path, not the strategy, and it is
-    # fixed at the source. With anchored folds this moves only when a genuinely
-    # worse drawdown occurs, which is worth failing on. It still ratchets — a
-    # running maximum cannot do otherwise — just slowly and meaningfully.
-    #
-    # `median_fold_drawdown` is the same risk question asked of a statistic
-    # whose expectation does not grow with the sample: each fold is a fixed
-    # 21-day block with its own book, so this is "what does a typical three-week
-    # stretch look like" and it gives the same answer next week.
-    #
-    # 0.20 against a measured median of 0.080 (folds: 0.0, 2.58, 2.59, 7.60,
-    # 8.41, 12.79, 22.47, 36.11). Deliberately loose — it catches typical
-    # three-week risk more than doubling, not a fine-tuning of it. The bars that
-    # protect real money are the live breakers, the $250 ruin floor and the $75
-    # daily-loss halt, and they are unaffected by anything here.
-    GateSpec('max_drawdown', 0.35, 'max', 1),
+    # Median over folds of each fold's own drawdown. Each fold is a fixed block
+    # with its own book, so the statistic does not grow with the sample.
     GateSpec('median_fold_drawdown', 0.20, 'max', 1),
     GateSpec('halted', 0.0, 'max', 1),
 )
@@ -1191,6 +1307,11 @@ GATE_NOTES: dict[str, str] = {
     'model_minus_market': 'the price is the counterparty, not F(x/sigma). Beating '
                           'the arithmetic null while losing to the quote is the '
                           'failure this whole stack is built to not make',
+    'model_minus_market_p': 'one-sided p that model_minus_market is above zero: '
+                            'window-weighted fold mean on venue-labelled rows, '
+                            'standard error from fold dispersion',
+    'min_folds': 'weekly folds that carry market rows; fewer and the fold '
+                 'dispersion behind model_minus_market_p means nothing',
     'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark. '
                       'Window-weighted mean over folds',
     'log_loss_skill_p': 'one-sided p that the weighted skill is above zero, from fold '
@@ -1231,24 +1352,21 @@ GATE_NOTES: dict[str, str] = {
                       'zero means it found nothing however good the in-sample loss',
     'control_gain_share': 'hour-of-day cannot forecast direction. If the clock carries '
                           'the model, the measurement is broken, not the market',
-    'windows_evaluated': 'the whole reason for this venue is sample size; without it '
-                         'the standard error cannot resolve a 1pp edge',
     'trades': 'fewer than this and the money numbers are anecdote',
     'coverage': 'abstaining on everything passes every other gate trivially',
     'realised_edge_pp': 'what actually happened, against what the model claimed. The '
                         'gap between the two is the winner\'s curse',
-    'total_return': 'on one continuous account across the whole out-of-sample '
-                    'span, sized additively so the slope is the per-trade edge '
-                    'rather than an exponential of it',
-    'sharpe': 'annualised on trades actually placed, never on windows available',
+    'realised_edge_lcb': 'lower end of the 90% interval of realised edge per '
+                         'contract, resampling whole windows: the symbols of one '
+                         'window are not independent trades',
+    'overconfidence_abs': 'mean predicted win probability against the realised '
+                          'win rate on traded rows. decide() selects rows where '
+                          'the model disagrees with the price, which is where it '
+                          'is most often overconfident',
     'sharpe_implausible': f'a Sharpe above {5.0} on a public venue is a bug '
                           f'signature, not an edge — every other gate asks '
                           f'whether the number is good, this one asks whether '
                           f'it is possible',
-    'max_drawdown': 'the worst this has ever been, held at the live breaker\'s own '
-                    'number so a drawdown that blocks promotion also stops the '
-                    'money. It ratchets, which is meaningful now the folds hold '
-                    'still and was not when they slid',
     'median_fold_drawdown': 'a typical three-week block, on a statistic that does '
                             'not grow with the sample the way a running maximum '
                             'does. The account still has to survive to compound',

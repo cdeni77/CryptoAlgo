@@ -11,6 +11,7 @@ multiple-testing correction.
 
     python -m scripts.promote
     python -m scripts.promote --history
+    python -m scripts.promote --go-live-check --days 14
     python -m scripts.promote --force --reason "skill is on the >0.9 tail; the
         average forecast is flat and the gates read averages"
 """
@@ -21,14 +22,22 @@ import argparse
 import logging
 import math
 import os
+from datetime import datetime, timezone
+from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from core.backtest import walk_forward
-from core.metrics import evaluate_gates, gate_report, gates_passed
+from core.baseline import clip_prob
+from core.metrics import (
+    block_bootstrap_means, bootstrap_interval, evaluate_gates, gate_report,
+    gates_passed,
+)
 from core.promotion import (
-    deflated_sharpe_for, gate_lock_status, history, load_live, new_trial_id, promote,
-    record_refusal, refusal_text, trial_count,
+    deflated_sharpe_for, gate_lock_status, history, installed_version, ledger_entry,
+    load_live, models_root, new_trial_id, promote, record_refusal, refusal_text,
+    trial_count,
 )
 from scripts._common import (
     add_data_arguments, config_from_args, groups_from_args, load_dataset, log_trial,
@@ -224,6 +233,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__))
     parser.add_argument('--history', action='store_true',
                         help='What has been tried, and why not. Then exit.')
+    parser.add_argument('--go-live-check', action='store_true',
+                        help='Compare live model_minus_market with the installed '
+                             'artifact\'s backtest figure. Reads only. Exit 0 on '
+                             'PASS, 1 otherwise.')
+    parser.add_argument('--days', type=float, default=14.0,
+                        help='Live window for --go-live-check (default 14).')
     parser.add_argument('--dry-run', action='store_true',
                         help='Evaluate and score the gates, install nothing.')
     parser.add_argument('--force', action='store_true')
@@ -248,6 +263,9 @@ def main() -> int:
         print(f'\n{len(frame)} attempts, {int(frame["installed"].sum())} installed. '
               f'Any claim of skill discounts by the trial count.')
         return 0
+
+    if args.go_live_check:
+        return go_live_check(args.days)
 
     if args.force and not args.reason:
         raise SystemExit(
@@ -298,8 +316,8 @@ def main() -> int:
     # best of the four (+0.00550 against a pooled -0.00072).
     market = market_measurement(getattr(result, 'scored', None),
                                 entry_offsets=config.entry_offsets)
-    market_metrics = {'model_minus_market': market.get('model_minus_market'),
-                      'market_windows': market.get('market_windows')}
+    market_metrics = {name: market.get(name) for name in (
+        'model_minus_market', 'model_minus_market_p', 'min_folds', 'market_windows')}
 
     if args.dry_run:
         gates = evaluate_gates(result.report, extra=market)
@@ -382,7 +400,7 @@ def publish_to_serving(attempt, report) -> None:
         from core.pg_writer import PgWriter
 
         writer = PgWriter()
-        gates = {g.name: g.value for g in attempt.gates}
+        values = report.gate_values()
         writer.record_model_run(
             version=attempt.version,
             installed=bool(attempt.installed),
@@ -396,8 +414,8 @@ def publish_to_serving(attempt, report) -> None:
             calibration_error=_finite(report.max_ece),
             residual_scale=_finite(report.mean_residual_scale),
             control_gain_share=_finite(report.max_control_gain_share),
-            sharpe=_finite(gates.get('sharpe')),
-            total_return=_finite(gates.get('total_return')),
+            sharpe=_finite(values.get('sharpe')),
+            total_return=_finite(values.get('total_return')),
             gates=[{'name': g.name, 'value': _finite(g.value),
                     'threshold': g.threshold, 'direction': g.direction,
                     'passed': bool(g.passed)} for g in attempt.gates],
@@ -432,6 +450,116 @@ def _finite(value):
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+# ---- go-live check ---------------------------------------------------------
+
+def live_market_rows(database_url: str, *, since, version: Optional[str]) -> pd.DataFrame:
+    """Settled live predictions with a quote, from `predictions`. SELECT only.
+
+    A row whose `model_version` is set must match `version`; a row without one
+    is kept.
+    """
+    from sqlalchemy import create_engine, or_, select
+
+    from core.pg_writer import Prediction
+
+    query = (select(Prediction.symbol, Prediction.window_open,
+                    Prediction.offset_minutes, Prediction.decision_time,
+                    Prediction.market_probability, Prediction.model_probability,
+                    Prediction.outcome, Prediction.model_version)
+             .where(Prediction.decision_time >= since)
+             .where(Prediction.market_probability.isnot(None))
+             .where(Prediction.model_probability.isnot(None))
+             .where(Prediction.outcome.isnot(None)))
+    if version is not None:
+        query = query.where(or_(Prediction.model_version.is_(None),
+                                Prediction.model_version == version))
+    engine = create_engine(database_url, future=True)
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(query).all()
+    finally:
+        engine.dispose()
+    frame = pd.DataFrame(rows, columns=['symbol', 'window_open', 'offset',
+                                        'decision_time', 'market', 'model',
+                                        'outcome', 'model_version'])
+    for column in ('market', 'model', 'outcome'):
+        frame[column] = pd.to_numeric(frame[column], errors='coerce')
+    finite = (np.isfinite(frame['market']) & np.isfinite(frame['model'])
+              & np.isfinite(frame['outcome']))
+    return frame.loc[finite].reset_index(drop=True)
+
+
+def _row_log_loss(outcome: np.ndarray, probability: np.ndarray) -> np.ndarray:
+    p = clip_prob(np.asarray(probability, dtype=float))
+    y = np.asarray(outcome, dtype=float)
+    return -(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
+
+
+def go_live_check(days: float = 14.0, *, root=None,
+                  database_url: Optional[str] = None, now=None) -> int:
+    """Compare live `model_minus_market` with the installed artifact's backtest.
+
+    PASS only if the live mean is not significantly below the backtest figure
+    (one-sided, 5%: the upper end of the 90% block-bootstrap interval reaches
+    it) and the live mean is above zero. Returns 0 on PASS, 1 otherwise.
+    Reads only: no install, no write.
+    """
+    url = database_url or os.getenv('DATABASE_URL')
+    root = models_root(root)
+    version = installed_version(root)
+    print(f'go-live check: installed artifact {version or "unknown"}, '
+          f'last {days:g} day(s)')
+    if version is None:
+        print('  FAIL: the installed artifact matches no staged promotion, so it '
+              'has no ledger entry to compare against')
+        return 1
+    entry = ledger_entry(version, root)
+    gates = {g.get('name'): g for g in (entry or {}).get('gates') or ()}
+    backtest = gates.get('model_minus_market', {}).get('value')
+    backtest = float(backtest) if backtest is not None else float('nan')
+    if not url:
+        print('  FAIL: DATABASE_URL is unset, so there are no live predictions')
+        return 1
+
+    now = pd.Timestamp(now or datetime.now(timezone.utc))
+    since = (now - pd.Timedelta(days=float(days))).to_pydatetime()
+    frame = live_market_rows(url, since=since, version=version)
+    offsets = (((entry or {}).get('report') or {}).get('config') or {}).get(
+        'entry_offsets')
+    if offsets is not None and len(frame):
+        frame = frame[frame['offset'].astype(int).isin({int(o) for o in offsets})]
+
+    diff = (_row_log_loss(frame['outcome'], frame['market'])
+            - _row_log_loss(frame['outcome'], frame['model']))
+    live = float(np.mean(diff)) if len(frame) else float('nan')
+    opens = pd.to_datetime(frame['window_open'], utc=True)
+    lower, upper = bootstrap_interval(block_bootstrap_means(diff, opens))
+    windows = int(frame.drop_duplicates(['symbol', 'window_open']).shape[0])
+    matched = int(frame['model_version'].notna().sum())
+    print(f'  live rows {len(frame):,} over {windows:,} windows '
+          f'({matched:,} carry this model_version, the rest none)'
+          + (f'; entry offsets {sorted(int(o) for o in offsets)}'
+             if offsets is not None else ''))
+    print(f'  live model_minus_market     {live:+.6f}  '
+          f'90% CI [{lower:+.6f}, {upper:+.6f}] (block bootstrap by window_open)')
+    print(f'  backtest model_minus_market {backtest:+.6f}  (ledger {version})')
+
+    reasons = []
+    if not np.isfinite(backtest):
+        reasons.append('the ledger entry carries no backtest model_minus_market')
+    if not np.isfinite(upper):
+        reasons.append('too few live windows to bootstrap')
+    elif np.isfinite(backtest) and upper < backtest:
+        reasons.append('live is significantly below the backtest (one-sided, 5%)')
+    if not (np.isfinite(live) and live > 0):
+        reasons.append('live model_minus_market is not above zero')
+    if reasons:
+        print('  verdict: FAIL — ' + '; '.join(reasons))
+        return 1
+    print('  verdict: PASS')
+    return 0
 
 
 if __name__ == '__main__':

@@ -44,7 +44,7 @@ import pandas as pd
 from core.baseline import BarrierBaseline, clip_prob, expit, log_loss, logit
 from core.config import Config, DEFAULT_CONFIG
 from core.features import (
-    BOOK_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS, feature_columns, mirror_rows,
+    BOOK_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS, feature_columns,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,13 +120,6 @@ MIN_SHRINKAGE_ROWS = 500
 
 INNER_VALIDATION_FRACTION = 0.2
 
-# Bounds on the blend's init coefficient and intercept, and the ridge pulling
-# them to (1, 0). The ridge is in pseudo-rows of log loss, so it fades as the
-# sample grows and only restrains a small one.
-BLEND_INIT_BOUNDS = (0.5, 1.5)
-BLEND_INTERCEPT_BOUNDS = (-0.5, 0.5)
-BLEND_RIDGE = 50.0
-
 # Standardized stack-layer inputs are clipped here so one outlier cannot dominate.
 LOGISTIC_CLIP = 5.0
 
@@ -165,9 +158,8 @@ class ForecastModel:
     init_score_source: str = 'baseline'
     config_provenance: dict = field(default_factory=dict)
     # The final layer is p = expit(init_coefficient*init + residual_scale*corr
-    # + intercept). 'scale' pins the coefficient at 1 and the intercept at 0.
-    # Artifacts pickled before these existed read them through getattr.
-    final_layer: str = 'scale'
+    # + intercept). A one-stage fit sets 1 and 0; an older artifact can carry
+    # other values, and artifacts without the fields read them through getattr.
     init_coefficient: float = 1.0
     intercept: float = 0.0
     # Every booster when ensembled (booster is members[0]); empty for one.
@@ -219,12 +211,9 @@ class ForecastModel:
                shrink: bool = True) -> np.ndarray:
         if not shrink:
             return clip_prob(expit(base + correction))
-        alpha = self.residual_scale
-        if getattr(self, 'final_layer', 'scale') == 'blend':
-            a = float(getattr(self, 'init_coefficient', 1.0))
-            c = float(getattr(self, 'intercept', 0.0))
-            return clip_prob(expit(a * base + alpha * correction + c))
-        return clip_prob(expit(base + alpha * correction))
+        a = float(getattr(self, 'init_coefficient', 1.0))
+        c = float(getattr(self, 'intercept', 0.0))
+        return clip_prob(expit(a * base + self.residual_scale * correction + c))
 
     def score(self, table: pd.DataFrame) -> pd.DataFrame:
         """`model_probability`, plus the members' spread when ensembled.
@@ -302,7 +291,6 @@ class ForecastModel:
             'empty_features': list(self.empty_features),
             'groups': list(self.groups),
             'residual_scale': self.residual_scale,
-            'final_layer': getattr(self, 'final_layer', 'scale'),
             'init_coefficient': float(getattr(self, 'init_coefficient', 1.0)),
             'intercept': float(getattr(self, 'intercept', 0.0)),
             'ensemble_size': self.ensemble_size,
@@ -328,20 +316,13 @@ class ForecastModel:
         """Can this artifact score a window it has never seen?"""
         return self.scoring is not None
 
-    def _blend_summary(self) -> str:
-        if getattr(self, 'final_layer', 'scale') != 'blend':
-            return ''
-        return (f' a={float(getattr(self, "init_coefficient", 1.0)):.3f}'
-                f' c={float(getattr(self, "intercept", 0.0)):+.3f}')
-
     def summary(self) -> str:
         skill = self.inner_baseline_log_loss - self.inner_log_loss
         return (
             f'model: {len(self.features)} features '
             f'({len(self.empty_features)} empty), {self.best_iteration} trees'
             f'{f" x{self.ensemble_size}" if self.ensemble_size > 1 else ""}, '
-            f'alpha={self.residual_scale:.3f}'
-            f'{self._blend_summary()} | inner log loss {self.inner_log_loss:.5f} '
+            f'alpha={self.residual_scale:.3f} | inner log loss {self.inner_log_loss:.5f} '
             f'vs baseline {self.inner_baseline_log_loss:.5f} '
             f'(skill {skill:+.5f}) | control gain share '
             f'{self.control_importance_share:.1%}'
@@ -577,83 +558,8 @@ def _fit_residual_scale(
     return float(np.clip(result.x, 0.0, max_scale))
 
 
-def _fit_blend(
-    init_logit: np.ndarray,
-    correction: np.ndarray,
-    outcome: np.ndarray,
-    *,
-    min_edge: float,
-    max_scale: float = 1.0,
-    intercept: bool = False,
-) -> tuple[float, float, float]:
-    """Fit `p = expit(a*init + b*correction + c)` on the rows that would trade.
-
-    Returns `(a, b, c)`. "Would trade" is the raw correction moving the
-    probability by at least `min_edge`: the selected subset where a single
-    alpha fitted on every row was measured to be overconfident. The selection
-    reads only covariates, never the outcome, so it does not bias the fit.
-    """
-    from scipy import optimize
-
-    init_logit = np.asarray(init_logit, dtype=float)
-    correction = np.asarray(correction, dtype=float)
-    outcome = np.asarray(outcome, dtype=float)
-    finite = np.isfinite(init_logit) & np.isfinite(correction) & np.isfinite(outcome)
-    init_logit, correction, outcome = (init_logit[finite], correction[finite],
-                                       outcome[finite])
-    if outcome.size < MIN_SHRINKAGE_ROWS:
-        raise ValueError(
-            f'only {outcome.size} scoreable rows remain of {finite.size}, which '
-            f'is under the {MIN_SHRINKAGE_ROWS} needed to fit a final layer')
-
-    move = np.abs(expit(init_logit + correction) - expit(init_logit))
-    trade = move >= float(min_edge)
-    if int(trade.sum()) >= MIN_SHRINKAGE_ROWS:
-        logger.info('fitting the blend on the %d of %d row(s) that would trade',
-                    int(trade.sum()), outcome.size)
-        init_logit, correction, outcome = (init_logit[trade], correction[trade],
-                                           outcome[trade])
-    else:
-        logger.warning(
-            'only %d row(s) would trade, under the %d minimum, so the blend is '
-            'fitted on all %d', int(trade.sum()), MIN_SHRINKAGE_ROWS, outcome.size)
-
-    n = outcome.size
-    ridge = BLEND_RIDGE / n
-
-    def objective(theta: np.ndarray) -> tuple[float, np.ndarray]:
-        a, b = theta[0], theta[1]
-        c = theta[2] if intercept else 0.0
-        eta = a * init_logit + b * correction + c
-        loss = float(np.mean(np.logaddexp(0.0, eta) - outcome * eta))
-        resid = (expit(eta) - outcome) / n
-        grad = [float(resid @ init_logit) + 2 * ridge * (a - 1.0),
-                float(resid @ correction)]
-        loss += ridge * ((a - 1.0) ** 2 + c ** 2)
-        if intercept:
-            grad.append(float(resid.sum()) + 2 * ridge * c)
-        return loss, np.asarray(grad)
-
-    bounds = [BLEND_INIT_BOUNDS, (0.0, float(max_scale))]
-    start = [1.0, min(1.0, float(max_scale))]
-    if intercept:
-        bounds.append(BLEND_INTERCEPT_BOUNDS)
-        start.append(0.0)
-    result = optimize.minimize(objective, np.asarray(start), jac=True,
-                               method='L-BFGS-B', bounds=bounds)
-    if not np.all(np.isfinite(result.x)):
-        raise ValueError(f'the blend fit did not converge ({result.message!r})')
-    if not result.success:
-        logger.warning('the blend fit stopped early (%s); using its last point',
-                       result.message)
-    a, b = float(result.x[0]), float(result.x[1])
-    c = float(result.x[2]) if intercept else 0.0
-    return a, b, c
-
-
 def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
-                     correction: np.ndarray, alpha: float,
-                     a: float = 1.0, c: float = 0.0) -> float:
+                     correction: np.ndarray, alpha: float) -> float:
     """Log loss over the rows that carry a forecast.
 
     These three numbers go into the artifact's provenance and its `summary()`
@@ -666,7 +572,7 @@ def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
     if not keep.any():
         return float('nan')
     return log_loss(outcome[keep],
-                    expit(a * base_logit[keep] + alpha * correction[keep] + c))
+                    expit(base_logit[keep] + alpha * correction[keep]))
 
 
 def fit_model(
@@ -823,16 +729,7 @@ def fit_model(
             return None
         return np.asarray(weights, dtype=float)[frame.index.to_numpy()]
 
-    # The rows the correction is fitted on. Mirrored copies join here and only
-    # here: early stopping and the final layer must judge real rows.
     fit_rows, fit_weights = inner_train, frame_weights(inner_train)
-    if getattr(config, 'mirror_augment', False):
-        fit_rows = pd.concat([inner_train, mirror_rows(inner_train)],
-                             ignore_index=True)
-        if fit_weights is not None:
-            fit_weights = np.concatenate([fit_weights, fit_weights])
-        logger.info('mirror augmentation: %d inner-train rows fitted as %d',
-                    len(inner_train), len(fit_rows))
 
     def dataset(frame: pd.DataFrame, w: Optional[np.ndarray], reference=None):
         return lgb.Dataset(
@@ -877,19 +774,10 @@ def fit_model(
     correction = mean_correction(alpha_rows)
     base_logit = alpha_rows[init_column].to_numpy(dtype=float)
     outcome = alpha_rows['outcome'].to_numpy(dtype=float)
-    max_scale = float(getattr(config, 'max_residual_scale', 2.0) or 2.0)
-    final_layer = getattr(config, 'final_layer', 'scale')
-    init_coefficient, intercept = 1.0, 0.0
-    if final_layer == 'blend':
-        init_coefficient, alpha, intercept = _fit_blend(
-            base_logit, correction, outcome,
-            min_edge=float(config.min_edge_pp) / 100.0, max_scale=max_scale,
-            intercept=bool(getattr(config, 'final_layer_intercept', False)))
-    else:
-        alpha = _fit_residual_scale(
-            base_logit, correction, outcome,
-            focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0),
-            max_scale=max_scale)
+    alpha = _fit_residual_scale(
+        base_logit, correction, outcome,
+        focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0),
+        max_scale=float(getattr(config, 'max_residual_scale', 2.0) or 2.0))
 
     model = ForecastModel(
         booster=booster, features=features, baseline=baseline,
@@ -901,13 +789,10 @@ def fit_model(
         train_log_loss=_finite_log_loss(
             inner_train['outcome'].to_numpy(dtype=float),
             inner_train[init_column].to_numpy(dtype=float),
-            mean_correction(inner_train), alpha, init_coefficient, intercept),
-        inner_log_loss=_finite_log_loss(outcome, base_logit, correction, alpha,
-                                        init_coefficient, intercept),
+            mean_correction(inner_train), alpha),
+        inner_log_loss=_finite_log_loss(outcome, base_logit, correction, alpha),
         inner_baseline_log_loss=_finite_log_loss(outcome, base_logit, correction, 0.0),
         config_provenance=config.provenance(),
-        final_layer=final_layer, init_coefficient=init_coefficient,
-        intercept=intercept,
         members=tuple(members) if len(members) > 1 else (),
     )
     logger.info(model.summary())
@@ -921,8 +806,8 @@ def fit_model(
 # only, with two or three parameters. The split exists because the quotes are
 # short and partly stale while the bars are long and clean, and a single
 # market-init model spends its capacity on the short, noisy half.
-STACK_INIT_BOUNDS = BLEND_INIT_BOUNDS
-STACK_INTERCEPT_BOUNDS = BLEND_INTERCEPT_BOUNDS
+STACK_INIT_BOUNDS = (0.5, 1.5)
+STACK_INTERCEPT_BOUNDS = (-0.5, 0.5)
 
 
 def stack_feature_groups(config: Config) -> tuple[str, ...]:
@@ -1248,8 +1133,8 @@ def fit_stacked_model(
                 'this table carries no market_probability at all')
         train = attach_market_logit(train)
     spot_groups = tuple(config.stack_spot_groups)
-    # Stage 1 is an ordinary baseline-init fit; ensemble, mirror,
-    # label and final-layer options reach it unchanged through `fit_model`.
+    # Stage 1 is an ordinary baseline-init fit; ensemble and label options
+    # reach it unchanged through `fit_model`.
     spot_config = replace(config, init_score_source='baseline', stack_mode='off')
 
     def spot_fit(rows: pd.DataFrame, *, final: bool = False) -> ForecastModel:
@@ -1315,7 +1200,7 @@ def fit_stacked_model(
         train_log_loss=spot.train_log_loss, inner_log_loss=spot.inner_log_loss,
         inner_baseline_log_loss=spot.inner_baseline_log_loss,
         init_score_source='market', config_provenance=config.provenance(),
-        final_layer='stack', init_coefficient=a, intercept=c,
+        init_coefficient=a, intercept=c,
         spot=spot, stack_features=book_names, stack_mean=mean,
         stack_scale=scale, stack_coef=coef, stack_l2=float(config.stack_l2),
         n_stack_rows=int(rows.sum()), stack_fitted=fitted,

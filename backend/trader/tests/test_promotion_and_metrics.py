@@ -59,12 +59,15 @@ def fold(index=0, skill=0.002, ece=0.009, alpha=0.7, control=0.18,
 
 
 def report(skills=(0.002,) * 6, *, deviation=0.02, non_finite=0,
-           **over) -> EvaluationReport:
-    """`deviation` and `non_finite` are per-fold; everything else sizes the book."""
+           trade_metrics=None, **over) -> EvaluationReport:
+    """`deviation` and `non_finite` are per-fold; `trade_metrics` stands in for
+    the traded rows; everything else sizes the book."""
     return EvaluationReport(
         folds=[fold(i, skill=s, deviation=deviation, non_finite=non_finite)
                for i, s in enumerate(skills)],
-        continuous=stats(**over), config_provenance=Config().provenance())
+        continuous=stats(**over), config_provenance=Config().provenance(),
+        trade_metrics=(trade_metrics if trade_metrics is not None else
+                       {'realised_edge_lcb': 0.3, 'overconfidence_abs': 0.005}))
 
 
 def beats_the_market() -> dict:
@@ -150,8 +153,8 @@ def test_every_gate_carries_a_note_explaining_it():
 def test_the_forecast_gates_come_before_the_money_gates():
     """A candidate that fails on skill should not have its Sharpe discussed."""
     names = list(DEFAULT_GATES)
-    assert names.index('log_loss_skill') < names.index('sharpe')
-    assert names.index('calibration_error') < names.index('total_return')
+    assert names.index('log_loss_skill') < names.index('realised_edge_lcb')
+    assert names.index('calibration_error') < names.index('trades')
 
 
 def test_an_implausible_sharpe_fails_even_though_it_is_high():
@@ -163,7 +166,6 @@ def test_an_implausible_sharpe_fails_even_though_it_is_high():
     assert {g.name: g.passed for g in good}['sharpe_implausible']
     absurd = evaluate_gates(report(sharpe=IMPLAUSIBLE_SHARPE + 7))
     flags = {g.name: g.passed for g in absurd}
-    assert flags['sharpe'] is True
     assert flags['sharpe_implausible'] is False
     assert not gates_passed(absurd)
 
@@ -391,7 +393,7 @@ class TestTheMarketGates:
         others = {g.name: g.passed for g in evaluate_gates(
             report(), extra=market_gate_values(market_rows(4_000, model_edge=-0.35)))}
         assert others['log_loss_skill'], 'the fixture must otherwise be a passing one'
-        assert others['sharpe']
+        assert others['realised_edge_lcb']
         assert not others['model_minus_market'], (
             'a model worse than the quote it must trade against was promotable'
         )
@@ -430,7 +432,7 @@ class TestTheMarketGates:
         the question that decides whether this pays."""
         names = list(DEFAULT_GATES)
         assert names.index('model_minus_market') < names.index('log_loss_skill')
-        assert names.index('market_windows') < names.index('sharpe')
+        assert names.index('market_windows') < names.index('trades')
 
     def test_the_threshold_is_defined_once(self):
         """`scripts.market_benchmark` and the gate must not drift apart."""

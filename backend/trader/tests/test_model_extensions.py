@@ -1,4 +1,4 @@
-"""Opt-in model extensions: blend layer, ensemble, mirror, venue label.
+"""Opt-in model extensions: ensemble, venue label.
 
 Every extension is off by default, so the first tests pin that the defaults
 fit and score exactly as before.
@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.baseline import BarrierBaseline, clip_prob, expit, log_loss
+from core.baseline import BarrierBaseline, clip_prob, expit
 from core.config import Config
 from core.model import (
-    BASELINE_LOGIT, MIN_SHRINKAGE_ROWS, _fit_blend, fit_model,
+    BASELINE_LOGIT, fit_model,
 )
 
 FAST = Config(n_estimators=80, early_stopping_rounds=15, min_child_samples=50,
@@ -70,8 +70,7 @@ def test_table():
 
 def test_the_defaults_are_the_historical_model(train_table, test_table):
     config = Config()
-    assert (config.final_layer, config.ensemble_size, config.mirror_augment,
-            config.label_source) == ('scale', 1, False, 'proxy')
+    assert (config.ensemble_size, config.label_source) == (1, 'proxy')
     assert config.edge_lower_bound_z == 0.0
     assert config.require_member_agreement is False
 
@@ -92,75 +91,32 @@ def test_an_artifact_pickled_before_these_fields_still_predicts(
         train_table, test_table, tmp_path):
     model = fit(train_table)
     expected = model.predict(test_table)
-    for name in ('final_layer', 'init_coefficient', 'intercept', 'members'):
+    for name in ('init_coefficient', 'intercept', 'members'):
         del model.__dict__[name]
     path = tmp_path / 'old.joblib'
     joblib.dump(model, path)
     old = joblib.load(path)
     np.testing.assert_array_equal(old.predict(test_table), expected)
     assert list(old.score(test_table).columns) == ['model_probability']
-    assert old.provenance()['final_layer'] == 'scale'
+    assert (old.provenance()['init_coefficient'],
+            old.provenance()['intercept']) == (1.0, 0.0)
     old.verify()
 
 
-# ------------------------------------------------------------ blend layer
-
-def _blend_sample(a=0.8, b=0.6, c=0.0, n=40_000, seed=3):
-    rng = np.random.default_rng(seed)
-    init = rng.normal(0.0, 1.5, n)
-    corr = rng.normal(0.0, 1.0, n)
-    y = (rng.random(n) < expit(a * init + b * corr + c)).astype(float)
-    return init, corr, y
-
-
-def test_the_blend_recovers_a_planted_init_and_correction_weight():
-    init, corr, y = _blend_sample()
-    a, b, c = _fit_blend(init, corr, y, min_edge=0.015)
-    assert a == pytest.approx(0.8, abs=0.06)
-    assert b == pytest.approx(0.6, abs=0.06)
-    assert c == 0.0
-
-
-def test_the_blend_recovers_a_planted_intercept_only_when_allowed():
-    init, corr, y = _blend_sample(c=0.25)
-    a, b, c = _fit_blend(init, corr, y, min_edge=0.015, intercept=True)
-    assert (a, b, c) == pytest.approx((0.8, 0.6, 0.25), abs=0.07)
-    assert _fit_blend(init, corr, y, min_edge=0.015)[2] == 0.0
-
-
-def test_the_blend_respects_its_bounds():
-    init, corr, y = _blend_sample(a=3.0, b=3.0)
-    a, b, _ = _fit_blend(init, corr, y, min_edge=0.015, max_scale=1.0)
-    assert a <= 1.5 + 1e-9 and b <= 1.0 + 1e-9
-
-
-def test_the_blend_falls_back_to_every_row_when_few_would_trade(caplog):
-    init, corr, y = _blend_sample(n=2 * MIN_SHRINKAGE_ROWS)
-    corr = corr * 1e-4                     # nothing moves the price 1.5pp
-    _fit_blend(init, corr, y, min_edge=0.015)
-    assert 'fitted on all' in caplog.text
-
-
-def test_the_ridge_holds_a_small_sample_near_the_identity():
-    init, corr, y = _blend_sample(a=1.0, b=0.6, n=MIN_SHRINKAGE_ROWS, seed=11)
-    a, _, c = _fit_blend(init, corr, y, min_edge=0.0, intercept=True)
-    assert abs(a - 1.0) < 0.3 and abs(c) < 0.3
-
-
-def test_a_blended_model_scores_through_its_own_layer(train_table, test_table):
-    model = fit(train_table, _config(final_layer='blend'))
-    assert model.final_layer == 'blend'
-    assert 0.5 <= model.init_coefficient <= 1.5
-    assert model.intercept == 0.0
+def test_an_artifact_pickled_with_a_blend_layer_still_predicts_through_it(
+        train_table, test_table, tmp_path):
+    model = fit(train_table)
+    model.__dict__.update(final_layer='blend', init_coefficient=0.8,
+                          intercept=0.1)
+    path = tmp_path / 'blend.joblib'
+    joblib.dump(model, path)
+    old = joblib.load(path)
     base = test_table[BASELINE_LOGIT].to_numpy()
-    raw = model.raw_correction(test_table)
-    expected = clip_prob(expit(model.init_coefficient * base
-                               + model.residual_scale * raw))
-    np.testing.assert_allclose(model.predict(test_table), expected, rtol=0, atol=1e-15)
-    record = model.provenance()
-    assert record['final_layer'] == 'blend'
-    assert record['init_coefficient'] == model.init_coefficient
-    assert record['config']['final_layer'] == 'blend'
+    expected = clip_prob(expit(0.8 * base
+                               + old.residual_scale * old.raw_correction(test_table)
+                               + 0.1))
+    np.testing.assert_array_equal(old.predict(test_table), expected)
+    old.verify()
 
 
 # ------------------------------------------------------------ ensemble
@@ -202,37 +158,6 @@ def test_a_row_with_no_init_has_no_spread_either(ensemble, test_table):
     assert scored.iloc[1:].notna().all().all()
 
 
-# ------------------------------------------------------------ mirror
-
-def test_mirroring_is_applied_to_inner_train_only(train_table, monkeypatch):
-    import core.model as model_module
-    seen = []
-    real = model_module.mirror_rows
-
-    def spy(frame):
-        seen.append(frame)
-        return real(frame)
-
-    monkeypatch.setattr(model_module, 'mirror_rows', spy)
-    fit(train_table, _config(mirror_augment=True))
-    assert len(seen) == 1
-    windows = np.sort(train_table['window_open'].unique())
-    cut = windows[int(len(windows) * 0.8)]
-    assert seen[0]['window_open'].max() < cut
-
-
-def test_a_symmetric_signal_is_learned_at_least_as_well_with_mirroring(test_table):
-    small = synthetic(n_windows=2400, signal=0.6, seed=5)
-    y = test_table['outcome'].to_numpy()
-    plain = fit(small, _config(mirror_augment=False))
-    mirrored = fit(small, _config(mirror_augment=True))
-    plain_loss = log_loss(y, plain.predict(test_table))
-    mirrored_loss = log_loss(y, mirrored.predict(test_table))
-    base_loss = log_loss(y, test_table['baseline_probability'].to_numpy())
-    assert mirrored_loss < base_loss
-    assert mirrored_loss <= plain_loss + 0.002
-
-
 # ------------------------------------------------------------ venue label
 
 def test_label_source_venue_trains_on_the_venue_label():
@@ -260,8 +185,7 @@ def test_label_source_venue_falls_back_to_the_proxy_where_absent(train_table):
 
 # ------------------------------------------------------------ config and CLI
 
-@pytest.mark.parametrize('bad', [dict(final_layer='mean'),
-                                 dict(label_source='kalshi'), dict(ensemble_size=0),
+@pytest.mark.parametrize('bad', [dict(label_source='kalshi'), dict(ensemble_size=0),
                                  dict(edge_lower_bound_z=-1.0)])
 def test_a_bad_setting_is_refused_at_construction(bad):
     with pytest.raises(ValueError):
@@ -272,12 +196,10 @@ def test_every_new_field_reaches_provenance_and_the_cli():
     from scripts._common import add_data_arguments, config_from_args
     parser = add_data_arguments(argparse.ArgumentParser())
     args = parser.parse_args([
-        '--final-layer', 'blend', '--final-layer-intercept', '--ensemble-size', '5',
-        '--mirror-augment', '--label-source', 'venue',
+        '--ensemble-size', '5', '--label-source', 'venue',
         '--edge-lower-bound-z', '1.5', '--require-member-agreement'])
     config = config_from_args(args)
-    expected = dict(final_layer='blend', final_layer_intercept=True,
-                    ensemble_size=5, mirror_augment=True, label_source='venue',
+    expected = dict(ensemble_size=5, label_source='venue',
                     edge_lower_bound_z=1.5, require_member_agreement=True)
     record = config.provenance()
     for name, value in expected.items():
@@ -287,4 +209,4 @@ def test_every_new_field_reaches_provenance_and_the_cli():
         assert (tuple(recorded) if isinstance(recorded, list) else recorded) == value
 
     untouched = config_from_args(parser.parse_args([]))
-    assert untouched.final_layer == 'scale' and not untouched.cli_overrides & set(expected)
+    assert untouched.ensemble_size == 1 and not untouched.cli_overrides & set(expected)

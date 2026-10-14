@@ -171,11 +171,10 @@ def test_load_proxy_minutes_on_an_empty_store(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_the_group_is_selectable_but_not_default():
-    from core.features import ALL_GROUPS, FEATURE_GROUPS, FEATURE_PARITY, feature_columns
+    from core.features import ALL_GROUPS, FEATURE_GROUPS, feature_columns
     assert FEATURE_GROUPS['index_proxy'] == INDEX_PROXY
     assert 'index_proxy' not in ALL_GROUPS
     assert not set(INDEX_PROXY) & set(feature_columns())
-    assert all(c in FEATURE_PARITY for c in INDEX_PROXY)
 
 
 def test_build_features_finishes_the_z_score_on_the_fitted_sigma():
@@ -191,14 +190,6 @@ def test_build_features_finishes_the_z_score_on_the_fitted_sigma():
     out = build_features(table, {}, groups=('index_proxy',))
     assert out['proxy_displacement_z'].iloc[0] == pytest.approx(0.55)
     assert out['proxy_n_exchanges'].iloc[0] == 3.0
-
-
-def test_the_mirror_flips_the_displacement_and_the_basis():
-    from core.features import mirror_rows
-    table = pd.DataFrame({'proxy_displacement_z': [1.5], 'proxy_minus_spot_bps': [-2.0],
-                          'proxy_n_exchanges': [3.0], 'proxy_displacement': [0.001]})
-    out = mirror_rows(table)
-    assert list(out.iloc[0]) == [-1.5, 2.0, 3.0, -0.001]
 
 
 def test_dataset_build_attaches_the_proxy_point_in_time():

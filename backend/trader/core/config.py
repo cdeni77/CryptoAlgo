@@ -328,17 +328,9 @@ class Config:
     # 2.0 remains available for comparison. Nothing above 1.0 is coherent as a
     # SHRINKAGE, which is why the default moved.
     max_residual_scale: float = 1.0
-    # How the correction is recalibrated after the fit. 'scale' fits one alpha;
-    # 'blend' fits p = expit(a*init + b*correction + c) on the held-out rows that
-    # would trade, since that selected subset is where the model is overconfident.
-    final_layer: str = 'scale'
-    final_layer_intercept: bool = False
     # Number of boosters averaged. Their spread is what `edge_lower_bound_z` and
     # `require_member_agreement` read; 1 is the single-model behaviour.
     ensemble_size: int = 1
-    # Train on each row and its up/down mirror (features negated or swapped per
-    # `core.features.FEATURE_PARITY`, label flipped). Inner-train rows only.
-    mirror_augment: bool = False
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'
@@ -820,8 +812,7 @@ class Config:
                 f'{self.max_slippage_cents}.'
             )
         # Typos here would otherwise surface deep inside a fold's fit.
-        for name, allowed in (('final_layer', ('scale', 'blend')),
-                              ('label_source', ('proxy', 'venue')),
+        for name, allowed in (('label_source', ('proxy', 'venue')),
                               ('null_quote_age', ('fresh', 'stale')),
                               ('stack_mode', ('off', 'spot_then_market'))):
             if getattr(self, name) not in allowed:

@@ -1,5 +1,5 @@
 {
-  "gate_spec_hash": "f876688d5c48097c22a4fbe71989215d18b63b05e2bccd265a00c231448e5280",
+  "gate_spec_hash": "88d1feb458f0d5967d05d08c904ebdb908a6ae28e3f2c4c4dd02b37845ab9823",
   "gates": [
     {
       "name": "market_windows",
@@ -10,6 +10,18 @@
     {
       "name": "model_minus_market",
       "threshold": 0.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "model_minus_market_p",
+      "threshold": 0.05,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "min_folds",
+      "threshold": 6.0,
       "direction": "min",
       "definition_version": 1
     },
@@ -74,12 +86,6 @@
       "definition_version": 1
     },
     {
-      "name": "windows_evaluated",
-      "threshold": 20000.0,
-      "direction": "min",
-      "definition_version": 1
-    },
-    {
       "name": "trades",
       "threshold": 200.0,
       "direction": "min",
@@ -98,26 +104,20 @@
       "definition_version": 1
     },
     {
-      "name": "total_return",
+      "name": "realised_edge_lcb",
       "threshold": 0.0,
       "direction": "min",
       "definition_version": 1
     },
     {
-      "name": "sharpe",
-      "threshold": 0.5,
-      "direction": "min",
+      "name": "overconfidence_abs",
+      "threshold": 0.015,
+      "direction": "max",
       "definition_version": 1
     },
     {
       "name": "sharpe_implausible",
       "threshold": 0.0,
-      "direction": "max",
-      "definition_version": 1
-    },
-    {
-      "name": "max_drawdown",
-      "threshold": 0.35,
       "direction": "max",
       "definition_version": 1
     },

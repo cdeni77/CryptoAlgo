@@ -169,20 +169,10 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'which optimises the average -- and the average is '
                             'already fine while the traded rows are 6.7pp '
                             'overconfident.')
-    model.add_argument('--final-layer', choices=('scale', 'blend'), default=None,
-                       help="'scale' (default) fits one alpha; 'blend' fits "
-                            "expit(a*init + b*correction [+ c]) on the held-out "
-                            "rows that would trade")
-    model.add_argument('--final-layer-intercept', action='store_true',
-                       default=None,
-                       help="let the blend fit an intercept c in [-0.5, 0.5]")
     model.add_argument('--ensemble-size', type=int, default=None, metavar='K',
                        help='average K boosters (default 1); their spread '
                             'feeds --edge-lower-bound-z and '
                             '--require-member-agreement')
-    model.add_argument('--mirror-augment', action='store_true', default=None,
-                       help='also fit on the up/down mirror of every inner-'
-                            'train row')
     model.add_argument('--stack-mode', choices=('off', 'spot_then_market'),
                        default=None,
                        help="'spot_then_market': stage 1 learns spot -> "
@@ -293,10 +283,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('init_score_source', 'init_score_source'),
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
         ('assume_maker', 'assume_maker'),
-        ('final_layer', 'final_layer'),
-        ('final_layer_intercept', 'final_layer_intercept'),
         ('ensemble_size', 'ensemble_size'),
-        ('mirror_augment', 'mirror_augment'),
         ('label_source', 'label_source'),
         ('null_quote_age', 'null_quote_age'),
         ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),
