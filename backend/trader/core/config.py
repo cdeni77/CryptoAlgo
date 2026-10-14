@@ -664,6 +664,18 @@ class Config:
     # A one-minute bar built from the Coinbase trade stream is final once the
     # clock passes its close by this much: trades arrive ~tens of ms late.
     spot_bar_grace_seconds: float = 0.75
+
+    # ---- the settlement-index proxy (`core/index_proxy.py`) --------------
+    # An exchange's mid counts toward the per-second median only while its
+    # connection delivered something this recently. Applied at RECORD time, so
+    # changing it changes what `index_proxy_1s` holds from then on.
+    index_proxy_max_staleness_seconds: float = 5.0
+    # Fewer fresh exchanges than this is a NaN proxy: one venue is the very
+    # proxy this replaces.
+    index_proxy_min_exchanges: int = 2
+    # The `index_proxy` feature group reads the newest proxy row stamped
+    # strictly before the decision, and only if it is at most this old.
+    index_proxy_max_age_seconds: float = 5.0
     # On a decision cycle venue reconciliation runs AFTER the orders, using the
     # last reconciled balance to size. If that is older than this (or never
     # happened) the cycle reconciles first, as non-decision cycles do.

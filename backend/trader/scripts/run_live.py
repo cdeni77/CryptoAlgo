@@ -197,6 +197,10 @@ COMPONENTS: tuple[Component, ...] = (
     # subscription rather than polling, and it is never gated: the trading
     # loop reads its bars on the decision path instead of a ~3s REST fetch.
     Component('spot_stream', phase=0.0),
+    # The settlement-index proxy: four constituent-exchange sockets and a
+    # per-second sampler. Nothing in trading reads it yet, so it is the safest
+    # thing here to disable (`--disable index`).
+    Component('index', phase=0.0),
     Component('ladder', phase=25.0),
     # +55s, not +35s. Decisions land about two seconds past the minute, so a
     # recorder at +35s left the freshest Polymarket reading ~27s old — inside
@@ -257,13 +261,16 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
         # belongs here rather than in the stream recorder for the same reason
         # the rest of this loop does: it is blocking Parquet work, and the
         # stream must not stop reading to do it.
+        # Every raw table (book frames, Coinbase trades, the index proxy), each
+        # pruned to its own retention, then the free-disk guard.
         try:
             from core.datastore import DEFAULT_ROOT
-            from core.spool import DEFAULT_SPOOL_ROOT, compact
+            from core.spool import DEFAULT_SPOOL_ROOT, compact_all
             rows = await asyncio.to_thread(
-                compact, DEFAULT_SPOOL_ROOT, DEFAULT_ROOT)
-            if rows:
-                logger.info('compacted %d book-event rows', rows)
+                compact_all, DEFAULT_SPOOL_ROOT, DEFAULT_ROOT)
+            for dataset, count in rows.items():
+                if count:
+                    logger.info('compacted %d %s rows', count, dataset)
         except Exception as exc:                      # noqa: BLE001
             logger.warning('spool compaction: %s', str(exc)[:200])
         # FOUR stages, in dependency order. The first two were here from the
@@ -348,9 +355,9 @@ STEP_TIMEOUT_SECONDS = 1800.0
 
 def build_factories(args, gate: TradingGate) -> dict:
     """One coroutine factory per component, all sharing the gate."""
-    from scripts import (record_implied_vol, record_ladder, record_pm_ladder,
-                         record_pm_stream, record_spot_stream,
-                         record_stream)
+    from scripts import (record_implied_vol, record_index, record_ladder,
+                         record_pm_ladder, record_pm_stream,
+                         record_spot_stream, record_stream)
     from scripts import live as live_module
 
     trade_argv = list(args.trade_args)
@@ -388,6 +395,10 @@ def build_factories(args, gate: TradingGate) -> dict:
         return await record_spot_stream.run(
             _recorder_args(record_spot_stream.build_parser), gate=gate)
 
+    async def index():
+        return await record_index.run(
+            _recorder_args(record_index.build_parser), gate=gate)
+
     async def implied_vol():
         await align_to_phase(45.0)
         return await record_implied_vol.run(
@@ -400,7 +411,7 @@ def build_factories(args, gate: TradingGate) -> dict:
 
     return {'trade': trade, 'stream': stream, 'ladder': ladder,
             'pm_ladder': pm_ladder, 'pm_stream': pm_stream,
-            'spot_stream': spot_stream,
+            'spot_stream': spot_stream, 'index': index,
             'implied_vol': implied_vol,
             'store_sync': store_sync}
 

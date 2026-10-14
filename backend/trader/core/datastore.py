@@ -247,6 +247,22 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'bid', 'ask', 'bid_size', 'ask_size', 'depth_1pct_bid', 'depth_1pct_ask',
     ),
+    # Every Coinbase trade the spot stream saw, written by `core/spool` like
+    # `venue_book_events` (never through `write()`). `event_time` is the print,
+    # `available_time` our receipt; bounded by RAW_RETENTION_DAYS.
+    'spot_trades': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'product_id', 'trade_id', 'price', 'size', 'side', 'received_time',
+        'sequence_num',
+    ),
+    # A per-second median of constituent-exchange mids, standing in for the CF
+    # Benchmarks index Kalshi settles on (`core/index_proxy.py`). Written by
+    # `core/spool`; `event_time` is the sampling instant.
+    'index_proxy_1s': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'proxy', 'n_exchanges',
+        'mid_coinbase', 'mid_kraken', 'mid_bitstamp', 'mid_gemini',
+    ),
 }
 
 # Ordered worst to best. `data_collection.ingest` stamps these from the
@@ -314,6 +330,10 @@ EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
     # name one price and were unaffected, which is what made it invisible: the
     # only frames destroyed were the ones a replay needs to bootstrap from.
     'venue_book_events': ('market_ticker', 'seq', 'side', 'price'),
+    # Many prints share a timestamp; the venue's id is what makes one unique,
+    # and keying on it is what lets a trade re-delivered after a reconnect
+    # collapse to one row.
+    'spot_trades': ('product_id', 'trade_id'),
 }
 
 
