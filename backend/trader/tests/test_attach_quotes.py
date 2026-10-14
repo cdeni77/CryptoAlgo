@@ -1,8 +1,7 @@
-"""Tests for `attach_quotes`: pricing a backtest row against the venue's recorded book.
+"""Tests for `attach_quotes`: pricing a backtest row against the recorded book.
 
-Without a book, `decide()` prices against the baseline, which is the model's own
-training target. A Kalshi YES book prices UP at the YES ask and DOWN at
-`1 - yes_bid`. Using `yes_bid` or the mid directly is wrong by the spread.
+UP costs the YES ask and DOWN costs `1 - yes_bid`; the mid or the raw bid is wrong by
+the spread.
 """
 
 from __future__ import annotations
@@ -45,16 +44,15 @@ def test_the_down_price_is_one_minus_the_yes_bid():
 
 
 def test_the_two_sides_sum_to_more_than_one_by_the_spread():
-    """The two costs sum to 1 + spread, never to 1. This catches a denomination error.
-    """
+    """The two costs sum to 1 + spread, never to 1. This catches a denomination error."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
     total = got['ask_up'].iloc[0] + got['ask_down'].iloc[0]
     assert total == pytest.approx(1.02), 'should be 1 + the 2c spread'
 
 
 def test_a_one_sided_book_prices_only_the_side_that_exists():
-    """A missing ask leaves UP unpriced, so the backtest cannot buy at a price that did not
-    exist.
+    """A missing ask leaves UP unpriced, so the backtest cannot buy at a price that did
+    not exist.
     """
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, np.nan, 1.0)]))
     assert pd.isna(got['ask_up'].iloc[0])
@@ -62,8 +60,7 @@ def test_a_one_sided_book_prices_only_the_side_that_exists():
 
 
 def test_a_window_with_no_quote_keeps_nan_so_decide_falls_back():
-    """Rows with no recorded quote price against the baseline, not a fabricated quote.
-    """
+    """Rows with no recorded quote price against the baseline, not a fabricated quote."""
     got = attach_quotes(_windows((3, 12)), _depth([(3, 0.44, 0.46, 1.0)]))
     late = got[got['offset'] == 12].iloc[0]
     assert pd.isna(late['ask_up']) and pd.isna(late['ask_down'])
@@ -76,9 +73,7 @@ def test_the_offset_must_match_exactly():
 
 
 def test_only_the_venue_we_trade_is_used():
-    """Only the traded venue prices the trade. Polymarket is a feature, not the execution
-    book.
-    """
+    """Only the traded venue prices the trade. Polymarket is a feature, not the execution book."""
     depth = pd.concat([_depth([(3, 0.10, 0.12, 1.0)], venue='polymarket'),
                        _depth([(3, 0.44, 0.46, 1.0)], venue='kalshi')])
     got = attach_quotes(_windows((3,)), depth, venue='kalshi')
@@ -102,8 +97,7 @@ def test_a_stale_quote_can_be_refused_outright():
 
 
 def test_crossed_or_nonsense_quotes_are_dropped():
-    """A crossed book (ask below bid) is dropped. Kept, it would show a guaranteed profit.
-    """
+    """A crossed book (ask below bid) is dropped. Kept, it would show a guaranteed profit."""
     got = attach_quotes(_windows((3,)), _depth([(3, 0.60, 0.40, 1.0)]))
     assert pd.isna(got['ask_up'].iloc[0]) and pd.isna(got['ask_down'].iloc[0])
 
@@ -114,8 +108,8 @@ def test_prices_outside_zero_to_one_are_dropped():
 
 
 def test_attaching_does_not_reorder_or_drop_window_rows():
-    """`decide()` reads the table row by row, so dropping or reordering rows changes which
-    windows trade.
+    """`decide()` reads the table row by row, so dropping or reordering rows changes
+    which windows trade.
     """
     windows = _windows((3, 6, 9, 12))
     got = attach_quotes(windows, _depth([(6, 0.44, 0.46, 1.0)]))
@@ -126,8 +120,8 @@ def test_attaching_does_not_reorder_or_drop_window_rows():
 def test_the_market_probability_is_the_mid():
     """The market probability is the mid.
 
-    `model_minus_market` compares forecasts. Scoring the market at its ask would
-    credit the model with half the spread on every row.
+    `model_minus_market` compares forecasts. Scoring the market at its ask would credit
+    the model with half the spread on every row.
     """
     got = attach_quotes(_windows((3,)), _depth([(3, 0.44, 0.46, 1.0)]))
     assert got['market_probability'].iloc[0] == pytest.approx(0.45)
@@ -173,9 +167,7 @@ def test_the_depth_columns_market_state_needs_are_attached():
 
 
 def test_the_other_venue_is_attached_under_its_own_prefix():
-    """The other venue's book is attached under its own prefix so the columns do not
-    collide.
-    """
+    """The other venue's book is attached under its own prefix so the columns do not collide."""
     depth = pd.concat([_rich_depth('kalshi'),
                        _rich_depth('polymarket').assign(yes_bid=0.40, yes_ask=0.41)])
     got = attach_quotes(_windows((3,)), depth, venue='kalshi', other_venue='polymarket')

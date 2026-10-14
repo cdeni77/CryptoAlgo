@@ -1,7 +1,7 @@
 """Tests for the collection ledger, which records the state of every window.
 
-The ledger separates pending, empty and error, retryable from terminal, and
-survives a kill mid-window. "Never asked" is a state, not an inference from absence.
+The ledger separates pending, empty and error, retryable from terminal, and survives a
+kill mid-window. "Never asked" is a state, not an inference from absence.
 """
 
 from __future__ import annotations
@@ -80,9 +80,7 @@ def test_ok_is_terminal(ledger):
 
 
 def test_error_stops_being_retried_once_attempts_are_exhausted(ledger):
-    """After `MAX_ATTEMPTS` errors a window stops being retried, so it cannot block the
-    queue.
-    """
+    """After `MAX_ATTEMPTS` errors a window stops being retried, so it cannot block the queue."""
     ledger.seed(_items(1))
     for _ in range(MAX_ATTEMPTS):
         batch = ledger.claim(10)
@@ -158,9 +156,7 @@ def test_coverage_reports_yield_over_answered_windows_only(ledger):
 # -- scheduling --------------------------------------------------------------
 
 def test_work_is_claimed_interleaved_by_month_not_venue_by_venue(tmp_path):
-    """Work is claimed by month across venues, so each finished month is usable on both
-    venues.
-    """
+    """Work is claimed by month across venues, so each finished month is usable on both venues."""
     ledger = Ledger(str(tmp_path / 'l.db'))
     ledger.seed([('kalshi', 'BTC-USD', _w(8), 'k1'),
                  ('polymarket', 'BTC-USD', _w(8), 'p1')])
@@ -182,8 +178,8 @@ def test_claim_can_be_limited_to_one_month_for_phased_runs(ledger):
 
 
 def test_claim_can_start_from_a_date_so_a_trial_can_target_a_known_overlap(ledger):
-    """`since` lets a trial start at a known date, such as the overlap with live-recorded
-    ladders.
+    """`since` lets a trial start at a known date, such as the overlap with
+    live-recorded ladders.
     """
     ledger.seed([('kalshi', 'BTC-USD', _w(8), 'early'),
                  ('kalshi', 'BTC-USD', _w(25), 'late')])

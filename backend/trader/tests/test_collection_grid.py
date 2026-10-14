@@ -1,9 +1,7 @@
-"""Tests for building the Polymarket window grid, used instead of paging through all
-markets.
+"""Tests for the Polymarket window grid, used instead of paging through all markets.
 
-Slugs are built from a pattern here, which is normally avoided. It is safe in
-this one place because a wrong slug returns nothing, not a wrong market, and
-every returned market is checked against the venue's own end_time.
+Building slugs is safe here: a wrong slug returns nothing, and every returned market is
+checked against its own end_time.
 """
 
 from __future__ import annotations

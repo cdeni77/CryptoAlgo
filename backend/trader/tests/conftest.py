@@ -1,9 +1,7 @@
-"""Shared fixtures, mainly the synthetic one-minute bar generator.
+"""Shared fixtures, mainly `make_bars`, a synthetic one-minute bar generator.
 
-`make_bars` has known properties: an intraday volatility shape, volatility
-clustering, and an optional lead-lag from BTC to the other symbols. A test that
-plants a mechanism checks that the pipeline finds it. A test that plants nothing
-checks that the pipeline finds nothing.
+Known properties (intraday vol shape, clustering, optional BTC lead) let a test check
+that the pipeline finds a planted mechanism and finds nothing otherwise.
 """
 
 from __future__ import annotations
@@ -22,8 +20,8 @@ if str(ROOT) not in sys.path:
 
 @pytest.fixture(autouse=True)
 def _no_peer_state_between_tests():
-    """Clears process-level peer state so one test cannot leak a resubscribe request into
-    the next.
+    """Clears process-level peer state so one test cannot leak a resubscribe request
+    into the next.
     """
     yield
     features = sys.modules.get('livetrade.features')
@@ -36,8 +34,7 @@ def _no_peer_state_between_tests():
 
 @pytest.fixture(scope='session')
 def repo_root() -> Path:
-    """Returns the trader package root, where `configs/` lives (the Docker build context).
-    """
+    """Returns the trader package root, where `configs/` lives (the Docker build context)."""
     return ROOT
 
 

@@ -1,8 +1,7 @@
 """Synthetic `venue_depth` rows for the stacking and quote-filter tests.
 
-The market price is the barrier probability at a fixed sigma plus logit noise. It
-cannot see other symbols, so a planted BTC lead gives a `cross_asset` model
-information the price does not have.
+The market price is the barrier probability plus logit noise and cannot see other
+symbols, so a planted BTC lead is information the price lacks.
 """
 
 from __future__ import annotations

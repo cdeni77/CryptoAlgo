@@ -1,9 +1,7 @@
-"""Tests that the balance-drift alarm ignores payouts we booked before the venue posts
-them.
+"""Tests that the balance-drift alarm ignores payouts the venue has not posted yet.
 
-`venue_balance` is sampled at the top of the cycle and `settle_due` credits our
-side afterwards, so the venue lags by one cycle. That lag is not drift. A real
-drift (unrecorded fill, partial, mispriced fee) must still warn.
+The venue balance lags our settlement credit by one cycle. That lag is not drift; a real
+drift must still warn.
 """
 
 from __future__ import annotations
@@ -21,8 +19,8 @@ class _Account:
 
 
 class _Writer:
-    """Fake writer with only what `adopt_venue_balance` uses. `account` is a method, as on
-    PgWriter.
+    """Fake writer with only what `adopt_venue_balance` uses. `account` is a method, as
+    on PgWriter.
     """
 
     def __init__(self, bankroll):

@@ -1,9 +1,7 @@
-"""Tests that `book_flow` chooses its observer and drops unusable books.
+"""Tests that `book_flow` picks its observer and drops unusable books, as
+`attach_quotes` does.
 
-It applies the same source ranking and the same crossed/stale filters as
-`attach_quotes`, so `market_state` and `book_flow` read the same book on a row.
-Unusable rows are dropped, not demoted, because a flow feature has no NaN
-fallback and would average a crossed book into a trend.
+Unusable rows are dropped, not demoted: a flow feature has no NaN fallback.
 """
 
 from __future__ import annotations

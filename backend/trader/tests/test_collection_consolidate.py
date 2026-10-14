@@ -1,7 +1,7 @@
 """Tests for converting collected JSONL into the derived and ladder Parquet layers.
 
-Collection jobs get killed and retried, so the converter must handle torn lines
-and duplicate windows without losing a partition.
+Collection jobs get killed and retried, so the converter must handle torn lines and
+duplicate windows without losing a partition.
 """
 
 from __future__ import annotations
@@ -175,7 +175,6 @@ def test_selecting_copies_keeps_locations_not_records(collected, tmp_path):
 
 
 def test_selecting_copies_points_at_the_fullest_copy(collected, tmp_path):
-    """The index points at the fullest copy."""
     collected([_record(market_id='pm', n=2), _record(market_id='pm', n=9),
                _record(market_id='pm', n=4)])
     path = next((tmp_path / 'archive').rglob('*.jsonl'))

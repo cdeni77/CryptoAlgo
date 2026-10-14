@@ -1,8 +1,7 @@
 """Tests for the `--compound` flag.
 
-Compounding is off by default: sizing from the starting bankroll keeps the equity
-curve additive, so its slope is the per-trade edge. The flag lets the
-alternative run without changing the default.
+Compounding is off by default, so the equity curve stays additive and its slope is the
+per-trade edge.
 """
 from __future__ import annotations
 
@@ -18,7 +17,6 @@ def _config(argv):
 
 
 def test_compounding_is_off_unless_asked_for():
-    """Compounding is off by default."""
     assert _config([]).compound is False
 
 
@@ -27,8 +25,8 @@ def test_compounding_can_be_turned_on():
 
 
 def test_it_reaches_the_sizing_base():
-    """The flag reaches the Config the backtest uses, which `decide()` reads for the sizing
-    base.
+    """The flag reaches the Config the backtest uses, which `decide()` reads for the
+    sizing base.
     """
     from core.decide import kelly_fraction_for  # noqa: F401  (import guard)
     config = _config(['--compound', '--bankroll', '500'])

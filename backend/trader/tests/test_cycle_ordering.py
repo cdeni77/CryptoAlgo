@@ -1,11 +1,7 @@
 """Tests that `run_cycle` adopts the venue balance after crediting our own settlements.
 
-The venue credits a payout as soon as a market settles. Reading its balance first
-and settling second would book every payout twice for one cycle, inflate Kelly
-sizing, and raise a false drift warning.
-
-The test drives the real `run_cycle`. Stale bars make the cycle return right
-after the settle/adopt step, so no model or quotes are needed.
+The other order would book each payout twice for one cycle. Stale bars make the real
+`run_cycle` return right after the settle/adopt step.
 """
 
 from __future__ import annotations
@@ -43,8 +39,7 @@ def _stale_bars() -> dict[str, pd.DataFrame]:
 
 
 class VenueStub:
-    """Reports a balance that already includes the payout, as the venue does at settlement.
-    """
+    """Reports a balance that already includes the payout, as the venue does at settlement."""
 
     def __init__(self, balance: float):
         self.balance = balance
@@ -153,8 +148,7 @@ def test_a_real_disagreement_still_reaches_the_log(writer, monkeypatch, caplog):
 
 
 def test_no_venue_means_no_balance_write(writer, monkeypatch):
-    """With no venue (paper mode or `--no-reconcile`) the settlement credit still applies.
-    """
+    """With no venue (paper mode or `--no-reconcile`) the settlement credit still applies."""
     writer.update_account(bankroll=93.8)
     _open_a_winning_position(writer)
 

@@ -1,8 +1,7 @@
 """Tests for the noise null subtracted from `calibration_vs_market`.
 
-ECE uses absolute deviations, so any unbiased perturbation of a calibrated
-forecast raises it. A market-initialised model therefore scores above zero just
-by moving. The gate compares the model with a random correction of the same size.
+ECE rises under any unbiased perturbation, so the model is compared with a random
+correction of the same size, not with zero.
 """
 
 from __future__ import annotations
@@ -66,7 +65,6 @@ def test_a_model_that_merely_perturbs_the_market_scores_near_zero():
 
 
 def test_a_systematically_overconfident_model_still_fails():
-    """A systematically overconfident model still fails the gate."""
     k, y = _market_rows(n=6000)
     lg = np.log(k/(1-k))
     overconfident = 1/(1+np.exp(-lg*1.6))  # pushed away from 0.5, no noise

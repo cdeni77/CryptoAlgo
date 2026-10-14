@@ -1,8 +1,7 @@
-"""Tests for the default embargo and a leakage check against the feature lookback.
+"""Tests that the default embargo covers the longest feature lookback.
 
-`assert_no_leakage` compares a fold's gap with the fold's own embargo, so it
-cannot catch an embargo that is too small. These tests compare with the longest
-feature lookback instead.
+`assert_no_leakage` checks a fold against its own embargo, so it cannot catch an embargo
+that is too small.
 """
 
 from __future__ import annotations
@@ -41,9 +40,7 @@ def test_the_module_default_matches_the_configured_default():
 
 
 def test_folds_built_from_the_config_alone_honour_a_day():
-    """Folds built without an explicit embargo (the production path) have at least a day's
-    gap.
-    """
+    """Folds built without an explicit embargo (the production path) have at least a day's gap."""
     config = Config()
     folds = purged_walk_forward(window_index(), n_folds=config.n_folds)
     # `>=`, not `==`: anchored calendar blocks accumulate, so `n_folds` is a cap, not a
@@ -59,9 +56,7 @@ def test_folds_built_from_the_config_alone_honour_a_day():
 
 
 def test_the_leakage_check_is_measured_against_the_lookback_not_the_fold():
-    """A fold built with a zero embargo passes `assert_no_leakage` but fails the lookback
-    check.
-    """
+    """A fold built with a zero embargo passes `assert_no_leakage` but fails the lookback check."""
     config = Config()
     folds = purged_walk_forward(window_index(), n_folds=4, embargo_minutes=0)
     lookback = pd.Timedelta(minutes=max(config.vol_lookbacks_minutes))

@@ -1,8 +1,7 @@
 """Tests for the venue fetchers: window parsing, book packing, and window verification.
 
-A window parsed from a venue identifier is checked against the venue's own
-stated times, and a disagreement is an error. A misread identifier otherwise
-shifts every window silently.
+A parsed window is checked against the venue's own stated times, and a mismatch is an
+error.
 """
 
 from __future__ import annotations
@@ -40,7 +39,6 @@ def test_a_malformed_kalshi_ticker_raises_rather_than_guessing():
 # -- Polymarket slug -> window open ------------------------------------------
 
 def test_a_polymarket_slug_stamp_is_the_window_open_not_its_close():
-    """The Polymarket slug stamp is the window open, not its close."""
     ts = int(dt.datetime(2026, 1, 8, 14, 0, tzinfo=UTC).timestamp())
     assert pm_window_open(f'btc-updown-15m-{ts}') == \
         dt.datetime(2026, 1, 8, 14, 0, tzinfo=UTC)
@@ -76,7 +74,6 @@ def test_a_window_of_the_wrong_length_is_caught():
 
 
 def test_missing_venue_times_are_not_treated_as_agreement():
-    """Missing venue times are not treated as agreement."""
     opened = dt.datetime(2026, 1, 8, 14, 0, tzinfo=UTC)
     assert verify_window(opened, venue_open=None, venue_close=None) is not None
 

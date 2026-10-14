@@ -1,7 +1,7 @@
 """Tests for the Kalshi exchange shard allocation payload.
 
-Balances are local to a shard, and the KX*15M series trade on `exchange_index` 2.
-A standing allocation makes the venue move settled cash back to that shard.
+Balances are local to a shard, and the KX*15M series trade on `exchange_index` 2. A
+standing allocation makes the venue move settled cash back to that shard.
 """
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ def test_everything_on_the_crypto_shard():
 
 
 def test_percentages_must_total_one_hundred():
-    """The payload must total 100%, otherwise the remainder stays stranded on another
-    shard.
-    """
+    """The payload must total 100%, otherwise the remainder stays stranded on another shard."""
     with pytest.raises(ValueError, match='100'):
         allocation_payload({2: 90})
 

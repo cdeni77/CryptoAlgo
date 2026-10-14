@@ -1,7 +1,7 @@
 """Tests for the collection rate limiter, circuit breaker and single-writer lock.
 
-Predexon's rate limit is org-wide, so only one process may collect. The breaker
-pauses a run during an outage, so an outage does not turn pending windows into errors.
+Predexon's rate limit is org-wide, so only one process may collect. The breaker pauses a
+run during an outage, so an outage does not turn pending windows into errors.
 """
 
 from __future__ import annotations
@@ -67,8 +67,7 @@ def test_a_short_burst_of_errors_does_not_trip_it():
 
 
 def test_the_breaker_only_considers_the_trailing_window():
-    """Only the trailing window counts, so the breaker resets after the venue recovers.
-    """
+    """Only the trailing window counts, so the breaker resets after the venue recovers."""
     breaker = Breaker(threshold=0.25, window=20)
     for _ in range(20):
         breaker.record(ok=False)
@@ -79,7 +78,6 @@ def test_the_breaker_only_considers_the_trailing_window():
 
 
 def test_the_breaker_needs_a_full_window_before_it_can_trip():
-    """The breaker needs a full window of results before it can trip."""
     breaker = Breaker(threshold=0.25, window=40)
     breaker.record(ok=False)
     breaker.record(ok=False)

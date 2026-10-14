@@ -96,10 +96,11 @@ async def test_the_span_is_exactly_one_short_of_the_limit():
 
 @pytest.mark.asyncio
 async def test_the_minute_still_in_progress_is_never_returned():
-    """The bar for the minute in progress is never returned, since its values are partial.
+    """The bar for the minute in progress is never returned, since its values are
+    partial.
 
-    The pipeline only accepts bars newer than the last stored one, so a stored
-    partial bar is never corrected.
+    The pipeline only accepts bars newer than the last stored one, so a stored partial
+    bar is never corrected.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None, second=30, microsecond=0)
     in_progress = now.replace(second=0)

@@ -1,8 +1,7 @@
 """Tests for fold construction in `core.cv` and position accounting in `core.book`.
 
-Cross-validation splits on the window, never the row: four offsets share one
-settlement. The Sharpe is annualised on trades placed, not windows available,
-or it is inflated by the reciprocal of coverage.
+Folds split on the window, never the row. The Sharpe is annualised on trades placed, not
+windows available.
 """
 
 from __future__ import annotations
@@ -39,8 +38,7 @@ def test_folds_never_overlap_and_honour_the_embargo():
 
 
 def test_the_embargo_covers_the_feature_lookback_not_just_the_label():
-    """The embargo covers the longest feature lookback (`log_rv_1440`), not only the label.
-    """
+    """The embargo covers the longest feature lookback (`log_rv_1440`), not only the label."""
     folds = purged_walk_forward(window_index(), n_folds=4, embargo_minutes=1440)
     for fold in folds:
         assert (fold.test_start - fold.train_end) > pd.Timedelta(minutes=1440)
@@ -77,9 +75,7 @@ def test_too_few_windows_is_an_error_not_a_degenerate_fold():
 
 
 def test_rows_are_selected_by_window_membership_not_a_timestamp_slice():
-    """Rows are selected by window membership, so a window is never split across train and
-    test.
-    """
+    """Rows are selected by window membership, so a window is never split across train and test."""
     table = pd.DataFrame({
         'window_open': [W, W, W, W, W + pd.Timedelta(minutes=15)],
         'offset': [3, 6, 9, 12, 3],
@@ -144,8 +140,7 @@ def test_a_position_settles_exactly_once():
 
 
 def test_settlement_is_keyed_on_symbol_and_window_together():
-    """Settlement is keyed on (symbol, window), since symbols settle at the same instant.
-    """
+    """Settlement is keyed on (symbol, window), since symbols settle at the same instant."""
     book = Book(config=Config())
     for symbol in ('BTC-USD', 'ETH-USD'):
         book.open_positions.append(make_position(symbol=symbol))

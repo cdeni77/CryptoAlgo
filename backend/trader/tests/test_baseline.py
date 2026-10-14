@@ -1,7 +1,6 @@
-"""Tests for the barrier baseline `F(displacement / sigma_remaining)`, the null hypothesis.
+"""Tests for the barrier baseline `F(displacement / sigma_remaining)`, the null.
 
-It may fit a scale factor and a tail thickness. It must never fit a drift,
-because drift is the alpha under test.
+It may fit a scale and a tail thickness, never a drift: drift is the alpha under test.
 """
 
 from __future__ import annotations
@@ -64,9 +63,7 @@ def test_the_fitted_barrier_beats_an_uncalibrated_one():
 
 
 def test_a_more_inflated_sigma_yields_a_smaller_scale():
-    """More sigma inflation yields a smaller fitted scale (uniform inflation, so no
-    confound).
-    """
+    """More sigma inflation yields a smaller fitted scale (uniform inflation, so no confound)."""
     mild = BarrierBaseline.fit(
         barrier_table(inflation={o: 1.05 for o in (3, 6, 9, 12)}, n=120_000),
         Config(baseline_fit_scale_per_offset=False))
@@ -140,8 +137,8 @@ def test_the_scale_is_fitted_per_offset_only_when_asked():
 def test_a_student_t_is_standardised_to_unit_variance():
     """The Student-t is standardised to unit variance (divided by `sqrt(nu/(nu-2))`).
 
-    Without it every probability moves toward one half, which looks conservative
-    instead of wrong.
+    Without it every probability moves toward one half, which looks conservative instead
+    of wrong.
     """
     for nu in (3.0, 5.0, 10.0):
         fitted = BarrierBaseline(distribution='student_t', nu=nu, scale={9: 1.0})
@@ -170,8 +167,7 @@ def test_attach_baseline_adds_the_logit_the_model_consumes():
 
 
 def test_reliability_bins_are_fixed_not_quantile():
-    """Reliability bins use fixed edges, so two runs' calibration tables are comparable.
-    """
+    """Reliability bins use fixed edges, so two runs' calibration tables are comparable."""
     y = np.array([0, 1] * 500)
     p = np.linspace(0.01, 0.99, 1000)
     first = reliability(y, p)

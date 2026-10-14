@@ -1,8 +1,7 @@
 """Tests for `complete_cases`: keep only rows where every input the model uses exists.
 
-LightGBM learns a default direction for missing values, so training on mixed rows
-fits a blend of two models. A complete-case row is one the live path could
-actually trade with all its inputs.
+LightGBM learns a default for missing values, so mixed rows would fit a blend of two
+models.
 """
 
 from __future__ import annotations
@@ -45,8 +44,8 @@ def test_a_row_missing_a_ladder_fit_is_dropped():
 
 
 def test_a_row_missing_the_venues_settlement_is_dropped():
-    """A row without the venue's settlement is dropped, so it is not graded on our Coinbase
-    label.
+    """A row without the venue's settlement is dropped, so it is not graded on our
+    Coinbase label.
     """
     got = complete_cases(_panel(venue_outcome=[1.0, np.nan, 1.0, np.nan]))
     assert len(got) == 2

@@ -1,7 +1,7 @@
 """Tests for the group ablation in `scripts.ablate`.
 
-Gain share shows where splits were spent, not whether a group forecasts. The
-ablation runs each group alone, which is the real test of the `clock` control.
+Gain share shows where splits were spent, not whether a group forecasts. The ablation
+runs each group alone, which is the real test of the `clock` control.
 """
 
 from __future__ import annotations

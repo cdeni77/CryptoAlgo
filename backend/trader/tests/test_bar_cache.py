@@ -1,9 +1,4 @@
-"""Tests for the live bar cache: the window is kept between cycles and only the tail is
-fetched.
-
-A full 1,500-minute fetch is about six sequential requests per symbol, the
-largest cost in a live cycle.
-"""
+"""Tests for the live bar cache: keep the window between cycles, fetch only the tail."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -90,8 +85,8 @@ async def test_the_window_still_spans_the_full_period_after_an_incremental(clien
 
 @pytest.mark.asyncio
 async def test_a_refetched_minute_takes_the_newer_value(client):
-    """A refetched minute takes the newer value, since the cached last bar may be a partial
-    candle.
+    """A refetched minute takes the newer value, since the cached last bar may be a
+    partial candle.
     """
     await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     symbol = DEFAULT_CONFIG.symbols[0]

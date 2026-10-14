@@ -1,9 +1,7 @@
 """Tests for features computed from the venue order book.
 
-Rules that apply to all of them:
-- Prices in these fields are integer cents; a probability is price / 100.
-- A missing side is NaN, never zero. A one-sided book has no mid.
-- No lookahead: a feature at offset m sees only books at or before that instant.
+Prices are integer cents (probability = price / 100); a missing side is NaN, never zero;
+a feature at offset m sees only books at or before that instant.
 """
 
 from __future__ import annotations
@@ -82,14 +80,12 @@ def test_depth_ratio_is_logged_so_it_is_symmetric():
 
 
 def test_level_counts_are_not_features():
-    """Level counts differ between backfilled and live sources, so they are not features.
-    """
+    """Level counts differ between backfilled and live sources, so they are not features."""
     assert not any('levels' in c for c in MARKET_STATE)
 
 
 def test_the_price_free_variant_cannot_echo_the_market():
-    """The price-free variant has no price columns, so its edge cannot copy the quote.
-    """
+    """The price-free variant has no price columns, so its edge cannot copy the quote."""
     structural = market_state_features(_snap(), include_price=False)
     assert 'market_prob' not in structural.columns
     assert 'market_minus_baseline' not in structural.columns
@@ -200,7 +196,6 @@ def test_the_join_does_not_leak_across_windows():
 # is a feature, not a filter, so the model can tell fresh from stale.
 
 def test_the_fit_is_the_last_one_at_or_before_the_decision():
-    """The fit used is the last one at or before the decision instant."""
     from core.book_features import attach_implied_vol
     fits = pd.DataFrame({
         'symbol': ['BTC-USD'] * 3,
@@ -247,7 +242,6 @@ def test_a_decision_before_any_fit_gets_nothing():
 
 
 def test_the_join_does_not_cross_symbols():
-    """The join never crosses symbols."""
     from core.book_features import attach_implied_vol
     fits = pd.DataFrame({
         'symbol': ['ETH-USD'],

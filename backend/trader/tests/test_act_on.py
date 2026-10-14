@@ -1,7 +1,7 @@
 """Tests for `act_on`, the step that sends orders and books positions.
 
-Each case checks three things: whether an order reached the wire, which position
-exists afterwards, and what happened to the bankroll.
+Each case checks three things: whether an order reached the wire, which position exists
+afterwards, and what happened to the bankroll.
 """
 
 from __future__ import annotations
@@ -224,8 +224,8 @@ class TestLimitPrice:
 class TestTheIdempotencyKey:
     """The venue-side idempotency key matches the policy: one position per window.
 
-    A killed fill_or_kill still consumes its key. A key per (symbol, window) would
-    block every later offset in that window, so the key includes the offset.
+    A killed fill_or_kill still consumes its key. A key per (symbol, window) would block
+    every later offset in that window, so the key includes the offset.
     """
 
     def _key(self, writer, offset: int) -> str:
@@ -240,8 +240,8 @@ class TestTheIdempotencyKey:
         assert self._key(writer, 3) != self._key(writer, 6)
 
     def test_the_same_offset_twice_is_the_same_order(self, writer):
-        """The same offset produces the same key, so a repeated cycle or a retry cannot buy
-        twice.
+        """The same offset produces the same key, so a repeated cycle or a retry cannot
+        buy twice.
         """
         assert self._key(writer, 9) == self._key(writer, 9)
 
@@ -263,9 +263,7 @@ class TestTheIdempotencyKey:
         )
 
     def test_a_crash_before_booking_still_blocks_the_window(self, writer):
-        """A ticket in any status except `skipped` counts as an entry, even without a
-        position.
-        """
+        """A ticket in any status except `skipped` counts as an entry, even without a position."""
         writer.write_ticket(
             symbol='BTC-USD', window_open=pd.Timestamp(WINDOW),
             settle_time=pd.Timestamp(WINDOW + timedelta(minutes=15)),
@@ -281,8 +279,8 @@ class TestTheIdempotencyKey:
 class TestOutlayMatchesTheFill:
     """The bankroll is debited what the venue charged, not what the decision intended.
 
-    A fill_or_kill fills at or better than its limit. Outlay and fee therefore come
-    from the fill price, not the decision price.
+    A fill_or_kill fills at or better than its limit. Outlay and fee therefore come from
+    the fill price, not the decision price.
     """
 
     def test_the_outlay_is_the_price_actually_paid(self, writer):
@@ -327,9 +325,7 @@ class TestOutlayMatchesTheFill:
 
 
 class TestQuoteStaleness:
-    """`act_on` refuses to send an order when the quote is older than
-    `max_quote_age_seconds`.
-    """
+    """`act_on` refuses to send an order when the quote is older than `max_quote_age_seconds`."""
 
     def test_a_fresh_quote_places_the_order(self, writer):
         kalshi = FakeKalshi({'status': 'executed', 'order_id': 'fresh',
@@ -388,8 +384,7 @@ def _tickets(writer):
 
 
 def test_a_filled_order_records_the_venue_order_id(writer):
-    """The ticket stores the venue order id, so it can be joined to the venue's fills.
-    """
+    """The ticket stores the venue order id, so it can be joined to the venue's fills."""
     kalshi = FakeKalshi({'status': 'executed', 'remaining_count': 0,
                          'order_id': 'venue-123'})
     assert run(act_on(args(), writer, kalshi, decision(), None)) is True

@@ -1,9 +1,7 @@
 """Tests that live refuses a symbol whose bar history is too short or holed.
 
-`volume_z_15` needs 1,455 contiguous bars and `log_rv_1440` needs 1,441. Below
-about 721 bars the features are NaN and `decide()` abstains. Between 721 and
-1,454 the features are wrong but finite, and the cycle would still trade. The
-same history also scales `sigma_remaining`, so it moves the baseline as well.
+Between about 721 and 1,454 bars the features are finite but wrong, so the cycle would
+trade on them. `volume_z_15` needs 1,455 contiguous bars.
 """
 from __future__ import annotations
 
@@ -37,8 +35,7 @@ def test_a_symbol_inside_the_silent_corruption_band_is_refused():
 
 
 def test_the_threshold_covers_the_longest_lookback_any_feature_needs():
-    """The threshold covers the longest lookback of any feature (1,455 for volume_z_15).
-    """
+    """The threshold covers the longest lookback of any feature (1,455 for volume_z_15)."""
     assert MIN_USABLE_BARS >= 1455
 
 

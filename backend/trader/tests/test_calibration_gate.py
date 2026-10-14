@@ -1,8 +1,7 @@
 """Tests for the calibration gates.
 
-The arithmetic baseline cannot pass a tight absolute ECE bar on 7-day folds,
-because binned ECE is biased upward at small n. So the absolute bar is a sanity
-floor, and the real gate asks whether the model is worse calibrated than the baseline.
+The baseline cannot pass a tight absolute ECE bar on 7-day folds, so the absolute bar is
+a sanity floor and the real gate compares the model with the baseline.
 """
 
 from __future__ import annotations
@@ -61,8 +60,7 @@ def test_the_statistic_is_a_median_over_folds():
 
 
 def test_a_fold_with_no_calibration_does_not_vanish():
-    """The median excludes non-finite folds explicitly instead of counting NaN as zero.
-    """
+    """The median excludes non-finite folds explicitly instead of counting NaN as zero."""
     import inspect
 
     from core.metrics import EvaluationReport

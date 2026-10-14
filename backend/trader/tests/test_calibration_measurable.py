@@ -1,8 +1,7 @@
-"""Tests for `resolve_max_deviation`: an unmeasurable calibration gate says so.
+"""Tests for `resolve_max_deviation`: per-fold maximum first, pooled rows as the
+fallback.
 
-The per-fold maximum is primary. When no fold has a bin with enough rows, the
-pooled out-of-sample rows are the fallback. When neither is measurable the value
-stays NaN and the reason names the sample size.
+When neither is measurable the value stays NaN and the reason names the sample size.
 """
 
 from __future__ import annotations
@@ -31,8 +30,7 @@ def test_a_single_measurable_fold_still_wins_over_the_pool():
 
 
 def test_nothing_measurable_anywhere_stays_nan_and_says_why():
-    """Nothing measurable stays NaN, and the reason names the sample size, not the model.
-    """
+    """Nothing measurable stays NaN, and the reason names the sample size, not the model."""
     ok, why = resolve_max_deviation(per_fold=[np.nan], pooled=float('nan'))
     assert np.isnan(ok)
     assert 'row' in why.lower() or 'popul' in why.lower()

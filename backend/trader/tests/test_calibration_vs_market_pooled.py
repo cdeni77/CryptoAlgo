@@ -1,8 +1,6 @@
 """Tests that `calibration_vs_market` uses the pooled ECE difference, not the worst bin.
 
-A maximum over bins is high-variance and can pass or fail an unchanged artifact
-on sampling noise. The pooled difference is stable. The gate is at <= 0 with no
-tolerance.
+The worst bin is too noisy to gate on; the pooled difference is stable.
 """
 
 from __future__ import annotations
@@ -33,7 +31,6 @@ def test_a_worse_calibrated_model_fails():
 
 
 def test_it_is_the_pooled_statistic_not_the_worst_bin():
-    """The gate reads the pooled statistic, not the worst bin."""
     import inspect
 
     from core import metrics

@@ -1,8 +1,7 @@
 """Tests for calendar-based folds in `purged_walk_forward`.
 
-Data density varies widely across the span, so folds cut on window count have
-very unequal calendar spans, and every boundary moves when data is added.
-Calendar folds give each fold an equal span, at the cost of unequal row counts.
+Count-based folds have very unequal spans when data density varies; calendar folds give
+each fold an equal span.
 """
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ def test_calendar_folds_have_comparable_spans():
 
 
 def test_calendar_spans_are_equal_by_construction_whatever_the_density():
-    """Calendar spans are equal by construction for any density profile."""
     for early, late in ((4, 200), (50, 60), (200, 4)):
         folds = purged_walk_forward(
             _index(per_day_early=early, per_day_late=late), n_folds=6,
@@ -46,8 +44,8 @@ def test_a_thin_early_block_costs_a_fold_and_that_must_be_visible():
     """A sparse start can leave fewer than `n_folds` folds, so the fold count must be
     visible.
 
-    The sign-agreement gate holds its significance at any fold count, so a lost
-    fold costs power rather than causing an automatic failure.
+    The sign-agreement gate holds its significance at any fold count, so a lost fold
+    costs power rather than causing an automatic failure.
     """
     thin = purged_walk_forward(_index(per_day_early=4, per_day_late=200),
                                n_folds=6, scheme='calendar')
@@ -83,8 +81,7 @@ def test_the_embargo_still_purges_training_windows():
 
 
 def test_count_remains_available_and_is_what_past_entries_used():
-    """The count scheme is still available. Provenance records which scheme a run used.
-    """
+    """The count scheme is still available. Provenance records which scheme a run used."""
     folds = purged_walk_forward(_index(), n_folds=6, scheme='count')
     assert len(folds) >= 5
 

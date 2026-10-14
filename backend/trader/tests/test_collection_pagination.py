@@ -1,7 +1,7 @@
 """Tests that both Kalshi and Polymarket fetchers follow pagination.
 
-Busy Polymarket windows exceed the 2,000-snapshot page size, so reading only the
-first page truncates them.
+Busy Polymarket windows exceed the 2,000-snapshot page size, so reading only the first
+page truncates them.
 """
 
 from __future__ import annotations

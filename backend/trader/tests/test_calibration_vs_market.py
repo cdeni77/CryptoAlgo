@@ -1,8 +1,6 @@
-"""Tests for the relative calibration gate `calibration_vs_market`.
+"""Tests for `calibration_vs_market`: the model must be as well calibrated as the price.
 
-The market price itself can miss an absolute 0.04 bin bar. The gate therefore
-asks whether the model is at least as well calibrated as the price. The absolute
-bar stays as a loose rail for gross miscalibration.
+The market itself can miss an absolute 0.04 bin bar, which stays only as a loose rail.
 """
 from __future__ import annotations
 

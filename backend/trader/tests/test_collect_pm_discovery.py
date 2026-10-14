@@ -1,8 +1,7 @@
 """Tests for Polymarket market discovery in `research.collect._collect_pm`.
 
-Discovery saves a cursor so a resumed walk continues from the failing page, not
-page 1. It keeps every asset by default, because one page mixes all assets and
-filtering by asset does not reduce the page count. `PM_ASSET` still narrows it.
+A saved cursor lets a resumed walk continue from the failing page. Every asset is kept
+by default, since filtering by asset does not reduce the page count.
 """
 
 from __future__ import annotations
@@ -60,8 +59,7 @@ def test_a_market_that_is_neither_era_has_no_era():
 
 
 def test_discovery_no_longer_silently_drops_the_old_era():
-    """`is_short` accepts the old era; 'updown-15m' is not a substring of 'up-or-down-15m'.
-    """
+    """`is_short` accepts the old era; 'updown-15m' is not a substring of 'up-or-down-15m'."""
     assert pm.is_short('eth-up-or-down-15m-1757724300', '')
 
 
@@ -71,8 +69,8 @@ def test_the_old_era_still_honours_an_asset_filter():
 
 
 def test_a_market_before_book_coverage_is_not_worth_a_request():
-    """Markets before the first retrievable Polymarket book are not priced, which saves a
-    request each.
+    """Markets before the first retrievable Polymarket book are not priced, which saves
+    a request each.
     """
     before = int(dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc).timestamp())
     after = int(dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp())
@@ -81,8 +79,7 @@ def test_a_market_before_book_coverage_is_not_worth_a_request():
 
 
 def test_the_old_endpoint_era_is_never_worth_pricing():
-    """The old era is never priced: it is a different instrument with no retrievable book.
-    """
+    """The old era is never priced: it is a different instrument with no retrievable book."""
     after = int(dt.datetime(2026, 2, 1, tzinfo=dt.timezone.utc).timestamp())
     assert not pm.worth_pricing({'market_slug': f'btc-up-or-down-15m-{after}'})
 

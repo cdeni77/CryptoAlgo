@@ -1,8 +1,7 @@
-"""Tests for `ForecastModel.verify`: an artifact is not scored under a config it was not
-fitted for.
+"""Tests for `ForecastModel.verify`: an artifact is refused under a mismatched config.
 
-A booster trained on a different feature list still returns numbers on a
-well-formed matrix of the wrong columns, so the feature check must raise.
+A booster given the wrong feature columns still returns numbers, so the check must
+raise.
 """
 
 from __future__ import annotations
@@ -45,8 +44,8 @@ def test_a_feature_list_the_booster_disagrees_with_is_refused():
 
 
 def test_a_reordered_feature_list_is_refused():
-    """A reordered list is refused: `booster.predict` checks only width, so it would score
-    the wrong columns.
+    """A reordered list is refused: `booster.predict` checks only width, so it would
+    score the wrong columns.
     """
     names = ['z_score', 'log_rv_15', 'hour_sin']
     with pytest.raises(ValueError, match='booster was trained on'):

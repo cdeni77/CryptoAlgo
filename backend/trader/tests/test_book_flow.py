@@ -58,9 +58,7 @@ def test_a_draining_book_reads_negative_depth_trend():
 
 
 def test_a_window_with_no_history_is_nan_not_zero():
-    """A window with no history gives NaN, not zero, since zero claims the book did not
-    move.
-    """
+    """A window with no history gives NaN, not zero, since zero claims the book did not move."""
     row = book_flow_features(_windows(12), _depth([12], [100], [100])).iloc[0]
     assert np.isnan(row['imbalance_change_3'])
 

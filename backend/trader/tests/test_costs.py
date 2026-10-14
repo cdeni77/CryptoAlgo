@@ -1,8 +1,6 @@
 """Tests for the Kalshi fee schedule in `core.costs`.
 
-`fee = ceil(0.07 * contracts * price * (1 - price) * 10_000) / 10_000` per
-order, and settlement is free. The ceiling is to a hundredth of a cent. The
-maker rate is modelled and not yet confirmed by a fill.
+`fee = ceil(0.07 * C * P * (1 - P) * 10_000) / 10_000` per order; settlement is free.
 """
 
 from __future__ import annotations
@@ -75,8 +73,7 @@ def test_required_edge_falls_toward_the_extremes():
 
 
 def test_the_half_spread_overtakes_the_fee_in_the_upper_tail():
-    """The half-spread exceeds the fee above a crossover price, computed from the config.
-    """
+    """The half-spread exceeds the fee above a crossover price, computed from the config."""
     half = CFG.half_spread_cents / 100.0
     crossover = 0.5 * (1 + math.sqrt(1 - 4 * half / CFG.fee_rate))
     assert 0.80 < crossover < 0.98, crossover
@@ -87,9 +84,7 @@ def test_the_half_spread_overtakes_the_fee_in_the_upper_tail():
 
 
 def test_the_unaffordable_band_is_the_middle_not_the_ends():
-    """The unaffordable band is the middle, since `p(1-p)` makes the affordable set two
-    tails.
-    """
+    """The unaffordable band is the middle, since `p(1-p)` makes the affordable set two tails."""
     threshold = 1.5
     low, high = unaffordable_price_band(threshold, CFG)
     assert low < 0.5 < high, (low, high)
@@ -146,8 +141,8 @@ def test_the_payout_is_one_dollar():
 def test_the_fee_rounds_up_to_a_hundredth_of_a_cent():
     """The fee rounds up to a hundredth of a cent.
 
-    From a real fill: 4 NO contracts at $0.76 were charged $0.0511
-    (0.07 * 4 * 0.76 * 0.24 = $0.0510720).
+    From a real fill: 4 NO contracts at $0.76 were charged $0.0511 (0.07 * 4 * 0.76 *
+    0.24 = $0.0510720).
     """
     assert trade_fee(4, 0.76, CFG) == pytest.approx(0.0511, abs=1e-9)
 

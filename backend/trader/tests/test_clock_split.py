@@ -1,8 +1,7 @@
 """Tests that the offset features and the calendar features are separate groups.
 
-`elapsed_fraction` and `remaining_minutes` describe the decision offset and are
-informative. Hour, weekday and quarter-hour are calendar position, the real
-control, since time of day cannot forecast direction.
+Offset position is informative; calendar position is the control, since time of day
+cannot forecast direction.
 """
 
 from __future__ import annotations
@@ -31,8 +30,7 @@ def test_the_calendar_group_holds_the_things_that_cannot_forecast_direction():
 
 
 def test_the_control_is_now_the_calendar_alone():
-    """`control_gain_share` gates on the control group, so it must be the calendar alone.
-    """
+    """`control_gain_share` gates on the control group, so it must be the calendar alone."""
     assert CONTROL_GROUPS == ('time_of_day',)
 
 

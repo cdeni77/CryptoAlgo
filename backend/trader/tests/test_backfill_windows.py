@@ -1,7 +1,7 @@
 """Tests for what the backfill fetches, and under which venue.
 
-Covers venue-scoped watermarks, interior gap detection, the incremental window in
-hours, deeper history on a populated store, and write-failure reporting.
+Covers venue-scoped watermarks, interior gap detection, the incremental window in hours,
+deeper history on a populated store, and write-failure reporting.
 """
 
 from __future__ import annotations
@@ -49,7 +49,6 @@ def test_one_venues_coverage_does_not_hide_anothers_absence(database):
 
 
 def test_an_unscoped_watermark_still_answers_for_any_venue(database):
-    """Without a venue, the watermark answers for any venue."""
     Ingestor(database).ingest_bars(_bars(range(50)), venue='coinbase')
 
     assert database.get_latest_ohlcv_time('BTC-PERP', '1h') is not None
@@ -125,8 +124,7 @@ def test_an_unknown_table_is_refused(database):
 
 
 def test_the_scrape_window_can_be_expressed_in_hours():
-    """`--backfill-hours` parses as a float, so a 6-hour window is not rounded up to a day.
-    """
+    """`--backfill-hours` parses as a float, so a 6-hour window is not rounded up to a day."""
     from scripts.scrape import build_parser
 
     args = build_parser().parse_args(['--backfill-hours', '6'])
@@ -137,7 +135,6 @@ def test_the_scrape_window_can_be_expressed_in_hours():
 
 
 def test_the_scrape_window_accepts_a_fraction_of_a_day():
-    """The window accepts a fraction of a day."""
     from scripts.scrape import build_parser
 
     args = build_parser().parse_args(['--backfill-days', '0.25'])
@@ -162,9 +159,7 @@ def test_hours_override_days_rather_than_adding_to_them():
 
 
 def test_the_default_window_is_five_years():
-    """The default first-cycle window is five years, since the first cycle defines the
-    dataset.
-    """
+    """The default first-cycle window is five years, since the first cycle defines the dataset."""
     from scripts.scrape import build_parser
 
     assert build_parser().parse_args([]).backfill_days == 1825
@@ -177,10 +172,11 @@ def test_the_default_window_is_five_years():
 
 @pytest.mark.asyncio
 async def test_a_deeper_request_fetches_history_older_than_the_store(database):
-    """A deeper `--backfill-days` on a populated store fetches the older missing history.
+    """A deeper `--backfill-days` on a populated store fetches the older missing
+    history.
 
-    The requested start must not be replaced by the newest stored bar. The forward
-    gap is still fetched as well.
+    The requested start must not be replaced by the newest stored bar. The forward gap
+    is still fetched as well.
     """
     from datetime import timezone
 
@@ -287,8 +283,8 @@ def test_a_readonly_database_raises_instead_of_reporting_zero(tmp_path, monkeypa
     """A read-only database raises `StorageWriteError` instead of reporting zero bars
     inserted.
 
-    A failure on every row is one connection-level problem, so it raises on the
-    first one. `PRAGMA query_only` simulates read-only because root ignores chmod.
+    A failure on every row is one connection-level problem, so it raises on the first
+    one. `PRAGMA query_only` simulates read-only because root ignores chmod.
     """
     import sqlite3
     from contextlib import contextmanager
@@ -329,8 +325,8 @@ def test_a_readonly_database_raises_instead_of_reporting_zero(tmp_path, monkeypa
 
 @pytest.mark.asyncio
 async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(database, caplog):
-    """A span that is fetched but not stored is logged as a write failure, not as missing
-    history.
+    """A span that is fetched but not stored is logged as a write failure, not as
+    missing history.
     """
     import logging
 
@@ -372,8 +368,8 @@ async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(data
 # ---------------------------------------------------------------------------
 
 def test_an_empty_batch_is_retried_with_backoff_not_immediately():
-    """Empty batches retry with growing backoff, since an instant retry cannot clear a rate
-    limit.
+    """Empty batches retry with growing backoff, since an instant retry cannot clear a
+    rate limit.
     """
     import inspect
 
@@ -388,9 +384,7 @@ def test_an_empty_batch_is_retried_with_backoff_not_immediately():
 
 @pytest.mark.asyncio
 async def test_an_empty_batch_is_retried_with_growing_waits():
-    """Counts the attempts and waits: an empty batch retries through the whole backoff
-    ladder.
-    """
+    """Counts the attempts and waits: an empty batch retries through the whole backoff ladder."""
     import asyncio
 
     from data_collection.coinbase_connector import (
@@ -429,9 +423,7 @@ async def test_an_empty_batch_is_retried_with_growing_waits():
 
 @pytest.mark.asyncio
 async def test_a_window_that_never_answers_is_recorded_on_the_client():
-    """A window that never returns data is recorded in `last_skipped_windows` for the
-    caller.
-    """
+    """A window that never returns data is recorded in `last_skipped_windows` for the caller."""
     from data_collection.coinbase_connector import CoinbaseRESTClient
 
     async def always_empty(method, path, params=None, **kwargs):
@@ -489,8 +481,7 @@ def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
 
 
 def test_min_minutes_controls_whether_a_lone_missing_minute_is_a_gap():
-    """`min_minutes` is the threshold, and 1 includes isolated single missing minutes.
-    """
+    """`min_minutes` is the threshold, and 1 includes isolated single missing minutes."""
     import sqlite3
     import tempfile
     from datetime import datetime, timedelta
@@ -574,8 +565,7 @@ async def test_a_forced_backfill_fetches_an_interior_range():
 
 
 def test_gaps_are_coalesced_into_requests_a_batch_can_cover():
-    """`coalesce` merges gaps that fit in one request, and keeps apart gaps that do not.
-    """
+    """`coalesce` merges gaps that fit in one request, and keeps apart gaps that do not."""
     from datetime import datetime as dt
 
     from scripts.scrape import coalesce
