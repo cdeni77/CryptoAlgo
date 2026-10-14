@@ -193,6 +193,10 @@ COMPONENTS: tuple[Component, ...] = (
     # load-bearing group in the model and the REST recorder left its peer price
     # ~30s stale at a decision; this makes the two books contemporaneous.
     Component('pm_stream', phase=0.0),
+    # The Coinbase trade socket. Like the other sockets it holds a
+    # subscription rather than polling, and it is never gated: the trading
+    # loop reads its bars on the decision path instead of a ~3s REST fetch.
+    Component('spot_stream', phase=0.0),
     Component('ladder', phase=25.0),
     # +55s, not +35s. Decisions land about two seconds past the minute, so a
     # recorder at +35s left the freshest Polymarket reading ~27s old — inside
@@ -345,7 +349,7 @@ STEP_TIMEOUT_SECONDS = 1800.0
 def build_factories(args, gate: TradingGate) -> dict:
     """One coroutine factory per component, all sharing the gate."""
     from scripts import (record_implied_vol, record_ladder, record_pm_ladder,
-                         record_pm_stream,
+                         record_pm_stream, record_spot_stream,
                          record_stream)
     from scripts import live as live_module
 
@@ -380,6 +384,10 @@ def build_factories(args, gate: TradingGate) -> dict:
         # is no cadence to align. Same shape as the Kalshi `stream` component.
         return await record_pm_stream.run(gate=gate)
 
+    async def spot_stream():
+        return await record_spot_stream.run(
+            _recorder_args(record_spot_stream.build_parser), gate=gate)
+
     async def implied_vol():
         await align_to_phase(45.0)
         return await record_implied_vol.run(
@@ -392,6 +400,7 @@ def build_factories(args, gate: TradingGate) -> dict:
 
     return {'trade': trade, 'stream': stream, 'ladder': ladder,
             'pm_ladder': pm_ladder, 'pm_stream': pm_stream,
+            'spot_stream': spot_stream,
             'implied_vol': implied_vol,
             'store_sync': store_sync}
 

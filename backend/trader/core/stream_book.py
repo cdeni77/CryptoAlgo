@@ -58,6 +58,10 @@ class _Book:
     no: dict[float, float] = field(default_factory=dict)
     last_received: float = 0.0
     gapped: bool = False
+    venue: str = ''
+    # Set when the connection that built this book went away; only a fresh
+    # snapshot on the new subscription makes it current again.
+    awaiting_snapshot: bool = False
 
 
 class BookCache:
@@ -80,6 +84,10 @@ class BookCache:
         # Sequence state is per CONNECTION — keyed by venue, because there is
         # one socket per venue. This is a grouping, not a per-venue rule.
         self._last_seq: dict[str, int] = {}
+        # When each connection last delivered ANY frame. `seq` is contiguous
+        # across the subscription, so a live, gap-free connection vouches for
+        # every book on it — a quiet market's book is unchanged, not stale.
+        self._last_frame: dict[str, float] = {}
 
     # -- writing ------------------------------------------------------------
 
@@ -93,12 +101,13 @@ class BookCache:
                 logger.debug('%s: delta before snapshot, dropped',
                              event.market_ticker)
                 return
-            book = self._books[event.market_ticker] = _Book()
+            book = self._books[event.market_ticker] = _Book(venue=event.venue)
 
         if event.is_snapshot:
             book.yes = {p: s for p, s in event.yes if s > MIN_SIZE}
             book.no = {p: s for p, s in event.no if s > MIN_SIZE}
             book.gapped = False
+            book.awaiting_snapshot = False
         else:
             if gap:
                 book.gapped = True
@@ -115,6 +124,8 @@ class BookCache:
                         target.pop(price, None)
 
         book.last_received = event.received
+        self._last_frame[event.venue] = max(
+            self._last_frame.get(event.venue, 0.0), event.received)
 
     def _note_sequence(self, event: BookEvent) -> bool:
         """Advance the connection's sequence; True if a frame was missed.
@@ -150,9 +161,32 @@ class BookCache:
         return Ladder(yes=sorted(book.yes.items()), no=sorted(book.no.items()),
                       age_seconds=age, stale=age > self.max_age_seconds)
 
+    def connection_age(self, ticker: str) -> Optional[float]:
+        """Seconds since the connection carrying `ticker` delivered a frame."""
+        book = self._books.get(ticker)
+        if book is None or book.venue not in self._last_frame:
+            return None
+        return self._now() - self._last_frame[book.venue]
+
+    def current(self, ticker: str, max_age_seconds: float) -> Optional[Ladder]:
+        """The ladder, only if it can be priced against right now.
+
+        Present, not gapped, not stale on its own clock, and on a connection
+        that delivered a frame within `max_age_seconds`. None otherwise — the
+        caller reads the venue instead.
+        """
+        book = self._books.get(ticker)
+        if book is None or book.gapped or book.awaiting_snapshot:
+            return None
+        ladder = self.ladder(ticker)
+        age = self.connection_age(ticker)
+        if ladder is None or ladder.stale or age is None or age > max_age_seconds:
+            return None
+        return Ladder(yes=ladder.yes, no=ladder.no, age_seconds=age, stale=False)
+
     def gapped(self, ticker: str) -> bool:
         book = self._books.get(ticker)
-        return bool(book and book.gapped)
+        return bool(book and (book.gapped or book.awaiting_snapshot))
 
     def any_gapped(self) -> bool:
         """Whether the connection needs resubscribing."""
@@ -164,6 +198,17 @@ class BookCache:
     def forget(self, ticker: str) -> None:
         """Drop a settled market, so a closed book cannot be sampled as live."""
         self._books.pop(ticker, None)
+
+    def invalidate(self, venue: str) -> None:
+        """The connection is gone: its books missed whatever happened since.
+
+        Not `gapped`, which makes the recorder rebuild: these are rebuilt by
+        the snapshots the new subscription opens with.
+        """
+        for book in self._books.values():
+            if book.venue == venue:
+                book.awaiting_snapshot = True
+        self._last_frame.pop(venue, None)
 
     def reset_sequence(self, venue: str) -> None:
         """Forget the sequence after a reconnect, so the restart is not a gap."""

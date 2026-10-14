@@ -7,20 +7,20 @@ already happened.
 
 Each cycle, in this order:
 
-1. **Fetch bars.** The last day of one-minute bars for the three symbols,
-   straight from Coinbase. A day is what the longest feature lookback needs.
-2. **Record minute prices**, so the dashboard can draw the path against the
-   strike. This is the only reason they are stored in the serving database.
-3. **Settle** any position whose window has closed, from the bar that opens on
-   its settlement minute. Settlement first, always: a position matures at the
-   instant the next window opens, and deciding before settling would stake the
-   same dollars twice.
-4. **Score** the current window at the nearest configured offset, through the
-   same `core.dataset` path the backtest uses.
-5. **Price** it. Live, against the venue's own ask; without a venue, against the
-   calibrated baseline, and the row says which.
-6. **Decide** with `core.decide.decide` — the same function the backtest calls —
-   and place, or record, or abstain.
+1. **Fetch bars.** The last day of one-minute bars for the three symbols. On an
+   entry cycle the newest minutes come from the Coinbase trade stream where it
+   provably saw them all (`stream_bars`), and from REST otherwise.
+2. **Bookkeeping** — reconcile with the venue, settle matured positions, record
+   minute prices. On a cycle that can ENTER, this moves after the orders: it
+   reads the past, every earlier cycle in the window has already done it, and
+   on the decision path it was seconds of staleness paid at the touch.
+3. **Score** the current window at the configured offset, through the same
+   `core.dataset` path the backtest uses.
+4. **Price** it. Live, against the stream book or one REST `/orderbook` read
+   per symbol; without a venue, against the calibrated baseline, and the row
+   says which.
+5. **Decide** with `core.decide.decide` — the same function the backtest calls —
+   and send every order at once, resending once after a kill.
 
 **Modes, and what each will actually do.**
 
@@ -67,6 +67,7 @@ import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
@@ -86,7 +87,8 @@ from core import venue_ledger
 from core.windows import bar_mean
 from data_collection.coinbase_connector import CoinbaseRESTClient
 from data_collection.kalshi_client import (
-    KalshiClient, KalshiError, Quote, parse_fill, parse_settlement,
+    KalshiClient, KalshiError, Quote, market_meta, parse_fill,
+    parse_settlement, quote_from_levels,
 )
 
 logger = logging.getLogger('live')
@@ -243,6 +245,10 @@ def build_parser() -> argparse.ArgumentParser:
                              'alphabetically — without narrowing `symbols`, which '
                              'would also narrow the bar fetch and NaN out every '
                              'cross_asset feature.')
+    parser.add_argument('--entry-style', choices=['taker', 'maker'], default=None,
+                        help='taker (default): cross with immediate_or_cancel. '
+                             'maker: post a non-crossing post-only limit, rest it '
+                             'for maker_rest_seconds, then cancel. Unmeasured.')
     parser.add_argument('--model', type=str, default=None,
                         help=f'Artifact path (default {MODELS_ROOT}/{LIVE_MODEL})')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -291,7 +297,8 @@ def _merge_bars(cached: pd.DataFrame, fresh: pd.DataFrame,
     return combined[combined['event_time'] >= floor].reset_index(drop=True)
 
 
-async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, pd.DataFrame]:
+async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES, *,
+                     prefer_stream: bool = False) -> dict[str, pd.DataFrame]:
     """One-minute bars for the universe, straight from the venue.
 
     **Only the tail is fetched.** `log_rv_1440` and `beta_1440` need a day of
@@ -305,10 +312,33 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
     re-asked. A symbol with no usable cache — first cycle, or a gap wider than
     the window after an outage — falls back to the full fetch, so this is an
     optimisation and never a source of missing history.
+
+    `prefer_stream` (decision cycles) first tries the Coinbase trade tape for
+    the newest minutes — see `stream_bars` — and asks REST only for symbols
+    the tape cannot vouch for. That takes the REST round trip off the decision
+    path, and with it the risk of reading a candle Coinbase has not finished.
     """
+    out: dict[str, pd.DataFrame] = {}
+    symbols = list(config.symbols)
+    if prefer_stream:
+        out = await _bars_from_stream(config, minutes)
+        symbols = [s for s in symbols if s not in out]
+        if not symbols:
+            logger.debug('bars from the trade stream for every symbol')
+            return out
+        if out:
+            logger.info('bars from the trade stream for %s, REST for %s',
+                        sorted(out), symbols)
+    out.update(await _fetch_rest_bars(config, minutes, symbols))
+    return out
+
+
+async def _fetch_rest_bars(config: Config, minutes: int,
+                           symbols: list[str]) -> dict[str, pd.DataFrame]:
     end = datetime.now(timezone.utc).replace(tzinfo=None)
     start = end - timedelta(minutes=minutes)
     floor = pd.Timestamp(start, tz='UTC')
+    asked_at = time.time()
     client = CoinbaseRESTClient(
         api_key=os.getenv('COINBASE_API_KEY'),
         api_secret=os.getenv('COINBASE_API_SECRET'),
@@ -317,16 +347,13 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
     try:
         # **Concurrently, not one symbol after another.** Measured at 3.17s for
         # three symbols — three independent round trips to the same host, run in
-        # series for no reason. This is the largest single cost in the cycle, and
-        # while reordering already moved it off the book-to-order path, it still
-        # sets how stale the bars are at decision time and how long the whole
-        # cycle takes.
+        # series for no reason.
         #
         # `return_exceptions` so one symbol's failure costs only that symbol.
         # Losing all three because SOL timed out would turn a partial outage into
         # a total one, and the loop already handles a missing symbol.
         spans: dict[str, datetime] = {}
-        for symbol in config.symbols:
+        for symbol in symbols:
             cached = _BAR_CACHE.get(symbol)
             spans[symbol] = start
             if cached is None or cached.empty:
@@ -343,9 +370,9 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
 
         results = await asyncio.gather(
             *(client.get_candles_range(symbol, '1m', spans[symbol], end)
-              for symbol in config.symbols),
+              for symbol in symbols),
             return_exceptions=True)
-        for symbol, bars in zip(config.symbols, results):
+        for symbol, bars in zip(symbols, results):
             if isinstance(bars, BaseException):
                 logger.error('%s: the venue refused one-minute bars (%s)',
                              symbol, str(bars)[:120])
@@ -365,6 +392,7 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
             else:
                 frame = frame[frame['event_time'] >= floor].reset_index(drop=True)
             _BAR_CACHE[symbol] = frame
+            _BAR_FETCHED_AT[symbol] = asked_at
             out[symbol] = frame
             logger.debug('%s: %d bars to %s (%s)', symbol, len(frame),
                          frame['event_time'].iloc[-1],
@@ -375,6 +403,135 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES) -> dict[str, 
             result = close()
             if asyncio.iscoroutine(result):
                 await result
+    return out
+
+
+# When each symbol's REST cache was last asked for (epoch seconds), and how long
+# after its close a REST candle must have been read to count as settled. Only a
+# settled candle can anchor the trade tape: one read a second after its minute
+# closed may still be missing that minute's last prints.
+_BAR_FETCHED_AT: dict[str, float] = {}
+BAR_SETTLED_SECONDS = 10.0
+
+
+def _spot_tape():
+    """The trade-stream recorder's tape, when this process is running one."""
+    try:
+        from scripts.record_spot_stream import TAPE
+        return TAPE
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _epoch_minutes(frame: pd.DataFrame) -> np.ndarray:
+    stamps = pd.to_datetime(frame['event_time'], utc=True)
+    return ((stamps - pd.Timestamp(0, tz='UTC')) // pd.Timedelta(seconds=1)
+            ).to_numpy(dtype='int64')
+
+
+def _same_bar(rest_row, bar: dict) -> bool:
+    for key in ('open', 'high', 'low', 'close'):
+        a, b = float(rest_row[key]), float(bar[key])
+        if abs(a - b) > 1e-9 * max(1.0, abs(a)):
+            return False
+    a, b = float(rest_row['volume']), float(bar['volume'])
+    return abs(a - b) <= 1e-6 * max(1.0, abs(a))
+
+
+def stream_bars(rest: Optional[pd.DataFrame], tape, symbol: str, *,
+                fetched_at: Optional[float], now: float,
+                floor: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """REST bars up to a verified anchor and the trade tape after it, or None.
+
+    The anchor is the newest REST candle read at least `BAR_SETTLED_SECONDS`
+    after it closed. The tape is used only when it
+
+      * covered every minute from the anchor through the newest closed minute,
+        continuously and untainted (`TradeTape.reliable`), and
+      * reproduces every settled REST candle inside that coverage — same OHLC,
+        same volume, and no bar where REST has none.
+
+    Anything less returns None and the caller uses REST exactly as before. The
+    frame has REST's shape and its newest row is still the minute before the
+    decision, so no feature definition moves.
+    """
+    if tape is None or rest is None or rest.empty or fetched_at is None:
+        return None
+    from core.trade_bars import MINUTE, minute_of
+
+    last = minute_of(now) - MINUTE
+    if not tape.final(last, now=now):
+        return None
+    epochs = _epoch_minutes(rest)
+    settled = epochs[epochs + MINUTE + BAR_SETTLED_SECONDS <= fetched_at]
+    if not len(settled):
+        return None
+    anchor = int(settled.max())
+    if not tape.reliable(symbol, anchor, now=now):
+        return None
+    by_minute = {int(m): i for i, m in enumerate(epochs)}
+    first = anchor
+    while first - MINUTE >= int(epochs.min()) and tape.reliable(
+            symbol, first - MINUTE, now=now):
+        first -= MINUTE
+    for minute in range(first, anchor + MINUTE, MINUTE):
+        bar = tape.bar(symbol, minute)
+        index = by_minute.get(minute)
+        if index is None and bar is None:
+            continue
+        if index is None or bar is None or not _same_bar(rest.iloc[index], bar):
+            logger.warning(
+                '%s: the trade stream disagrees with REST at %s (REST %s, '
+                'stream %s); using REST bars this cycle', symbol,
+                pd.Timestamp(minute, unit='s', tz='UTC'),
+                None if index is None else rest.iloc[index][
+                    ['open', 'high', 'low', 'close', 'volume']].to_dict(), bar)
+            return None
+    tail = tape.span(symbol, anchor + MINUTE, last, now=now) if last > anchor else []
+    if tail is None:
+        return None
+    head = rest[epochs <= anchor]
+    rows = pd.DataFrame([{
+        'event_time': pd.Timestamp(b['minute'], unit='s', tz='UTC'),
+        'open': b['open'], 'high': b['high'], 'low': b['low'],
+        'close': b['close'], 'volume': b['volume'],
+        # REST carries neither and nothing reads them.
+        'quote_volume': None, 'trade_count': None,
+    } for b in tail])
+    frame = pd.concat([head, rows], ignore_index=True) if len(rows) else head.copy()
+    frame = frame[frame['event_time'] >= floor].reset_index(drop=True)
+    logger.debug('%s: REST to %s, stream for %d minute(s) after, verified on %d',
+                 symbol, pd.Timestamp(anchor, unit='s', tz='UTC'), len(tail),
+                 (anchor - first) // MINUTE + 1)
+    return frame
+
+
+async def _bars_from_stream(config: Config, minutes: int) -> dict[str, pd.DataFrame]:
+    tape = _spot_tape()
+    if tape is None or not getattr(tape, 'is_connected', False):
+        return {}
+    from core.trade_bars import MINUTE, minute_of
+
+    tape.grace_seconds = float(config.spot_bar_grace_seconds)
+    now = time.time()
+    # The decision wakes ~1s past the minute and the newest bar it needs is
+    # final `grace` after its close: wait out any remainder rather than refuse.
+    wait = minute_of(now) + config.spot_bar_grace_seconds - now
+    if 0 < wait <= config.spot_bar_grace_seconds:
+        await asyncio.sleep(wait)
+        now = time.time()
+    floor = pd.Timestamp(now - minutes * MINUTE, unit='s', tz='UTC')
+    out: dict[str, pd.DataFrame] = {}
+    for symbol in config.symbols:
+        try:
+            frame = stream_bars(_BAR_CACHE.get(symbol), tape, symbol,
+                                fetched_at=_BAR_FETCHED_AT.get(symbol),
+                                now=now, floor=floor)
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('%s: stream bars unavailable (%s)', symbol, str(exc)[:120])
+            frame = None
+        if frame is not None and len(frame):
+            out[symbol] = frame
     return out
 
 
@@ -816,42 +973,138 @@ def config_for_artifact(config, model, *, mode: str):
     return replace(config, init_score_source=source)
 
 
+# symbol -> (settle_time, market metadata): each window's market is resolved
+# once, not on every read. The metadata carries NO touch (`market_meta`), so a
+# price can only come from a book.
+_MARKETS: dict[str, tuple[pd.Timestamp, Quote]] = {}
+
+_UNSET = object()
+
+
+async def _resolve_one(kalshi, symbol: str, settle_time: pd.Timestamp, *,
+                       refresh: bool) -> Optional[Quote]:
+    series = SERIES_BY_SYMBOL.get(symbol)
+    if not series:
+        logger.warning('%s has no Kalshi series configured, no quote', symbol)
+        return None
+    cached = _MARKETS.get(symbol)
+    known = cached is not None and cached[0] == settle_time
+    if known and not refresh:
+        return cached[1]
+    try:
+        if known:
+            raw = await kalshi.market(cached[1].ticker)
+        else:
+            raw = await kalshi.resolve_window_market(
+                series, pd.Timestamp(settle_time).to_pydatetime())
+    except Exception as exc:                                  # noqa: BLE001
+        if known:
+            logger.warning('%s: market refresh failed (%s); keeping what is known',
+                           symbol, str(exc)[:120])
+            return cached[1]
+        raise
+    if not raw:
+        return cached[1] if known else None
+    meta = market_meta(raw)
+    if not meta.ticker:
+        return cached[1] if known else None
+    _MARKETS[symbol] = (settle_time, meta)
+    return meta
+
+
+async def resolve_markets(kalshi, symbols, settle_time: pd.Timestamp, *,
+                          refresh: bool = False) -> dict[str, Quote]:
+    """Each symbol's market for this window: cached, or resolved concurrently.
+
+    `refresh` re-reads `/markets/{ticker}` for every cached market — status,
+    shard and `floor_strike`, which the venue publishes after the window opens.
+    Non-decision cycles do it, so a decision never pays for it.
+    """
+    symbols = list(symbols)
+    results = await asyncio.gather(
+        *(_resolve_one(kalshi, s, settle_time, refresh=refresh) for s in symbols),
+        return_exceptions=True)
+    out: dict[str, Quote] = {}
+    for symbol, result in zip(symbols, results):
+        if isinstance(result, BaseException):
+            logger.error('%s: could not resolve the market (%s)', symbol,
+                         str(result)[:160])
+        elif result is not None:
+            out[symbol] = result
+    return out
+
+
+def stream_quote(cache, meta: Quote, max_age_seconds: float) -> Optional[Quote]:
+    """`meta` priced off the in-process stream book, or None if it cannot vouch."""
+    if cache is None or meta is None or not meta.ticker:
+        return None
+    try:
+        ladder = cache.current(meta.ticker, max_age_seconds)
+    except Exception:                                         # noqa: BLE001
+        return None
+    if ladder is None:
+        return None
+    return quote_from_levels(meta, ladder.yes, ladder.no, source='stream',
+                             at=time.time())
+
+
 async def fetch_quotes(
     kalshi: Optional[KalshiClient],
     symbols: list[str],
     settle_time: pd.Timestamp,
+    *,
+    cache=_UNSET,
+    max_age_seconds: Optional[float] = None,
 ) -> dict[str, tuple[Quote, str]]:
-    """Resolve each symbol's market for this window and read its book."""
+    """Each symbol's touch for this window: the stream book, else one REST read.
+
+    **The stream first.** `record_stream.CACHE` is folded from the venue's own
+    socket in this process, ~34ms behind the venue, so pricing from it costs no
+    round trip. It is used only while that book is present, not gapped and its
+    connection delivered a frame within `stream_quote_max_age_seconds`.
+
+    **Otherwise one `/orderbook` read per symbol, all concurrently.** Never the
+    `/markets` touch: it is cached and measured up to 6.3c wrong, so a failed
+    book read is no quote — `decide()` refuses `no_quote` — not a fallback.
+
+    Each `Quote` carries `book_source` and `book_time`, stamped at its own read.
+    """
     if kalshi is None:
         return {}
-    quotes: dict[str, tuple[Quote, str]] = {}
+    if max_age_seconds is None:
+        max_age_seconds = float(
+            (_RUNNING_CONFIG or DEFAULT_CONFIG).stream_quote_max_age_seconds)
+    metas = await resolve_markets(kalshi, symbols, settle_time)
+    stream = _stream_cache() if cache is _UNSET else cache
+    found: dict[str, Quote] = {}
+    rest: list[str] = []
     for symbol in symbols:
-        series = SERIES_BY_SYMBOL.get(symbol)
-        if not series:
-            logger.warning('%s has no Kalshi series configured, no quote', symbol)
+        meta = metas.get(symbol)
+        if meta is None:
             continue
-        try:
-            market = await kalshi.resolve_window_market(
-                series, settle_time.to_pydatetime())
-            if market is None:
+        quote = stream_quote(stream, meta, max_age_seconds)
+        if quote is None:
+            rest.append(symbol)
+        else:
+            found[symbol] = quote
+    if rest:
+        results = await asyncio.gather(
+            *(kalshi.book_quote(metas[s]) for s in rest), return_exceptions=True)
+        for symbol, result in zip(rest, results):
+            if isinstance(result, BaseException):
+                logger.error('%s: could not read the book (%s); no quote, so no '
+                             'decision for it this cycle', symbol, str(result)[:160])
                 continue
-            ticker = str(market.get('ticker', ''))
-            # **The LIVE book, not `/markets`' cached touch.** See
-            # `KalshiClient.quote_with_live_book`: the cached fields sat frozen
-            # for ten seconds at a time while the real book moved cents, which
-            # both stopped orders filling and fed the market-initialised model a
-            # stale price to correct.
-            quote = await kalshi.quote_with_live_book(ticker)
-            if not quote.tradeable():
-                logger.info('%s %s is not tradeable (%s), abstaining',
-                            symbol, ticker, quote.status)
-                continue
-            quotes[symbol] = (quote, ticker)
-            logger.debug('%s %s: %.2f / %.2f (spread %.0fc, vol %d)',
-                        symbol, ticker, quote.yes_bid, quote.yes_ask,
-                        (quote.spread or 0) * 100, quote.volume)
-        except KalshiError as exc:
-            logger.error('%s: could not read the book (%s)', symbol, exc)
+            found[symbol] = result
+    quotes: dict[str, tuple[Quote, str]] = {}
+    for symbol, quote in found.items():
+        if not quote.tradeable():
+            logger.info('%s %s is not tradeable (%s), abstaining',
+                        symbol, quote.ticker, quote.status)
+            continue
+        quotes[symbol] = (quote, quote.ticker)
+        logger.debug('%s %s: %.4f / %.4f from %s', symbol, quote.ticker,
+                     quote.yes_bid, quote.yes_ask, quote.book_source)
     return quotes
 
 
@@ -1280,6 +1533,12 @@ def ladder_from_cache(cache, ticker: str):
     return list(ladder.yes or []), list(ladder.no or [])
 
 
+def quote_ladder(quote) -> tuple[list, list]:
+    """(yes_levels, no_levels) carried on a quote, or empty."""
+    return (list(getattr(quote, 'yes_levels', ()) or ()),
+            list(getattr(quote, 'no_levels', ()) or ()))
+
+
 def _stream_cache():
     """The stream task's cache, when this process is running one."""
     try:
@@ -1329,9 +1588,17 @@ def _venue_caches() -> tuple[dict, dict]:
 _GAP_HISTORY: dict = {}
 
 
+# The configuration the running loop is trading under, set by `run_cycle`.
+_RUNNING_CONFIG: Optional[Config] = None
+
+
 def config_offsets() -> tuple:
-    """The decision offsets in force, for the gap-change lookback."""
-    return tuple(DEFAULT_CONFIG.decision_offsets)
+    """The decision offsets in force, for the gap-change lookback.
+
+    The RUNNING config's, not the library default's: a loop started with other
+    offsets must difference against its own previous offset.
+    """
+    return tuple((_RUNNING_CONFIG or DEFAULT_CONFIG).decision_offsets)
 
 
 def reset_gap_history() -> None:
@@ -1661,7 +1928,11 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
         if entry is None:
             continue
         try:
-            yes_levels, no_levels = ladder_from_cache(cache, entry[1])
+            # The ladder the touch was read from, so every depth feature
+            # describes the same snapshot the order is priced against.
+            yes_levels, no_levels = quote_ladder(entry[0])
+            if not yes_levels and not no_levels:
+                yes_levels, no_levels = ladder_from_cache(cache, entry[1])
             row = book_feature_row(
                 entry[0], yes_levels, no_levels,
                 baseline_probability=float(base.iloc[i]) if len(base) > i else np.nan)
@@ -1857,8 +2128,13 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
             # a fallback for when the stream is not running -- with a flag on
             # the row saying so, because a reconstruction and an observation are
             # different claims.
-            yes_levels, no_levels = ladder_from_cache(_stream_cache(), ticker)
-            ladder_source = 'stream'
+            # The ladder the decision priced from comes first: it is the same
+            # snapshot as the touch, whichever transport supplied it.
+            yes_levels, no_levels = quote_ladder(quote)
+            ladder_source = getattr(quote, 'book_source', None) or 'stream'
+            if not yes_levels and not no_levels:
+                yes_levels, no_levels = ladder_from_cache(_stream_cache(), ticker)
+                ladder_source = 'stream'
             if not yes_levels and not no_levels and kalshi is not None and ticker:
                 ladder_source = 'rest_after_order'
                 try:
@@ -1930,7 +2206,10 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                 'source': 'live_touch',
             })
         if rows:
-            ResearchStore().write('venue_depth', pd.DataFrame(rows))
+            # Synchronous Parquet work: off the event loop, so the stream
+            # readers sharing it keep folding frames meanwhile.
+            await asyncio.to_thread(ResearchStore().write, 'venue_depth',
+                                    pd.DataFrame(rows))
     except Exception as exc:                       # noqa: BLE001 - never break a cycle
         logger.warning('could not record top of book (%s)', str(exc)[:120])
 
@@ -2173,26 +2452,221 @@ def seconds_until_next_decision(config: Config, args, *,
     return float(min(min(candidates), horizon))
 
 
+# time.monotonic() of the last reconciliation the venue answered. An entry
+# cycle sizes off the balance it adopted; see `run_cycle`.
+_LAST_RECONCILED: Optional[float] = None
+
+
+def entry_cycle(offset: Optional[int], config: Config) -> bool:
+    """Whether this cycle may open a position, so the decision goes first."""
+    if offset is None:
+        return False
+    entries = config.entry_offsets
+    return entries is None or int(offset) in tuple(entries)
+
+
+async def bookkeeping(args, config: Config, writer: PgWriter, kalshi,
+                      bars: dict, *, phase=None) -> list:
+    """Reconcile with the venue, settle, record outcomes, adopt its balance.
+
+    The order inside is the one `adopt_venue_balance` documents: settle our own
+    credits first, then take the venue's balance, so a payout is not counted
+    twice. The shard is the one the latest book reported.
+    """
+    global _LAST_RECONCILED
+    venue_settlements: dict[str, dict] = {}
+    venue_balance = float('nan')
+    shard = _LAST_EXCHANGE_INDEX
+    if kalshi is not None and args.reconcile:
+        try:
+            venue = await reconcile_with_venue(writer, kalshi, exchange_index=shard)
+            venue_settlements, venue_balance = venue.settlements, venue.balance
+            _LAST_RECONCILED = time.monotonic()
+        except KalshiError as exc:
+            logger.error('reconciliation failed (%s); falling back to our own '
+                         'bookkeeping for this cycle', exc)
+        if phase:
+            phase('reconcile')
+    settled = await _db(settle_due, writer, bars,
+                        venue_settlements=venue_settlements)
+    # Independent of whether anything was held: this is what turns the recorded
+    # market quotes into a scoreable sample.
+    await _db(settle_predictions, writer, bars)
+    # Now that our own credits are in, the drift is a real disagreement.
+    if kalshi is not None and args.reconcile:
+        await _db(adopt_venue_balance, writer, venue_balance, exchange_index=shard,
+                  credited_this_cycle=sum(p for _, p in settled))
+    if phase:
+        phase('settle')
+    return settled
+
+
+async def prewarm_fit_lookup(*, horizon: float = 75.0) -> None:
+    """Refresh the store-backed implied-vol frame in a thread, ahead of need.
+
+    `latest_fit` would otherwise do a synchronous whole-table Parquet read on
+    the event loop between the book read and the order whenever its memo
+    expired. Refreshing early, off the loop, keeps it from ever expiring there.
+    """
+    now = pd.Timestamp.now(tz='UTC')
+    stamp = _FIT_CACHE.get('at')
+    if stamp is not None and (now - stamp).total_seconds() < _FIT_REFRESH_SECONDS - horizon:
+        return
+    frame = await asyncio.to_thread(_read_recent_fits)
+    _FIT_CACHE['frame'] = frame
+    _FIT_CACHE['at'] = now
+
+
+def maker_prices(quote) -> tuple[Optional[float], Optional[float]]:
+    """(up, down) posting prices: one tick inside our side's best bid, or at it.
+
+    One tick better than the best bid on the side being bought, unless that
+    would reach the ask — then at the bid itself, which cannot cross.
+    """
+    from core.costs import tick_at
+
+    def post(bid, ask):
+        if bid is None or ask is None:
+            return None
+        better = round(float(bid) + float(tick_at(float(bid))), 4)
+        return better if better < float(ask) - 1e-9 else float(bid)
+
+    return (post(quote.yes_bid, quote.yes_ask), post(quote.no_bid, quote.no_ask))
+
+
+def entry_decision(row, config: Config, *, quote, bankroll: float,
+                   exposure: WindowExposure, require_quote: bool,
+                   halted: bool) -> tuple[Decision, bool]:
+    """`decide()` as a taker, or — opt-in — as a maker. Returns (decision, maker).
+
+    A maker's price is the one it POSTS and its fee is the maker fee, so the
+    row is priced at the posting prices and `decide()` runs with
+    `assume_maker`. Everything else — gates, sizing, limits — is the same
+    function the backtest calls.
+    """
+    if config.entry_style != 'maker' or quote is None:
+        return decide(row, config, bankroll=bankroll, exposure=exposure,
+                      require_quote=require_quote, halted=halted), False
+    up, down = maker_prices(quote)
+    posted = dict(row)
+    posted['ask_up'] = up if up is not None else np.nan
+    posted['ask_down'] = down if down is not None else np.nan
+    return decide(posted, replace(config, assume_maker=True), bankroll=bankroll,
+                  exposure=exposure, require_quote=require_quote,
+                  halted=halted), True
+
+
+async def fresh_quote(kalshi, quote, config: Config):
+    """Re-read one market's touch: the stream book first, else one REST read."""
+    fresh = stream_quote(_stream_cache(), quote, config.stream_quote_max_age_seconds)
+    if fresh is not None:
+        return fresh
+    if kalshi is None or not hasattr(kalshi, 'book_quote'):
+        return None
+    try:
+        return await kalshi.book_quote(quote)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning('%s: could not re-read the book (%s)',
+                       getattr(quote, 'ticker', '?'), str(exc)[:120])
+        return None
+
+
+async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row, *,
+                        config: Config, quote, quote_time, maker: bool,
+                        others: WindowExposure, bankroll: float, halted: bool,
+                        require_quote: bool):
+    """Send one entry, and resend once if an immediate_or_cancel took nothing.
+
+    The resend re-reads the touch and re-runs `decide()` on it with the SAME
+    model probability, against the window's exposure from every OTHER order
+    this cycle, so it can never exceed a limit the first attempt respected. It
+    goes out only while the kill is `kill_retry_window_seconds` fresh, only on
+    the same side, under `<key>-r1`. A partial fill is never topped up.
+
+    Returns `(final decision, final result, [(decision, killed result), ...])`.
+    """
+    result = await place_and_book(args, writer, kalshi, decision, row,
+                                  config=config, quote_time=quote_time,
+                                  maker=maker)
+    kills = [(decision, result)] if result.status == 'killed' else []
+    final_decision, final = decision, result
+    attempt = 0
+    while (not maker and final.status == 'killed' and final.filled == 0
+           and attempt < int(config.kill_retries) and quote is not None):
+        age = time.monotonic() - (final.answered_at or 0.0)
+        if age > config.kill_retry_window_seconds:
+            logger.info('%s: killed %.1fs ago, past the %.1fs resend window',
+                        decision.symbol, age, config.kill_retry_window_seconds)
+            break
+        attempt += 1
+        fresh = await fresh_quote(kalshi, quote, config)
+        if fresh is None or not fresh.tradeable():
+            logger.info('%s: no fresh book to re-price against; not resending',
+                        decision.symbol)
+            break
+        repriced = dict(row)
+        repriced['ask_up'] = fresh.ask_for('up')
+        repriced['ask_down'] = fresh.ask_for('down')
+        for side in ('up', 'down'):
+            depth = fresh.depth_dollars(side)
+            if depth is not None:
+                repriced[f'depth_{side}'] = depth
+        again = decide(repriced, config, bankroll=bankroll, exposure=others,
+                       require_quote=require_quote, halted=halted)
+        logger.info('%s: killed at %.4f; the book now says %s -> %s',
+                    decision.symbol, decision.price,
+                    f'{again.price:.4f}' if np.isfinite(again.price) else 'n/a',
+                    again.describe())
+        if not again.traded or again.side is not decision.side:
+            break
+        stamp = pd.Timestamp(fresh.book_time, unit='s', tz='UTC') \
+            if fresh.book_time is not None else pd.Timestamp.now(tz='UTC')
+        retried = await place_and_book(
+            args, writer, kalshi, again, repriced, config=config,
+            quote_time=stamp, attempt=attempt,
+            note=(f'resend {attempt} after a kill at {decision.price:.4f}: '
+                  f'{again.contracts} @ {again.price:.4f} '
+                  f'({fresh.book_source} book)'))
+        if retried.status == 'killed':
+            kills.append((again, retried))
+        final_decision, final = again, retried
+    return final_decision, final, kills
+
+
+def _write_predictions(writer: PgWriter, items: list) -> None:
+    for fields in items:
+        writer.write_prediction(**fields)
+
+
 async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
+    """One cycle. On an ENTRY cycle the decision goes first and the
+    bookkeeping after the orders; on every other cycle the reverse.
+
+    **What an entry cycle defers, and why it is safe.** Venue reconciliation
+    (four authenticated calls), `settle_due`, `settle_predictions`, the balance
+    adoption, minute prices and the equity point all read the past; none of it
+    changes what this decision should be. Positions settle at window
+    boundaries, and entries are at +12m, so every cycle since the boundary has
+    already settled and reconciled.
+
+    **Sizing uses the last-known bankroll**: the venue balance the previous
+    cycle adopted (at most a cycle old), less any stake debited since, which is
+    what `account.bankroll` holds. Only a deposit or withdrawal in the last
+    minute is unseen, and the ruin floor and breakers read the same figure. If
+    the venue has not answered a reconcile within `max_reconcile_age_seconds`
+    the cycle reconciles first, as before. The circuit breakers still run
+    before the decision — they read our settled positions, not the venue.
+    """
+    global _RUNNING_CONFIG
+    _RUNNING_CONFIG = config
     now = datetime.now(timezone.utc)
     window_open, elapsed = current_window(now, config)
     offset = decision_offset(elapsed, config, forced=args.offset)
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
 
-    # **The book is read LAST of everything that can precede it**, because its age
-    # is the only age paid at the touch. A quote that goes stale during the cycle
-    # can only cost a fill, never an overpay — the order is `immediate_or_cancel`
-    # at a limit derived from this price — so not filling is the direction to be
-    # wrong in, and shortening the interval is how fills are bought back.
-    # **Where the cycle spends its time between reading the book and sending the
-    # order**, because that interval is what decides whether a fill happens.
-    # Measured from the recorded tickets before this existed: median 4.97s, max
-    # 5.56s from book-read to order-sent — against a book that moves ~1-1.5c in
-    # that time and order allowances of 0.49c to 3c. Kills occurred even at the
-    # full 3c cap, so this is a latency problem before it is a limit-width one.
-    # `_record_touch` was the obvious suspect and is worth only ~300ms of it;
-    # this says which of the rest actually costs.
+    # Where the cycle spends its time, because the interval from reading the
+    # book to sending the order decides whether a fill happens.
     phase: dict[str, float] = {}
     _mark = time.perf_counter()
 
@@ -2202,113 +2676,69 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         phase[name] = now_ - _mark
         _mark = now_
 
-    # **Bars first, then the book.** Both are needed before a decision, but only
-    # the BOOK's age is paid at the touch: the quote is what the order is priced
-    # against, and every second between reading it and sending the order is a
-    # second the market can move away. Bars are one-minute candles — three
-    # seconds of age on them is nothing.
-    #
-    # Measured with the quote read first: quotes 0.39s, bars 3.17s, reconcile
-    # 0.93s, score 0.14s, touch 0.30s — 4.55s from book to order, of which the
-    # Coinbase call was 70%. Reading the book after the bars removes that 3.17s
-    # from the staleness with no change to anything else: `settle_time` comes
-    # from the clock, not from the bars, so nothing here depends on the order.
-    bars = await fetch_bars(config)
-    _phase('bars')
+    fast = entry_cycle(offset, config)
+    if (fast and kalshi is not None and getattr(args, 'reconcile', False)
+            and (_LAST_RECONCILED is None
+                 or time.monotonic() - _LAST_RECONCILED > config.max_reconcile_age_seconds)):
+        logger.warning('the venue has not been reconciled within %.0fs; '
+                       'reconciling before deciding', config.max_reconcile_age_seconds)
+        fast = False
 
+    # Bars, then the book: only the book's age is paid at the touch. On an
+    # entry cycle the newest minutes come from the trade stream where it can
+    # vouch for them, which takes the ~3s REST fetch off this path.
+    bars = await (fetch_bars(config, prefer_stream=True) if fast
+                  else fetch_bars(config))
+    _phase('bars')
     if not bars:
         logger.error('no bars, nothing to do this cycle')
         return []
-    record_minute_prices(writer, bars)
+    if not fast:
+        await _db(record_minute_prices, writer, bars)
+    deferred_prices = fast
 
-    halted = check_circuit_breakers(writer, config, now=now)
+    halted = await _db(check_circuit_breakers, writer, config, now=now)
     if halted:
-        # Note the offset is deliberately NOT cleared. That returns before
-        # `score_live`, which stopped the recording as well as the trading — and
-        # the measurement is the reason this loop is running. `decide()` refuses
-        # every row with `Reason.HALTED` instead, so quotes, scores and outcomes
-        # keep accruing for `market_benchmark` while no money moves.
+        # The offset is deliberately NOT cleared: `decide()` refuses every row
+        # with `Reason.HALTED`, so quotes, scores and outcomes keep accruing for
+        # `market_benchmark` while no money moves.
         logger.error('account halted (%s); scoring and recording continue, '
                      'no new entries', halted)
 
-    # Fresh AND complete. A symbol can pass the staleness check with 1,200
-    # bars, which reports 100% coverage and puts `rv_surprise` 67x out. Merged
-    # into one refusal because the consequence is identical: a short universe
-    # redefines every cross-asset feature rather than omitting one row.
+    # Fresh AND complete. A short universe redefines every cross-asset feature
+    # rather than omitting one row, so the whole cycle abstains.
     stale = dict(stale_symbols(bars, config, now=now))
     stale.update({sym: why for sym, why in short_symbols(bars, config).items()
                   if sym not in stale})
     if stale:
-        # Settlement and reconciliation below still run: they read the past, which
-        # a short feed does not invalidate, and a matured position should not be
-        # left hanging because this cycle cannot decide.
         for symbol, why in sorted(stale.items()):
             logger.error('%s: %s', symbol, why)
         logger.error('the universe is %d of %d symbols this cycle, so no decision '
                      'is made — a short universe redefines every cross-asset '
                      'feature rather than simply omitting one row',
                      len(config.symbols) - len(stale), len(config.symbols))
-        offset = None
-
+        offset, fast = None, False
+    if offset is not None:
+        try:
+            await prewarm_fit_lookup()
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('implied-vol prewarm: %s', str(exc)[:120])
     _phase('local')
 
-    # Read the venue first, where there is one: it knows what actually settled,
-    # and bars only fill in what it has not resolved. Its *balance* is adopted
-    # after we settle, not here — the venue credits a payout the moment it
-    # settles, so adopting first and settling second counted every payout twice
-    # for a cycle. `adopt_venue_balance` has the measured log.
-    venue_settlements: dict[str, dict] = {}
-    venue_balance = float('nan')
-    # **The shard is remembered between cycles, because the book is now read
-    # after this.** Kalshi shards its exchange by category and balances are local
-    # to a shard, so the balance query has to name the right one — and the only
-    # place it was ever read from was the quotes, which is what forced the book
-    # to be fetched first and cost ~1s of staleness on every order.
-    #
-    # It is a property of the series, not of a particular quote, so it is stable
-    # between cycles; `remember_exchange_index` re-checks it against every book
-    # actually read and complains if it ever moves. Until one has been seen, this
-    # is None and `balance()` falls back to its own default — the same thing that
-    # happens today on a cycle where no symbol quoted.
-    shard = _LAST_EXCHANGE_INDEX
-    if kalshi is not None and args.reconcile:
-        try:
-            venue = await reconcile_with_venue(writer, kalshi, exchange_index=shard)
-            venue_settlements, venue_balance = venue.settlements, venue.balance
-            _phase('reconcile')
-        except KalshiError as exc:
-            logger.error('reconciliation failed (%s); falling back to our own '
-                         'bookkeeping for this cycle', exc)
-    settled = settle_due(writer, bars, venue_settlements=venue_settlements)
-    _phase('settle')
-
-    # **The book, last.** Everything above — bars, local bookkeeping, the venue
-    # reconciliation, settlement — happens before the quote is read, so none of
-    # it is staleness the order pays. Measured going in: 4.55s from book to
-    # order, of which this reordering removes all but scoring.
-    quotes: dict = {}
-    quote_time = pd.Timestamp.now(tz='UTC')
-    if offset is not None and kalshi is not None:
-        try:
-            quotes = await fetch_quotes(kalshi, list(config.symbols), settle_time)
-            quote_time = pd.Timestamp.now(tz='UTC')
-        except Exception as exc:              # noqa: BLE001 - the cycle still settles
-            logger.error('could not read the book (%s); no decision this cycle', exc)
-            quotes, offset = {}, None
-    _phase('quotes')
-    remember_exchange_index(quotes)
-    # Independent of whether anything was held: this is what turns the recorded
-    # market quotes into a scoreable sample.
-    settle_predictions(writer, bars)
-    # Now that our own credits are in, the drift is a real disagreement.
-    if kalshi is not None and args.reconcile:
-        adopt_venue_balance(writer, venue_balance, exchange_index=shard,
-                            credited_this_cycle=sum(p for _, p in settled))
+    if not fast:
+        if deferred_prices:
+            await _db(record_minute_prices, writer, bars)
+        await bookkeeping(args, config, writer, kalshi, bars, phase=_phase)
 
     if offset is None:
-        # This used to read "N minutes into the window; first decision offset is
-        # +3m", which at 8 minutes in was both false and not the reason. There are
-        # three ways to arrive here and they are worth telling apart.
+        # Between decisions: keep this window's market metadata current (status,
+        # shard, floor_strike), so a decision never pays to resolve it.
+        if kalshi is not None and elapsed >= 1:
+            try:
+                await resolve_markets(kalshi, config.symbols, settle_time,
+                                      refresh=True)
+            except Exception as exc:                          # noqa: BLE001
+                logger.debug('market refresh: %s', str(exc)[:120])
         reached = [o for o in sorted(config.decision_offsets) if o <= elapsed]
         if not reached:
             logger.debug('%.1fm into the window; first offset is +%dm',
@@ -2320,10 +2750,34 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                          DECISION_TOLERANCE_SECONDS)
         return []
 
-    # Everything `_attach_book_features` fills after this returns. Declaring it
-    # keeps the warning meaningful: a book feature that is empty because the
-    # book has not been read yet is not the same as one nothing will ever fill,
-    # and nine spurious warnings a cycle made the real case invisible.
+    # **The book.** Stream cache where it can vouch for it, else one REST read
+    # per symbol, concurrently. Each quote is stamped at its own read.
+    quotes: dict = {}
+    if kalshi is not None:
+        try:
+            quotes = await fetch_quotes(kalshi, list(config.symbols), settle_time)
+        except Exception as exc:              # noqa: BLE001 - the cycle still settles
+            logger.error('could not read the book (%s); no decision this cycle', exc)
+            quotes, offset = {}, None
+    read_at = pd.Timestamp.now(tz='UTC')
+    quote_times = {
+        symbol: (pd.Timestamp(entry[0].book_time, unit='s', tz='UTC')
+                 if getattr(entry[0], 'book_time', None) is not None else read_at)
+        for symbol, entry in quotes.items()}
+    _phase('quotes')
+    remember_exchange_index(quotes)
+    if quotes:
+        logger.info('book: %s', ', '.join(
+            f'{s} {getattr(q, "book_source", None) or "?"}'
+            for s, (q, _) in sorted(quotes.items())))
+    if offset is None:
+        if fast:
+            await bookkeeping(args, config, writer, kalshi, bars, phase=_phase)
+            await _db(record_minute_prices, writer, bars)
+        return []
+
+    # Everything `_attach_book_features` fills after this returns, declared so
+    # the unscoreable-feature warning does not fire for columns not yet filled.
     from core.book_features import (
         CROSS_VENUE as _CV, IMPLIED_VOL as _IV,
         MARKET_PRICE as _MP, MARKET_STATE as _MS)
@@ -2332,57 +2786,25 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
 
-    # **When the book was actually read**, which is not `window_open + offset`.
-    #
-    # Measured over the first two live days: a decision nominally at +3m read its
-    # quote at +3.62m on average and up to +4.16m. The features are built for the
-    # nominal offset, so the market's price carries up to a minute of information
-    # the model does not have — and one minute is worth ~0.027 nats, measured, as
-    # against a total model edge of +0.002. The bias is comparable to the whole
-    # effect, and it runs against us.
-    #
-    # It is not a trading bug: a fresh quote is what a fill would actually pay.
-    # It is a *measurement* bug, and the fix is for the row to say what happened
-    # rather than what was intended, so `market_benchmark` can filter or correct.
-    # `quote_time` is stamped where the book is actually read, at the top of the
-    # cycle.
     scored['ask_up'] = [
         quotes[s][0].ask_for('up') if s in quotes else np.nan for s in scored['symbol']]
     scored['ask_down'] = [
         quotes[s][0].ask_for('down') if s in quotes else np.nan for s in scored['symbol']]
     scored['market_ticker'] = [
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
-    # `Quote.mid` is None on a one-sided book, which is the honest answer: the
-    # midpoint of a single quote is not a midpoint.
     scored['exchange_index'] = [
         quotes[s][0].exchange_index if s in quotes else 0 for s in scored['symbol']]
+    # `Quote.mid` is None on a one-sided book, which is the honest answer.
     scored['market_mid'] = [
         quotes[s][0].mid if s in quotes else np.nan for s in scored['symbol']]
 
-    # Scoring happens *after* the book is read, not before. A baseline-initialised
-    # model does not care — that is why this used to run above the quote fetch —
-    # but a market-initialised one is a correction to the price and cannot be
-    # evaluated without it. Leaving the old order in place would have left a
-    # runtime failure waiting behind a config flag, which is the shape of most of
-    # what the audit found. Behaviour is unchanged for the default source: the
-    # only thing between the two positions was `settle_time`.
-    # The book features, from the touch we just read. Without these the model
-    # scores them as NaN — LightGBM uses the default direction it learned, so the
-    # loop would run silently as a DIFFERENT model from the one whose gates were
-    # measured, which is the `price_source` failure one level deeper.
-    #
-    # The ladder comes from the stream's in-process cache, so the depth features
-    # cost no fetch and are fresher than REST would be (~34ms against ~73ms).
-    # An earlier version attached touch-only on the grounds that a ladder fetch
-    # would cost ~300ms against a 4.97s book-to-order budget — but that figure
-    # predates the phase instrumentation, which measures 0.10-0.11s, and the
-    # fetch is not needed at all.
+    # The book features, from the same snapshot the order is priced against.
+    # Without these LightGBM substitutes learned defaults and the loop runs as
+    # a different model from the one whose gates were measured.
     _attach_book_features(scored, quotes, _stream_cache())
     scored = prepare_init_score(scored, model)
     _phase('score')
-    # Liveness, at the point the cycle has demonstrably completed. A stamp
-    # written at startup would prove only that the process exists, which is
-    # what the old TCP-connect healthcheck proved.
+    # Liveness, at the point the cycle has demonstrably scored.
     heartbeat.touch('trade')
 
     _warn_unscoreable_features(scored, model,
@@ -2439,26 +2861,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         scored['strike_source'] = 'bars'
     scored['strike_source'] = scored['strike_source'].fillna('bars')
 
-    # Everything above happened AFTER the book was read and BEFORE any order can
-    # go out, so it is all quote staleness paid at the touch. Logged whether or
-    # not this cycle trades, because a cycle that abstains still measures the
-    # latency the next one will pay.
-    if phase and offset is not None:
-        # Only what ran AFTER the book was read. `phase` is insertion-ordered, so
-        # this stays correct if the cycle is reordered again — summing "everything
-        # except quotes" would have silently kept counting the bar fetch once the
-        # bars moved ahead of it, and reported no improvement from the change that
-        # produced all of it.
-        names = list(phase)
-        after = names[names.index('quotes') + 1:] if 'quotes' in phase else names
-        since_quote = sum(phase[k] for k in after)
-        logger.info('cycle latency: %s | %.2fs between the book and the order',
-                    ' '.join(f'{k} {v:.2f}s' for k, v in phase.items()),
-                    since_quote)
-
-    # Depth at the touch caps the stake. Measured, unlike
-    # `Config.max_stake_dollars`, which is a standing guess — so when the book
-    # tells us, believe the book.
+    # Depth at the touch caps the stake: measured, unlike `max_stake_dollars`.
     for index, row in scored.iterrows():
         quote = quotes.get(row['symbol'], (None, None))[0]
         if quote is None:
@@ -2468,30 +2871,31 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             if depth is not None:
                 scored.loc[index, f'depth_{side}'] = depth
 
-    account = writer.account()
+    account = await _db(writer.account)
     if account is None:
         raise RuntimeError('no account row; main() must call ensure_account first')
+    bankroll = float(account.bankroll)
 
     # Seed exposure from what is already committed for THIS window, so
     # `ALREADY_ENTERED` / `POSITION_LIMIT` / `WINDOW_EXPOSURE` survive a new
     # cycle, a new offset and a process restart.
-    entered, staked, n_entered = writer.entries_for_window(
+    entered, staked, n_entered = await _db(
+        writer.entries_for_window,
         window_open.to_pydatetime() if hasattr(window_open, 'to_pydatetime') else window_open)
-    exposure = WindowExposure(stake=staked, positions=n_entered, symbols_entered=entered)
+    base_exposure = WindowExposure(stake=staked, positions=n_entered,
+                                   symbols_entered=entered)
     if entered:
         logger.info('window %s already holds %s ($%.2f); those symbols will refuse',
                     window_open, sorted(entered), staked)
+    exposure = base_exposure
     decisions: list[Decision] = []
+    rows: dict[str, object] = {}
+    pending: list[tuple[Decision, object, bool]] = []
 
-    # Live prices from the book or not at all. Without this a row with no quote
-    # falls back to the backtest's counterfactual price — our own baseline — and
-    # can still return TRADED, which is how an unresolved market booked a
-    # position for an order that was never sent.
+    # Live prices from the book or not at all: without a quote `decide()` would
+    # fall back to our own baseline and could return TRADED.
     require_quote = args.mode == 'live'
     for _, row in scored.sort_values('symbol').iterrows():
-        # Re-read the clock. `now` was taken at the top of the cycle, and between
-        # then and here sit a Coinbase fetch, four authenticated reconcile calls,
-        # LightGBM inference and one quote call per symbol at up to 15s each.
         remaining = (settle_time - pd.Timestamp.now(tz='UTC')).total_seconds()
         if remaining < config.min_remaining_seconds:
             logger.warning(
@@ -2499,13 +2903,66 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                 'this row is for %s and the clock has moved past it',
                 row['symbol'], remaining, config.min_remaining_seconds, settle_time)
             break
-        decision = decide(row, config, bankroll=account.bankroll,
-                          exposure=exposure, require_quote=require_quote,
-                          halted=bool(halted))
+        quote = quotes.get(row['symbol'], (None, None))[0]
+        decision, maker = entry_decision(
+            row, config, quote=quote, bankroll=bankroll, exposure=exposure,
+            require_quote=require_quote, halted=bool(halted))
         decisions.append(decision)
-        writer.write_prediction(
+        rows[decision.symbol] = row
+        logger.log(decision_log_level(decision), decision.describe())
+        if decision.traded:
+            # Reserved before the order goes out: every order is in flight at
+            # once, so no later decision may assume an earlier one failed.
+            pending.append((decision, row, maker))
+            exposure = exposure.with_(decision)
+
+    # **Every order at once.** One symbol's round trip, kill or resend no
+    # longer delays the next symbol's order.
+    async def _one(index: int):
+        decision, row, maker = pending[index]
+        others = base_exposure
+        for j, (other, _, _) in enumerate(pending):
+            if j != index:
+                others = others.with_(other)
+        return await execute_entry(
+            args, writer, kalshi, decision, row, config=config,
+            quote=quotes.get(decision.symbol, (None, None))[0],
+            quote_time=quote_times.get(decision.symbol, read_at), maker=maker,
+            others=others, bankroll=bankroll, halted=bool(halted),
+            require_quote=require_quote)
+
+    outcomes = await asyncio.gather(*(_one(i) for i in range(len(pending))),
+                                    return_exceptions=True)
+    if pending:
+        _phase('orders')
+    finals: dict[str, Decision] = {}
+    kills: list[tuple[Decision, OrderResult, bool]] = []
+    for (decision, _, _), outcome in zip(pending, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error('%s: the order path raised (%s); see the traceback',
+                         decision.symbol, outcome, exc_info=outcome)
+            continue
+        final_decision, final, killed = outcome
+        finals[decision.symbol] = final_decision
+        for d, r in killed:
+            kills.append((d, r, r is final))
+
+    if phase and pending:
+        names = list(phase)
+        after = names[names.index('quotes') + 1:] if 'quotes' in phase else names
+        logger.info('cycle latency: %s | %.2fs between the book and the orders',
+                    ' '.join(f'{k} {v:.2f}s' for k, v in phase.items()),
+                    sum(phase[k] for k in after))
+
+    # ---- after the orders: everything that only records -------------------
+    decisions = [finals.get(d.symbol, d) for d in decisions]
+    records = []
+    for decision in decisions:
+        row = rows[decision.symbol]
+        records.append(dict(
             symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
-            offset_minutes=offset, decision_time=quote_time,
+            offset_minutes=offset,
+            decision_time=quote_times.get(decision.symbol, read_at),
             strike=float(row['strike']), last_price=float(row['last_price']),
             displacement=float(row['displacement']),
             sigma_remaining=_finite(row.get('sigma_remaining')),
@@ -2513,13 +2970,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             baseline_probability=float(row['baseline_probability']),
             model_probability=float(row['model_probability']),
             # The venue's belief (the mid) and what a trade would cost (both
-            # asks). This was `ask_up` recorded under the name
-            # `market_probability` — a price rather than a probability, one side
-            # of the book only, and read by nothing. The mid is the right input
-            # to "does the model beat the market"; the ask carries half the
-            # spread, so scoring against it would flatter us by exactly what we
-            # pay to cross. Written on EVERY row, refused ones included, because
-            # the sample that can answer that question has to be unselected.
+            # asks), on EVERY row, refused ones included: the sample that
+            # answers "does the model beat the market" must be unselected.
             market_probability=_finite(row.get('market_mid')),
             market_ask_up=_finite(row.get('ask_up')),
             market_ask_down=_finite(row.get('ask_down')),
@@ -2529,43 +2981,32 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             price=_finite(decision.price), effective_cost=_finite(decision.effective_cost),
             edge=_finite(decision.edge), contracts=decision.contracts or None,
             model_version=getattr(model, 'version', None),
-        )
-        logger.log(decision_log_level(decision), decision.describe())
-        if not decision.traded:
-            continue
-        # Only count exposure we actually took on. `act_on` returns False when
-        # the order was refused, killed, or never sent.
-        if await act_on(args, writer, kalshi, decision, row, config=config,
-                        quote_time=quote_time):
-            exposure = exposure.with_(decision)
+        ))
+    try:
+        await _db(_write_predictions, writer, records)
+    except Exception:                                         # noqa: BLE001
+        logger.exception('could not write this cycle\'s predictions')
 
-    # **Record the top of book we already have.** `Quote` parses `yes_bid_size`
-    # and `yes_ask_size` from the same REST response the price comes from, and
-    # `decide()` already uses them to cap the stake — and then they were dropped.
-    #
-    # They are the missing half of the economic question and they cost nothing:
-    # no historical endpoint carries size (candlesticks give top-of-book price and
-    # nothing behind it; the settled orderbook returns empty), so a size not
-    # written down here is gone. Observed at the touch: BTC ~6,900 contracts, ETH
-    # ~109, SOL ~6.9 — against orders of ~7, which makes SOL the case where this
-    # actually decides whether a fill was possible.
-    #
-    # Kept behind a flag from the bisect that cleared it: this was the last change
-    # deployed before every order began returning `market_not_found`, so it was
-    # the first suspect. Disabling it changed nothing — the cause was the market's
-    # `exchange_index` moving to 2 while the order body defaulted to 0.
-    #
-    # **After the orders, not before them.** It costs three REST orderbook calls
-    # and a synchronous Parquet write — measured at 0.29s — and every millisecond
-    # of that was staleness the order paid at the touch, for a row nothing in the
-    # decision reads. Moving it changes only WHEN the archive is written, never
-    # what it contains: `quotes` is the same object the decision priced against.
-    if os.getenv('RECORD_TOUCH', '1') == '1' and offset is not None and quotes:
+    if kills:
+        await asyncio.gather(*(
+            diagnose_and_note(kalshi, writer, d, r, write_note=last)
+            for d, r, last in kills), return_exceptions=True)
+
+    # The top of book we already have, written after the orders: it changes
+    # only WHEN the archive is written, never what it contains.
+    if os.getenv('RECORD_TOUCH', '1') == '1' and quotes:
         await _record_touch(scored, quotes, window_open, offset, config, kalshi)
         _phase('touch')
 
-    # Re-read: `account` was loaded before the decisions and is now stale by
-    # every stake debited this cycle.
+    if fast:
+        await bookkeeping(args, config, writer, kalshi, bars, phase=_phase)
+        await _db(record_minute_prices, writer, bars)
+
+    await _db(_write_equity_point, writer, now)
+    return decisions
+
+
+def _write_equity_point(writer: PgWriter, now) -> None:
     account = writer.account()
     open_now = writer.open_positions()
     writer.write_equity_point(
@@ -2576,7 +3017,6 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         open_positions=len(open_now),
         realized_pnl=account.realized_pnl if account else 0.0,
     )
-    return decisions
 
 
 # `snap_to_tick` used to live here, rounding the limit DOWN onto the venue's
@@ -2854,7 +3294,8 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
     # the money that actually left the account, so cost / count is the true
     # average fill — and it already accounts for filling better than the limit.
     price = float('nan')
-    for key in ('taker_fill_cost_dollars', 'fill_cost_dollars'):
+    for key in ('taker_fill_cost_dollars', 'maker_fill_cost_dollars',
+                'fill_cost_dollars'):
         cost = count(order.get(key))
         if cost is not None and cost > 0:
             paid = cost / float(filled)
@@ -2885,166 +3326,221 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
     return filled, price
 
 
-async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
-                 decision: Decision, row, *,
-                 config: Config = DEFAULT_CONFIG,
-                 quote_time: Optional[pd.Timestamp] = None) -> bool:
+class OrderResult(NamedTuple):
+    """What one order attempt did, for the caller to act on after the fact."""
+
+    booked: bool
+    # 'filled', 'partial', 'killed', 'refused', 'unknown', 'stale', 'unresolved',
+    # 'dry_run', 'paper', 'resting_cancelled'
+    status: str
+    filled: int = 0
+    order: Optional[dict] = None
+    ticket_id: Optional[int] = None
+    limit: float = float('nan')
+    # time.monotonic() when the venue answered, for the kill-retry window.
+    answered_at: Optional[float] = None
+
+
+def client_order_id_for(decision: Decision, attempt: int = 0) -> str:
+    """One key per (symbol, window, offset); a re-priced resend adds `-r<n>`."""
+    key = (f'{decision.symbol}-{decision.window_open:%Y%m%d%H%M}'
+           f'-{decision.offset:02d}')
+    return key if attempt <= 0 else f'{key}-r{attempt}'
+
+
+async def _db(fn, *args, **kwargs):
+    """A synchronous store call, off the event loop."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def lookup_after_ambiguity(kalshi, client_order_id: str, ticker: Optional[str],
+                                 *, attempts: int = 2, pause: float = 1.0):
+    """The venue's record of an order whose POST we never saw answered.
+
+    Returns `(found, record)`: `found` False means the lookup itself failed and
+    nothing is known. A listing that does not show the order is asked twice,
+    because the order may simply not be listed yet.
+    """
+    finder = getattr(kalshi, 'order_by_client_id', None)
+    if finder is None:
+        return False, None
+    record = None
+    for attempt in range(attempts):
+        try:
+            record = await finder(client_order_id, ticker=ticker)
+        except Exception as exc:                              # noqa: BLE001
+            logger.error('could not look up order %s after an ambiguous POST '
+                         '(%s)', client_order_id, str(exc)[:160])
+            return False, None
+        if record is not None:
+            return True, record
+        if attempt + 1 < attempts:
+            await asyncio.sleep(pause)
+    return True, None
+
+
+async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
+                         decision: Decision, row, *,
+                         config: Config = DEFAULT_CONFIG,
+                         quote_time: Optional[pd.Timestamp] = None,
+                         attempt: int = 0, maker: bool = False,
+                         note: Optional[str] = None) -> OrderResult:
     """Record the ticket, place the order when asked to twice, book the fill.
 
-    Returns whether a position was booked, so the caller only counts exposure it
-    actually took on.
+    **A position is written only when money actually moved.** An unresolved
+    market or a dry run books nothing — both once produced holdings the venue
+    had never heard of, which `settle_due` then settled into invented PnL.
 
-    **A position is written only when money actually moved.** Previously control
-    fell through to `open_position` in every branch: an unresolved market (no
-    ticker) wrote a position and debited the bankroll having sent no order, and so
-    did `--mode live --dry-run`. Both produced holdings the venue had never heard
-    of, which `settle_due` then settled into invented PnL — the exact failure the
-    `price_source` column exists to make visible.
+    **`quote_time` is when the book was read**, checked against
+    `max_quote_age_seconds`. None makes no staleness claim.
 
-    **`quote_time` is when the book was read, not when this function runs.**
-    `run_cycle` reads it once at the top of the cycle, then does a Coinbase
-    fetch, four authenticated reconcile calls, inference and six 15-second quote
-    calls before any order is sent — none of which revalidates that the book is
-    still the one being traded on. `max_quote_age_seconds` was declared for
-    exactly this and never checked anywhere. `None` (the default, and what every
-    call site had before this) makes no staleness claim and is not refused —
-    only a caller that supplies a timestamp is asking for the check.
+    The ticket write happens BEFORE the POST, per order, because it is what
+    `entries_for_window` counts: a crash between sending and booking must still
+    block the window. It runs in a thread so the other orders keep moving.
+
+    A POST that times out, or that the venue answers with a 5xx, may have been
+    accepted. The order is looked up by `client_order_id` and booked from the
+    venue's own record — filled, partial or nothing. Only if that lookup fails
+    is the ticket left `unknown`, which still blocks the window.
     """
     placing = bool(args.place_orders) and kalshi is not None and not args.dry_run
+    limit = order_limit_price(decision, config=config) if not maker else decision.price
+    booking_config = replace(config, assume_maker=True) if maker else config
 
     if placing and quote_time is not None:
         age = (pd.Timestamp.now(tz='UTC') - pd.Timestamp(quote_time)).total_seconds()
         if age > config.max_quote_age_seconds:
-            writer.write_ticket(
+            await _db(
+                writer.write_ticket,
                 symbol=decision.symbol, window_open=decision.window_open,
                 settle_time=decision.settle_time, offset_minutes=decision.offset,
                 market_ticker=decision.market_ticker, side=decision.side.value,
                 contracts=decision.contracts, limit_price=decision.price,
-                max_price=order_limit_price(decision, config=config), expected_cost=decision.stake,
+                max_price=limit, expected_cost=decision.stake,
                 model_probability=decision.model_probability, edge=decision.edge,
                 status='skipped',
                 note=(f'stale quote: {age:.0f}s old, over the '
-                     f'{config.max_quote_age_seconds}s limit'))
+                      f'{config.max_quote_age_seconds}s limit'))
             logger.warning(
                 '%s window %s: quote is %.0fs old, over the %ds limit. '
                 'Refusing rather than trading a book that may have moved.',
                 decision.symbol, decision.window_open, age,
                 config.max_quote_age_seconds)
-            return False
+            return OrderResult(False, 'stale', limit=limit)
 
     if placing and not decision.market_ticker:
         logger.error(
             '%s window %s: no market resolved, so nothing can be bought. '
             'Abstaining rather than booking a position against our own baseline.',
             decision.symbol, decision.window_open)
-        return False
+        return OrderResult(False, 'unresolved', limit=limit)
 
-    ticket_id = writer.write_ticket(
+    ticket_id = await _db(
+        writer.write_ticket,
         symbol=decision.symbol, window_open=decision.window_open,
         settle_time=decision.settle_time, offset_minutes=decision.offset,
         market_ticker=decision.market_ticker, side=decision.side.value,
         contracts=decision.contracts, limit_price=decision.price,
-        # The worst price still worth paying. Capped at a fraction of the edge:
-        # paying the whole edge away leaves a zero-EV fill, and under
-        # fill_or_kill that is what walking the book to break-even buys.
-        max_price=order_limit_price(decision, config=config),
+        # The worst price still worth paying: down to the gate, never past it.
+        max_price=limit,
         expected_cost=decision.stake, model_probability=decision.model_probability,
         edge=decision.edge,
     )
+    if attempt > 0 or note:
+        # `write_ticket` is one row per (symbol, window): a resend reuses the
+        # killed ticket, which must stop reading as dead before the POST so a
+        # crash mid-flight still blocks the window.
+        await _db(writer.resolve_ticket, ticket_id, status='new',
+                  note=(note or f'resend {attempt}')[:400])
 
     filled = decision.contracts
     placed_price = decision.price
-    # Set only when the venue reported a real fill price, which is what licenses
-    # recomputing the outlay from it rather than from the decision's stake.
     venue_fill_price: Optional[float] = None
-    # The market's own exchange, not the order body's default of 0. See
-    # `Quote.exchange_index` — a mismatch returns `404 market_not_found`, which
-    # names the market rather than the mismatch and took a bisect to find.
+    order: Optional[dict] = None
+    answered_at: Optional[float] = None
+    # The market's own exchange, not the order body's default of 0: a mismatch
+    # returns `404 market_not_found`, which names the market, not the mismatch.
     exchange_index = int(getattr(row, 'get', lambda *_: 0)('exchange_index', 0) or 0)
+    key = client_order_id_for(decision, attempt)
     if placing:
         try:
-            order = await kalshi.place_order(
-                ticker=decision.market_ticker, side=decision.side.value,
-                exchange_index=exchange_index,
-                contracts=decision.contracts,
-                limit_price=order_limit_price(decision, config=config),
+            if maker:
+                order = await _rest_as_maker(kalshi, decision, limit=limit,
+                                             exchange_index=exchange_index,
+                                             client_order_id=key, config=config)
+            else:
                 # **The offset belongs in this key.** Keyed on (symbol, window)
-                # alone it enforced one order *attempt* per window, while the
-                # policy is one *position* per window — and those differ exactly
-                # when an order does not fill. A fill_or_kill that kills still
-                # consumes the id at the venue, so the first thin-volume kill
-                # locked every later offset out of that window with
-                # `409 order_already_exists`.
-                #
-                # Measured over the first live night: 57 of 69 unfilled attempts
-                # were our own duplicate key, not the venue refusing us, and they
-                # carried a *higher* claimed edge (8.37pp) than the ones that
-                # filled (5.77pp). Only 9 were genuine
-                # `fill_or_kill_insufficient_resting_volume`, at 3.94pp — the
-                # lowest of the three. So the market was not selecting against
-                # us; we were blocking ourselves out of the better half of our
-                # own signal.
-                #
-                # Double-entry is not what this key was protecting. That is
-                # `entries_for_window`, which counts a ticket in any status but
-                # `skipped` — so a crash between sending an order and booking the
-                # position still blocks the window, and `skipped` (nothing
-                # bought) correctly reopens it. One attempt per offset is the
-                # documented rule: walk the offsets in order, take the first that
-                # clears every gate.
-                client_order_id=(
-                    f'{decision.symbol}-{decision.window_open:%Y%m%d%H%M}'
-                    f'-{decision.offset:02d}'),
-            )
-        except (KalshiError, ValueError) as exc:
-            writer.resolve_ticket(ticket_id, status='skipped', note=str(exc)[:400])
+                # alone it enforced one order ATTEMPT per window, and the first
+                # kill locked every later offset out with a 409.
+                order = await kalshi.place_order(
+                    ticker=decision.market_ticker, side=decision.side.value,
+                    exchange_index=exchange_index,
+                    contracts=decision.contracts, limit_price=limit,
+                    client_order_id=key)
+            answered_at = time.monotonic()
+        except (KalshiError, asyncio.TimeoutError, OSError) as exc:
+            ambiguous = (not isinstance(exc, KalshiError)
+                         or bool(getattr(exc, 'ambiguous', False)))
+            if not ambiguous:
+                await _db(writer.resolve_ticket, ticket_id, status='skipped',
+                          note=str(exc)[:400])
+                logger.error('order refused, no position recorded: %s', exc)
+                return OrderResult(False, 'refused', ticket_id=ticket_id, limit=limit)
+            # The request may well have reached the venue. Ask it, by our key.
+            found, record = await lookup_after_ambiguity(
+                kalshi, key, decision.market_ticker)
+            if not found:
+                await _db(writer.resolve_ticket, ticket_id, status='unknown',
+                          note=str(exc)[:400])
+                logger.error(
+                    'the order request to %s failed in flight (%s) and the venue '
+                    'could not be asked about %s. Not booking and not retrying; '
+                    'the next reconcile will report a position we do not hold.',
+                    decision.market_ticker, exc, key)
+                return OrderResult(False, 'unknown', ticket_id=ticket_id, limit=limit)
+            if record is None:
+                await _db(writer.resolve_ticket, ticket_id, status='skipped',
+                          note=(f'POST failed in flight ({str(exc)[:200]}); the '
+                                f'venue lists no order {key}'))
+                logger.error('the order POST to %s failed in flight (%s) and the '
+                             'venue lists no order %s; nothing was bought',
+                             decision.market_ticker, exc, key)
+                return OrderResult(False, 'refused', ticket_id=ticket_id, limit=limit)
+            logger.warning('the order POST to %s failed in flight (%s); the venue '
+                           'has %s as %s — booking what it says',
+                           decision.market_ticker, exc, key, record.get('status'))
+            order = record
+            answered_at = time.monotonic()
+        except ValueError as exc:
+            await _db(writer.resolve_ticket, ticket_id, status='skipped',
+                      note=str(exc)[:400])
             logger.error('order refused, no position recorded: %s', exc)
-            return False
-        except (asyncio.TimeoutError, OSError) as exc:
-            # The request may well have reached the venue. Do NOT book a position
-            # and do NOT retry: `client_order_id` is deterministic per
-            # (symbol, window), so the next cycle's attempt is the venue's problem
-            # to deduplicate, and reconciliation will surface a fill we never saw.
-            writer.resolve_ticket(ticket_id, status='unknown', note=str(exc)[:400])
-            logger.error(
-                'the order request to %s failed in flight (%s). It may have been '
-                'accepted. Not booking a position and not retrying; the next '
-                'reconcile will report a venue position we do not hold.',
-                decision.market_ticker, exc)
-            return False
+            return OrderResult(False, 'refused', ticket_id=ticket_id, limit=limit)
 
         filled, fill_price = filled_from_order(order, decision.contracts)
-        # V2 quotes everything from the YES side, so a DOWN fill comes back as the
-        # price we SOLD yes at. What we paid for the NO contract is `1 - that`.
-        # Recording 0.69 where 0.31 was paid would not corrupt PnL — that is
-        # computed from `outlay` — but it would put a wrong price on the position
-        # and make `realised_edge_pp` and every displayed number wrong for half the
-        # trades.
+        # V2 quotes everything from the YES side, so a DOWN fill comes back as
+        # the price we SOLD yes at; what we paid for the NO contract is 1 - that.
         if np.isfinite(fill_price) and decision.side is not Side.UP:
             fill_price = 1.0 - fill_price
         if filled <= 0:
+            status = 'resting_cancelled' if maker else 'killed'
             logger.warning(
                 '%s window %s: the order did not fill (status %r). No position.',
                 decision.symbol, decision.window_open, order.get('status'))
-            # The POST reply in full, then the book and the venue's record.
             logger.warning('kill diagnosis | post reply: %s',
                            json.dumps(order, sort_keys=True, default=str))
-            diagnosis = await diagnose_kill(
-                kalshi, decision, order,
-                order_limit_price(decision, config=config))
-            writer.resolve_ticket(
-                ticket_id, status='killed',
-                note=(f"status={order.get('status')!r} "
-                      f"order_id={str(order.get('order_id',''))[:60]} || "
-                      f"{diagnosis}")[:4000])
-            return False
+            await _db(writer.resolve_ticket, ticket_id, status='killed',
+                      note=(f"status={order.get('status')!r} "
+                            f"order_id={str(order.get('order_id', ''))[:60]} "
+                            f"key={key}")[:4000])
+            return OrderResult(False, status, 0, order, ticket_id, limit, answered_at)
         if np.isfinite(fill_price):
             placed_price = fill_price
             venue_fill_price = float(fill_price)
-        writer.resolve_ticket(
-            ticket_id, status='filled', filled_contracts=filled,
-            filled_price=placed_price,
-            note=str(order.get('order_id', ''))[:200])
+        await _db(writer.resolve_ticket,
+                  ticket_id, status='filled', filled_contracts=filled,
+                  filled_price=placed_price,
+                  note=str(order.get('order_id', ''))[:200])
         if filled < decision.contracts:
             logger.warning('%s window %s: partial fill %d of %d',
                            decision.symbol, decision.window_open,
@@ -3052,38 +3548,23 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         logger.info('filled %d @ %.4f (order %s)', filled, placed_price,
                     order.get('order_id'))
     elif args.mode == 'live':
-        # A real book was read and priced; nothing was bought. Recording a
-        # position here would put a holding on the books that does not exist.
+        # A real book was read and priced; nothing was bought.
         logger.info('dry run: ticket %d written, no order placed, no position',
                     ticket_id)
-        return False
+        return OrderResult(False, 'dry_run', ticket_id=ticket_id, limit=limit)
 
-    # **Book the fill, not the intention.**
-    #
-    # These were pro-rated from `decision.stake` and `decision.fee`, both computed
-    # at the *decision* price, while `price` on the position is taken from the
-    # fill. A `fill_or_kill` fills at or better than its limit, so the cash
-    # actually leaving the account was always <= the booked outlay and the
-    # bankroll read systematically low — surfacing later as unexplained "balance
-    # drift" against the venue, which the operator is told to read as an
-    # unrecorded fill.
-    #
-    # Observed 2026-08-25: `placing down 1 @ 0.08` then `filled 1 @ 0.0530`. The
-    # position recorded price 0.0530 and an outlay derived from 0.08.
-    #
-    # Recomputed ONLY when the venue actually reported a fill price. Without a
-    # book, `decide()` folds the half-spread into `stake` (`crossing`), and
-    # rebuilding the outlay from price alone would silently drop it and make paper
-    # trading cheaper than it is. `outlay` is fee-inclusive, matching
-    # `decide()`'s `stake`.
+    # **Book the fill, not the intention.** Outlay and fee come from the price
+    # the venue reports when it reports one; otherwise pro-rated from the
+    # decision, which in paper mode already carries the half-spread.
     ratio = (filled / decision.contracts) if decision.contracts else 0.0
     if filled and venue_fill_price is not None:
-        fee = float(trade_fee(filled, venue_fill_price, config))
+        fee = float(trade_fee(filled, venue_fill_price, booking_config))
         outlay = float(filled) * float(venue_fill_price) + fee
     else:
         outlay = decision.stake * ratio
         fee = decision.fee * ratio
-    writer.open_position(
+    await _db(
+        writer.open_position,
         symbol=decision.symbol, window_open=decision.window_open,
         settle_time=decision.settle_time, offset_minutes=decision.offset,
         side=decision.side.value, contracts=filled, price=placed_price,
@@ -3093,8 +3574,84 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     )
     # Relative, in one statement: a read-then-write across two transactions loses
     # one of two overlapping debits, and nothing enforces a single writer.
-    writer.adjust_account(bankroll_delta=-outlay, fees_delta=fee)
-    return True
+    await _db(writer.adjust_account, bankroll_delta=-outlay, fees_delta=fee)
+    status = 'paper' if not placing else (
+        'filled' if filled >= decision.contracts else 'partial')
+    return OrderResult(True, status, int(filled), order, ticket_id, limit, answered_at)
+
+
+async def _rest_as_maker(kalshi, decision: Decision, *, limit: float,
+                         exchange_index: int, client_order_id: str,
+                         config: Config) -> dict:
+    """Post a non-crossing limit, let it rest, cancel it, read what filled.
+
+    `post_only` makes the venue refuse it rather than cross, and
+    `expiration_time` makes the venue cancel it even if this process dies
+    while it rests. The returned record is the venue's own, after the cancel.
+    """
+    rest = max(0.0, float(config.maker_rest_seconds))
+    settle = pd.Timestamp(decision.settle_time)
+    room = (settle - pd.Timestamp.now(tz='UTC')).total_seconds() - config.min_remaining_seconds
+    rest = max(0.0, min(rest, room))
+    expires = int(time.time() + rest + 5.0)
+    posted = await kalshi.place_order(
+        ticker=decision.market_ticker, side=decision.side.value,
+        exchange_index=exchange_index, contracts=decision.contracts,
+        limit_price=limit, client_order_id=client_order_id,
+        time_in_force='good_till_canceled', post_only=True,
+        expiration_time=expires)
+    order_id = str(posted.get('order_id') or '')
+    if not order_id:
+        return posted
+    await asyncio.sleep(rest)
+    try:
+        await kalshi.cancel(order_id, ticker=decision.market_ticker)
+    except KalshiError as exc:
+        # Most often it filled completely or expired first; the record says.
+        logger.info('maker cancel of %s: %s', order_id, str(exc)[:160])
+    try:
+        record = await kalshi.order(order_id)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.error('could not read maker order %s back (%s); using the POST '
+                     'reply', order_id, str(exc)[:160])
+        return posted
+    return record or posted
+
+
+async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
+                 decision: Decision, row, *,
+                 config: Config = DEFAULT_CONFIG,
+                 quote_time: Optional[pd.Timestamp] = None) -> bool:
+    """`place_and_book` for one decision, diagnosing a kill straight away.
+
+    Returns whether a position was booked. The cycle itself calls
+    `place_and_book` for every order at once and diagnoses afterwards.
+    """
+    result = await place_and_book(args, writer, kalshi, decision, row,
+                                  config=config, quote_time=quote_time)
+    if result.status == 'killed':
+        await diagnose_and_note(kalshi, writer, decision, result)
+    return result.booked
+
+
+async def diagnose_and_note(kalshi, writer: PgWriter, decision: Decision,
+                            result: OrderResult, *, write_note: bool = True) -> None:
+    """Read the book and the venue's record for a kill, and keep it on the ticket.
+
+    `write_note=False` when a resend has since changed the ticket: the
+    diagnosis is logged and the ticket's newer status is left alone.
+    """
+    try:
+        diagnosis = await diagnose_kill(kalshi, decision, result.order or {},
+                                        result.limit)
+        if write_note and result.ticket_id is not None:
+            order = result.order or {}
+            await _db(writer.resolve_ticket, result.ticket_id, status='killed',
+                      note=(f"status={order.get('status')!r} "
+                            f"order_id={str(order.get('order_id', ''))[:60]} || "
+                            f"{diagnosis}")[:4000])
+    except Exception:                                         # noqa: BLE001
+        logger.exception('kill diagnosis failed')
 
 
 def _finite(value) -> Optional[float]:
@@ -3166,6 +3723,9 @@ def config_from_args(args) -> Config:
     compound = getattr(args, 'compound', None)
     if compound is not None:
         overrides['compound'] = bool(compound)
+    style = getattr(args, 'entry_style', None)
+    if style is not None:
+        overrides['entry_style'] = str(style)
     return config.with_overrides(**overrides) if overrides else config
 
 
@@ -3221,6 +3781,11 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
         return 0
 
     config = config_from_args(args)
+    # What the command line asked for, before any artifact's economics are
+    # adopted: a hot reload re-derives the trading config from this.
+    base_config = config
+    artifact = Path(args.model) if args.model else Path(MODELS_ROOT) / LIVE_MODEL
+    signature = artifact_signature(artifact)
 
     # Load WITHOUT the config first. `verify(None)` still checks the things that
     # are true of the artifact alone — that the booster's columns match the
@@ -3298,6 +3863,11 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                             decisions=hb_decisions, traded=hb_traded,
                             bankroll=float(writer.account().bankroll),
                             lag_seconds=hb_lag))
+                        # The first cycle of a window: nothing is in flight and
+                        # the next decision is minutes away, so a newly
+                        # promoted artifact is picked up here, not by a restart.
+                        model, config, signature = await reload_if_changed(
+                            args, base_config, artifact, model, config, signature)
                     hb_window = window_open
                     hb_cycles = hb_decisions = hb_traded = 0
                     hb_lag = float('nan')
@@ -3316,6 +3886,14 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                     # caught only KeyboardInterrupt, so the process died and
                     # `restart: unless-stopped` crash-looped it forever.
                     logger.error('cycle skipped, nothing scored: %s', exc)
+                    decisions = []
+                except Exception:                     # noqa: BLE001
+                    # Any other failure costs this cycle, not the next one.
+                    # Escaping to `supervise` meant a 5s-300s backoff and a
+                    # fresh startup, skipping decisions for nothing.
+                    # CancelledError and KeyboardInterrupt are not Exceptions
+                    # and still stop the loop.
+                    logger.exception('cycle failed; continuing with the next')
                     decisions = []
                 if decisions:
                     counts = rejection_histogram(decisions)
@@ -3347,6 +3925,65 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
     finally:
         if kalshi is not None:
             await kalshi.close()
+
+
+def artifact_signature(path) -> Optional[tuple]:
+    """What identifies the installed artifact on disk, cheaply.
+
+    `promote` installs by atomic rename, so a new artifact is a new inode with
+    its own mtime and size; reading the bytes every window is not needed.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _load_artifact(args, base_config: Config):
+    """The installed artifact and the config to trade it under, as `main` builds them."""
+    model = (load_live(config=None) if args.model is None
+             else __import__('core.model', fromlist=['ForecastModel'])
+             .ForecastModel.load(args.model, None))
+    if model is None:
+        raise RuntimeError('no artifact on disk')
+    config = config_for_artifact(base_config, model, mode=args.mode)
+    model.verify(config)
+    if not model.deployable:
+        raise RuntimeError('the artifact carries no scoring bundle')
+    if args.require_gates and not args.force:
+        _refuse_if_blocked()
+    return model, config
+
+
+async def reload_if_changed(args, base_config: Config, path, model, config,
+                            signature):
+    """Swap in a newly installed artifact; on any failure keep the old one.
+
+    Returns `(model, config, signature)`. Loading runs in a thread: a joblib
+    load is seconds of blocking work and the stream readers share this loop.
+    A refusal — a gate-blocked artifact under `--require-gates`, an init source
+    this mode cannot score, an unreadable file — is logged as an ERROR and the
+    loop keeps trading what it was already trading.
+    """
+    current = artifact_signature(path)
+    if current is None or current == signature:
+        return model, config, signature
+    logger.info('the installed artifact changed on disk; reloading')
+    try:
+        new_model, new_config = await asyncio.to_thread(
+            _load_artifact, args, base_config)
+    except (Exception, SystemExit) as exc:                    # noqa: BLE001
+        logger.error('could not load the new artifact (%s); still trading %s',
+                     str(exc)[:300], getattr(model, 'version', 'the old model'),
+                     exc_info=not isinstance(exc, SystemExit))
+        # Not retried every window: a refused artifact stays refused until
+        # the file changes again.
+        return model, config, current
+    logger.warning('now trading artifact %s (was %s)',
+                   getattr(new_model, 'version', '?'),
+                   getattr(model, 'version', '?'))
+    return new_model, new_config, current
 
 
 def _installed_version() -> Optional[str]:

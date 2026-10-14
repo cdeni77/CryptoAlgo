@@ -182,6 +182,8 @@ async def run(args, gate=None, cache=None) -> int:
         nonlocal stream, subscribed
         if stream is not None:
             await stream.close()
+            # Every book now lags the venue until its new snapshot lands.
+            cache.invalidate(VENUE)
         stream, subscribed = None, set()
 
     try:
