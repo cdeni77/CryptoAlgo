@@ -10,8 +10,9 @@ all, and the only number that means anything is the difference.
 **Standard errors come from fold dispersion.** Not from `N/(1+(N-1)rho)`: four
 decision offsets share one label, the three symbols are ~0.7 correlated within
 a window, and a breadth formula on that structure is not merely optimistic but
-degenerate. Six folds give five degrees of freedom, which is few — and honestly
-few, which is better than a precise-looking number from the wrong formula.
+degenerate. Folds are weighted by their window count (they vary ~10x in size)
+and the error bar uses the Kish effective number of folds, so a thin fold
+neither moves the mean as much as a thick one nor buys a full degree of freedom.
 
 **The gates exist because a Sharpe ratio is the wrong first question.** On the
 perp system a model 34x short of its cost hurdle failed every gate without any
@@ -24,11 +25,12 @@ same ratio and opposite fixes.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Iterable, Optional, Sequence
-
-import os
 
 import numpy as np
 import pandas as pd
@@ -39,6 +41,59 @@ from core.book import BookStats
 from core.config import Config, DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WeightedMean:
+    """A fold-size-weighted mean with its dispersion-based standard error."""
+
+    mean: float
+    standard_error: float
+    effective_n: float
+
+    @property
+    def t(self) -> float:
+        se = self.standard_error
+        if not np.isfinite(self.mean) or not np.isfinite(se):
+            return float('nan')
+        if se > 0:
+            return self.mean / se
+        # Every fold agreeing exactly: the sign is certain, the size is not.
+        return float(np.sign(self.mean) * np.inf) if self.mean else float('nan')
+
+    @property
+    def p_value(self) -> float:
+        """One-sided P(T >= t) under zero mean, Student t on n_eff - 1 df."""
+        from scipy import stats as sstats
+
+        t = self.t
+        if not np.isfinite(self.effective_n) or self.effective_n <= 1.0 or np.isnan(t):
+            return float('nan')
+        return float(sstats.t.sf(t, df=self.effective_n - 1.0))
+
+
+def weighted_fold_mean(values, weights=None) -> WeightedMean:
+    """Mean of per-fold values weighted by fold size, SE from weighted dispersion.
+
+    The variance is the unbiased reliability-weights estimate, and the SE divides
+    by the Kish effective count `(sum w)^2 / sum w^2`, so with equal weights this
+    is exactly the ordinary `std(ddof=1) / sqrt(n)`.
+    """
+    v = np.asarray(values, dtype=float)
+    w = (np.ones_like(v) if weights is None
+         else np.asarray(weights, dtype=float))
+    keep = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    v, w = v[keep], w[keep]
+    if not len(v):
+        return WeightedMean(float('nan'), float('nan'), 0.0)
+    p = w / w.sum()
+    mean = float(np.sum(p * v))
+    sum_p2 = float(np.sum(p ** 2))
+    n_eff = 1.0 / sum_p2
+    if len(v) < 2 or sum_p2 >= 1.0:
+        return WeightedMean(mean, float('nan'), n_eff)
+    variance = float(np.sum(p * (v - mean) ** 2)) / (1.0 - sum_p2)
+    return WeightedMean(mean, float(np.sqrt(variance * sum_p2)), n_eff)
 
 
 def log_loss_skill(outcome: np.ndarray, model: np.ndarray, baseline: np.ndarray) -> float:
@@ -206,6 +261,11 @@ class EvaluationReport:
     continuous: Optional[BookStats] = None
     config_provenance: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # How the folds were actually cut. `config_provenance['n_folds']` is the
+    # configured value, which the calendar scheme does not honour as a count.
+    fold_geometry: dict = field(default_factory=dict)
+    # Daily P&L moments of the continuous book, for the deflated Sharpe ratio.
+    sharpe_moments: dict = field(default_factory=dict)
 
     # ---- forecast ------------------------------------------------------
     @property
@@ -213,20 +273,50 @@ class EvaluationReport:
         return np.array([f.skill for f in self.folds], dtype=float)
 
     @property
+    def fold_weights(self) -> np.ndarray:
+        """Window counts. Folds vary ~10x in size, so equal weights let a thin
+        fold move the mean as much as one ten times its precision."""
+        return np.array([max(int(getattr(f, 'n_windows', 0) or 0), 0)
+                         for f in self.folds], dtype=float)
+
+    @property
+    def weighted_skill(self) -> WeightedMean:
+        weights = self.fold_weights
+        if not len(weights) or weights.sum() <= 0:
+            weights = None
+        return weighted_fold_mean(self.skills, weights)
+
+    @property
+    def unweighted_skill(self) -> WeightedMean:
+        """Every fold equal, as every ledger entry before gate definition v2."""
+        return weighted_fold_mean(self.skills)
+
+    @property
     def mean_skill(self) -> float:
-        return float(np.mean(self.skills)) if len(self.folds) else float('nan')
+        return self.weighted_skill.mean if self.folds else float('nan')
 
     @property
     def skill_standard_error(self) -> float:
-        """From fold dispersion. See the module docstring for why not breadth."""
-        if len(self.folds) < 2:
-            return float('nan')
-        return float(np.std(self.skills, ddof=1) / np.sqrt(len(self.folds)))
+        """From weighted fold dispersion. See the module docstring."""
+        return self.weighted_skill.standard_error
+
+    @property
+    def effective_folds(self) -> float:
+        return self.weighted_skill.effective_n
 
     @property
     def skill_t(self) -> float:
-        se = self.skill_standard_error
-        return self.mean_skill / se if se and np.isfinite(se) and se > 0 else float('nan')
+        return self.weighted_skill.t
+
+    @property
+    def skill_p_value(self) -> float:
+        """One-sided p of the weighted mean skill against zero.
+
+        `log_loss_skill >= 0` is a point estimate, and half of all nulls clear
+        it. This is the gate that asks whether the skill is distinguishable
+        from fold noise.
+        """
+        return self.weighted_skill.p_value
 
     @property
     def folds_positive(self) -> int:
@@ -489,6 +579,7 @@ class EvaluationReport:
         continuous = self.continuous
         return {
             'log_loss_skill': self.mean_skill,
+            'log_loss_skill_p': self.skill_p_value,
             'folds_skill_positive': float(self.folds_positive),
             'sign_agreement_p': self.sign_agreement_p_value,
             'calibration_error': self.max_ece,
@@ -513,13 +604,18 @@ class EvaluationReport:
         }
 
     def summary(self) -> str:
+        plain = self.unweighted_skill
         lines = [
             f'{self.folds_total} folds, {self.total_windows:,} out-of-sample windows',
             *[f.line() for f in self.folds],
             '',
             f'  log loss skill {self.mean_skill:+.5f} +/- {self.skill_standard_error:.5f} '
-            f'(t = {self.skill_t:+.2f}), {self.folds_positive}/{self.folds_total} folds '
-            f'positive (p = {self.sign_agreement_p_value:.3f})',
+            f'(t = {self.skill_t:+.2f}, one-sided p = {self.skill_p_value:.4f}, '
+            f'{self.effective_folds:.1f} effective folds; window-weighted)',
+            f'  unweighted     {plain.mean:+.5f} +/- {plain.standard_error:.5f} '
+            f'(t = {plain.t:+.2f})',
+            f'  {self.folds_positive}/{self.folds_total} folds '
+            f'positive (sign p = {self.sign_agreement_p_value:.3f})',
             f'  worst-fold calibration error {self.max_ece:.4f} | '
             f'mean alpha {self.mean_residual_scale:.3f} | '
             f'worst control gain share {self.max_control_gain_share:.1%}',
@@ -543,14 +639,11 @@ MIN_MARKET_WINDOWS = 2_000
 # headline was the model out-forecasting a price nobody was quoting any more.
 # Both halves flatter: market_ll worsens with age while model_ll improves,
 # because the rows carrying stale quotes are the easier ones.
-# **Read from the same env var `core.quotes` reads, not hardcoded.** These two
-# must move together: trades were once priced against quotes up to 900s old
-# while this comparison counted only those under 30s, so the money and the
-# forecast were measured on different samples. Pinning one to a literal while
-# the other honours `QUOTE_MAX_AGE_SECONDS` re-opens exactly that desync the
-# moment anyone sets it -- silently, and in the direction that manufactures
-# edge.
-MAX_QUOTE_AGE_SECONDS = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
+# **One limit, read from `Config`.** Trades were once priced against quotes up
+# to 900s old while this comparison counted only those under 30s, so the money
+# and the forecast were measured on different samples. `core.quotes` and the
+# live order check read the same field.
+MAX_QUOTE_AGE_SECONDS = float(DEFAULT_CONFIG.max_quote_age_seconds)
 
 MARKET_COLUMNS = ('symbol', 'window_open', 'offset', 'market', 'baseline',
                   'model', 'outcome', 'decision_time')
@@ -915,10 +1008,27 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
 
 # ---- gates ---------------------------------------------------------------
 
-# name -> (threshold, direction). 'min' passes at or above, 'max' at or below.
-# Ordered as they should be read: the forecast first, the money second. A
-# candidate that fails a forecast gate should not have its Sharpe discussed.
-DEFAULT_GATES: dict[str, tuple[float, str]] = {
+@dataclass(frozen=True)
+class GateSpec:
+    """One gate as frozen in `gate_spec.lock.json`.
+
+    `definition_version` names the COMPUTATION behind `name`. Bump it whenever
+    what the value means changes — a new aggregation, a new filter, a new
+    estimator — even if the threshold does not move, so the spec hash changes
+    and promotion refuses until the change is accepted with a reason.
+    """
+
+    name: str
+    threshold: float
+    direction: str            # 'min' passes at or above, 'max' at or below
+    definition_version: int = 1
+
+
+# The canonical gate list. Ordered as the gates should be read: the forecast
+# first, the money second. A candidate that fails a forecast gate should not
+# have its Sharpe discussed. `log_loss_skill` is v2: the fold mean became
+# window-weighted.
+GATE_SPEC: tuple[GateSpec, ...] = (
     # --- the benchmark that decides whether any of the rest pays ---
     #
     # These two come first because the benchmark below them is the wrong one to
@@ -933,10 +1043,17 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # honest state of the question rather than an obstacle to route around;
     # `--force` with a written reason is the documented way past it, and the
     # ledger records that it was used.
-    'market_windows': (float(MIN_MARKET_WINDOWS), 'min'),
-    'model_minus_market': (0.0, 'min'),
+    GateSpec('market_windows', float(MIN_MARKET_WINDOWS), 'min', 1),
+    GateSpec('model_minus_market', 0.0, 'min', 1),
     # --- the forecast ---
-    'log_loss_skill': (0.0, 'min'),
+    GateSpec('log_loss_skill', 0.0, 'min', 2),
+    # **Significance, not just sign.** `log_loss_skill >= 0` is a point
+    # estimate, and a zero-signal null clears it about half the time
+    # (measured on the synthetic null: two of four seeds, t = +0.69 and
+    # +0.77). One-sided Student-t on the window-weighted fold mean, with
+    # n_eff - 1 degrees of freedom. Every ledger entry since 2026-09-10 read
+    # t >= 2.6 on 25-28 folds (unweighted), i.e. p < 0.01.
+    GateSpec('log_loss_skill_p', 0.05, 'max', 1),
     # **A COUNT of agreeing folds is only meaningful at a fixed fold count.**
     # This was `folds_skill_positive >= 5`, written when the walk-forward always
     # produced exactly six. Anchored calendar blocks accumulate — 10 folds on a
@@ -948,7 +1065,7 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # binomial probability of seeing at least this many positive folds if each
     # were a coin flip. 0.11 reproduces the old five-of-six exactly (p = 0.109)
     # and stays that strict at any fold count.
-    'sign_agreement_p': (0.11, 'max'),
+    GateSpec('sign_agreement_p', 0.11, 'max', 1),
     # **A SANITY floor, not a quality bar.** 0.02 was derived under 21-day fold
     # blocks, and under the 7-day blocks the retrain actually runs the
     # ARITHMETIC NULL fails it on 21 of 25 folds (model 2/25 under the bar,
@@ -957,14 +1074,14 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # because binned ECE is biased upward at small n. 0.10 still fails a
     # catastrophically miscalibrated candidate (the baseline's own worst fold is
     # 0.0802) and leaves the discrimination to the two relative gates.
-    'calibration_error': (0.10, 'max'),
+    GateSpec('calibration_error', 0.10, 'max', 1),
     # **Does the correction make calibration worse than the arithmetic it
     # corrects?** Median over folds, so it does not drift as folds accumulate.
     # 0.005 sits below the one-sd fold-to-fold spread of 0.00707 and well above
     # the standard error of the median, so it catches a systematic degradation —
     # 0.005 against a typical fold ECE of 0.030 is 17% worse — without rejecting
     # a model for fold noise. Measured 2026-09-17: +0.00100, t = +0.06.
-    'calibration_vs_baseline': (0.005, 'max'),
+    GateSpec('calibration_vs_baseline', 0.005, 'max', 1),
     # The mean ECE is count-weighted over every row, and most rows sit where the
     # barrier is already decided. Measured: a model 5pp overconfident on the
     # 5% of rows it trades scores 0.0044 and passes. This bounds the worst
@@ -973,25 +1090,25 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # rather than certifying the edge.
     # A loose sanity rail now, not the binding claim — see
     # `calibration_vs_market`, which asks the question that can be met.
-    'calibration_max_deviation': (0.10, 'max'),
-    'calibration_vs_market': (0.0, 'max'),
+    GateSpec('calibration_max_deviation', 0.10, 'max', 1),
+    GateSpec('calibration_vs_market', 0.0, 'max', 1),
     # A data hole must report as a data hole. 31 non-finite rows in 99,388 turned
     # five of six folds' metrics into NaN while `scripts/baseline.py` printed
     # "gate passed", because `nan > 0.02` is False and pandas' max skips NaN.
     # A share rather than a count, because an outage is not a defect: measured,
     # one 6.5-hour Coinbase outage accounts for 0.02% of rows. A large share means
     # a lookback or embargo mistake, which is.
-    'non_finite_share': (0.001, 'max'),
-    'residual_scale': (0.25, 'min'),
-    'control_gain_share': (0.30, 'max'),
-    'windows_evaluated': (20_000.0, 'min'),
+    GateSpec('non_finite_share', 0.001, 'max', 1),
+    GateSpec('residual_scale', 0.25, 'min', 1),
+    GateSpec('control_gain_share', 0.30, 'max', 1),
+    GateSpec('windows_evaluated', 20_000.0, 'min', 1),
     # --- the money ---
-    'trades': (200.0, 'min'),
-    'coverage': (0.0005, 'min'),
-    'realised_edge_pp': (0.0, 'min'),
-    'total_return': (0.0, 'min'),
-    'sharpe': (0.5, 'min'),
-    'sharpe_implausible': (0.0, 'max'),
+    GateSpec('trades', 200.0, 'min', 1),
+    GateSpec('coverage', 0.0005, 'min', 1),
+    GateSpec('realised_edge_pp', 0.0, 'min', 1),
+    GateSpec('total_return', 0.0, 'min', 1),
+    GateSpec('sharpe', 0.5, 'min', 1),
+    GateSpec('sharpe_implausible', 0.0, 'max', 1),
     # **Two drawdown questions, and they need two statistics.**
     #
     # `max_drawdown` is the worst peak-to-trough over the whole out-of-sample
@@ -1016,10 +1133,62 @@ DEFAULT_GATES: dict[str, tuple[float, str]] = {
     # three-week risk more than doubling, not a fine-tuning of it. The bars that
     # protect real money are the live breakers, the $250 ruin floor and the $75
     # daily-loss halt, and they are unaffected by anything here.
-    'max_drawdown': (0.35, 'max'),
-    'median_fold_drawdown': (0.20, 'max'),
-    'halted': (0.0, 'max'),
-}
+    GateSpec('max_drawdown', 0.35, 'max', 1),
+    GateSpec('median_fold_drawdown', 0.20, 'max', 1),
+    GateSpec('halted', 0.0, 'max', 1),
+)
+
+# name -> (threshold, direction), derived so there is one list to change.
+DEFAULT_GATES: dict[str, tuple[float, str]] = {
+    g.name: (g.threshold, g.direction) for g in GATE_SPEC}
+
+GATE_SPEC_LOCK = Path(__file__).with_name('gate_spec.lock.json')
+
+
+def gate_spec(gates: Optional[dict[str, tuple[float, str]]] = None) -> list[dict]:
+    """The spec as plain rows. With `gates`, the spec of THOSE gates, taking
+    definition versions from `GATE_SPEC` (0 for a name it does not know)."""
+    if gates is None:
+        return [asdict(g) for g in GATE_SPEC]
+    versions = {g.name: g.definition_version for g in GATE_SPEC}
+    return [{'name': name, 'threshold': float(threshold), 'direction': direction,
+             'definition_version': versions.get(name, 0)}
+            for name, (threshold, direction) in gates.items()]
+
+
+def gate_spec_hash(gates: Optional[dict[str, tuple[float, str]]] = None) -> str:
+    rows = [{**row, 'threshold': float(row['threshold'])} for row in gate_spec(gates)]
+    canonical = json.dumps(rows, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def load_gate_lock(path: Optional[Path] = None) -> dict:
+    """The committed lock, or {} when it is missing or unreadable — which fails
+    every comparison rather than passing one."""
+    try:
+        return json.loads(Path(path or GATE_SPEC_LOCK).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_gate_lock(path: Optional[Path] = None) -> dict:
+    """Regenerate the lock from the code. Run it in the same commit as the gate
+    change: `python -c "from core.metrics import write_gate_lock; write_gate_lock()"`."""
+    payload = {'gate_spec_hash': gate_spec_hash(), 'gates': gate_spec()}
+    Path(path or GATE_SPEC_LOCK).write_text(json.dumps(payload, indent=2) + '\n')
+    return payload
+
+
+def gate_spec_diff(old: Sequence[dict], new: Sequence[dict]) -> dict:
+    """What changed between two spec row lists, by gate name."""
+    before = {row['name']: row for row in old or ()}
+    after = {row['name']: row for row in new or ()}
+    changed = {
+        name: {'from': before[name], 'to': after[name]}
+        for name in before.keys() & after.keys() if before[name] != after[name]}
+    return {'added': [after[n] for n in after if n not in before],
+            'removed': [before[n] for n in before if n not in after],
+            'changed': dict(sorted(changed.items()))}
 
 # Above this, a Sharpe ratio is evidence of a defect rather than of an edge.
 # Nothing trading a public venue at 30,000 trades a year earns a Sharpe of 12;
@@ -1035,14 +1204,20 @@ GATE_NOTES: dict[str, str] = {
     'model_minus_market': 'the price is the counterparty, not F(x/sigma). Beating '
                           'the arithmetic null while losing to the quote is the '
                           'failure this whole stack is built to not make',
-    'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark',
+    'log_loss_skill': 'the model must beat F(x/sigma); a coin flip is not the benchmark. '
+                      'Window-weighted mean over folds',
+    'log_loss_skill_p': 'one-sided p that the weighted skill is above zero, from fold '
+                        'dispersion on n_eff - 1 df. The point estimate alone clears '
+                        'zero on half of all nulls',
     'folds_skill_positive': 'how many folds agreed, reported not gated — the COUNT '
                             'is only meaningful at a fixed fold count, and '
                             'anchored blocks accumulate',
     'sign_agreement_p': 'the chance this many folds agree if each were a coin flip. '
                         '0.11 is exactly the old five-of-six bar (p=0.109) and stays '
                         'that strict as folds accumulate, where ">=5" would have '
-                        'decayed to a 62% event at ten folds and 81% at twelve',
+                        'decayed to a 62% event at ten folds and 81% at twelve. '
+                        'Unreachable at three folds or fewer (3/3 is p=0.125), so '
+                        'there it fails on sample size, not evidence',
     'calibration_error': 'a SANITY floor, not a quality bar. The old 0.02 was set '
                          'under 21-day fold blocks and the arithmetic null fails it '
                          'on 21 of 25 seven-day ones (model 2/25 under the bar, '
@@ -1152,3 +1327,99 @@ def gate_report(gates: Sequence[Gate]) -> str:
               else f'{len(failed)} of {len(gates)} gates failed: '
                    + ', '.join(g.name for g in failed))
     return '\n'.join([header] + [g.line() for g in gates])
+
+
+# ---- the deflated Sharpe ratio ---------------------------------------------
+
+EULER_GAMMA = 0.5772156649015329
+DAYS_PER_YEAR = 365.25
+
+
+def daily_pnl(trades: Optional[pd.DataFrame]) -> np.ndarray:
+    """Dollars per calendar day, idle days as zero — the series `BookStats.sharpe`
+    annualises, so the moments below describe the same number."""
+    if trades is None or trades.empty or 'pnl' not in trades.columns:
+        return np.empty(0)
+    daily = (trades.set_index('settle_time')['pnl'].sort_index().resample('1D').sum())
+    if len(daily) > 1:
+        calendar = pd.date_range(daily.index.min(), daily.index.max(),
+                                 freq='1D', tz=daily.index.tz)
+        daily = daily.reindex(calendar, fill_value=0.0)
+    return daily.to_numpy(dtype=float)
+
+
+def sharpe_moments(trades: Optional[pd.DataFrame]) -> dict:
+    """Observation count, skew and (non-excess) kurtosis of daily P&L."""
+    from scipy import stats as sstats
+
+    values = daily_pnl(trades)
+    if len(values) < 4 or not np.std(values) > 0:
+        return {'n_obs': int(len(values)), 'skew': float('nan'),
+                'kurtosis': float('nan')}
+    return {'n_obs': int(len(values)),
+            'skew': float(sstats.skew(values, bias=False)),
+            'kurtosis': float(sstats.kurtosis(values, fisher=False, bias=False))}
+
+
+def deflated_sharpe_ratio(
+    sharpe: float,
+    *,
+    n_obs: int,
+    skew: float,
+    kurtosis: float,
+    trial_sharpes: Sequence[float],
+    n_trials: int,
+    periods_per_year: float = DAYS_PER_YEAR,
+) -> dict:
+    """Bailey & López de Prado (2014): P(true Sharpe > the best of N null trials).
+
+    Sharpes arrive annualised (as `BookStats.sharpe` and the trial log carry
+    them) and are de-annualised to the per-period figure the formula needs. The
+    expected maximum of `n_trials` null Sharpes uses the variance ACROSS trials:
+
+        SR0 = sqrt(V) * ((1 - g) * Z(1 - 1/N) + g * Z(1 - 1/(N e)))
+        DSR = Phi((SR - SR0) sqrt(T - 1) / sqrt(1 - skew SR + (kurt - 1)/4 SR^2))
+
+    With a single trial SR0 is 0 and DSR is the probabilistic Sharpe ratio
+    against zero. Reported, not gated.
+    """
+    from scipy.stats import norm
+
+    scale = np.sqrt(float(periods_per_year))
+    finite = [v for v in map(_finite_or_nan, trial_sharpes or ()) if np.isfinite(v)]
+    out = {'sharpe': _finite_or_nan(sharpe), 'n_obs': int(n_obs or 0),
+           'skew': _finite_or_nan(skew), 'kurtosis': _finite_or_nan(kurtosis),
+           'n_trials': int(n_trials or 0), 'trials_with_sharpe': len(finite),
+           'trial_sharpe_variance': float('nan'), 'expected_max_sharpe': float('nan'),
+           'probabilistic_sharpe': float('nan'), 'deflated_sharpe': float('nan')}
+    if len(finite) >= 2:
+        out['trial_sharpe_variance'] = float(np.var(finite, ddof=1))
+    sr = out['sharpe'] / scale
+    if not (np.isfinite(sr) and np.isfinite(out['skew'])
+            and np.isfinite(out['kurtosis']) and out['n_obs'] >= 2):
+        return out
+    denominator = 1.0 - out['skew'] * sr + (out['kurtosis'] - 1.0) / 4.0 * sr ** 2
+    if denominator <= 0:
+        return out
+    root_t = np.sqrt(out['n_obs'] - 1.0) / np.sqrt(denominator)
+    out['probabilistic_sharpe'] = float(norm.cdf(sr * root_t))
+    n = out['n_trials']
+    if n <= 1:
+        sr0 = 0.0
+    elif np.isfinite(out['trial_sharpe_variance']):
+        sd = np.sqrt(out['trial_sharpe_variance']) / scale
+        sr0 = sd * ((1.0 - EULER_GAMMA) * norm.ppf(1.0 - 1.0 / n)
+                    + EULER_GAMMA * norm.ppf(1.0 - 1.0 / (n * np.e)))
+    else:
+        return out
+    out['expected_max_sharpe'] = float(sr0 * scale)
+    out['deflated_sharpe'] = float(norm.cdf((sr - sr0) * root_t))
+    return out
+
+
+def _finite_or_nan(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float('nan')
+    return value if np.isfinite(value) else float('nan')

@@ -31,10 +31,10 @@ import pandas as pd
 
 from core.book import Book, BookStats, summarise
 from core.config import Config, DEFAULT_CONFIG
-from core.cv import WindowFold, assert_no_leakage, effective_observations, purged_walk_forward, recency_weights
+from core.cv import WindowFold, assert_no_leakage, effective_observations, folds_for_config, recency_weights
 from core.dataset import Dataset, apply_fold, fit_fold
 from core.decide import Decision, Reason, decide_window, rejection_histogram, stateless_screen
-from core.metrics import EvaluationReport, FoldEvaluation, evaluate_fold
+from core.metrics import EvaluationReport, FoldEvaluation, evaluate_fold, sharpe_moments
 from core.model import ForecastModel, fit_model
 
 logger = logging.getLogger(__name__)
@@ -178,13 +178,8 @@ def walk_forward(
     """Fit and evaluate across purged expanding folds."""
     config = config or dataset.config
     window_index = dataset.window_index
-    folds = list(folds) if folds is not None else purged_walk_forward(
-        window_index, n_folds=config.n_folds,
-        embargo_minutes=config.embargo_minutes,
-        scheme=getattr(config, 'fold_scheme', 'calendar'),
-        fold_block_days=getattr(config, 'fold_block_days', 21.0),
-        min_test_windows=getattr(config, 'min_test_windows', 200),
-        train_days=getattr(config, 'fold_train_days', None))
+    supplied = folds is not None
+    folds = list(folds) if supplied else folds_for_config(window_index, config)
 
     evaluations: list[FoldEvaluation] = []
     models: list[ForecastModel] = []
@@ -245,9 +240,25 @@ def walk_forward(
             f'universe is {len(dataset.symbols)} symbols; the cross_asset group '
             f'is thinner than its column count suggests')
 
+    # The fold count actually cut. Under the calendar scheme `n_folds` is not a
+    # count at all, so recording only the config value put "6" beside 28 folds.
+    geometry = {
+        'n_folds_actual': len(evaluations),
+        'n_folds_config': int(config.n_folds),
+        'scheme': getattr(config, 'fold_scheme', 'calendar'),
+        'fold_block_days': getattr(config, 'fold_block_days', None),
+        'min_test_windows': getattr(config, 'min_test_windows', None),
+        'fold_train_days': getattr(config, 'fold_train_days', None),
+        'embargo_minutes': int(config.embargo_minutes),
+        'folds_supplied_by_caller': supplied,
+        'test_windows': [int(e.n_windows) for e in evaluations],
+    }
     report = EvaluationReport(
         folds=evaluations, continuous=continuous_stats,
         config_provenance=config.provenance(), notes=notes,
+        fold_geometry=geometry,
+        sharpe_moments=(sharpe_moments(continuous_book.trades())
+                        if continuous_book is not None else {}),
     )
     return RunResult(
         report=report, models=models, books=books, continuous_book=continuous_book,

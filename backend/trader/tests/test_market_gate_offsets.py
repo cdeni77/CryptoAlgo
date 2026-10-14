@@ -61,7 +61,7 @@ def test_evaluate_forwards_entry_offsets_to_the_market_gate():
 
     src = inspect.getsource(ev)
     assert 'market_measurement(' in src, 'call site vanished; update this test'
-    call = src[src.index('gates = evaluate_gates('):]
+    call = src[src.index('market = market_measurement('):]
     call = call[:call.index('\n\n')] if '\n\n' in call else call
     assert 'entry_offsets' in call, (
         'evaluate() must forward entry_offsets to market_measurement, or the '

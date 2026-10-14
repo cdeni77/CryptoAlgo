@@ -350,6 +350,11 @@ class Config:
     embargo_minutes: int = 1440
     recency_half_life_days: Optional[float] = None
     train_window_days: Optional[float] = None
+    # **The sealed holdout.** ISO date; every research script drops windows
+    # opening at or after it, in `scripts._common.load_dataset`. Reading past it
+    # takes `--unseal-holdout "<reason>"`, which is recorded and allowed once per
+    # date — a holdout looked at twice is a validation set.
+    holdout_start: Optional[str] = None
 
     # ---- costs (Kalshi) --------------------------------------------------
     # fee per contract = ceil(fee_rate * price * (1 - price) * 100) / 100,
@@ -612,7 +617,12 @@ class Config:
     # most of its edge — while `--complete-cases` already requires the peer in
     # training, so this is what makes live agree.
     require_peer_book: bool = False
-    max_quote_age_seconds: int = 45
+    # **The one quote-staleness limit.** `core.quotes` prices backtests with it,
+    # `core.metrics` filters the market comparison with it, and `scripts.live`
+    # refuses an order and a peer book past it. It was 45 here and 30 in the
+    # other two, so live traded quotes the evaluation would have discarded.
+    # `QUOTE_MAX_AGE_SECONDS` still overrides it, for every reader at once.
+    max_quote_age_seconds: float = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
     # Refuse to enter when this little of the window remains. `choose_offset`
     # floors to whole minutes, so a row built as "minute 12" could be submitted
     # at minute 14.9 carrying sigma for 2.33 minutes when 0.1 remained.
@@ -738,6 +748,14 @@ class Config:
                 f'max_slippage_cents must not be negative; got '
                 f'{self.max_slippage_cents}.'
             )
+        if self.holdout_start is not None:
+            from datetime import datetime
+            try:
+                datetime.fromisoformat(str(self.holdout_start))
+            except ValueError as exc:
+                raise ValueError(
+                    f'holdout_start={self.holdout_start!r} is not an ISO date; a '
+                    f'seal that cannot be parsed would seal nothing.') from exc
 
     # ---- derived ---------------------------------------------------------
     @property
@@ -806,50 +824,36 @@ class Config:
         )
 
     def provenance(self) -> dict[str, Any]:
-        """The fields that change an answer, for the model artifact."""
-        return {
-            'symbols': list(self.symbols),
-            'venue': self.venue,
-            'timeframe': self.timeframe,
-            'window_minutes': self.window_minutes,
-            'decision_offsets': list(self.decision_offsets),
-            'vol_lookbacks_minutes': list(self.vol_lookbacks_minutes),
-            'baseline_distribution': self.baseline_distribution,
-            'baseline_nu': self.baseline_nu,
-            # Which forecaster the correction sits on. Without it in the ledger,
-            # two attempts with the same `log_loss_skill` could be measuring
-            # skill over two different benchmarks.
-            'init_score_source': self.init_score_source,
-            'n_folds': self.n_folds,
-            'embargo_minutes': self.embargo_minutes,
-            'recency_half_life_days': self.recency_half_life_days,
-            'train_window_days': self.train_window_days,
-            'fee_rate': self.fee_rate,
-            'half_spread_cents': self.half_spread_cents,
-            'fee_config_version': self.fee_config_version,
-            # The trading POLICY, not just the forecast. The ledger is the
-            # record of account and the trial count, and 20260828T202438Z exists
-            # specifically to measure `--entry-offsets 12` — it moved realised
-            # edge +2.06 -> +4.17pp and drawdown 0.402 -> 0.232 — while
-            # recording nothing about which policy that was.
-            #
-            # `compound` matters most: sizing off the starting bankroll keeps the
-            # equity curve additive, so its slope IS the per-trade edge, while
-            # compounding makes it an exponential of the ESTIMATE of that edge.
-            # An artifact measured one way and traded the other is a different
-            # strategy, and `scripts/live.config_for_artifact` reads these to
-            # keep the two in step — it was already asking for three of them.
-            'fold_scheme': self.fold_scheme,
-            'entry_offsets': (list(self.entry_offsets)
-                              if self.entry_offsets is not None else None),
-            'compound': bool(self.compound),
-            'starting_bankroll': self.starting_bankroll,
-            'max_stake_dollars': self.max_stake_dollars,
-            'max_stake_fraction': self.max_stake_fraction,
-            'kelly_fraction': self.kelly_fraction,
-            'min_edge_pp': self.min_edge_pp,
-            'cli_overrides': sorted(self.cli_overrides),
-        }
+        """EVERY field, JSON-ready, for the artifact, the ledger and the trial log.
+
+        A hand-picked subset let two ledger entries that differed in a knob
+        (block length, shrinkage ceiling, LightGBM depth, price band) read as
+        the same experiment. Tuples become lists, sets sorted lists; `None` is
+        kept as `None` (`entry_offsets=None` means every offset may enter, and
+        `scripts/live.config_for_artifact` reads `None` as "left at default").
+        """
+        return {f.name: _jsonable(getattr(self, f.name)) for f in fields(self)}
+
+    def provenance_hash(self) -> str:
+        """Identity of the configuration under test. `cli_overrides` is left out:
+        it says how the values were reached, not what they are."""
+        import hashlib
+        import json
+
+        material = {k: v for k, v in self.provenance().items() if k != 'cli_overrides'}
+        canonical = json.dumps(material, sort_keys=True, separators=(',', ':'),
+                               default=str)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (frozenset, set)):
+        return sorted(_jsonable(v) for v in value)
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 DEFAULT_CONFIG = Config()
