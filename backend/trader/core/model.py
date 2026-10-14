@@ -42,7 +42,7 @@ import pandas as pd
 
 from core.baseline import BarrierBaseline, clip_prob, expit, log_loss, logit
 from core.config import Config, DEFAULT_CONFIG
-from core.features import CONTROL_GROUPS, feature_columns
+from core.features import CONTROL_GROUPS, feature_columns, mirror_rows
 
 logger = logging.getLogger(__name__)
 
@@ -117,12 +117,126 @@ MIN_SHRINKAGE_ROWS = 500
 
 INNER_VALIDATION_FRACTION = 0.2
 
+# Bounds on the blend's init coefficient and intercept, and the ridge pulling
+# them to (1, 0). The ridge is in pseudo-rows of log loss, so it fades as the
+# sample grows and only restrains a small one.
+BLEND_INIT_BOUNDS = (0.5, 1.5)
+BLEND_INTERCEPT_BOUNDS = (-0.5, 0.5)
+BLEND_RIDGE = 50.0
+
+# Standardized logistic inputs are clipped here so one outlier cannot dominate.
+LOGISTIC_CLIP = 5.0
+
 
 def _feature_matrix(table: pd.DataFrame, columns: Sequence[str]) -> np.ndarray:
     missing = [c for c in columns if c not in table.columns]
     if missing:
         raise ValueError(f'feature columns absent from the table: {missing}')
     return table.loc[:, list(columns)].to_numpy(dtype=float)
+
+
+@dataclass
+class LinearCorrection:
+    """An L2 logistic correction exposing the Booster surface ForecastModel uses.
+
+    No intercept: a base-rate shift is not a correction to the forecaster, and
+    an untrained (all-zero) model must reproduce the init exactly.
+    """
+
+    names: list[str]
+    mean: np.ndarray
+    scale: np.ndarray
+    coef: np.ndarray
+    l2: float = 1.0
+    n_iter: int = 0
+    best_iteration: Optional[int] = None
+
+    def _standardize(self, matrix: np.ndarray) -> np.ndarray:
+        z = (np.asarray(matrix, dtype=float) - self.mean) / self.scale
+        z = np.clip(z, -LOGISTIC_CLIP, LOGISTIC_CLIP)
+        return np.where(np.isfinite(z), z, 0.0)
+
+    def predict(self, matrix: np.ndarray, raw_score: bool = True) -> np.ndarray:
+        raw = self._standardize(matrix) @ self.coef
+        return raw if raw_score else expit(raw)
+
+    def feature_name(self) -> list[str]:
+        return list(self.names)
+
+    def num_feature(self) -> int:
+        return len(self.names)
+
+    def feature_importance(self, importance_type: str = 'gain') -> np.ndarray:
+        if importance_type == 'split':
+            return (self.coef != 0).astype(int)
+        return np.abs(self.coef)
+
+    @classmethod
+    def fit(cls, matrix: np.ndarray, names: Sequence[str], init: np.ndarray,
+            outcome: np.ndarray, *, weights: Optional[np.ndarray] = None,
+            l2: float = 1.0) -> 'LinearCorrection':
+        from scipy import optimize
+
+        matrix = np.asarray(matrix, dtype=float)
+        init = np.asarray(init, dtype=float)
+        outcome = np.asarray(outcome, dtype=float)
+        keep = np.isfinite(init) & np.isfinite(outcome)
+        matrix, init, outcome = matrix[keep], init[keep], outcome[keep]
+        w = (np.ones(len(outcome)) if weights is None
+             else np.asarray(weights, dtype=float)[keep])
+        w = w / w.sum()
+        with np.errstate(invalid='ignore'):
+            mean = np.nan_to_num(np.nanmean(matrix, axis=0))
+            scale = np.nan_to_num(np.nanstd(matrix, axis=0))
+        # A constant column standardizes to zero and so contributes nothing.
+        scale = np.where(scale > 0, scale, 1.0)
+        model = cls(names=list(names), mean=mean, scale=scale,
+                    coef=np.zeros(matrix.shape[1]), l2=float(l2))
+        if matrix.shape[1] == 0:
+            return model
+        z = model._standardize(matrix)
+        n = len(outcome)
+
+        def objective(beta: np.ndarray) -> tuple[float, np.ndarray]:
+            eta = init + z @ beta
+            # log(1 + e^eta) - y*eta, stably.
+            loss = float(np.sum(w * (np.logaddexp(0.0, eta) - outcome * eta)))
+            grad = z.T @ (w * (expit(eta) - outcome))
+            return (loss + 0.5 * l2 * float(beta @ beta) / n,
+                    grad + l2 * beta / n)
+
+        result = optimize.minimize(objective, model.coef, jac=True,
+                                   method='L-BFGS-B')
+        if not np.all(np.isfinite(result.x)):
+            raise ValueError(f'the logistic correction did not converge '
+                             f'({result.message!r})')
+        model.coef = np.asarray(result.x, dtype=float)
+        model.n_iter = int(getattr(result, 'nit', 0))
+        return model
+
+
+def _select_logistic_features(frame: pd.DataFrame, columns: Sequence[str],
+                              init_column: str, top_n: int) -> list[str]:
+    """The `top_n` columns most correlated with the residual on the fit rows."""
+    residual = (frame['outcome'].to_numpy(dtype=float)
+                - expit(frame[init_column].to_numpy(dtype=float)))
+    rows = np.isfinite(residual)
+    residual = residual[rows]
+    # Standardized exactly as LinearCorrection will see it: clipped, NaN -> 0.
+    probe = LinearCorrection(names=list(columns), mean=np.zeros(len(columns)),
+                             scale=np.ones(len(columns)), coef=np.zeros(len(columns)))
+    matrix = _feature_matrix(frame, columns)[rows]
+    with np.errstate(invalid='ignore'):
+        probe.mean = np.nan_to_num(np.nanmean(matrix, axis=0))
+        scale = np.nan_to_num(np.nanstd(matrix, axis=0))
+    probe.scale = np.where(scale > 0, scale, 1.0)
+    z = probe._standardize(matrix)
+    scores = {}
+    for i, column in enumerate(columns):
+        if np.std(z[:, i]) > 0 and np.std(residual) > 0:
+            scores[column] = abs(float(np.corrcoef(z[:, i], residual)[0, 1]))
+    ranked = sorted(scores, key=lambda c: -scores[c])
+    return ranked[:max(int(top_n), 0)]
 
 
 @dataclass
@@ -151,6 +265,15 @@ class ForecastModel:
     # perfectly well-formed probability that answers a different question.
     init_score_source: str = 'baseline'
     config_provenance: dict = field(default_factory=dict)
+    # The final layer is p = expit(init_coefficient*init + residual_scale*corr
+    # + intercept). 'scale' pins the coefficient at 1 and the intercept at 0.
+    # Artifacts pickled before these existed read them through getattr.
+    final_layer: str = 'scale'
+    init_coefficient: float = 1.0
+    intercept: float = 0.0
+    # Every booster when ensembled (booster is members[0]); empty for one.
+    members: tuple = ()
+    model_type: str = 'lgbm'
 
     @property
     def init_score_column(self) -> str:
@@ -162,10 +285,67 @@ class ForecastModel:
                 f'expected one of {sorted(INIT_SCORE_COLUMNS)}') from None
 
     # ---- prediction -----------------------------------------------------
-    def raw_correction(self, table: pd.DataFrame) -> np.ndarray:
-        """The model's logit correction, before shrinkage."""
+    @property
+    def boosters(self) -> list:
+        return list(getattr(self, 'members', ()) or ()) or [self.booster]
+
+    @property
+    def ensemble_size(self) -> int:
+        return len(self.boosters)
+
+    def member_corrections(self, table: pd.DataFrame) -> np.ndarray:
+        """Each member's raw logit correction, shape (members, rows)."""
         matrix = _feature_matrix(table, self.features)
-        return np.asarray(self.booster.predict(matrix, raw_score=True), dtype=float)
+        return np.vstack([np.asarray(b.predict(matrix, raw_score=True), dtype=float)
+                          for b in self.boosters])
+
+    def raw_correction(self, table: pd.DataFrame) -> np.ndarray:
+        """The model's logit correction, before shrinkage (the member mean)."""
+        if self.ensemble_size == 1:
+            matrix = _feature_matrix(table, self.features)
+            return np.asarray(self.booster.predict(matrix, raw_score=True), dtype=float)
+        return self.member_corrections(table).mean(axis=0)
+
+    def _init_logit(self, table: pd.DataFrame) -> np.ndarray:
+        column = self.init_score_column
+        if column not in table.columns:
+            raise ValueError(
+                f'{column} is missing — score through core.dataset.apply_fold, '
+                f'which attaches it from the fold\'s own baseline, or '
+                f'attach_market_logit for a market-initialised model. Recomputing '
+                f'it here would silently use a different one.'
+            )
+        return table[column].to_numpy(dtype=float)
+
+    def _final(self, base: np.ndarray, correction: np.ndarray, *,
+               shrink: bool = True) -> np.ndarray:
+        if not shrink:
+            return clip_prob(expit(base + correction))
+        alpha = self.residual_scale
+        if getattr(self, 'final_layer', 'scale') == 'blend':
+            a = float(getattr(self, 'init_coefficient', 1.0))
+            c = float(getattr(self, 'intercept', 0.0))
+            return clip_prob(expit(a * base + alpha * correction + c))
+        return clip_prob(expit(base + alpha * correction))
+
+    def score(self, table: pd.DataFrame) -> pd.DataFrame:
+        """`model_probability`, plus the members' spread when ensembled.
+
+        Member probabilities go through the same final layer as the mean, so
+        `model_probability` always lies between `_min` and `_max`.
+        """
+        out = pd.DataFrame(index=table.index)
+        out['model_probability'] = self.predict(table)
+        if self.ensemble_size > 1:
+            base = self._init_logit(table)
+            members = np.vstack([self._final(base, c)
+                                 for c in self.member_corrections(table)])
+            members = np.where(np.isfinite(base), members, np.nan)
+            with np.errstate(invalid='ignore'):
+                out['model_probability_sd'] = members.std(axis=0)
+                out['model_probability_min'] = members.min(axis=0)
+                out['model_probability_max'] = members.max(axis=0)
+        return out
 
     def predict(self, table: pd.DataFrame, *, shrink: bool = True) -> np.ndarray:
         """Calibrated probability that the window settles above its strike.
@@ -177,17 +357,8 @@ class ForecastModel:
         visible. Substituting the baseline would be silent and would put the
         wrong provenance on a real trade.
         """
-        column = self.init_score_column
-        if column not in table.columns:
-            raise ValueError(
-                f'{column} is missing — score through core.dataset.apply_fold, '
-                f'which attaches it from the fold\'s own baseline, or '
-                f'attach_market_logit for a market-initialised model. Recomputing '
-                f'it here would silently use a different one.'
-            )
-        base = table[column].to_numpy(dtype=float)
-        alpha = self.residual_scale if shrink else 1.0
-        out = clip_prob(expit(base + alpha * self.raw_correction(table)))
+        base = self._init_logit(table)
+        out = self._final(base, self.raw_correction(table), shrink=shrink)
         # Redundant today and kept deliberately. NaN already propagates through
         # `expit` and `np.clip`, so mutating this line away changes nothing and
         # mutation testing cannot tell the difference — which is exactly why the
@@ -202,7 +373,10 @@ class ForecastModel:
 
     # ---- provenance -----------------------------------------------------
     def importance(self, kind: str = 'gain') -> pd.DataFrame:
-        values = self.booster.feature_importance(importance_type=kind)
+        values = np.mean([np.asarray(b.feature_importance(importance_type=kind),
+                                     dtype=float) for b in self.boosters], axis=0) \
+            if self.ensemble_size > 1 else \
+            self.booster.feature_importance(importance_type=kind)
         control = {c for g in CONTROL_GROUPS for c in feature_columns([g])}
         frame = pd.DataFrame({'feature': self.features, kind: values})
         frame['is_control'] = frame['feature'].isin(control)
@@ -233,6 +407,11 @@ class ForecastModel:
             'empty_features': list(self.empty_features),
             'groups': list(self.groups),
             'residual_scale': self.residual_scale,
+            'final_layer': getattr(self, 'final_layer', 'scale'),
+            'init_coefficient': float(getattr(self, 'init_coefficient', 1.0)),
+            'intercept': float(getattr(self, 'intercept', 0.0)),
+            'ensemble_size': self.ensemble_size,
+            'model_type': getattr(self, 'model_type', 'lgbm'),
             # Which forecaster this is a correction to. A promoted artifact that
             # does not say is an artifact whose skill number means one of two
             # different things.
@@ -255,12 +434,20 @@ class ForecastModel:
         """Can this artifact score a window it has never seen?"""
         return self.scoring is not None
 
+    def _blend_summary(self) -> str:
+        if getattr(self, 'final_layer', 'scale') != 'blend':
+            return ''
+        return (f' a={float(getattr(self, "init_coefficient", 1.0)):.3f}'
+                f' c={float(getattr(self, "intercept", 0.0)):+.3f}')
+
     def summary(self) -> str:
         skill = self.inner_baseline_log_loss - self.inner_log_loss
         return (
             f'model: {len(self.features)} features '
-            f'({len(self.empty_features)} empty), {self.best_iteration} trees, '
-            f'alpha={self.residual_scale:.3f} | inner log loss {self.inner_log_loss:.5f} '
+            f'({len(self.empty_features)} empty), {self.best_iteration} trees'
+            f'{f" x{self.ensemble_size}" if self.ensemble_size > 1 else ""}, '
+            f'alpha={self.residual_scale:.3f}'
+            f'{self._blend_summary()} | inner log loss {self.inner_log_loss:.5f} '
             f'vs baseline {self.inner_baseline_log_loss:.5f} '
             f'(skill {skill:+.5f}) | control gain share '
             f'{self.control_importance_share:.1%}'
@@ -493,8 +680,83 @@ def _fit_residual_scale(
     return float(np.clip(result.x, 0.0, max_scale))
 
 
+def _fit_blend(
+    init_logit: np.ndarray,
+    correction: np.ndarray,
+    outcome: np.ndarray,
+    *,
+    min_edge: float,
+    max_scale: float = 1.0,
+    intercept: bool = False,
+) -> tuple[float, float, float]:
+    """Fit `p = expit(a*init + b*correction + c)` on the rows that would trade.
+
+    Returns `(a, b, c)`. "Would trade" is the raw correction moving the
+    probability by at least `min_edge`: the selected subset where a single
+    alpha fitted on every row was measured to be overconfident. The selection
+    reads only covariates, never the outcome, so it does not bias the fit.
+    """
+    from scipy import optimize
+
+    init_logit = np.asarray(init_logit, dtype=float)
+    correction = np.asarray(correction, dtype=float)
+    outcome = np.asarray(outcome, dtype=float)
+    finite = np.isfinite(init_logit) & np.isfinite(correction) & np.isfinite(outcome)
+    init_logit, correction, outcome = (init_logit[finite], correction[finite],
+                                       outcome[finite])
+    if outcome.size < MIN_SHRINKAGE_ROWS:
+        raise ValueError(
+            f'only {outcome.size} scoreable rows remain of {finite.size}, which '
+            f'is under the {MIN_SHRINKAGE_ROWS} needed to fit a final layer')
+
+    move = np.abs(expit(init_logit + correction) - expit(init_logit))
+    trade = move >= float(min_edge)
+    if int(trade.sum()) >= MIN_SHRINKAGE_ROWS:
+        logger.info('fitting the blend on the %d of %d row(s) that would trade',
+                    int(trade.sum()), outcome.size)
+        init_logit, correction, outcome = (init_logit[trade], correction[trade],
+                                           outcome[trade])
+    else:
+        logger.warning(
+            'only %d row(s) would trade, under the %d minimum, so the blend is '
+            'fitted on all %d', int(trade.sum()), MIN_SHRINKAGE_ROWS, outcome.size)
+
+    n = outcome.size
+    ridge = BLEND_RIDGE / n
+
+    def objective(theta: np.ndarray) -> tuple[float, np.ndarray]:
+        a, b = theta[0], theta[1]
+        c = theta[2] if intercept else 0.0
+        eta = a * init_logit + b * correction + c
+        loss = float(np.mean(np.logaddexp(0.0, eta) - outcome * eta))
+        resid = (expit(eta) - outcome) / n
+        grad = [float(resid @ init_logit) + 2 * ridge * (a - 1.0),
+                float(resid @ correction)]
+        loss += ridge * ((a - 1.0) ** 2 + c ** 2)
+        if intercept:
+            grad.append(float(resid.sum()) + 2 * ridge * c)
+        return loss, np.asarray(grad)
+
+    bounds = [BLEND_INIT_BOUNDS, (0.0, float(max_scale))]
+    start = [1.0, min(1.0, float(max_scale))]
+    if intercept:
+        bounds.append(BLEND_INTERCEPT_BOUNDS)
+        start.append(0.0)
+    result = optimize.minimize(objective, np.asarray(start), jac=True,
+                               method='L-BFGS-B', bounds=bounds)
+    if not np.all(np.isfinite(result.x)):
+        raise ValueError(f'the blend fit did not converge ({result.message!r})')
+    if not result.success:
+        logger.warning('the blend fit stopped early (%s); using its last point',
+                       result.message)
+    a, b = float(result.x[0]), float(result.x[1])
+    c = float(result.x[2]) if intercept else 0.0
+    return a, b, c
+
+
 def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
-                     correction: np.ndarray, alpha: float) -> float:
+                     correction: np.ndarray, alpha: float,
+                     a: float = 1.0, c: float = 0.0) -> float:
     """Log loss over the rows that carry a forecast.
 
     These three numbers go into the artifact's provenance and its `summary()`
@@ -507,7 +769,7 @@ def _finite_log_loss(outcome: np.ndarray, base_logit: np.ndarray,
     if not keep.any():
         return float('nan')
     return log_loss(outcome[keep],
-                    expit(base_logit[keep] + alpha * correction[keep]))
+                    expit(a * base_logit[keep] + alpha * correction[keep] + c))
 
 
 def fit_model(
@@ -577,6 +839,21 @@ def fit_model(
                 f'every training row has a non-finite {init_column}, so there is '
                 f'no market to fit a residual against')
 
+    if getattr(config, 'label_source', 'proxy') == 'venue':
+        # Everything downstream (fit, early stopping, final layer, the logged
+        # losses) reads `outcome`, so the label is swapped once, here.
+        proxy = train['outcome'].to_numpy(dtype=float)
+        venue = (pd.to_numeric(train['venue_outcome'], errors='coerce').to_numpy(dtype=float)
+                 if 'venue_outcome' in train.columns else np.full(len(train), np.nan))
+        has_venue = np.isfinite(venue)
+        logger.info(
+            'label_source=venue: %d of %d training rows carry the venue label '
+            '(%d disagree with the proxy); %d fall back to the proxy',
+            int(has_venue.sum()), len(train),
+            int((has_venue & np.isfinite(proxy) & (venue != proxy)).sum()),
+            int((~has_venue).sum()))
+        train = train.assign(outcome=np.where(has_venue, venue, proxy))
+
     populated = [
         c for c in columns
         if c in train.columns and np.isfinite(train[c].to_numpy(dtype=float)).any()
@@ -644,10 +921,23 @@ def fit_model(
     if inner_valid.empty or inner_train.empty or alpha_rows.empty:
         raise ValueError('inner validation split is empty')
 
-    def dataset(frame: pd.DataFrame, reference=None):
-        w = None
-        if weights is not None:
-            w = np.asarray(weights, dtype=float)[frame.index.to_numpy()]
+    def frame_weights(frame: pd.DataFrame) -> Optional[np.ndarray]:
+        if weights is None:
+            return None
+        return np.asarray(weights, dtype=float)[frame.index.to_numpy()]
+
+    # The rows the correction is fitted on. Mirrored copies join here and only
+    # here: early stopping and the final layer must judge real rows.
+    fit_rows, fit_weights = inner_train, frame_weights(inner_train)
+    if getattr(config, 'mirror_augment', False):
+        fit_rows = pd.concat([inner_train, mirror_rows(inner_train)],
+                             ignore_index=True)
+        if fit_weights is not None:
+            fit_weights = np.concatenate([fit_weights, fit_weights])
+        logger.info('mirror augmentation: %d inner-train rows fitted as %d',
+                    len(inner_train), len(fit_rows))
+
+    def dataset(frame: pd.DataFrame, w: Optional[np.ndarray], reference=None):
         return lgb.Dataset(
             _feature_matrix(frame, populated),
             label=frame['outcome'].to_numpy(dtype=float),
@@ -656,33 +946,77 @@ def fit_model(
             free_raw_data=False,
         )
 
-    params = {
-        'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-        'learning_rate': config.learning_rate, 'num_leaves': config.num_leaves,
-        'max_depth': config.max_depth, 'min_child_samples': config.min_child_samples,
-        'bagging_fraction': config.subsample, 'bagging_freq': 1,
-        'feature_fraction': config.colsample_bytree, 'lambda_l2': config.reg_lambda,
-        'deterministic': True, 'seed': 17,
-    }
-    train_set = dataset(inner_train)
-    valid_set = dataset(inner_valid, reference=train_set)
-    booster = lgb.train(
-        params, train_set, num_boost_round=config.n_estimators,
-        valid_sets=[valid_set], valid_names=['inner'],
-        callbacks=[lgb.early_stopping(config.early_stopping_rounds, verbose=False)],
-    )
+    model_type = getattr(config, 'model_type', 'lgbm')
+    features = list(populated)
+    if model_type == 'logistic':
+        chosen = tuple(getattr(config, 'logistic_features', ()) or ())
+        if chosen:
+            unknown = [c for c in chosen if c not in populated]
+            if unknown:
+                raise ValueError(f'logistic_features not among the populated '
+                                 f'features of these groups: {unknown}')
+            features = list(chosen)
+        else:
+            features = _select_logistic_features(
+                fit_rows, populated, init_column,
+                int(getattr(config, 'logistic_top_n', 8)))
+        logger.info('logistic correction on %d feature(s): %s',
+                    len(features), features)
+        members = [LinearCorrection.fit(
+            _feature_matrix(fit_rows, features), features,
+            fit_rows[init_column].to_numpy(dtype=float),
+            fit_rows['outcome'].to_numpy(dtype=float),
+            weights=fit_weights, l2=float(getattr(config, 'logistic_l2', 1.0)))]
+    else:
+        members = []
+        for k in range(max(int(getattr(config, 'ensemble_size', 1) or 1), 1)):
+            params = {
+                'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
+                'learning_rate': config.learning_rate, 'num_leaves': config.num_leaves,
+                'max_depth': config.max_depth,
+                'min_child_samples': config.min_child_samples,
+                'bagging_fraction': config.subsample, 'bagging_freq': 1,
+                'feature_fraction': config.colsample_bytree,
+                'lambda_l2': config.reg_lambda,
+                'deterministic': True, 'seed': 17 + k,
+            }
+            # Fresh datasets per member: a constructed Dataset pins seed-derived
+            # parameters, and the members must differ in their bagging draws.
+            train_set = dataset(fit_rows, fit_weights)
+            valid_set = dataset(inner_valid, frame_weights(inner_valid),
+                                reference=train_set)
+            members.append(lgb.train(
+                params, train_set, num_boost_round=config.n_estimators,
+                valid_sets=[valid_set], valid_names=['inner'],
+                callbacks=[lgb.early_stopping(config.early_stopping_rounds,
+                                              verbose=False)],
+            ))
+    booster = members[0]
 
-    alpha_matrix = _feature_matrix(alpha_rows, populated)
-    correction = np.asarray(booster.predict(alpha_matrix, raw_score=True), dtype=float)
+    def mean_correction(frame: pd.DataFrame) -> np.ndarray:
+        matrix = _feature_matrix(frame, features)
+        return np.mean([np.asarray(m.predict(matrix, raw_score=True), dtype=float)
+                        for m in members], axis=0)
+
+    correction = mean_correction(alpha_rows)
     base_logit = alpha_rows[init_column].to_numpy(dtype=float)
     outcome = alpha_rows['outcome'].to_numpy(dtype=float)
-    alpha = _fit_residual_scale(
-        base_logit, correction, outcome,
-        focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0),
-        max_scale=float(getattr(config, 'max_residual_scale', 2.0) or 2.0))
+    max_scale = float(getattr(config, 'max_residual_scale', 2.0) or 2.0)
+    final_layer = getattr(config, 'final_layer', 'scale')
+    init_coefficient, intercept = 1.0, 0.0
+    if final_layer == 'blend':
+        init_coefficient, alpha, intercept = _fit_blend(
+            base_logit, correction, outcome,
+            min_edge=float(config.min_edge_pp) / 100.0, max_scale=max_scale,
+            intercept=bool(getattr(config, 'final_layer_intercept', False)))
+    else:
+        alpha = _fit_residual_scale(
+            base_logit, correction, outcome,
+            focus_quantile=float(getattr(config, 'shrinkage_focus_quantile', 0.0) or 0.0),
+            max_scale=max_scale)
 
     model = ForecastModel(
-        booster=booster, features=list(populated), baseline=baseline,
+        booster=booster, features=features, baseline=baseline,
         scoring=scoring, residual_scale=alpha,
         groups=tuple(groups) if groups else (),
         n_train_rows=len(train), n_train_windows=len(windows),
@@ -691,12 +1025,15 @@ def fit_model(
         train_log_loss=_finite_log_loss(
             inner_train['outcome'].to_numpy(dtype=float),
             inner_train[init_column].to_numpy(dtype=float),
-            np.asarray(booster.predict(_feature_matrix(inner_train, populated),
-                                       raw_score=True), dtype=float),
-            alpha),
-        inner_log_loss=_finite_log_loss(outcome, base_logit, correction, alpha),
+            mean_correction(inner_train), alpha, init_coefficient, intercept),
+        inner_log_loss=_finite_log_loss(outcome, base_logit, correction, alpha,
+                                        init_coefficient, intercept),
         inner_baseline_log_loss=_finite_log_loss(outcome, base_logit, correction, 0.0),
         config_provenance=config.provenance(),
+        final_layer=final_layer, init_coefficient=init_coefficient,
+        intercept=intercept,
+        members=tuple(members) if len(members) > 1 else (),
+        model_type=model_type,
     )
     logger.info(model.summary())
     return model

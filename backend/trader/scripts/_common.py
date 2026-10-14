@@ -141,6 +141,41 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'which optimises the average -- and the average is '
                             'already fine while the traded rows are 6.7pp '
                             'overconfident.')
+    model.add_argument('--final-layer', choices=('scale', 'blend'), default=None,
+                       help="'scale' (default) fits one alpha; 'blend' fits "
+                            "expit(a*init + b*correction [+ c]) on the held-out "
+                            "rows that would trade")
+    model.add_argument('--final-layer-intercept', action='store_true',
+                       default=None,
+                       help="let the blend fit an intercept c in [-0.5, 0.5]")
+    model.add_argument('--ensemble-size', type=int, default=None, metavar='K',
+                       help='average K boosters (default 1); their spread '
+                            'feeds --edge-lower-bound-z and '
+                            '--require-member-agreement')
+    model.add_argument('--mirror-augment', action='store_true', default=None,
+                       help='also fit on the up/down mirror of every inner-'
+                            'train row')
+    model.add_argument('--model-type', choices=('lgbm', 'logistic'),
+                       default=None,
+                       help="'lgbm' (default) or an L2 'logistic' correction")
+    model.add_argument('--logistic-features', type=str, default=None,
+                       help='comma-separated features for --model-type logistic '
+                            '(default: the top --logistic-top-n by residual '
+                            'correlation, chosen inside each fold)')
+    model.add_argument('--logistic-top-n', type=int, default=None)
+    model.add_argument('--logistic-l2', type=float, default=None)
+    model.add_argument('--label-source', choices=('proxy', 'venue'),
+                       default=None,
+                       help="'venue' trains on the venue's own settlement "
+                            "where held, the Coinbase proxy elsewhere")
+    economics.add_argument('--edge-lower-bound-z', type=float, default=None,
+                           metavar='Z',
+                           help='also require the edge to clear the gate at the '
+                                'probability minus Z ensemble standard deviations')
+    economics.add_argument('--require-member-agreement', action='store_true',
+                           default=None,
+                           help='refuse unless every ensemble member still '
+                                'beats the cost on the chosen side')
     model.add_argument('--fold-train-days', type=float, default=None,
                        help='roll the TRAINING window to this many days '
                             '(default: expanding, which is what the Sunday '
@@ -196,6 +231,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
     offsets = _parse_list(getattr(args, 'offsets', None))
     if offsets:
         overrides['decision_offsets'] = tuple(int(o) for o in offsets)
+    logistic_features = _parse_list(getattr(args, 'logistic_features', None))
+    if logistic_features:
+        overrides['logistic_features'] = logistic_features
     for field, attr in (
         ('venue', 'venue'), ('window_minutes', 'window_minutes'),
         ('baseline_distribution', 'baseline_distribution'), ('n_folds', 'n_folds'),
@@ -215,6 +253,15 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('init_score_source', 'init_score_source'),
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
         ('assume_maker', 'assume_maker'),
+        ('final_layer', 'final_layer'),
+        ('final_layer_intercept', 'final_layer_intercept'),
+        ('ensemble_size', 'ensemble_size'),
+        ('mirror_augment', 'mirror_augment'),
+        ('model_type', 'model_type'),
+        ('logistic_top_n', 'logistic_top_n'), ('logistic_l2', 'logistic_l2'),
+        ('label_source', 'label_source'),
+        ('edge_lower_bound_z', 'edge_lower_bound_z'),
+        ('require_member_agreement', 'require_member_agreement'),
     ):
         value = getattr(args, attr, None)
         if value is not None:

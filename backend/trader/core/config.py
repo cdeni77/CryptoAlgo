@@ -328,6 +328,26 @@ class Config:
     # 2.0 remains available for comparison. Nothing above 1.0 is coherent as a
     # SHRINKAGE, which is why the default moved.
     max_residual_scale: float = 1.0
+    # How the correction is recalibrated after the fit. 'scale' fits one alpha;
+    # 'blend' fits p = expit(a*init + b*correction + c) on the held-out rows that
+    # would trade, since that selected subset is where the model is overconfident.
+    final_layer: str = 'scale'
+    final_layer_intercept: bool = False
+    # Number of boosters averaged. Their spread is what `edge_lower_bound_z` and
+    # `require_member_agreement` read; 1 is the single-model behaviour.
+    ensemble_size: int = 1
+    # Train on each row and its up/down mirror (features negated or swapped per
+    # `core.features.FEATURE_PARITY`, label flipped). Inner-train rows only.
+    mirror_augment: bool = False
+    # 'logistic' is an L2 logistic correction on a few standardized features:
+    # a low-variance challenger to the trees.
+    model_type: str = 'lgbm'
+    logistic_features: tuple[str, ...] = ()
+    logistic_top_n: int = 8
+    logistic_l2: float = 1.0
+    # 'venue' trains on the venue's own settlement where it exists, falling back
+    # to the Coinbase-built proxy elsewhere.
+    label_source: str = 'proxy'
     # **The rolling training window, in days. None means expanding.**
     #
     # Expanding is what `scripts/promote.py` actually deploys — the Sunday
@@ -510,6 +530,12 @@ class Config:
     # capital at risk is right under both hypotheses, since if the edge turns out
     # to be negative it loses 40% less.
     min_edge_pp: float = 1.5
+    # Ensemble-aware gates, both off by default and inert on rows without the
+    # ensemble's columns. With z > 0 the edge must also clear the gate at the
+    # probability minus z member standard deviations; with member agreement on,
+    # the least favourable member must still beat the cost.
+    edge_lower_bound_z: float = 0.0
+    require_member_agreement: bool = False
     # Traded-price band, and it must be symmetric. The edge here is a
     # disagreement about sigma_remaining, and that disagreement points both
     # ways: a smaller sigma than the market assumes makes the probability more
@@ -738,6 +764,19 @@ class Config:
                 f'max_slippage_cents must not be negative; got '
                 f'{self.max_slippage_cents}.'
             )
+        # Typos here would otherwise surface deep inside a fold's fit.
+        for name, allowed in (('final_layer', ('scale', 'blend')),
+                              ('model_type', ('lgbm', 'logistic')),
+                              ('label_source', ('proxy', 'venue'))):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f'{name}={getattr(self, name)!r}; expected one '
+                                 f'of {allowed}')
+        if int(self.ensemble_size) < 1:
+            raise ValueError(f'ensemble_size must be at least 1; got '
+                             f'{self.ensemble_size}')
+        if self.edge_lower_bound_z < 0.0:
+            raise ValueError(f'edge_lower_bound_z must not be negative; got '
+                             f'{self.edge_lower_bound_z}')
 
     # ---- derived ---------------------------------------------------------
     @property
@@ -848,6 +887,19 @@ class Config:
             'max_stake_fraction': self.max_stake_fraction,
             'kelly_fraction': self.kelly_fraction,
             'min_edge_pp': self.min_edge_pp,
+            # How the forecast was fitted and gated. Each changes the numbers a
+            # ledger entry reports, so each must be recoverable from it.
+            'final_layer': self.final_layer,
+            'final_layer_intercept': bool(self.final_layer_intercept),
+            'ensemble_size': int(self.ensemble_size),
+            'mirror_augment': bool(self.mirror_augment),
+            'model_type': self.model_type,
+            'logistic_features': list(self.logistic_features),
+            'logistic_top_n': int(self.logistic_top_n),
+            'logistic_l2': float(self.logistic_l2),
+            'label_source': self.label_source,
+            'edge_lower_bound_z': float(self.edge_lower_bound_z),
+            'require_member_agreement': bool(self.require_member_agreement),
             'cli_overrides': sorted(self.cli_overrides),
         }
 

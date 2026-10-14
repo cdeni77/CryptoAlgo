@@ -150,6 +150,111 @@ ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in BOOK_GROUPS)
 CONTROL_GROUPS = ('time_of_day',)
 
 
+# ---- up/down mirror ---------------------------------------------------------
+#
+# How each column transforms when every price path in the universe is reflected
+# about its strike (returns negated, highs and lows exchanged, YES and NO books
+# exchanged). 'even' is unchanged, 'odd' is negated, 'complement' is p -> 1-p,
+# and ('swap', partner, sign) takes `sign * partner`. Every feature must have an
+# entry; tests enforce it so a new feature cannot skip the question.
+EVEN, ODD, COMPLEMENT = 'even', 'odd', 'complement'
+
+
+def _swap(partner: str, sign: float = 1.0) -> tuple[str, str, float]:
+    return ('swap', partner, float(sign))
+
+
+FEATURE_PARITY: dict[str, object] = {
+    # vol_state: magnitudes of returns and ranges.
+    'log_rv_15': EVEN, 'log_rv_60': EVEN, 'log_rv_240': EVEN, 'log_rv_1440': EVEN,
+    'rv_slope_short': EVEN, 'rv_slope_long': EVEN,
+    'range_to_return': EVEN,          # Parkinson range is symmetric in high/low
+    'vol_of_vol': EVEN, 'log_sigma_per_min': EVEN, 'rv_surprise': EVEN,
+    'seasonal_ramp': EVEN,
+    # microstructure
+    'autocorr_60': EVEN,              # corr(-r, -r_lag) = corr(r, r_lag)
+    'run_length': ODD,                # signed by the run's direction
+    'body_ratio_15': EVEN, 'volume_z_15': EVEN,
+    'vwap_gap_15': ODD,               # odd to first order in log price
+    'signed_volume_15': ODD, 'zero_return_share_60': EVEN,
+    # cross_asset: the whole universe is mirrored, so peer moves flip too.
+    'peer_displacement': ODD, 'peer_return_5': ODD, 'peer_return_15': ODD,
+    'lead_residual': ODD, 'beta_1440': EVEN, 'universe_dispersion': EVEN,
+    # geometry: the high-water mark becomes minus the low-water mark.
+    'z_score': ODD, 'abs_z_score': EVEN,
+    'excursion_up_z': _swap('excursion_down_z', -1.0),
+    'excursion_down_z': _swap('excursion_up_z', -1.0),
+    'excursion_span_z': EVEN, 'excursion_asymmetry': ODD,
+    'path_efficiency': EVEN, 'displacement_vs_elapsed': ODD,
+    'touched_opposite': EVEN,         # exact except at displacement == 0
+    # offset and the calendar control
+    'elapsed_fraction': EVEN, 'remaining_minutes': EVEN,
+    'quarter_of_hour': EVEN, 'hour_sin': EVEN, 'hour_cos': EVEN,
+    'dow_sin': EVEN, 'dow_cos': EVEN, 'us_equity_hours': EVEN,
+    # market_state: the YES bid stack becomes the NO bid stack (the YES ask).
+    'spread': EVEN, 'imbalance_touch': ODD, 'imbalance_5c': ODD,
+    'depth_ratio': ODD, 'book_convexity': ODD,
+    # market_price
+    'market_prob': COMPLEMENT, 'market_minus_baseline': ODD,
+    # cross_venue
+    'venue_prob_gap': ODD, 'venue_gap_change_5': ODD,
+    'venue_spread_ratio': EVEN, 'pm_available': EVEN,
+    # implied_vol: a sigma has no direction.
+    'iv_minus_realised': EVEN, 'implied_sigma_per_min': EVEN, 'iv_r2': EVEN,
+    'iv_n_strikes': EVEN, 'iv_staleness_minutes': EVEN,
+    # book_flow
+    'imbalance_change_3': ODD, 'depth_trend_3': EVEN, 'spread_change_3': EVEN,
+    'imbalance_persistence': ODD,
+}
+
+# Non-feature columns the fit or the book reads, mirrored alongside.
+ROW_PARITY: dict[str, object] = {
+    'outcome': COMPLEMENT, 'venue_outcome': COMPLEMENT,
+    'baseline_probability': COMPLEMENT, 'market_probability': COMPLEMENT,
+    'pm_market_probability': COMPLEMENT,
+    'baseline_probability_logit': ODD, 'market_probability_logit': ODD,
+    'displacement': ODD, 'settle_return': ODD,
+    'excursion_up': _swap('excursion_down', -1.0),
+    'excursion_down': _swap('excursion_up', -1.0),
+    'ask_up': _swap('ask_down'), 'ask_down': _swap('ask_up'),
+    'depth_up': _swap('depth_down'), 'depth_down': _swap('depth_up'),
+    'bid_at_touch': _swap('ask_at_touch'), 'ask_at_touch': _swap('bid_at_touch'),
+    'bid_1c': _swap('ask_1c'), 'ask_1c': _swap('bid_1c'),
+    'bid_5c': _swap('ask_5c'), 'ask_5c': _swap('bid_5c'),
+    'bid_vol': _swap('ask_vol'), 'ask_vol': _swap('bid_vol'),
+}
+
+
+def mirror_rows(table: pd.DataFrame) -> pd.DataFrame:
+    """The same rows with every path reflected about its strike.
+
+    An involution: mirroring twice returns the original (up to float rounding
+    in `1 - p`). Columns without a parity entry are copied unchanged.
+    """
+    source = table
+    out = table.copy()
+    for column, rule in {**ROW_PARITY, **FEATURE_PARITY}.items():
+        if column not in source.columns:
+            continue
+        if rule == EVEN:
+            continue
+        if isinstance(rule, tuple):
+            _, partner, sign = rule
+            if partner not in source.columns:
+                raise ValueError(f'{column} swaps with {partner}, which the '
+                                 f'table does not carry')
+            out[column] = sign * pd.to_numeric(source[partner], errors='coerce')
+            continue
+        values = pd.to_numeric(source[column], errors='coerce')
+        if rule == ODD:
+            out[column] = -values
+        elif rule == COMPLEMENT:
+            out[column] = 1.0 - values
+        else:                                    # pragma: no cover - table typo
+            raise ValueError(f'unknown parity {rule!r} for {column}')
+    return out
+
+
 def feature_columns(groups: Optional[Sequence[str]] = None) -> list[str]:
     chosen = ALL_GROUPS if groups is None else tuple(groups)
     unknown = sorted(set(chosen) - set(FEATURE_GROUPS))
