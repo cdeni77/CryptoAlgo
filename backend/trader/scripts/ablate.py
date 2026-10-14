@@ -1,31 +1,13 @@
 """Measure each feature group alone, and the set with the control removed.
 
-**This exists because `control_gain_share` measures the wrong thing.** That gate
-reads LightGBM's gain share for the `clock` group and refuses above 0.30, on the
-reasoning that hour-of-day cannot forecast direction so a model leaning on it is
-broken. The reasoning is right and the measurement does not test it: gain share
-says how many splits the booster spent on a feature, not whether the feature
-forecasts anything.
+Gain share (`control_gain_share`) counts the splits spent on a group, not
+whether it forecasts. An ablation tests whether a group forecasts.
 
-Measured on 326 days of real bars, the two disagree completely:
-
-    control_gain_share      0.279   (against a 0.30 gate — nearly "carrying" it)
-    clock group ALONE      -0.000008   t=-0.26   2/6 folds positive
-    all groups minus clock +0.000315   t=+2.12   6/6   (slightly BETTER than all five)
-
-So the clock was absorbing splits and forecasting nothing, and the gate could
-neither confirm that nor rule it out. An ablation can. It is also the measurement
-that found what the skill actually is: `cross_asset` alone at +0.000183, t=+3.39,
-6/6 folds, against `vol_state` alone at **-0.000101** — which is the opposite of
-the sigma-disagreement mechanism this project was designed around.
-
-Forecast only, no book. `AUDIT_REPORT.md` records why the money numbers from a run
-this size must not be used to choose between configurations: across six
-configurations, skill and return were decoupled, with the *higher*-skill setting
-losing half the account.
+Forecast skill only, no money: money numbers from a run this size must not
+choose between configurations.
 
     python -m scripts.ablate
-    python -m scripts.ablate --offsets 3          # where the skill turned out to live
+    python -m scripts.ablate --offsets 3
 """
 
 from __future__ import annotations
@@ -47,16 +29,13 @@ from scripts._common import (
     setup_logging,
 )
 
-# Derived, never spelled out. A hardcoded second copy of the control's name is
-# a definition that agrees with `core.features` until one of them changes — and
-# the failure mode is a survey that quietly runs without a control, which is how
-# the previous incarnation of this project came to rank its own control first
-# and not notice.
+# Derived from `core.features`, never spelled out, so a survey cannot silently
+# run without its control.
 CONTROL = CONTROL_GROUPS[0]
 
 
 def trials(groups: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
-    """Every group alone, the full set, and the full set without the control."""
+    """Return every group alone, the full set, and the full set without the control."""
     out: dict[str, tuple[str, ...]] = {'all groups': groups}
     without = tuple(g for g in groups if g != CONTROL)
     if CONTROL in groups and without:
@@ -97,15 +76,15 @@ def main() -> int:
             y = test['outcome'].to_numpy(dtype=float)
             b = test['baseline_probability'].to_numpy(dtype=float)
             m = np.asarray(model.predict(test), dtype=float)
-            # Rows with no volatility estimate carry no forecast; excluding them is
-            # the same rule core/metrics.py applies.
+            # Rows with no volatility estimate carry no forecast; exclude them, as
+            # core/metrics.py does.
             keep = np.isfinite(y) & np.isfinite(b) & np.isfinite(m)
             skills.append(log_loss(y[keep], b[keep]) - log_loss(y[keep], m[keep]))
             trees.append(model.best_iteration or 0)
             sizes.append(effective_observations(test))
         v = np.asarray(skills, dtype=float)
-        # The same window-weighted aggregation the gates read, so an ablation
-        # cell and a promotion report the same number for the same folds.
+        # The window-weighted aggregation the gates read, so an ablation cell
+        # and a promotion report agree.
         weighted = weighted_fold_mean(v, sizes)
         plain = weighted_fold_mean(v)
         print(f'  {label:30s} {weighted.mean:+11.6f} {weighted.standard_error:10.6f} '
@@ -142,8 +121,8 @@ def main() -> int:
         path.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path / 'ablation.csv', index=False)
         print(f'\n  wrote {path / "ablation.csv"}')
-    # One line for the run; every cell it tried rides along, because each cell
-    # is a configuration somebody may later pick from.
+    # One trial line for the run, listing every cell, because each cell counts
+    # as a trial.
     log_trial('ablate', args, config, groups=available, dataset=dataset, metrics={
         'folds': len(folds),
         'cells': frame.to_dict('records'),

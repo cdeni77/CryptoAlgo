@@ -1,15 +1,12 @@
 """Hold the Coinbase trade stream open and fold it into one-minute bars.
 
-The trading loop's bar fetch was a ~3s REST round trip on the decision path,
-read ~1s after the minute closed — early enough that the venue may not have
-finished the candle. This keeps `TAPE` (a `core.trade_bars.TradeTape`) current
-from the public `market_trades` channel, so `scripts.live` can take the newest
-minutes from memory where the tape proves it saw all of them, and REST
-everywhere else.
+Keeps `TAPE` (a `core.trade_bars.TradeTape`) current from the public
+`market_trades` channel. `scripts.live` takes the newest minutes from it where
+the tape proves full coverage, which keeps REST off the decision path.
 
-**Every loss of coverage is recorded, never smoothed over.** A reconnect, an
-idle socket and a sequence gap all end the tape's coverage at the last instant
-we know we were receiving; minutes overlapping the hole are never served.
+Every loss of coverage is recorded. A reconnect, an idle socket or a sequence
+gap ends coverage at the last instant we know we were receiving; minutes that
+overlap the hole are never served.
 
 Protocol (Coinbase Advanced Trade WebSocket, public, no auth):
 
@@ -20,14 +17,11 @@ Protocol (Coinbase Advanced Trade WebSocket, public, no auth):
                             "trades": [{"trade_id", "product_id", "price",
                                         "size", "side", "time"}]}]}
 
-Read from Coinbase's own SDK (`coinbase-advanced-py`). Whether `sequence_num`
-counts per connection or per channel is not something the documentation
-settles, so a gap is declared only when the number jumps BOTH across the
-connection and within the channel — which is the correct test under either.
+The documentation does not say whether `sequence_num` counts per connection or
+per channel, so a gap is declared only when it jumps on both readings.
 
-**Every trade is also archived** to the research store's `spot_trades`
-(through `core.spool`, like the Kalshi frames), so the tape the live bars were
-built from can be replayed. The spool is a `SafeSpool`: a full disk costs rows,
+Every trade is also archived to `spot_trades` through `core.spool`, so the
+tape can be replayed. The spool is a `SafeSpool`: a full disk costs rows,
 never the tape.
 
 Never gated: a reader that pauses goes stale. Only the spool flush looks at the
@@ -58,19 +52,17 @@ TAPE = TradeTape(grace_seconds=DEFAULT_CONFIG.spot_bar_grace_seconds)
 
 
 class SequenceTracker:
-    """A lost message, judged on both readings of `sequence_num`."""
+    """Detect a lost message on both readings of `sequence_num`."""
 
     def __init__(self) -> None:
         self.previous: Optional[int] = None
         self.by_channel: dict[str, int] = {}
 
     def observe(self, channel: str, seq) -> bool:
-        """True when a message was lost before this one.
+        """Return True when a message was lost before this one.
 
-        A connection-wide counter is contiguous message to message unless one
-        was lost; a per-channel counter is contiguous within its channel. A
-        loss breaks whichever one is real, and the other is never contiguous
-        anyway — so requiring both is right under either reading.
+        A loss breaks whichever counter is real, and the other is never
+        contiguous, so requiring both is right under either reading.
         """
         try:
             seq = int(seq)
@@ -87,7 +79,7 @@ class SequenceTracker:
 
 
 def trade_record(trade: dict, *, received: float, sequence_num) -> Optional[dict]:
-    """One `spot_trades` spool line; None for a trade without an id or a time."""
+    """Return one `spot_trades` spool line, or None without an id or a time."""
     product = str(trade.get('product_id') or '')
     trade_id = trade.get('trade_id')
     if not product or trade_id in (None, ''):
@@ -256,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--backoff-start', type=float, default=1.0)
     parser.add_argument('--backoff-max', type=float, default=30.0)
     parser.add_argument('--spool-root', default=str(DEFAULT_SPOOL_ROOT))
-    # Archiving is on by default; off keeps the tape in memory only, as before.
+    # Archiving is on by default; off keeps the tape in memory only.
     parser.add_argument('--no-archive', dest='archive', action='store_false')
     return parser
 

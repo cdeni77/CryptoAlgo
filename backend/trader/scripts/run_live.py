@@ -1,43 +1,16 @@
-"""Everything the live system runs, in one process.
+"""Run the trading loop and every recorder in one process.
 
-The live side was five containers — the trading loop, three recorders and a
-shell loop that scraped and rebuilt the store. They were separate because they
-were written one at a time, not because they are different: four are async loops
-polling an HTTP API on a sixty-second cadence. One process means one restart
-policy, one log stream and one thing to check.
+Trading latency is the main constraint. `ResearchStore.write` is synchronous
+Parquet work that blocks the event loop, so:
 
-**Trading latency is the constraint everything else bends around**, and the
-threat is not the polling — that is all `await`. It is `ResearchStore.write`,
-which reads a Parquet partition, concatenates, sorts and rewrites it with zstd.
-That is synchronous pandas and pyarrow, and on this event loop it blocks
-everything, a pending decision included. Three recorders each do it on a timer.
+1. Store writes run in a thread.
+2. A recorder awaits `gate.idle()` before a cycle, so it never starts work
+   during a decision.
+3. Recorder cadences are phased away from the decision instants.
+4. `store_sync` runs as a subprocess, because it is minutes of CPU.
 
-Four defences, in the order they matter:
-
-1. **Store writes run in a thread** (`to_thread` at each recorder's call site),
-   so the stall leaves the event loop entirely. Correct regardless of whether
-   these share a process.
-2. **The trading gate.** A recorder awaits `gate.idle()` before starting a
-   cycle, so it never begins work while a decision is in flight. Recorders are
-   on a sixty-second cadence and a few seconds of deferral costs them nothing;
-   a decision delayed costs edge directly.
-3. **Phased cadences.** Decisions land about a second past minutes 3, 6, 9 and
-   12 of each window. Recorders are offset to fire near thirty seconds past the
-   minute, as far from those instants as a sixty-second period allows, so the
-   gate is rarely even consulted.
-4. **`store_sync` stays a subprocess.** Scraping and rebuilding Parquet is
-   minutes of pure CPU; awaiting it in-process would stall trading no matter how
-   the rest is arranged.
-
-Measured headroom: the loop currently decides 5.7s after its offset, against a
-information cliff at 45-60s. The point of the gate is not that the slack is
-missing — it is that spending it on a Parquet write buys nothing.
-
-**A failure in one component never stops another.** Split across containers,
-Docker restarted each and a crash-looping recorder was invisible unless someone
-looked. Here `supervise` catches, logs, and restarts with exponential backoff
-that resets after a healthy run, while everything else keeps going. Trading
-surviving a broken recorder is the case that matters.
+A failure in one component never stops another: `supervise` restarts it with
+backoff.
 """
 
 from __future__ import annotations
@@ -58,17 +31,15 @@ logger = logging.getLogger('run-live')
 
 BACKOFF_START = 5.0
 BACKOFF_MAX = 300.0
-# A component that ran this long before failing gets a fresh backoff: an hour of
-# work then a network blip is not the same as failing on startup.
+# A component that ran this long before failing gets a fresh backoff.
 BACKOFF_RESET_AFTER = 120.0
 
 
 class TradingGate:
     """Closed while a trading decision is in flight; recorders wait on it.
 
-    Re-entrant by count rather than a boolean, so a nested cycle cannot reopen
-    the gate early, and released in a `finally` so a cycle that raises does not
-    wedge every recorder forever.
+    Counts holders, so a nested cycle cannot reopen it early. Released in a
+    `finally`, so a cycle that raises does not block the recorders.
     """
 
     def __init__(self) -> None:
@@ -107,14 +78,10 @@ async def supervise(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Run `factory()` forever, restarting it on failure with backoff.
+    """Run `factory()` forever, restarting it with backoff on failure.
 
-    A component that RETURNS is restarted too. These are endless loops; one that
-    returns has stopped doing its job, and treating that as success would leave a
-    recorder silently dead behind a healthy-looking container.
-
-    `CancelledError` is re-raised untouched — shutdown must stop a component, not
-    restart it.
+    A component that returns is restarted too, because these are endless loops.
+    `CancelledError` is re-raised, so shutdown stops a component.
     """
     delay = backoff
     while True:
@@ -135,22 +102,17 @@ async def supervise(
 
 @dataclass(frozen=True)
 class Component:
-    """One supervised loop, and when in the minute it prefers to run."""
+    """One supervised loop and its preferred start within the minute."""
 
     name: str
-    # Seconds past the minute this component aims to start its cycle, chosen to
-    # sit away from the decision instants at ~1s past minutes 3/6/9/12.
+    # Seconds past the minute this component starts its cycle, away from the
+    # decision instants at ~1s past minutes 3/6/9/12.
     phase: float = 30.0
 
     @staticmethod
     def selected(known: Sequence[str], *,
                  disable: Iterable[str] = ()) -> list[str]:
-        """The components to run, refusing an unknown name rather than ignoring it.
-
-        A typo in `--disable` that silently ran everything would be the worst
-        outcome — this is the flag someone reaches for to keep a component from
-        touching a live account.
-        """
+        """Return the components to run; refuse an unknown name in `--disable`."""
         unknown = sorted(set(disable) - set(known))
         if unknown:
             raise ValueError(
@@ -165,8 +127,8 @@ async def align_to_phase(phase: float, *,
                          now: Callable[[], float] = time.time) -> None:
     """Wait until `phase` seconds past the next period boundary.
 
-    Called once at startup so a recorder's whole cadence sits away from the
-    decision instants, rather than drifting onto them.
+    Called once at startup, so a recorder's cadence stays away from the
+    decision instants.
     """
     current = now() % period
     wait = (phase - current) % period
@@ -178,37 +140,25 @@ async def align_to_phase(phase: float, *,
 # The components
 # ---------------------------------------------------------------------------
 
-# Phases in seconds past the minute. Decisions land ~1s past minutes 3/6/9/12,
-# so the recorders are spread across the far side of the minute: away from the
-# decision instant and away from each other, so no two Parquet writes queue on
-# the same thread at the same moment.
+# Phases in seconds past the minute. Recorders sit away from the decision
+# instant and from each other, so no two Parquet writes queue together.
 COMPONENTS: tuple[Component, ...] = (
     Component('trade', phase=0.0),          # keeps its own schedule
-    # Continuous, not periodic, and never gated: a stream that pauses goes
-    # stale, which is the failure the book cache exists to prevent. Its phase is
-    # meaningless and only the spool flush takes the gate.
+    # Sockets hold a subscription, so phase has no meaning. They are never
+    # gated, because a paused stream goes stale. Only the spool flush takes
+    # the gate.
     Component('stream', phase=0.0),
-    # The Polymarket socket, phase 0 like the Kalshi one: a socket has no
-    # cadence to phase, it holds a subscription. `cross_venue` is the only
-    # load-bearing group in the model and the REST recorder left its peer price
-    # ~30s stale at a decision; this makes the two books contemporaneous.
+    # The Polymarket socket keeps the peer book contemporaneous with Kalshi's.
     Component('pm_stream', phase=0.0),
-    # The Coinbase trade socket. Like the other sockets it holds a
-    # subscription rather than polling, and it is never gated: the trading
-    # loop reads its bars on the decision path instead of a ~3s REST fetch.
+    # The Coinbase trade socket. The trading loop reads its bars on the
+    # decision path.
     Component('spot_stream', phase=0.0),
-    # The settlement-index proxy: four constituent-exchange sockets and a
-    # per-second sampler. Nothing in trading reads it yet, so it is the safest
-    # thing here to disable (`--disable index`).
+    # The settlement-index proxy: constituent-exchange sockets and a
+    # per-second sampler.
     Component('index', phase=0.0),
     Component('ladder', phase=25.0),
-    # +55s, not +35s. Decisions land about two seconds past the minute, so a
-    # recorder at +35s left the freshest Polymarket reading ~27s old — inside
-    # the 30s bar the backtest applies, but only just, and past it on the tail.
-    # Training has the two venues contemporaneous (Polymarket 4.0s STALER on
-    # average), and `cross_venue` is the only load-bearing group in the model,
-    # so a systematic 27s skew there is the most expensive place to have one.
-    # At +55s the reading is ~7s old at the decision.
+    # +55s keeps the REST Polymarket reading a few seconds old at the next
+    # decision, well inside the backtest's peer age cap.
     Component('pm_ladder', phase=55.0),
     Component('implied_vol', phase=45.0),
     Component('store_sync', phase=50.0),
@@ -217,17 +167,9 @@ NAMES = tuple(c.name for c in COMPONENTS)
 
 
 def _recorder_args(build_parser, **over):
-    """Genuine defaults from a recorder's own `build_parser()`, not a copy.
+    """Return a recorder's defaults from its own `build_parser()`, with overrides.
 
-    This used to hand-build an `argparse.Namespace` with literal defaults
-    captioned "the defaults each recorder's own parser would have produced" —
-    a second, hardcoded copy of numbers that already lived in three other
-    files. The two agreed today; nothing enforced that they would keep
-    agreeing, and a default changed in one recorder's own parser (used when it
-    runs standalone via `python -m scripts.record_X`) would silently diverge
-    from what the supervised `live` service actually uses. Parsing `[]`
-    against the real parser makes that impossible: there is exactly one
-    definition of each default, in the file that owns it.
+    Parsing `[]` keeps one definition of each default, in the recorder's file.
     """
     ns = build_parser().parse_args([])
     for key, value in over.items():
@@ -236,33 +178,17 @@ def _recorder_args(build_parser, **over):
 
 
 async def store_sync_loop(*, every: float = 3600.0) -> None:
-    """Scrape recent bars and rebuild the store, as an awaited SUBPROCESS.
+    """Keep the research store current by running each step as a subprocess.
 
-    `scrape` and `sync_store` used to be one-off `docker compose run` commands,
-    so nothing ran them once the live loop started. Measured 2026-08-25: the
-    research store's newest bar was 2026-08-23 04:17 while live windows ran to
-    2026-08-25 00:00 — so not one traded window could be replayed offline, and
-    the Kalshi quote archive was unusable for comparing a candidate model
-    against the market. That is the one thing the archive exists for.
-
-    Deliberately not in-process. This is minutes of blocking CPU — HTTP paging
-    then a full Parquet rebuild — and `to_thread` would not save it either,
-    because the GIL is held through much of pandas. A subprocess is the only
-    arrangement where a rebuild cannot touch the trading loop's latency.
+    Not in-process, and not in a thread: the work is minutes of CPU and holds
+    the GIL, so only a subprocess cannot affect trading latency.
     """
-    # Stamped on ENTRY as well as after each pass. The period here is an
-    # hour and the first pass takes minutes, so 'never reported' would
-    # hold the container unhealthy through a perfectly normal startup.
-    # Liveness for this component means the loop is alive and
-    # progressing; the staleness limit is what catches a wedge.
+    # Stamp liveness on entry too, because the first pass takes minutes.
     heartbeat.touch('store_sync')
     while True:
-        # Fold the closed hours of the frame spool into immutable Parquet. This
-        # belongs here rather than in the stream recorder for the same reason
-        # the rest of this loop does: it is blocking Parquet work, and the
-        # stream must not stop reading to do it.
-        # Every raw table (book frames, Coinbase trades, the index proxy), each
-        # pruned to its own retention, then the free-disk guard.
+        # Fold closed spool hours into Parquet here, not in the stream
+        # recorder, so the stream never stops reading. Each raw table is
+        # pruned to its retention, then the free-disk guard runs.
         try:
             from core.datastore import DEFAULT_ROOT
             from core.spool import DEFAULT_SPOOL_ROOT, compact_all
@@ -273,52 +199,21 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
                     logger.info('compacted %d %s rows', count, dataset)
         except Exception as exc:                      # noqa: BLE001
             logger.warning('spool compaction: %s', str(exc)[:200])
-        # FOUR stages, in dependency order. The first two were here from the
-        # start; the second two were one-off commands nobody ran once the loop
-        # started, which is the same defect this docstring already describes for
-        # `scrape` and `sync_store` — and worse, because it is invisible. Live
-        # keeps trading and recording while the TRAINING set stops advancing.
-        #
-        # Measured six days into the live run: minute_bars, kalshi venue_depth
-        # and venue_implied_vol were all current, while venue_settlements — the
-        # LABEL — was seven days stale and polymarket venue_depth six. So no
-        # window after 2026-08-27 could be trained on, and a fresh walk-forward
-        # reproduced the previous run exactly. That reads like a stable model
-        # and is a stalled pipeline.
-        #
-        # `collect_settlements` stops at history it already holds, so keeping
-        # current is a page or two rather than a full walk. `build_depth` folds
-        # every BOOK source into venue_depth at every minute, which is what
-        # carries the recorded Polymarket ladders across for `cross_venue`.
+        # Stages in dependency order. Each one feeds the training set; a
+        # missing stage stalls it while live trading looks healthy.
         for step in (('scripts.scrape', '--backfill-days', '3'),
                      ('scripts.sync_store',),
                      ('scripts.build_depth',),
                      ('scripts.collect_settlements', '--venue', 'both'),
-                     # **Immediately after the settlements land**, because it
-                     # reads what that step just wrote. `predictions.outcome`
-                     # is the label the market gates score, and it is filled
-                     # from Coinbase bars; the venue's own settlement disagrees
-                     # on ~2.85% of windows and moves model_minus_market from
-                     # +0.000924 to +0.000188. Idempotent, so a re-run is free.
+                     # After collect_settlements, because it reads what that
+                     # step writes. Idempotent.
                      ('scripts.correct_outcomes',)):
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, '-m', *step,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE)
-            # **Bounded, because an unbounded await here is invisible.**
-            # `communicate()` with no timeout means a child that wedges -- a
-            # stuck HTTP socket inside it, a read on a corrupt partition --
-            # parks this coroutine forever. `supervise` cannot tell that from a
-            # coroutine legitimately awaiting, which is the EXACT failure
-            # `record_stream.consume` was rewritten to eliminate, where every
-            # exit is now enforced on a timeout.
-            #
-            # The consequence is the one the docstring above already names:
-            # trading and recording continue while `minute_bars`, `venue_depth`
-            # and the settlement LABEL stop advancing, and a fresh walk-forward
-            # then reproduces the previous run exactly -- which reads as a
-            # stable model and is a stalled pipeline. The only symptom was the
-            # ABSENCE of four hourly log lines.
+            # Bounded: a wedged child would otherwise park this coroutine
+            # forever, and `supervise` cannot detect that.
             try:
                 _out, err = await asyncio.wait_for(proc.communicate(),
                                                    timeout=STEP_TIMEOUT_SECONDS)
@@ -338,23 +233,19 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
                                (err or b'').decode(errors='replace')[:300])
             else:
                 logger.info('%s done', step[0])
-        # Liveness, recorded where the loop has demonstrably done its
-        # job. A stamp written at startup or by the supervisor would
-        # prove only that the process exists — which is exactly what
-        # the old healthcheck proved.
+        # Liveness, stamped once a pass has completed.
         heartbeat.touch('store_sync')
         await asyncio.sleep(every)
 
 
-# How long one store-sync child may run before it is killed. A full
-# `scripts.scrape --backfill-days 3` plus a store rebuild is minutes, not tens
-# of minutes, and the loop runs hourly -- so a generous ceiling still catches a
-# wedge long before the next pass would overlap it.
+# How long one store-sync child may run before it is killed. A normal step
+# takes minutes and the loop runs hourly, so this catches a wedge before the
+# next pass.
 STEP_TIMEOUT_SECONDS = 1800.0
 
 
 def build_factories(args, gate: TradingGate) -> dict:
-    """One coroutine factory per component, all sharing the gate."""
+    """Return one coroutine factory per component, all sharing the gate."""
     from scripts import (record_implied_vol, record_index, record_ladder,
                          record_pm_ladder, record_pm_stream,
                          record_spot_stream, record_stream)
@@ -363,8 +254,7 @@ def build_factories(args, gate: TradingGate) -> dict:
     trade_argv = list(args.trade_args)
 
     async def trade():
-        # The loop holds the gate across each cycle. It is the only component
-        # whose timing matters, so it never waits on anything else.
+        # The loop holds the gate across each cycle and never waits on it.
         return await live_module.main(trade_argv, gate=gate)
 
     async def stream():
@@ -377,18 +267,14 @@ def build_factories(args, gate: TradingGate) -> dict:
             _recorder_args(record_ladder.build_parser), gate=gate)
 
     async def pm_ladder():
-        # Read from the declaration rather than repeated, because they drifted:
-        # `Component('pm_ladder', phase=55.0)` was changed and this line was not,
-        # so the banner printed +55s while the poll ran at +35s and the fix was
-        # cosmetic. `Component.phase` is otherwise read only by that banner.
+        # Read the phase from the declaration, so the two cannot drift.
         await align_to_phase(
             next(c for c in COMPONENTS if c.name == 'pm_ladder').phase)
         return await record_pm_ladder.run(
             _recorder_args(record_pm_ladder.build_parser, batch_rows=6), gate=gate)
 
     async def pm_stream():
-        # No phase: a socket holds a subscription rather than polling, so there
-        # is no cadence to align. Same shape as the Kalshi `stream` component.
+        # No phase: a socket holds a subscription and has no cadence.
         return await record_pm_stream.run(gate=gate)
 
     async def spot_stream():
@@ -458,12 +344,9 @@ async def main(argv: Optional[Sequence[str]] = None) -> int:
              for name in selected]
     if not tasks:
         raise SystemExit('every component disabled; nothing to run')
-    # **A deliberate exit from any component stops the whole process.**
-    # `live.main` raises SystemExit for a config error or a trader lock already
-    # held, and both mean "do not run". Restarting would either spin on a bad
-    # flag or fight another trader for one account. Everything else is caught
-    # and retried inside `supervise`, so reaching here is a decision, not a bug —
-    # it is reported as one line rather than an asyncio traceback.
+    # A SystemExit from any component stops the whole process. `live.main`
+    # raises it for a config error or a held trader lock; a restart would spin
+    # or fight another trader. `supervise` retries everything else.
     try:
         await asyncio.gather(*tasks)
         return 0

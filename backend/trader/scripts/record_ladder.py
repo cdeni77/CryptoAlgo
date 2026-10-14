@@ -1,23 +1,9 @@
-"""Archive the raw order book every minute, for training we have not designed yet.
+"""Archive the raw Kalshi order book every minute, stored verbatim.
 
-Read-only. One REST call per market per minute; the ladder is stored verbatim.
-
-**The whole argument is irrecoverability.** `GET /markets/{ticker}/orderbook`
-returns the full ladder while a market is open and
-`{"no_dollars": [], "yes_dollars": []}` the moment it settles — verified. No
-historical endpoint carries resting size at any price. So unlike every other
-dataset here, this one cannot be rebuilt later at any cost, and a day not recorded
-is a day gone.
-
-Stored raw rather than summarised. `venue_depth` keeps cumulative size within 1c
-and 5c of the touch, which answers exactly one question — would a `fill_or_kill`
-have filled. The measured finding of this project is that the market holds
-information the feature set cannot express, and book imbalance, ladder slope,
-depth asymmetry and level counts are all plausible carriers of it that appear in
-no feature group today. A projection chosen for one question forecloses the rest.
-
-Cost: 3 symbols x ~15 minutes x 96 windows a day is ~4,300 calls, about 0.05 req/s
-against a Basic-tier ceiling of 20.
+Read-only. One REST call per market per minute, plus a sample from the stream
+cache. `/orderbook` returns an empty ladder once a market settles, and no
+historical endpoint serves depth, so a minute not recorded is lost. The ladder
+is stored raw, not summarised, so later features are not foreclosed.
 """
 
 from __future__ import annotations
@@ -37,46 +23,25 @@ from core.datastore import ResearchStore
 from scripts.record_stream import CACHE
 
 logger = logging.getLogger('ladder')
-# The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
-# This used to hardcode its own copy with no env read, so pointing
-# KALSHI_SERIES_BTC at a demo series moved what the trader traded while
-# this kept scraping production.
+# The one series<->symbol mapping: core/config.SERIES_BY_SYMBOL.
 SERIES = series_to_symbol()
 
 
 def ws_row(cache, *, ticker, symbol, now, open_time, minute, read_at=None):
-    """The same ladder, sampled from the stream cache instead of a REST call.
+    """Return the ladder row sampled from the stream cache, or None.
 
-    Returns None when the cache holds no book for the ticker. An empty ladder
-    and no ladder are different claims, and writing an empty one would record a
-    dead subscription as a market with nothing resting in it.
-
-    **A STALE book is still recorded, with its age.** For the archive a
-    four-second-old book is data, not a fault: a feature can filter on
-    `book_age_ms` later, and discarding it forecloses that question. The trading
-    path makes the opposite choice — it refuses a book it cannot date — and that
-    asymmetry is deliberate rather than an oversight.
+    Returns None when the cache holds no book, because an empty ladder would
+    record a dead subscription as an empty market. A stale book is recorded
+    with its age (`book_age_ms`); the trading path refuses it instead.
     """
     ladder = cache.ladder(ticker)
     if ladder is None:
         return None
     yes = [[p, s] for p, s in ladder.yes]
     no = [[p, s] for p, s in ladder.no]
-    # **`available_time` is when the BOOK was knowable, not when we looked.**
-    # The cache is read after the REST call returns, so the read instant is up
-    # to a round trip later than the book it describes. Stamping the read
-    # instant overstates how late this information arrived, and — because the
-    # REST row is stamped from the same cycle clock — made the two rows look
-    # simultaneous when they are ~100-150ms apart. Measured against the captured
-    # fixture, that much skew alone drops top-of-book agreement from 100% to
-    # ~92%, which is the whole of the shortfall the live comparison was showing.
-    #
-    # The cache knows exactly when its book last changed, so say that.
-    # `read_at` is when the cache was actually consulted (`now` is the cycle's
-    # clock, taken before the REST round trip, and the two are not the same
-    # instant); the age is measured from the read, so the frame landed at
-    # `read_at - age`. `event_time` still comes from `now` so this row pairs
-    # with the REST row for the same minute.
+    # `available_time` is when the book was knowable: `read_at - age`, where
+    # `read_at` is when the cache was consulted. `event_time` comes from `now`,
+    # so this row pairs with the REST row for the same minute.
     read_at = pd.Timestamp(now if read_at is None else read_at)
     event_time = pd.Timestamp(now).floor('min')
     observed = read_at - pd.Timedelta(seconds=ladder.age_seconds)
@@ -106,19 +71,10 @@ def _levels(raw) -> list:
 
 
 def seconds_to_next_mark(now: datetime, period: float, phase: float) -> float:
-    """How long to sleep so the NEXT sample lands on `phase` past the minute.
+    """Return the seconds to sleep so the next sample lands `phase` past the minute.
 
-    `asyncio.sleep(interval)` at the end of a cycle makes the real period
-    `interval + work`, so the sampling phase walks through the minute. Measured
-    on `venue_ladder` over 2026-09-15 it swept 21.0s -> 41.3s, with p5/p50/p95
-    of 5.3/32.9/57.5s -- essentially uniform rather than pinned where
-    `run_live.align_to_phase` put it at startup. Two consequences: the phase
-    table in `run_live.COMPONENTS` stops being true within the first hour, and
-    whole minutes go unsampled (979 two-minute steps and 40 longer ones over
-    seven days).
-
-    Never returns less than a second: a cycle that overran its mark should wait
-    for the NEXT one rather than spin.
+    A fixed sleep after each cycle makes the period `interval + work`, so the
+    phase drifts and minutes go unsampled. Never returns less than a second.
     """
     period = float(period)
     phase = float(phase) % period
@@ -136,15 +92,11 @@ async def run(args, gate=None) -> int:
     rows: list[dict] = []
 
     def _flush_on_exit() -> None:
-        """Write whatever is buffered before this task goes away.
+        """Write the buffer before this task is cancelled.
 
-        **`asyncio.CancelledError` is a BaseException, not an Exception**, so
-        the `except Exception` reconnect handler below never saw a shutdown and
-        `run_live`'s `task.cancel()` discarded the buffer -- up to a full batch
-        of rows on every restart, on a dataset whose whole justification is that
-        a minute not recorded is gone for good. Written synchronously rather
-        than through `asyncio.to_thread`: the loop is being torn down and a
-        thread hop is one more thing that can be cancelled.
+        `asyncio.CancelledError` is a BaseException, so `except Exception`
+        never sees a shutdown. Writes synchronously, because the event loop is
+        shutting down.
         """
         if not rows:
             return
@@ -162,29 +114,17 @@ async def run(args, gate=None) -> int:
             async with KalshiClient(key_id=os.environ['KALSHI_KEY_ID'],
                                     private_key_pem=pem) as client:
                 while True:
-                    # Never start a cycle while a trading decision is in flight:
-                    # this is a 60s cadence and a few seconds of deferral
-                    # costs nothing, while a delayed decision costs edge.
+                    # Never start a cycle while a trading decision is in flight.
                     if gate is not None:
                         await gate.idle()
                     now = datetime.now(timezone.utc)
                     for series, symbol in SERIES.items():
                         payload = await client._request(  # noqa: SLF001
                             'GET', '/markets',
-                            # **NOT `status: 'open'`.** `record_stream._trading`
-                            # documents why and was changed for it: `status`
-                            # lags the market by up to forty seconds, so the
-                            # replacement market -- already published, with an
-                            # `open_time` exactly at the boundary -- is still
-                            # `initialized` and invisible to this query for the
-                            # first part of every window. Measured on the store
-                            # in 10s buckets inside the first minute: 8, 73,
-                            # 170, 323, 332, 324 rows against ~340/bucket in
-                            # minute 1, so the first twenty seconds were ~95%
-                            # and ~78% missing -- the moment the edge is
-                            # largest. Closing time is the honest filter; the
-                            # `0 <= minute <= window_minutes` check below
-                            # already discards anything outside the window.
+                            # Filter on closing time, not on status: `status`
+                            # lags the market by up to forty seconds, which
+                            # hides the new market early in each window. The
+                            # minute check below drops anything outside it.
                             params={'series_ticker': series,
                                     'min_close_ts': int(now.timestamp()),
                                     'limit': 8})
@@ -197,16 +137,9 @@ async def run(args, gate=None) -> int:
                             minute = (now - open_time).total_seconds() / 60.0
                             if not (0 <= minute <= config.window_minutes):
                                 continue
-                            # **The stream sample is taken FIRST, so a REST
-                            # failure cannot discard it.** Both `continue`s
-                            # below -- the request error and the empty ladder --
-                            # sat before this, so the archive's websocket
-                            # coverage was a strict SUBSET of REST's by
-                            # construction. Measured over seven days:
-                            # rest_only = 30, ws_only = 0. The documented
-                            # retirement gate needs evidence that the stream
-                            # covers a REST outage, and the recorder was built
-                            # so that evidence could never exist.
+                            # Take the stream sample first, so a REST failure
+                            # below cannot discard it. The transports must be
+                            # independent observers.
                             paired = ws_row(
                                 CACHE, ticker=market['ticker'], symbol=symbol,
                                 now=now, open_time=open_time, minute=minute,
@@ -219,21 +152,16 @@ async def run(args, gate=None) -> int:
                             except Exception as exc:      # noqa: BLE001
                                 logger.warning('%s: %s', market['ticker'], str(exc)[:90])
                                 continue
-                            # When the response actually landed. The cycle clock
-                            # `now` was taken before the round trip, so using it
-                            # claims this book was knowable earlier than it was
-                            # — and made the REST and stream rows look
-                            # simultaneous when they are ~100-150ms apart.
+                            # When the response landed. `now` precedes the round
+                            # trip, so it would claim the book was knowable early.
                             rest_at = datetime.now(timezone.utc)
                             ladder = (book.get('orderbook_fp')
                                       or book.get('orderbook') or {})
                             yes = _levels(ladder.get('yes_dollars') or ladder.get('yes'))
                             no = _levels(ladder.get('no_dollars') or ladder.get('no'))
                             if not yes and not no:
-                                # Silent before. The stream row above is
-                                # already kept, so this drops the REST half
-                                # only -- but a run of these is a venue
-                                # problem worth seeing.
+                                # Drops the REST half only; a run of these is
+                                # a venue problem.
                                 logger.debug('%s: empty REST ladder at minute '
                                              '%.1f', market['ticker'], minute)
                                 continue
@@ -251,32 +179,21 @@ async def run(args, gate=None) -> int:
                                 'no_levels': json.dumps(no),
                                 'yes_total': sum(s for _, s in yes),
                                 'no_total': sum(s for _, s in no),
-                                # The REST call is instantaneous by definition:
-                                # it IS the sample, so there is no cache age.
+                                # The REST call is the sample, so it has no
+                                # cache age.
                                 'transport': 'rest', 'book_age_ms': 0.0,
                             })
-                            # The same minute, sampled from the stream. Both
-                            # rows survive a read because `transport` is part of
+                            # The stream row for this minute was added above.
+                            # Both survive a read, because `transport` is part
+                            # of the event key.
                     if len(rows) >= args.batch_rows:
                         await asyncio.to_thread(
                             store.write, 'venue_ladder', pd.DataFrame(rows))
                         logger.info('wrote %d ladder rows (%d levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()
-                    # **Sleep to the next aligned mark, not for a fixed
-                    # interval.** `sleep(interval)` at the end of the cycle
-                    # makes the period `interval + work`, so the sampling phase
-                    # walks through the minute: measured over 2026-09-15 it
-                    # swept 21.0s -> 41.3s, p5/p50/p95 of 5.3/32.9/57.5s --
-                    # essentially uniform rather than pinned where
-                    # `run_live.align_to_phase` put it. That voids the phase
-                    # table `run_live.COMPONENTS` states within the first hour,
-                    # and it is why whole minutes go unsampled: 979 two-minute
-                    # and 40 longer steps over seven days.
-                    # Liveness, recorded where the loop has demonstrably done its
-                    # job. A stamp written at startup or by the supervisor would
-                    # prove only that the process exists — which is exactly what
-                    # the old healthcheck proved.
+                    # Liveness, stamped after a completed cycle. Then sleep to
+                    # the next aligned mark, not a fixed interval.
                     heartbeat.touch('ladder')
                     await asyncio.sleep(seconds_to_next_mark(
                         datetime.now(timezone.utc), args.interval, args.phase))

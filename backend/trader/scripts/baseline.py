@@ -1,24 +1,10 @@
 """Fit and report the barrier baseline alone. The Phase 1 gate.
 
-Run this before anything else, and read it before believing any model result.
-It answers one question: **how much of a 15-minute up/down market is already
-settled by arithmetic?**
+Shows how much of a 15-minute up/down market arithmetic already settles.
+Every model result is measured as a difference against this baseline.
 
-The answer is most of it. Displacement is known exactly; only the remaining
-volatility has to be forecast; and volatility is forecastable. Expect the
-baseline to take log loss from 0.693 — a coin flip — to somewhere near 0.51,
-which is a 26% improvement using no features at all.
-
-That number is the trap this whole system is built around. A model measured
-against 50% would report a 40-point edge on late-window rows. There is no edge
-there; there is a clock. Everything downstream is measured as a *difference*
-against what this script prints.
-
-**The gate: the baseline must be calibrated out of sample.** If its reliability
-table is off — predicting 0.90 where 0.84 happens — then the "skill" a model
-shows against it is partly the baseline's own miscalibration, and the residual
-architecture that makes incremental skill readable stops meaning what it says.
-Fix the baseline before training anything.
+The gate: the baseline must be calibrated out of sample. Otherwise a model's
+skill against it is partly the baseline's own miscalibration.
 
     python -m scripts.baseline
     python -m scripts.baseline --baseline-distribution normal   # the comparison
@@ -71,9 +57,8 @@ def main() -> int:
             test = apply_fold(dataset, fit, fold.test, variant, groups=groups)
             y_all = test['outcome'].to_numpy(dtype=float)
             p_all = test['baseline_probability'].to_numpy(dtype=float)
-            # A row with no volatility estimate has no forecast. `log_loss` uses
-            # `np.mean`, so leaving them in made the whole fold read NaN — which
-            # then passed a `<= 0.02` gate, because `nan > 0.02` is False.
+            # A row with no volatility estimate has no forecast. Left in, it
+            # makes the fold's mean NaN.
             keep = np.isfinite(y_all) & np.isfinite(p_all)
             y, p = y_all[keep], p_all[keep]
             unscoreable = int((~keep).sum())
@@ -124,11 +109,8 @@ def main() -> int:
               '  and a model that merely knew that would look skilful.')
 
     print()
-    # `pandas.Series.max()` skips NaN, and `nan > 0.02` is False, so this gate
-    # used to fail OPEN: with 31 non-finite rows in 99,388 it printed
-    # "gate passed: worst-fold calibration error 0.01516 <= 0.02" while five of
-    # six folds had reported `log loss nan, ECE nan`. Refuse on unmeasured folds
-    # before comparing anything, so a data hole reads as a data hole.
+    # Refuse on unmeasured folds first: `Series.max()` skips NaN and
+    # `nan > 0.02` is False, so the gate would otherwise fail open.
     all_ece = np.concatenate([
         pd.DataFrame(rows)['ece'].to_numpy(dtype=float) for rows in results.values()])
     all_non_finite = int(sum(
@@ -146,13 +128,9 @@ def main() -> int:
                          if 'n' in pd.DataFrame(rows).columns)) or all_ece.size
     share = all_non_finite / max(total_rows + all_non_finite, 1)
     if all_non_finite:
-        # Reported, not fatal. A row with no volatility estimate has no forecast:
-        # measured, a single 6.5-hour Coinbase outage leaves ~83 rows in 53,200
-        # unscoreable in the two hours afterwards, because the 240-minute lookback
-        # cannot be filled. Live, `decide` refuses those as NOT_FINITE. What used
-        # to be wrong was the silence — they were counted in the 0.95-1.00
-        # reliability bin and turned every fold statistic into NaN while this
-        # script printed "gate passed".
+        # Reported, not fatal. A row with no volatility estimate has no
+        # forecast, for example after a data outage. Live, `decide` refuses
+        # those as NOT_FINITE.
         print(f'  {all_non_finite:,} row(s) ({share:.4%}) carried no forecast — a '
               f'NaN sigma, which is the tail of a data outage. Excluded from every '
               f'number above and counted here.')

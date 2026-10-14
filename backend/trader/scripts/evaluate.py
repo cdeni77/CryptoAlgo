@@ -1,32 +1,19 @@
 """Walk-forward evaluation: skill, calibration, money, gates, stress.
 
-The one script that answers "does this work". It fits and scores across purged
-expanding folds, runs the resulting probabilities through the same `decide()`
-the live path uses, and reports the answer in the order it should be read:
+Fits and scores across purged expanding folds, runs the probabilities through
+the `decide()` the live path uses, and reports in the order to read it:
 
-1. **Log loss skill against the baseline.** Positive or nothing else matters.
-   With the standard error from fold dispersion, not from a breadth formula —
-   four offsets share a label and the three symbols are ~0.7 correlated, and a
-   breadth-derived error bar on that structure is not merely optimistic but
-   degenerate.
-2. **Fold agreement.** Five of six positive happens 10.9% of the time by
-   chance, so agreement is necessary and never sufficient.
-3. **Calibration.** The system trades only its confident predictions, so being
-   wrong about *how* confident matters more than the average.
-4. **The rejection funnel.** Expected to be dominated by `edge_below_gate`.
-   That is the system working: the forecast does not cover the fee, so it
-   declines. On the perp system the equivalent number was the single most
-   informative output it ever produced.
-5. **The money**, per fold and then on one continuous $100 account.
-6. **Cost stress.** The half-spread is an assumption — no Kalshi order ticket
-   has been read against `core/costs.py` — and it is larger than the fee at
-   price above 83c (where 0.07*p(1-p) falls below a cent). A strategy that
-   survives only at the assumed
-   spread has not been demonstrated.
-7. **The edge curve.** A diagnostic on concentration — read the shape, not the
-   argmax. Choosing `min_edge_pp` from it would be selecting on the same
-   out-of-sample rows it is scored on; see `core/backtest.py:edge_curve` for the
-   measurement showing why the money on a run this size cannot choose anything.
+1. Log-loss skill against the baseline, with the standard error from fold
+   dispersion. Offsets share labels and symbols correlate, so a breadth
+   formula is wrong.
+2. Fold agreement. Necessary, never sufficient.
+3. Calibration. The system trades only its confident predictions.
+4. The rejection funnel, expected to be dominated by `edge_below_gate`.
+5. The money, per fold and on one continuous account.
+6. Cost stress. The half-spread is an assumption; a strategy that survives
+   only at the assumed spread is not demonstrated.
+7. The edge curve. Read the shape, not the argmax: choosing `min_edge_pp` from
+   it selects on the rows it is scored on.
 
     python -m scripts.evaluate
     python -m scripts.evaluate --groups clock        # the control, alone
@@ -51,7 +38,7 @@ from scripts._common import (
 
 
 def stack_table(models) -> pd.DataFrame:
-    """One row per fold of a stacked run: a, b, c and the stage-2 sample."""
+    """Return one row per fold of a stacked run: a, b, c and the stage-2 sample."""
     rows = []
     for i, model in enumerate(models):
         if not hasattr(model, 'stack_summary'):
@@ -150,23 +137,12 @@ def main() -> int:
     print('\n' + '-' * 78)
     print('GATES')
     print('-' * 78)
-    # The market gates read live-recorded quotes, which this run does not have and
-    # structurally cannot: a backtest has no book. Reading them here anyway means
-    # `evaluate` reports the same verdict `promote` will, rather than passing a
-    # candidate that promotion then blocks for a reason `evaluate` never mentioned.
+    # Read the market gates exactly as `promote` does, so both report the same
+    # verdict.
     from scripts.promote import market_measurement
 
-    # **`entry_offsets` MUST be forwarded, and omitting it is not a small
-    # difference.** `scored_against_market` returns every scored row and the loop
-    # records all four offsets while trading one, so pooling here measures a
-    # policy nobody runs. `promote.py` was fixed for exactly this and carries the
-    # note; `evaluate.py` was not, so the two disagreed about the same candidate
-    # on the gate that matters most. Measured 2026-09-16 on 5,468 live rows:
-    #
-    #     offset 12 (what trades)   model_minus_market  +0.000921   PASS
-    #     all four pooled           model_minus_market  -0.000311   FAIL
-    #
-    # `evaluate` reported the second and read as "the model loses to the price".
+    # Forward `entry_offsets`: pooling every scored offset measures a policy
+    # nobody runs.
     market = market_measurement(result.scored, entry_offsets=config.entry_offsets)
     gates = evaluate_gates(report, extra=market)
     print(gate_report(gates))

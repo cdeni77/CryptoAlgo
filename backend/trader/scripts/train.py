@@ -1,21 +1,13 @@
 """Fit one model on all available history, for inspection. Not for promotion.
 
-This is the microscope, not the gate. It trains on everything up to the most
-recent windows, holds back the last fold's worth for a single out-of-sample
-look, and prints what the model paid attention to. Use it to answer "what is it
-actually using" and "did the correction survive"; use `scripts.evaluate` to
-answer "does it work" and `scripts.promote` to install anything.
+Trains on all history except the last fold, scores that fold once, and prints
+what the model uses. Use `scripts.evaluate` to judge it and `scripts.promote`
+to install anything.
 
-Two numbers here are worth more than the rest:
-
-* **alpha**, the residual scale — how much of the model's claimed correction
-  survives on held-out rows. Near zero means it found nothing, however good the
-  training loss looked.
-* **the control's share of gain.** Hour of day cannot forecast direction. If the
-  `clock` group carries the model, the measurement is broken rather than the
-  market interesting. The previous incarnation of this project ran a 27-cell
-  survey whose best cell was its own control, and that was the most useful
-  result it produced.
+* alpha, the residual scale: how much of the correction survives on held-out
+  rows. Near zero means the model found nothing.
+* the control's share of gain: hour of day cannot forecast direction, so a
+  model the `clock` group carries is suspect.
 """
 
 from __future__ import annotations

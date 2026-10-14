@@ -1,13 +1,9 @@
 """Evaluate a candidate and install it, gates permitting.
 
-The only path to `models/forecast.joblib`. The live signal writer loads that
-file by name and nothing else, so this is the single place a model becomes real.
-
-Every attempt is recorded in `models/promotions/`, passed, blocked or refused,
-and every run (dry runs too) appends to `models/trials.jsonl`. The two together
-are the trial count, and the trial count is what any claim of skill has to be
-discounted by — a project that deletes its failures cannot compute its own
-multiple-testing correction.
+This is the only path to `models/forecast.joblib`, the file live trading loads.
+Every attempt is recorded in `models/promotions/`, and every run appends to
+`models/trials.jsonl`. Together they are the trial count for multiple-testing
+correction, so failures are never deleted.
 
     python -m scripts.promote
     python -m scripts.promote --history
@@ -49,24 +45,12 @@ logger = logging.getLogger('promote')
 
 
 def market_measurement(scored=None, *, entry_offsets=None) -> dict[str, float]:
-    """The market comparison, from recorded quotes.
+    """Return the market-comparison gate values.
 
-    Returns values that FAIL when there is nothing to read. The gate has to be
-    unmeasurable-and-failing rather than absent, because absent is how a
-    benchmark quietly stops being applied — and this particular benchmark is the
-    one the whole stack exists to satisfy.
-
-    **Two sources now, in that order of preference.** Live-recorded predictions
-    in the serving store are the original and remain first: they are the venue's
-    quote at the instant a decision was actually made. Failing that, a backtest
-    whose rows carry `market_probability` from the collected book — which for
-    most of this project's life did not exist, and is why `market_gate_values`
-    still says the comparison "cannot come from the backtest". Eight months of
-    book have since been collected and validated to 0.70c against the live
-    recording with the clock removed, so it can.
-
-    They are not the same claim and the print says which was used. A backfilled
-    quote is a reconstruction; a recorded one is an observation.
+    Sources, in order: the candidate's own rows against recorded quotes, the
+    deployed system's live predictions, then backfilled quotes from the
+    backtest. The print says which was used. With nothing to read, the values
+    fail the gate; the gate is never absent.
     """
     from core.metrics import market_gate_values, market_rows_from_scored
 
@@ -89,27 +73,10 @@ def market_measurement(scored=None, *, entry_offsets=None) -> dict[str, float]:
               'against the live recording)')
         return values
 
-    # **THE CANDIDATE'S OWN ROWS COME FIRST, against quotes somebody watched.**
-    #
-    # This used to prefer the live `predictions` table, on the stated ground
-    # that those are "the venue's quote at the instant a decision was actually
-    # made". True, and it created a DEADLOCK: those rows were produced by
-    # whatever model was deployed at the time, `model_version` is NULL on all
-    # of them, and a new candidate cannot change a single one. So a candidate
-    # was gated on its predecessor's live track record.
-    #
-    # Measured: the 2026-09-20 and 2026-09-27 retrains were both blocked by
-    # `calibration_vs_market` computed over 8,411 live windows, while their own
-    # numbers passed -- skill +0.0027 over 24,247 windows, every other gate
-    # green. The model froze on 20260917T021814Z for sixteen days and would
-    # have stayed there indefinitely, because the live figures can only improve
-    # if a new model is deployed and no new model could be deployed.
-    #
-    # The reason for preferring the live table also expired. Since the
-    # quote-source fix of 2026-09-16 the backtest prices against the same
-    # `live_touch` quotes where they exist, so the choice is no longer
-    # observation-versus-reconstruction -- `recorded_only` keeps that property
-    # while restoring attribution to the candidate.
+    # The candidate's own rows come first. The live `predictions` table holds
+    # the deployed model's record, which a candidate cannot change; gating on
+    # it would block every new model. `recorded_only` keeps only observed
+    # quotes.
     if scored is not None:
         rows = market_rows_from_scored(scored, entry_offsets=entry_offsets,
                                        recorded_only=True)
@@ -133,11 +100,8 @@ def market_measurement(scored=None, *, entry_offsets=None) -> dict[str, float]:
     except Exception as exc:                      # noqa: BLE001 - report and fail closed
         return _from_backtest(f'the serving store could not be read ({exc})')
     rows = list(rows)
-    # Same restriction as the backtest path: only offsets that can OPEN a
-    # position. `scored_against_market` returns every scored row, and the loop
-    # records all four offsets while trading one, so pooling here measured a
-    # policy nobody runs — measured, +12m reads +0.00550 against a pooled
-    # -0.00072. Row shape is (symbol, window_open, offset_minutes, ...).
+    # Only offsets that can open a position, as on the backtest path. Row
+    # shape is (symbol, window_open, offset_minutes, ...).
     if entry_offsets is not None:
         wanted = {int(o) for o in entry_offsets}
         rows = [r for r in rows if int(r[2]) in wanted]
@@ -156,32 +120,18 @@ logger = logging.getLogger('promote')
 def refit_on_all(dataset, config, *, groups=None):
     """Fit the same configuration on every window in the dataset.
 
-    Returns None rather than raising if it cannot be built: a failed refit
-    should fall back visibly to the last fold, not abort a promotion whose
-    evidence is already computed.
+    Returns None instead of raising, so a failed refit falls back visibly to
+    the last fold.
     """
     try:
         from core.dataset import fit_fold
         from core.model import fit_for_config, table_groups
-        # The same groups and the same fitter the walk-forward used, so a
-        # stacked configuration ships a stacked artifact.
+        # The same groups and fitter as the walk-forward.
         groups = table_groups(config, groups)
         fit, table = fit_fold(dataset, dataset.window_index, config, groups=groups)
-        # `scoring=` is not optional. It carries the volatility model, the
-        # intraday seasonality factor and the baseline's scale/tail — the three
-        # fitted things that turn a raw window into a feature row. Every fold
-        # model gets one from `core/backtest.py`; the refit did not, so the
-        # artifact this function returns is the one actually installed and was
-        # the only one in the pipeline that could not score.
-        # **`weights` too, or the artifact is not the model the gates measured.**
-        # Every fold model is fitted with `recency_weights(...)` in
-        # `core/backtest.py`; this refit omitted them, so under
-        # `--recency-half-life-days` the evidence came from weighted models and
-        # the INSTALLED artifact was an unweighted one. Inert while the
-        # half-life is None -- `recency_weights` returns None -- which is
-        # exactly how it would have shipped unnoticed the day someone set it.
-        # This is the same evidence-versus-artifact seam this function's own
-        # docstring was written to close for `scoring=`.
+        # `scoring=` is required: without the scoring bundle the installed
+        # artifact cannot score. `weights` must match the fold models, so the
+        # artifact is the model the gates measured.
         from core.cv import recency_weights
 
         return fit_for_config(table, fit.baseline, config, groups=groups,
@@ -195,20 +145,11 @@ def refit_on_all(dataset, config, *, groups=None):
 
 
 def choose_candidate(fold_models, refit):
-    """The artifact to deploy: the refit on all data, never the last fold's.
+    """Return the artifact to deploy: the refit on all data, not the last fold.
 
-    A fold model's training ends where that fold's TEST block begins, so
-    deploying it ships something one test block stale BY CONSTRUCTION. Measured
-    on the artifact that traded live: trained through 2025-12-05, deployed in
-    August, and it had therefore never seen a single Kalshi 15-minute market
-    because they did not exist yet.
-
-    The walk-forward is the EVIDENCE that a configuration works; what ships is
-    that configuration refitted through the present. Conflating the two costs a
-    test block of freshness every single time.
-
-    A refit that is not strictly fresher than the last fold means something went
-    wrong building it, and shipping it silently would hide that.
+    A fold model's training ends where its test block begins, so it is stale by
+    construction. The walk-forward is the evidence; the refit is what ships. A
+    refit that is not strictly fresher than the last fold is refused.
     """
     if not fold_models:
         raise ValueError('no models to promote: the walk-forward produced none')
@@ -310,10 +251,7 @@ def main() -> int:
     result = walk_forward(dataset, config, groups=groups, trade=True)
     print('\n' + result.report.summary())
 
-    # Score the gate on the offsets that can actually OPEN a position.
-    # Pooling all four rejected two candidates for losing to the market at
-    # offsets they never trade, while +12m — the only one they do — was the
-    # best of the four (+0.00550 against a pooled -0.00072).
+    # Score the market gate only on offsets that can open a position.
     market = market_measurement(getattr(result, 'scored', None),
                                 entry_offsets=config.entry_offsets)
     market_metrics = {name: market.get(name) for name in (
@@ -324,8 +262,7 @@ def main() -> int:
         print('\n' + gate_report(gates))
         dsr = deflated_sharpe_for(result.report, trial_id=trial_id)
         print('\n' + deflated_sharpe_line(dsr))
-        # Not in the ledger, which is for promotion attempts, but a trial all
-        # the same: a dry run that looked good is what the real run repeats.
+        # A dry run is not a promotion attempt, but it is still a trial.
         log_trial('promote', args, config, groups=groups, dataset=dataset,
                   report=result.report, trial_id=trial_id,
                   metrics={**market_metrics, 'gates_passed': gates_passed(gates),
@@ -335,9 +272,8 @@ def main() -> int:
         print('\ndry run: nothing installed; recorded in the trial log only')
         return 0
 
-    # Refit on EVERYTHING through the present, and deploy that. The folds are
-    # the evidence that this configuration works; they are not the artifact.
-    # See `choose_candidate`.
+    # Refit on all data through the present and deploy that (see
+    # `choose_candidate`).
     refit = refit_on_all(dataset, config, groups=groups)
     candidate = choose_candidate(result.models, refit)
     if refit is not None:
@@ -365,7 +301,7 @@ def main() -> int:
 
 
 def deflated_sharpe_line(dsr: dict) -> str:
-    """Reported, never gated: a probability the Sharpe beats the best null trial."""
+    """Format the deflated Sharpe probability. Reported, never gated."""
     def fmt(key, spec='.3f'):
         value = (dsr or {}).get(key)
         return 'n/a' if value is None or not math.isfinite(value) else format(value, spec)
@@ -379,18 +315,9 @@ def deflated_sharpe_line(dsr: dict) -> str:
 def publish_to_serving(attempt, report) -> None:
     """Mirror the attempt and its reliability table into the serving store.
 
-    `PgWriter.record_model_run` and `write_calibration` are the only writers of
-    the `model_runs` and `calibration` tables and had **zero callers anywhere**,
-    including tests — while `backend/api/controllers/serving.py` reads exclusively
-    from them and the dashboard's Model and Calibration pages poll those routes.
-    So those two tabs were empty forever regardless of real promotion activity,
-    and reading the filesystem ledger instead is not a workaround: the `backend`
-    compose service never mounts the `trader_models` volume.
-
-    Best effort on purpose. Promotion must not depend on a database being
-    reachable — the ledger under `models/promotions/` is the record of account,
-    and this is the dashboard's copy of it. A failure here is logged and the exit
-    status still reflects the gates.
+    The dashboard reads `model_runs` and `calibration` only from there. Best
+    effort: the ledger under `models/promotions/` is the record, so a failure
+    is logged and the exit status still reflects the gates.
     """
     if not os.getenv('DATABASE_URL'):
         logger.info('DATABASE_URL is unset, so the dashboard will not show this '
@@ -422,15 +349,8 @@ def publish_to_serving(attempt, report) -> None:
             failed_gates=', '.join(g.name for g in attempt.gates if not g.passed),
             provenance=attempt.payload().get('config'),
         )
-        # The reliability table of the fold that produced the candidate — the one
-        # trained on the most history, and so the one deployed.
-        #
-        # Read from the ATTEMPT, not recomputed from the report: the same rows
-        # now go into the ledger via `core.promotion.reliability_rows`, and two
-        # derivations of one table are two tables. The ledger copy is also what
-        # makes this repairable — before it existed, a promotion whose mirror
-        # failed (no DATABASE_URL, unreachable database) lost its calibration
-        # data permanently while every other number survived on disk.
+        # The reliability table of the candidate's fold, read from the attempt
+        # so the ledger and the serving store hold one derivation.
         rows = (attempt.payload().get('report') or {}).get('reliability') or []
         if rows:
             writer.write_calibration(attempt.version, 'model', rows)
@@ -442,9 +362,7 @@ def publish_to_serving(attempt, report) -> None:
 
 
 def _finite(value):
-    """None rather than NaN: the serving columns are nullable and the API's
-    contract is that a missing measurement is null with a reason, never a
-    substitute."""
+    """Return None for a non-finite value; serving columns store missing as null."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -455,7 +373,7 @@ def _finite(value):
 # ---- go-live check ---------------------------------------------------------
 
 def live_market_rows(database_url: str, *, since, version: Optional[str]) -> pd.DataFrame:
-    """Settled live predictions with a quote, from `predictions`. SELECT only.
+    """Return settled live predictions with a quote, from `predictions`. Reads only.
 
     A row whose `model_version` is set must match `version`; a row without one
     is kept.

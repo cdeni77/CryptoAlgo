@@ -1,42 +1,18 @@
 """Backfill the venue's own quote at each decision offset, from Kalshi candles.
 
-**Why this exists.** A backtest built from Coinbase bars has no order book, so
-`price_source` stands the calibrated baseline in for the market — which makes
-"beat the price" and "beat the baseline" the same question answered twice with
-the same number. `model_minus_market` can only be computed where a real quote was
-recorded, and recording forward was going to take ~70 days.
+Read-only. Enumerates settled markets, makes one candlestick call per market,
+and writes `venue_quotes` to the research store.
 
-It turns out not to be necessary. Kalshi's candlestick history reaches the series
-origin: `GET /series/{s}/markets/{t}/candlesticks` returns 16 one-minute candles
-for the oldest settled market in KXBTC15M, opened 2026-06-17T23:45Z. Sampled
-across the full span, 100% of markets returned candles and 100% of the four
-offsets were present and two-sided, at a 1.0c median spread.
+* `open_time` comes from the enumeration response, never the ticker: the
+  ticker names the close in US Eastern.
+* `end_period_ts` is the inclusive end of a candle. The candle stamped
+  `open + offset*60` is what a live decision sees; the next one would leak, so
+  a missing offset stays missing.
+* `yes_ask = 1.0000` means "no offer" only when the spread is also wide.
+* Fields are `_dollars` / `_fp` strings.
 
-Read-only. Enumerates settled markets, pulls one candlestick call per market, and
-writes `venue_quotes` to the research store.
-
-Correctness notes, each of which was a real trap:
-
-* **`open_time` comes from the enumeration response, never from the ticker.**
-  `KXBTC15M-26JUN172000-00` opens at 2026-06-17T**23:45**Z — the ticker names the
-  close in US Eastern. Building times from tickers is the pattern
-  `CLAUDE.md` already warns about for market resolution.
-* **`end_period_ts` is the inclusive END of a candle.** The candle stamped
-  `open + offset*60` closes at exactly the offset minute, which is the instant a
-  live decision sees. The next candle would leak, so a missing offset is recorded
-  as missing rather than filled from its neighbour.
-* **`yes_ask = "1.0000"` can mean "no offer".** Observed as an ask of 1.0000
-  against a 0.53 bid in a market's first candle. But a tight 0.999/1.000 book is
-  a real near-certain market — of 46 such rows in the live store, every one had a
-  spread of 0.3c or less. So the rule is ask >= 1.0 AND spread > 5c, not ask
-  >= 1.0 alone.
-* Everything is `_dollars` / `_fp` strings. The integer-cent fields the older
-  documentation describes are not present on this endpoint at all.
-
-Rows that cannot yield a two-sided mid are written with `usable=False` and a
-reason rather than dropped, so the coverage report can count what was lost and
-`DECISION_RULE.md`'s 5% exclusion ceiling can be checked against data instead of
-against a claim.
+Rows without a two-sided mid are written with `usable=False` and a reason, so
+coverage can count what was lost.
 """
 
 from __future__ import annotations
@@ -58,23 +34,15 @@ from core.config import series_to_symbol
 
 logger = logging.getLogger('backfill_quotes')
 
-# The one series<->symbol mapping — see core/config.SERIES_BY_SYMBOL.
-# This used to hardcode its own copy with no env read, so pointing
-# KALSHI_SERIES_BTC at a demo series moved what the trader traded while
-# this kept scraping production.
+# The one series<->symbol mapping: core/config.SERIES_BY_SYMBOL.
 SERIES = series_to_symbol()
 OFFSETS = (3, 6, 9, 12)
-# +14m is not traded. It exists so `DECISION_RULE.md` Appendix A's control can
-# run: at 14 minutes into a 15-minute window the market is nearly settled and must
-# score very well but NOT perfectly. A `market_ll` near 0.00 there is the
-# signature of a candle that contains the settlement itself, and the difference
-# between model and market would hide it because both are scored against the same
-# leaked outcome. Pulled as a separate sampled pass, since a control does not need
-# every market.
+# +14m is not traded; it is a leak control. Near settlement the market must
+# score very well but not perfectly; a `market_ll` near 0 means the candle
+# contains the settlement. Pulled as a separate sampled pass.
 CONTROL_OFFSET = 14
 WINDOW_MINUTES = 15
-# Measured 12.1-12.6 req/s without throttling against a Basic-tier ceiling of
-# 20/s (200 read tokens/s at 10 tokens a request). Stay under it deliberately.
+# Stay under the Basic-tier ceiling of 20 req/s.
 DEFAULT_RATE = 12.0
 NO_OFFER_SPREAD = 0.05      # ask >= 1.0 is only "no offer" when the book is wide
 
@@ -88,23 +56,12 @@ def _f(value) -> float:
 
 
 def _field(block: dict, *names: str) -> float:
-    """Read the first name present. **The two endpoints disagree on names.**
+    """Return the first named field present, as a float.
+
+    The two endpoints name the same values differently:
 
     Live  `/series/{s}/markets/{t}/candlesticks` -> `close_dollars`, `volume_fp`
     Hist. `/historical/markets/{t}/candlesticks` -> `close`,         `volume`
-
-    Same values, verified against the same market: the historical response's
-    `yes_bid.close "0.7600"` is the live response's fourth candle exactly. Reading
-    only the `_dollars` names off a historical response yields NaN for every row
-    and no error, which is the same class of failure as the `yes_bid_dollars`
-    trap this project was already bitten by — in the opposite direction.
-
-    It matters because `GET /historical/cutoff` reads 2026-06-25 and "will be
-    regularly updated, advancing forward over time". Candlesticks do not appear
-    to be governed by it today (the live path serves 2026-06-17, a week before
-    the cutoff, and the cutoff's fields are all positions/orders/trades/
-    settlements). But "does not appear to be governed by it today" is not a
-    guarantee, and the failure mode is silent.
     """
     for name in names:
         if name in block:
@@ -117,8 +74,10 @@ def parse_open_time(raw: str) -> datetime:
 
 
 def classify(bid: float, ask: float) -> tuple[bool, str]:
-    """Is this quote usable, and if not, why? The exclusion list is fixed by
-    DECISION_RULE.md Appendix A and must not grow here."""
+    """Return whether the quote is usable, and the reason if not.
+
+    The exclusion list is fixed; do not add to it here.
+    """
     import math
 
     if not (math.isfinite(bid) and math.isfinite(ask)):
@@ -192,26 +151,11 @@ class Throttle:
 
 
 async def fetch_cutoff(client) -> Optional[datetime]:
-    """The live/historical boundary, per Kalshi's own migration guidance.
+    """Return the live/historical boundary from `GET /historical/cutoff`.
 
-    `GET /historical/cutoff` returns a set of timestamps and the venue's advice is
-    to route by them and merge across the boundary rather than guess. Measured
-    2026-08-25 it reads:
-
-        market_positions_last_updated_ts  2026-06-25T00:00:00Z
-        market_settled_ts                 2026-06-25T00:00:00Z
-        orders_updated_ts                 2026-06-25T00:00:00Z
-        trades_created_ts                 2026-06-25T00:00:00Z
-
-    **None of those fields names candlesticks**, and empirically the live path
-    serves 2026-06-17 — a week older than every one of them. So candlesticks
-    either are not governed by this cutoff or have a longer window. `market_
-    settled_ts` is used as the routing boundary because it is the market-shaped
-    one, and because being wrong about it is cheap: both paths are tried and
-    merged, so a mis-routed market costs one extra request rather than a hole.
-
-    The cutoff "will be regularly updated, advancing forward over time", which is
-    why this is fetched per run instead of hardcoded.
+    Uses `market_settled_ts`. No cutoff field names candlesticks, so both
+    paths are tried and merged; a mis-routed market costs one extra request.
+    The cutoff moves forward, so it is fetched per run.
     """
     try:
         payload = await client._request('GET', '/historical/cutoff')  # noqa: SLF001
@@ -234,11 +178,7 @@ async def fetch_cutoff(client) -> Optional[datetime]:
 def merge_candles(*payloads: Optional[dict]) -> list[dict]:
     """Union the candles from several responses, keyed on `end_period_ts`.
 
-    Kalshi's guidance is to query both sides and combine when a range spans the
-    boundary. A 15-minute market almost never straddles it, but "almost never" is
-    the wrong thing to build on, and the merge costs nothing when only one side
-    answered. First writer wins per timestamp; the two endpoints serve identical
-    values under different key names, verified on the same market.
+    First writer wins per timestamp; both endpoints serve the same values.
     """
     out: dict[int, dict] = {}
     for payload in payloads:
@@ -249,7 +189,7 @@ def merge_candles(*payloads: Optional[dict]) -> list[dict]:
 
 
 async def enumerate_settled(client, series: str) -> list[dict]:
-    """Every settled market for a series. Cursor to exhaustion."""
+    """Return every settled market for a series, paging the cursor to the end."""
     out, cursor = [], None
     while True:
         params = {'series_ticker': series, 'status': 'settled', 'limit': 1000}
@@ -283,12 +223,8 @@ async def run(args) -> int:
     done: set[str] = set()
     if checkpoint.exists():
         done = set(json.loads(checkpoint.read_text()).get('tickers', []))
-        # **Entries written before the key carried the offsets are discarded.**
-        # A bare ticker records that SOMETHING was pulled for it without saying
-        # which offsets, and treating that as "done" is precisely the bug: a
-        # ticker fetched for the `--offsets 14` control pass was excluded from
-        # the traded pull forever. Re-requesting is cheap and idempotent;
-        # keeping an ambiguous entry is not.
+        # Discard bare-ticker entries: they do not say which offsets were
+        # pulled. Re-requesting is cheap and idempotent.
         stale = {k for k in done if '@' not in k}
         if stale:
             logger.warning('discarding %d checkpoint entry/entries written '
@@ -308,8 +244,7 @@ async def run(args) -> int:
             todo = [m for m in markets
                     if _checkpoint_key(m['ticker'], args.offsets) not in done]
             if args.limit_per_series:
-                # Evenly spaced across the whole span, not the first N — a control
-                # drawn from one end of the history would be a control of that end.
+                # Evenly spaced across the whole span, not the first N.
                 step = max(1, len(todo) // args.limit_per_series)
                 todo = todo[::step][:args.limit_per_series]
             logger.info('%s: %d settled markets, %d to pull (%d already done)',
@@ -325,8 +260,7 @@ async def run(args) -> int:
                           'period_interval': 1}
                 live = f'/series/{series}/markets/{ticker}/candlesticks'
                 hist = f'/historical/markets/{ticker}/candlesticks'
-                # Route by the cutoff, as the venue advises, then fall back to the
-                # other side. Preferred first so the common case is one request.
+                # Route by the cutoff, then fall back to the other side.
                 order = ([hist, live] if (cutoff and open_time < cutoff)
                          else [live, hist])
                 payloads, last_error = [], 'no candlesticks'
@@ -349,13 +283,8 @@ async def run(args) -> int:
                 batch.extend(rows_from_candles(
                     candles, symbol=symbol, ticker=ticker, open_time=open_time,
                     offsets=args.offsets))
-                # **Keyed on the offsets too.** `done.add(ticker)` marked a
-                # ticker finished regardless of `--offsets`, on one shared
-                # checkpoint file -- so a ticker pulled for the documented
-                # `--offsets 14` control pass was permanently excluded from the
-                # 3/6/9/12 pull, and `--limit-per-series` spaces the control
-                # evenly through history, making the hole a regular comb
-                # through the traded offsets.
+                # Key on the offsets too, so a control pass does not mark a
+                # ticker done for the traded offsets.
                 done.add(_checkpoint_key(ticker, args.offsets))
                 total += 1
                 if len(batch) >= args.batch_rows:
@@ -375,11 +304,7 @@ async def run(args) -> int:
 
 
 def _checkpoint_key(ticker: str, offsets) -> str:
-    """What "already pulled" means: this ticker AT these offsets.
-
-    A bare ticker conflates a control pass with the traded pull. The offsets are
-    sorted so the key does not depend on argument order.
-    """
+    """Return the checkpoint key: this ticker at these offsets, in sorted order."""
     return f"{ticker}@{','.join(str(int(o)) for o in sorted(offsets))}"
 
 

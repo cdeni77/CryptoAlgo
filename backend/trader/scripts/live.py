@@ -1,58 +1,32 @@
 """The live engine: score the current window, price it against the book, act.
 
-One script for the whole operational loop, because the previous incarnation of
-this project had four (`signals`, `paper_engine`, `live_orchestrator`, and a
-promotion cadence inside the orchestrator) and they disagreed about what had
-already happened.
-
 Each cycle, in this order:
 
-1. **Fetch bars.** The last day of one-minute bars for the three symbols. On an
-   entry cycle the newest minutes come from the Coinbase trade stream where it
-   provably saw them all (`stream_bars`), and from REST otherwise.
-2. **Bookkeeping** — reconcile with the venue, settle matured positions, record
-   minute prices. On a cycle that can ENTER, this moves after the orders: it
-   reads the past, every earlier cycle in the window has already done it, and
-   on the decision path it was seconds of staleness paid at the touch.
-3. **Score** the current window at the configured offset, through the same
-   `core.dataset` path the backtest uses.
-4. **Price** it. Live, against the stream book or one REST `/orderbook` read
-   per symbol; without a venue, against the calibrated baseline, and the row
-   says which.
-5. **Decide** with `core.decide.decide` — the same function the backtest calls —
-   and send every order at once, resending once after a kill.
+1. Fetch bars. On an entry cycle the newest minutes come from the Coinbase
+   trade stream where it verifies them, else from REST.
+2. Bookkeeping: reconcile with the venue, settle, record minute prices. On an
+   entry cycle this runs after the orders.
+3. Score the current window through the `core.dataset` path the backtest uses.
+4. Price it against the stream book or one REST `/orderbook` read. Without a
+   venue, price against the calibrated baseline; the row says which.
+5. Decide with `core.decide.decide` and send every order at once. Resend once
+   after a kill.
 
-**Modes, and what each will actually do.**
+Modes:
 
     --mode paper                 score, price, record. Places nothing.
-    --mode live --dry-run        talk to Kalshi, read the real book, size the
-                                 order, write the ticket, place nothing.
-    --mode live --place-orders    place them.
+    --mode live --dry-run        read the real book, size the order, write the
+                                 ticket, place nothing.
+    --mode live --place-orders   place orders.
 
-`--place-orders` is a separate flag from `--mode live` on purpose. The failure
-worth designing against is a script that was meant to observe and instead
-traded, and one flag guarding that is one typo away from being wrong.
+`--place-orders` is separate from `--mode live`, so one typo cannot place
+orders. `--require-gates` (the default) refuses an artifact whose promotion
+was blocked; overriding it needs `--force` and a `--reason`, recorded on every
+row.
 
-**The gates still apply.** `--require-gates` (the default) refuses to trade an
-artifact whose promotion was blocked. Overriding it needs `--force` and a written
-reason, which is recorded on every prediction the run writes.
-
-**Live, the venue is the account of record.** In paper mode the bankroll is
-arithmetic — start at the configured figure, subtract each outlay, add each
-payout — and settlement comes from our own bars. Live, both of those are
-*estimates of someone else's ledger*, and where they disagree the venue is right
-and we are wrong:
-
-* **Balance** comes from `/portfolio/balance` each cycle. Our running figure is
-  kept alongside and the gap is logged, because a widening gap is the first sign
-  of an unrecorded fill or a partial.
-* **Settlement** comes from the venue where it can. We approximate sixty seconds
-  of CF Benchmarks BRTI with a one-minute OHLC mean of Coinbase bars, which is a
-  close proxy and not the same number — so a position settled from our bars can
-  disagree with what was actually paid. `--reconcile` prefers the venue's
-  settlements and falls back to bars only for what it has not resolved yet.
-* **Fills** are read back rather than assumed. An order placed is not an order
-  filled, and a `fill_or_kill` that killed leaves a ticket and no position.
+Live, the venue is the account of record. Balance comes from the venue each
+cycle. Settlement comes from the venue where known, else from Coinbase bars as
+a proxy for BRTI. Fills are read back, never assumed.
 """
 
 from __future__ import annotations
@@ -83,11 +57,9 @@ from core.pg_writer import AccountModeMismatch, PgWriter, TraderAlreadyRunning
 from core.promotion import LIVE_MODEL, MODELS_ROOT, load_live
 from data_collection.kalshi_client import KalshiClient
 
-# The engine's parts live in `livetrade`. Everything `run_cycle` and `main` call
-# is imported here, and so is every public name this module used to define, so
-# `from scripts.live import X` keeps working. Module state is NOT re-exported:
-# it has one owner each (`livetrade.state` for what is shared), and a copy here
-# would silently go stale.
+# The engine's parts live in `livetrade` and are re-exported here, so
+# `from scripts.live import X` works. Module state is not re-exported, because
+# a copy would go stale.
 from livetrade import state
 from livetrade.artifact import (                                    # noqa: F401
     _refuse_if_blocked, artifact_signature, artifact_version,
@@ -128,32 +100,14 @@ from livetrade.util import _db
 
 logger = logging.getLogger('live')
 
-# Kalshi series for the 15-minute up/down markets, per Coinbase spot symbol.
-# Resolved to an actual market by close time — see
-# `KalshiClient.resolve_window_market` — so a series rename fails loudly here
-# rather than silently trading the wrong contract.
-#
-# The `15M` suffix is load-bearing. `KXBTCD` was tried first and every window
-# abstained: it is the *hourly* series, and its tickers carry an explicit strike
-# (`KXBTCD-26AUG2317-T86749.99`), making it a threshold ladder rather than an
-# up/down market. `KXBTC15M-26AUG230030` is series + date + HHMM with no strike
-# suffix, which is the tell — the strike is the price at the window's open, and
-# that is exactly what `core/windows.py` builds a target from.
-# SERIES_BY_SYMBOL now lives in core/config.py — this used to be the only
-# place the KALSHI_SERIES_* env vars reached; see core/config.py for why
-# that was a trap once other scripts read a hardcoded copy of the same map.
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
-    # Mutually exclusive, at the parser. `--dry-run` used to be declared and
-    # never read — `args.dry_run` appeared nowhere in this file — so
-    # `--mode live --dry-run --place-orders` parsed cleanly and placed real
-    # orders. A flag documented as a safety guard has to be either honoured or
-    # a usage error; silently ignored is the one option that gets money lost.
+    # Mutually exclusive at the parser: a safety flag is honoured or is a
+    # usage error, never ignored.
     orders = parser.add_mutually_exclusive_group()
     orders.add_argument('--dry-run', action='store_true', default=False,
                         help='Read the real book, size the order, place nothing '
@@ -164,21 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--loop', action='store_true',
                         help='Run every cycle-seconds until interrupted.')
     parser.add_argument('--cycle-seconds', type=int, default=60)
-    # Size off the running balance rather than the starting bankroll.
-    #
-    # Measured on the promoted config over the out-of-sample span: return 1.319
-    # -> 2.497 with FRACTIONAL drawdown essentially unchanged (0.242 -> 0.244),
-    # because drawdown is a ratio and peak and trough scale together. Sharpe
-    # falls 3.72 -> 3.45, so the extra return is bought with proportionally more
-    # risk, and in dollars the same 24% is far more money.
-    #
-    # It does NOT affect how the edge is measured: `model_minus_market` is a
-    # log-loss comparison on predictions, `realised_edge_pp` is per contract,
-    # and daily return-on-cost is a ratio. All three are sizing-independent.
-    # What it costs is the equity curve's slope no longer being the per-trade
-    # edge.
-    #
-    # Explicit here beats the artifact's provenance — see `config_for_artifact`.
+    # Size off the running balance instead of the starting bankroll. Edge
+    # measures are per contract, so they do not depend on this. An explicit
+    # value beats the artifact's provenance (see `config_for_artifact`).
     parser.add_argument('--compound', action='store_true', default=None,
                         help='size off the running balance (default: off)')
     parser.add_argument('--bankroll', type=float, default=None,
@@ -222,11 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
                              'config and in `ps`, and reverting is deleting a '
                              'line. 1.0 or more effectively disables it, leaving '
                              'only the ruin floor.')
-    # **Diagnostic levers.** Both exist so a forced run is visible in the deploy
-    # config and in `ps`, and reverting it is deleting a line — the same reason
-    # `--max-daily-loss-fraction` is a flag rather than an edit to the default.
-    # Explicit here beats the artifact's provenance: `config_for_artifact` skips
-    # any field in `cli_overrides`.
+    # Diagnostic levers. A flag keeps a forced run visible in the deploy config.
+    # An explicit value beats the artifact's provenance: `config_for_artifact`
+    # skips any field in `cli_overrides`.
     parser.add_argument('--require-peer-book', dest='require_peer_book',
                         action='store_true', default=None,
                         help='refuse a decision whose cross-venue peer book is '
@@ -284,73 +224,39 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def current_window(now: datetime, config: Config) -> tuple[pd.Timestamp, int]:
-    """The window being decided, and how many minutes into it we are."""
+    """Return the window being decided and the whole minutes elapsed in it."""
     stamp = pd.Timestamp(now).tz_convert('UTC').floor(f'{config.window_minutes}min')
     elapsed = int((pd.Timestamp(now).tz_convert('UTC') - stamp).total_seconds() // 60)
     return stamp, elapsed
 
 
 def choose_offset(elapsed: int, config: Config) -> Optional[int]:
-    """The latest configured offset the clock has reached.
+    """Return the latest configured offset the clock has reached, or None.
 
-    Not the nearest: an offset in the future has not happened, and scoring at one
-    would read a bar that does not exist. Returns None before the first offset,
-    which is an abstention rather than an error.
+    Never a future offset, because its bar does not exist yet.
     """
     reached = [o for o in sorted(config.decision_offsets) if o <= elapsed]
     return reached[-1] if reached else None
 
 
-# Wake just AFTER the offset, not before it.
-#
-# The first version of this woke 12 seconds early, reasoning that the cycle needs
-# that long to fetch bars, reconcile and score before it reads the book. It made
-# the lag four times worse — 2.64 minutes against the 0.62 it was meant to fix.
-#
-# `choose_offset(elapsed)` returns the largest offset at or below `elapsed`. Waking
-# at 5.8 minutes therefore selects offset **3**, not 6, and scores the old offset
-# nearly three minutes late. The simulation that vetted the early wake checked
-# where the loop landed and never checked what `choose_offset` would do with it.
-#
-# One second past the boundary picks the intended offset, and the residual lag is
-# then just the in-cycle latency before the book is read. Driving that below ~15s
-# means reordering the cycle to fetch quotes first, which is a separate change.
+# Wake just after the offset, never before it: `choose_offset` picks the largest
+# offset at or below `elapsed`, so an early wake selects the previous offset.
 DECISION_LAG_SECONDS = 1.0
 
 
-# How far past an offset instant is still worth acting on immediately rather than
-# waiting for the next one. Wider than a cycle takes (~10s), narrower than the gap
-# between offsets (180s).
+# How far past an offset instant a missed target still fires at once. Wider
+# than one cycle, narrower than the gap between offsets.
 MISSED_TARGET_GRACE_SECONDS = 60.0
 
 
-# How close to an offset instant a cycle must be to make a decision at all.
-#
-# **This is a latency budget, not a convenience window, and 75 was catastrophic.**
-# Measured 2026-08-25 on the quote backfill: holding the signal at the offset it
-# was built for and moving only the quote, one minute of staleness costs
-# 0.025 nats at +3m and 0.074 nats at +12m, against a total model edge over the
-# market of 0.002-0.005. Break-even lag is ~3s on the strict reading and ~10s on
-# the generous one (price discovery near settlement is back-loaded, so linear
-# interpolation over two minutes overstates the first seconds).
-#
-# At 75 the tolerance was WIDER than the ordinary cadence (60s), so after the
-# scheduler fired on target the next routine cycle was still inside it and
-# decided the same offset a full minute late. Observed on window 07:00 offset
-# +3m: at +5s the model wanted ETH up at 0.81; at +76s it wanted ETH down at
-# 0.07, reading the market's own 12-point move as a *larger* edge (7.43pp against
-# 3.04pp). The on-time orders did not fill and the stale one did, which is the
-# same mechanism as the ~30% no-fill rate seen from the other side.
-#
-# 15s admits the on-target cycle (observed +5s to +6s, book read first) with
-# margin for a slow fetch, and refuses anything a cadence behind.
+# How close to an offset instant a cycle must be to decide. This is a latency
+# budget: a late decision reads the market's own move as edge. It must stay
+# below the 60s cadence, so the next routine cycle cannot decide the same
+# offset late.
 DECISION_TOLERANCE_SECONDS = 15.0
 
 
-# Refusals that mean something is wrong rather than that the gates are working.
-# A latched breaker, a breached bankroll floor, an unreadable book, or the model
-# disagreeing with the market by an implausible margin are all worth a line; the
-# ordinary "the edge was not there" outcomes are not.
+# Refusals that indicate a fault, not a gate doing its job. These log at INFO.
 LOUD_REFUSALS = frozenset({
     Reason.HALTED, Reason.BANKROLL_FLOOR, Reason.DISAGREEMENT_IMPLAUSIBLE,
     Reason.NO_QUOTE, Reason.PROBABILITY_INVALID, Reason.NOT_FINITE,
@@ -359,16 +265,7 @@ LOUD_REFUSALS = frozenset({
 
 
 def decision_log_level(decision: Decision) -> int:
-    """How loudly to report one decision. Every one is stored either way.
-
-    `offset_not_traded` alone fires three symbols x two non-entry offsets x four
-    windows an hour, forever, by design. Together with the other routine refusals
-    it was the largest single source of noise in the live log, and none of it
-    carries information a human needs — the cycle summary counts them.
-
-    Anything that spends money is always INFO, and so is any refusal that
-    indicates a fault rather than a gate doing its job.
-    """
+    """Return the log level for one decision: INFO if traded or a fault, else DEBUG."""
     if decision.traded:
         return logging.INFO
     if decision.reason in LOUD_REFUSALS:
@@ -377,13 +274,9 @@ def decision_log_level(decision: Decision) -> int:
 
 
 def heartbeat_due(window_open, last_window) -> bool:
-    """One line per window, so a quiet log still proves the loop is turning.
+    """Return whether a new window started, so one heartbeat line is due.
 
-    Removing the per-cycle noise left the loop emitting nothing at all in steady
-    state, which cannot be distinguished from a hang. The container healthcheck
-    only proves the process is alive and can reach the database — not that it is
-    still waking on the offsets and deciding. A restart emits one immediately,
-    because that is exactly when an operator is watching.
+    The line proves the loop still turns when the log is otherwise quiet.
     """
     return last_window is None or window_open != last_window
 
@@ -391,10 +284,9 @@ def heartbeat_due(window_open, last_window) -> bool:
 def heartbeat_summary(*, window_open, cycles: int, decisions: int, traded: int,
                       bankroll: float, lag_seconds: float,
                       peer: Optional[dict] = None) -> str:
-    """The things worth checking, on one line.
+    """Return the heartbeat line for one window.
 
-    `peer` is `take_peer_counts` for the window: how many peer books were used
-    of those read, and the refusals by reason.
+    `peer` is `take_peer_counts` for the window.
     """
     lag = f'{lag_seconds:.1f}s' if lag_seconds == lag_seconds else 'n/a'
     line = (f'window {window_open:%H:%M} closed: {cycles} cycles, '
@@ -412,24 +304,11 @@ def heartbeat_summary(*, window_open, cycles: int, decisions: int, traded: int,
 
 def decision_offset(elapsed: float, config: Config,
                     forced: Optional[int] = None) -> Optional[int]:
-    """The offset this cycle may decide at, or None to settle and reconcile only.
+    """Return the offset this cycle may decide at, or None to settle only.
 
-    **Decide AT an offset, not on every cycle that happens to be past one.**
-    `choose_offset` returns the largest offset at or below `elapsed`, so at 4, 5
-    and 6 minutes into a window it returns 3, 3, 6 — and every cycle in between
-    once produced a full decision and an order attempt. Measured: fourteen order
-    attempts in three minutes where there should have been two. The intermediate
-    cycles exist to settle and reconcile on a steady cadence; they were never
-    meant to trade.
-
-    The gate is `DECISION_TOLERANCE_SECONDS`, which is a measured latency budget
-    — see the constant. A cycle further from its offset than that has watched the
-    market move away from the signal it is holding, and the "edge" it computes is
-    that displacement rather than a forecast. It abstains.
-
-    An explicit `--offset` is a deliberate override — a backfill, a manual
-    decision, or a test — and is honoured whatever the clock says. Only the offset
-    the scheduler chose is subject to the tolerance.
+    A cycle decides only within `DECISION_TOLERANCE_SECONDS` of an offset.
+    Cycles between offsets only settle and reconcile. An explicit `--offset`
+    is always honoured.
     """
     if forced is not None:
         return forced
@@ -446,20 +325,11 @@ def decision_offset(elapsed: float, config: Config,
 
 
 def mark_decided(fired_targets: set, decisions: list) -> None:
-    """Record every (window, offset) a cycle actually decided.
+    """Add every (window, offset) a cycle decided to `fired_targets`.
 
-    **Two different things start a cycle, and only one of them was recording.**
-    The `--cycle-seconds` cadence lands wherever it lands; if that is inside
-    `DECISION_TOLERANCE_SECONDS` of an offset, the cycle decides and orders.
-    `seconds_until_next_decision` then fired the same offset again a moment
-    later, because its `already_fired` set only held targets the planner itself
-    had scheduled. Measured on the live account: seventeen of forty-two order
-    attempts were the venue refusing `order_already_exists` on a duplicate
-    `client_order_id`, always five seconds after the first attempt.
-
-    A refused decision counts as fired. The offset was evaluated, and re-running
-    it produces the identical deterministic `client_order_id` — so a retry
-    cannot reach the book, only the 409.
+    Both the cadence and the planner can start a decision, so the planner must
+    skip a target the cadence already decided. A refused decision counts as
+    fired: a retry reuses the same `client_order_id` and gets a 409.
     """
     for decision in decisions:
         window = decision.window_open
@@ -471,28 +341,18 @@ def mark_decided(fired_targets: set, decisions: list) -> None:
 def seconds_until_next_decision(config: Config, args, *,
                                 now: Optional[datetime] = None,
                                 already_fired: Optional[set] = None) -> float:
-    """Sleep until just before the next decision offset, not a fixed interval.
+    """Return the seconds to sleep until the next decision offset.
 
-    **The free-running timer was a measurement bias.** The loop slept
-    `--cycle-seconds` from wherever it happened to be, so a decision nominally at
-    +3m was taken whenever a cycle next landed in [3m, 4m). Measured over the
-    first two live days: +3.62m on average, up to +4.16m.
-
-    The features are built for the nominal offset while the price is read late, so
-    the market gets up to a minute of information the model does not have — and
-    one minute is worth ~0.027 nats, measured by shifting the offset, against a
-    total model edge of +0.002. The bias was comparable to the whole effect and
-    ran against us.
-
-    Waking at `window_open + offset + 1s` collapses it to the in-cycle latency.
-    Falls back to `--cycle-seconds` when no offset is ahead in this window, so
-    settlement and reconciliation still run on their old cadence.
+    Targets `window_open + offset + DECISION_LAG_SECONDS`, because features are
+    built for the nominal offset and a late book read gives the market extra
+    information. Never sleeps past `--cycle-seconds`, so settlement keeps its
+    cadence.
     """
     now = now or datetime.now(timezone.utc)
     window_open, _ = current_window(now, config)
     horizon = float(getattr(args, 'cycle_seconds', 60) or 60)
     if already_fired is not None:
-        # Keep only this window and the next; anything older cannot fire again.
+        # Keep only this window and the next; older targets cannot fire again.
         keep = {window_open, window_open + timedelta(minutes=config.window_minutes)}
         already_fired.intersection_update(
             {k for k in already_fired if k[0] in keep})
@@ -501,21 +361,10 @@ def seconds_until_next_decision(config: Config, args, *,
         for offset in config.decision_offsets:
             target = window + timedelta(minutes=offset) + timedelta(seconds=DECISION_LAG_SECONDS)
             delay = (target - now).total_seconds()
-            # **A target just behind us must fire NOW, not be skipped.**
-            #
-            # The sleep is computed after the cycle finishes, so a cycle that runs
-            # even slightly long ends up past the target it was aiming at. Dropping
-            # it then jumps to the NEXT offset, capped at the ordinary cadence — so
-            # a two-second overshoot at 02:03:01 became a decision at 02:04:10,
-            # labelled +3m and taken at +4.17m. Every offset was missed the same
-            # way, which is worse than the free-running timer this replaced.
-            # A target just behind us fires NOW rather than being skipped — but
-            # exactly ONCE. Without the `already_fired` guard this returns 0.5s,
-            # the cycle runs, the target is still inside the grace window, and it
-            # fires again: measured, fourteen order attempts in three minutes
-            # where there should have been one or two. `already_entered` does not
-            # save you, because a refused order books no position and is
-            # legitimately retryable.
+            # A target just behind us fires now, exactly once. A slow cycle can
+            # overshoot its target, and skipping it would decide late at the
+            # next offset. `already_fired` stops a second firing within the
+            # grace window.
             key = (window, offset)
             if -MISSED_TARGET_GRACE_SECONDS < delay <= 1.0:
                 if already_fired is None or key not in already_fired:
@@ -527,13 +376,13 @@ def seconds_until_next_decision(config: Config, args, *,
                 candidates.append(delay)
     if not candidates:
         return horizon
-    # Never sleep past the ordinary cadence: settlement and venue reconciliation
-    # are on the same cycle and should not wait for the next decision offset.
+    # Never sleep past the ordinary cadence, so settlement and reconciliation
+    # do not wait for the next offset.
     return float(min(min(candidates), horizon))
 
 
 def entry_cycle(offset: Optional[int], config: Config) -> bool:
-    """Whether this cycle may open a position, so the decision goes first."""
+    """Return whether this cycle may open a position."""
     if offset is None:
         return False
     entries = config.entry_offsets
@@ -547,23 +396,14 @@ def _write_predictions(writer: PgWriter, items: list) -> None:
 
 async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
-    """One cycle. On an ENTRY cycle the decision goes first and the
-    bookkeeping after the orders; on every other cycle the reverse.
+    """Run one cycle.
 
-    **What an entry cycle defers, and why it is safe.** Venue reconciliation
-    (four authenticated calls), `settle_due`, `settle_predictions`, the balance
-    adoption, minute prices and the equity point all read the past; none of it
-    changes what this decision should be. Positions settle at window
-    boundaries, and entries are at +12m, so every cycle since the boundary has
-    already settled and reconciled.
-
-    **Sizing uses the last-known bankroll**: the venue balance the previous
-    cycle adopted (at most a cycle old), less any stake debited since, which is
-    what `account.bankroll` holds. Only a deposit or withdrawal in the last
-    minute is unseen, and the ruin floor and breakers read the same figure. If
-    the venue has not answered a reconcile within `max_reconcile_age_seconds`
-    the cycle reconciles first, as before. The circuit breakers still run
-    before the decision — they read our settled positions, not the venue.
+    On an entry cycle the decision goes first and bookkeeping runs after the
+    orders. Bookkeeping reads only the past, and earlier cycles in the window
+    have already done it. Sizing uses `account.bankroll`, the venue balance
+    adopted last cycle. If no reconcile succeeded within
+    `max_reconcile_age_seconds`, the cycle reconciles first. Circuit breakers
+    always run before the decision.
     """
     state._RUNNING_CONFIG = config
     now = datetime.now(timezone.utc)
@@ -571,8 +411,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     offset = decision_offset(elapsed, config, forced=args.offset)
     settle_time = window_open + pd.Timedelta(minutes=config.window_minutes)
 
-    # Where the cycle spends its time, because the interval from reading the
-    # book to sending the order decides whether a fill happens.
+    # Time per phase. The interval from book read to order decides fills.
     phase: dict[str, float] = {}
     _mark = time.perf_counter()
 
@@ -590,9 +429,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                        'reconciling before deciding', config.max_reconcile_age_seconds)
         fast = False
 
-    # Bars, then the book: only the book's age is paid at the touch. On an
-    # entry cycle the newest minutes come from the trade stream where it can
-    # vouch for them, which takes the ~3s REST fetch off this path.
+    # Bars before the book, so only the book's age is paid at the touch. An
+    # entry cycle prefers the trade stream, which keeps REST off this path.
     bars = await (fetch_bars(config, prefer_stream=True) if fast
                   else fetch_bars(config))
     _phase('bars')
@@ -605,14 +443,13 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     halted = await _db(check_circuit_breakers, writer, config, now=now)
     if halted:
-        # The offset is deliberately NOT cleared: `decide()` refuses every row
-        # with `Reason.HALTED`, so quotes, scores and outcomes keep accruing for
-        # `market_benchmark` while no money moves.
+        # Keep the offset: `decide()` refuses every row with `Reason.HALTED`,
+        # and scores and quotes keep accruing for `market_benchmark`.
         logger.error('account halted (%s); scoring and recording continue, '
                      'no new entries', halted)
 
-    # Fresh AND complete. A short universe redefines every cross-asset feature
-    # rather than omitting one row, so the whole cycle abstains.
+    # Bars must be fresh and complete for every symbol. A short universe changes
+    # every cross-asset feature, so the whole cycle abstains.
     stale = dict(stale_symbols(bars, config, now=now))
     stale.update({sym: why for sym, why in short_symbols(bars, config).items()
                   if sym not in stale})
@@ -637,8 +474,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         await bookkeeping(args, config, writer, kalshi, bars, phase=_phase)
 
     if offset is None:
-        # Between decisions: keep this window's market metadata current (status,
-        # shard, floor_strike), so a decision never pays to resolve it.
+        # Between decisions, refresh market metadata (status, shard,
+        # floor_strike), so a decision never pays to resolve it.
         if kalshi is not None and elapsed >= 1:
             try:
                 await resolve_markets(kalshi, config.symbols, settle_time,
@@ -656,8 +493,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                          DECISION_TOLERANCE_SECONDS)
         return []
 
-    # **The book.** Stream cache where it can vouch for it, else one REST read
-    # per symbol, concurrently. Each quote is stamped at its own read.
+    # The book: the stream cache, else one REST read per symbol. Each quote is
+    # stamped at its own read.
     quotes: dict = {}
     if kalshi is not None:
         try:
@@ -682,8 +519,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             await _db(record_minute_prices, writer, bars)
         return []
 
-    # Everything `_attach_book_features` fills after this returns, declared so
-    # the unscoreable-feature warning does not fire for columns not yet filled.
+    # Columns `_attach_book_features` fills later, declared so `score_live`
+    # does not warn about them.
     from core.book_features import (
         CROSS_VENUE as _CV, IMPLIED_VOL as _IV,
         MARKET_PRICE as _MP, MARKET_STATE as _MS)
@@ -701,18 +538,16 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
     scored['exchange_index'] = [
         quotes[s][0].exchange_index if s in quotes else 0 for s in scored['symbol']]
-    # `Quote.mid` is None on a one-sided book, which is the honest answer.
+    # `Quote.mid` is None on a one-sided book.
     scored['market_mid'] = [
         quotes[s][0].mid if s in quotes else np.nan for s in scored['symbol']]
 
-    # The book features, from the same snapshot the order is priced against.
-    # Without these LightGBM substitutes learned defaults and the loop runs as
-    # a different model from the one whose gates were measured.
+    # Book features, from the snapshot the order is priced against.
     _attach_book_features(scored, quotes, _stream_cache(), config=config,
                           groups=model.groups or None)
     scored = prepare_init_score(scored, model)
     _phase('score')
-    # Liveness, at the point the cycle has demonstrably scored.
+    # Liveness, once the cycle has scored.
     heartbeat.touch('trade')
 
     _warn_unscoreable_features(scored, model,
@@ -720,12 +555,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     for column, values in model.score(scored).items():
         scored[column] = values
 
-    # The venue publishes the number it will settle against, as `floor_strike`,
-    # the moment the window opens. Prefer it over the one built from bars: ours is
-    # a one-minute OHLC mean standing in for sixty seconds of CF Benchmarks BRTI,
-    # and the difference is a basis we can simply not take when the real figure is
-    # on the wire. The bar-derived strike stays for the backtest, which has no
-    # market to ask.
+    # The venue publishes its settlement strike as `floor_strike` when the
+    # window opens. Record it; ours is a Coinbase proxy for BRTI.
     for index, row in scored.iterrows():
         quote = quotes.get(row['symbol'], (None, None))[0]
         if quote is None or quote.floor_strike is None:
@@ -739,29 +570,10 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                 'Ours is an OHLC mean of Coinbase bars; theirs is BRTI. Using '
                 'theirs, but a gap this wide suggests a stale bar feed.',
                 row['symbol'], ours, venue_strike, drift_bps)
-        # **RECORDED, never fed to the model.**
-        #
-        # This used to overwrite `strike` and `displacement` in the scored frame
-        # and then recompute exactly one of the ten features derived from them
-        # (`z_score`), leaving `abs_z_score`, the three excursion-z columns,
-        # `path_efficiency`, `displacement_vs_elapsed`, `touched_opposite` and
-        # `peer_displacement` on the bar-derived basis. `abs_z_score ==
-        # |z_score|` holds by construction in every training row, so the vector
-        # handed to `predict` occupied a state the booster has never seen — and
-        # a tree ensemble does not degrade gracefully outside its training
-        # manifold, it lands in whatever leaf the splits reach.
-        #
-        # It fired on every cycle and every symbol, and was invisible: the only
-        # warning triggers above 25bp while the Coinbase-vs-BRTI basis is of
-        # order 1bp, which at offset 12 moves `z_score` ~0.13 z while its
-        # siblings do not move at all.
-        #
-        # Recomputing all ten would fix the impossible state and not the skew:
-        # training's displacement is `Coinbase_close / Coinbase_OHLC_mean - 1`
-        # and the override makes it `Coinbase_close / BRTI - 1`, injecting the
-        # cross-index basis into a feature fitted without it. The venue strike
-        # is the right reference for SETTLEMENT — which is where `decide()` and
-        # `settle_due` use it — not for features.
+        # Record the venue strike; never feed it to the model. Training builds
+        # `strike`, `displacement` and the features derived from them from
+        # Coinbase bars, so the venue strike would put the BRTI basis into
+        # them. The venue strike is for settlement only.
         scored.loc[index, 'strike_source'] = 'venue'
         scored.loc[index, 'venue_strike'] = venue_strike
         scored.loc[index, 'venue_strike_drift_bps'] = drift_bps
@@ -770,7 +582,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         scored['strike_source'] = 'bars'
     scored['strike_source'] = scored['strike_source'].fillna('bars')
 
-    # Depth at the touch caps the stake: measured, unlike `max_stake_dollars`.
+    # Depth at the touch caps the stake.
     for index, row in scored.iterrows():
         quote = quotes.get(row['symbol'], (None, None))[0]
         if quote is None:
@@ -785,9 +597,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         raise RuntimeError('no account row; main() must call ensure_account first')
     bankroll = float(account.bankroll)
 
-    # Seed exposure from what is already committed for THIS window, so
-    # `ALREADY_ENTERED` / `POSITION_LIMIT` / `WINDOW_EXPOSURE` survive a new
-    # cycle, a new offset and a process restart.
+    # Seed exposure from what this window already holds, so the per-window
+    # limits survive a new cycle, a new offset and a restart.
     entered, staked, n_entered = await _db(
         writer.entries_for_window,
         window_open.to_pydatetime() if hasattr(window_open, 'to_pydatetime') else window_open)
@@ -801,8 +612,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     rows: dict[str, object] = {}
     pending: list[tuple[Decision, object]] = []
 
-    # Live prices from the book or not at all: without a quote `decide()` would
-    # fall back to our own baseline and could return TRADED.
+    # Live prices come from the book or not at all. Without a quote, `decide()`
+    # would price against our own baseline.
     require_quote = args.mode == 'live'
     # decide() compares this against `require_model_version`.
     scored['model_version'] = getattr(model, 'version', None)
@@ -822,13 +633,11 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
         rows[decision.symbol] = row
         logger.log(decision_log_level(decision), decision.describe())
         if decision.traded:
-            # Reserved before the order goes out: every order is in flight at
-            # once, so no later decision may assume an earlier one failed.
+            # Reserve exposure before sending: all orders are in flight at once.
             pending.append((decision, row))
             exposure = exposure.with_(decision)
 
-    # The instant the decisions were taken: what every quote's age is
-    # measured to, for the archive.
+    # The decision instant, which every archived quote age is measured to.
     decided_at = pd.Timestamp.now(tz='UTC')
     model_version = getattr(model, 'version', None)
 
@@ -844,9 +653,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             z_score=_finite(row.get('z_score')),
             baseline_probability=float(row['baseline_probability']),
             model_probability=float(row['model_probability']),
-            # The venue's belief (the mid) and what a trade would cost (both
-            # asks), on EVERY row, refused ones included: the sample that
-            # answers "does the model beat the market" must be unselected.
+            # The market mid and both asks on every row, refused ones too, so
+            # the market benchmark sample is unselected.
             market_probability=_finite(row.get('market_mid')),
             market_ask_up=_finite(row.get('ask_up')),
             market_ask_down=_finite(row.get('ask_down')),
@@ -858,10 +666,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             model_version=model_version,
         )
 
-    # **Every order at once.** One symbol's round trip, kill or resend no
-    # longer delays the next symbol's order. Each traded row's prediction is
-    # written first (in a thread, all in parallel) so its ticket and position
-    # carry the id of the prediction that produced them.
+    # Send every order at once. Each traded row's prediction is written first,
+    # so its ticket and position carry the prediction id.
     async def _one(index: int):
         decision, row = pending[index]
         others = base_exposure
@@ -907,8 +713,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     # ---- after the orders: everything that only records -------------------
     decisions = [finals.get(d.symbol, d) for d in decisions]
-    # Every row, the traded ones again: an upsert on (symbol, window, offset)
-    # that keeps their id and records a resend's final price.
+    # Write every row. Traded rows upsert on (symbol, window, offset), which
+    # keeps their id and records a resend's final price.
     records = [record_for(d) for d in decisions]
     try:
         await _db(_write_predictions, writer, records)
@@ -920,8 +726,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             diagnose_and_note(kalshi, writer, d, r, write_note=last)
             for d, r, last in kills), return_exceptions=True)
 
-    # The top of book we already have, written after the orders: it changes
-    # only WHEN the archive is written, never what it contains.
+    # Archive the book already read, after the orders.
     if os.getenv('RECORD_TOUCH', '1') == '1' and quotes:
         await _record_touch(scored, quotes, window_open, offset, config, kalshi,
                             decided_at=decided_at)
@@ -946,12 +751,10 @@ def _finite(value) -> Optional[float]:
 
 
 def config_from_args(args) -> Config:
-    """The run's configuration, with everything that changes an answer explicit.
+    """Build the run's configuration from the command line.
 
-    `entry_offsets` is applied here rather than defaulted in `Config` because
-    `scripts.evaluate` must keep measuring every offset — a narrowed library
-    default would make the sweep unable to price the very cells that justify the
-    narrowing.
+    `entry_offsets` is set here, not defaulted in `Config`, because
+    `scripts.evaluate` must keep measuring every offset.
     """
     config = DEFAULT_CONFIG.with_fee_assumptions(find_fee_config())
     overrides: dict = {}
@@ -962,9 +765,7 @@ def config_from_args(args) -> Config:
         overrides['entry_offsets'] = tuple(int(o) for o in entry)
     daily = getattr(args, 'max_daily_loss_fraction', None)
     if daily is not None:
-        # Deliberately not clamped. A wider bound than the default is the whole
-        # point of the flag, and a silent clamp would mean the loop ran with a
-        # limit nobody asked for — worse than an obviously large number.
+        # Not clamped: a silent clamp would run a limit nobody asked for.
         overrides['max_daily_loss_fraction'] = float(daily)
     peer = getattr(args, 'require_peer_book', None)
     if peer is not None:
@@ -974,9 +775,8 @@ def config_from_args(args) -> Config:
         overrides['require_model_version'] = str(pinned)
     gate = getattr(args, 'min_edge_pp', None)
     if gate is not None:
-        # Not clamped at zero on purpose. A negative gate is the documented way
-        # to force the order path open for a fill test, and a silent clamp would
-        # leave the operator watching a loop that quietly refused to trade.
+        # Not clamped at zero: a negative gate opens the order path for a fill
+        # test.
         overrides['min_edge_pp'] = float(gate)
     cap = getattr(args, 'max_stake_dollars', None)
     if cap is not None:
@@ -987,23 +787,8 @@ def config_from_args(args) -> Config:
     cap = getattr(args, 'max_positions_per_window', None)
     if cap is not None:
         overrides['max_positions_per_window'] = int(cap)
-    # **`--compound` was parsed and dropped on the floor.** Declared at the
-    # parser since 2026-09-02 and read nowhere: `config.compound` stayed False,
-    # so `decide()` sized off `starting_bankroll` and the running balance was
-    # ignored. Measured 2026-09-13 on a $550 account — a trade that should have
-    # been 9 contracts was 3, because the base in force was the fixed $200.
-    #
-    # `6b288fc9` is titled "Compound live, and let an explicit flag beat the
-    # artifact's provenance" and added `compound` to the adoption loop in
-    # `config_for_artifact`, which skips any field in `cli_overrides`. Nothing
-    # ever put it there, so the flag could never win and the artifact's
-    # provenance (False) always did. The provenance half was built; the flag
-    # half was not.
-    #
-    # Same shape as `--dry-run`, which was "declared and never read, so
-    # `--mode live --dry-run --place-orders` parsed cleanly and placed real
-    # orders". A flag has to be honoured or be a usage error; silently ignored
-    # is the one option that costs money.
+    # An explicit `--compound` must reach `cli_overrides`, or the artifact's
+    # provenance wins in `config_for_artifact`.
     compound = getattr(args, 'compound', None)
     if compound is not None:
         overrides['compound'] = bool(compound)
@@ -1011,13 +796,11 @@ def config_from_args(args) -> Config:
 
 
 async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
-    """The live loop. `argv` is explicit so `scripts.run_live` can compose it.
+    """Run the live loop. `argv` is explicit so `scripts.run_live` can compose it.
 
-    `gate` is a `TradingGate` when this runs alongside the recorders in one
-    process. The loop holds it across each cycle, so a recorder never starts
-    work while a decision is in flight — the decision is the only
-    latency-sensitive thing here, and a Parquet write on the event loop would
-    land directly on it.
+    `gate` is a `TradingGate` shared with the recorders in one process. The
+    loop holds it across each cycle, so no recorder starts work during a
+    decision.
     """
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -1031,13 +814,7 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
         raise SystemExit('--force needs --reason, and it is recorded on every row')
 
     if args.clear_halt:
-        # Handled before the model is loaded, so a halt can be cleared on a box
-        # with no artifact installed — otherwise recovering from a breaker would
-        # require promoting a model first, which is absurd.
-        #
-        # The breakers are deliberately sticky: one that resets itself at midnight
-        # is a speed bump rather than a breaker. But sticky with no way to clear it
-        # is a trap, and that is what this was until now.
+        # Handled before the model loads, so a halt clears without an artifact.
         if not args.reason:
             raise SystemExit(
                 '--clear-halt needs --reason. The breaker fired for a cause, and '
@@ -1062,18 +839,14 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
         return 0
 
     config = config_from_args(args)
-    # What the command line asked for, before any artifact's economics are
-    # adopted: a hot reload re-derives the trading config from this.
+    # The command-line config before artifact adoption. A hot reload
+    # re-derives the trading config from it.
     base_config = config
     artifact = Path(args.model) if args.model else Path(MODELS_ROOT) / LIVE_MODEL
     signature = artifact_signature(artifact)
 
-    # Load WITHOUT the config first. `verify(None)` still checks the things that
-    # are true of the artifact alone — that the booster's columns match the
-    # recorded feature list, and that the init source is one this can score —
-    # but cannot compare against a configuration that does not yet know which
-    # forecaster the artifact corrects. `config_for_artifact` settles that, and
-    # the full check runs below against the config live will actually use.
+    # Load without the config first: the init source is not known until
+    # `config_for_artifact` adopts it. The full `verify` runs after that.
     model = (load_live(config=None) if args.model is None
              else __import__('core.model', fromlist=['ForecastModel'])
              .ForecastModel.load(args.model, None))
@@ -1132,12 +905,10 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
 
     try:
         with writer.exclusive_trader_lock():
-            # (window_open, offset) pairs already acted on, so a target that was
-            # missed and fired late is not fired repeatedly for the whole grace
-            # window. Bounded: pruned to the current and next window.
+            # (window_open, offset) pairs already decided, so a late target
+            # fires once. Pruned to the current and next window.
             fired_targets: set = set()
-            # Per-window counters behind the heartbeat. Cheap, and the only proof
-            # a quiet log gives that the loop is still turning.
+            # Per-window counters for the heartbeat line.
             hb_window = None
             hb_cycles = hb_decisions = hb_traded = 0
             hb_lag = float('nan')
@@ -1152,9 +923,8 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                             bankroll=float(writer.account().bankroll),
                             lag_seconds=hb_lag,
                             peer=take_peer_counts(hb_window)))
-                        # The first cycle of a window: nothing is in flight and
-                        # the next decision is minutes away, so a newly
-                        # promoted artifact is picked up here, not by a restart.
+                        # Reload a newly promoted artifact at the first cycle of
+                        # a window, when nothing is in flight.
                         model, config, signature = await reload_if_changed(
                             args, base_config, artifact, model, config, signature)
                     hb_window = window_open
@@ -1170,18 +940,12 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                         decisions = await run_cycle(
                             args, config, writer, model, kalshi)
                 except DatasetError as exc:
-                    # One unscoreable cycle is not a reason to exit. This used to
-                    # be fatal: `score_live` raised on every cycle and the loop
-                    # caught only KeyboardInterrupt, so the process died and
-                    # `restart: unless-stopped` crash-looped it forever.
+                    # One unscoreable cycle skips that cycle; it does not exit.
                     logger.error('cycle skipped, nothing scored: %s', exc)
                     decisions = []
                 except Exception:                     # noqa: BLE001
-                    # Any other failure costs this cycle, not the next one.
-                    # Escaping to `supervise` meant a 5s-300s backoff and a
-                    # fresh startup, skipping decisions for nothing.
-                    # CancelledError and KeyboardInterrupt are not Exceptions
-                    # and still stop the loop.
+                    # Any other failure costs only this cycle. CancelledError
+                    # and KeyboardInterrupt still stop the loop.
                     logger.exception('cycle failed; continuing with the next')
                     decisions = []
                 if decisions:
@@ -1192,17 +956,16 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                                'cycle: %s', counts[counts > 0].to_dict())
                     hb_decisions += len(decisions)
                     hb_traded += sum(1 for d in decisions if d.traded)
-                    # How late this cycle read the book, against the offset it
-                    # was deciding. The last one in the window is representative.
+                    # Decision lag against the offset; the window's last value
+                    # is reported.
                     hb_lag = (datetime.now(timezone.utc) - (
                         decisions[0].window_open.to_pydatetime()
                         + timedelta(minutes=int(decisions[0].offset)))
                     ).total_seconds()
                 if not args.loop:
                     return 0
-                # Before sleeping, record what this cycle actually decided —
-                # otherwise the planner refires an offset the cadence already
-                # traded, and the venue refuses the duplicate order_id.
+                # Record what this cycle decided, so the planner does not refire
+                # it with a duplicate order id.
                 mark_decided(fired_targets, decisions)
                 await asyncio.sleep(seconds_until_next_decision(
                     config, args, already_fired=fired_targets))

@@ -1,8 +1,8 @@
-"""Turning a decision into an order: price it, send it, book what filled.
+"""Turn a decision into an order: price it, send it, book what filled.
 
 A position is booked only from what the venue says filled. A kill is diagnosed
-from the book and the venue's own order record, and a taker kill may be resent
-once against a fresh book.
+from the book and the venue's order record, and may be resent once against a
+fresh book.
 """
 
 from __future__ import annotations
@@ -33,11 +33,11 @@ async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row,
                         require_quote: bool, prediction_id: Optional[int] = None):
     """Send one entry, and resend once if an immediate_or_cancel took nothing.
 
-    The resend re-reads the touch and re-runs `decide()` on it with the SAME
-    model probability, against the window's exposure from every OTHER order
-    this cycle, so it can never exceed a limit the first attempt respected. It
-    goes out only while the kill is `kill_retry_window_seconds` fresh, only on
-    the same side, under `<key>-r1`. A partial fill is never topped up.
+    The resend re-runs `decide()` on a fresh touch with the same model
+    probability and the exposure of every other order this cycle, so it never
+    exceeds a limit the first attempt respected. It goes out only within
+    `kill_retry_window_seconds`, only on the same side, under `<key>-r1`. A
+    partial fill is never topped up.
 
     Returns `(final decision, final result, [(decision, killed result), ...])`.
     """
@@ -90,57 +90,34 @@ async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row,
 
 
 def order_limit_price(decision: Decision, *, config: Optional[Config] = None) -> float:
-    """The worst price still worth paying for this decision.
+    """Return the worst price still worth paying for this decision.
 
-    **Pay down to the gate, not to a fraction.** `min_edge_pp` is the threshold
-    that admitted this trade, so any fill leaving at least that much is one the
-    system has already said yes to — while no fill at all earns zero. Everything
-    above the gate is therefore spendable.
-
-    Crossing further costs little: the order is `immediate_or_cancel` with
-    `taker_at_cross`, so it fills against resting size from the touch outward
-    and stops. The limit bounds the worst fill; it does not set the price.
-
-    **The gate is the one in force** (`config`), not `DEFAULT_CONFIG`'s: a lower
-    default gate would spend more than the rule allows.
-
-    `max_slippage_cents` is a rail against a book so thin the order walks it
-    absurdly far.
+    Edge above the `min_edge_pp` gate in force is spendable, because any fill
+    that keeps the gate is already accepted. The order is `immediate_or_cancel`,
+    so the limit bounds the worst fill and does not set the price.
+    `max_slippage_cents` caps the allowance on a thin book.
     """
     config = config if config is not None else DEFAULT_CONFIG
     edge = decision.edge if np.isfinite(decision.edge) else 0.0
     spendable = max(0.0, edge - config.min_edge_pp / 100.0)
     allowance = min(spendable, config.max_slippage_cents / 100.0)
-    # Never below the price we must actually pay: a limit below the ask cannot
-    # fill.
-    # No grid snapping here. `place_order` puts the limit on the venue's grid,
-    # rounding the way that can still FILL (`ceil` for a bid, `floor` for an
-    # ask); snapping down first would turn a sub-cent allowance into zero. The
-    # bound that matters is the gate in `decide()`, which a fill one tick above
-    # `max_price` still clears by `min_edge_pp - 1c`.
+    # Never below the price we must pay: a limit below the ask cannot fill.
+    # No grid snapping here. `place_order` rounds onto the venue grid in the
+    # direction that can still fill (`ceil` for a bid, `floor` for an ask).
+    # Snapping down here would turn a sub-cent allowance into zero.
     return float(max(min(0.99, decision.price + allowance), decision.price))
 
 
 def kill_diagnosis(*, side: str, sent_yes_price: float, book: dict) -> dict:
-    """Name which of the three things a non-fill was.
+    """Classify a non-fill from the book at the kill.
 
-    A miss cannot be attributed without the book as it stood at the kill, and
-    with it there are only three possibilities:
+    The three cases are: the limit never crossed (a price error), it crossed
+    with nothing resting (a size race), or it crossed with size resting (the
+    order is malformed).
 
-      * our limit never crossed         -> a price error, ours
-      * it crossed and nothing rested   -> a size race, the venue's
-      * it crossed with size resting    -> the order itself is malformed
-
-    Everything here is **YES-denominated**, because the venue's book is two BID
-    stacks and every previous confusion in this area came from mixing
-    denominations. `sent_yes_price` is the price actually on the wire — what
-    `place_order` puts in the body, and what the venue echoes back as
-    `yes_price_dollars`.
-
-    `side='up'` sends a YES **bid**, which fills at or ABOVE the YES ask, and
-    crosses the NO stack. `side='down'` sends a YES **ask**, which fills at or
-    BELOW the YES bid, and crosses the YES stack. Getting that comparison
-    backwards is the inverted-comparison bug, so both directions are asserted.
+    All prices are YES-denominated. `sent_yes_price` is the price on the wire.
+    `side='up'` sends a YES bid, which must be at or above the YES ask.
+    `side='down'` sends a YES ask, which must be at or below the YES bid.
     """
     up = str(side) == 'up'
     need = float(book.get('yes_ask', float('nan')) if up
@@ -172,11 +149,10 @@ def kill_diagnosis(*, side: str, sent_yes_price: float, book: dict) -> dict:
 
 
 def sent_yes_price(order: dict, decision, limit: float) -> float:
-    """The YES price that actually went on the wire.
+    """Return the YES price that went on the wire.
 
-    The venue echoes it as `yes_price_dollars`, which beats recomputing: it is
-    what the venue read, after `place_order`'s rounding onto the tick grid. The
-    fallback reproduces that conversion — a DOWN order sends `1 - limit`.
+    Prefers the venue's echo `yes_price_dollars`, which includes the tick
+    rounding. The fallback sends `1 - limit` for a DOWN order.
     """
     raw = order.get('yes_price_dollars') if isinstance(order, dict) else None
     try:
@@ -188,14 +164,9 @@ def sent_yes_price(order: dict, decision, limit: float) -> float:
 
 
 async def diagnose_kill(kalshi, decision, order: dict, limit: float) -> str:
-    """Read the book and the venue's own order record, right after a kill.
+    """Read the book and the venue's order record right after a kill.
 
-    Both are readable in the second after the kill; the POST reply's shape is
-    not the GET order record's, and the recorded ladder is sampled too far from
-    the order to attribute a miss.
-
-    Never raises. A diagnosis that breaks the loop is worse than no diagnosis,
-    and it runs inside the path that has just failed to buy something.
+    Never raises, because it runs inside the order path.
     """
     bits: list[str] = []
     price = sent_yes_price(order, decision, limit)
@@ -209,10 +180,8 @@ async def diagnose_kill(kalshi, decision, order: dict, limit: float) -> str:
         bits.append(f'orderbook read failed: {type(exc).__name__}: {exc}')
     try:
         oid = str(order.get('order_id') or '')
-        # Filtered by TICKER, so the read is exact (a market holds at most a
-        # handful of our orders). The listing can race the POST and miss the
-        # order; no retry or sleep, because the POST reply already carries the
-        # counts and this is corroboration, not worth stalling the loop for.
+        # Filter by ticker so the read is exact. The listing can race the POST
+        # and miss the order. No retry: this is corroboration only.
         candidates = await kalshi.orders(ticker=decision.market_ticker)
         record = next((o for o in candidates
                        if str(o.get('order_id')) == oid), None)
@@ -232,21 +201,17 @@ async def diagnose_kill(kalshi, decision, order: dict, limit: float) -> str:
 
 
 def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
-    """Contracts actually filled, and at what price, from the venue's reply.
+    """Return contracts filled and the YES-denominated price from the venue reply.
 
-    Never `count`, which is the size REQUESTED: a killed order, a partial fill
-    and an HTTP 200 with an empty body must not book a full fill.
-
-    Returns `(0, nan)` for anything that is not a confirmed fill. Assuming a fill
-    is the one error here that cannot be reconciled later: the position is
-    invented, `settle_due` settles it, and the PnL is fiction.
+    Never reads `count`, which is the requested size. Returns `(0, nan)` for
+    anything that is not a confirmed fill, because an assumed fill invents a
+    position that later settles.
     """
     status = str(order.get('status', '') or '').strip().lower()
     dead = status in ('canceled', 'cancelled', 'killed', 'rejected', 'expired')
 
-    # Counts arrive as fixed-point decimal strings ("10.00"), which `int(str)`
-    # rejects, so parse as float. Float also because the venue fills
-    # fractionally (one order came back 0.43 + 0.57).
+    # Counts arrive as fixed-point decimal strings ("10.00") and can be
+    # fractional, so parse as float.
     def count(value) -> Optional[float]:
         try:
             return float(value)
@@ -254,7 +219,7 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
             return None
 
     # `fill_count_fp` first: it is the only count a V2 order carries. Under
-    # `immediate_or_cancel` a partial fill is `status='canceled'` with a
+    # `immediate_or_cancel` a partial fill has `status='canceled'` and a
     # non-zero fill count, so status alone cannot decide.
     filled = None
     for key in ('fill_count_fp', 'taker_fill_count', 'filled_count', 'fill_count'):
@@ -264,9 +229,8 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
                 return 0, float('nan')
             break
 
-    # Never infer a fill from `remaining` on a dead order: remaining reaches zero
-    # when the order leaves the book, not only when it trades. It only means
-    # anything while the order is live.
+    # Never infer a fill from `remaining` on a dead order: it reaches zero when
+    # the order leaves the book, traded or not.
     if filled is None and not dead:
         for key in ('remaining_count_fp', 'remaining_count'):
             if order.get(key) is not None:
@@ -277,9 +241,8 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
                 break
 
     if filled is None:
-        # No count at all. Only 'executed'/'filled' justifies believing the whole
-        # order traded; anything else (including an empty body) is unknown, and
-        # unknown must not become a position.
+        # No count at all. Only 'executed' or 'filled' means the whole order
+        # traded. Anything else is unknown and must not become a position.
         if status in ('executed', 'filled'):
             filled = float(requested)
         else:
@@ -289,19 +252,16 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
     if filled <= 0:
         return 0, float('nan')
 
-    # The price actually paid: `taker_fill_cost_dollars` is the money that left
-    # the account, so cost / count is the true average fill, including any
-    # improvement on the limit.
+    # The price paid: fill cost / count is the true average fill, including
+    # any improvement on the limit.
     price = float('nan')
     for key in ('taker_fill_cost_dollars', 'maker_fill_cost_dollars',
                 'fill_cost_dollars'):
         cost = count(order.get(key))
         if cost is not None and cost > 0:
             paid = cost / float(filled)
-            # That cost is denominated in the side actually BOUGHT, while this
-            # function's contract is YES-denominated (the caller inverts for
-            # DOWN). A NO buy at 7c has `taker_fill_cost_dollars=0.07`; returning
-            # it unchanged would have the caller invert it and book 93c.
+            # The cost is in the side bought; this function returns YES terms
+            # and the caller inverts for DOWN. So a NO cost is inverted here.
             outcome = str(order.get('outcome_side', '') or '').strip().lower()
             price = (1.0 - paid) if outcome == 'no' else paid
             break
@@ -316,8 +276,8 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
             value = count(raw)
             if value is None:
                 continue
-            # Integer-cent fields on the same keys as dollar ones; the venue serves
-            # both shapes. Above 1.0 it can only be cents.
+            # The venue serves both dollar and integer-cent values on these
+            # keys. Above 1.0 it can only be cents.
             price = value / 100.0 if value > 1.0 else value
             if key == 'no_price':
                 price = 1.0 - price
@@ -326,7 +286,7 @@ def filled_from_order(order: dict, requested: int) -> tuple[int, float]:
 
 
 class OrderResult(NamedTuple):
-    """What one order attempt did, for the caller to act on after the fact."""
+    """The outcome of one order attempt."""
 
     booked: bool
     # 'filled', 'partial', 'killed', 'refused', 'unknown', 'stale', 'unresolved',
@@ -341,7 +301,7 @@ class OrderResult(NamedTuple):
 
 
 def client_order_id_for(decision: Decision, attempt: int = 0) -> str:
-    """One key per (symbol, window, offset); a re-priced resend adds `-r<n>`."""
+    """Return one key per (symbol, window, offset); a resend adds `-r<n>`."""
     key = (f'{decision.symbol}-{decision.window_open:%Y%m%d%H%M}'
            f'-{decision.offset:02d}')
     return key if attempt <= 0 else f'{key}-r{attempt}'
@@ -349,11 +309,10 @@ def client_order_id_for(decision: Decision, attempt: int = 0) -> str:
 
 async def lookup_after_ambiguity(kalshi, client_order_id: str, ticker: Optional[str],
                                  *, attempts: int = 2, pause: float = 1.0):
-    """The venue's record of an order whose POST we never saw answered.
+    """Return the venue's record of an order whose POST got no answer.
 
-    Returns `(found, record)`: `found` False means the lookup itself failed and
-    nothing is known. A listing that does not show the order is asked twice,
-    because the order may simply not be listed yet.
+    Returns `(found, record)`. `found` is False when the lookup itself failed.
+    Asks twice, because the order may not be listed yet.
     """
     finder = getattr(kalshi, 'order_by_client_id', None)
     if finder is None:
@@ -380,23 +339,18 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                          attempt: int = 0,
                          note: Optional[str] = None,
                          prediction_id: Optional[int] = None) -> OrderResult:
-    """Record the ticket, place the order when asked to twice, book the fill.
+    """Record the ticket, place the order if both flags allow, and book the fill.
 
-    **A position is written only when money actually moved.** An unresolved
-    market or a dry run books nothing, so `settle_due` cannot settle a holding
-    the venue never heard of.
+    A position is written only when money moved; an unresolved market or a dry
+    run books nothing. `quote_time` is when the book was read; None skips the
+    staleness check.
 
-    **`quote_time` is when the book was read**, checked against
-    `max_quote_age_seconds`. None makes no staleness claim.
+    The ticket is written before the POST, because `entries_for_window` counts
+    it: a crash between sending and booking must still block the window.
 
-    The ticket write happens BEFORE the POST, per order, because it is what
-    `entries_for_window` counts: a crash between sending and booking must still
-    block the window. It runs in a thread so the other orders keep moving.
-
-    A POST that times out, or that the venue answers with a 5xx, may have been
-    accepted. The order is looked up by `client_order_id` and booked from the
-    venue's own record — filled, partial or nothing. Only if that lookup fails
-    is the ticket left `unknown`, which still blocks the window.
+    A POST that times out or gets a 5xx may have been accepted. The order is
+    then looked up by `client_order_id` and booked from the venue's record. If
+    that lookup fails, the ticket stays `unknown`, which still blocks the window.
     """
     placing = bool(args.place_orders) and kalshi is not None and not args.dry_run
     limit = order_limit_price(decision, config=config)
@@ -435,15 +389,15 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         settle_time=decision.settle_time, offset_minutes=decision.offset,
         market_ticker=decision.market_ticker, side=decision.side.value,
         contracts=decision.contracts, limit_price=decision.price,
-        # The worst price still worth paying: down to the gate, never past it.
+        # The worst price still worth paying.
         max_price=limit,
         expected_cost=decision.stake, model_probability=decision.model_probability,
         edge=decision.edge, prediction_id=prediction_id,
     )
     if attempt > 0 or note:
-        # `write_ticket` is one row per (symbol, window): a resend reuses the
-        # killed ticket, which must stop reading as dead before the POST so a
-        # crash mid-flight still blocks the window.
+        # `write_ticket` is one row per (symbol, window). A resend reuses the
+        # killed ticket and marks it live before the POST, so a crash still
+        # blocks the window.
         await _db(writer.resolve_ticket, ticket_id, status='new',
                   note=(note or f'resend {attempt}')[:400])
 
@@ -452,14 +406,14 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
     venue_fill_price: Optional[float] = None
     order: Optional[dict] = None
     answered_at: Optional[float] = None
-    # The market's own exchange, not the order body's default of 0: a mismatch
-    # returns `404 market_not_found`, which names the market, not the mismatch.
+    # Use the market's own exchange index. A mismatch returns
+    # `404 market_not_found`.
     exchange_index = int(getattr(row, 'get', lambda *_: 0)('exchange_index', 0) or 0)
     key = client_order_id_for(decision, attempt)
     if placing:
         try:
-            # The offset is in this key, so a kill at one offset does not
-            # lock every later offset of the window out with a 409.
+            # The key carries the offset, so a kill at one offset does not
+            # block later offsets with a 409.
             order = await kalshi.place_order(
                 ticker=decision.market_ticker, side=decision.side.value,
                 exchange_index=exchange_index,
@@ -474,7 +428,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                           note=str(exc)[:400])
                 logger.error('order refused, no position recorded: %s', exc)
                 return OrderResult(False, 'refused', ticket_id=ticket_id, limit=limit)
-            # The request may well have reached the venue. Ask it, by our key.
+            # The request may have reached the venue. Ask it, by our key.
             found, record = await lookup_after_ambiguity(
                 kalshi, key, decision.market_ticker)
             if not found:
@@ -506,8 +460,8 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
             return OrderResult(False, 'refused', ticket_id=ticket_id, limit=limit)
 
         filled, fill_price = filled_from_order(order, decision.contracts)
-        # V2 quotes everything from the YES side, so a DOWN fill comes back as
-        # the price we SOLD yes at; what we paid for the NO contract is 1 - that.
+        # V2 quotes from the YES side. A DOWN fill is the YES sale price, so
+        # the NO price paid is 1 minus it.
         if np.isfinite(fill_price) and decision.side is not Side.UP:
             fill_price = 1.0 - fill_price
         if filled <= 0:
@@ -542,9 +496,8 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                     ticket_id)
         return OrderResult(False, 'dry_run', ticket_id=ticket_id, limit=limit)
 
-    # **Book the fill, not the intention.** Outlay and fee come from the price
-    # the venue reports when it reports one; otherwise pro-rated from the
-    # decision, which in paper mode already carries the half-spread.
+    # Book the fill, not the intention. Outlay and fee use the venue's fill
+    # price when known; otherwise they pro-rate the decision.
     ratio = (filled / decision.contracts) if decision.contracts else 0.0
     if filled and venue_fill_price is not None:
         fee = float(trade_fee(filled, venue_fill_price, config))
@@ -562,8 +515,8 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         baseline_probability=decision.baseline_probability, edge=decision.edge,
         prediction_id=prediction_id,
     )
-    # Relative, in one statement: a read-then-write across two transactions loses
-    # one of two overlapping debits, and nothing enforces a single writer.
+    # Adjust relatively, in one statement. A read-then-write can lose one of
+    # two overlapping debits.
     await _db(writer.adjust_account, bankroll_delta=-outlay, fees_delta=fee)
     status = 'paper' if not placing else (
         'filled' if filled >= decision.contracts else 'partial')
@@ -575,10 +528,9 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                  config: Config = DEFAULT_CONFIG,
                  quote_time: Optional[pd.Timestamp] = None,
                  prediction_id: Optional[int] = None) -> bool:
-    """`place_and_book` for one decision, diagnosing a kill straight away.
+    """Run `place_and_book` for one decision and diagnose a kill at once.
 
-    Returns whether a position was booked. The cycle itself calls
-    `place_and_book` for every order at once and diagnoses afterwards.
+    Returns whether a position was booked.
     """
     result = await place_and_book(args, writer, kalshi, decision, row,
                                   config=config, quote_time=quote_time,
@@ -590,10 +542,9 @@ async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
 
 async def diagnose_and_note(kalshi, writer: PgWriter, decision: Decision,
                             result: OrderResult, *, write_note: bool = True) -> None:
-    """Read the book and the venue's record for a kill, and keep it on the ticket.
+    """Diagnose a kill and write the result on the ticket.
 
-    `write_note=False` when a resend has since changed the ticket: the
-    diagnosis is logged and the ticket's newer status is left alone.
+    Pass `write_note=False` when a resend has changed the ticket since.
     """
     try:
         diagnosis = await diagnose_kill(kalshi, decision, result.order or {},
