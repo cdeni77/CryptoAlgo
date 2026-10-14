@@ -186,10 +186,9 @@ export function Loading({ what }: { what: string }) {
 }
 
 export function Failed({ error, what }: { error: Error; what: string }) {
-  const auth = 'isAuthProblem' in error && (error as { isAuthProblem: boolean }).isAuthProblem;
   return (
     <div className="border border-fail/40 bg-below-wash px-4 py-3">
-      <div className="eyebrow text-fail">{auth ? 'not authorised' : 'request failed'}</div>
+      <div className="eyebrow text-fail">request failed</div>
       <p className="mt-1 text-tiny text-ink">
         Could not load {what}. {error.message}
       </p>

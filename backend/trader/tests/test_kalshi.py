@@ -325,32 +325,6 @@ def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
     )
 
 
-def test_the_preflight_is_launchable_from_the_dashboard():
-    """It is read-only, so the job allow-list should include it."""
-    import sys
-    from pathlib import Path
-
-    api_root = Path(__file__).resolve().parents[2] / 'api'
-    if not api_root.exists():
-        pytest.skip('API package not present')
-    sys.path.insert(0, str(api_root))
-    try:
-        for name in list(sys.modules):
-            if name.startswith(('endpoints', 'security')):
-                del sys.modules[name]
-        from endpoints.jobs import JOBS
-
-        assert 'scripts.check_venue' in JOBS
-        # And the live loop is deliberately NOT launchable from a web request:
-        # two copies racing over one account.
-        assert 'scripts.live' not in JOBS
-    finally:
-        sys.path.remove(str(api_root))
-        for name in list(sys.modules):
-            if name.startswith(('endpoints', 'security')):
-                del sys.modules[name]
-
-
 def test_the_series_are_the_fifteen_minute_ones():
     """`KXBTCD` is the hourly series, and pointing at it abstains on every window.
 

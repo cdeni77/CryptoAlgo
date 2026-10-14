@@ -34,21 +34,10 @@ services:
       context: ./backend/api
       dockerfile: Dockerfile
     ports:
-      # Loopback only: the API serves a local dashboard and has one endpoint
-      # that starts a process.
+      # Loopback only: the API serves a local dashboard.
       - "127.0.0.1:8000:8000"
     environment:
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
-      - COINBASE_API_KEY=${COINBASE_API_KEY:-}
-      - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}
-      - TRADER_DIR=/trader
-      # No quotes around the default: `json.loads("'[]'")` raises, and the
-      # exception is swallowed, so a quoted default was indistinguishable from
-      # "not configured" — as would be a typo in a real wallet list.
-      # Shared secret for POST /research/launch, which starts a process in a
-      # container holding the exchange keys. Unset means that route returns 503
-      # — it fails closed rather than running unauthenticated.
-      - API_TOKEN=${API_TOKEN:-}
       # Comma-separated. `*` is filtered out: it made every other entry
       # decorative and let any open page call the API with credentials.
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
@@ -57,7 +46,6 @@ services:
         condition: service_healthy
     volumes:
       - ./backend/api:/app
-      - ./backend/trader:/trader
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 
   # ===========================================================================
@@ -74,7 +62,6 @@ services:
         # Default to the relative path nginx already proxies to the backend,
         # which makes the bundle host-agnostic.
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
-        VITE_API_TOKEN: ${API_TOKEN:-}
     ports:
       - "127.0.0.1:3000:80"
     depends_on:
@@ -82,8 +69,8 @@ services:
     # No runtime environment. Vite inlines `import.meta.env.VITE_*` at BUILD
     # time, so values set here on an nginx image serving a finished bundle are
     # silently ignored — what actually got baked in was the committed
-    # `frontend/.env`, which is why every deployment pointed at localhost:8000
-    # and the API token was always absent. They are `build.args` above now.
+    # `frontend/.env`, which is why every deployment pointed at localhost:8000.
+    # It is a `build.args` entry above now.
     # The default `/api` is a relative path that `nginx.conf` already proxies to
     # the backend, so the bundle no longer hardcodes a host at all.
     # `frontend/.env` still applies to `npm run dev`.

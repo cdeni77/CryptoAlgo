@@ -218,16 +218,11 @@ def test_every_dependency_is_pinned(relative):
 
 
 def test_the_two_requirement_files_agree_on_shared_packages():
-    """The API container runs trader scripts.
+    """Every package both containers pin must be pinned to one version.
 
-    `POST /jobs/{module}` executes `python -m scripts.<module>` with the API
-    container's interpreter, so `joblib`, `lightgbm`, `scikit-learn`, `numpy` and
-    `pandas` are load-bearing on both sides: an artifact written under one version
-    and read under another either fails to load or, worse, loads and scores
-    differently. `sqlalchemy` matters for a second reason — `backend/api/models/
-    serving.py` is a hand-maintained mirror of `core/pg_writer.py`, and two ORM
-    versions is a way for that mirror to drift while `test_orm_parity.py` still
-    passes.
+    `sqlalchemy` is the one that matters most: `backend/api/models/serving.py` is
+    a hand-maintained mirror of `core/pg_writer.py`, and two ORM versions is a way
+    for that mirror to drift while `test_orm_parity.py` still passes.
     """
     trader, api = (_pins(REPO / relative) for relative in REQUIREMENTS)
     shared = sorted(set(trader) & set(api))

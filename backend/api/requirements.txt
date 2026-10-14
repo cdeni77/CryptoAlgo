@@ -1,16 +1,9 @@
-# Crypto Trading System — read-only API and job launcher. Python 3.12+.
+# Crypto Trading System — read-only API. Python 3.12+.
 #
 # EXACT PINS, and the shared entries must match backend/trader/requirements.txt
 # exactly.
 #
-# This container runs trader scripts: `POST /jobs/{module}` executes
-# `python -m scripts.<module>` with THIS interpreter. So `joblib`, `lightgbm`,
-# `scikit-learn`, `numpy` and `pandas` are not incidental here — a model artifact
-# written under one version and read under another either fails to load or, worse,
-# loads and scores differently. They were floating or unconstrained on both sides,
-# which made that divergence a matter of which day each image was built.
-#
-# `sqlalchemy` was also pinned to a *different* version here (2.0.35) than the
+# `sqlalchemy` was pinned to a *different* version here (2.0.35) than the
 # trader floated to, while `backend/api/models/serving.py` is a hand-maintained
 # mirror of `core/pg_writer.py` and `tests/test_orm_parity.py` compares the two
 # column by column. Two ORM versions is a way for that mirror to drift.
@@ -24,19 +17,6 @@ python-dotenv==1.2.2
 # ---- serving store (must match the trader) ----------------------------------
 sqlalchemy==2.0.43
 psycopg2-binary==2.9.11
-
-# ---- shared with the trader, because this container runs its scripts ---------
-numpy==2.3.5
-pandas==3.0.0
-pyarrow==25.0.1
-duckdb==1.5.5
-scipy==1.17.0
-scikit-learn==1.8.0
-lightgbm==4.6.0
-joblib==1.5.3
-aiohttp==3.13.3
-coinbase-advanced-py==1.8.2
-redis==5.2.1
 
 # ---- tests ------------------------------------------------------------------
 # httpx backs fastapi.testclient.
