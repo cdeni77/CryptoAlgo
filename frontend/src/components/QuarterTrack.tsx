@@ -1,15 +1,7 @@
 /** The fifteen-minute band: what has happened, what is left, and when it settles.
  *
- * This is the app's primary structural device, and it is information rather than
- * ornament. A Kalshi crypto up/down market opens on a quarter-hour boundary and
- * settles on the next one, so *how much of the window is already gone* is half
- * of what determines the probability — the other half being volatility. A number
- * ("9 of 15 minutes") states that; a band shows it, and shows where the four
- * decision offsets sit relative to it, which a number cannot.
- *
- * Elapsed minutes are filled. The decision offsets carry a taller tick. The
- * current position is a firm rule. Remaining minutes are empty, and their count
- * is the thing the barrier divides by.
+ * Elapsed minutes are filled, decision offsets carry a tick, the current minute
+ * is outlined, and remaining minutes are empty.
  */
 interface QuarterTrackProps {
   windowMinutes: number;

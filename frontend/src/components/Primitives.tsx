@@ -1,8 +1,4 @@
-/** The small pieces: panels, section headers, numbers, states, tables.
- *
- * Collected in one file because each is a dozen lines and splitting them across
- * eight modules makes the design system harder to read than the components are.
- */
+/** The small pieces: panels, section headers, numbers, states, tables. */
 import type { ReactNode } from 'react';
 import type { Measured } from '../types';
 import { formatNumber } from '../lib/format';
@@ -23,8 +19,8 @@ export function Panel({
   );
 }
 
-/** A section header. The eyebrow carries a count or a span — real information —
- *  and the note carries the one sentence that says how to read what follows. */
+/** A section header. The eyebrow carries a count or a span; the note says how
+ *  to read what follows. */
 export function SectionHead({
   eyebrow,
   title,
@@ -52,10 +48,8 @@ export function SectionHead({
 
 /** A number with its label and unit, tabular, with an explicit missing state.
  *
- * `Measured<number>` from the API distinguishes "not measured, and here is why"
- * from zero. Rendering an em-dash with the reason in the tooltip is the whole
- * reason that distinction exists — the previous surface substituted plausible
- * numbers for absent ones and they rendered identically to real data.
+ * A missing `Measured<number>` renders as an em-dash with the reason in the
+ * tooltip, never as zero.
  */
 export function Metric({
   label,
@@ -70,10 +64,8 @@ export function Metric({
   value: number | null | Measured<number>;
   unit?: string;
   digits?: number;
-  // `warn` is for a number that is neither good nor bad but wants looking at:
-  // a reconciliation gap against the venue is the case it was added for. It
-  // borrows the gate palette rather than the directional one, because a drift of
-  // -$0.40 is not "price down".
+  // `warn` marks a number that needs a look, such as a reconciliation gap. It
+  // uses the gate palette, not the directional one: a drift is not "price down".
   tone?: 'ink' | 'above' | 'below' | 'accent' | 'muted' | 'warn';
   hint?: string;
   size?: 'base' | 'lg' | 'xl';
@@ -114,9 +106,8 @@ export function Metric({
 
 /* ------------------------------------------------------------------- states */
 
-/** A state chip. A 2px square of colour and a word — not a rounded pill, and
- *  never a gradient. Gate semantics use their own colours so "failed" cannot be
- *  mistaken for "price down". */
+/** A state chip: a square of colour and a word. Gate states use their own
+ *  colours, so "failed" never reads as "price down". */
 export function Chip({
   tone,
   children,
@@ -162,8 +153,7 @@ export function SideChip({ side }: { side: 'up' | 'down' | null }) {
 
 /* -------------------------------------------------------------------- empty */
 
-/** What to show when there is nothing yet, with the command that fixes it.
- *  A blank panel says "broken"; a blank panel with the next step says "waiting". */
+/** What to show when there is nothing yet, with the command that fixes it. */
 export function Empty({ what, next }: { what: string; next?: string }) {
   return (
     <div className="border border-dashed border-rule px-4 py-8 text-center">
@@ -217,9 +207,7 @@ export function DataTable<T>({
   rows: T[];
   keyOf: (row: T, index: number) => string;
   empty?: ReactNode;
-  /** Rows rendered. An uncapped table of a few hundred settlements produces a
-   *  page fourteen thousand pixels tall, which is not a table anyone reads —
-   *  and the count of what is hidden is itself information, so it is stated. */
+  /** Rows rendered. The count of hidden rows is shown below the table. */
   maxRows?: number;
 }) {
   if (rows.length === 0) return <>{empty ?? <Empty what="Nothing recorded yet." />}</>;

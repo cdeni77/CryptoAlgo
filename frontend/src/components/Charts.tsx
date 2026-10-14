@@ -1,9 +1,7 @@
-/** The three charts, and what each is for.
+/** The dashboard charts, in Recharts.
  *
- * Recharts, styled down hard: no gradients, no drop shadows, no rounded bars, no
- * animated entrances. A faint grid, hairline axes, and an emphasised endpoint
- * where one carries meaning. The colour rules from the palette hold — the two
- * poles are the only directional colours and the accent is never one of them.
+ * Plain styling: no gradients, shadows, rounded bars or animation. The two
+ * poles are the only directional colours; the accent is never one of them.
  */
 import {
   Area,
@@ -51,32 +49,11 @@ const TOOLTIP = {
 
 /* ----------------------------------------------------------- venue account */
 
-/** The account chart, drawn from the venue's ledger. Two series, two questions.
+/** The account chart: cumulative realised P&L from the venue's ledger.
  *
- *  **Realised P&L** steps once per settled market and is the answer to "how is
- *  the portfolio doing". It is built from settlement P&L rather than from balance
- *  differences, and that is the load-bearing choice: nothing in the ledger
- *  distinguishes a deposit from a profit, so a balance-difference curve reports
- *  the first deposit as the best day the strategy ever had.
- *
- *  **Balance** is the venue's cash, sampled every live cycle. It is the real
- *  money and it gives the chart a present rather than ending at the last
- *  settlement — but on its own it sawtooths, because entering a position debits
- *  it and settling credits it back. So it is the thin second line on its own
- *  axis, never the headline.
- *
- *  The P&L series is forward-filled between settlements. That is not invented
- *  data: cumulative realised P&L genuinely does not change until something
- *  settles, which is what a step means.
- */
-/**
- * Realised P&L only. The venue's cash used to ride along on a right-hand axis
- * and was removed deliberately: the balance is shown as a figure beside this
- * chart, and a cash line answers a different question from the one the page
- * exists to answer. Worse, it moves for reasons that are not the strategy — a
- * deposit or a withdrawal steps it without a single trade, which is the
- * balance-difference trap the trader's own notes warn about. P&L steps only
- * when a market settles.
+ *  Built from settlement P&L, not balance differences, because a deposit and a
+ *  profit look the same in the balance. It steps once per settled market and is
+ *  flat in between.
  */
 export function VenueAccountChart({ points }: { points: VenuePnlPoint[] }) {
   if (points.length === 0) {
@@ -88,8 +65,7 @@ export function VenueAccountChart({ points }: { points: VenuePnlPoint[] }) {
     );
   }
 
-  // One row per instant either series has a reading at, so both can be drawn
-  // against a shared time axis without resampling either onto the other's grid.
+  // One row per settlement instant.
   type Row = { t: number; cumulative_pnl?: number };
   const rows = new Map<number, Row>();
   const at = (t: number): Row => {
@@ -132,8 +108,7 @@ export function VenueAccountChart({ points }: { points: VenuePnlPoint[] }) {
           tickFormatter={(v) => `${Number(v) >= 0 ? '+' : ''}$${Number(v).toFixed(0)}`}
           domain={['auto', 'auto']}
         />
-        {/* Break-even. The line that matters on a P&L chart, and the one a
-            currency axis alone does not make legible. */}
+        {/* Break-even. */}
         <ReferenceLine
           yAxisId="pnl"
           y={0}
@@ -175,12 +150,8 @@ export function VenueAccountChart({ points }: { points: VenuePnlPoint[] }) {
 /* ---------------------------------------------------------------- equity */
 
 /**
- * P&L against the start of the series, not the equity level.
- *
- * The level answers "how much is in the account", which the figure beside this
- * chart already says, and it moves for reasons that are not the strategy: a
- * deposit or a withdrawal steps it without a single trade. Plotting the change
- * makes break-even a line rather than a number to read off an axis.
+ * P&L against the start of the series, not the equity level, which a deposit
+ * or withdrawal moves.
  */
 export function EquityChart({ points }: { points: EquityPoint[] }) {
   if (points.length === 0) {
@@ -220,8 +191,7 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
           tickFormatter={(v) => `${Number(v) >= 0 ? '+' : ''}$${Number(v).toFixed(0)}`}
           domain={['auto', 'auto']}
         />
-        {/* Break-even. The line that matters on a P&L chart, and the one a
-            currency axis alone does not make legible. */}
+        {/* Break-even. */}
         <ReferenceLine
           y={0}
           stroke="var(--rule-firm)"
@@ -256,13 +226,8 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
 
 /* ----------------------------------------------------------- reliability */
 
-/** Observed frequency against predicted probability, model and baseline.
- *
- * The one diagnostic that cannot be faked by a good average: a model can hit the
- * base rate exactly while being wrong at every level of confidence. Since this
- * system only trades its confident predictions, a deviation in the 0.85–0.95
- * band matters far more than the headline number — so both curves are drawn
- * against the diagonal and the diagonal is the subject of the chart.
+/** Observed frequency against predicted probability, model and baseline,
+ * drawn against the diagonal.
  */
 export function ReliabilityChart({ bins }: { bins: CalibrationBin[] }) {
   if (bins.length === 0) {
@@ -316,7 +281,7 @@ export function ReliabilityChart({ bins }: { bins: CalibrationBin[] }) {
           }}
         />
         <ZAxis dataKey="n" range={[24, 220]} />
-        {/* Perfect calibration. The chart is about distance from this line. */}
+        {/* Perfect calibration. */}
         <ReferenceLine
           segment={[
             { x: 0, y: 0 },
@@ -354,11 +319,8 @@ export function ReliabilityChart({ bins }: { bins: CalibrationBin[] }) {
 
 /** Why the system declined, in gate order.
  *
- * Expected to be dominated by `edge_below_gate`, and that is the system working
- * rather than failing: the forecast does not cover the fee, so it abstains. On
- * the predecessor of this system the equivalent count said what no Sharpe ratio
- * said. `traded` is drawn in the accent so it separates from the refusals
- * without implying a direction.
+ * `traded` uses the accent, which separates it from the refusals without
+ * implying a direction.
  */
 export function FunnelChart({ stages }: { stages: FunnelStage[] }) {
   if (stages.length === 0) {
