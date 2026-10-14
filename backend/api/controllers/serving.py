@@ -1,16 +1,8 @@
 """Read the serving store and shape it for the dashboard.
 
-**The API serves measurements, never substitutes.** A missing value comes back
-as null with a reason beside it. The previous version of this surface reported
-`pr_auc` as `holdout_auc - 0.06`, `precision_at_threshold` as
-`holdout_auc - 0.04`, and — when the artifact it wanted was absent, which was
-always — a hardcoded table of six feature importances. All of it rendered
-identically to real data, which is the whole problem: a fabricated number and a
-measured one look the same in a chart.
-
-So every response here distinguishes three states, and the frontend renders them
-differently: a measured value, an explicit null with `reason`, and an empty
-collection. There is no fourth state where something plausible is invented.
+The API serves measurements, never substitutes. Every value is one of three
+states: a measured value, an explicit null with a `reason`, or an empty
+collection. Nothing plausible is invented for a missing value.
 """
 
 from __future__ import annotations
@@ -26,11 +18,8 @@ from models.serving import (
     Outcome, Position, Prediction, VenueBalance, VenueSettlement,
 )
 
-# Reasons a decision was refused, in funnel order. The dashboard shows them in
-# this order because it is the order the gates apply, and the shape of the funnel
-# is the most informative thing this system can report: `edge_below_gate`
-# dominating means the forecast does not cover the fee, so it declines. On the
-# previous perp system that single number said what no Sharpe ratio said.
+# Decision reasons, in the order the gates apply. The dashboard shows them in
+# this order.
 FUNNEL_ORDER = (
     'traded', 'not_finite', 'probability_invalid', 'no_quote', 'no_peer_book',
     'price_out_of_band', 'disagreement_implausible', 'edge_below_gate',
@@ -49,10 +38,8 @@ def _measured(value: Any) -> dict[str, Any]:
 
 
 #: The time column each serving table is filtered on for the dashboard epoch.
-#: Named explicitly rather than guessed: `Prediction` alone carries four
-#: DateTimes, and filtering a decision on `created_at` instead of
-#: `decision_time` would hide rows by when they were WRITTEN rather than when
-#: they happened.
+#: Named explicitly: a row is filtered by when it happened, not when it was
+#: written.
 RESET_COLUMN = {
     'Prediction': 'decision_time',
     'Position': 'window_open',
@@ -67,19 +54,10 @@ RESET_COLUMN = {
 def reset_epoch(db: Session):
     """The instant the dashboard reads from, or None for all of history.
 
-    **This hides; it does not delete.** `predictions` is the only
-    out-of-sample measurement of whether the model beats the PRICE --
-    `PgWriter.scored_against_market` reads nothing else, and both
-    `model_minus_market` and `calibration_vs_market` are computed from it --
-    and `venue_fills`/`venue_settlements` hold windows Kalshi itself no longer
-    serves. Truncating for a clean chart would trade the one number that is not
-    self-graded for a cosmetic reset.
-
-    Research never consults this: `scripts/evaluate` and `scripts/promote` read
-    the store and the full `predictions` table regardless, so a reset cannot
-    silently shrink the sample a gate is computed on.
-
-    Clearing the column restores the full view.
+    The epoch hides rows; it never deletes them. `predictions` is the only
+    out-of-sample test of the model against the price, and the venue ledger
+    holds windows Kalshi no longer serves. Research and promotion ignore the
+    epoch. Clearing the column restores the full view.
     """
     row = db.execute(select(Account).order_by(Account.id)).scalars().first()
     return getattr(row, 'reset_at', None) if row is not None else None
@@ -88,12 +66,7 @@ def reset_epoch(db: Session):
 def since_reset(query, model, epoch):
     """Apply the dashboard epoch to `query`, or return it unchanged.
 
-    A named function so the seam can be TESTED. Eighteen call sites each
-    remembering a filter is the shape of defect this codebase keeps producing --
-    `entry_offsets` reaching `promote` and not `evaluate` inverted a gate, and
-    three scripts silently ignoring the fold geometry cut a different
-    experiment. `tests/test_serving_reset.py` asserts every serving query goes
-    through here.
+    Every time-series query in this module goes through here; a test asserts it.
     """
     if epoch is None:
         return query
@@ -126,16 +99,13 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
         }
     return {
         'configured': True,
-        # 'paper' or 'live'. Surfaced on every response that carries a number
-        # from this row, because a live account that renders identically to a
-        # paper one is the worst failure this surface could permit.
+        # 'paper' or 'live'. Every response with a number from this row
+        # carries it.
         'mode': row.mode,
         'starting_bankroll': row.starting_bankroll,
         'bankroll': _measured(row.bankroll),
-        # Equity is bankroll plus open stake carried at COST. Deliberately not
-        # marked to the model's own probability: marking an open binary at our
-        # own forecast books the edge we believe in as profit we have not
-        # received, which is how a losing system draws a rising equity curve.
+        # Equity is bankroll plus open stake at cost. Never mark an open binary
+        # at our own forecast: that books unearned edge as profit.
         'equity': _measured(row.bankroll + staked),
         'staked': _measured(staked),
         'open_positions': len(open_rows),
@@ -191,8 +161,8 @@ def _prediction_payload(row: Prediction) -> dict[str, Any]:
         'baseline_probability': row.baseline_probability,
         'model_probability': row.model_probability,
         'market_probability': row.market_probability,
-        # 'quote' when the venue's own ask priced this, 'baseline' when the
-        # calibrated barrier stood in for a market that was not observed.
+        # 'quote' when the venue's ask priced this, 'baseline' when the
+        # calibrated barrier stood in for an unobserved market.
         'price_source': row.price_source,
         'reason': row.reason, 'traded': bool(row.traded), 'side': row.side,
         'price': row.price, 'effective_cost': row.effective_cost,
@@ -222,9 +192,7 @@ def funnel(db: Session, *, days: int = 7) -> list[dict[str, Any]]:
     counts = {reason: int(n) for reason, n in rows}
     total = sum(counts.values())
     if total == 0:
-        # Nothing decided in this span. Returning a single zero-count `traded`
-        # row drew a chart axis with one empty bar, which reads as "we looked and
-        # the answer was zero" rather than "we have not looked yet".
+        # Nothing decided in this span: return no rows, not a zero-count row.
         return []
     return [{
         'reason': reason, 'count': counts.get(reason, 0),
@@ -282,12 +250,7 @@ def model_state(db: Session) -> dict[str, Any]:
 
 
 def model_history(db: Session, *, limit: int = 50) -> list[dict[str, Any]]:
-    """Every attempt, blocked ones included. The trial count.
-
-    A project that hides its failures cannot compute its own multiple-testing
-    correction, so this list is deliberately complete rather than filtered to
-    what was installed.
-    """
+    """Every promotion attempt, blocked ones included: the trial count."""
     rows = db.execute(
         select(ModelRun).order_by(ModelRun.created_at.desc()).limit(limit)
     ).scalars().all()
@@ -302,14 +265,7 @@ def model_history(db: Session, *, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def calibration(db: Session, *, version: Optional[str] = None) -> dict[str, Any]:
-    """The reliability table for model and baseline, side by side.
-
-    The one diagnostic that cannot be faked by a good average: a model can hit
-    the base rate exactly while being wrong at every level of confidence. Since
-    this system only trades its confident predictions, a miscalibration in the
-    0.85-0.95 band matters far more than the headline number — so both curves are
-    returned and the frontend draws them against the diagonal.
-    """
+    """The reliability table for model and baseline, side by side."""
     if version is None:
         latest = db.execute(
             select(ModelRun.version).order_by(ModelRun.created_at.desc())
@@ -335,12 +291,7 @@ def calibration(db: Session, *, version: Optional[str] = None) -> dict[str, Any]
 
 
 def minute_prices(db: Session, symbol: str, *, minutes: int = 240) -> list[dict[str, Any]]:
-    """Recent one-minute bars for one symbol, for the window chart.
-
-    A barrier problem's natural picture is the price path against the line it has
-    to finish above, and the prediction rows carry only four points per window —
-    enough to decide with, far too sparse to draw.
-    """
+    """Recent one-minute bars for one symbol, for the window chart."""
     since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
     rows = db.execute(
         select(MinutePrice)
@@ -356,9 +307,7 @@ def minute_prices(db: Session, symbol: str, *, minutes: int = 240) -> list[dict[
 def window_strikes(db: Session, *, minutes: int = 240) -> list[dict[str, Any]]:
     """The strike of each recent window, per symbol.
 
-    The chart draws these as horizontal segments spanning their own window, which
-    is what makes "above or below" readable at a glance — a single line across the
-    whole chart would be wrong, because the strike is reset every fifteen minutes.
+    The strike resets every window, so the chart draws one segment per window.
     """
     epoch = reset_epoch(db)
     since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
@@ -376,12 +325,7 @@ def window_strikes(db: Session, *, minutes: int = 240) -> list[dict[str, Any]]:
 
 
 def tickets(db: Session, *, open_only: bool = True, limit: int = 50) -> list[dict[str, Any]]:
-    """Live order tickets.
-
-    This repository places orders through the Kalshi client when told to twice;
-    a ticket is the record of the decision either way, so a dry run and a fill
-    are distinguishable after the fact.
-    """
+    """Live order tickets: the record of each live decision, dry run or filled."""
     epoch = reset_epoch(db)
     query = since_reset(select(OrderTicket), OrderTicket, epoch).order_by(OrderTicket.created_at.desc()).limit(limit)
     if open_only:
@@ -402,28 +346,13 @@ def tickets(db: Session, *, open_only: bool = True, limit: int = 50) -> list[dic
 # ---------------------------------------------------------------------------
 # The venue's ledger.
 #
-# Everything above this line reports our own arithmetic: a bankroll debited at
-# the price `decide()` sized at, a fee predicted from the published schedule, and
-# a payout decided by an OHLC mean of Coinbase standing in for sixty seconds of
-# CF Benchmarks BRTI. Live, all three are estimates of numbers Kalshi already
-# holds, and where they disagree the venue is right.
+# Everything above reports our own arithmetic. Below reads `venue_fills`,
+# `venue_settlements` and `venue_balance`, which the trader fills from the
+# venue. Where the two disagree, the venue is right.
 #
-# These read `venue_fills`, `venue_settlements` and `venue_balance`, which the
-# trader fills from `/portfolio/fills`, `/portfolio/settlements` and
-# `/portfolio/balance`. Two rules follow from "the API serves measurements, never
-# substitutes":
-#
-# * Per-settlement P&L is NOT computed here. It is a stored column, written by
-#   the one process that reads the venue, so the arithmetic has one definition
-#   rather than one per container. What happens here is summation and ordering.
-# * A `None` is counted, not coerced. A settlement whose revenue the venue did
-#   not serve has an unknown P&L; adding it as zero would understate a loss, and
-#   an equity curve must never err in that direction. `incomplete` carries the
-#   count so the frontend can say the total is short.
-#
-# The public tape (`/historical/trades`) is deliberately absent. It carries every
-# print in a market by anyone, with no account attribution, so it cannot produce
-# a portfolio — summing it sums the exchange.
+# * Per-settlement P&L is a stored column; this module only sums and orders.
+# * A `None` is counted in `incomplete`, never added as zero.
+# * The public tape is not used: it has no account attribution.
 
 
 def _venue_settlement_payload(row: VenueSettlement) -> dict[str, Any]:
@@ -440,9 +369,8 @@ def _venue_settlement_payload(row: VenueSettlement) -> dict[str, Any]:
         'fee_cost': row.fee_cost,
         'pnl': row.pnl,
         'settled_time': row.settled_time,
-        # Ours beside theirs, on the same row. The gap is a settlement our
-        # Coinbase proxy called differently or a fee we mispriced; a null means
-        # the venue settled a market we have no record of buying.
+        # Ours beside theirs. A null `our_pnl` means we have no record of
+        # buying this market.
         'our_pnl': row.our_pnl,
         'pnl_gap': (None if row.pnl is None or row.our_pnl is None
                     else row.pnl - row.our_pnl),
@@ -452,16 +380,11 @@ def _venue_settlement_payload(row: VenueSettlement) -> dict[str, Any]:
 
 
 def _venue_won(row: VenueSettlement) -> Optional[bool]:
-    """Did we win, per the venue's own resolution of the market?
+    """Did we win, per the venue's resolution of the market?
 
-    Read off `market_result` against the side we held, not off the sign of the
-    P&L. Those come apart exactly where this system trades: a winner bought at
-    97c and charged a fee can net negative, and calling that a loss would put the
-    win rate at odds with the venue's settlement record.
-
-    Mirrors `core.venue_ledger.won` — deliberately, since the API cannot import
-    the trader. It is a classification of two stored fields rather than
-    arithmetic, which is the line this file draws.
+    Reads `market_result` against the side held, not the sign of the P&L: a
+    winner bought near $1 can net negative after the fee. Mirrors
+    `core.venue_ledger.won`, because the API cannot import the trader.
     """
     if not row.market_result:
         return None
@@ -491,10 +414,8 @@ def venue_settlements(db: Session, *, days: Optional[int] = None,
 def venue_account_state(db: Session) -> dict[str, Any]:
     """The account as the venue's ledger reports it, with ours beside it.
 
-    Returns `available: False` with a reason rather than zeros when the ledger is
-    empty — which is the normal state of a paper account, since a paper account
-    has no venue ledger at all. A dashboard that renders an unsynced ledger as
-    `$0.00 realised` is claiming a measurement it does not have.
+    Returns `available: False` with a reason, not zeros, when the ledger is
+    empty, as for a paper account.
     """
     epoch = reset_epoch(db)
     rows = db.execute(since_reset(select(VenueSettlement), VenueSettlement, epoch)).scalars().all()
@@ -557,9 +478,7 @@ def venue_account_state(db: Session) -> dict[str, Any]:
     return {
         'available': True,
         'reason': None,
-        # Carried on this response too, not just on `/account`. A live figure
-        # that renders identically to a paper one is the worst failure this
-        # surface could permit, and this is the response that holds real money.
+        # Carried here too, so a live figure never renders as a paper one.
         'mode': account.mode if account is not None else 'paper',
         'settlements': len(rows),
         'realized_pnl': (_measured(realized) if have_pnl
@@ -571,9 +490,8 @@ def venue_account_state(db: Session) -> dict[str, Any]:
         'win_rate': (_measured(wins / decided) if decided
                      else _missing('nothing has settled with a named result')),
         'wins': wins, 'losses': losses, 'undecided': undecided,
-        # How many settlements are excluded from `realized_pnl` because the venue
-        # left a field absent. Non-zero means the total is short, and by an
-        # unknown amount rather than by zero.
+        # Settlements excluded from `realized_pnl` for a missing field. Non-zero
+        # means the total is short by an unknown amount.
         'incomplete': incomplete,
         'contracts': contracts,
         'first_settled': min(stamps) if stamps else None,
@@ -593,25 +511,15 @@ def venue_account_state(db: Session) -> dict[str, Any]:
 def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
     """The account chart: realised P&L stepped by settlement, cash sampled beside it.
 
-    Two series, because they answer different questions and neither one answers
-    both.
+    `points` is cumulative realised P&L, one step per settled market. It is
+    built from settlement P&L, not balance differences, because a deposit and a
+    profit look the same in the balance.
 
-    `pnl` is cumulative realised P&L, one step per settled market, and it is what
-    "how is the portfolio doing" means. It is built from settlement P&L and **not**
-    from balance differences, which is the load-bearing choice here: nothing in
-    the ledger distinguishes a deposit from a profit, so a balance-difference
-    curve reports the first deposit as the best day the strategy ever had.
+    `balances` is the venue's cash, sampled every cycle. An entry debits it and
+    settlement credits it.
 
-    `balance` is the venue's cash, sampled every cycle. It is the real money and
-    it makes the chart live between settlements, but on its own it sawtooths —
-    entering a position debits it, settling credits it back — so it is the second
-    series rather than the first.
-
-    Both are windowed by `days`, and the cumulative series is therefore
-    **cumulative within the window**: it starts at zero at the left edge rather
-    than carrying the account's lifetime total. `pnl_before_window` says what was
-    excluded, so a caller can shift the series onto a lifetime scale and a reader
-    is never shown a partial total labelled as the whole.
+    Both are windowed by `days`. The cumulative P&L starts at zero at the left
+    edge; `pnl_before_window` holds the excluded total.
     """
     epoch = reset_epoch(db)
     since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -653,8 +561,7 @@ def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
             'our_bankroll': b.our_bankroll, 'drift': b.drift,
             'exchange_index': b.exchange_index,
         } for b in balances],
-        # What settled before the window opened, so the series can be read on a
-        # lifetime scale. Null when nothing did.
+        # P&L settled before the window opened. Null when nothing did.
         'pnl_before_window': None if earlier is None else float(earlier),
         'realized_pnl_in_window': total if points else None,
     }

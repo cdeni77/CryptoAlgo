@@ -1,11 +1,7 @@
 """Test harness for the API.
 
-The app runs against SQLite here rather than Postgres. That is a real limitation
-— the `ADD COLUMN IF NOT EXISTS` migrations in `app.py` are Postgres syntax and
-are skipped — but the alternative is no API tests at all, which is where this
-started. What these tests cover is the layer above SQL: response shapes, and
-whether a missing measurement comes back as null instead of an invented number.
-Those are the behaviours that were broken.
+The app runs against SQLite, not Postgres. The tests cover the layer above SQL:
+response shapes, and a missing measurement returned as null with a reason.
 """
 
 from __future__ import annotations
@@ -31,15 +27,10 @@ def sqlite_database(tmp_path_factory):
 
 @pytest.fixture
 def client(sqlite_database):
-    """A TestClient over the real app.
+    """A TestClient over the real app, with nothing stubbed.
 
-    Nothing is stubbed. `app.run_migrations` checks the dialect and skips its
-    Postgres-only ALTERs on SQLite, which is why this works without patching the
-    engine — the guard belongs in the app, not in the harness.
-
-    Entered as a context manager because schema creation moved from module
-    import into the lifespan hook, and `TestClient` only runs lifespan inside
-    `with`. Constructed bare, the tables would never exist.
+    Entered with `with`, because `TestClient` runs the lifespan hook, which
+    creates the schema, only inside it.
     """
     from fastapi.testclient import TestClient
 
