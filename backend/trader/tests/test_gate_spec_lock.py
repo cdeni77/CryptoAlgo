@@ -47,11 +47,11 @@ def test_the_hash_moves_with_a_threshold_and_with_a_definition():
 
     rows = gate_spec()
     bumped = [dict(r, definition_version=r['definition_version'] + 1)
-              if r['name'] == 'sharpe' else r for r in rows]
+              if r['name'] == 'trades' else r for r in rows]
     canonical = lambda rs: json.dumps(rs, sort_keys=True)   # noqa: E731
     assert canonical(bumped) != canonical(rows)
     diff = gate_spec_diff(rows, bumped)
-    assert list(diff['changed']) == ['sharpe']
+    assert list(diff['changed']) == ['trades']
     assert not diff['added'] and not diff['removed']
 
 

@@ -298,8 +298,8 @@ def main() -> int:
     # best of the four (+0.00550 against a pooled -0.00072).
     market = market_measurement(getattr(result, 'scored', None),
                                 entry_offsets=config.entry_offsets)
-    market_metrics = {'model_minus_market': market.get('model_minus_market'),
-                      'market_windows': market.get('market_windows')}
+    market_metrics = {name: market.get(name) for name in (
+        'model_minus_market', 'model_minus_market_p', 'min_folds', 'market_windows')}
 
     if args.dry_run:
         gates = evaluate_gates(result.report, extra=market)
@@ -382,7 +382,7 @@ def publish_to_serving(attempt, report) -> None:
         from core.pg_writer import PgWriter
 
         writer = PgWriter()
-        gates = {g.name: g.value for g in attempt.gates}
+        values = report.gate_values()
         writer.record_model_run(
             version=attempt.version,
             installed=bool(attempt.installed),
@@ -396,8 +396,8 @@ def publish_to_serving(attempt, report) -> None:
             calibration_error=_finite(report.max_ece),
             residual_scale=_finite(report.mean_residual_scale),
             control_gain_share=_finite(report.max_control_gain_share),
-            sharpe=_finite(gates.get('sharpe')),
-            total_return=_finite(gates.get('total_return')),
+            sharpe=_finite(values.get('sharpe')),
+            total_return=_finite(values.get('total_return')),
             gates=[{'name': g.name, 'value': _finite(g.value),
                     'threshold': g.threshold, 'direction': g.direction,
                     'passed': bool(g.passed)} for g in attempt.gates],

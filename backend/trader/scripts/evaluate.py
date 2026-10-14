@@ -174,8 +174,9 @@ def main() -> int:
     # Every evaluation is a trial, whether or not anything is promoted after it.
     log_trial('evaluate', args, config, groups=groups, dataset=dataset,
               report=report, metrics={
-                  'model_minus_market': market.get('model_minus_market'),
-                  'market_windows': market.get('market_windows'),
+                  **{name: market.get(name) for name in (
+                      'model_minus_market', 'model_minus_market_p', 'min_folds',
+                      'market_windows')},
                   'gates_passed': gates_passed(gates),
                   'failed_gates': [g.name for g in gates if not g.passed],
                   **({'stack_b_median': float(stack['b'].median()),

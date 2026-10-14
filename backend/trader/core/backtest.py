@@ -34,7 +34,8 @@ from core.config import Config, DEFAULT_CONFIG
 from core.cv import WindowFold, assert_no_leakage, effective_observations, folds_for_config, recency_weights
 from core.dataset import Dataset, apply_fold, fit_fold
 from core.decide import Decision, Reason, decide_window, rejection_histogram, stateless_screen
-from core.metrics import EvaluationReport, FoldEvaluation, evaluate_fold, sharpe_moments
+from core.metrics import (EvaluationReport, FoldEvaluation, evaluate_fold, sharpe_moments,
+                          trade_gate_values)
 from core.model import ForecastModel, fit_for_config, table_groups
 
 logger = logging.getLogger(__name__)
@@ -306,6 +307,8 @@ def walk_forward(
         fold_geometry=geometry,
         sharpe_moments=(sharpe_moments(continuous_book.trades())
                         if continuous_book is not None else {}),
+        trade_metrics=(trade_gate_values(continuous_book.trades())
+                       if continuous_book is not None else {}),
     )
     return RunResult(
         report=report, models=models, books=books, continuous_book=continuous_book,
