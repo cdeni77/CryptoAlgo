@@ -1,15 +1,6 @@
-"""The live loop keeps the venue's ledger instead of reading it and dropping it.
+"""Tests that the live loop stores the venue ledger it reads during reconcile.
 
-The regression these close is specific and it had already happened once.
-`reconcile_with_venue` fetched the venue's fills and settlements every cycle,
-compared them, logged a count, and threw them away — `revenue` was assigned and
-never read. So the dashboard's P&L could only ever be our own arithmetic: the
-venue's numbers passed through the process every sixty seconds and nothing kept
-them.
-
-Behaviour, not source text. The tests that previously guarded this path asserted
-that `reconcile_with_venue` *contained a substring*, and they passed for the whole
-time the reconciliation they described did not exist.
+These drive `reconcile_with_venue` and check the stored rows, not the source text.
 """
 
 from __future__ import annotations
@@ -31,8 +22,8 @@ FILLS = [
      'is_taker': True, 'created_time': '2026-08-25T10:03:00Z'},
 ]
 SETTLEMENTS = [
-    # `fee_cost` unsuffixed, already in dollars — the venue does not serve
-    # `fee_cost_dollars` on a settlement at all (see kalshi_client._fee).
+    # `fee_cost` is unsuffixed and already in dollars; the venue serves no
+    # `fee_cost_dollars` on a settlement.
     {'ticker': 'KXBTC15M-A', 'market_result': 'no', 'no_count_fp': '5.00',
      'no_total_cost_dollars': '1.5000', 'revenue_dollars': '5.0000',
      'fee_cost': 0.0700, 'settled_time': '2026-08-25T10:15:00Z'},
@@ -58,7 +49,7 @@ def _client() -> KalshiClient:
 
 
 def test_a_reconcile_stores_the_ledger_it_reads(tmp_path):
-    """The cycle's own reconcile is what fills the venue tables. No extra request."""
+    """The cycle's own reconcile fills the venue tables, with no extra request."""
     writer = _writer(tmp_path)
     state = asyncio.run(reconcile_with_venue(writer, _client()))
 
@@ -67,7 +58,7 @@ def test_a_reconcile_stores_the_ledger_it_reads(tmp_path):
     fills = writer.venue_fills()
     assert len(fills) == 1
     assert fills[0].trade_id == 'f1'
-    # Priced from the NO side, not the YES book the venue quotes.
+    # Priced from the NO side, not the YES book.
     assert fills[0].price == pytest.approx(0.30)
 
     settled = writer.venue_settlements()
@@ -77,7 +68,7 @@ def test_a_reconcile_stores_the_ledger_it_reads(tmp_path):
 
 
 def test_storing_the_ledger_twice_converges(tmp_path):
-    """Every cycle re-reads the same live-tier rows; a doubled fill doubles a cost."""
+    """Storing the same ledger three times leaves one fill and one settlement."""
     writer = _writer(tmp_path)
     for _ in range(3):
         asyncio.run(reconcile_with_venue(writer, _client()))
@@ -87,11 +78,9 @@ def test_storing_the_ledger_twice_converges(tmp_path):
 
 
 def test_a_steady_state_cycle_writes_nothing_it_already_has(tmp_path):
-    """The venue returns the same rows every minute; re-writing them changes nothing.
+    """A steady-state cycle writes nothing it already has.
 
-    Without the filter this is four hundred read-then-write round trips a minute
-    against Postgres in the steady state. The rows still converge either way — the
-    upserts are idempotent — so what is pinned here is the cost, not the result.
+    The upserts are idempotent either way; this pins the write cost.
     """
     writer = _writer(tmp_path)
     assert persist_venue_ledger(writer, fills=FILLS,
@@ -103,30 +92,21 @@ def test_a_steady_state_cycle_writes_nothing_it_already_has(tmp_path):
 
 
 def test_an_incomplete_settlement_is_retried_so_it_can_heal(tmp_path):
-    """A row stored with a null P&L is not "already have it".
-
-    The venue amends its own records — a `_dollars` field appearing where only
-    cents were served is the documented direction of travel — so skipping on mere
-    presence would freeze the first bad parse in place forever.
-    """
+    """A settlement stored with a null P&L is retried, so a later complete row replaces it."""
     writer = _writer(tmp_path)
     partial = [{'ticker': 'KXBTC15M-A', 'no_count_fp': '5.00'}]
     assert persist_venue_ledger(writer, fills=[], settlements=partial) == (0, 1)
     assert writer.venue_settlements()[0].pnl is None
 
-    # Same ticker, now complete: written again rather than skipped.
+    # Same ticker, now complete: written again.
     assert persist_venue_ledger(writer, fills=[], settlements=SETTLEMENTS) == (0, 1)
     assert writer.venue_settlements()[0].pnl == pytest.approx(3.43)
-    # And now that it is complete, it stops being rewritten.
+    # Once complete, it is no longer rewritten.
     assert persist_venue_ledger(writer, fills=[], settlements=SETTLEMENTS) == (0, 0)
 
 
 def test_a_store_failure_does_not_stop_the_cycle(tmp_path):
-    """A cycle that cannot write telemetry must still trade and settle.
-
-    The store is a record, not the account. An unhandled write error killing the
-    loop is the wrong trade-off in a process that holds positions.
-    """
+    """A store write failure does not stop the cycle; the store is a record, not the account."""
     writer = _writer(tmp_path)
 
     def explode(_rows):
@@ -140,11 +120,9 @@ def test_a_store_failure_does_not_stop_the_cycle(tmp_path):
 
 
 def test_a_settlement_we_never_booked_is_stored_with_a_null_of_our_own(tmp_path):
-    """The venue settling a market we have no record of is kept, not dropped.
+    """A settlement for a market we never booked is kept, with a null `our_pnl`.
 
-    That is what an order POST which timed out after being accepted leaves behind,
-    and it is the discrepancy the audit called the one that costs money silently.
-    A null `our_pnl` says so; omitting the row would hide it.
+    That is what an accepted order whose POST timed out leaves behind.
     """
     writer = _writer(tmp_path)
     persist_venue_ledger(writer, fills=[], settlements=SETTLEMENTS)
@@ -155,13 +133,10 @@ def test_a_settlement_we_never_booked_is_stored_with_a_null_of_our_own(tmp_path)
 
 
 def test_the_balance_is_sampled_before_it_is_adopted(tmp_path):
-    """Sample first, overwrite second — or the drift is zero forever.
+    """The balance is sampled before it is adopted, or the recorded drift is always
+    zero.
 
-    `adopt_venue_balance` writes the venue's balance onto the account. Recording
-    the sample afterwards would store our bankroll *as* the venue's and report a
-    drift of nothing, which is a self-fulfilling alarm. The trend is the
-    diagnosis: a drift that stays put is a starting-balance mismatch, one that
-    grows is an unrecorded fill.
+    A steady drift is a starting-balance mismatch; a growing one is an unrecorded fill.
     """
     writer = _writer(tmp_path)
     adopt_venue_balance(writer, 103.43, exchange_index=2)
@@ -171,12 +146,11 @@ def test_the_balance_is_sampled_before_it_is_adopted(tmp_path):
     assert sample.our_bankroll == pytest.approx(100.0), 'ours, as it stood before'
     assert sample.drift == pytest.approx(3.43)
     assert sample.exchange_index == 2
-    # And the account did take the venue's figure.
+    # The account took the venue's figure.
     assert writer.account().bankroll == pytest.approx(103.43)
 
 
 def test_an_unreadable_balance_is_neither_sampled_nor_adopted(tmp_path):
-    """NaN must not overwrite a correct bankroll, nor land in the chart."""
     writer = _writer(tmp_path)
     adopt_venue_balance(writer, float('nan'))
     assert writer.latest_venue_balance() is None
