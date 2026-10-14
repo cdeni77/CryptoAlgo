@@ -2398,7 +2398,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     _warn_unscoreable_features(scored, model,
                                offsets=tuple(config.decision_offsets or ()))
-    scored['model_probability'] = model.predict(scored)
+    for column, values in model.score(scored).items():
+        scored[column] = values
 
     # The venue publishes the number it will settle against, as `floor_strike`,
     # the moment the window opens. Prefer it over the one built from bars: ours is

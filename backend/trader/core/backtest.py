@@ -205,7 +205,7 @@ def walk_forward(
 
         test_table = apply_fold(dataset, fit, fold.test, config, groups=groups)
         test_table = test_table.assign(
-            model_probability=model.predict(test_table),
+            **model.score(test_table),
             fold=fold.index,
         )
         scored_parts.append(test_table)

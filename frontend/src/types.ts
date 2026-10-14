@@ -26,6 +26,8 @@ export type Reason =
   | 'price_out_of_band'
   | 'disagreement_implausible'
   | 'edge_below_gate'
+  | 'edge_uncertain'
+  | 'members_disagree'
   | 'below_min_contracts'
   | 'fee_ceiling'
   | 'window_exposure'
