@@ -1,32 +1,9 @@
-"""How many basis points does our Coinbase proxy differ from the venue's index?
+"""How many basis points does our Coinbase displacement differ from Kalshi's index?
 
-Run:
-    python -m research.validate._validate_proxy_bias
-
-`_validate_label` answers the binary question — how often our UP/DOWN differs
-from the venue's — and gets ~97%. That leaves the SIZE of the error unmeasured,
-which matters because ~3% of every training label being wrong is not negligible
-against a measured log-loss skill of +0.002. A 3% label error that is randomly
-scattered is noise; one that is systematically signed is a bias every model
-will faithfully learn.
-
-Kalshi's `expiration_value` is the price a window actually settled at, so the
-question becomes numeric. The venue never publishes a STRIKE, but it does not
-need to: **a window's strike is the previous window's settlement value**, both
-being the mean over the same minute. Consecutive settled markets therefore
-yield the venue's own displacement — which is the quantity `F(x/sigma)`
-consumes, and the one whose error actually propagates.
-
-**Its limit is retention, not method.** `expiration_value` reaches back only to
-2026-06, because Kalshi purges older markets; Predexon's `result` reaches
-2025-12 but carries no price. So the bias is measurable on three months and
-must be ARGUED to hold earlier, not assumed. The argument is available: if the
-bias is stable across those months and across symbols, it is a property of how
-the two indices are built rather than of the period — and that is testable
-here, which is why the per-month breakdown is printed rather than a single
-headline number.
+A window's strike is the previous window's settlement value, so consecutive
+`expiration_value`s give the venue's own displacement. Prints the signed
+difference per symbol. Run: `python -m research.validate._validate_proxy_bias`.
 """
-
 from __future__ import annotations
 
 import json
@@ -46,22 +23,14 @@ WINDOW = dt.timedelta(minutes=15)
 
 
 def bias_bp(ours: float, theirs: float) -> Optional[float]:
-    """Signed basis points of ours against theirs.
-
-    Signed on purpose: a proxy reading consistently high is a different problem
-    from one that is merely noisy, and only the first is correctable.
-    """
+    """Signed basis points of ours against theirs. Signed, to expose a bias."""
     if not theirs:
         return None
     return (ours - theirs) / theirs * 1e4
 
 
 def displacement_bp(*, settle, strike) -> Optional[float]:
-    """The move from strike, in basis points.
-
-    The barrier model consumes displacement from the strike, so this — not the
-    absolute price level — is the quantity whose error matters.
-    """
+    """The move from strike, in basis points."""
     if not strike or settle is None:
         return None
     return (settle - strike) / strike * 1e4
@@ -71,9 +40,7 @@ def venue_moves(rows: list) -> list:
     """The venue's own (strike, settle) per window, from consecutive markets.
 
     Chains only across an exact fifteen-minute step within one symbol. A gap is
-    skipped rather than bridged: chaining across one would invent a thirty
-    minute move and label it fifteen, which is the silent-shift failure this
-    project has already had once with Polymarket slugs.
+    skipped, never bridged.
     """
     by_symbol: dict = {}
     for r in rows:
@@ -89,8 +56,7 @@ def venue_moves(rows: list) -> list:
         for opened in sorted(series):
             settle = series.get(opened)
             strike = series.get(opened - WINDOW)
-            # A null on either end breaks the chain: inventing one would
-            # fabricate both a strike and a settle.
+            # A null on either end breaks the chain.
             if settle is None or strike is None:
                 continue
             out.append({'symbol': symbol, 'window_open': opened,
@@ -113,12 +79,9 @@ def _load_settlements() -> list:
 
 
 def _our_moves(symbols) -> dict:
-    """Our own (strike, settle) per window, straight from `core/windows.py`.
+    """Our own (strike, settle) per window, from `core/windows.py`.
 
-    The real builder is reused rather than the means recomputed here. A second
-    implementation of the target would agree until it didn't, and the whole
-    point of this check is to test the one the model actually trains on —
-    including its `>=` tie rule and its one-minute averaging at both ends.
+    Reuses the real builder, so this tests the target the model trains on.
     """
     from core.datastore import ResearchStore
     from core.windows import build_windows

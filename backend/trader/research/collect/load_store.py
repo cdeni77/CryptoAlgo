@@ -1,39 +1,9 @@
 """Load the consolidated collection into the research store.
 
-Run:
-    python -m research.collect.load_store              # everything
-    python -m research.collect.load_store --what depth
-    python -m research.collect.load_store --month 2026-01
-
-**Why this exists.** 255 million snapshots were collected and nothing reads
-them. Every consumer — the four validators, `core/dataset.py`,
-`core/features.py` — reads the research store; the collection writes to
-`data/collection/`. Until this runs, `venue_depth` holds 885 rows and
-`venue_settlements` holds none, which is why every validator reported "not
-enough overlap" against a complete corpus.
-
-Two properties are load-bearing, and both were nearly got wrong.
-
-**It SUMMARISES rather than copies.** `venue_depth` holds one row per minute
-0..15 of a window, not one per snapshot. That is deliberate: the offset grid is
-itself under test, and a table sampled only where the model currently scores
-would foreclose the question. 116,242 windows x 16 minutes is ~1.9M rows
-against 255M snapshots — a 130x reduction that loses nothing the schema was
-ever meant to hold.
-
-**It STREAMS.** `ResearchStore.write` reads an existing partition whole in
-order to merge revisions, and one derived partition holds 44 million rows.
-Handing it those directly is precisely the shape that froze this machine when
-`consolidate` held a partition in memory. The summarisation therefore happens
-in DuckDB, which spills rather than allocating, and the store only ever sees
-the ~40k rows a single (venue, symbol, month) partition summarises to.
-
-**Prices are cents in the collection and DOLLARS in the store.** The existing
-`venue_depth` rows read `yes_bid 0.63`; the collection holds `63`. Loading one
-into the other unconverted is a hundredfold error, in the same direction every
-time, and nothing downstream would raise.
+Summarises each window's snapshots to one `venue_depth` row per minute 0..15,
+in DuckDB so memory stays bounded. Collection prices are cents; store prices
+are dollars. Run: `python -m research.collect.load_store [--what depth] [--month YYYY-MM]`.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -52,14 +22,9 @@ DERIVED = DATA / 'derived'
 WINDOW_MINUTES = 16                      # 0..15 inclusive
 CENTS = 100.0
 
-# `venue_depth`'s event key includes `source` precisely so a reconstructed book
-# and a recorded one coexist as independent observations rather than one
-# superseding the other. Measured before that existed: 58 overlapping
-# (symbol, window) pairs and the comparison still read zero rows, because the
-# live row's later `available_time` silently won.
-# The canonical value, matching `scripts/build_depth.py:241`. Inventing a
-# new one ('predexon_backfill') did not raise: `_validate_depth` filters on
-# == 'backfill' and silently reported zero rows against 1.49M.
+# `source` is part of `venue_depth`'s event key, so a reconstructed book and a
+# recorded one coexist. Must equal the value `scripts/build_depth.py` writes;
+# `_validate_depth` filters on it.
 BACKFILL_SOURCE = 'backfill'
 
 # collection column -> store column. Prices are converted; sizes are not.
@@ -83,14 +48,10 @@ def to_depth_rows(snaps: pd.DataFrame) -> pd.DataFrame:
     out['market_ticker'] = snaps['market_id']
     out['window_open'] = snaps['window_open']
     out['offset_minutes'] = snaps['offset_minutes'].astype(int)
-    # The minute mark itself, not the tick's own timestamp: the row asserts
-    # "this was the book at minute m", and the tick that proves it may be
-    # anywhere in the preceding sixty seconds.
+    # The minute mark, not the tick's timestamp: the row is the book at minute m.
     out['event_time'] = (pd.to_datetime(snaps['window_open'], utc=True)
                          + pd.to_timedelta(snaps['offset_minutes'], unit='m'))
-    # Reconstructed after the fact, so the minute mark is also when it became
-    # knowable. A live row's available_time is its poll instant, which is why
-    # `source` and not this column keeps the two apart.
+    # Reconstructed, so the minute mark is also when it became knowable.
     out['available_time'] = out['event_time']
     out['quality'] = 'valid'
     out['source'] = BACKFILL_SOURCE
@@ -98,14 +59,11 @@ def to_depth_rows(snaps: pd.DataFrame) -> pd.DataFrame:
         out[dst] = pd.to_numeric(snaps[src], errors='coerce') / CENTS
     for src, dst in _SIZES.items():
         out[dst] = pd.to_numeric(snaps[src], errors='coerce')
-    # How stale the book was at this minute mark. Predexon serves book CHANGES,
-    # so a quiet market carries forward, and a forward fill indistinguishable
-    # from an observation lets a fresh forecast "beat" a stale price.
+    # How stale the book was at the mark. Predexon serves book changes, so a
+    # quiet market carries forward.
     #
-    # Subtracted as timestamps, never as integers. `event_time` comes back from
-    # DuckDB as datetime64[**us**], not [ns], so `.astype('int64')` yields
-    # MICROseconds -- against a `ts` in milliseconds that is a 1000x error, and
-    # it produced ages of -1.78 billion seconds rather than raising.
+    # Subtract as timestamps, never as integers: DuckDB returns datetime64[us],
+    # and `ts` is in milliseconds.
     stamp = next((c for c in ('snap_ts', 'ts') if c in snaps.columns), None)
     if stamp is not None:
         taken = pd.to_datetime(pd.to_numeric(snaps[stamp], errors='coerce'),
@@ -116,11 +74,10 @@ def to_depth_rows(snaps: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarise_window(snaps: pd.DataFrame) -> pd.DataFrame:
-    """One row per minute 0..15: the last snapshot AT OR BEFORE each mark.
+    """One row per minute 0..15: the last snapshot at or before each mark.
 
-    Pure-pandas, used by the tests and for a single window. The production path
-    does the same thing in DuckDB across a whole partition, because a partition
-    can hold 44 million snapshots and this cannot.
+    Pandas, for tests and single windows. `summarise_partition` does the same
+    in DuckDB for a whole partition.
     """
     if snaps.empty:
         return pd.DataFrame(columns=['offset_minutes'])
@@ -133,22 +90,9 @@ def summarise_window(snaps: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=['offset_minutes'])
     frame = frame.sort_values('offset_seconds')
-    # **Last at or before the MARK, which is what `offset_minutes = m` means.**
-    #
-    # This grouped by minute and took `.last()` — the last tick that fell
-    # INSIDE minute m, i.e. up to 59 seconds AFTER the mark it claims to
-    # describe. The comment above already said "at or before"; the code did
-    # something else, and `tests/test_load_store.py` asserted the leak as the
-    # contract (minute 1 taking t+110s, fifty seconds past a t+60s mark).
-    #
-    # The production DuckDB path in this same file is correct
-    # (`ASOF JOIN ... s.ts <= k.mark_ms`) and its own comment names this version
-    # as "a lookahead leak… it made `quote_age_seconds` negative". Two
-    # implementations of one rule, disagreeing, with the wrong one under test.
-    #
-    # It never reached the store — zero negative ages across 1.9M depth rows —
-    # because the DuckDB path is what runs. This was a loaded gun: a negative
-    # age up to 30s passes `core/quotes.py`'s `abs(age) <= max_age` as FRESH.
+    # Point-in-time: take the last tick at or before the mark, never the last
+    # tick inside minute m, which is up to 59 seconds after it. Must match the
+    # ASOF JOIN in `_SQL`.
     marks = pd.DataFrame({'offset_minutes': range(int(WINDOW_MINUTES))})
     marks['mark_seconds'] = (marks['offset_minutes'] * 60).astype(float)
     keys = [k for k in ('market_id', 'window_open') if k in frame.columns]
@@ -165,9 +109,8 @@ def summarise_window(snaps: pd.DataFrame) -> pd.DataFrame:
             marks.sort_values('mark_seconds'), group,
             left_on='mark_seconds', right_on='offset_seconds',
             direction='backward', suffixes=('', '_snap'))
-        # A minute with nothing at or before it is OMITTED rather than carried:
-        # emitting one would date a later book to an earlier minute, which is a
-        # leak dressed as coverage.
+        # Omit a minute with nothing at or before it; never date a later book
+        # to an earlier minute.
         taken = taken[taken['offset_seconds'].notna()]
         if keys:
             for name, value in zip(keys, key if isinstance(key, tuple) else (key,)):
@@ -220,9 +163,8 @@ ASOF JOIN snaps s
 def summarise_partition(path) -> pd.DataFrame:
     """The same summary as `summarise_window`, for a whole partition, in DuckDB.
 
-    `arg_max(col, ts)` is the last value at or before the minute mark by
-    construction, because the GROUP BY is the minute. DuckDB streams and spills;
-    pandas would have to hold 44 million rows to do the same thing.
+    An ASOF JOIN takes the last snapshot at or before each minute mark. DuckDB
+    spills to disk, so memory stays bounded.
     """
     import duckdb
     con = duckdb.connect()
@@ -252,15 +194,11 @@ def load_depth(store, *, month=None, log=print) -> int:
 def settlement_rows(records) -> pd.DataFrame:
     """Kalshi settlements in the store's own column names.
 
-    `market_ticker`, not `market_id` — the collection and the store disagree,
-    and a wrong name does not raise. It lands as an absent column, and every
-    reader downstream sees nulls it will read as missing data rather than as a
-    loader bug.
+    The store names the column `market_ticker`; the collection says
+    `market_id`. A wrong name does not raise.
 
-    `expiration_value` is deliberately DROPPED: `venue_settlements` has no
-    price column. The numeric proxy-bias check reads the JSONL directly, so
-    inventing a field here would put the number somewhere nothing looks while
-    implying it had been stored.
+    Drops `expiration_value`: `venue_settlements` has no price column. The
+    proxy-bias check reads the JSONL directly.
     """
     rows = []
     for r in records:
@@ -299,19 +237,9 @@ def implied_vol_rows(records) -> pd.DataFrame:
 def catalog_settlement_rows(records) -> pd.DataFrame:
     """Predexon catalog rows that carry a `result`, as settlements.
 
-    **Why this and not just Kalshi's own API.** That API purges markets after
-    roughly two months, so its settlements reach only ~2026-06. A backtest
-    settling on the venue's label therefore fell back to our Coinbase label for
-    everything earlier and kept the leak: two of four trading folds were
-    byte-identical before and after the settlement fix. The catalog carries
-    `result` for 56,569 markets across 2026-01..08 at 79-94% yield, which covers
-    the whole book era.
-
-    A row without a result is SKIPPED, not stored blank: 20% of the catalog has
-    none, and a blank would rebuild the exact ambiguity `kalshi_settlements`
-    exists to remove. Kalshi's own rows still win where both exist — they are
-    the venue speaking directly and they carry `expiration_value`, which the
-    catalog does not.
+    Kalshi's own API purges markets after a few months; the catalog reaches
+    back over the whole book era. A row without a result is skipped, not
+    stored blank.
     """
     rows = []
     for r in records:
@@ -346,10 +274,8 @@ def load_settlements(store, *, log=print) -> int:
     n = store.write('venue_settlements', frame) if len(frame) else 0
     log(f'  venue_settlements  {n:>8,} rows (Kalshi API, with prices)')
 
-    # Then the catalog, which reaches back further. Written second so a genuine
-    # revision key collision keeps whichever `available_time` is later; the two
-    # agree on `settled_up` where they overlap, and only the API rows carry a
-    # settlement price.
+    # Then the catalog, which reaches back further. The two agree on
+    # `settled_up` where they overlap.
     cat = DATA / 'kalshi_catalog.jsonl'
     if cat.exists():
         recs = []

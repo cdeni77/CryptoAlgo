@@ -1,42 +1,10 @@
 """The complete Kalshi order book across each traded window, from Predexon.
 
-**Complete, not sampled.** An earlier version took two capped requests per market
-and accepted truncation. Re-fetching later costs exactly what fetching properly
-costs now, and the book is the one dataset Kalshi destroys on settlement — so
-this pages to exhaustion and keeps every snapshot.
-
-**Why the whole window and not just the offsets that trade.** Measured on the
-five-year Coinbase history at one-minute resolution, log-loss skill over the
-baseline DECLINES with offset and +12m sits near the bottom of the grid: +4m
-scores +0.002486 (6/6 folds) against +12m's +0.001042, and eleven of thirteen
-alternatives beat it. So the offset grid is itself under test, and a book sampled
-only where the model currently scores would foreclose the question. Keeping every
-snapshot also answers ones nobody has asked yet — queue position, ladder slope,
-how depth rebuilds after a sweep — which any fixed sample cannot.
-
-**Storage.** Each snapshot is reduced to thirteen numbers and stored as a packed
-array rather than a dict, with the field order recorded once per row. The raw
-ladders are ~1.1MB per window; this is ~60 bytes per snapshot, so a full window
-costs ~100KB instead of ~1MB.
-
-Established by probing, so it is not rediscovered:
-  * snapshots are book CHANGES returned FORWARD from `start_time`, capped at
-    2,000 per page, with `pagination.pagination_key` to continue
-  * update rate runs a median 1.8/s, 4.13/s at p90, 30/s at worst — so a full
-    window is 1,600 to 27,000 snapshots and pagination is mandatory
-  * the endpoint reports `zero_credit_endpoint`: free, limited only to 1 req/s on
-    an ORG-wide bucket, so nothing else may hit the API concurrently
-  * coverage for KXBTC15M begins 2026-01-08 (measured — see
-    BOOK_COVERAGE_START), not at the series open: Kalshi's own markets go back
-    to 2025-12-10, so the orderbook endpoint starts about a month after the
-    market metadata does. This note used to say ~2026-06-19, which was wrong
-    by five months and capped the book at ~70 days of a retrievable ~230.
-
-Work order is shuffled (seeded) so an interrupted run is a representative sample
-of the covered span rather than the oldest slice — iterating chronologically made a
-75% hit rate look like 25%, because the early windows are the uncovered ones.
+Pages each window to exhaustion and packs every snapshot into thirteen numbers
+(FIELDS), because Kalshi deletes books on settlement. Predexon returns book
+changes forward from `start_time`, 2,000 per page, at 1 req/s on an org-wide
+bucket. Run: `python research/collect/_collect_book.py` from backend/trader.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -50,36 +18,18 @@ import pandas as pd
 BASE = 'https://api.predexon.com'
 PAUSE = 1.15
 OUT = os.getenv('BOOK_OUT', 'data/book_full.jsonl')
-# Every minute, not the four the model happens to score. The series already
-# holds every book change (~1.8/s), so this index is pure convenience — but a
-# four-entry index implies a privilege the data does not have, and the offset
-# grid is itself under test. Recomputable from `series` for any offset.
+# Every minute, because the offset grid is itself under test. The index is a
+# convenience; `series` holds every book change.
 OFFSETS = tuple(int(x) for x in
                 os.getenv('BOOK_OFFSETS', '1,2,3,4,5,6,7,8,9,10,11,12,13,14')
                 .split(','))
 WINDOW_TARGET = int(os.getenv('BOOK_WINDOWS', '25000'))
 REQUEST_BUDGET = int(os.getenv('BOOK_BUDGET', '60000'))
 TAIL_SECONDS = 90
-# Measured, not assumed: binary search over constructed tickers, counting
-# snapshots that carry at least one resting LEVEL rather than snapshots that
-# merely exist (older windows return degenerate placeholders whose ladders are
-# both empty, which is what makes a naive count read as coverage).
-#
-#     2026-01-06  none        2026-01-07  none
-#     2026-01-08  BOOK        2026-01-10  BOOK
-#
-# Verified by dumping the window directly: KXBTC15M-26JAN081415-15 returns
-# 2,000 snapshots, all 2,000 carrying levels, quoting 44/46 with real sizes.
-#
-# This default was '2026-06-19' and that is wrong by five months. It was also
-# "verified" once and wrongly confirmed, because the check omitted the
-# start_time/end_time pair the endpoint requires — without them even a window
-# that certainly has a book returns nothing, so every probe looked empty and
-# the wrong boundary looked correct. Any future check of this constant must
-# assert a known-good recent window returns a book BEFORE trusting a negative.
-#
-# The cost of the old value was the project's binding constraint: it capped the
-# Kalshi book at ~70 days when ~230 are actually retrievable.
+# The first day Predexon serves a KXBTC15M book with resting levels. Older
+# windows return placeholders with empty ladders. A probe of this boundary must
+# send `start_time` and `end_time`, or every window looks empty; check a
+# known-good window first.
 BOOK_COVERAGE_START = os.getenv('BOOK_COVERAGE_START', '2026-01-08')
 MAX_PAGES = 30
 
@@ -154,43 +104,27 @@ async def main() -> int:
         print('PREDEXON_API_KEY is not set.')
         return 1
 
-    # See the sys.path note in research/_status.py — this file moved into
-    # research/collect/ and `core` is rooted at backend/trader/, two levels up.
+    # Put backend/trader on sys.path, so `core` imports when run as a script.
     import sys as _sys
     from pathlib import Path as _Path
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
     from core.datastore import ResearchStore
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
 
-    # **The window list comes from settlements, not quotes.** It used to come
-    # from `venue_quotes` at offset 12, filtered to usable rows inside
-    # [0.05, 0.95] — and that made the live-vs-backfill cross-check IMPOSSIBLE,
-    # not merely empty. `venue_quotes` is itself a backfill that stops before the
-    # live ladder recorder started, so no window it lists can also have been
-    # recorded live, whatever cutoff is used here. Widening the cutoff to two
-    # hours changed nothing until this changed with it.
-    #
-    # `venue_settlements` is the venue's own list of markets that existed and
-    # settled, running to within an hour of now, so the two sources finally
-    # overlap. It also drops the tradeability filter, which is the right call
-    # for training data: selecting windows by the price they happened to quote
-    # is selection on a variable the book features are supposed to explain.
+    # The window list comes from `venue_settlements`, which runs close to now,
+    # so backfilled windows overlap the live recorder. No price filter: the
+    # book features must not be selected on the price they explain.
     settled = store.read('venue_settlements')
     settled = settled[settled['venue'] == 'kalshi']
     settled['window_open'] = pd.to_datetime(settled['window_open'], utc=True)
     rows = settled[['symbol', 'window_open', 'market_ticker']].dropna(
     ).drop_duplicates()
 
-    # Predexon's ORDERBOOK coverage begins ~2026-06-19, months after the series
-    # opened and long after its market metadata starts. Asking for older windows
-    # costs a request each and returns nothing.
+    # Older windows cost a request each and return nothing.
     rows = rows[rows['window_open'] >= pd.Timestamp(BOOK_COVERAGE_START, tz='UTC')]
 
-    # **Stop two hours back, not a day.** A one-day cutoff ended the backfill
-    # exactly where the live ladder recorder begins, so the two never described
-    # the same minute. That cross-check is the only independent evidence that the
-    # history every book feature will be trained on is the same object we record
-    # live. Two hours is enough for the venue's own history to settle.
+    # Stop two hours back, so the backfill overlaps the live recorder. Two
+    # hours lets the venue's own history settle.
     rows = rows[rows['window_open']
                 < pd.Timestamp.now(tz='UTC') - pd.Timedelta(hours=2)]
     rows = rows.sort_values('window_open').reset_index(drop=True)
@@ -198,13 +132,8 @@ async def main() -> int:
     rows = rows.iloc[::step].head(WINDOW_TARGET)
     rows = rows.sample(frac=1.0, random_state=20260826).reset_index(drop=True)
 
-    # **The windows the live recorder also saw go first.** They are the only
-    # rows on which backfill can be checked against an independent observation
-    # of the same book, and a uniform shuffle scatters them through fourteen
-    # thousand others — so the one validation that matters would wait for the
-    # whole run. Everything after them stays shuffled, so any prefix of the
-    # remainder is still a representative sample of the period rather than its
-    # oldest slice.
+    # Windows the live recorder also saw go first, for the live-vs-backfill
+    # check. The rest stay shuffled, so any prefix is a representative sample.
     try:
         recorded = store.read('venue_ladder')
         first_live = pd.to_datetime(recorded['window_open'], utc=True).min()
@@ -251,9 +180,8 @@ async def main() -> int:
                     continue
                 books.sort(key=lambda b: b.get('timestamp', 0))
                 series = [pack(b) for b in books]
-                # Index of the last snapshot at or before each offset — the state
-                # a decision there would actually have priced against. Stored as
-                # an index rather than a copy so the series stays the only truth.
+                # Index of the last snapshot at or before each offset: the state
+                # a decision there would price against.
                 marks = {}
                 for offset in OFFSETS:
                     mark = ms(w + pd.Timedelta(minutes=offset))

@@ -1,25 +1,9 @@
-"""Phase 4: turn the collected JSONL into the two stored layers.
+"""Convert collected JSONL archives into Parquet layers, one closed month at a time.
 
-Collection appends JSONL because appending is crash-safe: a `kill -9` costs one
-partial line rather than a rewritten partition, and a 47-hour job will be
-interrupted. That property is worth having while collecting and worthless
-afterwards, so a closed month is converted once, here.
-
-Two outputs, per the design:
-
-    derived   the thirteen packed fields per snapshot, one row per snapshot.
-              This is what features read; a training run never touches the
-              archive.
-    archive   the full ladders, kept because Kalshi destroys books on
-              settlement and Predexon is the only source. Questions nobody has
-              asked yet — queue position, ladder slope past 5c, replenishment
-              shape — are answerable only from this.
-
-Both are Parquet with zstd, partitioned venue/symbol/month to match the
-existing research store. Idempotent: converting a month twice produces the
-same files, so a re-run after an interrupted conversion is safe.
+`derived` holds the thirteen packed fields per snapshot, which features read.
+`ladders` keeps the full ladders, because Kalshi deletes books on settlement.
+Both are zstd Parquet partitioned venue/symbol/month. Re-running is idempotent.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -61,9 +45,8 @@ def _open(path):
             else open(path))
 
 
-# Explicit schemas so every batch writes the same types. Inferring per batch
-# lets an all-null column land as `object` in one row group and `double` in
-# the next, which ParquetWriter rejects halfway through a partition.
+# Explicit schemas, so every batch writes the same types. ParquetWriter rejects
+# a type change between row groups.
 DERIVED_SCHEMA = pa.schema(
     [('ts', pa.int64())]
     + [(f, pa.float64()) for f in FIELDS[1:]]
@@ -77,23 +60,17 @@ LADDER_SCHEMA = pa.schema([
     ('venue', pa.string()), ('symbol', pa.string()), ('market_id', pa.string()),
     ('window_open', pa.timestamp('us', tz='UTC')), ('ladders', pa.string())])
 
-# A single real record reaches 43 MB of JSON, so the ladder layer is flushed on
-# a BYTE budget rather than a row count: 200 ladder rows could be 8 GB.
+# One record can reach tens of MB of JSON, so the ladder layer flushes on a byte
+# budget, not a row count.
 LADDER_BYTES = int(os.getenv('CONSOLIDATE_LADDER_BYTES', 128 * 1024 * 1024))
 
 
 def select_copies(paths) -> dict:
     """Pass 1: where the fullest copy of each window lives.
 
-    Returns `{(market_id, window_open): (path, line_number)}` — the LOCATION
-    only. This is the whole point: the previous version built the same mapping
-    to whole RECORDS, and a record carries its raw ladders, 97% of the bytes.
-    Measured on the real archive a record reaches 43 MB and a partition 2.0 GB
-    gzipped, so retaining them exhausted 31 GB of RAM faster than the kernel
-    could log an OOM kill — a hard lockup with an unflushed journal, twice.
-
-    Each line is parsed and dropped, so peak cost here is one record, not one
-    partition.
+    Returns `{(market_id, window_open): (path, line_number)}`, the location
+    only. Records carry their raw ladders and are too large to hold. Each line
+    is parsed and dropped, so peak memory is one record.
     """
     best: dict = {}
     for path in paths:
@@ -153,16 +130,10 @@ def convert(venue: str, symbol: str, month: str, paths, *, keep_ladders=True,
             batch_rows: int = 200_000):
     """One partition, both layers, streamed. Returns (n_snapshots, n_windows).
 
-    Two passes. `select_copies` decides which copy of each window wins while
-    holding only line numbers; this pass re-reads and emits, one record at a
-    time, flushing to Parquet in batches. Peak memory tracks the batch, not the
-    partition — the property the crash was missing.
-
-    Keeping the FULLEST copy is unchanged and still load-bearing: a window can
-    appear more than once because an `error` retry re-fetches it, and 3,099
-    Polymarket windows were archived truncated at the 2,000-snapshot page cap
-    before `fetch_pm` paginated, then reset and re-collected. Keeping whichever
-    copy was written first would silently keep the truncated one.
+    `select_copies` picks the fullest copy of each window by line number; this
+    pass re-reads and emits one record at a time. Peak memory tracks the batch.
+    A window can appear more than once after a retry, and an earlier copy can
+    be truncated, so the fullest copy wins.
     """
     chosen = select_copies(paths)
     if not chosen:

@@ -1,37 +1,9 @@
-"""The venue's own settlement for every Kalshi 15-minute window, with its PRICE.
+"""The venue's own settlement for every Kalshi 15-minute window, with its price.
 
-Run:
-    python -m research.collect.kalshi_settlements
-    python -m research.collect.kalshi_settlements --report
-
-**Why this exists, and why against Kalshi rather than Predexon.**
-
-Predexon is missing `result` on 6,828 Kalshi markets that TRADED. A market
-carrying $2.9M of volume unambiguously settled, so a blank result there is a
-provider gap, not a void market — and Kalshi has them: the ticker
-KXBTC15M-26AUG062245-45 reads `status: finalized, result: yes` on Kalshi's own
-API and blank in our Predexon catalog.
-
-It also carries `expiration_value`, the price the window actually settled at
-(80383.64 on a real BTC window). Nothing else in this project holds that.
-`_validate_label.py` can currently only score our Coinbase-derived UP/DOWN
-against the venue's UP/DOWN, giving 97% agreement. With settlement PRICES the
-question becomes numeric — by how many basis points does a one-minute Coinbase
-mean differ from CF Benchmarks' BRTI? — which is a measurement of the proxy's
-bias rather than a count of how often it flips the answer.
-
-**Cost.** The list endpoint returns 200 markets a page, each already carrying
-`result` and `expiration_value`, so the whole corpus is ~343 requests. Kalshi's
-public API served six back-to-back requests with zero spacing and no
-throttling, and it is a DIFFERENT rate bucket from Predexon's org-wide 1 req/s
-— so this runs alongside the collection rather than competing with it. The
-pacing below is politeness, not necessity.
-
-**Its limit is retention, not rate.** Kalshi purges markets past roughly two
-months; a ticker held in our own store 404s there. So this recovers the recent
-months and cannot reach January — measured, the floor is about 2026-06-20.
+Reads settled markets from Kalshi's API (`result`, `expiration_value`) into
+kalshi_settlements.jsonl. Kalshi keeps only a few months of markets.
+Run: `python -m research.collect.kalshi_settlements [--report]`.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -51,9 +23,7 @@ from research.collect.fetchers import kalshi_window_open, verify_window  # noqa:
 BASE = 'https://api.elections.kalshi.com/trade-api/v2'
 SERIES = {'KXBTC15M': 'BTC-USD', 'KXETH15M': 'ETH-USD', 'KXSOL15M': 'SOL-USD'}
 OUT = Path(os.getenv('COLLECT_DATA', 'data/collection')) / 'kalshi_settlements.jsonl'
-# Politeness, not a limit we were given. Kalshi took 15 req/s without
-# complaint; this finishes the corpus in about two minutes either way, and
-# being a good citizen on a free unmetered API costs nothing here.
+# Politeness, not a venue limit. This is a separate bucket from Predexon's.
 REQUESTS_PER_SECOND = float(os.getenv('KALSHI_RPS', '5'))
 PAGE = 200                                    # the endpoint's own page size
 SETTLED = ('finalized', 'settled', 'determined')
@@ -75,15 +45,8 @@ def _time(value):
 def parse_market(m: dict):
     """One settled market as a record, or None if it should not be stored.
 
-    Rejects rather than guesses in three cases, each mirroring a failure this
-    project has already had:
-
-      * a ticker that does not decode, or is not one of our three series;
-      * a decoded window the venue's own open/close times contradict — the
-        fifteen-minute-shift bug, which went unnoticed for weeks because every
-        window was a valid window;
-      * a market that has not settled. Storing a blank result would rebuild
-        the exact ambiguity this file exists to remove.
+    Rejects a ticker outside our three series or that does not decode, a
+    window the venue's open/close times contradict, and an unsettled market.
     """
     ticker = str(m.get('ticker') or '')
     series = ticker.split('-')[0]
@@ -101,9 +64,7 @@ def parse_market(m: dict):
     if not result or status not in SETTLED:
         return None
     value = m.get('expiration_value')
-    # Zero is kept. A settlement value is an observation, and a real zero
-    # dropped as "missing" is the same error as a zero quote read as a price,
-    # in the opposite direction.
+    # Zero is kept: a settlement value of zero is an observation.
     try:
         value = float(value) if value is not None else None
     except (TypeError, ValueError):

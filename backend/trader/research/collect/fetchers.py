@@ -1,20 +1,11 @@
 """Venue drivers. Each one knows its API's shape and nothing else.
 
-The orchestrator owns rate limiting, retries, resume and storage; a fetcher's
-whole contract is: given a market id and a window, return that window's tick
-series and a status. That split is deliberate — the two APIs differ genuinely
-(Kalshi returns paginated forward tick deltas that must be exhausted;
-Polymarket returns a snapshot list in one call), so forcing one control flow
-onto both would be false uniformity, while retry policy and coverage
-accounting are identical and belong in one place.
+A fetcher takes a market id and a window and returns that window's tick series
+and a status. The orchestrator owns rate limits, retries, resume and storage.
 
-Both venues are packed into the SAME thirteen fields, in the same units, so
-the two datasets are directly comparable. Polymarket serves dollars and Kalshi
-integer cents; the conversion happens here, at write time, because a schema
-that agrees on column names while disagreeing on units is worse than one that
-disagrees openly.
+Both venues pack into the same thirteen fields, with prices in integer cents.
+Polymarket serves dollars, so it is converted here.
 """
-
 from __future__ import annotations
 
 import datetime as dt
@@ -36,13 +27,8 @@ FIELDS = ('ts', 'best_bid', 'best_ask', 'bid_at_touch', 'ask_at_touch',
 def kalshi_window_open(ticker: str) -> dt.datetime:
     """The window a Kalshi ticker names, as UTC.
 
-    `KXBTC15M-26JAN061730-30` encodes the window's CLOSE in Eastern time, so
-    the open is fifteen minutes earlier. Validated against a ticker held in
-    our own settlement store: that one was recorded against window_open
-    2026-01-06 17:15 ET.
-
-    Eastern, not a fixed offset — the same ticker shape spans EST and EDT, and
-    a fixed -05:00 would silently shift every summer window by an hour.
+    `KXBTC15M-26JAN061730-30` encodes the window's close in US Eastern time
+    (EST or EDT), so the open is fifteen minutes earlier.
     """
     try:
         stamp = ticker.split('-')[1]
@@ -58,11 +44,7 @@ def kalshi_window_open(ticker: str) -> dt.datetime:
 def pm_window_open(slug: str) -> dt.datetime:
     """The window a Polymarket slug names, as UTC.
 
-    The trailing unix stamp is the window's OPEN. Reading it as the close
-    shifted every Polymarket window by fifteen minutes and nothing raised —
-    every window was a valid window and every book was a real book. It
-    surfaced only as a settlement agreement of 49.85% where Kalshi scored
-    96.98%.
+    The trailing unix stamp is the window's open, not its close.
     """
     stamp = (slug or '').rsplit('-', 1)[-1]
     if not stamp.isdigit():
@@ -75,14 +57,8 @@ def verify_window(derived: dt.datetime, *, venue_open: Optional[dt.datetime],
                   tolerance: dt.timedelta = dt.timedelta(seconds=90)) -> Optional[str]:
     """Cross-check a derived window against the venue's own stated times.
 
-    Returns None when they agree, or a description of the disagreement. The
-    derived value is never trusted on its own: a parse that can be
-    wrong-but-plausible needs a second opinion, and both venues state the
-    window independently of the identifier we decode.
-
-    Absent venue times are a failure, not a pass. Treating "the venue told us
-    nothing" as corroboration would rebuild the same false confidence
-    somewhere new.
+    Returns None when they agree, or a description of the disagreement.
+    Absent venue times are a failure, not a pass.
     """
     if venue_open is None and venue_close is None:
         return 'venue stated neither open nor close; cannot corroborate'

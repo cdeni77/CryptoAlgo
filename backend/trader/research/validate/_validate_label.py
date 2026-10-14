@@ -1,41 +1,13 @@
-"""Does our Coinbase-derived label agree with how the market actually settled?
+"""Does our Coinbase-derived label agree with how each venue settled?
 
-**This tests the target, which nothing else in the repository does.** Every
-window, every feature, every gate and every backtest in this project rests on
-`core/windows.py` deciding UP or DOWN from Coinbase one-minute bars: the strike
-is the mean over [t0-1min, t0), the settlement value the mean over [t1-1min, t1),
-and `>=` decides. The market settles on CF Benchmarks BRTI. `CLAUDE.md` calls
-that basis an unmeasured risk, and it stayed unmeasured because nothing here
-held the venue's answer.
-
-`venue_settlements` now does, for both venues. So:
-
-  * **Kalshi vs us** — the direct test. A disagreement rate of x% means x% of
-    every training label in five years is wrong in the same way, and no model
-    fixes a mislabelled target. It also bounds the backtest: a window we called
-    UP and the venue settled DOWN is a trade the backtest paid us for and the
-    venue did not.
-  * **Polymarket vs us** — the same test against a venue settling on
-    Chainlink's BTC-USD TWAP-60s data stream (confirmed from a live market's
-    own `resolutionSource`, not Binance as this used to say).
-  * **Kalshi vs Polymarket** — two independent settlement sources on the same
-    fifteen minutes. Where those two disagree, neither is a clean benchmark and
-    the window is genuinely ambiguous rather than mislabelled.
-
-Disagreement should concentrate where the two ends of the window are close
-together — a near-tie on one index is a coin flip on another — so the rate is
-reported against |settlement - strike| in basis points. If it is flat in that
-variable, something structural is wrong rather than something marginal.
+Compares `core/windows.py` labels with `venue_settlements` (Kalshi, Polymarket),
+and the two venues with each other, by |settlement - strike| band in bp.
+Run: `python research/validate/_validate_label.py` from backend/trader.
 """
 
 from __future__ import annotations
 
-# This file moved into research/validate/ during a repo cleanup; `core`/`scripts`
-# are packages rooted at backend/trader/, which Python does not add to
-# sys.path automatically for a script run from a subdirectory (only the
-# script's OWN directory is added). Without this, every `from core...`
-# import below raises ModuleNotFoundError the moment the file is not sitting
-# directly in backend/trader/.
+# Put backend/trader on sys.path, so `core` imports when run as a script.
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
@@ -62,10 +34,8 @@ def main() -> int:
 
     bars = load_minute_bars(config, store=store)
     dataset = Dataset.build(bars, config)
-    # `windows` carries one row per (symbol, window, offset); the label and the
-    # two ends of the comparison are identical across offsets, so collapse to
-    # one row per window before joining or every disagreement is counted four
-    # times and the rate is unchanged but the n is a fiction.
+    # `windows` has one row per (symbol, window, offset). Collapse to one row
+    # per window, or each window is counted once per offset.
     ours = dataset.windows[['symbol', 'window_open', 'strike',
                             'settle_price', 'outcome']].drop_duplicates(
         ['symbol', 'window_open'], keep='first').copy()
