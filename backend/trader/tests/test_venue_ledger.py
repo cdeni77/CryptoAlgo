@@ -161,8 +161,8 @@ def test_the_tape_is_anonymous_and_carries_no_side_of_ours():
     """
     trade = parse_trade(TAPE_PRINT)
     assert trade.contracts == pytest.approx(10.0)
-    assert trade.price_for('up') == pytest.approx(0.56)
-    assert trade.price_for('down') == pytest.approx(0.44)
+    assert trade.yes_price == pytest.approx(0.56)
+    assert trade.no_price == pytest.approx(0.44)
     assert trade.is_block_trade is True
     assert not hasattr(trade, 'pnl')
     assert not hasattr(trade, 'contracts_held')
@@ -209,8 +209,8 @@ def test_a_print_whose_two_prices_do_not_sum_to_a_dollar_is_read_as_served():
     """
     trade = parse_trade({**TAPE_PRINT, 'yes_price_dollars': '0.5600',
                          'no_price_dollars': '0.5600'})
-    assert trade.price_for('up') == pytest.approx(0.56)
-    assert trade.price_for('down') == pytest.approx(0.56)
+    assert trade.yes_price == pytest.approx(0.56)
+    assert trade.no_price == pytest.approx(0.56)
 
 
 # ------------------------------------------------------- reading both tiers

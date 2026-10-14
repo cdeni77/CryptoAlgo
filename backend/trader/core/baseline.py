@@ -393,28 +393,6 @@ class Reliability:
                             * np.abs(self.predicted[populated]
                                      - self.observed[populated])) / total)
 
-    def error_above(self, threshold: float) -> float:
-        """Count-weighted calibration error over bins at or above `threshold`.
-
-        The aggregate ECE cannot see the band that matters. It is count-weighted
-        over every row, and most rows sit at the extremes where the barrier is
-        already decided and calibration is nearly free. Constructed and measured:
-        a model perfectly calibrated on 190,000 pinned rows and 5pp overconfident
-        on the 10,000 rows it actually trades scores an aggregate ECE of 0.0044
-        and passes a 0.02 gate, because those rows contribute 0.05 * 10/200 =
-        0.0025.
-
-        Restricting to the confident bins is not a substitute for measuring the
-        traded subset directly, but it needs no book to compute and it moves when
-        the aggregate does not.
-        """
-        mask = (self.edges[:-1] >= threshold - 1e-12) & (self.count > 0)
-        total = self.count[mask].sum()
-        if not total:
-            return float('nan')
-        return float(np.sum(self.count[mask]
-                            * np.abs(self.predicted[mask] - self.observed[mask])) / total)
-
     @property
     def max_deviation(self) -> float:
         populated = self.count > 0

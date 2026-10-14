@@ -17,7 +17,7 @@ import pytest
 
 from data_collection.kalshi_client import (
     CENT, DEFAULT_BASE_URL, DEMO_BASE_URL, KalshiClient, KalshiError, NotLiveError,
-    Quote, _cents, _parse_time, _to_quote,
+    Quote, _parse_time, _price, _to_quote,
 )
 
 
@@ -226,10 +226,11 @@ def test_a_settled_market_is_not_tradeable():
 
 
 def test_a_zero_price_reads_as_absent_not_as_free():
-    assert _cents(0) is None
-    assert _cents(None) is None
-    assert _cents('nonsense') is None
-    assert _cents(45) == pytest.approx(0.45)
+    """The legacy integer-cent encoding, through the parser quotes use."""
+    assert _price({'yes_bid': 0}, 'yes_bid') is None
+    assert _price({'yes_bid': None}, 'yes_bid') is None
+    assert _price({'yes_bid': 'nonsense'}, 'yes_bid') is None
+    assert _price({'yes_bid': 45}, 'yes_bid') == pytest.approx(0.45)
 
 
 def test_times_parse_to_utc():

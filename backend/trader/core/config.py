@@ -636,20 +636,6 @@ class Config:
     # `rv_surprise` is 67x out at 1,200 bars. Below 721 the NaN reaches
     # `sigma_remaining` and the cycle abstains on its own.
     min_usable_bars: int = 1_455
-    # RESEARCH ONLY, default 0. Lags the PEER venue's book by this many minutes
-    # when building `cross_venue`, to answer whether that group's contribution
-    # is a genuine interaction or is contemporaneity.
-    #
-    # `cross_venue` is the only load-bearing group — leave-one-out takes skill
-    # +0.00282 -> -0.00015 — while scoring +0.000030 alone, below the clock
-    # control. Useless alone and essential combined is what an interaction looks
-    # like AND what a timing leak looks like. Training's gap is sub-second
-    # simultaneous (median |age difference| 0.56s); live admits up to 30s, and a
-    # stale peer converts the feature into Kalshi's own recent move (induced
-    # error correlates 0.724 with its 60s return). If skill survives a lag the
-    # interaction is real; if it collapses, the group is contributing an
-    # alignment production cannot guarantee.
-    peer_lag_minutes: int = 0
     # Refuse a decision whose cross-venue peer book is missing. OFF by default,
     # because every ledger entry so far was measured without it. Measured, a
     # one-minute peer lag costs 70% of the model's skill and dropping the peer
@@ -884,11 +870,6 @@ class Config:
                     f'seal that cannot be parsed would seal nothing.') from exc
 
     # ---- derived ---------------------------------------------------------
-    @property
-    def settle_offset(self) -> int:
-        """Minutes from window open to settlement."""
-        return self.window_minutes
-
     def remaining_minutes(self, offset: int) -> int:
         """Wall-clock minutes from the decision to settlement.
 

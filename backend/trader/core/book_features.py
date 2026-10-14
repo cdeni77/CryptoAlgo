@@ -37,8 +37,6 @@ Three invariants run through all of it:
 
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 
@@ -146,87 +144,7 @@ def market_state_features(snap: pd.DataFrame, *,
     bid_5c = pd.Series(_column(snap, 'bid_5c'), index=snap.index)
     ask_5c = pd.Series(_column(snap, 'ask_5c'), index=snap.index)
     out['book_convexity'] = _safe_div(bid_5c, bid_1c) - _safe_div(ask_5c, ask_1c)
-
-    # Produced by `book_at_decision`; carried as NaN when the caller has not
-    # joined a book, so the matrix shape never depends on availability.
     return out
-
-
-def cross_venue_features(kalshi: pd.DataFrame, pm: pd.DataFrame, *,
-                         prev_gap: Optional[np.ndarray] = None) -> pd.DataFrame:
-    """Two independent books on the same fifteen minutes.
-
-    The venues settle on different oracles — CF Benchmarks BRTI against
-    Chainlink's BTC-USD TWAP-60s — but agree on 99.52% of shared windows, so a
-    price gap is information or liquidity rather than a different question.
-    """
-    out = pd.DataFrame(index=kalshi.index)
-    k_mid, p_mid = _mid(kalshi), _mid(pm.set_index(kalshi.index))
-    out['venue_prob_gap'] = k_mid - p_mid
-    # Absence is not agreement: Polymarket coverage differs from Kalshi's, and
-    # a zeroed gap would read as two venues concurring.
-    out['pm_available'] = np.where(np.isnan(p_mid), 0.0, 1.0)
-    out['venue_gap_change_5'] = (
-        out['venue_prob_gap'].values - prev_gap if prev_gap is not None
-        else np.nan)
-
-    def _spread(frame):
-        bid = pd.Series(_column(frame, 'best_bid'), index=frame.index)
-        ask = pd.Series(_column(frame, 'best_ask'), index=frame.index)
-        return ((ask - bid) / CENTS).where(bid.notna() & ask.notna()).values
-
-    ratio = _safe_div(_spread(kalshi), _spread(pm.set_index(kalshi.index)))
-    with np.errstate(divide='ignore', invalid='ignore'):
-        out['venue_spread_ratio'] = np.where(ratio > 0, np.log(ratio), np.nan)
-    return out
-
-
-def implied_vol_features(table: pd.DataFrame, fits: pd.DataFrame) -> pd.DataFrame:
-    """The ladder's forward-looking sigma against the baseline's backward one.
-
-    `iv_minus_realised` is the mechanism and the rest is context. The baseline
-    scales a realised-vol forecast; where the market's implied sigma disagrees,
-    the baseline's `sigma_remaining` is wrong in a knowable direction, and that
-    is the only quantity the barrier framing says needs forecasting at all.
-    """
-    out = pd.DataFrame(index=table.index)
-    implied = _column(fits, 'implied_sigma_per_min')
-    realised = _column(table, 'sigma_per_min')
-    ratio = _safe_div(implied, realised)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        out['iv_minus_realised'] = np.where(ratio > 0, np.log(ratio), np.nan)
-    out['implied_sigma_per_min'] = implied
-    out['iv_r2'] = _column(fits, 'r2')
-    out['iv_n_strikes'] = _column(fits, 'n_strikes')
-    # Carried because coverage is ~15% of the timeline with a five-hour mean
-    # gap: a sigma forward-filled from three hours ago is a different claim
-    # from a fresh one, and the model has to be able to tell them apart.
-    out['iv_staleness_minutes'] = _column(fits, 'staleness_minutes')
-    return out
-
-
-def book_at_decision(books: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
-    """The last book snapshot AT OR BEFORE each decision instant.
-
-    An as-of join rather than a nearest one, and keyed on the window as well as
-    the symbol. Both matter:
-
-      * nearest would let a quote from *after* the decision inform it, which is
-        a leak that reads exactly like skill;
-      * consecutive windows chain — one window's strike is the previous one's
-        settlement value — so a join spilling across the boundary would look
-        entirely correct and be wrong.
-    """
-    if not len(books) or not len(table):
-        return pd.DataFrame(index=table.index)
-    left = table.sort_values('decision_time')
-    right = books.sort_values('event_time')
-    joined = pd.merge_asof(
-        left, right,
-        left_on='decision_time', right_on='event_time',
-        by=['symbol', 'window_open'], direction='backward',
-        suffixes=('', '_book'))
-    return joined.sort_index().reindex(table.index)
 
 
 # A ladder fit older than this is not a forward-looking estimate of anything.

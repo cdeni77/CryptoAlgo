@@ -20,7 +20,6 @@ anywhere.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import AsyncIterator, Protocol, Sequence
 
 Level = tuple[float, float]
 KINDS = ('snapshot', 'delta')
@@ -53,14 +52,3 @@ class BookEvent:
     def is_delta(self) -> bool:
         return self.kind == 'delta'
 
-
-class VenueStream(Protocol):
-    """Connect, subscribe, yield normalized events."""
-
-    async def connect(self) -> None: ...
-
-    async def subscribe(self, tickers: Sequence[str]) -> None: ...
-
-    def events(self) -> AsyncIterator[BookEvent]: ...
-
-    async def close(self) -> None: ...

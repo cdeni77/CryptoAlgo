@@ -549,19 +549,6 @@ class EvaluationReport:
     def traded_folds(self) -> list[BookStats]:
         return [f.stats for f in self.folds if f.stats is not None]
 
-    @property
-    def total_trades(self) -> int:
-        return int(sum(s.n_trades for s in self.traded_folds))
-
-    @property
-    def mean_fold_return(self) -> float:
-        stats = self.traded_folds
-        return float(np.mean([s.total_return for s in stats])) if stats else float('nan')
-
-    @property
-    def folds_profitable(self) -> int:
-        return int(sum(1 for s in self.traded_folds if s.total_return > 0))
-
     def per_offset(self) -> pd.DataFrame:
         frames = [f.per_offset.assign(fold=f.index) for f in self.folds if f.per_offset is not None]
         if not frames:

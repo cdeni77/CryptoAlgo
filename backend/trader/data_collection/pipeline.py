@@ -478,10 +478,3 @@ class DataPipeline:
 
     def get_quality_summary(self) -> Dict[str, Any]:
         return self._quality_tracker.get_summary()
-
-
-async def create_pipeline(config: Optional[PipelineConfig] = None) -> DataPipeline:
-    config = config or PipelineConfig()
-    pipeline = DataPipeline(config)
-    await pipeline.initialize()
-    return pipeline

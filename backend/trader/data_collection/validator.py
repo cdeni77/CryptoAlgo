@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 from .models import (
     OHLCVBar,
-    Trade,
     OrderBookSnapshot,
     TickerUpdate,
     DataQuality,
@@ -148,39 +147,6 @@ class DataValidator:
         bar.quality = result.quality
         bar.quality_notes = "; ".join(result.issues) if result.issues else None
         
-        return result
-    
-    def validate_trade(self, trade: Trade) -> DataValidationResult:
-        """
-        Validate individual trade.
-        """
-        result = DataValidationResult(is_valid=True, quality=DataQuality.VALID)
-        
-        # Price validation
-        if not self._is_valid_price(trade.price):
-            result.add_issue(f"Invalid price: {trade.price}", severity="error")
-        
-        # Size validation
-        if trade.size <= 0:
-            result.add_issue(f"Invalid size: {trade.size}", severity="error")
-        
-        # Timestamp validation
-        ts_result = self._validate_timestamp(trade.event_time, trade.available_time)
-        if not ts_result.is_valid:
-            result.issues.extend(ts_result.issues)
-            result.is_valid = False
-        
-        # Price continuity check
-        last_price = self._last_prices.get(trade.symbol)
-        if last_price:
-            price_change_pct = abs(trade.price - last_price) / last_price * 100
-            if price_change_pct > self.config.max_price_change_pct:
-                result.add_issue(
-                    f"Large price move: {price_change_pct:.2f}%",
-                    severity="warning"
-                )
-        
-        trade.quality = result.quality
         return result
     
     def validate_orderbook(self, book: OrderBookSnapshot) -> DataValidationResult:

@@ -647,21 +647,6 @@ class PgWriter:
             session.commit()
             return row.id
 
-    def recent_predictions(self, limit: int = 200, *, traded_only: bool = False) -> list[Prediction]:
-        with self._session() as session:
-            query = session.query(Prediction)
-            if traded_only:
-                query = query.filter(Prediction.traded.is_(True))
-            return list(query.order_by(Prediction.window_open.desc()).limit(limit))
-
-    def refusal_counts(self, since: Optional[datetime] = None) -> dict[str, int]:
-        """The funnel, as the dashboard shows it."""
-        with self._session() as session:
-            query = session.query(Prediction.reason, func.count(Prediction.id))
-            if since is not None:
-                query = query.filter(Prediction.window_open >= since)
-            return {reason: int(count) for reason, count in query.group_by(Prediction.reason)}
-
     # ---- minute prices --------------------------------------------------
     def write_minute_prices(self, rows: Iterable[dict]) -> int:
         """Upsert minute bars for the chart. Idempotent on (symbol, minute)."""
@@ -678,14 +663,6 @@ class PgWriter:
                 written += 1
             session.commit()
         return written
-
-    def minute_prices(self, symbol: str, since: datetime) -> list[MinutePrice]:
-        with self._session() as session:
-            return list(
-                session.query(MinutePrice)
-                .filter(MinutePrice.symbol == symbol, MinutePrice.minute >= since)
-                .order_by(MinutePrice.minute)
-            )
 
     def prune_minute_prices(self, before: datetime) -> int:
         """Drop rows that have scrolled off the chart. Called by the engine."""
@@ -1245,14 +1222,6 @@ class PgWriter:
             session.commit()
             return row.id
 
-    def equity_curve_since(self, since: datetime) -> list[EquityPoint]:
-        with self._session() as session:
-            return list(
-                session.query(EquityPoint)
-                .filter(EquityPoint.timestamp >= since)
-                .order_by(EquityPoint.timestamp)
-            )
-
     # ---- the venue ledger -----------------------------------------------
     #
     # Written by the live loop every cycle (from the reconcile it already
@@ -1443,16 +1412,6 @@ class PgWriter:
             session.commit()
             return row.id
 
-    def latest_model_run(self) -> Optional[ModelRun]:
-        with self._session() as session:
-            return (session.query(ModelRun)
-                    .order_by(ModelRun.created_at.desc()).first())
-
-    def model_runs(self, limit: int = 50) -> list[ModelRun]:
-        with self._session() as session:
-            return list(session.query(ModelRun)
-                        .order_by(ModelRun.created_at.desc()).limit(limit))
-
     def write_calibration(self, model_version: str, source: str,
                           bins: Iterable[dict]) -> int:
         """Replace the reliability table for one (version, source)."""
@@ -1466,10 +1425,3 @@ class PgWriter:
                 written += 1
             session.commit()
         return written
-
-    def calibration(self, model_version: Optional[str] = None) -> list[CalibrationBin]:
-        with self._session() as session:
-            query = session.query(CalibrationBin)
-            if model_version:
-                query = query.filter_by(model_version=model_version)
-            return list(query.order_by(CalibrationBin.source, CalibrationBin.bin_low))

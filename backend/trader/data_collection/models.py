@@ -15,10 +15,6 @@ class Side(Enum):
     """Trade/order side."""
     BUY = "buy"
     SELL = "sell"
-    
-    @classmethod
-    def from_string(cls, s: str) -> "Side":
-        return cls.BUY if s.lower() in ("buy", "bid", "long") else cls.SELL
 
 
 class DataQuality(Enum):
@@ -50,10 +46,6 @@ class BiTemporalMixin:
     """
     event_time: datetime  # When event occurred
     available_time: datetime  # When we received/could access the data
-    
-    def is_available_at(self, query_time: datetime) -> bool:
-        """Check if this data point was available at query_time."""
-        return query_time >= self.available_time
 
 
 @dataclass
@@ -218,21 +210,6 @@ class OrderBookSnapshot(BiTemporalMixin):
         """Total size on ask side up to depth levels."""
         levels = self.asks[:depth] if depth else self.asks
         return sum(level.size for level in levels)
-    
-    def imbalance(self, depth: int = 5) -> float:
-        """
-        Order book imbalance ratio.
-        
-        Returns value in [-1, 1]:
-        - Positive: More buying pressure (more bids)
-        - Negative: More selling pressure (more asks)
-        """
-        bid_size = self.total_bid_size(depth)
-        ask_size = self.total_ask_size(depth)
-        total = bid_size + ask_size
-        if total == 0:
-            return 0.0
-        return (bid_size - ask_size) / total
     
     def to_dict(self) -> Dict[str, Any]:
         return {

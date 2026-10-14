@@ -24,8 +24,6 @@ been published yet. Funding and OI in particular are revised.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 from datetime import datetime
@@ -242,10 +240,6 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         # in the schema could tell that from the stream ladder the decision
         # actually scored. Null on every row written before 2026-09-16.
         'transport',
-    ),
-    'book_snapshots': (
-        'venue', 'symbol', 'event_time', 'available_time', 'quality',
-        'bid', 'ask', 'bid_size', 'ask_size', 'depth_1pct_bid', 'depth_1pct_ask',
     ),
     # Every Coinbase trade the spot stream saw, written by `core/spool` like
     # `venue_book_events` (never through `write()`). `event_time` is the print,
@@ -670,61 +664,11 @@ class ResearchStore:
         return (out[cols].sort_values(['venue', 'symbol'])
                 .reset_index(drop=True))
 
-    # -- feature matrices ---------------------------------------------------
-
-    def write_features(
-        self,
-        frame: pd.DataFrame,
-        *,
-        name: str,
-        meta: Optional[dict[str, Any]] = None,
-    ) -> tuple[Path, str]:
-        """Materialise a feature matrix alongside a content hash.
-
-        The hash covers the column names and the values, so a model artifact can
-        record exactly which feature matrix it trained on. When a feature
-        definition changes, the hash changes, and a stale model is detectable
-        instead of quietly scoring against different inputs.
-        """
-        directory = self.root / 'features' / name
-        directory.mkdir(parents=True, exist_ok=True)
-
-        digest = feature_hash(frame)
-        path = directory / f"{digest}.parquet"
-        if not path.exists():
-            tmp = path.with_suffix('.parquet.tmp')
-            frame.to_parquet(tmp, compression='zstd')
-            os.replace(tmp, path)
-
-        payload = {
-            'name': name,
-            'hash': digest,
-            'rows': int(len(frame)),
-            'columns': list(map(str, frame.columns)),
-            **(meta or {}),
-        }
-        (directory / f"{digest}.json").write_text(json.dumps(payload, indent=2, default=str))
-        return path, digest
-
-    def read_features(self, name: str, digest: str) -> pd.DataFrame:
-        path = self.root / 'features' / name / f"{digest}.parquet"
-        if not path.exists():
-            raise DataStoreError(f"No feature matrix {name}/{digest}")
-        return pd.read_parquet(path)
-
     def drop(self, dataset: str) -> None:
         """Remove a dataset entirely. Used by tests and rebuilds."""
         target = self.root / dataset
         if target.exists():
             shutil.rmtree(target)
-
-
-def feature_hash(frame: pd.DataFrame) -> str:
-    """Stable content hash of a feature matrix (columns + values)."""
-    hasher = hashlib.sha256()
-    hasher.update(json.dumps(list(map(str, frame.columns))).encode())
-    hasher.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
-    return hasher.hexdigest()[:16]
 
 
 # Which research dataset a scraped timeframe belongs in. The 15-minute binary

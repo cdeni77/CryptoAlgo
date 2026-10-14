@@ -371,9 +371,6 @@ class ForecastModel:
         # confidently asserted" on a real-money path, silently.
         return np.where(np.isfinite(base), out, np.nan)
 
-    def predict_baseline(self, table: pd.DataFrame) -> np.ndarray:
-        return clip_prob(table['baseline_probability'].to_numpy(dtype=float))
-
     # ---- provenance -----------------------------------------------------
     def importance(self, kind: str = 'gain') -> pd.DataFrame:
         values = np.mean([np.asarray(b.feature_importance(importance_type=kind),

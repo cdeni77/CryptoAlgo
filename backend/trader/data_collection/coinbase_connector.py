@@ -269,30 +269,6 @@ class CoinbaseRESTClient:
         unique = {b.event_time: b for b in all_bars}
         return sorted(unique.values(), key=lambda x: x.event_time)
     
-    async def get_ticker(self, product_id: str) -> Optional[TickerUpdate]:
-        path = f"/api/v3/brokerage/products/{product_id}/ticker"
-        status, data = await self._request("GET", path, params={"limit": 1})
-        if status != 200:
-            logger.error(f"Failed to get ticker for {product_id}: {data}")
-            return None
-        try:
-            trades = data.get("trades", [])
-            best_bid = data.get("best_bid")
-            best_ask = data.get("best_ask")
-            if not trades:
-                return None
-            latest = trades[0]
-            now = utc_now()
-            return TickerUpdate(
-                symbol=product_id, event_time=now, available_time=now,
-                price=float(latest.get("price", 0)),
-                best_bid=float(best_bid) if best_bid else 0.0,
-                best_ask=float(best_ask) if best_ask else 0.0,
-            )
-        except (KeyError, ValueError) as e:
-            logger.error(f"Failed to parse ticker: {e}")
-            return None
-    
     def _granularity_to_seconds(self, granularity: str) -> int:
         mapping = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "6h": 21600, "1d": 86400}
         return mapping.get(granularity, 3600)
@@ -520,6 +496,3 @@ class CoinbaseWebSocketClient:
         if self._session and not self._session.closed:
             await self._session.close()
         logger.info("WebSocket client stopped")
-    
-    def get_orderbook(self, product_id: str) -> Optional[OrderBookSnapshot]:
-        return self._orderbook_state.get(product_id)
