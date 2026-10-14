@@ -16,40 +16,28 @@ logger = logging.getLogger('live')
 
 
 def config_for_artifact(config, model, *, mode: str):
-    """Adopt the artifact's init-score source, refusing the one mode that cannot
-    supply it.
+    """Adopt the artifact's economics and init-score source.
 
-    The artifact records which forecaster its correction was fitted on top of,
-    and live has no legitimate choice: scoring a market-fitted residual on the
-    baseline logit is the silent failure `ForecastModel.verify` exists to catch.
-    So the artifact wins.
-
-    A market-init model needs the book to score, and `fetch_quotes` returns {}
-    when no Kalshi client was opened (every paper run). Adopting silently would
-    turn a loud crash into a NaN prediction every cycle that reads as an
-    abstention, so that combination raises.
+    The artifact's init-score source always wins: a residual fitted on one
+    logit is wrong on the other. A market-init model needs a book, so it raises
+    outside live mode instead of scoring NaN every cycle.
     """
-    # The economic policy the artifact was EVALUATED under. `verify` cannot catch
-    # a mismatch here: these change what the strategy DOES, not what the model
-    # SAYS. Kelly is also an edge filter, not only a size — `decide()` floors
-    # stakes to whole contracts (CLAUDE.md: 0.25 -> 0.10 Kelly moved realised
-    # edge per contract +0.99pp -> +3.32pp).
+    # The economic policy the artifact was evaluated under. `verify` cannot
+    # catch a mismatch here, because these change what the strategy does.
+    # Kelly is also an edge filter: `decide()` floors stakes to whole contracts.
     provenance = dict(getattr(model, 'config_provenance', None) or {})
-    # Anything the command line set explicitly wins: adoption is so an artifact
-    # trades under the policy it was measured under, not to overrule the
-    # operator at the next promotion.
+    # A value set explicitly on the command line wins over the artifact.
     explicit = set(getattr(config, 'cli_overrides', None) or ())
     economics = {}
     for field in ('kelly_fraction', 'min_edge_pp', 'max_stake_dollars',
                   'max_stake_fraction', 'half_spread_cents', 'compound',
-                  # The ensemble gates are part of the policy the artifact was
-                  # evaluated under, so they travel with it like the rest.
+                  # The ensemble gates are part of the evaluated policy.
                   'edge_lower_bound_z', 'require_member_agreement'):
         if field in explicit:
             continue
         value = provenance.get(field)
-        # None means the promoting run left it at ITS default, which is the
-        # default here too. Adopting a None would erase a real setting.
+        # None means the promoting run used the default. Adopting it would
+        # erase a real setting.
         if value is not None and value != getattr(config, field, None):
             economics[field] = value
     if economics:
@@ -57,9 +45,9 @@ def config_for_artifact(config, model, *, mode: str):
                     ', '.join(f'{k}={v}' for k, v in sorted(economics.items())))
         config = replace(config, **economics)
 
-    # An artifact that reads the cross-venue group refuses a row without the
-    # peer book: `--complete-cases` put the peer on every training row, so a
-    # missing one sends LightGBM down NaN branches it never fitted. Explicit wins.
+    # An artifact that reads cross_venue refuses a row without the peer book.
+    # Training rows always carry the peer, so a NaN takes branches never
+    # fitted. An explicit flag wins.
     if ('cross_venue' in tuple(getattr(model, 'groups', ()) or ())
             and 'require_peer_book' not in explicit
             and not getattr(config, 'require_peer_book', False)):
@@ -80,10 +68,10 @@ def config_for_artifact(config, model, *, mode: str):
 
 
 def artifact_signature(path) -> Optional[tuple]:
-    """What identifies the installed artifact on disk, cheaply.
+    """Return a cheap identity for the installed artifact file.
 
-    `promote` installs by atomic rename, so a new artifact is a new inode with
-    its own mtime and size; reading the bytes every window is not needed.
+    `promote` installs by atomic rename, so a new artifact has a new inode,
+    mtime and size.
     """
     try:
         st = os.stat(path)
@@ -93,7 +81,7 @@ def artifact_signature(path) -> Optional[tuple]:
 
 
 def _load_artifact(args, base_config: Config):
-    """The installed artifact and the config to trade it under, as `main` builds them."""
+    """Load the installed artifact and the config to trade it under."""
     model = (load_live(config=None) if args.model is None
              else __import__('core.model', fromlist=['ForecastModel'])
              .ForecastModel.load(args.model, None))
@@ -114,11 +102,9 @@ async def reload_if_changed(args, base_config: Config, path, model, config,
                             signature):
     """Swap in a newly installed artifact; on any failure keep the old one.
 
-    Returns `(model, config, signature)`. Loading runs in a thread: a joblib
-    load is seconds of blocking work and the stream readers share this loop.
-    A refusal — a gate-blocked artifact under `--require-gates`, an init source
-    this mode cannot score, an unreadable file — is logged as an ERROR and the
-    loop keeps trading what it was already trading.
+    Returns `(model, config, signature)`. Loading runs in a thread because the
+    stream readers share this event loop. A refused artifact is logged as an
+    error and the loop keeps the old model.
     """
     current = artifact_signature(path)
     if current is None or current == signature:
@@ -131,8 +117,7 @@ async def reload_if_changed(args, base_config: Config, path, model, config,
         logger.error('could not load the new artifact (%s); still trading %s',
                      str(exc)[:300], getattr(model, 'version', 'the old model'),
                      exc_info=not isinstance(exc, SystemExit))
-        # Not retried every window: a refused artifact stays refused until
-        # the file changes again.
+        # A refused artifact stays refused until the file changes again.
         return model, config, current
     logger.warning('now trading artifact %s (was %s)',
                    getattr(new_model, 'version', '?'),
@@ -141,13 +126,10 @@ async def reload_if_changed(args, base_config: Config, path, model, config,
 
 
 def _installed_version() -> Optional[str]:
-    """Which staged artifact is the one on disk, by CONTENT.
+    """Return the staged version whose bytes match the installed file.
 
-    Not "the newest ledger entry": a failed promotion installs nothing, and a
-    rollback deliberately writes no ledger entry (a rollback is not a trial).
-    `promote` stages each candidate under `models/.staging/<version>/` and
-    renames it into place, so the installed file is byte-identical to exactly
-    one of them.
+    The newest ledger entry is not the answer: a failed promotion installs
+    nothing, and a rollback writes no ledger entry.
     """
     return _staged_version(Path(MODELS_ROOT) / 'forecast.joblib')
 
@@ -170,11 +152,10 @@ def _staged_version(path) -> Optional[str]:
 
 
 def artifact_version(path) -> Optional[str]:
-    """The version recorded on every prediction: the promotion ledger's.
+    """Return the version recorded on every prediction.
 
-    The staged version whose bytes the file matches; failing that (a file
-    promoted before staging existed, or `--model` pointing elsewhere) a content
-    hash, so rows from two different artifacts can never share a version.
+    This is the matching staged version, or else a content hash. Two different
+    artifacts never share a version.
     """
     import hashlib
 
@@ -203,8 +184,7 @@ def _refuse_if_blocked() -> None:
     frame = history()
     if frame.empty:
         raise SystemExit('no promotion attempt recorded; refusing to trade')
-    # The artifact ON DISK, not the newest attempt: the question is "did the
-    # model I am about to trade pass?", a property of the file. A failed later
+    # Judge the artifact on disk, not the newest attempt. A later failed
     # promotion or a rollback must not block a passing installed model.
     installed = _installed_version()
     if installed is not None:
@@ -212,8 +192,8 @@ def _refuse_if_blocked() -> None:
         if len(match):
             frame = match
     latest = frame.iloc[0]
-    # `installed` and `passed` are different questions: `--force` installs a
-    # gate-failing artifact with installed=True, so test the gates too.
+    # `--force` installs a gate-failing artifact with installed=True, so test
+    # `passed` too.
     if not bool(latest.get('installed')):
         raise SystemExit(
             f"the newest attempt {latest.get('version')} was blocked on "

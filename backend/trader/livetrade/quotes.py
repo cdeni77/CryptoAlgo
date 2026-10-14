@@ -1,9 +1,8 @@
-"""The Kalshi book for the live loop: which market, its touch, its ladder.
+"""The Kalshi book for the live loop: market resolution, touch and ladder.
 
-Markets are resolved by asking the venue, once per window. A quote comes from
-the in-process stream book when it can vouch for it, else one REST
-`/orderbook` read. Also here: the ladder and depth helpers every book feature is
-built from, and the top-of-book archive written after each decision.
+Resolves each window's market by asking the venue. Quotes come from the
+in-process stream book, else from one REST `/orderbook` read. Also holds the
+ladder and depth helpers and the top-of-book archive.
 """
 
 from __future__ import annotations
@@ -24,9 +23,8 @@ from livetrade import state
 
 logger = logging.getLogger('live')
 
-# symbol -> (settle_time, market metadata): each window's market is resolved
-# once, not on every read. The metadata carries NO touch (`market_meta`), so a
-# price can only come from a book.
+# symbol -> (settle_time, market metadata), resolved once per window. The
+# metadata carries no touch, so a price can only come from a book.
 _MARKETS: dict[str, tuple[pd.Timestamp, Quote]] = {}
 
 _UNSET = object()
@@ -65,11 +63,11 @@ async def _resolve_one(kalshi, symbol: str, settle_time: pd.Timestamp, *,
 
 async def resolve_markets(kalshi, symbols, settle_time: pd.Timestamp, *,
                           refresh: bool = False) -> dict[str, Quote]:
-    """Each symbol's market for this window: cached, or resolved concurrently.
+    """Return each symbol's market for this window, cached or resolved.
 
-    `refresh` re-reads `/markets/{ticker}` for every cached market — status,
-    shard and `floor_strike`, which the venue publishes after the window opens.
-    Non-decision cycles do it, so a decision never pays for it.
+    `refresh` re-reads `/markets/{ticker}` for status, shard and
+    `floor_strike`, which the venue publishes after the window opens.
+    Only non-decision cycles refresh.
     """
     symbols = list(symbols)
     results = await asyncio.gather(
@@ -86,7 +84,7 @@ async def resolve_markets(kalshi, symbols, settle_time: pd.Timestamp, *,
 
 
 def stream_quote(cache, meta: Quote, max_age_seconds: float) -> Optional[Quote]:
-    """`meta` priced off the in-process stream book, or None if it cannot vouch."""
+    """Price `meta` from the in-process stream book, or return None."""
     if cache is None or meta is None or not meta.ticker:
         return None
     try:
@@ -95,8 +93,7 @@ def stream_quote(cache, meta: Quote, max_age_seconds: float) -> Optional[Quote]:
         return None
     if ladder is None:
         return None
-    # As of the connection's last frame: until then the venue had told us
-    # every change, so that is when this book was last known to be right.
+    # The book is known correct as of the connection's last frame.
     return quote_from_levels(meta, ladder.yes, ladder.no, source='stream',
                              at=time.time() - max(0.0, float(ladder.age_seconds)))
 
@@ -109,18 +106,12 @@ async def fetch_quotes(
     cache=_UNSET,
     max_age_seconds: Optional[float] = None,
 ) -> dict[str, tuple[Quote, str]]:
-    """Each symbol's touch for this window: the stream book, else one REST read.
+    """Return each symbol's touch for this window.
 
-    **The stream first.** `record_stream.CACHE` is folded from the venue's own
-    socket in this process, ~34ms behind the venue, so pricing from it costs no
-    round trip. It is used only while that book is present, not gapped and its
-    connection delivered a frame within `stream_quote_max_age_seconds`.
-
-    **Otherwise one `/orderbook` read per symbol, all concurrently.** Never the
-    `/markets` touch: it is cached and measured up to 6.3c wrong, so a failed
-    book read is no quote — `decide()` refuses `no_quote` — not a fallback.
-
-    Each `Quote` carries `book_source` and `book_time`, stamped at its own read.
+    Uses the stream book while it is present, not gapped, and younger than
+    `stream_quote_max_age_seconds`. Otherwise reads `/orderbook` once per
+    symbol. Never uses the `/markets` touch, because it is cached and can be
+    cents wrong; a failed book read gives no quote.
     """
     if kalshi is None:
         return {}
@@ -162,7 +153,7 @@ async def fetch_quotes(
 
 
 def _stream_cache():
-    """The stream task's cache, when this process is running one."""
+    """Return the stream task's cache, if this process runs one."""
     try:
         from scripts.record_stream import CACHE
         return CACHE
@@ -186,14 +177,10 @@ async def fresh_quote(kalshi, quote, config: Config):
 
 
 def _ladder_touch(levels, *, invert: bool, fallback: float) -> float:
-    """The best price the LADDER actually shows, in the quote's denomination.
+    """Return the best price the ladder shows, in the quote's denomination.
 
-    Depth buckets must be measured against the touch of the same snapshot that
-    supplies the levels; a separately-fetched touch a cent better makes the 1c
-    bucket read zero.
-
-    `fallback` is used only when the ladder is empty, where there is nothing to
-    measure and the NaN is the honest answer.
+    Depth buckets must use the touch of the same snapshot as the levels.
+    `fallback` is used only when the ladder is empty.
     """
     best = None
     for entry in levels or []:
@@ -209,12 +196,7 @@ def _ladder_touch(levels, *, invert: bool, fallback: float) -> float:
 
 
 def _cumulative(levels, *, best: float, within: float, invert: bool) -> float:
-    """Resting size at prices at least as good as `best +/- within`.
-
-    This, not the touch, is what decides a fill: our limit sits a cent or two
-    past the touch, so the order fills only if the cumulative size up to that
-    limit covers it.
-    """
+    """Return resting size at prices at least as good as `best +/- within`."""
     total = 0.0
     for entry in levels or []:
         try:
@@ -228,7 +210,7 @@ def _cumulative(levels, *, best: float, within: float, invert: bool) -> float:
 
 
 def _resting_total(levels) -> float:
-    """Every resting contract on one side, at any price (`depth_*_total`)."""
+    """Return all resting contracts on one side, or NaN with no levels."""
     total, seen = 0.0, False
     for entry in levels or []:
         try:
@@ -240,23 +222,11 @@ def _resting_total(levels) -> float:
 
 
 def ladder_from_cache(cache, ticker: str):
-    """(yes_levels, no_levels) from the stream's in-process book, or empty.
+    """Return (yes_levels, no_levels) from the in-process stream book, or empty.
 
-    `run_live` runs the stream and trade tasks in one process, so
-    `record_stream.CACHE` already holds every subscribed ladder: no fetch, and
-    fresher than REST (~34ms against ~73ms).
-
-    Refused in three cases, all of which mean the book in hand may not be the
-    book on the venue:
-
-      * no cache — `scripts.live` also runs standalone, without the stream task;
-      * stale — ten seconds of silence at 400+ frames a second is a sick
-        transport, not a quiet market;
-      * gapped — `seq` is global per SUBSCRIPTION, so a miss condemns every book
-        on the connection, this one included.
-
-    Empty levels give NaN depth features, which `_warn_unscoreable_features`
-    reports. That is the honest answer, not a silent substitution.
+    Returns empty when there is no cache, or the book is stale or gapped.
+    `seq` is global per subscription, so a gap condemns every book on the
+    connection.
     """
     if cache is None or not ticker:
         return [], []
@@ -272,24 +242,17 @@ def ladder_from_cache(cache, ticker: str):
 
 
 def quote_ladder(quote) -> tuple[list, list]:
-    """(yes_levels, no_levels) carried on a quote, or empty."""
+    """Return (yes_levels, no_levels) carried on a quote, or empty."""
     return (list(getattr(quote, 'yes_levels', ()) or ()),
             list(getattr(quote, 'no_levels', ()) or ()))
 
 
 def depth_dollars(quote, yes_levels, no_levels):
-    """(depth_up, depth_down) in DOLLARS, or (None, None) with no ladder.
+    """Return (depth_up, depth_down) in dollars, or (None, None) with no ladder.
 
-    `decide()` caps the stake at `measured_depth * depth_fraction`; this is
-    where `depth_up`/`depth_down` come from.
-
-    Kalshi's book is two BID stacks: buying YES crosses the YES ask, whose size
-    comes from the NO stack; buying NO crosses the NO ask, whose size comes from
-    the YES stack. Dollars, because that is what `decide()` compares against the
-    stake.
-
-    None, not zero, when there is no ladder — zero would refuse every trade,
-    where the honest answer is "unmeasured, fall back to the standing cap".
+    Kalshi's book is two bid stacks. The YES ask size comes from the NO stack,
+    and the NO ask size from the YES stack. None means unmeasured, so
+    `decide()` uses the standing cap; zero would refuse every trade.
     """
     def _touch(levels):
         best = None
@@ -324,14 +287,10 @@ def quote_age_seconds(quote, decided_at) -> float:
 
 async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
                         config: Config, kalshi, *, decided_at=None) -> None:
-    """Write the venue's book — top of book plus cumulative depth — to the store,
-    with the peer book and implied-vol fit the same decision read.
+    """Write the decision's book, peer book and implied-vol fit to the store.
 
-    Best effort: a failure here must never stop a trading cycle, because this is
-    measurement and the cycle is money.
-
-    Depth is in no historical endpoint and `/orderbook` returns empty once a
-    market settles, so a book not written down now is gone.
+    Best effort: a failure here never stops a trading cycle. No historical
+    endpoint serves depth, so a book not written now is lost.
     """
     try:
         from core.datastore import ResearchStore
@@ -342,10 +301,9 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
             if quote is None or quote.yes_bid is None or quote.yes_ask is None:
                 continue
             ticker = quotes[symbol][1]
-            # The ladder the decision priced from, the same snapshot as the
-            # touch. Then the stream cache. A REST fetch is the last resort:
-            # it runs after our own fill has removed size from the traded side,
-            # so the row is flagged `rest_after_order`.
+            # Prefer the ladder the decision priced from, then the stream
+            # cache. A REST fetch runs after our own fill changed the book, so
+            # its row is flagged `rest_after_order`.
             yes_levels, no_levels = quote_ladder(quote)
             ladder_source = getattr(quote, 'book_source', None) or 'stream'
             if not yes_levels and not no_levels:
@@ -363,24 +321,20 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                     pass
             event_time = pd.Timestamp(window_open) + pd.Timedelta(minutes=offset)
             rows.append({
-                # How old the priced book was when the decision was taken: the
-                # stream's last frame or the REST response, to the decision
-                # instant. NaN only when the quote carries no read time — the
-                # backtest reads a NULL age as fresh, so never invent one.
+                # Age of the priced book at the decision. NaN when unknown;
+                # never invent a value, because the backtest reads NULL as fresh.
                 'quote_age_seconds': quote_age_seconds(quote, decided_at),
                 'venue': 'kalshi', 'symbol': symbol, 'event_time': event_time,
                 'available_time': pd.Timestamp.now(tz='UTC'), 'quality': 'valid',
-                # Which sampler produced the LADDER half of this row: an
-                # observation at the decision and a reconstruction after our
-                # own fill are different claims.
+                # Which sampler produced the ladder half of this row.
                 'transport': ladder_source,
                 'market_ticker': quotes[symbol][1], 'window_open': window_open,
                 'offset_minutes': offset,
                 'yes_bid': float(quote.yes_bid), 'yes_ask': float(quote.yes_ask),
                 'yes_bid_size': float(quote.yes_bid_size or 0.0),
                 'yes_ask_size': float(quote.yes_ask_size or 0.0),
-                # ONE sampler, as in `book_feature_row`: the ladder's own
-                # touch, not the quote's.
+                # Measure depth from the ladder's own touch, as in
+                # `book_feature_row`.
                 'depth_bid_1c': _cumulative(
                     yes_levels, within=0.01, invert=False,
                     best=_ladder_touch(yes_levels, invert=False,
@@ -397,29 +351,28 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                     no_levels, within=0.05, invert=True,
                     best=_ladder_touch(no_levels, invert=True,
                                        fallback=float(quote.yes_ask))),
-                # The whole resting ladder: `depth_ratio` and `book_convexity`
-                # read these, and the next retrain trains on what is recorded.
+                # The whole resting ladder, read by `depth_ratio` and
+                # `book_convexity`.
                 'depth_bid_total': _resting_total(yes_levels),
                 'depth_ask_total': _resting_total(no_levels),
                 'levels_bid': float(len(yes_levels)),
                 'levels_ask': float(len(no_levels)),
                 'seq': float('nan'), 'gaps': 0.0,
-                # The observer. `source` is in `EVENT_KEY_EXTRA['venue_depth']`
-                # so independent observations of one minute survive a read.
-                # Not 'live': that is the ladder recorder's REST poll, a
-                # different sample at a different instant.
+                # The observer. `source` is part of the `venue_depth` event key,
+                # so each observer's row for one minute survives a read. 'live'
+                # is the ladder recorder's REST poll.
                 'source': 'live_touch',
             })
-        # The peer book and the implied-vol fit the same decision read, so
-        # the backtest can join the inputs live actually used.
+        # Record the peer book and implied-vol fit this decision read, so the
+        # backtest can join the inputs live used.
         from livetrade.features import decision_input_rows, mark_fits_written
         peer_rows, fit_rows = decision_input_rows(
             list(scored['symbol']), window_open, offset, decided_at=decided_at)
         rows.extend(peer_rows)
         store = ResearchStore()
         if rows:
-            # Synchronous Parquet work: off the event loop, so the stream
-            # readers sharing it keep folding frames meanwhile.
+            # Synchronous Parquet work runs off the event loop the stream
+            # readers share.
             await asyncio.to_thread(store.write, 'venue_depth', pd.DataFrame(rows))
         if fit_rows:
             await asyncio.to_thread(store.write, 'venue_implied_vol',

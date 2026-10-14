@@ -1,8 +1,7 @@
 """The books: reconcile with the venue, settle, adopt its balance, record equity.
 
 Live, the venue is the account of record. Its balance, settlements and fills
-are read every cycle and preferred over our own arithmetic, which is kept
-alongside so the disagreement stays visible.
+win over our own arithmetic, which is kept alongside to show the disagreement.
 """
 
 from __future__ import annotations
@@ -29,15 +28,12 @@ logger = logging.getLogger('live')
 
 # Minute prices older than this are dropped from the serving store each cycle.
 PRICE_RETENTION_HOURS = 48
-# Venue balance samples older than this are dropped on the same cadence. One a
-# cycle is ~1,440 rows a day, so without it `venue_balance` grows forever. Kept
-# as long as the Account page's 30-day chart reads; the settlements are the
-# record and are never pruned.
+# Venue balance samples older than this are dropped on the same cadence. It
+# matches the Account page's 30-day chart. Settlements are never pruned.
 BALANCE_RETENTION_DAYS = 30
 
-# The last shard actually observed on a book. The balance query needs it, and
-# the book is read after reconciliation, so it cannot come from this cycle's
-# quotes.
+# The last shard observed on a book. The balance query needs it before this
+# cycle's book is read.
 _LAST_EXCHANGE_INDEX: Optional[int] = None
 
 
@@ -64,24 +60,20 @@ def record_minute_prices(writer: PgWriter, bars: dict[str, pd.DataFrame],
 
 
 def as_utc(value) -> pd.Timestamp:
-    """A UTC timestamp, whether the source remembered the timezone or not.
+    """Return a UTC timestamp from an aware or naive value.
 
-    Postgres returns tz-aware values from `DateTime(timezone=True)` and SQLite
-    naive ones, on which `tz_convert` raises. Everything stored is UTC, so
-    localise when the tz is missing.
+    Postgres returns aware values and SQLite naive ones. Everything stored is
+    UTC, so a naive value is localised.
     """
     stamp = pd.Timestamp(value)
     return stamp.tz_localize('UTC') if stamp.tz is None else stamp.tz_convert('UTC')
 
 
 def venue_settled_up(row: dict, side: str) -> Optional[bool]:
-    """Did the *up* side win, according to the venue's settlement row?
+    """Return whether the up side won, per the venue's settlement row.
 
-    The venue is the account of record, so this is preferred over any bar-derived
-    answer. Kalshi has published more than one shape for this, so read an
-    explicit result where there is one and fall back to inferring from revenue
-    and the side we held. Returns None when neither is legible — the caller then
-    falls back to bars and says so, rather than guessing.
+    Reads an explicit result if present, else infers it from revenue and the
+    side held. Returns None when neither is legible.
     """
     for key in ('market_result', 'result', 'settlement_result'):
         value = row.get(key)
@@ -104,14 +96,11 @@ def venue_settled_up(row: dict, side: str) -> Optional[bool]:
 
 def resolve_window(strike: float, settle_time, symbol: str,
                    bars: dict[str, pd.DataFrame]) -> tuple[Optional[bool], float]:
-    """Did this window settle up, per the trained rule? Plus the value used.
+    """Return whether the window settled up under the training rule, and the value.
 
-    The one implementation `settle_due` and `settle_predictions` share, so live
-    settlement cannot drift from the training label again.
-
-    The rule is `core/windows.py`'s: the `(O+H+L+C)/4` mean of the minute *ending*
-    at `settle_time`, compared with `>=` because the venue's `strike_type` is
-    `greater_or_equal`. Returns `(None, nan)` when the bar is not there yet.
+    Uses the `(O+H+L+C)/4` mean of the minute ending at `settle_time`, compared
+    with `>=` because the venue's `strike_type` is `greater_or_equal`. This
+    must match `core/windows.py`. Returns `(None, nan)` when the bar is missing.
     """
     frame = bars.get(symbol)
     if frame is None:
@@ -128,16 +117,11 @@ def resolve_window(strike: float, settle_time, symbol: str,
 
 def settle_predictions(writer: PgWriter, bars: dict[str, pd.DataFrame],
                        *, now: Optional[datetime] = None) -> int:
-    """Fill in the realised outcome on every settled window, traded or not.
+    """Record the realised outcome on every settled window, traded or not.
 
-    Without this the market benchmark cannot exist. `market_probability` is
-    recorded on each decision — the venue's own mid — and scoring it needs the
-    answer beside it. `settle_due` only touches windows we *hold*, which is the
-    ~6% we chose to trade: exactly the selected sample that cannot answer "is the
-    market's probability better than ours".
+    The market benchmark needs outcomes on all windows, not only the traded
+    ones that `settle_due` touches.
     """
-    # Injectable so a test can place a window in the past without waiting for the
-    # wall clock to agree.
     now = now or datetime.now(timezone.utc)
     filled = 0
     for symbol, window_open, settle_time, strike in writer.windows_awaiting_outcome(now):
@@ -153,16 +137,10 @@ def settle_predictions(writer: PgWriter, bars: dict[str, pd.DataFrame],
 def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
                *, venue_settlements: Optional[dict[str, dict]] = None,
                ) -> list[tuple[int, float]]:
-    """Settle every matured position, on the venue's rule.
+    """Settle every matured position on the venue's rule.
 
-    **This must agree with `core/windows.py:build_windows` exactly**, because the
-    model is trained against that label and the money is booked against this
-    one — hence the shared `resolve_window`.
-
-    The venue's own settlement wins wherever it is available. Ours is an OHLC
-    mean of Coinbase standing in for sixty seconds of CF Benchmarks BRTI, which
-    is a close proxy and not the same number; every disagreement is logged
-    because a persistent one is the basis risk becoming measurable.
+    The venue's settlement wins where available. Ours uses Coinbase bars as a
+    proxy for CF Benchmarks BRTI, so every disagreement is logged.
     """
     now = datetime.now(timezone.utc)
     venue_settlements = venue_settlements or {}
@@ -174,14 +152,14 @@ def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
                          position.symbol, position.window_open)
             continue
 
-        # The venue first, where it knows.
+        # The venue first, where it has settled.
         ticket = _ticket_for(writer, position)
         ticker = getattr(ticket, 'market_ticker', None) if ticket else None
         from_venue = None
         if ticker and ticker in venue_settlements:
             from_venue = venue_settled_up(venue_settlements[ticker], position.side)
 
-        # Ours: the mean over the minute ENDING at settle_time, and `>=`.
+        # Ours: the mean over the minute ending at settle_time, and `>=`.
         settle_minute = as_utc(position.settle_time) - pd.Timedelta(minutes=1)
         from_bars, settle_price = resolve_window(
             strike, position.settle_time, position.symbol, bars)
@@ -236,11 +214,9 @@ def _ticket_for(writer: PgWriter, position):
 
 
 class VenueState(NamedTuple):
-    """What the venue says, read before we settle anything ourselves.
+    """The venue's settlements and balance, read before we settle.
 
-    The balance travels with the settlements rather than being written on the
-    spot, because it must be adopted only after settlement — see
-    `adopt_venue_balance`.
+    The balance is adopted only after settlement (see `adopt_venue_balance`).
     """
 
     settlements: dict[str, dict]
@@ -250,23 +226,15 @@ class VenueState(NamedTuple):
 def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
                         exchange_index: Optional[int] = None,
                         credited_this_cycle: float = 0.0) -> None:
-    """Make the venue's balance the one we report. **Call this after settling.**
+    """Adopt the venue's balance as ours. Call this after settling.
 
-    Our running figure against theirs: a gap that grows is an unrecorded fill, a
-    partial, or a fee we mispriced. Logged rather than silently overwritten,
-    because the venue is right either way and a silent overwrite hides how wrong
-    we were.
-
-    **Ordering.** The venue credits a settlement the moment it settles, so a
-    balance adopted before `settle_due` would have the same payout credited
-    twice — inflating the bankroll Kelly sizes off for a cycle and filling the
-    drift log with benign pairs that would hide a real unrecorded fill.
-    Settling first makes the drift mean what it says.
+    The venue credits a settlement at once, so adopting before `settle_due`
+    counts a payout twice. Any drift from our figure is logged before the
+    overwrite; a growing drift means an unrecorded fill, a partial, or a
+    mispriced fee.
     """
     if not np.isfinite(venue_balance):
-        # The venue is the account of record only when it actually answered.
-        # Writing an unreadable balance over a correct one is worse than keeping
-        # ours and saying so.
+        # Never write an unreadable balance over a readable one.
         logger.error('the venue did not return a readable balance; keeping our own '
                      'figure this cycle rather than overwriting it')
         return
@@ -275,11 +243,8 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
         return
     ours = float(account.bankroll)
     drift = venue_balance - ours
-    # A payout we booked this cycle and the venue has not posted yet is not a
-    # drift: `venue_balance` is sampled at the top of the cycle, and the venue
-    # posts settlements one cycle behind. Subtract what we just credited; a
-    # drift that survives that is an unrecorded fill, a partial, or a
-    # mispriced fee.
+    # A payout we credited this cycle is not a drift: the venue balance is
+    # sampled at the top of the cycle, one settlement behind.
     explained = abs(abs(drift) - abs(float(credited_this_cycle or 0.0))) <= 0.01
     if abs(drift) > 0.01 and explained:
         logger.info('balance lags by %+.2f, which is exactly what we credited '
@@ -291,10 +256,7 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
             'account of record — writing theirs. A drift that grows means a '
             'fill we did not record, a partial, or a mispriced fee.',
             ours, venue_balance, drift)
-    # Sampled *before* the overwrite, so the row keeps both figures as they stood
-    # at the same instant; afterwards it would record a drift of zero forever.
-    # The trend is the diagnosis: a drift that stays put is a starting-balance
-    # mismatch, one that grows is an unrecorded fill.
+    # Sample before the overwrite, so the row keeps both figures at one instant.
     try:
         writer.write_venue_balance(
             timestamp=datetime.now(timezone.utc), balance=venue_balance,
@@ -305,13 +267,9 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
 
 
 def remember_exchange_index(quotes: dict) -> Optional[int]:
-    """Learn the shard from the book that was just read.
+    """Remember the shard from the book just read, and warn on a change.
 
-    **A change here is loud, not silent.** Balances are local to a shard, so a
-    stale one reads the wrong balance (every order refused
-    `insufficient_balance` while the funds sit elsewhere). A move is rare, costs
-    at most the one cycle that already reconciled, and is corrected before the
-    next.
+    Balances are local to a shard, so a stale shard reads the wrong balance.
     """
     global _LAST_EXCHANGE_INDEX
     seen = venue_exchange_index(quotes)
@@ -328,16 +286,11 @@ def remember_exchange_index(quotes: dict) -> Optional[int]:
 
 
 def venue_exchange_index(quotes: dict) -> Optional[int]:
-    """Which exchange shard the traded markets live on, per the venue.
+    """Return the exchange shard the traded markets live on, per the venue.
 
-    Kalshi shards its exchange by category and **balances are local to a
-    shard**, so the only balance an order can draw on is the one on the shard
-    holding its market.
-
-    Read off the quotes rather than configured, for the same reason markets are
-    resolved by asking rather than by building a ticker: a constant is a guess
-    that keeps working until the venue moves, and then it is silently wrong.
-    Returns None when no book was read, which means the whole-account total.
+    Balances are local to a shard, so an order draws only on its market's
+    shard. Read from the quotes, never configured. Returns None when no book
+    was read, which means the whole-account total.
     """
     # `fetch_quotes` stores `(Quote, ticker)`, not a bare Quote; accept both.
     candidates = [v[0] if isinstance(v, tuple) else v for v in quotes.values()]
@@ -346,8 +299,7 @@ def venue_exchange_index(quotes: dict) -> Optional[int]:
     if not seen:
         return None
     if len(seen) > 1:
-        # Never observed. Narrowing to one shard would understate the balance
-        # available to the others, so decline to narrow at all.
+        # Narrowing to one shard would understate the others' balance.
         logger.warning('markets span exchange shards %s; using the account total',
                        sorted(seen))
         return None
@@ -356,23 +308,15 @@ def venue_exchange_index(quotes: dict) -> Optional[int]:
 
 def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
                          settlements: list[dict]) -> tuple[int, int]:
-    """Store the venue's own fills and settlements. Idempotent on the venue's keys.
+    """Store the venue's fills and settlements. Idempotent on the venue's keys.
 
-    The account curve is drawn from what this writes. It adds no request:
-    `reconcile` already fetched both. It covers only what the live tier
-    returned; `scripts.sync_venue` does the deep backfill across the historical
-    tier.
-
-    Exceptions are caught and logged rather than raised. A cycle that cannot write
-    telemetry must still trade and settle — the store is a record, not the
-    account.
+    Covers only the live tier; `scripts.sync_venue` backfills the historical
+    tier. Logs exceptions instead of raising, so the cycle still trades.
     """
     written_fills = written_settlements = 0
     try:
-        # Two queries, then only the rows that are actually new: the venue
-        # returns the same ~200 fills and settlements every cycle. A settlement
-        # stored with a null `pnl` is not in the skip set, so an incomplete
-        # parse is retried and heals.
+        # Write only new rows. A settlement stored with a null `pnl` is not in
+        # the skip set, so an incomplete parse is retried.
         known_fills, known_settlements = writer.venue_ledger_keys()
     except Exception:  # noqa: BLE001 - telemetry must not stop the loop
         logger.exception('could not read the stored venue ledger; writing all rows')
@@ -382,8 +326,7 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
         rows = []
         for raw in fills:
             parsed = parse_fill(raw)
-            # Same scope as the settlements below: a fill in a market this
-            # system never traded is somebody's manual punt, not ours.
+            # Only markets this system trades.
             if not _is_ours(getattr(parsed, 'ticker', '') or ''):
                 continue
             if parsed.trade_id and parsed.trade_id not in known_fills:
@@ -397,9 +340,8 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
             parsed = parse_settlement(raw)
             if not parsed.ticker or parsed.ticker in known_settlements:
                 continue
-            # Only markets this system traded. The Kalshi account is a
-            # person's and may hold anything; another strategy's settlements
-            # summed into this equity curve would be a wrong P&L.
+            # Only markets this system trades. The account may hold others,
+            # which must not enter this equity curve.
             if not _is_ours(parsed.ticker):
                 continue
             rows.append(venue_ledger.settlement_row(
@@ -414,34 +356,23 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
 
 
 def _is_ours(ticker: str) -> bool:
-    """Delegates to `core.venue_ledger.is_ours`, so `scripts/sync_venue.py`
-    filters exactly the same way."""
+    """Return whether the ticker is in a series this system trades."""
     return venue_ledger.is_ours(ticker, SERIES_BY_SYMBOL.values())
 
 
 async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
                                exchange_index: Optional[int] = None) -> VenueState:
-    """Read the venue's ledger, and keep it.
+    """Read and store the venue's ledger, and compare open positions with ours.
 
-    Three comparisons, each of which has a specific failure it catches:
-
-    * **balance** — carried out in `VenueState` and written by
-      `adopt_venue_balance` *after* settlement, not here.
-    * **settlements** — what a position actually paid. Ours are settled from an
-      OHLC mean of Coinbase standing in for CF Benchmarks BRTI, which will
-      sometimes disagree.
-    * **open positions** — a position we think is open and the venue does not is
-      an order that never filled.
-
-    It also **stores** the fills and settlements, via `persist_venue_ledger`.
+    Returns the balance and settlements; `adopt_venue_balance` writes the
+    balance after settlement.
     """
     state = await kalshi.reconcile(exchange_index=exchange_index)
     venue_balance = float(state['balance'])
     persist_venue_ledger(writer, fills=list(state.get('fills') or []),
                          settlements=list(state.get('settlements') or []))
 
-    # Settlements keyed on the market ticker we stored, returned so `run_cycle`
-    # can hand them to `settle_due`.
+    # Settlements keyed on market ticker, for `settle_due`.
     resolved: dict[str, dict] = {}
     for row in state.get('settlements', []):
         ticker = str(row.get('ticker', ''))
@@ -451,12 +382,8 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
     if resolved:
         logger.debug('venue reports %d settlement(s) to reconcile', len(resolved))
 
-    # `KalshiClient.position_size`, not `p['position']`: the field is
-    # `position_fp`, a fixed-point string.
-    # Only the series this loop trades: the account may hold positions nobody
-    # here placed, and reporting those as unbooked fills every cycle would bury
-    # a real one. Scoped by series prefix rather than an ignore-list, so an
-    # unbooked fill in KXBTC15M / KXETH15M / KXSOL15M still fires.
+    # The size field is `position_fp`, a fixed-point string, so use
+    # `KalshiClient.position_size`. Only the series this loop trades count.
     venue_open = {str(p.get('ticker', '')) for p in state.get('positions', [])
                   if KalshiClient.position_size(p) != 0
                   and _is_ours(str(p.get('ticker', '')))}
@@ -470,9 +397,8 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
                 'leaves a ticket and no position.',
                 position.symbol, position.window_open, position.contracts)
 
-    # The reverse direction: a position the venue holds and we do not. That is
-    # what an order POST that timed out after the venue accepted it leaves
-    # behind, and it is the one discrepancy that costs money silently.
+    # The reverse: a position the venue holds and we do not. A POST that timed
+    # out after acceptance leaves this.
     ours = set()
     for position in writer.open_positions():
         ticket = _ticket_for(writer, position)
@@ -492,9 +418,7 @@ async def bookkeeping(args, config: Config, writer: PgWriter, kalshi,
                       bars: dict, *, phase=None) -> list:
     """Reconcile with the venue, settle, record outcomes, adopt its balance.
 
-    The order inside is the one `adopt_venue_balance` documents: settle our own
-    credits first, then take the venue's balance, so a payout is not counted
-    twice. The shard is the one the latest book reported.
+    Settles first and adopts the balance last, so a payout is not counted twice.
     """
     venue_settlements: dict[str, dict] = {}
     venue_balance = float('nan')
@@ -511,10 +435,9 @@ async def bookkeeping(args, config: Config, writer: PgWriter, kalshi,
             phase('reconcile')
     settled = await _db(settle_due, writer, bars,
                         venue_settlements=venue_settlements)
-    # Independent of whether anything was held: this is what turns the recorded
-    # market quotes into a scoreable sample.
+    # Record outcomes on every window, held or not.
     await _db(settle_predictions, writer, bars)
-    # Now that our own credits are in, the drift is a real disagreement.
+    # Our credits are in, so any remaining drift is a real disagreement.
     if kalshi is not None and args.reconcile:
         await _db(adopt_venue_balance, writer, venue_balance, exchange_index=shard,
                   credited_this_cycle=sum(p for _, p in settled))
