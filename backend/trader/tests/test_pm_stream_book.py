@@ -1,33 +1,10 @@
-"""Folding the Polymarket CLOB socket into a book, and the traps it does NOT share.
+"""Tests for `PmBookCache`, which folds the Polymarket CLOB socket into a book.
 
-Kalshi's socket sends `delta_fp`, a SIGNED CHANGE, so a level driven to zero
-accumulates float residue — measured, three BTC levels held 2.4e-12, 3.5e-14 and
-4.9e-13, and because they sat above the real touch the cache reported a best bid
-of 0.59 against a true 0.56. `core/stream_book.MIN_SIZE` exists for that.
-
-Polymarket does not work that way, and the difference was captured off the live
-socket rather than read from documentation:
-
-    0.003  before 1554.88  ->  msg 1553.87
-    0.002  before 5115.37  ->  msg  115.37
-    0.003  before 1525.88  ->  msg    0.00   <- reaches exactly zero
-
-`price_change.size` is the NEW ABSOLUTE size at that price. So a removed level
-arrives as a clean 0.00 and is deleted, with no residue to guard against.
-
-Two shapes that DO bite, both captured:
-
-  * bids arrive ASCENDING and asks DESCENDING, so the touch is the LAST entry
-    on each side, not the first.
-  * one `price_change` message carries changes for MORE THAN ONE asset — each
-    entry has its own `asset_id` — so folding a message wholesale into one
-    book mixes two markets.
-
-And the denomination trap this repo already recorded: Polymarket serves bids and
-asks on ONE token, so its asks are YES-denominated, while Kalshi's `no_levels`
-holds NO-side prices. Storing them as served puts a 0.51 YES ask in the column
-holding a 0.51 NO bid — same name, opposite meaning, wrong by the spread with
-imbalance inverted, and no exception anywhere.
+`price_change.size` is the new absolute size at that price, so a removed level
+arrives as exactly 0 and is deleted (unlike Kalshi's signed deltas). Bids arrive
+ascending and asks descending, so the touch is the last entry on each side. One
+`price_change` message can carry several assets, each with its own `asset_id`.
+Asks are returned NO-denominated to match Kalshi's `no_levels`.
 """
 from __future__ import annotations
 
@@ -52,7 +29,7 @@ def _change(rows, ts='1788487941435'):
 
 
 def test_a_snapshot_gives_the_touch_from_the_LAST_entry():
-    """Bids ascend and asks descend on this venue."""
+    """Bids ascend and asks descend on this venue, so the touch is the last entry."""
     c = PmBookCache()
     c.apply(_book([('0.40', '100'), ('0.44', '250')],
                   [('0.60', '80'), ('0.46', '150')]))
@@ -89,8 +66,8 @@ def test_one_message_can_carry_two_markets_and_they_do_not_mix():
 
 
 def test_the_ladder_is_returned_in_kalshis_denomination():
-    """Kalshi's `no_levels` holds NO-side prices; Polymarket's asks are
-    YES-denominated. The YES ask 0.46 is the NO bid 0.54."""
+    """The YES ask 0.46 is returned as the NO level 0.54, matching Kalshi's `no_levels`.
+    """
     c = PmBookCache()
     c.apply(_book([('0.44', '250')], [('0.46', '150')]))
     yes, no = c.ladder(TOK)
@@ -99,8 +76,8 @@ def test_the_ladder_is_returned_in_kalshis_denomination():
 
 
 def test_a_snapshot_replaces_the_book_rather_than_merging():
-    """A later `book` is the venue restating the whole side. Merging would keep
-    levels the venue has dropped."""
+    """A later `book` message replaces the whole book; merging would keep dropped levels.
+    """
     c = PmBookCache()
     c.apply(_book([('0.40', '100'), ('0.44', '250')], [('0.46', '150')]))
     c.apply(_book([('0.42', '10')], [('0.48', '20')]))

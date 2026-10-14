@@ -126,8 +126,11 @@ def _ms(ts: pd.Timestamp) -> str:
 
 
 def _run_recorder(monkeypatch, *, fresh: bool) -> int:
-    """Run `record_pm_stream.run` against fakes; return how many times it
-    resolved tokens. The live side decides three times in between."""
+    """Run `record_pm_stream.run` against fakes and return how many times it resolved
+    tokens.
+
+    The live side decides three times in between.
+    """
     from scripts.record_pm_ladder import slug_for
 
     resolved = {'n': 0}

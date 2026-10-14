@@ -1,22 +1,8 @@
-"""A Polymarket slug's trailing timestamp is the window OPEN, not its close.
+"""Tests that a Polymarket slug's trailing timestamp is the window open, not its close.
 
-This was assumed backwards, and the assumption is invisible: every window is a
-valid window, the books are real, the settlements are real, and everything is
-simply shifted by fifteen minutes. It surfaced only because the venue's own
-settlement could be scored against our Coinbase label — Kalshi agreed 96.98% of
-the time and Polymarket agreed 49.85%, which is a coin flip and therefore an
-alignment error rather than a data-quality one. Kalshi against Polymarket agreed
-on exactly 50.0% of 118 shared windows, confirming it sat in the mapping and not
-in either venue.
-
-The venue states it three ways at once, and all three agree:
-
-    slug     btc-updown-15m-1787707800   -> 2026-08-26 01:30 UTC
-    title    "Bitcoin Up or Down - August 25, 9:30PM-9:45PM ET"
-    end_time 2026-08-26T01:45:00Z        =  slug timestamp + 15 minutes
-
-So `end_time - slug_ts == window_minutes` is the invariant, and it is what makes
-the live recorder ask for the CURRENT window rather than the one after it.
+The venue states it three ways that agree: the slug timestamp, the title, and
+`end_time`, which equals the slug timestamp plus 15 minutes. The live recorder
+must ask for the window it is inside.
 """
 
 from __future__ import annotations
@@ -37,18 +23,17 @@ def test_the_slug_timestamp_is_the_window_open():
 
 
 def test_end_time_is_the_slug_timestamp_plus_one_window():
-    """The venue's own `end_time`, which is how this was settled."""
+    """The venue's `end_time` is the slug timestamp plus one window."""
     opened = window_of('btc-updown-15m-1787707800')
     assert opened + pd.Timedelta(minutes=WINDOW) == pd.Timestamp(
         '2026-08-26 01:45', tz='UTC')
 
 
 def test_the_live_recorder_asks_for_the_window_it_is_inside():
-    """Mid-window, the slug must name THIS window, not the next one.
+    """Mid-window the slug names this window, not the next one.
 
-    Building it from `ceil` returned a market that exists and trades — the venue
-    lists the next one early — so the book came back healthy and was stamped with
-    the previous window's `window_open`. Nothing raised.
+    The venue lists the next window early, so a slug built with `ceil` still returns
+    a healthy book, for the wrong window.
     """
     now = dt.datetime(2026, 8, 26, 1, 37, 12, tzinfo=dt.timezone.utc)
     assert slug_for('btc', now) == 'btc-updown-15m-1787707800'

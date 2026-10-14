@@ -1,23 +1,10 @@
-"""One container, five loops, and a failure in one must not stop the others.
+"""Tests for `scripts.run_live`, which runs all live loops in one process.
 
-The live side ran as four containers plus a shell loop because they were added
-one at a time. They are the same shape — async loops polling an HTTP API on a
-sixty-second cadence — so they belong in one process, and a single restart
-policy and log stream is easier to trust than five.
-
-**The supervisor is the whole reason this is safe.** Split across containers,
-Docker restarted each one and a crash-looping recorder was invisible unless you
-went looking. Here each component is wrapped: an exception is logged and the
-component restarts with exponential backoff, while everything else keeps
-running. Trading must survive a broken recorder, which is the case that matters.
-
-Backoff resets after a component has run for a while, so a loop that works for
-an hour and then fails does not inherit the delay from a failure last week.
-
-`store_sync` stays a subprocess rather than an in-process task. It scrapes and
-rebuilds Parquet — CPU-bound, blocking work — and awaiting it in this event loop
-would stall the trading decision. The measured latency budget has a cliff at
-45-60 seconds and a sync takes minutes.
+Each component is supervised: an exception is logged and the component
+restarts with exponential backoff while the others keep running, so a broken
+recorder never stops trading. Backoff resets after a long healthy run.
+`store_sync` runs as a subprocess because its blocking work would stall the
+trading loop.
 """
 
 from __future__ import annotations
@@ -92,7 +79,7 @@ def test_backoff_is_capped():
 
 
 def test_backoff_resets_after_a_long_healthy_run():
-    """An hour of working then failing is not the same as failing instantly."""
+    """Backoff resets after a long healthy run."""
     waits = []
     clock = {'t': 0.0}
 
@@ -116,7 +103,7 @@ def test_backoff_resets_after_a_long_healthy_run():
 
 
 def test_one_failing_component_does_not_stop_the_others():
-    """The case that matters: a broken recorder must not halt trading."""
+    """A failing component does not stop the others."""
     ticks = []
 
     async def broken():
@@ -144,7 +131,7 @@ def test_one_failing_component_does_not_stop_the_others():
 
 
 def test_cancellation_is_not_swallowed_as_a_failure():
-    """Shutdown must stop the component, not restart it."""
+    """Cancellation stops the component instead of restarting it."""
     starts = []
 
     async def component():
@@ -165,7 +152,7 @@ def test_cancellation_is_not_swallowed_as_a_failure():
 
 
 def test_a_component_returning_normally_is_still_restarted():
-    """These are endless loops. One that returns has stopped doing its job."""
+    """A component that returns normally is restarted, since these are endless loops."""
     starts = []
 
     async def exits():
@@ -192,7 +179,7 @@ def test_disabled_components_are_not_started():
 
 
 def test_an_unknown_component_name_is_refused_not_ignored():
-    """A typo in a flag must not silently run everything."""
+    """An unknown component name is refused, not ignored."""
     with pytest.raises(ValueError, match='nonsense'):
         Component.selected(['trade'], disable=('nonsense',))
 
@@ -242,7 +229,7 @@ def test_a_recorder_waits_while_a_decision_is_in_flight():
 
 
 def test_the_gate_reopens_even_if_the_decision_raises():
-    """A crashing cycle must not wedge every recorder forever."""
+    """The gate reopens even if the decision raises."""
     async def drive():
         gate = TradingGate()
         try:
@@ -262,7 +249,7 @@ def test_concurrent_decisions_keep_the_gate_shut_until_the_last_one_leaves():
         async with gate.deciding():
             async with gate.deciding():
                 pass
-            # still inside the outer one
+            # Still inside the outer one.
             assert not gate.is_idle
         return gate.is_idle
 
@@ -301,7 +288,8 @@ def test_it_does_not_wait_when_already_on_the_phase():
 
 
 def test_the_default_phase_is_far_from_every_decision_instant():
-    """Decisions fire ~1s past a minute. 30s is the maximum distance from that."""
+    """The default recorder phase is far from every decision instant (~1s past the minute).
+    """
     from scripts.live import DECISION_LAG_SECONDS
     decision_second = DECISION_LAG_SECONDS % 60.0
     gap = min(abs(30.0 - decision_second), 60.0 - abs(30.0 - decision_second))
@@ -313,12 +301,8 @@ def test_the_default_phase_is_far_from_every_decision_instant():
 # ---------------------------------------------------------------------------
 
 def test_a_systemexit_stops_the_component_rather_than_restarting_it():
-    """`live.main` raises SystemExit for a config error or a held trader lock.
-
-    Both mean "do not run", and retrying forever would either spin on a bad flag
-    or fight another trader for the same account. Observed for real: the runner
-    started while the old container still held the lock, and the only correct
-    response is to stop.
+    """SystemExit (a config error or a held trader lock) stops the component instead of
+    retrying.
     """
     starts = []
 
@@ -350,11 +334,9 @@ def test_a_keyboard_interrupt_is_not_treated_as_a_crash():
 # ---------------------------------------------------------------------------
 
 def test_recorder_args_takes_its_defaults_from_the_real_parser():
-    """This used to be a hand-copied Namespace with literal defaults — a
-    second definition of numbers that already lived in each recorder's own
-    `argparse` setup. Changing a recorder's own default (as it would when run
-    standalone via `python -m scripts.record_ladder`) must be reflected here
-    automatically, because there is now exactly one definition."""
+    """`_recorder_args` takes its defaults from each recorder's own parser, so there is one
+    definition.
+    """
     from scripts.run_live import _recorder_args
     from scripts import record_ladder
 
@@ -373,7 +355,7 @@ def test_recorder_args_overrides_apply_on_top_of_the_real_defaults():
 
 
 def test_a_changed_recorder_default_is_picked_up_without_touching_run_live():
-    """The whole point: bump one recorder's own default and this must follow."""
+    """A changed recorder default is picked up without editing run_live."""
     import argparse
     from scripts.run_live import _recorder_args
 

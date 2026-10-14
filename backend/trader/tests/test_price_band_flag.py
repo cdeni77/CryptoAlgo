@@ -1,11 +1,7 @@
-"""The traded-price band is a Config field with no CLI flag.
+"""Tests for the `--min-traded-price` and `--max-traded-price` flags.
 
-CLAUDE.md is explicit that the backfilled book is quantised to whole cents
-outside [0.10, 0.90] — ~0.24c mean rounding error, about half the measured
-half-spread — and that economics from backfilled quotes should restrict to that
-band or carry the uncertainty. Neither was possible from the command line, so
-every cost-stress run silently used [0.05, 0.95] and no measurement of the
-quantisation-free band was ever taken.
+The backfilled book rounds to whole cents outside [0.10, 0.90], so a cost study
+may need to restrict the band from the command line.
 """
 from scripts._common import add_data_arguments, config_from_args
 import argparse

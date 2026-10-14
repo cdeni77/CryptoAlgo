@@ -71,7 +71,7 @@ def test_a_garbage_retention_falls_back_rather_than_pruning_everything(monkeypat
 def test_prune_reads_the_hour_from_the_name_not_the_mtime(tmp_path):
     old = _parquet(tmp_path, 'venue_book_events', NOW - 61 * DAY)
     young = _parquet(tmp_path, 'venue_book_events', NOW - 59 * DAY)
-    # Both were just written, so an mtime rule would keep both.
+    # Both files were just written, so an mtime rule would keep both.
     assert prune(tmp_path, keep_days=60, now=NOW) == 1
     assert not old.exists() and young.exists()
 
@@ -104,8 +104,8 @@ def test_the_guard_does_nothing_with_room(tmp_path):
 def test_the_floor_is_the_larger_of_fraction_and_bytes(monkeypatch):
     monkeypatch.delenv('DISK_GUARD_MIN_FREE_FRACTION', raising=False)
     monkeypatch.delenv('DISK_GUARD_MIN_FREE_GB', raising=False)
-    assert free_space_needed(1e12) == 0.15e12          # 15% of 1 TB > 20 GB
-    assert free_space_needed(50e9) == 20e9             # 20 GB > 15% of 50 GB
+    assert free_space_needed(1e12) == 0.15e12  # 15% of 1 TB > 20 GB
+    assert free_space_needed(50e9) == 20e9  # 20 GB > 15% of 50 GB
     monkeypatch.setenv('DISK_GUARD_MIN_FREE_FRACTION', '0.5')
     assert free_space_needed(1e12) == 0.5e12
 
@@ -123,7 +123,7 @@ def test_the_guard_sheds_oldest_book_frames_first_until_above_the_floor(tmp_path
     assert removed == 2
     assert not files[0].exists() and not files[1].exists()
     assert files[2].exists() and files[3].exists()
-    # Not the oldest file on disk, but the most expendable table.
+    # The most expendable table goes first, not the oldest file on disk.
     assert index.exists() and trades.exists()
     assert 'DISK GUARD' in caplog.text
 
@@ -298,8 +298,7 @@ def test_a_broken_spool_never_costs_the_tape_a_trade():
 
 
 def test_a_redelivered_trade_is_stored_once(tmp_path):
-    """A reconnect replays a snapshot: the same print, received later, in a
-    different hour's file. The store must hold it once."""
+    """A trade replayed after a reconnect, in a later hour's file, is stored once."""
     spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
     spool = table_spool(spool_root, 'spot_trades', 'coinbase')
     first = _message(seq=5)['events'][0]['trades'][0]
@@ -321,8 +320,8 @@ def test_a_redelivered_trade_is_stored_once(tmp_path):
 
 
 def test_a_receipt_before_the_print_is_never_knowable_early(tmp_path):
-    """A local clock behind the venue's must not stamp a row available before
-    the trade happened — the store refuses that outright."""
+    """A receipt time before the trade time is never used; the store refuses such a row.
+    """
     spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
     spool = table_spool(spool_root, 'spot_trades', 'coinbase')
     trade = _message()['events'][0]['trades'][0]

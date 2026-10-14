@@ -1,8 +1,7 @@
-"""The stream component's contract with the rest of the live process.
+"""Tests for the stream component's contract with the rest of the live process.
 
-The gate assertions are the load-bearing ones. Every other recorder waits on
-`TradingGate.idle()`; this one must not, because a stream that pauses goes stale
-and staleness is the failure the book cache exists to prevent.
+Other recorders wait on `TradingGate.idle()`. The stream must not, because a
+paused stream goes stale.
 """
 from __future__ import annotations
 
@@ -41,13 +40,7 @@ def test_an_unknown_component_is_still_refused():
 
 @pytest.mark.asyncio
 async def test_the_stream_keeps_folding_while_a_decision_holds_the_gate():
-    """A held gate defers the flush; it never pauses the read loop.
-
-    The first version awaited the gate inside the loop. That passed a test
-    which only checked the wait sat in the flush branch, and still froze the
-    book for the length of every trading cycle, because the flush branch is
-    inside the loop.
-    """
+    """A held gate defers the flush but never pauses the read loop."""
     gate = run_live.TradingGate()
     cache = BookCache(now=lambda: 0.0)
     flushes = []
@@ -97,7 +90,8 @@ async def test_a_deferred_flush_runs_once_the_gate_reopens():
 
 
 def test_settled_markets_are_forgotten_rather_than_sampled_as_live():
-    """A settled Kalshi market serves an EMPTY ladder, not an error."""
+    """A settled Kalshi market serves an empty ladder, not an error, so it is forgotten.
+    """
     cache = BookCache(now=lambda: 0.0)
     cache.apply(snap('OLD'))
     cache.apply(snap('NEW'))
@@ -125,12 +119,9 @@ def test_the_component_is_wired_into_the_factories():
 
 # -- the silent-socket deadlock ---------------------------------------------
 #
-# Observed live on 2026-08-27 at 23:30:00, a window boundary. The subscribed
-# markets settled, the venue stopped sending, and `consume` sat forever in
-# `async for` — because the refresh deadline was only checked inside the loop
-# body, and the loop body needed a frame that was never coming. Nothing raised,
-# `supervise` saw a coroutine legitimately awaiting, and the recorder was dead
-# behind a container reporting healthy.
+# When the subscribed markets settle the venue stops sending. Every exit
+# condition is enforced on a timeout, so a quiet socket cannot block `consume`
+# forever while the container still reports healthy.
 
 class _FakeStream:
     """A stream that yields `events` then goes quiet forever."""
@@ -143,7 +134,7 @@ class _FakeStream:
         for event in self._events:
             yield event
         if self._quiet:
-            await asyncio.Event().wait()      # never set
+            await asyncio.Event().wait()  # never set
 
 
 class _NullSpool:
@@ -166,7 +157,7 @@ async def test_a_socket_that_never_speaks_does_not_hang_forever():
 
 @pytest.mark.asyncio
 async def test_a_socket_that_goes_quiet_after_a_burst_is_still_caught():
-    """The live failure exactly: frames, then settlement, then nothing."""
+    """Frames, then settlement, then silence: `consume` still returns."""
     reason = await asyncio.wait_for(
         record_stream.consume(
             _FakeStream([snap('A'), snap('B')]), BookCache(now=lambda: 0.0),
@@ -178,7 +169,7 @@ async def test_a_socket_that_goes_quiet_after_a_burst_is_still_caught():
 
 @pytest.mark.asyncio
 async def test_the_refresh_deadline_is_honoured_without_any_frame():
-    """A deadline that only fires on frame arrival is not a deadline."""
+    """The refresh deadline fires with no frame at all."""
     reason = await asyncio.wait_for(
         record_stream.consume(
             _FakeStream(), BookCache(now=lambda: 0.0), _NullSpool(), {},
@@ -223,16 +214,19 @@ NOW = datetime(2026, 8, 27, 15, 15, 5, tzinfo=timezone.utc)
 
 
 def test_a_market_past_its_close_is_not_subscribed():
-    """The settled market stays listed as open; subscribing to it buys nothing
-    and trips the silence detector."""
+    """A market past its close is not subscribed, even while the venue still lists it as
+    open.
+    """
     assert not record_stream._trading(
         _market('OLD', '2026-08-27T15:00:00Z', '2026-08-27T15:15:00Z'), NOW)
 
 
 def test_the_current_market_is_subscribed_even_while_status_says_initialized():
-    """MEASURED: the replacement market is published with an open_time exactly at
-    the boundary but stays `initialized` for ~40s, so a status=open query cannot
-    see it and the book is empty for the first part of every window."""
+    """The current market is subscribed while its status is still `initialized`.
+
+    The replacement market opens at the boundary but stays `initialized` for about
+    40s, so filtering on status would leave the book empty at the start of a window.
+    """
     assert record_stream._trading(
         _market('NEW', '2026-08-27T15:15:00Z', '2026-08-27T15:30:00Z',
                 status='initialized'), NOW)
@@ -252,8 +246,7 @@ def test_the_boundary_instant_belongs_to_the_new_window():
 
 
 def test_a_market_missing_a_timestamp_is_kept():
-    """Dropping a market because its clock looked odd is worse than briefly
-    holding one about to settle."""
+    """A market with a missing or bad timestamp is kept."""
     assert record_stream._trading({'ticker': 'X'}, NOW)
     assert record_stream._trading(
         _market('X', 'not-a-time', '2026-08-27T15:30:00Z'), NOW)
@@ -284,10 +277,11 @@ async def test_open_tickers_queries_by_close_time_not_status():
 
 
 def test_the_empty_market_retry_is_fast_not_the_refresh_cadence():
-    """At a window boundary every market is briefly filtered out — the old one
-    has closed and the venue has not yet listed its replacement. Sleeping the
-    refresh interval there was measured at 45s with no book, worse than the
-    churn the close_time filter removed."""
+    """The retry after an empty market set is fast, not the full refresh interval.
+
+    At a window boundary the old market has closed and the new one may not be listed
+    yet.
+    """
     args = record_stream.build_parser().parse_args([])
     assert args.empty_retry_seconds <= 5.0
     assert args.empty_retry_seconds < args.refresh_seconds
@@ -303,10 +297,9 @@ def test_the_empty_branch_waits_on_the_fast_retry():
 
 
 def test_an_incomplete_market_set_is_rechecked_soon():
-    """The venue does not list every series' next market at the same instant.
-    Measured at the 11:00 boundary: ETH's replacement was open at +19s, BTC's
-    and SOL's were not, and waiting the full refresh left those two without a
-    book until +65s."""
+    """An incomplete market set is rechecked soon; the venue lists each series' next market
+    at a different moment.
+    """
     source = inspect.getsource(record_stream.run)
     body = source[source.index('covered = set(symbols.values())'):]
     body = body[:body.index('reason = await consume')]

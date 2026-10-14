@@ -1,15 +1,8 @@
-"""What gets deployed must be trained on everything, not on the last fold.
+"""Tests that promotion deploys a model refitted on all data, not the last fold's model.
 
-`promote` installed `result.models[-1]`, whose training ends where that fold's
-TEST block begins — so the deployed artifact is always one test block stale, by
-construction. Measured on the artifact that traded live: it was trained through
-2025-12-05 and deployed in August, and had therefore never seen a single Kalshi
-15-minute market, because the venue's markets did not exist yet.
-
-The walk-forward is the EVIDENCE that the configuration works. The thing to ship
-is that configuration refitted on all data through the present. Those are
-different objects and conflating them costs exactly one test block of freshness
-every time.
+The walk-forward is the evidence that a configuration works. The shipped model
+is that configuration refitted through the present; the last fold's model is
+always one test block stale.
 """
 
 from __future__ import annotations
@@ -32,8 +25,7 @@ def test_the_deployed_model_is_the_refit_not_the_last_fold():
 
 
 def test_the_refit_must_see_more_history_than_the_last_fold():
-    """If the refit is not strictly fresher, something is wrong with how it was
-    built and shipping it silently would hide that."""
+    """A refit that has not seen more history than the last fold is refused."""
     from scripts.promote import choose_candidate
     folds = [_Model(300)]
     with pytest.raises(ValueError, match='fresher|history'):
@@ -41,9 +33,7 @@ def test_the_refit_must_see_more_history_than_the_last_fold():
 
 
 def test_without_a_refit_it_falls_back_and_the_caller_can_tell():
-    """A refit can legitimately fail — too few rows, a fit that did not
-    converge. Falling back to the last fold is right, but it must be visible,
-    because the fallback is the stale artifact this exists to stop shipping."""
+    """Without a refit, the last fold's model is used as the fallback."""
     from scripts.promote import choose_candidate
     folds = [_Model(100), _Model(300)]
     chosen = choose_candidate(folds, None)
@@ -57,19 +47,7 @@ def test_no_models_at_all_raises_rather_than_returning_none():
 
 
 def test_the_refit_carries_the_scoring_bundle_or_it_cannot_be_deployed():
-    """The refit was fitted WITHOUT `scoring=fit.bundle(config)`.
-
-    `core/backtest.py` passes it for every fold model, so the folds are
-    deployable and the refit — the thing actually installed — was not. Nothing
-    in `promote` checks, so the artifact installed cleanly, reported all its
-    gates, and then `scripts/live.py` refused it on every cycle:
-
-        this artifact carries no scoring bundle, so it cannot score a window
-        it has never seen
-
-    The volatility model, the seasonality factor and the baseline's scale/tail
-    all live in that bundle. Without them there is nothing to turn a raw window
-    into a feature row, so the artifact can be evaluated and never deployed.
+    """`refit_on_all` passes the scoring bundle, without which live cannot score a window.
     """
     import inspect
     from scripts.promote import refit_on_all
@@ -81,9 +59,7 @@ def test_the_refit_carries_the_scoring_bundle_or_it_cannot_be_deployed():
 
 
 def test_promote_refuses_to_install_an_artifact_live_cannot_load():
-    """The bundle bug reached a restart loop because nothing between fitting and
-    installing asked whether the artifact could score. Promotion is the gate;
-    `deployable` is the cheapest possible check and it was not among them."""
+    """`promote` checks `deployable` before installing."""
     import inspect
     from core import promotion
 

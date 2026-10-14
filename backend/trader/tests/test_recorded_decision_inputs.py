@@ -1,9 +1,8 @@
-"""The cycle records the peer book and the implied-vol fit it decided on.
+"""Tests that the cycle records the peer book and the implied-vol fit it decided on.
 
-The minute-grid recorders stamp `event_time` at the floored minute and capture
-about 29s later, so `core.quotes.decision_age` refuses them for a decision at
-that minute. These rows describe what the decision actually read, so the
-point-in-time joins accept them for that decision.
+The minute-grid recorders capture about 29s after the minute, so the
+point-in-time joins refuse them for a decision at that minute. These rows record
+what the decision actually read, so the joins accept them.
 """
 from __future__ import annotations
 
@@ -166,7 +165,7 @@ def test_attach_implied_vol_takes_the_recorded_fit_for_its_decision():
     assert len(fits) == 1
     joined = attach_implied_vol(_windows(), fits)
     assert joined['implied_sigma_per_min'].iloc[0] == pytest.approx(0.0006)
-    # The age live used: decision instant (+latency) minus capture.
+    # The age live used: decision instant (plus latency) minus capture time.
     assert joined['iv_staleness_minutes'].iloc[0] == pytest.approx(32 / 60)
 
 
