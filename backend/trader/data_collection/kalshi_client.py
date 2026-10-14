@@ -1137,19 +1137,6 @@ class KalshiClient:
         logger.info('order reply    %s', json.dumps(payload, sort_keys=True, default=str))
         return dict(payload.get('order', payload))
 
-    async def cancel(self, order_id: str, *, ticker: Optional[str] = None) -> dict:
-        """Cancel a resting order (V2 route; `ticker` lets the venue route it)."""
-        if not self.live:
-            raise NotLiveError('client is not live')
-        return await self._request(
-            'DELETE', f'/portfolio/events/orders/{order_id}',
-            params=_clean({'market_ticker': ticker}))
-
-    async def order(self, order_id: str) -> dict:
-        """The venue's record of one order, by the id it assigned."""
-        payload = await self._request('GET', f'/portfolio/orders/{order_id}')
-        return dict(payload.get('order', payload))
-
     async def order_by_client_id(self, client_order_id: str, *,
                                  ticker: Optional[str] = None,
                                  max_pages: int = 3) -> Optional[dict]:
