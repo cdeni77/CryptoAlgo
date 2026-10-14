@@ -1,6 +1,4 @@
-"""
-Data Collection Module for Crypto Perpetual Futures Trading System.
-"""
+"""Market data models and storage."""
 
 from .models import (
     OHLCVBar,
@@ -35,6 +33,5 @@ __all__ = [
     "DatabaseBase",
     "SQLiteDatabase",
     "create_database",
-    
-    # Connectors
+
 ]

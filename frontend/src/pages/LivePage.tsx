@@ -1,11 +1,7 @@
-/** The barrier, now. One card per symbol, the account beside it.
+/** The barrier state now: one card per symbol, the account beside it.
  *
- * The layout answers the question the system actually asks, in the order it asks
- * it: how far has price moved from the strike, how much volatility is left, what
- * probability does that imply, what does the market charge, and is the gap
- * between those two big enough to pay for. The quarter-hour track and the
- * probability scale carry the first and the last of those; the numbers in
- * between are supporting detail.
+ * Each card reads in decision order: displacement from the strike, volatility
+ * left, implied probability, market price, and the edge between them.
  */
 import { usePolling } from '../hooks/usePolling';
 import { fetchFunnel, fetchLive, fetchPrices } from '../api/serving';
@@ -164,10 +160,8 @@ export function LivePage() {
 
 /** The last two hours of price for one symbol, with each window's strike.
  *
- * Polled separately from the decision state and at a slower cadence: the path is
- * two hours of history that changes one minute at a time, while the decision
- * changes every cycle. One request for both would refetch 120 bars to learn a
- * probability moved.
+ * Polled separately and more slowly than the decision state: the path changes
+ * once a minute.
  */
 function SymbolChart({ symbol }: { symbol: string }) {
   const series = usePolling(() => fetchPrices(symbol, 120), 60_000, [symbol]);
@@ -219,9 +213,7 @@ function WindowCard({ window: w }: { window: Prediction }) {
 
       <div className="mt-4">
         {/* market_probability is the real quote, null when none was read.
-            price is what WE paid and is null on every refused window — using
-            it as a market fallback drew our own baseline and labelled it
-            "market" on the majority of rows. */}
+            Never fall back to `price`: it is what we paid, null when refused. */}
         <ProbabilityScale
           probability={w.model_probability}
           price={w.market_probability}

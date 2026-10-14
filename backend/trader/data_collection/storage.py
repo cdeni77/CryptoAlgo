@@ -1,9 +1,4 @@
-"""
-Database storage layer for the Crypto Trading System.
-
-Supports SQLite (development) and TimescaleDB (production).
-All data is stored with bi-temporal timestamps for backtesting integrity.
-"""
+"""SQLite storage for OHLCV bars, with bi-temporal timestamps."""
 
 import logging
 import re
@@ -24,10 +19,8 @@ logger = logging.getLogger(__name__)
 class StorageWriteError(RuntimeError):
     """A write failed for a reason that is not about the data.
 
-    Raised rather than counted, because a caller that receives 0 from an insert
-    cannot tell "the venue served nothing" from "this database is read-only" —
-    and the scrape logged the second as the first, concluding that Coinbase had
-    no history before 2025 while 34,060 bars sat in memory.
+    Raised, not counted: a returned 0 cannot tell "the venue served nothing"
+    from "this database is read-only".
     """
 
 
@@ -68,11 +61,7 @@ class DatabaseBase(ABC):
 
 
 class SQLiteDatabase(DatabaseBase):
-    """
-    SQLite database for development and testing.
-    
-    Uses bi-temporal schema for point-in-time queries.
-    """
+    """SQLite database with a bi-temporal schema for point-in-time queries."""
     
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -139,15 +128,13 @@ class SQLiteDatabase(DatabaseBase):
                 ON ohlcv(available_time)
             """)
             
-            # Lightweight migration for existing DBs.
-            # Pre-existing bars keep 'unknown': the backfill tried Coinbase first
-            # and filled gaps from CCXT (which itself falls back across six
-            # exchanges), so the true origin of historical rows is not recoverable.
+            # Migrate older databases. Their bars keep venue 'unknown', because
+            # their true origin is not recoverable.
             self._add_missing_columns(cursor, "ohlcv", {
                 "venue": "TEXT DEFAULT 'unknown'",
             })
-            # Databases created before venue was part of the key still carry the
-            # old constraint, and SQLite cannot alter one in place.
+            # Older databases lack venue in the key, and SQLite cannot alter a
+            # constraint in place.
             self._rebuild_for_venue_key(cursor, "ohlcv",
                                         "UNIQUE(symbol, timeframe, venue, event_time)")
 
@@ -166,17 +153,11 @@ class SQLiteDatabase(DatabaseBase):
 
     @staticmethod
     def _rebuild_for_venue_key(cursor, table: str, wanted_unique: str) -> None:
-        """Rebuild `table` if its unique key predates venue.
+        """Rebuild `table` if its unique key does not include venue.
 
-        SQLite cannot alter a UNIQUE constraint, so the table is recreated with
-        the wanted key and the rows copied across. This has to happen: with venue
-        outside the key, `INSERT OR REPLACE` silently discarded one venue's row
-        for every (symbol, hour) the other also covered, which is exactly the
-        pair the cross-venue features need.
-
-        Rows that survived the old key keep whatever venue they recorded; the
-        history that was already overwritten is not recoverable, and re-running
-        the backfill is the only way to get the second venue back.
+        SQLite cannot alter a UNIQUE constraint, so this recreates the table and
+        copies the rows. Without venue in the key, `INSERT OR REPLACE` lets one
+        venue overwrite the other. Overwritten rows need a new backfill.
         """
         cursor.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
@@ -209,9 +190,7 @@ class SQLiteDatabase(DatabaseBase):
 
         cursor.execute(f"DROP TABLE IF EXISTS {table}__new")
         cursor.execute(rebuilt)
-        # OR IGNORE, not OR REPLACE: where the old key already collapsed two
-        # venues into one row there is nothing to choose between, and keeping the
-        # first is at least deterministic.
+        # OR IGNORE keeps the first row, which is deterministic.
         cursor.execute(
             f"INSERT OR IGNORE INTO {table}__new ({column_list}) "
             f"SELECT {column_list} FROM {table}"
@@ -288,11 +267,8 @@ class SQLiteDatabase(DatabaseBase):
                     ))
                     inserted += 1
                 except sqlite3.OperationalError as e:
-                    # Connection-level: read-only file, full disk, locked
-                    # database. This affects every row, so looping over 34,000
-                    # bars emits 34,000 identical errors and then returns 0 —
-                    # which the caller cannot distinguish from "the venue has no
-                    # data for this span". Fail once, immediately, with the cause.
+                    # A connection-level failure (read-only file, full disk,
+                    # lock) affects every row. Fail once, with the cause.
                     raise StorageWriteError(
                         f"cannot write to {self.db_path}: {e}. "
                         f"{inserted} of {len(bars)} bars were written before this. "
@@ -305,8 +281,7 @@ class SQLiteDatabase(DatabaseBase):
             
             conn.commit()
             if failures and not inserted:
-                # Every row failed for a non-connection reason. Reporting zero
-                # here would read as "no data available" upstream.
+                # Every row failed. Returning 0 would read as "no data" upstream.
                 raise StorageWriteError(
                     f"all {len(bars)} bars rejected, first: {failures[0]}"
                 )
@@ -367,14 +342,7 @@ class SQLiteDatabase(DatabaseBase):
         venue: Optional[str] = None,
         timeframe: Optional[str] = None,
     ) -> list[tuple[datetime, datetime]]:
-        """Windows inside [start, end) with no rows, including interior holes.
-
-        The backfill only ever built `(start, existing_start)` and
-        `(existing_end, end)` from MIN and MAX, so any hole between them was
-        permanently bracketed and invisible — a failed request mid-history stayed
-        a hole for the life of the store, and the features computed straight
-        across it.
-        """
+        """Windows inside [start, end) with no rows, including interior holes."""
         allowed = {'ohlcv'}
         if table not in allowed:
             raise ValueError(f'unknown table {table!r}')
@@ -388,11 +356,8 @@ class SQLiteDatabase(DatabaseBase):
             sql += " AND venue = ?"
             params.append(venue)
         sql += " AND event_time >= ? AND event_time < ? ORDER BY event_time"
-        # Bind the datetime, not an isoformat string: rows are stored through the
-        # sqlite3 adapter as 'YYYY-MM-DD HH:MM:SS', and comparing that text
-        # against an isoformat 'T' separator is a lexicographic mismatch that
-        # silently matches nothing. Every other bounded query here binds the
-        # object for the same reason.
+        # Bind the datetime, not an isoformat string. Rows are stored as
+        # 'YYYY-MM-DD HH:MM:SS', and a 'T' separator compares wrong as text.
         params += [start, end]
 
         with self._get_connection() as conn:
@@ -418,13 +383,10 @@ class SQLiteDatabase(DatabaseBase):
     def get_latest_ohlcv_time(
         self, symbol: str, timeframe: str, venue: Optional[str] = None
     ) -> Optional[datetime]:
-        """MAX event_time for this instrument, optionally scoped to one venue.
+        """MAX event_time for this instrument, optionally for one venue.
 
-        `venue` is not optional in spirit. Without it the watermark answers "has
-        anyone covered this range" rather than "has THIS venue covered it", so
-        once Coinbase filled a span the CCXT prepend was skipped and the
-        reference-venue bars the cross-venue basis and lead-lag features need
-        were never collected at all.
+        Pass `venue` for a watermark: without it, one venue's bars hide another
+        venue's gap.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -444,13 +406,10 @@ class SQLiteDatabase(DatabaseBase):
     def get_earliest_ohlcv_time(
         self, symbol: str, timeframe: str, venue: Optional[str] = None
     ) -> Optional[datetime]:
-        """MIN event_time for this instrument, optionally scoped to one venue.
+        """MIN event_time for this instrument, optionally for one venue.
 
-        `venue` is not optional in spirit. Without it the watermark answers "has
-        anyone covered this range" rather than "has THIS venue covered it", so
-        once Coinbase filled a span the CCXT prepend was skipped and the
-        reference-venue bars the cross-venue basis and lead-lag features need
-        were never collected at all.
+        Pass `venue` for a watermark: without it, one venue's bars hide another
+        venue's gap.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()

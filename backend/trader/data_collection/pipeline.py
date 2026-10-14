@@ -1,13 +1,4 @@
-"""
-Data Collection Pipeline Orchestrator.
-
-Coordinates all components of the data collection system:
-- REST API polling
-- WebSocket streaming
-- Data validation
-- Database storage
-- Message queue for real-time data flow
-"""
+"""Runs data collection: REST polling, WebSocket streaming, validation and storage."""
 
 import asyncio
 import logging
@@ -43,12 +34,9 @@ class PipelineConfig:
     db_type: str = "sqlite"
     db_path: str = "./data/trading.db"
     queue_type: str = "memory"
-    # Label written to the `venue` column for Coinbase-native fetches, instead
-    # of the default 'coinbase'. Needed because the CDE perp and its Coinbase
-    # spot index are both "coinbase" and both resolve to the same base — so
-    # storing them under one label makes a cross-venue basis a comparison
-    # between an instrument and itself, which is identically zero and looks like
-    # a working feature. Scrape spot with `--venue-label coinbase_spot`.
+    # The `venue` label for this run, in place of 'coinbase'. Spot and perp
+    # share a base, so they need separate labels. Scrape spot with
+    # `--venue-label coinbase_spot`.
     venue_label: Optional[str] = None
     ohlcv_poll_interval: int = 60
     backfill_days: int = 30
@@ -64,8 +52,7 @@ class DataPipeline:
         self._database: Optional[DatabaseBase] = None
         self._validator: DataValidator = DataValidator(config.validation_config)
         self._quality_tracker: DataQualityTracker = DataQualityTracker()
-        # Storage goes through the ingestor so validation and quality-stamping
-        # happen in exactly one place, shared with run_pipeline's backfills.
+        # All storage goes through the ingestor, the one place that validates.
         self._ingestor: Optional[Ingestor] = None
         self._running = False
         self._tasks: List[asyncio.Task] = []
@@ -176,7 +163,7 @@ class DataPipeline:
         return mapping.get(granularity.lower(), 3600)
 
     def _ingest(self) -> Ingestor:
-        """The one door into storage, sharing this run's validator and tracker."""
+        """The ingestor, sharing this run's validator and tracker."""
         if self._ingestor is None or self._ingestor.database is not self._database:
             self._ingestor = Ingestor(
                 self._database, validator=self._validator, tracker=self._quality_tracker
@@ -184,18 +171,7 @@ class DataPipeline:
         return self._ingestor
 
     def _venue_name(self) -> str:
-        """The label every bar from this run is stored under.
-
-        One venue now. This used to pick between Coinbase and whichever CCXT
-        exchange served the request, because the backfill blended them — and it
-        returned `get_available_exchanges()[0]`, the first exchange that
-        *initialised*, while `fetch_ohlcv` chose per symbol from
-        ["okx","binance","bybit"]. Bars served by Binance were stamped 'okx', so
-        `REFERENCE_VENUE=binance` matched nothing and every cross-venue feature
-        was empty. Both venues this system reads are Coinbase now — the CDE perps
-        under 'coinbase', spot under 'coinbase_spot' — so the label is just the
-        run's own.
-        """
+        """The venue label for every bar from this run."""
         return self.config.venue_label or 'coinbase'
 
     async def _fetch_bars(self, symbol, timeframe, start_dt, end_dt):
@@ -227,23 +203,13 @@ class DataPipeline:
                        force: bool = False):
         """Fetch history into the store.
 
-        By default this is *resumable*: it prepends anything older than the
-        earliest stored bar and appends anything newer than the latest, and skips
-        a range the store already spans. That is right for growing a store and
-        wrong for repairing one.
+        By default this resumes: it prepends history older than the earliest
+        stored bar, appends history newer than the latest, and skips the rest.
+        That cannot fill an interior hole.
 
-        `force=True` fetches exactly `[start, end]` and writes it, whatever is
-        already there. Without it, `scripts/scrape.py:fill_gaps` could not do its
-        job at all: for an interior hole the prepend branch is skipped (the hole
-        is newer than the store's first bar) and `append_start` jumps to
-        `last_time + 1min`, which is *past* the requested `end` — so the fetch
-        never happened and it logged "store already covers ... which spans the
-        request". Ten thousand recoverable minutes per symbol sat in that hole
-        while the tool built to recover them reported success.
-
-        Writes are `INSERT OR REPLACE` on `UNIQUE(symbol, timeframe, venue,
-        event_time)`, so a forced refetch is idempotent and also repairs a bar
-        that was stored wrong — a partial candle, for instance.
+        `force=True` fetches exactly `[start, end]` and writes it. Writes are
+        `INSERT OR REPLACE` on `(symbol, timeframe, venue, event_time)`, so a
+        forced refetch is idempotent and also repairs a bad bar.
         """
         end = ensure_naive_utc(end) if end else utc_now()
         start = ensure_naive_utc(start) if start else (end - timedelta(days=self.config.backfill_days))
@@ -255,10 +221,8 @@ class DataPipeline:
             for timeframe in timeframes:
                 tf_seconds = self._granularity_to_seconds(timeframe)
                 tf_delta = timedelta(seconds=tf_seconds)
-                # Venue-scoped, and asked of the database rather than the
-                # in-memory cache: the cache is keyed symbol->timeframe with no
-                # venue dimension, so it answered "has ANYONE covered this
-                # range", which conflated the perp series with the spot one.
+                # Ask the database, per venue. The in-memory cache has no venue
+                # key, so it mixes the perp and spot series.
                 venue = self._venue_name()
                 last_time = ensure_naive_utc(
                     self._database.get_latest_ohlcv_time(
@@ -290,21 +254,9 @@ class DataPipeline:
                         logger.error(f"Error refetching {symbol} {timeframe}: {exc}")
                     continue
 
-                # Prepend: history older than anything stored. This branch was
-                # deleted along with CCXT and nothing replaced it, so on a
-                # populated store `append_start` jumped to the newest bar and the
-                # requested `start` was silently discarded — asking for 1,825 days
-                # against a store holding 400 fetched only the missing hour, and
-                # said "already up to date".
-                #
-                # What made the old prepend wrong was its *source*, not its
-                # direction: it filled the span before a contract was listed with
-                # another exchange's bars for the same underlying — a different
-                # quote currency, contract size, funding and participant set,
-                # stored under this symbol's name. This fetches from the same
-                # connector and the same venue as every other bar, so deeper
-                # history is the same series, and a request that pre-dates the
-                # listing simply returns nothing.
+                # Prepend history older than anything stored. It comes from the
+                # same connector and venue, so it is the same series. A request
+                # before the listing returns nothing.
                 if first_time and start < first_time:
                     prepend_end = first_time - tf_delta
                     if start <= prepend_end:
@@ -314,12 +266,8 @@ class DataPipeline:
                         )
                         bars = await self._fetch_bars(
                             symbol, timeframe, start, prepend_end)
-                        # "Nothing was written" and "nothing exists" are
-                        # different facts and only one of them is about the
-                        # market. Reporting the first as the second is how a
-                        # read-only database became the conclusion that Coinbase
-                        # serves no history before 2025, with 34,060 fetched bars
-                        # sitting in memory unwritten.
+                        # Report "nothing written" apart from "nothing served":
+                        # only the second is a fact about the market.
                         if not bars:
                             logger.info(
                                 f"   {symbol} {timeframe}: the venue served no "

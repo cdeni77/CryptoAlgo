@@ -1,9 +1,4 @@
-"""
-Data models for the Crypto Perpetual Futures Trading System.
-
-These models enforce strict temporal semantics with bi-temporal timestamps
-to prevent lookahead bias and data leakage.
-"""
+"""Market data records with bi-temporal timestamps, to prevent lookahead."""
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,11 +15,9 @@ class Side(Enum):
 class DataQuality(Enum):
     """Data quality flags.
 
-    UNVALIDATED is the default on every record so that data which skipped
-    validation stays distinguishable from data that was checked and passed.
-    Defaulting to VALID made the two identical, which is how open interest ended
-    up stamped 'valid' by a path that never validated it. Any row still marked
-    UNVALIDATED after ingest is a bypass, and can be found with a query.
+    UNVALIDATED is the default on every record, so that data which skipped
+    validation stays distinct from data that passed. A row still UNVALIDATED
+    after ingest is a bypass.
     """
     UNVALIDATED = "unvalidated"  # Never checked — treat as unknown
     VALID = "valid"
@@ -34,15 +27,9 @@ class DataQuality(Enum):
 
 @dataclass
 class BiTemporalMixin:
-    """
-    Mixin for bi-temporal data storage.
-    
-    Critical for preventing lookahead bias:
-    - event_time: When the event actually occurred in the market
-    - available_time: When the data became available to our system
-    
-    For backtesting, we can only use data where:
-    decision_time >= available_time
+    """Bi-temporal timestamps.
+
+    A decision may use a record only when decision_time >= available_time.
     """
     event_time: datetime  # When event occurred
     available_time: datetime  # When we received/could access the data
@@ -50,11 +37,9 @@ class BiTemporalMixin:
 
 @dataclass
 class OHLCVBar(BiTemporalMixin):
-    """
-    OHLCV (Open, High, Low, Close, Volume) bar data.
-    
-    Note: The bar for period [T, T+interval) is only fully available
-    at time T+interval. The available_time should reflect this.
+    """One OHLCV bar.
+
+    The bar for [T, T+interval) is available only at T+interval.
     """
     symbol: str
     timeframe: str  # e.g., "1m", "1h", "1d"
@@ -71,9 +56,8 @@ class OHLCVBar(BiTemporalMixin):
     # Number of trades in this bar
     trade_count: Optional[int] = None
 
-    # Which exchange produced this bar. The backfill tries Coinbase first and
-    # fills gaps from CCXT, so one symbol's history is a blend of venues with
-    # different microstructure. Without this, the boundary is invisible.
+    # The exchange that produced this bar. One symbol's history can blend
+    # venues with different microstructure.
     venue: str = 'unknown'
     
     # Data quality
@@ -121,9 +105,7 @@ class OHLCVBar(BiTemporalMixin):
 
 @dataclass
 class Trade(BiTemporalMixin):
-    """
-    Individual trade record.
-    """
+    """One trade."""
     symbol: str
     trade_id: str
     
@@ -159,11 +141,7 @@ class OrderBookLevel:
 
 @dataclass
 class OrderBookSnapshot(BiTemporalMixin):
-    """
-    Order book snapshot at a point in time.
-    
-    Stores top N levels of bids and asks.
-    """
+    """The top N levels of an order book at one instant."""
     symbol: str
     
     # Bids (buy orders) - sorted by price descending
@@ -224,9 +202,7 @@ class OrderBookSnapshot(BiTemporalMixin):
 
 @dataclass
 class TickerUpdate(BiTemporalMixin):
-    """
-    Real-time ticker update from WebSocket.
-    """
+    """A real-time ticker update from a WebSocket."""
     symbol: str
     
     price: float
@@ -265,6 +241,5 @@ class DataValidationResult:
             self.quality = DataQuality.SUSPICIOUS
 
 
-# Type aliases for clarity
 SymbolData = Dict[str, List[OHLCVBar]]
 TradeStream = List[Trade]

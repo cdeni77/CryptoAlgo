@@ -1,12 +1,6 @@
-/** The navigation rail.
+/** The navigation rail: a list of words, the active one marked by an accent bar.
  *
- * A list of words, not a column of icons. Five destinations do not need
- * pictograms, and a pictogram beside a word is decoration twice. The active item
- * is marked by a 2px accent bar on its leading edge and by ink-weight text —
- * structural accent, never a directional colour.
- *
- * The footer carries the fee schedule, because it is the denominator of every
- * number on every page and it is an assumption rather than a measurement.
+ * The footer shows the fee schedule and half-spread that every edge figure uses.
  */
 import { Logo } from './Logo';
 

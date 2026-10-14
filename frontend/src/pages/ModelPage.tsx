@@ -1,11 +1,7 @@
 /** The gates, and every candidate that has ever been evaluated.
  *
- * Two things this page is careful about. The gates are shown in the order they
- * should be read — the forecast first, the money second — because a candidate
- * that fails a forecast gate should not have its Sharpe ratio discussed. And the
- * attempt history includes blocked candidates, because the trial count is what
- * any claim of skill has to be discounted by, and a project that hides its
- * failures cannot compute its own correction.
+ * Gates read forecast first, money second. The attempt history includes blocked
+ * candidates, because the trial count discounts any claim of skill.
  */
 import { usePolling } from '../hooks/usePolling';
 import { fetchModel, fetchModelHistory } from '../api/serving';
@@ -23,9 +19,7 @@ import {
 import { stamp } from '../lib/format';
 import type { Gate, ModelAttempt } from '../types';
 
-/** Which gates read the forecast rather than a simulated outcome. On the
- *  predecessor of this system every gate read an outcome, so a model 34x short
- *  of its cost hurdle failed all of them without any saying why. */
+/** The gates that read the forecast rather than a simulated outcome. */
 const FORECAST_GATES = new Set([
   'log_loss_skill',
   'folds_skill_positive',

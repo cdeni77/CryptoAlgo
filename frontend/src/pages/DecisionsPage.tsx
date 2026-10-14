@@ -1,10 +1,4 @@
-/** Every decision point, traded or refused.
- *
- * The refusals are the point. A screen showing only trades cannot show that the
- * system declined because the forecast did not cover the fee, which is the most
- * informative thing it has to say — and on the predecessor of this system,
- * `edge_below_cost rejecting 82% of candidates` said what no Sharpe ratio said.
- */
+/** Every decision point, traded or refused, with the reason for each refusal. */
 import { useState } from 'react';
 import { usePolling } from '../hooks/usePolling';
 import { fetchPredictions } from '../api/serving';

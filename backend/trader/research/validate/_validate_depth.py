@@ -1,25 +1,13 @@
-"""Where live recording and Predexon backfill describe the same minute, do they agree?
+"""Do live-recorded and Predexon-backfilled Kalshi books agree on the same minute?
 
-This check was impossible until both landed in one table. It is the only
-independent evidence that the 70-day backfill — which every book-derived feature
-will be trained on — describes the same object our recorder sees.
-
-A disagreement in `yes_bid`/`yes_ask` is a pricing error and would invalidate the
-economics. A disagreement in depth is a coverage difference: Predexon returns
-book CHANGES, and the state at minute m is the last change at or before it, so
-a quiet minute is carried forward while our recorder polls the live ladder.
-Those are different measurements of the same thing and small gaps are expected;
-large ones are not.
+Compares `venue_depth` rows by source and judges the bid gap against quote
+staleness: a gap that grows with staleness is timing, a flat gap is a different
+book. Run: `python research/validate/_validate_depth.py` from backend/trader.
 """
 
 from __future__ import annotations
 
-# This file moved into research/validate/ during a repo cleanup; `core`/`scripts`
-# are packages rooted at backend/trader/, which Python does not add to
-# sys.path automatically for a script run from a subdirectory (only the
-# script's OWN directory is added). Without this, every `from core...`
-# import below raises ModuleNotFoundError the moment the file is not sitting
-# directly in backend/trader/.
+# Put backend/trader on sys.path, so `core` imports when run as a script.
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
@@ -32,14 +20,14 @@ import pandas as pd
 from core.datastore import ResearchStore
 
 pd.set_option('display.width', 200)
-# Both observations must sit this close to the minute mark, or the
-# comparison measures the time between them rather than the books.
+# Both quotes must be within this many seconds of the minute mark, or the
+# comparison measures the time between them, not the books.
 MAX_AGE = float(os.getenv('MAX_AGE', '15'))
 
 
 # Staleness bins, in seconds, for the trend the verdict is based on.
 AGE_BINS = ((0, 2), (2, 5), (5, 10), (10, 20), (20, 40), (40, 1e9))
-# One tick. The freshest bin has to land here or the shape does not matter.
+# About one tick. The freshest bin must land within it.
 ONE_TICK = 0.0125
 MIN_PAIRS = 40
 
@@ -47,15 +35,9 @@ MIN_PAIRS = 40
 def agreement_verdict(bins):
     """(ok, why) from [(upper_age_s, n, median_abs_diff)] ordered by freshness.
 
-    The question is the SHAPE, not the level. Two books sampled tens of seconds
-    apart differ by cents on a market that moves ~8.4pp a minute, so a fixed
-    threshold on the level mostly measures the sampling lag. A backfill that
-    describes a DIFFERENT book disagrees regardless of how fresh either quote
-    is — flat in this variable — while the same book sampled at different
-    instants produces a monotone ramp.
-
-    Necessary and not sufficient: the freshest bin must still land near one
-    tick, or a steep trend would excuse a book that is simply wrong.
+    Judges the shape, not the level. The same book sampled at different
+    instants gives a gap that grows with staleness; a different book gives a
+    flat gap. The freshest bin must also be within one tick.
     """
     usable = [b for b in bins if b[1] >= 15]
     if sum(b[1] for b in usable) < MIN_PAIRS or len(usable) < 3:
@@ -84,13 +66,9 @@ def main() -> int:
     both = live.merge(back, on=key, suffixes=('_live', '_back'))
     print(f'overlapping (symbol, window, minute): {len(both):,}')
 
-    # **Compare like with like, or measure the clock instead of the book.** The
-    # live row is stamped at the poll instant, up to a minute after the mark it
-    # is filed under; the backfill row is the last book CHANGE at or before that
-    # mark. Unfiltered, the two can be sixty seconds apart — and this market
-    # moves a measured ~8.4pp per minute, so a four-cent median difference is
-    # what the clock alone produces. The first run of this reported exactly that
-    # and it says nothing about whether the backfill is the same book.
+    # Keep only pairs where both quotes are near the mark. The live row is
+    # stamped at the poll, up to a minute late; the backfill row is the last
+    # book change at or before the mark.
     age_live = pd.to_numeric(both['quote_age_seconds_live'], errors='coerce')
     age_back = pd.to_numeric(both['quote_age_seconds_back'], errors='coerce')
     print(f'  quote age  live median {age_live.median():.1f}s p90 '
@@ -126,9 +104,7 @@ def main() -> int:
         print(f'{field:16s} n={int(ok.sum()):>6}  median backfill/live {ratio.median():.3f}  '
               f'p10 {ratio.quantile(0.10):.3f}  p90 {ratio.quantile(0.90):.3f}')
 
-    # The verdict is the SHAPE across staleness, not a threshold on the level.
-    # See `agreement_verdict`: a fixed threshold here failed the backfill at
-    # 1.8c when the two sides were a median 34s apart.
+    # The verdict is the shape across staleness. See `agreement_verdict`.
     print('\nprice gap against how stale the WORSE of the two quotes is:')
     age_worst = pd.concat([age_live.abs(), age_back.abs()], axis=1).max(axis=1)
     a = both['yes_bid_live'].astype(float)
