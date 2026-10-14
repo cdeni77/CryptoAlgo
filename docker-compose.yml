@@ -392,47 +392,6 @@ services:
         --min-edge-pp 1.5
         --bankroll 500
 
-  # ===========================================================================
-  # Everything the live system runs, in ONE service.
-  #
-  # This was five: the trading loop, three recorders and a shell loop that
-  # scraped and rebuilt the store. They were separate because they were written
-  # one at a time, not because they differ — four are async loops polling an
-  # HTTP API on a sixty-second cadence. One container means one restart policy,
-  # one log stream, and one thing to check.
-  #
-  # **Trading latency is what the arrangement protects.** The threat was never
-  # the polling, which is all `await`; it is `ResearchStore.write`, synchronous
-  # pandas and pyarrow that would block a pending decision. So writes run in a
-  # thread, recorders hold off while a decision is in flight (`TradingGate`),
-  # their cadences are phased to the far side of the minute from the decision
-  # instants, and the store rebuild stays a subprocess because it is minutes of
-  # blocking CPU. See `scripts/run_live.py`.
-  #
-  # A failure in one component no longer hides: `supervise` logs it and restarts
-  # that component with backoff while the rest keep running. Across five
-  # containers a crash-looping recorder was invisible unless someone looked.
-  #
-  # Disable a component without editing this file:
-  #   docker compose run --rm live --disable pm_ladder --trade-args ...
-  # ===========================================================================
-  live:
-    profiles: ["live"]
-    extends:
-      service: trader
-    restart: unless-stopped
-    command: >
-      -m scripts.run_live
-        --trade-args
-          --loop
-          --cycle-seconds 60
-          --mode live
-          --dry-run
-          --bankroll 200
-          --no-require-gates
-          --force
-          --reason "manual run of the live stack; edit before using"
-
 
 volumes:
   postgres_data:
