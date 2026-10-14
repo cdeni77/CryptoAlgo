@@ -1,8 +1,7 @@
 """Tests that `--require-gates` checks the artifact actually installed.
 
-The newest ledger entry can differ from the installed file: a failed promotion
-installs nothing, and a rollback writes no entry. The installed file is
-identified by content, since it is byte-identical to one staged candidate.
+The installed file is identified by content, since the newest ledger entry may not
+describe it.
 """
 
 from __future__ import annotations
@@ -45,8 +44,8 @@ def test_it_finds_the_installed_artifact_by_content(models):
 
 
 def test_a_failed_later_attempt_does_not_block_a_passing_artifact(models):
-    """A failed later promotion does not stop the trader starting on the passing installed
-    model.
+    """A failed later promotion does not stop the trader starting on the passing
+    installed model.
     """
     _artifact(models, '20260101T000000Z', b'good', passed=True)
     _artifact(models, '20260201T000000Z', b'bad', passed=False, installed=False)

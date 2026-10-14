@@ -1,8 +1,7 @@
 """Tests for the alignment canary and the null control.
 
-The canary: a feature equal to the outcome must be recovered end to end, and must
-fail when the target is shifted by one window. The null control: on bars with no
-structure, the pipeline must find no skill.
+A feature equal to the outcome must be recovered, and must fail when shifted by one
+window. Bars with no structure must give no skill.
 """
 
 from __future__ import annotations
@@ -39,8 +38,8 @@ def prepared():
 # ------------------------------------------------------------- the canary
 
 def test_a_perfect_feature_is_recovered_end_to_end(prepared):
-    """A feature equal to the outcome gives large skill. Otherwise the panel and target are
-    misaligned.
+    """A feature equal to the outcome gives large skill. Otherwise the panel and target
+    are misaligned.
     """
     _, fit, train, test = prepared
     column = FEATURE_GROUPS['geometry'][0]
@@ -114,9 +113,7 @@ def test_the_pipeline_finds_nothing_on_a_null():
 # ----------------------------------------------------------------- shape
 
 def test_every_declared_feature_is_produced(prepared):
-    """Every declared feature is populated, since an all-NaN column looks like a working
-    one.
-    """
+    """Every declared feature is populated, since an all-NaN column looks like a working one."""
     _, _, _, test = prepared
     report = population_report(test)
     empty = report[report['populated'] == 0]
@@ -165,8 +162,7 @@ def test_an_untrained_correction_reproduces_the_baseline(prepared):
 # ------------------------------------------------------- the scoring bundle
 
 def test_the_artifact_carries_what_the_live_path_needs(prepared):
-    """The artifact carries the scoring bundle the live path needs, so it is deployable.
-    """
+    """The artifact carries the scoring bundle the live path needs, so it is deployable."""
     _, fit, train, _ = prepared
     bundle = fit.bundle(FAST)
     model = fit_model(train, fit.baseline, FAST, scoring=bundle)
@@ -206,8 +202,8 @@ def test_score_live_reports_no_outcome_for_an_unsettled_window(prepared):
 def test_the_shrinkage_reads_near_zero_on_a_null():
     """On a null dataset `residual_scale` stays below the 0.25 gate.
 
-    Early stopping and the shrinkage fit must not share rows, and a failed
-    optimiser must not return its bracket point 0.7639320225 as a fitted value.
+    Early stopping and the shrinkage fit must not share rows, and a failed optimiser
+    must not return its bracket point 0.7639320225 as a fitted value.
     """
     from core.config import Config
     from core.dataset import Dataset, fit_fold
@@ -233,8 +229,7 @@ def test_the_shrinkage_reads_near_zero_on_a_null():
 
 
 def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
-    """The shrinkage fit drops unscoreable (NaN) rows and needs enough rows to remain.
-    """
+    """The shrinkage fit drops unscoreable (NaN) rows and needs enough rows to remain."""
     import numpy as np
 
     from core.model import MIN_SHRINKAGE_ROWS, _fit_residual_scale

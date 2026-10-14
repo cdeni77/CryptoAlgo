@@ -1,7 +1,6 @@
-"""Tests that `realised_high_water()` starts at the same epoch as `account.realized_pnl`.
+"""Tests that `realised_high_water()` uses the same epoch as `account.realized_pnl`.
 
-The drawdown breaker compares the two. A peak from before a dashboard reset
-against P&L counted after it gives a false drawdown and a sticky halt.
+A peak from before a reset against P&L after it gives a false drawdown halt.
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ def test_without_an_epoch_it_spans_everything(writer):
 
 
 def test_an_epoch_excludes_the_earlier_peak(writer):
-    """A peak from before the epoch is excluded."""
     account = writer.ensure_account(100.0, mode='paper')
     _settle(writer, +50.0, EPOCH - dt.timedelta(days=5))
     _settle(writer, -10.0, EPOCH + dt.timedelta(hours=1))

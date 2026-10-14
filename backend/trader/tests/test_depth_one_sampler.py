@@ -1,8 +1,6 @@
 """Tests that `book_feature_row` measures depth buckets against the ladder's own touch.
 
-When the quote's touch came from a different fetch than the ladder, the 1c bucket
-could be empty while the 5c bucket was full, so `book_convexity` became NaN. The
-backfill reads touch and ladder from one snapshot, so live must do the same.
+A touch from a different fetch can leave the 1c bucket empty and `book_convexity` NaN.
 """
 from __future__ import annotations
 

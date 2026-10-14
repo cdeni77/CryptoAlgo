@@ -1,8 +1,6 @@
-"""Tests that the backtest gets the same depth columns that live uses to cap the stake.
+"""Tests that the backtest gets the same depth columns live uses to cap the stake.
 
-Live and backtest call the same `decide()`. If only live supplied
-`depth_up`/`depth_down`, the backtest would claim fills the book could not
-support. The columns come from `venue_depth` sizes.
+Both call the same `decide()`, so both must supply `depth_up`/`depth_down`.
 """
 from __future__ import annotations
 
@@ -43,8 +41,7 @@ def test_the_backtest_carries_the_same_depth_cap_live_does():
 
 
 def test_depth_is_dollars_on_the_side_being_crossed():
-    """Depth is dollars on the side being crossed, as in `scripts.live.depth_dollars`.
-    """
+    """Depth is dollars on the side being crossed, as in `scripts.live.depth_dollars`."""
     out = attach_quotes(_windows(), _depth(bid=0.40, ask=0.42,
                                            bid_size=100.0, ask_size=80.0))
     row = out.iloc[0]
@@ -53,8 +50,7 @@ def test_depth_is_dollars_on_the_side_being_crossed():
 
 
 def test_a_row_with_no_size_gives_nan_not_zero():
-    """A row with no size gives NaN, so `decide()` falls back to the standing dollar cap.
-    """
+    """A row with no size gives NaN, so `decide()` falls back to the standing dollar cap."""
     d = _depth()
     d['yes_bid_size'] = np.nan
     d['yes_ask_size'] = np.nan

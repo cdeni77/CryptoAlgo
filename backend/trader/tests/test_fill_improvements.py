@@ -1,7 +1,7 @@
 """Tests for sizing and order type changes that improve the fill rate.
 
-Depth at the touch is usually ample, but a thin tail can shrink within seconds,
-and the quote used for sizing is a few seconds old when the order is sent.
+Depth at the touch is usually ample, but a thin tail can shrink within seconds, and the
+quote used for sizing is a few seconds old when the order is sent.
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ def row(**over):
 
 
 class TestDepthHeadroom:
-    """The stake uses only `depth_fraction` of the visible depth, since part of it is gone
-    by send time.
+    """The stake uses only `depth_fraction` of the visible depth, since part of it is
+    gone by send time.
     """
 
     def test_the_default_leaves_headroom(self):
@@ -56,8 +56,7 @@ class TestDepthHeadroom:
 
 
 class TestPartialFillsAllowed:
-    """Orders use `immediate_or_cancel`, so a partial fill is taken instead of killed.
-    """
+    """Orders use `immediate_or_cancel`, so a partial fill is taken instead of killed."""
 
     @pytest.mark.asyncio
     async def test_orders_default_to_immediate_or_cancel(self, monkeypatch):

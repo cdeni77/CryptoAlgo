@@ -1,7 +1,7 @@
 """Tests for `--entry-offsets` on the evaluate/promote side.
 
-Without it the backtest trades the first offset that clears, while live enters
-only at +12m. The gates would then measure a policy that is not deployed.
+Without it the backtest trades the first offset that clears, while live enters only at
++12m. The gates would then measure a policy that is not deployed.
 """
 from __future__ import annotations
 
@@ -29,13 +29,10 @@ def test_several_offsets_are_allowed():
 
 
 def test_the_default_is_unrestricted_so_existing_runs_are_unchanged():
-    """The default is None (every offset may enter), so past ledger entries keep their
-    meaning.
-    """
+    """The default is None (every offset may enter), so past ledger entries keep their meaning."""
     assert _config([]).entry_offsets is None
 
 
 def test_an_entry_offset_outside_the_decision_grid_is_refused():
-    """An entry offset outside the decision grid is refused."""
     with pytest.raises(ValueError, match='entry_offsets'):
         _config(['--offsets', '3,6,9,12', '--entry-offsets', '7'])

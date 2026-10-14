@@ -1,8 +1,7 @@
 """Tests that a latched breaker stops entries but not scoring and recording.
 
-`decide()` refuses with `Reason.HALTED`, so the row is still scored, priced
-against the real book, written, and settled. The market comparison needs these
-rows even on days the breaker fires.
+`decide()` refuses with `Reason.HALTED`, so the row is still scored, written and
+settled.
 """
 
 from __future__ import annotations
@@ -38,14 +37,11 @@ class TestTheHaltedGate:
         assert out.stake == 0.0
 
     def test_the_default_is_not_halted_so_nothing_else_changes(self):
-        """`decide()` is not halted by default, so the backtest and paper engine are
-        unaffected.
-        """
+        """`decide()` is not halted by default, so the backtest and paper engine are unaffected."""
         assert decide(row(), DEFAULT_CONFIG, bankroll=150.0).reason is Reason.TRADED
 
     def test_halted_is_distinct_from_the_bankroll_floor(self):
-        """A latched breaker (cleared by hand) and the ruin floor are different reasons.
-        """
+        """A latched breaker (cleared by hand) and the ruin floor are different reasons."""
         floored = decide(row(), DEFAULT_CONFIG, bankroll=1.0)
         assert floored.reason is Reason.BANKROLL_FLOOR
         assert decide(row(), DEFAULT_CONFIG, bankroll=150.0,
@@ -144,7 +140,6 @@ class TestTheCycleKeepsScoringWhileHalted:
         return writer, calls
 
     def test_a_halted_account_still_scores_the_window(self, tmp_path):
-        """A halted account still scores the window."""
         _, calls = self._cycle(tmp_path, halt=True)
         assert calls['scored'] == 1, (
             'a halted account skipped scoring, so no quote or outcome is '
@@ -152,8 +147,7 @@ class TestTheCycleKeepsScoringWhileHalted:
         )
 
     def test_a_halted_account_still_writes_the_prediction(self, tmp_path):
-        """A halted account still writes the prediction that `market_benchmark` reads.
-        """
+        """A halted account still writes the prediction that `market_benchmark` reads."""
         writer, _ = self._cycle(tmp_path, halt=True)
         rows = writer.scored_against_market()
         assert rows is not None

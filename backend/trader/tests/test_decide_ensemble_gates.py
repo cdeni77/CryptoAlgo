@@ -1,7 +1,7 @@
 """Tests for the ensemble gates EDGE_UNCERTAIN and MEMBERS_DISAGREE.
 
-Both are off by default and pass a row without ensemble columns, so a single
-model decides as before.
+Both are off by default and pass a row without ensemble columns, so a single model
+decides as before.
 """
 
 from __future__ import annotations

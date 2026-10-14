@@ -1,4 +1,5 @@
-"""Tests for `--max-daily-loss-fraction`, which widens the daily-loss breaker explicitly.
+"""Tests for `--max-daily-loss-fraction`, which widens the daily-loss breaker
+explicitly.
 
 A flag, not a changed default, so the running value shows in the deploy config.
 """
@@ -28,7 +29,6 @@ def test_a_value_at_or_above_one_leaves_only_the_ruin_floor():
 
 
 def test_the_value_is_not_silently_clamped():
-    """The value is not clamped."""
     assert _config(['--max-daily-loss-fraction', '3.0']).max_daily_loss_fraction == 3.0
 
 

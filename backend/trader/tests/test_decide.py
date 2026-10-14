@@ -1,7 +1,7 @@
 """Tests for `decide()`, the one place a trade is chosen, and its gates.
 
-The gates fire in funnel order, so the rejection histogram is meaningful. The
-vectorised screen admits exactly the rows the scalar path admits.
+The gates fire in funnel order, so the rejection histogram is meaningful. The vectorised
+screen admits exactly the rows the scalar path admits.
 """
 
 from __future__ import annotations
@@ -39,9 +39,7 @@ def test_both_sides_are_always_evaluated():
 
 
 def test_no_trade_when_the_forecast_agrees_with_the_market():
-    """When the forecast agrees with the market, the fee is the whole difference, so
-    abstain.
-    """
+    """When the forecast agrees with the market, the fee is the whole difference, so abstain."""
     decision = decide(row(model_probability=0.88), Config(), bankroll=100.0)
     assert not decision.traded
     assert decision.reason is Reason.EDGE_BELOW_GATE
@@ -86,7 +84,6 @@ def test_correlated_legs_are_capped_per_window():
 
 
 def test_a_stake_under_one_contract_is_a_skip_not_a_rounding():
-    """A stake below one contract is a skip, not a rounding."""
     config = Config(kelly_fraction=0.001, min_contracts=1)
     decision = decide(row(), config, bankroll=100.0)
     assert decision.reason is Reason.BELOW_MIN_CONTRACTS
@@ -122,7 +119,6 @@ def test_the_dollar_cap_binds_before_the_percentage_does():
 
 
 def test_kelly_uses_one_minus_cost_not_one_minus_probability():
-    """Kelly divides by one minus cost, not one minus probability."""
     q, cost = 0.93, 0.8969
     assert kelly_fraction_for(q, cost) == pytest.approx((q - cost) / (1 - cost))
     assert kelly_fraction_for(q, cost) != pytest.approx((q - cost) / (1 - q))
@@ -195,9 +191,7 @@ def test_the_histogram_covers_every_reason():
 
 
 def test_prices_round_to_the_venues_tapered_ladder():
-    """Prices round to the venue's tapered tick: 0.001 below 0.10 and above 0.90, 0.01
-    between.
-    """
+    """Prices round to the venue's tapered tick: 0.001 below 0.10 and above 0.90, 0.01 between."""
     assert round_to_tick(0.8749) == pytest.approx(0.87)
     assert round_to_tick(0.8751) == pytest.approx(0.88)
     assert round_to_tick(0.0123) == pytest.approx(0.012)
@@ -252,8 +246,8 @@ class TestHowManySymbolsMayHoldOneWindow:
     window.
 
     With fewer slots than symbols, `decide()` refuses whichever symbol comes last
-    alphabetically. That symbol then has no recorded edge, so per-symbol results
-    would not be comparable.
+    alphabetically. That symbol then has no recorded edge, so per-symbol results would
+    not be comparable.
     """
 
     def test_all_three_symbols_may_hold_a_position_in_one_window(self):
@@ -272,7 +266,6 @@ class TestHowManySymbolsMayHoldOneWindow:
         assert out.reason is not Reason.POSITION_LIMIT
 
     def test_a_fourth_position_would_still_be_refused(self):
-        """A fourth position is still refused."""
         exposure = WindowExposure(stake=6.60, positions=3,
                                   symbols_entered=frozenset(
                                       {'BTC-USD', 'ETH-USD', 'SOL-USD'}))

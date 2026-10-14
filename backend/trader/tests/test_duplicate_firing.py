@@ -1,8 +1,7 @@
 """Tests that one offset is not decided twice in the same window.
 
-`client_order_id` is fixed per (symbol, window, offset), so a second attempt
-always fails with `order_already_exists`. Both the cadence cycle and the decision
-planner can start a cycle, so `mark_decided` records every decided offset.
+`client_order_id` is fixed per (symbol, window, offset), so a second attempt always
+fails.
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ def test_an_offset_a_cycle_already_decided_does_not_fire_again():
 
 
 def test_an_offset_nobody_has_decided_still_fires_immediately():
-    """An offset nobody has decided still fires immediately."""
     at_05 = datetime(2026, 8, 26, 2, 12, 5, tzinfo=timezone.utc)
     delay = seconds_until_next_decision(
         DEFAULT_CONFIG, Args(), now=at_05, already_fired=set())

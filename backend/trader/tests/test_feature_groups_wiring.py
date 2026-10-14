@@ -18,16 +18,13 @@ def test_the_three_new_families_are_selectable():
 
 
 def test_the_calendar_control_is_still_the_only_control():
-    """`time_of_day` is the only control group; `offset` is informative and is not a
-    control.
-    """
+    """`time_of_day` is the only control group; `offset` is informative and is not a control."""
     assert CONTROL_GROUPS == ('time_of_day',)
     assert 'time_of_day' in ALL_GROUPS
 
 
 def test_no_column_is_declared_in_two_groups():
-    """No column belongs to two groups, so removing a group really removes its columns.
-    """
+    """No column belongs to two groups, so removing a group really removes its columns."""
     seen = {}
     for group, columns in FEATURE_GROUPS.items():
         for column in columns:
@@ -36,15 +33,14 @@ def test_no_column_is_declared_in_two_groups():
 
 
 def test_level_counts_never_became_features():
-    """Level counts are not features: they differ between backfilled and live sources.
-    """
+    """Level counts are not features: they differ between backfilled and live sources."""
     for column in feature_columns():
         assert 'levels' not in column, column
 
 
 def test_the_price_columns_are_isolated_so_they_can_be_ablated_alone():
-    """The price columns form their own `market_price` group, so structure-only can be run
-    alone.
+    """The price columns form their own `market_price` group, so structure-only can be
+    run alone.
     """
     from core.book_features import MARKET_STATE, PRICE_COLUMNS
     assert MARKET_STATE, 'structure-only must not be empty'
@@ -58,8 +54,8 @@ def test_selecting_an_unknown_group_still_raises():
 
 
 def test_book_groups_are_selectable_but_not_in_the_default_matrix():
-    """Book groups are selectable but not in the default matrix, since most bar history has
-    no book.
+    """Book groups are selectable but not in the default matrix, since most bar history
+    has no book.
     """
     from core.features import BOOK_GROUPS
     for group in BOOK_GROUPS:
@@ -77,8 +73,7 @@ def test_the_bar_only_groups_are_still_the_default():
 
 
 def test_market_minus_baseline_is_populated_after_the_baseline_attaches():
-    """`market_minus_baseline` is computed in `attach_baseline`, after the baseline exists.
-    """
+    """`market_minus_baseline` is computed in `attach_baseline`, after the baseline exists."""
     import pandas as pd
     from core.baseline import attach_baseline
 

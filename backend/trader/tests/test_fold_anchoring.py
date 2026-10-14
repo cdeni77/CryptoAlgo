@@ -1,7 +1,7 @@
 """Tests that calendar fold boundaries stay fixed when data is appended.
 
-Blocks are anchored to a fixed origin, so adding data within a block changes no
-fold. Only then is a weekly gate run comparable with the previous one.
+Blocks are anchored to a fixed origin, so adding data within a block changes no fold.
+Only then is a weekly gate run comparable with the previous one.
 """
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ def _folds(days: float, scheme: str = 'calendar', block: float = BLOCK):
 
 
 def test_appending_data_within_a_block_moves_no_boundary():
-    """Appending data within a block moves no boundary."""
     before, after = _folds(240), _folds(243)
     assert len(before) == len(after)
     assert [f.test_start for f in before] == [f.test_start for f in after]

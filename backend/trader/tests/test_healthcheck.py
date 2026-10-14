@@ -1,8 +1,6 @@
 """Tests for the container healthcheck, which reads each component's heartbeat.
 
-`supervise` restarts a component that raises or returns, but cannot tell a
-coroutine that is waiting from one that will wait forever. A stale heartbeat
-catches the second case.
+A stale heartbeat catches a coroutine that will wait forever, which `supervise` cannot.
 """
 
 from __future__ import annotations
@@ -27,7 +25,6 @@ def test_a_fresh_component_passes():
 
 
 def test_a_component_that_never_reported_fails():
-    """A component that never reported fails the check."""
     assert main(['--components', 'ladder', '--quiet']) == 1
 
 
@@ -44,7 +41,6 @@ def test_one_dead_component_fails_the_whole_check():
 
 
 def test_only_the_components_asked_for_are_checked():
-    """Only the requested components are checked."""
     heartbeat.touch('trade')
     assert main(['--components', 'trade', '--quiet']) == 0
 

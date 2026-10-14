@@ -1,8 +1,6 @@
 """Tests that an entry cycle places orders first and does its bookkeeping afterwards.
 
-Time between reading the book and sending the order lets the market move. These
-tests drive the real `run_cycle` against a recording venue and assert the order
-of calls.
+They drive the real `run_cycle` against a recording venue and assert the order of calls.
 """
 from __future__ import annotations
 
@@ -169,9 +167,7 @@ class TestOrdering:
         assert first(venue.events, 'order') > first(venue.events, 'quotes')
 
     def test_a_successful_reconcile_records_its_time(self, tmp_path, monkeypatch):
-        """A successful reconcile records its time, which the entry-cycle staleness guard
-        reads.
-        """
+        """A successful reconcile records its time, which the entry-cycle staleness guard reads."""
         before = time.monotonic()
         run(tmp_path, monkeypatch, Venue(), offset=9, reconciled=False)
         assert live_state._LAST_RECONCILED is not None

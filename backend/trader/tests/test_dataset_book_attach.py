@@ -1,8 +1,7 @@
 """Tests for attaching observed book data to the window panel.
 
-Quotes and ladder fits are observed, so they attach when the panel is built.
-`iv_minus_realised` divides by the fitted `sigma_per_min`, so it is computed per
-fold. Computing it at build time would use a sigma fitted on the whole sample.
+Quotes and fits attach at build time; `iv_minus_realised` needs the fitted
+`sigma_per_min`, so it is computed per fold.
 """
 
 from __future__ import annotations

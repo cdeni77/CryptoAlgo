@@ -1,8 +1,7 @@
 """Tests for walk-forward fold geometry.
 
-`fold_block_days` is both the test span and the step, and matches the weekly
-retrain cadence. `fold_train_days` sets a rolling training window; expanding is
-the default because the retrain fits on all history.
+`fold_block_days` is the test span and the step (the weekly retrain cadence);
+`fold_train_days` sets a rolling window, with expanding as the default.
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ def test_a_rolling_window_holds_its_length_instead_of_growing():
 
 
 def test_the_rolling_window_is_measured_from_the_embargo_not_the_test_start():
-    """The rolling window is measured back from the embargo, not from the test start."""
     folds = _folds(fold_block_days=21.0, train_days=35.0)
     f = folds[-1]
     embargo = pd.Timedelta(minutes=1440)
@@ -58,8 +56,8 @@ def test_a_rolling_window_never_crosses_the_embargo():
 
 
 def test_a_shorter_block_gives_the_cadence_live_actually_runs():
-    """Seven-day blocks match the weekly retrain, so the model is never staler in test than
-    live.
+    """Seven-day blocks match the weekly retrain, so the model is never staler in test
+    than live.
     """
     weekly = _folds(fold_block_days=7.0)
     triweekly = _folds(fold_block_days=21.0)
@@ -70,7 +68,6 @@ def test_a_shorter_block_gives_the_cadence_live_actually_runs():
 
 
 def test_blocks_do_not_overlap_so_no_window_is_scored_twice():
-    """Blocks do not overlap, so no window is scored twice."""
     seen: set = set()
     for f in _folds(fold_block_days=7.0):
         assert not (seen & set(f.test)), f'fold {f.index} re-tests scored windows'

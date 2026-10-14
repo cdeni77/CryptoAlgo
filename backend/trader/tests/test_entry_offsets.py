@@ -1,8 +1,6 @@
 """Tests for `entry_offsets`, which limits the offsets that may open a position.
 
-Every offset in `decision_offsets` is still scored, since that is the
-measurement sample. Only entry is restricted. Live defaults to +12m, the offset
-with the best measured per-contract edge.
+Every offset is still scored; only entry is restricted. Live defaults to +12m.
 """
 
 from __future__ import annotations
@@ -63,9 +61,7 @@ def test_widening_the_entry_set_is_one_line():
 
 
 def test_the_live_script_defaults_to_entering_only_at_the_offset_that_pays():
-    """`scripts.live` defaults to entering only at +12m, so the deploy config shows the
-    policy.
-    """
+    """`scripts.live` defaults to entering only at +12m, so the deploy config shows the policy."""
     from scripts.live import build_parser
 
     args = build_parser().parse_args([])

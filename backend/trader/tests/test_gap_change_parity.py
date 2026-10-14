@@ -1,8 +1,6 @@
 """Tests that `venue_gap_change_5` means the same thing in training and live.
 
-It is the change in `venue_prob_gap` from the previous configured offset. Live
-cannot see which rows `--complete-cases` dropped, so both sides use the
-configured offset grid, not the rows present.
+Both use the configured offset grid, since live cannot see which rows training dropped.
 """
 
 from __future__ import annotations
@@ -39,7 +37,6 @@ def test_a_complete_window_differences_one_offset():
 
 
 def test_a_missing_middle_offset_yields_NaN_not_a_longer_step():
-    """A missing middle offset gives NaN, not a longer step."""
     got = _gap_change([(3, 0.01), (6, 0.03), (12, 0.10)])
     assert np.isnan(got[12]), (
         'the previous CONFIGURED offset is absent, so there is no one-offset '
@@ -60,8 +57,7 @@ def test_a_NaN_gap_upstream_propagates():
 
 
 def test_it_follows_the_configured_grid_not_the_rows_present():
-    """The step follows the configured grid, so on a (3, 12) policy it spans 9 minutes.
-    """
+    """The step follows the configured grid, so on a (3, 12) policy it spans 9 minutes."""
     got = _gap_change([(3, 0.01), (12, 0.10)], decision_offsets=(3, 12))
     assert got[12] == pytest.approx(0.09)
 

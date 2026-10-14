@@ -1,9 +1,7 @@
-"""Tests that the gate spec matches the lock committed beside the code.
+"""Tests that the gate spec matches `core/gate_spec.lock.json`.
 
-The lock makes a gate change visible: this test fails until
-`core/gate_spec.lock.json` is regenerated in the same commit, and
-`scripts.promote` refuses a different running spec unless `--accept-gate-change`
-records why.
+A gate change needs the lock regenerated in the same commit, and promotion needs
+`--accept-gate-change` with a reason.
 """
 from __future__ import annotations
 

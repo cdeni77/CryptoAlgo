@@ -1,7 +1,7 @@
 """Tests that `venue_depth.quality` is derived from the book.
 
-A crossed book or a price outside [0, 1] is marked 'suspicious', not dropped. A
-default `min_quality='valid'` read then excludes it.
+A crossed book or a price outside [0, 1] is marked 'suspicious', not dropped. A default
+`min_quality='valid'` read then excludes it.
 """
 
 from __future__ import annotations

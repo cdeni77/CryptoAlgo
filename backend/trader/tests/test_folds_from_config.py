@@ -1,7 +1,7 @@
 """Tests for `folds_for_config`, which builds folds from the whole Config.
 
-Callers that pass only some fields to `purged_walk_forward` silently use its
-other defaults. Taking the Config makes that impossible.
+Callers that pass only some fields to `purged_walk_forward` silently use its other
+defaults. Taking the Config makes that impossible.
 """
 
 from __future__ import annotations
@@ -54,9 +54,7 @@ def test_the_rolling_train_window_is_honoured():
 
 
 def test_every_fold_building_script_uses_the_helper():
-    """The scripts build folds through `folds_for_config`, not `purged_walk_forward`
-    directly.
-    """
+    """The scripts build folds through `folds_for_config`, not `purged_walk_forward` directly."""
     import scripts.ablate, scripts.baseline, scripts.train, core.backtest
 
     for mod in (scripts.ablate, scripts.baseline, scripts.train):

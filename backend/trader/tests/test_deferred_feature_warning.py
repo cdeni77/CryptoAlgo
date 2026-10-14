@@ -1,7 +1,7 @@
 """Tests that `build_features` does not warn about columns the caller will attach later.
 
-The live path fills the book groups after building features from bars. Only
-columns nobody promised to attach are warned about.
+The live path fills the book groups after building features from bars. Only columns
+nobody promised to attach are warned about.
 """
 from __future__ import annotations
 
