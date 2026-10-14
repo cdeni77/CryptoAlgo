@@ -47,16 +47,20 @@ def _venue_caches() -> tuple[dict, dict]:
     # as training assumes. The REST recorder writes ~32s past the minute, and a
     # gap against a minute-stale peer correlates only 0.672 with the
     # contemporaneous one. `cross_venue_row` refuses a stale reading either way.
+    # Each entry is copied and tagged with its `transport`, which the
+    # recorded peer row carries.
     pm = {}
     try:
         from scripts.record_pm_stream import CACHE as pm_ws
-        pm = dict(pm_ws)
+        pm = {sym: dict(entry, transport='stream')
+              for sym, entry in dict(pm_ws).items()}
     except Exception:                                         # noqa: BLE001
         pm = {}
     if not pm:
         try:
             from scripts.record_pm_ladder import CACHE as pm_rest
-            pm = pm_rest
+            pm = {sym: dict(entry, transport='rest')
+                  for sym, entry in dict(pm_rest).items()}
         except Exception:                                     # noqa: BLE001
             pm = {}
     try:
@@ -125,7 +129,121 @@ def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
     return float(value - before)
 
 
-def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) -> dict:
+# A peer cap under this refuses most peer books on transport latency alone.
+TIGHT_PEER_CAP_SECONDS = 5.0
+
+
+def peer_max_age_seconds(config=None) -> float:
+    """The peer book's age cap: `peer_max_quote_age_seconds`, else
+    `max_quote_age_seconds`. The same rule `core.dataset.peer_quote_limits`
+    gives the backtest."""
+    config = config or state._RUNNING_CONFIG or DEFAULT_CONFIG
+    peer = getattr(config, 'peer_max_quote_age_seconds', None)
+    return float(config.max_quote_age_seconds if peer is None else peer)
+
+
+def warn_if_peer_cap_tight(config) -> None:
+    """Log a WARNING when the effective peer cap is under
+    `TIGHT_PEER_CAP_SECONDS`."""
+    cap = peer_max_age_seconds(config)
+    if cap < TIGHT_PEER_CAP_SECONDS:
+        logger.warning('peer book age cap is %.1fs, under %.0fs: this would void '
+                       'most peer books', cap, TIGHT_PEER_CAP_SECONDS)
+
+
+# Why a peer book is not used. `future` is a book stamped after the decision.
+PEER_REFUSALS = ('no_book', 'wrong_window', 'too_old', 'future', 'one_sided')
+PEER_USED = 'used'
+
+# window_open -> {verdict: count}, one verdict per symbol per decision cycle.
+_PEER_COUNTS: dict = {}
+# The refusals a stuck stream cache produces. `future` and `one_sided` describe
+# a book that is current, so they do not count toward a resubscribe.
+STUCK_REFUSALS = ('no_book', 'wrong_window', 'too_old')
+# symbol -> consecutive decision cycles refused for a STUCK_REFUSALS reason.
+_PEER_STREAK: dict = {}
+
+
+def peer_refusal(pm: Optional[dict], *, now=None, window_open=None,
+                 config=None) -> Optional[str]:
+    """The reason `pm` cannot be used for this decision, or None.
+
+    The window check comes first: a rollover leaves a fresh-looking book for
+    the previous window. A reading with no window or no stamp is kept: the REST
+    fallback publishes the window as `window_open`, the socket as `window`, and
+    absence of a stamp is not evidence of staleness (matching `attach_quotes`).
+    """
+    if not pm:
+        return 'no_book'
+    peer_window = pm.get('window') or pm.get('window_open')
+    if (window_open is not None and peer_window is not None
+            and pd.Timestamp(peer_window) != pd.Timestamp(window_open)):
+        return 'wrong_window'
+    if pm.get('at') is not None and now is not None:
+        age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
+        if age < 0:
+            return 'future'
+        if age > peer_max_age_seconds(config):
+            return 'too_old'
+    if np.isnan(_two_sided_mid(pm.get('best_bid'), pm.get('best_ask'))):
+        return 'one_sided'
+    return None
+
+
+def _note_peer(window_open, verdict: str, *, symbol=None, config=None) -> None:
+    if window_open is not None:
+        key = pd.Timestamp(window_open)
+        counts = _PEER_COUNTS.setdefault(key, {})
+        counts[verdict] = counts.get(verdict, 0) + 1
+    if symbol is not None:
+        _track_streak(str(symbol), verdict, config)
+
+
+def _track_streak(symbol: str, verdict: str, config=None) -> None:
+    """Ask the stream to resubscribe `symbol` after N stuck refusals in a row.
+
+    N is `peer_resubscribe_after_cycles`. The streak restarts after each
+    request, so a symbol the venue does not list asks at most once per N
+    cycles.
+    """
+    if verdict not in STUCK_REFUSALS:
+        _PEER_STREAK.pop(symbol, None)
+        return
+    streak = _PEER_STREAK.get(symbol, 0) + 1
+    config = config or state._RUNNING_CONFIG or DEFAULT_CONFIG
+    if streak < int(config.peer_resubscribe_after_cycles):
+        _PEER_STREAK[symbol] = streak
+        return
+    _PEER_STREAK.pop(symbol, None)
+    logger.warning('%s: peer book refused %d decision cycles running (last: %s); '
+                   'asking the Polymarket stream to resubscribe',
+                   symbol, streak, verdict)
+    try:
+        from scripts.record_pm_stream import request_resubscribe
+        request_resubscribe(symbol, verdict)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning('%s: could not signal the Polymarket stream (%s)',
+                       symbol, str(exc)[:110])
+
+
+def reset_peer_tracking() -> None:
+    """Drop the refusal counts and streaks. For tests."""
+    _PEER_COUNTS.clear()
+    _PEER_STREAK.clear()
+
+
+def take_peer_counts(window_open) -> dict:
+    """{verdict: count} for `window_open`, removed from the tally. Older
+    windows are dropped with it."""
+    key = pd.Timestamp(window_open)
+    counts = _PEER_COUNTS.pop(key, {})
+    for stale in [k for k in _PEER_COUNTS if k < key]:
+        del _PEER_COUNTS[stale]
+    return counts
+
+
+def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None,
+                    config=None, symbol: Optional[str] = None) -> dict:
     """`cross_venue` from the in-process Polymarket cache.
 
     Two independent books on the same fifteen minutes, settling on different
@@ -134,32 +252,26 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) ->
     or liquidity, not a different question.
 
     `best_bid`/`best_ask` are CENTS on both sides, matching `core.book_features`.
+
+    The peer must be for THIS window and no staler than the peer cap the
+    backtest applies (`peer_max_age_seconds`); otherwise the gap partly
+    measures Kalshi's own move since the peer was read. Each verdict is counted
+    per window for the heartbeat line (`take_peer_counts`).
     """
     from core.book_features import CROSS_VENUE
 
     out = {name: float('nan') for name in CROSS_VENUE}
-    # The peer must be for THIS window and no staler than the bar the backtest
-    # applies to both venues (`core.quotes.DEFAULT_MAX_AGE`); otherwise the gap
-    # partly measures Kalshi's own move since the peer was read. `cross_venue`
-    # is the load-bearing group. The window check comes first because a
-    # rollover leaves a fresh-looking book for the previous window. A reading
-    # with no window or no stamp is kept: the REST fallback publishes the window
-    # as `window_open`, the socket as `window`, and absence of a stamp is not
-    # evidence of staleness (matching `attach_quotes`).
-    if (pm is not None and window_open is not None
-            and (pm.get('window') or pm.get('window_open')) is not None
-            and pd.Timestamp(pm.get('window') or pm.get('window_open'))
-                != pd.Timestamp(window_open)):
-        logger.debug('peer book is for window %s, not %s; gap refused',
-                     pm.get('window') or pm.get('window_open'), window_open)
+    refusal = peer_refusal(pm, now=now, window_open=window_open, config=config)
+    _note_peer(window_open, refusal or PEER_USED, symbol=symbol, config=config)
+    if refusal is not None:
+        if pm:
+            logger.debug('%s: peer book refused (%s): window %s, at %s, %s/%s',
+                         symbol or '?', refusal,
+                         pm.get('window') or pm.get('window_open'), pm.get('at'),
+                         pm.get('best_bid'), pm.get('best_ask'))
+        else:
+            logger.debug('%s: peer book refused (%s)', symbol or '?', refusal)
         pm = None
-    if pm is not None and pm.get('at') is not None and now is not None:
-        from core.quotes import DEFAULT_MAX_AGE
-        age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
-        if not (0 <= age <= DEFAULT_MAX_AGE):
-            logger.debug('peer book %.0fs old, past the %.0fs bar; gap refused',
-                         age, DEFAULT_MAX_AGE)
-            pm = None
     k_mid = _two_sided_mid(getattr(quote, 'yes_bid', np.nan) * 100.0,
                            getattr(quote, 'yes_ask', np.nan) * 100.0)
     p_mid = _two_sided_mid(*(
@@ -241,7 +353,7 @@ def latest_fit(symbol: str, *, now, cache: dict, read=None):
     if live is not None:
         age = (now - pd.Timestamp(live['at'])).total_seconds() / 60.0
         if 0 <= age <= MAX_FIT_AGE_MINUTES:
-            return live
+            return dict(live, source='recorder')
 
     reader = read or _read_recent_fits
     stamp = _FIT_CACHE.get('at')
@@ -263,7 +375,7 @@ def latest_fit(symbol: str, *, now, cache: dict, read=None):
         return None
     return {'implied_sigma_per_min': float(row['implied_sigma_per_min']),
             'r2': float(row['r2']), 'n_strikes': float(row['n_strikes']),
-            'at': row['_at']}
+            'at': row['_at'], 'source': 'store'}
 
 
 async def prewarm_fit_lookup(*, horizon: float = 75.0) -> None:
@@ -360,14 +472,67 @@ def book_feature_row(quote, yes_levels, no_levels, *,
     return market_state_features(frame).iloc[0].to_dict()
 
 
-def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> None:
+def _index_cache():
+    """The index recorder's in-process cache, or None when it is not running."""
+    try:
+        from scripts.record_index import CACHE
+        return CACHE
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _attach_index_proxy(scored: pd.DataFrame, config=None, cache=None) -> None:
+    """The `index_proxy` group onto the scoring rows, in place.
+
+    `core.index_features.index_features_row` over the recorder's rolling
+    history: the same `attach_index_proxy` the backtest runs. The decision
+    instant is the row's `decision_time`, the minute boundary the backtest
+    uses. With no recorder the columns stay NaN, which
+    `_warn_unscoreable_features` reports.
+    """
+    from core.index_features import INDEX_PROXY, index_features_row
+
+    for column in INDEX_PROXY:
+        if column not in scored.columns:
+            scored[column] = np.nan
+    cache = _index_cache() if cache is None else cache
+    if cache is None or not len(scored):
+        return
+    config = config or state._RUNNING_CONFIG or DEFAULT_CONFIG
+    for i, symbol in enumerate(scored['symbol']):
+        window_open = pd.Timestamp(scored['window_open'].iloc[i])
+        if 'decision_time' in scored.columns:
+            decided = pd.Timestamp(scored['decision_time'].iloc[i])
+        else:
+            decided = window_open + pd.Timedelta(minutes=int(scored['offset'].iloc[i]))
+        try:
+            row = index_features_row(
+                cache.snapshot(symbol), window_open, decided,
+                float(scored['sigma_remaining'].iloc[i]),
+                last_price=float(scored['last_price'].iloc[i]),
+                symbol=symbol,
+                max_age_seconds=float(config.index_proxy_max_age_seconds))
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('%s: index proxy features unavailable (%s)',
+                           symbol, str(exc)[:80])
+            continue
+        for column, value in row.items():
+            scored.iloc[i, scored.columns.get_loc(column)] = value
+
+
+def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None, *,
+                          config=None, groups=None) -> None:
     """Book features onto the scoring rows, in place, from the touch.
 
     One row per symbol: the quote is the same for every offset in the cycle,
-    and it is the book the order will actually be priced against.
+    and it is the book the order will actually be priced against. The
+    `index_proxy` group is attached too when `groups` names it.
     """
     from core.book_features import (
         CROSS_VENUE, IMPLIED_VOL, MARKET_PRICE, MARKET_STATE)
+
+    if groups and 'index_proxy' in groups:
+        _attach_index_proxy(scored, config)
 
     pm_cache, iv_cache = _venue_caches()
     now = pd.Timestamp.now(tz='UTC')
@@ -404,22 +569,142 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
             row['depth_up'] = up
         if down is not None:
             row['depth_down'] = down
+        window_open = scored['window_open'].iloc[i]
+        offset = (int(scored['offset'].iloc[i]) if 'offset' in scored.columns
+                  else int(scored['offset_minutes'].iloc[i]))
+        peer = pm_cache.get(symbol)
+        fit = latest_fit(symbol, now=now, cache=iv_cache)
+        DECISION_INPUTS[symbol] = {
+            'window_open': window_open, 'offset': offset, 'peer': peer,
+            'refusal': peer_refusal(peer, now=now, window_open=window_open,
+                                    config=config),
+            'fit': fit}
         row.update(cross_venue_row(
-            pm_cache.get(symbol), entry[0], now=now,
-            window_open=scored['window_open'].iloc[i]))
+            peer, entry[0], now=now, window_open=window_open, config=config,
+            symbol=symbol))
         row.update(implied_vol_row(
-            latest_fit(symbol, now=now, cache=iv_cache), now=now,
+            fit, now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]
             if 'sigma_per_min' in scored.columns else np.nan))
         row['venue_gap_change_5'] = gap_change(
-            symbol, row.get('venue_prob_gap'),
-            window_open=scored['window_open'].iloc[i],
-            offset=int(scored['offset'].iloc[i])
-            if 'offset' in scored.columns
-            else int(scored['offset_minutes'].iloc[i]))
+            symbol, row.get('venue_prob_gap'), window_open=window_open,
+            offset=offset)
         for column in columns:
             if column in row:
                 scored.iloc[i, scored.columns.get_loc(column)] = row[column]
+
+
+# symbol -> what the last decision cycle read for it: the peer book (or its
+# absence), the refusal reason, and the implied-vol fit. `_record_touch` writes
+# them beside the Kalshi row.
+DECISION_INPUTS: dict = {}
+# symbol -> fit times this process has already written to `venue_implied_vol`.
+_FITS_WRITTEN: dict = {}
+_FITS_KEPT = 32
+
+
+def _cents_to_probability(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float('nan')
+    return value / 100.0 if np.isfinite(value) else float('nan')
+
+
+def peer_depth_row(symbol: str, inputs: dict, *, decided_at,
+                   written_at=None) -> dict:
+    """The `venue_depth` row for the peer book one decision used or refused.
+
+    `source='live_touch'`, so `core.quotes.decision_age` reads
+    `quote_age_seconds` backward from the decision instant. A used book is
+    'valid'. A refused one is kept for research but out of the default read:
+    'invalid' when it does not describe this window (no book, wrong window),
+    'suspicious' otherwise (too old, future stamp, one-sided, crossed).
+    """
+    pm = inputs.get('peer') or {}
+    refusal = inputs.get('refusal')
+    window_open = pd.Timestamp(inputs['window_open'])
+    offset = int(inputs['offset'])
+    bid = _cents_to_probability(pm.get('best_bid'))
+    ask = _cents_to_probability(pm.get('best_ask'))
+    at = pm.get('at')
+    age = (max(0.0, (pd.Timestamp(decided_at) - pd.Timestamp(at)).total_seconds())
+           if at is not None and decided_at is not None else float('nan'))
+    if refusal in ('no_book', 'wrong_window'):
+        quality = 'invalid'
+    elif (refusal is not None
+          or not (0.0 <= bid <= 1.0 and 0.0 <= ask <= 1.0 and ask >= bid)):
+        quality = 'suspicious'
+    else:
+        quality = 'valid'
+    return {
+        'venue': 'polymarket', 'symbol': symbol,
+        'event_time': window_open + pd.Timedelta(minutes=offset),
+        'available_time': (pd.Timestamp.now(tz='UTC') if written_at is None
+                           else pd.Timestamp(written_at)),
+        'quality': quality, 'market_ticker': pm.get('slug'),
+        'window_open': window_open, 'offset_minutes': offset,
+        'yes_bid': bid, 'yes_ask': ask,
+        'yes_bid_size': float('nan'), 'yes_ask_size': float('nan'),
+        'depth_bid_1c': float('nan'), 'depth_bid_5c': float('nan'),
+        'depth_ask_1c': float('nan'), 'depth_ask_5c': float('nan'),
+        'depth_bid_total': float('nan'), 'depth_ask_total': float('nan'),
+        'levels_bid': float('nan'), 'levels_ask': float('nan'),
+        'seq': float('nan'), 'gaps': 0.0, 'source': 'live_touch',
+        'quote_age_seconds': age, 'transport': pm.get('transport'),
+    }
+
+
+def fit_row(symbol: str, fit: Optional[dict]) -> Optional[dict]:
+    """The `venue_implied_vol` row for the fit one decision used, or None.
+
+    None when there is no fit, when it came from the store (already there), or
+    when this process wrote it already. `event_time` and `available_time` are
+    both the fit's capture time: the point-in-time join then accepts it for
+    any decision after the capture, and `iv_staleness_minutes` in the backtest
+    measures the same age live used.
+    """
+    if not fit or fit.get('source') == 'store' or fit.get('at') is None:
+        return None
+    at = pd.Timestamp(fit['at'])
+    if at in _FITS_WRITTEN.get(symbol, ()):
+        return None
+    return {
+        'venue': 'kalshi', 'symbol': symbol, 'event_time': at,
+        'available_time': at, 'quality': 'valid',
+        'event_ticker': fit.get('event_ticker'),
+        'close_time': fit.get('close_time'),
+        'minutes_to_close': float(fit.get('minutes_to_close', np.nan)),
+        'implied_sigma_per_min': float(fit.get('implied_sigma_per_min', np.nan)),
+        'implied_spot': float(fit.get('implied_spot', np.nan)),
+        'atm_strike': float(fit.get('atm_strike', np.nan)),
+        'n_strikes': float(fit.get('n_strikes', np.nan)),
+        'r2': float(fit.get('r2', np.nan)),
+    }
+
+
+def mark_fits_written(rows) -> None:
+    """Remember written fits, so a fit used by several decisions is written once."""
+    for row in rows:
+        seen = _FITS_WRITTEN.setdefault(row['symbol'], [])
+        seen.append(pd.Timestamp(row['event_time']))
+        del seen[:-_FITS_KEPT]
+
+
+def decision_input_rows(symbols, window_open, offset, *, decided_at):
+    """(peer depth rows, fit rows) for the decision at (window_open, offset)."""
+    depth, fits = [], []
+    for symbol in symbols:
+        inputs = DECISION_INPUTS.get(symbol)
+        if (not inputs or inputs.get('window_open') is None
+                or pd.Timestamp(inputs['window_open']) != pd.Timestamp(window_open)
+                or int(inputs['offset']) != int(offset)):
+            continue
+        depth.append(peer_depth_row(symbol, inputs, decided_at=decided_at))
+        row = fit_row(symbol, inputs.get('fit'))
+        if row is not None:
+            fits.append(row)
+    return depth, fits
 
 
 # Features that are legitimately absent at a known offset, with the reason. A

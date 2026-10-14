@@ -666,6 +666,10 @@ class Config:
     # frame this recently (and the book is not gapped); otherwise one REST
     # `/orderbook` read. A frame lands ~34ms after the venue stamps it.
     stream_quote_max_age_seconds: float = 2.0
+    # After this many consecutive decision cycles with the peer book refused
+    # for one symbol (no book, wrong window, too old), live asks
+    # `record_pm_stream` to drop that symbol's state and resubscribe.
+    peer_resubscribe_after_cycles: int = 3
     # A one-minute bar built from the Coinbase trade stream is final once the
     # clock passes its close by this much: trades arrive ~tens of ms late.
     spot_bar_grace_seconds: float = 0.75
@@ -824,6 +828,9 @@ class Config:
         if self.decision_latency_seconds < 0.0:
             raise ValueError(f'decision_latency_seconds must not be negative; '
                              f'got {self.decision_latency_seconds}')
+        if self.peer_resubscribe_after_cycles < 1:
+            raise ValueError(f'peer_resubscribe_after_cycles must be at least 1; '
+                             f'got {self.peer_resubscribe_after_cycles}')
         if (self.peer_max_quote_age_seconds is not None
                 and self.peer_max_quote_age_seconds <= 0.0):
             raise ValueError(f'peer_max_quote_age_seconds must be positive; got '

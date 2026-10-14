@@ -106,8 +106,9 @@ from livetrade.execution import (                                   # noqa: F401
 from livetrade.features import (                                    # noqa: F401
     EXPECTED_NAN, _attach_book_features, _warn_unscoreable_features,
     book_feature_row, config_offsets, cross_venue_row, gap_change,
-    implied_vol_row, latest_fit, prepare_init_score, prewarm_fit_lookup,
-    reset_fit_lookup, reset_gap_history,
+    PEER_USED, implied_vol_row, latest_fit, peer_max_age_seconds,
+    peer_refusal, prepare_init_score, prewarm_fit_lookup, reset_fit_lookup,
+    reset_gap_history, take_peer_counts, warn_if_peer_cap_tight,
 )
 from livetrade.ledger import (                                      # noqa: F401
     PRICE_RETENTION_HOURS, VenueState, _write_equity_point, adopt_venue_balance,
@@ -382,12 +383,25 @@ def heartbeat_due(window_open, last_window) -> bool:
 
 
 def heartbeat_summary(*, window_open, cycles: int, decisions: int, traded: int,
-                      bankroll: float, lag_seconds: float) -> str:
-    """The five things worth checking, on one line."""
+                      bankroll: float, lag_seconds: float,
+                      peer: Optional[dict] = None) -> str:
+    """The things worth checking, on one line.
+
+    `peer` is `take_peer_counts` for the window: how many peer books were used
+    of those read, and the refusals by reason.
+    """
     lag = f'{lag_seconds:.1f}s' if lag_seconds == lag_seconds else 'n/a'
-    return (f'window {window_open:%H:%M} closed: {cycles} cycles, '
+    line = (f'window {window_open:%H:%M} closed: {cycles} cycles, '
             f'{decisions} decisions, {traded} traded, bankroll ${bankroll:.2f}, '
             f'decision lag {lag}')
+    if peer:
+        used = int(peer.get(PEER_USED, 0))
+        refused = {k: int(v) for k, v in peer.items() if k != PEER_USED and v}
+        line += f', peer used {used}/{used + sum(refused.values())}'
+        if refused:
+            line += ' refused ' + ' '.join(
+                f'{k}={v}' for k, v in sorted(refused.items()))
+    return line
 
 
 def decision_offset(elapsed: float, config: Config,
@@ -667,7 +681,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     from core.book_features import (
         CROSS_VENUE as _CV, IMPLIED_VOL as _IV,
         MARKET_PRICE as _MP, MARKET_STATE as _MS)
-    deferred = tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV)
+    from core.index_features import INDEX_PROXY as _IP
+    deferred = tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV) + tuple(_IP)
     scored = score_live(bars, model.scoring, config, deferred=deferred,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
@@ -687,7 +702,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # The book features, from the same snapshot the order is priced against.
     # Without these LightGBM substitutes learned defaults and the loop runs as
     # a different model from the one whose gates were measured.
-    _attach_book_features(scored, quotes, _stream_cache())
+    _attach_book_features(scored, quotes, _stream_cache(), config=config,
+                          groups=model.groups or None)
     scored = prepare_init_score(scored, model)
     _phase('score')
     # Liveness, at the point the cycle has demonstrably scored.
@@ -1067,6 +1083,7 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
             'evaluated but not deployed.')
     if args.require_gates and not args.force:
         _refuse_if_blocked()
+    warn_if_peer_cap_tight(config)
 
     print('=' * 78)
     print(f'Quarter — {args.mode} mode'
@@ -1117,7 +1134,8 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                             window_open=hb_window, cycles=hb_cycles,
                             decisions=hb_decisions, traded=hb_traded,
                             bankroll=float(writer.account().bankroll),
-                            lag_seconds=hb_lag))
+                            lag_seconds=hb_lag,
+                            peer=take_peer_counts(hb_window)))
                         # The first cycle of a window: nothing is in flight and
                         # the next decision is minutes away, so a newly
                         # promoted artifact is picked up here, not by a restart.

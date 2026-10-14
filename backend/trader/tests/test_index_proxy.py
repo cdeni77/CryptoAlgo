@@ -70,9 +70,20 @@ def test_kraken_asks_for_a_bbo_triggered_ticker():
     assert ticker['symbol'] == ['BTC/USD', 'ETH/USD', 'SOL/USD']
 
 
-def test_coinbase_subscribes_to_level2_and_heartbeats():
+def test_coinbase_subscribes_to_ticker_and_heartbeats_only():
+    """`ticker` carries the touch on every message; `level2` would fold a whole
+    book on the trading process's event loop for the same mid."""
     channels = {m['channel'] for m in subscribe_messages('coinbase', SYMBOLS)}
-    assert {'level2', 'heartbeats'} <= channels
+    assert channels == {'ticker', 'heartbeats'}
+
+
+def test_a_coinbase_ticker_for_another_product_is_ignored():
+    state = ExchangeState('coinbase', ('BTC-USD',))
+    message = dict(FIXTURES['coinbase'][1])
+    message['events'] = [{'type': 'update', 'tickers': [
+        dict(message['events'][0]['tickers'][0], product_id='DOGE-USD')]}]
+    HANDLERS['coinbase'](message, state, T0)
+    assert state.quotes['BTC-USD'].mid is None
 
 
 def test_bitstamp_subscribes_to_the_snapshot_book_per_pair():
@@ -240,16 +251,16 @@ def test_a_venue_error_ends_the_connection_with_its_reason():
     assert 'reconnect' in asyncio.run(drive())
 
 
-def test_a_coinbase_sequence_gap_rebuilds_the_book():
-    from scripts.record_spot_stream import SequenceTracker
+def test_a_coinbase_sequence_gap_keeps_the_connection():
+    """Each ticker message carries the whole touch, so a missed one loses no
+    state and is no reason to rebuild."""
     messages = FIXTURES['coinbase'][:2] + [dict(FIXTURES['coinbase'][2], sequence_num=9)]
 
     async def drive():
+        state = ExchangeState('coinbase', SYMBOLS)
         return await record_index.consume(
-            FakeWS(messages, then='silent'), 'coinbase',
-            ExchangeState('coinbase', SYMBOLS), idle_timeout=5.0,
-            seqs=SequenceTracker())
-    assert asyncio.run(drive()) == 'sequence gap'
+            FakeWS(messages, then='silent'), 'coinbase', state, idle_timeout=0.05)
+    assert asyncio.run(drive()).startswith('silent')
 
 
 def test_a_large_message_is_decoded_off_the_loop_and_still_applied():

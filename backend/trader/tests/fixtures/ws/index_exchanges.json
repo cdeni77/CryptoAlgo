@@ -1,22 +1,15 @@
 {
-  "_source": "Hand-written in the shapes of each venue's public market-data WebSocket, NOT live captures. Kraken: the v2 field set from krakenfx/kraken-cli crates/kraken-core (ticker/book/trade structs and their round-trip tests, which cite docs.kraken.com/api/docs/websocket-v2). Coinbase: coinbase/coinbase-advanced-py websocket types (L2Update: side/event_time/price_level/new_quantity on channel l2_data; side names bid/offer per ccxt). Bitstamp and Gemini: no official SDK reachable; shapes from ccxt.pro's bitstamp.py and gemini.py example payloads, which cite bitstamp.net/websocket/v2 and docs.gemini.com.",
+  "_source": "Hand-written in the shapes of each venue's public market-data WebSocket, NOT live captures. Kraken: the v2 field set from krakenfx/kraken-cli crates/kraken-core (ticker/book/trade structs and their round-trip tests, which cite docs.kraken.com/api/docs/websocket-v2). Coinbase: coinbase/coinbase-advanced-py websocket types (WSTicker: type/product_id/price/volume_24_h/low_24_h/high_24_h/low_52_w/high_52_w/price_percent_chg_24_h/best_bid/best_ask/best_bid_quantity/best_ask_quantity, inside events[].tickers on channel ticker). Bitstamp and Gemini: no official SDK reachable; shapes from ccxt.pro's bitstamp.py and gemini.py example payloads, which cite bitstamp.net/websocket/v2 and docs.gemini.com.",
   "coinbase": [
     {"channel": "subscriptions", "client_id": "", "timestamp": "2026-10-14T12:30:00.000000Z", "sequence_num": 0,
-     "events": [{"subscriptions": {"level2": ["BTC-USD"], "heartbeats": ["BTC-USD"]}}]},
-    {"channel": "l2_data", "client_id": "", "timestamp": "2026-10-14T12:30:00.100000Z", "sequence_num": 1,
-     "events": [{"type": "snapshot", "product_id": "BTC-USD", "updates": [
-       {"side": "bid", "event_time": "1970-01-01T00:00:00Z", "price_level": "62000.00", "new_quantity": "0.5"},
-       {"side": "bid", "event_time": "1970-01-01T00:00:00Z", "price_level": "61999.50", "new_quantity": "1.2"},
-       {"side": "offer", "event_time": "1970-01-01T00:00:00Z", "price_level": "62001.00", "new_quantity": "0.3"},
-       {"side": "offer", "event_time": "1970-01-01T00:00:00Z", "price_level": "62002.00", "new_quantity": "2.0"}]}]},
-    {"channel": "l2_data", "client_id": "", "timestamp": "2026-10-14T12:30:00.200000Z", "sequence_num": 2,
-     "events": [{"type": "update", "product_id": "BTC-USD", "updates": [
-       {"side": "bid", "event_time": "2026-10-14T12:30:00.190000Z", "price_level": "62000.00", "new_quantity": "0"},
-       {"side": "offer", "event_time": "2026-10-14T12:30:00.190000Z", "price_level": "62000.80", "new_quantity": "0.1"}]}]},
-    {"channel": "market_trades", "client_id": "", "timestamp": "2026-10-14T12:30:00.300000Z", "sequence_num": 3,
-     "events": [{"type": "update", "trades": [
-       {"trade_id": "9001", "product_id": "BTC-USD", "price": "62000.80", "size": "0.01", "side": "BUY", "time": "2026-10-14T12:30:00.290000Z"}]}]},
-    {"channel": "heartbeats", "client_id": "", "timestamp": "2026-10-14T12:30:01.000000Z", "sequence_num": 4,
+     "events": [{"subscriptions": {"ticker": ["BTC-USD"], "heartbeats": ["BTC-USD"]}}]},
+    {"channel": "ticker", "client_id": "", "timestamp": "2026-10-14T12:30:00.100000Z", "sequence_num": 1,
+     "events": [{"type": "snapshot", "tickers": [
+       {"type": "ticker", "product_id": "BTC-USD", "price": "62000.50", "volume_24_h": "8123.4", "low_24_h": "61000.00", "high_24_h": "62500.00", "low_52_w": "15000.00", "high_52_w": "73000.00", "price_percent_chg_24_h": "0.85", "best_bid": "62000.00", "best_bid_quantity": "0.5", "best_ask": "62001.00", "best_ask_quantity": "0.3"}]}]},
+    {"channel": "ticker", "client_id": "", "timestamp": "2026-10-14T12:30:00.200000Z", "sequence_num": 2,
+     "events": [{"type": "update", "tickers": [
+       {"type": "ticker", "product_id": "BTC-USD", "price": "62000.80", "volume_24_h": "8123.41", "low_24_h": "61000.00", "high_24_h": "62500.00", "low_52_w": "15000.00", "high_52_w": "73000.00", "price_percent_chg_24_h": "0.85", "best_bid": "61999.50", "best_bid_quantity": "1.2", "best_ask": "62000.80", "best_ask_quantity": "0.09"}]}]},
+    {"channel": "heartbeats", "client_id": "", "timestamp": "2026-10-14T12:30:01.000000Z", "sequence_num": 3,
      "events": [{"current_time": "2026-10-14 12:30:01.000 +0000 UTC", "heartbeat_counter": 7}]}
   ],
   "kraken": [
