@@ -1,25 +1,14 @@
 """Research data store: Parquet on disk, DuckDB for queries.
 
-Two stores exist in this system and they have different jobs:
+This is the research store: immutable Parquet partitioned by dataset, venue,
+symbol and month. `core.pg_writer` is the separate serving store (PostgreSQL).
 
-* **This one** is the research store. Immutable Parquet partitioned by dataset,
-  venue, symbol and month. It answers "what did the market look like at time t"
-  for feature building, backtests and simulation. No server, columnar, and fast
-  enough that a full-history feature build is not an afternoon.
-* **`core.pg_writer`** is the serving store. PostgreSQL, mutable, holds signals,
-  trades and paper state, and is what the API and frontend read. Untouched here.
+Invariants:
 
-Two invariants make the research store trustworthy:
-
-**Venue is part of the key.** Bars from Coinbase and bars from Binance are
-different series and are stored as such. The pipeline previously stored Binance
-perp data under Coinbase contract codes, which silently made every funding and
-open-interest feature describe the wrong book.
-
-**Reads are point-in-time.** Every table carries `event_time` (when the thing
-happened) and `available_time` (when we could first have known it). `as_of`
-filters on `available_time`, so a backtest cannot see a revision that had not
-been published yet. Funding and OI in particular are revised.
+* Venue is part of the key. Bars from different venues are different series.
+* Reads are point-in-time. Every table carries `event_time` (when it happened)
+  and `available_time` (when we could first know it). `as_of` filters on
+  `available_time`, so a backtest never sees an unpublished revision.
 """
 
 from __future__ import annotations
@@ -37,194 +26,105 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Absolute, not cwd-relative. `data/research` resolved against whatever directory
-# the process happened to start in, so running a script from the repo root rather
-# than from backend/trader created a second, empty store and the first one simply
-# went unread — the same hidden-second-copy failure as the compose named volume
-# masking the host directory. RESEARCH_STORE still wins.
+# Absolute, not cwd-relative, so a script started elsewhere cannot create a
+# second, empty store. RESEARCH_STORE overrides.
 _TRADER_ROOT = Path(__file__).resolve().parents[1]
 
 
 def default_root() -> Path:
-    """The store root, resolved NOW rather than at import.
+    """The store root, resolved at call time, not at import.
 
-    `DEFAULT_ROOT` used to be a module constant computed when this file was
-    first imported. `scripts/_common.py` imports this module at its own top and
-    only then sets `RESEARCH_STORE` from `--research-store`, so by the time the
-    flag was read the constant was already frozen: every `_common`-based script
-    accepted the flag, echoed it in the run header, and read the DEFAULT store.
-    Twenty research scripts that call `ResearchStore(os.getenv('RESEARCH_STORE'))`
-    at call time honoured it, so the flag worked in some tools and was silently
-    ignored in exactly the ones that produce gate numbers.
+    Scripts set `RESEARCH_STORE` after importing this module, so an import-time
+    value would ignore their `--research-store` flag.
     """
     return Path(os.getenv('RESEARCH_STORE') or _TRADER_ROOT / 'data' / 'research')
 
 
-# Kept as a name because several modules import it. It is the value at import
-# time; anything that must honour a later override goes through `default_root()`.
+# Kept because several modules import it. It is the import-time value; anything
+# that must honour a later override calls `default_root()`.
 DEFAULT_ROOT = default_root()
 
 # Datasets and the columns they must carry. `event_time` and `available_time`
-# are required everywhere — they are what makes a point-in-time read possible.
+# are required everywhere: they make point-in-time reads possible.
 SCHEMAS: dict[str, tuple[str, ...]] = {
-    # The dataset this system reads. One-minute bars, and the timeframe is in
-    # the dataset name rather than a column because the whole pipeline runs on
-    # one timeframe — a `timeframe` column would be constant, and the previous
-    # `bars` dataset had no such column at all, which made its implicit hourly
-    # granularity a fact you had to know rather than one you could read.
+    # One-minute bars: the dataset this system reads. The timeframe is in the
+    # dataset name, not a column.
     'minute_bars': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
     ),
-    # `bars` is the hourly perp and spot history the previous system read. Kept
-    # in the schema because a store on disk may still hold it and an unreadable
-    # partition is worse than an unused one; written by nothing.
+    # Hourly history from a retired system. Kept so stored partitions stay
+    # readable; nothing writes it.
     'bars': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
     ),
-    # The venue's own quote at each decision offset, backfilled from Kalshi's
-    # candlesticks. This is the only dataset here that is not derived from
-    # Coinbase, and it is the one the market benchmark needs: a backtest built
-    # from bars has no order book, so `price_source` substitutes the calibrated
-    # baseline for the market and "beat the price" and "beat the baseline" become
-    # one question answered twice with the same number.
-    #
-    # `event_time` is the offset instant (window_open + offset minutes), which is
-    # what the quote describes and what the partitioning wants. `window_open` is
-    # carried separately because it is the join key against `core/windows.py`.
+    # The venue's quote at each decision offset, backfilled from Kalshi
+    # candlesticks. `event_time` is the offset instant (window_open + offset);
+    # `window_open` is the join key against `core/windows.py`.
     'venue_quotes': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'window_open', 'offset_minutes', 'market_ticker',
         'yes_bid', 'yes_ask', 'market_probability', 'spread',
         'volume', 'open_interest', 'usable', 'exclude_reason',
     ),
-    # Order-book depth at each decision offset, from the websocket. **This is the
-    # only dataset here that cannot be backfilled at any price.** Verified:
-    # `GET /markets/{ticker}/orderbook` on a settled market returns
-    # `{"no_dollars": [], "yes_dollars": []}` — no ladder, no resting size, no
-    # queue position, ever. Kalshi's candlesticks give top-of-book bid and ask and
-    # nothing behind them.
-    #
-    # It matters because it is the missing half of the economic question. The
-    # retroactive economics can price a trade at the venue's real ask, but it must
-    # assume the order filled, and nothing in any historical endpoint can say
-    # whether it would have. Every day this is not running is a day of fill
-    # evidence that cannot be recovered later.
-    # The raw ladder, both sides, every minute a market is open. Deliberately
-    # more than any current consumer needs.
-    #
-    # **Because it cannot be recovered.** Verified: the orderbook endpoint returns
-    # empty the moment a market settles, and no historical endpoint carries size
-    # at all. Every other dataset here can be rebuilt from source; this one exists
-    # only if something wrote it down at the time.
-    #
-    # And the shape may matter more than the summary. The measured finding is that
-    # the market holds information the feature set cannot express — book
-    # imbalance, ladder slope, depth asymmetry and level counts are all plausible
-    # carriers of it, and none of them appears in any feature group today. The
-    # 1c/5c buckets in `venue_depth` are a lossy projection chosen for one
-    # question (would a fill_or_kill have filled). Storing the levels keeps every
-    # other question open.
+    # The raw ladder, both sides, every minute a market is open.
+    # It cannot be backfilled: the orderbook endpoint returns empty once a market
+    # settles, and no historical endpoint carries size. Store every level so any
+    # later question about book shape stays answerable.
     'venue_ladder': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'minute_into_window',
         'yes_levels', 'no_levels', 'yes_total', 'no_total',
-        # How this ladder reached us, and how stale the cache was when sampled.
-        # `transport` is part of the EVENT KEY rather than a plain column: a
-        # REST-sampled and a WS-sampled row for the same minute are two
-        # independent observations of one book, not a correction and the thing
-        # it corrects. Level counts are already known to be incomparable across
-        # sources at a measured ratio of 0.579, so an unlabelled row would make
-        # a change of transport look like a change in the market.
+        # How this ladder reached us, and the cache age when sampled.
+        # `transport` is part of the event key: REST and WS rows for one minute
+        # are independent observations, not a revision of each other.
         'transport', 'book_age_ms',
     ),
-    # The same ladder from Polymarket, in the same columns, so the two venues
-    # join on (symbol, window_open, minute). Two extra fields because the market
-    # is addressed differently: `outcomes` proves which token is "Up", and
-    # `token_id_up` is what the book was actually read from.
-    #
-    # This exists to answer whether the offset structure replicates on a venue
-    # with different participants and a different settlement source. That
-    # question dies if the two datasets are shaped differently, which is why
-    # this is a schema twin rather than whatever Polymarket happens to serve.
+    # The Polymarket ladder in the same columns, so the venues join on
+    # (symbol, window_open, minute). `outcomes` proves which token is "Up";
+    # `token_id_up` is the token the book was read from.
     'pm_ladder': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'minute_into_window',
         'yes_levels', 'no_levels', 'yes_total', 'no_total',
         'outcomes', 'token_id_up',
-        # The schema twin stays a twin — see venue_ladder.
+        # Keep in step with venue_ladder.
         'transport', 'book_age_ms',
     ),
-    # **The raw stream, one row per book frame.**
-    #
-    # NOT written through `write()`. That path merges and rewrites a whole
-    # (venue, symbol, month) partition per call, which is right for a revisable
-    # series and impossible here: measured, Kalshi sends 777 frames a second
-    # across three markets, so a month partition would reach tens of gigabytes
-    # and be rewritten on every flush. `core/spool.compact` writes immutable
-    # hour-named Parquet files instead, which `read()` still globs because it
-    # matches `**/*.parquet` and does not depend on the path layout.
-    #
-    # The columns ARE the message. Storing them typed rather than as JSON text
-    # is not the lossy projection `record_ladder` warns about — a Kalshi delta
-    # is flat, and these are all of its fields but the redundant `market_id`.
-    # It also compresses about an order of magnitude better, which is what makes
-    # any retention at this rate affordable.
+    # The raw stream, one row per book level per frame.
+    # Not written through `write()`, which rewrites a whole partition per call
+    # and cannot keep up with the frame rate. `core/spool.compact` writes
+    # immutable hour-named Parquet files, which `read()` finds by glob.
+    # Typed columns, not JSON text: they are all of a delta's fields and compress far better.
     'venue_book_events': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'seq', 'kind', 'side', 'price', 'size', 'absolute',
     ),
-    # **The venue's own settlement, which is the only authority on the label.**
-    # Every target in this repository is built from Coinbase one-minute bars
-    # standing in for sixty seconds of CF Benchmarks BRTI. `CLAUDE.md` lists that
-    # basis as an unmeasured risk, and it stayed unmeasured because nothing here
-    # held the venue's answer. Predexon serves `result` per settled market, so the
-    # proxy can finally be scored against the thing it proxies.
-    #
-    # One schema for both venues: Kalshi's `result` ('yes'/'no') and Polymarket's
-    # `winning_side` ('A'/'B') both reduce to `settled_up`, and a disagreement
-    # between the two venues on the same fifteen minutes is itself a measurement.
+    # The venue's own settlement: the authority on the label. Our target is
+    # built from Coinbase bars, a proxy for CF Benchmarks BRTI.
+    # One schema for both venues: Kalshi's `result` ('yes'/'no') and
+    # Polymarket's `winning_side` ('A'/'B') both reduce to `settled_up`.
     'venue_settlements': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'close_time', 'settlement_time',
         'result', 'settled_up', 'volume', 'open_interest', 'last_price',
     ),
-    # **The one summarised book, across both venues and both provenances.**
-    # `scripts/build_depth.py` writes every source into this table at every
-    # minute of the window: Kalshi and Polymarket, live recording and Predexon
-    # backfill. `source` says which, because a row that cannot distinguish a
-    # recorded book from a reconstructed one makes a backfill look like a
-    # measurement — the same argument `price_source` settles for predictions.
-    #
-    # Totals are carried alongside the 1c/5c buckets. The buckets answer one
-    # question (would this order have filled); the totals and level counts are
-    # what imbalance and ladder slope are built from, and those are the
-    # plausible carriers of the information the feature set cannot express.
-    #
-    # **`quote_age_seconds` is not optional.** Predexon serves book CHANGES, so
-    # the state at minute m is the last change at or before it and a quiet book
-    # is carried forward. Without the age, a forward-filled quote is
-    # indistinguishable from an observed one — and comparing a fresh forecast
-    # against a stale price manufactures edge. Measured: a first pass fetched
-    # only to +13.5m, and the resulting minute-14 rows showed the baseline
-    # "beating" the market by 0.246 nats at t = 8.4, which was entirely the
-    # carry-forward.
-    # **The market's own forward volatility.** `sigma_remaining` is the only
-    # forecast the barrier framing requires, and everything in `core/vol.py`
-    # estimates it from PAST returns. Kalshi's KXBTCD threshold ladder is priced
-    # off a single volatility over an overlapping horizon, published free and
-    # updated every minute; inverting it gives the market's forward estimate of
-    # exactly the quantity the model guesses. No feature group has ever seen it.
-    #
-    # `r2` is the honesty column: it says whether the ladder was internally
-    # consistent enough for the number beside it to mean anything.
+    # The market's forward volatility, from inverting Kalshi's KXBTCD threshold
+    # ladder. `core/vol.py` estimates sigma only from past returns.
+    # `r2` says whether the ladder was consistent enough for the fit to mean anything.
     'venue_implied_vol': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'event_ticker', 'close_time', 'minutes_to_close',
         'implied_sigma_per_min', 'implied_spot', 'atm_strike', 'n_strikes',
         'r2',
     ),
+    # The one summarised book, for both venues and both provenances, at every
+    # minute of the window. `scripts/build_depth.py` is the only writer.
+    # `source` separates a recorded book from a reconstructed one.
+    # `quote_age_seconds` is required: Predexon serves book changes, so a quiet
+    # book is carried forward, and a stale price compared with a fresh forecast
+    # manufactures edge.
     'venue_depth': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'offset_minutes',
@@ -233,17 +133,13 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'depth_bid_total', 'depth_ask_total',
         'levels_bid', 'levels_ask', 'seq', 'gaps', 'source',
         'quote_age_seconds',
-        # Which sampler produced the LADDER half of the row, as against the
-        # `source` that produced the row. `live_touch` used to re-fetch the
-        # ladder over REST AFTER the order was placed, so its depth buckets
-        # described a book our own fill had already eaten into -- and nothing
-        # in the schema could tell that from the stream ladder the decision
-        # actually scored. Null on every row written before 2026-09-16.
+        # Which sampler produced the ladder half of the row, as against the
+        # `source` of the row itself. Null on older rows.
         'transport',
     ),
-    # Every Coinbase trade the spot stream saw, written by `core/spool` like
-    # `venue_book_events` (never through `write()`). `event_time` is the print,
-    # `available_time` our receipt; bounded by RAW_RETENTION_DAYS.
+    # Every Coinbase trade the spot stream saw, written by `core/spool`, never
+    # through `write()`. `event_time` is the print, `available_time` our receipt.
+    # Bounded by RAW_RETENTION_DAYS.
     'spot_trades': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'product_id', 'trade_id', 'price', 'size', 'side', 'received_time',
@@ -260,73 +156,36 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
 }
 
 # Ordered worst to best. `data_collection.ingest` stamps these from the
-# validator; carrying them through means a feature build can exclude flagged
-# data instead of silently averaging it in. A 50%-per-hour funding rate is
-# stored as SUSPICIOUS rather than dropped, and it has no business reaching the
-# carry features.
+# validator, so a feature build can exclude flagged data.
 QUALITY_LEVELS = ('invalid', 'unvalidated', 'suspicious', 'valid')
 DEFAULT_MIN_QUALITY = 'valid'
 
 TIME_COLUMNS = ('event_time', 'available_time')
 
-# The store is bitemporal: one event can have several revisions, distinguished by
-# when each was published. All revisions are kept, so a read at any `as_of` sees
-# exactly the revision that was current then.
+# The store is bitemporal: one event can have several revisions, keyed by
+# publication time. All revisions are kept, so a read at any `as_of` sees the
+# revision current then.
 EVENT_KEY = ('venue', 'symbol', 'event_time')
 
-# **Datasets where one event is observed by more than one instrument.**
-#
-# `read` keeps exactly one row per EVENT_KEY — the latest `available_time` — so
-# a corrected figure supersedes the one it corrects. That is right for a revised
-# series and wrong for `venue_depth`, which holds the same minute of the same
-# book recorded live AND reconstructed later from Predexon. Those are
-# independent measurements, not a correction and its predecessor, and comparing
-# them is the only evidence the reconstruction is trustworthy.
-#
-# Without this the live row always won, because its `available_time` is the poll
-# instant while the backfill's is the minute mark itself. Measured: 58
-# (symbol, window) pairs overlapped and the comparison still saw zero rows — the
-# backfill rows were on disk and invisible to every read, silently, on exactly
-# the rows the check needed.
-#
-# Revisions still collapse WITHIN an observer.
+# Datasets where one event is observed by more than one instrument.
+# `read` keeps one row per event key (the latest `available_time`), so a
+# revision supersedes its predecessor. Independent observers of the same event
+# (live versus backfill, REST versus WS) need their own key column, or one
+# silently hides the other. Revisions still collapse within an observer.
 EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
-    # `offset_minutes` as well as `source`, because `event_time` is
-    # `window_open + offset_minutes` -- so minute 15 of one window and minute 0
-    # of the NEXT are the same instant and collided on one key. They are
-    # different markets with different books: a real colliding pair reads
-    # 0.73/0.98 against 0.49/0.50, and one of them was destroyed at WRITE time
-    # by `_merge`, with the survivor decided by JSONL line order, which
-    # `_collect_book` deliberately shuffles. Measured 2026-09-16: 60 rows
-    # collide today, small only because offset 0 is almost never produced (211
-    # rows against 51,259 at offset 15). Anything that starts populating minute
-    # 0 makes it one silent loss per window.
-    #
-    # `transport` is deliberately NOT in this key, though it is on
-    # `venue_ladder`. Every row written before 2026-09-16 lacks the column, and
-    # a key column absent from the stored parquet makes `read` fail outright --
-    # verified, DuckDB raises `Referenced column "transport" not found`. Adding
-    # it needs a backfill of the existing 1.9M rows first; `source` already
-    # separates `live_touch` from the recorders, and the stream-vs-REST split
-    # within it is a fallback, not a second sampler.
+    # `offset_minutes` as well as `source`: `event_time` is
+    # `window_open + offset_minutes`, so minute 15 of one window and minute 0 of
+    # the next share an instant but are different markets.
+    # `transport` is not in this key: older rows lack the column, and a missing
+    # key column makes `read` fail. Adding it needs a backfill first.
     'venue_depth': ('source', 'offset_minutes'),
-    # Same argument as venue_depth, one layer down. During the WebSocket
-    # migration the REST sampler and the WS sampler both write the same minute,
-    # and comparing them is the only evidence the stream reproduces the book.
-    # Without this the later `available_time` silently wins and the comparison
-    # reads zero rows — which is exactly what happened to venue_depth above.
+    # REST and WS samplers both write the same minute; comparing them needs both rows.
     'venue_ladder': ('transport',),
     'pm_ladder': ('transport',),
-    # Hundreds of frames share one millisecond, and every level of a SNAPSHOT
-    # shares one `seq`. `(market_ticker, seq)` alone therefore collapsed each
-    # ~200-level snapshot to a single level — measured, 138,878 rows written and
-    # 134,313 read back, with the loss falling entirely on snapshots. Deltas
-    # name one price and were unaffected, which is what made it invisible: the
-    # only frames destroyed were the ones a replay needs to bootstrap from.
+    # Every level of a snapshot shares one `seq`, so side and price complete the key.
     'venue_book_events': ('market_ticker', 'seq', 'side', 'price'),
-    # Many prints share a timestamp; the venue's id is what makes one unique,
-    # and keying on it is what lets a trade re-delivered after a reconnect
-    # collapse to one row.
+    # The venue's trade id makes a print unique, so a re-delivered trade
+    # collapses to one row.
     'spot_trades': ('product_id', 'trade_id'),
 }
 
@@ -362,21 +221,9 @@ class Partition:
 def _in_utc(frame: pd.DataFrame) -> pd.DataFrame:
     """Force every timezone-aware column to UTC.
 
-    DuckDB returns `TIMESTAMPTZ` in the *process's local* timezone, so the same
-    Parquet file read on two machines produced two different `event_time`
-    representations — and the trader container sets `TZ=America/New_York`.
-    Nothing downstream re-normalised: `core/features.py` derives minute-of-day
-    straight off this index for the intraday seasonality and for
-    `us_equity_hours`, whose bounds are written as UTC minutes.
-
-    So the research path indexed seasonality in local time while
-    `scripts/live.py:fetch_bars` builds its index with an explicit `tz='UTC'`.
-    That is a train/serve skew in a fitted object, and it moves with DST twice a
-    year. Measured elsewhere in this audit: the same bars under an
-    `America/New_York` index shift the fitted seasonal peak by 353 minutes.
-
-    Pinned here rather than at each call site, because the point is that no
-    consumer should have to remember.
+    DuckDB returns `TIMESTAMPTZ` in the process's local timezone, and the
+    container sets `TZ=America/New_York`. Minute-of-day features and the live
+    path assume UTC, so every read is normalised here.
     """
     for column in frame.columns:
         dtype = frame[column].dtype
@@ -388,20 +235,8 @@ def _in_utc(frame: pd.DataFrame) -> pd.DataFrame:
 def _utc_bound(value) -> datetime:
     """A query bound as a plain UTC `datetime`, from naive or aware input.
 
-    Two separate failures met here. `pd.Timestamp` stopped being implicitly
-    convertible by the driver's binder under pandas 3.0, so the bound has to be a
-    plain `datetime` — hence `.to_pydatetime()`. And `pd.Timestamp(x, tz='UTC')`
-    *raises* when `x` already carries a timezone, which is exactly what
-    `scripts/_common.load_dataset` hands in:
-
-        ValueError: Cannot pass a datetime or Timestamp with tzinfo with the tz
-        parameter. Use tz_convert instead.
-
-    So `--start`/`--end` were unusable on every script that reads the store — the
-    date-limited run you need to retrain on a chosen window could not start. This
-    is the boundary, so it accepts either shape rather than making each caller
-    guess which one is wanted. An aware bound is *converted*, never relabelled, so
-    a New York timestamp selects the UTC rows it actually names.
+    The DuckDB binder needs a plain `datetime`, not `pd.Timestamp`. An aware
+    bound is converted, never relabelled.
     """
     stamp = pd.Timestamp(value)
     stamp = stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
@@ -421,10 +256,9 @@ class ResearchStore:
         """Write rows into their (venue, symbol, month) partitions.
 
         Existing partitions are merged and de-duplicated on the full revision
-        key, so re-writing identical rows is idempotent while a genuine revision
-        is appended rather than replacing its predecessor. Discarding
-        superseded revisions would make early point-in-time reads return
-        nothing. Pass `overwrite` to replace a partition outright.
+        key: identical rows are idempotent, and a real revision is appended,
+        not replaced, so early point-in-time reads still work.
+        Pass `overwrite` to replace a partition outright.
         """
         if dataset not in SCHEMAS:
             raise DataStoreError(f"Unknown dataset {dataset!r}; known: {sorted(SCHEMAS)}")
@@ -472,9 +306,8 @@ class ResearchStore:
             if col in out.columns:
                 out[col] = pd.to_datetime(out[col], utc=True)
 
-        # Absent an explicit publication time, assume the data was knowable when
-        # the event closed. Conservative for bars; callers should set it
-        # explicitly for revised series like funding and OI.
+        # Without an explicit publication time, assume the data was knowable
+        # when the event closed. Revised series must set it explicitly.
         if 'available_time' not in out.columns:
             out['available_time'] = out['event_time']
 
@@ -525,15 +358,12 @@ class ResearchStore:
     ) -> pd.DataFrame:
         """Read a dataset as of a point in time.
 
-        `as_of` is the whole point: it drops revisions published after the moment
-        being simulated, then returns the revision of each event that was current
-        at that moment. Omitting it reads the newest revision of everything,
-        which is right for feature research and never right for a backtest.
+        `as_of` drops revisions published after that moment, then returns the
+        revision of each event current then. Without it, the newest revision is
+        returned: fine for research, never for a backtest.
 
-        One row per `(venue, symbol, event_time)` comes back either way.
-
-        `min_quality` defaults to 'valid', so flagged data is excluded unless
-        asked for. Pass a lower level to include it, or None for everything.
+        One row per event key comes back either way. `min_quality` defaults to
+        'valid'; pass a lower level to include flagged data, or None for everything.
         """
         if dataset not in SCHEMAS:
             raise DataStoreError(f"Unknown dataset {dataset!r}")
@@ -553,11 +383,7 @@ class ResearchStore:
             placeholders = ', '.join('?' for _ in symbols)
             clauses.append(f'symbol IN ({placeholders})')
             params.extend(s.upper() for s in symbols)
-        # Bound as plain `datetime`, not `pd.Timestamp`. Under pandas 3.0 the
-        # Timestamp is no longer implicitly convertible by the driver's binder and
-        # every `--start`/`--end` run raised, which meant no run could be
-        # date-limited at all — including the small ones you would use to check a
-        # change quickly.
+        # Bound as plain `datetime`, not `pd.Timestamp`: see `_utc_bound`.
         if start is not None:
             clauses.append('event_time >= ?')
             params.append(_utc_bound(start))
@@ -577,13 +403,10 @@ class ResearchStore:
             params.extend(acceptable)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
-        # `union_by_name` because partitions written before a column existed do
-        # not carry it. Verified: without it, a glob spanning an old and a new
-        # partition raises `schema mismatch in glob` and the WHOLE dataset
-        # becomes unreadable the moment a column is added — the 3.2MB of
-        # venue_ladder already on disk has no `transport`.
-        # Rank revisions per event and keep the newest one still visible at
-        # `as_of`, which the WHERE clause has already bounded.
+        # `union_by_name`, because older partitions lack newer columns, and a
+        # schema mismatch in the glob would make the whole dataset unreadable.
+        # Rank revisions per event and keep the newest one visible at `as_of`
+        # (the WHERE clause already bounds it).
         sql = (
             f"SELECT {select} FROM ("
             f"  SELECT * EXCLUDE (_rn) FROM ("
@@ -610,11 +433,7 @@ class ResearchStore:
         as_of: pd.Timestamp | str | None = None,
         min_quality: str | None = DEFAULT_MIN_QUALITY,
     ) -> pd.DataFrame:
-        """One field for many symbols as a time x symbol frame.
-
-        This is the shape the cross-sectional features and the pooled model want:
-        rank and z-score across the row, not per-symbol loops.
-        """
+        """One field for many symbols as a time x symbol frame."""
         long = self.read(
             'bars', venue=venue, symbols=symbols, start=start, end=end, as_of=as_of,
             columns=('symbol', 'event_time', field), min_quality=min_quality,
@@ -626,11 +445,7 @@ class ResearchStore:
         return wide.sort_index()
 
     def coverage(self, dataset: str) -> pd.DataFrame:
-        """Row count and time span per (venue, symbol) — the first thing to check.
-
-        This is what answers "do I actually have Coinbase history for this
-        contract, or have I been training on a proxy".
-        """
+        """Row count and time span per (venue, symbol)."""
         frame = self.read(
             dataset, columns=('venue', 'symbol', 'event_time', 'quality'),
             min_quality=None
@@ -641,15 +456,8 @@ class ResearchStore:
         grouped = frame.groupby(['venue', 'symbol'])['event_time']
         out = grouped.agg(rows='count', start='min', end='max').reset_index()
         out['days'] = (out['end'] - out['start']).dt.total_seconds() / 86400.0
-        # **`rows` is every row; `usable` is what a default read returns.**
-        # This counted only the first, while `core/dataset.load_minute_bars`
-        # reads with `min_quality='valid'` -- so a bar demoted to SUSPICIOUS is
-        # invisible to every tool an operator would check. `validator.py`
-        # demotes any bar older than `max_past_days` (1825, the same constant as
-        # `--backfill-days`), and 34,302 bars per symbol already sit past that
-        # line, advancing a day per day: any re-validation demotes them in
-        # place, `find_gaps` reads SQLite and ignores quality, and
-        # `_stored_count` counts rows, so a repair reports "recovered 0 of N".
+        # `rows` is every row; `usable` is what a default (`min_quality='valid'`)
+        # read returns. `demoted` shows bars the validator has flagged.
         if 'quality' in frame.columns:
             usable = (frame[frame['quality'].astype(str) == 'valid']
                       .groupby(['venue', 'symbol'])['event_time'].count()
@@ -671,8 +479,7 @@ class ResearchStore:
             shutil.rmtree(target)
 
 
-# Which research dataset a scraped timeframe belongs in. The 15-minute binary
-# system reads `minute_bars` and nothing else; anything coarser is archive.
+# Which research dataset a scraped timeframe belongs in. Only `minute_bars` is read.
 BARS_DATASET_BY_TIMEFRAME = {'1m': 'minute_bars'}
 
 
@@ -686,13 +493,8 @@ def from_sqlite(
 ) -> dict[str, int]:
     """Migrate the scraper's SQLite tables into the research store.
 
-    The scraper's schema already carries `event_time`/`available_time`; this
-    preserves both rather than collapsing to one, so migrated history supports
-    point-in-time reads too.
-
-    `venue` is the caller's label for rows that recorded none. Rows that did keep
-    theirs — which is what the venue column is for, now that it is part of the
-    scraper's unique key.
+    Keeps both `event_time` and `available_time`, so migrated history supports
+    point-in-time reads. `venue` labels only rows that recorded none.
     """
     import sqlite3
 
@@ -723,8 +525,8 @@ def from_sqlite(
             con, params=params,
         )
         if not bars.empty:
-            # Prefer the venue recorded per row; fall back to the caller's label
-            # for rows written before the column existed.
+            # Prefer the venue recorded per row; use the caller's label for
+            # rows written before the column existed.
             bars['venue'] = bars['row_venue'].where(
                 bars['row_venue'] != 'unknown', venue
             )
