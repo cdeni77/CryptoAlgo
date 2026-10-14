@@ -73,6 +73,7 @@ class Reason(str, Enum):
     OFFSET_NOT_TRADED = 'offset_not_traded'    # scored, but not an entry offset
     BANKROLL_FLOOR = 'bankroll_floor'          # stop-trading floor breached
     HALTED = 'halted'                          # a circuit breaker is latched
+    MODEL_NOT_PINNED = 'model_not_pinned'      # not the model pinned for trading
 
 
 @dataclass(frozen=True)
@@ -413,6 +414,9 @@ def decide(
     # money moves.
     if halted:
         return refuse(Reason.HALTED)
+    pinned = getattr(config, 'require_model_version', None)
+    if pinned and _optional_str(get, 'model_version') != pinned:
+        return refuse(Reason.MODEL_NOT_PINNED)
     # Scored but not tradeable. Every offset is still measured — that sample is
     # what the forecast tests read — but only `entry_offsets` may open a position.
     # See `Config.entry_offsets`: the earliest offset that cleared was taking 90%

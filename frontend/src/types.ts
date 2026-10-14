@@ -23,6 +23,9 @@ export interface Measured<T> {
 export type Reason =
   | 'traded'
   | 'not_finite'
+  | 'probability_invalid'
+  | 'no_quote'
+  | 'no_peer_book'
   | 'price_out_of_band'
   | 'disagreement_implausible'
   | 'edge_below_gate'
@@ -33,7 +36,10 @@ export type Reason =
   | 'window_exposure'
   | 'position_limit'
   | 'already_entered'
-  | 'bankroll_floor';
+  | 'offset_not_traded'
+  | 'bankroll_floor'
+  | 'halted'
+  | 'model_not_pinned';
 
 export type Side = 'up' | 'down';
 export type PositionOutcome = 'pending' | 'won' | 'lost';

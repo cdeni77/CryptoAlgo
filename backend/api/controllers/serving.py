@@ -32,10 +32,11 @@ from models.serving import (
 # dominating means the forecast does not cover the fee, so it declines. On the
 # previous perp system that single number said what no Sharpe ratio said.
 FUNNEL_ORDER = (
-    'traded', 'not_finite', 'price_out_of_band', 'disagreement_implausible',
-    'edge_below_gate', 'edge_uncertain', 'members_disagree',
-    'below_min_contracts', 'fee_ceiling', 'window_exposure',
-    'position_limit', 'already_entered', 'bankroll_floor',
+    'traded', 'not_finite', 'probability_invalid', 'no_quote', 'no_peer_book',
+    'price_out_of_band', 'disagreement_implausible', 'edge_below_gate',
+    'edge_uncertain', 'members_disagree', 'below_min_contracts',
+    'fee_ceiling', 'window_exposure', 'position_limit', 'already_entered',
+    'offset_not_traded', 'bankroll_floor', 'halted', 'model_not_pinned',
 )
 
 

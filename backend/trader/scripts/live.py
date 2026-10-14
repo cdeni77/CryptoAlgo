@@ -237,6 +237,11 @@ def build_parser() -> argparse.ArgumentParser:
                              'makes live agree".')
     parser.add_argument('--no-require-peer-book', dest='require_peer_book',
                         action='store_false')
+    parser.add_argument('--require-model-version', default=None, metavar='VERSION',
+                        help='place orders only while this artifact version is '
+                             'loaded (as recorded in predictions.model_version); '
+                             'rows from any other model are refused '
+                             'model_not_pinned but still scored and recorded')
     parser.add_argument('--min-edge-pp', type=float, default=None, metavar='PP',
                         help='Override the edge gate, in probability points '
                              '(promoted policy: 3.0). A NEGATIVE value admits '
@@ -349,6 +354,7 @@ DECISION_TOLERANCE_SECONDS = 15.0
 LOUD_REFUSALS = frozenset({
     Reason.HALTED, Reason.BANKROLL_FLOOR, Reason.DISAGREEMENT_IMPLAUSIBLE,
     Reason.NO_QUOTE, Reason.PROBABILITY_INVALID, Reason.NOT_FINITE,
+    Reason.MODEL_NOT_PINNED,
 })
 
 
@@ -798,6 +804,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # Live prices from the book or not at all: without a quote `decide()` would
     # fall back to our own baseline and could return TRADED.
     require_quote = args.mode == 'live'
+    # decide() compares this against `require_model_version`.
+    scored['model_version'] = getattr(model, 'version', None)
     for _, row in scored.sort_values('symbol').iterrows():
         remaining = (settle_time - pd.Timestamp.now(tz='UTC')).total_seconds()
         if remaining < config.min_remaining_seconds:
@@ -961,6 +969,9 @@ def config_from_args(args) -> Config:
     peer = getattr(args, 'require_peer_book', None)
     if peer is not None:
         overrides['require_peer_book'] = bool(peer)
+    pinned = getattr(args, 'require_model_version', None)
+    if pinned:
+        overrides['require_model_version'] = str(pinned)
     gate = getattr(args, 'min_edge_pp', None)
     if gate is not None:
         # Not clamped at zero on purpose. A negative gate is the documented way
@@ -1070,6 +1081,11 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
         config = config_for_artifact(config, model, mode=args.mode)
         model.verify(config)
         stamp_version(model, artifact)
+        pinned = getattr(config, 'require_model_version', None)
+        if pinned and getattr(model, 'version', None) != pinned:
+            logger.warning('the loaded model is %s but orders are pinned to %s: '
+                           'every decision will be refused model_not_pinned',
+                           getattr(model, 'version', None), pinned)
     if model is None:
         raise SystemExit(
             f'no artifact at {MODELS_ROOT / LIVE_MODEL}. Run '

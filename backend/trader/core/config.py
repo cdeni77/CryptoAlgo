@@ -629,6 +629,10 @@ class Config:
     # most of its edge — while `--complete-cases` already requires the peer in
     # training, so this is what makes live agree.
     require_peer_book: bool = False
+    # Place orders only while this exact artifact version is loaded. A row
+    # scored by any other model is refused `model_not_pinned`, so a failed
+    # reload or an unreviewed retrain cannot trade. None disables the check.
+    require_model_version: Optional[str] = None
     # **The one quote-staleness limit.** `core.quotes` prices backtests with it,
     # `core.metrics` filters the market comparison with it, and `scripts.live`
     # refuses an order and a peer book past it. It was 45 here and 30 in the
