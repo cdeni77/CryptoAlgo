@@ -1,8 +1,7 @@
 """Tests that `mid_of` selects strikes the way the backfill does.
 
-The backfill keeps a strike only with a two-sided quote. A zero price means no
-level, a last trade price is not a quote, and a price with zero size behind it
-is not a quote either. Half-invented mids made live ETH and SOL fits collapse.
+Only a two-sided quote with size on both sides counts; a zero price or a last trade does
+not.
 """
 from __future__ import annotations
 
@@ -47,8 +46,8 @@ def test_a_crossed_quote_is_refused():
 def test_a_price_with_no_size_behind_it_is_not_a_quote():
     """A price with zero size behind it is not a quote.
 
-    Example: bid 0.01 (size 2314) and ask 1.00 (size 0) would give a false mid of
-    0.505 for a strike with no market.
+    Example: bid 0.01 (size 2314) and ask 1.00 (size 0) would give a false mid of 0.505
+    for a strike with no market.
     """
     assert mid_of({'yes_bid_dollars': '0.0100', 'yes_ask_dollars': '1.0000',
                    'yes_bid_size_fp': '2314.00',
@@ -68,7 +67,6 @@ def test_a_genuinely_two_sided_market_is_kept():
 
 
 def test_absent_size_fields_do_not_reject_a_two_sided_quote():
-    """Sizes are checked only when present; missing size fields do not reject a quote.
-    """
+    """Sizes are checked only when present; missing size fields do not reject a quote."""
     assert mid_of({'yes_bid_dollars': '0.4400',
                    'yes_ask_dollars': '0.4600'}) == pytest.approx(0.45)

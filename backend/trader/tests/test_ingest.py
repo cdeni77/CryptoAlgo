@@ -1,7 +1,7 @@
 """Tests for storage ingest invariants.
 
-`data_collection.ingest` is the only path into the database and the only place
-that sets `quality`. Records default to `DataQuality.UNVALIDATED`.
+`data_collection.ingest` is the only path into the database and the only place that sets
+`quality`. Records default to `DataQuality.UNVALIDATED`.
 """
 
 from __future__ import annotations
@@ -98,9 +98,7 @@ def test_venue_is_persisted_per_row(ingestor, database):
 
 
 def test_two_venues_coexist_for_the_same_bar(tmp_path):
-    """Bars from two venues for the same instant both survive; the unique key includes
-    venue.
-    """
+    """Bars from two venues for the same instant both survive; the unique key includes venue."""
     from datetime import datetime, timedelta, timezone
 
     from data_collection.models import DataQuality, OHLCVBar

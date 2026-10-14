@@ -1,10 +1,6 @@
-"""Tests for `init_score_source`: the model's correction sits on the baseline logit or the
-market logit.
+"""Tests for `init_score_source`: the correction sits on the baseline or market logit.
 
-With market initialisation the fitted residual is how the price is wrong, which
-is what the money depends on. An untrained market-init model reproduces the price,
-so its edge is zero and nothing trades. These tests check the mechanism, and that
-every misuse is refused instead of returning a plausible number.
+An untrained market-init model reproduces the price; every misuse is refused.
 """
 
 from __future__ import annotations
@@ -30,8 +26,7 @@ def table(n: int = 6, *, market=None) -> pd.DataFrame:
 
 
 class Booster:
-    """A booster whose correction is a known constant, so the arithmetic can be checked.
-    """
+    """A booster whose correction is a known constant, so the arithmetic can be checked."""
 
     def __init__(self, correction: float = 0.5):
         self.correction = correction
@@ -67,8 +62,8 @@ class TestTheConfigField:
             Config(init_score_source='markets')
 
     def test_it_reaches_the_provenance_record(self):
-        """The source is recorded in provenance, so ledger entries show which benchmark was
-        used.
+        """The source is recorded in provenance, so ledger entries show which benchmark
+        was used.
         """
         assert Config(init_score_source='market').provenance()[
             'init_score_source'] == 'market'
@@ -108,8 +103,8 @@ class TestPrediction:
         assert np.isfinite(out[[0, 2, 4, 5]]).all()
 
     def test_clip_prob_propagates_nan_which_this_relies_on(self):
-        """`clip_prob` and `expit` propagate NaN, which the missing-quote behaviour relies
-        on.
+        """`clip_prob` and `expit` propagate NaN, which the missing-quote behaviour
+        relies on.
 
         A `clip_prob` that filled NaN (with 0.5, say) would turn "no quote" into a
         confident coin flip, and the other tests would still pass.
@@ -120,7 +115,6 @@ class TestPrediction:
         assert np.isnan(clip_prob(np.array([np.nan]))[0])
 
     def test_an_untrained_market_model_reproduces_the_price_exactly(self):
-        """An untrained market-init model reproduces the price exactly."""
         prices = np.array([0.05, 0.2, 0.5, 0.83, 0.95])
         frame = attach_market_logit(table(len(prices), market=prices))
         assert model('market', correction=0.0).predict(frame) == pytest.approx(
@@ -151,8 +145,8 @@ class TestTheArtifactCannotBeUsedAgainstTheWrongBenchmark:
 
 class TestAttachMarketLogit:
     def test_a_missing_column_names_the_backtest_as_the_reason(self):
-        """The error names the backtest as the reason, so nobody substitutes the baseline
-        column.
+        """The error names the backtest as the reason, so nobody substitutes the
+        baseline column.
         """
         with pytest.raises(ValueError, match='backtest has no book'):
             attach_market_logit(table())

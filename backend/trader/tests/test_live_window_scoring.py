@@ -1,9 +1,4 @@
-"""Tests that `score_live` scores the window it is inside, using only bars up to the
-decision.
-
-These tests feed exactly what a live cycle has: bars ending at the decision
-minute and nothing after.
-"""
+"""Tests that `score_live` scores the window it is inside, from bars up to the decision only."""
 
 from __future__ import annotations
 
@@ -53,8 +48,8 @@ def test_the_window_being_decided_can_be_scored(fitted, offset):
 
 @pytest.mark.parametrize('offset', (3, 6, 9, 12))
 def test_the_decision_reads_the_close_of_the_bar_before_it(fitted, offset):
-    """`last_price` is exactly `close(window_open + offset - 1)`; a one-minute slip reads
-    like skill.
+    """`last_price` is exactly `close(window_open + offset - 1)`; a one-minute slip
+    reads like skill.
     """
     bars, bundle, index = fitted
     window = index[-6]
@@ -73,8 +68,8 @@ def test_the_decision_reads_the_close_of_the_bar_before_it(fitted, offset):
 
 
 def test_an_unsettled_window_reports_no_outcome(fitted):
-    """An unsettled window reports NaN outcome, not zero (which would book an open bet as a
-    loss).
+    """An unsettled window reports NaN outcome, not zero (which would book an open bet
+    as a loss).
     """
     bars, bundle, index = fitted
     window = index[-6]
@@ -89,8 +84,8 @@ def test_an_unsettled_window_reports_no_outcome(fitted):
 
 
 def test_a_feed_that_has_not_reached_the_decision_minute_abstains(fitted):
-    """A feed that has not reached the decision minute raises instead of forward-filling a
-    price.
+    """A feed that has not reached the decision minute raises instead of forward-filling
+    a price.
     """
     bars, bundle, index = fitted
     window = index[-6]

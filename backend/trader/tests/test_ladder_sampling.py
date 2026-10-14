@@ -1,8 +1,7 @@
 """Tests that the ladder recorder keeps its sampling phase and sees the whole window.
 
-Sleeping a fixed interval after each cycle makes the period `interval + work`,
-so the phase drifts. The recorder sleeps to the next mark instead. It filters
-markets by close time, not `status: 'open'`, which lags the market by up to 40s.
+It sleeps to the next mark, not a fixed interval, and filters by close time, not by
+`status`.
 """
 
 from __future__ import annotations

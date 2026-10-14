@@ -1,10 +1,6 @@
-"""Tests that a decision is priced from the live `/orderbook`, never the cached `/markets`
-touch.
+"""Tests that a decision is priced from `/orderbook`, never the cached `/markets` touch.
 
-The `/markets` touch can be several cents stale. A limit set from it may never
-cross the real book. Its mid is also the market-init `init_score`, so a stale
-touch is a forecast error too. Training reads recorded ladders, so live must
-read the book as well.
+The cached touch can be cents stale, so a limit set from it may never cross.
 """
 from __future__ import annotations
 
@@ -53,8 +49,8 @@ class FakeClient(KalshiClient):
 
 
 def _live_quote(client):
-    """The live quote path for one symbol: market metadata with the touch blanked, priced
-    by one `/orderbook` read.
+    """The live quote path for one symbol: market metadata with the touch blanked,
+    priced by one `/orderbook` read.
     """
     return client.book_quote(market_meta(STALE_MARKET['market']))
 
@@ -95,8 +91,7 @@ def test_the_sizes_come_from_the_stack_that_gets_crossed():
 
 
 def test_metadata_still_comes_from_markets():
-    """Status, shard and close time still come from `/markets`; only the touch is replaced.
-    """
+    """Status, shard and close time still come from `/markets`; only the touch is replaced."""
     c = FakeClient()
     q = asyncio.run(_live_quote(c))
     assert q.exchange_index == 2
@@ -133,7 +128,6 @@ def test_the_rest_quote_says_where_it_came_from_and_carries_its_ladder():
 
 
 def test_it_reads_the_book_exactly_once_per_quote():
-    """Each quote reads the book once."""
     c = FakeClient()
     asyncio.run(_live_quote(c))
     assert sum(1 for p in c.calls if p.endswith('/orderbook')) == 1

@@ -1,8 +1,7 @@
 """Tests for loading the consolidated collection into the research store.
 
-`venue_depth` holds one row per minute 0..15 per window, not one per snapshot.
-Every minute is kept because the offset grid is itself under test. Loading
-streams, because one partition is too large to merge in memory.
+`venue_depth` gets one row per minute 0..15 per window, and loading streams because
+partitions are large.
 """
 
 from __future__ import annotations
@@ -67,7 +66,6 @@ def test_a_minute_with_no_snapshot_yet_is_omitted_not_carried():
 
 
 def test_every_minute_of_the_window_is_kept_not_just_the_decision_offsets():
-    """Every minute of the window is kept, not just the decision offsets."""
     snaps = _snaps([(s, 40, 42) for s in range(0, 16 * 60, 30)])
     got = summarise_window(snaps)
     assert set(got['offset_minutes']) >= set(range(0, 16))
@@ -97,7 +95,6 @@ def test_the_frame_carries_the_columns_the_store_expects():
 
 
 def test_a_one_sided_book_keeps_the_side_it_has():
-    """A one-sided book keeps the side it has."""
     got = summarise_window(_snaps([(0, 40, float('nan'))]))
     assert got['yes_bid'].iloc[0] == pytest.approx(0.40)
     assert pd.isna(got['yes_ask'].iloc[0])
@@ -183,8 +180,7 @@ def _write_parquet(tmp_path, rows):
 
 
 def test_a_book_persists_until_it_changes(tmp_path):
-    """A book serves every following minute until it changes, taken at or before each mark.
-    """
+    """A book serves every following minute until it changes, taken at or before each mark."""
     from research.collect.load_store import summarise_partition
     got = summarise_partition(_write_parquet(
         tmp_path, [(0, 40, 42), (59, 41, 43), (900, 44, 46), (959, 48, 50)]))

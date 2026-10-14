@@ -1,8 +1,7 @@
 """Tests for `config_for_artifact`: live adopts settings from the artifact.
 
-Live adopts the artifact's `init_score_source`, since scoring a market-fitted
-residual on the baseline logit is always wrong. It also adopts the economics the
-artifact was evaluated under, except fields set explicitly on the command line.
+It adopts `init_score_source` and the evaluated economics, except fields set on the
+command line.
 """
 from __future__ import annotations
 
@@ -48,8 +47,8 @@ def test_live_adopts_the_economics_the_artifact_was_measured_under():
     """Live adopts the economics (`kelly_fraction`, `min_edge_pp`) the artifact was
     evaluated under.
 
-    `verify` does not check these, because they change what the strategy does, not
-    what the model predicts.
+    `verify` does not check these, because they change what the strategy does, not what
+    the model predicts.
     """
     config = config_for_artifact(
         Config(), _artifact_with(kelly_fraction=0.10, min_edge_pp=3.0),

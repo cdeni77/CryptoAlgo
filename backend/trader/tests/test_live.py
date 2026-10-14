@@ -1,5 +1,4 @@
-"""Tests for the live loop's own logic: window, offset choice, and decision tolerance.
-"""
+"""Tests for the live loop's own logic: window, offset choice, and decision tolerance."""
 
 from __future__ import annotations
 
@@ -34,7 +33,6 @@ def test_elapsed_counts_whole_minutes_into_the_window():
 
 
 def test_the_offset_is_the_latest_one_reached_never_a_future_one():
-    """The offset is the latest one reached, never a future one."""
     assert choose_offset(0, CFG) is None
     assert choose_offset(2, CFG) is None, 'chose an offset before it was reached'
     assert choose_offset(3, CFG) == 3
@@ -142,9 +140,7 @@ def test_before_the_first_offset_there_is_nothing_to_decide():
 
 
 def test_the_exchange_shard_is_read_off_the_markets_not_hardcoded():
-    """The exchange shard is read from the quotes, not hardcoded, since the venue can move
-    it.
-    """
+    """The exchange shard is read from the quotes, not hardcoded, since the venue can move it."""
     from data_collection.kalshi_client import Quote
     from scripts.live import venue_exchange_index
 

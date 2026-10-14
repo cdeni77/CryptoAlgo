@@ -1,7 +1,7 @@
 """Tests that the live implied-vol recorder covers BTC, ETH and SOL.
 
-The venue serves `KXBTCD`, `KXETHD` and `KXSOLD` with the same shape, and the
-backfill covers all three, so live must too.
+The venue serves `KXBTCD`, `KXETHD` and `KXSOLD` with the same shape, and the backfill
+covers all three, so live must too.
 """
 from __future__ import annotations
 

@@ -1,9 +1,7 @@
 """Tests for `order_limit_price`: how far a limit may cross.
 
-The order is `immediate_or_cancel`, so it fills from the touch outward and stops;
-the limit is the worst price we accept, not the price paid. The limit may spend
-all the edge above `min_edge_pp`, so any fill still clears the gate that admitted
-the trade. A cents cap still applies.
+The limit may spend the edge above `min_edge_pp`, so any fill still clears the gate. A
+cents cap still applies.
 """
 
 from __future__ import annotations

@@ -28,8 +28,7 @@ def fitted():
 
 @pytest.mark.parametrize('offset', (3, 12))
 def test_the_live_path_reproduces_the_measured_feature_vector(fitted, offset):
-    """Same bars, artifact, window and offset give the same model features and baseline.
-    """
+    """Same bars, artifact, window and offset give the same model features and baseline."""
     bars, dataset, fit, measured, test_index = fitted
     bundle = fit.bundle(FAST)
     window = test_index[len(test_index) // 2]

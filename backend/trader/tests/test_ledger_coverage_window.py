@@ -1,8 +1,6 @@
 """Tests for `first_position_time`, the start of our own books.
 
-`sync_venue` compares our realised P&L with the venue's. If our store starts
-later than the venue's history, part of the gap is only the coverage difference.
-`first_position_time` lets the comparison use the same period.
+It lets `sync_venue` compare our P&L with the venue's over the same period.
 """
 
 from __future__ import annotations
@@ -32,7 +30,6 @@ def position(writer: PgWriter, when: datetime) -> None:
 
 
 def test_an_empty_store_has_no_start(writer):
-    """An empty store has no start date."""
     assert writer.first_position_time() is None
 
 

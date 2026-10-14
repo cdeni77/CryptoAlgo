@@ -1,8 +1,7 @@
 """Tests that live builds the same book features the backtest scored.
 
-A missing feature does not raise: LightGBM scores NaN with its learned default
-direction, so live would silently run a different model. Live uses the same
-`market_state_features` as the backtest, on the quote the fill is priced against.
+A missing feature silently scores NaN with LightGBM's learned default, which is a
+different model.
 """
 
 from __future__ import annotations
@@ -66,9 +65,7 @@ def test_an_empty_ladder_does_not_raise():
 
 
 def test_every_feature_the_model_expects_is_present():
-    """Every market_state and market_price column is present, since an absent one scores as
-    NaN.
-    """
+    """Every market_state and market_price column is present, since an absent one scores as NaN."""
     from core.book_features import MARKET_PRICE, MARKET_STATE
     row = book_feature_row(_Quote(), _YES, _NO, baseline_probability=0.40)
     for column in tuple(MARKET_STATE) + tuple(MARKET_PRICE):
@@ -107,17 +104,15 @@ def test_the_ladder_comes_from_the_stream_cache_when_it_is_fresh():
 
 
 def test_a_stale_ladder_is_refused():
-    """A stale ladder is refused: silence at this frame rate means the transport is
-    unhealthy.
-    """
+    """A stale ladder is refused: silence at this frame rate means the transport is unhealthy."""
     from scripts.live import ladder_from_cache
     cache = _Cache(_Ladder(_YES, _NO, age=30.0, stale=True))
     assert ladder_from_cache(cache, 'KXBTC15M-1') == ([], [])
 
 
 def test_a_gapped_book_is_refused():
-    """A gapped book is refused: `seq` is global per subscription, so a gap may drop levels
-    anywhere.
+    """A gapped book is refused: `seq` is global per subscription, so a gap may drop
+    levels anywhere.
     """
     from scripts.live import ladder_from_cache
     cache = _Cache(_Ladder(_YES, _NO), gapped=True)
@@ -143,7 +138,8 @@ def test_the_full_feature_set_is_computable_from_a_cached_ladder():
 
 @pytest.mark.asyncio
 async def test_record_touch_persists_the_resting_totals_it_trades_on():
-    """`_record_touch` writes every depth column that live trades on, including the totals.
+    """`_record_touch` writes every depth column that live trades on, including the
+    totals.
 
     The next retrain uses these rows, so a column used for trading must be recorded.
     """

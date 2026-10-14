@@ -1,7 +1,7 @@
 """Tests that the REST and stream ladder rows are independent observers.
 
-The stream row is built before the REST call, so a REST failure cannot discard
-it. Otherwise the stream can never be shown to cover a REST outage.
+The stream row is built before the REST call, so a REST failure cannot discard it.
+Otherwise the stream can never be shown to cover a REST outage.
 """
 
 from __future__ import annotations
@@ -26,9 +26,7 @@ def test_the_stream_sample_is_taken_before_the_rest_call():
 
 
 def test_the_rest_failure_path_comes_after_the_stream_append():
-    """The `except ... continue` after a REST failure comes after the stream row is
-    appended.
-    """
+    """The `except ... continue` after a REST failure comes after the stream row is appended."""
     src = _cycle_source()
     append_at = src.index('rows.append(paired)')
     except_at = src.index('except Exception as exc:      # noqa: BLE001')

@@ -20,9 +20,7 @@ WDT = datetime(2026, 8, 23, 0, 30, tzinfo=timezone.utc)
 
 @pytest.fixture
 def writer(tmp_path):
-    """A real PgWriter over a throwaway SQLite file, so the real ORM and uniqueness logic
-    run.
-    """
+    """A real PgWriter over a throwaway SQLite file, so the real ORM and uniqueness logic run."""
     from core.pg_writer import PgWriter
 
     return PgWriter(f'sqlite:///{tmp_path / "live.db"}')
@@ -49,8 +47,8 @@ def position_fields(**over):
 # ------------------------------------------------ duplicate-order prevention
 
 def test_a_second_position_for_the_same_symbol_and_window_is_refused(writer):
-    """A duplicate position returns None instead of raising, so the loop does not die after
-    the order is sent.
+    """A duplicate position returns None instead of raising, so the loop does not die
+    after the order is sent.
     """
     first = writer.open_position(**position_fields())
     assert first is not None
@@ -83,8 +81,7 @@ def test_another_symbol_in_the_same_window_is_not_blocked(writer):
 # ------------------------------------------------------- restart recovery
 
 def test_exposure_survives_a_process_restart(writer, tmp_path):
-    """A fresh PgWriter over the same file sees the committed entry, and `decide` refuses.
-    """
+    """A fresh PgWriter over the same file sees the committed entry, and `decide` refuses."""
     from core.pg_writer import PgWriter
 
     writer.open_position(**position_fields())
@@ -191,7 +188,6 @@ def test_a_quote_that_is_not_active_is_not_tradeable():
 
 
 def test_a_one_sided_book_is_not_tradeable():
-    """A one-sided book is not tradeable."""
     from data_collection.kalshi_client import Quote
 
     for yes_bid, yes_ask in ((None, 0.20), (0.19, None), (None, None)):

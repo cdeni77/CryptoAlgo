@@ -1,7 +1,6 @@
-"""Tests for the live risk controls: circuit breakers, stale data, and `decide()` refusals.
+"""Tests for live risk controls: circuit breakers, stale data, and `decide()` refusals.
 
-The halt state lives on the serving account, so it survives a restart and shows
-on the dashboard.
+The halt state lives on the serving account, so it survives a restart.
 """
 
 from __future__ import annotations
@@ -125,8 +124,7 @@ class TestStaleness:
         assert 'old' in stale[first]
 
     def test_a_missing_symbol_is_named(self):
-        """A missing symbol is named: the symbol set defines every cross-asset feature.
-        """
+        """A missing symbol is named: the symbol set defines every cross-asset feature."""
         newest = pd.Timestamp(NOW) - pd.Timedelta(minutes=1)
         bars = {s: self._bars(newest) for s in CONFIG.symbols}
         dropped = sorted(CONFIG.symbols)[-1]
@@ -160,8 +158,8 @@ class TestDecideRefusals:
         assert d.reason is Reason.BANKROLL_FLOOR
 
     def test_live_refuses_to_price_from_our_own_baseline(self):
-        """With `require_quote=True` a row with no book is refused instead of priced at the
-        baseline.
+        """With `require_quote=True` a row with no book is refused instead of priced at
+        the baseline.
         """
         without = decide(self.row(), CONFIG, bankroll=100.0,
                          exposure=WindowExposure(), require_quote=True)
@@ -173,9 +171,7 @@ class TestDecideRefusals:
         assert withbook.traded and withbook.price_source == 'quote'
 
     def test_the_half_spread_is_not_charged_on_top_of_a_real_ask(self):
-        """No half-spread is charged on top of a real ask, which already includes the
-        spread.
-        """
+        """No half-spread is charged on top of a real ask, which already includes the spread."""
         from core.costs import trade_fee
 
         quoted = decide(self.row(ask_up=0.60, ask_down=0.40), CONFIG,
@@ -194,7 +190,6 @@ class TestDecideRefusals:
             + float(trade_fee(counterfactual.contracts, counterfactual.price, CONFIG)))
 
     def test_both_probabilities_are_reported_on_the_traded_side(self):
-        """Both probabilities are reported for the traded side."""
         d = decide(self.row(model_probability=0.28, baseline_probability=0.40),
                    CONFIG, bankroll=100.0, exposure=WindowExposure())
         assert d.side is Side.DOWN
@@ -227,7 +222,6 @@ class TestMarketBenchmark:
             'low': value, 'close': value, 'volume': 1.0}])}
 
     def test_a_refused_window_still_gets_its_outcome(self, writer):
-        """A refused window still gets its outcome."""
         from scripts.live import settle_predictions
 
         window = NOW - timedelta(minutes=30)
@@ -342,8 +336,8 @@ class TestClearingAHalt:
 class TestTheDrawdownBreaker:
     """Tests the peak-to-current drawdown breaker on realised equity.
 
-    The daily rule cannot see a run-up and give-back within one UTC day, so a
-    separate breaker watches drawdown from the peak.
+    The daily rule cannot see a run-up and give-back within one UTC day, so a separate
+    breaker watches drawdown from the peak.
     """
 
     def _run_up_then_give_back(self, w: PgWriter, up: float, down: float,
@@ -393,7 +387,6 @@ class TestTheDrawdownBreaker:
         assert check_circuit_breakers(writer, CONFIG, now=NOW) is None
 
     def test_it_measures_from_the_peak_and_not_from_the_start(self, writer):
-        """Drawdown is measured from the peak, not from the start."""
         self._run_up_then_give_back(writer, up=60.0, down=60.0, when=NOW)
         account = writer.account()
         assert float(account.realized_pnl) == pytest.approx(0.0, abs=0.5)

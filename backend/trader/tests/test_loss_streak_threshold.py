@@ -1,9 +1,6 @@
-"""Tests for the `max_consecutive_losses` threshold.
+"""Tests for the `max_consecutive_losses` threshold (25).
 
-A long losing streak is rare on even-money bets and common on cheap contracts,
-which are supposed to lose most of the time. The threshold (25) is set so that a
-streak at a 25% win rate is about as rare as 12 at 50%. A price-scaled threshold
-would mean the same thing at any odds.
+A streak of 25 at a 25% win rate is about as rare as 12 on even-money bets.
 """
 from __future__ import annotations
 
@@ -15,8 +12,7 @@ def _p_streak(win_rate: float, n: int) -> float:
 
 
 def test_the_threshold_is_not_tuned_for_even_money_bets():
-    """At a 25% win rate a 12-loss streak is over 3% likely, so the threshold is above 12.
-    """
+    """At a 25% win rate a 12-loss streak is over 3% likely, so the threshold is above 12."""
     assert _p_streak(0.25, 12) > 0.03
     assert Config().max_consecutive_losses > 12
 

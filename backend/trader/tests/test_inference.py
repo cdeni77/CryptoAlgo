@@ -1,8 +1,6 @@
-"""Tests for the significance tests in `core.inference`, checked against planted truth.
+"""Tests for the block bootstrap in `core.inference`, against planted truth.
 
-Fold dispersion is too coarse over a short span, so the block bootstrap must
-work. It must find an effect that exists, and must not find one that does not,
-even when days are correlated.
+It must find a real effect and must not find a false one, even when days are correlated.
 """
 
 from __future__ import annotations
@@ -24,8 +22,8 @@ def synthetic(n_days: int = 69, per_day: int = 96 * 3, *, edge: float = 0.0,
 
     `edge` moves the model toward the truth relative to the market. `noise` moves it
     away from the market without edge, so the statistic varies. `day_edge_sd` with
-    `persistence` makes the model's advantage an AR(1) across days. Persistence is
-    what makes blocks matter, since blocks capture dependence between adjacent days.
+    `persistence` makes the model's advantage an AR(1) across days. Persistence is what
+    makes blocks matter, since blocks capture dependence between adjacent days.
     """
     rng = np.random.default_rng(seed)
     rows = []
@@ -72,8 +70,8 @@ class TestTheBlockBootstrapRecoversPlantedTruth:
         assert g.point < 0 and g.p_value > 0.5
 
     def test_correlated_days_widen_the_interval(self):
-        """With a persistent day-level edge, 5-day blocks give a wider interval than 1-day
-        blocks.
+        """With a persistent day-level edge, 5-day blocks give a wider interval than
+        1-day blocks.
         """
         frame = synthetic(edge=0.0, day_edge_sd=0.10, persistence=0.9, noise=0.02, seed=5)
         r = model_minus_market(frame, block_days=(1, 5), n_resamples=2000)
@@ -175,16 +173,14 @@ class TestTheEconomicNull:
         assert r.p_value < 0.05, f'planted +20pp edge missed: p = {r.p_value:.4f}'
 
     def test_the_expected_pnl_under_the_null_is_negative(self):
-        """Expected P&L under the null is negative, since every trade pays the fee and the
-        spread.
+        """Expected P&L under the null is negative, since every trade pays the fee and
+        the spread.
         """
         r = pnl_against_market_null(self._trades(), n_resamples=2000)
         assert r.expected < 0
 
     def test_higher_correlation_widens_the_distribution(self):
-        """Higher rho widens the distribution: symbols in one window are not independent
-        bets.
-        """
+        """Higher rho widens the distribution: symbols in one window are not independent bets."""
         t = self._trades()
         lo = pnl_against_market_null(t, rho=0.0, n_resamples=2000)
         hi = pnl_against_market_null(t, rho=0.9, n_resamples=2000)

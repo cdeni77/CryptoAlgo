@@ -1,9 +1,7 @@
 """Tests for `latest_fit`, which falls back to the store when the in-process cache is
 empty.
 
-A restart empties `record_implied_vol.CACHE`. The backtest accepts a stored fit up
-to `MAX_FIT_AGE_MINUTES` old, and the artifact never saw a NaN there, so live
-reads the store too.
+A restart empties the cache, and the model was never trained on a missing fit.
 """
 from __future__ import annotations
 

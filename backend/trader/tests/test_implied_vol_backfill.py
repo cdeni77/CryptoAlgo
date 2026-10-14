@@ -1,8 +1,7 @@
 """Tests for rebuilding the strike-ladder implied sigma from history.
 
-The inversion is reused from `scripts/record_implied_vol.implied_sigma`, so live
-and backfill share one definition. What is new is the cross-section: history is
-one tick series per strike, aligned here onto a common instant.
+The inversion is shared with live; what is new is aligning per-strike tick series onto
+one instant.
 """
 
 from __future__ import annotations
@@ -28,8 +27,7 @@ def _snap(ts_ms, bid, ask):
 
 
 def test_the_cross_section_is_the_last_quote_at_or_before_the_instant():
-    """The cross-section takes the last quote at or before the instant, never a later one.
-    """
+    """The cross-section takes the last quote at or before the instant, never a later one."""
     series = {
         70000.0: [_snap(1_000, 30, 31), _snap(5_000, 40, 41)],
         71000.0: [_snap(2_000, 20, 21), _snap(9_000, 25, 26)],
@@ -44,7 +42,6 @@ def test_a_strike_with_no_tick_yet_is_omitted_rather_than_guessed():
 
 
 def test_a_one_sided_quote_is_omitted_because_it_has_no_mid():
-    """A one-sided quote has no mid, so its strike is omitted."""
     series = {70000.0: [_snap(1_000, 30, None)],
               71000.0: [_snap(1_000, 20, 21)]}
     assert [s for s, _ in cross_section(_packed(series), at_ms=2_000)] == [71000.0]
@@ -79,7 +76,6 @@ def test_sample_instants_excludes_the_close_itself():
 
 
 def test_all_three_assets_have_a_ladder_series():
-    """All three assets have a ladder series."""
     assert set(LADDER_SERIES.values()) == {'BTC-USD', 'ETH-USD', 'SOL-USD'}
 
 
@@ -95,8 +91,7 @@ def test_the_inversion_itself_is_reused_not_reimplemented():
 # latency, not the rate limit. Concurrency must not change what is collected.
 
 class _FakeApi:
-    """Answers a book for every strike except those in `empty_for`, and records requests.
-    """
+    """Answers a book for every strike except those in `empty_for`, and records requests."""
 
     def __init__(self, empty_for=()):
         self.empty_for = set(empty_for)
@@ -132,7 +127,6 @@ def test_a_strike_whose_book_is_empty_is_omitted_not_stored_blank():
 
 
 def test_every_strike_is_asked_for_exactly_once():
-    """Each strike is requested exactly once."""
     from research.collect.implied_vol_backfill import fetch_rungs
     api = _FakeApi()
     fetch_rungs(api, _strikes(), 0, 1, workers=4)
@@ -156,14 +150,12 @@ def test_a_finer_sample_step_asks_more_questions_of_the_same_fetched_books():
 
 
 def test_the_sample_step_is_configurable_and_defaults_below_the_window():
-    """`SAMPLE_MINUTES` stays below `TAIL_MINUTES`, or the grid collapses to one instant.
-    """
+    """`SAMPLE_MINUTES` stays below `TAIL_MINUTES`, or the grid collapses to one instant."""
     from research.collect import implied_vol_backfill as m
     assert m.SAMPLE_MINUTES < m.TAIL_MINUTES
 
 
 def test_the_finer_grid_still_excludes_the_close():
-    """The finer grid still excludes the close."""
     o = dt.datetime(2026, 7, 29, 20, 40, tzinfo=UTC)
     c = dt.datetime(2026, 7, 29, 21, 0, tzinfo=UTC)
     assert c not in sample_instants(o, c, minutes=1)
@@ -177,7 +169,6 @@ def test_the_finer_grid_still_excludes_the_close():
 # the 20-50 minute band before the close.
 
 def test_the_fetch_window_starts_strictly_before_the_first_sampled_instant():
-    """The fetch starts strictly before the first sampled instant."""
     from research.collect.implied_vol_backfill import windows_for
     opened = dt.datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
     closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
@@ -199,7 +190,6 @@ def test_the_sampled_instants_sit_in_the_band_where_rungs_exist():
 
 
 def test_a_ladder_that_opened_late_is_clamped_not_sampled_before_it_existed():
-    """A ladder that opened late is not sampled before it opened."""
     from research.collect.implied_vol_backfill import windows_for
     closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
     opened = closes - dt.timedelta(minutes=25)
@@ -231,7 +221,6 @@ def test_the_stride_selects_the_same_ladders_regardless_of_what_is_done():
 
 
 def test_resuming_never_adds_a_ladder_the_stride_had_skipped():
-    """Resuming never adds a ladder the stride skipped."""
     from research.collect.implied_vol_backfill import select_ladders
     every = [f'L{i:03d}' for i in range(100)]
     target = set(select_ladders(every, done=set(), stride=3))
@@ -256,8 +245,7 @@ def test_max_ladders_caps_after_the_stride_not_before():
 
 
 def test_ladders_are_ordered_by_close_time_not_ticker_text():
-    """Ladders are ordered by close time, not ticker text (which sorts by month name).
-    """
+    """Ladders are ordered by close time, not ticker text (which sorts by month name)."""
     import datetime as dt
     from research.collect.implied_vol_backfill import select_ladders
     utc = dt.timezone.utc

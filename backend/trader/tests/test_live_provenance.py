@@ -1,8 +1,7 @@
 """Tests that live rows record what produced them.
 
-Predictions carry `model_version`, tickets and positions carry `prediction_id`,
-and `live_touch` quote rows carry `quote_age_seconds`. A missing age reads as
-fresh to the backtest's staleness filter.
+`model_version`, `prediction_id` and `quote_age_seconds` must be set; a missing age
+reads as fresh.
 """
 from __future__ import annotations
 

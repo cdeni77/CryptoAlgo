@@ -1,9 +1,7 @@
 """Tests for `kill_diagnosis`, which explains why an order did not fill.
 
-It compares the order with the book at the time of the kill and gives one of
-three answers: the limit never crossed (our price), it crossed but nothing rested
-(a size race), or it crossed with size resting (the order is malformed). All
-prices are YES-denominated, since the venue's book is two bid stacks.
+The answers: the limit never crossed, it crossed but nothing rested, or it crossed with
+size resting. Prices are YES-denominated.
 """
 from __future__ import annotations
 

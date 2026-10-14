@@ -71,8 +71,8 @@ def test_kraken_asks_for_a_bbo_triggered_ticker():
 
 
 def test_coinbase_subscribes_to_ticker_and_heartbeats_only():
-    """Coinbase uses `ticker` (the touch on every message), not `level2`, to avoid folding
-    a full book.
+    """Coinbase uses `ticker` (the touch on every message), not `level2`, to avoid
+    folding a full book.
     """
     channels = {m['channel'] for m in subscribe_messages('coinbase', SYMBOLS)}
     assert channels == {'ticker', 'heartbeats'}
@@ -255,9 +255,7 @@ def test_a_venue_error_ends_the_connection_with_its_reason():
 
 
 def test_a_coinbase_sequence_gap_keeps_the_connection():
-    """A Coinbase ticker gap keeps the connection, since each message carries the whole
-    touch.
-    """
+    """A Coinbase ticker gap keeps the connection, since each message carries the whole touch."""
     messages = FIXTURES['coinbase'][:2] + [dict(FIXTURES['coinbase'][2], sequence_num=9)]
 
     async def drive():

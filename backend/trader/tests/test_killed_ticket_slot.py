@@ -1,8 +1,6 @@
 """Tests that a killed order releases its window entry slot.
 
-Tickets count as entries from the moment an order is sent, so a crash between
-sending and booking still blocks the window. 'unknown' may have been accepted and
-keeps the slot. 'killed' is the venue confirming no position, so it releases it.
+'unknown' may have been accepted and keeps the slot; 'killed' confirms no position.
 """
 
 from __future__ import annotations

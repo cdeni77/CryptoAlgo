@@ -1,8 +1,7 @@
 """Tests for the Kalshi client: signing, market resolution, and refusal to trade.
 
-Nothing reaches the network. The key safety rules: an order is refused unless the
-client was built with `live=True`, and an unresolved market gives an abstention,
-never a neighbouring contract.
+An order is refused unless the client is built with `live=True`, and an unresolved
+market gives an abstention. Nothing reaches the network.
 """
 
 from __future__ import annotations
@@ -43,8 +42,8 @@ def test_an_unconfigured_client_says_so_rather_than_failing_later(monkeypatch):
 
 
 def test_the_signature_covers_timestamp_method_and_path(key_pem):
-    """The signature is RSA-PSS over SHA-256 of `timestamp + METHOD + path`, with the query
-    excluded.
+    """The signature is RSA-PSS over SHA-256 of `timestamp + METHOD + path`, with the
+    query excluded.
     """
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -131,8 +130,8 @@ def _sent_price(key_pem, side, limit_price):
 ])
 def test_a_limit_is_rounded_onto_the_venue_tick_toward_a_fill(
         key_pem, side, limit, expected):
-    """A limit rounds onto the `tapered_deci_cent` tick toward a fill: up for a bid, down
-    for an ask.
+    """A limit rounds onto the `tapered_deci_cent` tick toward a fill: up for a bid,
+    down for an ask.
     """
     assert _sent_price(key_pem, side, limit) == expected
 
@@ -154,8 +153,7 @@ def test_a_quote_is_converted_to_probabilities_at_the_boundary():
 
 
 def test_a_quote_is_read_from_the_real_wire_shape():
-    """A quote is read from the venue's dollar-string fields (`yes_bid_dollars: "0.1900"`).
-    """
+    """A quote is read from the venue's dollar-string fields (`yes_bid_dollars: "0.1900"`)."""
     quote = _to_quote({
         'ticker': 'KXBTC15M-A', 'status': 'active',
         'yes_bid_dollars': '0.1900', 'yes_ask_dollars': '0.2000',
@@ -174,8 +172,7 @@ def test_a_quote_is_read_from_the_real_wire_shape():
 
 
 def test_bare_cent_fields_are_null_on_a_live_response_and_must_not_be_trusted_alone():
-    """With the bare cent fields absent, the dollar fields alone give a tradeable quote.
-    """
+    """With the bare cent fields absent, the dollar fields alone give a tradeable quote."""
     quote = _to_quote({
         'ticker': 'KXBTC15M-A', 'status': 'active',
         'yes_bid_dollars': '0.1900', 'yes_ask_dollars': '0.2000',
@@ -212,8 +209,8 @@ def test_times_parse_to_utc():
 
 
 def test_market_resolution_abstains_rather_than_taking_a_neighbour(monkeypatch):
-    """Resolution asks the venue which market closes at this settlement, and returns None
-    if none does.
+    """Resolution asks the venue which market closes at this settlement, and returns
+    None if none does.
     """
     import asyncio
 
@@ -260,8 +257,7 @@ def test_a_request_before_opening_the_client_is_an_error(key_pem):
 # ------------------------------------------------------- the preflight script
 
 def test_the_preflight_cannot_place_an_order():
-    """The preflight builds the client without `live=True`, so it cannot place an order.
-    """
+    """The preflight builds the client without `live=True`, so it cannot place an order."""
     import inspect
 
     from scripts import check_venue
@@ -272,9 +268,7 @@ def test_the_preflight_cannot_place_an_order():
 
 
 def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
-    """The preflight tells a network block (such as an egress 403) apart from a key
-    rejection.
-    """
+    """The preflight tells a network block (such as an egress 403) apart from a key rejection."""
     import inspect
 
     from scripts import check_venue
@@ -289,9 +283,7 @@ def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
 
 
 def test_the_series_are_the_fifteen_minute_ones():
-    """The series are the 15-minute ones (`KXBTC15M`), not the hourly threshold ladder
-    `KXBTCD`.
-    """
+    """The series are the 15-minute ones (`KXBTC15M`), not the hourly threshold ladder `KXBTCD`."""
     from scripts.live import SERIES_BY_SYMBOL
 
     for symbol, series in SERIES_BY_SYMBOL.items():
@@ -302,8 +294,8 @@ def test_the_series_are_the_fifteen_minute_ones():
 
 
 def test_resolution_uses_close_time_and_not_the_ticker():
-    """Resolution matches on `close_time` (UTC), never by parsing the ticker (named in US
-    Eastern).
+    """Resolution matches on `close_time` (UTC), never by parsing the ticker (named in
+    US Eastern).
     """
     import asyncio
     import inspect
@@ -336,8 +328,8 @@ def test_reconcile_pulls_everything_authoritative_in_one_call():
     """`reconcile` returns balance, positions, fills and settlements, the account of
     record.
 
-    Live, the venue's ledger is right where it disagrees with ours, since our
-    settlement is a Coinbase proxy for BRTI.
+    Live, the venue's ledger is right where it disagrees with ours, since our settlement
+    is a Coinbase proxy for BRTI.
     """
     import asyncio
 
@@ -537,7 +529,6 @@ async def test_the_default_balance_is_still_the_total(key_pem):
 
 @pytest.mark.asyncio
 async def test_a_shard_absent_from_the_breakdown_holds_nothing(key_pem):
-    """A shard missing from the breakdown holds nothing."""
     client = _client_returning(BREAKDOWN_PAYLOAD, key_pem)
     assert await client.balance(exchange_index=7) == pytest.approx(0.0)
 
@@ -551,8 +542,8 @@ async def test_a_venue_with_no_breakdown_falls_back_to_the_total(key_pem):
 
 @pytest.mark.asyncio
 async def test_reconcile_reads_the_balance_of_the_shard_it_is_told_about(key_pem):
-    """`reconcile` reads the balance of the named shard, so sizing uses money an order can
-    reach.
+    """`reconcile` reads the balance of the named shard, so sizing uses money an order
+    can reach.
     """
     client = KalshiClient(key_id='k', private_key_pem=key_pem)
     seen = {}

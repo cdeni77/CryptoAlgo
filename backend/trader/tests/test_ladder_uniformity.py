@@ -1,9 +1,7 @@
 """Tests that the Kalshi and Polymarket ladders use the same denomination.
 
-Kalshi serves two bid stacks, so `no_levels` holds NO-side bid prices and the
-YES ask is `1 - best_no_bid`. Polymarket serves bids and asks on one token, so
-its asks are converted to NO-denominated levels at write time. On both venues
-`1 - price` of the best `no_levels` entry is the YES ask.
+On both venues `no_levels` holds NO-side prices, and `1 - best no_levels price` is the
+YES ask.
 """
 
 from __future__ import annotations
@@ -23,8 +21,7 @@ BOOK = {
 
 
 def test_bids_come_back_best_first_in_yes_terms():
-    """Bids are stored best first, as Kalshi does; Polymarket serves them worst first.
-    """
+    """Bids are stored best first, as Kalshi does; Polymarket serves them worst first."""
     assert _levels(BOOK['bids']) == [[0.49, 300.0], [0.48, 200.0], [0.45, 100.0]]
 
 

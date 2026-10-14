@@ -1,11 +1,7 @@
-"""Tests for `implied_sigma`, which inverts a Kalshi strike ladder to the sigma that priced
-it.
+"""Tests for `implied_sigma`, which inverts a Kalshi strike ladder to its sigma.
 
-Under the zero-drift barrier model, P(S_T > K) = F(ln(S/K) / (sigma * sqrt(t))).
-Applying the inverse CDF makes the ladder linear in ln(K/S) with slope
--1 / (sigma * sqrt(t)). One regression recovers sigma, and R^2 shows whether the
-ladder is consistent. This is the market's forward estimate of sigma, while
-`core/vol.py` uses past returns.
+Under the zero-drift barrier model the inverse CDF of each quote is linear in ln(K/S)
+with slope -1 / (sigma * sqrt(t)), so one regression recovers sigma.
 """
 
 from __future__ import annotations
@@ -65,8 +61,7 @@ def test_degenerate_quotes_are_refused_rather_than_fitted():
 
 
 def test_far_rungs_are_dropped_rather_than_allowed_to_dominate():
-    """Far rungs are dropped: near 0 or 1 they are mostly tick noise after the inverse CDF.
-    """
+    """Far rungs are dropped: near 0 or 1 they are mostly tick noise after the inverse CDF."""
     rungs = ladder(0.00035, 60.0, 77200.0)
     with_tails = rungs + [(60000.0, 0.999), (95000.0, 0.001)]
     assert implied_sigma(with_tails, 60.0).n_strikes == len(rungs)
@@ -81,8 +76,7 @@ def test_zero_minutes_remaining_is_refused_not_divided_by():
 
 
 def test_an_inverted_ladder_is_refused():
-    """A ladder whose price rises with strike is refused, since sigma would be negative.
-    """
+    """A ladder whose price rises with strike is refused, since sigma would be negative."""
     rungs = [(k, p) for k, p in ladder(0.00035, 60.0, 77200.0)]
     flipped = [(k, p) for (k, _), (_, p) in zip(rungs, reversed(rungs))]
     assert implied_sigma(flipped, 60.0) is None

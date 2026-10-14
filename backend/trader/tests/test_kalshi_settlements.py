@@ -1,9 +1,7 @@
-"""Tests for parsing Kalshi's own settlement records, including the settlement price.
+"""Tests for parsing Kalshi's own settlement records, including `expiration_value`.
 
-The venue fills results missing from Predexon, and `expiration_value` gives the
-price the market settled at. That lets the label check measure the bias of our
-Coinbase mean against BRTI in basis points. Kalshi purges markets older than
-about two months.
+The settlement price lets the label check measure our Coinbase proxy's bias in basis
+points.
 """
 
 from __future__ import annotations
@@ -34,15 +32,14 @@ def test_a_settled_market_becomes_a_record_with_its_settlement_price():
 
 
 def test_the_window_is_decoded_and_cross_checked_against_the_venues_times():
-    """The record carries the window open in UTC, checked against the venue's own open and
-    close times.
+    """The record carries the window open in UTC, checked against the venue's own open
+    and close times.
     """
     row = parse_market(_market())
     assert row['window_open'] == '2026-08-27T14:30:00+00:00'
 
 
 def test_a_market_whose_stated_times_contradict_its_ticker_is_rejected():
-    """A market whose stated times contradict its ticker is rejected."""
     assert parse_market(_market(open_time='2026-08-27T15:30:00Z',
                                 close_time='2026-08-27T15:45:00Z')) is None
 
@@ -66,14 +63,12 @@ def test_a_settlement_price_of_zero_is_kept_not_treated_as_missing():
 
 
 def test_a_market_with_no_settlement_price_still_yields_its_result():
-    """A market with no settlement price still yields its result."""
     row = parse_market(_market(expiration_value=None))
     assert row is not None and row['result'] == 'yes'
     assert row['expiration_value'] is None
 
 
 def test_an_unsettled_market_is_skipped_rather_than_stored_as_blank():
-    """An unsettled market is skipped, not stored with a blank result."""
     assert parse_market(_market(status='active', result='')) is None
 
 

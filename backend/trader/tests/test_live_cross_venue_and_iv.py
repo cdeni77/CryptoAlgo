@@ -1,7 +1,7 @@
 """Tests for the live `cross_venue` and `implied_vol` feature rows.
 
-Both groups are in the fitted artifact, so live must attach them. A missing
-column scores NaN with a learned default direction.
+Both groups are in the fitted artifact, so live must attach them. A missing column
+scores NaN with a learned default direction.
 """
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ def test_a_missing_polymarket_book_is_absent_not_agreement():
 
 
 def test_a_one_sided_polymarket_book_gives_no_mid():
-    """A one-sided Polymarket book has no mid."""
     row = cross_venue_row({'best_bid': 56.0, 'best_ask': np.nan}, _Quote())
     assert np.isnan(row['venue_prob_gap'])
 

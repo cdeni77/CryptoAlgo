@@ -1,5 +1,5 @@
-"""Tests for live log levels: routine repetition is DEBUG, anything about money is INFO or
-louder.
+"""Tests for live log levels: routine repetition is DEBUG, anything about money is INFO
+or louder.
 """
 
 from __future__ import annotations
@@ -50,16 +50,15 @@ class TestCoverageReporting:
             report(minutes_present=1450)) >= logging.INFO
 
     def test_the_one_boundary_the_live_grid_always_drops_is_not_news(self):
-        """One dropped boundary (the window in progress) is expected every cycle, so it is
-        DEBUG.
+        """One dropped boundary (the window in progress) is expected every cycle, so it
+        is DEBUG.
         """
         from core.windows import coverage_log_level
 
         assert coverage_log_level(report(dropped=1)) == logging.DEBUG
 
     def test_more_dropped_boundaries_than_the_live_edge_explains_are_news(self):
-        """Two or more dropped boundaries mean lost windows, so they log at INFO or louder.
-        """
+        """Two or more dropped boundaries mean lost windows, so they log at INFO or louder."""
         from core.windows import coverage_log_level
 
         assert coverage_log_level(report(dropped=2)) >= logging.INFO
@@ -67,8 +66,8 @@ class TestCoverageReporting:
 
 
 class TestDecisionReporting:
-    """Every decision is recorded in the database; this decides only which ones appear in
-    the log.
+    """Every decision is recorded in the database; this decides only which ones appear
+    in the log.
     """
 
     def test_a_trade_is_always_logged_at_info(self):
@@ -78,8 +77,7 @@ class TestDecisionReporting:
             decision(Reason.TRADED, traded=True, contracts=4)) == logging.INFO
 
     def test_the_designed_steady_state_is_quiet(self):
-        """`offset_not_traded` fires on every non-entry offset by design, so it is DEBUG.
-        """
+        """`offset_not_traded` fires on every non-entry offset by design, so it is DEBUG."""
         from scripts.live import decision_log_level
 
         assert decision_log_level(
@@ -98,8 +96,7 @@ class TestDecisionReporting:
         Reason.HALTED, Reason.BANKROLL_FLOOR, Reason.DISAGREEMENT_IMPLAUSIBLE,
     ])
     def test_refusals_that_signal_a_problem_stay_loud(self, reason):
-        """A halt, a breached floor, or an implausible disagreement logs at INFO or louder.
-        """
+        """A halt, a breached floor, or an implausible disagreement logs at INFO or louder."""
         from scripts.live import decision_log_level
 
         assert decision_log_level(decision(reason)) >= logging.INFO

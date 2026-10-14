@@ -1,9 +1,7 @@
 """Tests for the `--min-r2` gate in `scripts/record_implied_vol.py`.
 
-The backfill applies no R^2 gate, and `iv_r2` is a model feature, so parity
-argues for no gate. But live fits the whole open ladder while the backfill had
-only the liquid strikes, so ungated live fits differ widely. The gate stays at
-0.90 until strike selection matches.
+The backfill has no gate, but live fits more strikes than the backfill had, so the gate
+stays at 0.90 until strike selection matches.
 """
 from __future__ import annotations
 
@@ -44,5 +42,4 @@ def test_a_noisy_ladder_is_kept_and_its_r2_reported():
 
 
 def test_a_threshold_can_still_be_asked_for_explicitly():
-    """An explicit threshold can still be set."""
     assert build_parser().parse_args(['--min-r2', '0.9']).min_r2 == 0.9
