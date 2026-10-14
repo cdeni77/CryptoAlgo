@@ -1,20 +1,8 @@
-"""A latched breaker must stop the entries and not the measurement.
+"""Tests that a latched breaker stops entries but not scoring and recording.
 
-`run_cycle` used to set `offset = None` on a halt, which returns before
-`score_live` — so a halted account wrote no predictions and recorded no quotes.
-The breaker exists to stop risking money; freezing the data collection was
-collateral damage nobody chose, and the expensive kind.
-
-The arithmetic that makes it expensive, measured on the live account: ~285
-symbol-windows recorded per day, 2,000 needed before the market comparison means
-anything, and a `max_daily_loss_fraction` of 0.15 on a $154 account is ~$23/day
-against a ~$24/day expected burn. So the breaker fires most days, and every day it
-fires used to contribute zero windows. The recording run could not reach its own
-sample-size target.
-
-`decide()` refuses with `Reason.HALTED` instead, which keeps the row honest: it is
-scored, priced against the real book, written with that reason, and settled like
-any other.
+`decide()` refuses with `Reason.HALTED`, so the row is still scored, priced
+against the real book, written, and settled. The market comparison needs these
+rows even on days the breaker fires.
 """
 
 from __future__ import annotations
@@ -50,44 +38,33 @@ class TestTheHaltedGate:
         assert out.stake == 0.0
 
     def test_the_default_is_not_halted_so_nothing_else_changes(self):
-        """The backtest and the paper engine call the same `decide()` and must be
-        unaffected — there is one `decide()` on purpose."""
+        """`decide()` is not halted by default, so the backtest and paper engine are
+        unaffected.
+        """
         assert decide(row(), DEFAULT_CONFIG, bankroll=150.0).reason is Reason.TRADED
 
     def test_halted_is_distinct_from_the_bankroll_floor(self):
-        """A latched breaker and a breached ruin floor are different states with
-        different remedies: one is cleared by hand, the other by having money."""
+        """A latched breaker (cleared by hand) and the ruin floor are different reasons.
+        """
         floored = decide(row(), DEFAULT_CONFIG, bankroll=1.0)
         assert floored.reason is Reason.BANKROLL_FLOOR
         assert decide(row(), DEFAULT_CONFIG, bankroll=150.0,
                       halted=True).reason is Reason.HALTED
 
     def test_the_ruin_floor_still_wins_when_both_apply(self):
-        """Ordering: no money is a harder stop than a latched breaker, and the
-        recorded reason should name the one that cannot be cleared by hand."""
+        """When both apply, the ruin floor is the recorded reason."""
         out = decide(row(), DEFAULT_CONFIG, bankroll=1.0, halted=True)
         assert out.reason is Reason.BANKROLL_FLOOR
 
     def test_a_halt_does_not_suppress_the_scored_probability(self):
-        """The row must still carry what the measurement needs. A refusal that
-        blanked the model probability would record the abstention and lose the
-        forecast, which is the whole reason to keep scoring."""
+        """A halted row still carries the model and baseline probabilities."""
         out = decide(row(), DEFAULT_CONFIG, bankroll=150.0, halted=True)
         assert out.model_probability == pytest.approx(0.72)
         assert out.baseline_probability == pytest.approx(0.60)
 
 
 class TestTheCycleKeepsScoringWhileHalted:
-    """Behaviour, not source text.
-
-    The first version of this asserted that `run_cycle`'s halt branch did not
-    contain the string `offset = None`. That is a test of the comment — the
-    pattern `tests/test_kalshi.py` was written to shame, and one this repo has
-    already been burned by: two tests there passed for the entire time the
-    reconciliation they described did not exist. So: stub the scorer, run a real
-    cycle against a halted account, and assert the scorer was reached and a
-    prediction was written.
-    """
+    """Runs a real cycle on a halted account with a stubbed scorer."""
 
     def _cycle(self, tmp_path, *, halt: bool):
         import argparse
@@ -153,13 +130,11 @@ class TestTheCycleKeepsScoringWhileHalted:
         try:
             args = argparse.Namespace(offset=3, reconcile=False, mode='paper',
                                       place_orders=False, dry_run=False)
-            # The fixture carries a handful of synthetic bars, not the 1,455
-            # a live feed must supply — `min_usable_bars` guards the band where
-            # a partial Coinbase answer produces confident wrong features.
-            # Lowered here so the test exercises the halt path rather than the
-            # short-feed refusal.
-            # `min_remaining_seconds=0` too: on the real clock, a run in the
-            # last 45s of a quarter-hour otherwise stops before any decision.
+            # The fixture has only a few synthetic bars, so `min_usable_bars` is lowered
+            # to
+            # reach the halt path. `min_remaining_seconds=0` stops the real clock ending
+            # the
+            # run in the last 45s of a quarter-hour.
             config = dataclasses.replace(DEFAULT_CONFIG, min_usable_bars=1,
                                          min_remaining_seconds=0)
             asyncio.run(live_mod.run_cycle(args, config, writer,
@@ -169,7 +144,7 @@ class TestTheCycleKeepsScoringWhileHalted:
         return writer, calls
 
     def test_a_halted_account_still_scores_the_window(self, tmp_path):
-        """The regression. With `offset = None` this was 0."""
+        """A halted account still scores the window."""
         _, calls = self._cycle(tmp_path, halt=True)
         assert calls['scored'] == 1, (
             'a halted account skipped scoring, so no quote or outcome is '
@@ -177,7 +152,8 @@ class TestTheCycleKeepsScoringWhileHalted:
         )
 
     def test_a_halted_account_still_writes_the_prediction(self, tmp_path):
-        """What `market_benchmark` actually reads."""
+        """A halted account still writes the prediction that `market_benchmark` reads.
+        """
         writer, _ = self._cycle(tmp_path, halt=True)
         rows = writer.scored_against_market()
         assert rows is not None

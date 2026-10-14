@@ -1,14 +1,7 @@
-"""Peak and current realised P&L must span the same period.
+"""Tests that `realised_high_water()` starts at the same epoch as `account.realized_pnl`.
 
-`realised_high_water()` is half of the live drawdown breaker; the other half is
-`account.realized_pnl`. `scripts/reset_dashboard.py --rebase` zeroes the second
-at a new epoch — and this walked every settlement ever recorded, so the breaker
-compared a high-water from BEFORE the reset against a P&L counted AFTER it.
-
-Measured on the live account 2026-09-24: peak $322.38 against current $173.02,
-a phantom **46.3% drawdown** that halted an account whose realised P&L since its
-epoch was **-$26.98**. The halt is sticky and cleared by hand, so a false one
-costs real trading days.
+The drawdown breaker compares the two. A peak from before a dashboard reset
+against P&L counted after it gives a false drawdown and a sticky halt.
 """
 
 from __future__ import annotations
@@ -50,8 +43,7 @@ def test_without_an_epoch_it_spans_everything(writer):
 
 
 def test_an_epoch_excludes_the_earlier_peak(writer):
-    """The bug: a +$50 run before the reset must not become the peak that a
-    post-reset -$10 is measured against."""
+    """A peak from before the epoch is excluded."""
     account = writer.ensure_account(100.0, mode='paper')
     _settle(writer, +50.0, EPOCH - dt.timedelta(days=5))
     _settle(writer, -10.0, EPOCH + dt.timedelta(hours=1))

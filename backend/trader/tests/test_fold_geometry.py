@@ -1,19 +1,8 @@
-"""The walk-forward's geometry must be the one that is deployed.
+"""Tests for walk-forward fold geometry.
 
-Two knobs, and they answer different questions.
-
-**`fold_block_days` is the cadence.** Blocks do not overlap, so it is both the
-test span and the step. The live loop retrains every SEVEN days (the Sunday
-cron) while the evaluation tested TWENTY-ONE-day blocks with a single model —
-so the backtest let a model go three weeks stale before anyone refitted it,
-while live never exceeds one. That is an evaluation of a deployment nobody
-runs, the same defect as fitting to a backfilled quote and trading a recorded
-one, on a different axis.
-
-**`fold_train_days` is the training window**, and expanding remains the default
-because expanding is what `scripts/promote.py` actually installs — the Sunday
-retrain fits on all history. Setting it here WITHOUT matching it in the retrain
-recreates the very mismatch this file is about, which is why the flag says so.
+`fold_block_days` is both the test span and the step, and matches the weekly
+retrain cadence. `fold_train_days` sets a rolling training window; expanding is
+the default because the retrain fits on all history.
 """
 
 from __future__ import annotations
@@ -23,7 +12,7 @@ import pytest
 
 from core.cv import purged_walk_forward
 
-# ~54 complete-case windows/day is the measured density; 15-minute grid.
+# 15-minute grid over eight months.
 INDEX = pd.DatetimeIndex(pd.date_range('2026-01-01', '2026-09-01',
                                        freq='15min', tz='UTC'))
 
@@ -34,7 +23,7 @@ def _folds(**kw):
 
 
 def test_expanding_is_still_the_default():
-    """The deployed geometry. If this changes, the Sunday retrain must too."""
+    """Expanding training is the default; the weekly retrain must match it."""
     folds = _folds(fold_block_days=21.0)
     sizes = [len(f.train) for f in folds]
     assert sizes == sorted(sizes), 'training set must never shrink when expanding'
@@ -46,23 +35,19 @@ def test_a_rolling_window_holds_its_length_instead_of_growing():
     spans = [(f.train.max() - f.train.min()).total_seconds() / 86400.0
              for f in folds]
     assert max(spans) <= 35.0 + 1e-9
-    # Flat, not growing: that is the whole difference from expanding. The FIRST
-    # fold is the exception and legitimately so — it has only ~20 days of
-    # history behind it, and a rolling window cannot invent data it does not
-    # have. It is capped by the request, never padded to meet it.
+    # Flat, not growing. The first fold may be shorter because less history exists.
     assert spans[0] <= 35.0 + 1e-9
     assert all(abs(s - 35.0) < 1.0 for s in spans[1:]), spans
 
 
 def test_the_rolling_window_is_measured_from_the_embargo_not_the_test_start():
-    """A day out of 35 is 3% of the sample. A parameter that means 34 when it
-    says 35 is exactly the silent drift this module exists to prevent."""
+    """The rolling window is measured back from the embargo, not from the test start."""
     folds = _folds(fold_block_days=21.0, train_days=35.0)
     f = folds[-1]
     embargo = pd.Timedelta(minutes=1440)
     floor = (f.test.min() - embargo) - pd.Timedelta(days=35.0)
     assert f.train.min() >= floor
-    # And it really does reach back the full 35 days of usable history.
+    # It reaches back the full 35 days.
     assert (f.train.min() - floor) < pd.Timedelta(days=1)
 
 
@@ -73,9 +58,9 @@ def test_a_rolling_window_never_crosses_the_embargo():
 
 
 def test_a_shorter_block_gives_the_cadence_live_actually_runs():
-    """Seven days is the Sunday retrain. The point is not more folds for their
-    own sake — it is that the model is never staler in the test than it is in
-    production."""
+    """Seven-day blocks match the weekly retrain, so the model is never staler in test than
+    live.
+    """
     weekly = _folds(fold_block_days=7.0)
     triweekly = _folds(fold_block_days=21.0)
     assert len(weekly) > len(triweekly) * 2
@@ -85,9 +70,7 @@ def test_a_shorter_block_gives_the_cadence_live_actually_runs():
 
 
 def test_blocks_do_not_overlap_so_no_window_is_scored_twice():
-    """`fold_block_days` is the step as well as the span. If that stopped being
-    true, pooled metrics would double-count and every money number would be
-    inflated by the overlap."""
+    """Blocks do not overlap, so no window is scored twice."""
     seen: set = set()
     for f in _folds(fold_block_days=7.0):
         assert not (seen & set(f.test)), f'fold {f.index} re-tests scored windows'

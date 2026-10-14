@@ -1,10 +1,9 @@
-"""The gate spec is frozen in a lock committed beside the code.
+"""Tests that the gate spec matches the lock committed beside the code.
 
-Gate thresholds and definitions were changed repeatedly while they were the
-blocking failure. The lock does not stop a change; it makes one visible: this
-test fails until `core/gate_spec.lock.json` is regenerated in the same commit,
-and `scripts.promote` refuses a running spec that differs from it unless
-`--accept-gate-change` records why.
+The lock makes a gate change visible: this test fails until
+`core/gate_spec.lock.json` is regenerated in the same commit, and
+`scripts.promote` refuses a different running spec unless `--accept-gate-change`
+records why.
 """
 from __future__ import annotations
 

@@ -1,22 +1,7 @@
-"""Fold boundaries must not move when data is appended.
+"""Tests that calendar fold boundaries stay fixed when data is appended.
 
-`purged_walk_forward`'s docstring gave this as the whole reason `'calendar'`
-exists — "earlier boundaries then stay put as data arrives, so fold-level
-results are comparable run to run" — and the implementation did not deliver it.
-It cut with `pd.date_range(index.min(), index.max(), periods=n_folds + 2)`,
-dividing the span between the first and LAST window, so every interior boundary
-slid whenever anything was appended. Measured on a 245-day span, adding three
-days moved the cuts by +10h, +21h, +31h, +41h, +51h, +62h and +72h; fold 5's
-test block shifted more than two days.
-
-It stayed invisible while evaluation was occasional. Weekly promotion exposed
-it immediately: the SAME configuration on three extra days took `max_drawdown`
-0.182 -> 0.388 and `calibration_vs_market` -0.014 -> +0.009, failing three
-gates it had passed three days earlier. Almost none of that was the model, and
-on that evidence the candidate was refused while the incumbent — which would
-also have failed, had anything re-tested it — stayed deployed.
-
-A gate is only a measurement if the thing under it holds still.
+Blocks are anchored to a fixed origin, so adding data within a block changes no
+fold. Only then is a weekly gate run comparable with the previous one.
 """
 from __future__ import annotations
 
@@ -26,10 +11,8 @@ import pytest
 from core.cv import purged_walk_forward
 
 ORIGIN = pd.Timestamp('2026-01-09', tz='UTC')
-# An explicit block width for these tests. It deliberately does NOT track
-# Config.fold_block_days (now 7.0): what is under test here is that anchored
-# boundaries hold still, which must hold at ANY width. The old comment
-# claimed it matched the Config and silently stopped being true.
+# An explicit block width. It does not track `Config.fold_block_days`, because
+# anchoring must hold at any width.
 BLOCK = 21.0
 
 
@@ -42,20 +25,17 @@ def _folds(days: float, scheme: str = 'calendar', block: float = BLOCK):
 
 
 def test_appending_data_within_a_block_moves_no_boundary():
-    """The defect, directly. Three more days used to slide all six."""
+    """Appending data within a block moves no boundary."""
     before, after = _folds(240), _folds(243)
     assert len(before) == len(after)
     assert [f.test_start for f in before] == [f.test_start for f in after]
 
 
 def test_within_a_block_the_folds_are_IDENTICAL_end_to_end():
-    """Stronger than "boundaries did not move": nothing moves at all.
+    """Within a block the folds are identical end to end.
 
-    Only COMPLETE blocks are tested, so data arriving mid-block lands in the
-    untested trailing stub and the evaluation is bit-for-bit the same run to
-    run. That is what makes a weekly gate a comparison. The cost is the stub:
-    up to `fold_block_days` of the newest data is not in the test set until its
-    block completes.
+    Only complete blocks are tested, so new data waits in an untested trailing stub
+    until its block completes.
     """
     before, after = _folds(240), _folds(243)
     assert len(before) == len(after)
@@ -73,14 +53,7 @@ def test_every_boundary_sits_on_the_anchored_grid():
 
 
 def test_a_new_block_ADDS_a_fold_and_evicts_nothing():
-    """Folds accumulate; they do not roll off.
-
-    Capping at the most recent `n_folds` blocks halved the evaluation —
-    `windows_evaluated` 21,307 -> 10,488, failing its own 20,000 bar — because
-    six 21-day blocks cover 126 days of a 245-day span. Testing every complete
-    block costs nothing in stability, since the boundaries are anchored either
-    way, and it is why gates counting folds had to become proportions.
-    """
+    """A new complete block adds a fold and removes none."""
     # 21-day blocks: 210d is exactly 10 blocks, 231d is 11.
     before = [f.test_start for f in _folds(210)]
     after = [f.test_start for f in _folds(231)]
@@ -96,19 +69,14 @@ def test_a_longer_block_gives_wider_folds_anchored_the_same_way():
 
 
 def test_the_count_scheme_is_still_NOT_anchored():
-    """Recorded, not fixed. `'count'` blocks are defined by data volume, so
-    they cannot be anchored to a time grid — appending re-cuts them by
-    construction. This matters because `Config.fold_scheme` defaults to
-    'count' for GATING, so the anchoring above does not reach the gates until
-    that default changes. Asserted so nobody assumes it was fixed too.
-    """
+    """The 'count' scheme is not anchored, since its blocks follow data volume."""
     before = [f.test_start for f in _folds(245, scheme='count')]
     after = [f.test_start for f in _folds(248, scheme='count')]
     assert before != after
 
 
 def test_folds_never_overlap_and_train_precedes_test():
-    """The anchoring must not have broken the property the module exists for."""
+    """Anchored folds never overlap and train precedes test."""
     from core.cv import assert_no_leakage
     for fold in _folds(300):
         assert_no_leakage(fold)
@@ -116,10 +84,7 @@ def test_folds_never_overlap_and_train_precedes_test():
 
 
 def test_a_span_too_short_to_anchor_falls_back_and_WARNS(caplog):
-    """A fresh store has weeks, not months. Refusing outright would break every
-    short-span research run, so it subdivides — but the boundaries are then
-    span-dependent again, which is the whole property being claimed, so it has
-    to say so rather than quietly hand back unstable folds."""
+    """A span too short to anchor falls back to subdivision and logs a warning."""
     with caplog.at_level('WARNING'):
         folds = _folds(30, block=35.0)
     assert folds, 'a short span must still yield folds'

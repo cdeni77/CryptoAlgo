@@ -1,7 +1,4 @@
-"""The three symbol fetches are independent, so they run concurrently.
-
-Measured at 3.17s in series — three round trips to one host, run one after
-another for no reason. It was the largest single cost in the live cycle.
+"""Tests that the per-symbol bar fetches run concurrently, since they are independent.
 """
 from __future__ import annotations
 
@@ -15,7 +12,8 @@ from livetrade import bars as live_bars
 
 
 class _Client:
-    """Each call sleeps; in series three take 3x as long as in parallel."""
+    """Each call sleeps, so a serial run takes three times as long as a concurrent one.
+    """
 
     def __init__(self, delay=0.15, fail=()):
         self.delay, self.fail, self.calls = delay, set(fail), []
@@ -55,7 +53,7 @@ async def test_the_symbols_are_fetched_concurrently(patched):
 
 @pytest.mark.asyncio
 async def test_one_symbol_failing_does_not_lose_the_others(patched):
-    """A partial outage must not become a total one."""
+    """One failing symbol does not lose the others."""
     failed = DEFAULT_CONFIG.symbols[0]
     patched(_Client(delay=0.01, fail=[failed]))
     out = await live_bars.fetch_bars(DEFAULT_CONFIG)
@@ -65,7 +63,9 @@ async def test_one_symbol_failing_does_not_lose_the_others(patched):
 
 @pytest.mark.asyncio
 async def test_every_symbol_failing_returns_empty_rather_than_raising():
-    """The cycle checks `if not bars` and abstains; it must not see an exception."""
+    """If every symbol fails the result is empty, not an exception; the cycle then
+    abstains.
+    """
     class AllFail(_Client):
         async def get_candles_range(self, symbol, timeframe, start, end):
             raise RuntimeError('venue down')

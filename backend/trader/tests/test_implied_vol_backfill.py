@@ -1,23 +1,8 @@
-"""Reconstructing the strike ladder's implied sigma from history.
+"""Tests for rebuilding the strike-ladder implied sigma from history.
 
-**Why this dataset matters more than its size suggests.** The barrier framing
-says the displacement `x` is known exactly and `sigma_remaining` is the ONLY
-quantity requiring a forecast. Every volatility feature in `core/features.py`
-is backward-looking realised vol. The KXBTCD/KXETHD/KXSOLD strike ladders
-invert to a FORWARD-looking sigma — the market's own estimate of the one
-unknown — at R² > 0.95.
-
-It was in the plan as a feature family and marked "already recorded live",
-which was wrong: `venue_implied_vol` held 1,256 rows over 3 days, BTC only.
-Three days cannot train anything. The ladders themselves reach January, so the
-history is recoverable; this rebuilds it.
-
-The inversion is NOT reimplemented here. `scripts/record_implied_vol.implied_sigma`
-is the one definition and the live path uses it, so a second copy would be two
-definitions that agree until they don't — the same argument as one `decide()`.
-What is new is assembling the cross-section: the live recorder reads every
-strike's CURRENT quote at once, while history arrives as one tick series per
-strike that has to be aligned onto a common instant.
+The inversion is reused from `scripts/record_implied_vol.implied_sigma`, so live
+and backfill share one definition. What is new is the cross-section: history is
+one tick series per strike, aligned here onto a common instant.
 """
 
 from __future__ import annotations
@@ -43,9 +28,8 @@ def _snap(ts_ms, bid, ask):
 
 
 def test_the_cross_section_is_the_last_quote_at_or_before_the_instant():
-    """A book is a step function: the state at time T is the last tick at or
-    before T, not the nearest one. Taking the nearest would let a quote from
-    AFTER the instant inform it, which is lookahead."""
+    """The cross-section takes the last quote at or before the instant, never a later one.
+    """
     series = {
         70000.0: [_snap(1_000, 30, 31), _snap(5_000, 40, 41)],
         71000.0: [_snap(2_000, 20, 21), _snap(9_000, 25, 26)],
@@ -60,8 +44,7 @@ def test_a_strike_with_no_tick_yet_is_omitted_rather_than_guessed():
 
 
 def test_a_one_sided_quote_is_omitted_because_it_has_no_mid():
-    """The inversion needs P(above); a single side does not give one, and
-    inventing the other side would fabricate a probability."""
+    """A one-sided quote has no mid, so its strike is omitted."""
     series = {70000.0: [_snap(1_000, 30, None)],
               71000.0: [_snap(1_000, 20, 21)]}
     assert [s for s, _ in cross_section(_packed(series), at_ms=2_000)] == [71000.0]
@@ -80,8 +63,7 @@ def test_probabilities_come_back_as_fractions_not_cents():
 
 
 def test_sample_instants_walk_the_quarter_hour_grid_inside_the_ladder():
-    """Sigma is wanted where the 15-minute windows decide, so the samples sit
-    on the same grid rather than on an arbitrary cadence."""
+    """Samples sit on the quarter-hour grid where the windows decide."""
     o = dt.datetime(2026, 7, 29, 20, 0, tzinfo=UTC)
     c = dt.datetime(2026, 7, 29, 21, 0, tzinfo=UTC)
     got = sample_instants(o, c, minutes=15)
@@ -90,17 +72,14 @@ def test_sample_instants_walk_the_quarter_hour_grid_inside_the_ladder():
 
 
 def test_sample_instants_excludes_the_close_itself():
-    """At the close there is no time left, so sigma is undefined — dividing by
-    sqrt(0) minutes."""
+    """The close itself is excluded: no time remains, so sigma is undefined."""
     o = dt.datetime(2026, 7, 29, 20, 0, tzinfo=UTC)
     c = dt.datetime(2026, 7, 29, 20, 30, tzinfo=UTC)
     assert c not in sample_instants(o, c, minutes=15)
 
 
 def test_all_three_assets_have_a_ladder_series():
-    """The live recorder only reads KXBTCD. ETH and SOL ladders exist and
-    cross_asset was the strongest measured feature group, so leaving them out
-    would waste the cheapest part of this dataset."""
+    """All three assets have a ladder series."""
     assert set(LADDER_SERIES.values()) == {'BTC-USD', 'ETH-USD', 'SOL-USD'}
 
 
@@ -112,18 +91,12 @@ def test_the_inversion_itself_is_reused_not_reimplemented():
 
 # --- fetching a ladder's cross-section concurrently -------------------------
 #
-# The first live run measured 1,050 requests in ~6 minutes: 2.8 req/s against
-# a budget of 8. A ladder's ~25 strike books were fetched one at a time, so
-# the run was bound by round-trip latency and not by the rate limit — the
-# identical finding as the window collector, which went from 26h to 13.3h on
-# the same fix. At 14,868 ladders the serial version is a 59-hour job.
-#
-# Concurrency must not change WHAT is collected, only how fast. These two
-# tests pin the part that could silently drift: a dict keyed by strike, with
-# a strike omitted rather than guessed when its book comes back empty.
+# Strikes are fetched concurrently because the run is bound by round-trip
+# latency, not the rate limit. Concurrency must not change what is collected.
 
 class _FakeApi:
-    """Answers a book for every strike but one, and records concurrency."""
+    """Answers a book for every strike except those in `empty_for`, and records requests.
+    """
 
     def __init__(self, empty_for=()):
         self.empty_for = set(empty_for)
@@ -143,8 +116,7 @@ def _strikes():
 
 
 def test_fetching_a_cross_section_concurrently_matches_the_serial_result():
-    """Ordering must not leak into the data. One worker and eight workers
-    describe the same book, or the speed-up changed the measurement."""
+    """One worker and eight workers return the same cross-section."""
     from research.collect.implied_vol_backfill import fetch_rungs
     one = fetch_rungs(_FakeApi(), _strikes(), 0, 1, workers=1)
     many = fetch_rungs(_FakeApi(), _strikes(), 0, 1, workers=8)
@@ -153,36 +125,28 @@ def test_fetching_a_cross_section_concurrently_matches_the_serial_result():
 
 
 def test_a_strike_whose_book_is_empty_is_omitted_not_stored_blank():
-    """`empty` and `error` are never conflated anywhere else in this
-    collection, and a strike with no book is not a strike priced at zero."""
+    """A strike with an empty book is omitted, not stored as zero."""
     from research.collect.implied_vol_backfill import fetch_rungs
     got = fetch_rungs(_FakeApi(empty_for={'T71000'}), _strikes(), 0, 1, workers=4)
     assert set(got) == {70000.0, 72000.0}
 
 
 def test_every_strike_is_asked_for_exactly_once():
-    """A retry loop inside a thread pool is the easy way to double-spend the
-    rate budget without noticing."""
+    """Each strike is requested exactly once."""
     from research.collect.implied_vol_backfill import fetch_rungs
     api = _FakeApi()
     fetch_rungs(api, _strikes(), 0, 1, workers=4)
     assert sorted(api.asked) == ['T70000', 'T71000', 'T72000']
 
 
-# --- sampling density is free, and the coarse grid was throwing it away -----
+# --- sampling density ------------------------------------------------------
 #
-# Measured on the first 150 ladders: 89 fits, and `minutes_to_close` took
-# exactly two values, 5.0 and 20.0. That is not what the ladder offers — it is
-# what a 15-minute step across a 20-minute fetch window asks for. Every
-# strike's tick series is already fetched and in memory for the whole window,
-# so each extra sample instant costs ZERO additional requests.
-#
-# The finer grid is also the correct one rather than merely a denser one: the
-# trader decides at offsets 3, 6, 9 and 12 of a fifteen-minute window, so what
-# the feature needs is sigma at several minutes-to-close, not one.
+# Each strike's tick series is already fetched for the whole window, so extra
+# sample instants cost no requests. The trader decides at several offsets, so
+# the feature needs sigma at several minutes-to-close.
 
 def test_a_finer_sample_step_asks_more_questions_of_the_same_fetched_books():
-    """Four instants across a 20-minute window instead of two, for free."""
+    """A finer step samples more instants from the same fetched books."""
     o = dt.datetime(2026, 7, 29, 20, 40, tzinfo=UTC)
     c = dt.datetime(2026, 7, 29, 21, 0, tzinfo=UTC)
     coarse = sample_instants(o, c, minutes=15)
@@ -192,39 +156,28 @@ def test_a_finer_sample_step_asks_more_questions_of_the_same_fetched_books():
 
 
 def test_the_sample_step_is_configurable_and_defaults_below_the_window():
-    """A step at or above TAIL_MINUTES collapses the grid to one instant, which
-    is how the two-value histogram happened. The default must stay under it."""
+    """`SAMPLE_MINUTES` stays below `TAIL_MINUTES`, or the grid collapses to one instant.
+    """
     from research.collect import implied_vol_backfill as m
     assert m.SAMPLE_MINUTES < m.TAIL_MINUTES
 
 
 def test_the_finer_grid_still_excludes_the_close():
-    """sqrt(0) minutes remaining is not a sigma at any step size."""
+    """The finer grid still excludes the close."""
     o = dt.datetime(2026, 7, 29, 20, 40, tzinfo=UTC)
     c = dt.datetime(2026, 7, 29, 21, 0, tzinfo=UTC)
     assert c not in sample_instants(o, c, minutes=1)
 
 
-# --- the fetch window must START before the first instant -------------------
+# --- the fetch window must start before the first instant -------------------
 #
-# Measured, three ladders, at the same instant: a narrow fetch ending AT the
-# instant found 6 / 4 / 10 two-sided rungs; the collector's wide fetch, whose
-# range STARTED at that instant, found 0 / 0 / 0 -- with the full span present
-# and 355-868 ticks per strike, so nothing was truncated.
-#
-# `cross_section` is right: a book is a step function and the state at T is the
-# last tick AT OR BEFORE T. The bug is asking about T when T is the first
-# moment fetched, where by construction almost nothing precedes it. The first
-# instant was therefore empty EVERY time, which is why `minutes_to_close` held
-# only two values and the yield sat near 3%.
-#
-# Separately, rung count grows with time to close until the ladder's open:
-# measured 4/2/5 rungs at 5 minutes, 10/7/14 at 30, and a hard 0 at 60 because
-# an hourly ladder does not exist yet. So the sampled region belongs in the
-# 20-50 minute band, not the last 20.
+# A book is a step function, so the state at T is the last tick at or before T.
+# If the fetch starts at T, nothing precedes T and the first instant is empty.
+# Rung count grows with time to close until the ladder opens, so samples sit in
+# the 20-50 minute band before the close.
 
 def test_the_fetch_window_starts_strictly_before_the_first_sampled_instant():
-    """Every instant must have history behind it, the first one included."""
+    """The fetch starts strictly before the first sampled instant."""
     from research.collect.implied_vol_backfill import windows_for
     opened = dt.datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
     closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
@@ -234,8 +187,7 @@ def test_the_fetch_window_starts_strictly_before_the_first_sampled_instant():
 
 
 def test_the_sampled_instants_sit_in_the_band_where_rungs_exist():
-    """20-50 minutes to close fitted 23 of 24 measured cases; the last five
-    minutes fitted 2 of 3 and 60 minutes never, the ladder being unopened."""
+    """Sampled instants fall between 5 and 50 minutes before the close."""
     from research.collect.implied_vol_backfill import windows_for
     opened = dt.datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
     closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
@@ -247,8 +199,7 @@ def test_the_sampled_instants_sit_in_the_band_where_rungs_exist():
 
 
 def test_a_ladder_that_opened_late_is_clamped_not_sampled_before_it_existed():
-    """No book exists before the ladder opens, and asking anyway spends
-    requests to collect zeros."""
+    """A ladder that opened late is not sampled before it opened."""
     from research.collect.implied_vol_backfill import windows_for
     closes = dt.datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
     opened = closes - dt.timedelta(minutes=25)
@@ -264,17 +215,10 @@ def test_the_close_itself_is_never_sampled():
     assert closes not in instants
 
 
-# --- the stride must select from ALL ladders, not from the survivors --------
+# --- the stride selects from all ladders, not from the unfinished ones -------
 #
-# Observed: a run reported "2,480 to do", completed 602, and on resume reported
-# "2,179 to do" -- 301 MORE than the 1,878 that should have remained. The
-# stride was applied after filtering out the finished ladders, so it re-sampled
-# the survivors and pulled in ladders the first pass had deliberately skipped.
-#
-# Nothing collected that way is wrong, but the sampling grid stops being the
-# every-Nth-hour grid it claims to be, and the scope changes on every restart.
-# A stride is a statement about which population is being sampled, so it has
-# to be evaluated against the population.
+# Applying the stride after removing finished ladders re-samples the remainder
+# and changes the scope on every restart.
 
 def test_the_stride_selects_the_same_ladders_regardless_of_what_is_done():
     from research.collect.implied_vol_backfill import select_ladders
@@ -282,12 +226,12 @@ def test_the_stride_selects_the_same_ladders_regardless_of_what_is_done():
     fresh = select_ladders(every, done=set(), stride=2)
     partly = select_ladders(every, done={'L000', 'L002'}, stride=2)
     assert fresh == ['L000', 'L002', 'L004', 'L006', 'L008']
-    # the same target set, minus what is finished -- never a new selection
+    # The same target set, minus what is finished. Never a new selection.
     assert partly == ['L004', 'L006', 'L008']
 
 
 def test_resuming_never_adds_a_ladder_the_stride_had_skipped():
-    """The 301-ladder surprise, asserted away."""
+    """Resuming never adds a ladder the stride skipped."""
     from research.collect.implied_vol_backfill import select_ladders
     every = [f'L{i:03d}' for i in range(100)]
     target = set(select_ladders(every, done=set(), stride=3))
@@ -302,7 +246,9 @@ def test_a_stride_of_one_is_every_ladder():
 
 
 def test_max_ladders_caps_after_the_stride_not_before():
-    """A cap applied first would collapse the stride to the earliest ladders."""
+    """`max_ladders` applies after the stride, so the stride is not collapsed to the
+    earliest ladders.
+    """
     from research.collect.implied_vol_backfill import select_ladders
     every = [f'L{i:03d}' for i in range(20)]
     got = select_ladders(every, done=set(), stride=4, max_ladders=3)
@@ -310,7 +256,8 @@ def test_max_ladders_caps_after_the_stride_not_before():
 
 
 def test_ladders_are_ordered_by_close_time_not_ticker_text():
-    """Ticker text sorts by month name, so April came before August."""
+    """Ladders are ordered by close time, not ticker text (which sorts by month name).
+    """
     import datetime as dt
     from research.collect.implied_vol_backfill import select_ladders
     utc = dt.timezone.utc

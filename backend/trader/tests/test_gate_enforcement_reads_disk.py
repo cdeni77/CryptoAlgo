@@ -1,22 +1,8 @@
-"""`--require-gates` must ask about the artifact being TRADED.
+"""Tests that `--require-gates` checks the artifact actually installed.
 
-It read `history().iloc[0]` — the newest promotion ATTEMPT. That diverges from
-the artifact on disk in two ordinary cases, both of which happened on
-2026-09-16:
-
-  * a promotion that FAILS installs nothing and leaves the previous, passing
-    model trading. Under the old check the next restart would refuse to start
-    the loop — so one failed Sunday retrain could take the trader down at the
-    next host reboot, silently, for as long as nobody looked.
-  * a ROLLBACK deliberately writes no ledger entry at all, because the ledger is
-    the multiple-testing denominator and a rollback is not a trial. The newest
-    entry then describes an artifact that is no longer installed.
-
-The question the gate asks is "did the model I am about to trade pass?", and
-that is a property of the file. Identified by CONTENT: `promote` stages each
-candidate under `models/.staging/<version>/` and renames it into place, so the
-installed file is byte-identical to exactly one of them, and no new bookkeeping
-is needed.
+The newest ledger entry can differ from the installed file: a failed promotion
+installs nothing, and a rollback writes no entry. The installed file is
+identified by content, since it is byte-identical to one staged candidate.
 """
 
 from __future__ import annotations
@@ -59,17 +45,17 @@ def test_it_finds_the_installed_artifact_by_content(models):
 
 
 def test_a_failed_later_attempt_does_not_block_a_passing_artifact(models):
-    """The safety property. Sunday's retrain fails, installs nothing, and the
-    trader must still start on the model that IS deployed."""
+    """A failed later promotion does not stop the trader starting on the passing installed
+    model.
+    """
     _artifact(models, '20260101T000000Z', b'good', passed=True)
     _artifact(models, '20260201T000000Z', b'bad', passed=False, installed=False)
     (models / 'forecast.joblib').write_bytes(b'good')
-    live_artifact._refuse_if_blocked()          # must not raise
+    live_artifact._refuse_if_blocked()  # must not raise
 
 
 def test_a_forced_installed_artifact_is_still_refused(models):
-    """The check must not become toothless: a model force-installed with
-    failing gates is exactly what `--require-gates` exists to stop."""
+    """A force-installed artifact that failed its gates is still refused."""
     _artifact(models, '20260101T000000Z', b'forced', passed=False, forced=True)
     (models / 'forecast.joblib').write_bytes(b'forced')
     with pytest.raises(SystemExit):
@@ -77,8 +63,7 @@ def test_a_forced_installed_artifact_is_still_refused(models):
 
 
 def test_an_unrecognised_artifact_falls_back_to_the_newest_attempt(models):
-    """A file matching nothing staged is not evidence of anything, so the old
-    conservative behaviour stands rather than silently passing."""
+    """A file that matches no staged candidate falls back to the newest ledger entry."""
     _artifact(models, '20260101T000000Z', b'known', passed=False, forced=True)
     (models / 'forecast.joblib').write_bytes(b'mystery')
     assert live_artifact._installed_version() is None

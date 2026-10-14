@@ -1,24 +1,11 @@
-"""Inverting a Kalshi strike ladder back to the sigma that priced it.
+"""Tests for `implied_sigma`, which inverts a Kalshi strike ladder to the sigma that priced
+it.
 
-`KXBTCD` is a threshold ladder — "BTC above K at time T" at nine or so strikes
-on the same expiry — and the whole ladder is priced off one volatility. Under
-the same zero-drift barrier model this project already uses,
-
-    P(S_T > K) = F( ln(S/K) / (sigma * sqrt(t)) )
-
-so applying the inverse CDF to every quote makes the ladder LINEAR in
-`ln(K/S)`, with slope `-1 / (sigma * sqrt(t))`. One regression across the
-strikes recovers sigma, and its R^2 says whether the ladder was internally
-consistent enough to believe — measured on the existing archive, R^2 > 0.99.
-
-**Why this matters more than another feature.** The barrier framing says the
-displacement is known exactly and `sigma_remaining` is the only forecast
-required. Everything in `core/vol.py` estimates it from PAST returns. This is
-the market's own FORWARD estimate of the same quantity, published free, and
-nothing in the model has ever seen it.
-
-The tests below price a synthetic ladder from a known sigma and require the
-inversion to return it.
+Under the zero-drift barrier model, P(S_T > K) = F(ln(S/K) / (sigma * sqrt(t))).
+Applying the inverse CDF makes the ladder linear in ln(K/S) with slope
+-1 / (sigma * sqrt(t)). One regression recovers sigma, and R^2 shows whether the
+ladder is consistent. This is the market's forward estimate of sigma, while
+`core/vol.py` uses past returns.
 """
 
 from __future__ import annotations
@@ -33,12 +20,10 @@ from scripts.record_implied_vol import implied_sigma
 
 def ladder(sigma_per_min: float, minutes: float, spot: float,
            zs=(-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2)):
-    """Quotes a zero-drift model would post, on strikes spaced in SIGMA.
+    """Quotes a zero-drift model would post, with strikes spaced in sigma units.
 
-    Spacing in fixed basis points is what a naive test does and it is not what
-    a venue lists: at 60 minutes and 3.5bp/min a +/-150bp ladder is +/-5.5
-    sigma, so the outer rungs price at 0 and 1 and carry no slope at all. A
-    real ladder brackets the money, which is the case worth testing.
+    Fixed basis-point spacing puts the outer rungs at 0 and 1, where they carry no
+    slope. A real ladder brackets the money.
     """
     from statistics import NormalDist
     normal = NormalDist()
@@ -54,7 +39,7 @@ def test_it_recovers_the_sigma_that_priced_the_ladder():
 
 
 def test_it_recovers_sigma_at_a_different_horizon():
-    """The sqrt(t) scaling has to be right, not just the slope."""
+    """The sqrt(t) scaling is correct at another horizon."""
     fit = implied_sigma(ladder(0.0005, 12.0, 60000.0), 12.0)
     assert fit.sigma_per_min == pytest.approx(0.0005, rel=1e-6)
 
@@ -75,12 +60,13 @@ def test_a_noisy_ladder_still_fits_but_reports_a_lower_r2():
 
 
 def test_degenerate_quotes_are_refused_rather_than_fitted():
-    """All-0 or all-1 quotes carry no slope; a number here would be invented."""
+    """All-0 or all-1 quotes carry no slope, so no sigma is returned."""
     assert implied_sigma([(70000.0, 1.0), (75000.0, 1.0), (80000.0, 1.0)], 60.0) is None
 
 
 def test_far_rungs_are_dropped_rather_than_allowed_to_dominate():
-    """A 1c rung is mostly tick noise once the inverse CDF is applied."""
+    """Far rungs are dropped: near 0 or 1 they are mostly tick noise after the inverse CDF.
+    """
     rungs = ladder(0.00035, 60.0, 77200.0)
     with_tails = rungs + [(60000.0, 0.999), (95000.0, 0.001)]
     assert implied_sigma(with_tails, 60.0).n_strikes == len(rungs)
@@ -95,7 +81,8 @@ def test_zero_minutes_remaining_is_refused_not_divided_by():
 
 
 def test_an_inverted_ladder_is_refused():
-    """Price RISING with strike is not a threshold ladder. Sigma would be < 0."""
+    """A ladder whose price rises with strike is refused, since sigma would be negative.
+    """
     rungs = [(k, p) for k, p in ladder(0.00035, 60.0, 77200.0)]
     flipped = [(k, p) for (k, _), (_, p) in zip(rungs, reversed(rungs))]
     assert implied_sigma(flipped, 60.0) is None

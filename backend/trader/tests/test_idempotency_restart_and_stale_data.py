@@ -1,23 +1,7 @@
-"""PROPOSED. One entry per (symbol, window) across a restart; stale data refused.
+"""Tests for one entry per (symbol, window) across restarts, and refusal of stale or bad
+data.
 
-Drop into `backend/trader/tests/`.
-
-`scripts/live.py` is 19.0% covered (measured; 82 of 431 statements) and
-`tests/test_live.py` tests only `current_window`, `choose_offset`, three module
-constants and the argparse defaults. The invariants that stop a restart loop
-from placing the same bet twelve times are all in the uncovered part.
-
-`core/pg_writer.py:603 entries_for_window` and `:527 open_position` carry the
-whole restart story in their docstrings — including that the process *did* die
-after putting a duplicate order on the wire and `restart: unless-stopped`
-brought it back to do it again. None of that is tested. These tests run against
-a throwaway SQLite file, so no Postgres and no network.
-
-Also covered here: `test_live.py::test_place_orders_requires_live_mode` and
-`::test_forcing_past_the_gates_requires_a_reason` assert only that the *parser
-accepts* the dangerous combination, with a comment saying `main()` rejects it.
-`scripts/live.py:563-566` is where the rejection lives and it never executes in
-the suite.
+Runs against a throwaway SQLite file, so no Postgres or network is needed.
 """
 
 from __future__ import annotations
@@ -36,10 +20,8 @@ WDT = datetime(2026, 8, 23, 0, 30, tzinfo=timezone.utc)
 
 @pytest.fixture
 def writer(tmp_path):
-    """A real PgWriter over a throwaway SQLite file.
-
-    `_run_migrations` already tolerates a non-Postgres dialect, so this exercises
-    the actual ORM and the actual uniqueness logic rather than a fake.
+    """A real PgWriter over a throwaway SQLite file, so the real ORM and uniqueness logic
+    run.
     """
     from core.pg_writer import PgWriter
 
@@ -67,12 +49,8 @@ def position_fields(**over):
 # ------------------------------------------------ duplicate-order prevention
 
 def test_a_second_position_for_the_same_symbol_and_window_is_refused(writer):
-    """Not an IntegrityError that kills the loop — a None the caller can see.
-
-    The failure this is designed against is documented in `open_position`: the
-    bare insert raised, `scripts/live.py`'s loop caught only KeyboardInterrupt,
-    the process died *after* the duplicate order was on the wire, and the
-    container restarted it to do the same thing again.
+    """A duplicate position returns None instead of raising, so the loop does not die after
+    the order is sent.
     """
     first = writer.open_position(**position_fields())
     assert first is not None
@@ -83,7 +61,7 @@ def test_a_second_position_for_the_same_symbol_and_window_is_refused(writer):
 
 
 def test_a_second_ticket_for_the_same_symbol_and_window_returns_the_first(writer):
-    """A ticket exists from the moment an order is sent, so it has to dedupe too."""
+    """A duplicate ticket returns the first one."""
     fields = dict(symbol='BTC-USD', window_open=WDT,
                   settle_time=WDT + timedelta(minutes=15), offset_minutes=9,
                   side=Side.UP.value, contracts=3, limit_price=0.88,
@@ -96,8 +74,7 @@ def test_a_second_ticket_for_the_same_symbol_and_window_returns_the_first(writer
 
 
 def test_another_symbol_in_the_same_window_is_not_blocked(writer):
-    """The key is (symbol, window). Blocking on the window alone would abstain on
-    two of three symbols every cycle."""
+    """The key is (symbol, window), so another symbol in the same window is allowed."""
     assert writer.open_position(**position_fields(symbol='BTC-USD')) is not None
     assert writer.open_position(**position_fields(symbol='ETH-USD')) is not None
     assert len(writer.open_positions()) == 2
@@ -106,11 +83,7 @@ def test_another_symbol_in_the_same_window_is_not_blocked(writer):
 # ------------------------------------------------------- restart recovery
 
 def test_exposure_survives_a_process_restart(writer, tmp_path):
-    """The window does not restart when the process does.
-
-    A fresh `PgWriter` over the same file must report the committed entry, and
-    `decide` must then refuse — which is exactly the sequence
-    `scripts/live.py:556-561` performs at the top of every cycle.
+    """A fresh PgWriter over the same file sees the committed entry, and `decide` refuses.
     """
     from core.pg_writer import PgWriter
 
@@ -130,8 +103,7 @@ def test_exposure_survives_a_process_restart(writer, tmp_path):
 
 
 def test_a_ticket_alone_counts_as_an_entry_after_a_restart(writer, tmp_path):
-    """A crash between sending the order and booking the position leaves a ticket
-    and no position. That must still block."""
+    """A ticket with no position still blocks the window after a restart."""
     from core.pg_writer import PgWriter
 
     writer.write_ticket(symbol='BTC-USD', window_open=WDT,
@@ -150,7 +122,7 @@ def test_a_ticket_alone_counts_as_an_entry_after_a_restart(writer, tmp_path):
 
 
 def test_a_skipped_ticket_does_not_block_the_window(writer):
-    """An abstention is not an entry."""
+    """A skipped ticket is not an entry."""
     writer.write_ticket(symbol='BTC-USD', window_open=WDT,
                         settle_time=WDT + timedelta(minutes=15), offset_minutes=9,
                         side=Side.UP.value, contracts=0, limit_price=0.88,
@@ -162,7 +134,7 @@ def test_a_skipped_ticket_does_not_block_the_window(writer):
 
 
 def test_the_previous_windows_entry_does_not_block_this_one(writer):
-    """Exposure is per window. Leaking it forward abstains forever."""
+    """Exposure is per window; the previous window's entry does not block this one."""
     writer.open_position(**position_fields(
         window_open=WDT - timedelta(minutes=15),
         settle_time=WDT))
@@ -188,9 +160,7 @@ def _run_main_with_argv(argv):
 
 
 def test_paper_mode_with_place_orders_is_refused_by_main():
-    """`test_live.py` asserts the *parser accepts* `--mode paper --place-orders`
-    and comments that main() rejects it. That rejection is `scripts/live.py:563`
-    and it never executes in the suite. Here it does."""
+    """`main()` refuses `--mode paper --place-orders`."""
     from scripts.live import build_parser
 
     args = build_parser().parse_args(['--mode', 'paper', '--place-orders'])
@@ -200,15 +170,13 @@ def test_paper_mode_with_place_orders_is_refused_by_main():
 
 
 def test_forcing_past_the_gates_without_a_reason_is_refused_by_main():
-    """`scripts/live.py:565`. The existing test asserts only that the parser
-    allows the pair."""
+    """`main()` refuses `--force` without `--reason`."""
     with pytest.raises(SystemExit, match='needs --reason'):
         _run_main_with_argv(['live', '--force'])
 
 
 def test_a_quote_that_is_not_active_is_not_tradeable():
-    """A settled or paused market still returns a book. Trading it is trading a
-    price that cannot be filled."""
+    """A market that is not active is not tradeable, even if it still returns a book."""
     from data_collection.kalshi_client import Quote
 
     live = Quote(ticker='T', yes_bid=0.19, yes_ask=0.20, no_bid=0.80, no_ask=0.81,
@@ -223,8 +191,7 @@ def test_a_quote_that_is_not_active_is_not_tradeable():
 
 
 def test_a_one_sided_book_is_not_tradeable():
-    """The measured book was 0.19/0.20. A missing side is a parse failure or an
-    empty market, and both used to read as a zero price."""
+    """A one-sided book is not tradeable."""
     from data_collection.kalshi_client import Quote
 
     for yes_bid, yes_ask in ((None, 0.20), (0.19, None), (None, None)):
@@ -235,8 +202,7 @@ def test_a_one_sided_book_is_not_tradeable():
 
 
 def test_the_depth_of_a_side_is_read_from_that_side():
-    """`decide` prefers a measured depth over `max_stake_dollars`, so reading the
-    wrong side's size caps the wrong order."""
+    """Each side's depth is read from that side, since `decide` caps the stake on it."""
     from data_collection.kalshi_client import Quote
 
     quote = Quote(ticker='T', yes_bid=0.19, yes_ask=0.20, no_bid=0.80, no_ask=0.81,

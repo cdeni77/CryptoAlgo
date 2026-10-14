@@ -1,13 +1,7 @@
-"""The live implied-vol recorder was BTC-only; the venue is not.
+"""Tests that the live implied-vol recorder covers BTC, ETH and SOL.
 
-`record_implied_vol.py` hardcoded `SERIES = 'KXBTCD'` / `SYMBOL = 'BTC-USD'`,
-so ETH and SOL carried NaN for all five implied-vol features on every live
-cycle. The venue serves `KXETHD` and `KXSOLD` with the same shape — 200 open
-markets each, every one carrying a strike, `strike_type=greater` — and the
-BACKFILL already covers all three (BTC 22,248 rows, ETH 5,286, SOL 3,110).
-
-So live was the half that lagged: the model was fitted against ETH/SOL implied
-vol that existed, and scored live against NaN.
+The venue serves `KXBTCD`, `KXETHD` and `KXSOLD` with the same shape, and the
+backfill covers all three, so live must too.
 """
 from __future__ import annotations
 
@@ -32,10 +26,10 @@ def test_all_three_crypto_ladders_are_recorded():
 
 
 def test_rows_carry_the_symbol_of_the_series_they_came_from():
-    """The bug this replaces stamped every row 'BTC-USD' regardless."""
+    """Each row carries the symbol of the series it came from."""
     now = dt.datetime(2026, 8, 28, 19, 0, tzinfo=dt.timezone.utc)
     close = (now + dt.timedelta(minutes=120)).isoformat()
-    # A monotone ladder around a 3,200 spot: deeper strikes are cheaper.
+    # A monotone ladder around a 3,200 spot: higher strikes are cheaper.
     markets = [_market('KXETHD-X', s, p - 0.01, p + 0.01, close)
                for s, p in ((3100.0, 0.90), (3150.0, 0.75), (3200.0, 0.50),
                             (3250.0, 0.25), (3300.0, 0.10))]

@@ -1,10 +1,7 @@
-"""Storage ingest invariants.
+"""Tests for storage ingest invariants.
 
-`data_collection.ingest` is the only door into the database, and the only place
-that sets `quality`. Records default to `DataQuality.UNVALIDATED`, so a column
-cannot claim data was checked when nothing checked it.
-
-These tests pin the properties that stop that from recurring.
+`data_collection.ingest` is the only path into the database and the only place
+that sets `quality`. Records default to `DataQuality.UNVALIDATED`.
 """
 
 from __future__ import annotations
@@ -44,10 +41,7 @@ def _bar(hour: int, close: float = 100.0) -> OHLCVBar:
 
 
 def test_quality_defaults_to_unvalidated():
-    """The default must not claim the data was checked.
-
-    This is what let hand-constructed records masquerade as validated ones.
-    """
+    """The default quality does not claim the data was checked."""
     assert _bar(0).quality is DataQuality.UNVALIDATED
 
 
@@ -62,7 +56,7 @@ def test_ingest_stamps_quality_and_venue(ingestor):
 
 def test_inconsistent_bar_is_rejected(ingestor):
     broken = _bar(20)
-    broken.high, broken.low = 90.0, 110.0        # high below low
+    broken.high, broken.low = 90.0, 110.0  # high below low
 
     result = ingestor.ingest_bars([broken], venue='coinbase')
 
@@ -71,12 +65,7 @@ def test_inconsistent_bar_is_rejected(ingestor):
 
 
 def test_rejected_bar_does_not_poison_the_next_comparison(ingestor):
-    """A dropped bar must not become the reference for the following bar.
-
-    The previous implementation advanced `prev_bar` unconditionally, so one
-    corrupt record became the baseline for the next gap and price-jump check and
-    cascaded into rejecting healthy bars after it.
-    """
+    """A rejected bar is not used as the reference for the next bar's checks."""
     corrupt = _bar(31)
     corrupt.high, corrupt.low = 1.0, 2.0
 
@@ -93,7 +82,7 @@ def test_nothing_reaches_storage_unvalidated(ingestor, database):
 
 
 def test_venue_is_persisted_per_row(ingestor, database):
-    """The backfill blends venues on purpose; the boundary must be recoverable."""
+    """Venue is stored per row, so blended backfill sources stay recoverable."""
     ingestor.ingest_bars([_bar(i) for i in range(10)], venue='coinbase')
     ingestor.ingest_bars([_bar(i, 200.0) for i in range(50, 55)], venue='binance')
 
@@ -108,15 +97,9 @@ def test_venue_is_persisted_per_row(ingestor, database):
     assert counts == {'coinbase': 10, 'binance': 5}
 
 
-
 def test_two_venues_coexist_for_the_same_bar(tmp_path):
-    """Both venues' bars for the same hour must survive. Neither may replace the other.
-
-    The unique key was `(symbol, timeframe, event_time)` with venue outside it,
-    against `INSERT OR REPLACE`. So writing a Coinbase bar and then a Binance bar
-    for the same instrument and hour silently discarded the first — and the
-    cross-venue features (basis, lead-lag) need exactly that pair, so they would
-    have produced no rows at all while the venue column sat there looking correct.
+    """Bars from two venues for the same instant both survive; the unique key includes
+    venue.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -147,11 +130,7 @@ def test_two_venues_coexist_for_the_same_bar(tmp_path):
 
 
 def test_the_same_venue_still_deduplicates(tmp_path):
-    """Venue widens the key; it must not disable de-duplication within a venue.
-
-    Re-running a backfill re-writes the same bars, and each should update its row
-    rather than accumulate a duplicate.
-    """
+    """Within one venue, a rewritten bar updates its row instead of duplicating it."""
     from datetime import datetime, timedelta, timezone
 
     from data_collection.models import DataQuality, OHLCVBar
@@ -176,12 +155,9 @@ def test_the_same_venue_still_deduplicates(tmp_path):
 
 
 def test_a_legacy_database_is_rebuilt_onto_the_venue_key(tmp_path):
-    """An existing database keyed without venue must be migrated, not left broken.
+    """A database keyed without venue is rebuilt onto the venue key.
 
     SQLite cannot alter a UNIQUE constraint, so `initialize()` rebuilds the table.
-    Rows already collapsed by the old key are unrecoverable — re-running the
-    backfill is the only way to get the second venue back — but from the rebuild
-    onward both venues coexist.
     """
     import sqlite3
     from datetime import datetime, timedelta, timezone
@@ -192,7 +168,7 @@ def test_a_legacy_database_is_rebuilt_onto_the_venue_key(tmp_path):
     path = tmp_path / 'legacy.db'
     stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-    # The old schema, verbatim in the part that matters.
+    # The old schema, as it was in the part that matters.
     con = sqlite3.connect(str(path))
     con.execute("""
         CREATE TABLE ohlcv (
@@ -223,7 +199,7 @@ def test_a_legacy_database_is_rebuilt_onto_the_venue_key(tmp_path):
     rows = _bars_at(db, 'BIP', stamp)
     assert len(rows) == 1 and rows[0]['venue'] == 'coinbase'
 
-    # And the second venue can now be written alongside it.
+    # The second venue can now be written beside it.
     db.insert_ohlcv(OHLCVBar(
         symbol='BIP', timeframe='1h', venue='binance',
         event_time=stamp, available_time=stamp + timedelta(hours=1),
@@ -247,12 +223,7 @@ def _bars_at(db, symbol: str, stamp) -> list[dict]:
 
 
 def test_no_module_imports_ccxt():
-    """The dependency is gone, not merely unused.
-
-    CCXT served purposes that are all gone or native now: spot bars come from
-    Coinbase (`coinbase_spot`), and the perp funding and open-interest paths it
-    once fed have been deleted.
-    """
+    """No module imports CCXT; spot bars come from the native Coinbase client."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
@@ -265,8 +236,7 @@ def test_no_module_imports_ccxt():
             offenders.append(str(path.relative_to(root)))
     assert not offenders, f'CCXT survives in: {offenders}'
 
-    # Both requirement files. The API declared ccxt and never imported it, which
-    # is how a dependency outlives every use of it.
+    # Both requirement files must also be free of ccxt.
     for requirements in (root / 'requirements.txt',
                          root.parent / 'api' / 'requirements.txt'):
         if not requirements.exists():
@@ -278,15 +248,8 @@ def test_no_module_imports_ccxt():
         assert not declared, f'{requirements.name} still declares {declared}'
 
 
-
 def test_the_minute_bar_dataset_rejects_a_flagged_row_by_default():
-    """Quality survives the trip into the research store.
-
-    A validator that marks a bar suspicious is useless if the reader averages it
-    in anyway. Replaces a test that asserted the same thing about the `funding`
-    dataset, which no longer exists — spot has no funding, and the perpetual
-    contracts this repo used to trade are gone.
-    """
+    """The minute-bar dataset excludes flagged rows by default."""
     import pandas as pd
     from core.datastore import DEFAULT_MIN_QUALITY, ResearchStore
     import tempfile
