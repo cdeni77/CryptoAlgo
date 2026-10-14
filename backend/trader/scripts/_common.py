@@ -52,6 +52,20 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            'venue, a ladder fit and the venue settlement are '
                            'ALL present. Fewer rows, but each is one the live '
                            'path could have traded with everything it claims.')
+    data.add_argument('--quote-sources', type=str, default=None,
+                      help='Comma-separated venue_depth observers allowed to '
+                           'price a row, e.g. live_touch,live_ws,live. Default: '
+                           'every source, ranked by QUOTE_SOURCE_PRIORITY.')
+    data.add_argument('--null-quote-age', choices=('fresh', 'stale'),
+                      default=None,
+                      help="'fresh' (default) keeps a quote with no recorded "
+                           "age; 'stale' drops it, after bounding live_touch "
+                           "ages by available_time - event_time.")
+    data.add_argument('--peer-max-quote-age-seconds', type=float, default=None,
+                      metavar='S',
+                      help='staleness cap for the cross-venue PEER book only '
+                           '(default: follow the Kalshi cap). Setting it also '
+                           'applies --null-quote-age to the peer.')
     data.add_argument('--start', type=str, default=None, help='ISO date, inclusive')
     data.add_argument('--end', type=str, default=None, help='ISO date, exclusive')
     data.add_argument('--train-window-days', type=float, default=None,
@@ -174,6 +188,24 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'correlation, chosen inside each fold)')
     model.add_argument('--logistic-top-n', type=int, default=None)
     model.add_argument('--logistic-l2', type=float, default=None)
+    model.add_argument('--stack-mode', choices=('off', 'spot_then_market'),
+                       default=None,
+                       help="'spot_then_market': stage 1 learns spot -> "
+                            "probability on every bar, stage 2 fits "
+                            "a*logit(market) + b*(logit(spot) - logit(market)) "
+                            "only on rows with a usable quote")
+    model.add_argument('--stack-spot-groups', type=str, default=None,
+                       help='comma-separated stage-1 feature groups (default: '
+                            + ','.join(DEFAULT_CONFIG.stack_spot_groups) + ')')
+    model.add_argument('--stack-book-features', type=str, default=None,
+                       help='comma-separated book columns entering stage 2 '
+                            'linearly (L2-penalised, standardized)')
+    model.add_argument('--stack-l2', type=float, default=None)
+    model.add_argument('--stack-crossfit-blocks', type=int, default=None,
+                       help='contiguous blocks used to give stage-2 rows an '
+                            'out-of-sample stage-1 prediction (default 4)')
+    model.add_argument('--stack-intercept', action='store_true', default=None,
+                       help='let stage 2 fit an intercept c in [-0.5, 0.5]')
     model.add_argument('--label-source', choices=('proxy', 'venue'),
                        default=None,
                        help="'venue' trains on the venue's own settlement "
@@ -244,6 +276,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
     logistic_features = _parse_list(getattr(args, 'logistic_features', None))
     if logistic_features:
         overrides['logistic_features'] = logistic_features
+    for field, attr in (('quote_sources', 'quote_sources'),
+                        ('stack_spot_groups', 'stack_spot_groups'),
+                        ('stack_book_features', 'stack_book_features')):
+        listed = _parse_list(getattr(args, attr, None))
+        if listed:
+            overrides[field] = listed
     for field, attr in (
         ('venue', 'venue'), ('window_minutes', 'window_minutes'),
         ('baseline_distribution', 'baseline_distribution'), ('n_folds', 'n_folds'),
@@ -270,6 +308,11 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('model_type', 'model_type'),
         ('logistic_top_n', 'logistic_top_n'), ('logistic_l2', 'logistic_l2'),
         ('label_source', 'label_source'),
+        ('null_quote_age', 'null_quote_age'),
+        ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),
+        ('stack_mode', 'stack_mode'), ('stack_l2', 'stack_l2'),
+        ('stack_crossfit_blocks', 'stack_crossfit_blocks'),
+        ('stack_intercept', 'stack_intercept'),
         ('edge_lower_bound_z', 'edge_lower_bound_z'),
         ('require_member_agreement', 'require_member_agreement'),
         ('holdout_start', 'holdout_start'),
@@ -470,6 +513,7 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
         got = int(dataset.windows['venue_outcome'].notna().sum())
         logger.info("venue settlements joined: %s rows carry the venue's own label",
                     f'{got:,}')
+    log_quote_coverage(depth, dataset, config)
     coverage = dataset.coverage()
     logger.info('coverage:\n%s', coverage.to_string(index=False))
     worst = coverage['boundary_drop_rate'].max() if len(coverage) else 0.0
@@ -479,12 +523,45 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
             'Each missing minute kills two windows — the one settling on it and '
             'the one opening on it — so this is twice the gap rate.', worst * 100)
     if getattr(args, 'complete_cases', False):
+        if getattr(config, 'stack_mode', 'off') != 'off':
+            raise SystemExit(
+                '--complete-cases contradicts --stack-mode: stage 1 is fitted '
+                'on every bar, and stage 2 already admits only rows carrying a '
+                'usable quote. Filter the quotes with --quote-sources and '
+                '--null-quote-age instead.')
         apply_complete_cases(args, dataset)
 
     logger.info('%s windows, %s rows, %.0f days',
                 f'{len(dataset.window_index):,}', f'{len(dataset.windows):,}',
                 dataset.span_days)
     return dataset
+
+
+def log_quote_coverage(depth, dataset: Dataset, config: Config) -> dict:
+    """Which observers the store holds, how old their quotes were, and which
+    of them actually priced a row once the source/age filters ran."""
+    from core.quotes import quote_coverage, source_age_table
+
+    logger = logging.getLogger('dataset')
+    if depth is not None and len(depth) and 'venue' in depth.columns:
+        raw = source_age_table(depth[depth['venue'] == 'kalshi'])
+        if len(raw):
+            logger.info('venue_depth (kalshi) rows by source and recorded age:\n%s',
+                        raw.to_string(index=False))
+    coverage = quote_coverage(dataset.windows)
+    logger.info('quotes priced %s of %s rows (%.1f%%) under sources=%s, '
+                'max age %.0fs (peer %s), null age %s',
+                f"{coverage['quoted']:,}", f"{coverage['rows']:,}",
+                100 * coverage['share'],
+                ','.join(config.quote_sources) or 'all',
+                float(config.max_quote_age_seconds),
+                'follows' if config.peer_max_quote_age_seconds is None
+                else f'{config.peer_max_quote_age_seconds:.0f}s',
+                config.null_quote_age)
+    if coverage['by_source_age']:
+        logger.info('priced rows by observer and age:\n%s',
+                    pd.DataFrame(coverage['by_source_age']).to_string(index=False))
+    return coverage
 
 
 def data_span(dataset: Optional[Dataset], args: Optional[argparse.Namespace] = None) -> dict:
@@ -534,6 +611,15 @@ def print_header(title: str, config: Config) -> None:
           f'{config.half_spread_cents:.1f}c half-spread [{config.fee_config_version}]')
     print(f'account           ${config.starting_bankroll:.2f}, '
           f'{config.kelly_fraction:.2f} Kelly, gate {config.min_edge_pp:.2f}pp')
+    if config.quote_sources or config.null_quote_age != 'fresh':
+        print(f'quotes            sources {",".join(config.quote_sources) or "all"}, '
+              f'null age {config.null_quote_age}, max age '
+              f'{config.max_quote_age_seconds:.0f}s')
+    if config.stack_mode != 'off':
+        print(f'stack             {config.stack_mode}: stage 1 on '
+              f'{",".join(config.stack_spot_groups)}; stage 2 book terms '
+              f'{",".join(config.stack_book_features) or "none"}, '
+              f'{config.stack_crossfit_blocks} cross-fit blocks')
     if config.cli_overrides:
         print(f'cli overrides     {", ".join(sorted(config.cli_overrides))}')
     if getattr(config, 'holdout_start', None):
