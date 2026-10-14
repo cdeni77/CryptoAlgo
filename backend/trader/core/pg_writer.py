@@ -1,27 +1,15 @@
 """The serving store: what the API and the frontend read.
 
-Two stores, two jobs. `core/datastore.py` is the research store — immutable
-Parquet, point-in-time reads, the thing feature builds and backtests run on.
-This is PostgreSQL, mutable, and holds only what a dashboard needs to show:
-predictions we actually made, positions we actually took, and the account.
+PostgreSQL, mutable, holding what a dashboard shows: predictions made, positions
+taken, the account and the venue's ledger. `core/datastore.py` is the separate
+research store.
 
-**A binary needs almost none of what a perpetual future needed.** The previous
-schema carried mark price, unrealised PnL, funding accrual, take-profit and
-stop-loss levels, notional and leverage. None of them exists here. A contract is
-bought once at a known price, cannot lose more than its stake, accrues nothing,
-and settles once at $1 or $0. Carrying those columns would mean writing zeros
-into them forever and inviting a dashboard to render a zero as a measurement.
+A binary needs no mark price, unrealised P&L, funding or leverage columns:
+it is bought once, cannot lose more than its stake, and settles once at $1 or $0.
+Refusals are stored as well as trades.
 
-**Refusals are stored, not just trades.** A dashboard showing only trades cannot
-show that the system declined 99% of windows because the forecast did not cover
-the fee — which is the most informative thing it could say, and was on the perp
-system.
-
-**These models are duplicated in `backend/api/models/` for container isolation,
-and `tests/test_orm_parity.py` fails when they diverge** in columns, types,
-nullability, defaults or the migration list. That test exists because
-`wallet.balance` once differed by a factor of ten between the two copies, so
-whichever container created the row decided the account's starting balance.
+These models are duplicated in `backend/api/models/` for container isolation.
+`tests/test_orm_parity.py` fails when the two copies diverge.
 """
 
 from __future__ import annotations
@@ -82,23 +70,12 @@ class Prediction(Base):
     baseline_probability = Column(Float, nullable=False)
     model_probability = Column(Float, nullable=False)
 
-    # What the forecast was actually judged against, and where that came from.
-    # A backtest has no quotes and stands the calibrated baseline in for the
-    # market; a live decision reads the real book. Those are different claims and
-    # a row that does not distinguish them makes a backtest look like a fill.
-    # The venue's own view, and the realised answer. These three exist for one
-    # purpose: to eventually score the MARKET's probability against the outcome,
-    # on every window, traded or refused.
-    #
-    # That is the only economically meaningful benchmark and nothing in this
-    # system could compute it. `market_probability` was written and read by
-    # nothing, there was no `outcome` column at all, and `positions` only covers
-    # the ~6% of windows that traded — a selected sample. Beating F(x/sigma) says
-    # nothing about beating the price you would actually pay.
-    #
-    # `market_probability` is the MID (the venue's belief). The two asks are what
-    # a trade would cost, which is a different question and needed for expected
-    # value rather than for calibration.
+    # What the forecast was judged against. `price_source` separates a backtest
+    # (the calibrated baseline stands in for the market) from a real book.
+    # `market_probability` (the venue's mid) and `outcome` are recorded on every
+    # window, traded or refused, so the market's own probability can be scored.
+    # The traded subset alone is a selected sample.
+    # The asks are what a trade would cost, for expected value, not calibration.
     market_probability = Column(Float, nullable=True)
     market_ask_up = Column(Float, nullable=True)
     market_ask_down = Column(Float, nullable=True)
@@ -127,14 +104,8 @@ class Prediction(Base):
 class MinutePrice(Base):
     """One minute of price per symbol, for the window chart.
 
-    The prediction rows carry `last_price` at four offsets, which is enough to
-    decide with and far too sparse to draw. A barrier problem's natural picture
-    is the path against the line it has to finish above, and that needs every
-    minute.
-
-    Cheap: three symbols at one row a minute is 4,320 rows a day. The research
-    store keeps the authoritative bars; this is a rolling window for the screen,
-    and `prune` drops what has scrolled off.
+    A rolling window for the screen; the research store keeps the authoritative
+    bars, and `prune` drops what has scrolled off.
     """
 
     __tablename__ = 'minute_prices'
@@ -192,10 +163,9 @@ class Position(Base):
 class Account(Base):
     """The single account row: the bankroll, and what it is now.
 
-    `mode` is 'paper' or 'live' and it is not cosmetic. A live account holds real
-    money, so every surface that shows a number from this row has to be able to
-    say which kind it is — a live account that renders identically to a paper one
-    is the single worst failure this schema could permit.
+    `mode` is 'paper' or 'live'. Every surface that shows a number from this row
+    must say which: a live account that looks like a paper one is the worst
+    failure this schema could permit.
     """
 
     __tablename__ = 'account'
@@ -206,19 +176,10 @@ class Account(Base):
     bankroll = Column(Float, nullable=False, default=100.0)
     staked = Column(Float, nullable=False, default=0.0)
     realized_pnl = Column(Float, nullable=False, default=0.0)
-    # **The epoch the dashboard reads from. NOT a deletion.**
-    #
-    # Restarting the P&L view must not destroy the evidence. `predictions` is
-    # the only out-of-sample measurement of whether the model beats the PRICE --
-    # `scored_against_market` reads nothing else, and `model_minus_market` and
-    # `calibration_vs_market` are computed from it -- and `venue_fills` /
-    # `venue_settlements` hold windows Kalshi itself no longer serves. Truncating
-    # for a clean chart would trade the one number that is not self-graded for a
-    # cosmetic reset.
-    #
-    # So the API filters on or after this instant and the rows stay. Clearing it
-    # restores the full history, and `scripts/evaluate` and `scripts/promote`
-    # never consult it: research always reads everything.
+    # The epoch the dashboard reads from. Not a deletion: the API filters on or
+    # after this instant and the rows stay, because `predictions` and the venue
+    # ledger are evidence that cannot be rebuilt. Clearing it restores the full
+    # history. `scripts/evaluate` and `scripts/promote` never read it.
     reset_at = Column(DateTime(timezone=True), nullable=True)
     fees_paid = Column(Float, nullable=False, default=0.0)
     halted = Column(Boolean, nullable=False, default=False)
@@ -230,9 +191,8 @@ class Account(Base):
 class EquityPoint(Base):
     """Equity at a settlement. Never marked to a model probability.
 
-    Marking an open binary at our own forecast books the edge we believe in as
-    profit we have not received, which is how a losing system draws a rising
-    equity curve. `staked` is carried at cost.
+    Marking an open binary at our own forecast books believed edge as profit.
+    `staked` is carried at cost.
     """
 
     __tablename__ = 'equity_curve'
@@ -275,11 +235,10 @@ class ModelRun(Base):
 
 
 class CalibrationBin(Base):
-    """A row of the reliability table, for the one chart that cannot be faked.
+    """A row of the reliability table.
 
-    A model can hit the base rate exactly while being wrong at every level of
-    confidence. Since this system only trades its confident predictions, a
-    miscalibration in the 0.85-0.95 band matters far more than the headline.
+    The system trades its confident predictions, so per-band calibration matters
+    more than the average.
     """
 
     __tablename__ = 'calibration'
@@ -301,16 +260,11 @@ class CalibrationBin(Base):
 
 
 class OrderTicket(Base):
-    """A live decision, as something a person can act on.
+    """A live order: what was decided, what was sent, and what came back.
 
-    This repository has no Kalshi API client and no Kalshi credentials, so in
-    live mode the engine does not place orders — it writes a ticket carrying
-    everything needed to place one, and records what came back. Being explicit
-    about that boundary is the point: a system that silently did nothing while
-    appearing to trade would be worse than one that says a human is in the loop.
-
-    `status` moves new -> placed -> filled, or new -> skipped. Nothing here
-    advances it automatically; the dashboard does, or a future order client will.
+    `status` moves new -> placed -> filled, or to skipped, killed or unknown.
+    The ticket exists from the moment an order is sent, so a crash before the
+    position is booked still shows as exposure.
     """
 
     __tablename__ = 'order_tickets'
@@ -322,17 +276,15 @@ class OrderTicket(Base):
     settle_time = Column(DateTime(timezone=True), nullable=False)
     offset_minutes = Column(Integer, nullable=False)
 
-    # The venue's own identifier for the market, resolved by asking the venue
-    # which market opens and closes on this window rather than by building a
-    # ticker from a pattern. A pattern is a guess that keeps working until the
-    # venue renames a series.
+    # The venue's identifier for the market, resolved by asking the venue which
+    # market covers this window, never built from a ticker pattern.
     market_ticker = Column(String, nullable=True, index=True)
     venue_order_id = Column(String, nullable=True)
 
     side = Column(String, nullable=False)
     contracts = Column(Integer, nullable=False)
     # The price the decision was sized at, and the worst price still worth
-    # paying. A ticket without a limit is an instruction to pay anything.
+    # paying. A ticket without a limit is an instruction to pay any price.
     limit_price = Column(Float, nullable=False)
     max_price = Column(Float, nullable=False)
     expected_cost = Column(Float, nullable=False)
@@ -354,23 +306,14 @@ class OrderTicket(Base):
 
 
 class VenueFill(Base):
-    """One execution, as the VENUE recorded it. Not our belief about it.
+    """One execution, as the venue recorded it.
 
-    `Position` says what we thought we bought: the price `decide()` sized at and
-    the fee it predicted from the published schedule. This says what the account
-    of record actually shows. The two differ on every partial fill, every fill
-    better than the limit, and every fee we mispriced — 16 of the first 323 live
-    fills were partial — and where they differ, this row is right.
+    `Position` holds what we believed we bought; this holds the account of record.
+    Where they differ (partial fills, better fills, mispriced fees), this row is right.
 
-    Keyed on the venue's `trade_id`, so a re-sync is idempotent. That matters more
-    here than anywhere else in this schema: the live loop and
-    `scripts/sync_venue.py` both write these, the live and historical tiers
-    overlap around the cutoff, and a fill counted twice doubles a cost basis.
-
-    `raw` keeps the whole payload. A parser reads the fields it knows about, and
-    the fields it does not are the ones a venue change turns out to hinge on —
-    the `position_fp` and `yes_bid_dollars` lessons both cost real money and both
-    would have been visible in a stored payload.
+    Keyed on the venue's `trade_id`, so a re-sync is idempotent: the live and
+    historical tiers overlap, and a fill counted twice doubles a cost basis.
+    `raw` keeps the whole payload, including fields the parser does not read.
     """
 
     __tablename__ = 'venue_fills'
@@ -380,17 +323,15 @@ class VenueFill(Base):
     order_id = Column(String, nullable=True, index=True)
     ticker = Column(String, nullable=False, index=True)
 
-    # 'up' or 'down', this project's vocabulary for the venue's yes/no. The
-    # translation happens in the parser, once, because a mislabelled side inverts
-    # a trade's P&L rather than merely mis-displaying it.
+    # 'up' or 'down', our vocabulary for the venue's yes/no. Translated once, in
+    # the parser: a mislabelled side inverts a trade's P&L.
     side = Column(String, nullable=False)
     action = Column(String, nullable=True)
-    # Fractional because the wire encoding is a fixed-point string (`count_fp`:
-    # "5.00"). Whole contracts in practice; an Integer column would silently
-    # truncate the day that stops being true.
+    # Float, because the wire encoding is fixed-point (`count_fp`: "5.00").
+    # An Integer column would truncate a fractional count.
     contracts = Column(Float, nullable=False)
-    # Dollars paid per contract, for `side`. Nullable: a fill whose price did not
-    # parse is a fill at an unknown price, which is not a fill at zero.
+    # Dollars per contract, for `side`. Null when the price did not parse:
+    # an unknown price is not a zero price.
     price = Column(Float, nullable=True)
     is_taker = Column(Boolean, nullable=True)
     created_time = Column(DateTime(timezone=True), nullable=True, index=True)
@@ -404,25 +345,15 @@ class VenueFill(Base):
 
 
 class VenueSettlement(Base):
-    """One market resolved, as the venue paid it. **This is the P&L.**
+    """One market resolved, as the venue paid it. This is the P&L.
 
-    A binary bought once and held to expiry pays one fee at entry and settles once
-    at $1 or $0, so a settlement row is a position's complete economic history:
-    cost basis, payout, fee. Our own `Position.pnl` recomputes all three — the
-    outcome from an OHLC mean of Coinbase standing in for sixty seconds of CF
-    Benchmarks BRTI, the fee from the published schedule — and both are estimates
-    of the numbers in this row.
+    A binary held to expiry pays one fee and settles once, so this row is a
+    position's complete economic history: cost basis, payout, fee.
 
-    `pnl` is stored rather than derived on read, and that is a deliberate
-    exception to keeping derived values out of this schema. The API runs in another
-    container and cannot import the trader, so a P&L computed at read time would
-    have to be written twice, in two languages' worth of null handling, and
-    `test_orm_parity` cannot compare arithmetic — only columns. Storing it keeps
-    one definition, in the one process that writes here, and leaves the API doing
-    what it is supposed to do: serving a measurement it did not invent.
-
-    Null `pnl` means the venue left one of the three fields absent. That is not
-    break-even, and nothing downstream may read it as zero.
+    `pnl` is stored, not derived on read: the API runs in another container and
+    cannot import the trader, so storing keeps one definition of the arithmetic.
+    Null `pnl` means the venue left a field absent. It is not break-even, and
+    nothing downstream may read it as zero.
     """
 
     __tablename__ = 'venue_settlements'
@@ -430,7 +361,7 @@ class VenueSettlement(Base):
     id = Column(Integer, primary_key=True, index=True)
     ticker = Column(String, nullable=False, unique=True, index=True)
     event_ticker = Column(String, nullable=True)
-    # 'yes' or 'no', as the venue resolved it — the answer our bars only estimate.
+    # 'yes' or 'no', as the venue resolved it.
     market_result = Column(String, nullable=True)
 
     yes_contracts = Column(Float, nullable=False, default=0.0)
@@ -445,11 +376,9 @@ class VenueSettlement(Base):
 
     settled_time = Column(DateTime(timezone=True), nullable=True, index=True)
 
-    # Our own books, alongside the venue's, for the one comparison that matters:
-    # a gap that grows is a fee we mispriced or a settlement our Coinbase proxy
-    # got wrong. Null when no position of ours maps to this ticker — which is
-    # itself informative, since it means the venue settled something we never
-    # recorded buying.
+    # Our own books beside the venue's: a growing gap is a mispriced fee or a
+    # settlement our Coinbase proxy called differently. Null when no position of
+    # ours maps to this ticker, meaning the venue settled something we never booked.
     position_id = Column(Integer, nullable=True, index=True)
     our_pnl = Column(Float, nullable=True)
 
@@ -462,20 +391,11 @@ class VenueSettlement(Base):
 
 
 class VenueBalance(Base):
-    """The venue's balance, sampled. What makes the account chart live.
+    """The venue's balance, sampled every cycle, for the account chart.
 
-    Settlements step the curve every fifteen minutes at most, and only when
-    something settled. This is read every cycle, so the chart has a present
-    rather than ending at the last resolved market.
-
-    It is cash on the shard, not equity: entering a position debits it and
-    settlement credits it back, so on its own it sawtooths. That is why the
-    account curve plots realised P&L as its primary series and carries this
-    beside it — the balance is the real money, and the P&L is how the portfolio
-    is doing. `exchange_index` is recorded because **balances are local to a
-    shard**: a total across shards is not money any single order can draw on, and
-    reading one number as the other is what made every order come back
-    `insufficient_balance` against an apparently healthy $107.96.
+    Cash, not equity: an entry debits it and settlement credits it back.
+    `exchange_index` is recorded because balances are local to a shard: a total
+    across shards is not money a single order can draw on.
     """
 
     __tablename__ = 'venue_balance'
@@ -484,10 +404,9 @@ class VenueBalance(Base):
     timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     balance = Column(Float, nullable=False)
     exchange_index = Column(Integer, nullable=True)
-    # What our own arithmetic thought at the same instant, and the difference.
-    # Stored rather than only logged because a drift that GROWS is the signal —
-    # an unrecorded fill, a partial, a mispriced fee — and a single log line
-    # cannot show a trend.
+    # Our own bankroll at the same instant, and the difference. Stored because
+    # a drift that grows (an unrecorded fill, a partial, a mispriced fee) is a
+    # trend a log line cannot show.
     our_bankroll = Column(Float, nullable=True)
     drift = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -496,10 +415,8 @@ class VenueBalance(Base):
         Index('ix_venue_balance_timestamp_desc', 'timestamp'),
     )
 
-# Indexes and constraints added after a table first shipped. Applied by
-# `_run_migrations` and asserted identical to the API's list by test_orm_parity —
-# an index that exists in one container and not the other is a query that is
-# fast in development and a table scan in production.
+# Indexes added after a table first shipped. Applied by `_run_migrations` and
+# asserted identical to the API's list by test_orm_parity.
 MIGRATIONS: tuple[str, ...] = (
     'CREATE INDEX IF NOT EXISTS ix_predictions_reason_window '
     'ON predictions (reason, window_open DESC)',
@@ -511,28 +428,16 @@ MIGRATIONS: tuple[str, ...] = (
     'ON minute_prices (symbol, minute DESC)',
     'CREATE INDEX IF NOT EXISTS ix_order_tickets_window '
     'ON order_tickets (window_open DESC)',
-    # The venue ledger. Every read of these is "newest first" or "since a
-    # timestamp", which is one index each; the settlements one carries the P&L
-    # aggregate and the account chart, so it is the hottest query on the surface.
+    # The venue ledger. Reads are "newest first" or "since a timestamp".
     'CREATE INDEX IF NOT EXISTS ix_venue_fills_created_desc '
     'ON venue_fills (created_time DESC)',
     'CREATE INDEX IF NOT EXISTS ix_venue_settlements_settled_desc '
     'ON venue_settlements (settled_time DESC)',
     'CREATE INDEX IF NOT EXISTS ix_venue_balance_recent '
     'ON venue_balance (timestamp DESC)',
-    # NOTE: the market-benchmark columns on `predictions` (market_ask_up,
-    # market_ask_down, outcome) deliberately have NO migration here.
-    #
-    # `ADD COLUMN IF NOT EXISTS` is not parseable on SQLite, so it would be
-    # skipped by the dialect guard in `_run_migrations` and production would be
-    # running a statement the test suite had never executed — which is exactly
-    # the trap `tests/test_orm_parity.py` was written to close, and exactly what
-    # the previous all-ADD-COLUMN list did.
-    #
-    # The ORM gives them to a fresh database via `create_all`, and the serving
-    # store is regenerated telemetry rather than a record of account, so an
-    # existing one is wiped: `docker compose down -v`. The research store and the
-    # scraped SQLite are the irreplaceable parts and neither is touched.
+    # No ADD COLUMN migrations here: SQLite cannot parse `ADD COLUMN IF NOT
+    # EXISTS`, so the test suite would never run the statement production runs.
+    # New columns go through `PgWriter.ADDED_COLUMNS`.
 )
 
 
@@ -564,23 +469,11 @@ class PgWriter:
     )
 
     def _ensure_columns(self) -> None:
-        """Add columns that `create_all` cannot.
+        """Add columns that `create_all` cannot: it creates missing tables, never columns.
 
-        **`create_all` creates missing TABLES, never missing columns**, so a
-        database that predates a field reports `UndefinedColumn` on every read
-        of that table -- loudly, but only at runtime.
-
-        This is NOT in `MIGRATIONS`. That tuple is asserted by
-        `tests/test_orm_parity.py` to hold only portable, idempotent
-        `CREATE INDEX IF NOT EXISTS` statements, for a stated reason: anything
-        else needs a dialect guard, and a guard means the SQLite test suite
-        stops exercising the statement production runs. `ADD COLUMN IF NOT
-        EXISTS` is Postgres-only.
-
-        So the existence check is done in Python via the dialect-neutral
-        inspector, and the `ALTER` that follows is bare `ADD COLUMN`, which
-        SQLite and Postgres both accept. Idempotent by inspection rather than
-        by syntax, and exercised identically on both.
+        Not in `MIGRATIONS`, which holds only portable index statements.
+        The existence check uses the dialect-neutral inspector, and the
+        `ALTER` is bare `ADD COLUMN`, which SQLite and Postgres both accept.
         """
         from sqlalchemy import inspect as _inspect
 
@@ -598,17 +491,10 @@ class PgWriter:
             logger.info('added %s.%s', table, column)
 
     def _run_migrations(self) -> None:
-        """Apply the additive migrations, tolerating only SQLite's dialect gaps.
+        """Apply the index migrations. Failures raise, except on SQLite.
 
-        This used to catch bare `Exception` and log at `debug`, so *any* migration
-        failure against real Postgres — a type mismatch, a lock timeout, a
-        permissions problem — vanished at a level most deployments do not
-        capture, and the failure resurfaced later as a confusing runtime error on
-        the accounting database instead of a loud one at startup.
-
-        The tolerance it was written for is real but narrow: `MIGRATIONS` uses
-        `ADD COLUMN IF NOT EXISTS` and similar, which SQLite does not parse, and
-        the tests run on SQLite. So tolerate it on SQLite and nowhere else.
+        SQLite (the test database) lacks some dialect features, so a failure
+        there is tolerated and logged. On Postgres every failure is loud.
         """
         sqlite = self._engine.dialect.name == 'sqlite'
         with self._engine.begin() as connection:
@@ -629,8 +515,7 @@ class PgWriter:
     def write_prediction(self, **fields) -> int:
         """Upsert one decision point. Idempotent on (symbol, window, offset).
 
-        Idempotent because the orchestrator can re-run a cycle — a retry after a
-        network failure must not double-count a refusal or, worse, a trade.
+        A retried cycle must not double-count a refusal or a trade.
         """
         with self._session() as session:
             existing = session.query(Prediction).filter_by(
@@ -676,23 +561,18 @@ class PgWriter:
     def exclusive_trader_lock(self):
         """Hold a database-wide lock for the duration of a trading process.
 
-        There was no singleton of any kind. `docker-compose` runs a `trader`
-        service and nothing stopped an operator also running
-        `python -m scripts.live` by hand — two processes, one account, one
-        window. Measured, both sized a full position off the same bankroll.
-
-        A Postgres session-level advisory lock is the right primitive: it is
-        released automatically when the connection drops, so a killed trader does
-        not strand the lock. On SQLite (tests) there is no advisory lock and no
-        concurrency to guard, so this yields with a warning rather than pretending.
+        Two traders on one account would both size off the same bankroll.
+        A Postgres session-level advisory lock is released when the connection
+        drops, so a killed trader cannot strand it. SQLite (tests) has no
+        advisory lock, so this yields with a warning.
         """
         if self._engine.dialect.name != 'postgresql':
             logger.warning('no advisory lock on %s; single-writer is unenforced',
                            self._engine.dialect.name)
             yield True
             return
-        # An arbitrary but stable key. Distinct from the API's schema-bootstrap
-        # lock in backend/api/app.py so the two cannot block each other.
+        # Arbitrary but stable, and distinct from the API's schema-bootstrap
+        # lock in backend/api/app.py, so the two cannot block each other.
         key = 0x51545241  # 'QTRA'
         connection = self._engine.connect()
         try:
@@ -743,11 +623,9 @@ class PgWriter:
             row.status = status
             if venue_order_id:
                 row.venue_order_id = str(venue_order_id)
-            # Only overwrite a recorded fill with another recorded fill. These
-            # default to None, so a later call — e.g. the venue rejecting a
-            # duplicate submission as `skipped` — used to erase the
-            # filled_contracts / filled_price / filled_at of a real, filled,
-            # real-money order, destroying the only local record of it.
+            # Only overwrite a recorded fill with another recorded fill. A later
+            # call with None (e.g. a rejected duplicate marked `skipped`) must
+            # not erase a real fill.
             if filled_contracts is not None:
                 row.filled_contracts = filled_contracts
             if filled_price is not None:
@@ -762,13 +640,8 @@ class PgWriter:
     def open_position(self, **fields) -> Optional[int]:
         """Book a position, once, for a (symbol, window). Returns None if it exists.
 
-        A bare insert against `uq_position_window` used to raise `IntegrityError`
-        on the second cycle of any window, and `scripts/live.py`'s loop catches
-        only `KeyboardInterrupt` — so the process died, *after* the duplicate
-        order was already on the wire, and `restart: unless-stopped` brought it
-        back to do it again. The constraint was doing its job; the caller was
-        not. Get-or-create makes the second attempt a no-op the caller can see,
-        matching `write_ticket`.
+        Get-or-create, matching `write_ticket`, so a second attempt is a visible
+        no-op instead of an IntegrityError.
         """
         with self._session() as session:
             existing = session.query(Position).filter_by(
@@ -793,25 +666,11 @@ class PgWriter:
             )
 
     def settle_position(self, position_id: int, *, settled_up: bool) -> Optional[float]:
-        """Resolve one position, credit the account, and return its PnL.
+        """Resolve one position, credit the account, and return its P&L.
 
-        Returns None if the position was already settled, which is what makes a
-        re-run of `settle_due` idempotent.
-
-        **The payout is credited here, in the same transaction as the outcome.**
-        It used to be nowhere: `act_on` debited the stake and nothing ever
-        credited a win, so the only two writers of `Account.bankroll` were the
-        entry debit and the live venue overwrite. In paper mode there is no venue,
-        so the bankroll fell by the stake on every trade and rose never — the
-        equity curve decayed to the ruin floor regardless of the win rate, and
-        `realized_pnl` was a hard-coded zero rendered as a measurement. The
-        backtest (`core/book.py`) always did this correctly, which is exactly why
-        no gate caught it: the two accounting paths had diverged and only the
-        simulated one was right.
-
-        Crediting inside the position's own transaction is deliberate. A payout
-        applied in a second transaction can be lost to a crash between the two,
-        and then the position says "won" while the bankroll never saw the money.
+        Returns None if the position was already settled, so a re-run of
+        `settle_due` is idempotent. The payout is credited in the same
+        transaction as the outcome, so a crash cannot leave a win uncredited.
         """
         with self._session() as session:
             row = session.get(Position, position_id)
@@ -838,25 +697,10 @@ class PgWriter:
     def entries_for_window(self, window_open: datetime) -> tuple[frozenset[str], float, int]:
         """What is already committed for one window: symbols, stake, count.
 
-        The live loop used to build `WindowExposure()` empty on every cycle, so
-        `ALREADY_ENTERED`, `POSITION_LIMIT` and `WINDOW_EXPOSURE` were evaluated
-        against nothing and a single window could be entered once per cycle per
-        offset — up to twelve times where the backtest permits one. Exposure has
-        to come from the durable store, because the process restarts and the
-        window does not.
-
-        Tickets count as well as positions: a ticket exists from the moment an
-        order is sent, so a crash between sending and booking still shows up.
-        That includes 'unknown' — a POST that failed in flight may well have been
-        accepted, and re-entering on top of it could double the position.
-
-        **A kill is the exception, because the venue has told us it took
-        nothing.** Live on 2026-08-26 two `immediate_or_cancel` orders were
-        cancelled with `fill_count_fp: "0.00"` and no position anywhere, and the
-        next cycle refused the window as already holding $8.55 — which was
-        exactly the two decision stakes. A window with a dead order in it is a
-        window with no exposure, and holding the slot shut costs the entry
-        outright.
+        Read from the durable store, because the process restarts and the window
+        does not. Tickets count as well as positions, including 'unknown' (a
+        failed POST may have been accepted). 'skipped' and 'killed' tickets do not
+        count: the venue took nothing.
         """
         with self._session() as session:
             symbols: set[str] = set()
@@ -877,17 +721,9 @@ class PgWriter:
     def first_position_time(self) -> Optional[datetime]:
         """When our books start, or None if they hold nothing.
 
-        `sync_venue` needs this to say how much of the P&L gap is simply a
-        shorter book. The venue remembers every settlement it ever made; this
-        store is wiped between experiments on purpose, so the two routinely
-        total over different periods. Measured on the first live run: 365 venue
-        settlements over four days against a store reset the night before, and
-        the entire gap was coverage rather than error.
-
-        Returned tz-aware in UTC. SQLite hands back naive datetimes even for a
-        `DateTime(timezone=True)` column, and comparing one of those against the
-        venue's aware timestamp raises rather than misreporting — which is the
-        better failure, but not one to ship.
+        `sync_venue` uses this to separate a coverage gap from a P&L error: the
+        venue remembers every settlement, while this store is reset between
+        experiments. Returned tz-aware in UTC, because SQLite returns naive datetimes.
         """
         with self._session() as session:
             earliest = session.query(func.min(Position.window_open)).scalar()
@@ -915,26 +751,11 @@ class PgWriter:
             )
 
     def realised_high_water(self) -> float:
-        """The highest cumulative realised PnL this account has ever reached.
+        """The highest cumulative realised P&L this account has reached.
 
-        Derived from the settlements rather than stored on the account, so it
-        needs no column and cannot drift out of sync with the ledger it
-        summarises. `account.realized_pnl` is the current value of the same
-        series, so the pair gives peak and current without a second source of
-        truth.
-
-        **Both sides must span the same period, and they did not.**
-        `scripts/reset_dashboard.py --rebase` zeroes `account.realized_pnl` at a
-        new epoch, while this walked every settlement ever recorded — so the
-        drawdown breaker compared a high-water from BEFORE the reset against a
-        P&L counted AFTER it. Measured 2026-09-24: peak $322.38 against a
-        current $173.02, a phantom 46.3% drawdown that halted a live account
-        whose realised P&L since its epoch was -$26.98. A halt is sticky and
-        cleared by hand, so a false one costs real trading days.
-
-        Bounded by `account.reset_at` when one is set, which makes the pair
-        commensurable again. Research never reads this — it is a live-account
-        breaker only.
+        Derived from settled positions, so it cannot drift from the ledger.
+        Bounded by `account.reset_at` when set, so it spans the same period as
+        `account.realized_pnl`. A live-account drawdown breaker only.
         """
         with self._session() as session:
             epoch = (session.query(Account.reset_at)
@@ -958,15 +779,9 @@ class PgWriter:
         `(symbol, window_open, offset_minutes, market_probability,
         baseline_probability, model_probability, outcome, decision_time)`.
 
-        Traded *and* refused, which is the point — the traded subset is selected by
-        our own model's opinion, and it is our own opinion under test.
-
-        `decision_time` is carried because it is not `window_open + offset`. The
-        features are built for the nominal offset while the quote is read whenever
-        the cycle got there — measured, +3.62m on average for a +3m decision. One
-        minute of information is worth ~0.027 nats against a total model edge of
-        +0.002, so that lag is comparable to the whole effect and runs against us.
-        Reporting it is how the comparison stops being silently unfair.
+        Traded and refused: the traded subset is selected by the model under test.
+        `decision_time` is carried because the quote is read when the cycle gets
+        there, which can be later than `window_open + offset`.
         """
         with self._session() as session:
             return list(
@@ -985,12 +800,9 @@ class PgWriter:
                                 ) -> list[tuple[str, datetime, datetime, float]]:
         """Settled windows whose predictions still have no realised outcome.
 
-        One row per (symbol, window), with the strike, newest first. This is what
-        makes the market benchmark possible: `market_probability` is recorded on
-        every window including the refused ones, and without the outcome beside it
-        the venue's probability can never be scored. `positions` cannot substitute
-        — it only covers the ~6% of windows that traded, which is a selected
-        sample and the wrong one.
+        One row per (symbol, window), with the strike, newest first. The outcome
+        beside `market_probability` lets the venue's probability be scored on
+        every window, not only the traded ones.
         """
         with self._session() as session:
             rows = (session.query(Prediction.symbol, Prediction.window_open,
@@ -1017,30 +829,15 @@ class PgWriter:
             return int(n)
 
     def correct_positions_from_venue(self, labels) -> tuple[int, int, float]:
-        """Re-settle positions the VENUE graded differently, and fix the P&L.
+        """Re-settle positions the venue graded differently, and fix the P&L.
 
-        **`settle_due` prefers the venue's settlement, but only if it has one
-        at that moment.** When the venue's row has not arrived by the time the
-        window matures it falls back to our Coinbase bars, and nothing ever
-        re-grades it — the same "only fills what is empty" shape that
-        `set_window_outcome` had for predictions.
+        `settle_due` falls back to our Coinbase label when the venue's settlement
+        has not arrived; this re-grades those positions once it does.
+        `account.realized_pnl` feeds the daily-loss and drawdown breakers, so it
+        must match the venue's grading.
 
-        Measured 2026-10-03 over 216 settled trades since the epoch: our books
-        showed **130 winners against the venue's 123**, a 3.2% disagreement
-        that matches the documented Coinbase-vs-BRTI rate almost exactly, all
-        of it in near-ties. It was worth $21.06 — our books read +$8.80 where
-        the venue read -$12.26.
-
-        That is not merely a reporting gap. `account.realized_pnl` is what the
-        daily-loss limit and the drawdown breaker read, so both were keyed to a
-        P&L optimistic by that amount: the safety brakes under-react by exactly
-        the margin our own label flatters us.
-
-        **`bankroll` is deliberately NOT adjusted here.** `adopt_venue_balance`
-        writes the venue's balance every cycle and the venue is the account of
-        record; correcting a derived figure the venue already owns would be a
-        second source of truth. `realized_pnl` has no such owner, which is why
-        it drifted.
+        `bankroll` is not adjusted: `adopt_venue_balance` already writes the
+        venue's balance, the account of record.
 
         `labels` is an iterable of `(symbol, window_open, settled_up)`.
         Returns `(examined, corrected, pnl_delta)`.
@@ -1069,22 +866,9 @@ class PgWriter:
                     row.outcome = Outcome.WON.value if won else Outcome.LOST.value
                     delta_total += float(row.pnl) - before
                     corrected += 1
-            # **The invariant, restated every pass rather than only after a
-            # correction.** It is a statement about what `realized_pnl` IS,
-            # so enforcing it only when something changed leaves any drift
-            # already present in place -- which is exactly what happened on
-            # the first run here.
-            # **Recomputed from the positions, not nudged by the delta.**
-            # `account.realized_pnl` covers the period since
-            # `account.reset_at` -- `reset_dashboard --rebase` zeroes it
-            # there and `settle_position` accumulates forward from it. The
-            # labels this walks reach further back than the epoch, so
-            # applying the raw delta leaks pre-epoch corrections into a
-            # post-epoch total: on the first real run that put it at
-            # -$42.20 against post-epoch positions summing to -$12.20.
-            #
-            # Restating the invariant is both the fix and a repair for any
-            # drift already there, from this or anything else:
+            # Restate the invariant on every pass, recomputed from positions,
+            # not nudged by the delta: the labels reach back past the epoch, and
+            # restating also repairs any existing drift.
             #
             #     realized_pnl == sum(positions.pnl where settled_at >= epoch)
             epoch = (session.query(Account.reset_at)
@@ -1101,26 +885,12 @@ class PgWriter:
         return examined, corrected, delta_total
 
     def correct_outcomes_from_venue(self, labels) -> tuple[int, int]:
-        """Overwrite `Prediction.outcome` where the VENUE settled differently.
+        """Overwrite `Prediction.outcome` where the venue settled differently.
 
-        **The market gates are scored on this column, and it was filled from
-        Coinbase bars only.** `settle_due` prefers the venue's own settlement
-        for the money; `settle_predictions`, eleven lines away in the same
-        function with the venue data already in scope, did not -- and
-        `scored_against_market()` can return no other label. So
-        `model_minus_market` and `calibration_vs_market` were computed on our
-        proxy while the backtest branch of the same gate substitutes
-        `venue_outcome`. Two label conventions under one gate name.
-
-        Measured 2026-09-16 on 5,471 rows at +12m: the labels disagree on 2.85%,
-        all of it in near-ties as expected, and the statistic moves
-        **+0.000924 -> +0.000188**. Four fifths of the apparent live edge was
-        self-grading.
-
-        `set_window_outcome` deliberately fills only NULLs, so a venue label
-        arriving after ours could never correct it. This one overwrites, and
-        ONLY where the two differ, so a re-run is free and the count is the
-        disagreement rather than the row count.
+        The market gates read this column, so it must carry the venue's label,
+        as the backtest does. `set_window_outcome` fills only NULLs; this
+        overwrites, and only where the labels differ, so a re-run is free and
+        the count is the disagreement.
 
         `labels` is an iterable of `(symbol, window_open, settled_up)`.
         Returns `(examined, corrected)`.
@@ -1157,13 +927,8 @@ class PgWriter:
                 session.commit()
                 session.refresh(row)
                 return row
-            # `mode` used to be set only on creation. Paper is the compose
-            # default, so the first run created a paper account and every later
-            # `--mode live` run kept rendering as paper on every dashboard
-            # surface — the failure this schema's own comment calls the worst it
-            # could permit. Switching mode is not a display change either: the
-            # bankroll history belongs to the other mode, so refuse rather than
-            # silently inherit it.
+            # The stored mode must match. The bankroll history belongs to one
+            # mode, so switching would report one mode's money under the other's name.
             if row.mode != mode:
                 raise AccountModeMismatch(
                     f"this account was opened in {row.mode!r} mode and holds its "
@@ -1182,10 +947,8 @@ class PgWriter:
     def update_account(self, **fields) -> None:
         """Set absolute fields on the account.
 
-        For anything that is an *increment* — a stake debited, a payout credited,
-        a fee accrued — use `adjust_account` instead. This method reads the row
-        into Python and writes it back, so two overlapping callers lose one
-        another's change.
+        For increments (a stake, a payout, a fee), use `adjust_account`: this
+        method reads and writes back, so overlapping callers lose a change.
         """
         with self._session() as session:
             row = session.query(Account).order_by(Account.id).first()
@@ -1198,14 +961,10 @@ class PgWriter:
     def adjust_account(self, *, bankroll_delta: float = 0.0,
                        fees_delta: float = 0.0,
                        realized_delta: float = 0.0) -> None:
-        """Apply increments to the account in one atomic statement.
+        """Apply increments to the account in one atomic SQL statement.
 
-        `bankroll = bankroll - stake` used to be computed in Python between two
-        separate transactions. Nothing enforces one trader process, so a
-        supervisor restart overlap or an operator running paper and live against
-        one `DATABASE_URL` silently dropped one of the two debits. Doing the
-        arithmetic in SQL removes the read entirely, so there is no window to
-        lose.
+        The arithmetic runs in the database, so overlapping writers cannot lose
+        an update.
         """
         with self._session() as session:
             updated = session.query(Account).update(
@@ -1227,23 +986,16 @@ class PgWriter:
 
     # ---- the venue ledger -----------------------------------------------
     #
-    # Written by the live loop every cycle (from the reconcile it already
-    # performs) and by `scripts.sync_venue` for the deep, paginated backfill.
-    # Both paths upsert on the venue's own key, so running them together, or the
-    # same one twice, converges rather than double-counting.
+    # Written by the live loop every cycle and by `scripts.sync_venue` for the
+    # paginated backfill. Both upsert on the venue's own key, so running them
+    # together, or one twice, converges.
 
     def upsert_venue_fills(self, rows: Iterable[dict]) -> int:
         """Upsert fills on `trade_id`. Returns the number of rows written.
 
-        Idempotent because it has to be: the live and historical tiers overlap
-        around the cutoff, so the same fill arrives twice in one sync, and a fill
-        counted twice doubles a cost basis.
-
-        A row's fields are overwritten on conflict rather than skipped. The venue
-        amends its own records — a `_dollars` field appearing where only cents were
-        served before is the documented direction of travel — and a stale row that
-        parsed badly the first time should heal on the next sync instead of being
-        preserved forever by an INSERT ... DO NOTHING.
+        Idempotent: the live and historical tiers overlap, so one fill can arrive
+        twice. A conflict overwrites the row, so a badly parsed row heals on the
+        next sync.
         """
         written = 0
         with self._session() as session:
@@ -1288,16 +1040,9 @@ class PgWriter:
     def venue_ledger_keys(self) -> tuple[set[str], set[str]]:
         """What is already stored, as two sets, in two queries.
 
-        The live loop reconciles every cycle and the venue returns up to 200 fills
-        and 200 settlements each time — almost all of them rows it returned last
-        cycle too. Upserting all four hundred means four hundred SELECT-then-write
-        round trips a minute in the steady state, for no change.
-
-        So the caller filters against these first. The settlement set deliberately
-        holds only tickers whose `pnl` is **not** null: a row that parsed
-        incompletely is left out, so it is retried and can heal when the venue
-        fills the gap in. Filtering on mere presence would freeze the first bad
-        parse in place forever.
+        The caller filters the venue's response against these to skip unchanged
+        rows. The settlement set holds only tickers with a non-null `pnl`, so an
+        incomplete row is retried and can heal.
         """
         with self._session() as session:
             trade_ids = {tid for (tid,) in session.query(VenueFill.trade_id)}
@@ -1317,10 +1062,8 @@ class PgWriter:
                           limit: Optional[int] = None) -> list[VenueSettlement]:
         """Settled markets, newest first. `limit=None` for the whole ledger.
 
-        The default is unlimited because the P&L total is a sum over everything: a
-        limit would silently report the profit of the most recent N trades as the
-        account's profit. Callers drawing a table pass one; callers totalling do
-        not.
+        Unlimited by default: a P&L total is a sum over everything, and a limit
+        would report the latest N trades as the account's profit.
         """
         with self._session() as session:
             query = session.query(VenueSettlement)
@@ -1334,11 +1077,9 @@ class PgWriter:
     def position_for_ticker(self, ticker: str):
         """Our own position for a venue ticker, via the ticket that placed it.
 
-        `positions` has no ticker column — a position is keyed on (symbol, window)
-        because the paper engine predates the venue client — so the join goes
-        through `order_tickets`, which records the market the order was actually
-        sent to. Returns None when nothing maps, which is what the venue settling
-        a market we never booked looks like.
+        `positions` has no ticker column, so the join goes through
+        `order_tickets`. Returns None when nothing maps: the venue settled a
+        market we never booked.
         """
         with self._session() as session:
             ticket = (session.query(OrderTicket)
@@ -1355,10 +1096,9 @@ class PgWriter:
     def write_venue_balance(self, *, timestamp: datetime, balance: float,
                             exchange_index: Optional[int] = None,
                             our_bankroll: Optional[float] = None) -> int:
-        """Sample the venue's balance. The drift is computed here, once.
+        """Sample the venue's balance; the drift is computed here, once.
 
-        Sampled rather than upserted: the point of the series is the trend, and
-        every cycle's reading is a distinct observation of a moving number.
+        Appended, not upserted: each cycle's reading is a separate observation.
         """
         drift = (None if our_bankroll is None
                  else float(balance) - float(our_bankroll))
@@ -1389,10 +1129,7 @@ class PgWriter:
     def prune_venue_balances(self, before: datetime) -> int:
         """Drop balance samples that have scrolled off the chart.
 
-        One row a minute is 1,440 a day, the same order as `minute_prices`, and
-        for the same reason it is pruned rather than kept forever: this is a
-        rolling window for a screen. The settlements are the record and they are
-        never pruned.
+        A rolling window for a screen. Settlements are the record and are never pruned.
         """
         with self._session() as session:
             n = (session.query(VenueBalance)
