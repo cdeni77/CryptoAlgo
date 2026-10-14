@@ -1,18 +1,6 @@
-"""Kalshi's fee schedule, and the shape that decides the strategy.
+"""Tests for the Kalshi fee schedule in `core.costs`.
 
-`fee = ceil(0.07 * contracts * price * (1 - price) * 10_000) / 10_000`, per
-order, and settlement is free. The ceiling is to a HUNDREDTH of a cent, not a
-whole cent — this file used to say `* 100) / 100`, which over-charged 7% in
-aggregate and ~17% on the smallest orders before it was corrected against 328
-real fills. The `p(1-p)` term means a confident bet is a cheap bet, which is
-the opposite of a perpetual future's fixed toll — and it is why the barrier
-framing and this venue fit together at all.
-
-The taker formula is now measured: all 328 real fills came back `is_taker:
-true`, confirming the published schedule at hundredth-of-a-cent precision. The
-maker rate remains a flat modelled per-contract charge that no order ticket has
-ever confirmed — treat it as provisional, and see `core/costs.py` for the full
-account of what changed and why.
+`fee = ceil(0.07 * C * P * (1 - P) * 10_000) / 10_000` per order; settlement is free.
 """
 
 from __future__ import annotations
@@ -40,32 +28,17 @@ def test_the_fee_follows_the_published_formula():
 
 
 def test_the_ceiling_is_per_order_not_per_contract():
-    """The ceiling is still per order — it is just no longer material.
-
-    This test used to assert $0.02 for one contract at 50c and call the 14%
-    surcharge "the dominant correction" at a $100 account. Measured against 328
-    real fills, the granularity is a hundredth of a cent, so the same order pays
-    $0.0175 and the per-order effect is a rounding detail after all.
-
-    The direction of the effect is unchanged and still worth pinning: rounding is
-    per order, so splitting an order can only cost more, never less.
-    """
+    """The ceiling applies per order, so splitting an order can only cost more."""
     assert trade_fee(1, 0.50, CFG) == pytest.approx(0.0175)
     assert trade_fee(2, 0.50, CFG) == pytest.approx(0.035)
     assert trade_fee(10, 0.50, CFG) == pytest.approx(0.175)
-    # A price whose raw fee is not a whole number of hundredth-cents still
-    # rounds up once per order, so per-contract cost falls (very slightly) with
-    # size.
+    # A raw fee that is not a whole number of hundredth-cents rounds up once per
+    # order, so the per-contract cost falls slightly with size.
     assert trade_fee(7, 0.37, CFG) / 7 < trade_fee(1, 0.37, CFG)
 
 
 def test_a_confident_bet_is_a_cheap_bet():
-    """The whole reason this venue suits a barrier forecast.
-
-    The fee is maximal at 50c and falls toward either extreme, so the
-    large-displacement, late-in-the-window predictions — the confident ones — are
-    exactly where `p(1-p)` is small.
-    """
+    """The fee falls from 50c toward either extreme, so confident bets are cheap."""
     prices = np.array([0.50, 0.60, 0.70, 0.80, 0.90, 0.95])
     fees = np.asarray(fee_per_contract(prices, CFG))
     assert np.all(np.diff(fees) < 0)
@@ -81,7 +54,7 @@ def test_the_fee_is_symmetric_about_a_half():
 
 
 def test_break_even_is_the_all_in_cost():
-    """A contract paying $1 breaks even when the win probability equals its cost."""
+    """A $1 contract breaks even when the win probability equals its all-in cost."""
     for price in (0.20, 0.50, 0.85, 0.95):
         cost = float(effective_price(price, CFG))
         assert break_even_probability(price, CFG) == pytest.approx(cost)
@@ -89,13 +62,7 @@ def test_break_even_is_the_all_in_cost():
 
 
 def test_required_edge_falls_toward_the_extremes():
-    """Derived from the config rather than hardcoded.
-
-    The half-spread moved from an assumed 1.0c to a measured 0.5c, and hardcoded
-    expectations then fail for the right reason in the wrong place. Both endpoints
-    are computed here, so the shape is asserted and the level tracks whatever the
-    schedule actually is.
-    """
+    """Required edge falls toward the extremes; expected values come from the config."""
     prices = np.array([0.50, 0.70, 0.85, 0.95])
     edges = np.asarray(required_edge_pp(prices, CFG))
     assert np.all(np.diff(edges) < 0), edges
@@ -106,13 +73,7 @@ def test_required_edge_falls_toward_the_extremes():
 
 
 def test_the_half_spread_overtakes_the_fee_in_the_upper_tail():
-    """Where the spread starts to dominate the fee, derived not hardcoded.
-
-    `0.07 * p * (1 - p) = half_spread` has a closed form, and the crossover moves
-    when the spread does — it was 83c at the assumed 1.0c and is about 92c at the
-    measured 0.5c. Docstrings in this repo have twice stated a stale figure for
-    this (60c, then 83c), so it is computed.
-    """
+    """The half-spread exceeds the fee above a crossover price, computed from the config."""
     half = CFG.half_spread_cents / 100.0
     crossover = 0.5 * (1 + math.sqrt(1 - 4 * half / CFG.fee_rate))
     assert 0.80 < crossover < 0.98, crossover
@@ -123,30 +84,26 @@ def test_the_half_spread_overtakes_the_fee_in_the_upper_tail():
 
 
 def test_the_unaffordable_band_is_the_middle_not_the_ends():
-    """`p(1-p)` makes the affordable set two disjoint tails.
-
-    Reporting min and max of a disjoint set reads as "everything is affordable",
-    which is the opposite of what the schedule says.
-    """
+    """The unaffordable band is the middle, since `p(1-p)` makes the affordable set two tails."""
     threshold = 1.5
     low, high = unaffordable_price_band(threshold, CFG)
     assert low < 0.5 < high, (low, high)
-    # Inside the band the schedule alone demands more than the threshold;
-    # outside it, less. That is the whole claim.
+    # Inside the band the schedule alone needs more than the threshold; outside it,
+    # less.
     assert float(required_edge_pp(0.5, CFG)) > threshold
     assert float(required_edge_pp(max(low - 0.02, 0.01), CFG)) <= threshold
     assert float(required_edge_pp(min(high + 0.02, 0.99), CFG)) <= threshold
 
 
 def test_the_maker_fee_is_zero_by_default():
-    """The venue's maker multiplier defaults to 0 for these series."""
+    """The maker multiplier defaults to 0 for these series."""
     maker = Config(assume_maker=True)
     assert fee_per_contract(0.50, maker) == 0.0
     assert trade_fee(100, 0.5, maker) == 0.0
 
 
 def test_the_maker_fee_is_a_quarter_of_the_taker_schedule():
-    """ceil(M * 0.0175 * C * P * (1 - P)) per order, per the fee schedule."""
+    """Maker fee is ceil(M * 0.0175 * C * P * (1 - P)) per order."""
     maker = Config(assume_maker=True, maker_fee_multiplier=1.0)
     taker = Config()
     assert fee_per_contract(0.30, maker) == pytest.approx(
@@ -161,7 +118,7 @@ def test_effective_price_never_leaves_the_tick_range():
 
 
 def test_the_schedule_reports_itself_as_unverified():
-    """No filled ticket has been read against this module, and it says so."""
+    """The schedule reports that it is not verified against an order ticket."""
     schedule = FeeSchedule.of(CFG)
     assert schedule.verified_against_ticket is False
     rows = schedule.table()
@@ -176,38 +133,27 @@ def test_the_payout_is_one_dollar():
         1.0 - float(effective_price(0.85, CFG)))
 
 
-# --- measured against real fills, 2026-08-25 -------------------------------
+# --- checked against real fills ---------------------------------------------
 #
-# 328 filled orders were read back from `GET /portfolio/fills` — the first time
-# any order ticket had been checked against this module. The venue's `fee_cost`
-# matches `ceil(rate * n * p * (1-p) * 10_000) / 10_000` on 311 of them: the
-# ceiling is to a **hundredth of a cent**, not to a whole cent.
-#
-# The whole-cent rule this module used over-charged by 7% in aggregate and ~17%
-# on a small order, which made every net-edge gate too strict.
+# The venue's `fee_cost` matches `ceil(rate * n * p * (1-p) * 10_000) / 10_000`:
+# the ceiling is to a hundredth of a cent, not a whole cent.
 
 def test_the_fee_rounds_up_to_a_hundredth_of_a_cent():
-    """The venue's granularity, from a real ticket.
+    """The fee rounds up to a hundredth of a cent.
 
-    Fill: 4 contracts of NO at $0.76, `fee_cost` $0.051100.
-    0.07 * 4 * 0.76 * 0.24 = $0.0510720, and the venue charged $0.0511.
-    A whole-cent ceiling would have charged $0.06 — 17% more.
+    From a real fill: 4 NO contracts at $0.76 were charged $0.0511 (0.07 * 4 * 0.76 *
+    0.24 = $0.0510720).
     """
     assert trade_fee(4, 0.76, CFG) == pytest.approx(0.0511, abs=1e-9)
 
 
 def test_a_one_contract_order_is_not_rounded_to_two_cents():
-    """0.07 * 1 * 0.5 * 0.5 = $0.0175 exactly, and that is what is charged.
-
-    The old rule billed $0.02 and this module's docstring called that 14%
-    surcharge "the dominant correction" at a $100 account. It is not a
-    correction at all — the granularity is 100x finer than assumed.
-    """
+    """One contract at 50c costs exactly $0.0175, not $0.02."""
     assert trade_fee(1, 0.50, CFG) == pytest.approx(0.0175, abs=1e-9)
 
 
 def test_the_fee_is_still_ceiled_not_truncated():
-    """Rounding is still upward — the venue never charges less than the formula."""
+    """Rounding is upward: the venue never charges less than the formula."""
     raw = CFG.fee_rate * 3 * 0.37 * 0.63
     charged = float(trade_fee(3, 0.37, CFG))
     assert charged >= raw
@@ -215,8 +161,7 @@ def test_the_fee_is_still_ceiled_not_truncated():
 
 
 def test_the_per_order_ceiling_no_longer_penalises_small_orders_materially():
-    """Ten one-contract orders cost within a hundredth of a cent each of one
-    ten-contract order. Under the whole-cent rule they cost 11% more."""
+    """Ten one-contract orders cost almost the same as one ten-contract order."""
     single = float(trade_fee(1, 0.50, CFG))
     ten = float(trade_fee(10, 0.50, CFG))
     assert 10 * single - ten < 1e-3

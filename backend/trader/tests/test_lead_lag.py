@@ -1,10 +1,7 @@
-"""The lead-lag study finds a planted lag, and finds none where none is planted.
+"""Tests that the lead-lag study finds a planted lag and finds none where none exists.
 
-Synthetic world: a one-second spot random walk, and a Kalshi book whose mid is
-the barrier probability of spot as it stood `lag` seconds earlier — so Kalshi
-is a pure delayed copy. The book reaches the study as raw `venue_book_events`
-rows (a snapshot, then signed deltas), replayed through `BookCache` exactly as
-the archive would be.
+The Kalshi mid is spot's barrier probability `lag` seconds earlier, replayed through
+`BookCache` from raw `venue_book_events` rows.
 """
 
 from __future__ import annotations

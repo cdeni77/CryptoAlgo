@@ -1,20 +1,7 @@
-"""PROPOSED. Property test: nothing a decision reads may depend on a future bar.
+"""Property test: nothing a decision reads may depend on a bar at or after the decision.
 
-Drop into `backend/trader/tests/`. Runs against the existing conftest.
-
-Why it is needed, measured rather than asserted: the suite's only lookahead
-guard (`test_windows.py::test_a_decision_sees_the_bar_before_it_and_nothing_after`)
-inspects `last_price` alone. Mutating `core/windows.py`
-`highs[:, :offset]` -> `highs[:, :offset+1]` — a one-minute lookahead into
-`excursion_up`/`excursion_down`, which feed six `geometry` features — leaves all
-230 tests passing.
-
-The property is stated the only way that cannot be fooled: freeze a decision
-point, scramble every bar at or after it, and require every column that decision
-reads to be bit-identical. Anything that moves has read the future.
-
-`hypothesis` is not installed, so the randomisation is an explicit seeded loop.
-Swap the loops for `@given` if hypothesis is ever added.
+Scramble every bar from the decision onward; every column the decision reads must not
+change.
 """
 
 from __future__ import annotations
@@ -28,7 +15,7 @@ from core.windows import build_windows
 from tests.conftest import make_bars
 
 # Everything a decision at offset m may depend on. `settle_*` and `outcome` are
-# excluded deliberately: they are the label, and the label is a future quantity.
+# excluded: they are the label, a future quantity.
 DECISION_COLUMNS = ('strike', 'last_price', 'displacement',
                     'excursion_up', 'excursion_down')
 
@@ -36,11 +23,7 @@ OFFSETS = (3, 6, 9, 12)
 
 
 def scramble_from(bars: pd.DataFrame, cutoff: pd.Timestamp, rng) -> pd.DataFrame:
-    """Scramble every bar at or after `cutoff`; leave everything before it alone.
-
-    The shock is 5% — far outside any float tolerance, so a leak cannot hide in
-    rounding.
-    """
+    """Scramble every bar at or after `cutoff` by up to 5%, far outside float tolerance."""
     out = bars.copy()
     hit = (out['event_time'] >= cutoff).to_numpy()
     assert hit.any(), 'cutoff is past the end of the sample'
@@ -78,7 +61,7 @@ def test_no_window_column_a_decision_reads_moves_when_the_future_moves(offset):
                 f'{a} -> {b} when only bars at or after the decision minute '
                 f'({cutoff}) were perturbed — it reads the future'
             )
-        # The perturbation must actually bite, or the assertion above is vacuous.
+        # The perturbation must change the settlement, or the check above is vacuous.
         assert float(clean.loc[target, 'settle_price']) != pytest.approx(
             float(dirty.loc[target, 'settle_price'])), 'perturbation was inert'
 
@@ -87,11 +70,7 @@ def test_no_window_column_a_decision_reads_moves_when_the_future_moves(offset):
 def test_no_scored_feature_moves_when_the_future_moves(offset):
     """The same property over the whole live feature matrix.
 
-    `build_windows` is where the leak was planted, but a feature can leak on its
-    own: a rolling window that centres instead of trailing, a stray `shift(-1)`,
-    a seasonality factor fitted across the decision point. The fitted objects
-    are held fixed — one `ScoringBundle`, fitted once on clean bars — so the only
-    thing varying between the two calls is the bars.
+    The fitted bundle is held fixed, so only the bars differ between the two calls.
     """
     from core.dataset import Dataset, fit_fold, score_live
 

@@ -1,9 +1,7 @@
-"""`quote_sources` and `null_quote_age`: research may price only on quotes
-somebody watched, and may refuse a quote whose age nobody recorded.
+"""Tests for `quote_sources` and `null_quote_age`.
 
-The backfill is often stale (>30s for 12-29% of rows) and its stale asks sit
-~13-16c from the live one; `live_touch` rows carried no age at all until
-2026-10-14. Both defaults keep the historical behaviour exactly.
+Research can restrict pricing to quotes somebody recorded live, and can refuse a quote
+with no recorded age. Both defaults keep the previous behaviour.
 """
 
 from __future__ import annotations
@@ -81,8 +79,7 @@ class TestNullAge:
         assert np.isnan(out['market_probability'].iloc[0])
 
     def test_stale_bounds_a_live_touch_age_from_its_own_timestamps(self):
-        """Written 4s after the decision instant, so the book it priced was read
-        at most 4s from it: kept, and the bound is what the row now carries."""
+        """A live_touch row written 4s after the decision has an age bound of 4s and is kept."""
         depth = pd.DataFrame([_row('live_touch', 0.30, 0.32, np.nan, written_after=4)])
         out = attach_quotes(_windows(), depth, null_age='stale')
         assert out['market_probability'].iloc[0] == pytest.approx(0.31)
@@ -99,8 +96,9 @@ class TestNullAge:
         assert out['quote_age_seconds'].iloc[0] == pytest.approx(1.5)
 
     def test_the_bound_is_only_derived_for_live_touch(self):
-        """Every other observer's available_time is when IT ran, not when the
-        quote was read — the backfill's is weeks later."""
+        """The age bound is derived only for live_touch; other observers' available_time
+        is not the read time.
+        """
         frame = pd.DataFrame([_row('live_touch', 0.3, 0.32, np.nan, written_after=7),
                               _row('backfill', 0.3, 0.32, np.nan, written_after=7)])
         bound = derived_quote_age(frame)
@@ -117,13 +115,13 @@ class TestNullAge:
 
 
 class TestPeerCap:
-    """The peer's staleness cap is its own: only ~5% of live Polymarket rows are
-    5s fresh, so a tight Kalshi cap applied to the peer voided `venue_prob_gap`
-    nearly everywhere and `--complete-cases` kept 0.1% of rows."""
+    """The peer venue has its own staleness cap, since few live Polymarket rows are only
+    seconds old.
+    """
 
     def _depth(self, kalshi_age, peer_age):
-        # Backfill rows: their age counts back from the minute, so each cap
-        # sees age + the 3s decision latency.
+        # Backfill rows: age counts back from the minute, so each cap sees age plus the
+        # 3s decision latency.
         return pd.DataFrame([_row('backfill', 0.30, 0.32, kalshi_age),
                              _row('backfill', 0.50, 0.52, peer_age,
                                   venue='polymarket')])
@@ -187,8 +185,7 @@ class TestPeerCap:
 
 
 def test_an_unlisted_source_is_excluded_not_merely_ranked_last():
-    """QUOTE_SOURCE_PRIORITY only RANKS: with no live row for the key, a backfill
-    row still wins under it. `quote_sources` must EXCLUDE it."""
+    """`quote_sources` excludes an unlisted source; `QUOTE_SOURCE_PRIORITY` only ranks."""
     depth = pd.DataFrame([_row('backfill', 0.30, 0.32, 0.5, offset=12),
                           _row('live_touch', 0.60, 0.62, np.nan, offset=6)])
     ranked = attach_quotes(_windows((6, 12)), depth)

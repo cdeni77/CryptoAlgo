@@ -1,14 +1,7 @@
-"""The settlement collector must read the venue's real field names.
+"""Tests that the settlement collector reads the venue's real field names.
 
-**Kalshi serves `volume_fp`, `open_interest_fp` and `last_price_dollars`, with
-the bare names NULL.** This is the same trap already recorded for
-`yes_bid_dollars`, where reading only the integer form parsed every quote as
-empty and reported "no two-sided book" against a market quoting 0.19/0.20.
-
-Here it was quieter, because `float(market.get('volume') or 0.0)` is `0.0` and
-a stored zero is indistinguishable from a real one. Measured on the store
-2026-09-16: 4,303 of 4,509 rows written in 2026-09 (95.4%) carried volume 0,
-against 0-98 in most earlier months.
+Kalshi serves `volume_fp`, `open_interest_fp` and `last_price_dollars`, with the bare
+names null. Reading only the bare names stores zeros that look like real values.
 """
 
 from __future__ import annotations
@@ -39,7 +32,7 @@ def test_the_fixed_point_fields_are_read():
 
 
 def test_the_plain_fields_still_work_when_the_venue_sends_them():
-    """Both encodings are accepted; the venue has shipped more than one."""
+    """The bare field names still work when the venue sends them."""
     row = rows_from_kalshi_markets(
         [_market(volume=99, volume_fp=None,
                  open_interest=7, open_interest_fp=None,

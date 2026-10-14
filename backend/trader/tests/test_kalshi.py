@@ -1,10 +1,7 @@
-"""The venue client: signing, market resolution, and the refusal to trade.
+"""Tests for the Kalshi client: signing, market resolution, and refusal to trade.
 
-Nothing here reaches the network. What is tested is the shape of what would be
-sent and — more importantly — the two behaviours that make an unattended script
-safe: an order is refused unless the client was constructed for it, and a market
-that cannot be resolved produces an abstention rather than a neighbouring
-contract.
+An order is refused unless the client is built with `live=True`, and an unresolved
+market gives an abstention. Nothing reaches the network.
 """
 
 from __future__ import annotations
@@ -45,11 +42,8 @@ def test_an_unconfigured_client_says_so_rather_than_failing_later(monkeypatch):
 
 
 def test_the_signature_covers_timestamp_method_and_path(key_pem):
-    """RSA-PSS over SHA-256, not an HMAC secret.
-
-    The signed string is `timestamp + METHOD + path`, and the path excludes the
-    query — so signing the final URL instead would authenticate a different
-    message than the one sent.
+    """The signature is RSA-PSS over SHA-256 of `timestamp + METHOD + path`, with the
+    query excluded.
     """
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -77,10 +71,7 @@ def test_the_method_is_upper_cased_in_the_signed_message(key_pem):
 
 
 def test_placing_an_order_is_refused_unless_the_client_is_live(key_pem):
-    """The failure being designed against is a script meant to observe that trades.
-
-    Which cannot be undone, unlike a missed trade.
-    """
+    """A client not built with `live=True` refuses to place an order."""
     import asyncio
 
     client = KalshiClient(key_id='k', private_key_pem=key_pem, live=False)
@@ -122,38 +113,31 @@ def _sent_price(key_pem, side, limit_price):
 
 
 @pytest.mark.parametrize('side, limit, expected', [
-    # Middle band: whole-cent tick, rounded toward a fill as before.
+    # Middle band: whole-cent tick, rounded toward a fill.
     ('up', 0.6, ('bid', '0.6000')),
     ('up', 0.603, ('bid', '0.6100')),
-    ('down', 0.397, ('ask', '0.6000')),       # YES 0.603, floored for an ask
+    ('down', 0.397, ('ask', '0.6000')),  # YES 0.603, floored for an ask
     # Tails: deci-cent tick, so the limit is not widened by up to 0.9c.
     ('up', 0.0632, ('bid', '0.0640')),
     ('up', 0.9213, ('bid', '0.9220')),
-    ('down', 0.0632, ('ask', '0.9360')),      # YES 0.9368 -> floor 0.936
-    ('down', 0.9213, ('ask', '0.0780')),      # YES 0.0787 -> floor 0.078
+    ('down', 0.0632, ('ask', '0.9360')),  # YES 0.9368 -> floor 0.936
+    ('down', 0.9213, ('ask', '0.0780')),  # YES 0.0787 -> floor 0.078
     # Exactly on a deci-cent level stays put.
     ('up', 0.064, ('bid', '0.0640')),
     # Crossing a band edge lands on a level valid in the band it lands in.
     ('up', 0.0995, ('bid', '0.1000')),
-    ('down', 0.8995, ('ask', '0.1000')),      # YES 0.1005 -> floor to 0.10
+    ('down', 0.8995, ('ask', '0.1000')),  # YES 0.1005 -> floor to 0.10
 ])
 def test_a_limit_is_rounded_onto_the_venue_tick_toward_a_fill(
         key_pem, side, limit, expected):
-    """`tapered_deci_cent`: a tenth of a cent below 10c and above 90c.
-
-    Ceiling to a whole cent there gave an immediate_or_cancel up to 0.9c more
-    reach than `order_limit_price` chose. Still rounded in the direction that
-    can fill: up for a bid, down for an ask.
+    """A limit rounds onto the `tapered_deci_cent` tick toward a fill: up for a bid,
+    down for an ask.
     """
     assert _sent_price(key_pem, side, limit) == expected
 
 
 def test_a_quote_is_converted_to_probabilities_at_the_boundary():
-    """Everything above this module reasons on the probability scale.
-
-    A stray factor of 100 between cents and dollars is the classic bug in a
-    binary system, so the conversion happens once, here.
-    """
+    """A quote is converted from cents to probabilities once, here."""
     quote = _to_quote({'ticker': 'KXBTCD-T1', 'yes_bid': 84, 'yes_ask': 87,
                        'no_bid': 13, 'no_ask': 16, 'last_price': 85,
                        'volume': 1200, 'open_interest': 4000,
@@ -164,22 +148,12 @@ def test_a_quote_is_converted_to_probabilities_at_the_boundary():
     assert quote.ask_for('up') == pytest.approx(0.87)
     assert quote.ask_for('down') == pytest.approx(0.16)
     assert quote.tradeable()
-    # The two asks sum above one: that difference is the spread being crossed.
+    # The two asks sum above one; the excess is the spread.
     assert quote.ask_for('up') + quote.ask_for('down') > 1.0
 
 
 def test_a_quote_is_read_from_the_real_wire_shape():
-    """The dollar-string encoding, which is what the venue actually sends.
-
-    Every other test of `_to_quote` here fed it bare integer cents — the
-    legacy fallback, not the live one. `yes_bid_dollars: "0.1900"` is the real
-    shape (`CLAUDE.md`: reading only bare cents parsed every quote as null and
-    reported "no two-sided book on any symbol" against a market quoting
-    0.19/0.20 with 1,594 contracts on the bid). That was the historical
-    incident; this pins the fixture that would have caught it, since none of
-    the other tests in this file exercise the `_dollars` branch of `_price` at
-    all.
-    """
+    """A quote is read from the venue's dollar-string fields (`yes_bid_dollars: "0.1900"`)."""
     quote = _to_quote({
         'ticker': 'KXBTC15M-A', 'status': 'active',
         'yes_bid_dollars': '0.1900', 'yes_ask_dollars': '0.2000',
@@ -198,13 +172,7 @@ def test_a_quote_is_read_from_the_real_wire_shape():
 
 
 def test_bare_cent_fields_are_null_on_a_live_response_and_must_not_be_trusted_alone():
-    """The exact historical failure: reading only bare cents on a real payload.
-
-    A live market quoting 0.19/0.20 serves `yes_bid_dollars`/`yes_ask_dollars`
-    and the bare `yes_bid`/`yes_ask` keys are simply ABSENT — not zero, absent.
-    `_price` must still recover a tradeable quote from the dollar-suffixed
-    fields alone.
-    """
+    """With the bare cent fields absent, the dollar fields alone give a tradeable quote."""
     quote = _to_quote({
         'ticker': 'KXBTC15M-A', 'status': 'active',
         'yes_bid_dollars': '0.1900', 'yes_ask_dollars': '0.2000',
@@ -226,7 +194,7 @@ def test_a_settled_market_is_not_tradeable():
 
 
 def test_a_zero_price_reads_as_absent_not_as_free():
-    """The legacy integer-cent encoding, through the parser quotes use."""
+    """A zero integer-cent price reads as absent, not free."""
     assert _price({'yes_bid': 0}, 'yes_bid') is None
     assert _price({'yes_bid': None}, 'yes_bid') is None
     assert _price({'yes_bid': 'nonsense'}, 'yes_bid') is None
@@ -241,10 +209,8 @@ def test_times_parse_to_utc():
 
 
 def test_market_resolution_abstains_rather_than_taking_a_neighbour(monkeypatch):
-    """A ticker built from a pattern fails by finding the *wrong* contract.
-
-    So resolution asks the venue which market closes when this window settles,
-    and returns nothing when none does.
+    """Resolution asks the venue which market closes at this settlement, and returns
+    None if none does.
     """
     import asyncio
 
@@ -291,10 +257,7 @@ def test_a_request_before_opening_the_client_is_an_error(key_pem):
 # ------------------------------------------------------- the preflight script
 
 def test_the_preflight_cannot_place_an_order():
-    """It constructs the client without live=True, so ordering is impossible.
-
-    A read-only check that could trade would be worse than no check at all.
-    """
+    """The preflight builds the client without `live=True`, so it cannot place an order."""
     import inspect
 
     from scripts import check_venue
@@ -305,13 +268,7 @@ def test_the_preflight_cannot_place_an_order():
 
 
 def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
-    """Both surface as an HTTP error and the fix is completely different.
-
-    Measured: this container's own egress policy returns 403 "Host not in
-    allowlist", which under the previous message read as "the key id and the
-    private key are not a pair" — sending the reader to rotate a credential that
-    was never even seen.
-    """
+    """The preflight tells a network block (such as an egress 403) apart from a key rejection."""
     import inspect
 
     from scripts import check_venue
@@ -326,18 +283,7 @@ def test_the_preflight_distinguishes_a_network_block_from_a_rejection():
 
 
 def test_the_series_are_the_fifteen_minute_ones():
-    """`KXBTCD` is the hourly series, and pointing at it abstains on every window.
-
-    Measured against the live venue: `KXBTCD` returns 200 open markets, all
-    closing on the hour, with an explicit strike in the ticker
-    (`KXBTCD-26AUG2317-T86749.99`) — a threshold ladder, not an up/down market.
-    The 15-minute series is `KXBTC15M`, whose tickers are series + date + HHMM
-    with no strike, because the strike is the price at the window's open.
-
-    Worth a test rather than a comment: the failure was silent in the sense that
-    everything reported healthy — credentials fine, series present, hundreds of
-    markets — and only the resolution step said no.
-    """
+    """The series are the 15-minute ones (`KXBTC15M`), not the hourly threshold ladder `KXBTCD`."""
     from scripts.live import SERIES_BY_SYMBOL
 
     for symbol, series in SERIES_BY_SYMBOL.items():
@@ -348,12 +294,8 @@ def test_the_series_are_the_fifteen_minute_ones():
 
 
 def test_resolution_uses_close_time_and_not_the_ticker():
-    """The ticker is named in Eastern; `close_time` is UTC.
-
-    `KXBTC15M-26AUG230045` settles at 04:45Z, because 00:45 EDT is 04:45 UTC.
-    Parsing the ticker for its settlement would mean hardcoding the venue's
-    timezone and its daylight-saving rule, and being wrong twice a year — so this
-    asserts the resolver never looks at the ticker string.
+    """Resolution matches on `close_time` (UTC), never by parsing the ticker (named in
+    US Eastern).
     """
     import asyncio
     import inspect
@@ -368,8 +310,7 @@ def test_resolution_uses_close_time_and_not_the_ticker():
             f'{parsed!r} suggests the ticker is being parsed for a time'
         )
 
-    # And behaviourally: a ticker whose name disagrees with its close_time must
-    # be matched on the close_time.
+    # A ticker whose name disagrees with its close_time is matched on the close_time.
     client = kalshi_client.KalshiClient(key_id='k', private_key_pem='')
     settle = datetime(2026, 8, 23, 4, 45, tzinfo=timezone.utc)
 
@@ -384,13 +325,11 @@ def test_resolution_uses_close_time_and_not_the_ticker():
 
 
 def test_reconcile_pulls_everything_authoritative_in_one_call():
-    """Balance, positions, fills and settlements — the account of record.
+    """`reconcile` returns balance, positions, fills and settlements, the account of
+    record.
 
-    In paper mode the bankroll is arithmetic and settlement comes from our own
-    bars. Live, both are estimates of someone else's ledger: we approximate sixty
-    seconds of CF Benchmarks BRTI with a one-minute OHLC mean of Coinbase bars, so
-    a position settled from bars can disagree with what was actually paid. Where
-    they disagree the venue is right.
+    Live, the venue's ledger is right where it disagrees with ours, since our settlement
+    is a Coinbase proxy for BRTI.
     """
     import asyncio
 
@@ -426,7 +365,7 @@ def test_reconcile_pulls_everything_authoritative_in_one_call():
 
 
 def test_reconcile_survives_settlements_being_unavailable():
-    """An endpoint that moves must not take the balance check down with it."""
+    """If the settlements endpoint fails, the balance is still returned."""
     import asyncio
 
     client = KalshiClient(key_id='k', private_key_pem='')
@@ -454,20 +393,7 @@ def test_reconcile_survives_settlements_being_unavailable():
 
 
 def test_the_venues_settlement_wins_over_our_bars(tmp_path):
-    """Behaviour, not source text.
-
-    This pair of tests used to read `inspect.getsource` and assert that certain
-    strings appeared in it — `'reconcile_with_venue' in source`,
-    `'update_account(bankroll=venue_balance)' in source`. Both passed for the
-    whole time the settlement reconciliation they describe **did not exist**:
-    `reconcile_with_venue` built a dict of the venue's settlements, logged its
-    length, and dropped it, and `settle_position` was called from exactly one
-    place — `settle_due`, off our own bars, with the wrong rule. A test that
-    checks a function contains a substring is a test of the comment.
-
-    So: construct a position, hand `settle_due` a venue settlement that disagrees
-    with the bars, and assert the venue's answer is the one booked.
-    """
+    """`settle_due` books the venue's settlement when it disagrees with our bars."""
     from core.pg_writer import PgWriter
     from scripts.live import settle_due
 
@@ -512,19 +438,14 @@ def test_the_venues_settlement_wins_over_our_bars(tmp_path):
         'record and its answer must be the one booked'
     )
     assert position.payout == 5.0
-    # And the payout reached the account, which it never used to.
+    # The payout reaches the account.
     assert writer.account().bankroll == pytest.approx(100.0 + 5.0)
     assert writer.account().realized_pnl == pytest.approx(5.0 - 3.1)
 
 
 def test_settling_from_bars_uses_the_trained_rule(tmp_path):
-    """The mean over the minute ENDING at settle_time, compared with `>=`.
-
-    `settle_due` read the `open` of the bar *starting* at `settle_time` and used a
-    strict `>`. Three deviations from the label the model is trained against, and
-    measured on real bars they disagreed on 3.4-8.2% of windows. A dead-flat
-    window is the cheapest case that separates them: `>=` pays the up side and `>`
-    does not.
+    """Settling from bars uses the training label: the mean of the minute ending at
+    settle_time, compared with `>=`.
     """
     from core.pg_writer import PgWriter
     from scripts.live import settle_due
@@ -547,7 +468,7 @@ def test_settling_from_bars_uses_the_trained_rule(tmp_path):
         model_probability=0.6, baseline_probability=0.5, edge=0.01)
 
     # The minute ending at settle_time is exactly flat on the strike. The minute
-    # *starting* at settle_time is below it — which is what the old code read.
+    # starting at settle_time is below it.
     bars = {'BTC-USD': pd.DataFrame([
         {'event_time': pd.Timestamp(settle_time - timedelta(minutes=1)),
          'open': 100.0, 'high': 100.0, 'low': 100.0, 'close': 100.0, 'volume': 1.0},
@@ -564,15 +485,11 @@ def test_settling_from_bars_uses_the_trained_rule(tmp_path):
     )
 
 
-# --- per-shard balance, measured 2026-08-25 --------------------------------
+# --- per-shard balance ------------------------------------------------------
 #
-# Kalshi shards its exchange by category and **subaccount balances are local to a
-# shard**. `GET /portfolio/balance` returns a `balance_breakdown` array, one entry
-# per `exchange_index`. The KX*15M crypto series report `exchange_index=2`.
-#
-# Observed live: `balance_dollars` read "107.9618" while shard 2 held $1.35 and
-# shard 0 held $106.61. Every order was refused `insufficient_balance` against a
-# $107.96 balance, and sizing ran against 80x the capital it could reach.
+# Kalshi shards its exchange by category and balances are local to a shard.
+# `GET /portfolio/balance` returns a `balance_breakdown` entry per
+# `exchange_index`. The KX*15M crypto series use `exchange_index=2`.
 
 BREAKDOWN_PAYLOAD = {
     'balance': 10796,
@@ -605,32 +522,28 @@ async def test_the_spendable_balance_is_the_shard_the_market_lives_on(key_pem):
 
 @pytest.mark.asyncio
 async def test_the_default_balance_is_still_the_total(key_pem):
-    """Callers that do not name a shard keep the old, whole-account meaning."""
+    """Without a shard, the balance is the account total."""
     client = _client_returning(BREAKDOWN_PAYLOAD, key_pem)
     assert await client.balance() == pytest.approx(107.9618)
 
 
 @pytest.mark.asyncio
 async def test_a_shard_absent_from_the_breakdown_holds_nothing(key_pem):
-    """Not an error, and not the total: an unlisted shard is empty."""
     client = _client_returning(BREAKDOWN_PAYLOAD, key_pem)
     assert await client.balance(exchange_index=7) == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
 async def test_a_venue_with_no_breakdown_falls_back_to_the_total(key_pem):
-    """Older responses carry no breakdown. Returning NaN there would halt trading
-    on a venue that is behaving correctly, so fall back rather than fail."""
+    """A response with no breakdown falls back to the total instead of NaN."""
     client = _client_returning({'balance_dollars': '50.0000'}, key_pem)
     assert await client.balance(exchange_index=2) == pytest.approx(50.0)
 
 
 @pytest.mark.asyncio
 async def test_reconcile_reads_the_balance_of_the_shard_it_is_told_about(key_pem):
-    """The loop must compare its bankroll against money it can actually spend.
-
-    `reconcile` fed `balance()` with no shard, so the cross-shard total became the
-    adopted bankroll and sizing ran against capital an order could not reach.
+    """`reconcile` reads the balance of the named shard, so sizing uses money an order
+    can reach.
     """
     client = KalshiClient(key_id='k', private_key_pem=key_pem)
     seen = {}

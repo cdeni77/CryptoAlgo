@@ -1,14 +1,7 @@
-"""Shared fixtures. The synthetic bar generator is the important one.
+"""Shared fixtures, mainly `make_bars`, a synthetic one-minute bar generator.
 
-Almost every test here needs one-minute bars, and building them by hand invites
-each test to invent a slightly different convention. `synthetic_bars` produces
-one generator with known properties — a real intraday volatility shape, genuine
-volatility clustering, and an optional lead-lag from Bitcoin to the other two —
-so a test that plants a mechanism can assert the pipeline finds it, and a test
-that plants nothing can assert it finds nothing.
-
-That pairing is the point. A suite that only checks a model can find signal
-cannot catch a pipeline that manufactures it.
+Known properties (intraday vol shape, clustering, optional BTC lead) let a test check
+that the pipeline finds a planted mechanism and finds nothing otherwise.
 """
 
 from __future__ import annotations
@@ -27,9 +20,9 @@ if str(ROOT) not in sys.path:
 
 @pytest.fixture(autouse=True)
 def _no_peer_state_between_tests():
-    """Peer refusal streaks and resubscribe requests are process state. A test
-    that scores three cycles without a peer book must not leave a request for
-    the next test's `record_pm_stream.consume` to act on."""
+    """Clears process-level peer state so one test cannot leak a resubscribe request
+    into the next.
+    """
     yield
     features = sys.modules.get('livetrade.features')
     if features is not None:
@@ -41,12 +34,7 @@ def _no_peer_state_between_tests():
 
 @pytest.fixture(scope='session')
 def repo_root() -> Path:
-    """Where `configs/` lives.
-
-    Inside the trader package, not the repository root: the trader's Docker build
-    context is `backend/trader`, so anything above it is never copied into the
-    image.
-    """
+    """Returns the trader package root, where `configs/` lives (the Docker build context)."""
     return ROOT
 
 
@@ -61,11 +49,9 @@ def make_bars(
 ) -> dict[str, pd.DataFrame]:
     """One-minute bars with a known generating process.
 
-    `lead` moves that fraction of Bitcoin's move into the *next* minute for the
-    other symbols, which is the lead-lag the `cross_asset` group exists to find.
-    `close_noise` adds mean-reverting noise to the close only, leaving the open
-    clean — the bid-ask bounce the `microstructure` group exists to find, and the
-    reason a close-anchored target manufactures edge.
+    `lead` moves that fraction of the BTC move into the next minute for the other
+    symbols (the `cross_asset` mechanism). `close_noise` adds mean-reverting noise to
+    the close only (the bid-ask bounce the `microstructure` group looks for).
     """
     rng = np.random.default_rng(seed)
     n = int(days * 1440)
@@ -94,10 +80,8 @@ def make_bars(
         out[symbol] = pd.DataFrame({
             'event_time': times, 'open': price, 'high': high, 'low': low,
             'close': close, 'volume': np.exp(rng.normal(0, 0.4, n)) * seasonal,
-            # Both NULL, as the real store has them: Coinbase's candles endpoint
-            # returns OHLCV and nothing else. This fixture used to synthesise a
-            # plausible `trade_count`, which is how a feature that can never fire
-            # on real data passed `test_every_declared_feature_is_produced`.
+            # Both NULL, as in the real store: the Coinbase candles endpoint returns
+            # only OHLCV.
             'quote_volume': np.nan,
             'trade_count': np.nan,
         })

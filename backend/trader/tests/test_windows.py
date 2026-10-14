@@ -1,14 +1,7 @@
-"""The window grid, and the conventions that make it mean anything.
+"""Tests for the window grid and the venue's settlement conventions.
 
-The conventions here are the *venue's*, read off a live market's own
-`rules_primary`, and three of them are not what a reasonable person would guess:
-both ends are sixty-second averages rather than point prices, a tie resolves UP
-(`strike_type: greater_or_equal`), and a window's strike is the settlement value
-of the window before it.
-
-An earlier version of this module used `open(t0)` and `open(t1)` and a strict
-`>`. That was a defensible reading of "up/down in the next 15 minutes" and it was
-wrong in three places at once, which is why these are tests and not comments.
+Both ends are one-minute averages, a tie resolves UP, and a window's strike is the
+previous settlement.
 """
 
 from __future__ import annotations
@@ -31,18 +24,14 @@ def test_windows_are_aligned_to_the_quarter_hour():
     opens = pd.DatetimeIndex(table['window_open'].unique())
     assert (opens.minute % 15 == 0).all()
     assert (opens.second == 0).all()
-    # And every window settles exactly one window later.
+    # Every window settles exactly one window later.
     assert (table['settle_time'] - table['window_open']
             == pd.Timedelta(minutes=15)).all()
 
 
 def test_both_ends_are_one_minute_averages():
-    """The venue settles on "the simple average of the sixty seconds before".
-
-    So the strike is the mean over `[t0 - 1min, t0)` and the settlement value is
-    the mean over `[t1 - 1min, t1)`. Both are the same kind of quantity, which is
-    what makes their comparison meaningful — an earlier version used `open(t0)`
-    and `open(t1)`, a different and noisier pair.
+    """The strike is the mean over `[t0 - 1min, t0)` and the settlement the mean over
+    `[t1 - 1min, t1)`.
     """
     from core.windows import bar_mean
 
@@ -59,10 +48,10 @@ def test_both_ends_are_one_minute_averages():
 
 
 def test_a_windows_strike_is_the_previous_windows_settlement():
-    """Both are the mean over the same minute, so consecutive markets chain.
+    """A window's strike is the previous window's settlement, so consecutive markets
+    chain.
 
-    A real structural dependence, and one more reason the cross-validation
-    embargo is a day rather than a window.
+    This dependence is one reason the cross-validation embargo is a day.
     """
     bars = make_bars(days=2)['BTC-USD']
     table, _ = build_windows(bars, 'BTC-USD', offsets=(9,))
@@ -72,7 +61,9 @@ def test_a_windows_strike_is_the_previous_windows_settlement():
 
 
 def test_the_first_window_is_dropped_for_want_of_a_strike():
-    """Its strike is the previous window's settlement, which does not exist."""
+    """The first window is dropped, since its strike would come from a window that does
+    not exist.
+    """
     bars = make_bars(days=1)['BTC-USD']
     table, report = build_windows(bars, 'BTC-USD', offsets=(9,))
     first_grid_window = bars['event_time'].iloc[0].floor('15min')
@@ -84,8 +75,7 @@ def test_the_first_window_is_dropped_for_want_of_a_strike():
 def test_a_decision_sees_the_bar_before_it_and_nothing_after():
     """At offset m the last observable price is the close of bar m-1.
 
-    A one-minute leak in a fifteen-minute window is enormous — it is 7% of the
-    whole question — and it reads exactly like skill.
+    A one-minute leak is 7% of a fifteen-minute window and reads like skill.
     """
     bars = make_bars(days=1)['BTC-USD']
     indexed = bars.set_index('event_time')
@@ -98,12 +88,9 @@ def test_a_decision_sees_the_bar_before_it_and_nothing_after():
 
 
 def test_a_tie_resolves_up():
-    """`strike_type` is `greater_or_equal`, so a dead-flat window pays the up side.
+    """A tie resolves UP (`strike_type: greater_or_equal`).
 
-    The opposite of what a strict `>` gives it. Worth a test rather than a
-    comment even though a real tie is measure-zero (1 in 173,937 real BTC
-    windows, both ends being one-minute OHLC means of a liquid asset) —
-    precisely because it is rare, nothing else exercises this path.
+    Real ties are extremely rare, so nothing else exercises this path.
     """
     times = pd.date_range('2025-01-01', periods=46, freq='1min', tz='UTC')
     flat = pd.DataFrame({
@@ -117,15 +104,11 @@ def test_a_tie_resolves_up():
 
 
 def test_one_missing_averaging_minute_drops_two_windows():
-    """The minute before a boundary feeds two markets, so losing it costs both.
+    """One missing averaging minute drops two windows.
 
-    It is the settlement average of the window ending there *and* the strike of
-    the window starting there. Both are unrecoverable: they are the numbers the
-    venue read, and inventing either is the one repair this module refuses.
-
-    Note this is the minute *before* a boundary, not the boundary itself — the
-    boundary minute is used by neither average, which is a change from when the
-    strike was `open(t0)`.
+    The minute before a boundary is both the settlement average of the window ending
+    there and the strike of the next. Neither is invented. The boundary minute itself is
+    used by neither average.
     """
     bars = make_bars(days=1)['BTC-USD']
     # The last minute of a window: index 14 of 0..14.
@@ -140,11 +123,7 @@ def test_one_missing_averaging_minute_drops_two_windows():
 
 
 def test_a_missing_boundary_minute_no_longer_matters():
-    """`open(t0)` is used by nothing now, so losing that minute drops no window.
-
-    Recorded because the opposite was true and tested a few hours ago; a reader
-    finding the old assertion should see why it changed.
-    """
+    """A missing boundary minute drops no window, since neither average uses it."""
     bars = make_bars(days=1)['BTC-USD']
     boundary = bars.index[bars['event_time'].dt.minute % 15 == 0][20]
     table, report = build_windows(bars.drop(index=[boundary]), 'BTC-USD',
@@ -154,7 +133,7 @@ def test_a_missing_boundary_minute_no_longer_matters():
 
 
 def test_an_interior_gap_is_counted_but_kept():
-    """A minute with no trades carries no new price; the last trade still holds."""
+    """A missing interior minute is counted but kept; the last trade price still holds."""
     bars = make_bars(days=1)['BTC-USD']
     interior = bars.index[bars['event_time'].dt.minute % 15 == 7][10]
     holed = bars.drop(index=[interior])
@@ -176,14 +155,9 @@ def test_offsets_outside_the_window_are_refused():
 
 
 def test_the_base_rate_is_near_a_half():
-    """A large departure is a grid bug, not a market fact.
+    """The base rate is near one half; a large departure is a grid bug.
 
-    Slightly *above* 0.5 is expected, not below: `strike_type` is
-    `greater_or_equal`, so a tie pays up rather than losing it. Measured on
-    real data it is 0.5009 (BTC) / 0.5031 (ETH). This docstring used to claim
-    the opposite, describing the superseded strict-`>` rule and the discredited
-    idea that a minute grid produces ties often enough to matter (it does not
-    — 1 in 173,937 real windows).
+    Slightly above 0.5 is expected, since ties pay UP.
     """
     bars = make_bars(days=40)
     panel, _ = build_window_panel(bars, Config())
@@ -192,9 +166,9 @@ def test_the_base_rate_is_near_a_half():
 
 
 def test_every_offset_produces_the_same_number_of_rows():
-    """Four offsets of one window are four rows sharing one label.
+    """Every offset has the same row count: four offsets of one window share one label.
 
-    Which is why cross-validation splits on the window and never on the row.
+    So cross-validation splits on the window, never the row.
     """
     bars = make_bars(days=3)
     panel, _ = build_window_panel(bars, Config())
@@ -219,14 +193,11 @@ def test_floor_to_window_is_exact_on_a_boundary():
 
 
 def test_remaining_variance_is_less_than_wall_clock_time():
-    """The settlement value is an average, and averaging reduces variance.
+    """Remaining variance is `(W - delta - m) + delta/3`, less than wall-clock time.
 
-    The variance of a time-average over an interval is a third of its endpoint's,
-    so the unresolved variance at offset m is `(W - delta - m) + delta/3` rather
-    than `W - m`. At offset 12 that is 2.33 minutes against 3 — ignoring it
-    overstates sigma by 13%, which the baseline's fitted scale would quietly
-    absorb, and a fitted parameter that absorbs a known analytic correction stops
-    meaning anything.
+    The settlement value is a one-minute average, and an average has a third of its
+    endpoint's variance. At offset 12 that is 2.33 minutes against 3. Ignoring it would
+    overstate sigma by 13%.
     """
     config = Config()
     for offset in config.decision_offsets:
@@ -237,14 +208,14 @@ def test_remaining_variance_is_less_than_wall_clock_time():
                     - offset) + config.settle_average_minutes / 3.0
         assert variance == pytest.approx(expected)
 
-    # It is monotone and never negative, including past the last offset.
+    # Monotone and never negative, including past the last offset.
     values = [config.remaining_variance_minutes(m) for m in range(0, 16)]
     assert all(a >= b for a, b in zip(values, values[1:]))
     assert min(values) >= 0.0
 
 
 def test_disabling_the_settlement_average_recovers_wall_clock_time():
-    """A sanity anchor: with delta=0 the correction vanishes."""
+    """With `settle_average_minutes=0` the correction vanishes."""
     config = Config(settle_average_minutes=0.0)
     for offset in (3, 9, 12):
         assert config.remaining_variance_minutes(offset) == pytest.approx(

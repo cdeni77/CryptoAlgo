@@ -1,9 +1,4 @@
-"""The tick sink must never touch the store's read-concat-rewrite path.
-
-At a measured 862 frames a second a `(venue, symbol, month)` partition would
-reach tens of gigabytes and be rewritten on every flush — which is exactly the
-stall `run_live.py` arranges the whole live process to avoid.
-"""
+"""Tests for `core.spool`: the tick sink writes hourly files and never rewrites a partition."""
 from __future__ import annotations
 
 import json
@@ -18,7 +13,7 @@ from data_collection.stream.base import BookEvent
 
 HOUR = 1756200000.0          # 2025-08-26T09:20:00Z, mid-hour
 NEXT_HOUR = HOUR + 3600.0
-LATER = HOUR + 7200.0        # so both files above are closed
+LATER = HOUR + 7200.0  # so both files above are closed
 
 
 def rec(t=HOUR, ticker='K', price=0.30, size=10.0):
@@ -79,7 +74,6 @@ def test_compaction_writes_immutable_parquet_the_store_can_read(tmp_path):
 
 
 def test_the_hour_still_being_appended_to_is_never_compacted(tmp_path):
-    """Compacting an open file archives a prefix and deletes the rest."""
     spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
     spool = FrameSpool(spool_root, 'kalshi')
     spool.append(rec(t=HOUR))
@@ -89,7 +83,7 @@ def test_the_hour_still_being_appended_to_is_never_compacted(tmp_path):
 
 
 def test_compaction_never_rewrites_an_existing_partition(tmp_path):
-    """The whole point: two hours are two files, not one file written twice."""
+    """Two hours become two files; no existing partition is rewritten."""
     spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
     spool = FrameSpool(spool_root, 'kalshi')
     spool.append(rec(t=HOUR))
@@ -114,12 +108,10 @@ def test_pruning_bounds_the_raw_tier(tmp_path):
 
 
 def test_every_level_of_a_snapshot_survives_a_read(tmp_path):
-    """A snapshot's levels share one `seq`, so the event key must go further.
+    """Every level of a snapshot survives a read.
 
-    Measured before the key was widened: 138,878 rows written, 134,313 read
-    back, the loss falling entirely on snapshots. Deltas name a single price and
-    were untouched — so the only frames destroyed were the ones a replay needs
-    to bootstrap from, and nothing said so.
+    All levels of a snapshot share one `seq`, so the event key also includes side and
+    price.
     """
     spool_root, store_root = tmp_path / 'spool', tmp_path / 'store'
     spool = FrameSpool(spool_root, 'kalshi')

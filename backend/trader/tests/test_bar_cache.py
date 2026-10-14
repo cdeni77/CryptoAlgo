@@ -1,10 +1,4 @@
-"""The 1,500-minute window is kept between cycles; only the tail is re-asked.
-
-Re-downloading twenty-five hours every sixty seconds to learn one new minute was
-measured at 3.2s — the largest single cost in the live cycle, and the reason
-fetching the three symbols concurrently barely helped: `get_candles_range` pages
-at 300 candles, so a full window is ~6 sequential round trips per symbol.
-"""
+"""Tests for the live bar cache: keep the window between cycles, fetch only the tail."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -24,7 +18,7 @@ class _Bar:
 
 
 class _Client:
-    """Serves one bar a minute, and records the span it was asked for."""
+    """Serves one bar per minute and records each requested span."""
 
     def __init__(self, close_price=1.0):
         self.spans: list[tuple] = []
@@ -91,9 +85,9 @@ async def test_the_window_still_spans_the_full_period_after_an_incremental(clien
 
 @pytest.mark.asyncio
 async def test_a_refetched_minute_takes_the_newer_value(client):
-    """The newest cached bar is the minute still forming; the later read is the
-    finished one. Keeping the cached copy would freeze a partial candle into the
-    window, and every log_rv_* feature is built off these closes."""
+    """A refetched minute takes the newer value, since the cached last bar may be a
+    partial candle.
+    """
     await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=100)
     symbol = DEFAULT_CONFIG.symbols[0]
     stale_last = live_bars._BAR_CACHE[symbol]['event_time'].iloc[-1]
@@ -108,8 +102,8 @@ async def test_a_refetched_minute_takes_the_newer_value(client):
 async def test_a_cache_too_short_for_the_window_falls_back_to_a_full_fetch(client):
     await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=50)
     client.spans.clear()
-    # A wider window than the cache covers: an incremental tail would leave a
-    # hole in the middle that no feature would notice.
+    # A wider window than the cache covers: an incremental tail would leave a hole in
+    # the middle.
     await live_bars.fetch_bars(DEFAULT_CONFIG, minutes=400)
     symbol = DEFAULT_CONFIG.symbols[0]
     _, start, end = next(s for s in client.spans if s[0] == symbol)

@@ -1,9 +1,7 @@
-"""The decision is priced from the stream book where it can vouch for itself.
+"""Tests that a decision is priced from the stream book when it is fresh.
 
-`record_stream.CACHE` holds the Kalshi ladder folded from the socket, ~34ms
-behind the venue. A REST `/orderbook` read is the fallback — concurrently for
-every symbol that needs one — and a failed read is no quote, never the
-`/markets` touch, which is measured up to 6.3c wrong.
+A REST `/orderbook` read is the fallback, run concurrently for every symbol that needs
+one. A failed read gives no quote; the `/markets` touch is never used.
 """
 from __future__ import annotations
 
@@ -27,7 +25,7 @@ TICKERS = {'BTC-USD': 'KXBTC15M-26OCT140815-15', 'ETH-USD': 'KXETH15M-26OCT14081
 def _market(ticker):
     return {'ticker': ticker, 'status': 'active', 'exchange_index': 2,
             'close_time': '2026-10-14T12:15:00Z', 'floor_strike': 100.0,
-            # The cached touch, deliberately wrong: it must never price.
+            # The cached touch, wrong on purpose: it must never price.
             'yes_bid_dollars': '0.1000', 'yes_ask_dollars': '0.1100'}
 
 
@@ -119,7 +117,7 @@ class TestFetchQuotes:
         quote, ticker = quotes['BTC-USD']
         assert quote.book_source == 'stream' and ticker == TICKERS['BTC-USD']
         assert quote.yes_bid == pytest.approx(0.60)
-        assert quote.yes_ask == pytest.approx(0.62)        # 1 - best NO bid
+        assert quote.yes_ask == pytest.approx(0.62)  # 1 - best NO bid
         assert quote.exchange_index == 2 and quote.floor_strike == 100.0
 
     def test_a_stale_stream_falls_back_to_rest_concurrently(self):

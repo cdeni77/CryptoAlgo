@@ -37,7 +37,7 @@ def test_no_book_means_no_row_rather_than_an_empty_ladder():
 
 
 def test_a_stale_book_is_still_archived_with_its_age():
-    """The archive fails honest; the trading path fails closed."""
+    """A stale stream book is still archived, with its age."""
     row = ws_row(_cache(received=0.0, now=100.0), ticker='K', symbol='BTC-USD',
                  now=NOW, open_time=OPEN, minute=0.417)
     assert row is not None and row['book_age_ms'] == 100000.0
@@ -52,20 +52,17 @@ def test_the_row_is_schema_compatible_with_the_rest_row(tmp_path):
 
 
 def test_available_time_is_when_the_book_was_knowable_not_when_we_looked():
-    """A cache read happens after the REST round trip, so the read instant is
-    later than the frame that produced the book. Stamping the read instant made
-    the two rows look simultaneous when they are ~100-150ms apart — and that
-    skew alone accounts for the whole live agreement shortfall."""
+    """`available_time` is when the frame arrived, not when the cache was read."""
     read_at = pd.Timestamp('2026-08-26 12:00:25.400', tz='UTC')
     row = ws_row(_cache(received=99.0, now=100.0), ticker='K', symbol='BTC-USD',
                  now=NOW, open_time=OPEN, minute=0.417, read_at=read_at)
-    # age is 1.0s, so the frame landed a second before the read.
+    # Age is 1.0s, so the frame arrived a second before the read.
     assert row['available_time'] == read_at - pd.Timedelta(seconds=1.0)
     assert row['event_time'] == NOW.floor('min'), 'still pairs with the REST row'
 
 
 def test_available_time_never_precedes_event_time():
-    """The store rejects a row published before the event it describes."""
+    """`available_time` is never before `event_time`; the store rejects such rows."""
     row = ws_row(_cache(received=0.0, now=100.0), ticker='K', symbol='BTC-USD',
                  now=NOW, open_time=OPEN, minute=0.417, read_at=NOW)
     assert row['available_time'] >= row['event_time']

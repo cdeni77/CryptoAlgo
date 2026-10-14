@@ -1,17 +1,7 @@
-"""What the backfill decides to fetch, and under which venue.
+"""Tests for what the backfill fetches, and under which venue.
 
-Three defects in one code path, all of which made a scrape quietly incomplete:
-
-- Watermarks were keyed on `(symbol, timeframe)` with no venue. So once Coinbase
-  covered a span, the CCXT prepend was skipped and the reference-venue bars the
-  cross-venue basis and lead-lag features need were never collected at all.
-- Missing windows were built from MIN and MAX only, giving `(start, MIN)` and
-  `(MAX, end)`. Any interior hole — a failed request mid-history — was
-  permanently bracketed and invisible, and the features were computed straight
-  across it.
-- `INCREMENTAL_BACKFILL_HOURS=6` was quantised with `ceil(hours / 24)`, so every
-  value from 1 to 24 fetched a whole day: four times the API calls for the same
-  data.
+Covers venue-scoped watermarks, interior gap detection, the incremental window in hours,
+deeper history on a populated store, and write-failure reporting.
 """
 
 from __future__ import annotations
@@ -49,7 +39,7 @@ def _bars(hours, symbol='BTC-PERP'):
 
 
 def test_one_venues_coverage_does_not_hide_anothers_absence(database):
-    """The defect that emptied every cross-venue feature."""
+    """Coverage on one venue does not mark another venue as covered."""
     Ingestor(database).ingest_bars(_bars(range(50)), venue='coinbase')
 
     assert database.get_latest_ohlcv_time('BTC-PERP', '1h', venue='coinbase') is not None
@@ -59,7 +49,6 @@ def test_one_venues_coverage_does_not_hide_anothers_absence(database):
 
 
 def test_an_unscoped_watermark_still_answers_for_any_venue(database):
-    """Omitting the venue keeps the old meaning, for callers that want it."""
     Ingestor(database).ingest_bars(_bars(range(50)), venue='coinbase')
 
     assert database.get_latest_ohlcv_time('BTC-PERP', '1h') is not None
@@ -71,7 +60,7 @@ def test_an_unscoped_watermark_still_answers_for_any_venue(database):
 
 
 def test_an_interior_hole_is_found(database):
-    """MIN/MAX bracketing could not see this, so it stayed a hole forever."""
+    """A hole between the earliest and latest bar is found."""
     Ingestor(database).ingest_bars(
         _bars(list(range(10)) + list(range(20, 30))), venue='coinbase')
 
@@ -85,7 +74,7 @@ def test_an_interior_hole_is_found(database):
 
 
 def test_a_complete_range_reports_no_gaps(database):
-    """Otherwise every cycle refetches everything."""
+    """A complete range has no gaps, so a cycle does not refetch everything."""
     Ingestor(database).ingest_bars(_bars(range(30)), venue='coinbase')
 
     assert database.find_gaps(
@@ -111,7 +100,7 @@ def test_leading_and_trailing_gaps_are_both_found(database):
 
 
 def test_gaps_are_venue_scoped(database):
-    """A hole in the reference venue must not be hidden by the trade venue."""
+    """A hole in one venue is not hidden by coverage on another."""
     ingestor = Ingestor(database)
     ingestor.ingest_bars(_bars(range(30)), venue='coinbase')
     ingestor.ingest_bars(_bars(range(10)), venue='binance_proxy')
@@ -123,7 +112,7 @@ def test_gaps_are_venue_scoped(database):
 
 
 def test_an_unknown_table_is_refused(database):
-    """The table name is interpolated into SQL, so it must be a known one."""
+    """The table name goes into SQL, so only known tables are accepted."""
     with pytest.raises(ValueError):
         database.find_gaps('drop_me', 'BIP', T0, T0 + timedelta(hours=1),
                            step_seconds=3600)
@@ -135,13 +124,7 @@ def test_an_unknown_table_is_refused(database):
 
 
 def test_the_scrape_window_can_be_expressed_in_hours():
-    """`ceil(hours / 24)` once made a 6-hour incremental fetch pull 24.
-
-    Asserted by parsing the actual parser rather than by grepping the source for a
-    quoted flag name: the earlier version searched for `"--backfill-hours"` with
-    double quotes and broke on a module that uses single ones, which is a test
-    failing on its own formatting assumption rather than on the behaviour.
-    """
+    """`--backfill-hours` parses as a float, so a 6-hour window is not rounded up to a day."""
     from scripts.scrape import build_parser
 
     args = build_parser().parse_args(['--backfill-hours', '6'])
@@ -152,7 +135,6 @@ def test_the_scrape_window_can_be_expressed_in_hours():
 
 
 def test_the_scrape_window_accepts_a_fraction_of_a_day():
-    """The hourly cycle wants 0.25 days, not 1."""
     from scripts.scrape import build_parser
 
     args = build_parser().parse_args(['--backfill-days', '0.25'])
@@ -164,7 +146,7 @@ def test_hours_override_days_rather_than_adding_to_them():
 
     args = build_parser().parse_args(['--backfill-days', '400', '--backfill-hours', '6'])
     assert args.backfill_days == 400 and args.backfill_hours == 6.0
-    # `main` prefers hours when both are given; this pins the parser half of it.
+    # `main` prefers hours when both are given; this pins that order in the source.
     import inspect
 
     import scripts.scrape as scrape
@@ -177,12 +159,7 @@ def test_hours_override_days_rather_than_adding_to_them():
 
 
 def test_the_default_window_is_five_years():
-    """An empty store's first cycle *defines* the dataset.
-
-    `--backfill-days` in compose is the FIRST cycle only; every cycle after it
-    uses the incremental window. It was 30 once, which at this window size is far
-    too little to fit anything, and nothing in the log said why.
-    """
+    """The default first-cycle window is five years, since the first cycle defines the dataset."""
     from scripts.scrape import build_parser
 
     assert build_parser().parse_args([]).backfill_days == 1825
@@ -195,30 +172,23 @@ def test_the_default_window_is_five_years():
 
 @pytest.mark.asyncio
 async def test_a_deeper_request_fetches_history_older_than_the_store(database):
-    """`--backfill-days 1825` against a 400-day store must fetch the 1,425 missing.
+    """A deeper `--backfill-days` on a populated store fetches the older missing
+    history.
 
-    It did not. `append_start` was set to the newest stored bar whenever anything
-    was stored, so the requested `start` was discarded and the scrape fetched only
-    the forward gap — then logged "already up to date". Every deeper request on a
-    populated store was a no-op, which is exactly the situation once a loop has
-    been running: the only way to get more history was to delete the database.
-
-    The prepend branch had been removed along with CCXT, and correctly so for the
-    reason it existed: it filled the span before a contract was listed with
-    another exchange's bars for the same underlying. But the defect there was the
-    *source*, not the direction. This asserts the direction is back.
+    The requested start must not be replaced by the newest stored bar. The forward gap
+    is still fetched as well.
     """
     from datetime import timezone
 
     from data_collection.pipeline import DataPipeline
 
-    stored = _bars(range(24))                      # one day, at T0
+    stored = _bars(range(24))  # one day, at T0
     Ingestor(database).ingest_bars(stored, venue='coinbase')
 
     requested = []
 
     class _Pipe(DataPipeline):
-        def __init__(self):                        # no connector, no config
+        def __init__(self):  # no connector, no config
             self._database = database
             self._quality_tracker = _NullQuality()
 
@@ -240,8 +210,7 @@ async def test_a_deeper_request_fetches_history_older_than_the_store(database):
             return Ingestor(database).ingest_bars(bars, venue=venue)
 
     deep_start = T0 - timedelta(days=30)
-    # `end` past the stored day, so there is a genuine forward gap too and the
-    # test can show the prepend did not replace the append.
+    # `end` is past the stored day, so a forward gap exists as well as the prepend.
     await _Pipe().backfill(start=deep_start, end=T0 + timedelta(days=3),
                            symbols=['BTC-PERP'], timeframes=['1h'])
 
@@ -257,8 +226,7 @@ async def test_a_deeper_request_fetches_history_older_than_the_store(database):
     )
     assert first_end < T0, 'the prepend must stop before the stored span begins'
 
-    # The forward gap is still fetched, so restoring the prepend did not replace
-    # the append.
+    # The forward gap is still fetched alongside the prepend.
     assert any(a >= T0 for a, _ in requested), f'no forward fetch: {requested}'
 
     earliest = database.get_earliest_ohlcv_time('BTC-PERP', '1h', venue='coinbase')
@@ -267,11 +235,8 @@ async def test_a_deeper_request_fetches_history_older_than_the_store(database):
 
 @pytest.mark.asyncio
 async def test_a_request_inside_the_stored_span_still_fetches_nothing(database):
-    """The fix must not turn every run into a full re-fetch.
-
-    An incremental cycle asks for a few hours against a store that already covers
-    them. That has to stay a no-op, or the hourly loop re-downloads its whole
-    history every hour.
+    """A range already covered by the store fetches nothing, so the hourly loop stays
+    incremental.
     """
     from data_collection.pipeline import DataPipeline
 
@@ -315,21 +280,11 @@ class _NullQuality:
 
 
 def test_a_readonly_database_raises_instead_of_reporting_zero(tmp_path, monkeypatch):
-    """The defect that nearly concluded Coinbase has no history before 2025.
+    """A read-only database raises `StorageWriteError` instead of reporting zero bars
+    inserted.
 
-    `insert_ohlcv_batch` caught every per-bar exception and returned a count. On a
-    read-only file that produced 34,060 identical ERROR lines and a return of 0,
-    and a caller cannot distinguish 0-because-nothing-was-served from
-    0-because-nothing-could-be-written. The scrape logged the second as the first
-    — "the request pre-dates the contract, so nothing is missing" — while 34,060
-    fetched bars sat in memory unwritten.
-
-    A failure affecting every row is one connection-level problem, not N row
-    problems, so it raises on the first occurrence with the cause attached.
-
-    Read-only is induced with `PRAGMA query_only` rather than `chmod`, because
-    these tests run as root and root ignores file permissions — the chmod version
-    of this test passed against the unfixed code.
+    A failure on every row is one connection-level problem, so it raises on the first
+    one. `PRAGMA query_only` simulates read-only because root ignores chmod.
     """
     import sqlite3
     from contextlib import contextmanager
@@ -359,22 +314,19 @@ def test_a_readonly_database_raises_instead_of_reporting_zero(tmp_path, monkeypa
     assert 'cannot write' in message
     assert str(path) in message, 'the message must name the file that failed'
     assert 'writable' in message, 'the message must say what to check'
-    # And it names how far it got, so a partial write is not mistaken for none.
+    # The message states how far the write got, so a partial write is not read as none.
     assert '0 of 10' in message, message
 
-    # The same insert succeeds once writes are allowed again, so this is
-    # exercising the write path rather than a schema problem.
+    # The same insert succeeds once writes are allowed, so the failure is the write
+    # path, not the schema.
     monkeypatch.setattr(SQLiteDatabase, '_get_connection', original)
     assert Ingestor(db).ingest_bars(_bars(range(10)), venue='coinbase').inserted == 10
 
 
 @pytest.mark.asyncio
 async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(database, caplog):
-    """The log has to distinguish "no data" from "data we threw away".
-
-    When a prepend fetches bars and stores none of them, that is an error about
-    this process, not a discovery about the venue. Asserted on the message,
-    because the message is the only thing a human reads at 3am during a scrape.
+    """A span that is fetched but not stored is logged as a write failure, not as
+    missing history.
     """
     import logging
 
@@ -398,7 +350,7 @@ async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(data
             return _bars(range(-48, -24), symbol=symbol)
 
         def _process_and_insert_bars(self, bars, symbol, timeframe, venue):
-            return 0                      # ...and nothing is stored.
+            return 0  # ...and nothing is stored.
 
     with caplog.at_level(logging.ERROR):
         await _Pipe().backfill(start=T0 - timedelta(days=2), end=T0 + timedelta(days=2),
@@ -416,11 +368,8 @@ async def test_fetched_but_unwritten_history_is_reported_as_a_write_failure(data
 # ---------------------------------------------------------------------------
 
 def test_an_empty_batch_is_retried_with_backoff_not_immediately():
-    """A rate limit answers an instant retry exactly as it answered the first ask.
-
-    The previous version retried once with no delay, which cannot recover the
-    most likely cause of an empty batch. On a five-year backfill of ~8,700
-    batches per symbol, two gave up that way and left two five-hour holes.
+    """Empty batches retry with growing backoff, since an instant retry cannot clear a
+    rate limit.
     """
     import inspect
 
@@ -435,14 +384,7 @@ def test_an_empty_batch_is_retried_with_backoff_not_immediately():
 
 @pytest.mark.asyncio
 async def test_an_empty_batch_is_retried_with_growing_waits():
-    """Behaviour, not source text.
-
-    This asserted `'EMPTY_BATCH_BACKOFF_SECONDS' in source` and
-    `'asyncio.sleep(delay)' in source`. Both would keep passing if the retry loop
-    were rewritten to sleep once and give up, or to sleep on the wrong branch —
-    they check that two identifiers appear in a function body. Count the attempts
-    instead.
-    """
+    """Counts the attempts and waits: an empty batch retries through the whole backoff ladder."""
     import asyncio
 
     from data_collection.coinbase_connector import (
@@ -481,11 +423,7 @@ async def test_an_empty_batch_is_retried_with_growing_waits():
 
 @pytest.mark.asyncio
 async def test_a_window_that_never_answers_is_recorded_on_the_client():
-    """So a caller can act on it rather than parse a log line.
-
-    This checked `'self.last_skipped_windows' in source`, which is true of a
-    function that assigns the attribute and never populates it.
-    """
+    """A window that never returns data is recorded in `last_skipped_windows` for the caller."""
     from data_collection.coinbase_connector import CoinbaseRESTClient
 
     async def always_empty(method, path, params=None, **kwargs):
@@ -514,7 +452,7 @@ async def test_a_window_that_never_answers_is_recorded_on_the_client():
 
 
 def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
-    """The shape of the real failure: a 300-minute block from one failed batch."""
+    """Finds a 300-minute block, the shape a failed batch leaves."""
     import sqlite3
     from datetime import datetime, timedelta
 
@@ -529,7 +467,7 @@ def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
     rows = [
         ('BTC-USD', '1m', 'coinbase_spot', (start + timedelta(minutes=i)).isoformat(' '))
         for i in range(600)
-        if not (194 <= i < 494) and i != 550        # a 300-min hole, and one lone minute
+        if not (194 <= i < 494) and i != 550  # a 300-min hole, and one lone minute
     ]
     connection.executemany('INSERT INTO ohlcv VALUES (?,?,?,?)', rows)
     connection.commit()
@@ -543,17 +481,7 @@ def test_gap_detection_finds_a_multi_hour_hole(tmp_path):
 
 
 def test_min_minutes_controls_whether_a_lone_missing_minute_is_a_gap():
-    """`min_minutes` is the threshold, and 1 includes isolated single minutes.
-
-    This test used to be called
-    `test_a_single_missing_minute_is_not_a_gap_worth_refetching`, asserting that
-    a lone hole is "a minute in which nothing traded". That premise was false —
-    86% of the isolated holes in the real store were a client-side pagination
-    off-by-one, spaced exactly 301 minutes apart and co-occurring across symbols
-    177x more often than chance allows. The mechanism the body checks is correct
-    and unchanged; only the claim in the name was wrong, and the default moved
-    from 2 to 1 as a result.
-    """
+    """`min_minutes` is the threshold, and 1 includes isolated single missing minutes."""
     import sqlite3
     import tempfile
     from datetime import datetime, timedelta
@@ -583,16 +511,10 @@ def test_min_minutes_controls_whether_a_lone_missing_minute_is_a_gap():
 
 @pytest.mark.asyncio
 async def test_a_forced_backfill_fetches_an_interior_range():
-    """`--fill-gaps` could not fill a gap, which is the whole job.
+    """`force=True` fetches an interior range that the resuming path skips.
 
-    `backfill` resumes from the store's own boundaries: it prepends what is older
-    than the earliest bar and appends what is newer than the latest. For a hole in
-    the *middle* the prepend branch is skipped (the hole is newer than the first
-    bar) and `append_start` jumps to `last_time + 1min`, which is past the
-    requested `end` — so `append_start < end` is False and nothing is fetched. It
-    logged "store already covers ... which spans the request" and returned
-    success. Ten thousand recoverable minutes per symbol survived every run of the
-    tool built to recover them.
+    Without `force`, `backfill` resumes from the store's boundaries, so a hole in the
+    middle is never fetched. `--fill-gaps` relies on `force`.
     """
     from datetime import datetime as dt
 
@@ -643,13 +565,7 @@ async def test_a_forced_backfill_fetches_an_interior_range():
 
 
 def test_gaps_are_coalesced_into_requests_a_batch_can_cover():
-    """One request per hole is the venue's bill; merging what fits is free.
-
-    Holes left by the 301-for-300 pagination bug are one minute further apart than
-    a request can span, so those cannot merge — but a store with clustered outages
-    collapses a long way, and `fill_gaps` used to issue one request per gap
-    regardless.
-    """
+    """`coalesce` merges gaps that fit in one request, and keeps apart gaps that do not."""
     from datetime import datetime as dt
 
     from scripts.scrape import coalesce
