@@ -107,6 +107,7 @@ class Dataset:
         reference: str = REFERENCE_SYMBOL,
         depth: Optional[pd.DataFrame] = None,
         ladder_fits: Optional[pd.DataFrame] = None,
+        index_proxy: Optional[pd.DataFrame] = None,
     ) -> 'Dataset':
         grids = {s: minute_grid(b) for s, b in bars_by_symbol.items()}
         flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
@@ -135,6 +136,14 @@ class Dataset:
         if ladder_fits is not None and len(ladder_fits):
             from core.book_features import attach_implied_vol
             windows = attach_implied_vol(windows, ladder_fits)
+        # The settlement-index proxy, as per-minute summaries
+        # (`core.index_features.minute_summary` / `load_proxy_minutes`).
+        # Observed, so it attaches here; its z-score waits for the fold.
+        if index_proxy is not None and len(index_proxy):
+            from core.index_features import attach_index_proxy
+            windows = attach_index_proxy(
+                windows, index_proxy,
+                max_age_seconds=config.index_proxy_max_age_seconds)
         forward = {s: forward_realised_vol(g, config.window_minutes) for s, g in grids.items()}
         return cls(config=config, grids=grids, states=states, windows=windows,
                    reports=reports, forward_vol=forward)

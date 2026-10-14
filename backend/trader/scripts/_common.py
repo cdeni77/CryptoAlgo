@@ -416,8 +416,22 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     except Exception:                                         # noqa: BLE001
         settlements = None
 
+    # The index proxy is read only when its group is asked for: a year of it
+    # is ~95M one-second rows, reduced to minute summaries in DuckDB.
+    index_proxy = None
+    if 'index_proxy' in (groups_from_args(args) or ()):
+        try:
+            from core.index_features import load_proxy_minutes
+            index_proxy = load_proxy_minutes(store.root, end=end)
+            logger.info('index_proxy_1s: %s minute summaries',
+                        f'{len(index_proxy):,}')
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('no index_proxy_1s (%s); the group will be NaN',
+                           str(exc)[:80])
+
     dataset = Dataset.build(
-        bars, config, depth=depth, ladder_fits=ladder_fits
+        bars, config, depth=depth, ladder_fits=ladder_fits,
+        index_proxy=index_proxy,
     ).trailing(config.train_window_days)
     if cutoff is not None and len(dataset.windows):
         opens = pd.to_datetime(dataset.windows['window_open'], utc=True)
