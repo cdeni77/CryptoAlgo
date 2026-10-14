@@ -37,12 +37,14 @@ import numpy as np
 import pandas as pd
 
 from core.baseline import log_loss
-from core.cv import assert_no_leakage, folds_for_config
+from core.cv import assert_no_leakage, effective_observations, folds_for_config
 from core.dataset import apply_fold, fit_fold
 from core.features import CONTROL_GROUPS, FEATURE_GROUPS
+from core.metrics import weighted_fold_mean
 from core.model import fit_model
 from scripts._common import (
-    add_data_arguments, config_from_args, load_dataset, print_header, setup_logging,
+    add_data_arguments, config_from_args, load_dataset, log_trial, print_header,
+    setup_logging,
 )
 
 # Derived, never spelled out. A hardcoded second copy of the control's name is
@@ -87,7 +89,7 @@ def main() -> int:
 
     rows = []
     for label, groups in trials(available).items():
-        skills, trees = [], []
+        skills, trees, sizes = [], [], []
         for fold in folds:
             fit, train = fit_fold(dataset, fold.train, config, groups=groups)
             test = apply_fold(dataset, fit, fold.test, config, groups=groups)
@@ -100,12 +102,19 @@ def main() -> int:
             keep = np.isfinite(y) & np.isfinite(b) & np.isfinite(m)
             skills.append(log_loss(y[keep], b[keep]) - log_loss(y[keep], m[keep]))
             trees.append(model.best_iteration or 0)
+            sizes.append(effective_observations(test))
         v = np.asarray(skills, dtype=float)
-        se = float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else float('nan')
-        t = v.mean() / se if se and np.isfinite(se) and se > 0 else float('nan')
-        print(f'  {label:30s} {v.mean():+11.6f} {se:10.6f} {t:+7.2f} '
-              f'{int((v > 0).sum()):>6d}/{len(v)} {np.mean(trees):>7.0f}')
-        rows.append({'groups': label, 'skill': v.mean(), 'se': se, 't': t,
+        # The same window-weighted aggregation the gates read, so an ablation
+        # cell and a promotion report the same number for the same folds.
+        weighted = weighted_fold_mean(v, sizes)
+        plain = weighted_fold_mean(v)
+        print(f'  {label:30s} {weighted.mean:+11.6f} {weighted.standard_error:10.6f} '
+              f'{weighted.t:+7.2f} {int((v > 0).sum()):>6d}/{len(v)} '
+              f'{np.mean(trees):>7.0f}')
+        rows.append({'groups': label, 'skill': weighted.mean,
+                     'se': weighted.standard_error, 't': weighted.t,
+                     'p': weighted.p_value, 'skill_unweighted': plain.mean,
+                     'se_unweighted': plain.standard_error,
                      'folds_positive': int((v > 0).sum()), 'folds': len(v)})
 
     frame = pd.DataFrame(rows)
@@ -133,6 +142,12 @@ def main() -> int:
         path.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path / 'ablation.csv', index=False)
         print(f'\n  wrote {path / "ablation.csv"}')
+    # One line for the run; every cell it tried rides along, because each cell
+    # is a configuration somebody may later pick from.
+    log_trial('ablate', args, config, groups=available, dataset=dataset, metrics={
+        'folds': len(folds),
+        'cells': frame.to_dict('records'),
+    })
     return 0
 
 

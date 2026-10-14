@@ -60,6 +60,16 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            'both are useful and neither substitutes for the other.')
     data.add_argument('--research-store', type=str, default=None,
                       help='Override RESEARCH_STORE')
+    data.add_argument('--holdout-start', type=str, default=None, metavar='DATE',
+                      help='Seal every window opening at or after this ISO date. '
+                           'No research script sees it until --unseal-holdout.')
+    data.add_argument('--unseal-holdout', type=str, default=None, metavar='REASON',
+                      help='Read the sealed holdout. Recorded in the trial log, the '
+                           'ledger and models/holdout_unsealed.jsonl; refused on a '
+                           'second unseal of the same date without --force-unseal.')
+    data.add_argument('--force-unseal', action='store_true',
+                      help='Allow a repeat unseal of a holdout already read. '
+                           'Separate from promote --force, which installs past gates.')
 
     market = parser.add_argument_group('market structure')
     market.add_argument('--window-minutes', type=int, default=None,
@@ -262,6 +272,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('label_source', 'label_source'),
         ('edge_lower_bound_z', 'edge_lower_bound_z'),
         ('require_member_agreement', 'require_member_agreement'),
+        ('holdout_start', 'holdout_start'),
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -320,14 +331,60 @@ def apply_complete_cases(args: argparse.Namespace, dataset: Dataset) -> Dataset:
     return dataset
 
 
+def _utc(value) -> pd.Timestamp:
+    stamp = pd.Timestamp(value)
+    return stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
+
+
+def resolve_holdout(args: argparse.Namespace, config: Config) -> dict:
+    """Decide whether this run may read past `config.holdout_start`.
+
+    Records an unseal (once per date, refusing a repeat without
+    `--force-unseal`) and returns the state the trial log and ledger carry.
+    """
+    reason = getattr(args, 'unseal_holdout', None)
+    start = getattr(config, 'holdout_start', None)
+    if start is None:
+        if reason:
+            raise SystemExit('--unseal-holdout without --holdout-start: there is '
+                             'no seal to lift')
+        return {'start': None, 'sealed': False}
+    if not reason:
+        return {'start': str(start), 'sealed': True}
+    from core.promotion import HoldoutError, unseal_holdout
+
+    script = Path(sys.argv[0]).stem if sys.argv and sys.argv[0] else ''
+    try:
+        record = unseal_holdout(str(start), reason,
+                                force=bool(getattr(args, 'force_unseal', False)),
+                                script=script)
+    except HoldoutError as exc:
+        raise SystemExit(str(exc)) from exc
+    logging.getLogger('dataset').warning(
+        'HOLDOUT UNSEALED from %s: %s', start, reason)
+    return {'start': str(start), 'sealed': False, 'unsealed': record}
+
+
 def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
-    """Read the store, lay the window grid, report coverage."""
+    """Read the store, lay the window grid, report coverage.
+
+    **The one place the sealed holdout is enforced.** Bars are cut at
+    `holdout_start` so nothing fitted inside a fold (volatility, seasonality,
+    baseline) sees them, and windows opening at or after it are dropped.
+    """
     logger = logging.getLogger('dataset')
+    holdout = resolve_holdout(args, config)
+    args.holdout_state = holdout
+    cutoff = _utc(holdout['start']) if holdout.get('sealed') else None
+    end = _utc(args.end) if getattr(args, 'end', None) else None
+    if cutoff is not None:
+        end = cutoff if end is None else min(end, cutoff)
+        logger.info('holdout sealed: nothing at or after %s is read', cutoff)
     store = ResearchStore()
     bars = load_minute_bars(
         config, store=store,
-        start=pd.Timestamp(args.start, tz='UTC') if getattr(args, 'start', None) else None,
-        end=pd.Timestamp(args.end, tz='UTC') if getattr(args, 'end', None) else None,
+        start=_utc(args.start) if getattr(args, 'start', None) else None,
+        end=end,
     )
     # The venue's own book and the ladder fits, where they exist. Both are
     # OBSERVED rather than fitted, so they attach with the panel; passing them
@@ -362,6 +419,9 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     dataset = Dataset.build(
         bars, config, depth=depth, ladder_fits=ladder_fits
     ).trailing(config.train_window_days)
+    if cutoff is not None and len(dataset.windows):
+        opens = pd.to_datetime(dataset.windows['window_open'], utc=True)
+        dataset.windows = dataset.windows.loc[(opens < cutoff).to_numpy()].reset_index(drop=True)
 
     if settlements is not None and len(settlements) and 'settled_up' in settlements.columns:
         # **One venue, newest revision.** This dropped `venue` entirely and
@@ -413,6 +473,40 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     return dataset
 
 
+def data_span(dataset: Optional[Dataset], args: Optional[argparse.Namespace] = None) -> dict:
+    """What the run actually read, for the trial log."""
+    span: dict = {}
+    if args is not None:
+        span.update({'start_arg': getattr(args, 'start', None),
+                     'end_arg': getattr(args, 'end', None),
+                     'complete_cases': bool(getattr(args, 'complete_cases', False))})
+    if dataset is not None:
+        index = dataset.window_index
+        span.update({
+            'first_window': str(index.min()) if len(index) else None,
+            'last_window': str(index.max()) if len(index) else None,
+            'windows': int(len(index)), 'rows': int(len(dataset.windows)),
+            'symbols': list(dataset.symbols),
+        })
+    return span
+
+
+def log_trial(script: str, args: argparse.Namespace, config: Config, *,
+              groups: Optional[Sequence[str]] = None,
+              dataset: Optional[Dataset] = None, report=None,
+              metrics: Optional[dict] = None, trial_id: Optional[str] = None,
+              extra: Optional[dict] = None) -> dict:
+    """One line in `trials.jsonl` for this run. Every research script calls it,
+    because the ledger alone counted only promotions."""
+    from core.promotion import record_trial, trial_metrics
+
+    return record_trial(
+        script, trial_id=trial_id, config=config, groups=groups,
+        data_span=data_span(dataset, args),
+        metrics=trial_metrics(report, metrics),
+        holdout=getattr(args, 'holdout_state', None), extra=extra)
+
+
 def print_header(title: str, config: Config) -> None:
     print('=' * 78)
     print(title)
@@ -428,4 +522,6 @@ def print_header(title: str, config: Config) -> None:
           f'{config.kelly_fraction:.2f} Kelly, gate {config.min_edge_pp:.2f}pp')
     if config.cli_overrides:
         print(f'cli overrides     {", ".join(sorted(config.cli_overrides))}')
+    if getattr(config, 'holdout_start', None):
+        print(f'holdout           sealed from {config.holdout_start}')
     print()

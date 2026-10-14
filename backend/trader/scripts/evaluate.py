@@ -43,10 +43,10 @@ from pathlib import Path
 import pandas as pd
 
 from core.backtest import cost_stress, edge_curve, walk_forward
-from core.metrics import evaluate_gates, gate_report, gates_passed
+from core.metrics import evaluate_gates, gate_report, gate_spec_hash, gates_passed
 from scripts._common import (
-    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
-    setup_logging,
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, log_trial,
+    print_header, setup_logging,
 )
 
 
@@ -145,9 +145,17 @@ def main() -> int:
     #     all four pooled           model_minus_market  -0.000311   FAIL
     #
     # `evaluate` reported the second and read as "the model loses to the price".
-    gates = evaluate_gates(report, extra=market_measurement(
-        result.scored, entry_offsets=config.entry_offsets))
+    market = market_measurement(result.scored, entry_offsets=config.entry_offsets)
+    gates = evaluate_gates(report, extra=market)
     print(gate_report(gates))
+
+    # Every evaluation is a trial, whether or not anything is promoted after it.
+    log_trial('evaluate', args, config, groups=groups, dataset=dataset,
+              report=report, metrics={
+                  'model_minus_market': market.get('model_minus_market'),
+                  'market_windows': market.get('market_windows'),
+                  'gates_passed': gates_passed(gates),
+                  'failed_gates': [g.name for g in gates if not g.passed]})
 
     if args.out:
         out = Path(args.out)
@@ -160,6 +168,8 @@ def main() -> int:
             'gate_values': report.gate_values(),
             'gates': [{'name': g.name, 'value': g.value, 'threshold': g.threshold,
                        'passed': g.passed} for g in gates],
+            'gate_spec_hash': gate_spec_hash(),
+            'fold_geometry': report.fold_geometry,
             'config': report.config_provenance,
             'per_offset': per_offset.to_dict('records'),
             'rejections': result.rejections.to_dict(),

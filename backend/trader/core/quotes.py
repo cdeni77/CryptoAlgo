@@ -34,6 +34,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from core.config import DEFAULT_CONFIG
+
 # The store's depth columns, renamed to what `core.book_features` expects.
 # Declared here so a rename cannot leave FEATURE_GROUPS pointing at a column
 # nothing joins — which is exactly how a run reported "46 features (12 empty),
@@ -79,12 +81,11 @@ QUOTE_SOURCE_PRIORITY = tuple(
 # taken. Measured on the real store, 88.1% of backfilled minute rows are fresher
 # than 30s and 70.8% fresher than 5s, so tightening this costs little coverage.
 #
-# It matters that this MATCHES `core.metrics.MAX_QUOTE_AGE_SECONDS`: trades were
-# priced against quotes up to 900s old while `model_minus_market` counted only
-# those under 30s, so the money and the forecast comparison were measured on
-# different samples — and stale quotes are exactly where fake edge comes from
-# (model_minus_market ran 9x higher at 900s than at 5s).
-DEFAULT_MAX_AGE = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
+# Read from `Config.max_quote_age_seconds`, the one limit `core.metrics` and the
+# live order check also read: trades were once priced against quotes up to 900s
+# old while `model_minus_market` counted only those under 30s, and stale quotes
+# are exactly where fake edge comes from (9x higher at 900s than at 5s).
+DEFAULT_MAX_AGE = float(DEFAULT_CONFIG.max_quote_age_seconds)
 
 
 def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,

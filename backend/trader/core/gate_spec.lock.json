@@ -1,0 +1,137 @@
+{
+  "gate_spec_hash": "f876688d5c48097c22a4fbe71989215d18b63b05e2bccd265a00c231448e5280",
+  "gates": [
+    {
+      "name": "market_windows",
+      "threshold": 2000.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "model_minus_market",
+      "threshold": 0.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "log_loss_skill",
+      "threshold": 0.0,
+      "direction": "min",
+      "definition_version": 2
+    },
+    {
+      "name": "log_loss_skill_p",
+      "threshold": 0.05,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "sign_agreement_p",
+      "threshold": 0.11,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "calibration_error",
+      "threshold": 0.1,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "calibration_vs_baseline",
+      "threshold": 0.005,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "calibration_max_deviation",
+      "threshold": 0.1,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "calibration_vs_market",
+      "threshold": 0.0,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "non_finite_share",
+      "threshold": 0.001,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "residual_scale",
+      "threshold": 0.25,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "control_gain_share",
+      "threshold": 0.3,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "windows_evaluated",
+      "threshold": 20000.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "trades",
+      "threshold": 200.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "coverage",
+      "threshold": 0.0005,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "realised_edge_pp",
+      "threshold": 0.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "total_return",
+      "threshold": 0.0,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "sharpe",
+      "threshold": 0.5,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "sharpe_implausible",
+      "threshold": 0.0,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "max_drawdown",
+      "threshold": 0.35,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "median_fold_drawdown",
+      "threshold": 0.2,
+      "direction": "max",
+      "definition_version": 1
+    },
+    {
+      "name": "halted",
+      "threshold": 0.0,
+      "direction": "max",
+      "definition_version": 1
+    }
+  ]
+}

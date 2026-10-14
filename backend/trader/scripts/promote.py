@@ -3,9 +3,10 @@
 The only path to `models/forecast.joblib`. The live signal writer loads that
 file by name and nothing else, so this is the single place a model becomes real.
 
-Every attempt is recorded in `models/promotions/`, passed or blocked. That
-ledger is the trial count, and the trial count is what any claim of skill has
-to be discounted by — a project that deletes its failures cannot compute its own
+Every attempt is recorded in `models/promotions/`, passed, blocked or refused,
+and every run (dry runs too) appends to `models/trials.jsonl`. The two together
+are the trial count, and the trial count is what any claim of skill has to be
+discounted by — a project that deletes its failures cannot compute its own
 multiple-testing correction.
 
     python -m scripts.promote
@@ -24,11 +25,14 @@ import os
 import pandas as pd
 
 from core.backtest import walk_forward
-from core.metrics import evaluate_gates, gate_report
-from core.promotion import history, load_live, promote, trial_count
+from core.metrics import evaluate_gates, gate_report, gates_passed
+from core.promotion import (
+    deflated_sharpe_for, gate_lock_status, history, load_live, new_trial_id, promote,
+    record_refusal, refusal_text, trial_count,
+)
 from scripts._common import (
-    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
-    setup_logging,
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, log_trial,
+    print_header, setup_logging,
 )
 
 
@@ -222,6 +226,12 @@ def main() -> int:
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--reason', type=str, default=None,
                         help='Required with --force, and stored with the artifact.')
+    parser.add_argument('--accept-gate-change', type=str, default=None,
+                        metavar='REASON',
+                        help='Promote although the gate spec differs from '
+                             'core/gate_spec.lock.json. The reason and the spec '
+                             'diff are stored in the ledger. --force does not '
+                             'reach past a changed spec; only this does.')
     args = parser.parse_args()
     setup_logging(args.verbose)
 
@@ -246,7 +256,28 @@ def main() -> int:
     config = config_from_args(args)
     groups = groups_from_args(args)
     print_header('Promotion', config)
-    print(f'  attempts so far: {trial_count()}')
+    trial_id = new_trial_id()
+    print(f'  distinct trials so far: {trial_count()} (trial log + ledger)')
+
+    # The gate spec is checked BEFORE hours of walk-forward, against the lock
+    # committed beside the code. A changed spec is refused, not overridden by
+    # --force; only --accept-gate-change records a reason and proceeds.
+    status = gate_lock_status()
+    print(f'  gate spec {status["current_hash"][:12]} '
+          f'(lock {str(status["locked_hash"])[:12]}): '
+          f'{"matches" if status["matches"] else "DIFFERS"}')
+    if not status['matches'] and not args.accept_gate_change and not args.dry_run:
+        change = {'locked_hash': status['locked_hash'],
+                  'current_hash': status['current_hash'], 'diff': status['diff']}
+        attempt = record_refusal(refused=refusal_text(status), gate_change=change,
+                                 trial_id=trial_id)
+        log_trial('promote', args, config, groups=groups, trial_id=trial_id,
+                  extra={'evaluated': False,
+                         'promotion': {'version': attempt.version,
+                                       'refused': attempt.refused}})
+        print('\n' + attempt.summary())
+        return 1
+
     live = load_live()
     if live is not None:
         print(f'  currently live: alpha={live.residual_scale:.3f}, '
@@ -264,10 +295,23 @@ def main() -> int:
     # best of the four (+0.00550 against a pooled -0.00072).
     market = market_measurement(getattr(result, 'scored', None),
                                 entry_offsets=config.entry_offsets)
+    market_metrics = {'model_minus_market': market.get('model_minus_market'),
+                      'market_windows': market.get('market_windows')}
 
     if args.dry_run:
-        print('\n' + gate_report(evaluate_gates(result.report, extra=market)))
-        print('\ndry run: nothing installed, nothing recorded')
+        gates = evaluate_gates(result.report, extra=market)
+        print('\n' + gate_report(gates))
+        dsr = deflated_sharpe_for(result.report, trial_id=trial_id)
+        print('\n' + deflated_sharpe_line(dsr))
+        # Not in the ledger, which is for promotion attempts, but a trial all
+        # the same: a dry run that looked good is what the real run repeats.
+        log_trial('promote', args, config, groups=groups, dataset=dataset,
+                  report=result.report, trial_id=trial_id,
+                  metrics={**market_metrics, 'gates_passed': gates_passed(gates),
+                           'failed_gates': [g.name for g in gates if not g.passed],
+                           'deflated_sharpe': dsr.get('deflated_sharpe')},
+                  extra={'promotion': {'dry_run': True}})
+        print('\ndry run: nothing installed; recorded in the trial log only')
         return 0
 
     # Refit on EVERYTHING through the present, and deploy that. The folds are
@@ -280,10 +324,35 @@ def main() -> int:
               f'against the last fold\'s {result.models[-1].n_train_windows:,}')
     attempt = promote(candidate, result.report, force=args.force,
                       force_reason=args.reason, trades=result.trades(),
-                      extra=market)
+                      extra=market, accept_gate_change=args.accept_gate_change,
+                      trial_id=trial_id,
+                      holdout=getattr(args, 'holdout_state', None))
     print('\n' + attempt.summary())
+    print('\n' + deflated_sharpe_line(attempt.deflated_sharpe))
+    print(f'  distinct trials including this one: {attempt.trial_count}')
+    log_trial('promote', args, config, groups=groups, dataset=dataset,
+              report=result.report, trial_id=trial_id,
+              metrics={**market_metrics, 'gates_passed': attempt.passed,
+                       'failed_gates': [g.name for g in attempt.gates if not g.passed],
+                       'deflated_sharpe': attempt.deflated_sharpe.get('deflated_sharpe')},
+              extra={'promotion': {'version': attempt.version,
+                                   'installed': attempt.installed,
+                                   'forced': attempt.forced,
+                                   'refused': attempt.refused}})
     publish_to_serving(attempt, result.report)
     return 0 if attempt.installed else 1
+
+
+def deflated_sharpe_line(dsr: dict) -> str:
+    """Reported, never gated: a probability the Sharpe beats the best null trial."""
+    def fmt(key, spec='.3f'):
+        value = (dsr or {}).get(key)
+        return 'n/a' if value is None or not math.isfinite(value) else format(value, spec)
+
+    return (f'  deflated Sharpe {fmt("deflated_sharpe")} (probabilistic '
+            f'{fmt("probabilistic_sharpe")}; Sharpe {fmt("sharpe", "+.2f")} against '
+            f'an expected best-of-{(dsr or {}).get("n_trials", "?")} null of '
+            f'{fmt("expected_max_sharpe", "+.2f")}, {(dsr or {}).get("n_obs", 0)} days)')
 
 
 def publish_to_serving(attempt, report) -> None:

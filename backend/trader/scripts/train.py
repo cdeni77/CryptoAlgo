@@ -32,8 +32,8 @@ from core.dataset import apply_fold, fit_fold
 from core.features import population_report
 from core.model import fit_model
 from scripts._common import (
-    add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
-    setup_logging,
+    add_data_arguments, config_from_args, groups_from_args, load_dataset, log_trial,
+    print_header, setup_logging,
 )
 
 
@@ -94,6 +94,14 @@ def main() -> int:
         path = model.save(Path(args.save))
         print(f'\n  wrote {path} and {path.with_suffix(".provenance.json")}')
         print('  this is NOT promoted — run `python -m scripts.promote` for that')
+
+    # One look at one fold is still a look, so it counts as a trial.
+    log_trial('train', args, config, groups=groups, dataset=dataset, metrics={
+        'held_out_skill': log_loss(y, pb) - log_loss(y, p),
+        'held_out_fold': int(fold.index),
+        'residual_scale': model.residual_scale,
+        'control_gain_share': model.control_importance_share,
+    })
     return 0
 
 
