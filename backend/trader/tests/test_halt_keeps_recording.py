@@ -135,6 +135,10 @@ class TestTheCycleKeepsScoringWhileHalted:
             def predict(self, table):
                 return np.array([0.72] * len(table))
 
+            def score(self, table):
+                return pd.DataFrame({'model_probability': self.predict(table)},
+                                    index=table.index)
+
         async def fake_bars(config, minutes=None):
             return bars
 

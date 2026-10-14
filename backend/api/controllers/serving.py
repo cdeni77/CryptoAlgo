@@ -33,7 +33,8 @@ from models.serving import (
 # previous perp system that single number said what no Sharpe ratio said.
 FUNNEL_ORDER = (
     'traded', 'not_finite', 'price_out_of_band', 'disagreement_implausible',
-    'edge_below_gate', 'below_min_contracts', 'fee_ceiling', 'window_exposure',
+    'edge_below_gate', 'edge_uncertain', 'members_disagree',
+    'below_min_contracts', 'fee_ceiling', 'window_exposure',
     'position_limit', 'already_entered', 'bankroll_floor',
 )
 
