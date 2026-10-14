@@ -331,9 +331,6 @@ class Config:
     # Number of boosters averaged. Their spread is what `edge_lower_bound_z` and
     # `require_member_agreement` read; 1 is the single-model behaviour.
     ensemble_size: int = 1
-    # Train on each row and its up/down mirror (features negated or swapped per
-    # `core.features.FEATURE_PARITY`, label flipped). Inner-train rows only.
-    mirror_augment: bool = False
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'

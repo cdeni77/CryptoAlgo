@@ -173,9 +173,6 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                        help='average K boosters (default 1); their spread '
                             'feeds --edge-lower-bound-z and '
                             '--require-member-agreement')
-    model.add_argument('--mirror-augment', action='store_true', default=None,
-                       help='also fit on the up/down mirror of every inner-'
-                            'train row')
     model.add_argument('--stack-mode', choices=('off', 'spot_then_market'),
                        default=None,
                        help="'spot_then_market': stage 1 learns spot -> "
@@ -287,7 +284,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
         ('assume_maker', 'assume_maker'),
         ('ensemble_size', 'ensemble_size'),
-        ('mirror_augment', 'mirror_augment'),
         ('label_source', 'label_source'),
         ('null_quote_age', 'null_quote_age'),
         ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),

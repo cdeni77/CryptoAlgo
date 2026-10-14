@@ -44,7 +44,7 @@ import pandas as pd
 from core.baseline import BarrierBaseline, clip_prob, expit, log_loss, logit
 from core.config import Config, DEFAULT_CONFIG
 from core.features import (
-    BOOK_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS, feature_columns, mirror_rows,
+    BOOK_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS, feature_columns,
 )
 
 logger = logging.getLogger(__name__)
@@ -729,16 +729,7 @@ def fit_model(
             return None
         return np.asarray(weights, dtype=float)[frame.index.to_numpy()]
 
-    # The rows the correction is fitted on. Mirrored copies join here and only
-    # here: early stopping and the final layer must judge real rows.
     fit_rows, fit_weights = inner_train, frame_weights(inner_train)
-    if getattr(config, 'mirror_augment', False):
-        fit_rows = pd.concat([inner_train, mirror_rows(inner_train)],
-                             ignore_index=True)
-        if fit_weights is not None:
-            fit_weights = np.concatenate([fit_weights, fit_weights])
-        logger.info('mirror augmentation: %d inner-train rows fitted as %d',
-                    len(inner_train), len(fit_rows))
 
     def dataset(frame: pd.DataFrame, w: Optional[np.ndarray], reference=None):
         return lgb.Dataset(

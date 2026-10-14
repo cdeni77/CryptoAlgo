@@ -1,4 +1,4 @@
-"""Opt-in model extensions: ensemble, mirror, venue label.
+"""Opt-in model extensions: ensemble, venue label.
 
 Every extension is off by default, so the first tests pin that the defaults
 fit and score exactly as before.
@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.baseline import BarrierBaseline, clip_prob, expit, log_loss
+from core.baseline import BarrierBaseline, clip_prob, expit
 from core.config import Config
 from core.model import (
     BASELINE_LOGIT, fit_model,
@@ -70,8 +70,7 @@ def test_table():
 
 def test_the_defaults_are_the_historical_model(train_table, test_table):
     config = Config()
-    assert (config.ensemble_size, config.mirror_augment,
-            config.label_source) == (1, False, 'proxy')
+    assert (config.ensemble_size, config.label_source) == (1, 'proxy')
     assert config.edge_lower_bound_z == 0.0
     assert config.require_member_agreement is False
 
@@ -159,37 +158,6 @@ def test_a_row_with_no_init_has_no_spread_either(ensemble, test_table):
     assert scored.iloc[1:].notna().all().all()
 
 
-# ------------------------------------------------------------ mirror
-
-def test_mirroring_is_applied_to_inner_train_only(train_table, monkeypatch):
-    import core.model as model_module
-    seen = []
-    real = model_module.mirror_rows
-
-    def spy(frame):
-        seen.append(frame)
-        return real(frame)
-
-    monkeypatch.setattr(model_module, 'mirror_rows', spy)
-    fit(train_table, _config(mirror_augment=True))
-    assert len(seen) == 1
-    windows = np.sort(train_table['window_open'].unique())
-    cut = windows[int(len(windows) * 0.8)]
-    assert seen[0]['window_open'].max() < cut
-
-
-def test_a_symmetric_signal_is_learned_at_least_as_well_with_mirroring(test_table):
-    small = synthetic(n_windows=2400, signal=0.6, seed=5)
-    y = test_table['outcome'].to_numpy()
-    plain = fit(small, _config(mirror_augment=False))
-    mirrored = fit(small, _config(mirror_augment=True))
-    plain_loss = log_loss(y, plain.predict(test_table))
-    mirrored_loss = log_loss(y, mirrored.predict(test_table))
-    base_loss = log_loss(y, test_table['baseline_probability'].to_numpy())
-    assert mirrored_loss < base_loss
-    assert mirrored_loss <= plain_loss + 0.002
-
-
 # ------------------------------------------------------------ venue label
 
 def test_label_source_venue_trains_on_the_venue_label():
@@ -228,11 +196,10 @@ def test_every_new_field_reaches_provenance_and_the_cli():
     from scripts._common import add_data_arguments, config_from_args
     parser = add_data_arguments(argparse.ArgumentParser())
     args = parser.parse_args([
-        '--ensemble-size', '5',
-        '--mirror-augment', '--label-source', 'venue',
+        '--ensemble-size', '5', '--label-source', 'venue',
         '--edge-lower-bound-z', '1.5', '--require-member-agreement'])
     config = config_from_args(args)
-    expected = dict(ensemble_size=5, mirror_augment=True, label_source='venue',
+    expected = dict(ensemble_size=5, label_source='venue',
                     edge_lower_bound_z=1.5, require_member_agreement=True)
     record = config.provenance()
     for name, value in expected.items():
