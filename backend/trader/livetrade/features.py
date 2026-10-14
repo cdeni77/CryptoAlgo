@@ -151,7 +151,7 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) ->
             and pd.Timestamp(pm.get('window') or pm.get('window_open'))
                 != pd.Timestamp(window_open)):
         logger.debug('peer book is for window %s, not %s; gap refused',
-                     pm['window'], window_open)
+                     pm.get('window') or pm.get('window_open'), window_open)
         pm = None
     if pm is not None and pm.get('at') is not None and now is not None:
         from core.quotes import DEFAULT_MAX_AGE

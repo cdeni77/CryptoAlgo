@@ -170,6 +170,14 @@ class TestOrdering:
         assert first(venue.events, 'reconcile') < first(venue.events, 'quotes')
         assert first(venue.events, 'order') > first(venue.events, 'quotes')
 
+    def test_a_successful_reconcile_records_its_time(self, tmp_path, monkeypatch):
+        """The entry-cycle staleness guard reads this clock. If bookkeeping
+        stopped recording it, every entry cycle would reconcile first again."""
+        before = time.monotonic()
+        run(tmp_path, monkeypatch, Venue(), offset=9, reconciled=False)
+        assert live_state._LAST_RECONCILED is not None
+        assert live_state._LAST_RECONCILED >= before
+
     def test_predictions_are_still_written_for_every_symbol(self, tmp_path, monkeypatch):
         writer, _ = run(tmp_path, monkeypatch, Venue())
         with writer._session() as session:            # noqa: SLF001

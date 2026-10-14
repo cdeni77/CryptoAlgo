@@ -83,3 +83,15 @@ def test_no_fit_at_all_is_all_nan_rather_than_an_exception():
     row = implied_vol_row(None, sigma_per_min=4.0,
                           now=pd.Timestamp('2026-08-28 19:30', tz='UTC'))
     assert all(np.isnan(v) for v in row.values())
+
+
+def test_a_rest_fallback_peer_for_another_window_is_refused_not_raised():
+    """The REST fallback names the window `window_open`, the socket `window`.
+    The refusal's log line read `pm['window']`, so a rollover on the fallback
+    raised KeyError and failed the whole cycle."""
+    peer = {'best_bid': 56.0, 'best_ask': 58.0,
+            'window_open': pd.Timestamp('2026-10-14 10:00', tz='UTC')}
+    row = cross_venue_row(peer, _Quote(0.60, 0.62),
+                          window_open=pd.Timestamp('2026-10-14 10:15', tz='UTC'))
+    assert np.isnan(row['venue_prob_gap'])
+    assert row['pm_available'] == 0.0
