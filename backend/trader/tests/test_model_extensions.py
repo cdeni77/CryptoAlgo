@@ -1,6 +1,6 @@
-"""Opt-in model extensions: ensemble, venue label.
+"""Tests for opt-in model extensions: the ensemble and the venue label.
 
-Every extension is off by default, so the first tests pin that the defaults
+Every extension is off by default, so the first tests check that the defaults
 fit and score exactly as before.
 """
 
@@ -161,7 +161,7 @@ def test_a_row_with_no_init_has_no_spread_either(ensemble, test_table):
 # ------------------------------------------------------------ venue label
 
 def test_label_source_venue_trains_on_the_venue_label():
-    """Proxy and venue disagree in sign; the fitted coefficient follows the source."""
+    """With `label_source='venue'` the fitted coefficient follows the venue label."""
     table = synthetic(signal=0.0, seed=21)
     rng = np.random.default_rng(22)
     x = table['z_score'].to_numpy()

@@ -1,20 +1,8 @@
-"""Loading the consolidated collection into the research store.
+"""Tests for loading the consolidated collection into the research store.
 
-255 million snapshots were collected and nothing reads them: every consumer —
-the validators, `core/dataset.py`, `core/features.py` — reads the research
-store, and the collection writes to `data/collection/`. This is the path
-between them, and two properties of that path are load-bearing.
-
-**It summarises rather than copies.** `venue_depth` holds one row per minute
-0..15, not one per snapshot — CLAUDE.md is explicit that the offset grid is
-itself under test, so a table sampled only where the model currently scores
-would foreclose the question. 116,242 windows x 16 minutes is ~1.9M rows
-against 255M snapshots.
-
-**It must stream.** `ResearchStore.write` reads an existing partition whole in
-order to merge, and one derived partition holds 44 million rows. Handing it
-those directly is the same shape that froze the machine when `consolidate`
-held a partition in memory.
+`venue_depth` holds one row per minute 0..15 per window, not one per snapshot.
+Every minute is kept because the offset grid is itself under test. Loading
+streams, because one partition is too large to merge in memory.
 """
 
 from __future__ import annotations
@@ -33,7 +21,7 @@ W0 = dt.datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 
 
 def _snaps(rows):
-    """rows: (offset_seconds, best_bid_cents, best_ask_cents)"""
+    """Rows are (offset_seconds, best_bid_cents, best_ask_cents)."""
     return pd.DataFrame([{
         'venue': 'kalshi', 'symbol': 'BTC-USD', 'market_id': 'KX-1',
         'window_open': pd.Timestamp(W0), 'ts': int((W0.timestamp() + o) * 1000),
@@ -46,37 +34,23 @@ def _snaps(rows):
 
 
 def test_a_minute_takes_the_last_snapshot_at_or_before_it():
-    """A book is a step function, and minute 1's mark is t+60s.
-
-    **This test used to assert the leak it is named against.** It required
-    minute 1 to take t+110s -- fifty seconds AFTER its own mark -- because
-    `summarise_window` grouped by minute and took `.last()`, the last tick
-    that fell INSIDE the minute. The production DuckDB path in the same file
-    does `ASOF JOIN ... s.ts <= k.mark_ms`, and its comment names the groupby
-    version as "a lookahead leak... it made `quote_age_seconds` negative".
-
-    At or before t+60s, the answer is t+50s. Corrected 2026-09-16, and
-    `test_the_two_implementations_agree` passes for the first time, which is
-    the evidence for which half of the disagreement was right.
-    """
+    """Each minute takes the last snapshot at or before its mark (minute 1 is t+60s)."""
     got = summarise_window(_snaps([(50, 40, 42), (110, 44, 46), (130, 48, 50)]))
     row = got[got['offset_minutes'] == 1].iloc[0]
     assert row['yes_bid'] == pytest.approx(0.40), 'must take t+50s, not t+110s'
-    # Minute 2's mark is t+120s, so it takes t+110s -- not t+130s.
+    # Minute 2's mark is t+120s, so it takes t+110s, not t+130s.
     assert got[got['offset_minutes'] == 2].iloc[0]['yes_bid'] == pytest.approx(0.44)
 
 
 def test_cents_become_dollars():
-    """The existing venue_depth holds 0.63/0.64; the collection holds 63/64.
-    Loading one into the other unconverted is a hundredfold error downstream,
-    in the same direction every time."""
+    """Prices convert from cents to dollars."""
     got = summarise_window(_snaps([(0, 63, 64)]))
     assert got['yes_bid'].iloc[0] == pytest.approx(0.63)
     assert got['yes_ask'].iloc[0] == pytest.approx(0.64)
 
 
 def test_sizes_and_depths_are_not_rescaled():
-    """Only PRICES are in cents. Sizes are contracts and must pass through."""
+    """Only prices are in cents; sizes are contracts and pass through unchanged."""
     got = summarise_window(_snaps([(0, 63, 64)]))
     r = got.iloc[0]
     assert r['yes_bid_size'] == 10.0 and r['yes_ask_size'] == 20.0
@@ -85,16 +59,7 @@ def test_sizes_and_depths_are_not_rescaled():
 
 
 def test_a_minute_with_no_snapshot_yet_is_omitted_not_carried():
-    """Nothing at or before a mark means no row for that mark.
-
-    With the only tick at t+90s: minute 0 (mark t+0) and minute 1 (mark
-    t+60) both have nothing at or before them; minute 2 (mark t+120) is the
-    first that can see it.
-
-    This previously required minute 1 to be PRESENT -- the same
-    off-by-one-minute leak as the test above, dating a t+90s book to a t+60s
-    mark.
-    """
+    """A minute with no snapshot at or before its mark gets no row."""
     got = summarise_window(_snaps([(90, 44, 46)]))
     assert 0 not in set(got['offset_minutes'])
     assert 1 not in set(got['offset_minutes'])
@@ -102,24 +67,22 @@ def test_a_minute_with_no_snapshot_yet_is_omitted_not_carried():
 
 
 def test_every_minute_of_the_window_is_kept_not_just_the_decision_offsets():
-    """The offset grid is itself under test; a table sampled only where the
-    model currently scores would foreclose the question."""
+    """Every minute of the window is kept, not just the decision offsets."""
     snaps = _snaps([(s, 40, 42) for s in range(0, 16 * 60, 30)])
     got = summarise_window(snaps)
     assert set(got['offset_minutes']) >= set(range(0, 16))
 
 
 def test_nothing_past_the_window_close_is_emitted():
-    """A snapshot at +16m belongs to the next window's book, not this one."""
+    """A snapshot past +15m belongs to the next window and is not emitted."""
     got = summarise_window(_snaps([(0, 40, 42), (16 * 60 + 5, 90, 92)]))
     assert max(got['offset_minutes']) <= 15
 
 
 def test_the_source_marks_it_as_backfill():
-    """`venue_depth`'s event key includes `source` precisely so a reconstructed
-    book and a recorded one coexist. Measured before that existed: 58 overlapping
-    (symbol, window) pairs and the comparison still read zero rows, because the
-    live row's later available_time silently won."""
+    """Rows carry `source=BACKFILL_SOURCE`, so they coexist with recorded rows under the
+    event key.
+    """
     got = summarise_window(_snaps([(0, 40, 42)]))
     assert got['source'].iloc[0] == BACKFILL_SOURCE
     assert BACKFILL_SOURCE, 'must be a non-empty marker, not NaN'
@@ -134,7 +97,7 @@ def test_the_frame_carries_the_columns_the_store_expects():
 
 
 def test_a_one_sided_book_keeps_the_side_it_has():
-    """Unlike a mid, a single side is a real observation of that side."""
+    """A one-sided book keeps the side it has."""
     got = summarise_window(_snaps([(0, 40, float('nan'))]))
     assert got['yes_bid'].iloc[0] == pytest.approx(0.40)
     assert pd.isna(got['yes_ask'].iloc[0])
@@ -146,11 +109,8 @@ def test_an_empty_partition_yields_no_rows_rather_than_raising():
 
 # --- the store's schema, not the collection's ------------------------------
 #
-# Checked before running against 20 GB, and it caught two mismatches:
-# `venue_settlements` names the column `market_ticker`, not `market_id`, and
-# has NO column for a settlement price at all. A frame with the wrong names
-# does not raise — it lands as absent columns, and every downstream reader sees
-# nulls it will interpret as missing data rather than as a loader bug.
+# A frame with wrong column names does not raise: the columns land as absent
+# and readers see nulls. So the loader's output is checked against the schema.
 
 def test_settlements_use_the_store_column_names():
     from research.collect.load_store import settlement_rows
@@ -163,8 +123,7 @@ def test_settlements_use_the_store_column_names():
 
 
 def test_settled_up_is_derived_from_the_venues_own_result():
-    """`result` is the venue's word. `settled_up` is the boolean the label
-    check compares against, and deriving it here keeps one definition."""
+    """`settled_up` is derived here from the venue's `result`."""
     from research.collect.load_store import settlement_rows
     base = {'symbol': 'BTC-USD', 'market_id': 'k',
             'window_open': '2026-07-01T12:00:00+00:00',
@@ -174,9 +133,7 @@ def test_settled_up_is_derived_from_the_venues_own_result():
 
 
 def test_a_settlement_price_is_not_forced_into_a_column_that_does_not_exist():
-    """`venue_settlements` has no price field. The numeric bias measurement
-    reads the JSONL directly; inventing a column here would put it somewhere
-    no reader looks and imply it was stored."""
+    """`venue_settlements` has no price column, so the loader does not add one."""
     from research.collect.load_store import settlement_rows
     from core.datastore import SCHEMAS
     got = settlement_rows([{'symbol': 'BTC-USD', 'market_id': 'k',
@@ -212,15 +169,11 @@ def test_depth_rows_stay_inside_the_declared_schema_too():
     assert set(got.columns) <= declared, set(got.columns) - declared
 
 
-# --- the DuckDB path, not just the pandas one ------------------------------
+# --- the DuckDB path --------------------------------------------------------
 #
-# `summarise_window` (pandas) and `summarise_partition` (DuckDB) compute the
-# same thing two ways, and they DIVERGED: pandas `//` floors, DuckDB's `//` on
-# a DOUBLE is ordinary division and CAST rounds, so 959.0 seconds became minute
-# 16 and 59.9 seconds became minute 1. Every tested assertion passed against
-# the path that was not shipped, on roughly half of 1.49 million rows.
-#
-# So the production path gets its own tests, against a real Parquet file.
+# `summarise_window` (pandas) and `summarise_partition` (DuckDB) compute the same
+# thing. DuckDB's `//` on a DOUBLE divides and CAST rounds, unlike pandas floor,
+# so the production DuckDB path has its own tests against a real Parquet file.
 
 def _write_parquet(tmp_path, rows):
     frame = _snaps(rows)
@@ -230,11 +183,8 @@ def _write_parquet(tmp_path, rows):
 
 
 def test_a_book_persists_until_it_changes(tmp_path):
-    """The row for minute m is the last snapshot AT OR BEFORE the mark, so a
-    quiet book serves every following minute. Grouping by "which minute did the
-    tick fall in" instead gives the book at the END of the minute -- up to 59
-    seconds after the decision instant, which is a leak, and it showed up only
-    as a NEGATIVE quote age."""
+    """A book serves every following minute until it changes, taken at or before each mark.
+    """
     from research.collect.load_store import summarise_partition
     got = summarise_partition(_write_parquet(
         tmp_path, [(0, 40, 42), (59, 41, 43), (900, 44, 46), (959, 48, 50)]))
@@ -247,8 +197,7 @@ def test_a_book_persists_until_it_changes(tmp_path):
 
 
 def test_no_row_is_built_from_a_book_that_did_not_exist_yet(tmp_path):
-    """The leak, stated directly: a quote from after the mark may never inform
-    the row for that mark."""
+    """A quote from after a mark never informs that mark's row."""
     from research.collect.load_store import summarise_partition
     got = summarise_partition(_write_parquet(tmp_path, [(190, 44, 46)]))
     assert (got['quote_age_seconds'] >= 0).all(), 'negative age = future book'
@@ -263,8 +212,7 @@ def test_the_duckdb_path_emits_nothing_past_the_close(tmp_path):
 
 
 def test_the_two_implementations_agree(tmp_path):
-    """The property that would have caught this: pandas and DuckDB must return
-    the same offsets for the same input, whichever one ships."""
+    """The pandas and DuckDB paths return the same offsets for the same input."""
     from research.collect.load_store import summarise_partition
     rows = [(s, 40 + s % 7, 42 + s % 7) for s in range(0, 16 * 60, 17)]
     duck = summarise_partition(_write_parquet(tmp_path, rows))
@@ -278,19 +226,11 @@ def test_the_duckdb_path_converts_cents_to_dollars_too(tmp_path):
     assert got['yes_bid'].iloc[0] == pytest.approx(0.63)
 
 
-# --- provenance vocabulary and staleness -----------------------------------
+# --- provenance and staleness ----------------------------------------------
 #
-# Two things this loader got wrong on the first pass, both caught by reading
-# `scripts/build_depth.py` -- which is documented as "the one path into
-# venue_depth" and whose JSONL inputs have simply gone stale.
-#
-# `source` must be the canonical 'backfill'. Inventing 'predexon_backfill' does
-# not raise; `_validate_depth` filters on == 'backfill' and silently reported
-# zero rows against 1.49M.
-#
-# `quote_age_seconds` must be carried. Predexon serves book CHANGES, so a quiet
-# book carries forward, and a forward fill that cannot be told from an
-# observation lets a fresh forecast "beat" a stale price.
+# `source` must be the canonical 'backfill', which `_validate_depth` filters on.
+# `quote_age_seconds` must be carried: Predexon serves book changes, so a quiet
+# book carries forward, and the age shows how stale each row is.
 
 def test_the_source_is_the_canonical_backfill_value():
     from research.collect.load_store import BACKFILL_SOURCE
@@ -299,7 +239,7 @@ def test_the_source_is_the_canonical_backfill_value():
 
 
 def test_quote_age_says_how_stale_the_minute_is(tmp_path):
-    """The row for minute 5 built from a snapshot at t+3m10s is 110s stale."""
+    """A snapshot at t+3m10s serves minute 4 with an age of 50s."""
     from research.collect.load_store import summarise_partition
     got = summarise_partition(_write_parquet(tmp_path, [(190, 44, 46)]))
     row = got[got['offset_minutes'] == 4].iloc[0]
@@ -313,17 +253,11 @@ def test_a_fresh_quote_has_near_zero_age(tmp_path):
     assert row['quote_age_seconds'] == pytest.approx(0.0)
 
 
-# --- the venue's label has to cover the era we test on ---------------------
+# --- the venue's label must cover the tested period ------------------------
 #
-# Kalshi's own API only reaches ~2026-06 (it purges older markets), so a
-# backtest settling on `venue_outcome` fell back to our Coinbase label for
-# folds 2 and 3 and kept the leak: those folds were byte-identical before and
-# after the settlement fix.
-#
-# Predexon's catalog carries `result` for 56,569 markets across 2026-01..08 at
-# 79-94% yield. Loading those closes the gap. Kalshi's own rows still win where
-# both exist: they are the venue speaking directly, and they carry
-# `expiration_value`, which the catalog does not.
+# Kalshi's own API purges older markets. Predexon's catalog `result` fills the
+# earlier months. Kalshi's own rows win where both exist, since they also carry
+# `expiration_value`.
 
 def test_catalog_results_become_settlements():
     from research.collect.load_store import catalog_settlement_rows
@@ -338,8 +272,7 @@ def test_catalog_results_become_settlements():
 
 
 def test_a_catalog_row_without_a_result_is_skipped():
-    """20% of catalog rows have no result. Storing a blank would rebuild the
-    exact ambiguity the settlement collector exists to remove."""
+    """A catalog row with no result is skipped, not stored blank."""
     from research.collect.load_store import catalog_settlement_rows
     got = catalog_settlement_rows([
         {'venue': 'kalshi', 'symbol': 'BTC-USD', 'market_id': 'k1',
@@ -351,8 +284,7 @@ def test_a_catalog_row_without_a_result_is_skipped():
 
 
 def test_only_kalshi_rows_are_taken_from_the_catalog():
-    """The catalog is Kalshi-only by construction, but a venue column that says
-    otherwise must not be silently relabelled."""
+    """Only rows labelled kalshi are taken from the catalog."""
     from research.collect.load_store import catalog_settlement_rows
     got = catalog_settlement_rows([
         {'venue': 'polymarket', 'symbol': 'BTC-USD', 'market_id': 'p1',

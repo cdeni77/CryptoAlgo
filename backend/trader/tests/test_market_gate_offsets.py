@@ -1,19 +1,8 @@
-"""The market comparison must score the offset that TRADES, not all four.
+"""Tests that the market comparison scores only the offsets that trade.
 
-`PgWriter.scored_against_market` returns every scored row, and the live loop
-records a prediction at +3m, +6m, +9m and +12m while `--entry-offsets 12` means
-exactly one of them can open a position. Pooling all four measures a policy
-nobody runs -- and it does not merely add noise, it inverts the verdict.
-
-Measured 2026-09-16 on 5,468 live rows:
-
-    offset 12 (what trades)   model_minus_market  +0.000921   PASS
-    all four pooled           model_minus_market  -0.000311   FAIL
-
-`scripts/promote.py` was fixed for this and carries the note. `scripts/evaluate.py`
-called the same helper WITHOUT `entry_offsets` for as long as it had existed, so
-the two disagreed about the same candidate on the gate the whole stack exists to
-satisfy, and `evaluate` read as "the model loses to the price".
+Live records a prediction at four offsets while `--entry-offsets 12` lets only
+one open a position. Pooling all four measures a policy nobody runs, and can
+invert the verdict.
 """
 
 from __future__ import annotations
@@ -24,18 +13,13 @@ from scripts.promote import market_measurement
 
 
 def _rows(offset, market, model, outcomes):
-    """(symbol, window_open, offset, market, baseline, model, outcome)."""
+    """Rows are (symbol, window_open, offset, market, baseline, model, outcome)."""
     return [('BTC-USD', f'{offset}-{i}', offset, market, 0.5, model, o)
             for i, o in enumerate(outcomes)]
 
 
 def test_pooling_the_untraded_offsets_can_invert_the_verdict():
-    """The defect itself, on numbers that make it unambiguous.
-
-    At +12m the model is confident and right; at +3m it is equally confident
-    and wrong. Scored where it trades it beats the price; pooled across offsets
-    it loses to it. Same model, same rows, opposite verdict.
-    """
+    """Pooling an untraded offset can invert the verdict of the traded one."""
     from core.metrics import market_gate_values
 
     traded = _rows(12, 0.5, 0.9, [1] * 50)
@@ -50,13 +34,7 @@ def test_pooling_the_untraded_offsets_can_invert_the_verdict():
 
 
 def test_evaluate_forwards_entry_offsets_to_the_market_gate():
-    """A seam test, because the bug was a MISSING ARGUMENT at one call site.
-
-    Testing `market_measurement` alone passed the whole time this was broken --
-    the helper was always correct. What was wrong was that `evaluate` did not
-    tell it which offsets trade. So the thing under test is the call, not the
-    callee.
-    """
+    """`scripts/evaluate.py` passes `entry_offsets` to `market_measurement`."""
     import scripts.evaluate as ev
 
     src = inspect.getsource(ev)

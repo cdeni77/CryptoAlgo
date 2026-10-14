@@ -1,18 +1,8 @@
-"""The "different model" warning must not fire every window.
+"""Tests that the unscoreable-feature warning fires only for unexpected NaNs.
 
-`_warn_unscoreable_features` is the ONLY signal that the live model is not the
-one whose gates were measured — LightGBM substitutes a learned default for a
-NaN and nothing raises.
-
-It fired **96 times in 24 hours**: once per window, always
-`venue_gap_change_5`, which is a first difference against the previous offset
-and therefore NaN at a window's first offset by construction. A genuine failure
-— a dead stream leaving `imbalance_5c`, `depth_ratio` and `book_convexity`
-empty — appends three names to the identical line at the identical rate, so the
-signal was indistinguishable from the noise from the day the feature shipped.
-
-Expected absences are still reported at debug rather than dropped: the day one
-of them stops being expected, silence would be worse than noise.
+It is the only signal that live is scoring with NaN features, which LightGBM
+fills with a learned default. `venue_gap_change_5` is NaN at a window's first
+offset by design, so that case logs at DEBUG and real gaps still warn.
 """
 
 from __future__ import annotations
@@ -56,14 +46,14 @@ def test_it_is_still_reported_at_debug(caplog):
 
 
 def test_the_same_feature_at_a_later_offset_DOES_warn(caplog):
-    """At +12m there is a previous offset, so an empty gap_change is real."""
+    """At +12m a previous offset exists, so an empty gap change warns."""
     caplog.set_level(logging.DEBUG, logger='live')
     _warn_unscoreable_features(_scored(12), _Model(), offsets=OFFSETS)
     assert _warnings(caplog)
 
 
 def test_a_dead_stream_still_warns_at_the_first_offset(caplog):
-    """The case the saturation was hiding."""
+    """A dead stream still warns at the first offset."""
     caplog.set_level(logging.DEBUG, logger='live')
     dead = _scored(3, imbalance_5c=float('nan'), depth_ratio=float('nan'))
     _warn_unscoreable_features(dead, _Model(), offsets=OFFSETS)

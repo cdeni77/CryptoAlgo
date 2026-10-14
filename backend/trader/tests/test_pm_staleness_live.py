@@ -1,25 +1,9 @@
-"""Live read the Polymarket price from a cache written ~30 seconds earlier.
+"""Tests that the live Polymarket price used in `venue_prob_gap` is fresh and from the same
+window.
 
-Training aligns the two venues: `event_time` is identical on 100% of 693,805
-matched pairs, and on the rows the model sees Polymarket is 4.0 SECONDS STALER
-on average. So `venue_prob_gap` in training is a contemporaneous disagreement
-between two books.
-
-Live it was not. `record_pm_ladder` wrote at a median of 32 seconds past the
-minute while decisions land at about +2s, so the freshest reading available to a
-decision was ~30 seconds old — and `cross_venue_row` carried no staleness check,
-so the model could not tell. A 30-second-old peer price makes the "gap" partly a
-measure of KALSHI'S OWN MOVE over those thirty seconds, which is a different
-quantity from the one the model was fitted on.
-
-That matters more here than anywhere else: `cross_venue` is the only
-load-bearing group in the model — dropping it takes skill from +0.00282 to
--0.00015.
-
-Two fixes, and both are needed. The guard refuses a reading past the same
-`max_age_seconds` the backtest applies to both venues, so a stale gap is NaN
-rather than wrong. The re-phasing makes the reading fresh enough to survive that
-guard most of the time, so the fix buys parity rather than coverage loss.
+In training the two venues' books are contemporaneous. Live refuses a peer
+reading older than the backtest's `max_age_seconds`, and the recorder runs late
+in the minute so its reading is fresh at the decision.
 """
 from __future__ import annotations
 
@@ -51,8 +35,8 @@ def test_a_fresh_peer_reading_is_used():
 
 
 def test_a_stale_peer_reading_is_refused():
-    """Past the bar the backtest applies to both venues, the gap is a different
-    quantity — it carries Kalshi's own move over the interval."""
+    """A stale peer reading is refused: the gap would include Kalshi's own move since.
+    """
     row = cross_venue_row(_pm(90), _Quote(), now=NOW)
     assert np.isnan(row['venue_prob_gap'])
     assert row['pm_available'] == 0.0, (
@@ -68,16 +52,15 @@ def test_the_boundary_matches_the_backtest_tolerance():
 
 
 def test_a_reading_with_no_timestamp_is_kept():
-    """Absence of a stamp is not evidence of staleness, matching the backtest,
-    where a peer row without `quote_age_seconds` is kept."""
+    """A reading with no timestamp is kept, as in the backtest."""
     row = cross_venue_row({'best_bid': 40.0, 'best_ask': 42.0}, _Quote(), now=NOW)
     assert not np.isnan(row['venue_prob_gap'])
 
 
 def test_the_recorder_is_phased_to_be_fresh_at_a_decision():
-    """Decisions land ~2s past the minute. A recorder firing at +35s leaves the
-    freshest reading ~27s old — inside the 30s bar, but only just, and past it
-    on the tail. Phased late in the minute it is a few seconds old."""
+    """The recorder runs late in the minute, so its reading is a few seconds old at the
+    decision.
+    """
     from scripts.run_live import COMPONENTS
     pm = next(c for c in COMPONENTS if c.name == 'pm_ladder')
     staleness_at_decision = (60 - pm.phase) + 2
@@ -87,13 +70,10 @@ def test_the_recorder_is_phased_to_be_fresh_at_a_decision():
 
 
 def test_a_peer_reading_from_another_window_is_refused():
-    """Staleness cannot catch this and the window must.
+    """A peer reading from another window is refused, however fresh.
 
-    Observed live at a rollover: Kalshi rebuilt at 22:45:16 and Polymarket at
-    22:45:46, so for thirty seconds the cache held the 22:30 book with a recent
-    stamp. It passes any age test — the data really is fresh — but it is about a
-    different fifteen minutes. A gap computed from it prices this window against
-    the last one's book.
+    At a window rollover the cache can briefly hold the previous window's book with
+    a recent timestamp.
     """
     pm = {'best_bid': 40.0, 'best_ask': 42.0,
           'at': NOW - pd.Timedelta(seconds=3),
@@ -114,8 +94,7 @@ def test_the_matching_window_is_used():
 
 
 def test_a_reading_with_no_window_is_still_accepted():
-    """The REST fallback publishes no window. Refusing it would disable the
-    fallback entirely at the moment the socket is down."""
+    """A reading with no window (the REST fallback) is still accepted."""
     pm = {'best_bid': 40.0, 'best_ask': 42.0, 'at': NOW - pd.Timedelta(seconds=3)}
     row = cross_venue_row(pm, _Quote(), now=NOW,
                           window_open=pd.Timestamp('2026-09-03 12:15', tz='UTC'))
@@ -123,18 +102,16 @@ def test_a_reading_with_no_window_is_still_accepted():
 
 
 def test_the_declared_phase_is_the_one_actually_used():
-    """`Component.phase` is read only by the startup banner; the recorder aligns
-    on a separately hardcoded number. So the declaration said +55s, the banner
-    printed +55s, and the poll ran at +35s — a fix that was cosmetic, and looked
-    applied in the log.
+    """The recorder aligns on the declared `Component.phase`, not a separate hardcoded
+    number.
     """
     import inspect
     from scripts.run_live import COMPONENTS, build_factories
 
     source = inspect.getsource(build_factories)
     body = source.split('async def pm_ladder')[1].split('async def')[0]
-    # Either it reads the declaration, or it repeats the SAME number. A repeated
-    # different number is the drift this test exists for.
+    # Either it reads the declaration or it repeats the same number. A different
+    # literal is the drift this test catches.
     declared = next(c for c in COMPONENTS if c.name == 'pm_ladder').phase
     reads_declaration = 'COMPONENTS' in body and 'phase' in body
     import re

@@ -1,9 +1,8 @@
-"""The only measurement that decides anything, so its arithmetic is pinned.
+"""Tests for `scripts/market_benchmark.py`, the comparison of the model with the market
+price.
 
-Everything `scripts/evaluate.py` reports is skill against `F(x/sigma)` — a formula
-we wrote. Beating it says nothing about beating the price on offer: the audit
-measured a model that knows the truth exactly earning +2219% against a
-baseline-priced counterparty and **zero** against an informed one.
+Skill against `F(x/sigma)` says nothing about beating the price on offer. This
+is the measurement that does.
 """
 
 from __future__ import annotations
@@ -18,19 +17,16 @@ import pytest
 
 from core.pg_writer import PgWriter
 
-# tests/ -> backend/trader/. A developer-specific absolute path here failed on
-# any other machine, container or CI runner — this is the same fix already
-# used in test_repo_hygiene.py, just one directory shallower.
+# tests/ -> backend/trader/.
 REPO_TRADER = str(Path(__file__).resolve().parents[1])
 NOW = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
 
 
 def seed(writer: PgWriter, *, n: int, market_skill: float, model_skill: float,
          seed_value: int = 0) -> None:
-    """Windows where truth is known, and market/model are each `skill` away from it.
+    """Windows with known truth, where the market and model are each `skill` close to it.
 
-    A larger `skill` means *closer* to the truth, so the better forecaster is the
-    one whose probability sits nearer the realised frequency.
+    A larger `skill` means closer to the truth.
     """
     rng = np.random.default_rng(seed_value)
     truth = rng.uniform(0.15, 0.85, n)
@@ -59,7 +55,7 @@ def run(url: str) -> subprocess.CompletedProcess:
 
 
 def test_it_refuses_when_no_quote_has_ever_been_recorded(tmp_path):
-    """Which is the state today, and it must say so rather than print zeros."""
+    """With no recorded quotes it refuses instead of printing zeros."""
     url = f'sqlite:///{tmp_path}/empty.db'
     PgWriter(database_url=url)
     result = run(url)
@@ -82,9 +78,7 @@ def test_a_better_model_reads_positive_against_the_market(tmp_path):
 
 
 def test_a_worse_model_reads_negative_against_the_market(tmp_path):
-    """The case that matters. A model that beats the formula and loses to the
-    price must read negative here, because that is the situation the whole
-    backtest apparatus cannot detect."""
+    """A model that loses to the price reads negative."""
     url = f'sqlite:///{tmp_path}/worse.db'
     writer = PgWriter(database_url=url)
     seed(writer, n=300, market_skill=0.9, model_skill=0.4)
@@ -98,7 +92,7 @@ def test_a_worse_model_reads_negative_against_the_market(tmp_path):
 
 
 def test_a_small_sample_is_not_a_conclusion(tmp_path):
-    """300 windows cannot settle a 0.5pp question, and it must exit non-zero."""
+    """300 windows is too few to conclude, so it exits non-zero."""
     url = f'sqlite:///{tmp_path}/small.db'
     writer = PgWriter(database_url=url)
     seed(writer, n=300, market_skill=0.5, model_skill=0.9)

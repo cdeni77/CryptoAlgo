@@ -1,18 +1,8 @@
-"""Fitting the correction on top of the PRICE instead of on top of F(x/sigma).
+"""Tests for fitting the correction on the market logit instead of on F(x/sigma).
 
-`model_minus_market` fails at -0.00248: the model is a worse forecaster than the
-quote it has to trade against. A baseline-initialised model spends its capacity
-correcting a forecaster that is already behind the price, so "beat the baseline"
-stops implying anything about whether the trade pays.
-
-Initialised on the market the null inverts in the right direction: an untrained
-model reproduces the PRICE, so `model_minus_market >= 0` unless the trees
-actively hurt, and the residual being fitted is `logit(truth) - logit(price)` —
-how the price is wrong, which is the quantity the money depends on.
-
-This was tried once before as `refit_market_init` and overfit, its alpha
-collapsing to 0.386. It needs a quote on EVERY training row to be honest, which
-is what `--complete-cases` now guarantees and did not before.
+An untrained market-init model reproduces the price, and the fitted residual is
+how the price is wrong. It needs a quote on every training row, which
+`--complete-cases` guarantees.
 """
 
 from __future__ import annotations
@@ -36,9 +26,7 @@ def test_the_market_logit_is_attached():
 
 
 def test_a_row_without_a_quote_stays_nan_rather_than_borrowing_the_baseline():
-    """A market-init model that silently fell back to the baseline would be a
-    baseline-init model wearing the other one's provenance — invisible, because
-    both produce identically well-formed numbers."""
+    """A row without a quote stays NaN and never borrows the baseline logit."""
     got = attach_market_logit(_table(market=(0.45, np.nan)))
     assert np.isfinite(got[MARKET_LOGIT].iloc[0])
     assert not np.isfinite(got[MARKET_LOGIT].iloc[1])
@@ -56,8 +44,7 @@ def test_the_config_accepts_only_the_two_sources():
 
 
 def test_market_init_is_reachable_from_the_cli():
-    """It exists in Config and in core.model, and was never wired to a flag —
-    so the one fix for the gate that matters could not be run."""
+    """`--init-score-source market` is available on the CLI."""
     import argparse
     from scripts._common import add_data_arguments
     parser = add_data_arguments(argparse.ArgumentParser())

@@ -1,18 +1,8 @@
-"""`predictions.outcome` must agree with the venue, because the gates read it.
+"""Tests that `predictions.outcome` is corrected to the venue's settlement.
 
-`settle_due` prefers the venue's own settlement for the money.
-`settle_predictions` — eleven lines away, with the venue data in scope — fills
-the same window's label from Coinbase bars, and `scored_against_market()` can
-return no other column. So the live branch of `model_minus_market` was computed
-on our proxy while the backtest branch substitutes `venue_outcome`.
-
-Measured 2026-09-16 on 5,471 rows at +12m:
-
-    OUR label     model_minus_market  +0.000924
-    VENUE label   model_minus_market  +0.000188
-    disagreement                           2.85%
-
-Four fifths of the apparent live edge was self-grading.
+The live branch of `model_minus_market` reads this column, while the backtest
+uses `venue_outcome`. Grading live rows on our Coinbase label would grade the
+model on our own proxy.
 """
 
 from __future__ import annotations
@@ -40,8 +30,7 @@ def _frame(rows):
 
 
 def test_the_newest_revision_of_a_window_wins():
-    """The store keeps revisions. The venue's latest word is the one to
-    believe, not whichever row the reader happened to return first."""
+    """The newest revision of a window's settlement wins."""
     store = _Store(_frame([
         {'venue': 'kalshi', 'symbol': 'BTC-USD', 'window_open': OPEN,
          'settled_up': False, 'available_time': pd.Timestamp('2026-09-16T15:20Z')},
@@ -53,8 +42,8 @@ def test_the_newest_revision_of_a_window_wins():
 
 
 def test_only_the_venue_asked_for_is_returned():
-    """Polymarket settles on a different oracle. Mixing the two under one
-    label silently grades some windows on Chainlink and some on BRTI."""
+    """Only the requested venue is returned; Polymarket settles on a different oracle.
+    """
     store = _Store(_frame([
         {'venue': 'kalshi', 'symbol': 'BTC-USD', 'window_open': OPEN,
          'settled_up': True, 'available_time': OPEN},
@@ -77,8 +66,9 @@ def test_an_empty_store_is_not_an_error():
 
 
 def test_the_correction_only_touches_rows_that_disagree():
-    """Idempotence is the point: the reported count IS the disagreement, so a
-    re-run corrects nothing and the number means something."""
+    """Only rows that disagree are updated, so the reported count is the disagreement and a
+    re-run changes nothing.
+    """
     from core.pg_writer import PgWriter
 
     src = inspect.getsource(PgWriter.correct_outcomes_from_venue)

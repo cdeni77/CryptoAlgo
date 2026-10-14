@@ -1,25 +1,9 @@
-"""The market gates must measure the CANDIDATE, not its predecessor.
+"""Tests that the market gates measure the candidate, not the deployed model.
 
-`market_measurement` preferred the live `predictions` table, on the stated
-ground that those rows carry "the venue's quote at the instant a decision was
-actually made". True — and it created a deadlock.
-
-Those rows were produced by whatever model was deployed at the time, and
-`model_version` is NULL on every one of them. A new candidate cannot change a
-single row. So a candidate was gated on its predecessor's live track record:
-
-    2026-09-20  blocked  calibration_vs_market      (8,411 live windows)
-    2026-09-27  blocked  calibration_vs_market, model_minus_market
-
-Both candidates' own numbers passed — skill +0.0027 over 24,247 windows, every
-other gate green. The model froze on 20260917T021814Z for sixteen days and
-would have stayed there indefinitely: the live figures can only improve if a
-new model is deployed, and no new model could be deployed.
-
-The reason for preferring the live table also expired. Since the quote-source
-fix of 2026-09-16 the backtest prices against the same `live_touch` quotes
-where they exist, so the choice is no longer observation-versus-reconstruction.
-`recorded_only` keeps that property while restoring attribution.
+Live `predictions` rows come from whichever model was deployed, so a candidate
+cannot change them. Gating a candidate on them blocks every new model. The
+candidate's own backtest rows priced against recorded quotes (`recorded_only`)
+come first; the live table is the fallback.
 """
 
 from __future__ import annotations
@@ -56,13 +40,12 @@ def test_recorded_only_keeps_the_watched_observers():
 def test_recorded_only_drops_the_reconstruction():
     frame = _scored(['backfill'])
     assert market_rows_from_scored(frame, recorded_only=True) == []
-    # ...but it is still a legitimate backtest price when not restricted.
+    # It is still a valid backtest price when not restricted.
     assert len(market_rows_from_scored(frame, recorded_only=False)) == 3
 
 
 def test_a_frame_with_no_observer_column_is_refused_not_assumed():
-    """Absent provenance must not be read as 'recorded'. That assumption is
-    how a reconstruction would be graded as an observation."""
+    """A frame without an observer column is refused, not assumed to be recorded."""
     frame = _scored(['live_touch']).drop(columns=['quote_observer'])
     assert market_rows_from_scored(frame, recorded_only=True) == []
 
@@ -76,8 +59,8 @@ def test_every_live_observer_is_a_real_source():
 
 
 def test_the_candidate_is_preferred_over_the_live_table():
-    """A seam test. The bug was a SOURCE preference, so testing the row filter
-    alone proves nothing about which one `market_measurement` reaches for."""
+    """`market_measurement` tries the candidate's recorded rows before the live table.
+    """
     from scripts.promote import market_measurement
 
     src = inspect.getsource(market_measurement)
@@ -90,8 +73,7 @@ def test_the_candidate_is_preferred_over_the_live_table():
 
 
 def test_the_live_table_remains_the_fallback():
-    """It is still the right answer when the candidate has no recorded quotes
-    at all — which is every run before 2026-08-25."""
+    """The live table remains the fallback when the candidate has no recorded quotes."""
     from scripts.promote import market_measurement
 
     src = inspect.getsource(market_measurement)
