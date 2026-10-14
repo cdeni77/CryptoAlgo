@@ -397,3 +397,15 @@ def test_cli_reads_the_store_and_reports_both_inputs(tmp_path, capsys):
     text = capsys.readouterr().out
     assert 'input=snapshots  fill=conservative  all orders' in text
     assert 'fill=queue' not in text
+
+
+def test_the_quadratic_maker_fee_follows_the_venue_schedule():
+    """round_up(M * 0.0175 * C * P * (1 - P)), per order, to a hundredth of a cent."""
+    from core.config import DEFAULT_CONFIG
+    from research.analysis.maker_fill import maker_fee
+
+    # 10 contracts at 50c, M=1: 0.0175 * 10 * 0.25 = 0.04375 -> 0.0438 per order.
+    assert maker_fee(0.50, 10, DEFAULT_CONFIG, multiplier=1.0) == pytest.approx(0.00438)
+    assert maker_fee(0.50, 10, DEFAULT_CONFIG, multiplier=0.0) == 0.0
+    # The default series multiplier is zero, so the flat config value is ignored.
+    assert maker_fee(0.90, 10, DEFAULT_CONFIG, multiplier=0.0) == 0.0

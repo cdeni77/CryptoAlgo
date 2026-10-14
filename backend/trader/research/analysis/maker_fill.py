@@ -201,6 +201,9 @@ class Policy:
     max_book_age: float = 60.0
     min_edge: float = 0.0
     maker_fee_rate: float = DEFAULT_CONFIG.maker_fee_rate
+    # The venue's maker formula: round_up(M * 0.0175 * C * P * (1 - P)).
+    # When set, it replaces the flat `maker_fee_rate`.
+    maker_fee_multiplier: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.select not in SELECTS:
@@ -253,8 +256,20 @@ def post_price(bid: float, ask: float, improve: bool) -> tuple[float, bool]:
     return bid, False
 
 
-def maker_fee(price: float, contracts: int, config: Config) -> float:
-    """Maker fee per contract, rounded per order as the venue charges."""
+MAKER_FEE_COEFFICIENT = 0.0175
+
+
+def maker_fee(price: float, contracts: int, config: Config,
+              multiplier: Optional[float] = None) -> float:
+    """Maker fee per contract, rounded per order as the venue charges.
+
+    With `multiplier`, the venue's quadratic maker schedule; otherwise the flat
+    `config.maker_fee_rate`.
+    """
+    if multiplier is not None:
+        raw = (multiplier * MAKER_FEE_COEFFICIENT * contracts
+               * price * (1.0 - price))
+        return math.ceil(round(raw * 10_000, 6)) / 10_000 / contracts
     return float(trade_fee(contracts, price, config, maker=True)) / contracts
 
 
@@ -283,7 +298,8 @@ def choose_sides(policy: Policy, top: Top, *, model_p: float = math.nan,
         if not (math.isfinite(bid) and math.isfinite(ask)) or ask <= bid + EPS:
             continue
         price, _ = post_price(bid, ask, policy.improve)
-        edge = p - price - maker_fee(price, policy.contracts, config)
+        edge = p - price - maker_fee(price, policy.contracts, config,
+                                     policy.maker_fee_multiplier)
         if edge > best_edge:
             best, best_edge = side, edge
     return [best] if best is not None and best_edge > policy.min_edge else []
@@ -585,7 +601,8 @@ def order_rows(orders: Sequence[Order], settlements: Settlements, policy: Policy
         payout = (math.nan if settled is None
                   else float(settled if o.side == 'UP' else not settled))
         t_fee = taker_fee(o.ask, policy.contracts, config)
-        m_fee = maker_fee(o.price, policy.contracts, config)
+        m_fee = maker_fee(o.price, policy.contracts, config,
+                          policy.maker_fee_multiplier)
         modes = (CONSERVATIVE, QUEUE) if o.input == 'stream' else (CONSERVATIVE,)
         for mode in modes:
             filled = mode in o.fills
@@ -751,7 +768,8 @@ def run(args) -> tuple[pd.DataFrame, Counter, Policy]:
         rest_seconds=args.rest_seconds, contracts=args.contracts, improve=args.improve,
         band=tuple(args.band), horizons=tuple(args.horizons),
         max_book_age=args.max_book_age, min_edge=args.min_edge,
-        maker_fee_rate=args.maker_fee)
+        maker_fee_rate=args.maker_fee,
+        maker_fee_multiplier=args.maker_fee_multiplier)
     end = _utc(args.end) or pd.Timestamp.now(tz='UTC').floor('15min')
     start = _utc(args.start) or end - pd.Timedelta(days=1)
     symbols = [s.strip() for s in args.symbols.split(',') if s.strip()]
@@ -824,6 +842,10 @@ def build_parser() -> argparse.ArgumentParser:
                              'change when the book changes)')
     parser.add_argument('--maker-fee', type=float, default=DEFAULT_CONFIG.maker_fee_rate,
                         help='dollars per contract (default: config maker_fee_rate)')
+    parser.add_argument('--maker-fee-multiplier', type=float, default=None,
+                        metavar='M',
+                        help='use the venue schedule round_up(M * 0.0175 * C * P '
+                             '* (1-P)) instead of the flat --maker-fee')
     parser.add_argument('--boot', type=int, default=5000)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', default=None, help='per-order rows, .csv or .parquet')
@@ -847,7 +869,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f'maker fill simulation: input={args.input} select={policy.select} '
           f'offsets={list(policy.offsets)} delay={policy.delay_seconds:g}s '
           f'rest={policy.rest_seconds:g}s contracts={policy.contracts} '
-          f'improve={policy.improve} maker_fee=${policy.maker_fee_rate:.4f}')
+          f'improve={policy.improve} maker_fee='
+          + (f'quadratic M={policy.maker_fee_multiplier:g}'
+             if policy.maker_fee_multiplier is not None
+             else f'${policy.maker_fee_rate:.4f} flat'))
     if args.input == 'snapshots':
         print('snapshots: change-driven touch only; conservative fill rule only; '
               'tail prices on a whole-cent grid')
