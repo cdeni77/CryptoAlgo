@@ -5,11 +5,13 @@ folding its own messages into a `core.index_proxy.ExchangeState`, and one
 sampler that every second takes the median fresh mid per symbol, records it in
 `CACHE` for the live process and spools it to `index_proxy_1s`.
 
-**Coinbase gets its own `level2` socket here rather than reusing
-`record_spot_stream`.** That stream carries trades only — there is no book on
-it to take a mid from — and it feeds the bars the trading loop decides on. Its
-own socket means an index failure, a 10MB level2 snapshot or a sequence gap here
-can never touch the tape trading reads.
+**Coinbase gets its own `ticker` socket here rather than reusing
+`record_spot_stream`.** That stream carries trades only — there is no best bid
+or ask on it to take a mid from — and it feeds the bars the trading loop decides
+on. Its own socket means an index failure here can never touch the tape trading
+reads. `ticker` rather than `level2`: each message carries the touch, so there
+is no book to fold on the trading process's event loop and no sequence gap to
+rebuild from.
 
 **Fails soft, by construction.** Every exchange task catches its own failures
 and reconnects with backoff; a dead venue is a NaN column, and fewer than two
@@ -63,14 +65,14 @@ def _decode(raw) -> Optional[dict]:
 
 
 async def consume(ws, exchange: str, state: ExchangeState, *, idle_timeout: float,
-                  large_bytes: int = 1_000_000, now: Callable[[], float] = time.time,
-                  seqs=None) -> str:
+                  large_bytes: int = 1_000_000,
+                  now: Callable[[], float] = time.time) -> str:
     """Fold messages until the connection needs rebuilding; returns why.
 
-    A message over `large_bytes` (a Coinbase level2 snapshot runs to megabytes)
-    is DECODED in a thread so the parse cannot stall the trading loop's event
-    loop. It is still APPLIED here: folding it in a thread would let the
-    sampler read a book mid-rebuild.
+    A message over `large_bytes` (a full-book snapshot) is DECODED in a thread
+    so the parse cannot stall the trading loop's event loop. It is still
+    APPLIED here: folding it in a thread would let the sampler read a book
+    mid-rebuild.
     """
     handler = HANDLERS[exchange]
     try:
@@ -93,12 +95,6 @@ async def consume(ws, exchange: str, state: ExchangeState, *, idle_timeout: floa
                 payload = _decode(msg.data)
             if payload is None:
                 continue
-            # A lost Coinbase message is a lost book delta, so the book is
-            # wrong until a fresh snapshot: rebuild rather than serve it.
-            if (seqs is not None and 'sequence_num' in payload
-                    and seqs.observe(str(payload.get('channel') or ''),
-                                     payload.get('sequence_num'))):
-                return 'sequence gap'
             reason = handler(payload, state, received)
             if reason:
                 return reason
@@ -122,14 +118,9 @@ async def run_exchange(session, exchange: str, state: ExchangeState, args) -> No
                 for message in subscribe_messages(exchange, args.symbols):
                     await ws.send_json(message)
                 logger.info('%s: streaming %s', exchange, ', '.join(args.symbols))
-                seqs = None
-                if exchange == 'coinbase':
-                    from scripts.record_spot_stream import SequenceTracker
-                    seqs = SequenceTracker()
                 reason = await consume(ws, exchange, state,
                                        idle_timeout=args.idle_timeout,
-                                       large_bytes=args.large_message_bytes,
-                                       seqs=seqs)
+                                       large_bytes=args.large_message_bytes)
         except asyncio.CancelledError:
             state.disconnect()
             raise

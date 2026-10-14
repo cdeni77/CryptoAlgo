@@ -229,9 +229,11 @@ def subscribe_messages(exchange: str, symbols: Iterable[str]) -> list[dict]:
     products = [PRODUCTS[exchange][s] for s in symbols]
     if exchange == 'coinbase':
         # `heartbeats` keeps a quiet product's connection open and gives the
-        # connection-level liveness every second.
+        # connection-level liveness every second. `ticker` carries the best bid
+        # and ask on each message, so no book is folded on the event loop and
+        # a lost message loses no state.
         return [{'type': 'subscribe', 'product_ids': products, 'channel': channel}
-                for channel in ('heartbeats', 'level2', 'market_trades')]
+                for channel in ('heartbeats', 'ticker')]
     if exchange == 'kraken':
         # `event_trigger: bbo` fires the ticker on every best-bid/offer change,
         # so no book has to be maintained for a top-of-book mid.
@@ -253,32 +255,23 @@ def subscribe_messages(exchange: str, symbols: Iterable[str]) -> list[dict]:
 
 
 def handle_coinbase(payload: dict, state: ExchangeState, received: float) -> Optional[str]:
-    """Advanced Trade `level2` (served on channel `l2_data`), `market_trades`."""
+    """Advanced Trade `ticker`: `events[].tickers[]`, each with `product_id`,
+    `best_bid`, `best_ask` and the last trade `price`."""
     if not isinstance(payload, dict):
         return None
     if payload.get('type') == 'error':
         return f"venue error: {str(payload.get('message') or payload)[:160]}"
     state.alive(received)
-    channel = payload.get('channel')
+    if payload.get('channel') != 'ticker':
+        return None
     for event in payload.get('events') or []:
-        if channel == 'l2_data':
-            symbol = state.symbol_for(event.get('product_id'))
+        for ticker in event.get('tickers') or []:
+            symbol = state.symbol_for(ticker.get('product_id'))
             if symbol is None:
                 continue
-            if event.get('type') == 'snapshot':
-                state.reset_book(symbol)
-            for update in event.get('updates') or []:
-                side = str(update.get('side') or '').lower()
-                if side not in ('bid', 'offer', 'ask'):
-                    continue
-                state.apply_level(symbol, side == 'bid', update.get('price_level'),
-                                  update.get('new_quantity'))
-            state.book_touched(symbol, received)
-        elif channel == 'market_trades':
-            for trade in event.get('trades') or []:
-                symbol = state.symbol_for(trade.get('product_id'))
-                if symbol is not None:
-                    state.trade(symbol, trade.get('price'), received)
+            state.set_bbo(symbol, ticker.get('best_bid'), ticker.get('best_ask'),
+                          received)
+            state.trade(symbol, ticker.get('price'), received)
     return None
 
 
