@@ -138,12 +138,21 @@ def test_the_unaffordable_band_is_the_middle_not_the_ends():
     assert float(required_edge_pp(min(high + 0.02, 0.99), CFG)) <= threshold
 
 
-def test_a_maker_schedule_is_flat_per_contract():
+def test_the_maker_fee_is_zero_by_default():
+    """The venue's maker multiplier defaults to 0 for these series."""
     maker = Config(assume_maker=True)
-    assert fee_per_contract(0.20, maker) == pytest.approx(maker.maker_fee_rate)
-    assert fee_per_contract(0.80, maker) == pytest.approx(maker.maker_fee_rate)
-    assert trade_fee(100, 0.5, maker) == pytest.approx(
-        math.ceil(round(maker.maker_fee_rate * 100 * 100, 9)) / 100)
+    assert fee_per_contract(0.50, maker) == 0.0
+    assert trade_fee(100, 0.5, maker) == 0.0
+
+
+def test_the_maker_fee_is_a_quarter_of_the_taker_schedule():
+    """ceil(M * 0.0175 * C * P * (1 - P)) per order, per the fee schedule."""
+    maker = Config(assume_maker=True, maker_fee_multiplier=1.0)
+    taker = Config()
+    assert fee_per_contract(0.30, maker) == pytest.approx(
+        fee_per_contract(0.30, taker) / 4)
+    # 10 contracts at 50c: 0.0175 * 10 * 0.25 = 0.04375 -> 0.0438.
+    assert trade_fee(10, 0.5, maker) == pytest.approx(0.0438)
 
 
 def test_effective_price_never_leaves_the_tick_range():

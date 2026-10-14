@@ -42,13 +42,15 @@ class RateLimiter:
         self._next_at = 0.0
         self._lock = threading.Lock()
 
-    def wait(self) -> None:
+    def wait(self) -> float:
+        """Sleep until this caller's slot and return the slot's start time."""
         with self._lock:
             start = max(time.monotonic(), self._next_at)
             self._next_at = start + self.interval
         delay = start - time.monotonic()
         if delay > 0:
             time.sleep(delay)
+        return start
 
 
 class Breaker:

@@ -116,7 +116,7 @@ class TestProvenance:
         """`ForecastModel.verify` compares these only when both sides record them;
         four were never recorded, so its check on them was silently skipped."""
         p = Config().provenance()
-        for key in ('maker_fee_rate', 'assume_maker', 'min_traded_price',
+        for key in ('maker_fee_multiplier', 'assume_maker', 'min_traded_price',
                     'max_traded_price', 'window_minutes', 'embargo_minutes'):
             assert key in p
 

@@ -225,6 +225,14 @@ def _time(value):
         return None
 
 
+def _when(value):
+    """An ISO date or instant from the command line, as an aware UTC datetime."""
+    if not value:
+        return None
+    parsed = dt.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
 def ladders(api: Predexon, series: str) -> dict:
     """{event_ticker: (open, close)} for every ladder at or after the floor."""
     found, cursor, pages = {}, None, 0
@@ -291,7 +299,8 @@ def book_of(api: Predexon, ticker: str, lo_ms: int, hi_ms: int):
     return out, True
 
 
-def select_ladders(every, done, stride: int, max_ladders: int = 0) -> list:
+def select_ladders(every, done, stride: int, max_ladders: int = 0, *,
+                   since=None, until=None) -> list:
     """Which ladders this run should walk, from the full sorted population.
 
     Order matters and got it wrong once. The stride must be applied to EVERY
@@ -306,10 +315,21 @@ def select_ladders(every, done, stride: int, max_ladders: int = 0) -> list:
 
     The cap comes last for the same reason: applied first it would collapse the
     stride onto the earliest ladders instead of spreading it across the range.
+
+    `every` as {ticker: (open, close)} orders by close time. Ticker text sorts
+    by month NAME (26APR before 26AUG), so it is not a time order. `since` and
+    `until` restrict by close time after the stride, so the grid stays the same.
     """
-    target = sorted(every)
+    if isinstance(every, dict):
+        target = sorted(every, key=lambda e: (every[e][1], e))
+    else:
+        target = sorted(every)
     if stride > 1:
         target = target[::stride]
+    if isinstance(every, dict) and (since is not None or until is not None):
+        target = [e for e in target
+                  if (since is None or every[e][1] >= since)
+                  and (until is None or every[e][1] < until)]
     if max_ladders:
         target = target[:max_ladders]
     return [e for e in target if e not in done]
@@ -375,7 +395,8 @@ def fetch_rungs(api: Predexon, strikes, lo_ms: int, hi_ms: int, *,
     return out
 
 
-def run(api: Predexon, *, only_series=None, max_ladders: int = 0) -> int:
+def run(api: Predexon, *, only_series=None, max_ladders: int = 0,
+        since=None, until=None) -> int:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     done = set()
     if STATE.exists():
@@ -392,7 +413,8 @@ def run(api: Predexon, *, only_series=None, max_ladders: int = 0) -> int:
             if only_series and series != only_series:
                 continue
             found = ladders(api, series)
-            todo = select_ladders(found, done, LADDER_STRIDE, max_ladders)
+            todo = select_ladders(found, done, LADDER_STRIDE, max_ladders,
+                                  since=since, until=until)
             log(f'  {series}: {len(found):,} ladders in range, {len(todo):,} to do')
             for n, ev in enumerate(todo, 1):
                 opened, closes = found[ev]
@@ -468,6 +490,10 @@ def main() -> int:
     parser.add_argument('--series', default=None, choices=sorted(LADDER_SERIES))
     parser.add_argument('--max-ladders', type=int, default=0,
                         help='stop after N ladders per series, for a trial')
+    parser.add_argument('--since', default=None,
+                        help='only ladders closing at or after this ISO date')
+    parser.add_argument('--until', default=None,
+                        help='only ladders closing before this ISO date')
     args = parser.parse_args()
     if args.report:
         report()
@@ -482,7 +508,8 @@ def main() -> int:
     with SingleWriterLock(str(LOCK)):
         log(f'implied vol backfill at {args.rps:g} req/s')
         api = Predexon(key, RateLimiter(args.rps))
-        n = run(api, only_series=args.series, max_ladders=args.max_ladders)
+        n = run(api, only_series=args.series, max_ladders=args.max_ladders,
+                since=_when(args.since), until=_when(args.until))
         log(f'  {n:,} fits written to {OUT}')
         log(f'  {api.calls:,} requests, {api.throttled:,} throttled')
     report()

@@ -202,7 +202,12 @@ def _from_packed(path: str, *, venue: str, window_minutes: int,
     the minutes before that would be fabricating the very thing under test.
     """
     if not os.path.exists(path):
-        logger.info('no %s; skipping', path)
+        # The research/collect pipeline does not write this file; its books
+        # reach venue_depth through load_store.
+        logger.warning('no %s, so no %s backfill is built here. Books from '
+                       'research/collect load with `python -m '
+                       'research.collect.load_store --what depth --month '
+                       'YYYY-MM`.', path, venue)
         return []
     rows: list[dict] = []
     index = {name: i for i, name in enumerate(PACKED)}

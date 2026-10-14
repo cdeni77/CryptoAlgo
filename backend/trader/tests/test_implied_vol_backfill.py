@@ -307,3 +307,21 @@ def test_max_ladders_caps_after_the_stride_not_before():
     every = [f'L{i:03d}' for i in range(20)]
     got = select_ladders(every, done=set(), stride=4, max_ladders=3)
     assert got == ['L000', 'L004', 'L008']
+
+
+def test_ladders_are_ordered_by_close_time_not_ticker_text():
+    """Ticker text sorts by month name, so April came before August."""
+    import datetime as dt
+    from research.collect.implied_vol_backfill import select_ladders
+    utc = dt.timezone.utc
+    every = {'KXBTCD-26AUG0117': (dt.datetime(2026, 8, 1, tzinfo=utc),
+                                  dt.datetime(2026, 8, 1, 17, tzinfo=utc)),
+             'KXBTCD-26APR0117': (dt.datetime(2026, 4, 1, tzinfo=utc),
+                                  dt.datetime(2026, 4, 1, 17, tzinfo=utc)),
+             'KXBTCD-26JUL0117': (dt.datetime(2026, 7, 1, tzinfo=utc),
+                                  dt.datetime(2026, 7, 1, 17, tzinfo=utc))}
+    assert select_ladders(every, done=set(), stride=1) == [
+        'KXBTCD-26APR0117', 'KXBTCD-26JUL0117', 'KXBTCD-26AUG0117']
+    recent = select_ladders(every, done=set(), stride=1,
+                            since=dt.datetime(2026, 7, 1, tzinfo=utc))
+    assert recent == ['KXBTCD-26JUL0117', 'KXBTCD-26AUG0117']
