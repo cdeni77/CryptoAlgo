@@ -106,8 +106,9 @@ from livetrade.execution import (                                   # noqa: F401
 from livetrade.features import (                                    # noqa: F401
     EXPECTED_NAN, _attach_book_features, _warn_unscoreable_features,
     book_feature_row, config_offsets, cross_venue_row, gap_change,
-    implied_vol_row, latest_fit, prepare_init_score, prewarm_fit_lookup,
-    reset_fit_lookup, reset_gap_history,
+    implied_vol_row, latest_fit, peer_max_age_seconds, prepare_init_score,
+    prewarm_fit_lookup, reset_fit_lookup, reset_gap_history,
+    warn_if_peer_cap_tight,
 )
 from livetrade.ledger import (                                      # noqa: F401
     PRICE_RETENTION_HOURS, VenueState, _write_equity_point, adopt_venue_balance,
@@ -687,7 +688,7 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # The book features, from the same snapshot the order is priced against.
     # Without these LightGBM substitutes learned defaults and the loop runs as
     # a different model from the one whose gates were measured.
-    _attach_book_features(scored, quotes, _stream_cache())
+    _attach_book_features(scored, quotes, _stream_cache(), config=config)
     scored = prepare_init_score(scored, model)
     _phase('score')
     # Liveness, at the point the cycle has demonstrably scored.
@@ -1067,6 +1068,7 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
             'evaluated but not deployed.')
     if args.require_gates and not args.force:
         _refuse_if_blocked()
+    warn_if_peer_cap_tight(config)
 
     print('=' * 78)
     print(f'Quarter — {args.mode} mode'

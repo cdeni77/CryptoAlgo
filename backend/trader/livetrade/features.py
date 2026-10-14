@@ -125,7 +125,30 @@ def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
     return float(value - before)
 
 
-def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) -> dict:
+# A peer cap under this refuses most peer books on transport latency alone.
+TIGHT_PEER_CAP_SECONDS = 5.0
+
+
+def peer_max_age_seconds(config=None) -> float:
+    """The peer book's age cap: `peer_max_quote_age_seconds`, else
+    `max_quote_age_seconds`. The same rule `core.dataset.peer_quote_limits`
+    gives the backtest."""
+    config = config or state._RUNNING_CONFIG or DEFAULT_CONFIG
+    peer = getattr(config, 'peer_max_quote_age_seconds', None)
+    return float(config.max_quote_age_seconds if peer is None else peer)
+
+
+def warn_if_peer_cap_tight(config) -> None:
+    """Log a WARNING when the effective peer cap is under
+    `TIGHT_PEER_CAP_SECONDS`."""
+    cap = peer_max_age_seconds(config)
+    if cap < TIGHT_PEER_CAP_SECONDS:
+        logger.warning('peer book age cap is %.1fs, under %.0fs: this would void '
+                       'most peer books', cap, TIGHT_PEER_CAP_SECONDS)
+
+
+def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None,
+                    config=None) -> dict:
     """`cross_venue` from the in-process Polymarket cache.
 
     Two independent books on the same fifteen minutes, settling on different
@@ -138,8 +161,8 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) ->
     from core.book_features import CROSS_VENUE
 
     out = {name: float('nan') for name in CROSS_VENUE}
-    # The peer must be for THIS window and no staler than the bar the backtest
-    # applies to both venues (`core.quotes.DEFAULT_MAX_AGE`); otherwise the gap
+    # The peer must be for THIS window and no staler than the peer cap the
+    # backtest applies (`peer_max_age_seconds`); otherwise the gap
     # partly measures Kalshi's own move since the peer was read. `cross_venue`
     # is the load-bearing group. The window check comes first because a
     # rollover leaves a fresh-looking book for the previous window. A reading
@@ -154,11 +177,11 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None) ->
                      pm.get('window') or pm.get('window_open'), window_open)
         pm = None
     if pm is not None and pm.get('at') is not None and now is not None:
-        from core.quotes import DEFAULT_MAX_AGE
+        cap = peer_max_age_seconds(config)
         age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
-        if not (0 <= age <= DEFAULT_MAX_AGE):
+        if not (0 <= age <= cap):
             logger.debug('peer book %.0fs old, past the %.0fs bar; gap refused',
-                         age, DEFAULT_MAX_AGE)
+                         age, cap)
             pm = None
     k_mid = _two_sided_mid(getattr(quote, 'yes_bid', np.nan) * 100.0,
                            getattr(quote, 'yes_ask', np.nan) * 100.0)
@@ -360,7 +383,8 @@ def book_feature_row(quote, yes_levels, no_levels, *,
     return market_state_features(frame).iloc[0].to_dict()
 
 
-def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> None:
+def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None, *,
+                          config=None) -> None:
     """Book features onto the scoring rows, in place, from the touch.
 
     One row per symbol: the quote is the same for every offset in the cycle,
@@ -406,7 +430,7 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None) -> Non
             row['depth_down'] = down
         row.update(cross_venue_row(
             pm_cache.get(symbol), entry[0], now=now,
-            window_open=scored['window_open'].iloc[i]))
+            window_open=scored['window_open'].iloc[i], config=config))
         row.update(implied_vol_row(
             latest_fit(symbol, now=now, cache=iv_cache), now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]

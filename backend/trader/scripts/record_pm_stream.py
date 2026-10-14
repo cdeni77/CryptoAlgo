@@ -62,6 +62,10 @@ def publish(book: PmBookCache, tokens: dict, *, window=None) -> None:
         if bid is None or ask is None:
             CACHE.pop(symbol, None)
             continue
+        # The book's own last change, not the socket's last frame. The market
+        # channel carries no sequence number, so a live connection cannot show
+        # that one asset's feed is intact: a quiet book and a stopped one look
+        # the same. Kalshi's `seq` can vouch for a quiet book; nothing here can.
         stamp = book._stamp.get(token)  # noqa: SLF001 — same module family
         heartbeat.touch('pm_stream')
         CACHE[symbol] = {
