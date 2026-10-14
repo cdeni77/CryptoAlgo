@@ -11,13 +11,11 @@ where the model currently scores would foreclose the question.
 **`venue_quotes` is a fourth, separate table this does NOT read, and an earlier
 version of this docstring claimed it did.** It holds the Kalshi Predexon
 backfill at an irregular seven offsets (2, 3, 4, 6, 9, 12, 14) and is written by
-`scripts/backfill_quotes.py`, not by this module. As of this writing twelve
-files still read it directly — `retro_economics.py`, `refit_market_init.py`,
-`retro_forecast_test.py`, `diagnose_market_mid.py`, `quote_coverage.py`,
-`_status.py`, `_book_analysis.py`, `_offset_vs_market.py`, `_collect_book.py`
-among them — so "one table" was true of the book and not yet true of the whole
+`scripts/backfill_quotes.py`, not by this module. Other files still read it
+directly — `retro_forecast_test.py`, `_status.py` and `_collect_book.py` among
+them — so "one table" was true of the book and not yet true of the whole
 pipeline. Folding `venue_quotes` into `venue_depth` too is a real migration
-(different offset grid, different producer, a dozen consumers to repoint) and
+(different offset grid, different producer, consumers to repoint) and
 was deliberately left undone here rather than done under time pressure.
 
 `quote_age_seconds` says how stale each row is. Predexon serves book CHANGES,

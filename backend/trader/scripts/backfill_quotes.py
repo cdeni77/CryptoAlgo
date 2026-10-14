@@ -371,7 +371,6 @@ async def run(args) -> int:
                 total, written, failed, straddled)
     print(f'\n{total:,} markets pulled, {written:,} rows written, {failed} failures, '
           f'{straddled} needed both endpoints')
-    print('next: python -m scripts.quote_coverage')
     return 0
 
 

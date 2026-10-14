@@ -42,8 +42,8 @@ def won(*, side: str, settled_up: bool) -> bool:
 
     The one rule — `settled_up if side is up else not settled_up` — used to be
     written out fresh in four places (`Position.payout` here,
-    `PgWriter.settle_position`, and both `retro_economics.py` and
-    `simulated_book_economics.py`), which is exactly the shape of the bug that
+    `PgWriter.settle_position`, and two since-deleted economics scripts),
+    which is exactly the shape of the bug that
     once left the paper bankroll never credited a win: one of the four copies
     drifting from the other three. `side` compares equal to the plain string
     `'up'`/`'down'` because `Side` is a `str, Enum`, so this takes either.

@@ -24,7 +24,7 @@ from data_collection.stream.kalshi import parse_frame, rest_levels
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'ws' / 'kalshi_capture.jsonl.gz'
 pytestmark = pytest.mark.skipif(
-    not FIXTURE.exists(), reason='capture a fixture with scripts.probe_ws first')
+    not FIXTURE.exists(), reason='kalshi_capture.jsonl.gz fixture is missing')
 
 
 def records():

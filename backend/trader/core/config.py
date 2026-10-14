@@ -402,8 +402,8 @@ class Config:
     # and 0.10/0.11 — a one-cent spread, so half a cent. The previous default of
     # 1.0 was twice too pessimistic, which made every backtested required-edge
     # figure too high rather than too low. Still a single observation on one
-    # symbol at one time of day, so `scripts/measure_book.py` samples it properly
-    # and `scripts/evaluate.py` stresses it either way.
+    # symbol at one time of day; the recorded `venue_ladder`/`venue_depth` books
+    # sample it properly and `scripts/evaluate.py` stresses it either way.
     half_spread_cents: float = 0.5
 
     # ---- sizing and risk (a $100 account) --------------------------------
