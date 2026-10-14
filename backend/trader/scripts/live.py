@@ -1044,8 +1044,10 @@ def stream_quote(cache, meta: Quote, max_age_seconds: float) -> Optional[Quote]:
         return None
     if ladder is None:
         return None
+    # As of the connection's last frame: until then the venue had told us
+    # every change, so that is when this book was last known to be right.
     return quote_from_levels(meta, ladder.yes, ladder.no, source='stream',
-                             at=time.time())
+                             at=time.time() - max(0.0, float(ladder.age_seconds)))
 
 
 async def fetch_quotes(
@@ -2089,7 +2091,7 @@ def book_feature_row(quote, yes_levels, no_levels, *,
 
 
 async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset: int,
-                        config: Config, kalshi) -> None:
+                        config: Config, kalshi, *, decided_at=None) -> None:
     """Write the venue's book — top of book plus cumulative depth — to the store.
 
     Best effort: a failure here must never stop a trading cycle, because this is
@@ -2147,6 +2149,11 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                     pass
             event_time = pd.Timestamp(window_open) + pd.Timedelta(minutes=offset)
             rows.append({
+                # How old the priced book was when the decision was taken: the
+                # stream's last frame or the REST response, to the decision
+                # instant. NaN only when the quote carries no read time — the
+                # backtest reads a NULL age as fresh, so never invent one.
+                'quote_age_seconds': quote_age_seconds(quote, decided_at),
                 'venue': 'kalshi', 'symbol': symbol, 'event_time': event_time,
                 'available_time': pd.Timestamp.now(tz='UTC'), 'quality': 'valid',
                 # Which sampler produced the LADDER half of this row. A
@@ -2212,6 +2219,16 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                                     pd.DataFrame(rows))
     except Exception as exc:                       # noqa: BLE001 - never break a cycle
         logger.warning('could not record top of book (%s)', str(exc)[:120])
+
+
+def quote_age_seconds(quote, decided_at) -> float:
+    """Seconds from the book's as-of time to the decision, or NaN if unknown."""
+    at = getattr(quote, 'book_time', None)
+    if at is None or decided_at is None:
+        return float('nan')
+    age = (pd.Timestamp(decided_at) - pd.Timestamp(float(at), unit='s', tz='UTC')
+           ).total_seconds()
+    return float(max(0.0, age))
 
 
 def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:
@@ -2574,7 +2591,7 @@ async def fresh_quote(kalshi, quote, config: Config):
 async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row, *,
                         config: Config, quote, quote_time, maker: bool,
                         others: WindowExposure, bankroll: float, halted: bool,
-                        require_quote: bool):
+                        require_quote: bool, prediction_id: Optional[int] = None):
     """Send one entry, and resend once if an immediate_or_cancel took nothing.
 
     The resend re-reads the touch and re-runs `decide()` on it with the SAME
@@ -2587,7 +2604,7 @@ async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row,
     """
     result = await place_and_book(args, writer, kalshi, decision, row,
                                   config=config, quote_time=quote_time,
-                                  maker=maker)
+                                  maker=maker, prediction_id=prediction_id)
     kills = [(decision, result)] if result.status == 'killed' else []
     final_decision, final = decision, result
     attempt = 0
@@ -2623,7 +2640,7 @@ async def execute_entry(args, writer: PgWriter, kalshi, decision: Decision, row,
             if fresh.book_time is not None else pd.Timestamp.now(tz='UTC')
         retried = await place_and_book(
             args, writer, kalshi, again, repriced, config=config,
-            quote_time=stamp, attempt=attempt,
+            quote_time=stamp, attempt=attempt, prediction_id=prediction_id,
             note=(f'resend {attempt} after a kill at {decision.price:.4f}: '
                   f'{again.contracts} @ {again.price:.4f} '
                   f'({fresh.book_source} book)'))
@@ -2916,20 +2933,60 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             pending.append((decision, row, maker))
             exposure = exposure.with_(decision)
 
+    # The instant the decisions were taken: what every quote's age is
+    # measured to, for the archive.
+    decided_at = pd.Timestamp.now(tz='UTC')
+    model_version = getattr(model, 'version', None)
+
+    def record_for(decision: Decision) -> dict:
+        row = rows[decision.symbol]
+        return dict(
+            symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
+            offset_minutes=offset,
+            decision_time=quote_times.get(decision.symbol, read_at),
+            strike=float(row['strike']), last_price=float(row['last_price']),
+            displacement=float(row['displacement']),
+            sigma_remaining=_finite(row.get('sigma_remaining')),
+            z_score=_finite(row.get('z_score')),
+            baseline_probability=float(row['baseline_probability']),
+            model_probability=float(row['model_probability']),
+            # The venue's belief (the mid) and what a trade would cost (both
+            # asks), on EVERY row, refused ones included: the sample that
+            # answers "does the model beat the market" must be unselected.
+            market_probability=_finite(row.get('market_mid')),
+            market_ask_up=_finite(row.get('ask_up')),
+            market_ask_down=_finite(row.get('ask_down')),
+            price_source=decision.price_source,
+            reason=decision.reason.value, traded=decision.traded,
+            side=decision.side.value if decision.side else None,
+            price=_finite(decision.price), effective_cost=_finite(decision.effective_cost),
+            edge=_finite(decision.edge), contracts=decision.contracts or None,
+            model_version=model_version,
+        )
+
     # **Every order at once.** One symbol's round trip, kill or resend no
-    # longer delays the next symbol's order.
+    # longer delays the next symbol's order. Each traded row's prediction is
+    # written first (in a thread, all in parallel) so its ticket and position
+    # carry the id of the prediction that produced them.
     async def _one(index: int):
         decision, row, maker = pending[index]
         others = base_exposure
         for j, (other, _, _) in enumerate(pending):
             if j != index:
                 others = others.with_(other)
+        try:
+            prediction_id = await _db(writer.write_prediction, **record_for(decision))
+        except Exception:                                     # noqa: BLE001
+            logger.exception('%s: could not write the prediction before the '
+                             'order; the ticket will carry no prediction_id',
+                             decision.symbol)
+            prediction_id = None
         return await execute_entry(
             args, writer, kalshi, decision, row, config=config,
             quote=quotes.get(decision.symbol, (None, None))[0],
             quote_time=quote_times.get(decision.symbol, read_at), maker=maker,
             others=others, bankroll=bankroll, halted=bool(halted),
-            require_quote=require_quote)
+            require_quote=require_quote, prediction_id=prediction_id)
 
     outcomes = await asyncio.gather(*(_one(i) for i in range(len(pending))),
                                     return_exceptions=True)
@@ -2956,32 +3013,9 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
 
     # ---- after the orders: everything that only records -------------------
     decisions = [finals.get(d.symbol, d) for d in decisions]
-    records = []
-    for decision in decisions:
-        row = rows[decision.symbol]
-        records.append(dict(
-            symbol=decision.symbol, window_open=window_open, settle_time=settle_time,
-            offset_minutes=offset,
-            decision_time=quote_times.get(decision.symbol, read_at),
-            strike=float(row['strike']), last_price=float(row['last_price']),
-            displacement=float(row['displacement']),
-            sigma_remaining=_finite(row.get('sigma_remaining')),
-            z_score=_finite(row.get('z_score')),
-            baseline_probability=float(row['baseline_probability']),
-            model_probability=float(row['model_probability']),
-            # The venue's belief (the mid) and what a trade would cost (both
-            # asks), on EVERY row, refused ones included: the sample that
-            # answers "does the model beat the market" must be unselected.
-            market_probability=_finite(row.get('market_mid')),
-            market_ask_up=_finite(row.get('ask_up')),
-            market_ask_down=_finite(row.get('ask_down')),
-            price_source=decision.price_source,
-            reason=decision.reason.value, traded=decision.traded,
-            side=decision.side.value if decision.side else None,
-            price=_finite(decision.price), effective_cost=_finite(decision.effective_cost),
-            edge=_finite(decision.edge), contracts=decision.contracts or None,
-            model_version=getattr(model, 'version', None),
-        ))
+    # Every row, the traded ones again: an upsert on (symbol, window, offset)
+    # that keeps their id and records a resend's final price.
+    records = [record_for(d) for d in decisions]
     try:
         await _db(_write_predictions, writer, records)
     except Exception:                                         # noqa: BLE001
@@ -2995,7 +3029,8 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # The top of book we already have, written after the orders: it changes
     # only WHEN the archive is written, never what it contains.
     if os.getenv('RECORD_TOUCH', '1') == '1' and quotes:
-        await _record_touch(scored, quotes, window_open, offset, config, kalshi)
+        await _record_touch(scored, quotes, window_open, offset, config, kalshi,
+                            decided_at=decided_at)
         _phase('touch')
 
     if fast:
@@ -3384,7 +3419,8 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                          config: Config = DEFAULT_CONFIG,
                          quote_time: Optional[pd.Timestamp] = None,
                          attempt: int = 0, maker: bool = False,
-                         note: Optional[str] = None) -> OrderResult:
+                         note: Optional[str] = None,
+                         prediction_id: Optional[int] = None) -> OrderResult:
     """Record the ticket, place the order when asked to twice, book the fill.
 
     **A position is written only when money actually moved.** An unresolved
@@ -3418,7 +3454,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                 contracts=decision.contracts, limit_price=decision.price,
                 max_price=limit, expected_cost=decision.stake,
                 model_probability=decision.model_probability, edge=decision.edge,
-                status='skipped',
+                prediction_id=prediction_id, status='skipped',
                 note=(f'stale quote: {age:.0f}s old, over the '
                       f'{config.max_quote_age_seconds}s limit'))
             logger.warning(
@@ -3444,7 +3480,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         # The worst price still worth paying: down to the gate, never past it.
         max_price=limit,
         expected_cost=decision.stake, model_probability=decision.model_probability,
-        edge=decision.edge,
+        edge=decision.edge, prediction_id=prediction_id,
     )
     if attempt > 0 or note:
         # `write_ticket` is one row per (symbol, window): a resend reuses the
@@ -3571,6 +3607,7 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         outlay=outlay, fee=fee,
         model_probability=decision.model_probability,
         baseline_probability=decision.baseline_probability, edge=decision.edge,
+        prediction_id=prediction_id,
     )
     # Relative, in one statement: a read-then-write across two transactions loses
     # one of two overlapping debits, and nothing enforces a single writer.
@@ -3621,14 +3658,16 @@ async def _rest_as_maker(kalshi, decision: Decision, *, limit: float,
 async def act_on(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                  decision: Decision, row, *,
                  config: Config = DEFAULT_CONFIG,
-                 quote_time: Optional[pd.Timestamp] = None) -> bool:
+                 quote_time: Optional[pd.Timestamp] = None,
+                 prediction_id: Optional[int] = None) -> bool:
     """`place_and_book` for one decision, diagnosing a kill straight away.
 
     Returns whether a position was booked. The cycle itself calls
     `place_and_book` for every order at once and diagnoses afterwards.
     """
     result = await place_and_book(args, writer, kalshi, decision, row,
-                                  config=config, quote_time=quote_time)
+                                  config=config, quote_time=quote_time,
+                                  prediction_id=prediction_id)
     if result.status == 'killed':
         await diagnose_and_note(kalshi, writer, decision, result)
     return result.booked
@@ -3799,6 +3838,7 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
     if model is not None:
         config = config_for_artifact(config, model, mode=args.mode)
         model.verify(config)
+        stamp_version(model, artifact)
     if model is None:
         raise SystemExit(
             f'no artifact at {MODELS_ROOT / LIVE_MODEL}. Run '
@@ -3947,6 +3987,8 @@ def _load_artifact(args, base_config: Config):
              .ForecastModel.load(args.model, None))
     if model is None:
         raise RuntimeError('no artifact on disk')
+    stamp_version(model, Path(args.model) if args.model
+                  else Path(MODELS_ROOT) / LIVE_MODEL)
     config = config_for_artifact(base_config, model, mode=args.mode)
     model.verify(config)
     if not model.deployable:
@@ -3999,15 +4041,17 @@ def _installed_version() -> Optional[str]:
     each candidate under `models/.staging/<version>/` and then renames it into
     place, so the installed file is byte-identical to exactly one of them.
     """
-    import hashlib
-    from pathlib import Path
+    return _staged_version(Path(MODELS_ROOT) / 'forecast.joblib')
 
-    root = Path(MODELS_ROOT)
-    live = root / 'forecast.joblib'
-    if not live.exists():
+
+def _staged_version(path) -> Optional[str]:
+    import hashlib
+
+    path = Path(path)
+    if not path.exists():
         return None
-    digest = hashlib.md5(live.read_bytes()).hexdigest()
-    staging = root / '.staging'
+    digest = hashlib.md5(path.read_bytes()).hexdigest()
+    staging = Path(MODELS_ROOT) / '.staging'
     if not staging.is_dir():
         return None
     for candidate in sorted(staging.iterdir(), reverse=True):
@@ -4015,6 +4059,34 @@ def _installed_version() -> Optional[str]:
         if staged.exists() and hashlib.md5(staged.read_bytes()).hexdigest() == digest:
             return candidate.name
     return None
+
+
+def artifact_version(path) -> Optional[str]:
+    """The version recorded on every prediction: the promotion ledger's.
+
+    The staged version whose bytes the file matches; failing that (a file
+    promoted before staging existed, or `--model` pointing elsewhere) a content
+    hash, so rows from two different artifacts can never share a version.
+    """
+    import hashlib
+
+    try:
+        staged = _staged_version(path)
+        if staged is not None:
+            return staged
+        return 'md5:' + hashlib.md5(Path(path).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+def stamp_version(model, path) -> None:
+    """Put the artifact's version on the model, where `run_cycle` reads it."""
+    version = artifact_version(path)
+    try:
+        model.version = version
+    except AttributeError:
+        logger.warning('could not record the artifact version on the model')
+    logger.info('trading artifact %s', version)
 
 
 def _refuse_if_blocked() -> None:
