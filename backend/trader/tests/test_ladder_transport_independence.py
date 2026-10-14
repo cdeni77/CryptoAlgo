@@ -1,15 +1,7 @@
-"""The two transports must be independent observers.
+"""Tests that the REST and stream ladder rows are independent observers.
 
-`venue_ladder` carries both a REST poll and a websocket fold for the same
-minute, and the whole point is to compare them: the retirement gate for the
-REST sampler needs evidence that the stream covers a REST outage.
-
-It could not. Both `continue`s in the cycle — the request failure and the empty
-ladder — sat BEFORE the websocket row was built, so a REST failure discarded a
-perfectly good cached book too. Measured over seven days: `rest_only = 30`,
-**`ws_only = 0`**. The archive's websocket coverage was a strict subset of
-REST's by construction, so the evidence the migration is gated on could never
-have existed.
+The stream row is built before the REST call, so a REST failure cannot discard
+it. Otherwise the stream can never be shown to cover a REST outage.
 """
 
 from __future__ import annotations
@@ -34,7 +26,9 @@ def test_the_stream_sample_is_taken_before_the_rest_call():
 
 
 def test_the_rest_failure_path_comes_after_the_stream_append():
-    """Specifically the `except ... continue`, which is the one that fired."""
+    """The `except ... continue` after a REST failure comes after the stream row is
+    appended.
+    """
     src = _cycle_source()
     append_at = src.index('rows.append(paired)')
     except_at = src.index('except Exception as exc:      # noqa: BLE001')

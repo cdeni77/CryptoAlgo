@@ -1,14 +1,9 @@
-"""Live read implied vol only from the in-process cache, which starts empty.
+"""Tests for `latest_fit`, which falls back to the store when the in-process cache is
+empty.
 
-The backtest attaches it with an as-of join over stored history, tolerating a
-fit up to `MAX_FIT_AGE_MINUTES` (360) old. Live consulted only
-`record_implied_vol.CACHE`, which a restart empties — so after every deploy the
-five iv_* features were NaN until the recorder happened to fit again, even
-though the store held a usable fit from twenty-six minutes earlier.
-
-That is not a small gap. `--complete-cases` means the artifact was fitted on
-66,555 rows that ALL carry an implied-vol fit; it has never seen a NaN there.
-Scoring without one is out-of-distribution, on a live account.
+A restart empties `record_implied_vol.CACHE`. The backtest accepts a stored fit up
+to `MAX_FIT_AGE_MINUTES` old, and the artifact never saw a NaN there, so live
+reads the store too.
 """
 from __future__ import annotations
 
@@ -43,14 +38,14 @@ def test_the_in_process_cache_wins_when_it_is_fresher():
 
 
 def test_the_store_is_used_when_the_cache_is_empty():
-    """A restart empties the cache; the store still holds the fit."""
+    """After a restart the store's fit is used."""
     fit = latest_fit('BTC-USD', now=NOW, cache={}, read=lambda: _stored(26))
     assert fit is not None and fit['implied_sigma_per_min'] == 8.0
     assert (NOW - fit['at']).total_seconds() / 60 == pytest.approx(26.0)
 
 
 def test_a_stored_fit_past_the_age_cap_is_not_used():
-    """Beyond MAX_FIT_AGE_MINUTES it describes a different session."""
+    """A stored fit older than MAX_FIT_AGE_MINUTES is not used."""
     assert latest_fit('BTC-USD', now=NOW, cache={},
                       read=lambda: _stored(400)) is None
 
@@ -60,9 +55,9 @@ def test_a_symbol_with_nothing_anywhere_is_none_not_an_error():
 
 
 def test_the_store_is_not_read_on_every_call():
-    """The hot path is a decision. Reading a Parquet partition per cycle would
-    put a synchronous pandas read on the event loop for a value that changes
-    every few minutes at most."""
+    """The store is not read on every call, to keep a synchronous Parquet read off the
+    event loop.
+    """
     calls = []
 
     def _read():

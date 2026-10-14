@@ -1,17 +1,4 @@
-"""PROPOSED. The live feature vector must equal the backtest feature vector.
-
-Drop into `backend/trader/tests/`.
-
-`core/dataset.py::score_live`'s own docstring makes this claim — "the same code
-path as the backtest, deliberately" — and nothing tests it. The existing
-`test_score_live_*` tests check the *shape* (one row per symbol, an `outcome`
-column of NaN); neither compares a single number against what the measured path
-produced for the same window.
-
-That is the exact failure the docstring says was lived through: "the previous
-incarnation of this repo had them disagree about entry price for months". A
-backtested edge that the live path cannot reproduce is not an edge.
-"""
+"""Tests that `score_live` produces the same feature vector as the backtest path."""
 
 from __future__ import annotations
 
@@ -41,10 +28,7 @@ def fitted():
 
 @pytest.mark.parametrize('offset', (3, 12))
 def test_the_live_path_reproduces_the_measured_feature_vector(fitted, offset):
-    """Same bars, same artifact, same window, same offset — same numbers.
-
-    Compared on the feature columns the model actually consumes plus the
-    baseline, because those are the inputs to the trade.
+    """Same bars, artifact, window and offset give the same model features and baseline.
     """
     bars, dataset, fit, measured, test_index = fitted
     bundle = fit.bundle(FAST)
@@ -82,7 +66,7 @@ def test_the_live_path_reproduces_the_measured_feature_vector(fitted, offset):
 
 
 def test_the_live_path_never_sees_the_label(fitted):
-    """`score_live` must report the outcome as unknown, not as a plausible zero."""
+    """`score_live` reports the outcome as unknown (NaN), not zero."""
     bars, _, fit, _, test_index = fitted
     live = score_live(bars, fit.bundle(FAST), FAST,
                       window_open=test_index[len(test_index) // 2], offset=3)
@@ -92,10 +76,7 @@ def test_the_live_path_never_sees_the_label(fitted):
 
 
 def test_the_live_path_refuses_a_window_the_bars_do_not_reach(fitted):
-    """Rather than scoring the last window it happens to have.
-
-    Silently scoring a stale window is how a live loop trades a settled market.
-    """
+    """A window the bars do not reach raises instead of scoring an older window."""
     from core.dataset import DatasetError
 
     bars, _, fit, _, test_index = fitted
@@ -105,8 +86,9 @@ def test_the_live_path_refuses_a_window_the_bars_do_not_reach(fitted):
 
 
 def test_a_symbol_with_no_fitted_volatility_model_is_dropped_not_guessed(fitted):
-    """An artifact that does not cover a symbol must not score it off another
-    symbol's model."""
+    """A symbol without a fitted volatility model is dropped, not scored with another
+    symbol's model.
+    """
     bars, _, fit, _, test_index = fitted
     bundle = fit.bundle(FAST)
     dropped = 'SOL-USD'

@@ -1,19 +1,8 @@
-"""Our books and the venue's cover different periods, and the totals say so.
+"""Tests for `first_position_time`, the start of our own books.
 
-`sync_venue` prints the venue's realised P&L beside ours and calls the
-difference a gap. Measured the first time it ran against the live account: the
-venue held 365 settlements spanning four days while our store had been wiped the
-previous night for a clean experiment, so it held one. The gap was almost
-entirely that.
-
-The three causes the tool listed — a settlement our Coinbase proxy called
-differently, a fee we mispriced, a fill nobody booked — are all real and none of
-them was this one. Wiping the store between experiments is deliberate practice
-here, so the mismatch recurs every time, and a number presented as error when it
-is arithmetic sends someone hunting a bug that does not exist.
-
-`first_position_time` is what makes the comparison honest: it says when our
-books actually start.
+`sync_venue` compares our realised P&L with the venue's. If our store starts
+later than the venue's history, part of the gap is only the coverage difference.
+`first_position_time` lets the comparison use the same period.
 """
 
 from __future__ import annotations
@@ -43,7 +32,7 @@ def position(writer: PgWriter, when: datetime) -> None:
 
 
 def test_an_empty_store_has_no_start(writer):
-    """Nothing to compare against, and it must not claim a date anyway."""
+    """An empty store has no start date."""
     assert writer.first_position_time() is None
 
 
@@ -55,7 +44,7 @@ def test_it_reports_the_earliest_position(writer):
 
 
 def test_the_answer_is_timezone_aware_utc(writer):
-    """A naive datetime compared against the venue's aware one raises."""
+    """The result is timezone-aware UTC, so it compares with the venue's aware times."""
     position(writer, W)
     got = writer.first_position_time()
     assert got.tzinfo is not None

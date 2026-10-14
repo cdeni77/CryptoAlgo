@@ -1,15 +1,8 @@
-"""The artifact is the authority on which forecaster its correction corrects.
+"""Tests for `config_for_artifact`: live adopts settings from the artifact.
 
-`scripts/live.py` has no `--init-score-source` flag, so `config_from_args`
-left `Config.init_score_source` at its 'baseline' default and `model.verify`
-refused every market-init artifact at load — a crash loop with a message about
-a configuration the operator had no way to set.
-
-Live has no legitimate freedom here: scoring a market-fitted residual on the
-baseline logit is always the bug the guard describes. So live adopts the
-artifact's value. But adopting it silently would trade one failure for a worse
-one — a market-init model needs a live quote to score, and paper mode never
-opens a client, so every window would score NaN instead of raising.
+Live adopts the artifact's `init_score_source`, since scoring a market-fitted
+residual on the baseline logit is always wrong. It also adopts the economics the
+artifact was evaluated under, except fields set explicitly on the command line.
 """
 from __future__ import annotations
 
@@ -36,10 +29,10 @@ def test_a_baseline_artifact_is_left_alone():
 
 
 def test_a_market_artifact_in_paper_mode_is_refused_not_silently_scored_as_nan():
-    """Paper mode opens no Kalshi client, so `fetch_quotes` returns {} and the
-    market logit is never attached. Refusing at startup names the problem;
-    proceeding would produce a NaN prediction every cycle and look like a model
-    that abstains."""
+    """A market-init artifact in paper mode is refused at startup.
+
+    Paper mode has no Kalshi client and so no quotes, so every window would score NaN.
+    """
     with pytest.raises(SystemExit) as excinfo:
         config_for_artifact(Config(), _artifact('market'), mode='paper')
     message = str(excinfo.value)
@@ -52,19 +45,11 @@ def _artifact_with(**provenance):
 
 
 def test_live_adopts_the_economics_the_artifact_was_measured_under():
-    """`--kelly-fraction 0.10 --min-edge-pp 3.0` promoted the artifact, and
-    `scripts/live.py` has neither flag — so `config_from_args` left Config at
-    0.25 Kelly and a 1.50pp gate and the live loop traded a policy nothing had
-    evaluated.
+    """Live adopts the economics (`kelly_fraction`, `min_edge_pp`) the artifact was
+    evaluated under.
 
-    `verify`'s material fields do not include these, because they change what
-    the strategy DOES rather than what the model SAYS. That distinction is real
-    and it is exactly why nothing caught this: the model was scored correctly
-    and then acted on wrongly.
-
-    CLAUDE.md measures the cost: 0.25 -> 0.10 moved realised edge per contract
-    +0.99pp -> +3.32pp and drawdown 58% -> 21%, because a smaller Kelly also
-    floors marginal trades under one contract and refuses them.
+    `verify` does not check these, because they change what the strategy does, not
+    what the model predicts.
     """
     config = config_for_artifact(
         Config(), _artifact_with(kelly_fraction=0.10, min_edge_pp=3.0),
@@ -74,8 +59,7 @@ def test_live_adopts_the_economics_the_artifact_was_measured_under():
 
 
 def test_a_field_the_artifact_did_not_record_keeps_the_running_default():
-    """Provenance carries None for anything the promoting run left at default.
-    Adopting a None would erase a real setting."""
+    """A field recorded as None keeps the running value."""
     config = config_for_artifact(
         Config(), _artifact_with(kelly_fraction=0.10, max_stake_dollars=None),
         mode='live')
@@ -89,13 +73,7 @@ def test_an_artifact_with_no_provenance_changes_nothing():
 
 
 def test_an_explicit_cli_setting_beats_the_artifact_provenance():
-    """Economics adoption exists so an artifact trades under the policy it was
-    MEASURED under. But the operator must still be able to override it — and
-    silently reverting them at the next promotion is the failure mode.
-
-    `cli_overrides` already records which fields the command line set, so
-    adoption skips those and adopts the rest.
-    """
+    """A field set on the command line is not replaced by the artifact's value."""
     from dataclasses import replace
     config = replace(Config(compound=True, kelly_fraction=0.25),
                      cli_overrides=frozenset({'compound'}))
@@ -117,9 +95,7 @@ def _artifact_with_groups(*groups):
 
 
 def test_an_artifact_that_reads_cross_venue_requires_the_peer_book():
-    """`--complete-cases` put the peer on every training row, and the deployed
-    command never passed `--require-peer-book`, so live traded rows with no peer
-    through NaN branches the model was never fitted on."""
+    """An artifact that reads `cross_venue` requires the peer book, as training did."""
     out = config_for_artifact(
         Config(), _artifact_with_groups('cross_venue', 'geometry'), mode='live')
     assert out.require_peer_book is True

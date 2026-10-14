@@ -1,8 +1,4 @@
-"""The live loop's own logic: which offset, and settle before deciding.
-
-Everything else in `scripts/live.py` is plumbing over code tested elsewhere.
-These two are its own, and both are the kind of off-by-one that produces
-plausible numbers rather than an error.
+"""Tests for the live loop's own logic: window, offset choice, and decision tolerance.
 """
 
 from __future__ import annotations
@@ -38,7 +34,7 @@ def test_elapsed_counts_whole_minutes_into_the_window():
 
 
 def test_the_offset_is_the_latest_one_reached_never_a_future_one():
-    """Scoring at an offset that has not happened reads a bar that does not exist."""
+    """The offset is the latest one reached, never a future one."""
     assert choose_offset(0, CFG) is None
     assert choose_offset(2, CFG) is None, 'chose an offset before it was reached'
     assert choose_offset(3, CFG) == 3
@@ -53,7 +49,7 @@ def test_before_the_first_offset_is_an_abstention_not_an_error():
 
 
 def test_the_fetch_window_covers_the_longest_feature_lookback():
-    """`log_rv_1440` needs a day. Fetching less makes it NaN and the column dead."""
+    """The fetch window covers `log_rv_1440`, the longest lookback."""
     assert FETCH_MINUTES > max(CFG.vol_lookbacks_minutes)
     assert FETCH_MINUTES >= 1440 + CFG.window_minutes
 
@@ -68,7 +64,9 @@ def test_prices_are_retained_longer_than_the_chart_shows():
 
 
 def test_place_orders_requires_live_mode():
-    """One flag guarding an irreversible action is one typo away from wrong."""
+    """The parser accepts `--mode paper --place-orders` so `main()` can reject it with a
+    message.
+    """
     from scripts.live import build_parser
 
     args = build_parser().parse_args(['--mode', 'paper', '--place-orders'])
@@ -96,27 +94,15 @@ def test_paper_is_the_default_mode():
     assert args.require_gates is True
 
 
-# --- the decision tolerance, measured 2026-08-25 ---------------------------
+# --- the decision tolerance --------------------------------------------------
 #
-# The market's price moves ~8.4 percentage points per minute. Holding the signal
-# fixed and moving only the quote, one minute of staleness costs 0.025-0.074 nats
-# of log loss against a total model edge of 0.002-0.005 — a break-even lag of
-# about three seconds.
-#
-# `DECISION_TOLERANCE_SECONDS` was 75, which is wider than the ordinary cycle
-# cadence (60s). So after the scheduler fired on target, the *next* ordinary
-# cycle — a full minute later — was still inside tolerance and decided the same
-# offset again. Observed live on window 07:00 offset +3m: at +5s the model wanted
-# ETH up at 0.81; at +76s it wanted ETH down at 0.07, and read the market's own
-# 12-point move as a *larger* edge. The on-time orders did not fill; the stale
-# one did.
+# The market price moves several points per minute, so a few seconds of
+# staleness can cost more than the model's edge. The tolerance must be narrower
+# than the cycle cadence, or the next ordinary cycle re-decides the same offset
+# a full minute late.
 
 def test_the_decision_tolerance_is_tighter_than_the_cycle_cadence():
-    """A tolerance wider than the cadence lets every offset be decided twice.
-
-    The second decision is a full cadence late, which is 20x the measured
-    break-even lag. This is the constant that permitted it.
-    """
+    """The decision tolerance is narrower than the 60s cycle cadence."""
     from scripts.live import DECISION_TOLERANCE_SECONDS
 
     assert DECISION_TOLERANCE_SECONDS < 60.0, (
@@ -126,28 +112,24 @@ def test_the_decision_tolerance_is_tighter_than_the_cycle_cadence():
 
 
 def test_the_decision_tolerance_fits_the_measured_latency_budget():
-    """Break-even lag is ~3s strict, ~10s generous. Allow the cycle to run."""
+    """The tolerance stays between 5 and 20 seconds."""
     from scripts.live import DECISION_TOLERANCE_SECONDS
 
     assert 5.0 <= DECISION_TOLERANCE_SECONDS <= 20.0
 
 
 def test_a_stale_cycle_does_not_decide_the_offset_it_has_drifted_past():
-    """+72s past an offset must abstain; +6s must act.
-
-    These are the two lags actually observed in production.
-    """
+    """6s past an offset decides; 72s past it abstains."""
     from scripts.live import decision_offset
 
     # 6 seconds past +3m -> decide at 3
     assert decision_offset(3 + 6 / 60.0, CFG) == 3
-    # 72 seconds past +3m -> too stale, abstain rather than trade a moved market
+    # 72 seconds past +3m -> too stale; abstain
     assert decision_offset(3 + 72 / 60.0, CFG) is None
 
 
 def test_an_explicit_offset_overrides_the_tolerance():
-    """A forced offset is a deliberate instruction — a backfill or a manual run —
-    and is not subject to the staleness gate."""
+    """A forced offset (backfill or manual run) skips the staleness check."""
     from scripts.live import decision_offset
 
     assert decision_offset(3 + 600 / 60.0, CFG, forced=3) == 3
@@ -160,11 +142,8 @@ def test_before_the_first_offset_there_is_nothing_to_decide():
 
 
 def test_the_exchange_shard_is_read_off_the_markets_not_hardcoded():
-    """Which shard holds the money we can spend is the venue's statement.
-
-    Kalshi moved the KX*15M series to `exchange_index` 2 mid-session on
-    2026-08-25. A constant would have to be edited on the next move; the quotes
-    carry it.
+    """The exchange shard is read from the quotes, not hardcoded, since the venue can move
+    it.
     """
     from data_collection.kalshi_client import Quote
     from scripts.live import venue_exchange_index
@@ -174,20 +153,16 @@ def test_the_exchange_shard_is_read_off_the_markets_not_hardcoded():
                      no_ask=0.50, last_price=0.50, volume=1, open_interest=1,
                      close_time=None, status='active', exchange_index=2)
 
-    # **The shape `fetch_quotes` actually produces: `(Quote, ticker)`.** This
-    # test used to build `{symbol: Quote}`, which the live path never produces —
-    # so it passed while production read `.exchange_index` off a tuple, found
-    # nothing, and fell back to the whole-account balance on every cycle.
+    # The shape `fetch_quotes` produces: `{symbol: (Quote, ticker)}`.
     quotes = {'BTC-USD': (quote('a'), 'a'), 'ETH-USD': (quote('b'), 'b')}
     assert venue_exchange_index(quotes) == 2
 
-    # The bare shape still works, so a caller that already unpacked is not broken.
+    # A bare `{symbol: Quote}` mapping also works.
     assert venue_exchange_index({'BTC-USD': quote('a')}) == 2
 
 
 def test_with_no_quotes_no_shard_is_claimed():
-    """No book read this cycle means no basis for narrowing the balance, so fall
-    back to the whole-account figure rather than guessing a shard."""
+    """With no quotes, no shard is claimed and the whole-account balance is used."""
     from scripts.live import venue_exchange_index
 
     assert venue_exchange_index({}) is None

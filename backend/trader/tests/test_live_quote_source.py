@@ -1,28 +1,10 @@
-"""A decision is priced off the LIVE book, never `/markets`' cached touch.
+"""Tests that a decision is priced from the live `/orderbook`, never the cached `/markets`
+touch.
 
-**This is what stopped the live loop filling on 2026-09-04.** `fetch_quotes`
-priced every decision off `kalshi.quote(ticker)`, which reads `/markets` and its
-`yes_bid_dollars`/`yes_ask_dollars` fields. Those are cached. Measured by
-sampling both endpoints for the same market two seconds apart, `/markets`
-returned an identical `0.9120/0.9160` on ETH for five consecutive samples across
-ten seconds while `/orderbook` moved 0.934 -> 0.960 -> 0.951 -> 0.950. Across 28
-paired samples the two disagreed on 96.4%, mean 0.66c, ask understated by up to
-6.3c.
-
-The captured kill: the loop believed the ask was 0.74 and sent a 74c bid; the
-real book was 0.75/0.76, so our limit was a cent below the actual BID and could
-never cross. Ten of ten orders after the restart died this way.
-
-Two consequences, and the second is the worse one:
-
-  * the order cannot fill, and
-  * `market_probability` — the midpoint of this touch — is the `init_score` of a
-    market-initialised artifact, so the model spends its capacity correcting a
-    price that is several cents stale. That is a forecast error, not a fill one.
-
-It also closes a live/training mismatch: the backtest reads `venue_depth`, built
-from RECORDED LADDERS, so `/markets` was a price source live used and training
-never saw.
+The `/markets` touch can be several cents stale. A limit set from it may never
+cross the real book. Its mid is also the market-init `init_score`, so a stale
+touch is a forecast error too. Training reads recorded ladders, so live must
+read the book as well.
 """
 from __future__ import annotations
 
@@ -35,9 +17,8 @@ from data_collection.kalshi_client import (
 )
 
 
-# The venue's real shapes, recorded from the live account 2026-09-04. `/markets`
-# is deliberately STALE here — two cents under the book — which is the whole
-# condition under test.
+# The venue's real shapes. `/markets` is stale here on purpose, two cents under
+# the book; that is the condition under test.
 STALE_MARKET = {'market': {
     'ticker': 'KXSOL15M-26SEP041145-45',
     'yes_bid_dollars': '0.7300', 'yes_ask_dollars': '0.7400',
@@ -71,16 +52,16 @@ class FakeClient(KalshiClient):
         return STALE_MARKET
 
 
-
 def _live_quote(client):
-    """What the live quote path does for one symbol off the stream: the
-    market's metadata (touch blanked), priced by one `/orderbook` read."""
+    """The live quote path for one symbol: market metadata with the touch blanked, priced
+    by one `/orderbook` read.
+    """
     return client.book_quote(market_meta(STALE_MARKET['market']))
 
 def test_the_touch_comes_from_the_book_not_the_cached_quote():
     c = FakeClient()
     q = asyncio.run(_live_quote(c))
-    # /markets said 0.73/0.74. The book says 0.75 bid, and the YES ask is
+    # /markets said 0.73/0.74. The book has a 0.75 bid, and the YES ask is
     # 1 - best_no_bid = 1 - 0.24 = 0.76.
     assert q.yes_bid == pytest.approx(0.75)
     assert q.yes_ask == pytest.approx(0.76)
@@ -88,21 +69,17 @@ def test_the_touch_comes_from_the_book_not_the_cached_quote():
 
 
 def test_the_no_side_is_converted_and_not_relabelled():
-    """Buying NO costs `1 - best_yes_bid`. Getting this backwards prices the
-    wrong side of the book, which is the same class of error as inverting the
-    trade outright."""
+    """Buying NO costs `1 - best_yes_bid`."""
     c = FakeClient()
     q = asyncio.run(_live_quote(c))
     assert q.no_bid == pytest.approx(0.24)
-    assert q.no_ask == pytest.approx(0.25)     # 1 - 0.75
+    assert q.no_ask == pytest.approx(0.25)  # 1 - 0.75
     assert q.ask_for('down') == pytest.approx(0.25)
 
 
 def test_the_captured_kill_would_now_cross():
-    """The regression test for the actual failure.
-
-    Our limit was 0.74 against a real 0.76 ask. With the live touch the decision
-    prices at 0.76, so `order_limit_price` starts from a number that can fill.
+    """With the live touch the decision prices at 0.76, not the stale 0.74, so the limit
+    can fill.
     """
     c = FakeClient()
     q = asyncio.run(_live_quote(c))
@@ -110,9 +87,7 @@ def test_the_captured_kill_would_now_cross():
 
 
 def test_the_sizes_come_from_the_stack_that_gets_crossed():
-    """`yes_ask_size` is what rests on the NO bid — a YES buy crosses NO bids.
-    `decide()` caps the stake on this, so taking it from the wrong stack sizes
-    against liquidity that is not there."""
+    """`yes_ask_size` is the size resting on the NO bid, which a YES buy crosses."""
     c = FakeClient()
     q = asyncio.run(_live_quote(c))
     assert q.yes_bid_size == pytest.approx(64.0)
@@ -120,9 +95,8 @@ def test_the_sizes_come_from_the_stack_that_gets_crossed():
 
 
 def test_metadata_still_comes_from_markets():
-    """Only the touch is replaced. Status, shard and close time have no
-    orderbook equivalent, and `exchange_index` in particular must survive — a
-    wrong shard is a 404 that names the market rather than the mismatch."""
+    """Status, shard and close time still come from `/markets`; only the touch is replaced.
+    """
     c = FakeClient()
     q = asyncio.run(_live_quote(c))
     assert q.exchange_index == 2
@@ -131,8 +105,7 @@ def test_metadata_still_comes_from_markets():
 
 
 def test_an_empty_book_is_trusted_rather_than_papered_over():
-    """A settled or halted market really has no book, and reporting the cached
-    touch instead would reintroduce exactly the bug being fixed."""
+    """An empty book is reported as empty; the cached touch is not substituted."""
     c = FakeClient(book={'orderbook': {'orderbook_fp': {}}})
     q = asyncio.run(_live_quote(c))
     assert q.yes_bid is None and q.yes_ask is None
@@ -140,8 +113,7 @@ def test_an_empty_book_is_trusted_rather_than_papered_over():
 
 
 def test_a_FAILED_book_request_is_no_quote_not_the_cached_touch():
-    """A transport failure is not an empty book, and the cached touch is up to
-    6.3c wrong — pricing a decision off it is a refusal, not a fallback."""
+    """A failed book request raises; the cached touch is never used as a fallback."""
     c = FakeClient(raise_on_book=KalshiError('503'))
     with pytest.raises(KalshiError):
         asyncio.run(_live_quote(c))
@@ -161,16 +133,14 @@ def test_the_rest_quote_says_where_it_came_from_and_carries_its_ladder():
 
 
 def test_it_reads_the_book_exactly_once_per_quote():
-    """One extra round trip per symbol per cycle, not one per feature. The
-    cycle's own budget is the reason the recorders share a process."""
+    """Each quote reads the book once."""
     c = FakeClient()
     asyncio.run(_live_quote(c))
     assert sum(1 for p in c.calls if p.endswith('/orderbook')) == 1
 
 
 def test_parse_orderbook_ignores_the_dust_level():
-    """Both stacks carry a 0.0010 level with ~100k resting. Reading THAT as the
-    touch would price every trade at a tenth of a cent."""
+    """The 0.0010 dust level with large size is not read as the touch."""
     book = parse_orderbook(LIVE_BOOK)
     assert book['yes_bid'] == pytest.approx(0.75)
     assert book['no_bid'] == pytest.approx(0.24)

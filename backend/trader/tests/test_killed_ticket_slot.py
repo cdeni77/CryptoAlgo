@@ -1,22 +1,8 @@
-"""A killed order took nothing, so it must not hold the window's entry slot.
+"""Tests that a killed order releases its window entry slot.
 
-Live, 2026-08-26 02:12. Two `immediate_or_cancel` orders found nothing resting
-at their limit and the venue cancelled both — `fill_count_fp: "0.00"`,
-`taker_fill_cost_dollars: "0.000000"`, no position anywhere. The very next cycle
-logged:
-
-    window 2026-08-26 02:00:00+00:00 already holds ['BTC-USD', 'SOL-USD']
-    ($8.55); those symbols will refuse
-
-$8.55 is exactly the two *decision* stakes, $3.82 + $4.73. Nothing was held at
-all. `entries_for_window` counted every ticket whose status was not 'skipped',
-and a kill is written as 'killed'.
-
-Tickets are counted on purpose: one exists from the moment an order is sent, so
-a crash between sending and booking still shows up, and 'unknown' — a POST that
-failed in flight and may well have been accepted — must keep holding the slot.
-But a kill is the one outcome the venue has affirmatively told us produced no
-position, so it is the one that must release it.
+Tickets count as entries from the moment an order is sent, so a crash between
+sending and booking still blocks the window. 'unknown' may have been accepted and
+keeps the slot. 'killed' is the venue confirming no position, so it releases it.
 """
 
 from __future__ import annotations
@@ -57,7 +43,7 @@ def test_a_killed_order_releases_the_window_slot(writer):
 
 
 def test_an_in_flight_unknown_still_holds_the_slot(writer):
-    """It may have been accepted. Re-entering could double the position."""
+    """An in-flight 'unknown' may have been accepted, so it still holds the slot."""
     ticket(writer, 'BTC-USD', status='unknown')
     symbols, _stake, count = writer.entries_for_window(WINDOW)
     assert symbols == frozenset({'BTC-USD'})
