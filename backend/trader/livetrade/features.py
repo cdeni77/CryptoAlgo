@@ -147,8 +147,60 @@ def warn_if_peer_cap_tight(config) -> None:
                        'most peer books', cap, TIGHT_PEER_CAP_SECONDS)
 
 
+# Why a peer book is not used. `future` is a book stamped after the decision.
+PEER_REFUSALS = ('no_book', 'wrong_window', 'too_old', 'future', 'one_sided')
+PEER_USED = 'used'
+
+# window_open -> {verdict: count}, one verdict per symbol per decision cycle.
+_PEER_COUNTS: dict = {}
+
+
+def peer_refusal(pm: Optional[dict], *, now=None, window_open=None,
+                 config=None) -> Optional[str]:
+    """The reason `pm` cannot be used for this decision, or None.
+
+    The window check comes first: a rollover leaves a fresh-looking book for
+    the previous window. A reading with no window or no stamp is kept: the REST
+    fallback publishes the window as `window_open`, the socket as `window`, and
+    absence of a stamp is not evidence of staleness (matching `attach_quotes`).
+    """
+    if not pm:
+        return 'no_book'
+    peer_window = pm.get('window') or pm.get('window_open')
+    if (window_open is not None and peer_window is not None
+            and pd.Timestamp(peer_window) != pd.Timestamp(window_open)):
+        return 'wrong_window'
+    if pm.get('at') is not None and now is not None:
+        age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
+        if age < 0:
+            return 'future'
+        if age > peer_max_age_seconds(config):
+            return 'too_old'
+    if np.isnan(_two_sided_mid(pm.get('best_bid'), pm.get('best_ask'))):
+        return 'one_sided'
+    return None
+
+
+def _note_peer(window_open, verdict: str) -> None:
+    if window_open is None:
+        return
+    key = pd.Timestamp(window_open)
+    counts = _PEER_COUNTS.setdefault(key, {})
+    counts[verdict] = counts.get(verdict, 0) + 1
+
+
+def take_peer_counts(window_open) -> dict:
+    """{verdict: count} for `window_open`, removed from the tally. Older
+    windows are dropped with it."""
+    key = pd.Timestamp(window_open)
+    counts = _PEER_COUNTS.pop(key, {})
+    for stale in [k for k in _PEER_COUNTS if k < key]:
+        del _PEER_COUNTS[stale]
+    return counts
+
+
 def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None,
-                    config=None) -> dict:
+                    config=None, symbol: Optional[str] = None) -> dict:
     """`cross_venue` from the in-process Polymarket cache.
 
     Two independent books on the same fifteen minutes, settling on different
@@ -157,32 +209,26 @@ def cross_venue_row(pm: Optional[dict], quote, *, now=None, window_open=None,
     or liquidity, not a different question.
 
     `best_bid`/`best_ask` are CENTS on both sides, matching `core.book_features`.
+
+    The peer must be for THIS window and no staler than the peer cap the
+    backtest applies (`peer_max_age_seconds`); otherwise the gap partly
+    measures Kalshi's own move since the peer was read. Each verdict is counted
+    per window for the heartbeat line (`take_peer_counts`).
     """
     from core.book_features import CROSS_VENUE
 
     out = {name: float('nan') for name in CROSS_VENUE}
-    # The peer must be for THIS window and no staler than the peer cap the
-    # backtest applies (`peer_max_age_seconds`); otherwise the gap
-    # partly measures Kalshi's own move since the peer was read. `cross_venue`
-    # is the load-bearing group. The window check comes first because a
-    # rollover leaves a fresh-looking book for the previous window. A reading
-    # with no window or no stamp is kept: the REST fallback publishes the window
-    # as `window_open`, the socket as `window`, and absence of a stamp is not
-    # evidence of staleness (matching `attach_quotes`).
-    if (pm is not None and window_open is not None
-            and (pm.get('window') or pm.get('window_open')) is not None
-            and pd.Timestamp(pm.get('window') or pm.get('window_open'))
-                != pd.Timestamp(window_open)):
-        logger.debug('peer book is for window %s, not %s; gap refused',
-                     pm.get('window') or pm.get('window_open'), window_open)
+    refusal = peer_refusal(pm, now=now, window_open=window_open, config=config)
+    _note_peer(window_open, refusal or PEER_USED)
+    if refusal is not None:
+        if pm:
+            logger.debug('%s: peer book refused (%s): window %s, at %s, %s/%s',
+                         symbol or '?', refusal,
+                         pm.get('window') or pm.get('window_open'), pm.get('at'),
+                         pm.get('best_bid'), pm.get('best_ask'))
+        else:
+            logger.debug('%s: peer book refused (%s)', symbol or '?', refusal)
         pm = None
-    if pm is not None and pm.get('at') is not None and now is not None:
-        cap = peer_max_age_seconds(config)
-        age = (pd.Timestamp(now) - pd.Timestamp(pm['at'])).total_seconds()
-        if not (0 <= age <= cap):
-            logger.debug('peer book %.0fs old, past the %.0fs bar; gap refused',
-                         age, cap)
-            pm = None
     k_mid = _two_sided_mid(getattr(quote, 'yes_bid', np.nan) * 100.0,
                            getattr(quote, 'yes_ask', np.nan) * 100.0)
     p_mid = _two_sided_mid(*(
@@ -430,7 +476,8 @@ def _attach_book_features(scored: pd.DataFrame, quotes: dict, cache=None, *,
             row['depth_down'] = down
         row.update(cross_venue_row(
             pm_cache.get(symbol), entry[0], now=now,
-            window_open=scored['window_open'].iloc[i], config=config))
+            window_open=scored['window_open'].iloc[i], config=config,
+            symbol=symbol))
         row.update(implied_vol_row(
             latest_fit(symbol, now=now, cache=iv_cache), now=now,
             sigma_per_min=scored['sigma_per_min'].iloc[i]
