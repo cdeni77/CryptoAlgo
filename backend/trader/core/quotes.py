@@ -1,29 +1,12 @@
 """Price a window row against the venue's recorded book.
 
-**This closes the circularity the audit named.** `core/decide.py` falls back to
-`p_market = baseline_probability` when a row carries no `ask_up`/`ask_down` —
-which is every backtest row — so the simulated counterparty is the model's own
-training target. Two of the eighteen gates, `market_windows` and
-`model_minus_market`, read NaN and fail for want of a price rather than for want
-of skill. `AUDIT_REPORT.md` calls that the sharpest complaint against the whole
-result, and eight months of collected book is the answer to it.
+Without a quote, `core/decide.py` prices against the calibrated baseline.
+This module supplies the real book, so the backtest trades against the market.
 
-**Denomination is the thing that kills you quietly.** A Kalshi YES book quotes
-what YES costs. The price of the DOWN side is `1 - yes_bid`, because buying NO
-is taking the other side of what YES bidders will pay — not `yes_bid`, and not
-the mid, which is a price nobody will sell you. Getting it wrong is an error of
-the spread with the sign inverted on one side, and nothing raises. It is the
-same class of mistake as the `no_levels` trap that put a 0.51 YES ask in the
-column holding a 0.51 NO bid.
+Denomination: the UP side costs `yes_ask`; the DOWN side costs `1 - yes_bid`.
+Never the mid. The two costs sum to `1 + spread`; a sum below 1 is a crossed book.
 
-A useful property falls out and is asserted in the tests: the two costs must sum
-to `1 + spread`. Summing to exactly 1 means the mid was used; summing to less
-than 1 means the book is crossed and the row is not a book at all.
-
-**A row with no quote keeps NaN on purpose.** Most of five years predates the
-venue, and those rows must go on pricing against the calibrated baseline exactly
-as before. `price_source` then still reads `baseline`, which is the distinction
-the schema has always insisted on: a backtest and a fill are different claims.
+A row with no quote keeps NaN, and `price_source` stays `baseline`.
 """
 
 from __future__ import annotations
@@ -40,9 +23,7 @@ from core.config import DEFAULT_CONFIG
 logger = logging.getLogger(__name__)
 
 # The store's depth columns, renamed to what `core.book_features` expects.
-# Declared here so a rename cannot leave FEATURE_GROUPS pointing at a column
-# nothing joins — which is exactly how a run reported "46 features (12 empty),
-# 2 trees": a quarter of the matrix was all-NaN and only a warning said so.
+# Declared here so a rename cannot leave FEATURE_GROUPS pointing at a missing column.
 DEPTH_MAP = {
     'yes_bid_size': 'bid_at_touch', 'yes_ask_size': 'ask_at_touch',
     'depth_bid_1c': 'bid_1c', 'depth_ask_1c': 'ask_1c',
@@ -51,52 +32,28 @@ DEPTH_MAP = {
 }
 QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
                   'quote_age_seconds', 'quote_source', 'quote_observer',
-                  # Not features — `decide()` reads these to cap the stake.
+                  # Not features: `decide()` reads these to cap the stake.
                   'depth_up', 'depth_down')
                  + tuple(DEPTH_MAP.values()))
 # Which observer to believe when several recorded the same minute.
-#
-# **`quote_age_seconds` is NOT comparable across sources, so it cannot be the
-# ranking key.** It means a different thing in each producer: for `backfill` it
-# is time since the last book CHANGE (Predexon serves changes, so a quiet book
-# reads ~0.5s), while for the live recorders it is the sampler's own lag, and
-# `scripts/record_ladder.py` samples at +25s past the minute. Measured at
-# offset 12: backfill 0.52s median, live/live_ws 32.7s, `live_touch` NaN. Rank
-# on that and backfill wins essentially every contested row — not because it is
-# fresher, but because its clock starts later.
-#
-# That is the same defect already recorded for `levels_bid`/`levels_ask` across
-# sources (ratio 0.579), except used as a SELECTOR rather than a feature, so it
-# silently chose a provenance while appearing to choose a freshness.
-#
-# It matters because the model is fitted to correct `market_probability`
-# (`init_score_source=market`) and then trades against whatever `scripts/live.py`
-# reads at the decision instant. Those must be the same object. `live_touch` IS
-# that object — `live._record_touch` writes the quote the loop actually decided
-# on — so it ranks first, ahead of the minute-grid recorders, ahead of the
-# after-the-fact reconstruction. The old ordering put it LAST of the four.
+# `quote_age_seconds` means a different thing in each producer, so it cannot
+# rank across sources; it breaks ties only within one source.
+# `live_touch` ranks first: it is the quote the live loop actually decided on,
+# and the model must be fitted against the same object it trades against.
 QUOTE_SOURCE_PRIORITY = tuple(
     s.strip() for s in os.getenv(
         'QUOTE_SOURCE_PRIORITY', 'live_touch,live_ws,live,backfill').split(',')
     if s.strip())
 
-# A book quoted twenty minutes ago is not a price this decision could have
-# taken. Measured on the real store, 88.1% of backfilled minute rows are fresher
-# than 30s and 70.8% fresher than 5s, so tightening this costs little coverage.
-#
-# Read from `Config.max_quote_age_seconds`, the one limit `core.metrics` and the
-# live order check also read: trades were once priced against quotes up to 900s
-# old while `model_minus_market` counted only those under 30s, and stale quotes
-# are exactly where fake edge comes from (9x higher at 900s than at 5s).
+# A stale book is not a price this decision could have taken. Stale quotes are
+# where fake edge comes from. Shares `Config.max_quote_age_seconds` with
+# `core.metrics` and the live order check.
 DEFAULT_MAX_AGE = float(DEFAULT_CONFIG.max_quote_age_seconds)
 
-# The one observer whose `available_time` bounds its quote's age. `live_touch`
-# rows are written by the trading cycle itself: the cycle starts at or after
-# `event_time` (the decision instant), reads the book, and stamps
-# `available_time` when it writes the row afterwards. So the book it priced was
-# read inside [event_time, available_time] and is at most that far from the
-# decision instant. No other source has that property — the backfill's
-# `available_time` is when the backfill RAN, weeks later.
+# The one observer whose `available_time` bounds its quote's age. The trading
+# cycle reads the book at or after `event_time` (the decision instant) and
+# stamps `available_time` when it writes the row. Other sources lack this:
+# the backfill's `available_time` is when the backfill ran.
 AGE_BOUNDED_SOURCES = ('live_touch',)
 
 # Buckets for the source/age coverage report, in seconds.
@@ -107,10 +64,9 @@ AGE_BUCKETS = ((2.0, '<=2s'), (5.0, '2-5s'), (30.0, '5-30s'),
 def derived_quote_age(book: pd.DataFrame) -> pd.Series:
     """`available_time - event_time` in seconds on age-bounded rows, else NaN.
 
-    An UPPER bound on how far the priced book can be from the decision instant,
-    for rows that recorded no age of their own (every `live_touch` row before
-    2026-10-14). It includes the cycle's post-decision latency, so it
-    overstates the true age — the conservative direction for a staleness filter.
+    An upper bound on the priced book's distance from the decision instant, for
+    rows with no recorded age. It includes post-decision latency, so it errs
+    toward stale.
     """
     out = pd.Series(np.nan, index=book.index, dtype=float)
     if not {'source', 'event_time', 'available_time'} <= set(book.columns):
@@ -137,11 +93,9 @@ def filter_sources(book: pd.DataFrame, sources: Sequence[str]) -> pd.DataFrame:
     return book[book['source'].isin(tuple(sources))]
 
 
-# How each producer's `quote_age_seconds` is measured. The backfill counts back
-# from the row's minute. `live_touch` counts back from the decision instant
-# itself. The minute-grid recorders count FORWARD: they sample after the minute,
-# so their age is how long after it the book was seen. Read with one rule, a
-# forward row is a book from after the decision.
+# How each producer measures `quote_age_seconds`. The backfill counts back from
+# the row's minute. `live_touch` counts back from the decision instant. The
+# minute-grid recorders count forward: they sample after the minute.
 MINUTE_BACKWARD_SOURCES = ('backfill',)
 
 
@@ -165,8 +119,10 @@ def decision_age(book: pd.DataFrame, null_age: str,
 
 
 def _effective_age(book: pd.DataFrame, null_age: str) -> pd.Series:
-    """The age a row is judged on. Under 'stale', a missing age is first bounded
-    where the row's own timestamps allow, and stays NaN (dropped) otherwise."""
+    """The age a row is judged on.
+
+    Under 'stale', a missing age is bounded from the row's own timestamps where
+    possible, and stays NaN (dropped) otherwise."""
     age = (pd.to_numeric(book['quote_age_seconds'], errors='coerce')
            if 'quote_age_seconds' in book.columns
            else pd.Series(np.nan, index=book.index, dtype=float))
@@ -187,31 +143,22 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   decision_latency_seconds: float = 3.0) -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
-    Joined on (symbol, window_open, offset) EXACTLY. Not as-of across offsets:
-    a decision at +3m priced with the book at +12m would be nine minutes of a
-    fifteen-minute window ahead of itself, which is most of the question and
-    reads exactly like skill. The at-or-before rule already lives one layer
-    down, in how `venue_depth`'s minute rows are built.
+    Joined on (symbol, window_open, offset) exactly, never as-of across offsets:
+    a later offset's book is lookahead.
 
-    Only `venue` is used. Polymarket is a cross-venue FEATURE, never the book we
-    execute against — pricing a Kalshi trade off a Polymarket quote would book a
-    fill at a price the venue never showed.
+    Only `venue` prices a trade. The other venue is a cross-venue feature,
+    never an execution price.
 
-    `sources` (`Config.quote_sources`), when non-empty, admits only those
-    observers on BOTH venues — an excluded row does not price, rank or supply
-    depth. `null_age='stale'` (`Config.null_quote_age`) drops a quote with no
-    age instead of treating it as fresh, after bounding `live_touch` ages from
-    their own timestamps (`derived_quote_age`).
-
-    The PEER has its own cap, `peer_max_age_seconds` (None follows
-    `max_age_seconds`), and its own null-age rule, `peer_null_age`, which stays
-    'fresh' unless the caller asks: only ~5% of live Polymarket rows are 5s
-    fresh, so a tight Kalshi cap applied to the peer voids `venue_prob_gap`
-    almost everywhere.
+    Args:
+        sources: when non-empty, only these observers count on both venues.
+        null_age: 'stale' drops a quote with no age (after `derived_quote_age`);
+            'fresh' keeps it.
+        peer_max_age_seconds: the other venue's age cap; None follows `max_age_seconds`.
+        peer_null_age: the other venue's null-age rule.
+        decision_latency_seconds: the decision instant is the minute plus this.
 
     Both venues are point-in-time: a row is usable only if its book was seen at
-    or before the decision instant, the minute plus `decision_latency_seconds`
-    (see `decision_age`). `quote_age_seconds` on the output is that
+    or before the decision instant. The output `quote_age_seconds` is that
     decision-relative age.
     """
     out = windows.copy()
@@ -231,8 +178,7 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     age = decision_age(book, null_age, decision_latency_seconds)
 
     # A price outside [0, 1] is not a probability, and an ask below the bid is
-    # not a book — kept, it would show a guaranteed profit and the backtest
-    # would take it every time.
+    # not a book: it would show a guaranteed profit.
     sane = ((bid.isna() | ((bid >= 0.0) & (bid <= 1.0)))
             & (ask.isna() | ((ask >= 0.0) & (ask <= 1.0)))
             & (bid.isna() | ask.isna() | (ask >= bid)))
@@ -243,20 +189,14 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
 
     book['ask_up'] = ask.where(keep)
     book['ask_down'] = (1.0 - bid).where(keep)
-    # The market's FORECAST, which is the mid — not the ask, which is what a
-    # trade costs. `model_minus_market` compares log losses, so scoring the
-    # market at its ask would credit the model with half the spread as skill on
-    # every row, in its own favour.
+    # The market's forecast is the mid, not the ask. Scoring the market at its
+    # ask would credit the model with half the spread.
     book['market_probability'] = ((bid + ask) / 2.0).where(
         keep & bid.notna() & ask.notna())
-    # The stake cap `decide()` reads, in DOLLARS on the side actually crossed.
-    # `scripts/live.py` supplies these from the live ladder; without them here
-    # the backtest would size against `max_stake_dollars` alone while live sized
-    # against the book, and "one decide()" is the invariant that stops the two
-    # from drifting. NaN, never zero, when the venue reported no size: zero
-    # refuses every trade where the honest answer is "unmeasured".
-    # The RAW column names: `bid_at_touch`/`ask_at_touch` are the DEPTH_MAP
-    # renames and that loop has not run yet at this point in the function.
+    # The stake cap `decide()` reads, in dollars on the side crossed. Live
+    # supplies it from the ladder; the backtest must size the same way.
+    # NaN, never zero, when no size is reported: zero would refuse every trade.
+    # Raw column names: the DEPTH_MAP renames have not run yet here.
     def _size(name):
         return (pd.to_numeric(book[name], errors='coerce')
                 if name in book.columns
@@ -267,28 +207,15 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     book['depth_down'] = (bid_size * book['ask_down']).where(keep)
     book['quote_age_seconds'] = age.where(keep)
     book['quote_source'] = np.where(keep, venue, None)
-    # WHICH observer priced the row, as opposed to which venue. `quote_source`
-    # has always held the venue despite its name, so nothing downstream could
-    # tell a reconstruction from an observation — which is precisely why the
-    # ranking defect above survived: the mixture was invisible in every frame
-    # that carried it. `research/validate` and the market gates can now split
-    # on it, and a shift in the mix is a thing that can be seen rather than
-    # inferred from a disagreeing number.
+    # Which observer priced the row. `quote_source` holds the venue.
     book['quote_observer'] = (np.where(keep, book['source'], None)
                               if 'source' in book.columns else None)
 
-    # One row per (symbol, window, offset). `venue_depth` can hold the same
-    # minute from more than one observer — that is what `source` is for — so
-    # collapse before joining rather than fanning the window table out.
-    #
-    # Ranked on three keys, in this order:
-    #   1. `_unusable` — a row that failed `sane`/`fresh` must never displace a
-    #      row that passed. The previous version got this for free by NaN-ing
-    #      such a row's age and sorting nulls last; now that age is no longer
-    #      the leading key, it has to be said out loud.
-    #   2. `_source_rank` — see QUOTE_SOURCE_PRIORITY. This is the fix.
-    #   3. age — still the tie-break, but only WITHIN one source, which is the
-    #      only comparison where it means one thing.
+    # One row per (symbol, window, offset): collapse duplicate observers before
+    # joining. Ranked by:
+    #   1. `_unusable`: a row that failed `sane`/`fresh` never displaces one that passed.
+    #   2. `_source_rank`: see QUOTE_SOURCE_PRIORITY.
+    #   3. age, as a tie-break within one source.
     book['_unusable'] = (~keep).astype(int)
     if 'source' in book.columns:
         rank = {name: i for i, name in enumerate(QUOTE_SOURCE_PRIORITY)}
@@ -309,9 +236,8 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     take = ['symbol', 'window_open', 'offset_minutes', 'ask_up', 'ask_down',
             'market_probability', 'quote_age_seconds', 'quote_source',
             'quote_observer',
-            # The stake cap. Listed here and not derived from QUOTE_COLUMNS
-            # because that tuple is also the drop list above; keeping them in
-            # step is the reason this line exists rather than a comprehension.
+            # The stake cap. Listed explicitly because QUOTE_COLUMNS is also
+            # the drop list above.
             'depth_up', 'depth_down']
     take += list(DEPTH_MAP.values())
     merged = out.drop(columns=list(QUOTE_COLUMNS)).merge(
@@ -321,10 +247,7 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
         how='left')
     merged = merged.drop(columns=['offset_minutes'])
 
-    # The other venue, under its own prefix. `cross_venue` needs both books on
-    # one row and they must never share a column: a Polymarket bid sitting in a
-    # column holding a Kalshi one is the `no_levels` denomination trap wearing a
-    # different name.
+    # The other venue, under its own prefix. The two books must never share a column.
     if other_venue:
         peer = filter_sources(depth[depth['venue'] == other_venue],
                               sources).copy()
@@ -333,25 +256,9 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
         if len(peer):
             pbid = pd.to_numeric(peer['yes_bid'], errors='coerce')
             pask = pd.to_numeric(peer['yes_ask'], errors='coerce')
-            # **The SAME staleness bar as the traded side.** This block had none,
-            # and Polymarket rows reach 899 seconds in the store. `venue_prob_gap`
-            # is a DIFFERENCE of the two venues, and a difference is exactly where
-            # a timing asymmetry turns into apparent skill.
-            #
-            # It matters here more than anywhere: `cross_venue` is the only
-            # load-bearing group — dropping it takes skill +0.00282 -> -0.00015 —
-            # while scoring +0.000030 ALONE, below the clock control. Useless
-            # alone and essential combined is what an interaction looks like AND
-            # what a leak looks like, and the pattern cannot separate them.
-            # Filtering both sides to one tolerance is what makes the group's
-            # contribution interpretable either way.
-            #
-            # Measured on the 431,198 rows the model sees, Polymarket is 4.0s
-            # STALER on average, so the leak is not the mean case — but it is
-            # fresher by >10s on 6% of rows and nothing bounded it.
-            #
-            # A missing stamp is kept: absence is not evidence of staleness, and
-            # the backfilled fixtures carry rows without one.
+            # The same staleness bar as the traded side. `venue_prob_gap` is a
+            # difference of the two venues, and a timing asymmetry there reads as skill.
+            # A missing stamp is kept: absence is not evidence of staleness.
             peer_cap = (max_age_seconds if peer_max_age_seconds is None
                         else float(peer_max_age_seconds))
             page = decision_age(peer, peer_null_age, decision_latency_seconds)
@@ -362,14 +269,9 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
             two_sided = pbid.notna() & pask.notna() & (pask >= pbid) & pfresh
             peer['pm_market_probability'] = ((pbid + pask) / 2.0).where(two_sided)
             peer['pm_spread'] = (pask - pbid).where(two_sided)
-            # Ranked, not taken in store order. `pm_ladder` carries a
-            # `transport` key, so duplicates per (symbol, window, offset) are
-            # real -- and an arbitrary winner that fails `two_sided` sends
-            # `venue_prob_gap` to NaN while a usable duplicate sits beside it.
-            # That changes `pm_available` and, under `--complete-cases`, which
-            # ROWS survive at all. The traded side has been ranked since the
-            # source-priority fix; this is the same rule for the other half of
-            # the same feature.
+            # Rank duplicates instead of taking store order. An arbitrary winner
+            # that fails `two_sided` would void `venue_prob_gap` while a usable
+            # duplicate exists. Same rule as the traded side.
             peer['_unusable'] = (~two_sided).astype(int)
             peer = (peer.sort_values(['_unusable', 'quote_age_seconds'],
                                      na_position='last')
@@ -382,9 +284,8 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                 left_on=['symbol', 'window_open', 'offset'],
                 right_on=['symbol', 'window_open', 'offset_minutes'],
                 how='left').drop(columns=['offset_minutes'])
-    # `how='left'` preserves order and count, but the table is fed to decide()
-    # row by row and losing or reordering rows silently changes which windows
-    # were traded. Cheap to assert, expensive to discover.
+    # decide() reads rows in order; a lost or reordered row changes which
+    # windows trade.
     if len(merged) != len(out):
         raise ValueError(f'quote join changed the row count: '
                          f'{len(out)} -> {len(merged)}')
@@ -425,17 +326,11 @@ def source_age_table(frame: pd.DataFrame, *, source_column: str = 'source',
 
 
 def quote_coverage(table: pd.DataFrame) -> dict:
-    """How many rows a real price actually reached.
-
-    `market_windows` gates on exactly this, so it is worth reporting rather than
-    inferring from a gate that failed.
-    """
+    """How many rows a real price reached. `market_windows` gates on this."""
     if not len(table) or 'ask_up' not in table.columns:
         return {'rows': 0, 'quoted': 0, 'share': 0.0, 'by_source_age': []}
     quoted = table['ask_up'].notna()
-    # Which observer priced the quoted rows, and how old its quote was: the
-    # mix is the thing a source or age filter changes, and a headline share
-    # cannot show it.
+    # Which observer priced the quoted rows, and how old its quote was.
     by_source = source_age_table(table.loc[quoted], source_column='quote_observer')
     return {'rows': int(len(table)), 'quoted': int(quoted.sum()),
             'share': int(quoted.sum()) / max(len(table), 1),

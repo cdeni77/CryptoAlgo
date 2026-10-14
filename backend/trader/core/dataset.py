@@ -1,26 +1,14 @@
 """Loading the panel, and keeping every fitted thing inside its fold.
 
-Three objects in this system are *fitted*: the volatility model, the intraday
-seasonality factor, and the barrier baseline's scale and tail. All three are
-fitted against realised outcomes, so all three leak if they see a test fold.
-None of them is a headline number, which is exactly why the leak would go
-unnoticed — a seasonality factor estimated on the full sample makes the
-baseline stronger and the model look weaker, and nobody audits a result in that
-direction.
+Three objects are fitted against realised outcomes, so all three leak if they
+see a test fold: the volatility model, the intraday seasonality factor, and the
+baseline's scale and tail.
 
-So the split here is deliberate:
+* `Dataset` holds only what trailing bars compute. It is built once.
+* `FoldFit` holds the three fitted objects, built from a training slice.
 
-* **`Dataset` holds only what is computable from trailing bars.** The minute
-  grid, the per-minute state (rolling statistics, all backward-looking), and the
-  window table with its outcomes. Building it is the expensive step and it
-  happens once.
-* **`FoldFit` holds the three fitted objects**, and is constructed from a
-  training slice. Applying it to any slice is cheap.
-
-The seasonality shortcut matters for this to be affordable: only three of the
-forty-two feature columns depend on the fitted factor, and all three are a
-minute-of-day lookup, so `apply_seasonality` re-derives them per fold in
-milliseconds instead of rebuilding five years of rolling windows six times.
+Only a few feature columns depend on the seasonality factor, and
+`apply_seasonality` re-derives them per fold cheaply.
 """
 
 from __future__ import annotations
@@ -53,9 +41,10 @@ class DatasetError(RuntimeError):
 
 
 def peer_quote_limits(config: Config) -> dict:
-    """The peer venue's staleness cap and null-age rule. Unset, the cap follows
-    `max_quote_age_seconds` and a missing peer age stays fresh; `null_quote_age`
-    reaches the peer only once its own cap is set explicitly."""
+    """The peer venue's staleness cap and null-age rule.
+
+    Unset, the cap follows `max_quote_age_seconds` and a missing peer age stays
+    fresh. `null_quote_age` reaches the peer only once its own cap is set."""
     peer = getattr(config, 'peer_max_quote_age_seconds', None)
     return {'peer_max_age_seconds': peer,
             'peer_null_age': ('fresh' if peer is None
@@ -124,11 +113,9 @@ class Dataset:
         states = {s: minute_state(g, flat, config) for s, g in grids.items()}
         states = attach_cross_asset(states, reference, config)
         windows, reports = build_window_panel(bars_by_symbol, config)
-        # Quotes and ladder fits are OBSERVED, not fitted, so they attach here
-        # rather than per fold — unlike the volatility model, the seasonality
-        # factor and the baseline's scale/tail, all three of which must stay
-        # inside the fold. Only the RATIO `iv_minus_realised` is deferred, to
-        # `build_features`, because its denominator is the fitted sigma.
+        # Quotes and ladder fits are observed, not fitted, so they attach here,
+        # not per fold. Only `iv_minus_realised` waits for `build_features`,
+        # because its denominator is the fitted sigma.
         if depth is not None and len(depth):
             from core.quotes import attach_quotes
             windows = attach_quotes(
@@ -139,11 +126,8 @@ class Dataset:
                 decision_latency_seconds=float(
                     getattr(config, 'decision_latency_seconds', 3.0)),
                 **peer_quote_limits(config))
-            # Book dynamics from the SAME depth table, which carries a row at
-            # every minute 0..15. Attached here beside the quotes because it is
-            # observed rather than fitted; the lookahead guard lives inside
-            # `book_flow_features`, which reads only minutes at or before the
-            # decision.
+            # Book dynamics from the same depth table. Observed, so attached here.
+            # `book_flow_features` reads only minutes at or before the decision.
             from core.book_flow import book_flow_features
             from core.quotes import filter_sources
             flow = book_flow_features(
@@ -209,9 +193,7 @@ class Dataset:
     def trailing(self, days: Optional[float]) -> 'Dataset':
         """A hard cut to the last `days` of windows.
 
-        Distinct from the recency half-life, which is a soft weighting. Both are
-        useful and they are not substitutes: this one changes what the model can
-        see, the other changes how much it cares.
+        Changes what the model can see; the recency half-life changes only the weighting.
         """
         if not days:
             return self
@@ -226,10 +208,8 @@ class Dataset:
         )
 
 
-# What each book family needs before a row can honestly be said to carry it.
-# One representative column per family: if the join produced anything at all it
-# produced this, and requiring the full list would drop rows for a legitimately
-# absent depth level rather than for a missing book.
+# One representative column per book family that a complete row must carry.
+# Requiring every column would drop rows for an absent depth level, not a missing book.
 COMPLETE_CASE_COLUMNS = {
     'market_state': ('ask_up', 'market_probability', 'bid_at_touch'),
     'cross_venue': ('pm_market_probability',),
@@ -240,17 +220,11 @@ COMPLETE_CASE_COLUMNS = {
 
 def complete_cases(windows: pd.DataFrame,
                    groups: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    """Rows where every field the model claims to use is actually present.
+    """Rows where every field the model claims to use is present.
 
-    **Why this is not optional.** Every run before it trained on a mixture: 15
-    of 57 features NaN for most rows, because the venue's book starts
-    2026-01-08 against five years of bars. LightGBM does not skip a NaN — it
-    learns a default direction for it — so the fit is two models blended and the
-    evaluation measures the blend. That answers a question nobody asked.
-
-    `venue_outcome` is required too. Without it the row is graded on our
-    Coinbase label, and that is the leak measured at a 72.77% win rate on the
-    windows where the two indices disagree against 56.17% where they agree.
+    LightGBM learns a default direction for NaN, so a mixed panel trains a blend
+    of two models. `venue_outcome` is required, so rows are graded on the venue's
+    own settlement, not our Coinbase label.
     """
     wanted = tuple(groups) + ('label',) if groups else tuple(COMPLETE_CASE_COLUMNS)
     needed = [c for g in wanted for c in COMPLETE_CASE_COLUMNS.get(g, ())]
@@ -268,16 +242,9 @@ def complete_cases(windows: pd.DataFrame,
 class ScoringBundle:
     """Everything needed to score a window that has never been seen.
 
-    The promoted artifact used to carry only the baseline, which meant it could
-    not score a fresh window on its own: the volatility model and the intraday
-    seasonality factor are both *fitted*, both live inside the fold, and both are
-    required before a barrier probability exists. An artifact missing them is one
-    that can be evaluated and not deployed, and nothing said so until the live
-    path tried.
-
-    Deliberately excludes the per-minute state frames. Those are derived from
-    bars and are hundreds of megabytes; the live path rebuilds them from the last
-    day of bars in milliseconds.
+    Carries the fitted seasonality and volatility models with the baseline, so a
+    promoted artifact can score live. Excludes the per-minute state frames: live
+    rebuilds them from the last day of bars.
     """
 
     seasonality: dict[str, Seasonality]
@@ -337,9 +304,8 @@ def fit_fold(
 ) -> tuple[FoldFit, pd.DataFrame]:
     """Fit seasonality, the volatility model and the baseline on training windows.
 
-    Returns the fit and the *training* feature table. Scoring any other slice
-    goes through `apply_fold`, which shares this fit — so a test row can never
-    be scored against a model that saw it.
+    Returns the fit and the training feature table. Other slices go through
+    `apply_fold`, so a test row is never scored by a model that saw it.
     """
     config = config or dataset.config
     train_end = train_window_opens.max() if len(train_window_opens) else None
@@ -350,7 +316,7 @@ def fit_fold(
     vol_models: dict[str, VolModel] = {}
     states: dict[str, pd.DataFrame] = {}
     for symbol, grid in dataset.grids.items():
-        # Only bars strictly before the end of training may inform either fit.
+        # Only bars strictly before the end of training inform either fit.
         cut = grid.loc[grid.index < train_end]
         returns = log_returns(cut)
         seasonality[symbol] = Seasonality.fit(returns, config)
@@ -404,10 +370,8 @@ def _score_windows(
 ) -> pd.DataFrame:
     """Attach the volatility forecast, then the features, to a window slice.
 
-    `deferred` names feature columns the CALLER will fill after this returns —
-    the live path's book groups, which are read at the decision instant and
-    cannot exist yet. They are created empty and not warned about, so a real
-    gap still shows.
+    `deferred` names feature columns the caller fills afterwards (the live
+    book groups). They are created empty without a warning, so a real gap still shows.
     """
     if windows.empty:
         raise DatasetError('no windows in this slice')
@@ -422,26 +386,21 @@ def _score_windows(
         decision = pd.DatetimeIndex(part['decision_time'])
         part = part.copy()
         part['sigma_per_min'] = sigma.reindex(decision).to_numpy()
-        # Variance-minutes, not wall-clock minutes. The settlement value is a
-        # one-minute average, and the variance of a time-average over an interval
-        # is a third of its endpoint's — so the unresolved variance at offset m is
-        # `(window - delta - m) + delta/3`, which at m=12 is 2.33 rather than 3.
+        # Variance-minutes, not wall-clock minutes: the settlement value is a
+        # one-minute average, so remaining variance at offset m is
+        # `(window - delta - m) + delta/3` (2.33 at m=12, not 3).
         remaining = np.array(
             [config.remaining_variance_minutes(o) for o in part['offset']],
             dtype=float)
 
-        # The HAR forecasts volatility *at the decision minute*, seasonality
-        # included. The remaining span is a different set of minutes and can
-        # straddle a seasonal ramp — a window opening at 13:28 covers the New
-        # York cash open — so scale by the ratio of the root-mean seasonal
-        # factor over the minutes actually left to the factor at the decision
-        # minute. Variance adds, which is why it is a root mean and not a mean.
+        # The HAR forecasts volatility at the decision minute. Scale by the
+        # root-mean seasonal factor over the remaining minutes divided by the
+        # factor now, because the remaining span can straddle a seasonal ramp.
         seasonality = seasonalities[symbol]
         now_factor = seasonality.at(decision)
         ramp = np.ones(len(part))
-        # Rounded up to whole minutes for the seasonal lookup: the factor is a
-        # per-minute table, so a fractional span has no entry of its own and the
-        # conservative reading is the longer one.
+        # Rounded up to whole minutes for the per-minute seasonal table: the
+        # longer span is the conservative reading.
         for span in np.unique(np.ceil(remaining).astype(int)):
             mask = np.ceil(remaining).astype(int) == span
             ramp[mask] = (seasonality.mean_over(decision[mask], max(int(span), 1))
@@ -470,16 +429,8 @@ def score_live(
 ) -> pd.DataFrame:
     """Score exactly one decision point per symbol, from freshly fetched bars.
 
-    The same code path as the backtest, deliberately: `minute_state`,
-    `apply_seasonality`, the fold's own `VolModel`, then `build_features` and the
-    fold's own baseline. `core/backtest.py` and this function differ only in
-    which windows they ask for, which is what stops the live path and the
-    measured path from drifting apart — the previous incarnation of this repo had
-    them disagree about entry price for months.
-
-    The outcome column is present and NaN. A window being decided has not
-    settled, and writing a plausible zero into it would make an unresolved bet
-    look like a loss.
+    Uses the same code path as the backtest; only the requested windows differ.
+    The outcome is NaN: the window has not settled.
     """
     if offset not in bundle.decision_offsets:
         logger.warning('offset +%dm is not one the model was fitted at (%s)',
@@ -498,10 +449,8 @@ def score_live(
         raise DatasetError('no symbol could be scored with this artifact')
     states = attach_cross_asset(states, REFERENCE_SYMBOL, config)
 
-    # `include_unsettled=True`: the window being decided has not settled, which is
-    # the entire point. Without it `build_windows` trims the in-progress window
-    # away and this raised on every live cycle — the loop caught only
-    # `KeyboardInterrupt`, so the process died and never placed an order.
+    # `include_unsettled=True`: the window being decided has not settled.
+    # Without it, `build_windows` trims the in-progress window away.
     windows, _ = build_window_panel(
         {s: bars_by_symbol[s] for s in states}, config, offsets=(offset,),
         include_unsettled=True)
@@ -519,8 +468,7 @@ def score_live(
     table = _score_windows(dataset, states, bundle.vol_models, bundle.seasonality,
                            slice_, config, groups=groups, deferred=deferred)
     scored = attach_baseline(table, bundle.baseline)
-    # The window has not settled. Say so rather than carrying the value the
-    # window table computed from a settle price that does not exist yet.
+    # The window has not settled; clear values derived from a settle price.
     scored['outcome'] = np.nan
     scored['settle_price'] = np.nan
     scored['settle_return'] = np.nan

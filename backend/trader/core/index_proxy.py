@@ -1,30 +1,14 @@
 """A live estimate of the index Kalshi settles on, from its constituent exchanges.
 
-Kalshi settles BTC on CF Benchmarks' BRTI (ETH and SOL on CF's equivalent
-real-time indices), not on Coinbase. Our label is a Coinbase one-minute OHLC
-mean, and measured against Kalshi's own results it disagrees on ~35% of windows
-within 1bp of the strike and ~14% within 1-2bp — exactly the near-ties this
-system trades disproportionately. A better estimate of the index itself is the
-most promising information nobody here has yet.
+Kalshi settles BTC on CF Benchmarks' BRTI (ETH and SOL on CF's equivalents),
+not on Coinbase. This is an approximation: the plain median of each fresh
+exchange's top-of-book mid across four venues. It has no depth weighting and no
+outlier filter beyond the median. `research/validate/_validate_index_proxy.py`
+measures the gap.
 
-**This is an approximation, and the gap is known.** CF's methodology builds a
-consolidated order book from its constituent exchanges, derives a volume-weighted
-"utilised depth" mid-price curve from it and takes a weighted median across
-exchanges, with outlier and staleness rules on each venue. This takes the plain
-MEDIAN of each fresh exchange's top-of-book mid: no depth, no volume weighting,
-no outlier filter beyond the median itself, and only four venues (Coinbase,
-Kraken, Bitstamp, Gemini — the US-dollar constituents that matter most for
-volume). It should track the index far better than one venue's trades do; it
-will not reproduce it, and `research/validate/_validate_index_proxy.py` is
-what says by how much.
-
-**Freshness is per connection, not per quote.** A quiet book sends nothing, so
-"no update for five seconds" means "unchanged", not "stale", as long as the
-connection is demonstrably delivering — and on an in-order socket any later
-message proves that. An exchange counts when its connection delivered something
-within `max_staleness` seconds AND that symbol's quote changed within
-`MAX_QUIET_SECONDS`, the second bound catching a feed that keeps heartbeating
-while one book silently stops.
+Freshness is per connection, not per quote: a quiet book sends nothing.
+An exchange counts when its connection delivered something within
+`max_staleness` seconds and that symbol's quote changed within `MAX_QUIET_SECONDS`.
 
 Pure: no sockets and no clock. Every receive time is passed in.
 """
@@ -57,8 +41,7 @@ URLS = {
 }
 
 # A symbol whose quote has not changed for this long is dropped even on a live
-# connection. Generous: a top-of-book on any of these venues moves within
-# seconds, so a minute of nothing is a stuck book, not a calm market.
+# connection: a minute without a top-of-book change is a stuck book.
 MAX_QUIET_SECONDS = 60.0
 
 
@@ -73,8 +56,8 @@ def _number(value) -> Optional[float]:
 class SideBook:
     """One side of an L2 book, with the best level cached.
 
-    Recomputing the best only when the best itself is removed keeps a
-    30,000-level Coinbase book at O(1) per update in the common case.
+    The best is recomputed only when the best level is removed, so an update
+    is O(1) in the common case.
     """
 
     def __init__(self, bids: bool) -> None:
@@ -117,7 +100,7 @@ class Quote:
 
     @property
     def mid(self) -> Optional[float]:
-        # A crossed or locked book on ONE venue is a broken book, not a price.
+        # A crossed or locked book on one venue is broken, not a price.
         if self.bid is None or self.ask is None or not (0 < self.bid < self.ask):
             return None
         return 0.5 * (self.bid + self.ask)
@@ -202,8 +185,7 @@ def proxy_row(states: Iterable[ExchangeState], symbol: str, now: float, *,
               max_staleness: float = 5.0, min_exchanges: int = 2) -> dict:
     """One per-second row: the median fresh mid, how many fed it, and each mid.
 
-    Fewer than `min_exchanges` fresh venues is NaN rather than one venue's
-    price: a single exchange is exactly the proxy this replaces.
+    Fewer than `min_exchanges` fresh venues gives NaN, not one venue's price.
     """
     row: dict = {'symbol': symbol, 'proxy': float('nan'), 'n_exchanges': 0}
     mids = []
@@ -228,15 +210,12 @@ def proxy_row(states: Iterable[ExchangeState], symbol: str, now: float, *,
 def subscribe_messages(exchange: str, symbols: Iterable[str]) -> list[dict]:
     products = [PRODUCTS[exchange][s] for s in symbols]
     if exchange == 'coinbase':
-        # `heartbeats` keeps a quiet product's connection open and gives the
-        # connection-level liveness every second. `ticker` carries the best bid
-        # and ask on each message, so no book is folded on the event loop and
-        # a lost message loses no state.
+        # `heartbeats` gives connection liveness every second. `ticker` carries
+        # the best bid and ask on each message, so no book is folded.
         return [{'type': 'subscribe', 'product_ids': products, 'channel': channel}
                 for channel in ('heartbeats', 'ticker')]
     if exchange == 'kraken':
-        # `event_trigger: bbo` fires the ticker on every best-bid/offer change,
-        # so no book has to be maintained for a top-of-book mid.
+        # `event_trigger: bbo` fires the ticker on every best-bid/offer change.
         return [{'method': 'subscribe',
                  'params': {'channel': 'ticker', 'symbol': products,
                             'event_trigger': 'bbo', 'snapshot': True}},
@@ -244,8 +223,8 @@ def subscribe_messages(exchange: str, symbols: Iterable[str]) -> list[dict]:
                  'params': {'channel': 'trade', 'symbol': products,
                             'snapshot': False}}]
     if exchange == 'bitstamp':
-        # `order_book_<pair>` pushes the whole top-100 on every change, so each
-        # message is a snapshot and there is no delta to lose.
+        # `order_book_<pair>` pushes the whole top-100 on every change: each
+        # message is a snapshot.
         return [{'event': 'bts:subscribe', 'data': {'channel': f'{kind}_{p}'}}
                 for p in products for kind in ('order_book', 'live_trades')]
     if exchange == 'gemini':
@@ -333,8 +312,8 @@ def handle_bitstamp(payload: dict, state: ExchangeState, received: float) -> Opt
 def handle_gemini(payload: dict, state: ExchangeState, received: float) -> Optional[str]:
     """Market data v2: `l2_updates` (first one per symbol is the full book), `trade`.
 
-    The book is cleared on every (re)connect, so applying the first, complete
-    `l2_updates` onto an empty book IS the snapshot.
+    The book is cleared on every (re)connect, so the first complete
+    `l2_updates` applied onto an empty book is the snapshot.
     """
     if not isinstance(payload, dict):
         return None
@@ -376,9 +355,8 @@ HANDLERS = {'coinbase': handle_coinbase, 'kraken': handle_kraken,
 class IndexProxyCache:
     """The latest proxy row per symbol and a rolling one-second history.
 
-    Like `record_stream.CACHE`, process-wide so the trading loop can read what
-    the recorder maintains. The history covers a whole window plus its strike
-    minute with room to spare, which is all `index_features_row` needs.
+    Process-wide, so the trading loop reads what the recorder maintains.
+    The history covers a window plus its strike minute, as `index_features_row` needs.
     """
 
     def __init__(self, history_seconds: int = 1800) -> None:
