@@ -140,15 +140,32 @@ imbalance features from Predexon.**
 `floor_strike` is the number the market actually settles against; it and
 `expiration_value` come from `/historical/markets/{ticker}` or `/markets/{ticker}`.
 
+Measured 2026-10-21 over the whole table, 85,879 markets, 2025-12-10 to now
+(a full census, not the 88-window sample this entry used to quote):
+
 ```
-coverage probed 2026-10-21, 88 random windows across 11 months:
-  market metadata   88/88
-  floor_strike      88/88
-  expiration_value   0/8 in 2025-12, 6/8 in 2026-01, 8/8 from 2026-02
+month      markets   floor_strike   expiration_value   result
+2025-12       3,123      83.2%             0%          100%
+2026-01       8,142      99.2%            63.7%        100%
+2026-02 on  ~8,500/mo    99.8%+          100%          100%
 ```
+
+**`result` is 100% populated in every month, and `result` is the LABEL.**
+`expiration_value` is the settlement VALUE: it adds magnitude, not sign, so
+its absence before 2026-02 does not block `--label-source venue`. 99.1% of
+markets carry both a `floor_strike` and a `result`.
+
+The oldest weeks are the thin ones: 2025-12 is missing `floor_strike` for
+16.8% of markets and `expiration_value` for all of them. The venue begins
+serving `expiration_value` around 2026-01-14.
 
 This is the **exact** strike and the **exact** label. It removes two standing
 caveats outright rather than reducing them.
+
+**Gap-filling:** re-running the script fills holes — it skips windows already
+held. It was ~3 weeks short at the start until 2026-10-21 (it began
+2026-01-07 while candles reached 2025-12-16); running it from 2025-12-01
+closed a 3,692-market gap to zero.
 
 ### `venue_candles` — the venue's own per-minute candle
 
@@ -176,8 +193,9 @@ strike row but NO candles      179 of 81,568   0.22%   Jan/Feb, genuine no-trade
 candles but NO strike row    3,692 of 85,081   4.34%   2025-12 (2,523), 2026-01 (1,136)
 ```
 
-The second number is a `backfill_markets` gap, not a candle gap:
-`venue_strikes` starts 2026-01-07 while candles reach back to 2025-12-16.
+The second number was a `backfill_markets` gap, not a candle gap, and it is
+now CLOSED (3,692 -> 0): `venue_strikes` began 2026-01-07 while candles
+reached 2025-12-16. It now runs from 2025-12-10.
 
 **Two endpoints, and the gap-fill needs the right one.** `--historical` reads
 the per-ticker tier, which reaches 2025-12 to 2026-08-21. The default batch
