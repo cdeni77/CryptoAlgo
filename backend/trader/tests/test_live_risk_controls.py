@@ -39,11 +39,19 @@ def writer(url) -> PgWriter:
 def settle(w: PgWriter, *, index: int, pnl: float, when: datetime) -> None:
     """Book and resolve one position with a chosen PnL."""
     window = when - timedelta(minutes=15 * (index + 1))
+    # **The outlay is net of the fee, because `settle_position` subtracts it.**
+    # Since 2026-10-20 `pnl = payout - outlay - fee`; before that the fee was
+    # silently dropped. This helper promises a CHOSEN pnl, so it has to absorb
+    # the fee rather than let every position land 2c low — otherwise a test
+    # about drawdown thresholds is quietly also a test about fee arithmetic,
+    # and the +60/-60 "exactly flat" case drifted far enough to trip a breaker.
+    fee = 0.02
+    outlay = (abs(pnl) - fee) if pnl < 0 else (10 - pnl - fee)
     position_id = w.open_position(
         symbol=f'SYM{index}-USD', window_open=window,
         settle_time=window + timedelta(minutes=15), offset_minutes=3,
-        side='up', contracts=10, price=0.5, outlay=abs(pnl) if pnl < 0 else 10 - pnl,
-        fee=0.02, model_probability=0.6, baseline_probability=0.5, edge=0.01)
+        side='up', contracts=10, price=0.5, outlay=outlay,
+        fee=fee, model_probability=0.6, baseline_probability=0.5, edge=0.01)
     assert position_id is not None
     # `settle_position` derives the payout from the side and the outcome, so
     # steer it with the outcome rather than by writing pnl directly.
@@ -56,9 +64,15 @@ class TestCircuitBreakers:
         assert not writer.account().halted
 
     def test_a_losing_day_halts_the_account(self, writer):
-        # Each loss is the full outlay. Twelve $2 losses is 24% of a $100 start,
-        # over the 15% daily limit.
-        for i in range(12):
+        # Each loss is the full outlay. **Sized off the config rather than
+        # hardcoded**: this read "twelve $2 losses is 24% of a $100 start, over
+        # the 15% daily limit" and broke the day `max_daily_loss_fraction`
+        # moved to 0.25, because the number encoded the limit instead of
+        # deriving from it. A test that restates a parameter stops testing it.
+        import math
+        need = CONFIG.starting_bankroll * CONFIG.max_daily_loss_fraction
+        losses = int(math.ceil(need / 2.0)) + 1
+        for i in range(losses):
             settle(writer, index=i, pnl=-2.0, when=NOW)
         reason = check_circuit_breakers(writer, CONFIG, now=NOW)
         assert reason is not None and 'limit' in reason

@@ -33,7 +33,20 @@ import {
   YAxis,
 } from 'recharts';
 import type { MinuteBar, WindowStrike } from '../types';
+import { clock } from '../lib/format';
 import { Empty } from './Primitives';
+
+/** **Eastern, via `clock` — not `toLocaleTimeString(undefined)`.**
+ *
+ *  `undefined` is the VIEWER's zone, so this axis and its tooltip disagreed
+ *  with the "settles" column four inches away the moment the dashboard was
+ *  opened from anywhere but EDT. `src/lib/format.ts` documents that exact
+ *  defect as fixed and `Rail.tsx` carries a comment warning against the call;
+ *  it had recurred here, in the one chart on the Live page.
+ */
+const tick = (v: number | string) => clock(new Date(v).toISOString());
+const label = (v: number | string) =>
+  `${clock(new Date(Number(v)).toISOString())} ET`;
 
 const AXIS = { stroke: 'var(--rule-firm)', strokeWidth: 1 };
 const TICK = { fill: 'var(--ink-3)', fontSize: 10, fontFamily: '"Kode Mono", monospace' };
@@ -112,13 +125,7 @@ export function WindowChart({
           axisLine={AXIS}
           tickLine={false}
           minTickGap={56}
-          tickFormatter={(v) =>
-            new Date(v).toLocaleTimeString(undefined, {
-              hour: '2-digit',
-              minute: '2-digit',
-              hour12: false,
-            })
-          }
+          tickFormatter={tick}
         />
         <YAxis
           domain={[low - pad, high + pad]}
@@ -145,9 +152,7 @@ export function WindowChart({
             boxShadow: 'none',
           }}
           labelStyle={{ color: 'var(--ink-3)', fontSize: 10 }}
-          labelFormatter={(v) =>
-            new Date(Number(v)).toLocaleTimeString(undefined, { hour12: false })
-          }
+          labelFormatter={label}
           formatter={(v: number, name) => [
             v == null ? '—' : v.toFixed(digits),
             name === 'strike' ? 'strike' : 'price',

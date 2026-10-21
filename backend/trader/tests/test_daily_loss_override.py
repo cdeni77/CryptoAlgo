@@ -6,6 +6,7 @@ rather than remembering to change a number back.
 """
 from __future__ import annotations
 
+from core.config import DEFAULT_CONFIG
 from scripts.live import build_parser, config_from_args
 
 
@@ -14,7 +15,10 @@ def _config(argv):
 
 
 def test_the_default_is_unchanged_when_the_flag_is_absent():
-    assert _config([]).max_daily_loss_fraction == 0.15
+    # Sourced from the dataclass, not restated. This asserted 0.15 and broke
+    # the day the default moved to 0.25 — a test that repeats a parameter
+    # stops testing it and starts pinning a number nobody meant to pin.
+    assert _config([]).max_daily_loss_fraction == DEFAULT_CONFIG.max_daily_loss_fraction
 
 
 def test_the_flag_widens_the_breaker():

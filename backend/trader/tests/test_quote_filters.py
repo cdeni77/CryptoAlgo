@@ -107,13 +107,47 @@ class TestNullAge:
         assert bound.iloc[0] == pytest.approx(7.0)
         assert np.isnan(bound.iloc[1])
 
-    def test_the_default_is_unchanged_behaviour(self):
-        depth = pd.DataFrame([_row('live_touch', 0.30, 0.32, np.nan, written_after=95)])
-        assert Config().null_quote_age == 'fresh'
+    def test_the_default_bounds_a_missing_age_instead_of_assuming_it(self):
+        """The default is 'stale', and an unboundable-or-too-old row is DROPPED.
+
+        'fresh' was the historical default and it is an assumption rather than a
+        measurement: it admitted 53,721 rows -- 30% of every priced row in a
+        Jan-Oct walk-forward -- whose staleness was simply unknown. Tightening a
+        July run from ('fresh', 30s) to ('stale', 5s) took one fold from 881
+        trades and +19.25% to 70 trades and -15.59%, so this is not a tolerance
+        dial. The live loop had no way to set it at all, which meant a model
+        validated under bounded ages would trade under assumed-fresh ones.
+        """
+        assert Config().null_quote_age == 'stale'
         assert Config().quote_sources == ()
+        # 95s between the quote being read and the row being written: bounded,
+        # and far past the 30s cap, so it goes.
+        depth = pd.DataFrame([_row('live_touch', 0.30, 0.32, np.nan, written_after=95)])
+        out = attach_quotes(_windows(), depth)
+        assert np.isnan(out['market_probability'].iloc[0])
+
+    def test_a_missing_age_that_bounds_INSIDE_the_cap_is_still_kept(self):
+        """'stale' bounds, it does not blanket-drop. The live recorder reads the
+        book at the decision instant and stamps `available_time` after the fetch
+        returns, so its bound is ~3s and overstates the true age -- dropping
+        those would discard the live era for a stopwatch artifact."""
+        depth = pd.DataFrame([_row('live_touch', 0.30, 0.32, np.nan, written_after=3)])
         out = attach_quotes(_windows(), depth)
         assert out['market_probability'].iloc[0] == pytest.approx(0.31)
-        assert np.isnan(out['quote_age_seconds'].iloc[0])
+
+    def test_the_default_is_env_readable_so_the_live_path_can_set_it(self, monkeypatch):
+        """`scripts/live.py` carries no freshness flag, so without this the live
+        loop is pinned to whatever the dataclass default happens to be."""
+        monkeypatch.setenv('QUOTE_NULL_AGE', 'fresh')
+        import importlib
+        import core.config as cfg
+        importlib.reload(cfg)
+        try:
+            assert cfg.Config().null_quote_age == 'fresh'
+        finally:
+            monkeypatch.delenv('QUOTE_NULL_AGE', raising=False)
+            importlib.reload(cfg)
+        assert cfg.Config().null_quote_age == 'stale'
 
 
 class TestPeerCap:
@@ -191,9 +225,12 @@ def test_an_unlisted_source_is_excluded_not_merely_ranked_last():
     row still wins under it. `quote_sources` must EXCLUDE it."""
     depth = pd.DataFrame([_row('backfill', 0.30, 0.32, 0.5, offset=12),
                           _row('live_touch', 0.60, 0.62, np.nan, offset=6)])
-    ranked = attach_quotes(_windows((6, 12)), depth)
+    # null_age pinned to 'fresh': the subject here is `sources`, and the
+    # default is now 'stale', which would drop the unaged live_touch row before
+    # source selection ever ran.
+    ranked = attach_quotes(_windows((6, 12)), depth, null_age='fresh')
     assert ranked['market_probability'].notna().all()
-    filtered = attach_quotes(_windows((6, 12)), depth,
+    filtered = attach_quotes(_windows((6, 12)), depth, null_age='fresh',
                              sources=('live_touch', 'live_ws', 'live'))
     by_offset = filtered.set_index('offset')
     assert by_offset.loc[6, 'market_probability'] == pytest.approx(0.61)
@@ -208,7 +245,9 @@ class TestCoverage:
         depth = pd.DataFrame([_row('live_touch', 0.3, 0.32, np.nan, offset=3),
                               _row('live', 0.3, 0.32, 0.0, offset=6),
                               _row('backfill', 0.3, 0.32, 12.0, offset=9)])
-        out = attach_quotes(_windows((3, 6, 9, 12)), depth)
+        # null_age pinned to 'fresh': this asserts on the 'null' age bucket,
+        # which is only populated when an unaged row is admitted at all.
+        out = attach_quotes(_windows((3, 6, 9, 12)), depth, null_age='fresh')
         cov = quote_coverage(out)
         assert cov['rows'] == 4 and cov['quoted'] == 3
         table = pd.DataFrame(cov['by_source_age']).set_index('source')

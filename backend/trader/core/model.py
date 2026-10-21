@@ -715,10 +715,20 @@ def fit_model(
         if not stop_block.empty and not alpha_block.empty:
             inner_valid, alpha_rows = stop_block, alpha_block
     if inner_valid is alpha_rows:
+        # **Measured, not merely feared.** On the 2026-10-18 promotion this
+        # fired on 3 of 28 folds and ALL THREE returned alpha at the 1.000 cap,
+        # against 0.637 mean across the 27 folds whose blocks were separated.
+        # So a shared block does not nudge alpha high, it pins it — and those
+        # folds then inflate the `residual_scale` aggregate the gate reads.
+        #
+        # It does not explain everything: 10 properly-split folds also hit the
+        # cap and 4 returned exactly 0.000, so alpha is genuinely unstable on
+        # this data. That is a finding about the correction, not a bug here.
         logger.warning(
             'the inner validation block (%d windows) is too small to separate '
             'early stopping from the shrinkage fit; alpha will be measured on '
-            'the rows the tree count was chosen for and will read high.',
+            'the rows the tree count was chosen for and will read high. '
+            'Measured: every fold this fired on returned alpha at the cap.',
             len(valid_windows))
 
     if inner_valid.empty or inner_train.empty or alpha_rows.empty:

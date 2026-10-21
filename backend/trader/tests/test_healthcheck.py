@@ -81,3 +81,24 @@ def test_every_component_has_a_limit():
 
     missing = [n for n in NAMES if n not in heartbeat.MAX_AGE]
     assert not missing, f'no staleness limit for {missing}'
+
+
+def test_every_component_has_a_factory():
+    """`COMPONENTS` and `build_factories` are two lists that must agree.
+
+    A name in one and not the other is a `KeyError` at startup, after the
+    banner has already printed the component as `on` — which is exactly what
+    adding `marks` did on 2026-10-20: the trader crash-looped, `restart:
+    unless-stopped` kept bringing it back, and the log said the component was
+    enabled right before it died.
+    """
+    import argparse
+
+    from scripts.run_live import NAMES, TradingGate, build_factories
+
+    args = argparse.Namespace(trade_args=[], disable=[], verbose=False)
+    factories = build_factories(args, TradingGate())
+    missing = [n for n in NAMES if n not in factories]
+    assert not missing, f'declared in COMPONENTS with no factory: {missing}'
+    extra = [n for n in factories if n not in NAMES]
+    assert not extra, f'has a factory but is not in COMPONENTS: {extra}'

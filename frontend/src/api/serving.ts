@@ -9,8 +9,9 @@ import { get } from './client';
 import type {
   AccountState,
   CalibrationTable,
+  CollectionHealth,
   EquityPoint,
-  FunnelStage,
+  Funnel,
   LiveState,
   ModelAttempt,
   ModelState,
@@ -18,6 +19,7 @@ import type {
   Prediction,
   PriceSeries,
   VenueAccountState,
+  VenueDaily,
   VenueEquityCurve,
   VenueSettlement,
 } from '../types';
@@ -42,13 +44,17 @@ export const fetchVenueSettlements = (limit = 200, days?: number) =>
     `/venue/settlements?limit=${limit}${days == null ? '' : `&days=${days}`}`,
   );
 
+/** Realised P&L per Eastern day. Not bounded by the dashboard epoch — a
+ *  calendar is history, and the headline figures above it stay epoch-scoped. */
+export const fetchVenueDaily = (days = 120) =>
+  get<VenueDaily>(`/account/venue/daily?days=${days}`);
+
 export const fetchPredictions = (limit = 100, tradedOnly = false) =>
   get<{ predictions: Prediction[] }>(
     `/predictions?limit=${limit}&traded_only=${tradedOnly}`,
   );
 
-export const fetchFunnel = (days = 7) =>
-  get<{ days: number; stages: FunnelStage[] }>(`/funnel?days=${days}`);
+export const fetchFunnel = (days = 7) => get<Funnel>(`/funnel?days=${days}`);
 
 export const fetchPositions = (openOnly = false, limit = 100) =>
   get<{ positions: Position[] }>(
@@ -67,3 +73,9 @@ export const fetchCalibration = (version?: string) =>
   get<CalibrationTable>(
     version ? `/model/calibration?version=${encodeURIComponent(version)}` : '/model/calibration',
   );
+
+/** Data-collection health: are rows still arriving, and are the loops still
+ *  cycling. Two questions, served side by side and never merged — a recorder
+ *  can cycle forever and write nothing, which is exactly what happened to
+ *  `venue_ladder` for thirty-one days. */
+export const fetchCollectionHealth = () => get<CollectionHealth>('/collection');

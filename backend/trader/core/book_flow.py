@@ -45,8 +45,27 @@ BOOK_FLOW = (
     'depth_trend_3',         # log ratio of total resting size over three minutes
     'spread_change_3',       # spread now minus three minutes ago, in cents
     'imbalance_persistence',  # mean imbalance so far — standing pressure, not a blip
+    # **The mid's own revision**, which nothing above reads. Imbalance, depth and
+    # spread all describe the SHAPE of the ladder; none of them says the market
+    # changed its mind about the price. That is a different claim, and under the
+    # barrier framing a sharper one: the mid IS the market's probability, so its
+    # change over the last minutes is the market revising `sigma_remaining` or
+    # the displacement's meaning in front of us.
+    #
+    # Not an echo of the quote. The LEVEL is already the init score, so a model
+    # that copies it scores ~0 on `model_minus_market` by construction — which is
+    # exactly why `market_price` is held out of the default matrix. A CHANGE over
+    # a window that has already closed is past information about the level we are
+    # given, not the level itself.
+    'mid_change_1',          # mid now minus one minute ago, in cents
+    'mid_change_3',          # mid now minus three minutes ago, in cents
 )
 LOOKBACK = 3
+# A second, shorter horizon. The three-minute family can only speak for a
+# decision at offset 3 or later; one minute also reaches offset 1 and 2, and the
+# measured skill in this project peaks at the EARLIEST offset rather than
+# mid-window, so the short horizon is where a book feature has most to say.
+LOOKBACK_SHORT = 1
 
 
 def _imbalance(bid, ask):
@@ -81,6 +100,9 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
                               book['yes_ask_size'].to_numpy())
     book['_total'] = book['yes_bid_size'] + book['yes_ask_size']
     book['_spread'] = (book['yes_ask'] - book['yes_bid']) * 100.0
+    # NaN on a one-sided book rather than a half-price: a missing side is not a
+    # mid, and zero would read as "the market did not move".
+    book['_mid'] = (book['yes_ask'] + book['yes_bid']) * 50.0
     # **A crossed or stale book is not a book, and the observer is chosen, not
     # taken.** This path applied neither test, and its dedup sorted on
     # `offset_minutes` -- part of the dedup key itself, so it imposed no order
@@ -141,11 +163,18 @@ def book_flow_features(windows: pd.DataFrame, depth: pd.DataFrame, *,
         if len(past) >= 2:
             out.at[pos, 'imbalance_persistence'] = float(
                 np.nanmean(past['_imb'].to_numpy()))
+        # Before the three-minute guard below, so a window carrying only two
+        # observations still gets the short horizon rather than nothing.
+        short_rows = past[past.index <= int(off) - LOOKBACK_SHORT]
+        if len(short_rows):
+            out.at[pos, 'mid_change_1'] = float(
+                now['_mid'] - short_rows.iloc[-1]['_mid'])
         if not len(then_rows):
             continue
         then = then_rows.iloc[-1]
         out.at[pos, 'imbalance_change_3'] = float(now['_imb'] - then['_imb'])
         out.at[pos, 'spread_change_3'] = float(now['_spread'] - then['_spread'])
+        out.at[pos, 'mid_change_3'] = float(now['_mid'] - then['_mid'])
         if now['_total'] > 0 and then['_total'] > 0:
             out.at[pos, 'depth_trend_3'] = float(
                 np.log(now['_total'] / then['_total']))

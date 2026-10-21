@@ -1,0 +1,368 @@
+{
+  "index_proxy_1s": {
+    "files": 62,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "proxy",
+      "n_exchanges",
+      "mid_coinbase",
+      "mid_kraken",
+      "mid_bitstamp",
+      "mid_gemini",
+      "date"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 218800,
+        "event_time_min": "2026-10-14 10:16:15-04:00",
+        "event_time_max": "2026-10-16 23:59:59-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 218800,
+        "event_time_min": "2026-10-14 10:16:15-04:00",
+        "event_time_max": "2026-10-16 23:59:59-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 218800,
+        "event_time_min": "2026-10-14 10:16:15-04:00",
+        "event_time_max": "2026-10-16 23:59:59-04:00"
+      }
+    ]
+  },
+  "minute_bars": {
+    "files": 189,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "open",
+      "high",
+      "low",
+      "close",
+      "volume",
+      "quote_volume",
+      "trade_count",
+      "month"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 2705784,
+        "event_time_min": "2021-08-24 00:18:00-04:00",
+        "event_time_max": "2026-10-17 00:54:00-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 2705747,
+        "event_time_min": "2021-08-24 00:18:00-04:00",
+        "event_time_max": "2026-10-17 00:54:00-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 2702103,
+        "event_time_min": "2021-08-24 00:18:00-04:00",
+        "event_time_max": "2026-10-17 00:54:00-04:00"
+      }
+    ]
+  },
+  "pm_ladder": {
+    "files": 9,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "market_ticker",
+      "window_open",
+      "minute_into_window",
+      "yes_levels",
+      "no_levels",
+      "yes_total",
+      "no_total",
+      "outcomes",
+      "token_id_up",
+      "transport",
+      "book_age_ms",
+      "month"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 73908,
+        "event_time_min": "2026-08-25 23:18:00-04:00",
+        "event_time_max": "2026-10-17 01:24:00-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 73908,
+        "event_time_min": "2026-08-25 23:18:00-04:00",
+        "event_time_max": "2026-10-17 01:24:00-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 73894,
+        "event_time_min": "2026-08-25 23:18:00-04:00",
+        "event_time_max": "2026-10-17 01:24:00-04:00"
+      }
+    ]
+  },
+  "research": {
+    "files": 0
+  },
+  "spot_trades": {
+    "files": 62,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "product_id",
+      "trade_id",
+      "price",
+      "size",
+      "side",
+      "received_time",
+      "sequence_num",
+      "date"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 1308551,
+        "event_time_min": "2026-10-14 10:16:05.692416-04:00",
+        "event_time_max": "2026-10-16 23:59:59.526021-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 585540,
+        "event_time_min": "2026-10-14 10:15:44.748831-04:00",
+        "event_time_max": "2026-10-16 23:59:59.317636-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 288871,
+        "event_time_min": "2026-10-14 10:15:23.151542-04:00",
+        "event_time_max": "2026-10-16 23:59:59.365443-04:00"
+      }
+    ]
+  },
+  "venue_book_events": {
+    "files": 396,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "market_ticker",
+      "seq",
+      "kind",
+      "side",
+      "price",
+      "size",
+      "absolute",
+      "date"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 787559755,
+        "event_time_min": "2026-09-30 09:00:00.011995-04:00",
+        "event_time_max": "2026-10-16 23:59:59.975309-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 235277568,
+        "event_time_min": "2026-09-30 09:00:00.028794-04:00",
+        "event_time_max": "2026-10-16 23:59:59.922539-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 155374558,
+        "event_time_min": "2026-09-30 09:00:00.029403-04:00",
+        "event_time_max": "2026-10-16 23:59:59.949145-04:00"
+      }
+    ]
+  },
+  "venue_depth": {
+    "files": 60,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "market_ticker",
+      "window_open",
+      "offset_minutes",
+      "yes_bid",
+      "yes_ask",
+      "yes_bid_size",
+      "yes_ask_size",
+      "depth_bid_1c",
+      "depth_bid_5c",
+      "depth_ask_1c",
+      "depth_ask_5c",
+      "depth_bid_total",
+      "depth_ask_total",
+      "levels_bid",
+      "levels_ask",
+      "seq",
+      "gaps",
+      "source",
+      "quote_age_seconds",
+      "transport",
+      "month"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 820929,
+        "event_time_min": "2026-01-07 19:01:00-05:00",
+        "event_time_max": "2026-10-17 01:24:00-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 818589,
+        "event_time_min": "2026-01-07 19:01:00-05:00",
+        "event_time_max": "2026-10-17 01:24:00-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 817626,
+        "event_time_min": "2026-01-07 19:01:00-05:00",
+        "event_time_max": "2026-10-17 01:24:00-04:00"
+      }
+    ]
+  },
+  "venue_implied_vol": {
+    "files": 30,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "event_ticker",
+      "close_time",
+      "minutes_to_close",
+      "implied_sigma_per_min",
+      "implied_spot",
+      "atm_strike",
+      "n_strikes",
+      "r2",
+      "month"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 79541,
+        "event_time_min": "2026-01-07 23:10:00-05:00",
+        "event_time_max": "2026-10-17 01:23:26.192258-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 51759,
+        "event_time_min": "2026-01-08 09:10:00-05:00",
+        "event_time_max": "2026-10-17 01:00:22.204459-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 7446,
+        "event_time_min": "2026-01-07 22:10:00-05:00",
+        "event_time_max": "2026-10-16 16:04:17.528070-04:00"
+      }
+    ]
+  },
+  "venue_ladder": {
+    "files": 6,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "market_ticker",
+      "window_open",
+      "minute_into_window",
+      "yes_levels",
+      "no_levels",
+      "yes_total",
+      "no_total",
+      "transport",
+      "book_age_ms",
+      "month"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 59580,
+        "event_time_min": "2026-08-25 01:28:00-04:00",
+        "event_time_max": "2026-09-16 20:21:00-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 59582,
+        "event_time_min": "2026-08-25 01:28:00-04:00",
+        "event_time_max": "2026-09-16 20:21:00-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 59491,
+        "event_time_min": "2026-08-25 01:28:00-04:00",
+        "event_time_max": "2026-09-16 20:21:00-04:00"
+      }
+    ]
+  },
+  "venue_settlements": {
+    "files": 60,
+    "columns": [
+      "venue",
+      "symbol",
+      "event_time",
+      "available_time",
+      "quality",
+      "market_ticker",
+      "window_open",
+      "close_time",
+      "settlement_time",
+      "result",
+      "settled_up",
+      "volume",
+      "open_interest",
+      "last_price",
+      "month"
+    ],
+    "by_symbol": [
+      {
+        "symbol": "BTC-USD",
+        "rows": 15890441,
+        "event_time_min": "2026-01-06 17:15:00-05:00",
+        "event_time_max": "2026-10-17 00:30:00-04:00"
+      },
+      {
+        "symbol": "ETH-USD",
+        "rows": 15896502,
+        "event_time_min": "2026-01-06 17:15:00-05:00",
+        "event_time_max": "2026-10-17 00:30:00-04:00"
+      },
+      {
+        "symbol": "SOL-USD",
+        "rows": 15875921,
+        "event_time_min": "2026-01-07 19:00:00-05:00",
+        "event_time_max": "2026-10-17 00:30:00-04:00"
+      }
+    ]
+  }
+}

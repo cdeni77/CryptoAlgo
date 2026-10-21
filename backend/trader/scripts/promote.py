@@ -227,7 +227,17 @@ def choose_candidate(fold_models, refit):
     return refit
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The real parser, exposed so callers can CHECK a command before running it.
+
+    It used to be built inline in `main()`, which meant
+    `tests/test_deployed_config_parity.py` could only approximate it with
+    `add_data_arguments` — and that approximation does not know `--force` or
+    `--reason`. So a compose command carrying promote-only flags failed a test
+    whose stated job is "a flag the retrain passes that `scripts.promote` does
+    not know exits 2". The test was measuring a different parser from the one
+    that runs.
+    """
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__))
@@ -250,7 +260,11 @@ def main() -> int:
                              'core/gate_spec.lock.json. The reason and the spec '
                              'diff are stored in the ledger. --force does not '
                              'reach past a changed spec; only this does.')
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     setup_logging(args.verbose)
 
     if args.history:
@@ -340,6 +354,17 @@ def main() -> int:
     # See `choose_candidate`.
     refit = refit_on_all(dataset, config, groups=groups)
     candidate = choose_candidate(result.models, refit)
+    # **Gate the artifact that SHIPS.** `residual_scale` in the report is the
+    # walk-forward's; this is the deployed refit's own alpha. They disagreed by
+    # two orders of magnitude on 2026-10-18 (0.940 gated, 0.015 installed), and
+    # nothing noticed because no gate read the candidate.
+    deployed_alpha = getattr(candidate, 'residual_scale', None)
+    if deployed_alpha is not None:
+        market['deployed_residual_scale'] = float(deployed_alpha)
+        walk = getattr(result.report, 'residual_scale', None)
+        logger.info('deployed artifact alpha %.4f%s', float(deployed_alpha),
+                    f' against the walk-forward\'s {float(walk):.4f}'
+                    if walk is not None else '')
     if refit is not None:
         print(f'  deploying a refit on {refit.n_train_windows:,} windows, '
               f'against the last fold\'s {result.models[-1].n_train_windows:,}')
@@ -416,11 +441,43 @@ def publish_to_serving(attempt, report) -> None:
             control_gain_share=_finite(report.max_control_gain_share),
             sharpe=_finite(values.get('sharpe')),
             total_return=_finite(values.get('total_return')),
+            # **`note` and `measured` travel with the gate.** Without them a
+            # gate that could not be COMPUTED -- the market comparisons read
+            # NaN until the live loop has recorded enough quotes -- arrived at
+            # the dashboard as `value: null, passed: false` and rendered as a
+            # red FAIL, identical to a gate that was measured and lost. Those
+            # are different claims, and `GATE_NOTES` already explains each one
+            # in a sentence that never reached a screen.
             gates=[{'name': g.name, 'value': _finite(g.value),
                     'threshold': g.threshold, 'direction': g.direction,
-                    'passed': bool(g.passed)} for g in attempt.gates],
+                    'passed': bool(g.passed),
+                    'measured': bool(np.isfinite(g.value)),
+                    'note': g.note or ''} for g in attempt.gates],
             failed_gates=', '.join(g.name for g in attempt.gates if not g.passed),
-            provenance=attempt.payload().get('config'),
+            # **The multiple-testing context travels with the run.** The
+            # dashboard tells a reader to "discount any claim of skill by this
+            # count" and then had nothing to discount it WITH: `trial_count`
+            # and the deflated Sharpe were computed, written to the ledger JSON
+            # and dropped here. A deflated Sharpe of 0.141 against a raw 1.23
+            # is the number that says the result is not distinguishable from
+            # the best of twenty tries, and it never reached a screen.
+            #
+            # `gate_spec_hash` so the surface can say whether the thresholds on
+            # screen are still the thresholds in force.
+            provenance={
+                **(attempt.payload().get('config') or {}),
+                'trial_count': attempt.payload().get('trial_count'),
+                'deflated_sharpe': attempt.payload().get('deflated_sharpe'),
+                'gate_spec_hash': attempt.payload().get('gate_spec_hash'),
+                'model': attempt.payload().get('model'),
+                'report': {
+                    k: (attempt.payload().get('report') or {}).get(k)
+                    for k in ('log_loss_skill_se', 'log_loss_skill_t',
+                              'log_loss_skill_p', 'effective_folds',
+                              'sign_agreement_p', 'mean_residual_scale',
+                              'median_residual_scale')
+                },
+            },
         )
         # The reliability table of the fold that produced the candidate — the one
         # trained on the most history, and so the one deployed.

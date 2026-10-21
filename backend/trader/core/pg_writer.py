@@ -33,6 +33,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
+import pandas as pd
 from sqlalchemy import (
     JSON, Boolean, Column, DateTime, Float, Index, Integer, String, Text,
     UniqueConstraint, create_engine, text,
@@ -45,6 +46,34 @@ from core.book import won as _won
 logger = logging.getLogger(__name__)
 
 Base = declarative_base()
+
+
+def _int_or_none(value) -> Optional[int]:
+    """An integer where the venue sent one, None where it sent nothing."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finite_or_none(value: Optional[float]) -> Optional[float]:
+    """A number only when it is one. NaN and inf become NULL.
+
+    `balance_breakdown` reports NaN when the venue did not answer, and NaN is a
+    float that Postgres will happily store in a DOUBLE PRECISION column — where
+    it then poisons every AVG, MAX and comparison downstream, silently. NULL is
+    the honest encoding of "the venue did not say", and the serving layer
+    already renders a null as a reason rather than a zero.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float('inf'), float('-inf')) else None
 
 
 def utcnow() -> datetime:
@@ -169,14 +198,33 @@ class Position(Base):
     side = Column(String, nullable=False)
     contracts = Column(Integer, nullable=False)
     price = Column(Float, nullable=False)
-    outlay = Column(Float, nullable=False)     # everything paid, fee included
-    fee = Column(Float, nullable=False)
+    # **Cost only: `contracts * price`. The fee is NOT in here**, despite what
+    # this comment said until 2026-10-20 ("everything paid, fee included").
+    # Verified against every row with a non-zero fee: `outlay == contracts *
+    # price` exactly, and `settle_position` subtracts `fee` separately --
+    # which it would not if the fee were already included. The false comment
+    # mattered because `at risk` on the dashboard is this column and reads as
+    # cash committed, and `unrealized_pnl` is computed against it.
+    outlay = Column(Float, nullable=False)
+    fee = Column(Float, nullable=False)        # charged at entry, subtracted at settle
     model_probability = Column(Float, nullable=False)
     baseline_probability = Column(Float, nullable=False)
     edge = Column(Float, nullable=False)
 
     outcome = Column(String, nullable=False, default=Outcome.PENDING.value, index=True)
     settled_up = Column(Boolean, nullable=True)
+    # **Mark to the VENUE's bid, not to our forecast.** `at risk` on the
+    # dashboard is cost, deliberately: marking a position to the model's own
+    # probability books conviction as profit. The venue's bid is a different
+    # claim -- it is what someone will actually pay for this contract right
+    # now, so an open position can be shown moving without inventing P&L.
+    # `bid_for(side)` because that is where a SALE lands; the ask is what it
+    # would cost to buy more, which is not what this position is worth.
+    #
+    # Nullable, and stale-able: `mark_at` is when the quote was read, so the
+    # surface can say how old the number is rather than implying it is live.
+    mark_price = Column(Float, nullable=True)
+    mark_at = Column(DateTime(timezone=True), nullable=True)
     payout = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True)
     settled_at = Column(DateTime(timezone=True), nullable=True)
@@ -184,7 +232,22 @@ class Position(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('symbol', 'window_open', name='uq_position_window'),
+        # **Keyed on the OFFSET too, since 2026-10-20.** It was
+        # (symbol, window_open), which made one position per window a database
+        # invariant -- correct while `already_entered` allowed exactly one
+        # entry, and wrong the moment `max_entries_per_symbol_window` could
+        # exceed 1: entries 2..N could not be booked at all, so our books
+        # recorded 1 contract where the venue held 4 and `pnl_gap` drifted by
+        # the difference.
+        #
+        # The protection it was written for is kept intact. That was a
+        # duplicate order for the SAME decision surviving a restart -- the
+        # process died after the order was on the wire and `restart:
+        # unless-stopped` brought it back to send it again. A decision is
+        # (symbol, window, offset), so keying on all three still refuses the
+        # repeat while allowing the four offsets to be distinct bets.
+        UniqueConstraint('symbol', 'window_open', 'offset_minutes',
+                         name='uq_position_window_offset'),
         Index('ix_positions_open', 'outcome', 'settle_time'),
     )
 
@@ -348,7 +411,19 @@ class OrderTicket(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('symbol', 'window_open', name='uq_ticket_window'),
+        # **Keyed on the OFFSET too, since 2026-10-20** — the same widening
+        # `positions` needed, and missing it left a worse hole. The order for
+        # the second offset was still PLACED and FILLED at the venue (two
+        # distinct `order_id`s on KXETH15M-26OCT201000-00, 13:48:09 @ 0.680 and
+        # 13:51:05 @ 0.750), but `write_ticket` returned the first ticket's id
+        # instead of recording it. No ticket means no position, so our books
+        # showed 1 contract against the venue's 2 and `pnl_gap` moved every
+        # time a window took a second entry.
+        #
+        # The protection it was written for — one order per decision surviving
+        # a restart — is intact, because a decision is (symbol, window, offset).
+        UniqueConstraint('symbol', 'window_open', 'offset_minutes',
+                         name='uq_ticket_window_offset'),
         Index('ix_order_tickets_status_created', 'status', 'created_at'),
     )
 
@@ -461,6 +536,42 @@ class VenueSettlement(Base):
     )
 
 
+class VenuePosition(Base):
+    """The venue's own open positions, as it reports them, replaced each sample.
+
+    **Our `positions` table is not the same thing and never will be.** A row
+    there exists once the live loop has booked a fill; the venue has the
+    position the instant it fills. The gap is one cycle at best, and at worst
+    it is permanent -- an order POST that timed out after being accepted
+    leaves a position the venue holds and we have no record of, which is the
+    one discrepancy that costs money silently.
+
+    So the dashboard shows these, and ours are joined on where they exist to
+    supply what the venue does not know: which decision offset opened it, what
+    the model thought, what edge was claimed. A venue row with no match is
+    displayed as exactly that rather than hidden.
+
+    Replaced wholesale on every sample rather than appended, because this is
+    current state and not a series. The series is `venue_balance`, which
+    carries the account value a second at a time.
+    """
+
+    __tablename__ = 'venue_positions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    exchange_index = Column(Integer, nullable=True)
+    #: SIGNED, as the venue serves it: negative is a NO position. Stored as
+    #: served rather than normalised, because converting here would put the
+    #: same sign convention in two places and they would drift.
+    position = Column(Float, nullable=False)
+    #: Cost basis, net of any netting the venue has already applied.
+    market_exposure = Column(Float, nullable=True)
+    fees_paid = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)
+    sampled_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
 class VenueBalance(Base):
     """The venue's balance, sampled. What makes the account chart live.
 
@@ -484,6 +595,21 @@ class VenueBalance(Base):
     timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     balance = Column(Float, nullable=False)
     exchange_index = Column(Integer, nullable=True)
+    # **The cross-shard total, which is what the venue's own app shows.**
+    # `balance` above is the TRADING shard alone -- the only cash an order on a
+    # crypto market can draw on -- and the two differ by whatever is stranded
+    # elsewhere. Recording only the shard made the dashboard read $482.46
+    # against the app's $483.57 and look out of sync when drift was exactly
+    # 0.00. Nullable because rows written before 2026-10-18 do not have it, and
+    # a backfilled zero would draw a cliff in the series that never happened.
+    total_balance = Column(Float, nullable=True)
+    #: The VENUE's own mark of the open book at this instant, from
+    #: `/portfolio/balance.portfolio_value`. Null when the venue did not answer
+    #: -- never a zero, because a flat book is a real zero and the two must not
+    #: be confused. Recorded per cycle because Kalshi serves only the current
+    #: value: there is no history endpoint, so an equity curve has to be
+    #: sampled or it cannot be built at all.
+    portfolio_value = Column(Float, nullable=True)
     # What our own arithmetic thought at the same instant, and the difference.
     # Stored rather than only logged because a drift that GROWS is the signal —
     # an unrecorded fill, a partial, a mispriced fee — and a single log line
@@ -555,12 +681,17 @@ class PgWriter:
         self._sessions = sessionmaker(bind=self._engine, future=True)
         Base.metadata.create_all(self._engine)
         self._ensure_columns()
+        self._ensure_constraints()
         self._run_migrations()
 
     #: Columns added to an existing table after it was first created.
     #: `(table, column, type)`, applied only when genuinely absent.
     ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
         ('account', 'reset_at', 'TIMESTAMP WITH TIME ZONE'),
+        ('venue_balance', 'total_balance', 'DOUBLE PRECISION'),
+        ('venue_balance', 'portfolio_value', 'DOUBLE PRECISION'),
+        ('positions', 'mark_price', 'DOUBLE PRECISION'),
+        ('positions', 'mark_at', 'TIMESTAMP WITH TIME ZONE'),
     )
 
     def _ensure_columns(self) -> None:
@@ -596,6 +727,57 @@ class PgWriter:
                 con.exec_driver_sql(
                     f'ALTER TABLE {table} ADD COLUMN {column} {type_}')
             logger.info('added %s.%s', table, column)
+
+    #: Unique constraints that had to CHANGE, as (table, old_name, new_name,
+    #: columns). `create_all` gives a fresh database the new one straight from
+    #: the ORM; only an existing database needs the swap.
+    CHANGED_UNIQUES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+        ('positions', 'uq_position_window', 'uq_position_window_offset',
+         ('symbol', 'window_open', 'offset_minutes')),
+        ('order_tickets', 'uq_ticket_window', 'uq_ticket_window_offset',
+         ('symbol', 'window_open', 'offset_minutes')),
+    )
+
+    def _ensure_constraints(self) -> None:
+        """Swap unique constraints that widened, on databases that predate them.
+
+        Separate from `_ensure_columns` because the statement is not portable:
+        SQLite cannot `ALTER TABLE ... DROP CONSTRAINT` at all. That is
+        tolerable here in a way the repo's `MIGRATIONS` note says it generally
+        is not, for one specific reason -- the ORM is the source of truth, so
+        `create_all` builds the NEW constraint on any fresh database, which is
+        every SQLite test database. There is no path where SQLite needs the
+        swap, so skipping it there does not leave production running a
+        statement the tests never exercise; it leaves production catching up to
+        what the tests already have.
+
+        Existence is checked through the dialect-neutral inspector and the swap
+        runs in ONE transaction, so a crash between the drop and the create
+        cannot leave the table with no uniqueness at all -- which on this table
+        would mean duplicate positions for one decision, the exact failure the
+        constraint exists to prevent.
+        """
+        from sqlalchemy import inspect as _inspect
+
+        if self._engine.dialect.name == 'sqlite':
+            return
+        inspector = _inspect(self._engine)
+        tables = set(inspector.get_table_names())
+        for table, old_name, new_name, columns in self.CHANGED_UNIQUES:
+            if table not in tables:
+                continue
+            names = {c['name'] for c in inspector.get_unique_constraints(table)}
+            if new_name in names:
+                continue
+            cols = ', '.join(columns)
+            with self._engine.begin() as con:
+                if old_name in names:
+                    con.exec_driver_sql(
+                        f'ALTER TABLE {table} DROP CONSTRAINT {old_name}')
+                con.exec_driver_sql(
+                    f'ALTER TABLE {table} ADD CONSTRAINT {new_name} '
+                    f'UNIQUE ({cols})')
+            logger.info('%s: %s -> %s (%s)', table, old_name, new_name, cols)
 
     def _run_migrations(self) -> None:
         """Apply the additive migrations, tolerating only SQLite's dialect gaps.
@@ -714,8 +896,11 @@ class PgWriter:
     def write_ticket(self, **fields) -> int:
         """Record a live decision as something a person can place."""
         with self._session() as session:
+            # Matched on the decision, not the window: returning the first
+            # offset's ticket here silently discarded every later entry.
             existing = session.query(OrderTicket).filter_by(
-                symbol=fields['symbol'], window_open=fields['window_open']).one_or_none()
+                symbol=fields['symbol'], window_open=fields['window_open'],
+                offset_minutes=fields['offset_minutes']).one_or_none()
             if existing is not None:
                 return existing.id
             row = OrderTicket(**fields)
@@ -723,11 +908,17 @@ class PgWriter:
             session.commit()
             return row.id
 
+    #: Ticket states that are still live at the venue and therefore still the
+    #: loop's problem. 'resting' joins 'new' because a `good_till_canceled`
+    #: maker order sits on the book until it fills or is cancelled — and a
+    #: resting order nothing sweeps is an open position nobody decided to hold.
+    OPEN_TICKET_STATUSES = ('new', 'resting')
+
     def open_tickets(self, limit: int = 50) -> list[OrderTicket]:
         with self._session() as session:
             return list(
                 session.query(OrderTicket)
-                .filter(OrderTicket.status == 'new')
+                .filter(OrderTicket.status.in_(self.OPEN_TICKET_STATUSES))
                 .order_by(OrderTicket.created_at.desc()).limit(limit)
             )
 
@@ -772,11 +963,14 @@ class PgWriter:
         """
         with self._session() as session:
             existing = session.query(Position).filter_by(
-                symbol=fields['symbol'], window_open=fields['window_open']).one_or_none()
+                symbol=fields['symbol'], window_open=fields['window_open'],
+                offset_minutes=fields['offset_minutes']).one_or_none()
             if existing is not None:
                 logger.warning(
-                    '%s window %s already holds a position; not booking a second',
-                    fields['symbol'], fields['window_open'])
+                    '%s window %s offset +%sm already holds a position; '
+                    'not booking a second',
+                    fields['symbol'], fields['window_open'],
+                    fields['offset_minutes'])
                 return None
             row = Position(outcome=Outcome.PENDING.value, **fields)
             session.add(row)
@@ -792,7 +986,8 @@ class PgWriter:
                 .order_by(Position.settle_time)
             )
 
-    def settle_position(self, position_id: int, *, settled_up: bool) -> Optional[float]:
+    def settle_position(self, position_id: int, *, settled_up: bool,
+                        fee: Optional[float] = None) -> Optional[float]:
         """Resolve one position, credit the account, and return its PnL.
 
         Returns None if the position was already settled, which is what makes a
@@ -812,6 +1007,27 @@ class PgWriter:
         Crediting inside the position's own transaction is deliberate. A payout
         applied in a second transaction can be lost to a crash between the two,
         and then the position says "won" while the bankroll never saw the money.
+
+        **`fee` is the venue's own charge, and the P&L subtracts it.** Two
+        defects, measured 2026-10-20 and fixed together:
+
+          * `pnl` was `payout - outlay`, and `outlay` is `contracts * price`
+            exactly. The fee was never in the arithmetic at all, so our books
+            reported GROSS where the venue reports net. Measured against 419
+            settled markets, 409 of them differed from the venue by precisely
+            the fee and nothing else.
+          * `Position.fee` was 0.0000 on every row, because `maker_entry`
+            implies `assume_maker` and the estimate is made at DECISION time --
+            before it is known whether the order rests or crosses. About 19% of
+            fills cross and pay roughly 1.18c per contract.
+
+        Passing the venue's figure fixes both: it is what was actually charged,
+        not what the published schedule predicts. Omitted (paper mode, or a
+        settlement the venue has not posted), the stored estimate is used, so
+        the arithmetic is still net rather than gross.
+
+        `Account.fees_paid` moves by the DIFFERENCE between the new figure and
+        whatever was booked at entry, so a fee is never counted twice.
         """
         with self._session() as session:
             row = session.get(Position, position_id)
@@ -819,17 +1035,23 @@ class PgWriter:
                 return None
             won = _won(side=row.side, settled_up=settled_up)
             payout = float(row.contracts) if won else 0.0
+            booked_fee = float(row.fee or 0.0)
+            if fee is not None and float(fee) == float(fee):  # not NaN
+                row.fee = float(fee)
+            charged = float(row.fee or 0.0)
             row.settled_up = settled_up
             row.payout = payout
-            row.pnl = payout - row.outlay
+            row.pnl = payout - row.outlay - charged
             row.outcome = Outcome.WON.value if won else Outcome.LOST.value
             row.settled_at = utcnow()
             pnl = float(row.pnl)
+            fee_delta = charged - booked_fee
             # Relative UPDATE rather than read-modify-write: the arithmetic
             # happens in the database, so a concurrent debit cannot be lost.
             session.query(Account).update(
                 {Account.bankroll: Account.bankroll + payout,
-                 Account.realized_pnl: Account.realized_pnl + pnl},
+                 Account.realized_pnl: Account.realized_pnl + pnl,
+                 Account.fees_paid: Account.fees_paid + fee_delta},
                 synchronize_session=False,
             )
             session.commit()
@@ -873,6 +1095,203 @@ class PgWriter:
                     symbols.add(str(row.symbol))
                     stake += float(row.expected_cost or 0.0)
             return frozenset(symbols), stake, len(symbols)
+
+    def reconcile_position_size(self, *, symbol: str, window_open,
+                                offset_minutes: int, contracts: float,
+                                cost: float, fee: float) -> bool:
+        """Correct a PENDING position to the venue's own fill totals.
+
+        **A position is booked from the fills visible at the time**, and an
+        order can keep filling afterwards: `book_resting_fills` books the
+        partial, resolves the ticket, and the ticket then drops out of
+        `open_tickets()` so later fills are never added. Measured live
+        2026-10-20 on the 15:00 SOL window -- three entries recorded 2, 1 and 0
+        contracts against the venue's 6, which under-credited the settlement
+        payout and showed up as a $1.00 balance drift.
+
+        Only PENDING positions, and only UPWARDS: a settled position already
+        has a payout computed from its size, and shrinking a position would
+        discard contracts the venue says we hold. Returns whether anything
+        changed, so the caller can log a correction rather than a no-op.
+        """
+        target = int(round(float(contracts)))
+        if target < 1:
+            return False
+        stamp = pd.Timestamp(window_open)
+        stamp = (stamp.tz_localize('UTC') if stamp.tzinfo is None
+                 else stamp.tz_convert('UTC'))
+        with self._session() as session:
+            row = (session.query(Position)
+                   .filter(Position.symbol == str(symbol),
+                           Position.offset_minutes == int(offset_minutes),
+                           Position.outcome == Outcome.PENDING.value)
+                   .all())
+            match = None
+            for candidate in row:
+                when = pd.Timestamp(candidate.window_open)
+                when = (when.tz_localize('UTC') if when.tzinfo is None
+                        else when.tz_convert('UTC'))
+                if when == stamp:
+                    match = candidate
+                    break
+            if match is None or int(match.contracts or 0) >= target:
+                return False
+            before = int(match.contracts or 0)
+            # The bankroll was debited for what we booked, so only the
+            # DIFFERENCE is taken now -- debiting the whole cost again would
+            # double-charge the contracts already recorded.
+            extra = float(cost) - float(match.outlay or 0.0)
+            match.contracts = target
+            match.outlay = float(cost)
+            match.price = float(cost) / target if target else match.price
+            match.fee = float(fee)
+            session.query(Account).update(
+                {Account.bankroll: Account.bankroll - extra},
+                synchronize_session=False,
+            )
+            session.commit()
+            logger.warning(
+                '%s window %s offset +%sm: the venue filled %d contract(s), we '
+                'booked %d. Corrected, and the bankroll debited $%.4f more.',
+                symbol, window_open, offset_minutes, target, before, extra)
+            return True
+
+    def tickers_for_open_positions(self) -> dict:
+        """(symbol, window_open, offset) -> market ticker, for pending positions.
+
+        `positions` carries no ticker column -- it is keyed on the decision
+        because the paper engine predates the venue client -- so anything that
+        needs to look a position up at the venue goes through the ticket that
+        placed it.
+        """
+        out: dict = {}
+        with self._session() as session:
+            open_keys = {
+                (str(p.symbol), p.window_open, int(p.offset_minutes))
+                for p in session.query(Position)
+                .filter(Position.outcome == Outcome.PENDING.value)
+            }
+            if not open_keys:
+                return out
+            for ticket in (session.query(OrderTicket)
+                           .filter(OrderTicket.market_ticker.isnot(None))):
+                key = (str(ticket.symbol), ticket.window_open,
+                       int(ticket.offset_minutes))
+                if key in open_keys:
+                    out[key] = str(ticket.market_ticker)
+        return out
+
+    def mark_open_positions(self, marks: dict, *, at: datetime) -> int:
+        """Record what the venue's book says each OPEN position is worth now.
+
+        `marks` maps (symbol, window_open) -> price, the bid for the side held.
+        Only pending positions are touched: a settled one has a payout, and a
+        mark on top of that would be a second, contradictory answer to the same
+        question.
+
+        Returns the number updated. Telemetry, not accounting -- nothing sizes
+        or decides off this, so the caller treats a failure here as something to
+        log rather than something to stop the cycle for.
+        """
+        if not marks:
+            return 0
+
+        def key(symbol, when):
+            """A key that survives the representation the row came back in.
+
+            **SQLite hands back naive datetimes even for a
+            `DateTime(timezone=True)` column**, while callers pass tz-aware
+            `pandas.Timestamp`s, and the two never compare equal -- so a direct
+            dict lookup silently matched nothing and marked zero positions.
+            Normalising to a UTC epoch makes the lookup indifferent to naive
+            vs aware and to Timestamp vs datetime. Naive values are read as
+            UTC, which is what every stored timestamp in this schema is.
+            """
+            stamp = pd.Timestamp(when)
+            stamp = (stamp.tz_localize('UTC') if stamp.tzinfo is None
+                     else stamp.tz_convert('UTC'))
+            return (str(symbol), stamp.value)
+
+        normalised = {key(sym, when): price for (sym, when), price in marks.items()}
+        updated = 0
+        with self._session() as session:
+            for row in (session.query(Position)
+                        .filter(Position.outcome == Outcome.PENDING.value)):
+                price = normalised.get(key(row.symbol, row.window_open))
+                if price is None:
+                    continue
+                try:
+                    value = float(price)
+                except (TypeError, ValueError):
+                    continue
+                # A zero BID means nobody is bidding, which is a real state and
+                # a real mark -- distinct from "no quote", which leaves the
+                # previous mark and its timestamp alone so the surface can show
+                # it going stale instead of jumping to zero.
+                if value != value:               # NaN
+                    continue
+                row.mark_price = value
+                row.mark_at = at
+                updated += 1
+            session.commit()
+        return updated
+
+    def entry_counts_for_window(self, window_open: datetime):
+        """Per-symbol entry COUNTS, total stake and total entries for a window.
+
+        `entries_for_window` answers "which symbols are in this window" and
+        deduplicates by symbol, which is exactly right while one entry per
+        (symbol, window) is the rule. Once `max_entries_per_symbol_window`
+        exceeds 1 that dedupe silently UNDER-COUNTS: a second entry on a symbol
+        already seen contributes no stake, so `max_window_exposure_fraction` --
+        the notional backstop that is doing the real work once the per-symbol
+        gate is relaxed -- would be computed against less than is at risk.
+
+        Double counting is avoided by pairing on `prediction_id` rather than on
+        symbol: a ticket is counted only when no position exists for the same
+        decision. A ticket with no `prediction_id` is counted on its own, since
+        there is nothing to pair it with and missing real exposure is the worse
+        error. Dead tickets ('skipped', 'killed') are excluded for the reason
+        `entries_for_window` documents -- the venue has said it took nothing.
+        """
+        counts: dict[str, int] = {}
+        sides: dict[str, str] = {}
+        stake = 0.0
+        entries = 0
+        with self._session() as session:
+            claimed: set[int] = set()
+            # Oldest first, so `setdefault` records the side actually entered
+            # FIRST. That is the side the window is committed to; a later
+            # opposite decision must be refused against it, not the reverse.
+            for row in (session.query(Position)
+                        .filter(Position.window_open == window_open)
+                        .order_by(Position.id)):
+                symbol = str(row.symbol)
+                counts[symbol] = counts.get(symbol, 0) + 1
+                if row.side is not None:
+                    sides.setdefault(symbol, str(row.side))
+                stake += float(row.outlay or 0.0)
+                entries += 1
+                if row.prediction_id is not None:
+                    claimed.add(int(row.prediction_id))
+            dead = ('skipped', 'killed')
+            for row in (session.query(OrderTicket)
+                        .filter(OrderTicket.window_open == window_open)
+                        .filter(OrderTicket.status.notin_(dead))
+                        .order_by(OrderTicket.id)):
+                if row.prediction_id is not None and int(row.prediction_id) in claimed:
+                    continue
+                symbol = str(row.symbol)
+                counts[symbol] = counts.get(symbol, 0) + 1
+                if row.side is not None:
+                    sides.setdefault(symbol, str(row.side))
+                stake += float(row.expected_cost or 0.0)
+                entries += 1
+        # **The side must come from the STORE, not only from this cycle's
+        # exposure.** A restart, or simply the next cycle, rebuilds
+        # `WindowExposure` from here; without the side a window entered UP at
+        # +3 would happily be entered DOWN at +9, which is the -$6.29 defect.
+        return counts, stake, entries, sides
 
     def first_position_time(self) -> Optional[datetime]:
         """When our books start, or None if they hold nothing.
@@ -1065,7 +1484,15 @@ class PgWriter:
                     before = float(row.pnl or 0.0)
                     row.settled_up = bool(settled_up)
                     row.payout = payout
-                    row.pnl = payout - float(row.outlay or 0.0)
+                    # **Net of the fee, like `settle_position`.** This read
+                    # `payout - outlay` while the settle path reads
+                    # `payout - outlay - fee`, so any position the venue
+                    # re-graded silently became fee-free -- and
+                    # `account.realized_pnl` is restated as `sum(positions.pnl)`
+                    # a few lines below, so the error propagated straight to
+                    # the dashboard's headline.
+                    row.pnl = (payout - float(row.outlay or 0.0)
+                               - float(row.fee or 0.0))
                     row.outcome = Outcome.WON.value if won else Outcome.LOST.value
                     delta_total += float(row.pnl) - before
                     corrected += 1
@@ -1331,6 +1758,28 @@ class PgWriter:
                 query = query.limit(limit)
             return list(query)
 
+    def replace_venue_positions(self, rows, *, at) -> int:
+        """Store the venue's open positions, replacing whatever was there.
+
+        Current state, not a series -- a venue that reports nothing open must
+        leave an EMPTY table, so the delete runs whether or not there are rows
+        to write. Appending instead would leave a settled position on screen
+        forever, which is the failure this is meant to prevent.
+        """
+        with self._session() as session:
+            session.query(VenuePosition).delete()
+            for row in rows:
+                session.add(VenuePosition(
+                    ticker=str(row.get('ticker') or ''),
+                    exchange_index=_int_or_none(row.get('exchange_index')),
+                    position=float(row.get('position') or 0.0),
+                    market_exposure=_finite_or_none(row.get('market_exposure')),
+                    fees_paid=_finite_or_none(row.get('fees_paid')),
+                    realized_pnl=_finite_or_none(row.get('realized_pnl')),
+                    sampled_at=at))
+            session.commit()
+            return len(rows)
+
     def position_for_ticker(self, ticker: str):
         """Our own position for a venue ticker, via the ticket that placed it.
 
@@ -1347,14 +1796,21 @@ class PgWriter:
                       .first())
             if ticket is None:
                 return None
+            # **Matched on the offset as well.** A window can hold one position
+            # per decision offset, so filtering on (symbol, window) alone would
+            # raise `MultipleResultsFound` and take the reconcile down with it.
+            # The ticket names the decision, so it names the position.
             return (session.query(Position)
                     .filter(Position.symbol == ticket.symbol,
-                            Position.window_open == ticket.window_open)
+                            Position.window_open == ticket.window_open,
+                            Position.offset_minutes == ticket.offset_minutes)
                     .one_or_none())
 
     def write_venue_balance(self, *, timestamp: datetime, balance: float,
                             exchange_index: Optional[int] = None,
-                            our_bankroll: Optional[float] = None) -> int:
+                            our_bankroll: Optional[float] = None,
+                            total_balance: Optional[float] = None,
+                            portfolio_value: Optional[float] = None) -> int:
         """Sample the venue's balance. The drift is computed here, once.
 
         Sampled rather than upserted: the point of the series is the trend, and
@@ -1366,11 +1822,30 @@ class PgWriter:
             row = VenueBalance(
                 timestamp=timestamp, balance=float(balance),
                 exchange_index=exchange_index, our_bankroll=our_bankroll,
-                drift=drift,
+                drift=drift, total_balance=_finite_or_none(total_balance),
+                portfolio_value=_finite_or_none(portfolio_value),
             )
             session.add(row)
             session.commit()
             return row.id
+
+    def last_exchange_index(self) -> Optional[int]:
+        """The shard the last sampled balance came from, or None.
+
+        **Seeds `_LAST_EXCHANGE_INDEX` across a restart.** That global starts
+        None, so the first cycles after every restart reconcile with
+        `exchange_index=None` -- which reads the CROSS-SHARD TOTAL and adopts
+        it as the bankroll. Measured 2026-10-20: $495.1542 adopted against a
+        true shard-2 balance of $494.0487, a $1.1055 overstatement that then
+        sizes Kelly until a book is read and the shard relearned. The shard
+        moves roughly never, and the last one is already recorded here.
+        """
+        with self._session() as session:
+            value = (session.query(VenueBalance.exchange_index)
+                     .filter(VenueBalance.exchange_index.isnot(None))
+                     .order_by(VenueBalance.timestamp.desc())
+                     .limit(1).scalar())
+        return int(value) if value is not None else None
 
     def venue_balances_since(self, since: datetime) -> list[VenueBalance]:
         with self._session() as session:

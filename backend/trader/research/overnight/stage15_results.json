@@ -1,0 +1,207 @@
+{
+  "n_features": 65,
+  "features": [
+    "z_score",
+    "abs_z_score",
+    "excursion_up_z",
+    "excursion_down_z",
+    "excursion_span_z",
+    "excursion_asymmetry",
+    "path_efficiency",
+    "displacement_vs_elapsed",
+    "touched_opposite",
+    "log_rv_15",
+    "log_rv_60",
+    "log_rv_240",
+    "log_rv_1440",
+    "rv_slope_short",
+    "rv_slope_long",
+    "range_to_return",
+    "vol_of_vol",
+    "log_sigma_per_min",
+    "rv_surprise",
+    "seasonal_ramp",
+    "autocorr_60",
+    "run_length",
+    "body_ratio_15",
+    "volume_z_15",
+    "vwap_gap_15",
+    "signed_volume_15",
+    "zero_return_share_60",
+    "peer_displacement",
+    "peer_return_5",
+    "peer_return_15",
+    "lead_residual",
+    "beta_1440",
+    "universe_dispersion",
+    "elapsed_fraction",
+    "remaining_minutes",
+    "imbalance",
+    "touch_imbalance",
+    "d_imbalance_1",
+    "d_imbalance_3",
+    "d_touch_imb_1",
+    "d_touch_imb_3",
+    "d_book_mid_1",
+    "d_book_mid_3",
+    "k_spread",
+    "k_depth_imb_1c",
+    "k_depth_imb_5c",
+    "k_levels_ratio",
+    "pm_mid",
+    "pm_spread",
+    "iv_sigma",
+    "imbalance__miss",
+    "touch_imbalance__miss",
+    "d_imbalance_1__miss",
+    "d_imbalance_3__miss",
+    "d_touch_imb_1__miss",
+    "d_touch_imb_3__miss",
+    "d_book_mid_1__miss",
+    "d_book_mid_3__miss",
+    "k_spread__miss",
+    "k_depth_imb_1c__miss",
+    "k_depth_imb_5c__miss",
+    "k_levels_ratio__miss",
+    "pm_mid__miss",
+    "pm_spread__miss",
+    "iv_sigma__miss"
+  ],
+  "epochs": [
+    21,
+    23,
+    22,
+    22,
+    21,
+    21,
+    21,
+    21,
+    21,
+    21,
+    21,
+    21,
+    21,
+    21,
+    21
+  ],
+  "min_edge_pp": 0.5,
+  "kelly": 0.25,
+  "bankroll": 500.0,
+  "mmm_row": {
+    "mean": -0.0007414820704853705,
+    "ci": [
+      -0.0009278225364800848,
+      -0.0005511845579374127
+    ]
+  },
+  "mmm_window": {
+    "mean": -0.0006099822655391855,
+    "ci": [
+      -0.0011879109698352708,
+      -3.066588961727433e-05
+    ]
+  },
+  "per_fold": [
+    {
+      "fold": 1,
+      "trades": 0
+    },
+    {
+      "fold": 2,
+      "trades": 1333,
+      "contracts": 17381,
+      "pnl": -67.96910000000007
+    },
+    {
+      "fold": 3,
+      "trades": 1630,
+      "contracts": 23709,
+      "pnl": -344.90610000000015
+    },
+    {
+      "fold": 4,
+      "trades": 1833,
+      "contracts": 32174,
+      "pnl": -1321.2372
+    },
+    {
+      "fold": 5,
+      "trades": 1500,
+      "contracts": 20821,
+      "pnl": -505.4815
+    },
+    {
+      "fold": 6,
+      "trades": 1606,
+      "contracts": 23881,
+      "pnl": -24.66700000000006
+    },
+    {
+      "fold": 7,
+      "trades": 620,
+      "contracts": 7247,
+      "pnl": 93.41730000000004
+    },
+    {
+      "fold": 8,
+      "trades": 916,
+      "contracts": 11291,
+      "pnl": -40.56390000000003
+    },
+    {
+      "fold": 9,
+      "trades": 1294,
+      "contracts": 18429,
+      "pnl": -159.23060000000007
+    },
+    {
+      "fold": 10,
+      "trades": 1388,
+      "contracts": 19793,
+      "pnl": -606.9945000000001
+    },
+    {
+      "fold": 11,
+      "trades": 1526,
+      "contracts": 22221,
+      "pnl": 57.294799999999924
+    },
+    {
+      "fold": 12,
+      "trades": 1635,
+      "contracts": 23172,
+      "pnl": 188.26359999999994
+    },
+    {
+      "fold": 13,
+      "trades": 1692,
+      "contracts": 23705,
+      "pnl": -723.3739
+    },
+    {
+      "fold": 14,
+      "trades": 1696,
+      "contracts": 25137,
+      "pnl": -248.21309999999988
+    },
+    {
+      "fold": 15,
+      "trades": 627,
+      "contracts": 11029,
+      "pnl": -39.037500000000044
+    }
+  ],
+  "trades": 19296,
+  "contracts": 279990,
+  "pnl": -3742.698700000001,
+  "pp_per_contract": -1.3367258473516914,
+  "t_stat": -3.0008109390206337,
+  "pnl_ci": [
+    -6153.917165000001,
+    -1340.013650000002
+  ],
+  "traded_last5": 5,
+  "profitable": false,
+  "verdict": "DO NOT PROMOTE",
+  "max_drawdown": 4032.5738999999894
+}

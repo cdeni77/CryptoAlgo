@@ -56,6 +56,14 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                       help='Comma-separated venue_depth observers allowed to '
                            'price a row, e.g. live_touch,live_ws,live. Default: '
                            'every source, ranked by QUOTE_SOURCE_PRIORITY.')
+    data.add_argument('--peer-quote-sources', type=str, default=None,
+                      help='The same, for the PEER venue (Polymarket). '
+                           "Unset, it follows --quote-sources; 'all' frees it. "
+                           'Needed because --quote-sources matches on the bare '
+                           "source name, so excluding Kalshi's Predexon "
+                           "backfill also excluded Polymarket's gamma backfill "
+                           '— a different pipeline, 77,759 windows, and under '
+                           '--complete-cases every cross_venue row with it.')
     data.add_argument('--null-quote-age', choices=('fresh', 'stale'),
                       default=None,
                       help="'fresh' (default) keeps a quote with no recorded "
@@ -117,6 +125,79 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     economics.add_argument('--bankroll', type=float, default=None,
                            help=f'Starting account (default ${DEFAULT_CONFIG.starting_bankroll:.0f})')
     economics.add_argument('--kelly-fraction', type=float, default=None)
+    # **The halt the backtest latches on, and the reason every money number in
+    # this repo was five days long.** `core/book.py` sets `halted_at` once and
+    # never clears it, mirroring the live account, where a halt is sticky until
+    # an operator restarts. Over a nine-month walk-forward there is no operator:
+    # measured 2026-10-17, the continuous book halted on 2026-01-20 — day five —
+    # and traded nothing for the remaining nine months, so `trades`,
+    # `total_return`, `sharpe` and `realised_edge_pp` all described five days
+    # while the forecast metrics described 55,487 windows. The default is
+    # unchanged at 0.15 because that IS what the live account runs; this flag
+    # exists so the MEASUREMENT can be taken at a different leash without
+    # editing what trades.
+    model.add_argument('--min-train-windows', type=int, default=None,
+                       help='Windows the first TESTED fold must train on '
+                            f'(default {DEFAULT_CONFIG.min_train_windows}). '
+                            'Thinner folds are skipped. This is the warm-up: '
+                            'the book era is short and an undertrained early '
+                            'fold can latch the halt and end the money sample.')
+    # Companion to --max-daily-loss-fraction. `core/book.py` latches `halted_at`
+    # once and never clears it, so over a nine-month walk-forward ONE bad week
+    # ends the money sample while the forecast metrics run on. Raising this
+    # measures a longer sample; it does not change what the live account runs,
+    # which is the 0.35 default.
+    economics.add_argument('--max-drawdown-fraction', type=float, default=None,
+                           help='Peak-to-current halt, as a fraction '
+                                f'(default {DEFAULT_CONFIG.max_drawdown_fraction}). '
+                                'Raise it to measure a full period instead of '
+                                'the week before the first latch.')
+    # **Price the entry the way it will be entered.** `--assume-maker` alone
+    # only zeroes the FEE and leaves the backtest lifting the ask, which
+    # understates maker economics by a full spread. This also swaps the entry
+    # to the BID (`core.decide.as_maker_prices`), and implies --assume-maker so
+    # the fee and the price can never disagree. Measured 2026-10-18 on 54,100
+    # live-recorded rows, the SAME model: -$77.25 taker -> +$2,445.76 maker.
+    # It does NOT model whether a resting order fills, which is the whole risk.
+    # The depth cap the economics apply. `scripts/live.py` has always had this
+    # and the shared parser never did, so the trader's override could set 40
+    # while every evaluation measured the 25 default — a strategy sized 37.5%
+    # larger than the one being graded.
+    economics.add_argument('--max-stake-dollars', type=float, default=None,
+                           metavar='D',
+                           help='Cap on a single stake, standing in for market '
+                                'depth. Must match the trader override.')
+    # **Both, or the retrain grades a policy the account does not run.** These
+    # exist on the research side only so `scripts/promote` can express what the
+    # trader override sets; `tests/test_deployed_config_parity.py` asserts the
+    # two agree. Raising the per-symbol limit alone does nothing, because
+    # `max_positions_per_window` (3) is saturated by one entry on each of three
+    # symbols -- it reallocates slots rather than adding entries.
+    economics.add_argument('--max-entries-per-symbol-window', type=int,
+                           default=None, metavar='N',
+                           help='Entries allowed per (symbol, window). Default '
+                                '1. Above 1 is a real increase in correlated '
+                                'exposure: the offsets are one bet seen N times.')
+    economics.add_argument('--max-positions-per-window', type=int,
+                           default=None, metavar='N',
+                           help='Total positions allowed per window, across '
+                                'symbols. Must rise with the per-symbol limit.')
+    economics.add_argument('--maker-entry', action='store_true',
+                           help='Rest at the bid instead of lifting the ask, '
+                                'and charge the maker fee. Does not model '
+                                'whether the order fills.')
+    economics.add_argument('--exclude-price-band', type=str, default=None,
+                           metavar='LO,HI',
+                           help='Refuse trades priced inside this band, e.g. '
+                                '"0.35,0.65". Must be symmetric about 0.5. The '
+                                'fee 0.07*p(1-p) peaks mid-book while the '
+                                'measured signal there is ~0; off by default.')
+    economics.add_argument('--max-daily-loss-fraction', type=float, default=None,
+                           help='Daily realised-loss limit as a fraction of the '
+                                f'starting bankroll (default '
+                                f'{DEFAULT_CONFIG.max_daily_loss_fraction:.2f}). '
+                                'Raising it measures a longer sample; it does '
+                                'not change what the live account runs.')
     # The band the backfilled book can actually represent. Kalshi's tick is a
     # TENTH of a cent below 10c and above 90c, and Predexon's snapshot of the
     # same book is whole cents — measured, ~91% of tail quotes are off the cent
@@ -258,12 +339,30 @@ def config_from_args(args: argparse.Namespace) -> Config:
     offsets = _parse_list(getattr(args, 'offsets', None))
     if offsets:
         overrides['decision_offsets'] = tuple(int(o) for o in offsets)
+    # Separate from the loop below: for the peer, "given but empty" is a real
+    # instruction (free the peer) and must not collapse into "not given".
+    raw_peer = getattr(args, 'peer_quote_sources', None)
+    if raw_peer is not None:
+        overrides['peer_quote_sources'] = (
+            () if str(raw_peer).strip().lower() in ('all', '')
+            else tuple(_parse_list(raw_peer)))
     for field, attr in (('quote_sources', 'quote_sources'),
                         ('stack_spot_groups', 'stack_spot_groups'),
                         ('stack_book_features', 'stack_book_features')):
         listed = _parse_list(getattr(args, attr, None))
         if listed:
             overrides[field] = listed
+    # `--exclude-price-band LO,HI` arrives as a string; Config wants a tuple and
+    # validates its symmetry in __post_init__.
+    raw_band = getattr(args, 'exclude_price_band', None)
+    if isinstance(raw_band, str):
+        try:
+            lo_s, hi_s = raw_band.split(',')
+            args.exclude_price_band = (float(lo_s), float(hi_s))
+        except (ValueError, AttributeError):
+            raise SystemExit(
+                f'--exclude-price-band wants "LO,HI" like "0.35,0.65"; '
+                f'got {raw_band!r}')
     for field, attr in (
         ('venue', 'venue'), ('window_minutes', 'window_minutes'),
         ('baseline_distribution', 'baseline_distribution'), ('n_folds', 'n_folds'),
@@ -282,6 +381,18 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('max_traded_price', 'max_traded_price'),
         ('init_score_source', 'init_score_source'),
         ('min_edge_pp', 'min_edge_pp'), ('half_spread_cents', 'half_spread_cents'),
+        ('max_daily_loss_fraction', 'max_daily_loss_fraction'),
+        ('maker_entry', 'maker_entry'),
+        ('max_stake_dollars', 'max_stake_dollars'),
+        ('maker_time_in_force', 'maker_time_in_force'),
+        ('maker_cancel_seconds', 'maker_cancel_seconds'),
+        ('maker_entry', 'maker_entry'),
+        ('max_stake_dollars', 'max_stake_dollars'),
+        ('max_entries_per_symbol_window', 'max_entries_per_symbol_window'),
+        ('max_positions_per_window', 'max_positions_per_window'),
+        ('min_train_windows', 'min_train_windows'),
+        ('exclude_price_band', 'exclude_price_band'),
+        ('max_drawdown_fraction', 'max_drawdown_fraction'),
         ('assume_maker', 'assume_maker'),
         ('ensemble_size', 'ensemble_size'),
         ('label_source', 'label_source'),
@@ -412,13 +523,26 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     # as None simply leaves the columns NaN, which is the correct state for the
     # four and a half years that predate the venue.
     depth = ladder_fits = None
+    # **Pruned to the requested range, like the bars above.** These two reads
+    # took no start or end, so a 51-day run loaded the same 2,462,859 depth rows
+    # as a 282-day one -- measured 2026-10-17, identical row counts in both logs
+    # while the bars correctly fell 405,613 -> 76,320 per symbol. The book is
+    # the larger table and it was never pruned.
+    #
+    # A day of padding on the near side, because the book features look BACK:
+    # `core/book_flow.py` reads three minutes before the decision, and a window
+    # at the very start of the range needs the minutes before it. A day is far
+    # more than any lookback here and costs almost nothing.
+    pad = pd.Timedelta(days=1)
+    depth_start = (_utc(args.start) - pad) if getattr(args, 'start', None) else None
     try:
-        depth = store.read('venue_depth')
+        depth = store.read('venue_depth', start=depth_start, end=end)
     except Exception as exc:                                  # noqa: BLE001
         logger.info('no venue_depth (%s); rows will price against the baseline',
                     str(exc)[:60])
     try:
-        ladder_fits = store.read('venue_implied_vol')
+        ladder_fits = store.read('venue_implied_vol',
+                                 start=depth_start, end=end)
     except Exception as exc:                                  # noqa: BLE001
         logger.info('no venue_implied_vol (%s)', str(exc)[:60])
     if depth is not None and len(depth):

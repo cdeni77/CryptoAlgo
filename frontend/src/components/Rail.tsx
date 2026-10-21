@@ -8,6 +8,7 @@
  * The footer carries the fee schedule, because it is the denominator of every
  * number on every page and it is an assumption rather than a measurement.
  */
+import { clock } from '../lib/format';
 import { Logo } from './Logo';
 
 export interface RailProps {
@@ -19,7 +20,9 @@ export interface RailProps {
 
 export function Rail({ routes, current, onNavigate, lastUpdated }: RailProps) {
   return (
-    <nav className="flex w-rail shrink-0 flex-col border-r border-rule bg-surface">
+    // Hidden below `md`, where `TabBar` takes over. 13.5rem of a 375px phone
+    // left 159px for the page, which wrapped every heading to one word a line.
+    <nav className="hidden w-rail shrink-0 flex-col border-r border-rule bg-surface md:flex">
       <div className="border-b border-rule px-5 py-5">
         <Logo />
         <p className="mt-2 font-mono text-micro leading-4 text-ink-3">
@@ -62,7 +65,10 @@ export function Rail({ routes, current, onNavigate, lastUpdated }: RailProps) {
         <div className="mt-2 text-ink-3/70">spread measured; depth read from the book</div>
         {lastUpdated && (
           <div className="mt-3 border-t border-rule pt-3">
-            {lastUpdated.toLocaleTimeString(undefined, { hour12: false })}
+            {/* `clock`, not `toLocaleTimeString(undefined)`: the latter is the
+                VIEWER's zone, so this line disagreed with every other time on
+                the page as soon as the dashboard was opened from elsewhere. */}
+            {clock(lastUpdated.toISOString())} ET
           </div>
         )}
       </div>

@@ -1,0 +1,71 @@
+services:
+  trader:
+    command:
+      - -m
+      - scripts.run_live
+      - --trade-args
+      - --loop
+      - --cycle-seconds
+      - "60"
+      - --mode
+      - live
+      - --place-orders
+      - --compound
+      - --bankroll
+      - "500"
+      - --max-stake-dollars
+      - "40"
+      # **0.5, not 1.5, because a maker pays a different toll.** 1.5pp was
+      # sized for a TAKER: the fee averages ~1.1pp of stake plus a 0.5c
+      # half-spread, so ~1.6pp had to be cleared before a crossing trade paid.
+      # Resting at the bid costs nothing and buys at a full cent better, so the
+      # cost is a CREDIT of ~0.465pp against the mid, not a charge — measured
+      # 2026-10-18, net +1.382pp at t=+5.17 with 100% of rows tradeable.
+      # At 1.5pp the model placed no orders at all and collected no fill data,
+      # which is the one thing maker entry was switched on to gather.
+      # Must match the `retrain` service, or the gates grade a policy the
+      # account does not run.
+      - --min-edge-pp
+      - "0.5"
+      - --kelly-fraction
+      - "0.10"
+      - --entry-offsets
+      - "3"
+      - "6"
+      - "9"
+      - "12"
+      - --require-peer-book
+      # A hole in the middle of the book. The fee 0.07*p(1-p) peaks at a coin
+      # flip -- 1.75pp of stake against 0.33pp at 95c -- and the measured signal
+      # there is ~0: on live-recorded quotes the 35-65c band alone lost $393
+      # (-2.38pp/ct) while excluding it took the whole book from -$55 to +$297.
+      # **Must stay identical to the `retrain` service's own flag**, or the
+      # gates score a policy the account does not run -- which is exactly the
+      # drift found on 2026-10-18, where the retrain graded wait_12 at 0.05
+      # Kelly while this traded first-clear across four offsets at 0.10.
+      - --exclude-price-band
+      - "0.35,0.65"
+      # **Rest at the bid instead of lifting the ask.** The venue charges makers
+      # nothing and the entry is a full cent better on a measured 1.000c spread
+      # -- together ~1.5-2pp per contract, against a model edge of ~1.1-1.5pp,
+      # so the execution cost had been larger than the entire signal. Measured
+      # 2026-10-18 on 54,100 live-recorded rows, the SAME model with no
+      # retraining: -$77.25 taker against +$2,445.76 maker.
+      #
+      # **This is a live EXPERIMENT, not a validated setting.** All 1,556 fills
+      # on this account are `is_taker: true` -- no resting order has ever filled
+      # here, and the backtest assumes every one does. The likeliest outcome is
+      # simply fewer fills: one observed book had 441 contracts already queued
+      # at the bid and we join behind them. A session with zero fills is a
+      # RESULT, not a fault. The gates are scored at the ask on purpose, so
+      # they bound this from below rather than banking the assumption.
+      - --maker-entry
+      # Pull an unfilled order after 60s of its OWN age. The forecast is what
+      # expires -- `sigma_remaining` is computed for the decision instant -- so
+      # a fill arriving minutes later takes an edge that has already moved.
+      - --maker-cancel-seconds
+      - "60"
+      - --no-require-gates
+      - --force
+      - --reason
+      - "live forward test; gates fail on the market comparison (model_minus_market, model_minus_market_p, calibration_vs_market) and the operator authorised real orders. --require-model-version was REMOVED 2026-10-18, so this no longer names one artifact - whatever the Sunday retrain installs trades at the next window boundary, unreviewed."

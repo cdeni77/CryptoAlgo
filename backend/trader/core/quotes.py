@@ -75,9 +75,30 @@ QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
 # that object — `live._record_touch` writes the quote the loop actually decided
 # on — so it ranks first, ahead of the minute-grid recorders, ahead of the
 # after-the-fact reconstruction. The old ordering put it LAST of the four.
+# **An unlisted source ranks LAST**, below the Predexon backfill -- the map
+# below fills a miss with `len(rank)`. So a new producer that is not named here
+# is fetched, stored, and then silently never selected. Both sources added on
+# 2026-10-21 hit exactly that: `candles` and `live_ws_replay` would have been
+# written and ignored.
+#
+# `candles` is Kalshi's own per-minute `yes_bid`/`yes_ask`, on the venue's true
+# `tapered_deci_cent` grid. It outranks `backfill` because the Predexon rows
+# round every tail quote to a whole cent -- measured 2026-10-21, 100% of
+# backfill quotes sit on a whole cent in every band against ~10% of live ones
+# in the tails, which is a 0.5c error where a 4c quote makes it a 12.5%
+# relative error in the probability. It ranks BELOW every live observer,
+# because a candle close is a 60-second bar boundary and not a decision-instant
+# quote.
+#
+# `live_ws_replay` is the stream archive re-folded through the same `BookCache`
+# the live path uses; it validated at 100.0000% exact whole-ladder agreement
+# against the recorded ladder over 8,169 overlapping minutes. It is a
+# RECONSTRUCTION, so it sits below the three live observers and above the
+# candles, which are a summary.
 QUOTE_SOURCE_PRIORITY = tuple(
     s.strip() for s in os.getenv(
-        'QUOTE_SOURCE_PRIORITY', 'live_touch,live_ws,live,backfill').split(',')
+        'QUOTE_SOURCE_PRIORITY',
+        'live_touch,live_ws,live,live_ws_replay,candles,backfill').split(',')
     if s.strip())
 
 # A book quoted twenty minutes ago is not a price this decision could have
@@ -181,9 +202,10 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                   other_venue: Optional[str] = 'polymarket',
                   max_age_seconds: float = DEFAULT_MAX_AGE,
                   sources: Sequence[str] = (),
-                  null_age: str = 'fresh',
+                  null_age: str = 'stale',
                   peer_max_age_seconds: Optional[float] = None,
                   peer_null_age: str = 'fresh',
+                  peer_sources: Optional[Sequence[str]] = None,
                   decision_latency_seconds: float = 3.0) -> pd.DataFrame:
     """`ask_up` / `ask_down` on each window row, from `venue_depth`.
 
@@ -204,8 +226,9 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     their own timestamps (`derived_quote_age`).
 
     The PEER has its own cap, `peer_max_age_seconds` (None follows
-    `max_age_seconds`), and its own null-age rule, `peer_null_age`, which stays
-    'fresh' unless the caller asks: only ~5% of live Polymarket rows are 5s
+    `max_age_seconds`), its own source list, `peer_sources` (None follows
+    `sources`; an empty list frees it entirely), and its own null-age rule,
+    `peer_null_age`, which stays 'fresh' unless the caller asks: only ~5% of live Polymarket rows are 5s
     fresh, so a tight Kalshi cap applied to the peer voids `venue_prob_gap`
     almost everywhere.
 
@@ -326,8 +349,25 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     # column holding a Kalshi one is the `no_levels` denomination trap wearing a
     # different name.
     if other_venue:
+        # **The peer gets its OWN source list, and this is not a detail.**
+        # `sources` exists to exclude a producer whose KALSHI prices are not
+        # executable -- Predexon, which quantises a deci-cent grid to whole
+        # cents. Polymarket's backfill is a different pipeline (the gamma API)
+        # and has nothing to do with that defect, but `filter_sources` matches
+        # on the bare name, so naming Kalshi's live observers discarded
+        # Polymarket's `backfill` too: 77,759 windows, and with
+        # `--complete-cases` every row needing a `cross_venue` feature went
+        # with them. Measured 2026-10-21, 6,465 candidate windows became 956
+        # and the walk-forward could not form a single fold.
+        #
+        # `None` follows `sources`, which is what every caller got before and
+        # keeps the old behaviour exactly; an explicit list -- including an
+        # empty one, meaning no restriction -- frees the peer. Same shape as
+        # `peer_max_age_seconds` and `peer_null_age` for the same reason: the
+        # peer is a cross-venue FEATURE, never the book we execute against.
         peer = filter_sources(depth[depth['venue'] == other_venue],
-                              sources).copy()
+                              sources if peer_sources is None
+                              else peer_sources).copy()
         merged['pm_market_probability'] = np.nan
         merged['pm_spread'] = np.nan
         if len(peer):

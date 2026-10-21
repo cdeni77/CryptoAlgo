@@ -1,0 +1,467 @@
+# DATA.md — how the training set is built, and what every number in it is
+
+Companion to `CLAUDE.md` (why the strategy is shaped the way it is) and
+`research/RESEARCH_PROTOCOL.md` (how a result is allowed to be believed). This
+file is about the **data itself**: where each number comes from, what is wrong
+with it, what cannot be recovered, and what the pipeline does from raw bytes to
+a scored row.
+
+Everything stated as measured here was measured against the live venue, and the
+date is given. Where something is an assumption, it says so.
+
+---
+
+## 0. The unit of data is a WINDOW, not a row
+
+A Kalshi 15-minute market opens on a quarter-hour, records the price there as
+its **strike**, and settles on whether the price at the next boundary is at or
+above it. We score four decision offsets (+3, +6, +9, +12 minutes) per window,
+on three symbols.
+
+```
+1 window  ->  3 symbols  ->  4 offsets  =  12 rows
+```
+
+Those 12 rows are **not 12 observations**. The four offsets share one
+settlement; the three symbols are ~0.7 correlated inside a window; consecutive
+windows chain, because a window's strike is the previous window's settlement.
+
+**All inference resamples windows.** Quoting a row count as a sample size is a
+protocol violation (`RESEARCH_PROTOCOL` §0). This bit us directly on
+2026-10-21: 642 live settlements looked like a comfortable sample against the
+500-trade decision rule, but they were 275 windows over **4 days**, and the
+window-clustered interval on realised edge was −5.23 .. +2.14 pp — useless in
+either direction.
+
+---
+
+## 1. The datasets, what they are, and what is wrong with each
+
+### `minute_bars` — the price series
+
+| venue | span | what it is |
+|---|---|---|
+| `coinbase_spot` | 2021-08-24 → now, 8.1M rows | one-minute OHLCV from Coinbase |
+| `cfbenchmarks` | being backfilled | CF Benchmarks' own index (BRTI / ETHUSD_RTI / SOLUSD_RTI) |
+
+**The problem Coinbase has:** the markets settle on BRTI, and the market prices
+on BRTI. We compute displacement, `sigma_remaining` and **35 of the deployed
+artifact's 55 features** from Coinbase.
+
+Measured 2026-10-21 over 400 consecutive BTC windows:
+
+```
+sd of the Coinbase-vs-BRTI basis          0.96 bp
+autocorrelation at 15 minutes            +0.094      <- white noise
+sd of the change over 15 minutes          1.29 bp
+fraction that cancels between strike and decision   ~5%
+```
+
+`CLAUDE.md` assumed *"both ends use the same approximation, so most of its bias
+cancels in the comparison."* **That is wrong.** The basis is white noise at the
+window scale, so it compounds rather than cancels. ~1.29 bp reaches
+displacement, which at +12m against ~8 bp of remaining sigma is **~6 pp of
+probability error** — against a target edge of **1.5 pp**. The signal is
+smaller than the noise in its own input.
+
+The fix is to run the pipeline on `venue='cfbenchmarks'`. `load_minute_bars`
+reads `minute_bars` with `venue=config.venue`, so this is a config change, not
+a rewrite — and it gives a clean A/B.
+
+**Volume is carried over from Coinbase on the index bars, deliberately.** An
+index has no volume, but `microstructure` reads `volume_z_15`, `vwap_gap_15`
+and `signed_volume_15`, and under `--complete-cases` a null column drops every
+row. Volume is also the one quantity the basis cannot distort. The prices are
+the venue's; only the activity columns are Coinbase's, and `venue` says so.
+
+**Validated on write:** BRTI bars agree with Coinbase to a median +0.03 bp, and
+the minute alignment was confirmed by shift test — mean |diff| 4.15 at shift 0
+against 34.15 and 31.81 at ±1 minute. A bar stamped at the wrong end would
+shift every window and nothing would raise.
+
+### `venue_depth` — the order book at each minute
+
+One row per `(venue, symbol, window, offset, source)`. `source` says which pipe
+produced it, and **the sources are not interchangeable**:
+
+| source | span | prices | sizes/depth |
+|---|---|---|---|
+| `backfill` (Predexon) | 2026-01-07 → 2026-10-14 | whole-cent in the tails | present |
+| `candles` (Kalshi) | 2026-08-13 → now (+ history being added) | **true deci-cent** | **absent** |
+| `live` / `live_ws` / `live_touch` | 2026-08-25 → now | true deci-cent | present |
+| `live_ws_replay` | 2026-09-30 → 2026-10-18 | true deci-cent | present |
+| `polymarket` | 2026-01-07 → now | — | cross-venue feature only |
+
+**Predexon's defect is quantisation, not staleness-of-price-level.** Kalshi's
+tick is `tapered_deci_cent` — a tenth of a cent below 10c and above 90c — and
+Predexon rounds to whole cents there.
+
+Measured 2026-10-21 on the 2026-08-25 .. 2026-10-14 overlap where all three
+sources exist, as the share of quotes NOT on a whole cent:
+
+```
+             above 90c   below 10c   mid band
+backfill          0%          0%         0%     <- fully quantised
+candles          93%         68%         0%
+live_ws          93%         90%         0%     <- ground truth
+```
+
+Candles reproduce the live book's tick behaviour almost exactly above 90c and
+substantially below it; Predexon reproduces none of it. Mid-band 0% is correct
+for all three — the tick genuinely is a whole cent inside [0.10, 0.90].
+
+**The price-error comparison does NOT discriminate**, and should not be quoted
+as if it did: median |error| against the live book is 2.200c for Predexon and
+2.000c for candles, because both are MINUTE-BOUNDARY observations compared
+against live samples taken at arbitrary instants, and these markets move ~2c in
+a minute. That is timing common to both, not accuracy.
+
+Caveat worth carrying: candles are 68% off-grid below 10c where the live book
+is 90%, so candle closes land on whole cents more often than the real book does
+in the deep tail — and 41% of live contracts are bought under 15c.
+
+**Predexon's sizes are a separate and worse problem.** Measured 2026-10-21 on
+110,555 rows overlapping the live book:
+
+```
+total depth ratio        1.0140      <- usable
+bid size ratio (median)  1.2182      <- 22% too big
+bid size correlation     0.2623      <- weak
+median |price diff|      2.000 cents
+```
+
+The 2-cent price gap explains the size gap: Predexon is a **minute-stale**
+snapshot, so its "best bid" sits at a different price level and "size at the
+touch" is a different quantity, not the same one noisily. **Do not build
+imbalance features from Predexon.**
+
+### `venue_strikes` — the venue's own strike and settlement
+
+`floor_strike` is the number the market actually settles against; it and
+`expiration_value` come from `/historical/markets/{ticker}` or `/markets/{ticker}`.
+
+```
+coverage probed 2026-10-21, 88 random windows across 11 months:
+  market metadata   88/88
+  floor_strike      88/88
+  expiration_value   0/8 in 2025-12, 6/8 in 2026-01, 8/8 from 2026-02
+```
+
+This is the **exact** strike and the **exact** label. It removes two standing
+caveats outright rather than reducing them.
+
+### `venue_candles` — the venue's own per-minute candle
+
+Traded-price OHLC, bid OHLC, ask OHLC, volume, open interest. `price_low` is
+the cheapest print in the minute, which bounds the maker-fill question over
+every market the endpoint serves.
+
+### `venue_trades` — the public tape
+
+One row per `(market, minute, aggressor side)` with `n_prints`, `contracts`,
+`min_price`, `max_price`, `vwap`. 27.4M prints, 16,269 markets, 2026-08-25 → now.
+
+**`taker_book_side='ask'` is the SELLING aggressor** — its prints land on the
+bid (vwap − yes_bid = −0.0001 over 188,451 rows), while `'bid'` prints land on
+the ask. The natural reading is backwards, and a fill simulation built on it
+inverts every result while looking entirely plausible.
+
+**The minute aggregation is too coarse for its own purpose.** A minute carries
+a median 724 selling prints spanning 11 cents, so "the minute's low was below
+our limit" is true ~99.9% of the time. Answering the fill question properly
+needs per-print timestamps, which `backfill_trades._rows` discards.
+
+### Everything else
+
+| dataset | span | note |
+|---|---|---|
+| `venue_ladder` | 2026-08-25 → now | recorded live book; **cannot be backfilled** |
+| `venue_book_events` | 2026-09-30 → now | raw WS frames, 1.5bn rows, **60-day retention** |
+| `venue_implied_vol` | 2026-01-07 → now | fitted off the KXBTCD ladder — inputs are Predexon |
+| `venue_settlements` | 2026-01-06 → now | market results, both venues |
+| `pm_ladder` | 2026-08-25 → now | Polymarket book |
+| `index_proxy_1s` | 2026-10-14 → now | home-made 4-exchange median; superseded by BRTI |
+| `spot_trades` | 2026-10-14 → now | Coinbase tape, 60-day retention |
+
+---
+
+## 2. What cannot be recovered, ever
+
+**The venue serves no historical order book.** Sizes, depth buckets and level
+counts before **2026-08-25** do not exist at any price. Predexon's stale-touch
+sizes were the only candidate and failed validation (§1).
+
+That is why these **7 of 55** features cannot extend back:
+
+```
+book_flow     imbalance_change_3, depth_trend_3, imbalance_persistence
+market_state  imbalance_touch, imbalance_5c, depth_ratio, book_convexity
+```
+
+The other **48 extend to 2026-01-14**, which is where the exact label starts.
+
+**Retention clocks that are running:**
+
+* `venue_book_events` — 60 days. The WS replay window closes ~2026-11-29.
+* `spot_trades` — 60 days.
+* The live `/markets/trades` tier — ~3 months; older prints answer on
+  `/historical/trades`, which returned empty for 2026-08 markets when tested,
+  so the fallback is **unverified**, not confirmed.
+
+---
+
+## 3. Enumeration was the wall, not the data
+
+The single most important structural fact found on 2026-10-21:
+
+> `/markets?status=settled` and `/historical/markets` only **list** about 69
+> days back. The **per-ticker** endpoints serve far older markets. The limit
+> was the listing, never the data.
+
+A ticker is `series + close in New York local + minute suffix`, fully
+determined by the window, so tickers are **constructed**, not enumerated:
+
+```
+KXBTC15M  first market ~2025-12-16
+KXETH15M  first market ~2025-12-16
+KXSOL15M  first market ~2025-12-31
+```
+
+This is what makes the long history reachable at all. It applies to market
+metadata, candlesticks and trades alike.
+
+**The two candle endpoints TILE rather than overlap:**
+
+```
+/historical/markets/{ticker}/candlesticks   2025-12 .. 2026-08   (empty after)
+/markets/candlesticks (batch)               ~69 days back from today
+```
+
+---
+
+## 4. Traps that produce silence, not errors
+
+Every one of these was found by running something, not by reading it.
+
+1. **The two candle endpoints disagree on field names.** Batch sends
+   `yes_bid.close_dollars` and `volume_fp`; per-ticker historical sends
+   `yes_bid.close` and `volume`. `rows_for_market()` returned **0 of 15**
+   candles on a historical payload — it would have written nothing for 69,120
+   markets without an error.
+2. **The websocket and REST disagree the same way.** Stream sends
+   `msg.yes_dollars_fp`; REST sends `orderbook_fp.yes_dollars`.
+3. **`taker_book_side` is inverted** against the natural reading (§1).
+4. **`--quote-sources` filters BOTH venues.** Excluding Predexon from Kalshi
+   also discarded Polymarket's gamma backfill — 77,759 windows — and under
+   `--complete-cases` every `cross_venue` row with it: 6,465 candidate windows
+   became 956 and no fold could form. Fixed by `peer_quote_sources`.
+5. **A Polymarket slug's trailing stamp is the window OPEN, not its close.**
+6. **`no_levels` is NO-denominated on Kalshi and YES-denominated on Polymarket**
+   before conversion.
+7. **`seq` is global per SUBSCRIPTION, not per market**, so one gap condemns
+   every book on the connection.
+8. **`delta_fp` is a signed change**, so levels driven to zero accumulate float
+   residue and keep a dead price at the touch.
+9. **Minute-grid sources are aged FORWARD** (`latency − raw`), so a book
+   sampled more than `decision_latency_seconds` after its own minute goes
+   negative and is dropped. A stream row stamped 0s old yields 6/6 `book_flow`
+   features; the same row at 7s yields 0/6.
+
+---
+
+## 5. The pipeline, end to end
+
+```
+Coinbase REST/WS ─┐
+Kalshi REST/WS   ─┼─> spool / recorders ─> ResearchStore (Parquet, partitioned)
+Polymarket       ─┘                              │
+CF Benchmarks ───────────────────────────────────┘
+                                                 │
+                        core/windows.py ── the 15-minute grid, strike, label
+                                                 │
+                        core/vol.py ── HAR + intraday seasonality -> sigma_remaining
+                                                 │
+                        core/baseline.py ── F(x/sigma), THE NULL
+                                                 │
+                        core/quotes.py ── attach the market quote (priority ladder)
+                                                 │
+                        core/features.py ── 9 groups + the clock control
+                                                 │
+                        core/model.py ── LightGBM on an init_score
+                                                 │
+                        core/backtest.py ── walk-forward, 7-day folds, 1-day embargo
+                                                 │
+                        core/metrics.py ── 24 gates ─> core/promotion.py
+```
+
+### The quote priority ladder
+
+```
+QUOTE_SOURCE_PRIORITY = live_touch, live_ws, live, live_ws_replay, candles, backfill
+```
+
+An **unlisted source ranks LAST**, below the backfill — a new producer that is
+not named here is quietly distrusted rather than quietly trusted.
+
+### The init score
+
+`init_score_source='market'` with `init_coefficient=1.0` means the prediction is
+
+```
+market_logit x 1.0  +  residual_scale x (tree correction)
+```
+
+So the **anchor is the market's own probability** — which is BRTI-correct by
+construction — and only the **correction** rides on our price-derived features.
+That bounds how much the Coinbase basis can hurt: it degrades the correction,
+not the anchor.
+
+### Point-in-time discipline
+
+* A decision at offset `m` sees the close of bar `m-1` and nothing after.
+* Cross-validation splits on the **window**, never the row.
+* The embargo is a **day**, not fifteen minutes, because `log_rv_1440` reaches
+  back that far.
+* `available_time` is when a row became knowable, and a row whose
+  `available_time` precedes its `event_time` is refused at write time.
+* Standard errors come from **fold dispersion**, not a breadth formula.
+
+---
+
+## 6. The target
+
+```
+strike      = mean over [t0 - 1min, t0)        <- 60s of BRTI, per the venue's rules
+settlement  = mean over [t1 - 1min, t1)
+outcome     = settlement >= strike             <- `strike_type` is greater_or_equal
+```
+
+Today `core/windows.py` builds both from Coinbase OHLC means. Measured against
+56,284 of the venue's own settlements, that proxy agrees **96.98%** of the
+time, and the disagreement lives entirely in near-ties:
+
+```
+move from strike   windows   disagree
+     <1bp             2806     34.85%
+     1-2bp            2826     13.91%
+     2-5bp            7860      3.18%
+    10-25bp          18147      0.05%
+     >25bp           13472      0.01%
+```
+
+**This is ALREADY FIXED in the deployed configuration, and the fix is not
+`expiration_value`.** `--label-source venue` swaps `outcome` for
+`venue_outcome`, which is the venue's own `result`; measured 2026-10-21 it is
+present on 100% of scored rows. The 3.12% above is the Coinbase PROXY's error
+against the venue label, not an error the training set still carries.
+
+What `expiration_value` adds is the settlement **value** — the number, not the
+yes/no. That gives an exact next-window strike and an exact distance from
+strike, which the proxy only approximates. It does not remove label noise that
+has already been removed.
+
+---
+
+## 7. The intended end state
+
+| quantity | today | after |
+|---|---|---|
+| strike | Coinbase OHLC mean, ~0.55bp median error | venue `floor_strike`, exact |
+| label | **already venue-sourced** (`--label-source venue`) | unchanged; `expiration_value` adds the settlement VALUE |
+| price series | Coinbase | CF Benchmarks index |
+| quotes | Predexon whole-cent in tails | venue candles at true tick |
+| span (Kalshi-only) | 2026-08-13 → now, 6,465 windows | 2026-01-14 → now |
+| windows actually usable | 6,465 | **~16,600 with `implied_vol`, ~27,000 without** |
+| features available | 55 | 48 over the long span, 55 from 2026-08-25 |
+| folds | 5 (`min_folds` FAILS) | ~20 with `implied_vol`, ~35 without |
+
+**`implied_vol` coverage is the binding constraint over the long span, not the
+quote source.** Measured 2026-10-21, the fraction of (symbol, window) with an
+IV fit in the same hour:
+
+```
+2026-01  22%   2026-04  28%   2026-07  28%
+2026-02  25%   2026-05  19%   2026-08  43%
+2026-03  21%   2026-06  13%   2026-09  68%   2026-10  61%
+```
+
+Under `--complete-cases` a NaN in any selected feature drops the whole row, so
+keeping `implied_vol` caps the recoverable sample at roughly a quarter of the
+pre-August windows. Whether its 5 features are worth ~10,000 windows is an
+ablation, not a judgement.
+
+**A second source-comparability trap sits in `cross_venue`.** Polymarket rows
+exist at 96-99% of decision offsets across the whole span, but the share
+passing a 5-second freshness gate runs 91% in January against 28% in
+September — because backfilled rows have their age counted MINUTE-BACKWARD
+while live recorders count FORWARD (`core/quotes.MINUTE_BACKWARD_SOURCES`).
+The backfill can report a small age by construction. Extending the span
+therefore makes old rows pass the peer gate far more often than recent ones,
+which is a selection artifact and not better data.
+
+### The constraint that governs any switch
+
+Live **already fetches `floor_strike`** and uses it for settlement, but
+deliberately **not** for features. An earlier version overwrote `strike` and
+recomputed only `z_score`, leaving `abs_z_score`, the three excursion-z
+columns, `path_efficiency`, `displacement_vs_elapsed`, `touched_opposite` and
+`peer_displacement` on the bar basis — so `abs_z_score == |z_score|`, which
+holds in every training row, was violated at inference. A tree ensemble does
+not degrade gracefully off its training manifold.
+
+**So the strike must be changed in TRAINING first, and live switched to match.**
+Not the other way round, and never piecemeal.
+
+**The same rule binds the price series, and this is MEASURED, not argued.**
+Tested 2026-10-21 on 16,344 windows graded against the venue's own settlement,
+fitting one calibration scale per variant so neither gets more freedom:
+
+```
+Coinbase price / Coinbase strike   log loss 0.482983
+Coinbase price / venue strike      log loss 0.488026   WORSE
+window-clustered gain -0.0063 nats, 90% CI -0.0118 .. -0.0018
+```
+
+Adopting the venue's exact strike while the price stays on Coinbase makes the
+barrier null **significantly worse**, because it injects the cross-index basis
+rather than removing it. The strike and the price series move together, or
+neither moves. The end-state cell — BRTI price with the venue strike — is not
+yet testable; it needs index bars over the same windows.
+
+---
+
+## 8. Rate limits and cost
+
+```
+usage tier   advanced (granted 2026-10-21, free, permanent, Advanced is the ceiling)
+read         300 tokens/s, bucket 900   -> 30 req/s at the default 10-token cost
+write        300 tokens/s, bucket 900   -> 30 req/s
+/cfbenchmarks/*   50 tokens             ->  6 req/s
+```
+
+**Backfills must be SEQUENCED, not parallel.** They share one bucket, and the
+429 retry holds its semaphore slot while it sleeps, so once throttling starts
+throughput collapses — measured on the tape backfill at **~11 markets/min at
+concurrency 4 against ~96/min at concurrency 2**, about 9x.
+
+---
+
+## 9. How to rebuild from nothing
+
+```bash
+cd backend/trader
+python -m scripts.scrape --backfill-days 1825      # Coinbase bars
+python -m scripts.scrape --fill-gaps               # see the 1-in-301 note in CLAUDE.md
+python -m scripts.sync_store
+
+python -m scripts.backfill_markets --start 2026-01-07   # exact strike + label
+python -m scripts.backfill_candles --historical \
+       --start 2025-12-16 --end 2026-08-13              # true-tick quotes, old
+python -m scripts.backfill_candles                      # true-tick quotes, recent
+python -m scripts.backfill_index --start 2026-01-07     # CF Benchmarks index
+python -m scripts.backfill_trades --concurrency 2       # the tape
+python -m scripts.build_depth                           # one table from every book source
+
+python -m scripts.baseline                              # read the NULL first
+python -m scripts.evaluate                              # walk-forward + gates
+```

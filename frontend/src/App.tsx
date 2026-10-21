@@ -10,18 +10,22 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ComponentType } from 'react';
 import { Rail } from './components/Rail';
+import { TabBar } from './components/TabBar';
 import { AccountPage } from './pages/AccountPage';
 import { CalibrationPage } from './pages/CalibrationPage';
 import { DecisionsPage } from './pages/DecisionsPage';
 import { LivePage } from './pages/LivePage';
 import { ModelPage } from './pages/ModelPage';
 
+// `short` is only for the mobile tab bar, where five labels share 375px.
+// Carried here rather than mapped inside `TabBar` so a new route cannot get a
+// tab with no label and no compile error.
 export const ROUTES = {
-  '/': { label: 'Live', hint: 'the barrier state now, per symbol' },
-  '/decisions': { label: 'Decisions', hint: 'every decision point, traded or refused' },
-  '/calibration': { label: 'Calibration', hint: 'is the forecast honest about its own confidence' },
-  '/model': { label: 'Model', hint: 'gates, and every candidate ever evaluated' },
-  '/account': { label: 'Account', hint: 'equity over time and settled positions' },
+  '/': { label: 'Live', short: 'Live', hint: 'the barrier state now, per symbol' },
+  '/decisions': { label: 'Decisions', short: 'Decide', hint: 'every decision point, traded or refused' },
+  '/calibration': { label: 'Calibration', short: 'Calib', hint: 'is the forecast honest about its own confidence' },
+  '/model': { label: 'Model', short: 'Model', hint: 'gates, and every candidate ever evaluated' },
+  '/account': { label: 'Account', short: 'Acct', hint: 'what the account is worth, and how it got there' },
 } as const;
 
 export type RoutePath = keyof typeof ROUTES;
@@ -74,6 +78,7 @@ export default function App() {
         routes={Object.entries(ROUTES).map(([path, meta]) => ({
           path,
           label: meta.label,
+          short: meta.short,
           hint: meta.hint,
         }))}
         current={route}
@@ -82,13 +87,23 @@ export default function App() {
       />
 
       <main className="min-w-0 flex-1">
-        <header className="sticky top-0 z-10 flex items-center justify-between gap-6 border-b border-rule bg-paper/95 px-8 py-4 backdrop-blur-sm">
-          <div>
-            <div className="eyebrow">{ROUTES[route].hint}</div>
-            <h1 className="text-lg font-semibold text-ink">{ROUTES[route].label}</h1>
+        <header className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-rule bg-paper/95 px-4 py-3 backdrop-blur-sm md:gap-6 md:px-8 md:py-4">
+          {/* `min-w-0` on the flex child, or the long hint refuses to shrink and
+              pushes the clock off the right edge instead of truncating. */}
+          <div className="min-w-0">
+            {/* The hint is a full sentence; on a phone it is one line or it is
+                three. Hidden rather than wrapped — the h1 already names the
+                page, and the hint is still the button's title in the rail. */}
+            <div className="eyebrow hidden truncate sm:block">{ROUTES[route].hint}</div>
+            <h1 className="truncate text-base font-semibold text-ink md:text-lg">
+              {ROUTES[route].label}
+            </h1>
           </div>
-          <div className="text-right">
-            <div className="eyebrow">next settlement</div>
+          <div className="shrink-0 text-right">
+            {/* Every time on this dashboard is US Eastern -- the venue's own
+                day boundary, and the zone the account reconciles against. Said
+                here because a clock with no zone is read as the viewer's. */}
+            <div className="eyebrow">next settlement · ET</div>
             <div className="font-mono text-mid font-medium tabular-nums text-ink">
               {String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:
               {String(secondsLeft % 60).padStart(2, '0')}
@@ -96,10 +111,23 @@ export default function App() {
           </div>
         </header>
 
-        <div className="mx-auto max-w-shell px-8 py-8">
+        {/* `pb-20` clears the fixed tab bar, which would otherwise sit on top of
+            the last row of every page. */}
+        <div className="mx-auto max-w-shell px-4 pb-20 pt-5 md:px-8 md:pb-8 md:pt-8">
           <Page />
         </div>
       </main>
+
+      <TabBar
+        routes={Object.entries(ROUTES).map(([path, meta]) => ({
+          path,
+          label: meta.label,
+          short: meta.short,
+          hint: meta.hint,
+        }))}
+        current={route}
+        onNavigate={navigate}
+      />
     </div>
   );
 }

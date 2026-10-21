@@ -50,8 +50,31 @@ MAX_AGE: dict[str, float] = {
     'spot_stream': 180.0,  # heartbeats every second; stamps every ~5s
     'index': 180.0,        # stamps every ~5s while a proxy is being produced
     'ladder': 300.0,       # 60s cadence
+    # The public tape. A 60s poll, and it stamps at the END of each cycle
+    # whether or not the cycle produced a row -- a 15-minute market that never
+    # printed in a minute is normal, so silence is not evidence of a wedge and
+    # must not be the thing this measures.
+    #
+    # **Until the trader is restarted this reads STALE, and that is correct.**
+    # This directory is bind-mounted into the live container, so the file is
+    # current while the running process read its component list hours ago and
+    # is not stamping this. A declared component that is not running is a true
+    # unhealthy, not a false alarm -- the fix is the restart, not a quieter
+    # check.
+    'trades': 300.0,
     'pm_ladder': 300.0,
     'implied_vol': 600.0,  # slower, and tolerant of venue gaps
+    # Reads the in-process stream cache every ~5s, so 120s of silence is
+    # twenty-four missed passes — that is the loop stopped, not a slow one.
+    # It marks only while something is OPEN, and touches each pass regardless
+    # so an idle book is not mistaken for a dead task.
+    'marks': 120.0,
+    # The per-minute book sampler that feeds `book_flow`. A 60s period, so
+    # three missed minutes is a real stall -- and a stall here is not loud:
+    # `book_flow` simply scores NaN and the live model silently stops being
+    # the one the gates measured, which is the failure this component was
+    # added to end.
+    'book_minutes': 200.0,
     'store_sync': 7200.0,  # hourly, so two missed passes
 }
 

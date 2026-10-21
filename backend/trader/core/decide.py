@@ -35,7 +35,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Mapping, Optional
 
 import numpy as np
 import pandas as pd
@@ -69,7 +69,8 @@ class Reason(str, Enum):
     FEE_CEILING = 'fee_ceiling'                # negative EV once the order fee rounds up
     WINDOW_EXPOSURE = 'window_exposure'        # too much already at risk this window
     POSITION_LIMIT = 'position_limit'          # too many correlated legs this window
-    ALREADY_ENTERED = 'already_entered'        # one entry per window
+    ALREADY_ENTERED = 'already_entered'        # entries per (symbol, window) used up
+    OPPOSITE_SIDE = 'opposite_side'            # window already held on the other side
     OFFSET_NOT_TRADED = 'offset_not_traded'    # scored, but not an entry offset
     BANKROLL_FLOOR = 'bankroll_floor'          # stop-trading floor breached
     HALTED = 'halted'                          # a circuit breaker is latched
@@ -129,14 +130,55 @@ class WindowExposure:
     stake: float = 0.0
     positions: int = 0
     symbols_entered: frozenset[str] = frozenset()
+    #: How many entries each symbol already holds in this window. Needed once
+    #: `max_entries_per_symbol_window` can exceed 1, because a set answers
+    #: "has it entered" and not "how many times". Left empty by callers that
+    #: predate it; the check below then falls back to the set, so the default
+    #: one-entry rule behaves exactly as it always did.
+    entry_counts: Mapping[str, int] = field(default_factory=dict)
+    #: The side each symbol is already held on in this window. **Once more than
+    #: one entry per (symbol, window) is allowed, nothing else stops two
+    #: offsets taking OPPOSITE sides** -- and that is not a hedge, it is a
+    #: guaranteed loss: measured live 2026-10-20, three such markets settled
+    #: with revenue $0.00 and -$6.29, the whole stake, because buying the other
+    #: side closes the first at a loss rather than holding both to settlement.
+    #: `already_entered` used to prevent this as a side effect of forbidding
+    #: any second entry at all; with that relaxed the constraint has to be
+    #: stated explicitly.
+    sides: Mapping[str, str] = field(default_factory=dict)
+
+    def side_for(self, symbol: str) -> Optional[str]:
+        """The side this symbol is already held on, or None."""
+        value = self.sides.get(symbol)
+        return str(value) if value is not None else None
+
+    def entries_for(self, symbol: str) -> int:
+        """Entries already taken for `symbol` in this window.
+
+        Falls back to membership of `symbols_entered` so an exposure built the
+        old way still reports 1 rather than 0 — reporting 0 would re-open a
+        window that is already held, which is the double-entry this guards.
+        """
+        if symbol in self.entry_counts:
+            return int(self.entry_counts[symbol])
+        return 1 if symbol in self.symbols_entered else 0
 
     def with_(self, decision: Decision) -> 'WindowExposure':
         if not decision.traded:
             return self
+        counts = dict(self.entry_counts)
+        counts[decision.symbol] = self.entries_for(decision.symbol) + 1
+        sides = dict(self.sides)
+        if decision.side is not None:
+            # First side wins and is never overwritten, so a later opposite
+            # decision is refused against the side actually held.
+            sides.setdefault(decision.symbol, str(decision.side.value))
         return WindowExposure(
             stake=self.stake + decision.stake,
             positions=self.positions + 1,
             symbols_entered=self.symbols_entered | {decision.symbol},
+            entry_counts=counts,
+            sides=sides,
         )
 
 
@@ -239,6 +281,63 @@ def price_and_edge(
     )
 
 
+def as_maker_prices(frame):
+    """The price a RESTING order pays, in the columns `decide()` reads.
+
+    **`price_and_edge` takes the price to PAY, and that depends on how we
+    enter.** A taker lifts the ask; a maker rests at the bid. Handing decide()
+    the ask while resting at the bid understates every edge by a full spread
+    and refuses trades that are profitable — the mirror of the defect that had
+    the live path adding a half-spread on top of a real ask.
+
+    `scripts/live.py` does not call this: it has the book and takes the true
+    touch from `Quote.bid_for`. A backtest has only the summarised asks, so the
+    bids are derived — `yes_bid = 1 - ask_down`, `no_bid = 1 - ask_up` — which
+    is exact whenever both asks came from the same snapshot, and they do.
+
+    Worth the arithmetic: measured 2026-10-18 on 54,100 live-recorded rows, the
+    SAME model with no retraining went -$77.25 (-0.108pp/ct) as a taker to
+    +$2,445.76 (+1.608pp/ct) priced this way. The fee is only half of it — the
+    venue charges makers nothing, and on a measured 1.000c spread buying the
+    bid is worth as much again.
+
+    **It does not model whether the order FILLS**, which is the whole risk.
+    This used to add that nothing had ever been observed to rest; that stopped
+    being true on 2026-10-18, and 512 of 668 fills since (77%) are makers. The
+    untested half is now narrower but sharper: a resting order fills only when
+    somebody chooses to cross to it, so the filled subset is adversely selected
+    relative to the orders placed. See `Config.maker_entry`.
+    """
+    if frame is None or not len(frame):
+        return frame
+    if 'ask_up' not in frame.columns or 'ask_down' not in frame.columns:
+        return frame
+    out = frame.copy()
+    up, down = out['ask_up'], out['ask_down']
+    out['ask_up'], out['ask_down'] = 1.0 - down, 1.0 - up
+    return out
+
+
+def outside_dead_band(price, config) -> np.ndarray:
+    """True where `price` is tradeable, i.e. NOT inside `exclude_price_band`.
+
+    The cost is a parabola and the signal is not: `0.07*p(1-p)` is 1.75pp of
+    stake at a coin flip against 0.33pp at 95c, so the middle of the book is the
+    most expensive place to trade — and measured on 54,100 live-recorded rows
+    graded on the venue's own settlement, 35c-65c is also where the model's
+    disagreement was worth -0.021pp. Maximum toll, zero signal.
+
+    All-True when the band is unset, which is the default, so this is inert
+    unless asked for.
+    """
+    band = getattr(config, 'exclude_price_band', None)
+    price = np.asarray(price, dtype=float)
+    if band is None:
+        return np.ones(np.shape(price), dtype=bool)
+    lo, hi = float(band[0]), float(band[1])
+    return ~((price >= lo) & (price <= hi))
+
+
 def ensemble_gates(
     is_up: np.ndarray,
     probability: np.ndarray,
@@ -310,7 +409,9 @@ def stateless_screen(
         ask_up=rows['ask_up'].to_numpy(dtype=float) if has_book else None,
         ask_down=rows['ask_down'].to_numpy(dtype=float) if has_book else None,
     )
-    in_band = (price >= config.min_traded_price) & (price <= config.max_traded_price)
+    in_band = ((price >= config.min_traded_price)
+               & (price <= config.max_traded_price)
+               & outside_dead_band(price, config))
     plausible = np.abs(probability - price) * 100.0 <= config.max_disagreement_pp
     clears = edge >= config.min_edge_pp / 100.0
     uncertain, disagree = ensemble_gates(
@@ -424,7 +525,9 @@ def decide(
     tradeable = config.entry_offsets
     if tradeable is not None and int(base.offset) not in tuple(tradeable):
         return refuse(Reason.OFFSET_NOT_TRADED)
-    if symbol in exposure.symbols_entered:
+    # `>=`, counted, not `in`: with `max_entries_per_symbol_window` at its
+    # default of 1 this is exactly the old membership test.
+    if exposure.entries_for(symbol) >= config.max_entries_per_symbol_window:
         return refuse(Reason.ALREADY_ENTERED)
     if exposure.positions >= config.max_positions_per_window:
         return refuse(Reason.POSITION_LIMIT)
@@ -477,6 +580,15 @@ def decide(
         ask_down=np.array([ask_down]) if has_book else None,
     )
     side = Side.UP if bool(is_up_a[0]) else Side.DOWN
+    # **Never both sides of one market.** Checked here rather than beside
+    # ALREADY_ENTERED because the side is not known until now. Buying the
+    # opposite side does not hedge -- the venue nets it against the open
+    # position, so the pair settles at revenue $0.00 and the entire premium on
+    # both legs is lost. Refusing is also the honest reading: the model has
+    # changed its mind, and with hold-to-settle there is no exit to take.
+    held = exposure.side_for(symbol)
+    if held is not None and held != str(side.value):
+        return refuse(Reason.OPPOSITE_SIDE)
     price = float(price_a[0])
     probability = float(probability_a[0])
     cost = float(cost_a[0])
@@ -496,6 +608,8 @@ def decide(
                   market_ticker=_optional_str(get, 'market_ticker'))
 
     if not (config.min_traded_price <= price <= config.max_traded_price):
+        return refuse(Reason.PRICE_OUT_OF_BAND, **common)
+    if not bool(outside_dead_band(np.array([price]), config)[0]):
         return refuse(Reason.PRICE_OUT_OF_BAND, **common)
     if abs(probability - price) * 100.0 > config.max_disagreement_pp:
         return refuse(Reason.DISAGREEMENT_IMPLAUSIBLE, **common)

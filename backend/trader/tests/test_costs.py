@@ -220,3 +220,56 @@ def test_the_per_order_ceiling_no_longer_penalises_small_orders_materially():
     single = float(trade_fee(1, 0.50, CFG))
     ten = float(trade_fee(10, 0.50, CFG))
     assert 10 * single - ten < 1e-3
+
+
+# --------------------------------------------------------------------------
+# the dead band: a HOLE in the middle of the price band
+# --------------------------------------------------------------------------
+
+def test_the_dead_band_is_inert_until_asked_for():
+    """Default None, so nothing changes for anything already running."""
+    from core.config import DEFAULT_CONFIG
+    from core.decide import outside_dead_band
+    import numpy as np
+    assert DEFAULT_CONFIG.exclude_price_band is None
+    px = np.array([0.05, 0.35, 0.50, 0.65, 0.95])
+    assert outside_dead_band(px, DEFAULT_CONFIG).all()
+
+
+def test_the_dead_band_refuses_only_prices_inside_it():
+    from dataclasses import replace
+    from core.config import DEFAULT_CONFIG
+    from core.decide import outside_dead_band
+    import numpy as np
+    cfg = replace(DEFAULT_CONFIG, exclude_price_band=(0.35, 0.65))
+    px = np.array([0.05, 0.34, 0.35, 0.50, 0.65, 0.66, 0.95])
+    got = outside_dead_band(px, cfg).tolist()
+    assert got == [True, True, False, False, False, True, True]
+
+
+def test_an_off_centre_dead_band_is_refused():
+    """The edge is a disagreement about sigma_remaining and points BOTH ways,
+    so an off-centre hole silently discards one direction of the thesis — the
+    same failure the asymmetric outer band already guards against."""
+    import pytest
+    from dataclasses import replace
+    from core.config import DEFAULT_CONFIG
+    with pytest.raises(ValueError, match='symmetric'):
+        replace(DEFAULT_CONFIG, exclude_price_band=(0.35, 0.60))
+    with pytest.raises(ValueError, match='band in'):
+        replace(DEFAULT_CONFIG, exclude_price_band=(0.65, 0.35))
+
+
+def test_both_decision_paths_agree_about_the_dead_band():
+    """`decide()` and the vectorised `stateless_screen` must refuse the same
+    rows — the backtest uses one and live uses the other, and this repo has
+    already had them disagree about entry price for months."""
+    from dataclasses import replace
+    from core.config import DEFAULT_CONFIG
+    from core.decide import outside_dead_band
+    import numpy as np
+    cfg = replace(DEFAULT_CONFIG, exclude_price_band=(0.35, 0.65))
+    for price in (0.04, 0.20, 0.36, 0.50, 0.64, 0.80, 0.96):
+        vec = bool(outside_dead_band(np.array([price]), cfg)[0])
+        single = not (0.35 <= price <= 0.65)
+        assert vec == single, f'paths disagree at {price}'

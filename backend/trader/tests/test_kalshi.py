@@ -514,7 +514,12 @@ def test_the_venues_settlement_wins_over_our_bars(tmp_path):
     assert position.payout == 5.0
     # And the payout reached the account, which it never used to.
     assert writer.account().bankroll == pytest.approx(100.0 + 5.0)
-    assert writer.account().realized_pnl == pytest.approx(5.0 - 3.1)
+    # **Net of the fee, not gross.** This asserted `5.0 - 3.1` until
+    # 2026-10-20, which was the defect: `settle_position` computed
+    # `payout - outlay` and never subtracted the fee, so our books reported
+    # gross where the venue reports net. Measured over 419 settled markets,
+    # 409 differed from the venue by precisely the fee and nothing else.
+    assert writer.account().realized_pnl == pytest.approx(5.0 - 3.1 - 0.02)
 
 
 def test_settling_from_bars_uses_the_trained_rule(tmp_path):
@@ -633,19 +638,25 @@ async def test_reconcile_reads_the_balance_of_the_shard_it_is_told_about(key_pem
     adopted bankroll and sizing ran against capital an order could not reach.
     """
     client = KalshiClient(key_id='k', private_key_pem=key_pem)
-    seen = {}
 
     async def _request(method, path, **kwargs):
         if path == '/portfolio/balance':
             return BREAKDOWN_PAYLOAD
         return {}
 
-    async def _balance(*, exchange_index=None):
-        seen['exchange_index'] = exchange_index
-        return 1.3533
-
     client._request = _request
-    client.balance = _balance
     state = await client.reconcile(exchange_index=2)
-    assert seen['exchange_index'] == 2
+
+    # **Asserted on the OUTCOME, not on `balance()` being called.** This used
+    # to stub `client.balance` and check it received `exchange_index=2`;
+    # `reconcile` now derives both figures from ONE `/portfolio/balance`
+    # response, so that delegation no longer happens and the old assertion
+    # tested a mechanism rather than the invariant. The invariant is what
+    # matters and is stronger stated this way: the shard's money, never the
+    # cross-shard total, which is capital no single order can reach.
     assert state['balance'] == pytest.approx(1.3533)
+    assert state['balance'] != pytest.approx(107.9618)
+    # And the total is carried alongside, because it is what the venue's own
+    # app shows and the dashboard is read beside it.
+    assert state['balance_total'] == pytest.approx(107.9618)
+    assert state['balance_shards'][0] == pytest.approx(106.6085)

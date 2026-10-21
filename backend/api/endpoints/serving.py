@@ -65,6 +65,18 @@ def get_venue_settlements(days: Optional[int] = Query(None, ge=1, le=3650),
     return {'settlements': serving.venue_settlements(db, days=days, limit=limit)}
 
 
+@router.get('/account/venue/daily')
+def get_venue_daily(days: int = Query(120, ge=1, le=3650),
+                    db: Session = Depends(get_db)):
+    """Realised P&L per Eastern calendar day, from the venue's settlements.
+
+    Eastern because that is the boundary Kalshi's own app rolls the trading day
+    over on, so the figures here reconcile against the account rather than
+    against UTC. Not bounded by the dashboard epoch -- a calendar is history.
+    """
+    return serving.venue_daily_pnl(db, days=days)
+
+
 @router.get('/live')
 def get_live(db: Session = Depends(get_db)):
     """The current barrier state per symbol, and the account beside it."""
@@ -88,8 +100,13 @@ def get_predictions(
 
 @router.get('/funnel')
 def get_funnel(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)):
-    """Why the system declined. Expected to be dominated by `edge_below_gate`."""
-    return {'days': days, 'stages': serving.funnel(db, days=days)}
+    """Why the system declined, and over the span actually covered.
+
+    `days` is what was ASKED for; `covered_days` is what the dashboard epoch
+    left. The response used to echo the request back as `days` while the rows
+    were epoch-bounded, so a panel headed "7 days" summed 2.2.
+    """
+    return serving.funnel(db, days=days)
 
 
 @router.get('/positions')

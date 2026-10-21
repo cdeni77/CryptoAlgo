@@ -5,7 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from database import engine
+from jsonsafe import SafeJSONResponse
 from security import allowed_origins
+from endpoints.collection import router as collection_router
 from endpoints.serving import router as serving_router
 from models.base import Base
 
@@ -100,6 +102,8 @@ async def lifespan(_: FastAPI):
     yield
 
 
+
+
 app = FastAPI(
     title="Quarter — 15-minute binary telemetry",
     description=(
@@ -111,6 +115,7 @@ app = FastAPI(
     ),
     version="1.0.0",
     lifespan=lifespan,
+    default_response_class=SafeJSONResponse,
 )
 
 # Origins come from CORS_ALLOW_ORIGINS, and `*` is filtered out. The previous
@@ -124,7 +129,30 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+@app.middleware("http")
+async def no_store(request, call_next):
+    """Tell every cache this telemetry expires immediately.
+
+    **A response with no cache headers is not an uncacheable response.** With no
+    `Cache-Control`, `ETag` or `Last-Modified` -- which is what this API served
+    -- a browser is free to apply HEURISTIC freshness and reuse the body without
+    revalidating. The symptom is the one reported on 2026-10-18: a dashboard
+    that polls on schedule, raises no error, and shows numbers that only move
+    when the page is manually reloaded.
+
+    Every route here is a live measurement of an account that changes each
+    cycle, so there is no response worth caching for any length of time.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 app.include_router(serving_router)
+# Data-collection health. Deliberately a separate router with no database
+# dependency: it must still answer when the thing it reports on is broken.
+app.include_router(collection_router)
 
 
 @app.get("/")
@@ -134,5 +162,6 @@ def root():
         "what": "15-minute binary barrier system telemetry",
         "routes": ["/live", "/account", "/account/equity", "/predictions",
                    "/funnel", "/positions", "/model", "/model/history",
-                   "/model/calibration"],
+                   "/model/calibration", "/collection",
+                   "/collection/freshness", "/collection/liveness"],
     }

@@ -129,6 +129,144 @@ def gap_change(symbol: str, gap, *, window_open, offset: int) -> float:
     return float(value - before)
 
 
+# The book at every MINUTE of the window in progress, per symbol, so
+# `book_flow` has a history to difference. Same shape and same eviction rule as
+# `_GAP_HISTORY` above.
+#
+# **Why this has to exist at all.** `core/book_flow.book_flow_features` is
+# called from exactly one place, `core/dataset.py` -- the research path. The
+# live path never built it, so all six features were NaN on every real-money
+# decision while the deployed artifact was fitted on them. The loop said so
+# every cycle ("scoring with features the row cannot supply") and nothing
+# escalated it.
+#
+# **Why a MINUTE sampler and not the decision cycle.** `book_flow` differences
+# over one and three minutes, and decisions happen only at offsets 3/6/9/12, so
+# the decision cycle alone can never supply offset-1 or offset-3. The history
+# has to be recorded every minute.
+_BOOK_HISTORY: dict = {}
+
+#: How fresh a recorded minute must be to be worth keeping, in seconds.
+#: `core/quotes.decision_age` ages a minute-grid source FORWARD --
+#: `latency - raw` -- so a row observed more than `decision_latency_seconds`
+#: after its minute goes NEGATIVE and `book_flow_features` drops it. Measured
+#: 2026-10-21: at age 0s a stream row yields 6/6 features, at 7s it yields 0/6.
+#: The live decision cycle starts ~7s into the minute, so sampling there would
+#: have reproduced the all-NaN bug while looking like a fix.
+BOOK_SAMPLE_MAX_AGE_SECONDS = 3.0
+
+
+def reset_book_history() -> None:
+    """Drop every recorded minute. For tests, and for a clean restart."""
+    _BOOK_HISTORY.clear()
+
+
+def _touch_size(levels, best: float, *, invert: bool) -> float:
+    """Resting size at exactly the touch.
+
+    `build_depth.py` defines `yes_bid_size` as the size at the best price and
+    nothing behind it, so this matches it rather than inventing a second
+    convention for the same column name.
+    """
+    import numpy as _np
+    total, seen = 0.0, False
+    for entry in levels or []:
+        try:
+            price, size = float(entry[0]), float(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        effective = (1.0 - price) if invert else price
+        if _np.isfinite(best) and abs(effective - best) < 1e-9:
+            total += size
+            seen = True
+    return total if seen else float('nan')
+
+
+def record_book_minute(symbol: str, *, window_open, offset: int,
+                       yes_levels, no_levels,
+                       age_seconds: float = 0.0) -> bool:
+    """Remember this minute's book. Returns whether it was kept.
+
+    Refused, rather than stored with a flattering stamp, when the sample is
+    older than `BOOK_SAMPLE_MAX_AGE_SECONDS`: `book_flow_features` would drop
+    it anyway, and storing it would hide a sampler that has drifted off the
+    minute boundary behind features that merely look absent.
+    """
+    import numpy as _np
+    try:
+        off = int(offset)
+        age = float(age_seconds)
+    except (TypeError, ValueError):
+        return False
+    if not _np.isfinite(age) or age < 0.0 or age > BOOK_SAMPLE_MAX_AGE_SECONDS:
+        return False
+    if not yes_levels and not no_levels:
+        return False
+
+    bid = _ladder_touch(yes_levels, invert=False, fallback=_np.nan)
+    ask = _ladder_touch(no_levels, invert=True, fallback=_np.nan)
+    key = (str(symbol), pd.Timestamp(window_open))
+    if key not in _BOOK_HISTORY:
+        # Evict by WINDOW, never by arrival: three symbols are sampled in the
+        # same minute of the same window and must not evict each other.
+        for stale in [k for k in _BOOK_HISTORY if k[1] != key[1]]:
+            del _BOOK_HISTORY[stale]
+        _BOOK_HISTORY[key] = {}
+    _BOOK_HISTORY[key][off] = {
+        'venue': 'kalshi', 'symbol': str(symbol),
+        'window_open': pd.Timestamp(window_open), 'offset_minutes': off,
+        'yes_bid': bid, 'yes_ask': ask,
+        'yes_bid_size': _touch_size(yes_levels, bid, invert=False),
+        'yes_ask_size': _touch_size(no_levels, ask, invert=True),
+        # The stream is the same observer `live_ws` names in `venue_depth`, and
+        # the age is the real one -- see the constant above for why it must be
+        # small rather than merely recorded.
+        'source': 'live_ws', 'quote_age_seconds': age,
+    }
+    return True
+
+
+def book_history_depth(window_open=None) -> pd.DataFrame:
+    """Everything remembered, in `venue_depth` shape."""
+    rows = [r for (sym, open_at), minutes in _BOOK_HISTORY.items()
+            if window_open is None or open_at == pd.Timestamp(window_open)
+            for r in minutes.values()]
+    return pd.DataFrame(rows)
+
+
+def book_flow_row(scored: pd.DataFrame) -> pd.DataFrame:
+    """`book_flow` for the rows being scored, from the recorded minutes.
+
+    Calls `core.book_flow.book_flow_features` -- the function the backtest
+    calls, not a live re-implementation of it -- so the two cannot drift. The
+    only live-specific part is assembling the depth frame it reads.
+    """
+    from core.book_flow import BOOK_FLOW, book_flow_features
+    import numpy as _np
+
+    out = pd.DataFrame(index=scored.index)
+    for col in BOOK_FLOW:
+        out[col] = _np.nan
+    if not len(scored):
+        return out
+    depth = book_history_depth()
+    if not len(depth):
+        return out
+    windows = pd.DataFrame({
+        'symbol': scored['symbol'].to_numpy(),
+        'window_open': pd.to_datetime(scored['window_open'], utc=True),
+        'offset': pd.to_numeric(scored.get('offset'), errors='coerce'),
+    }, index=scored.index)
+    got = book_flow_features(windows, depth,
+                             decision_latency_seconds=float(
+                                 getattr(DEFAULT_CONFIG,
+                                         'decision_latency_seconds', 3.0)))
+    for col in BOOK_FLOW:
+        if col in got.columns:
+            out[col] = got[col].to_numpy()
+    return out
+
+
 # A peer cap under this refuses most peer books on transport latency alone.
 TIGHT_PEER_CAP_SECONDS = 5.0
 

@@ -185,9 +185,28 @@ async def run(args, gate=None) -> int:
                             # largest. Closing time is the honest filter; the
                             # `0 <= minute <= window_minutes` check below
                             # already discards anything outside the window.
+                            # **`max_close_ts` is load-bearing, not a
+                            # refinement.** Without an upper bound every future
+                            # market matches, the venue returns them NEWEST
+                            # first, and `limit` then yields only the furthest
+                            # ones -- measured 2026-10-19, all 8 rows came back
+                            # opening ~24h out, so the in-window filter below
+                            # rejected every one. `rows` never reached
+                            # `batch_rows`, so nothing was written and nothing
+                            # was LOGGED: the recorder sat silent and
+                            # `supervise` saw a coroutine legitimately
+                            # awaiting. venue_ladder died 2026-09-16, the day
+                            # Kalshi began publishing more than 8 windows
+                            # ahead, and was dead for 32 days.
+                            #
+                            # Half an hour returns exactly the current market
+                            # and the next, which is what `record_stream.
+                            # open_tickers` already does and why the stream
+                            # kept recording while this did not.
                             params={'series_ticker': series,
                                     'min_close_ts': int(now.timestamp()),
-                                    'limit': 8})
+                                    'max_close_ts': int(now.timestamp()) + 1800,
+                                    'limit': 10})
                         for market in payload.get('markets', []):
                             if not market.get('open_time'):
                                 continue

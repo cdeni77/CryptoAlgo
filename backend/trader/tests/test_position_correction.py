@@ -32,13 +32,26 @@ def writer(tmp_path):
     return PgWriter(database_url=f'sqlite:///{tmp_path}/t.db')
 
 
-def _position(writer, *, side='up', contracts=4, price=0.5, fee=0.05,
+#: The entry fee every fixture position in this file carries.
+FEE = 0.05
+
+
+def _position(writer, *, side='up', contracts=4, price=0.5, fee=FEE,
               settled_up=True):
     """One settled position, graded OUR way."""
     from core.pg_writer import Outcome, Position
     from core.book import won as _won
 
-    outlay = contracts * price + fee
+    # **`outlay` is cost ONLY — the fee is a separate column.** This fixture
+    # built `contracts * price + fee`, matching an ORM comment that claimed
+    # "everything paid, fee included". That comment was false: verified
+    # 2026-10-20 against every production row with a non-zero fee,
+    # `outlay == contracts * price` exactly, and `settle_position` subtracts
+    # `fee` separately — which it would not if the fee were already inside.
+    # A fixture on the wrong convention made `correct_positions_from_venue`
+    # look like it double-charged when it was corrected to match the settle
+    # path.
+    outlay = contracts * price
     win = _won(side=side, settled_up=settled_up)
     payout = float(contracts) if win else 0.0
     with writer._session() as session:                    # noqa: SLF001
@@ -48,7 +61,7 @@ def _position(writer, *, side='up', contracts=4, price=0.5, fee=0.05,
             outlay=outlay, fee=fee, model_probability=0.6,
             baseline_probability=0.5, edge=0.02,
             outcome=Outcome.WON.value if win else Outcome.LOST.value,
-            settled_up=settled_up, payout=payout, pnl=payout - outlay,
+            settled_up=settled_up, payout=payout, pnl=payout - outlay - fee,
             settled_at=OPEN))
         session.commit()
     return outlay
@@ -67,14 +80,20 @@ def test_a_winner_the_venue_calls_a_loser_is_re_settled(writer):
     # `realized_pnl` is RESTATED from the positions, not nudged by the delta --
     # see `test_realized_pnl_is_restated_not_nudged` for why. With one settled
     # position that is now a loss, the total is its own pnl.
-    assert writer.account().realized_pnl == pytest.approx(-outlay)
+    #
+    # **Stake AND fee.** A loss costs both: the fee was charged on entry and
+    # does not come back. This asserted `-outlay` while the fixture had the
+    # fee baked into `outlay`; with both corrected to the production
+    # convention the loss is the stake plus the fee charged to take it.
+    lost = outlay + FEE
+    assert writer.account().realized_pnl == pytest.approx(-lost)
     assert before == pytest.approx(0.0), 'sanity: the fixture starts flat'
     with writer._session() as session:                    # noqa: SLF001
         from core.pg_writer import Position
         row = session.query(Position).first()
         assert row.settled_up is False
         assert row.payout == 0.0
-        assert row.pnl == pytest.approx(-outlay)
+        assert row.pnl == pytest.approx(-lost)
 
 
 def test_agreement_re_settles_nothing(writer):

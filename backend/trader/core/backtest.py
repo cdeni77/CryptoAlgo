@@ -33,7 +33,7 @@ from core.book import Book, BookStats, summarise
 from core.config import Config, DEFAULT_CONFIG
 from core.cv import WindowFold, assert_no_leakage, effective_observations, folds_for_config, recency_weights
 from core.dataset import Dataset, apply_fold, fit_fold
-from core.decide import Decision, Reason, decide_window, rejection_histogram, stateless_screen
+from core.decide import as_maker_prices, Decision, Reason, decide_window, rejection_histogram, stateless_screen
 from core.metrics import (EvaluationReport, FoldEvaluation, evaluate_fold, sharpe_moments,
                           trade_gate_values)
 from core.model import ForecastModel, fit_for_config, table_groups
@@ -73,6 +73,32 @@ def run_book(
     """
     book = book or Book(config=config)
     decisions: list[Decision] = []
+    # **Under `maker_entry` the backtest still lifts the ASK, deliberately.**
+    #
+    # A maker gets two things: the venue charges makers nothing, and the entry
+    # is a full cent better on a measured 1.000c spread. Only the first is
+    # CERTAIN. The second is conditional on the resting order filling.
+    #
+    # **That assumption is no longer untested.** This used to read "nothing
+    # here has ever observed that -- all 1,556 fills on this account are
+    # `is_taker: true`". Since `--maker-entry` went live on 2026-10-18, 512
+    # of 668 fills (77%) have rested. What is still NOT established is
+    # whether the ones that rest are a fair sample of the ones we wanted: a
+    # resting order fills when somebody chooses to cross to it, which is
+    # adverse selection by construction. So pricing the backtest at the ask
+    # still bounds the result from below, and still should.
+    #
+    # Measured 2026-10-18 on 54,100 live-recorded rows, that is the difference
+    # between +$885.78 (+0.748pp/ct, t=+1.34) and +$2,445.76 (+1.608pp/ct,
+    # t=+2.91). The conservative number is the one the gates should see.
+    #
+    # `core.decide.as_maker_prices` implements the optimistic pricing and is
+    # kept, tested, for measuring the upper bound explicitly — but it is not
+    # wired in here. `scripts/live.py` DOES price at the bid, because that is
+    # the order it actually sends: evaluating the edge at the ask would refuse
+    # trades that are profitable at the price being offered. So the two differ
+    # on purpose, and in the safe direction — live trades only what clears at
+    # the resting price, while the gates are scored at the worse one.
     # Screen the whole span once, vectorised, before touching the per-window
     # loop. On real data the state-independent gates reject the overwhelming
     # majority of rows, and grouping five years of minutes into windows to
@@ -296,6 +322,7 @@ def walk_forward(
         'scheme': getattr(config, 'fold_scheme', 'calendar'),
         'fold_block_days': getattr(config, 'fold_block_days', None),
         'min_test_windows': getattr(config, 'min_test_windows', None),
+        'min_train_windows': getattr(config, 'min_train_windows', None),
         'fold_train_days': getattr(config, 'fold_train_days', None),
         'embargo_minutes': int(config.embargo_minutes),
         'folds_supplied_by_caller': supplied,

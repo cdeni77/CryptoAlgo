@@ -79,7 +79,15 @@ def beats_the_market() -> dict:
     defined further down with the rest of the market tests; it is a pure
     function of rows, so calling it here is not a dependency on those tests.
     """
-    return market_gate_values(market_rows(4_000, model_edge=+0.35))
+    values = market_gate_values(market_rows(4_000, model_edge=+0.35))
+    # `deployed_residual_scale` is the INSTALLED artifact's alpha, supplied by
+    # `scripts/promote.py` after `choose_candidate`, not by the walk-forward.
+    # A fixture that omits it describes a candidate nobody measured — the same
+    # reason `model_max_deviation` and `n_non_finite` had to be added above.
+    # 0.94 is the walk-forward value from the 2026-10-18 run, i.e. a candidate
+    # whose shipped alpha agrees with its folds, which is what passing means.
+    values.setdefault('deployed_residual_scale', 0.94)
+    return values
 
 
 class FakeModel:

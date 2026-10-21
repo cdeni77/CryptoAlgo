@@ -1,0 +1,185 @@
+{
+  "gate_1.0": [
+    {
+      "fold": 1,
+      "train_rows": 5746,
+      "trades": 0
+    },
+    {
+      "fold": 2,
+      "train_rows": 20532,
+      "trades": 0
+    },
+    {
+      "fold": 3,
+      "train_rows": 35680,
+      "trades": 20,
+      "pnl": -3.0122
+    },
+    {
+      "fold": 4,
+      "train_rows": 57009,
+      "trades": 288,
+      "pnl": 4.0146999999999995
+    },
+    {
+      "fold": 5,
+      "train_rows": 75625,
+      "trades": 70,
+      "pnl": -0.3070000000000003
+    },
+    {
+      "fold": 6,
+      "train_rows": 93525,
+      "trades": 0
+    },
+    {
+      "fold": 7,
+      "train_rows": 111394,
+      "trades": 53,
+      "pnl": 2.4370000000000003
+    },
+    {
+      "fold": 8,
+      "train_rows": 128025,
+      "trades": 0
+    },
+    {
+      "fold": 9,
+      "train_rows": 144632,
+      "trades": 0
+    },
+    {
+      "fold": 10,
+      "train_rows": 160465,
+      "trades": 64,
+      "pnl": -1.9468000000000005
+    },
+    {
+      "fold": 11,
+      "train_rows": 180224,
+      "trades": 55,
+      "pnl": 2.077700000000001
+    },
+    {
+      "fold": 12,
+      "train_rows": 202962,
+      "trades": 1666,
+      "pnl": 54.663700000000006
+    },
+    {
+      "fold": 13,
+      "train_rows": 225496,
+      "trades": 1850,
+      "pnl": 47.165499999999994
+    },
+    {
+      "fold": 14,
+      "train_rows": 249541,
+      "trades": 1818,
+      "pnl": 78.6567
+    },
+    {
+      "fold": 15,
+      "train_rows": 272695,
+      "trades": 591,
+      "pnl": 35.2247
+    }
+  ],
+  "gate_1.0_late": {
+    "trades": 5980,
+    "pnl": 217.7883,
+    "silent": 0
+  },
+  "gate_1.5": [
+    {
+      "fold": 1,
+      "train_rows": 5746,
+      "trades": 0
+    },
+    {
+      "fold": 2,
+      "train_rows": 20532,
+      "trades": 0
+    },
+    {
+      "fold": 3,
+      "train_rows": 35680,
+      "trades": 0
+    },
+    {
+      "fold": 4,
+      "train_rows": 57009,
+      "trades": 192,
+      "pnl": 3.4012999999999987
+    },
+    {
+      "fold": 5,
+      "train_rows": 75625,
+      "trades": 25,
+      "pnl": 0.46850000000000036
+    },
+    {
+      "fold": 6,
+      "train_rows": 93525,
+      "trades": 0
+    },
+    {
+      "fold": 7,
+      "train_rows": 111394,
+      "trades": 19,
+      "pnl": -0.5500000000000004
+    },
+    {
+      "fold": 8,
+      "train_rows": 128025,
+      "trades": 0
+    },
+    {
+      "fold": 9,
+      "train_rows": 144632,
+      "trades": 0
+    },
+    {
+      "fold": 10,
+      "train_rows": 160465,
+      "trades": 19,
+      "pnl": 0.4082999999999999
+    },
+    {
+      "fold": 11,
+      "train_rows": 180224,
+      "trades": 1,
+      "pnl": 0.45249999999999996
+    },
+    {
+      "fold": 12,
+      "train_rows": 202962,
+      "trades": 1460,
+      "pnl": 71.5268
+    },
+    {
+      "fold": 13,
+      "train_rows": 225496,
+      "trades": 1726,
+      "pnl": 56.38959999999999
+    },
+    {
+      "fold": 14,
+      "train_rows": 249541,
+      "trades": 1682,
+      "pnl": 82.7081
+    },
+    {
+      "fold": 15,
+      "train_rows": 272695,
+      "trades": 551,
+      "pnl": 38.4389
+    }
+  ],
+  "gate_1.5_late": {
+    "trades": 5420,
+    "pnl": 249.5159,
+    "silent": 0
+  }
+}

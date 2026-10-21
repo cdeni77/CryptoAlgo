@@ -1,0 +1,333 @@
+{
+  "n_features": 56,
+  "features": [
+    "z_score",
+    "abs_z_score",
+    "excursion_up_z",
+    "excursion_down_z",
+    "excursion_span_z",
+    "excursion_asymmetry",
+    "path_efficiency",
+    "displacement_vs_elapsed",
+    "touched_opposite",
+    "log_rv_15",
+    "log_rv_60",
+    "log_rv_240",
+    "log_rv_1440",
+    "rv_slope_short",
+    "rv_slope_long",
+    "range_to_return",
+    "vol_of_vol",
+    "log_sigma_per_min",
+    "rv_surprise",
+    "seasonal_ramp",
+    "autocorr_60",
+    "run_length",
+    "body_ratio_15",
+    "volume_z_15",
+    "vwap_gap_15",
+    "signed_volume_15",
+    "zero_return_share_60",
+    "peer_displacement",
+    "peer_return_5",
+    "peer_return_15",
+    "lead_residual",
+    "beta_1440",
+    "universe_dispersion",
+    "elapsed_fraction",
+    "remaining_minutes",
+    "quarter_of_hour",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "us_equity_hours",
+    "imbalance",
+    "touch_imbalance",
+    "d_imbalance_1",
+    "d_imbalance_3",
+    "d_touch_imb_1",
+    "d_touch_imb_3",
+    "d_book_mid_1",
+    "d_book_mid_3",
+    "k_spread",
+    "k_depth_imb_1c",
+    "k_depth_imb_5c",
+    "k_levels_ratio",
+    "pm_mid",
+    "pm_spread",
+    "iv_sigma"
+  ],
+  "population": {
+    "z_score": 1.0,
+    "abs_z_score": 1.0,
+    "excursion_up_z": 1.0,
+    "excursion_down_z": 1.0,
+    "excursion_span_z": 1.0,
+    "excursion_asymmetry": 0.9999785615515719,
+    "path_efficiency": 0.9999785615515719,
+    "displacement_vs_elapsed": 1.0,
+    "touched_opposite": 1.0,
+    "log_rv_15": 1.0,
+    "log_rv_60": 1.0,
+    "log_rv_240": 1.0,
+    "log_rv_1440": 1.0,
+    "rv_slope_short": 1.0,
+    "rv_slope_long": 1.0,
+    "range_to_return": 1.0,
+    "vol_of_vol": 1.0,
+    "log_sigma_per_min": 1.0,
+    "rv_surprise": 1.0,
+    "seasonal_ramp": 1.0,
+    "autocorr_60": 1.0,
+    "run_length": 1.0,
+    "body_ratio_15": 1.0,
+    "volume_z_15": 1.0,
+    "vwap_gap_15": 0.999974988476834,
+    "signed_volume_15": 1.0,
+    "zero_return_share_60": 1.0,
+    "peer_displacement": 1.0,
+    "peer_return_5": 1.0,
+    "peer_return_15": 1.0,
+    "lead_residual": 1.0,
+    "beta_1440": 1.0,
+    "universe_dispersion": 1.0,
+    "elapsed_fraction": 1.0,
+    "remaining_minutes": 1.0,
+    "quarter_of_hour": 1.0,
+    "hour_sin": 1.0,
+    "hour_cos": 1.0,
+    "dow_sin": 1.0,
+    "dow_cos": 1.0,
+    "us_equity_hours": 1.0,
+    "imbalance": 0.9703363335250883,
+    "touch_imbalance": 0.9703363335250883,
+    "d_imbalance_1": 0.8720589128562802,
+    "d_imbalance_3": 0.7067398908782975,
+    "d_touch_imb_1": 0.8720589128562802,
+    "d_touch_imb_3": 0.7067398908782975,
+    "d_book_mid_1": 0.8716551554108858,
+    "d_book_mid_3": 0.7065362256182313,
+    "k_spread": 0.9936685115642564,
+    "k_depth_imb_1c": 1.0,
+    "k_depth_imb_5c": 1.0,
+    "k_levels_ratio": 1.0,
+    "pm_mid": 0.8849755780341657,
+    "pm_spread": 0.8849755780341657,
+    "iv_sigma": 0.2741191477502135
+  },
+  "best_iters": [
+    22,
+    24,
+    36,
+    322
+  ],
+  "n_oof": 235713,
+  "row": {
+    "mean": 0.0005342385863374512,
+    "ci": [
+      0.0003515395200954254,
+      0.0007216998558379179
+    ],
+    "n": 235713
+  },
+  "symbol-window": {
+    "mean": 0.0005979077876526674,
+    "ci": [
+      0.00017785279531882508,
+      0.0010250752794057922
+    ],
+    "n": 23260
+  },
+  "window": {
+    "mean": 0.0005128414378126955,
+    "ci": [
+      -3.635545529348447e-05,
+      0.0010564506573480196
+    ],
+    "n": 7826
+  },
+  "gain_share": {
+    "z_score": 0.015181313337173355,
+    "abs_z_score": 0.0007604636251484857,
+    "excursion_up_z": 0.008718944192583343,
+    "excursion_down_z": 0.014510267899110566,
+    "excursion_span_z": 0.003963621124743035,
+    "excursion_asymmetry": 0.015194983781178733,
+    "path_efficiency": 0.0014346495026802452,
+    "displacement_vs_elapsed": 0.012533990540820227,
+    "touched_opposite": 0.0,
+    "log_rv_15": 0.010176536147881571,
+    "log_rv_60": 0.025115352782288686,
+    "log_rv_240": 0.03532475021363231,
+    "log_rv_1440": 0.030541710549141596,
+    "rv_slope_short": 0.017941390125104113,
+    "rv_slope_long": 0.06638308449529044,
+    "range_to_return": 0.027995077516067952,
+    "vol_of_vol": 0.043433892369898496,
+    "log_sigma_per_min": 0.012343347553789758,
+    "rv_surprise": 0.02088440863960796,
+    "seasonal_ramp": 0.007037957650520133,
+    "autocorr_60": 0.032554776997971005,
+    "run_length": 3.907787311965505e-05,
+    "body_ratio_15": 0.01553881712029987,
+    "volume_z_15": 0.021923319680109753,
+    "vwap_gap_15": 0.0029145336770058723,
+    "signed_volume_15": 0.021142360462987692,
+    "zero_return_share_60": 0.008491499552370392,
+    "peer_displacement": 0.011813317642093512,
+    "peer_return_5": 0.0018431257309928482,
+    "peer_return_15": 0.03268182077521066,
+    "lead_residual": 0.010642074177338076,
+    "beta_1440": 0.029090234207232443,
+    "universe_dispersion": 0.016798658166266474,
+    "elapsed_fraction": 3.0505225674876952e-05,
+    "remaining_minutes": 0.0,
+    "quarter_of_hour": 0.035473727630276834,
+    "hour_sin": 0.08444888312251993,
+    "hour_cos": 0.0982919823589232,
+    "dow_sin": 0.04517058005092986,
+    "dow_cos": 0.011795862710656779,
+    "us_equity_hours": 0.002019826268105251,
+    "imbalance": 0.019285933019067947,
+    "touch_imbalance": 0.006973841919060146,
+    "d_imbalance_1": 0.0004618950068297553,
+    "d_imbalance_3": 0.0019451333720382348,
+    "d_touch_imb_1": 0.0011775365262108827,
+    "d_touch_imb_3": 0.0002680874048527014,
+    "d_book_mid_1": 0.0026853034236162207,
+    "d_book_mid_3": 0.004940868090708117,
+    "k_spread": 0.0013041552962130977,
+    "k_depth_imb_1c": 0.005099704268578677,
+    "k_depth_imb_5c": 0.0009350758951055373,
+    "k_levels_ratio": 0.024288027768071162,
+    "pm_mid": 0.07176764074231722,
+    "pm_spread": 0.003393233387844679,
+    "iv_sigma": 0.0032928384027396352
+  },
+  "money": {
+    "gate_1.0": {
+      "per_fold": [
+        {
+          "fold": 1,
+          "trades": 484,
+          "pnl": -0.8876000000000008,
+          "pp_per_contract": -0.1833884297520663,
+          "win_rate": 0.5268595041322314
+        },
+        {
+          "fold": 2,
+          "trades": 198,
+          "pnl": 6.201900000000002,
+          "pp_per_contract": 3.1322727272727278,
+          "win_rate": 0.5555555555555556
+        },
+        {
+          "fold": 3,
+          "trades": 313,
+          "pnl": 6.8862000000000005,
+          "pp_per_contract": 2.2000638977635782,
+          "win_rate": 0.5686900958466453
+        },
+        {
+          "fold": 4,
+          "trades": 4498,
+          "pnl": 68.11059999999998,
+          "pp_per_contract": 1.5142418852823472,
+          "win_rate": 0.6309470875944865
+        }
+      ],
+      "silent_folds": 0,
+      "trades": 5493,
+      "pnl": 80.31110000000001,
+      "pp_per_contract": 1.4620626251592939,
+      "t_stat": 1.8974266846420202,
+      "pnl_window_ci": [
+        -3.547002500000003,
+        162.730845
+      ]
+    },
+    "gate_1.5": {
+      "per_fold": [
+        {
+          "fold": 1,
+          "trades": 197,
+          "pnl": -0.09090000000000042,
+          "pp_per_contract": -0.04614213197969565,
+          "win_rate": 0.5228426395939086
+        },
+        {
+          "fold": 2,
+          "trades": 80,
+          "pnl": -2.3421000000000007,
+          "pp_per_contract": -2.9276250000000013,
+          "win_rate": 0.5
+        },
+        {
+          "fold": 3,
+          "trades": 95,
+          "pnl": -4.7434,
+          "pp_per_contract": -4.993052631578947,
+          "win_rate": 0.4842105263157895
+        },
+        {
+          "fold": 4,
+          "trades": 4014,
+          "pnl": 83.7961,
+          "pp_per_contract": 2.08759591429995,
+          "win_rate": 0.6395117090184355
+        }
+      ],
+      "silent_folds": 0,
+      "trades": 4386,
+      "pnl": 76.6197,
+      "pp_per_contract": 1.7469151846785225,
+      "t_stat": 2.0398296175356134,
+      "pnl_window_ci": [
+        2.277277499999996,
+        149.33312999999995
+      ]
+    },
+    "gate_2.5": {
+      "per_fold": [
+        {
+          "fold": 1,
+          "trades": 22,
+          "pnl": -0.8553999999999997,
+          "pp_per_contract": -3.888181818181817,
+          "win_rate": 0.45454545454545453
+        },
+        {
+          "fold": 2,
+          "trades": 10,
+          "pnl": 0.12800000000000045,
+          "pp_per_contract": 1.2800000000000045,
+          "win_rate": 0.5
+        },
+        {
+          "fold": 3,
+          "trades": 16,
+          "pnl": 3.4919000000000002,
+          "pp_per_contract": 21.824375,
+          "win_rate": 0.6875
+        },
+        {
+          "fold": 4,
+          "trades": 3050,
+          "pnl": 99.9885,
+          "pp_per_contract": 3.2783114754098364,
+          "win_rate": 0.6485245901639344
+        }
+      ],
+      "silent_folds": 0,
+      "trades": 3098,
+      "pnl": 102.753,
+      "pp_per_contract": 3.3167527437056163,
+      "t_stat": 3.3280046902447227,
+      "pnl_window_ci": [
+        42.445165,
+        163.10219249999994
+      ]
+    }
+  }
+}

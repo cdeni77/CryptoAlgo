@@ -1,0 +1,700 @@
+{
+  "results": {
+    "NC1c_s0": {
+      "name": "NC1c_featperm_s0",
+      "status": "OK",
+      "hypothesis": "features permuted within 2-day blocks; the market keeps its real predictive power, so any remaining skill is manufactured",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset"
+      ],
+      "features": [
+        "abs_z_score",
+        "autocorr_60",
+        "beta_1440",
+        "body_ratio_15",
+        "displacement_vs_elapsed",
+        "elapsed_fraction",
+        "excursion_asymmetry",
+        "excursion_down_z",
+        "excursion_span_z",
+        "excursion_up_z",
+        "lead_residual",
+        "log_rv_1440",
+        "log_rv_15",
+        "log_rv_240",
+        "log_rv_60",
+        "log_sigma_per_min",
+        "path_efficiency",
+        "peer_displacement",
+        "peer_return_15",
+        "peer_return_5",
+        "range_to_return",
+        "remaining_minutes",
+        "run_length",
+        "rv_slope_long",
+        "rv_slope_short",
+        "rv_surprise",
+        "seasonal_ramp",
+        "signed_volume_15",
+        "touched_opposite",
+        "universe_dispersion",
+        "vol_of_vol",
+        "volume_z_15",
+        "vwap_gap_15",
+        "z_score",
+        "zero_return_share_60"
+      ],
+      "n_features": 35,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.46896526695847257,
+      "log_loss_market": 0.46798477715885234,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.0010468699848027215,
+      "ci95": [
+        -0.0014536777394644142,
+        -0.0006534166190234734
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.010240614555287134,
+        "max_dev": 0.024576542565613924,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.024794221122274116,
+            "y_mean": 0.019356316573130226
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.13588025441452653,
+            "y_mean": 0.12556789982056274
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.2660410497854074,
+            "y_mean": 0.25243385637384036
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.37359341881729174,
+            "y_mean": 0.3627686786546024
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.4655722284358846,
+            "y_mean": 0.44099568587027066
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.5511339276794933,
+            "y_mean": 0.5393425724430191
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.6435064836771548,
+            "y_mean": 0.634329782766388
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.751292502230448,
+            "y_mean": 0.7540182491505364
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.8773539301648099,
+            "y_mean": 0.8878708051769557
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9783141172731791,
+            "y_mean": 0.9817508494635971
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008080288626732351,
+        "max_dev": 0.01441780551386368,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401691404901622,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940503093394583,
+            "y_mean": 0.3609824769384655
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.4598716328303974,
+            "y_mean": 0.4454538273165337
+          },
+          {
+            "n": 26494,
+            "p_mean": 0.5438729523665736,
+            "y_mean": 0.5395183815203443
+          },
+          {
+            "n": 26198,
+            "p_mean": 0.6376979158714405,
+            "y_mean": 0.6406595923352928
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 65.2
+    },
+    "NC1c_s1": {
+      "name": "NC1c_featperm_s1",
+      "status": "OK",
+      "hypothesis": "features permuted within 2-day blocks; the market keeps its real predictive power, so any remaining skill is manufactured",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset"
+      ],
+      "features": [
+        "abs_z_score",
+        "autocorr_60",
+        "beta_1440",
+        "body_ratio_15",
+        "displacement_vs_elapsed",
+        "elapsed_fraction",
+        "excursion_asymmetry",
+        "excursion_down_z",
+        "excursion_span_z",
+        "excursion_up_z",
+        "lead_residual",
+        "log_rv_1440",
+        "log_rv_15",
+        "log_rv_240",
+        "log_rv_60",
+        "log_sigma_per_min",
+        "path_efficiency",
+        "peer_displacement",
+        "peer_return_15",
+        "peer_return_5",
+        "range_to_return",
+        "remaining_minutes",
+        "run_length",
+        "rv_slope_long",
+        "rv_slope_short",
+        "rv_surprise",
+        "seasonal_ramp",
+        "signed_volume_15",
+        "touched_opposite",
+        "universe_dispersion",
+        "vol_of_vol",
+        "volume_z_15",
+        "vwap_gap_15",
+        "z_score",
+        "zero_return_share_60"
+      ],
+      "n_features": 35,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.46894405219095886,
+      "log_loss_market": 0.46798477715885234,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.000999361376391705,
+      "ci95": [
+        -0.0013998056134910957,
+        -0.0005984910863117251
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.010060423834117203,
+        "max_dev": 0.01884732297843056,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.024732110020671234,
+            "y_mean": 0.019165425877142747
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.13541893235361635,
+            "y_mean": 0.1268277784140801
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.2654919411000082,
+            "y_mean": 0.2509067308059405
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.37270464694720407,
+            "y_mean": 0.3590272210132478
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.4645007418307957,
+            "y_mean": 0.44565341885236515
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.5504904501368425,
+            "y_mean": 0.5384262971022792
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.6429700797251711,
+            "y_mean": 0.633948001374413
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.7508755260660659,
+            "y_mean": 0.7568052533119536
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.8770742765325686,
+            "y_mean": 0.8862291451914633
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9782798105884681,
+            "y_mean": 0.9814454243500171
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008080288626732351,
+        "max_dev": 0.01441780551386368,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401691404901622,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940503093394583,
+            "y_mean": 0.3609824769384655
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.4598716328303974,
+            "y_mean": 0.4454538273165337
+          },
+          {
+            "n": 26494,
+            "p_mean": 0.5438729523665736,
+            "y_mean": 0.5395183815203443
+          },
+          {
+            "n": 26198,
+            "p_mean": 0.6376979158714405,
+            "y_mean": 0.6406595923352928
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 92.7
+    },
+    "NC1c_s2": {
+      "name": "NC1c_featperm_s2",
+      "status": "OK",
+      "hypothesis": "features permuted within 2-day blocks; the market keeps its real predictive power, so any remaining skill is manufactured",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset"
+      ],
+      "features": [
+        "abs_z_score",
+        "autocorr_60",
+        "beta_1440",
+        "body_ratio_15",
+        "displacement_vs_elapsed",
+        "elapsed_fraction",
+        "excursion_asymmetry",
+        "excursion_down_z",
+        "excursion_span_z",
+        "excursion_up_z",
+        "lead_residual",
+        "log_rv_1440",
+        "log_rv_15",
+        "log_rv_240",
+        "log_rv_60",
+        "log_sigma_per_min",
+        "path_efficiency",
+        "peer_displacement",
+        "peer_return_15",
+        "peer_return_5",
+        "range_to_return",
+        "remaining_minutes",
+        "run_length",
+        "rv_slope_long",
+        "rv_slope_short",
+        "rv_surprise",
+        "seasonal_ramp",
+        "signed_volume_15",
+        "touched_opposite",
+        "universe_dispersion",
+        "vol_of_vol",
+        "volume_z_15",
+        "vwap_gap_15",
+        "z_score",
+        "zero_return_share_60"
+      ],
+      "n_features": 35,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.4688404041958405,
+      "log_loss_market": 0.46798477715885234,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.0008540765540617877,
+      "ci95": [
+        -0.0012455783305287723,
+        -0.00048257436367845984
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.01036489953639948,
+        "max_dev": 0.02032688148478018,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.024811116957157313,
+            "y_mean": 0.019432672851525216
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.13611521579486194,
+            "y_mean": 0.12549154354216777
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.2663230264509196,
+            "y_mean": 0.2520138968426679
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.37341692097786555,
+            "y_mean": 0.3591417554308403
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.46540762824918286,
+            "y_mean": 0.4450807467644027
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.5508597483907006,
+            "y_mean": 0.5372045966479594
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.6437581196352041,
+            "y_mean": 0.6357041957774978
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.751537500095524,
+            "y_mean": 0.7553163058832513
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.8774657165308721,
+            "y_mean": 0.8876035582025732
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9783354450442816,
+            "y_mean": 0.9814454243500171
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008080288626732351,
+        "max_dev": 0.01441780551386368,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401691404901622,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940503093394583,
+            "y_mean": 0.3609824769384655
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.4598716328303974,
+            "y_mean": 0.4454538273165337
+          },
+          {
+            "n": 26494,
+            "p_mean": 0.5438729523665736,
+            "y_mean": 0.5395183815203443
+          },
+          {
+            "n": 26198,
+            "p_mean": 0.6376979158714405,
+            "y_mean": 0.6406595923352928
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 88.8
+    },
+    "NC2_noise": {
+      "name": "NC2_noise_only",
+      "status": "OK",
+      "hypothesis": "eight iid gaussian features must not beat the market",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset"
+      ],
+      "features": [
+        "_noise_0",
+        "_noise_1",
+        "_noise_2",
+        "_noise_3",
+        "_noise_4",
+        "_noise_5",
+        "_noise_6",
+        "_noise_7"
+      ],
+      "n_features": 8,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.4687606599634706,
+      "log_loss_market": 0.46798477715885234,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.0008097091066003321,
+      "ci95": [
+        -0.0011255441814130452,
+        -0.0004986543111064224
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.010068354314379791,
+        "max_dev": 0.01911995887755269,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.024781606515861202,
+            "y_mean": 0.019585385408315198
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.13562354090163337,
+            "y_mean": 0.12648417516130264
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.26560232984091137,
+            "y_mean": 0.25041041499637307
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.3727498325844128,
+            "y_mean": 0.3586454396212729
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.46462066517312783,
+            "y_mean": 0.44550070629557514
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.5499924286726151,
+            "y_mean": 0.5387699003550567
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.6427130557170613,
+            "y_mean": 0.6344824953231779
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.7507575836349182,
+            "y_mean": 0.7559271561104112
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.8770736153515701,
+            "y_mean": 0.8872981330889932
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9782463792460923,
+            "y_mean": 0.9813308899324247
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008080288626732351,
+        "max_dev": 0.01441780551386368,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401691404901622,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940503093394583,
+            "y_mean": 0.3609824769384655
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.4598716328303974,
+            "y_mean": 0.4454538273165337
+          },
+          {
+            "n": 26494,
+            "p_mean": 0.5438729523665736,
+            "y_mean": 0.5395183815203443
+          },
+          {
+            "n": 26198,
+            "p_mean": 0.6376979158714405,
+            "y_mean": 0.6406595923352928
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 80.5
+    }
+  },
+  "runtime_s": 331.6,
+  "exp_id": "negative_controls_v2",
+  "recorded_at": "2026-10-17T07:02:07.037531+00:00"
+}

@@ -41,11 +41,22 @@ services:
       # Comma-separated. `*` is filtered out: it made every other entry
       # decorative and let any open page call the API with credentials.
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      # Where the trader publishes what it alone can measure. The API image has
+      # no pyarrow and cannot import the trader package, so dataset freshness is
+      # measured on that side (`core/collection_status.py`) and read here as a
+      # small JSON document; component liveness is one tiny stamp file each
+      # under `alive/`, read live. Absent or old, both come back null with a
+      # reason — never as healthy.
+      - TRADER_DATA_DIR=/app/trader-data
     depends_on:
       db:
         condition: service_healthy
     volumes:
       - ./backend/api:/app
+      # **Read-only, and the same mount the trader writes.** The whole volume
+      # rather than two sub-paths because the default is a NAMED volume
+      # (`trader_data`), and a named volume cannot be mounted by sub-path.
+      - ${TRADER_DATA_MOUNT:-trader_data}:/app/trader-data:ro
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 
   # ===========================================================================
@@ -63,7 +74,24 @@ services:
         # which makes the bundle host-agnostic.
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
     ports:
-      - "127.0.0.1:3000:80"
+      # **Deliberately on every interface, unlike every other service here.**
+      # The dashboard is meant to be read from a phone on the house wifi, so
+      # loopback would defeat the point. Two things make this the one service
+      # it is safe for:
+      #
+      #   * nginx proxies `/api` to `http://backend:8000` over the DOCKER
+      #     network, so the API and Postgres stay bound to 127.0.0.1 and gain
+      #     no exposure from this line.
+      #   * every route is a read-only GET; `allow_methods` is GET+OPTIONS, so
+      #     there is no write surface reachable from here.
+      #
+      # What it does NOT do is authenticate. `backend/api/security.py` sets
+      # CORS and nothing else, and CORS is a browser policy that `curl`
+      # ignores -- so anyone on this LAN can read the live account balance,
+      # positions and P&L. That is the accepted trade for home access. Do not
+      # port-forward this or put it behind a public tunnel without putting
+      # real auth in front of it first.
+      - "0.0.0.0:3000:80"
     depends_on:
       - backend
     # No runtime environment. Vite inlines `import.meta.env.VITE_*` at BUILD
@@ -105,6 +133,26 @@ services:
       - RESEARCH_STORE=/app/data/research
       - MODELS_ROOT=/app/models
 
+      # **Refuse a quote older than 5 seconds.** One variable, read by
+      # `core.quotes`, `core.metrics` and `scripts.live` at once. The library
+      # default stays 30; the DEPLOYED services take 5, and the `retrain`
+      # service sets the same value — they must not differ, or the gates score
+      # a sample the account never saw.
+      #
+      # Why: Predexon serves book CHANGES, so a quiet book is re-reported every
+      # later minute and its age climbs by 60s per minute. Measured 2026-10-18,
+      # backfill p90 age runs 0.6s at offset 1, 88s at offset 6, 328s at offset
+      # 12 and 452s at offset 15 — a quarter of offset-12 rows price against a
+      # book last seen five minutes earlier, and a carried-forward price is
+      # trivially beatable by a model that sees fresh bars.
+      #
+      # 5 is the floor that works: `decision_latency_seconds` is 3.0, so every
+      # SELECTED quote is ~3s old by construction and a 2s limit keeps 512 rows
+      # of 136,673. At 5s, 89.3% survive — live_touch 98.8%, backfill 83.1% —
+      # and the drops land where the carry-forward lives (11.9% at offset 3
+      # rising to 21.2% at offset 12).
+      - QUOTE_MAX_AGE_SECONDS=${QUOTE_MAX_AGE_SECONDS:-5}
+
       # Kalshi. Only needed for `--mode live`; paper mode never opens a client.
       # Prefer the PATH form — a PEM in an environment variable is a PEM in every
       # process listing.
@@ -140,6 +188,11 @@ services:
       # GB/day for the book); the per-second index proxy is tiny and kept a year.
       - RAW_RETENTION_DAYS=${RAW_RETENTION_DAYS:-60}
       - INDEX_PROXY_RETENTION_DAYS=${INDEX_PROXY_RETENTION_DAYS:-365}
+      # Its own retention, NOT the 60-day raw tier it used to inherit: at 60
+      # days `spot_trades` tops out around 5,760 windows, which is the floor of
+      # a usable training window, so it could never have fed a model. ~20 MB a
+      # day measured, so a year is ~7 GB.
+      - SPOT_TRADES_RETENTION_DAYS=${SPOT_TRADES_RETENTION_DAYS:-365}
       # Free-disk guard on the store volume: below max(fraction x volume, GB)
       # the oldest raw partitions are deleted (book frames first, the index
       # proxy last, never the newest day), logged at ERROR.
@@ -269,7 +322,7 @@ services:
         --compound
         --bankroll 500
         --max-stake-dollars 40
-        --min-edge-pp 1.5
+        --min-edge-pp 0.5
         --kelly-fraction 0.05
 
   # ===========================================================================
@@ -351,9 +404,87 @@ services:
   # 21) was measured better on forecast metrics and worse on realised edge and
   # drawdown, and deliberately not adopted.
   #
-  # **Promoting does not affect trading until the loop restarts** — `live.py`
-  # calls `load_live` once at startup and never reloads. That is why the cron
-  # wrapper restarts the trader on exit 0 and leaves it alone on exit 1.
+  # **It had drifted, and the drift was silent.** Measured 2026-10-18, this read
+  # `--entry-offsets 12 --kelly-fraction 0.05` with no `--compound`, while the
+  # account traded first-clear across 3/6/9/12 at 0.10 Kelly, compounding. So
+  # every Sunday the gates scored a policy nobody ran — the defect this repo
+  # names as "an evaluation measuring one system while another trades".
+  # Re-aligned; anything changed in the trader's override must be changed here
+  # in the same commit.
+  #
+  # `book_flow` joins the groups on evidence: through `scripts/evaluate` over
+  # 2026-01-08..10-17 it took log-loss skill +0.002370 -> +0.002455 (p 1.2e-5 ->
+  # 3.7e-6) and, more to the point, cut P&L concentration — the top three
+  # windows fell from 507% of total to 116%, i.e. the control LOST money
+  # excluding its best three windows and this does not. It carries the two new
+  # `mid_change_*` terms: the group tracked imbalance, depth and spread but
+  # never the mid, which is the market revising its own probability.
+  #
+  # **The ensemble and label flags are here so the gates stop turning
+  # themselves off.** `scripts/live.py` adopts `edge_lower_bound_z`,
+  # `require_member_agreement` and `init_score_source` from the installed
+  # artifact's provenance, and skips any value equal to the default. The
+  # deployed artifact records ensemble_size 5, label_source venue,
+  # edge_lower_bound_z 1.0 and require_member_agreement True; this command
+  # passed NONE of them, so the next promotion would have written the defaults
+  # (1 / proxy / 0.0 / False) and live would have silently dropped two real
+  # refusal gates — `Reason.EDGE_UNCERTAIN` and `Reason.MEMBERS_DISAGREE` — at
+  # the next window boundary, with no log line and no restart. `label_source
+  # venue` also matters on its own: grading on the Coinbase proxy is a measured
+  # leak (72.77% against 56.17% win rate).
+  #
+  # `--max-stake-dollars 40` matches the trader's override. It is the depth cap
+  # the economics apply; at 25 the gates would measure a strategy sized 37.5%
+  # smaller than the one trading.
+  #
+  # **`--start 2025-10-01`, and what it does NOT fix.** Without it this loaded
+  # 2,707,180 minutes per symbol for a model that `--complete-cases` can only
+  # score on the book era (`venue_depth` begins 2026-01-07). The date is set by
+  # the longest lookback, not by taste: `seasonality_min_days` is 60, the
+  # longest rolling feature is 1,440 minutes and `embargo_minutes` is 1,440, so
+  # ~62 days of padding is the minimum and this leaves 98.
+  #
+  # It does not make the MONEY gates honest. `venue_depth` before 2026-08-25 is
+  # Predexon backfill, which is unbiased but 54x noisier than the live book and
+  # stamped a minute late — not an executable price. Measured 2026-10-18 over
+  # one walk-forward: P&L split **+$3,493.94 (t=+3.95) on backfilled quotes
+  # against -$55.03 (t=-0.12) on live-recorded ones**, and the 0-20c band
+  # reversed sign entirely (+5.98pp/ct backfill, -4.82pp/ct live). `decide()`
+  # selects rows where `q - ask` is large, so a noisy ask makes it
+  # preferentially pick prices that never existed.
+  #
+  # The MARKET gates are already protected — `scripts/promote.py:114` passes
+  # `recorded_only=True`, so `model_minus_market`, `model_minus_market_p`,
+  # `calibration_vs_market` and `directional_tilt_abs` see live quotes only.
+  # `realised_edge_pp`, `total_return`, `sharpe` and `max_drawdown` do not, and
+  # should be read as an upper bound until live recording covers more than the
+  # 51 days it has. Cutting `--start` to 2026-08-25 would fix them and leaves
+  # too little to fit 55 features: measured, training on live-only quotes gives
+  # `log_loss_skill` **-0.000118 (p=0.80)**, i.e. no skill at all.
+  #
+  # `--max-entries-per-symbol-window 4` / `--max-positions-per-window 12`
+  # mirror the trader override's multi-entry experiment of 2026-10-20: the
+  # account takes one entry per decision offset instead of the first that
+  # clears. Grading first-clear here while the account runs multi-entry is the
+  # exact drift `tests/test_deployed_config_parity.py` exists to catch, and the
+  # defect already recorded in this file from 2026-10-18. Both flags move
+  # together -- at 3, `max_positions_per_window` is saturated by one entry on
+  # each of three symbols, so the per-symbol limit alone changes nothing.
+  # `decide()` is shared, so the same-side constraint (`OPPOSITE_SIDE`) applies
+  # here too: the backtest cannot buy both sides of a window either.
+  #
+  # `--exclude-price-band 0.35,0.65` puts a hole in the middle of the book,
+  # where the fee `0.07*p(1-p)` peaks and the measured signal is ~0. On live
+  # quotes that band alone was -$393 (-2.38pp/ct) while excluding it took the
+  # whole book from -$55 to +$297. Symmetric, and `Config.__post_init__`
+  # refuses an off-centre hole for the same reason the outer band is symmetric.
+  #
+  # **Promoting DOES affect trading, at the next window boundary.** This said
+  # "`live.py` calls `load_live` once at startup and never reloads", which was
+  # true once and is not now: `scripts/live.py` calls `reload_if_changed` on the
+  # first cycle of each window, so a newly installed artifact is picked up with
+  # no restart. `ops/weekly_retrain.sh` already said so; this comment had
+  # drifted and the two contradicted each other — corrected 2026-10-18.
   # ===========================================================================
   retrain:
     profiles: ["tools"]
@@ -363,6 +494,11 @@ services:
     environment:
       - RESEARCH_STORE=/app/data/research
       - MODELS_ROOT=/app/models
+      # Identical to the trader's, deliberately — see the long note there. A
+      # retrain scoring quotes the account would refuse is grading a sample the
+      # account never sees, which is the drift this file keeps getting caught
+      # by. Change one and change the other in the same commit.
+      - QUOTE_MAX_AGE_SECONDS=${QUOTE_MAX_AGE_SECONDS:-5}
       - FEE_CONFIG=${FEE_CONFIG:-}
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trades_db}
     volumes:
@@ -371,13 +507,28 @@ services:
       - ./backend/trader:/app
     command: >
       -m scripts.promote
-        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,market_state,implied_vol
+        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,market_state,implied_vol,book_flow
+        --start 2025-10-01
         --complete-cases
-        --entry-offsets 12
+        --entry-offsets 3 6 9 12
         --init-score-source market
-        --kelly-fraction 0.05
-        --min-edge-pp 1.5
+        --kelly-fraction 0.10
+        --compound
+        --min-edge-pp 0.5
         --bankroll 500
+        --exclude-price-band 0.35,0.65
+        --max-entries-per-symbol-window 4
+        --max-positions-per-window 12
+        --maker-entry
+        --max-stake-dollars 40
+        --ensemble-size 5
+        --label-source venue
+        --edge-lower-bound-z 1.0
+        --require-member-agreement
+        --quote-sources live_touch,live_ws,live,live_ws_replay,candles
+        --peer-quote-sources all
+        --force
+        --reason "Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
 
 
 volumes:

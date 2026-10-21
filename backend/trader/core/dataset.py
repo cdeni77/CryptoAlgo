@@ -53,13 +53,18 @@ class DatasetError(RuntimeError):
 
 
 def peer_quote_limits(config: Config) -> dict:
-    """The peer venue's staleness cap and null-age rule. Unset, the cap follows
-    `max_quote_age_seconds` and a missing peer age stays fresh; `null_quote_age`
+    """The peer venue's staleness cap, source list and null-age rule.
+
+    Unset, the cap follows `max_quote_age_seconds`, the source list follows
+    `quote_sources`, and a missing peer age stays fresh; `null_quote_age`
     reaches the peer only once its own cap is set explicitly."""
     peer = getattr(config, 'peer_max_quote_age_seconds', None)
+    peer_sources = getattr(config, 'peer_quote_sources', None)
     return {'peer_max_age_seconds': peer,
             'peer_null_age': ('fresh' if peer is None
-                              else getattr(config, 'null_quote_age', 'fresh'))}
+                              else getattr(config, 'null_quote_age', 'fresh')),
+            'peer_sources': (None if peer_sources is None
+                             else tuple(peer_sources))}
 
 
 def load_minute_bars(
@@ -135,7 +140,7 @@ class Dataset:
                 windows, depth,
                 max_age_seconds=float(config.max_quote_age_seconds),
                 sources=tuple(getattr(config, 'quote_sources', ()) or ()),
-                null_age=getattr(config, 'null_quote_age', 'fresh'),
+                null_age=getattr(config, 'null_quote_age', 'stale'),
                 decision_latency_seconds=float(
                     getattr(config, 'decision_latency_seconds', 3.0)),
                 **peer_quote_limits(config))

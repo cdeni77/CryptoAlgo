@@ -54,13 +54,22 @@ class FakeDisk:
 def test_retention_defaults_and_env(monkeypatch):
     monkeypatch.delenv('RAW_RETENTION_DAYS', raising=False)
     monkeypatch.delenv('INDEX_PROXY_RETENTION_DAYS', raising=False)
+    monkeypatch.delenv('SPOT_TRADES_RETENTION_DAYS', raising=False)
     assert retention_days('venue_book_events') == 60.0
-    assert retention_days('spot_trades') == 60.0
+    # **A year, not the 60-day raw tier it used to inherit.** `spot_trades` is
+    # a feature source in waiting; at 60 days it tops out near 5,760 windows,
+    # the floor of a usable training window, so it could never have fed a
+    # model however long it ran. This assertion used to read 60.0 and was
+    # encoding that cap as if it were intended.
+    assert retention_days('spot_trades') == 365.0
     assert retention_days('index_proxy_1s') == 365.0
     monkeypatch.setenv('RAW_RETENTION_DAYS', '90')
     monkeypatch.setenv('INDEX_PROXY_RETENTION_DAYS', '30')
+    monkeypatch.setenv('SPOT_TRADES_RETENTION_DAYS', '45')
     assert retention_days('venue_book_events') == 90.0
     assert retention_days('index_proxy_1s') == 30.0
+    # Its own knob: RAW_RETENTION_DAYS must no longer move it.
+    assert retention_days('spot_trades') == 45.0
 
 
 def test_a_garbage_retention_falls_back_rather_than_pruning_everything(monkeypatch):
@@ -79,13 +88,19 @@ def test_prune_reads_the_hour_from_the_name_not_the_mtime(tmp_path):
 def test_each_table_is_pruned_to_its_own_retention(tmp_path, monkeypatch):
     monkeypatch.delenv('RAW_RETENTION_DAYS', raising=False)
     monkeypatch.delenv('INDEX_PROXY_RETENTION_DAYS', raising=False)
+    monkeypatch.delenv('SPOT_TRADES_RETENTION_DAYS', raising=False)
     spool, store = tmp_path / 'spool', tmp_path / 'store'
     book = _parquet(store, 'venue_book_events', NOW - 100 * DAY)
     trades = _parquet(store, 'spot_trades', NOW - 100 * DAY)
+    stale_trades = _parquet(store, 'spot_trades', NOW - 400 * DAY)
     index = _parquet(store, 'index_proxy_1s', NOW - 100 * DAY)
     compact_all(spool, store, now=NOW,
                 disk_usage=lambda _p: Usage(10**12, 0, 10**12))
-    assert not book.exists() and not trades.exists()
+    assert not book.exists(), 'raw frames are a 60-day replay buffer'
+    # 100 days old and KEPT: this used to assert the opposite, which is the
+    # cap that made the dataset untrainable.
+    assert trades.exists(), 'spot_trades is kept a year'
+    assert not stale_trades.exists(), 'but a year is still a limit'
     assert index.exists(), 'the index proxy is kept a year'
 
 

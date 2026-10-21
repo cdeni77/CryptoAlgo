@@ -1,5 +1,5 @@
 {
-  "gate_spec_hash": "88d1feb458f0d5967d05d08c904ebdb908a6ae28e3f2c4c4dd02b37845ab9823",
+  "gate_spec_hash": "09db8e300301aa9cf047ca1448ee884dc79fa1467266b2d6d76f6ff8db1b5bf2",
   "gates": [
     {
       "name": "market_windows",
@@ -11,6 +11,12 @@
       "name": "model_minus_market",
       "threshold": 0.0,
       "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "directional_tilt_abs",
+      "threshold": 0.5,
+      "direction": "max",
       "definition_version": 1
     },
     {
@@ -75,6 +81,12 @@
     },
     {
       "name": "residual_scale",
+      "threshold": 0.25,
+      "direction": "min",
+      "definition_version": 1
+    },
+    {
+      "name": "deployed_residual_scale",
       "threshold": 0.25,
       "direction": "min",
       "definition_version": 1

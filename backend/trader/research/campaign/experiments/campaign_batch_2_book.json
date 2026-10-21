@@ -1,0 +1,1316 @@
+{
+  "results": {
+    "E7_implied_vol": {
+      "name": "E7_implied_vol",
+      "status": "OK",
+      "hypothesis": "the market's own forward sigma, inverted from the KXBTCD ladder, beats bar-only features",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset",
+        "implied_vol"
+      ],
+      "features": [
+        "abs_z_score",
+        "autocorr_60",
+        "beta_1440",
+        "body_ratio_15",
+        "displacement_vs_elapsed",
+        "elapsed_fraction",
+        "excursion_asymmetry",
+        "excursion_down_z",
+        "excursion_span_z",
+        "excursion_up_z",
+        "implied_sigma_per_min",
+        "iv_minus_realised",
+        "iv_n_strikes",
+        "iv_r2",
+        "iv_staleness_minutes",
+        "lead_residual",
+        "log_rv_1440",
+        "log_rv_15",
+        "log_rv_240",
+        "log_rv_60",
+        "log_sigma_per_min",
+        "path_efficiency",
+        "peer_displacement",
+        "peer_return_15",
+        "peer_return_5",
+        "range_to_return",
+        "remaining_minutes",
+        "run_length",
+        "rv_slope_long",
+        "rv_slope_short",
+        "rv_surprise",
+        "seasonal_ramp",
+        "signed_volume_15",
+        "touched_opposite",
+        "universe_dispersion",
+        "vol_of_vol",
+        "volume_z_15",
+        "vwap_gap_15",
+        "z_score",
+        "zero_return_share_60"
+      ],
+      "n_features": 40,
+      "params": {},
+      "symbols": [
+        "BTC-USD",
+        "ETH-USD"
+      ],
+      "trailing_days": null,
+      "n_oof": 170252,
+      "windows": 7876,
+      "log_loss_model": 0.47948065184766464,
+      "log_loss_market": 0.47394040025230266,
+      "log_loss_baseline": 0.4810435974076748,
+      "model_minus_market": -0.006750003131283792,
+      "ci95": [
+        -0.008611932110735274,
+        -0.004960480775546522
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.009376774120057975,
+        "max_dev": 0.022917654199441917,
+        "table": [
+          {
+            "n": 17026,
+            "p_mean": 0.02229815334161674,
+            "y_mean": 0.022495007635381183
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.12559408776778933,
+            "y_mean": 0.13309838472834068
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.2556971402333661,
+            "y_mean": 0.26508076358296623
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.3630543858835898,
+            "y_mean": 0.37010279001468427
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.45669308379916357,
+            "y_mean": 0.45397944199706314
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.5473330507190508,
+            "y_mean": 0.5365638766519824
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.6469998862111893,
+            "y_mean": 0.6240822320117474
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.7613750480911509,
+            "y_mean": 0.7411453744493393
+          },
+          {
+            "n": 17025,
+            "p_mean": 0.8869108879958089,
+            "y_mean": 0.8776505139500734
+          },
+          {
+            "n": 17026,
+            "p_mean": 0.9804863689575753,
+            "y_mean": 0.9767414542464466
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.00890595998872261,
+        "max_dev": 0.0162103883726471,
+        "table": [
+          {
+            "n": 17039,
+            "p_mean": 0.02603151593403369,
+            "y_mean": 0.020717178238159516
+          },
+          {
+            "n": 17540,
+            "p_mean": 0.14035778221208667,
+            "y_mean": 0.1315279361459521
+          },
+          {
+            "n": 17649,
+            "p_mean": 0.2724562298147204,
+            "y_mean": 0.2641509433962264
+          },
+          {
+            "n": 16218,
+            "p_mean": 0.37475274386484153,
+            "y_mean": 0.3689110864471575
+          },
+          {
+            "n": 16788,
+            "p_mean": 0.4599797474386466,
+            "y_mean": 0.4437693590659995
+          },
+          {
+            "n": 18022,
+            "p_mean": 0.5436333370325158,
+            "y_mean": 0.5392298302075241
+          },
+          {
+            "n": 15937,
+            "p_mean": 0.6334645792809186,
+            "y_mean": 0.6432829265231851
+          },
+          {
+            "n": 17102,
+            "p_mean": 0.7378069816395744,
+            "y_mean": 0.7514325809846801
+          },
+          {
+            "n": 17797,
+            "p_mean": 0.8700598134517054,
+            "y_mean": 0.8839692082935326
+          },
+          {
+            "n": 16160,
+            "p_mean": 0.9772917388613861,
+            "y_mean": 0.9798267326732674
+          }
+        ]
+      },
+      "runtime_s": 51.8,
+      "money": {
+        "gate_1.0": {
+          "trades": 11180,
+          "contracts": 11180,
+          "pnl": -145.04309999999998,
+          "pp_per_contract": -1.2973443649373881,
+          "win_rate": 0.5768336314847943,
+          "mean_price": 0.5755372987477638,
+          "fees": 159.5361,
+          "independent_windows": 6980,
+          "pnl_ci95": [
+            -243.8928,
+            -47.92650249999997
+          ],
+          "t_stat": -2.9107801155817525,
+          "eligible_windows": 15226,
+          "by_offset": {
+            "3": {
+              "size": 7966,
+              "sum": -79.30649999999999
+            },
+            "6": {
+              "size": 1956,
+              "sum": -32.00769999999999
+            },
+            "9": {
+              "size": 915,
+              "sum": -30.335399999999996
+            },
+            "12": {
+              "size": 343,
+              "sum": -3.393499999999999
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 5552,
+              "sum": -45.30209999999999
+            },
+            "ETH-USD": {
+              "size": 5628,
+              "sum": -99.74099999999999
+            }
+          },
+          "max_drawdown": 161.29760000000002
+        },
+        "gate_1.5": {
+          "trades": 9920,
+          "contracts": 9920,
+          "pnl": -138.3319,
+          "pp_per_contract": -1.3944747983870966,
+          "win_rate": 0.5688508064516129,
+          "mean_price": 0.5683254032258065,
+          "fees": 143.5439,
+          "independent_windows": 6499,
+          "pnl_ci95": [
+            -231.25027499999996,
+            -46.531185000000015
+          ],
+          "t_stat": -2.934058724090066,
+          "eligible_windows": 15226,
+          "by_offset": {
+            "3": {
+              "size": 7054,
+              "sum": -76.97139999999999
+            },
+            "6": {
+              "size": 1735,
+              "sum": -38.42739999999999
+            },
+            "9": {
+              "size": 795,
+              "sum": -20.678
+            },
+            "12": {
+              "size": 336,
+              "sum": -2.255100000000001
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 4935,
+              "sum": -44.00069999999999
+            },
+            "ETH-USD": {
+              "size": 4985,
+              "sum": -94.33119999999998
+            }
+          },
+          "max_drawdown": 147.58300000000023
+        },
+        "gate_2.5": {
+          "trades": 7685,
+          "contracts": 7685,
+          "pnl": -111.44539999999999,
+          "pp_per_contract": -1.450167859466493,
+          "win_rate": 0.5517241379310345,
+          "mean_price": 0.5513440468445022,
+          "fees": 114.3664,
+          "independent_windows": 5418,
+          "pnl_ci95": [
+            -194.68398249999998,
+            -30.005165000000044
+          ],
+          "t_stat": -2.6547606519996507,
+          "eligible_windows": 15226,
+          "by_offset": {
+            "3": {
+              "size": 5460,
+              "sum": -66.66429999999998
+            },
+            "6": {
+              "size": 1352,
+              "sum": -27.440899999999996
+            },
+            "9": {
+              "size": 596,
+              "sum": -20.8124
+            },
+            "12": {
+              "size": 277,
+              "sum": 3.4722
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 3860,
+              "sum": -42.441199999999995
+            },
+            "ETH-USD": {
+              "size": 3825,
+              "sum": -69.00419999999998
+            }
+          },
+          "max_drawdown": 119.77819999999993
+        }
+      }
+    },
+    "E8_book_features": {
+      "name": "E8_book_features",
+      "status": "OK",
+      "hypothesis": "verified order-book structure (imbalance, depth, ladder slope) carries information the bar features cannot express",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset",
+        "market_state",
+        "book_flow"
+      ],
+      "features": [
+        "abs_z_score",
+        "autocorr_60",
+        "beta_1440",
+        "body_ratio_15",
+        "book_convexity",
+        "depth_ratio",
+        "depth_trend_3",
+        "displacement_vs_elapsed",
+        "elapsed_fraction",
+        "excursion_asymmetry",
+        "excursion_down_z",
+        "excursion_span_z",
+        "excursion_up_z",
+        "imbalance_5c",
+        "imbalance_change_3",
+        "imbalance_persistence",
+        "imbalance_touch",
+        "lead_residual",
+        "log_rv_1440",
+        "log_rv_15",
+        "log_rv_240",
+        "log_rv_60",
+        "log_sigma_per_min",
+        "path_efficiency",
+        "peer_displacement",
+        "peer_return_15",
+        "peer_return_5",
+        "range_to_return",
+        "remaining_minutes",
+        "run_length",
+        "rv_slope_long",
+        "rv_slope_short",
+        "rv_surprise",
+        "seasonal_ramp",
+        "signed_volume_15",
+        "spread",
+        "spread_change_3",
+        "touched_opposite",
+        "universe_dispersion",
+        "vol_of_vol",
+        "volume_z_15",
+        "vwap_gap_15",
+        "z_score",
+        "zero_return_share_60"
+      ],
+      "n_features": 44,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.4715192370010447,
+      "log_loss_market": 0.4679854294734271,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.004038544607676119,
+      "ci95": [
+        -0.005429167356087901,
+        -0.002658761830333514
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.010303236668212184,
+        "max_dev": 0.025494625626490186,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.02000824840276117,
+            "y_mean": 0.019852632382697667
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.12329611115488967,
+            "y_mean": 0.12564425609895774
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.25304225362408594,
+            "y_mean": 0.25682434238155233
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.3626422584893047,
+            "y_mean": 0.3634558851601573
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.4597899958386969,
+            "y_mean": 0.4502347955560646
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.5536631772999157,
+            "y_mean": 0.535792005497652
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.6571233434933406,
+            "y_mean": 0.6320772725537357
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.7735952632014148,
+            "y_mean": 0.7481006375749246
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.8997519062553075,
+            "y_mean": 0.8842057038139961
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9846667844705335,
+            "y_mean": 0.9822471652731646
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008077011033482212,
+        "max_dev": 0.01445572320088473,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401735511832163,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940447523431996,
+            "y_mean": 0.36101952358018746
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.45987005292677147,
+            "y_mean": 0.44541432972588674
+          },
+          {
+            "n": 26495,
+            "p_mean": 0.5438745046235138,
+            "y_mean": 0.5395357614644273
+          },
+          {
+            "n": 26197,
+            "p_mean": 0.6376993548879644,
+            "y_mean": 0.6406458754819254
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 91.4,
+      "money": {
+        "gate_1.0": {
+          "trades": 16499,
+          "contracts": 16499,
+          "pnl": -116.69969999999998,
+          "pp_per_contract": -0.7073137765925206,
+          "win_rate": 0.6087641675253046,
+          "mean_price": 0.6018579913934178,
+          "fees": 230.6447,
+          "independent_windows": 7487,
+          "pnl_ci95": [
+            -247.01495749999998,
+            9.16851249999996
+          ],
+          "t_stat": -1.8051762811592325,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 11218,
+              "sum": -105.37769999999996
+            },
+            "6": {
+              "size": 3231,
+              "sum": -16.383699999999994
+            },
+            "9": {
+              "size": 1477,
+              "sum": -3.857299999999998
+            },
+            "12": {
+              "size": 573,
+              "sum": 8.919
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 5395,
+              "sum": 13.695400000000012
+            },
+            "ETH-USD": {
+              "size": 5338,
+              "sum": -60.33949999999998
+            },
+            "SOL-USD": {
+              "size": 5766,
+              "sum": -70.05559999999998
+            }
+          },
+          "max_drawdown": 129.61280000000014
+        },
+        "gate_1.5": {
+          "trades": 14357,
+          "contracts": 14357,
+          "pnl": -98.76719999999997,
+          "pp_per_contract": -0.6879375914188199,
+          "win_rate": 0.6027721668872327,
+          "mean_price": 0.5954345615379256,
+          "fees": 204.1132,
+          "independent_windows": 7089,
+          "pnl_ci95": [
+            -217.39680499999997,
+            20.13453999999997
+          ],
+          "t_stat": -1.6274835771551392,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 9746,
+              "sum": -94.22149999999998
+            },
+            "6": {
+              "size": 2789,
+              "sum": -27.892299999999995
+            },
+            "9": {
+              "size": 1320,
+              "sum": 7.7172
+            },
+            "12": {
+              "size": 502,
+              "sum": 15.6294
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 4702,
+              "sum": -8.95799999999999
+            },
+            "ETH-USD": {
+              "size": 4581,
+              "sum": -39.520499999999984
+            },
+            "SOL-USD": {
+              "size": 5074,
+              "sum": -50.28869999999999
+            }
+          },
+          "max_drawdown": 106.05099999999996
+        },
+        "gate_2.5": {
+          "trades": 10592,
+          "contracts": 10592,
+          "pnl": -95.75149999999996,
+          "pp_per_contract": -0.9039983006042294,
+          "win_rate": 0.5833648036253777,
+          "mean_price": 0.5777751132930513,
+          "fees": 154.95749999999998,
+          "independent_windows": 5966,
+          "pnl_ci95": [
+            -199.83382749999996,
+            6.360392500000006
+          ],
+          "t_stat": -1.813704390757073,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 7233,
+              "sum": -63.24789999999997
+            },
+            "6": {
+              "size": 2029,
+              "sum": -31.176599999999997
+            },
+            "9": {
+              "size": 939,
+              "sum": -6.5386
+            },
+            "12": {
+              "size": 391,
+              "sum": 5.2116
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 3451,
+              "sum": -8.22189999999999
+            },
+            "ETH-USD": {
+              "size": 3316,
+              "sum": -29.100899999999992
+            },
+            "SOL-USD": {
+              "size": 3825,
+              "sum": -58.42869999999999
+            }
+          },
+          "max_drawdown": 105.25730000000001
+        }
+      }
+    },
+    "E8b_book_only": {
+      "name": "E8b_book_only",
+      "status": "OK",
+      "hypothesis": "the book ALONE beats the market -- run separately because a group that forecasts nothing still absorbs splits",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "offset",
+        "market_state",
+        "book_flow"
+      ],
+      "features": [
+        "book_convexity",
+        "depth_ratio",
+        "depth_trend_3",
+        "elapsed_fraction",
+        "imbalance_5c",
+        "imbalance_change_3",
+        "imbalance_persistence",
+        "imbalance_touch",
+        "remaining_minutes",
+        "spread",
+        "spread_change_3"
+      ],
+      "n_features": 11,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.4688154100049579,
+      "log_loss_market": 0.4679854294734271,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.0008362935373558481,
+      "ci95": [
+        -0.0013340847427661742,
+        -0.000340904032224513
+      ],
+      "p_one_sided": 0.9994,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.008430943504475827,
+        "max_dev": 0.02169941725387009,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.022723954552438096,
+            "y_mean": 0.019509029129920207
+          },
+          {
+            "n": 26254,
+            "p_mean": 0.13128059473651077,
+            "y_mean": 0.12619029481221908
+          },
+          {
+            "n": 26135,
+            "p_mean": 0.26348920019018174,
+            "y_mean": 0.25245838913334606
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.3715268976782295,
+            "y_mean": 0.3589508647348528
+          },
+          {
+            "n": 26196,
+            "p_mean": 0.46375163896710875,
+            "y_mean": 0.44205222171323866
+          },
+          {
+            "n": 26191,
+            "p_mean": 0.5517955265048597,
+            "y_mean": 0.5399182925432401
+          },
+          {
+            "n": 26238,
+            "p_mean": 0.6446119205044544,
+            "y_mean": 0.6373961429987042
+          },
+          {
+            "n": 26173,
+            "p_mean": 0.7533057974647863,
+            "y_mean": 0.7556642341344133
+          },
+          {
+            "n": 26174,
+            "p_mean": 0.8789162114794806,
+            "y_mean": 0.8858409108275388
+          },
+          {
+            "n": 26183,
+            "p_mean": 0.978881071859242,
+            "y_mean": 0.9812091815300004
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008077011033482212,
+        "max_dev": 0.01445572320088473,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401735511832163,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940447523431996,
+            "y_mean": 0.36101952358018746
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.45987005292677147,
+            "y_mean": 0.44541432972588674
+          },
+          {
+            "n": 26495,
+            "p_mean": 0.5438745046235138,
+            "y_mean": 0.5395357614644273
+          },
+          {
+            "n": 26197,
+            "p_mean": 0.6376993548879644,
+            "y_mean": 0.6406458754819254
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 45.4,
+      "money": {
+        "gate_1.0": {
+          "trades": 3001,
+          "contracts": 3001,
+          "pnl": -50.6018,
+          "pp_per_contract": -1.686164611796068,
+          "win_rate": 0.5148283905364879,
+          "mean_price": 0.5185504831722759,
+          "fees": 39.4318,
+          "independent_windows": 2081,
+          "pnl_ci95": [
+            -102.04796750000001,
+            1.3256874999999864
+          ],
+          "t_stat": -1.9429273488411718,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 472,
+              "sum": -0.756299999999998
+            },
+            "6": {
+              "size": 689,
+              "sum": -3.9948999999999986
+            },
+            "9": {
+              "size": 1283,
+              "sum": -38.86450000000001
+            },
+            "12": {
+              "size": 557,
+              "sum": -6.986099999999998
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 923,
+              "sum": -23.083299999999998
+            },
+            "ETH-USD": {
+              "size": 936,
+              "sum": -6.034300000000003
+            },
+            "SOL-USD": {
+              "size": 1142,
+              "sum": -21.484199999999998
+            }
+          },
+          "max_drawdown": 64.02500000000005
+        },
+        "gate_1.5": {
+          "trades": 1881,
+          "contracts": 1881,
+          "pnl": -26.342999999999996,
+          "pp_per_contract": -1.4004784688995213,
+          "win_rate": 0.5188729399255715,
+          "mean_price": 0.5197793726741096,
+          "fees": 24.637999999999998,
+          "independent_windows": 1416,
+          "pnl_ci95": [
+            -66.61421,
+            13.185024999999982
+          ],
+          "t_stat": -1.3009638293586898,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 377,
+              "sum": 0.5612000000000008
+            },
+            "6": {
+              "size": 585,
+              "sum": -1.7064999999999952
+            },
+            "9": {
+              "size": 493,
+              "sum": -25.3305
+            },
+            "12": {
+              "size": 426,
+              "sum": 0.13280000000000253
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 480,
+              "sum": -3.534699999999995
+            },
+            "ETH-USD": {
+              "size": 598,
+              "sum": -1.6760999999999995
+            },
+            "SOL-USD": {
+              "size": 803,
+              "sum": -21.132199999999997
+            }
+          },
+          "max_drawdown": 33.44269999999994
+        },
+        "gate_2.5": {
+          "trades": 1098,
+          "contracts": 1098,
+          "pnl": 4.234200000000004,
+          "pp_per_contract": 0.3856284153005468,
+          "win_rate": 0.5264116575591985,
+          "mean_price": 0.5083351548269581,
+          "fees": 15.613800000000001,
+          "independent_windows": 821,
+          "pnl_ci95": [
+            -26.934177499999997,
+            36.27730249999998
+          ],
+          "t_stat": 0.2626951528669059,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 224,
+              "sum": 2.126399999999999
+            },
+            "6": {
+              "size": 355,
+              "sum": 9.5396
+            },
+            "9": {
+              "size": 219,
+              "sum": -3.6633999999999998
+            },
+            "12": {
+              "size": 300,
+              "sum": -3.768399999999997
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 260,
+              "sum": -0.14289999999999758
+            },
+            "ETH-USD": {
+              "size": 330,
+              "sum": 10.759099999999998
+            },
+            "SOL-USD": {
+              "size": 508,
+              "sum": -6.381999999999999
+            }
+          },
+          "max_drawdown": 13.73899999999998
+        }
+      }
+    },
+    "E11_cross_venue": {
+      "name": "E11_cross_venue",
+      "status": "OK",
+      "hypothesis": "Polymarket's price identifies Kalshi mispricing",
+      "fitter": "lgbm",
+      "init": "market",
+      "groups": [
+        "geometry",
+        "vol_state",
+        "microstructure",
+        "cross_asset",
+        "offset",
+        "cross_venue"
+      ],
+      "features": [
+        "abs_z_score",
+        "autocorr_60",
+        "beta_1440",
+        "body_ratio_15",
+        "displacement_vs_elapsed",
+        "elapsed_fraction",
+        "excursion_asymmetry",
+        "excursion_down_z",
+        "excursion_span_z",
+        "excursion_up_z",
+        "lead_residual",
+        "log_rv_1440",
+        "log_rv_15",
+        "log_rv_240",
+        "log_rv_60",
+        "log_sigma_per_min",
+        "path_efficiency",
+        "peer_displacement",
+        "peer_return_15",
+        "peer_return_5",
+        "pm_available",
+        "range_to_return",
+        "remaining_minutes",
+        "run_length",
+        "rv_slope_long",
+        "rv_slope_short",
+        "rv_surprise",
+        "seasonal_ramp",
+        "signed_volume_15",
+        "touched_opposite",
+        "universe_dispersion",
+        "venue_gap_change_5",
+        "venue_prob_gap",
+        "venue_spread_ratio",
+        "vol_of_vol",
+        "volume_z_15",
+        "vwap_gap_15",
+        "z_score",
+        "zero_return_share_60"
+      ],
+      "n_features": 39,
+      "params": {},
+      "symbols": "all",
+      "trailing_days": null,
+      "n_oof": 261930,
+      "windows": 7932,
+      "log_loss_model": 0.4721772787883387,
+      "log_loss_market": 0.4679854294734271,
+      "log_loss_baseline": 0.47346010127515625,
+      "model_minus_market": -0.004979984011557191,
+      "ci95": [
+        -0.006495117387039131,
+        -0.003494523881411803
+      ],
+      "p_one_sided": 1.0,
+      "beats_market": false,
+      "calibration": {
+        "error": 0.011525092289555219,
+        "max_dev": 0.029470815325922994,
+        "table": [
+          {
+            "n": 26193,
+            "p_mean": 0.01994567545028076,
+            "y_mean": 0.01973809796510518
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.12293603952691234,
+            "y_mean": 0.1259496812125377
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.2532592216404118,
+            "y_mean": 0.2580460428358722
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.36345408744835456,
+            "y_mean": 0.36284503493299736
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.46116895248100487,
+            "y_mean": 0.45168556484556943
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.5556491919485808,
+            "y_mean": 0.5353338678272821
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.6599827841725614,
+            "y_mean": 0.6305119688466384
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.7759333857677679,
+            "y_mean": 0.7476806780437522
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9009808310374294,
+            "y_mean": 0.8845493070667736
+          },
+          {
+            "n": 26193,
+            "p_mean": 0.9847745239529796,
+            "y_mean": 0.9820944527163746
+          }
+        ]
+      },
+      "market_calibration": {
+        "error": 0.008077011033482212,
+        "max_dev": 0.01445572320088473,
+        "table": [
+          {
+            "n": 26491,
+            "p_mean": 0.02464034955267827,
+            "y_mean": 0.019553810728171833
+          },
+          {
+            "n": 26073,
+            "p_mean": 0.13401735511832163,
+            "y_mean": 0.12668277528477737
+          },
+          {
+            "n": 26370,
+            "p_mean": 0.2620678801668563,
+            "y_mean": 0.2522184300341297
+          },
+          {
+            "n": 26993,
+            "p_mean": 0.36940447523431996,
+            "y_mean": 0.36101952358018746
+          },
+          {
+            "n": 25318,
+            "p_mean": 0.45987005292677147,
+            "y_mean": 0.44541432972588674
+          },
+          {
+            "n": 26495,
+            "p_mean": 0.5438745046235138,
+            "y_mean": 0.5395357614644273
+          },
+          {
+            "n": 26197,
+            "p_mean": 0.6376993548879644,
+            "y_mean": 0.6406458754819254
+          },
+          {
+            "n": 26066,
+            "p_mean": 0.7473171948131666,
+            "y_mean": 0.7579221974986573
+          },
+          {
+            "n": 25759,
+            "p_mean": 0.8751172988081835,
+            "y_mean": 0.8890873092899569
+          },
+          {
+            "n": 26168,
+            "p_mean": 0.9777153011311526,
+            "y_mean": 0.981886273310914
+          }
+        ]
+      },
+      "runtime_s": 81.6,
+      "money": {
+        "gate_1.0": {
+          "trades": 16636,
+          "contracts": 16636,
+          "pnl": -147.96209999999996,
+          "pp_per_contract": -0.8894091127674919,
+          "win_rate": 0.6071772060591488,
+          "mean_price": 0.6020750781437845,
+          "fees": 232.84110000000004,
+          "independent_windows": 7511,
+          "pnl_ci95": [
+            -276.9792925,
+            -22.71178500000003
+          ],
+          "t_stat": -2.265083419884776,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 11459,
+              "sum": -107.57809999999996
+            },
+            "6": {
+              "size": 3127,
+              "sum": -40.194799999999994
+            },
+            "9": {
+              "size": 1481,
+              "sum": 0.10510000000000053
+            },
+            "12": {
+              "size": 569,
+              "sum": -0.29429999999999934
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 5449,
+              "sum": -12.674399999999993
+            },
+            "ETH-USD": {
+              "size": 5380,
+              "sum": -64.62809999999999
+            },
+            "SOL-USD": {
+              "size": 5807,
+              "sum": -70.65959999999998
+            }
+          },
+          "max_drawdown": 158.50089999999983
+        },
+        "gate_1.5": {
+          "trades": 14558,
+          "contracts": 14558,
+          "pnl": -148.02159999999998,
+          "pp_per_contract": -1.0167715345514492,
+          "win_rate": 0.5993955213628246,
+          "mean_price": 0.5953606951504327,
+          "fees": 206.7606,
+          "independent_windows": 7145,
+          "pnl_ci95": [
+            -269.08771249999995,
+            -27.945462499999987
+          ],
+          "t_stat": -2.405719138958899,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 10028,
+              "sum": -97.60659999999997
+            },
+            "6": {
+              "size": 2731,
+              "sum": -33.4229
+            },
+            "9": {
+              "size": 1275,
+              "sum": -15.6851
+            },
+            "12": {
+              "size": 524,
+              "sum": -1.307
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 4762,
+              "sum": -18.012499999999992
+            },
+            "ETH-USD": {
+              "size": 4631,
+              "sum": -65.24579999999999
+            },
+            "SOL-USD": {
+              "size": 5165,
+              "sum": -64.76329999999999
+            }
+          },
+          "max_drawdown": 158.90450000000007
+        },
+        "gate_2.5": {
+          "trades": 10901,
+          "contracts": 10901,
+          "pnl": -106.19549999999998,
+          "pp_per_contract": -0.9741812677735986,
+          "win_rate": 0.5837996514081277,
+          "mean_price": 0.5789371617282819,
+          "fees": 159.2015,
+          "independent_windows": 6111,
+          "pnl_ci95": [
+            -212.44204749999997,
+            0.7923925000000266
+          ],
+          "t_stat": -1.9820670206026294,
+          "eligible_windows": 23038,
+          "by_offset": {
+            "3": {
+              "size": 7571,
+              "sum": -55.06419999999997
+            },
+            "6": {
+              "size": 2021,
+              "sum": -57.9372
+            },
+            "9": {
+              "size": 879,
+              "sum": 0.4489000000000004
+            },
+            "12": {
+              "size": 430,
+              "sum": 6.357
+            }
+          },
+          "by_symbol": {
+            "BTC-USD": {
+              "size": 3544,
+              "sum": -33.785
+            },
+            "ETH-USD": {
+              "size": 3377,
+              "sum": -26.895399999999988
+            },
+            "SOL-USD": {
+              "size": 3980,
+              "sum": -45.51509999999999
+            }
+          },
+          "max_drawdown": 118.94829999999975
+        }
+      }
+    }
+  },
+  "folds": [
+    "fold 1: train 1,940w (to 07-21) -> test 2,035w [07-22 .. 08-12]",
+    "fold 2: train 3,975w (to 08-11) -> test 2,035w [08-12 .. 09-02]",
+    "fold 3: train 6,010w (to 09-01) -> test 2,035w [09-02 .. 09-23]",
+    "fold 4: train 8,045w (to 09-22) -> test 2,035w [09-23 .. 10-14]"
+  ],
+  "total_runtime_s": 1630.1,
+  "exp_id": "campaign_batch_2_book",
+  "recorded_at": "2026-10-17T07:22:40.503181+00:00"
+}

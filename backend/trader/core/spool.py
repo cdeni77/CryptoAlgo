@@ -74,6 +74,20 @@ COLUMNS = ('venue', 'symbol', 'event_time', 'available_time', 'quality',
 # compose change takes effect on the next pass without a code path to forget.
 DEFAULT_RAW_RETENTION_DAYS = 60.0
 DEFAULT_INDEX_RETENTION_DAYS = 365.0
+#: **`spot_trades` is a FEATURE SOURCE in waiting, not a replayable buffer.**
+#:
+#: It inherited `RAW_RETENTION_DAYS` (60) because it sits in the same raw tier
+#: as `venue_book_events`, and that quietly capped it at ~5,760 windows -- the
+#: floor of any usable `min_train_windows`, so it could never have supported a
+#: walk-forward no matter how long it ran. History not kept cannot be
+#: recovered, so the retention has to be right BEFORE the data accrues, not
+#: after somebody wants it.
+#:
+#: It is the natural source for trade-level lead-lag, and `cross_asset` is the
+#: group with the strongest independent prior support in this project
+#: (+0.000183 at t=+3.39, 6/6 folds). Measured 2026-10-21 at ~20 MB/day, so a
+#: year costs ~7 GB against 356 GB free.
+DEFAULT_SPOT_TRADES_RETENTION_DAYS = 365.0
 DEFAULT_MIN_FREE_FRACTION = 0.15
 DEFAULT_MIN_FREE_GB = 20.0
 # The guard never deletes the newest day of any table: a disk filled by
@@ -302,7 +316,10 @@ class RawTable:
 RAW_TABLES: dict[str, RawTable] = {
     'venue_book_events': RawTable('venue_book_events', _book_row, shed_rank=0),
     'spot_trades': RawTable('spot_trades', _trade_row,
-                            dedupe=('product_id', 'trade_id'), shed_rank=1),
+                            dedupe=('product_id', 'trade_id'),
+                            retention_env='SPOT_TRADES_RETENTION_DAYS',
+                            default_retention=DEFAULT_SPOT_TRADES_RETENTION_DAYS,
+                            shed_rank=1),
     'index_proxy_1s': RawTable('index_proxy_1s', _index_row,
                                dedupe=('symbol', 'event_time'),
                                retention_env='INDEX_PROXY_RETENTION_DAYS',

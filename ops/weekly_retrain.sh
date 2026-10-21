@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 #
-# Weekly gated retrain for the live trader. Installed via cron:
+# Weekly FORCED retrain for the live trader. Installed via cron, and the time
+# here is the one actually installed -- this comment said 0 9 while the crontab
+# said 0 5, checked 2026-10-21:
 #
-#   0 9 * * 0  /home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/ops/weekly_retrain.sh
+#   0 5 * * 0  /home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/ops/weekly_retrain.sh
 #
 # WHAT IT DOES
 #   1. Runs `scripts.promote` in the one-off `retrain` container: walk-forward,
-#      gates, and install ONLY if every gate passes.
+#      gates, and install **whatever the gates say**.
 #   2. Nothing else. The trader is NOT restarted.
+#
+# **IT ALWAYS INSTALLS, BY STANDING OPERATOR POLICY (2026-10-21.)**
+#   The compose `retrain` service passes `--force` with a written reason. The
+#   gates still run, still print, and are still recorded in
+#   `models/promotions/` -- that ledger IS the trial count and a forced install
+#   is marked `forced: true` in it. What changed is that they no longer BLOCK:
+#   the operator reads them, the cron does not act on them. The reason is that
+#   the account needs the model to keep absorbing new data, and no arm has yet
+#   beaten the market anyway (`model_minus_market_p` 0.21-0.23), so a gate that
+#   refuses every candidate refuses the retrain rather than the risk.
+#
+#   The consequence worth naming: `forced` is now constant, so it no longer
+#   distinguishes one promotion from another. The gate VALUES in the ledger are
+#   what to read week to week, not the pass/fail flag.
 #
 # WHY THERE IS NO RESTART
 #   `scripts/live.py` checks the installed artifact at the first cycle of every
@@ -61,14 +77,17 @@ cd "$REPO" || exit 2
 
   case "$CODE" in
     0)
-      echo "gates PASSED and the artifact was installed; the running trader "
-      echo "reloads it at the next window boundary (no restart)"
+      echo "artifact INSTALLED; the running trader reloads it at the next "
+      echo "window boundary (no restart). Under --force this says nothing "
+      echo "about whether the gates passed -- read the gate values in "
+      echo "models/promotions/ for that, and the failed_gates list."
       ;;
     1)
-      echo "gates REFUSED the candidate; nothing installed and the trader is "
-      echo "left running its current artifact. The rejection is recorded in "
-      echo "models/promotions/ -- that ledger IS the trial count, so a refusal "
-      echo "is data, not a failure."
+      echo "promote ran but installed NOTHING. Under --force that is not a "
+      echo "gate refusal -- forcing installs regardless -- so this means the "
+      echo "install itself failed: a staging or rename error, or a candidate "
+      echo "that could not be built. Investigate; the trader is still running "
+      echo "its previous artifact."
       ;;
     *)
       echo "promote did not complete (exit $CODE). Trader untouched."

@@ -39,10 +39,28 @@ def _windows(offset=12):
                           'offset': offset, 'baseline_probability': 0.40}])
 
 
-def _row(source, bid, ask, age, offset=12):
+def _row(source, bid, ask, age, offset=12, *, written_after=600.0):
+    """One `venue_depth` row.
+
+    `written_after` is how long after the row's minute it was STORED, and it
+    carries real weight now that `null_quote_age` defaults to 'stale': a row
+    with no recorded age is bounded from `available_time - event_time`
+    (`core.quotes.derived_quote_age`) and dropped only when it cannot be
+    bounded at all. Omitting the column made every ageless `live_touch` row
+    unbounded, so the two tests below lost to a backfill row with an explicit
+    0.5s — which is the exact defect they exist to prevent, reproduced by the
+    fixture rather than by the code. Mirrors `tests/test_quote_filters.py`,
+    which already carried this parameter.
+
+    The default is deliberately LATE, so a row only looks fresh when a test
+    says it was written promptly.
+    """
+    event = OPEN + pd.Timedelta(minutes=offset)
     return {'venue': 'kalshi', 'symbol': 'BTC-USD', 'window_open': OPEN,
             'offset_minutes': offset, 'yes_bid': bid, 'yes_ask': ask,
-            'quote_age_seconds': age, 'source': source}
+            'quote_age_seconds': age, 'source': source,
+            'event_time': event,
+            'available_time': event + pd.Timedelta(seconds=written_after)}
 
 
 def test_the_decision_instant_quote_beats_the_reconstruction():
@@ -50,7 +68,9 @@ def test_the_decision_instant_quote_beats_the_reconstruction():
     the old key the reconstruction won every contested row."""
     depth = pd.DataFrame([
         _row('backfill', 0.30, 0.32, 0.5),
-        _row('live_touch', 0.60, 0.62, np.nan),
+        # Written at the decision instant — that is what `live_touch` IS, and
+        # under null_age='stale' it is what lets an ageless row be bounded.
+        _row('live_touch', 0.60, 0.62, np.nan, written_after=2.0),
     ])
     out = attach_quotes(_windows(), depth)
     assert out['market_probability'].iloc[0] == 0.61
@@ -148,7 +168,7 @@ def test_the_winning_observer_is_recorded_on_the_row():
     every table that carried it."""
     depth = pd.DataFrame([
         _row('backfill', 0.30, 0.32, 0.5),
-        _row('live_touch', 0.60, 0.62, np.nan),
+        _row('live_touch', 0.60, 0.62, np.nan, written_after=2.0),
     ])
     out = attach_quotes(_windows(), depth)
     assert out['quote_source'].iloc[0] == 'kalshi'      # the venue, unchanged

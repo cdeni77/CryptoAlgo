@@ -299,6 +299,7 @@ def folds_for_config(window_index, config) -> list[WindowFold]:
         scheme=getattr(config, 'fold_scheme', 'calendar'),
         fold_block_days=getattr(config, 'fold_block_days', 21.0),
         min_test_windows=getattr(config, 'min_test_windows', 200),
+        min_train_windows=getattr(config, 'min_train_windows', 500),
         train_days=getattr(config, 'fold_train_days', None))
 
 

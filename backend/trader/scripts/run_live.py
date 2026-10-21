@@ -201,7 +201,30 @@ COMPONENTS: tuple[Component, ...] = (
     # per-second sampler. Nothing in trading reads it yet, so it is the safest
     # thing here to disable (`--disable index`).
     Component('index', phase=0.0),
+    # **Marks, every few seconds, off the stream cache.** Not a recorder and
+    # not on the minute grid: it reads a book this process already holds and
+    # writes what each open position is worth, so the dashboard shows a
+    # position moving instead of a number that only changes once a cycle. No
+    # venue request, so `phase` is meaningless here.
+    Component('marks', phase=0.0),
+    # Phase 0, and the phase is the whole point: `core.quotes.decision_age`
+    # ages a minute-grid source FORWARD, so a book stamped more than
+    # `decision_latency_seconds` past its own minute is DROPPED by
+    # `book_flow_features`. Measured: 0s old -> 6/6 features, 7s old -> 0/6.
+    # The decision cycle starts ~7s in, which is why this cannot simply live
+    # there.
+    Component('book_minutes', phase=0.0),
     Component('ladder', phase=25.0),
+    # The public TAPE, polled. It is the only evidence that answers whether a
+    # RESTING order would have filled — a resting bid is hit by an aggressive
+    # seller and the quoted ask never moves, so neither `venue_depth` nor the
+    # book deltas can see it. Until 2026-10-20 the only writer was a manual
+    # backfill, so the dataset stopped accruing whenever nobody ran it.
+    # Deliberately REST rather than a second websocket channel — see the
+    # module docstring; the short version is that the book socket's `seq` is
+    # global per subscription and trade frames on it would make the trading
+    # path's book cache resubscribe continuously.
+    Component('trades', phase=35.0),
     # +55s, not +35s. Decisions land about two seconds past the minute, so a
     # recorder at +35s left the freshest Polymarket reading ~27s old — inside
     # the 30s bar the backtest applies, but only just, and past it on the tail.
@@ -338,6 +361,48 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
                                (err or b'').decode(errors='replace')[:300])
             else:
                 logger.info('%s done', step[0])
+        # **Which DATASETS stopped receiving rows**, as against which
+        # components are still cycling. `core.heartbeat` answers the second and
+        # cannot answer the first: `record_ladder` stopped writing on
+        # 2026-09-16 and was dead for THIRTY-ONE DAYS with every heartbeat
+        # green, because its loop ran happily and produced nothing.
+        #
+        # The cost compounded. `build_depth` reads `venue_ladder` for
+        # `source='live'`, so `venue_depth` lost its full minute grid too and
+        # carried only the four decision offsets from 2026-10-14 to 10-18 --
+        # the sampling CLAUDE.md says "would foreclose the question" of which
+        # offsets to trade. And the raw frames needed to rebuild it aged out
+        # before anyone looked: only 18.6 of the 31 dark days were recoverable.
+        #
+        # **Logged, never fatal.** It deliberately does not reach the container
+        # healthcheck. A dataset can be legitimately behind -- a venue outage,
+        # a backfill not yet run -- and failing the healthcheck restarts a
+        # process trading real money. Staleness is a thing to be told about,
+        # not a thing to restart for.
+        #
+        # **And published, because logged is not told.** The log line below is
+        # the one that existed while venue_ladder was dead, and the thing that
+        # failed was nobody reading it. `core.collection_status` writes the
+        # same measurement to a small JSON document on the shared data volume,
+        # which the API serves at `/collection` and the dashboard renders --
+        # the API cannot import this package or read a Parquet footer, so the
+        # measurement has to be made here and published rather than exposed.
+        try:
+            from core import collection_status, freshness
+            from core.datastore import DEFAULT_ROOT
+            # One pass over the footers, not two: `late()` reads the same
+            # document that gets published instead of re-walking the store.
+            document = await asyncio.to_thread(collection_status.publish,
+                                               str(DEFAULT_ROOT))
+            for dataset, age, limit in collection_status.late(document):
+                logger.error(
+                    'STALE DATASET %s: newest row %s, expected within %s. The '
+                    'recorder may be cycling and writing nothing — this is the '
+                    'failure that cost 31 days of venue_ladder.',
+                    dataset, freshness.describe(age), freshness.describe(limit))
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning('freshness check: %s', str(exc)[:200])
+
         # Liveness, recorded where the loop has demonstrably done its
         # job. A stamp written at startup or by the supervisor would
         # prove only that the process exists — which is exactly what
@@ -355,9 +420,10 @@ STEP_TIMEOUT_SECONDS = 1800.0
 
 def build_factories(args, gate: TradingGate) -> dict:
     """One coroutine factory per component, all sharing the gate."""
-    from scripts import (record_implied_vol, record_index, record_ladder,
-                         record_pm_ladder, record_pm_stream,
-                         record_spot_stream, record_stream)
+    from scripts import (mark_positions, record_implied_vol, record_index,
+                         record_book_minutes,
+                         record_ladder, record_pm_ladder, record_pm_stream,
+                         record_spot_stream, record_stream, record_trades)
     from scripts import live as live_module
 
     trade_argv = list(args.trade_args)
@@ -371,10 +437,28 @@ def build_factories(args, gate: TradingGate) -> dict:
         return await record_stream.run(
             _recorder_args(record_stream.build_parser), gate=gate)
 
+    async def marks():
+        return await mark_positions.run(
+            _recorder_args(mark_positions.build_parser), gate=gate)
+
+    async def book_minutes():
+        await align_to_phase(
+            next(c for c in COMPONENTS if c.name == 'book_minutes').phase)
+        return await record_book_minutes.run(gate=gate)
+
     async def ladder():
         await align_to_phase(25.0)
         return await record_ladder.run(
             _recorder_args(record_ladder.build_parser), gate=gate)
+
+    async def trades():
+        # Read from the declaration rather than repeated: `pm_ladder` is here
+        # because the two drifted once already and the banner then printed a
+        # phase the poll did not use.
+        await align_to_phase(
+            next(c for c in COMPONENTS if c.name == 'trades').phase)
+        return await record_trades.run(
+            _recorder_args(record_trades.build_parser), gate=gate)
 
     async def pm_ladder():
         # Read from the declaration rather than repeated, because they drifted:
@@ -410,9 +494,11 @@ def build_factories(args, gate: TradingGate) -> dict:
         return await store_sync_loop()
 
     return {'trade': trade, 'stream': stream, 'ladder': ladder,
+            'trades': trades,
             'pm_ladder': pm_ladder, 'pm_stream': pm_stream,
             'spot_stream': spot_stream, 'index': index,
-            'implied_vol': implied_vol,
+            'implied_vol': implied_vol, 'marks': marks,
+            'book_minutes': book_minutes,
             'store_sync': store_sync}
 
 

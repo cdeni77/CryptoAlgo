@@ -63,7 +63,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   try {
-    const response = await fetch(url, { ...init, headers, signal: controller.signal });
+    // **`no-store`, or polling silently serves stale bytes.** These responses
+    // carry no `Cache-Control`, `ETag` or `Last-Modified`, and a response with
+    // none of those is not uncacheable -- the browser falls back to HEURISTIC
+    // freshness and may reuse it without revalidating. The symptom is a page
+    // that polls on schedule, shows no error, and only updates when the user
+    // hits reload: every request after the first was answered from disk.
+    // Belt and braces with the `no-store` the API now sends, because this end
+    // is the one that survives a proxy in between.
+    const response = await fetch(url, {
+      cache: 'no-store',
+      ...init,
+      headers,
+      signal: controller.signal,
+    });
     if (!response.ok) {
       throw new ApiError(response.status, url, describe(response.status, await response.text(), url));
     }

@@ -1044,6 +1044,12 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
     frame = market_frame(rows)
     if frame.empty:
         return {'market_windows': 0.0,
+                # NaN, not 0.0: no rows means the tilt is UNKNOWN, and a zero
+                # here would pass the gate by claiming a model with no measured
+                # lean has no lean. Same rule as every other value in this
+                # block — a missing measurement fails rather than flatters.
+                'directional_tilt_pp': float('nan'),
+                'directional_tilt_abs': float('nan'),
                 'model_minus_market': float('nan'),
                 'model_minus_market_p': float('nan'),
                 'min_folds': 0.0,
@@ -1110,7 +1116,29 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
     # though it is too noisy to gate on.
     market_dev = _worst_populated_bin(frame['market'], frame['outcome'])
     p_value, n_folds = market_fold_test(frame)
+    # **The model's systematic directional lean, against the price.**
+    #
+    # Needs no outcomes, which is why it is the sharpest thing here: measured
+    # 2026-10-17 over 2,178 live windows the deployed model read +0.883pp
+    # [+0.817, +0.948] at **t=+25.9**, while every outcome-based statistic on
+    # the same sample was noise. It is a property of the forecaster, not of the
+    # sample's luck.
+    #
+    # The mechanism was one-sided sharpening: it sharpened UP-favourites by
+    # +1.705pp and DOWN-favourites by -0.035pp, a 49x asymmetry whose net is
+    # exactly this number (0.508*1.705 + 0.492*0.035 = 0.883). Against a
+    # `min_edge_pp` of 1.5 a constant +0.88pp inflates every UP edge and
+    # deflates every DOWN one, so the real hurdle becomes ~0.6pp one way and
+    # ~2.4pp the other. Live consequence: 83 UP trades and ZERO DOWN over four
+    # days, and the buy-the-longshot half of the thesis silently discarded —
+    # the same failure `Config.__post_init__` refuses an asymmetric price band
+    # for.
+    tilt = float((pd.to_numeric(frame['model'], errors='coerce').mean()
+                  - pd.to_numeric(frame['market'], errors='coerce').mean())
+                 * 100.0)
     return {'market_windows': windows,
+            'directional_tilt_pp': tilt,
+            'directional_tilt_abs': abs(tilt),
             'model_minus_market': float(overall['model_minus_market']),
             'model_minus_market_p': float(p_value),
             'min_folds': float(n_folds),
@@ -1159,6 +1187,13 @@ GATE_SPEC: tuple[GateSpec, ...] = (
     # ledger records that it was used.
     GateSpec('market_windows', float(MIN_MARKET_WINDOWS), 'min', 1),
     GateSpec('model_minus_market', 0.0, 'min', 1),
+    # **A systematic lean is not a forecast.** The edge here is a disagreement
+    # about `sigma_remaining` and it points BOTH ways, so a model that is
+    # constantly more bullish than the price is trading a bias, not the thesis.
+    # 0.5pp sits below the +0.883pp defect this was written for and above any
+    # plausible noise: the market's own lean against realised outcomes on the
+    # same sample was +0.31pp at t=0.53, i.e. indistinguishable from zero.
+    GateSpec('directional_tilt_abs', 0.5, 'max', 1),
     # One-sided t-test of the window-weighted fold mean of model_minus_market
     # against zero, on venue-labelled rows. A point estimate >= 0 is passed by
     # half of all nulls.
@@ -1221,6 +1256,20 @@ GATE_SPEC: tuple[GateSpec, ...] = (
     # a lookback or embargo mistake, which is.
     GateSpec('non_finite_share', 0.001, 'max', 1),
     GateSpec('residual_scale', 0.25, 'min', 1),
+    # **The alpha of the artifact that SHIPS, not the walk-forward's.**
+    #
+    # `residual_scale` above is an aggregate over folds; `choose_candidate`
+    # then deploys a refit on all data, which fits its OWN alpha. Measured
+    # 2026-10-18 they disagreed by two orders of magnitude: the gate passed at
+    # 0.940 and the artifact installed at **0.015**, so the model that traded
+    # shrank its correction to 1.5% and departed from the price by 0.027pp on
+    # average — against a 0.5pp edge gate it could barely clear, and every
+    # stake Kelly sized came back as one contract. The gates had described a
+    # different model from the one trading.
+    #
+    # Same threshold as the walk-forward's, because it is the same quantity
+    # asked of the thing that actually trades.
+    GateSpec('deployed_residual_scale', 0.25, 'min', 1),
     GateSpec('control_gain_share', 0.30, 'max', 1),
     # --- the money ---
     # `windows_evaluated`, `total_return`, `sharpe` and `max_drawdown` are
@@ -1301,6 +1350,25 @@ def gate_spec_diff(old: Sequence[dict], new: Sequence[dict]) -> dict:
 IMPLAUSIBLE_SHARPE = 5.0
 
 GATE_NOTES: dict[str, str] = {
+    'deployed_residual_scale':
+        'How much of its claimed correction the INSTALLED artifact keeps, as '
+        'against the walk-forward aggregate that `residual_scale` reports. '
+        'They are different fits: the folds judge the configuration, '
+        '`choose_candidate` ships a refit on all data. On 2026-10-18 the gate '
+        'passed at 0.940 and the artifact shipped at 0.015 — a model that '
+        'disagreed with the price by 0.027pp and could not clear its own edge '
+        'gate. A gate that does not measure the thing that trades is not a '
+        'gate.',
+    'directional_tilt_abs':
+        'How much more bullish the model is than the price, on average, in '
+        'probability points. Needs no outcomes, which is why it is sharp: the '
+        'deployed model read +0.883pp at t=+25.9 over 2,178 live windows while '
+        'every outcome-based statistic on the same sample was noise. The '
+        'mechanism was one-sided sharpening (+1.705pp on UP favourites against '
+        '-0.035pp on DOWN), and against a 1.5pp edge gate a constant lean makes '
+        'the real hurdle ~0.6pp one way and ~2.4pp the other — live took 83 UP '
+        'trades and zero DOWN over four days. A systematic lean is not a '
+        'forecast.',
     'market_windows': 'the market comparison needs live-recorded quotes; a '
                       'backtest has no book and stands the baseline in for one, '
                       'which answers a different question with the same number',

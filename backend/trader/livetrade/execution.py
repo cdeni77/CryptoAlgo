@@ -460,11 +460,20 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         try:
             # The offset is in this key, so a kill at one offset does not
             # lock every later offset of the window out with a 409.
+            # **A maker order RESTS; it does not cross.** `time_in_force=None`
+            # omits the field so the venue applies its own default, which is
+            # the documented way to rest. The enum is configurable rather than
+            # guessed: a wrong value may be rejected (harmless) or silently
+            # fill as a taker (not), and nothing in this repo has ever recorded
+            # a working one — all 1,556 fills are `is_taker: true`.
+            _maker = bool(getattr(config, 'maker_entry', False))
+            _tif = (getattr(config, 'maker_time_in_force', None) if _maker
+                    else 'immediate_or_cancel')
             order = await kalshi.place_order(
                 ticker=decision.market_ticker, side=decision.side.value,
                 exchange_index=exchange_index,
                 contracts=decision.contracts, limit_price=limit,
-                client_order_id=key)
+                client_order_id=key, time_in_force=_tif, rest=_maker)
             answered_at = time.monotonic()
         except (KalshiError, asyncio.TimeoutError, OSError) as exc:
             ambiguous = (not isinstance(exc, KalshiError)
@@ -511,6 +520,47 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
         if np.isfinite(fill_price) and decision.side is not Side.UP:
             fill_price = 1.0 - fill_price
         if filled <= 0:
+            # **A RESTING order has not failed; it has not happened YET.**
+            #
+            # `filled_from_order` reads the POST reply, and for an
+            # immediate_or_cancel that is the whole story: it crossed or it
+            # died, in one round trip. A `good_till_canceled` order necessarily
+            # comes back with zero fills because it is sitting ON the book —
+            # the fill arrives seconds later. Booking that as 'killed' is how
+            # 2026-10-18's first three maker fills became UNRECORDED positions:
+            # the venue held 1 ETH @ 0.79 and 2 SOL @ 0.80, both `is_taker:
+            # false`, while our own `positions` table had neither. The ticket
+            # notes even said so — "venue has no order ... among 0 it lists
+            # there" — because a filled order is not an OPEN order.
+            #
+            # That matters past the bookkeeping: `exposure`,
+            # `max_positions_per_window` and `max_window_exposure_fraction` are
+            # all computed from OUR book, so positions it cannot see are
+            # positions the risk limits do not bind on.
+            #
+            # So: a maker order that the venue accepted (it returned an id) and
+            # did not explicitly kill is RESTING. The reconcile books the fill
+            # if one comes; `cancel_stale_resting` retires it if none does.
+            status_text = str(order.get('status', '') or '').strip().lower()
+            dead = status_text in ('canceled', 'cancelled', 'killed',
+                                   'rejected', 'expired')
+            order_id = order.get('order_id')
+            if _maker and order_id and not dead:
+                logger.info(
+                    '%s window %s: resting %d @ %.4f, order %s — not a kill; '
+                    'the reconcile books any fill and the sweep retires it '
+                    'after %ss unfilled',
+                    decision.symbol, decision.window_open, decision.contracts,
+                    limit, str(order_id)[:18],
+                    getattr(config, 'maker_cancel_seconds', None))
+                await _db(writer.resolve_ticket, ticket_id, status='resting',
+                          note=(f"resting at {limit:.4f} under "
+                                f"time_in_force={_tif!r}; POST carried no fill, "
+                                f"which for a maker order means it is on the "
+                                f"book rather than dead")[:4000],
+                          venue_order_id=order_id)
+                return OrderResult(False, 'resting', 0, order, ticket_id,
+                                   limit, answered_at)
             logger.warning(
                 '%s window %s: the order did not fill (status %r). No position.',
                 decision.symbol, decision.window_open, order.get('status'))

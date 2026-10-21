@@ -1,0 +1,113 @@
+services:
+  trader:
+    command:
+      - -m
+      - scripts.run_live
+      - --trade-args
+      - --loop
+      - --cycle-seconds
+      - "60"
+      - --mode
+      - live
+      - --place-orders
+      - --compound
+      - --bankroll
+      - "500"
+      - --max-stake-dollars
+      - "40"
+      # **0.5, not 1.5, because a maker pays a different toll.** 1.5pp was
+      # sized for a TAKER: the fee averages ~1.1pp of stake plus a 0.5c
+      # half-spread, so ~1.6pp had to be cleared before a crossing trade paid.
+      # Resting at the bid costs nothing and buys at a full cent better, so the
+      # cost is a CREDIT of ~0.465pp against the mid, not a charge — measured
+      # 2026-10-18, net +1.382pp at t=+5.17 with 100% of rows tradeable.
+      # At 1.5pp the model placed no orders at all and collected no fill data,
+      # which is the one thing maker entry was switched on to gather.
+      # Must match the `retrain` service, or the gates grade a policy the
+      # account does not run.
+      - --min-edge-pp
+      - "0.5"
+      - --kelly-fraction
+      - "0.10"
+      - --entry-offsets
+      - "3"
+      - "6"
+      - "9"
+      - "12"
+      - --require-peer-book
+      # A hole in the middle of the book. The fee 0.07*p(1-p) peaks at a coin
+      # flip -- 1.75pp of stake against 0.33pp at 95c -- and the measured signal
+      # there is ~0: on live-recorded quotes the 35-65c band alone lost $393
+      # (-2.38pp/ct) while excluding it took the whole book from -$55 to +$297.
+      # **Must stay identical to the `retrain` service's own flag**, or the
+      # gates score a policy the account does not run -- which is exactly the
+      # drift found on 2026-10-18, where the retrain graded wait_12 at 0.05
+      # Kelly while this traded first-clear across four offsets at 0.10.
+      - --exclude-price-band
+      - "0.35,0.65"
+      # **Rest at the bid instead of lifting the ask.** The venue charges makers
+      # nothing and the entry is a full cent better on a measured 1.000c spread
+      # -- together ~1.5-2pp per contract, against a model edge of ~1.1-1.5pp,
+      # so the execution cost had been larger than the entire signal. Measured
+      # 2026-10-18 on 54,100 live-recorded rows, the SAME model with no
+      # retraining: -$77.25 taker against +$2,445.76 maker.
+      #
+      # **This is a live EXPERIMENT, not a validated setting.** All 1,556 fills
+      # on this account are `is_taker: true` -- no resting order has ever filled
+      # here, and the backtest assumes every one does. The likeliest outcome is
+      # simply fewer fills: one observed book had 441 contracts already queued
+      # at the bid and we join behind them. A session with zero fills is a
+      # RESULT, not a fault. The gates are scored at the ask on purpose, so
+      # they bound this from below rather than banking the assumption.
+      - --maker-entry
+      # Pull an unfilled order after 60s of its OWN age. The forecast is what
+      # expires -- `sigma_remaining` is computed for the decision instant -- so
+      # a fill arriving minutes later takes an edge that has already moved.
+      - --maker-cancel-seconds
+      - "60"
+      # **EXPERIMENT, 2026-10-20: one entry per offset instead of per window.**
+      # `already_entered` was 43.5% of all refusals (956 decisions), and the
+      # operator asked to see what the system does without it.
+      #
+      # This is a REAL increase in correlated exposure, not a loosened filter:
+      # offsets 3/6/9/12 are the same 15-minute move bought up to four times,
+      # so a window that goes against us now loses up to 4x. The notional
+      # backstop is unchanged -- `max_window_exposure_fraction` 0.08 caps a
+      # window at ~$39 against a ~$490 bankroll, and at the measured ~$0.67
+      # average stake twelve entries come to ~$8, so it should not bind.
+      #
+      # **Both flags or neither.** `max_positions_per_window` defaults to 3 and
+      # is exactly saturated by one entry on each of three symbols, so raising
+      # the per-symbol limit alone would not add a single trade -- it would let
+      # one symbol take all three slots and starve the other two. 12 = 3
+      # symbols x 4 offsets.
+      #
+      # Two things this costs, both deliberate:
+      #   * it restarts the 500-trade pre-registered sample, which was ~1 day
+      #     from completing on first-clear;
+      #   * correlated entries are not independent trades, so the count rises
+      #     faster than the evidence does.
+      # Revert by deleting these two flags; the code defaults to 1 per symbol.
+      # **Multi-entry, second attempt — now with a same-side constraint.**
+      #
+      # First attempt ran 2026-10-20 10:42-12:50 and was reverted: different
+      # offsets took OPPOSITE sides of the same market. Three settled with
+      # yes_contracts>0 AND no_contracts>0, revenue $0.00 and -$6.29 -- the
+      # entire stake on both legs -- against +$6.85 on the 18 one-sided
+      # markets over the same two hours. Buying the other side does not hedge;
+      # the venue nets it against the open position, so the pair pays nothing.
+      #
+      # `already_entered` had been preventing this as a SIDE EFFECT of
+      # forbidding any second entry at all. With it relaxed the constraint is
+      # explicit: `Reason.OPPOSITE_SIDE` in `decide()`, checked after the side
+      # is chosen, against the side read from the store so it survives a
+      # restart. A window commits to the side of its FIRST entry and may only
+      # add to it.
+      - --max-entries-per-symbol-window
+      - "4"
+      - --max-positions-per-window
+      - "12"
+      - --no-require-gates
+      - --force
+      - --reason
+      - "live forward test; gates fail on the market comparison (model_minus_market, model_minus_market_p, calibration_vs_market) and the operator authorised real orders. --require-model-version was REMOVED 2026-10-18, so this no longer names one artifact - whatever the Sunday retrain installs trades at the next window boundary, unreviewed."

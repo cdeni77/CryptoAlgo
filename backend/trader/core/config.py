@@ -289,6 +289,18 @@ class Config:
     # varies 8x across the history. Below this it is skipped and said so,
     # rather than averaged in as a peer of a block twenty times its size.
     min_test_windows: int = 200
+    # **How much history the first TESTED fold must stand on.** The guard existed
+    # in `core/cv.py` at a hardcoded 500 and was reachable from neither the
+    # Config nor the CLI, so nothing could raise it. Measured 2026-10-17 on the
+    # book era: with `init_score_source=market` every training row without a
+    # recorded quote is dropped, the venue's book starts 2026-01-07, and the
+    # first emitted fold therefore trained on 3,875 usable rows — about two days
+    # — cleared 500 by a hair, lost money, and LATCHED the book's halt on
+    # 2026-01-20. `halted_at` is set once and never cleared, so one undertrained
+    # fold ended the money measurement five days into a nine-month run while the
+    # forecast metrics went on describing 55,487 windows. Raising this is how a
+    # warm-up is expressed: folds thinner than it are skipped, not scored.
+    min_train_windows: int = 500
     # **Where the shrinkage is fitted, as a quantile of |model correction|.**
     #
     # 0.0 fits it on every validation row, which optimises the AVERAGE -- and
@@ -495,16 +507,33 @@ class Config:
     # that was actually doing the work.
     max_positions_per_window: int = 3
 
-    # One entry per (symbol, window). The four decision offsets are the same
-    # bet observed at four moments, not four bets, so letting each fire
-    # independently would put four times the intended size on one 15-minute
+    # Entries allowed per (symbol, window). **Default 1, which is the
+    # historical invariant**: the four decision offsets are the same bet
+    # observed at four moments, not four bets, so letting each fire
+    # independently puts up to four times the intended size on one 15-minute
     # move. The live-honest rule is to walk the offsets in order and take the
     # first that clears every gate; `scripts/evaluate.py` reports edge per
     # offset separately, which is how the offset set gets narrowed on evidence
-    # rather than by taking the best one in hindsight. One entry per
-    # (symbol, window) is enforced directly in `decide()` (`ALREADY_ENTERED`)
-    # rather than through a config field — it is an invariant, not a policy
-    # anyone should be tuning.
+    # rather than by taking the best one in hindsight.
+    #
+    # This comment used to end "it is an invariant, not a policy anyone should
+    # be tuning", and the rule was hard-coded. It became a field on 2026-10-20
+    # for a deliberate operator experiment — raising it is a REAL increase in
+    # correlated exposure, not a loosened filter, and the entries it adds are
+    # the same 15-minute move bought repeatedly. Two consequences worth holding
+    # onto before changing it:
+    #
+    #   * `max_positions_per_window` (3) is saturated by one entry on each of
+    #     three symbols. Raising this alone does not add trades — it reallocates
+    #     the same three slots, so one symbol can take all of them and the other
+    #     two get none. That is concentration, not expansion. Raise both or
+    #     neither.
+    #   * n correlated entries are not n independent trades. A 500-trade sample
+    #     gathered this way carries less information than 500 first-clear ones,
+    #     so it reaches the pre-registered count sooner while proving less.
+    #
+    # `max_window_exposure_fraction` remains the notional backstop either way.
+    max_entries_per_symbol_window: int = 1
 
     # Settlement is free; an exit is not. Selling a contract back pays a second
     # fee and crosses the spread a second time, so an early exit at 85c costs
@@ -572,6 +601,22 @@ class Config:
     # asserted in `__post_init__`.
     min_traded_price: float = 0.05
     max_traded_price: float = 0.95
+    # **A HOLE in the middle of the band, because the cost is a parabola and the
+    # signal is not.** `0.07*p(1-p)` peaks at a coin flip — 1.75pp of stake at
+    # 50c against 0.33pp at 95c, a 5x swing — so the most expensive place to
+    # trade is the middle. Measured 2026-10-17 on 54,100 live-recorded rows
+    # graded on the venue's own settlement, that is also where the model knows
+    # nothing: in 35c-65c its disagreement was worth **-0.021pp** against a
+    # 2.20pp toll, the single largest source of loss in the book (-2.24pp net
+    # over 4,446 tradeable rows). Outside it the model's call is worth +0.9 to
+    # +2.7pp.
+    #
+    # `(lo, hi)` refuses any trade whose own price lands inside. None disables
+    # it, which is the default, so nothing changes unless it is asked for.
+    # Symmetric for the same reason the outer band is: the edge is a
+    # disagreement about sigma_remaining and it points both ways, so a hole
+    # that is off-centre silently discards one direction of the thesis.
+    exclude_price_band: Optional[tuple[float, float]] = None
 
     # An outlier guard, not an economic gate. A sigma disagreement produces
     # modest departures from the quote; a 40-point departure is a bug, a stale
@@ -640,17 +685,70 @@ class Config:
     # `core.metrics` filters the market comparison with it, and `scripts.live`
     # refuses an order and a peer book past it. It was 45 here and 30 in the
     # other two, so live traded quotes the evaluation would have discarded.
-    # `QUOTE_MAX_AGE_SECONDS` still overrides it, for every reader at once.
+    # `QUOTE_MAX_AGE_SECONDS` still overrides it, for every reader at once —
+    # and **the deployed services set it to 5**, in both `docker-compose.yml`'s
+    # `retrain` and the trader's override, so the account and its gates stop
+    # pricing against carried-forward quotes.
+    #
+    # **Why 5 there and 30 here.** Predexon serves book CHANGES, so a quiet
+    # book is reported again at every later minute and its age climbs by 60s
+    # per minute. The staleness therefore grows THROUGH the window: measured
+    # 2026-10-18 on the backfill, p90 age runs 0.6s at offset 1, 88s at offset
+    # 6, 328s at offset 12 and 452s at offset 15. A quarter of backfilled rows
+    # at offset 12 price against a book last seen five minutes earlier, and a
+    # carried-forward price is trivially beatable by a model that sees fresh
+    # bars — the mechanism behind `model_minus_market` reading +0.0023 (t=4.8)
+    # against backfilled quotes and +0.0003 (t=0.92) against the live book.
+    #
+    # Measured cost of 5s on selected rows: 89.3% survive — live_touch
+    # 53,301/53,962 (98.8%), backfill 68,638/82,573 (83.1%) — and the drops
+    # concentrate exactly where the carry-forward lives, 11.9% at offset 3
+    # rising to 21.2% at offset 12.
+    #
+    # It is NOT the library default, deliberately. Lowering it globally is a
+    # blast radius discovered one test at a time, and it lands in the middle of
+    # `core/quotes.py`'s own in-flight change to the `null_age` default — a
+    # null age currently PASSES this filter, which is the only reason
+    # live_touch survives any cut at all, and flipping both at once could gut
+    # the very rows the change exists to protect. The env var gives the
+    # deployment the behaviour without moving the floor under everyone else.
+    #
+    # Below 3 is impossible whatever the reader: `decision_latency_seconds` is
+    # 3.0, so the as-of join takes the newest quote at or before
+    # `window_open + offset + 3s` and every SELECTED quote is ~3s old by
+    # construction. A 2s limit keeps 512 rows of 136,673.
     max_quote_age_seconds: float = float(os.getenv('QUOTE_MAX_AGE_SECONDS', '30'))
     # RESEARCH: which `venue_depth` observers may price a row. Empty keeps every
     # source (ranked by QUOTE_SOURCE_PRIORITY); e.g. ('live_touch', 'live_ws',
     # 'live') excludes the Predexon backfill, whose >30s-stale asks sit a median
     # ~13-16c off the contemporaneous live ask.
     quote_sources: tuple[str, ...] = ()
-    # What a quote with NO recorded age means. 'fresh' keeps it (the historical
-    # behaviour); 'stale' drops it, after deriving an age bound for `live_touch`
-    # rows from `available_time - event_time` (see `core.quotes`).
-    null_quote_age: str = 'fresh'
+    # RESEARCH: the same, for the PEER venue. `None` follows `quote_sources`,
+    # which is what every caller got before this existed. An explicit value --
+    # including an empty tuple, meaning no restriction -- frees the peer.
+    #
+    # It needs to be separate because `quote_sources` exists to exclude a
+    # producer whose KALSHI prices are not executable, and `filter_sources`
+    # matches on the bare source name. Polymarket's `backfill` is the gamma
+    # API, a different pipeline with none of that defect, so naming Kalshi's
+    # live observers silently discarded 77,759 peer windows and -- under
+    # `--complete-cases` -- every row carrying a `cross_venue` feature.
+    peer_quote_sources: Optional[tuple[str, ...]] = None
+    # What a quote with NO recorded age means. 'fresh' keeps it; 'stale' bounds
+    # it, deriving an age for `live_touch` rows from
+    # `available_time - event_time` (see `core.quotes`) and dropping only what
+    # cannot be bounded at all.
+    #
+    # **Defaults to 'stale', and is env-readable so the live path can set it.**
+    # 'fresh' was the historical default and it is an ASSUMPTION, not a
+    # measurement: it admitted 53,721 rows -- 30% of every priced row in a
+    # Jan-Oct run -- whose staleness was simply unknown. Measured, it is not a
+    # tolerance dial. Tightening a July walk-forward from ('fresh', 30s) to
+    # ('stale', 5s) took one fold from 881 trades and +19.25% to 70 trades and
+    # -15.59%: nine trades in ten were filled against a book the decision could
+    # not have seen. The live loop had no flag for this at all, so a model
+    # validated under bounded ages would have traded under assumed-fresh ones.
+    null_quote_age: str = os.getenv('QUOTE_NULL_AGE', 'stale')
     # The cross-venue PEER's staleness cap. None follows
     # `max_quote_age_seconds`. Separate because only ~5% of live Polymarket
     # rows are <=5s old: a tight Kalshi cap applied to the peer voided
@@ -709,7 +807,67 @@ class Config:
     # floor they are recorded on the account so they survive a restart. Clearing
     # a halt is deliberately manual: an automatic reset makes a circuit breaker a
     # speed bump.
-    max_daily_loss_fraction: float = 0.15
+    # **Enter as a MAKER: rest at the bid instead of lifting the ask.**
+    #
+    # Measured 2026-10-18 on 54,100 live-recorded rows, the SAME model with no
+    # retraining (costs do not enter training, so only the execution price
+    # changed):
+    #
+    #     taker, ask + fee          7,259 trades    -$77.25   -0.108pp/ct  t=-0.17
+    #     fee=0 only, still lifts  12,112 trades   +$885.78   +0.748pp/ct  t=+1.34
+    #     MAKER, bid + fee=0       13,400 trades  +$2445.76   +1.608pp/ct  t=+2.91
+    #     MAKER + no 35-65c band   12,588 trades  +$3781.70   +2.346pp/ct  t=+4.74
+    #
+    # The fee is only half of it: the venue charges makers nothing, and buying
+    # at the bid on a measured 1.000c spread is worth as much again. Together
+    # ~1.5-2pp per contract, against a model edge of ~1.1-1.5pp — the execution
+    # cost has been larger than the entire signal.
+    #
+    # **OFF by default, and the default is load-bearing.** Every one of those
+    # numbers assumes a resting order FILLS, and no resting order has ever
+    # filled on this account: all 1,556 recorded fills are `is_taker: true`.
+    # A resting order also fills LATE, against a barrier probability that has
+    # moved — which is why `place_order` defaults to immediate_or_cancel and
+    # why `maker_cancel_seconds` exists.
+    maker_entry: bool = False
+    # **The venue's enum for an order that RESTS.**
+    #
+    # `good_till_canceled` — one 'l', the American spelling; `good_till_
+    # cancelled` is not the value. Confirmed three ways on 2026-10-18: Kalshi's
+    # V2 spec names it for an order that stays open until filled or cancelled,
+    # the official Go SDK's constants are exactly `immediate_or_cancel` and
+    # `good_till_canceled` and its example rests a post-only order with it, and
+    # our own rejection settles the documentation's ambiguity about whether the
+    # field is optional.
+    #
+    # **It is REQUIRED, and omitting it was measured.** The first 48 maker
+    # orders, 2026-10-18 06:45-12:06 UTC, were every one refused:
+    #
+    #   400 missing_parameters — Key: 'CreateOrderV2Request.TimeInForce'
+    #   Error:Field validation for 'TimeInForce' failed on the 'required' tag
+    #
+    # Harmless — no money moved, no position taken, 48 clean rejections — but
+    # the night collected no fill data, which was the only reason maker entry
+    # was switched on. There is no venue default to fall back to.
+    maker_time_in_force: Optional[str] = 'good_till_canceled'
+    # **How long an unfilled resting order may live, in SECONDS of its own age.**
+    #
+    # Age, not an offset into the window. This was `maker_cancel_offset = 9`,
+    # an absolute minute, which gave an order placed at +3m a six-minute life
+    # and one placed at +12m none at all — the same flag meaning two different
+    # leashes depending on when it was sent. Age gives every order the same one.
+    #
+    # Sixty seconds because the forecast is what expires. `sigma_remaining` is
+    # computed for the decision instant, and a fill arriving minutes later is
+    # filling against a barrier probability that has moved out from under it —
+    # the reason `place_order` defaults to immediate_or_cancel in the first
+    # place. A minute keeps the fill close enough to the decision for the edge
+    # that justified it to still be the edge being taken.
+    #
+    # None or a non-positive value never cancels, which is only reasonable
+    # while measuring whether fills happen at all.
+    maker_cancel_seconds: Optional[float] = 60.0
+    max_daily_loss_fraction: float = 0.25
     # 25, raised from 12 on 2026-09-03. Twelve is an alarm at even money and
     # routine at longshot prices, because a longshot is SUPPOSED to lose most of
     # the time — that is what a 4:1 payoff means:
@@ -781,6 +939,28 @@ class Config:
                 f"a KeyError deep inside the fit, after the fold's baseline, "
                 f"volatility models and seasonality had already been fitted."
             )
+        # **A maker pays the maker fee, by definition.** Resting at the bid
+        # while the model charges the taker schedule is never a coherent
+        # combination — it would price the entry as a maker and the cost as a
+        # taker, understating the net edge by the whole fee and refusing trades
+        # that pay. Implied rather than validated so neither flag can be set
+        # without the other quietly disagreeing.
+        if self.maker_entry and not self.assume_maker:
+            object.__setattr__(self, 'assume_maker', True)
+        if self.exclude_price_band is not None:
+            lo, hi = (float(self.exclude_price_band[0]),
+                      float(self.exclude_price_band[1]))
+            if not (0.0 <= lo < hi <= 1.0):
+                raise ValueError(
+                    f'exclude_price_band {self.exclude_price_band} is not a '
+                    f'band in [0, 1] with lo < hi.')
+            if abs(hi - (1.0 - lo)) > 1e-9:
+                raise ValueError(
+                    f'exclude_price_band {self.exclude_price_band} is not '
+                    f'symmetric about 0.5: hi {hi} != 1 - lo {1.0 - lo}. The '
+                    f'edge is a disagreement about sigma_remaining and points '
+                    f'both ways; an off-centre hole discards one direction.')
+            object.__setattr__(self, 'exclude_price_band', (lo, hi))
         if abs(self.max_traded_price - (1.0 - self.min_traded_price)) > 1e-9:
             raise ValueError(
                 f'the price band must be symmetric about 0.5: '

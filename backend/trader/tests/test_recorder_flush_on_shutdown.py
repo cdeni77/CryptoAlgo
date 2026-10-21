@@ -1,12 +1,15 @@
 """Buffered rows must survive a shutdown.
 
-Three recorders accumulate into a local list and write when it reaches
+Four recorders accumulate into a local list and write when it reaches
 `--batch-rows`. Their only handler was `except Exception`, and
 `asyncio.CancelledError` is a **BaseException** -- so `run_live`'s
 `task.cancel()` discarded whatever was buffered. Up to a full batch per restart,
 on datasets whose entire justification is that a minute not recorded is gone.
 
-`record_stream` was already correct; these three were not.
+`record_stream` was already correct; the first three were not. `record_trades`
+was written with the handler in place and is held to the same contract, because
+the dataset it writes has the same property -- a minute not recorded is gone
+until somebody runs a backfill.
 """
 
 from __future__ import annotations
@@ -19,8 +22,9 @@ import pytest
 import scripts.record_implied_vol as iv
 import scripts.record_ladder as ladder
 import scripts.record_pm_ladder as pm
+import scripts.record_trades as trades
 
-MODULES = (ladder, pm, iv)
+MODULES = (ladder, pm, iv, trades)
 
 
 @pytest.mark.parametrize('mod', MODULES, ids=lambda m: m.__name__.split('.')[-1])

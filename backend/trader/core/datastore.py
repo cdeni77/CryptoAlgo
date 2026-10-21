@@ -185,6 +185,88 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
     # One schema for both venues: Kalshi's `result` ('yes'/'no') and Polymarket's
     # `winning_side` ('A'/'B') both reduce to `settled_up`, and a disagreement
     # between the two venues on the same fifteen minutes is itself a measurement.
+    # **The public tape, AGGREGATED PER MINUTE.**
+    #
+    # Added 2026-10-18 for one question the book cannot answer: would a RESTING
+    # order have filled. A resting bid fills when an aggressive SELLER crosses
+    # into it and the quoted ask never moves, so minute snapshots of
+    # `venue_depth` cannot see it, and `venue_book_events` deltas cannot either
+    # because a delta cannot distinguish a trade from a cancellation.
+    #
+    # **Aggregated, not raw.** Measured 2026-10-18: a single BTC 15-minute
+    # market prints 20,000+ times (~25/second), so the raw tape over the
+    # live-book era is ~115M rows. What the question needs is far smaller --
+    # per market-minute, the EXTREME price at which each side's aggressor
+    # traded. `min_price` with a selling aggressor is the lowest a resting bid
+    # would have been hit at; that is the whole fill test, and it is ~16 rows
+    # per market instead of 7,500.
+    #
+    # `taker_book_side` names which side the AGGRESSOR of those prints crossed
+    # on, and is part of the event key because a buying and a selling aggressor
+    # in the same minute are two different facts, not a correction. It does NOT
+    # make the prints ours: the tape is anonymous and summing it sums the
+    # exchange -- see `Trade` in `data_collection/kalshi_client.py`.
+    # **The venue's own per-minute candle, in its OWN table.**
+    #
+    # `backfill_candles.py` already lands the candle's CLOSING bid and ask in
+    # `venue_depth`, because that is a book summary at a minute and belongs
+    # with every other book summary. The rest of the payload is a different
+    # concept and is kept apart rather than bolted on:
+    #
+    #   * `price_*` is the TRADED price, not a quote. `price_low` is the
+    #     cheapest print inside the minute, which bounds the question the whole
+    #     maker thesis turns on -- would a resting bid have filled? A print at
+    #     or below our bid is evidence it would. It is a per-minute bound, not
+    #     the tape: it cannot say WHICH side crossed, so `venue_trades` with
+    #     its `taker_book_side` remains the exact answer. This is the cheap,
+    #     deep approximation that reaches every market the candle endpoint
+    #     serves.
+    #   * `volume` and `open_interest` are flow and positioning. Both are
+    #     REVISED series -- open interest in particular is restated -- so
+    #     `available_time` matters here and must be the fetch, never the mark.
+    #   * the bid/ask OHLC says how far the quote travelled INSIDE the minute,
+    #     which no single-sample book summary can express.
+    #
+    # Keeping it out of `venue_depth` means the live book writers' schema does
+    # not move at all, so none of this can disturb a running loop.
+    'venue_candles': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'offset_minutes',
+        'price_open', 'price_high', 'price_low', 'price_close', 'price_mean',
+        'price_previous',
+        'yes_bid_open', 'yes_bid_high', 'yes_bid_low', 'yes_bid_close',
+        'yes_ask_open', 'yes_ask_high', 'yes_ask_low', 'yes_ask_close',
+        'volume', 'open_interest',
+    ),
+    'venue_trades': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'offset_minutes', 'taker_book_side',
+        'n_prints', 'contracts', 'min_price', 'max_price', 'vwap',
+    ),
+    # **The venue's own strike, in its OWN table.**
+    #
+    # `floor_strike` is the number a market actually settles against -- CF
+    # Benchmarks' 60-second mean at the window open. `core/windows.py` stands a
+    # Coinbase 1-minute OHLC mean in for it, and measured 2026-10-21 over 600
+    # markets the two differ by a median 1.33bp, p90 3.23bp, mostly random
+    # (mean -0.54bp). Negligible against a price; ~17% of the ~8bp remaining
+    # sigma at three minutes left, and `z_score = (price - strike)/sigma` is
+    # the feature the barrier framing rests on.
+    #
+    # **Not merged into `venue_settlements`, deliberately.** That table is the
+    # LABEL. Its `EVENT_KEY` is `(venue, symbol, event_time)` with no ticker,
+    # and it stores `event_time = window_OPEN` -- so a row keyed on the CLOSE
+    # lands on the NEXT window's open and `_merge` destroys one of them at
+    # write time, exactly as documented for `venue_depth` minute 15 against
+    # minute 0. Even keyed correctly, a second writer can publish a revision
+    # whose null fields mask good ones on read. A strike is a different
+    # measurement from a settlement; it gets a different table, joined on
+    # `(symbol, window_open)`.
+    'venue_strikes': (
+        'venue', 'symbol', 'event_time', 'available_time', 'quality',
+        'market_ticker', 'window_open', 'close_time',
+        'floor_strike', 'expiration_value', 'result',
+    ),
     'venue_settlements': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'market_ticker', 'window_open', 'close_time', 'settlement_time',
@@ -291,6 +373,13 @@ EVENT_KEY = ('venue', 'symbol', 'event_time')
 #
 # Revisions still collapse WITHIN an observer.
 EVENT_KEY_EXTRA: dict[str, tuple[str, ...]] = {
+    # Many prints share a second; without `trade_id` the tape collapses to one
+    # row per second and most of it is destroyed at write time.
+    'venue_trades': ('offset_minutes', 'taker_book_side'),
+    # One row per market per minute; `market_ticker` because three symbols
+    # share a window, and `offset_minutes` for the same reason as
+    # `venue_depth` -- minute 15 of one window is minute 0 of the next.
+    'venue_candles': ('market_ticker', 'offset_minutes'),
     # `offset_minutes` as well as `source`, because `event_time` is
     # `window_open + offset_minutes` -- so minute 15 of one window and minute 0
     # of the NEXT are the same instant and collided on one key. They are
@@ -430,6 +519,34 @@ class ResearchStore:
             raise DataStoreError(f"Unknown dataset {dataset!r}; known: {sorted(SCHEMAS)}")
         if frame.empty:
             return 0
+        # **A quality outside the vocabulary writes rows that no default read
+        # can ever see.** `read` keeps `QUALITY_LEVELS[index(min_quality):]`,
+        # which for the default 'valid' is exactly ('valid',) -- so an
+        # unrecognised value is not a weaker grade, it is invisibility.
+        #
+        # Measured 2026-10-21: `scripts/backfill_trades.py` wrote
+        # `quality='backfill'`, and all 31,462 rows of `venue_trades` were
+        # unreadable. `read()` returned 0 while the files held the data, which
+        # also silently broke that script's own resume check -- `_already()`
+        # saw an empty set, so every run refetched the whole history. Nothing
+        # raised, and the dataset looked merely empty.
+        #
+        # Quality is a GRADE, not a provenance. Where provenance matters a
+        # dataset carries its own `source` column -- `venue_depth` does, and
+        # uses it to separate a recorded book from a reconstructed one --
+        # but not every dataset has one, so encoding the producer here is
+        # both wrong and silently destructive. Refused at the only door into
+        # the store, because a check at each call site is a check the next
+        # call site will not have.
+        if 'quality' in frame.columns:
+            unknown = sorted(set(frame['quality'].dropna().unique())
+                             - set(QUALITY_LEVELS))
+            if unknown:
+                raise DataStoreError(
+                    f"Unknown quality {unknown} for {dataset!r}; expected one of "
+                    f"{list(QUALITY_LEVELS)}. Rows written with an unrecognised "
+                    f"quality are invisible to every default read. If you meant "
+                    f"to record WHO produced the row, that is the `source` column.")
 
         prepared = self._prepare(dataset, frame)
         written = 0

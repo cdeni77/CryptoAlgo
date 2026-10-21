@@ -1,0 +1,92 @@
+{
+  "features": [
+    "abs_z_score",
+    "autocorr_60",
+    "beta_1440",
+    "body_ratio_15",
+    "book_convexity",
+    "depth_ratio",
+    "depth_trend_3",
+    "displacement_vs_elapsed",
+    "elapsed_fraction",
+    "excursion_asymmetry",
+    "excursion_down_z",
+    "excursion_span_z",
+    "excursion_up_z",
+    "imbalance_5c",
+    "imbalance_change_3",
+    "imbalance_persistence",
+    "imbalance_touch",
+    "implied_sigma_per_min",
+    "iv_minus_realised",
+    "iv_n_strikes",
+    "iv_r2",
+    "iv_staleness_minutes",
+    "lead_residual",
+    "log_rv_1440",
+    "log_rv_15",
+    "log_rv_240",
+    "log_rv_60",
+    "log_sigma_per_min",
+    "path_efficiency",
+    "peer_displacement",
+    "peer_return_15",
+    "peer_return_5",
+    "pm_available",
+    "range_to_return",
+    "remaining_minutes",
+    "run_length",
+    "rv_slope_long",
+    "rv_slope_short",
+    "rv_surprise",
+    "seasonal_ramp",
+    "signed_volume_15",
+    "spread",
+    "spread_change_3",
+    "touched_opposite",
+    "universe_dispersion",
+    "venue_gap_change_5",
+    "venue_prob_gap",
+    "venue_spread_ratio",
+    "vol_of_vol",
+    "volume_z_15",
+    "vwap_gap_15",
+    "z_score",
+    "zero_return_share_60"
+  ],
+  "n_features": 53,
+  "n_oof": 274125,
+  "row": {
+    "mean": 0.0001001399255473295,
+    "ci": [
+      -5.362266061708715e-07,
+      0.00019878536565535833
+    ],
+    "n": 274125
+  },
+  "sym-win": {
+    "mean": 0.00023916699566586624,
+    "ci": [
+      2.0573928991663282e-06,
+      0.0004693862160594037
+    ],
+    "n": 27924
+  },
+  "window": {
+    "mean": 0.00020080297536258479,
+    "ci": [
+      -9.532995792472057e-05,
+      0.0004951816858136957
+    ],
+    "n": 9397
+  },
+  "money": {
+    "trades": 1517,
+    "pnl": 3.730200000000006,
+    "pp_per_contract": 0.2458932102834546,
+    "t_stat": 0.18673120331356297,
+    "silent_folds": 4,
+    "late_trades": 416,
+    "late_pnl": 11.730499999999997
+  }
+}

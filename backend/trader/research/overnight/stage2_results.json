@@ -1,0 +1,145 @@
+{
+  "S2a_logit_survivors": {
+    "name": "S2a_logit_survivors",
+    "status": "OK",
+    "kind": "logit",
+    "features": [
+      "imbalance",
+      "d_imbalance_1",
+      "d_imbalance_3",
+      "d_touch_imb_3",
+      "d_book_mid_1",
+      "d_book_mid_3"
+    ],
+    "n_oof": 34180,
+    "windows": 987,
+    "log_loss_model": 0.4528342532182299,
+    "log_loss_market": 0.4486660181366448,
+    "model_minus_market": -0.0033678753472407993,
+    "ci95": [
+      -0.00756738068666775,
+      0.0006764627706097497
+    ],
+    "beats_market": false,
+    "best_iters": [
+      0,
+      0,
+      0
+    ],
+    "train_log_loss": [
+      0.3961982440220261,
+      0.45414645626508404,
+      0.4533396558711003
+    ],
+    "seed": 17,
+    "runtime_s": 1.3
+  },
+  "S2b_logit_imbalance_only": {
+    "name": "S2b_logit_imbalance_only",
+    "status": "OK",
+    "kind": "logit",
+    "features": [
+      "imbalance"
+    ],
+    "n_oof": 34180,
+    "windows": 987,
+    "log_loss_model": 0.45233596842367807,
+    "log_loss_market": 0.4486660181366448,
+    "model_minus_market": -0.002963531096319411,
+    "ci95": [
+      -0.006749416736946403,
+      0.0007168856224588691
+    ],
+    "beats_market": false,
+    "best_iters": [
+      0,
+      0,
+      0
+    ],
+    "train_log_loss": [
+      0.39797374979619116,
+      0.4545022579883587,
+      0.453770459175621
+    ],
+    "seed": 17,
+    "runtime_s": 0.3
+  },
+  "S2c_lgbm_survivors": {
+    "name": "S2c_lgbm_survivors",
+    "status": "OK",
+    "kind": "lgbm",
+    "features": [
+      "imbalance",
+      "d_imbalance_1",
+      "d_imbalance_3",
+      "d_touch_imb_3",
+      "d_book_mid_1",
+      "d_book_mid_3"
+    ],
+    "n_oof": 34180,
+    "windows": 987,
+    "log_loss_model": 0.44818714743266264,
+    "log_loss_market": 0.4486660181366448,
+    "model_minus_market": 0.0006610322936914735,
+    "ci95": [
+      -0.00026778772982201377,
+      0.0015625972401453485
+    ],
+    "beats_market": false,
+    "best_iters": [
+      1,
+      18,
+      173
+    ],
+    "train_log_loss": [
+      0.4116815530506337,
+      0.45470623077994116,
+      0.451080707933786
+    ],
+    "seed": 17,
+    "runtime_s": 34.5
+  },
+  "S2d_lgbm_allflow": {
+    "name": "S2d_lgbm_allflow",
+    "status": "OK",
+    "kind": "lgbm",
+    "features": [
+      "imbalance",
+      "d_imbalance_1",
+      "d_imbalance_3",
+      "d_touch_imb_3",
+      "d_book_mid_1",
+      "d_book_mid_3",
+      "touch_imbalance",
+      "yes_depletion",
+      "no_depletion",
+      "flow_asym",
+      "d_total_size_1",
+      "d_touch_size_1",
+      "log_event_rate",
+      "d_levels_1"
+    ],
+    "n_oof": 34180,
+    "windows": 987,
+    "log_loss_model": 0.44861398828057075,
+    "log_loss_market": 0.4486660181366448,
+    "model_minus_market": 0.00033367195702889923,
+    "ci95": [
+      -0.0006082004943243843,
+      0.0012862460349738717
+    ],
+    "beats_market": false,
+    "best_iters": [
+      1,
+      8,
+      104
+    ],
+    "train_log_loss": [
+      0.4115599524296695,
+      0.4554016667383679,
+      0.4502691122446221
+    ],
+    "seed": 17,
+    "runtime_s": 29.0
+  }
+}

@@ -80,6 +80,7 @@ from core.decide import (
 )
 from core.dataset import DatasetError
 from core.pg_writer import AccountModeMismatch, PgWriter, TraderAlreadyRunning
+from core.costs import trade_fee
 from core.promotion import LIVE_MODEL, MODELS_ROOT, load_live
 from data_collection.kalshi_client import KalshiClient
 
@@ -105,7 +106,8 @@ from livetrade.execution import (                                   # noqa: F401
 )
 from livetrade.features import (                                    # noqa: F401
     EXPECTED_NAN, _attach_book_features, _warn_unscoreable_features,
-    book_feature_row, config_offsets, cross_venue_row, gap_change,
+    book_feature_row, book_flow_row, config_offsets, cross_venue_row,
+    gap_change,
     PEER_USED, implied_vol_row, latest_fit, peer_max_age_seconds,
     peer_refusal, prepare_init_score, prewarm_fit_lookup, reset_fit_lookup,
     reset_gap_history, take_peer_counts, warn_if_peer_cap_tight,
@@ -161,6 +163,43 @@ def build_parser() -> argparse.ArgumentParser:
     orders.add_argument('--place-orders', action='store_true',
                         help='Actually place orders. Requires --mode live, and is '
                              'a separate flag from it deliberately.')
+    # **Maker entry: rest at the bid instead of lifting the ask.**
+    # Measured 2026-10-18 on 54,100 live-recorded rows, the SAME model with no
+    # retraining: taker -$77.25 (-0.108pp/ct, t=-0.17) against maker +$2445.76
+    # (+1.608pp/ct, t=+2.91), and +$3781.70 (t=+4.74) also excluding 35-65c.
+    # The fee is only half of it; buying at the bid on a 1.000c spread is worth
+    # as much again. OFF by default because every one of those numbers assumes
+    # a resting order FILLS, and none ever has on this account — all 1,556
+    # recorded fills are `is_taker: true`.
+    # Must mirror the `retrain` service's own flag exactly, or the gates score a
+    # policy the account does not run. It was added to the trader's override on
+    # 2026-10-18 and `scripts/live.py` had no such argument, so the service
+    # exited with `SystemExit 2` before placing anything — caught before the
+    # container was recreated.
+    parser.add_argument('--exclude-price-band', type=str, default=None,
+                        metavar='LO,HI',
+                        help='Refuse trades priced inside this band, e.g. '
+                             '"0.35,0.65". Symmetric about 0.5. The fee '
+                             '0.07*p(1-p) peaks mid-book while the measured '
+                             'signal there is ~0.')
+    parser.add_argument('--maker-entry', action='store_true',
+                        help='Rest at the bid rather than lifting the ask. '
+                             'decide() is priced at the resting price, so the '
+                             'edge it reports is the one actually available.')
+    parser.add_argument('--maker-time-in-force', default=None,
+                        help="The venue's enum for an order that rests. "
+                             'Omitted by default, which lets the venue apply '
+                             'its own default. Not guessed here: a wrong value '
+                             'may be rejected (harmless) or silently fill as a '
+                             'TAKER (not).')
+    parser.add_argument('--maker-cancel-seconds', type=float, default=60.0,
+                        help='Pull an unfilled resting order after this many '
+                             'seconds of its OWN age. The forecast is what '
+                             'expires: sigma_remaining is computed for the '
+                             'decision instant, so a fill arriving minutes '
+                             'later takes an edge that has moved. 0 never '
+                             'cancels, which is only reasonable while '
+                             'measuring whether fills happen at all.')
     parser.add_argument('--loop', action='store_true',
                         help='Run every cycle-seconds until interrupted.')
     parser.add_argument('--cycle-seconds', type=int, default=60)
@@ -269,6 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
                              'decision to actually place an order. Every other '
                              'script already takes this flag via `_common.py`; '
                              'live was the only one that could not say it.')
+    parser.add_argument('--max-entries-per-symbol-window', type=int, default=None,
+                        help='entries allowed per (symbol, window). Default 1 — '
+                             'the four offsets are one bet seen four times, so '
+                             'above 1 this is a real increase in correlated '
+                             'exposure. Raise --max-positions-per-window with '
+                             'it or the 3-slot window cap just reallocates.')
     parser.add_argument('--max-positions-per-window', type=int, default=None,
                         metavar='N',
                         help='How many of the three symbols may open a position '
@@ -545,6 +590,200 @@ def _write_predictions(writer: PgWriter, items: list) -> None:
         writer.write_prediction(**fields)
 
 
+async def book_resting_fills(writer: PgWriter, kalshi, config: Config) -> int:
+    """Book positions for resting orders the venue has filled.
+
+    **The half the `resting` status was missing.** Marking a maker order
+    `resting` instead of `killed` stopped it being written off — but nothing
+    then moved it to `filled`, so the fill was simply lost. Measured
+    2026-10-18: the venue held 35 contracts from 30 fills while our `positions`
+    table showed 6. The cancel sweep said so every minute without anyone
+    reading it: every DELETE came back `404 not_found`, because the order was
+    gone from the book for the one reason the code never considered — it had
+    already filled.
+
+    That matters past the bookkeeping. `exposure`,
+    `max_positions_per_window` and `max_window_exposure_fraction` are computed
+    from OUR book, so a position it cannot see is a position no risk limit
+    binds on.
+
+    Idempotent: `open_position` is keyed on (symbol, window_open), so a fill
+    seen twice books once.
+    """
+    if not getattr(config, 'maker_entry', False) or kalshi is None:
+        return 0
+    tickets = [t for t in writer.open_tickets(limit=100)
+               if str(getattr(t, 'status', '')) == 'resting'
+               and getattr(t, 'venue_order_id', None)]
+    if not tickets:
+        return 0
+    try:
+        raw = await kalshi.fills(limit=200)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.info('could not read fills to reconcile resting orders (%s); '
+                    'they stay resting and will be retried', str(exc)[:120])
+        return 0
+    by_order: dict[str, list[dict]] = {}
+    for row in raw:
+        oid = str(row.get('order_id') or '')
+        if oid:
+            by_order.setdefault(oid, []).append(row)
+
+    booked = 0
+    for ticket in tickets:
+        rows = by_order.get(str(ticket.venue_order_id))
+        if not rows:
+            continue
+        side = str(ticket.side)
+        # The price for the side we BOUGHT. V2 quotes from the YES side, so a
+        # NO fill's cost is 1 - the yes price; reading the wrong one books a
+        # 30c purchase as 70c.
+        prices, count = [], 0.0
+        for row in rows:
+            n = float(row.get('count_fp') or row.get('count') or 0) or 0.0
+            yes = row.get('yes_price_dollars') or row.get('yes_price')
+            try:
+                yes = float(yes)
+            except (TypeError, ValueError):
+                continue
+            if yes > 1.0:                      # integer cents, older encoding
+                yes /= 100.0
+            prices.append((yes if side == 'up' else 1.0 - yes) * n)
+            count += n
+        if count <= 0 or not prices:
+            continue
+        # **A sub-contract partial is not a fill yet.** `contracts` is an
+        # integer column, so `int(round(count))` turned 0.4 filled contracts
+        # into a position of 0 -- real money spent, nothing recorded, and a
+        # ticket closed so the rest of the order could never be booked.
+        # Measured live: position 1133 held `contracts=0, outlay=$0.07`
+        # against a venue fill of 1 contract and -$0.70. Leaving the ticket
+        # resting costs nothing: the next cycle sees the larger total, and
+        # `cancel_stale_resting` retires it if it never completes.
+        if int(round(count)) < 1:
+            logger.info('%s window %s: %.2f contract(s) filled so far, under '
+                        'one; leaving the ticket resting rather than booking '
+                        'a zero-contract position',
+                        ticket.symbol, ticket.window_open, count)
+            continue
+        price = sum(prices) / count
+        fee = float(trade_fee(int(round(count)), price, config))
+        outlay = count * price + fee
+        # **`positions` requires the forecast columns, not just the money.**
+        # model_probability, baseline_probability and edge are all NOT NULL, so
+        # booking without them raises NotNullViolation and the whole reconcile
+        # aborts — which is how the first version of this silently did nothing
+        # while logging "the resting-order sweep raised" once a minute.
+        #
+        # The ticket carries the model's own number and the edge it was sized
+        # on. The baseline comes from the prediction that produced the ticket;
+        # where that is missing, the MARKET price is the honest stand-in,
+        # because a resting order's price IS what the book offered.
+        model_p = getattr(ticket, 'model_probability', None)
+        edge = getattr(ticket, 'edge', None)
+        baseline_p = None
+        pid = getattr(ticket, 'prediction_id', None)
+        if pid is not None:
+            pred = writer.prediction(pid) if hasattr(writer, 'prediction') else None
+            if pred is not None:
+                model_p = model_p if model_p is not None else getattr(
+                    pred, 'model_probability', None)
+                baseline_p = getattr(pred, 'baseline_probability', None)
+                edge = edge if edge is not None else getattr(pred, 'edge', None)
+        if model_p is None:
+            model_p = price
+        if baseline_p is None:
+            baseline_p = price
+        if edge is None:
+            edge = float(model_p) - price
+        await _db(writer.open_position,
+                  symbol=ticket.symbol, window_open=ticket.window_open,
+                  settle_time=ticket.settle_time,
+                  offset_minutes=ticket.offset_minutes, side=side,
+                  contracts=int(round(count)), price=price,
+                  outlay=outlay, fee=fee,
+                  model_probability=float(model_p),
+                  baseline_probability=float(baseline_p),
+                  edge=float(edge),
+                  prediction_id=pid)
+        await _db(writer.adjust_account, bankroll_delta=-outlay, fees_delta=fee)
+        await _db(writer.resolve_ticket, ticket.id, status='filled',
+                  filled_contracts=int(round(count)), filled_price=price,
+                  note=f'resting order filled at {price:.4f} ({count:.2f} '
+                       f'contracts), booked by the reconcile')
+        logger.info('%s: resting order filled %.2f @ %.4f — position booked',
+                    ticket.symbol, count, price)
+        booked += 1
+    if booked:
+        logger.info('booked %d position(s) from resting orders the venue filled',
+                    booked)
+    return booked
+
+
+async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
+                               now=None) -> int:
+    """Cancel resting orders that have outlived the forecast behind them.
+
+    **An immediate-or-cancel order is over the instant it is sent; a resting one
+    is not.** It sits until it fills, the market closes, or somebody cancels it
+    — and on a fifteen-minute market an order left from offset 3 can fill at
+    offset 14 against a barrier probability that has almost entirely resolved.
+    That is the real objection to resting as a policy, and it is why
+    `place_order` defaults to immediate_or_cancel. This is what makes resting
+    safe to switch on: the order's life is bounded by the forecast's.
+
+    **The leash is the order's own AGE, not an offset into the window.** This
+    keyed on `window_open` and a fixed minute, which gave an order placed at
+    +3m a six-minute life and one placed at +12m none at all — one flag meaning
+    two different leashes depending on when it was sent. `created_at` gives
+    every order the same one.
+
+    Inert unless `maker_entry` is on, and a non-positive `maker_cancel_seconds`
+    disables it — which is only reasonable while measuring whether fills happen
+    at all, and leaves orders resting to settlement.
+    """
+    if not getattr(config, 'maker_entry', False):
+        return 0
+    cutoff = getattr(config, 'maker_cancel_seconds', None)
+    if cutoff is None or float(cutoff) <= 0:
+        return 0
+    now = now or pd.Timestamp.now(tz='UTC')
+    cancelled = 0
+    for ticket in writer.open_tickets(limit=100):
+        order_id = getattr(ticket, 'venue_order_id', None)
+        if not order_id:
+            continue
+        sent = getattr(ticket, 'created_at', None)
+        if sent is None:
+            # No send time is not "old enough to cancel". Leaving it is the
+            # conservative error: the reconcile still finds any position, and
+            # cancelling an order we cannot age could kill a fresh one.
+            continue
+        sent = pd.Timestamp(sent)
+        if sent.tzinfo is None:
+            sent = sent.tz_localize('UTC')
+        age = (now - sent).total_seconds()
+        if age < float(cutoff):
+            continue
+        try:
+            await kalshi.cancel_order(str(order_id))
+        except Exception as exc:                               # noqa: BLE001
+            # A cancel that fails because the order already filled or the
+            # market closed is not an error worth stopping the cycle for; it is
+            # the reconcile's job to find the position either way.
+            logger.info('could not cancel %s (%s); reconcile will settle it',
+                        order_id, str(exc)[:100])
+            continue
+        await _db(writer.resolve_ticket, ticket.id, status='cancelled',
+                  note=f'resting order cancelled after {age:.0f}s unfilled '
+                       f'(maker_cancel_seconds={cutoff})')
+        cancelled += 1
+    if cancelled:
+        logger.info('cancelled %d resting order(s) unfilled past %.0fs',
+                    cancelled, float(cutoff))
+    return cancelled
+
+
 async def run_cycle(args, config: Config, writer: PgWriter, model,
                     kalshi: Optional[KalshiClient]) -> list[Decision]:
     """One cycle. On an ENTRY cycle the decision goes first and the
@@ -666,10 +905,50 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
             logger.error('could not read the book (%s); no decision this cycle', exc)
             quotes, offset = {}, None
     read_at = pd.Timestamp.now(tz='UTC')
+    # **Mark the open positions while the book is in hand.** These markets
+    # settle every fifteen minutes, so anything still pending belongs to the
+    # window just quoted -- no extra request, no second clock. The bid for the
+    # side held, because that is where a sale lands; marking to our own
+    # forecast would book conviction as profit, which is why `at risk` on the
+    # dashboard has always been cost.
+    #
+    # Wrapped, and deliberately after the quotes rather than inside the
+    # decision path: this is telemetry, and a cycle that cannot write telemetry
+    # must still trade and settle.
+    if quotes:
+        try:
+            marks = {}
+            for symbol, entry in quotes.items():
+                quote = entry[0]
+                for side in ('up', 'down'):
+                    price = quote.bid_for(side)
+                    if price is not None:
+                        marks[(symbol, side)] = float(price)
+            by_position = {}
+            for position in await _db(writer.open_positions):
+                price = marks.get((str(position.symbol), str(position.side)))
+                if price is not None:
+                    by_position[(str(position.symbol), position.window_open)] = price
+            if by_position:
+                await _db(writer.mark_open_positions, by_position,
+                          at=read_at.to_pydatetime())
+        except Exception:                         # noqa: BLE001
+            logger.exception('could not mark the open positions this cycle')
     quote_times = {
         symbol: (pd.Timestamp(entry[0].book_time, unit='s', tz='UTC')
                  if getattr(entry[0], 'book_time', None) is not None else read_at)
         for symbol, entry in quotes.items()}
+    # Before this cycle's decisions, retire any resting order from an earlier
+    # one that has outlived its forecast. Inert unless `maker_entry` is on.
+    if getattr(config, 'maker_entry', False) and kalshi is not None:
+        try:
+            # Fills first: an order that filled must be booked, not cancelled.
+            await book_resting_fills(writer, kalshi, config)
+            await cancel_stale_resting(writer, kalshi, config, now=read_at)
+        except Exception:                                      # noqa: BLE001
+            logger.exception('the resting-order sweep raised; continuing — a '
+                             'stale order is a worse outcome than a noisy log, '
+                             'but not worse than skipping the cycle entirely')
     _phase('quotes')
     remember_exchange_index(quotes)
     if quotes:
@@ -693,10 +972,28 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)
 
+    # **The price `decide()` is handed must be the one we will actually pay.**
+    # A taker lifts the ask; a MAKER rests at the bid. Handing decide() the ask
+    # while resting at the bid would understate every edge by a full spread and
+    # refuse trades that are profitable — the mirror of the defect that had the
+    # live path adding a half-spread to a real ask. `Config.maker_entry` is off
+    # by default, so this is the ask unless asked otherwise.
+    _price_at = 'bid_for' if getattr(config, 'maker_entry', False) else 'ask_for'
     scored['ask_up'] = [
-        quotes[s][0].ask_for('up') if s in quotes else np.nan for s in scored['symbol']]
+        getattr(quotes[s][0], _price_at)('up') if s in quotes else np.nan
+        for s in scored['symbol']]
     scored['ask_down'] = [
-        quotes[s][0].ask_for('down') if s in quotes else np.nan for s in scored['symbol']]
+        getattr(quotes[s][0], _price_at)('down') if s in quotes else np.nan
+        for s in scored['symbol']]
+    if getattr(config, 'maker_entry', False):
+        # What is queued AHEAD of us at that price. Not a cap on our size the
+        # way the ask's depth is — a reason to expect not to fill.
+        scored['rest_queue_up'] = [
+            quotes[s][0].rest_size_for('up') if s in quotes else np.nan
+            for s in scored['symbol']]
+        scored['rest_queue_down'] = [
+            quotes[s][0].rest_size_for('down') if s in quotes else np.nan
+            for s in scored['symbol']]
     scored['market_ticker'] = [
         quotes[s][1] if s in quotes else None for s in scored['symbol']]
     scored['exchange_index'] = [
@@ -710,6 +1007,15 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # a different model from the one whose gates were measured.
     _attach_book_features(scored, quotes, _stream_cache(), config=config,
                           groups=model.groups or None)
+    # Book DYNAMICS, from the minutes `scripts.record_book_minutes` sampled.
+    # Separate from `_attach_book_features` because it reads a HISTORY rather
+    # than the decision snapshot: `book_flow` differences the book over one and
+    # three minutes, and decisions happen only at offsets 3/6/9/12, so the
+    # decision cycle can never supply offset-1 on its own. All six of these
+    # were NaN on every live decision until this existed, while the deployed
+    # artifact was fitted on them.
+    for _col, _values in book_flow_row(scored).items():
+        scored[_col] = _values.to_numpy()
     scored = prepare_init_score(scored, model)
     _phase('score')
     # Liveness, at the point the cycle has demonstrably scored.
@@ -788,11 +1094,20 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # Seed exposure from what is already committed for THIS window, so
     # `ALREADY_ENTERED` / `POSITION_LIMIT` / `WINDOW_EXPOSURE` survive a new
     # cycle, a new offset and a process restart.
-    entered, staked, n_entered = await _db(
-        writer.entries_for_window,
-        window_open.to_pydatetime() if hasattr(window_open, 'to_pydatetime') else window_open)
+    wopen = (window_open.to_pydatetime()
+             if hasattr(window_open, 'to_pydatetime') else window_open)
+    # **Counts, not just symbols.** `entries_for_window` deduplicates by symbol,
+    # which under-reports both the stake and the entry count once
+    # `max_entries_per_symbol_window` exceeds 1 -- and the stake is what
+    # `max_window_exposure_fraction` caps, so that under-report would quietly
+    # raise the real limit. `entry_counts_for_window` pairs on `prediction_id`
+    # instead, so each decision is counted exactly once.
+    counts, staked, n_entered, sides = await _db(
+        writer.entry_counts_for_window, wopen)
+    entered = frozenset(counts)
     base_exposure = WindowExposure(stake=staked, positions=n_entered,
-                                   symbols_entered=entered)
+                                   symbols_entered=entered, entry_counts=counts,
+                                   sides=sides)
     if entered:
         logger.info('window %s already holds %s ($%.2f); those symbols will refuse',
                     window_open, sorted(entered), staked)
@@ -955,6 +1270,36 @@ def config_from_args(args) -> Config:
     """
     config = DEFAULT_CONFIG.with_fee_assumptions(find_fee_config())
     overrides: dict = {}
+    # **Everything the parser accepts must be mapped HERE.** This function
+    # shadows `scripts._common.config_from_args`, so a flag added to the shared
+    # parser does not reach live, and a flag added to live's parser does
+    # nothing unless it is written below. Measured 2026-10-18: `--maker-entry`,
+    # `--maker-time-in-force` and `--maker-cancel-seconds` all parsed cleanly
+    # and were dropped on the floor, leaving live a plain taker paying full
+    # fees while the weekly gates were scored fee-free. That is the "flag
+    # declared and never read" pattern this repo has now recorded five times.
+    band = getattr(args, 'exclude_price_band', None)
+    if isinstance(band, str) and band.strip():
+        try:
+            lo_s, hi_s = band.split(',')
+            overrides['exclude_price_band'] = (float(lo_s), float(hi_s))
+        except (ValueError, AttributeError):
+            raise SystemExit(
+                f'--exclude-price-band wants "LO,HI" like "0.35,0.65"; '
+                f'got {band!r}')
+    elif band is not None and not isinstance(band, str):
+        overrides['exclude_price_band'] = band
+    if getattr(args, 'maker_entry', False):
+        # Implies `assume_maker` in Config.__post_init__: a maker pays the
+        # maker fee, and pricing the entry one way while charging the other
+        # understates the net edge by the whole fee.
+        overrides['maker_entry'] = True
+    tif = getattr(args, 'maker_time_in_force', None)
+    if tif:
+        overrides['maker_time_in_force'] = str(tif)
+    cancel = getattr(args, 'maker_cancel_seconds', None)
+    if cancel is not None:
+        overrides['maker_cancel_seconds'] = float(cancel)
     if args.bankroll is not None:
         overrides['starting_bankroll'] = args.bankroll
     entry = getattr(args, 'entry_offsets', None)
@@ -984,6 +1329,9 @@ def config_from_args(args) -> Config:
     kelly = getattr(args, 'kelly_fraction', None)
     if kelly is not None:
         overrides['kelly_fraction'] = float(kelly)
+    per_symbol = getattr(args, 'max_entries_per_symbol_window', None)
+    if per_symbol is not None:
+        overrides['max_entries_per_symbol_window'] = int(per_symbol)
     cap = getattr(args, 'max_positions_per_window', None)
     if cap is not None:
         overrides['max_positions_per_window'] = int(cap)

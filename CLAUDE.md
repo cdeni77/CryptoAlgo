@@ -4,6 +4,13 @@ Full architecture and agent guidance lives in `AGENTS.md`. This file adds
 Claude Code-specific notes and, more importantly, the reasoning that is easy to
 lose.
 
+**`research/RESEARCH_PROTOCOL.md` is binding on every research session.** It is
+the anti-overfitting contract: the effective sample is ~2,161 windows with a
+trustworthy market price, not 387,000 rows; all inference resamples windows;
+failures are reported alongside successes; negative controls are mandatory; and
+the ranking criterion is generalization, not return. Read it before designing any
+experiment.
+
 **Read `AUDIT_REPORT.md` first.** An adversarial audit in August 2026 found that
 the research core is sound — no lookahead, and the backtest and live paths compute
 identical feature vectors to 16 decimal places — while everything that traded was
@@ -367,8 +374,13 @@ say, and three of them would have shipped as silent failures:
   sustained, against the ~5/s the first retention estimate assumed. Typed and
   zstd-compressed that is **18.4 bytes/row**, measured over a real compaction of
   191,238 rows — roughly 0.4-1.1 GB/day depending on activity. So
-  `venue_book_events` is a **bounded tier**, 14 days by default, while
-  `venue_ladder` is the one kept forever.
+  `venue_book_events` is a **bounded tier**, **60 days** by default
+  (`core/spool.DEFAULT_RAW_RETENTION_DAYS = 60.0`; compose passes
+  `RAW_RETENTION_DAYS=60`). This file said **14** for months and the code never
+  agreed — measured 2026-10-17. `venue_ladder` is the one kept forever, except
+  that **it stopped recording on 2026-09-16 and was dead for a month before
+  anyone noticed**, while the raw frames it is built from stayed current. The
+  gap is recoverable by replaying the stream.
 * **`seq` is global per SUBSCRIPTION, not per market.** It runs 1..N contiguously
   across every market on one `sid`, and reads 1, 9, 10 within any one of them. A
   per-market gap check — which is what "snapshot then incremental updates"

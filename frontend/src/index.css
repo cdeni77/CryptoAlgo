@@ -164,17 +164,38 @@
   .grid-table {
     @apply w-full border-collapse text-tiny;
   }
+  /* Tighter gutters on a phone. At `px-3` a five-column table spends 30px of
+     a 375px screen on padding alone, which is the difference between the
+     action column wrapping and being clipped. */
+  /* Sticky, so the column a number belongs to is still on screen when the
+     table is scrolled sideways on a phone or down inside a tall panel. */
   .grid-table thead th {
-    @apply border-b border-rule bg-sunken px-3 py-2 text-left font-mono text-micro
-      uppercase font-medium text-ink-3;
+    @apply sticky top-0 z-10 border-b border-rule bg-sunken px-2 py-2 text-left
+      font-mono text-micro uppercase font-medium text-ink-3 sm:px-3;
   }
   .grid-table tbody td {
-    @apply border-b border-rule px-3 py-[0.4375rem] align-middle;
+    @apply px-2 py-[0.4375rem] align-middle sm:px-3;
   }
-  .grid-table tbody tr:last-child td {
-    @apply border-b-0;
+  /* **Banded rather than ruled.** A line under every row plus a dozen numeric
+     columns is a grid of boxes, and the eye loses which row it is on halfway
+     across. Alternating bands carry it instead, and cost no vertical space. */
+  /* `bg-sunken` plain: the palette's colours are bare CSS variables, so
+     Tailwind cannot derive an alpha from them (`bg-sunken/50` is a build
+     error, not a softer band). */
+  .grid-table tbody tr:nth-child(even) {
+    @apply bg-sunken;
   }
   .grid-table .num {
     @apply text-right font-mono;
+  }
+  /* **The header of a numeric column, right-aligned to match its cells.**
+     A bare `text-right` utility on the `th` loses: `.grid-table thead th` is
+     one class and two elements, `.text-right` is one class and none, and
+     specificity is compared before source order. So every numeric column had
+     right-aligned figures under a left-aligned heading, and the heading sat
+     over a different column's numbers. Qualified here so it outranks the
+     base rule, exactly as `.grid-table .num` already does for the cells. */
+  .grid-table thead th.num {
+    @apply text-right;
   }
 }

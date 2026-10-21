@@ -11,6 +11,7 @@ import { usePolling } from '../hooks/usePolling';
 import { fetchFunnel, fetchLive, fetchPrices } from '../api/serving';
 import type { OrderTicket, Prediction } from '../types';
 import { FunnelChart } from '../components/Charts';
+import { CollectionHealthPanel } from '../components/CollectionHealth';
 import { ProbabilityScale } from '../components/ProbabilityScale';
 import { QuarterTrack } from '../components/QuarterTrack';
 import { WindowChart } from '../components/WindowChart';
@@ -41,6 +42,10 @@ export function LivePage() {
   if (!state) return null;
 
   const account = state.account;
+  // **Declines only.** `traded` is in the funnel payload so the shares sum to
+  // the whole population, but it was the FIRST bar in a chart titled "why it
+  // declined" — 20.5% of it, and not a decline.
+  const declinedStages = (funnel.data?.stages ?? []).filter((s) => s.declined);
 
   return (
     <div className="space-y-8">
@@ -85,7 +90,7 @@ export function LivePage() {
                   : 'paper account'
             }
             title="Account"
-            note="Open positions are carried at cost, never marked to our own forecast."
+            note="Open positions are marked to the venue’s own figure, never to our forecast — marking a binary at the probability the model believes books conviction as profit."
           />
           <div className="grid grid-cols-2 gap-x-4 gap-y-4">
             <Metric label="equity" value={account.equity} unit="$" digits={2} size="lg" />
@@ -112,16 +117,22 @@ export function LivePage() {
 
         <Panel>
           <SectionHead
-            eyebrow={`${funnel.data?.days ?? 7} days`}
+            eyebrow={
+              funnel.data
+                ? funnel.data.covered_days < funnel.data.requested_days - 0.05
+                  ? `${funnel.data.covered_days} days · since reset`
+                  : `${funnel.data.covered_days} days`
+                : '—'
+            }
             title="Why it declined"
-            note="Abstention is the default action. This funnel dominated by edge-below-gate is the system working: the forecast does not cover the fee, so it declines."
+            note="Abstention is the default action: most decisions end in a refusal, and every one is named. The span is what the dashboard epoch actually leaves — this read “7 days” over 2.2 days of rows until 2026-10-20. `traded` is listed so the shares sum to the whole population; it is not a decline."
           />
           {funnel.loading ? (
             <Loading what="the funnel" />
           ) : funnel.error ? (
             <Failed error={funnel.error} what="the funnel" />
           ) : (
-            <FunnelChart stages={funnel.data?.stages ?? []} />
+            <FunnelChart stages={declinedStages} />
           )}
         </Panel>
       </section>
@@ -158,6 +169,11 @@ export function LivePage() {
           />
         </Panel>
       </section>
+
+      {/* Last, because it is the thing you look at when something above is
+          wrong — but on this page rather than its own, because a health
+          surface nobody opens is the log line that already existed. */}
+      <CollectionHealthPanel />
     </div>
   );
 }
@@ -189,6 +205,17 @@ function WindowCard({ window: w }: { window: Prediction }) {
   );
   const displacementBps = w.displacement * 10_000;
   const above = w.model_probability >= 0.5;
+  // **How old the DECISION is, not how old the fetch is.**
+  // `live_windows` returns the newest prediction per symbol with no recency
+  // bound, so if the trader dies the backend keeps serving the last window
+  // forever: the poll keeps succeeding, the card keeps drawing a full track,
+  // and the only timestamp anywhere was the Rail's `lastUpdated` — which is
+  // when the BROWSER fetched, not when anything was measured. A decision older
+  // than its own window is the tell, so the card carries its own age.
+  const decidedAgeMin = w.decision_time
+    ? (Date.now() - new Date(w.decision_time).getTime()) / 60_000
+    : null;
+  const stale = decidedAgeMin != null && decidedAgeMin > 16;
 
   return (
     <Panel>
@@ -202,6 +229,15 @@ function WindowCard({ window: w }: { window: Prediction }) {
           </Chip>
         )}
       </div>
+      {w.decision_time && (
+        <div className={`mt-1 text-micro ${stale ? 'text-warn' : 'text-ink-3'}`}>
+          decided {clock(w.decision_time)} ET
+          {stale && (
+            <> · {Math.round(decidedAgeMin!)}m ago — older than one window, so
+            the trader may not be running</>
+          )}
+        </div>
+      )}
 
       <div className="mt-3">
         <QuarterTrack
@@ -222,9 +258,14 @@ function WindowCard({ window: w }: { window: Prediction }) {
             price is what WE paid and is null on every refused window — using
             it as a market fallback drew our own baseline and labelled it
             "market" on the majority of rows. */}
+        {/* **Side-relative, not P(up).** `probability` below is already the
+            probability of the side TAKEN, so a raw P(up) market put the bar
+            and the caret on OPPOSITE axes for every down row — they summed to
+            1.0, and a +0.51pp edge drew as a 59-point gap with the caret on
+            the wrong side of break-even. A third of the table is down rows. */}
         <ProbabilityScale
           probability={w.model_probability}
-          price={w.market_probability}
+          price={w.market_probability_side}
           breakEven={w.effective_cost}
         />
       </div>
@@ -246,12 +287,16 @@ function WindowCard({ window: w }: { window: Prediction }) {
           hint="sigma over the minutes still to come — the only quantity being forecast. Labelled in Latin because the eyebrow style uppercases, and CSS turns a lowercase sigma into a capital one."
         />
         <Metric
-          label="forecast"
+          label={w.side ? `forecast · ${w.side}` : 'forecast'}
           value={w.model_probability * 100}
           unit="%"
           digits={1}
           tone={above ? 'above' : 'below'}
-          hint="probability the window settles above its strike"
+          hint={
+            w.side
+              ? `probability the window settles ${w.side === 'up' ? 'ABOVE' : 'BELOW'} its strike — the side this decision took. The stored column is P(up) and is read side-relative for display, so a DOWN row reading 98.8% means P(up) of 1.2%.`
+              : 'probability the window settles above its strike'
+          }
         />
         <Metric
           label="baseline"
@@ -259,11 +304,18 @@ function WindowCard({ window: w }: { window: Prediction }) {
           unit="%"
           digits={1}
           tone="muted"
-          hint="F(x/σ) — what a clock and a volatility estimate alone imply. This is the benchmark, not 50%."
+          hint={
+            w.side === 'down'
+              ? '1 − F(x/σ), read for the DOWN side. F(x/σ) is P(up) by definition; this is its complement, so it sits on the same axis as the forecast above. The benchmark, not 50%.'
+              : 'F(x/σ) — what a clock and a volatility estimate alone imply. This is the benchmark, not 50%.'
+          }
         />
         <div>
-          <div className="eyebrow" title="model probability minus quote, half-spread and fee">
-            edge
+          <div
+            className="eyebrow"
+            title="model probability minus the quote. Since the maker switch this is GROSS of fee and spread: effective_cost == price on every row since the epoch (1397 of 1397, against 0 of 15,889 before it). Resting at the bid genuinely pays neither, but the ~19% of orders that cross still pay about 1.2c per contract — a material share of a ~0.5pp edge."
+          >
+            edge · gross
           </div>
           <div
             className={`mt-0.5 font-mono text-mid font-medium ${

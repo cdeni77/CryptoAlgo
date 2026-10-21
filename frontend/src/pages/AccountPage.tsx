@@ -28,33 +28,52 @@ import {
   fetchEquity,
   fetchPositions,
   fetchVenueAccount,
+  fetchVenueDaily,
   fetchVenueEquity,
   fetchVenueSettlements,
 } from '../api/serving';
 import { EquityChart, VenueAccountChart } from '../components/Charts';
 import {
   Chip,
-  Column,
-  DataTable,
-  Empty,
   Failed,
   Loading,
   Metric,
   Panel,
+  PageLink,
   SectionHead,
 } from '../components/Primitives';
-import { cents, pct, signedPp, stamp } from '../lib/format';
-import type { Position, VenueSettlement } from '../types';
+import { DailyPnlCalendar } from '../components/DailyPnlCalendar';
+import { go } from '../lib/navigate';
+import { cents } from '../lib/format';
 
 export function AccountPage() {
-  const account = usePolling(fetchAccount, 30_000);
-  // Faster than the internal figures, because this is the series that moves: the
-  // live loop samples the venue's balance every cycle.
-  const venue = usePolling(fetchVenueAccount, 20_000);
-  const venueCurve = usePolling(() => fetchVenueEquity(30), 30_000);
-  const equity = usePolling(() => fetchEquity(90), 60_000);
-  const settlements = usePolling(() => fetchVenueSettlements(200), 60_000);
-  const positions = usePolling(() => fetchPositions(false, 200), 60_000);
+  // **Everything on this page polls at one second.**
+  //
+  // The cadences here used to be tuned per endpoint, from 10s to 120s, and the
+  // result was a page whose panels disagreed with each other: the account value
+  // had moved, the day's total had not, and the two were describing the book at
+  // different instants. A single interval means every number on screen is read
+  // from the same second.
+  //
+  // It is affordable because these are small reads against a local backend --
+  // measured 2026-10-20: /account 4ms, the day totals 46ms and 737 bytes.
+  // `Cache-Control: no-store` means each one is a real query rather than a
+  // revalidation, and `usePolling` stops the timer entirely when the tab is
+  // hidden, so an unwatched dashboard costs nothing.
+  //
+  // The one to watch is the venue curve: 475 KB a response, so a second is
+  // ~475 KB/s on the wire for a 30-day series that gains one step per settled
+  // market. It is here for consistency rather than need.
+  const LIVE_MS = 1_000;
+
+  const account = usePolling(fetchAccount, LIVE_MS);
+  const venue = usePolling(fetchVenueAccount, LIVE_MS);
+  const venueCurve = usePolling(() => fetchVenueEquity(30), LIVE_MS);
+  const equity = usePolling(() => fetchEquity(90), LIVE_MS);
+  const settlements = usePolling(() => fetchVenueSettlements(200), LIVE_MS);
+  const positions = usePolling(() => fetchPositions(false, 200), LIVE_MS);
+  const daily = usePolling(() => fetchVenueDaily(180), LIVE_MS);
+  const openPositions = usePolling(() => fetchPositions(true, 50), LIVE_MS);
 
   if (account.loading) return <Loading what="the account" />;
   if (account.error) return <Failed error={account.error} what="the account" />;
@@ -62,12 +81,24 @@ export function AccountPage() {
   if (!state) return null;
 
   const ledger = venue.data;
+  // Seconds since the venue was last read. `lastUpdated` is when the RESPONSE
+  // landed; `balance_at` is when the sample inside it was taken, and it is the
+  // second that matters — a fresh response carrying an hour-old sample is
+  // exactly the failure being watched for.
+  const staleSeconds = venue.data?.balance_at
+    ? (Date.now() - new Date(venue.data.balance_at).getTime()) / 1000
+    : null;
   // The venue has a ledger only once real orders have filled. Until then this
   // page shows our arithmetic and says so, rather than drawing a $0.00 P&L that
   // looks like a measurement.
   const onVenue = Boolean(ledger?.available);
 
   const settled = (positions.data?.positions ?? []).filter((p) => p.outcome !== 'pending');
+  // Newest first, so the entry that just filled is at the top rather than
+  // buried under whatever has been running longest.
+  const openRows = [...(openPositions.data?.positions ?? [])].sort((a, b) =>
+    b.window_open.localeCompare(a.window_open) || a.offset_minutes - b.offset_minutes,
+  );
   const settledContracts = settled.reduce((s, p) => s + p.contracts, 0);
 
   // Per TRADE, and displayed as such. The venue resolves markets, not
@@ -111,12 +142,18 @@ export function AccountPage() {
 
   return (
     <div className="space-y-8">
+      {/* **No eyebrow.** It read "live · real money · started at $462.10",
+          and both halves had to go. The mode is already on screen as a `live`
+          chip two lines below — the invariant is that `account.mode` reaches
+          every surface showing one of its numbers, not that it appears twice.
+          And `starting_bankroll` is a CONFIG value (`--bankroll`), not the
+          balance this dashboard epoch actually began at, so presenting it as
+          where the account "started" was simply wrong. */}
       <SectionHead
-        eyebrow={`${state.mode === 'live' ? 'live · real money' : 'paper'} · started at $${state.starting_bankroll.toFixed(2)}`}
         title="Account"
         note={
           onVenue
-            ? 'Every figure below the chart is the venue’s: cost, revenue and fee per settled market, from /portfolio/settlements. Ours is kept beside it, and the gap is the measurement.'
+            ? 'Every figure here is the venue’s — cash and the mark on what is open, both read from Kalshi, so fees and settlement are already inside them. Nothing on this page is our own arithmetic about money.'
             : 'No venue ledger yet, so these are our own figures — a bankroll debited at the price we sized at and a payout decided by our own bars. The venue has a ledger once real orders fill.'
         }
         right={
@@ -137,6 +174,128 @@ export function AccountPage() {
         }
       />
 
+      {state.open_positions > 0 && (
+        <Panel>
+          {/* **Marked to the venue's bid, not to our forecast.** `at risk`
+              below is cost and stays cost; this strip is what the book says
+              the open contracts would fetch right now, which is safe to show
+              moving because it is not an opinion. Only rendered while
+              something is open — an empty live strip reads as a broken feed. */}
+          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-3">
+            {/* **Every shard, not just the trading one.** This read $494.27
+                against a real $495.37 because it was built on
+                `account.bankroll`, which holds the crypto shard alone. Sizing
+                still uses that — it is the only cash an order can reach — but
+                the figure a person reads as "my account" has to be the whole
+                account. The stranded part is named below rather than dropped. */}
+            <Metric
+              label="account value"
+              value={state.account_value}
+              unit="$"
+              size="lg"
+              hint="every shard's cash plus open contracts at the venue’s bid — what someone would pay for the position right now, not what we paid"
+            />
+            <Metric
+              label="open p&l"
+              value={state.unrealized_pnl}
+              unit="$"
+              size="lg"
+              tone={(state.unrealized_pnl.value ?? 0) >= 0 ? 'above' : 'below'}
+              hint="the venue's own mark, minus what the fills cost and the fee it charged to open them. Unrealised: it moves every second and is worth nothing until the market settles."
+            />
+            <Metric
+              label="open"
+              value={state.open_positions}
+              digits={0}
+              hint={`${state.open_contracts} contract(s) across ${state.open_positions} position(s)`}
+            />
+            {/* **Only the warning survives here.** The quote timestamp and
+                the stranded-cash figure were steady-state facts dressed as
+                news: the mark is rewritten every second, so its time is always
+                now, and cash sits off the trading shard permanently without
+                anything being wrong. A position still carried at COST is
+                different — it means no book was readable for it, so its P&L
+                above is a placeholder rather than a measurement. */}
+            {state.unmarked_positions > 0 && (
+              <div className="text-tiny text-warn">
+                {state.unmarked_positions} still at cost — no book for{' '}
+                {state.unmarked_positions === 1 ? 'it' : 'them'} yet
+              </div>
+            )}
+          </div>
+
+          {/* One row per open entry.
+              **Four columns, not six.** `symbol | side | ct | bought | now |
+              p&l` overflowed 375px and the horizontal scroll clipped P&L — the
+              one column worth looking at. Side is folded into the symbol as a
+              colour and an arrow, and size is folded into the entry price, so
+              nothing is lost and nothing is cut off.
+
+              The offset is kept because multi-entry puts several rows on the
+              same symbol and window; without it two rows look like a duplicate
+              rather than two bets. */}
+          {openRows.length > 0 && (
+            <div className="mt-4 border-t border-rule pt-3">
+              <table className="w-full text-tiny">
+                <thead>
+                  <tr className="text-micro uppercase tracking-wider text-ink-3">
+                    <th className="pb-1 text-left font-normal">position</th>
+                    <th className="pb-1 text-right font-normal">bought</th>
+                    <th className="pb-1 text-right font-normal">now</th>
+                    <th className="pb-1 text-right font-normal">p&amp;l</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {openRows.map((p) => {
+                    const live = p.unrealized_pnl;
+                    const up = p.side === 'up';
+                    return (
+                      <tr key={p.id} className="border-t border-rule/40">
+                        <td className="py-1.5 whitespace-nowrap">
+                          <span className={up ? 'text-above' : 'text-below'}>
+                            {up ? '▲' : '▼'}
+                          </span>{' '}
+                          <span className="font-medium text-ink">
+                            {p.symbol.replace('-USD', '')}
+                          </span>
+                          <span className="ml-1 text-micro text-ink-3">
+                            +{p.offset_minutes}m
+                          </span>
+                        </td>
+                        <td className="py-1.5 text-right tabular-nums text-ink-2">
+                          {p.contracts}&thinsp;@&thinsp;{cents(p.price)}
+                        </td>
+                        <td className="py-1.5 text-right tabular-nums text-ink">
+                          {p.mark_price == null ? (
+                            <span className="text-ink-3">—</span>
+                          ) : (
+                            cents(p.mark_price)
+                          )}
+                        </td>
+                        <td
+                          className={[
+                            'py-1.5 text-right font-semibold tabular-nums',
+                            live == null
+                              ? 'text-ink-3'
+                              : live >= 0
+                                ? 'text-above'
+                                : 'text-below',
+                          ].join(' ')}
+                        >
+                          {live == null
+                            ? '—'
+                            : `${live >= 0 ? '+' : ''}${live.toFixed(2)}`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <Panel>
           {onVenue ? (
@@ -148,9 +307,10 @@ export function AccountPage() {
               <>
                 <VenueAccountChart points={venueCurve.data?.points ?? []} />
                 <p className="mt-2 text-tiny text-ink-3">
-                  Realised P&amp;L, stepped once per settled market. The venue’s cash
-                  is the figure beside this chart, not a line on it: it moves on
-                  deposits and withdrawals too, and those are not the strategy.{' '}
+                  Trading profit only, stepped once per market that resolved.
+                  It is not the balance: the balance also moves when you deposit
+                  or withdraw, and that is not the strategy. Over any stretch
+                  with nothing open at either end the two agree.{' '}
                   {beforeWindow != null && (
                     <>
                       Cumulative within the last {venueCurve.data?.days ?? 30} days;{' '}
@@ -171,37 +331,71 @@ export function AccountPage() {
         </Panel>
         <Panel>
           <div className="grid grid-cols-2 gap-x-4 gap-y-4">
+            {/* **The same quantity the calendar below sums to, and read from
+                the same response.** It used to be realised P&L on settled
+                markets while the calendar showed the change in account value,
+                so the headline and the squares under it disagreed by whatever
+                was open and by the midnight boundary — which simply reads as
+                one of them being broken. One number, one definition. */}
             <Metric
-              label={onVenue ? 'realised p&l · venue' : 'realised p&l'}
-              value={onVenue ? ledger!.realized_pnl : state.realized_pnl}
+              label={onVenue ? 'p&l · since reset' : 'realised p&l'}
+              value={
+                onVenue
+                  ? (daily.data?.total ?? null)
+                  : state.realized_pnl
+              }
               unit="$"
               size="lg"
               tone={
-                ((onVenue ? ledger!.realized_pnl.value : state.realized_pnl.value) ?? 0) >= 0
+                ((onVenue ? daily.data?.total : state.realized_pnl.value) ?? 0) >= 0
                   ? 'above'
                   : 'below'
               }
               hint={
                 onVenue
-                  ? 'revenue minus cost minus fee, summed over every market the venue settled'
+                  ? 'the change in account value — cash plus what is open, both from Kalshi — summed over the days below. Fees and settlement are already inside it.'
                   : 'our own arithmetic — the venue has not been read'
               }
             />
+            {/* **The total, because that is the number the venue's own app
+                shows.** This used to render the trading shard alone, so the
+                page read $482.46 against an app saying $483.57 while
+                `balance_drift` sat at exactly 0.00 — two correct figures and
+                no way to tell that from a sync fault. The shard is the one an
+                order can actually spend and is carried directly beneath. */}
             <Metric
               label={onVenue ? 'cash · venue' : 'cash'}
-              value={onVenue ? ledger!.balance : state.bankroll}
+              value={onVenue ? ledger!.total_balance : state.bankroll}
               unit="$"
               size="lg"
               hint={
                 onVenue
-                  ? `from /portfolio/balance${
-                      ledger!.exchange_index == null
-                        ? ''
-                        : `, shard ${ledger!.exchange_index}`
-                    }. Cash, not equity: an open position has already left it.`
+                  ? 'every shard, from /portfolio/balance — the figure the Kalshi app shows. Cash, not equity: an open position has already left it.'
                   : undefined
               }
             />
+            {onVenue && (
+              <Metric
+                label={
+                  ledger!.exchange_index == null
+                    ? 'tradeable'
+                    : `tradeable · shard ${ledger!.exchange_index}`
+                }
+                value={ledger!.balance}
+                unit="$"
+                size="lg"
+                tone={
+                  (ledger!.stranded.value ?? 0) > 0.01 ? 'muted' : undefined
+                }
+                hint={
+                  (ledger!.stranded.value ?? 0) > 0.01
+                    ? `what a crypto order can draw on. $${ledger!.stranded.value!.toFixed(
+                        2,
+                      )} sits on other shards and cannot reach these markets — balances are local to a shard, which is what made every order come back insufficient_balance against an apparently healthy total.`
+                    : 'what a crypto order can draw on. Balances are local to a shard; nothing is stranded elsewhere.'
+                }
+              />
+            )}
             <Metric
               label="at risk"
               value={state.staked}
@@ -274,262 +468,77 @@ export function AccountPage() {
         </Panel>
       </div>
 
-      {onVenue && (
-        <section>
-          <SectionHead
-            eyebrow="ours against theirs"
-            title="Reconciliation"
-            note="The venue is the account of record, so a gap is our error. Its size matters less than whether it grows: a stable gap is usually a starting-balance mismatch, a growing one is an unrecorded fill, a partial, or a fee we mispriced."
-          />
-          <Panel>
-            <div className="grid grid-cols-2 gap-x-4 gap-y-4 lg:grid-cols-4">
-              <Metric
-                label="p&l · venue"
-                value={ledger!.realized_pnl}
-                unit="$"
-                hint="revenue minus cost minus fee, per settled market"
-              />
-              <Metric
-                label="p&l · ours"
-                value={ledger!.our_realized_pnl}
-                unit="$"
-                tone="muted"
-                hint="settled from our own bars, with the fee predicted from the schedule"
-              />
-              <Metric
-                label="p&l gap"
-                value={ledger!.pnl_gap}
-                unit="$"
-                tone={Math.abs(ledger!.pnl_gap.value ?? 0) > 0.01 ? 'warn' : 'muted'}
-                hint="venue minus ours"
-              />
-              <Metric
-                label="balance drift"
-                value={ledger!.balance_drift}
-                unit="$"
-                tone={Math.abs(ledger!.balance_drift.value ?? 0) > 0.01 ? 'warn' : 'muted'}
-                hint="the venue's balance minus ours, at the last sample"
-              />
-            </div>
-            <p className="mt-4 text-tiny text-ink-3">
-              Last balance sample {stamp(ledger!.balance_at)}
-              {ledger!.last_settled && <> · last settlement {stamp(ledger!.last_settled)}</>}
-              {ledger!.undecided > 0 && (
-                <>
-                  {' '}
-                  · {ledger!.undecided} settled market
-                  {ledger!.undecided === 1 ? '' : 's'} the venue named no result for
-                </>
-              )}
-            </p>
-          </Panel>
-        </section>
-      )}
-
       <section>
         <SectionHead
-          eyebrow={onVenue ? `${venueRows.length} settled · venue` : `${settled.length} settled`}
-          title={onVenue ? 'Settled markets' : 'Settled positions'}
-          note={
-            onVenue
-              ? 'What the venue paid, per market: cost basis, payout, and the fee it actually charged. One fee, at entry — settlement is free, which is why nothing here exits early.'
-              : 'One fee, at entry. Settlement is free, which is why nothing here exits early.'
-          }
+          eyebrow="as the Kalshi app shows it"
+          title="Day by day"
+          note="Each cell is how much the Kalshi balance moved on that Eastern calendar day — the same number, on the same day boundary, as the app. It will not tie to the chart above: that one counts a trade on the day it resolves, this one on the day the cash moved, and a window bought before midnight pays out after it."
         />
-        <Panel flush>
-          {onVenue ? (
-            settlements.loading ? (
-              <Loading what="settlements" />
-            ) : settlements.error ? (
-              <Failed error={settlements.error} what="the venue settlements" />
-            ) : (
-              <DataTable
-                columns={venueColumns}
-                rows={venueRows}
-                keyOf={(r) => r.ticker}
-                empty={
-                  <Empty
-                    what="The venue has settled nothing yet."
-                    next="python -m scripts.sync_venue"
-                  />
-                }
-              />
-            )
-          ) : positions.loading ? (
-            <Loading what="positions" />
+        <Panel>
+          {daily.loading ? (
+            <Loading what="the daily record" />
+          ) : daily.error ? (
+            <Failed error={daily.error} what="the daily record" />
           ) : (
-            <DataTable
-              columns={settledColumns}
-              rows={settled}
-              keyOf={(p) => String(p.id)}
-              empty={
-                <Empty
-                  what="Nothing has settled yet."
-                  next="python -m scripts.live"
-                />
-              }
+            <DailyPnlCalendar
+              days={daily.data?.days ?? []}
+              timezone={daily.data?.timezone}
+              epoch={daily.data?.epoch}
             />
           )}
         </Panel>
       </section>
 
-      {/* Kept alongside the venue table rather than replaced by it. The venue
-          knows what a position paid; only our own row knows what the model
-          claimed at entry, and the forecast against the outcome is the whole
-          research question. */}
-      {onVenue && settled.length > 0 && (
-        <section>
-          <SectionHead
-            eyebrow={`${settled.length} recorded`}
-            title="What we thought at entry"
-            note="Our own rows, for the forecast provenance the venue's ledger does not carry: the model's probability, the edge it claimed, and the fee we predicted. The money numbers above are the venue's."
-          />
-          <Panel flush>
-            <DataTable
-              columns={settledColumns}
-              rows={settled}
-              keyOf={(p) => String(p.id)}
-              empty={<Empty what="Nothing has settled yet." />}
-            />
-          </Panel>
-        </section>
+      {/* **No reconciliation section, and no completeness section either.**
+
+          The first compared `p&l · venue` against `p&l · ours` — two figures
+          now both SET from the venue's own `realized_pnl`, so it was Kalshi
+          against Kalshi and the gap read -2e-14.
+
+          The second asked whether every settled market had a position of ours
+          behind it. That is a real question, but not one for this page: no
+          money figure here reads our `positions` table any more. A trade with
+          no decision record of ours is a hole in the RESEARCH sample — it has
+          no offset, no forecast, no edge — and it costs nothing. The
+          reconciler reports it, which is where it belongs.
+
+          What can still go wrong is the mirror going stale. Everything here
+          is Kalshi's, read once a second by `scripts/mark_positions.py`; if
+          that stops, the page freezes on numbers that look perfectly healthy.
+          So the only thing left is a staleness warning, and it shows up only
+          when there is something to say. */}
+      {onVenue && staleSeconds != null && staleSeconds > 90 && (
+        <p className="rounded border border-warn/40 bg-warn/10 px-3 py-2 text-tiny text-warn">
+          The venue was last read {Math.round(staleSeconds)}s ago. Every figure
+          on this page is that old — the per-second sampler has stopped, so
+          nothing here is moving even if the market is.
+        </p>
       )}
+
+      {/* **Linked, not duplicated.** Both of these tables were full copies of
+          pages that already exist: the venue's settled markets and our own
+          entry rows are both in Decisions, which has the filters and the room
+          for them. Rendering them twice meant two places to keep correct and a
+          page you had to scroll past to reach anything. */}
+      <section>
+        <SectionHead
+          eyebrow="the detail"
+          title="Every trade, one by one"
+          note="This page is the totals. The row-level record — what was bought, what it cost and what the venue paid — is the Decisions page with its traded filter on."
+        />
+        {/* **One link, and it lands filtered.** Decisions already holds this
+            table; the account does not need a second copy of it, only a way
+            in. Calibration is not here because it is a question about the
+            MODEL — whether a forecast was honest about its own confidence —
+            and it has its own tab. */}
+        <PageLink
+          href="/decisions?traded=1"
+          title="Trades"
+          note="every position taken, with the forecast and the edge that justified it"
+          count={onVenue ? `${venueRows.length.toLocaleString()} settled` : undefined}
+          onNavigate={go}
+        />
+      </section>
     </div>
   );
 }
-
-/** The venue's own settlement rows. Money only — every column is a number Kalshi
- *  served, and `ours` is the one comparison against our books. */
-const venueColumns: Column<VenueSettlement>[] = [
-  {
-    key: 'settled',
-    head: 'settled',
-    render: (r) => <span className="font-mono">{stamp(r.settled_time)}</span>,
-  },
-  {
-    key: 'ticker',
-    head: 'market',
-    render: (r) => <span className="font-mono text-tiny">{r.ticker}</span>,
-  },
-  {
-    key: 'side',
-    head: 'side',
-    render: (r) =>
-      r.yes_contracts > 0 && r.no_contracts > 0 ? (
-        <span className="text-ink-3">both</span>
-      ) : r.yes_contracts > 0 ? (
-        <Chip tone="above">up</Chip>
-      ) : r.no_contracts > 0 ? (
-        <Chip tone="below">down</Chip>
-      ) : (
-        <span className="text-ink-3">—</span>
-      ),
-  },
-  { key: 'qty', head: 'qty', numeric: true, render: (r) => r.contracts.toFixed(0) },
-  {
-    key: 'cost',
-    head: 'cost',
-    numeric: true,
-    render: (r) => (r.cost == null ? '—' : `$${r.cost.toFixed(2)}`),
-  },
-  {
-    key: 'revenue',
-    head: 'revenue',
-    numeric: true,
-    render: (r) => (r.revenue == null ? '—' : `$${r.revenue.toFixed(2)}`),
-  },
-  {
-    key: 'fee',
-    head: 'fee',
-    numeric: true,
-    render: (r) => (r.fee_cost == null ? '—' : `$${r.fee_cost.toFixed(2)}`),
-  },
-  {
-    key: 'result',
-    head: 'result',
-    render: (r) =>
-      r.won == null ? (
-        <span className="text-ink-3" title="the venue named no result for this market">
-          —
-        </span>
-      ) : (
-        <Chip tone={r.won ? 'pass' : 'fail'}>{r.won ? 'won' : 'lost'}</Chip>
-      ),
-  },
-  {
-    key: 'pnl',
-    head: 'p&l',
-    numeric: true,
-    render: (r) =>
-      r.pnl == null ? (
-        <span className="text-ink-3" title="the venue left a field absent — this is not zero">
-          —
-        </span>
-      ) : (
-        <span className={r.pnl >= 0 ? 'text-above' : 'text-below'}>
-          {r.pnl >= 0 ? '+' : ''}
-          {r.pnl.toFixed(2)}
-        </span>
-      ),
-  },
-  {
-    key: 'gap',
-    head: 'vs ours',
-    numeric: true,
-    render: (r) =>
-      r.pnl_gap == null ? (
-        <span
-          className="text-ink-3"
-          title={
-            r.our_pnl == null
-              ? 'we have no record of buying this market'
-              : 'the venue left a field absent'
-          }
-        >
-          —
-        </span>
-      ) : (
-        <span className={Math.abs(r.pnl_gap) > 0.01 ? 'text-warn' : 'text-ink-3'}>
-          {r.pnl_gap >= 0 ? '+' : ''}
-          {r.pnl_gap.toFixed(2)}
-        </span>
-      ),
-  },
-];
-
-const settledColumns: Column<Position>[] = [
-  { key: 'when', head: 'window', render: (p) => <span className="font-mono">{stamp(p.window_open)}</span> },
-  { key: 'symbol', head: 'symbol', render: (p) => <span className="font-mono">{p.symbol}</span> },
-  {
-    key: 'side',
-    head: 'side',
-    render: (p) => (
-      <Chip tone={p.side === 'up' ? 'above' : 'below'}>{p.side}</Chip>
-    ),
-  },
-  { key: 'offset', head: 'at', numeric: true, render: (p) => `+${p.offset_minutes}m` },
-  { key: 'contracts', head: 'qty', numeric: true, render: (p) => p.contracts },
-  { key: 'price', head: 'price', numeric: true, render: (p) => cents(p.price) },
-  { key: 'q', head: 'forecast', numeric: true, render: (p) => pct(p.model_probability, 1) },
-  { key: 'edge', head: 'edge', numeric: true, render: (p) => signedPp(p.edge) },
-  { key: 'fee', head: 'fee', numeric: true, render: (p) => `$${p.fee.toFixed(2)}` },
-  {
-    key: 'result',
-    head: 'result',
-    render: (p) => (
-      <Chip tone={p.outcome === 'won' ? 'pass' : 'fail'}>{p.outcome}</Chip>
-    ),
-  },
-  {
-    key: 'pnl',
-    head: 'p&l',
-    numeric: true,
-    render: (p) =>
-      p.pnl == null ? '—' : (
-        <span className={p.pnl >= 0 ? 'text-above' : 'text-below'}>
-          {p.pnl >= 0 ? '+' : ''}
-          {p.pnl.toFixed(2)}
-        </span>
-      ),
-  },
-];

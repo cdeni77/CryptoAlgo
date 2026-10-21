@@ -158,6 +158,11 @@ class Position(Base):
 
     outcome = Column(String, nullable=False, default=Outcome.PENDING.value, index=True)
     settled_up = Column(Boolean, nullable=True)
+    # Mirrors the trader's ORM: what the VENUE's bid says this open position is
+    # worth now, and when that quote was read. Never our own forecast — marking
+    # a binary at the probability we believe books conviction as profit.
+    mark_price = Column(Float, nullable=True)
+    mark_at = Column(DateTime(timezone=True), nullable=True)
     payout = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True)
     settled_at = Column(DateTime(timezone=True), nullable=True)
@@ -165,7 +170,12 @@ class Position(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('symbol', 'window_open', name='uq_position_window'),
+        # Mirrors the trader's ORM, which widened this on 2026-10-20 so a
+        # window can hold one position per decision OFFSET. The two models are
+        # asserted identical by the parity test; a mismatch here would have the
+        # API build a different table than the trader on a fresh database.
+        UniqueConstraint('symbol', 'window_open', 'offset_minutes',
+                         name='uq_position_window_offset'),
         Index('ix_positions_open', 'outcome', 'settle_time'),
     )
 
@@ -320,7 +330,10 @@ class OrderTicket(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('symbol', 'window_open', name='uq_ticket_window'),
+        # Mirrors the trader's ORM, widened 2026-10-20 so a window can hold
+        # one ticket per decision offset.
+        UniqueConstraint('symbol', 'window_open', 'offset_minutes',
+                         name='uq_ticket_window_offset'),
         Index('ix_order_tickets_status_created', 'status', 'created_at'),
     )
 
@@ -433,6 +446,32 @@ class VenueSettlement(Base):
     )
 
 
+class VenuePosition(Base):
+    """The venue's own open positions, replaced wholesale every second.
+
+    Read instead of our `positions` rows wherever the question is MONEY. Ours
+    carry the decision -- which offset, what the model thought -- and the venue
+    carries what was actually paid and charged. Measured 2026-10-20 on three
+    open markets: the cost basis agreed exactly ($3.28), but our fee read
+    $0.0000 against the venue's $0.0414, because `Position.fee` is set at
+    decision time where `assume_maker` makes it zero and is only corrected at
+    settlement. An open position was therefore shown fee-free for its whole
+    life.
+    """
+
+    __tablename__ = 'venue_positions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, nullable=False, index=True)
+    exchange_index = Column(Integer, nullable=True)
+    #: Signed, as served: negative is a NO position.
+    position = Column(Float, nullable=False)
+    market_exposure = Column(Float, nullable=True)
+    fees_paid = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)
+    sampled_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
 class VenueBalance(Base):
     """The venue's balance, sampled. What makes the account chart live.
 
@@ -456,6 +495,22 @@ class VenueBalance(Base):
     timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     balance = Column(Float, nullable=False)
     exchange_index = Column(Integer, nullable=True)
+    # **The cross-shard total, which is what the venue's own app shows.**
+    # `balance` above is the TRADING shard alone -- the only cash an order on a
+    # crypto market can draw on -- and the two differ by whatever is stranded
+    # elsewhere. Recording only the shard made the dashboard read $482.46
+    # against the app's $483.57 and look out of sync when drift was exactly
+    # 0.00. Nullable because rows written before 2026-10-18 do not have it, and
+    # a backfilled zero would draw a cliff in the series that never happened.
+    total_balance = Column(Float, nullable=True)
+    # **The VENUE's own mark of the open book at this instant**, from
+    # `/portfolio/balance.portfolio_value`. Kalshi adds this to cash to show an
+    # account value, so reporting ours instead -- each position marked at the
+    # bid -- put the dashboard a marking convention away from the app: $0.21
+    # apart on ~$5 of open contracts, measured 2026-10-20. Nullable because
+    # rows written before that date do not carry it, and because a flat book is
+    # a real 0.00 that must not be confused with "the venue did not answer".
+    portfolio_value = Column(Float, nullable=True)
     # What our own arithmetic thought at the same instant, and the difference.
     # Stored rather than only logged because a drift that GROWS is the signal —
     # an unrecorded fill, a partial, a mispriced fee — and a single log line

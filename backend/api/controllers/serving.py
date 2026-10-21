@@ -17,13 +17,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from models.serving import (
     Account, CalibrationBin, EquityPoint, MinutePrice, ModelRun, OrderTicket,
-    Outcome, Position, Prediction, VenueBalance, VenueSettlement,
+    Outcome, Position, Prediction, VenueBalance, VenuePosition, VenueSettlement,
 )
 
 # Reasons a decision was refused, in funnel order. The dashboard shows them in
@@ -36,6 +37,12 @@ FUNNEL_ORDER = (
     'price_out_of_band', 'disagreement_implausible', 'edge_below_gate',
     'edge_uncertain', 'members_disagree', 'below_min_contracts',
     'fee_ceiling', 'window_exposure', 'position_limit', 'already_entered',
+    # The window is held on the OTHER side. Distinct from `already_entered`,
+    # which means the entries are used up: this one means the model changed
+    # its mind, and buying the opposite side nets against the open position
+    # rather than hedging it -- measured -$6.29 on three markets, the whole
+    # stake, before the constraint existed.
+    'opposite_side',
     'offset_not_traded', 'bankroll_floor', 'halted', 'model_not_pinned',
 )
 
@@ -97,7 +104,9 @@ def since_reset(query, model, epoch):
     """
     if epoch is None:
         return query
-    column = getattr(model, RESET_COLUMN[model.__name__], None)
+    # `.get`, not `[]`: an unlisted model used to raise KeyError and 500 the
+    # whole surface rather than simply going unfiltered.
+    column = getattr(model, RESET_COLUMN.get(model.__name__, ''), None)
     if column is None:
         return query
     return query.where(column >= epoch)
@@ -111,6 +120,74 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
     ).scalars().all()
     staked = sum(p.outlay for p in open_rows)
 
+    # **Marked to the venue's bid, where there is one.** `staked` is cost and
+    # stays cost; this is a second, different number -- what the book says the
+    # open contracts would fetch right now. A position with no mark yet falls
+    # back to its cost, so `mark_value` is never short by a whole position; it
+    # is counted in `unmarked` instead, so the surface can say how much of the
+    # figure is actually live.
+    # **The CROSS-SHARD total, because that is the account.** `account.bankroll`
+    # holds the trading shard only -- correct for sizing, since that is the only
+    # cash a crypto order can draw on -- but showing it as "account value" hides
+    # whatever sits on the other shards. Measured 2026-10-20: the page read
+    # $494.27 against a real $495.37, and the missing $1.10 was simply invisible.
+    # Sizing still reads `bankroll`; only the DISPLAY totals use this.
+    latest_balance = db.execute(
+        since_reset(select(VenueBalance), VenueBalance, epoch)
+        .order_by(VenueBalance.timestamp.desc()).limit(1)
+    ).scalars().first()
+    venue_total = (float(latest_balance.total_balance)
+                   if latest_balance is not None
+                   and latest_balance.total_balance is not None else None)
+
+    # **The venue's own figures for the open book, where it has them.**
+    #
+    # Two of ours were wrong and in opposite directions. `Position.fee` is set
+    # at DECISION time, where `assume_maker` makes it 0.00, and is only
+    # corrected at settlement -- so an open position was shown fee-free for its
+    # whole life: $0.0000 against the venue's $0.0414 on three markets,
+    # measured 2026-10-20. And we mark at the BID, which is what a sale would
+    # fetch; Kalshi marks higher, so the same book read $3.436 to us and $3.540
+    # to it, and the page showed "$0.54 still open" beside an "open p&l" of
+    # $0.36 with nothing explaining the difference.
+    #
+    # The cost basis agreed exactly, which is the reassuring part: the fills
+    # are right, only the charges and the marking convention were ours.
+    venue_open = db.execute(select(VenuePosition)).scalars().all()
+    venue_cost = sum(float(r.market_exposure or 0.0) for r in venue_open)
+    venue_fees = sum(float(r.fees_paid or 0.0) for r in venue_open)
+
+    marked = 0.0
+    unmarked = 0
+    oldest_mark = None
+    open_contracts = sum(float(p.contracts or 0) for p in open_rows)
+    # **The entry fee is already spent and is not in `outlay`.** `staked` is
+    # `contracts * price` exactly -- the ORM comment claiming otherwise was
+    # wrong and is corrected -- so `marked - staked` overstates the open
+    # position by whatever was charged to open it.
+    for position in open_rows:
+        if position.mark_price is None:
+            marked += float(position.outlay or 0.0)
+            unmarked += 1
+            continue
+        marked += float(position.mark_price) * float(position.contracts or 0)
+        if position.mark_at is not None:
+            oldest_mark = (position.mark_at if oldest_mark is None
+                           else min(oldest_mark, position.mark_at))
+
+    # The venue's where it has one, ours otherwise. `portfolio_value` is a
+    # TOTAL and arrives with the balance sample, so it is only usable when the
+    # set of open positions it describes is the one we are reporting -- which
+    # is why it is taken from the same row as the cash.
+    venue_mark = (float(latest_balance.portfolio_value)
+                  if latest_balance is not None
+                  and getattr(latest_balance, 'portfolio_value', None) is not None
+                  and venue_open else None)
+    open_worth = venue_mark if venue_mark is not None else marked
+    open_cost = venue_cost if venue_open else staked
+    open_fees = venue_fees if venue_open else sum(
+        float(p.fee or 0.0) for p in open_rows)
+
     if row is None:
         return {
             'configured': False,
@@ -119,7 +196,18 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
             'bankroll': _missing('no account row yet — the paper engine has not run'),
             'equity': _missing('no account row yet — the paper engine has not run'),
             'staked': _measured(staked),
+            'account_value': _missing('no account row yet'),
+            'total_balance': _missing('no account row yet'),
+            'tradeable_balance': _missing('no account row yet'),
+            'stranded': _missing('no account row yet'),
+            'mark_value': _measured(open_worth),
+            'unrealized_pnl': _measured(round(open_worth - open_cost - open_fees, 6)),
+            'open_fees': _measured(open_fees),
+            'unmarked_positions': unmarked,
+            'marked_at': oldest_mark,
             'open_positions': len(open_rows),
+            'open_contracts': open_contracts,
+            'unrealized_pp_per_contract': _missing('no account row yet'),
             'realized_pnl': _missing('no account row yet'),
             'fees_paid': _missing('no account row yet'),
             'halted': False, 'halted_reason': None, 'updated_at': None,
@@ -132,13 +220,57 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
         'mode': row.mode,
         'starting_bankroll': row.starting_bankroll,
         'bankroll': _measured(row.bankroll),
-        # Equity is bankroll plus open stake carried at COST. Deliberately not
-        # marked to the model's own probability: marking an open binary at our
-        # own forecast books the edge we believe in as profit we have not
-        # received, which is how a losing system draws a rising equity curve.
+        # **Equity carries open positions at COST.** Deliberately not marked to
+        # the model's own probability: marking an open binary at our own
+        # forecast books the edge we believe in as profit we have not received,
+        # which is how a losing system draws a rising equity curve. Left on
+        # cost so the figure cannot move on an opinion.
         'equity': _measured(row.bankroll + staked),
         'staked': _measured(staked),
+        # **Account value, marked to the VENUE's bid.** The same total as
+        # `equity` except that open contracts are carried at what someone will
+        # actually pay for them rather than at what we paid. That is not an
+        # opinion, so it is safe to show moving -- and it is the number a
+        # person means by "what is my account worth right now".
+        # Falls back to the shard when no cross-shard total has been sampled
+        # yet, which is only true on a brand-new store -- and says so, rather
+        # than silently reporting a smaller number as the whole account.
+        'account_value': (_measured(venue_total + open_worth) if venue_total is not None
+                          else _measured(row.bankroll + open_worth)),
+        # Carried so the surface can show what is spendable where, and name the
+        # part that is stranded off the trading shard.
+        'total_balance': (_measured(venue_total) if venue_total is not None
+                          else _missing('no cross-shard balance sampled yet')),
+        'tradeable_balance': _measured(row.bankroll),
+        'stranded': (_measured(round(venue_total - float(row.bankroll), 6))
+                     if venue_total is not None
+                     else _missing('no cross-shard balance sampled yet')),
+        'mark_value': _measured(open_worth),
+        # Marked minus cost AND minus the fee already paid to open it: the
+        # open P&L, which is what moves between cycles. Every term is the
+        # venue's where the venue has one, so this equals the "still open"
+        # part of the headline instead of sitting $0.18 under it.
+        'unrealized_pnl': _measured(round(open_worth - open_cost - open_fees, 6)),
+        'open_fees': _measured(open_fees),
+        # Ours at the bid, kept beside the venue's so the difference between
+        # "what it is worth" and "what a sale would fetch" stays visible rather
+        # than being quietly chosen for the reader.
+        'mark_value_bid': _measured(marked),
+        # How much of `mark_value` is still cost rather than a live quote, and
+        # how old the oldest quote in it is. Without these a stale mark is
+        # indistinguishable from a fresh one.
+        'unmarked_positions': unmarked,
+        'marked_at': oldest_mark,
         'open_positions': len(open_rows),
+        'open_contracts': open_contracts,
+        # **Per CONTRACT, in probability points.** The size-independent figure,
+        # and the same unit `realised_edge_pp` gates on -- so the open book and
+        # the settled record can be read against each other. A dollar total
+        # cannot: it moves with how much was staked, not with how well the
+        # position is doing.
+        'unrealized_pp_per_contract': (
+            _measured(round((marked - staked - open_fees) / open_contracts * 100.0, 4))
+            if open_contracts else _missing('nothing open')),
         'realized_pnl': _measured(row.realized_pnl),
         'fees_paid': _measured(row.fees_paid),
         'halted': bool(row.halted),
@@ -188,9 +320,28 @@ def _prediction_payload(row: Prediction) -> dict[str, Any]:
         'strike': row.strike, 'last_price': row.last_price,
         'displacement': row.displacement,
         'sigma_remaining': row.sigma_remaining, 'z_score': row.z_score,
-        'baseline_probability': row.baseline_probability,
-        'model_probability': row.model_probability,
+        # Side-relative where a side was chosen; a refused row has none and
+        # keeps its P(up), which is the only meaningful reading for it.
+        'baseline_probability': _for_side(row.baseline_probability,
+                                          getattr(row, 'side', None)),
+        'model_probability': _for_side(row.model_probability,
+                                       getattr(row, 'side', None)),
+        # The MARKET's number stays P(up) always: it is the venue's mid, not a
+        # claim about the side we took, and `model_minus_market` compares the
+        # two in up terms.
         'market_probability': row.market_probability,
+        # **The same quantity read for the SIDE TAKEN, for display only.**
+        # `model_probability` above is already side-relative, so plotting it on
+        # one axis against a P(up) market put the two on OPPOSITE axes for
+        # every down row: measured 2026-10-20, a down trade showed model 0.7951
+        # against a market caret at 0.2050 — they sum to 1.0 — so a +0.51pp
+        # edge was drawn as a 59-point gap, with the caret on the wrong side of
+        # the break-even hairline. A third of the table is down rows.
+        #
+        # Added rather than converting the field above, because the gate reads
+        # that one and must keep comparing in up terms.
+        'market_probability_side': _for_side(row.market_probability,
+                                             getattr(row, 'side', None)),
         # 'quote' when the venue's own ask priced this, 'baseline' when the
         # calibrated barrier stood in for a market that was not observed.
         'price_source': row.price_source,
@@ -211,9 +362,19 @@ def recent_predictions(db: Session, *, limit: int = 100,
     return [_prediction_payload(r) for r in db.execute(query).scalars().all()]
 
 
-def funnel(db: Session, *, days: int = 7) -> list[dict[str, Any]]:
+def funnel(db: Session, *, days: int = 7) -> dict[str, Any]:
+    """Why decisions were refused, and over what span.
+
+    **It returns the span it actually covers, not the one it was asked for.**
+    This applied BOTH a `days` bound and the dashboard epoch, then the endpoint
+    echoed back `days: 7` regardless -- so a panel headed "7 days" was summing
+    2.2 days of rows, with 69% of the period missing and nothing saying so.
+    """
     epoch = reset_epoch(db)
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    requested = datetime.now(timezone.utc) - timedelta(days=days)
+    # The later of the two bounds is the one that binds, and it is the one the
+    # caller is told about.
+    since = requested if epoch is None else max(requested, epoch)
     rows = db.execute(
         since_reset(select(Prediction.reason, func.count(Prediction.id)), Prediction, epoch)
         .where(Prediction.window_open >= since)
@@ -221,17 +382,51 @@ def funnel(db: Session, *, days: int = 7) -> list[dict[str, Any]]:
     ).all()
     counts = {reason: int(n) for reason, n in rows}
     total = sum(counts.values())
+    covered = (datetime.now(timezone.utc) - since).total_seconds() / 86400.0
     if total == 0:
         # Nothing decided in this span. Returning a single zero-count `traded`
         # row drew a chart axis with one empty bar, which reads as "we looked and
         # the answer was zero" rather than "we have not looked yet".
-        return []
-    return [{
-        'reason': reason, 'count': counts.get(reason, 0),
-        'share': counts.get(reason, 0) / total if total else None,
-    } for reason in FUNNEL_ORDER if reason in counts]
+        return {'stages': [], 'requested_days': days,
+                'covered_days': round(covered, 2), 'epoch': None, 'total': 0}
+    return {
+        'stages': [{
+            'reason': reason, 'count': counts.get(reason, 0),
+            'share': counts.get(reason, 0) / total if total else None,
+            # `traded` is in this list because the funnel has to add to the
+            # whole population to be read as shares -- but it is not a refusal,
+            # and a chart headed "why it declined" should not lead with it.
+            'declined': reason != 'traded',
+        } for reason in FUNNEL_ORDER if reason in counts],
+        'requested_days': days,
+        'covered_days': round(covered, 2),
+        'epoch': epoch.isoformat() if epoch is not None else None,
+        'total': total,
+    }
 
 
+
+def _for_side(probability, side):
+    """A stored P(up) read as the probability of the SIDE actually taken.
+
+    **The column is P(up) and must stay P(up).** `scripts/promote.py` scores
+    `model_minus_market` by comparing `model_probability` against
+    `market_probability` and `outcome`, all in up terms, so flipping the stored
+    value would break the gate. But a DOWN row displayed as P(up) is nonsense
+    to read: measured 2026-10-17, every one of the 80 DOWN trades since the
+    start line satisfied `edge == (1 - model_probability) - effective_cost`,
+    so the dashboard showed e.g. "paid 0.920, model probability 0.054" for a
+    trade whose real forecast was 0.946 and whose edge was +2.07pp.
+
+    The conversion belongs here, at the point of DISPLAY, and nowhere else.
+    """
+    if probability is None or side is None:
+        return probability
+    try:
+        value = float(probability)
+    except (TypeError, ValueError):
+        return probability
+    return value if str(side) == 'up' else 1.0 - value
 def positions(db: Session, *, open_only: bool = False,
               limit: int = 100) -> list[dict[str, Any]]:
     epoch = reset_epoch(db)
@@ -241,22 +436,100 @@ def positions(db: Session, *, open_only: bool = False,
             .order_by(Position.settle_time)
     else:
         query = query.order_by(Position.window_open.desc()).limit(limit)
+
+    # **The venue's fee, per position, so these rows sum to the open P&L
+    # above.** `Position.fee` is 0.00 on anything still open -- it is set at
+    # decision time where `assume_maker` makes it zero, and corrected only at
+    # settlement -- so a row's P&L was GROSS while the panel's total was net,
+    # and four rows summing to $0.88 sat under a headline of $0.83.
+    #
+    # The venue charges per MARKET and a market can hold several of our
+    # entries, so the charge is split by contracts, the same rule settlement
+    # already uses.
+    venue_fee_for: dict[tuple, float] = {}
+    if open_only:
+        charged = {r.ticker: float(r.fees_paid or 0.0)
+                   for r in db.execute(select(VenuePosition)).scalars().all()}
+        if charged:
+            rows = db.execute(
+                select(OrderTicket).where(OrderTicket.market_ticker.in_(charged))
+            ).scalars().all()
+            by_ticker: dict[str, list] = {}
+            for ticket in rows:
+                by_ticker.setdefault(str(ticket.market_ticker), []).append(ticket)
+            for ticker, tickets in by_ticker.items():
+                fee = charged.get(ticker, 0.0)
+                total = sum(float(t.contracts or 0.0) for t in tickets)
+                for ticket in tickets:
+                    share = ((float(ticket.contracts or 0.0) / total) if total > 0
+                             else 1.0 / len(tickets))
+                    venue_fee_for[(ticket.symbol, ticket.window_open,
+                                   ticket.offset_minutes)] = fee * share
+
+    def open_fee(row) -> float:
+        """The venue's charge where it has one, ours otherwise."""
+        charge = venue_fee_for.get(
+            (row.symbol, row.window_open, row.offset_minutes))
+        return charge if charge is not None else float(row.fee or 0.0)
+
     return [{
         'id': r.id, 'symbol': r.symbol, 'window_open': r.window_open,
         'settle_time': r.settle_time, 'offset_minutes': r.offset_minutes,
         'side': r.side, 'contracts': r.contracts, 'price': r.price,
         'outlay': r.outlay, 'fee': r.fee,
-        'model_probability': r.model_probability,
-        'baseline_probability': r.baseline_probability, 'edge': r.edge,
+        # Side-relative for display; the column itself stays P(up).
+        'model_probability': _for_side(r.model_probability, r.side),
+        'baseline_probability': _for_side(r.baseline_probability, r.side),
+        'edge': r.edge,
         'outcome': r.outcome, 'settled_up': r.settled_up, 'payout': r.payout,
         'pnl': r.pnl, 'settled_at': r.settled_at,
+        # **What the position is worth NOW, from the venue's bid.** Only
+        # meaningful while open: once settled, `pnl` is the answer and a mark
+        # beside it would be a second, contradictory one.
+        'mark_price': r.mark_price,
+        'mark_at': r.mark_at,
+        'mark_value': (None if r.mark_price is None
+                       else round(float(r.mark_price) * float(r.contracts or 0), 6)),
+        # Marked minus what we paid. Unrealised: it is not money until the
+        # market settles, and a binary goes to the full win or the full loss.
+        'unrealized_pnl': (
+            None if r.mark_price is None or r.outcome != Outcome.PENDING.value
+            else round(float(r.mark_price) * float(r.contracts or 0)
+                       - float(r.outlay or 0.0) - open_fee(r), 6)),
+        # What opening it actually cost in fees: the venue's figure while it
+        # is open, ours only as a fallback.
+        'open_fee': (round(open_fee(r), 6)
+                     if r.outcome == Outcome.PENDING.value else None),
     } for r in db.execute(query).scalars().all()]
 
 
 def model_state(db: Session) -> dict[str, Any]:
+    """The artifact that is TRADING, not the newest attempt recorded.
+
+    **This took the newest row by `created_at`.** On 2026-10-20 that was
+    `20261018T091125Z` -- a candidate that failed four gates and was never
+    installed -- while every live prediction carried `20261018T064404Z`. So the
+    Model and Calibration pages showed the gates, the calibration curve and the
+    headline statistics of a model that had never placed an order, with nothing
+    on screen saying so. Someone asking "is the thing trading my money any
+    good?" was reading a different model's report card.
+
+    The installed one is what trades, so the installed one is what is served.
+    The newest attempt is still returned alongside as `latest_candidate`, since
+    a blocked candidate is information -- it is the trial count, and the reason
+    the ledger keeps failures -- it just is not the live model.
+    """
     row = db.execute(
+        select(ModelRun).where(ModelRun.installed.is_(True))
+        .order_by(ModelRun.created_at.desc())
+    ).scalars().first()
+    newest = db.execute(
         select(ModelRun).order_by(ModelRun.created_at.desc())
     ).scalars().first()
+    if row is None:
+        # Nothing installed: fall back to the newest attempt rather than an
+        # empty page, and say which it is so it cannot be read as the live one.
+        row = newest
     if row is None:
         return {
             'present': False,
@@ -266,6 +539,21 @@ def model_state(db: Session) -> dict[str, Any]:
         'present': True, 'reason': None,
         'version': row.version, 'created_at': row.created_at,
         'installed': bool(row.installed), 'forced': bool(row.forced),
+        # **Whether this is the artifact actually placing orders.** False means
+        # nothing has ever been installed and the page is showing a candidate.
+        'is_live': bool(row.installed),
+        # A newer attempt that did NOT install, if there is one. Surfaced so a
+        # blocked candidate is visible without being mistaken for the live
+        # model — the ledger keeps failures because they are the trial count.
+        'latest_candidate': (
+            None if newest is None or newest.version == row.version else {
+                'version': newest.version,
+                'created_at': newest.created_at,
+                'installed': bool(newest.installed),
+                'forced': bool(newest.forced),
+                'failed_gates': ((newest.failed_gates or '').split(', ')
+                                 if newest.failed_gates else []),
+            }),
         'force_reason': row.force_reason,
         'folds': row.folds, 'windows_evaluated': row.windows_evaluated,
         'log_loss_skill': row.log_loss_skill,
@@ -275,7 +563,28 @@ def model_state(db: Session) -> dict[str, Any]:
         'residual_scale': row.residual_scale,
         'control_gain_share': row.control_gain_share,
         'sharpe': row.sharpe, 'total_return': row.total_return,
-        'gates': row.gates or [],
+        # **`measured` distinguishes "cannot compute yet" from "computed and
+        # lost".** The market comparisons read NaN until the live loop has
+        # recorded enough quotes, and both arrived as `passed: false` -- one
+        # red row for two different claims. Derived here from the value's
+        # presence so it works on records written before `promote.py` started
+        # sending it; newer ones carry it and a `note` explaining the gate.
+        'gates': [
+            {**g, 'measured': g.get('measured', g.get('value') is not None)}
+            for g in (row.gates or [])
+        ],
+        # Computed every run, written to the ledger, and never surfaced until
+        # now. The page tells the reader to discount skill by the trial count;
+        # these are what performs that discount.
+        'trial_count': (row.provenance or {}).get('trial_count'),
+        'deflated_sharpe': (row.provenance or {}).get('deflated_sharpe'),
+        'gate_spec_hash': (row.provenance or {}).get('gate_spec_hash'),
+        # The alpha actually BAKED INTO the artifact, which is a different
+        # quantity from the `residual_scale` gate: measured 2026-10-20 the gate
+        # read 0.9404 across folds while the deployed model applied 0.0151 --
+        # 60x apart, same name, nothing on screen distinguishing them.
+        'deployed_residual_scale': ((row.provenance or {}).get('model') or {}).get('residual_scale'),
+        'report_stats': (row.provenance or {}).get('report') or {},
         'failed_gates': (row.failed_gates or '').split(', ') if row.failed_gates else [],
         'provenance': row.provenance or {},
     }
@@ -294,7 +603,14 @@ def model_history(db: Session, *, limit: int = 50) -> list[dict[str, Any]]:
     return [{
         'version': r.version, 'created_at': r.created_at,
         'installed': bool(r.installed), 'forced': bool(r.forced),
-        'log_loss_skill': r.log_loss_skill, 'folds_positive': r.folds_positive,
+        'log_loss_skill': r.log_loss_skill,
+        # **`folds_positive` is meaningless without its denominator.** A count
+        # of agreeing folds only compares across runs at a FIXED fold count:
+        # "5 of 10" is a 62% event under the null where "5 of 6" is a 10.9%
+        # one. The ledger showed `agree 6` (6/6, perfect) sorted below
+        # `agree 25` (25/29), which is backwards. `core/metrics.py` retired the
+        # gate for exactly this reason; the column reintroduced it.
+        'folds_positive': r.folds_positive, 'folds': r.folds,
         'windows_evaluated': r.windows_evaluated,
         'failed_gates': (r.failed_gates or '').split(', ') if r.failed_gates else [],
         'force_reason': r.force_reason,
@@ -311,10 +627,17 @@ def calibration(db: Session, *, version: Optional[str] = None) -> dict[str, Any]
     returned and the frontend draws them against the diagonal.
     """
     if version is None:
-        latest = db.execute(
-            select(ModelRun.version).order_by(ModelRun.created_at.desc())
+        # **The INSTALLED artifact, for the reason `model_state` documents** —
+        # this defaulted to the newest attempt and drew the reliability curve
+        # of a blocked candidate under the heading of the live model.
+        version = db.execute(
+            select(ModelRun.version).where(ModelRun.installed.is_(True))
+            .order_by(ModelRun.created_at.desc())
         ).scalars().first()
-        version = latest
+        if version is None:
+            version = db.execute(
+                select(ModelRun.version).order_by(ModelRun.created_at.desc())
+            ).scalars().first()
     if version is None:
         return {'version': None, 'bins': [],
                 'reason': 'no model run recorded, so no reliability table exists'}
@@ -392,7 +715,8 @@ def tickets(db: Session, *, open_only: bool = True, limit: int = 50) -> list[dic
         'settle_time': r.settle_time, 'offset_minutes': r.offset_minutes,
         'market_ticker': r.market_ticker, 'side': r.side, 'contracts': r.contracts,
         'limit_price': r.limit_price, 'max_price': r.max_price,
-        'expected_cost': r.expected_cost, 'model_probability': r.model_probability,
+        'expected_cost': r.expected_cost,
+        'model_probability': _for_side(r.model_probability, r.side),
         'edge': r.edge, 'status': r.status,
         'filled_contracts': r.filled_contracts, 'filled_price': r.filled_price,
         'filled_at': r.filled_at, 'note': r.note,
@@ -488,6 +812,252 @@ def venue_settlements(db: Session, *, days: Optional[int] = None,
     return [_venue_settlement_payload(r) for r in db.execute(query).scalars().all()]
 
 
+#: The venue settles on a UTC clock, but Kalshi's own app rolls the trading day
+#: over at MIDNIGHT EASTERN, and that is the boundary the operator reconciles
+#: against. Measured 2026-10-19: settlements since 00:00 UTC summed to $10.08
+#: while the account showed $7.07 -- the difference was two markets from the
+#: previous evening ET. Grouping by UTC would make every day on this calendar
+#: disagree with the venue's own by a few trades.
+EASTERN = 'America/New_York'
+
+
+def venue_daily_pnl(db: Session, *, days: int = 120) -> dict[str, Any]:
+    """Realised P&L per EASTERN calendar day, from the venue's own settlements.
+
+    **Epoch-scoped, like every other figure on this page.** It was briefly
+    served unfiltered on the reasoning that a calendar exists to show history;
+    that put days from a different configuration beside days from this one,
+    under one month total, with nothing on the surface saying where one ended.
+    The dashboard epoch is exactly the line that separates them, so the
+    calendar honours it and the page means one thing throughout.
+
+    Days with no settlement are omitted rather than sent as zero -- a day the
+    system did not trade is not a break-even day, and drawing it flat would put
+    a false point on anyone's mental equity curve.
+    """
+    epoch = reset_epoch(db)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.execute(
+        since_reset(select(VenueSettlement), VenueSettlement, epoch)
+        .where(VenueSettlement.settled_time >= since)
+        .order_by(VenueSettlement.settled_time)
+    ).scalars().all()
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.settled_time is None:
+            continue
+        stamp = row.settled_time
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        key = stamp.astimezone(ZoneInfo(EASTERN)).date().isoformat()
+        day = buckets.setdefault(key, {
+            'date': key, 'pnl': 0.0, 'markets': 0, 'contracts': 0.0,
+            'fees': 0.0, 'wins': 0, 'losses': 0, 'incomplete': 0,
+        })
+        day['markets'] += 1
+        day['contracts'] += (row.yes_contracts or 0.0) + (row.no_contracts or 0.0)
+        if row.fee_cost is not None:
+            day['fees'] += float(row.fee_cost)
+        if row.pnl is None:
+            # Counted, never treated as break-even: the venue left a field
+            # absent, so the day's total is short by an unknown amount.
+            day['incomplete'] += 1
+            continue
+        day['pnl'] += float(row.pnl)
+        verdict = _venue_won(row)
+        if verdict is True:
+            day['wins'] += 1
+        elif verdict is False:
+            day['losses'] += 1
+
+    # **A day is the change in ACCOUNT VALUE across it, and nothing else.**
+    #
+    # This was built three times the hard way and each attempt failed the same
+    # reader test. First as realised P&L on markets that settled in the day,
+    # which disagreed with the Kalshi app. Then as the cash change, which sawed
+    # up and down as the trader opened and closed windows. Then as cash plus a
+    # reconstruction of what was held at each boundary -- which produced a
+    # correction nobody could read, because a single net number covering two
+    # different midnights does not mean anything you can say in a sentence.
+    #
+    # Account value is `cash + what the open book is worth`, and the venue
+    # serves both on `/portfolio/balance` -- the second as `portfolio_value`,
+    # its OWN mark. Sampled every second by `scripts/mark_positions.py`,
+    # because Kalshi has no history endpoint of any kind (probed exhaustively
+    # 2026-10-20: summary, pnl, history, balance_history, statements, ledger
+    # are all 404). A day's P&L is then the last sample of the day minus the
+    # last sample of the day before. No boundary correction exists, because a
+    # window open at midnight is simply inside both measurements.
+    #
+    # Fees, settlement, netting and the whole fee schedule are already in those
+    # two numbers. Nothing here models any of them.
+    #
+    # Deposits and withdrawals would corrupt this, being cash that is not
+    # strategy -- `incomplete` carries the warning and the dashboard says so.
+    # None have landed inside any sampled day on this account.
+    #
+    # **One row per day, selected in the database.** The sampler writes a row a
+    # second -- 86,400 a day -- so loading the range into Python and keeping
+    # the last of each day, which is what this did first, would pull millions
+    # of rows to compute a few dozen numbers. `DISTINCT ON` does the same work
+    # at the index. The bucketing is `AT TIME ZONE` in Postgres so the day
+    # boundary is the same one the settlement buckets above use; computing it
+    # in two places in two languages is how they drift apart.
+    eastern = ZoneInfo(EASTERN)
+    closes = db.execute(text('''
+        SELECT DISTINCT ON (day) day, timestamp, balance, total_balance, portfolio_value,
+               first_value(balance)         OVER w AS open_balance,
+               first_value(total_balance)   OVER w AS open_total,
+               first_value(portfolio_value) OVER w AS open_portfolio
+        FROM (
+            SELECT (timestamp AT TIME ZONE :tz)::date AS day,
+                   timestamp, balance, total_balance, portfolio_value
+            FROM venue_balance
+            WHERE timestamp >= :since AND timestamp >= :epoch
+        ) rows
+        WINDOW w AS (PARTITION BY day ORDER BY timestamp
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+        ORDER BY day, timestamp DESC
+    '''), {'tz': EASTERN, 'since': since,
+           # No epoch means the whole ledger, expressed as a floor nothing is
+           # below rather than as a NULL branch -- `:epoch::timestamptz` reads
+           # as a bind parameter to SQLAlchemy and will not parse.
+           'epoch': epoch or datetime(1970, 1, 1, tzinfo=timezone.utc)},
+    ).mappings().all()
+
+    close_value: dict[str, float] = {}
+    #: Only used for the FIRST day in range, which has no previous close.
+    open_value: dict[str, float] = {}
+    closed_at: dict[str, Any] = {}
+    _mark_only: dict[str, float] = {}
+    ordered_days: list[str] = []
+    marked_days: set[str] = set()
+    for row in closes:
+        # **The trading shard, consistently -- NOT the cross-shard total.**
+        # Preferring the total and falling back to the shard mixed two bases
+        # within one subtraction: 2026-10-18 opened on a row with
+        # `total_balance` NULL (472.28, the shard) and closed on one that had
+        # it (486.81, the total), inventing the $1.11 that permanently sits on
+        # the other shards. These are DIFFERENCES, and the stranded cash does
+        # not move, so the shard gives the same answer with no NULLs in it.
+        cash = row['balance']
+        if cash is None:
+            continue
+        # **Null is not zero here.** Rows written before the sampler existed
+        # carry no mark, and treating that as a flat book would report every
+        # open position at a day's end as a total loss and then as a windfall
+        # the next morning. Those days are measured on cash alone and flagged.
+        mark = row['portfolio_value']
+        key = row['day'].isoformat()
+        ordered_days.append(key)
+        closed_at[key] = row['timestamp']
+        close_value[key] = float(cash) + (0.0 if mark is None else float(mark))
+        open_cash = (row['open_total'] if row['open_total'] is not None
+                     else row['open_balance'])
+        if open_cash is not None:
+            open_value[key] = float(open_cash) + (
+                0.0 if row['open_portfolio'] is None
+                else float(row['open_portfolio']))
+        if mark is not None:
+            marked_days.add(key)
+            _mark_only[key] = float(mark)
+    ordered_days.sort()
+    newest = ordered_days[-1] if ordered_days else None
+    first_day = ordered_days[0] if ordered_days else None
+
+    def day_change(key: str) -> Optional[float]:
+        """Close minus the previous day's close."""
+        if key not in close_value:
+            return None
+        position = ordered_days.index(key)
+        if position == 0:
+            # **The first day in range falls back to its settled P&L.**
+            #
+            # Differencing it against its own first sample was tried and is
+            # worse: the epoch lands mid-day AND mid-trade -- measured, three
+            # positions costing $5.56 were already open at 2026-10-18 12:33 --
+            # so that day's opening sample is a balance with their cost
+            # already deducted and nothing recorded for what they were worth.
+            # The day then reported a gain it had not made.
+            #
+            # Settled P&L is the honest answer for a day whose opening
+            # position is unknown, and `partial` says it is not comparable
+            # with the days around it.
+            return None
+        return round(close_value[key] - close_value[ordered_days[position - 1]], 4)
+
+    days_out = [buckets[k] for k in sorted(buckets)]
+    for day in days_out:
+        day['cash_change'] = day_change(day['date'])
+        # Retained as a field so the payload shape does not change under the
+        # frontend, but there is no boundary correction any more: the account
+        # value already contains whatever was open at each end.
+        day['open_value'] = 0.0
+        # Partial when the day is still running, or when it is the first day in
+        # range and has no previous close to difference against.
+        day['partial'] = day['date'] in (newest, first_day)
+        # Measured on cash alone, because no mark was recorded that day. Worth
+        # saying: it is right only if the book was flat at the boundary.
+        day['unmarked'] = day['date'] not in marked_days
+        day['pp_per_contract'] = (
+            round(day['pnl'] / day['contracts'] * 100.0, 3)
+            if day['contracts'] else None)
+        day['pnl'] = round(day['pnl'], 4)
+        day['fees'] = round(day['fees'], 4)
+
+    # **The first day also gets credited with whatever it ended still holding.**
+    #
+    # It is measured as settled P&L, which counts nothing for a position that
+    # had not resolved by midnight. The NEXT day is measured as a change in
+    # account value, and its opening value does include that position -- so
+    # the open book at that one boundary was being subtracted from day two
+    # without ever having been added to day one. Measured 2026-10-20: $0.32,
+    # showing up as +$0.53 on 10-19 and -$0.21 on 10-20, and leaving the
+    # headline 32c above the settled total on a completely flat book.
+    #
+    # Adding the closing unrealised to the first day cancels it exactly.
+    if days_out and ordered_days:
+        boundary = ordered_days[0]
+        at = closed_at.get(boundary)
+        first = next((d for d in days_out if d['date'] == boundary), None)
+        if first is not None and at is not None and boundary in marked_days:
+            held = db.execute(
+                select(Position)
+                .where(Position.window_open <= at)
+                .where((Position.settled_at.is_(None))
+                       | (Position.settled_at > at))
+            ).scalars().all()
+            cost = sum(float(p.outlay or 0.0) + float(p.fee or 0.0) for p in held)
+            # What the open book was worth at that midnight, minus what it
+            # cost to put on: the unrealised P&L carried into the next day.
+            carried = round(_mark_only.get(boundary, 0.0) - cost, 4)
+            first['carried_open'] = carried
+            if first['cash_change'] is None:
+                first['cash_change'] = round(first['pnl'] + carried, 4)
+
+    # The sum of exactly what the cells show, so the header can never disagree
+    # with the squares underneath it.
+    shown_total = round(sum(
+        (d['cash_change'] if d['cash_change'] is not None else d['pnl'])
+        for d in days_out), 4)
+
+    return {
+        'timezone': EASTERN,
+        # So the surface can say what it is showing rather than imply it is
+        # everything. Null when no reset is set, which means the full ledger.
+        'epoch': epoch.isoformat() if epoch is not None else None,
+        'days': days_out,
+        'first': days_out[0]['date'] if days_out else None,
+        'last': days_out[-1]['date'] if days_out else None,
+        # The SHOWN total -- the sum of the cells. `settled_total` is the old
+        # quantity (realised P&L on markets that resolved), kept because the
+        # promotion gates and the research surface still speak in it.
+        'total': shown_total,
+        'settled_total': round(sum(d['pnl'] for d in days_out), 4),
+    }
+
+
 def venue_account_state(db: Session) -> dict[str, Any]:
     """The account as the venue's ledger reports it, with ours beside it.
 
@@ -524,6 +1094,8 @@ def venue_account_state(db: Session) -> dict[str, Any]:
             'balance_drift': _missing('no venue balance sampled'),
             'balance_at': None,
             'exchange_index': None,
+            'total_balance': _missing('no venue balance sampled'),
+            'stranded': _missing('no venue balance sampled'),
         }
 
     realized = 0.0
@@ -554,6 +1126,25 @@ def venue_account_state(db: Session) -> dict[str, Any]:
 
     decided = wins + losses
     ours = float(account.realized_pnl) if account is not None else None
+    # Settled at the venue with no position of ours behind it. Joined through
+    # `order_tickets`, which is the only thing that knows which market one of
+    # our rows was sent to.
+    booked = {
+        str(t.market_ticker)
+        for t in db.execute(
+            select(OrderTicket).where(OrderTicket.market_ticker.is_not(None))
+        ).scalars().all()
+    }
+    unbooked = 0
+    unbooked_pnl = 0.0
+    for row in rows:
+        if str(row.ticker) in booked:
+            continue
+        unbooked += 1
+        if row.pnl is not None:
+            unbooked_pnl += float(row.pnl)
+    unbooked_pnl = round(unbooked_pnl, 4)
+
     return {
         'available': True,
         'reason': None,
@@ -566,8 +1157,17 @@ def venue_account_state(db: Session) -> dict[str, Any]:
                          else _missing('every settlement was missing a field')),
         'fees': (_measured(fees) if have_fees
                  else _missing('the venue served no fee on any settlement')),
+        # **Shard, then total.** `balance` is the trading shard -- the only cash
+        # an order on a crypto market can draw on, and what Kelly sizes off.
+        # `total_balance` is the cross-shard figure the venue's own app puts on
+        # screen. Showing one without the other is why the dashboard read
+        # $482.46 against an app saying $483.57 with drift at exactly 0.00.
         'balance': (_measured(balance.balance) if balance is not None
                     else _missing('no venue balance sampled')),
+        'total_balance': (_measured(balance.total_balance)
+                          if balance is not None and balance.total_balance is not None
+                          else _missing('the venue served no cross-shard total; '
+                                        'rows written before 2026-10-18 have none')),
         'win_rate': (_measured(wins / decided) if decided
                      else _missing('nothing has settled with a named result')),
         'wins': wins, 'losses': losses, 'undecided': undecided,
@@ -586,7 +1186,30 @@ def venue_account_state(db: Session) -> dict[str, Any]:
                           if balance is not None and balance.drift is not None
                           else _missing('no drift recorded on the last sample')),
         'balance_at': balance.timestamp if balance is not None else None,
+        # Cash the trading shard cannot reach. Derived here rather than stored
+        # so it can never disagree with the two figures it is the difference of.
+        'stranded': (_measured(float(balance.total_balance) - float(balance.balance))
+                     if balance is not None and balance.total_balance is not None
+                     else _missing('no cross-shard total on the last sample')),
         'exchange_index': balance.exchange_index if balance is not None else None,
+        # **The one check that still means anything.**
+        #
+        # `pnl_gap` compares two figures that are now both set from the
+        # venue's own `realized_pnl`, so it is Kalshi against Kalshi and reads
+        # 0.00 by construction. What it cannot be is a fee we mispriced or a
+        # settlement our proxy called differently -- nothing is priced or
+        # called on our side any more.
+        #
+        # The failure that survives is a market the venue settled and we never
+        # booked at all: an order POST that timed out after being accepted
+        # leaves a real position with no row of ours, and it is the one
+        # discrepancy that costs money silently. Measured 2026-10-20, there
+        # was one. Counted here rather than inferred from a dollar gap,
+        # because a market we never booked can settle at exactly break-even
+        # and move no total at all.
+        'unbooked': unbooked,
+        'unbooked_pnl': (_measured(unbooked_pnl) if unbooked
+                         else _measured(0.0)),
     }
 
 

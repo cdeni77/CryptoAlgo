@@ -188,6 +188,32 @@ class Quote:
         """What it costs to buy `side` right now, crossing the spread."""
         return self.yes_ask if side == 'up' else self.no_ask
 
+    def bid_for(self, side: str) -> Optional[float]:
+        """Where a RESTING buy of `side` would sit — the bid, not the ask.
+
+        A maker joins the bid instead of lifting the ask. On a measured 1.000c
+        spread that is a full cent better per contract, and the venue charges
+        makers nothing (`Config.maker_fee_multiplier` is 0.0, and the venue's
+        own ticket quotes "$0 fee" for a limit at the bid). Together those are
+        worth ~1.5-2pp per contract, which is larger than this model's entire
+        edge — see `Config.maker_entry`.
+
+        It is NOT what a trade costs today: a resting order may never fill.
+        `ask_for` remains the price of certainty, and `decide()` is handed
+        whichever one the configured entry style is actually going to use.
+        """
+        return self.yes_bid if side == 'up' else self.no_bid
+
+    def rest_size_for(self, side: str) -> Optional[float]:
+        """Contracts already queued at the price we would rest at.
+
+        The queue AHEAD of us, so it is a reason to expect not to fill, not a
+        cap on our size the way `size_for` is. A NO bid is built from the YES
+        ask stack, which is why the sides look crossed here — see the
+        `_no_levels` note on denomination.
+        """
+        return self.yes_bid_size if side == 'up' else self.yes_ask_size
+
     def size_for(self, side: str) -> Optional[float]:
         """Contracts available at the touch on the side being bought."""
         return self.yes_ask_size if side == 'up' else self.yes_bid_size
@@ -488,6 +514,48 @@ def parse_fill(raw: dict) -> Fill:
     )
 
 
+def settlement_payout(raw: dict) -> Optional[float]:
+    """What the winning contracts in this market must pay, at $1 each.
+
+    **The venue's own `revenue` is short whenever both sides were held.**
+    Kalshi nets offsetting contracts in one market and credits that cash when
+    the netting happens, not at settlement -- so the settlement row reports
+    `revenue: 0` for the netted part and our `revenue - cost - fee` understates
+    the market by the netted amount. Measured 2026-10-20: three markets held
+    both sides (1 YES / 4 NO, 2/2, 2/2) and reported revenue 0 against $1, $2
+    and $2 owed. That $5.00 was the entire gap between our settled P&L (+2.27)
+    and the day's cash change corrected for the midnight boundary (+7.27); with
+    this applied the two agree to the cent.
+
+    A binary settles at $1 or $0, so the payout is not an estimate: it is the
+    count of contracts on the winning side. `value` is the YES settlement price
+    in cents and is preferred, because it states the outcome directly;
+    `market_result` is the fallback for a row that omits it.
+
+    None when the row says nothing about which side won -- an unsettled or
+    malformed row, where a zero would read as "lost" rather than "unknown".
+    """
+    yes_n = _quantity(raw, 'yes_count') or 0.0
+    no_n = _quantity(raw, 'no_count') or 0.0
+
+    value = raw.get('value')
+    yes_share: Optional[float] = None
+    if value is not None:
+        try:
+            yes_share = float(value) / 100.0
+        except (TypeError, ValueError):
+            yes_share = None
+    if yes_share is None:
+        result = str(raw.get('market_result') or '').strip().lower()
+        if result == 'yes':
+            yes_share = 1.0
+        elif result == 'no':
+            yes_share = 0.0
+    if yes_share is None:
+        return None
+    return float(yes_n) * yes_share + float(no_n) * (1.0 - yes_share)
+
+
 def parse_settlement(raw: dict) -> Settlement:
     """A settlements row, in dollars, with zeros preserved.
 
@@ -508,7 +576,11 @@ def parse_settlement(raw: dict) -> Settlement:
         no_contracts=_quantity(raw, 'no_count'),
         yes_cost=_money(raw, 'yes_total_cost'),
         no_cost=_money(raw, 'no_total_cost'),
-        revenue=_money(raw, 'revenue'),
+        # Computed, not read. The served `revenue` omits cash the venue
+        # credited when it netted offsetting contracts -- see
+        # `settlement_payout`. The served value stays visible in `raw`.
+        revenue=(settlement_payout(raw) if settlement_payout(raw) is not None
+                 else _money(raw, 'revenue')),
         fee_cost=_fee(raw),
         settled_time=_parse_time(raw.get('settled_time')),
         raw=dict(raw),
@@ -714,6 +786,66 @@ class KalshiClient:
         except (TypeError, ValueError):
             logger.error('balance was %r, which is not a number', cents)
             return float('nan')
+
+    async def balance_breakdown(self) -> dict:
+        """Every shard's cash, and the whole-account total, in one read.
+
+        `balance(exchange_index=...)` answers the only question an ORDER has —
+        what can this market draw on — and that is deliberately NOT the number
+        the venue's own app puts on screen. The app shows the cross-shard total,
+        so a dashboard reporting the trading shard alone reads as a sync fault
+        against it: measured 2026-10-18, ours said $482.46 against the app's
+        $483.57, and the $1.10 difference was cash stranded on shards 0 and 1
+        that no crypto order can reach. Both figures were right. Only one was
+        shown, and nothing said which.
+
+        So both are recorded. `total` is what the app shows; `shards` is where
+        the money actually is; `stranded` is the part the trading shard cannot
+        spend. A total that grows while the traded shard does not is interest or
+        a transfer residue rather than strategy P&L, which is a distinction the
+        equity curve must never blur — see `AccountPage`, where the curve is
+        realised P&L precisely because a balance moves on deposits too.
+        """
+        payload = await self._request('GET', '/portfolio/balance')
+        shards: dict[int, float] = {}
+        breakdown = payload.get('balance_breakdown')
+        if isinstance(breakdown, list):
+            for row in breakdown:
+                try:
+                    shards[int(row.get('exchange_index', -1))] = float(row.get('balance'))
+                except (TypeError, ValueError):
+                    logger.error('balance_breakdown row was %r', row)
+        total = float('nan')
+        dollars = payload.get('balance_dollars')
+        if dollars is not None:
+            try:
+                total = float(dollars)
+            except (TypeError, ValueError):
+                logger.error('balance_dollars was %r, which is not a number', dollars)
+        elif payload.get('balance') is not None:
+            try:
+                total = float(payload['balance']) * CENT
+            except (TypeError, ValueError):
+                logger.error('balance was %r, which is not a number', payload['balance'])
+        # **The venue's OWN mark of the open book, in CENTS.** `428` is $4.28.
+        # It is the figure Kalshi's app adds to cash to show an account value,
+        # so using it rather than marking the positions ourselves removes a
+        # whole class of disagreement: measured 2026-10-20, our bid-mark and
+        # this differed by $0.21 on ~$5 of open contracts, which is marking
+        # convention, not error -- but it is a difference the user sees as the
+        # dashboard failing to agree with the app.
+        #
+        # Zero is a measurement: a flat book really is worth nothing.
+        portfolio_value = float('nan')
+        raw_value = payload.get('portfolio_value')
+        if raw_value is not None:
+            try:
+                portfolio_value = float(raw_value) * CENT
+            except (TypeError, ValueError):
+                logger.error('portfolio_value was %r, which is not a number',
+                             raw_value)
+        return {'total': total, 'shards': shards,
+                'portfolio_value': portfolio_value}
 
     async def markets(self, **params) -> list[dict]:
         """One page of markets. `series_ticker`, `status`, `limit` all apply."""
@@ -972,7 +1104,8 @@ class KalshiClient:
     async def market_trades(self, *, ticker: Optional[str] = None,
                             since: Optional[datetime] = None,
                             limit: int = 100,
-                            historical: bool = False) -> list[Trade]:
+                            historical: bool = False,
+                            max_pages: int = 40) -> list[Trade]:
         """The public tape. **Everyone's trades, not ours — see `Trade`.**
 
         Useful for exactly two jobs, and dangerous for a third. It marks an open
@@ -989,8 +1122,37 @@ class KalshiClient:
         params: dict[str, Any] = {'limit': limit, 'ticker': ticker}
         if since is not None:
             params['min_ts'] = naive_utc_to_epoch_seconds(since)
-        rows = await self._pages(path, 'trades', base=base, **params)
+        # A busy market can outrun the default page cap, and a truncated
+        # tape is not a short one: the rows below the cut are MISSING,
+        # which for a fill simulation means prints that would have hit a
+        # resting order are simply absent. `_pages` logs an ERROR when it
+        # gives up with a cursor outstanding; callers that need the whole
+        # tape raise this rather than silently accepting the head of it.
+        rows = await self._pages(path, 'trades', base=base,
+                                 max_pages=max_pages, **params)
         return [parse_trade(raw) for raw in rows]
+
+    async def cancel_order(self, order_id: str) -> dict:
+        """Cancel a resting order. Refuses unless constructed with `live=True`.
+
+        **A resting order needs an owner for the rest of its life.** An
+        immediate-or-cancel order is over the moment it is sent; a resting one
+        sits until it fills, the market closes, or somebody cancels it. On a
+        fifteen-minute market an order left from offset 3 can fill at offset 14
+        against a barrier probability that no longer holds, which is the real
+        objection to resting as a policy and the reason
+        `Config.maker_cancel_seconds` exists.
+        """
+        if not self.live:
+            raise NotLiveError(
+                'this client was not constructed with live=True, so it will '
+                'not cancel orders either — the same guard as place_order, '
+                'because a script meant to observe must not mutate.')
+        if not order_id:
+            raise ValueError('order_id is required')
+        logger.info('cancelling order %s', order_id)
+        return await self._request('DELETE',
+                                   f'/portfolio/events/orders/{order_id}')
 
     async def reconcile(self, *, exchange_index: Optional[int] = None) -> dict:
         """Balance, open positions and recent fills, as the venue sees them.
@@ -1003,7 +1165,42 @@ class KalshiClient:
         on. Without it the cross-shard total is reported, which is not money any
         single order can draw on — see `balance`.
         """
-        balance = await self.balance(exchange_index=exchange_index)
+        # **One request, both figures.** The shard is what an order can spend;
+        # the total is what the venue's own app shows. Asking twice sampled a
+        # moving number at two instants, so `total - shard` could report cash
+        # stranded that was only a settlement landing between the calls -- and
+        # when the venue omits `balance_breakdown` entirely, `balance()` falls
+        # through to the total by design, which made the two identical and the
+        # stranded figure a spurious 0.00. Deriving both from one payload makes
+        # the difference an arithmetic fact rather than a race.
+        try:
+            detail = await self.balance_breakdown()
+        except KalshiError as exc:
+            logger.warning('balance breakdown unavailable (%s)', exc)
+            detail = {'total': float('nan'), 'shards': {}}
+        shards = detail.get('shards') or {}
+        if exchange_index is None:
+            balance = detail.get('total', float('nan'))
+        elif shards:
+            # A shard the venue does not list holds nothing -- reporting the
+            # total here is the original `insufficient_balance` bug by another
+            # name.
+            balance = float(shards.get(int(exchange_index), 0.0))
+        else:
+            # No breakdown at all: an older response shape, or a venue that does
+            # not shard. `balance` keeps the documented fall-through, and the
+            # total is left NaN rather than echoing the same number twice.
+            balance = await self.balance(exchange_index=exchange_index)
+            detail = {'total': float('nan'), 'shards': {}}
+        # **Never hand back a NaN balance while `balance()` could still answer.**
+        # The one-request path above reads `/portfolio/balance` directly, so a
+        # caller that overrides `balance` -- which the tests do, and which any
+        # wrapper might -- was bypassed entirely and got NaN. `reconcile`'s
+        # balance feeds `adopt_venue_balance`, which refuses to overwrite on a
+        # non-finite value, so the failure was silent: the bankroll simply
+        # stopped tracking the venue.
+        if not (balance == balance):                      # NaN
+            balance = await self.balance(exchange_index=exchange_index)
         positions = await self.positions()
         fills = await self.fills(limit=200)
         settled = []
@@ -1013,6 +1210,9 @@ class KalshiClient:
             logger.warning('settlements unavailable (%s); falling back to fills', exc)
         return {
             'balance': balance,
+            'balance_total': detail.get('total', float('nan')),
+            'balance_shards': detail.get('shards', {}),
+            'portfolio_value': detail.get('portfolio_value', float('nan')),
             'positions': positions,
             'fills': fills,
             'settlements': settled,
@@ -1032,11 +1232,25 @@ class KalshiClient:
         contracts: int,
         limit_price: float,
         client_order_id: Optional[str] = None,
-        time_in_force: str = 'immediate_or_cancel',
+        time_in_force: Optional[str] = 'immediate_or_cancel',
+        rest: bool = False,
     ) -> dict:
         """Buy `contracts` of `side` at no worse than `limit_price` (dollars).
 
         Refuses unless the client was constructed with `live=True`.
+
+        **`rest=True` is what makes an order rest**, by sending
+        `self_trade_prevention_type: 'maker'` instead of `taker_at_cross`.
+        That field, not `time_in_force`, is the one that decides whether the
+        order crosses — see the body below.
+
+        **`time_in_force` is REQUIRED; there is no venue default.** Omitting
+        it was tried on 2026-10-18 and every one of 48 orders came back
+        `400 missing_parameters — 'CreateOrderV2Request.TimeInForce' failed on
+        the 'required' tag`. `good_till_canceled` (one 'l') is the value for an
+        order that rests; `immediate_or_cancel` crosses. Passing None now sends
+        no field and will be refused — kept only so the refusal is the venue's,
+        loud and attributable, rather than this client inventing a default.
 
         The default is `immediate_or_cancel`, not `fill_or_kill`. Both refuse to
         rest — correct on a wasting asset, where an order filling eight minutes
@@ -1091,10 +1305,30 @@ class KalshiClient:
         # tick) stay exact. The epsilon absorbs binary representation: 0.60 is
         # 599.999... tenths in float.
         step = int(round(float(tick_at(yes_limit)) / DECI_CENT))
+        # **A crossing order and a resting order round OPPOSITE ways.**
+        #
+        # The rule above is taker-shaped and right for what it was written for:
+        # a bid fills against asks at or below it, so rounding UP buys reach,
+        # and under fill_or_kill rounding the wrong way is a guaranteed kill.
+        #
+        # For a RESTING order that same rounding is the bug. A bid rounded up
+        # moves toward the ask, and on a 1.000c spread one tick is enough to
+        # cross — so the order that was meant to rest takes instead, pays the
+        # fee, and gives up the spread. Measured 2026-10-18, the first hours of
+        # maker entry came back 25 taker fills against 10 maker ones while
+        # every order was supposed to rest.
+        #
+        # So when resting, round AWAY from the other side: a bid down, an ask
+        # up. That costs at most one tick of price and is the difference
+        # between being the maker and being the taker.
         if book_side == 'bid':
-            ticks = int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
+            ticks = (int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step
+                     if rest else
+                     int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step)
         else:
-            ticks = int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step
+            ticks = (int(math.ceil(yes_limit / DECI_CENT / step - 1e-9)) * step
+                     if rest else
+                     int(math.floor(yes_limit / DECI_CENT / step + 1e-9)) * step)
         price = ticks * DECI_CENT
         if not CENT - 1e-9 <= price <= 1.0 - CENT + 1e-9:
             raise ValueError(
@@ -1109,11 +1343,15 @@ class KalshiClient:
             # `price` 2-4; a bare int for count is rejected.
             'count': f'{int(contracts)}.00',
             'price': f'{price:.4f}',
-            'time_in_force': time_in_force,
-            # Required in V2. `taker_at_cross` crosses the spread, which is what a
-            # immediate_or_cancel on a wasting 15-minute market is for; `maker`
-            # would rest and is the opposite of the intent.
-            'self_trade_prevention_type': 'taker_at_cross',
+            **({'time_in_force': time_in_force} if time_in_force else {}),
+            # Required in V2. **`taker_at_cross` CROSSES the spread and `maker`
+            # RESTS**, so this field decides whether a maker order is actually a
+            # maker order — `time_in_force` alone does not. Hardcoding
+            # `taker_at_cross` here while pricing the entry at the bid would send
+            # a crossing order at a price nothing is offering: it would mostly
+            # fail to fill and read as "resting does not work" when what was
+            # wrong was the flag. Caught before any maker order was ever sent.
+            'self_trade_prevention_type': 'maker' if rest else 'taker_at_cross',
             # Which exchange holds the market. Omitting it defaults to 0, and a
             # market on another exchange is then simply not found — a 404 that
             # names the market rather than the mismatch.

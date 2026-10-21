@@ -15,11 +15,22 @@
  * threshold the forecast has to clear rather than a competing estimate.
  */
 interface ProbabilityScaleProps {
-  /** Model probability that the window settles above its strike. */
+  /** Model probability of the SIDE TAKEN — not of "up".
+   *
+   *  The controller reads `model_probability` side-relative for display, so a
+   *  DOWN row arrives here as P(down). `price` must therefore also be
+   *  side-relative: feeding it a raw P(up) put the bar and the caret on
+   *  opposite axes for every down row, and a +0.51pp edge drew as a 59-point
+   *  gap with the caret on the wrong side of the hairline. */
   probability: number;
-  /** The market's implied probability — the quote, on the same axis. */
+  /** The market's implied probability for the same side — the venue's MID,
+   *  not an executable price. `market_ask_up`/`market_ask_down` are what a
+   *  trade would actually cost; this is the venue's belief. */
   price?: number | null;
-  /** Quote plus half-spread plus fee: what the forecast actually has to beat. */
+  /** What the forecast has to clear. Since the maker switch this is the quote
+   *  alone: `effective_cost == price` on every row since the epoch, because
+   *  resting at the bid pays no fee and crosses no spread. It is NOT net of
+   *  cost for the ~19% of orders that cross. */
   breakEven?: number | null;
   height?: number;
   showAxis?: boolean;
@@ -71,7 +82,7 @@ export function ProbabilityScale({
           <span
             className="absolute -top-px bottom-[-1px] w-0 -translate-x-1/2"
             style={{ left: `${clamp(price) * 100}%` }}
-            title={`market ${(price * 100).toFixed(0)}c`}
+            title={`market mid ${(price * 100).toFixed(1)}c — the venue's belief, not a tradeable price. The ask is what a trade would cost.`}
           >
             <span className="absolute -top-1 left-0 h-[calc(100%+0.5rem)] w-0.5 -translate-x-1/2 bg-ink" />
           </span>

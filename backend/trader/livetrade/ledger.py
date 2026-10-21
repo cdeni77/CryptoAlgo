@@ -203,7 +203,35 @@ def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
                 settle_minute)
             continue
 
-        pnl = writer.settle_position(position.id, settled_up=bool(settled_up))
+        # **The venue's own fee, not the published schedule's estimate.**
+        # `Position.fee` is set at DECISION time, where `assume_maker` makes it
+        # 0.00 -- correct for an order that rests, wrong for the ~19% that
+        # cross. The settlement row knows what was actually charged.
+        #
+        # Parsed rather than read straight off the dict: the venue serves
+        # `revenue` in integer cents and `fee_cost` in dollars, both unsuffixed,
+        # and reading the fee through the cents fallback divides it by a
+        # hundred -- a bug this repo has already had once.
+        venue_fee = None
+        if ticker and ticker in venue_settlements:
+            try:
+                venue_fee = parse_settlement(venue_settlements[ticker]).fee_cost
+            except Exception:                              # noqa: BLE001
+                logger.warning('%s: could not read the venue fee; keeping ours',
+                               ticker)
+        # **The venue's `fee_cost` is PER MARKET, and multi-entry puts several
+        # positions on one.** Handing the whole figure to each of them charged
+        # it once per position: measured 2026-10-20 on
+        # KXBTC15M-26OCT201130-30, our fee came to 0.0714 against the venue's
+        # 0.0357 -- exactly double, across two positions -- and that 3.5c was
+        # the entire residual `pnl_gap` after everything else reconciled.
+        #
+        # Split by contracts, which is how the venue charges it. A market with
+        # one position is unaffected: the share is 1.0.
+        if venue_fee is not None:
+            venue_fee = float(venue_fee) * _fee_share(writer, position)
+        pnl = writer.settle_position(position.id, settled_up=bool(settled_up),
+                                     fee=venue_fee)
         if pnl is not None:
             settled.append((position.id, pnl))
             logger.info('settled %s %s: %s (%s) vs strike %.4f -> %+.2f',
@@ -212,6 +240,30 @@ def settle_due(writer: PgWriter, bars: dict[str, pd.DataFrame],
                         'venue' if from_venue is not None else f'mean {settle_price:.4f}',
                         strike, pnl)
     return settled
+
+
+def _fee_share(writer: PgWriter, position) -> float:
+    """This position's share of its market's fee, by contracts.
+
+    One position in the market -> 1.0, which is every row before multi-entry.
+    A market whose positions hold no contracts at all splits evenly rather than
+    dividing by zero; that only arises from the sub-contract rounding already
+    fixed in `scripts/live.py`, and an even split is still closer than
+    charging each of them the whole fee.
+    """
+    from core.pg_writer import Position
+
+    with writer._session() as session:                     # noqa: SLF001
+        rows = (session.query(Position)
+                .filter(Position.symbol == position.symbol,
+                        Position.window_open == position.window_open)
+                .all())
+    if len(rows) <= 1:
+        return 1.0
+    total = sum(float(r.contracts or 0.0) for r in rows)
+    if total <= 0:
+        return 1.0 / len(rows)
+    return float(position.contracts or 0.0) / total
 
 
 def _strike_for(writer: PgWriter, position) -> Optional[float]:
@@ -229,9 +281,13 @@ def _ticket_for(writer: PgWriter, position):
     from core.pg_writer import OrderTicket
 
     with writer._session() as session:  # noqa: SLF001 - same package, one query
+        # Matched on the offset too: a window holds one ticket per decision
+        # offset once multi-entry is on, and `(symbol, window)` alone would
+        # raise `MultipleResultsFound` inside the reconcile.
         return (session.query(OrderTicket)
                 .filter(OrderTicket.symbol == position.symbol,
-                        OrderTicket.window_open == position.window_open)
+                        OrderTicket.window_open == position.window_open,
+                        OrderTicket.offset_minutes == position.offset_minutes)
                 .one_or_none())
 
 
@@ -245,11 +301,21 @@ class VenueState(NamedTuple):
 
     settlements: dict[str, dict]
     balance: float
+    #: The cross-shard total, which is the figure the venue's own app shows.
+    #: `balance` above is the trading shard alone. Defaulted so every existing
+    #: construction site and test keeps working unchanged.
+    total_balance: float = float('nan')
+    #: The venue's OWN mark of the open book, from `/portfolio/balance`. Kept
+    #: beside the cash so the account value on screen is Kalshi's arithmetic
+    #: rather than ours marked at the bid.
+    portfolio_value: float = float('nan')
 
 
 def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
                         exchange_index: Optional[int] = None,
-                        credited_this_cycle: float = 0.0) -> None:
+                        credited_this_cycle: float = 0.0,
+                        total_balance: float = float('nan'),
+                        portfolio_value: float = float('nan')) -> None:
     """Make the venue's balance the one we report. **Call this after settling.**
 
     Our running figure against theirs: a gap that grows is an unrecorded fill, a
@@ -298,7 +364,8 @@ def adopt_venue_balance(writer: PgWriter, venue_balance: float, *,
     try:
         writer.write_venue_balance(
             timestamp=datetime.now(timezone.utc), balance=venue_balance,
-            exchange_index=exchange_index, our_bankroll=ours)
+            exchange_index=exchange_index, our_bankroll=ours,
+            total_balance=total_balance, portfolio_value=portfolio_value)
     except Exception:  # noqa: BLE001 - telemetry must not stop the loop
         logger.exception('could not sample the venue balance this cycle')
     writer.update_account(bankroll=venue_balance)
@@ -407,10 +474,75 @@ def persist_venue_ledger(writer: PgWriter, *, fills: list[dict],
         written_settlements = writer.upsert_venue_settlements(rows)
     except Exception:  # noqa: BLE001
         logger.exception('could not store the venue settlements this cycle')
+    # **Correct any position the venue has since filled further.**
+    # `book_resting_fills` books what has filled SO FAR and then resolves the
+    # ticket, which drops it out of `open_tickets()` -- so an order that keeps
+    # filling afterwards leaves us holding fewer contracts than the venue does.
+    # Measured 2026-10-20 on the 15:00 SOL window: three entries recorded 2, 1
+    # and 0 contracts against the venue's 6, which under-credited the payout at
+    # settlement and surfaced as a $1.00 balance drift.
+    #
+    # Driven off the venue's own fills, grouped by order, and applied only to
+    # PENDING positions -- a settled one already has a payout computed from its
+    # size, and changing it here would contradict that.
+    try:
+        _reconcile_sizes(writer, fills)
+    except Exception:                                  # noqa: BLE001
+        logger.exception('could not reconcile position sizes this cycle')
     if written_fills or written_settlements:
         logger.debug('venue ledger: %d fill(s), %d settlement(s) stored',
                      written_fills, written_settlements)
     return written_fills, written_settlements
+
+
+def _reconcile_sizes(writer: PgWriter, fills: list[dict]) -> int:
+    """Bring each pending position up to the venue's fill total for its order."""
+    from core.pg_writer import OrderTicket
+
+    by_order: dict[str, list[dict]] = {}
+    for raw in fills:
+        parsed = parse_fill(raw)
+        oid = str(getattr(parsed, 'order_id', '') or raw.get('order_id') or '')
+        if oid and _is_ours(str(getattr(parsed, 'ticker', '') or '')):
+            by_order.setdefault(oid, []).append(raw)
+    if not by_order:
+        return 0
+
+    with writer._session() as session:                 # noqa: SLF001
+        tickets = {
+            str(t.venue_order_id): t
+            for t in session.query(OrderTicket)
+            .filter(OrderTicket.venue_order_id.isnot(None))
+            .all()
+        }
+    corrected = 0
+    for oid, rows in by_order.items():
+        ticket = tickets.get(oid)
+        if ticket is None:
+            continue
+        side = str(ticket.side)
+        total = 0.0
+        cost = 0.0
+        for row in rows:
+            n = float(row.get('count_fp') or row.get('count') or 0) or 0.0
+            yes = row.get('yes_price_dollars') or row.get('yes_price')
+            try:
+                yes = float(yes)
+            except (TypeError, ValueError):
+                continue
+            if yes > 1.0:                               # integer cents
+                yes /= 100.0
+            # The price of the side BOUGHT: a NO fill costs 1 - the yes price.
+            cost += (yes if side == 'up' else 1.0 - yes) * n
+            total += n
+        if total <= 0:
+            continue
+        if writer.reconcile_position_size(
+                symbol=ticket.symbol, window_open=ticket.window_open,
+                offset_minutes=ticket.offset_minutes,
+                contracts=total, cost=cost, fee=0.0):
+            corrected += 1
+    return corrected
 
 
 def _is_ours(ticker: str) -> bool:
@@ -485,7 +617,10 @@ async def reconcile_with_venue(writer: PgWriter, kalshi: KalshiClient, *,
             'An order was filled and not booked — most likely a POST that timed '
             'out after being accepted. Reconcile by hand before trading again.',
             ticker)
-    return VenueState(settlements=resolved, balance=venue_balance)
+    return VenueState(settlements=resolved, balance=venue_balance,
+                      total_balance=float(state.get('balance_total', float('nan'))),
+                      portfolio_value=float(state.get('portfolio_value',
+                                                      float('nan'))))
 
 
 async def bookkeeping(args, config: Config, writer: PgWriter, kalshi,
@@ -498,11 +633,30 @@ async def bookkeeping(args, config: Config, writer: PgWriter, kalshi,
     """
     venue_settlements: dict[str, dict] = {}
     venue_balance = float('nan')
+    venue_total = float('nan')
+    venue_portfolio_value = float('nan')
     shard = _LAST_EXCHANGE_INDEX
+    if shard is None:
+        # **Seed from the store rather than reconciling against the total.**
+        # With no shard, `reconcile` reads the cross-shard balance and
+        # `adopt_venue_balance` writes it onto the account -- $495.15 adopted
+        # against a true shard-2 $494.05 on 2026-10-20, a $1.11 overstatement
+        # that sizes Kelly until the first book is read. The shard practically
+        # never moves and the last one is already recorded.
+        try:
+            shard = writer.last_exchange_index()
+            if shard is not None:
+                globals()['_LAST_EXCHANGE_INDEX'] = shard
+                logger.info('seeded the exchange shard as %s from the last '
+                            'recorded balance', shard)
+        except Exception:                          # noqa: BLE001
+            logger.exception('could not seed the exchange shard')
     if kalshi is not None and args.reconcile:
         try:
             venue = await reconcile_with_venue(writer, kalshi, exchange_index=shard)
             venue_settlements, venue_balance = venue.settlements, venue.balance
+            venue_total = venue.total_balance
+            venue_portfolio_value = venue.portfolio_value
             live_state._LAST_RECONCILED = time.monotonic()
         except KalshiError as exc:
             logger.error('reconciliation failed (%s); falling back to our own '
@@ -517,7 +671,9 @@ async def bookkeeping(args, config: Config, writer: PgWriter, kalshi,
     # Now that our own credits are in, the drift is a real disagreement.
     if kalshi is not None and args.reconcile:
         await _db(adopt_venue_balance, writer, venue_balance, exchange_index=shard,
-                  credited_this_cycle=sum(p for _, p in settled))
+                  credited_this_cycle=sum(p for _, p in settled),
+                  total_balance=venue_total,
+                  portfolio_value=venue_portfolio_value)
     if phase:
         phase('settle')
     return settled

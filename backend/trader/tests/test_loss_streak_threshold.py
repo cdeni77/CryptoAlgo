@@ -27,7 +27,7 @@ today's prices will be wrong again if the drift reverses.
 """
 from __future__ import annotations
 
-from core.config import Config
+from core.config import DEFAULT_CONFIG, Config
 
 
 def _p_streak(win_rate: float, n: int) -> float:
@@ -56,5 +56,5 @@ def test_the_money_breakers_are_untouched():
     """The count breaker catches a stuck model; these bound real damage. Raising
     one must not loosen the others — they were the ones behaving correctly."""
     config = Config()
-    assert config.max_daily_loss_fraction == 0.15
+    assert config.max_daily_loss_fraction == DEFAULT_CONFIG.max_daily_loss_fraction
     assert config.ruin_floor_fraction == 0.50

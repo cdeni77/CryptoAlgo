@@ -194,3 +194,14 @@ node_modules/
 # `declare const _default: any;` and broke `npm run lint`.
 frontend/vite.config.js
 frontend/vite.config.d.ts
+
+# Research OUTPUTS, not research. Added 2026-10-21, when `research/overnight/`
+# alone had reached 2.1 GB of scored parquet and `research/campaign/` 107 MB.
+# The analysis — the .md write-ups, the harness, the pre-registrations and the
+# ledgers — is 0.5 MB of it and stays tracked; the artifacts those scripts
+# regenerate do not belong in git.
+*.parquet
+*.npy
+backend/trader/research/**/*.log
+backend/trader/research/campaign/datasets/
+backend/trader/research_campaign/
