@@ -483,6 +483,23 @@ services:
   # "`live.py` calls `load_live` once at startup and never reloads", which was
   # true once and is not now: `scripts/live.py` calls `reload_if_changed` on the
   # first cycle of each window, so a newly installed artifact is picked up with
+  # **`book_quote` replaces `market_state,book_flow`, dropping the 7 DEPTH
+  # columns.** The venue serves no historical order book, so
+  # `imbalance_*`, `depth_ratio`, `depth_trend_3` and `book_convexity` cannot
+  # exist before 2026-08-25 at any price. Under `--complete-cases` a NaN in a
+  # selected column drops the whole row, so keeping them pins training to the
+  # live era. The 4 quote columns are recoverable to 2025-12-10 from the
+  # venue's own candles, at the true deci-cent grid: `venue_depth` holds
+  # 1,278,978 candle-sourced rows with 100% quote and 0% sizes, and monthly
+  # quote coverage is 92-100% back to 2025-12 while pre-August SIZE coverage
+  # is 54-65% and comes entirely from the Predexon backfill, which is
+  # whole-cent quantised with size ratio 1.22 and correlation 0.26 against
+  # the live book.
+  #
+  # Do NOT add `market_state` or `book_flow` back beside `book_quote`:
+  # the two framings cover the same columns and `feature_columns` refuses the
+  # mix, because deduping would silently restore every depth column and make
+  # this change a no-op that reports no effect.
   # no restart. `ops/weekly_retrain.sh` already said so; this comment had
   # drifted and the two contradicted each other — corrected 2026-10-18.
   # ===========================================================================
@@ -507,7 +524,7 @@ services:
       - ./backend/trader:/app
     command: >
       -m scripts.promote
-        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,market_state,implied_vol,book_flow
+        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,book_quote,implied_vol
         --start 2025-10-01
         --complete-cases
         --entry-offsets 3 6 9 12
@@ -528,7 +545,7 @@ services:
         --quote-sources live_touch,live_ws,live,live_ws_replay,candles
         --peer-quote-sources all
         --force
-        --reason "Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
+        --reason "Groups are book_quote, not market_state+book_flow: the 7 depth columns cannot exist before 2026-08-25 because the venue serves no historical order book, and under --complete-cases they pin training to the live era; the 4 quote columns are recoverable to 2025-12-10 from the venue's own candles. Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
 
 
 volumes:
