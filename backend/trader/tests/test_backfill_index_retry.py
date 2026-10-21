@@ -26,8 +26,10 @@ def test_the_drop_counter_starts_empty():
 
 
 def test_the_rate_default_respects_the_endpoint_cost():
-    """50 tokens against a 200/s refill is ~4 req/s; 3.0 leaves headroom."""
-    assert 0 < bi.DEFAULT_RATE <= 4.0
+    """The bucket refills at 300/s and `/cfbenchmarks/*` costs 50, so 6/s is
+    the ceiling for this endpoint. The bucket is shared and priced per
+    request, so a cheap consumer at 30/s starves this one."""
+    assert 0 < bi.DEFAULT_RATE <= 6.0
 
 
 def test_the_true_minute_mean_is_stored_not_approximated():

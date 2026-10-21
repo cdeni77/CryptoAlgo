@@ -55,9 +55,12 @@ INDEX_BY_SYMBOL = {
 }
 
 #: `/cfbenchmarks/*` costs 50 tokens against a 200/s refill, so ~4 req/s.
-#: `/cfbenchmarks/*` costs 50 tokens against a 200/s refill, so about 4
-#: requests a second is the ceiling and 3.0 leaves headroom.
-DEFAULT_RATE = 3.0
+#: The token bucket refills at 300/s and is SHARED across endpoints, priced
+#: per request: `/cfbenchmarks/*` costs 50 (so 6/s is the ceiling here) while
+#: the default is 10 (30/s). A cheap high-rate consumer therefore starves this
+#: one, because it needs 50 tokens at once -- measured, `/markets` returned 200
+#: at the same instant `/cfbenchmarks` returned 429. Run this alone.
+DEFAULT_RATE = 5.0
 
 #: Hours abandoned after exhausting retries. Non-zero means the index is
 #: thinner than the venue served, and the run should be repeated.
