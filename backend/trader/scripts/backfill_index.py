@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import datetime as dt
 import logging
 import os
@@ -54,7 +55,13 @@ INDEX_BY_SYMBOL = {
 }
 
 #: `/cfbenchmarks/*` costs 50 tokens against a 200/s refill, so ~4 req/s.
+#: `/cfbenchmarks/*` costs 50 tokens against a 200/s refill, so about 4
+#: requests a second is the ceiling and 3.0 leaves headroom.
 DEFAULT_RATE = 3.0
+
+#: Hours abandoned after exhausting retries. Non-zero means the index is
+#: thinner than the venue served, and the run should be repeated.
+DROPPED: dict = collections.defaultdict(int)
 
 
 def minute_bars_from_points(points, symbol: str) -> list[dict]:
@@ -135,14 +142,35 @@ async def run(args) -> int:
                 continue
             batch: list[dict] = []
             for hour in hours:
-                try:
-                    payload = await client._request(      # noqa: SLF001
-                        'GET', '/cfbenchmarks/history/values',
-                        params={'id': idx, 'timespan': 'HOUR',
-                                'timestamp': hour.strftime('%Y-%m-%dT%H:%M:%SZ')},
-                        base=client.historical_base_url)
-                except Exception as exc:                      # noqa: BLE001
-                    logger.warning('%s %s: %s', idx, hour, str(exc)[:140])
+                # **A rate-limited hour is RETRIED, not dropped.** This
+                # used to log a warning and `continue` on the first error.
+                # `/cfbenchmarks/*` costs 50 tokens against a 200/s refill,
+                # so 429 is the ordinary failure here, and dropping on it
+                # left the index at 7% coverage that read as "the venue has
+                # no data" rather than "we asked too fast".
+                payload = None
+                for attempt in range(6):
+                    try:
+                        payload = await client._request(  # noqa: SLF001
+                            'GET', '/cfbenchmarks/history/values',
+                            params={'id': idx, 'timespan': 'HOUR',
+                                    'timestamp': hour.strftime('%Y-%m-%dT%H:%M:%SZ')},
+                            base=client.historical_base_url)
+                        break
+                    except Exception as exc:                  # noqa: BLE001
+                        msg = str(exc)
+                        if ('429' in msg or 'too_many_requests' in msg) and attempt < 5:
+                            await asyncio.sleep(gap * (2 ** attempt))
+                            continue
+                        if attempt == 5:
+                            DROPPED['hours'] += 1
+                            logger.warning(
+                                '%s %s DROPPED after 6 attempts (%s); %d hour(s) '
+                                'lost so far', idx, hour, msg[:90], DROPPED['hours'])
+                        else:
+                            logger.warning('%s %s: %s', idx, hour, msg[:140])
+                        break
+                if payload is None:
                     await asyncio.sleep(gap)
                     continue
                 pts = (payload.get('data') or {}).get('payload') or []
