@@ -156,6 +156,38 @@ Traded-price OHLC, bid OHLC, ask OHLC, volume, open interest. `price_low` is
 the cheapest print in the minute, which bounds the maker-fill question over
 every market the endpoint serves.
 
+**A candle exists only for a minute in which that strike had activity.** A
+market with no candle is usually a market nobody traded, not a fetch that
+failed. The two are indistinguishable downstream, so coverage has to be
+measured carefully.
+
+**Join on `market_ticker`, never on `event_time`.** The two tables are at
+different grains: `venue_strikes.event_time` is the window open, while
+`venue_candles.event_time` is the candle MINUTE. Joining them on
+`event_time` silently asks "did minute 0 of this window trade", which is a
+liquidity question, and returns a plausible-looking coverage number that
+means something else entirely. Both tables carry `market_ticker` and
+`window_open`; use those.
+
+Measured 2026-10-21 on `market_ticker`:
+
+```
+strike row but NO candles      179 of 81,568   0.22%   Jan/Feb, genuine no-trade
+candles but NO strike row    3,692 of 85,081   4.34%   2025-12 (2,523), 2026-01 (1,136)
+```
+
+The second number is a `backfill_markets` gap, not a candle gap:
+`venue_strikes` starts 2026-01-07 while candles reach back to 2025-12-16.
+
+**Two endpoints, and the gap-fill needs the right one.** `--historical` reads
+the per-ticker tier, which reaches 2025-12 to 2026-08-21. The default batch
+path reaches only ~69 days back. That edge hid a real casualty: **2026-08-13,
+both halves of the day, all three symbols** had no candles at all, and sits
+exactly on the 69-day boundary, so a default re-run could no longer see it.
+`--historical` recovered it — 285 markets, 132,345 rows. Anything older than
+~69 days must be filled with `--historical` or the run will report nothing to
+do and look clean.
+
 ### `venue_trades` — the public tape
 
 One row per `(market, minute, aggressor side)` with `n_prints`, `contracts`,
@@ -562,7 +594,7 @@ python -m scripts.scrape --backfill-days 1825      # Coinbase bars
 python -m scripts.scrape --fill-gaps               # see the 1-in-301 note in CLAUDE.md
 python -m scripts.sync_store
 
-python -m scripts.backfill_markets --start 2026-01-07   # exact strike + label
+python -m scripts.backfill_markets --start 2025-12-16   # exact strike + label
 python -m scripts.backfill_candles --historical \
        --start 2025-12-16 --end 2026-08-13              # true-tick quotes, old
 python -m scripts.backfill_candles                      # true-tick quotes, recent
