@@ -93,12 +93,35 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     # The settlement index, estimated live from its constituent exchanges
     # (`core/index_proxy.py`). Short history, so opt-in.
     'index_proxy': INDEX_PROXY,
+    # **The book groups split by what the DATA requires, not by what they
+    # mean.** `market_state` and `book_flow` each mix two kinds of feature:
+    # some read only the quote, some read resting SIZES. That distinction is
+    # invisible in the names and decides whether a feature can exist at all
+    # before 2026-08-25, because the venue serves no historical order book and
+    # Predexon's minute-stale touch sizes are not a substitute (ratio 1.22,
+    # correlation 0.26 against the live book, measured 2026-10-21).
+    #
+    # Selecting the whole group therefore drags four perfectly recoverable
+    # features down with seven unrecoverable ones — and under
+    # `--complete-cases` that costs the entire pre-August history. Same reason
+    # `market_price` was split out of `market_state`.
+    #
+    # These OVERLAP the groups above by design: pick one framing or the other.
+    'book_quote': ('spread', 'spread_change_3', 'mid_change_1', 'mid_change_3'),
+    'book_depth': ('imbalance_touch', 'imbalance_5c', 'depth_ratio',
+                   'book_convexity', 'imbalance_change_3', 'depth_trend_3',
+                   'imbalance_persistence'),
 }
 
 # The venue's book covers a small share of the bar history, so these groups
 # are selectable, not default: in the default matrix they would be mostly NaN.
 BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol',
-               'book_flow')
+               'book_flow', 'book_quote', 'book_depth')
+# The two framings of the eleven book columns. Declared, so `feature_columns`
+# can refuse a selection that mixes them and so the no-column-in-two-groups
+# invariant can be asserted WITHIN a framing rather than abandoned.
+QUOTE_DEPTH_FRAMING = ('book_quote', 'book_depth')
+MEANING_FRAMING = ('market_state', 'book_flow')
 # Selectable, never default: everything with a short history.
 OPT_IN_GROUPS = BOOK_GROUPS + ('index_proxy',)
 ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in OPT_IN_GROUPS)
@@ -111,7 +134,29 @@ def feature_columns(groups: Optional[Sequence[str]] = None) -> list[str]:
     unknown = sorted(set(chosen) - set(FEATURE_GROUPS))
     if unknown:
         raise ValueError(f'unknown feature groups: {unknown}')
-    return [c for g in chosen for c in FEATURE_GROUPS[g]]
+    # **Mixing the two framings is refused, because it is a silent no-op.**
+    # `book_quote | book_depth` and `market_state | book_flow` cover the SAME
+    # eleven columns, cut by data requirement in one case and by meaning in
+    # the other. Dedup below makes selecting both harmless, which is exactly
+    # the problem: an ablation that drops `book_depth` while `market_state` is
+    # still selected gets every depth column back and reports no effect. That
+    # reads as "the feature does not matter" when the feature was never
+    # removed — the most expensive kind of wrong answer this repo can produce.
+    both = sorted(set(chosen) & set(QUOTE_DEPTH_FRAMING)), sorted(
+        set(chosen) & set(MEANING_FRAMING))
+    if both[0] and both[1]:
+        raise ValueError(
+            'feature groups %s and %s are two framings of the same columns; '
+            'select one framing, not both' % (both[0], both[1]))
+    # De-duplicated anyway: a framing's own groups are disjoint, but this
+    # keeps `feature_columns` order-stable and total.
+    seen, out = set(), []
+    for g in chosen:
+        for c in FEATURE_GROUPS[g]:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+    return out
 
 
 # --------------------------------------------------------------------------

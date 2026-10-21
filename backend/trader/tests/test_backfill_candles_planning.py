@@ -73,3 +73,33 @@ def test_the_default_limit_leaves_a_normal_day_unsplit():
     for chunk, markets, lo, hi in plans:
         span = int((hi - lo).total_seconds() // 60)
         assert len(markets) * span <= MAX_CANDLES_PER_REQUEST
+
+
+class TestThrottlingIsNotMistakenForHistory:
+    """A 429 says nothing about the data and everything about our rate.
+
+    The chunk loop used to log a warning and `continue` on the FIRST error,
+    abandoning every window in the chunk. Afterwards that loss is
+    indistinguishable from a stretch the venue never listed — throttling
+    quietly becomes "history", which is the shape this repo keeps
+    rediscovering.
+    """
+
+    def test_the_retry_and_the_drop_counter_are_wired_into_the_chunk_loop(self):
+        """Asserted on the real source, because the loop lives inside `run()`
+        behind a store, a client and a work queue — a hand-rolled stand-in
+        would assert the stand-in, which is worse than no test."""
+        import inspect
+        from scripts import backfill_candles as bc
+
+        src = inspect.getsource(bc.run)
+        assert "'/markets/candlesticks'" in src
+        # the request sits inside a bounded retry, not a bare try/continue
+        assert 'for attempt in range(5)' in src
+        assert "DROPPED['windows']" in src
+        assert 'DROPPED after 5 attempts' in src
+
+    def test_the_dropped_counter_exists_and_starts_empty(self):
+        from scripts import backfill_candles as bc
+        assert bc.DROPPED['chunks'] == 0
+        assert bc.DROPPED['windows'] == 0

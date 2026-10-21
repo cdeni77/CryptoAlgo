@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from core.features import ALL_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS, feature_columns
+from core.features import (ALL_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS,
+                           MEANING_FRAMING, QUOTE_DEPTH_FRAMING, feature_columns)
 
 
 def test_the_three_new_families_are_selectable():
@@ -24,12 +25,42 @@ def test_the_calendar_control_is_still_the_only_control():
 
 
 def test_no_column_is_declared_in_two_groups():
-    """No column belongs to two groups, so removing a group really removes its columns."""
-    seen = {}
-    for group, columns in FEATURE_GROUPS.items():
-        for column in columns:
-            assert column not in seen, f'{column} in both {seen.get(column)} and {group}'
-            seen[column] = group
+    """No column belongs to two groups, so removing a group really removes its columns.
+
+    Asserted WITHIN a framing. The eleven book columns are deliberately cut
+    two ways — by data requirement (`book_quote`/`book_depth`) and by meaning
+    (`market_state`/`book_flow`) — so the invariant cannot hold across the
+    whole dict. It must still hold inside each framing, or an ablation that
+    drops one group silently keeps its columns.
+    """
+    for framing in (QUOTE_DEPTH_FRAMING, MEANING_FRAMING):
+        groups = [g for g in FEATURE_GROUPS if g not in
+                  (set(QUOTE_DEPTH_FRAMING) | set(MEANING_FRAMING))] + list(framing)
+        seen = {}
+        for group in groups:
+            for column in FEATURE_GROUPS[group]:
+                assert column not in seen, (
+                    f'{column} in both {seen.get(column)} and {group}')
+                seen[column] = group
+
+
+def test_the_two_framings_cover_exactly_the_same_columns():
+    """If they ever diverge, one framing silently drops a feature."""
+    assert set(feature_columns(QUOTE_DEPTH_FRAMING)) == set(
+        feature_columns(MEANING_FRAMING))
+
+
+def test_mixing_the_two_framings_is_refused():
+    """Dedup makes mixing HARMLESS, which is why it must be refused.
+
+    An ablation dropping `book_depth` while `market_state` is still selected
+    gets every depth column back and reports no effect — "the feature does not
+    matter" when the feature was never removed.
+    """
+    with pytest.raises(ValueError, match='two framings'):
+        feature_columns(['market_state', 'book_depth'])
+    with pytest.raises(ValueError, match='two framings'):
+        feature_columns(['book_quote', 'book_flow'])
 
 
 def test_level_counts_never_became_features():

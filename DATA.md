@@ -177,7 +177,7 @@ needs per-print timestamps, which `backfill_trades._rows` discards.
 |---|---|---|
 | `venue_ladder` | 2026-08-25 → now | recorded live book; **cannot be backfilled** |
 | `venue_book_events` | 2026-09-30 → now | raw WS frames, 1.5bn rows, **60-day retention** |
-| `venue_implied_vol` | 2026-01-07 → now | fitted off the KXBTCD ladder — inputs are Predexon |
+| `venue_implied_vol` | 2026-01-07 → now | fitted off the KXBTCD ladder; `source` names the writer (`live` / `ladder_candles`). The Predexon-derived rows were purged 2026-10-21 |
 | `venue_settlements` | 2026-01-06 → now | market results, both venues |
 | `pm_ladder` | 2026-08-25 → now | Polymarket book |
 | `index_proxy_1s` | 2026-10-14 → now | home-made 4-exchange median; superseded by BRTI |
@@ -390,6 +390,49 @@ keeping `implied_vol` caps the recoverable sample at roughly a quarter of the
 pre-August windows. Whether its 5 features are worth ~10,000 windows is an
 ablation, not a judgement.
 
+**That coverage is an artifact of the recorder, and the rebuild is VALIDATED.**
+The live recorder only ever saw markets with `status=open`; the venue still
+serves every strike of every past hour. Rebuilding the fit from each strike's
+own candlesticks reproduces a live-recorded fit **10/10 at a median 0.01
+bp/min** (mean −0.03, same `n_strikes` in 9 of 10) — the same number by
+another route, not an approximation of it.
+
+Three endpoints **tile**, and missing the third is what made this look
+unverifiable for a day:
+
+```
+/historical/markets/{t}/candlesticks   2025-12  ->  2026-08-21
+/markets/{t}/candlesticks              nothing, ever, for a 1-hour strike
+/markets/candlesticks   (PLURAL)       ~69 days back  ->  now
+live recorder                          2026-08-26  ->  now
+```
+
+The first two stop **five days before** the live recorder starts. With only
+those wired there is no era holding both a candle fit and a live fit, which
+reads as "no overlap, cannot validate" when the cause is a missing endpoint.
+The plural path is keyed on `market_tickers`, nests one level deeper
+(`markets[].candlesticks[]`), and names the ticker `ticker` or `market_ticker`
+by tier — so it cannot share the per-ticker parse. Because it takes a list, a
+response can carry markets you did not ask for; returning the first block
+regardless fits one strike's quotes onto another strike's price, a wrong
+ladder that raises nothing and fits fine. Matched on ticker, with a test.
+
+**The eras are not equally dense, and the thinness is REAL rather than an
+endpoint artifact.** A candle exists only for a minute in which that strike
+had activity, so a quiet ladder yields few candles, few strikes quoting at a
+given fit offset, thinner `n_strikes` and lower R2.
+
+The tempting explanation was that the older tier is lossy. It is not. In the
+**Aug 13-21 overlap**, where both the per-ticker historical endpoint and the
+plural batch endpoint serve the same market, the two return the **same count
+every time** — 16/16, 12/12, 39/39, 40/40, 7/7 across three strikes on each
+of four hours. The earlier "9-14 against 60" reading compared *different
+dates*, not the same market, and measured the venue getting busier over 2026
+rather than one endpoint dropping rows.
+
+So old-era coverage cannot be raised by querying differently. It is what the
+market was.
+
 **A second source-comparability trap sits in `cross_venue`.** Polymarket rows
 exist at 96-99% of decision offsets across the whole span, but the share
 passing a 5-second freshness gate runs 91% in January against 28% in
@@ -469,6 +512,9 @@ month     windows    +quote     +sizes    +peer5s +impl_vol
   KXBTCD strike ladder is constructible per hour (75 strikes listed for a
   January 2026 event), so the 13-28% coverage is an artifact of the live
   recorder only seeing `status=open` markets, not a limit of the venue.
+  **Confirmed 2026-10-21** — the rebuild reproduces live fits to 0.01 bp/min,
+  so this is a recovery rather than a substitute, and the keep-or-drop
+  question is no longer "is it worth ~10,000 windows".
 * **The book-shape features cost only 11%.** Whether those 7 unrecoverable
   features earn their place is therefore an 11% decision, not a 51% one.
 * **Keeping every feature exactly as deployed, the candle backfill took the

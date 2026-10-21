@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import datetime as dt
 import logging
 import os
@@ -64,6 +65,11 @@ CANDLE_COLUMNS = (
 )
 
 logger = logging.getLogger('candles')
+
+#: Market-windows abandoned after exhausting retries. Non-zero means this
+#: run holds LESS than the venue served, and a dropped chunk is not
+#: distinguishable later from history that never existed.
+DROPPED: dict = collections.defaultdict(int)
 
 WINDOW_MINUTES = 15
 MONTHS = dict(JAN=1, FEB=2, MAR=3, APR=4, MAY=5, JUN=6,
@@ -347,15 +353,39 @@ async def run(args) -> int:
         batch: list[dict] = []
         candle_batch: list[dict] = []
         for chunk, markets, lo, hi in plan_requests(windows, by_window):
-            try:
-                payload = await client._request(
-                    'GET', '/markets/candlesticks',
-                    params={'market_tickers': ','.join(t for t, _ in markets),
-                            'period_interval': 1,
-                            'start_ts': int(lo.timestamp()),
-                            'end_ts': int(hi.timestamp())})
-            except Exception as exc:                    # noqa: BLE001
-                logger.warning('chunk at %s failed: %s', lo, str(exc)[:160])
+            # **A failed chunk is RETRIED, not dropped.** It used to log a
+            # warning and `continue`, which abandoned every window in the
+            # chunk on the first error -- and the commonest error by far is a
+            # 429, i.e. the one failure that says nothing about the data and
+            # everything about how fast we asked. A dropped chunk is
+            # indistinguishable afterwards from a stretch the venue never
+            # listed, so throttling quietly became "history".
+            payload = None
+            for attempt in range(5):
+                try:
+                    payload = await client._request(
+                        'GET', '/markets/candlesticks',
+                        params={'market_tickers': ','.join(t for t, _ in markets),
+                                'period_interval': 1,
+                                'start_ts': int(lo.timestamp()),
+                                'end_ts': int(hi.timestamp())})
+                    break
+                except Exception as exc:                # noqa: BLE001
+                    msg = str(exc)
+                    if ('429' in msg or 'too_many_requests' in msg) and attempt < 4:
+                        await asyncio.sleep(1.5 * (2 ** attempt))
+                        continue
+                    if attempt == 4:
+                        DROPPED['chunks'] += 1
+                        DROPPED['windows'] += len(markets)
+                        logger.warning(
+                            'chunk at %s DROPPED after 5 attempts (%s); %d '
+                            'market-windows lost, %d so far', lo, msg[:90],
+                            len(markets), DROPPED['windows'])
+                    else:
+                        logger.warning('chunk at %s failed: %s', lo, msg[:160])
+                    break
+            if payload is None:
                 await asyncio.sleep(gap)
                 continue
             requests += 1

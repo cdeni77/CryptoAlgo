@@ -306,6 +306,27 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
         'event_ticker', 'close_time', 'minutes_to_close',
         'implied_sigma_per_min', 'implied_spot', 'atm_strike', 'n_strikes',
         'r2',
+        # **Which pipe produced the fit, and it is not cosmetic.** Three have
+        # written this table and they are not the same measurement:
+        #
+        #   live            `/markets?status=open`, the live ladder WITH resting
+        #                   sizes, so `mid_of` can refuse a rung with nothing
+        #                   behind it. 2026-08 onward.
+        #   predexon        `/kalshi/orderbooks` via a third party
+        #                   (`research/collect/implied_vol_backfill.py`). Has
+        #                   sizes, but its prices are rounded to whole cents --
+        #                   and the fit uses rungs with mids near 0.995, where
+        #                   the venue's real tick is a TENTH of a cent.
+        #   ladder_candles  the strike markets' own candlesticks. True tick, but
+        #                   candles carry no sizes at all, so the "nothing
+        #                   resting behind it" filter cannot run.
+        #
+        # Until 2026-10-21 there was no such column, and a backfill that left
+        # `available_time` unset was indistinguishable from a live recording --
+        # `_prepare` defaults it to `event_time`, so 100% of the pre-August rows
+        # read as zero-lag and looked live. A table that cannot say where a row
+        # came from cannot be audited, and this one needed auditing.
+        'source',
     ),
     'venue_depth': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',

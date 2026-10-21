@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import datetime as dt
 import logging
 import os
@@ -49,6 +50,10 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 logger = logging.getLogger('backfill_markets')
+
+#: Requests lost to rate limiting. Non-zero means this run under-reports the
+#: venue, and it should be repeated rather than believed.
+THROTTLED: dict = collections.defaultdict(int)
 
 NY = ZoneInfo('America/New_York')
 MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
@@ -118,6 +123,19 @@ async def fetch_one(client, sem, series, symbol, window_open, fetched_at):
                 except Exception as exc:                  # noqa: BLE001
                     msg = str(exc)
                     if '429' in msg or 'too_many_requests' in msg:
+                        # **Exhausting the retries is LOGGED, not swallowed.**
+                        # Falling out of this loop quietly makes the function
+                        # return None, and the caller reads None as "this
+                        # market never existed" -- so a throttled run silently
+                        # reports a thinner venue than the real one, and the
+                        # missing strikes look like history rather than loss.
+                        if attempt == 4:
+                            THROTTLED['markets'] += 1
+                            logger.warning(
+                                '%s gave up after 5 rate-limited attempts; it '
+                                'will look like a market that never existed '
+                                '(%d so far)', tk, THROTTLED['markets'])
+                            break
                         await asyncio.sleep(1.5 * (2 ** attempt))
                         continue
                     # A 404 here means "not on THIS tier"; try the other one
