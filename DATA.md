@@ -432,60 +432,65 @@ yet testable; it needs index bars over the same windows.
 
 ## 7b. What `--complete-cases` costs, per feature group
 
-**This is the number that governs every feature decision, so it lives here
-rather than being re-derived.** A NaN in any SELECTED feature drops the whole
-training row, so a sparse feature is paid for in rows. Measured 2026-10-21.
+**Measured 2026-10-21, AFTER the candle backfill landed.** An earlier version of
+this section carried numbers from evaluate runs started before it, over a span
+beginning 2025-10-01 — months in which there was no Kalshi book at all, so the
+book features were NaN for reasons unrelated to sizes. Those numbers said the
+book groups cost 51% and `implied_vol` 15%. **Both were wrong, and backwards.**
 
-### On the long span (`--start 2025-10-01`, 286 days)
-
-```
-configuration                        windows   vs all groups
-all nine groups                       14,926        —
-minus book_flow                       14,930        +0.03%   <- costs nothing
-minus implied_vol                     17,096        +15%
-minus book_flow AND market_state      22,551        +51%
-```
-
-So `book_flow` is free on sample grounds and only its skill matters;
-`market_state` is the expensive one, not `implied_vol` as first thought.
-
-### On the live-book era (`--start 2026-08-25`, 57 days)
+Window ceilings at the four decision offsets, Kalshi-only quote sources:
 
 ```
-quotes priced                 65,715 of 66,492 rows (98.8%)
-complete cases kept           19,706 of 66,492 rows (29.6%)
+feature set kept                      windows   vs all   earliest
+everything (quote+sizes+peer+IV)       20,839       —    2026-01-07
+drop implied_vol                       58,569    +181%   2026-01-07
+drop book (sizes)                      23,198     +11%   2026-01-07
+drop book AND implied_vol              74,648    +258%   2026-01-07
+drop book, IV and cross_venue          84,795    +307%   2025-12-15
 ```
 
-**70% of rows are lost to complete-cases, and the peer is the main reason.**
-The Polymarket peer inherits Kalshi's 5-second cap when
-`peer_max_quote_age_seconds` is unset, and only 28-35% of recent peer rows are
-that fresh (see the freshness table in §1). `core/quotes.py` warns of exactly
-this: "a tight Kalshi cap applied to the peer voids `venue_prob_gap` almost
-everywhere."
+Per month, what each requirement admits:
+
+```
+month     windows    +quote     +sizes    +peer5s +impl_vol
+2025-12     2,555     2,555          0          0         0
+2026-01     8,126     8,056      6,295      6,563     1,424
+2026-03     8,772     8,772      7,803      8,688     1,664
+2026-05     8,743     8,743      2,577      8,258     1,511
+2026-07     8,793     8,775      7,932      8,169     2,292
+2026-09     8,544     8,544      8,544      7,419     5,792
+2026-10     5,868     5,868      5,862      5,269     3,552
+```
+
+### What this means
+
+* **`implied_vol` is the binding constraint by a wide margin** — it alone caps
+  the set at 20,839 of 84,795 quoted windows. It is also RECOVERABLE: the
+  KXBTCD strike ladder is constructible per hour (75 strikes listed for a
+  January 2026 event), so the 13-28% coverage is an artifact of the live
+  recorder only seeing `status=open` markets, not a limit of the venue.
+* **The book-shape features cost only 11%.** Whether those 7 unrecoverable
+  features earn their place is therefore an 11% decision, not a 51% one.
+* **Keeping every feature exactly as deployed, the candle backfill took the
+  Kalshi-only sample from 6,465 to 20,839 windows — about 3.2x**, with no
+  feature changes and no trade-off. Folds go from 5 (`min_folds` FAILED) to
+  roughly 27.
 
 ### The consequence, which is NOT symmetric
 
 `--complete-cases` binds at TRAINING time. Live scoring does not drop rows — it
 substitutes LightGBM's learned defaults for a NaN, which is the `book_flow`
-failure in §4. So the model is fitted on the ~30% of rows where everything was
-present and then scored on rows where things are missing. Both halves of that
-mismatch are real and they point in opposite directions.
+failure in §4. So the model is fitted on the rows where everything was present
+and then scored on rows where things are missing.
 
 ### What is NOT yet known
 
-Whether the book-shape groups earn the rows they cost. **Both available tests
-are unusable**, and this is recorded so it is not attempted a fourth time:
-
-* On the long span, 67% of the sample computes those features from the Predexon
-  backfill, whose touch sizes are measured at ratio 1.22 and correlation 0.26
-  against the live book (§1). A null there cannot distinguish "no signal" from
-  "we fed it noise".
-* On the live era, there is not enough history: 500 training windows yield
-  1,367 rows, whose inner holdout is 369 — below the 500 the shrinkage fit
-  needs. `scripts.evaluate` raises rather than fitting an alpha that means
-  nothing.
-
-**It needs calendar time, not compute.** The live-book era began 2026-08-25.
+Whether the book-shape groups earn their 11%. Both available tests are
+unusable: the long span computes those features from Predexon's minute-stale
+touch (ratio 1.22, correlation 0.26) for most of its sample, and the live-book
+era yields a 369-row inner holdout against a 500-row minimum. Four attempts are
+recorded in `research/campaign/experiments/`. **It needs calendar time since
+2026-08-25, not another configuration** — and at 11% it is not urgent.
 
 ## 8. Rate limits and cost
 
