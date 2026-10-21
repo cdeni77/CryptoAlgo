@@ -84,8 +84,13 @@ def minute_bars_from_points(points, symbol: str) -> list[dict]:
         return []
     f = pd.DataFrame(rows, columns=['minute', 'value'])
     g = f.groupby('minute')['value']
+    # `mean_price` is the exact quantity the market settles on: the average
+    # of the index values inside the minute. `core/windows.bar_mean` has to
+    # approximate it as `(O+H+L+C)/4` for OHLC-only sources; here the prints
+    # are available, so the real mean is stored instead of re-derived.
     out = pd.DataFrame({'open': g.first(), 'high': g.max(),
-                        'low': g.min(), 'close': g.last()}).reset_index()
+                        'low': g.min(), 'close': g.last(),
+                        'mean_price': g.mean()}).reset_index()
     out['event_time'] = pd.to_datetime(out['minute'], unit='s', utc=True)
     out['venue'] = VENUE
     out['symbol'] = symbol

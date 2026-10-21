@@ -72,9 +72,17 @@ SCHEMAS: dict[str, tuple[str, ...]] = {
     # one timeframe — a `timeframe` column would be constant, and the previous
     # `bars` dataset had no such column at all, which made its implicit hourly
     # granularity a fact you had to know rather than one you could read.
+    # `mean_price` is the TRUE average of the prints inside the minute, and it
+    # is null for any source that serves only OHLC. Kalshi settles on the mean
+    # of sixty seconds of index values, which `core/windows.bar_mean`
+    # approximates as `(O+H+L+C)/4` because Coinbase gives nothing better. The
+    # CF Benchmarks index is served at one second, so for that venue the exact
+    # quantity exists and is stored rather than re-derived. Captured now
+    # because recovering it later means fetching the whole index again.
     'minute_bars': (
         'venue', 'symbol', 'event_time', 'available_time', 'quality',
         'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count',
+        'mean_price',
     ),
     # `bars` is the hourly perp and spot history the previous system read. Kept
     # in the schema because a store on disk may still hold it and an unreadable
