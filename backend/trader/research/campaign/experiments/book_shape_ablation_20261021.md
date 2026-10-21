@@ -34,3 +34,41 @@ order 0.00026). A drop inside that band means the groups are dispensable.
 `market_state` imbalance features are untested.
 
 **This is a new trial.** 25 were spent before it.
+
+---
+
+## WITHDRAWN and re-run, 2026-10-21
+
+**The testbed was the thing under suspicion.** 67% of the sample (14,743 of
+22,099 windows) predates 2026-08-25, where the imbalance features are computed
+from the Predexon backfill — measured the same day at size ratio 1.22 and
+correlation 0.26 against the live book, because its minute-stale touch sits at
+a different price level and "size at the touch" is therefore a different
+quantity.
+
+So a null on those features could mean either "they do not help" or "we fed
+them noise for two thirds of the run", and the design cannot separate the two.
+Testing the value of book-shape features on data whose book shape we had
+already discredited is circular.
+
+**Re-run restricted to 2026-08-25 onward**, where every size comes from the
+live book, and compared against ARM B2 (same quote sources, same era, all nine
+groups, 4,823 windows). The cost is power — ~7,000 windows and far fewer
+folds — but a weak measurement of the right quantity beats a precise
+measurement of the wrong one.
+
+## Attempt 4, also abandoned — and the reason is the protocol, not the data
+
+Relaunched on the live era with `--peer-max-quote-age-seconds 30` to recover
+the rows the 5-second peer cap was cutting. Killed before it produced a number.
+
+The cap was loosened **because the run errored**, not because 30s is the right
+cap, and it is not what the account trades. That is `RESEARCH_PROTOCOL` §10
+exactly: "Do not keep modifying features, architecture, datasets, evaluation
+boundaries or thresholds until something positive appears." A result from a
+configuration chosen to make the error go away is not evidence about the
+configuration we run.
+
+**Four attempts, no answer. The honest state is in `DATA.md` §7b: this question
+needs calendar time, not another configuration.** Do not attempt a fifth
+without new live-book history.

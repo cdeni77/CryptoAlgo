@@ -430,6 +430,63 @@ yet testable; it needs index bars over the same windows.
 
 ---
 
+## 7b. What `--complete-cases` costs, per feature group
+
+**This is the number that governs every feature decision, so it lives here
+rather than being re-derived.** A NaN in any SELECTED feature drops the whole
+training row, so a sparse feature is paid for in rows. Measured 2026-10-21.
+
+### On the long span (`--start 2025-10-01`, 286 days)
+
+```
+configuration                        windows   vs all groups
+all nine groups                       14,926        —
+minus book_flow                       14,930        +0.03%   <- costs nothing
+minus implied_vol                     17,096        +15%
+minus book_flow AND market_state      22,551        +51%
+```
+
+So `book_flow` is free on sample grounds and only its skill matters;
+`market_state` is the expensive one, not `implied_vol` as first thought.
+
+### On the live-book era (`--start 2026-08-25`, 57 days)
+
+```
+quotes priced                 65,715 of 66,492 rows (98.8%)
+complete cases kept           19,706 of 66,492 rows (29.6%)
+```
+
+**70% of rows are lost to complete-cases, and the peer is the main reason.**
+The Polymarket peer inherits Kalshi's 5-second cap when
+`peer_max_quote_age_seconds` is unset, and only 28-35% of recent peer rows are
+that fresh (see the freshness table in §1). `core/quotes.py` warns of exactly
+this: "a tight Kalshi cap applied to the peer voids `venue_prob_gap` almost
+everywhere."
+
+### The consequence, which is NOT symmetric
+
+`--complete-cases` binds at TRAINING time. Live scoring does not drop rows — it
+substitutes LightGBM's learned defaults for a NaN, which is the `book_flow`
+failure in §4. So the model is fitted on the ~30% of rows where everything was
+present and then scored on rows where things are missing. Both halves of that
+mismatch are real and they point in opposite directions.
+
+### What is NOT yet known
+
+Whether the book-shape groups earn the rows they cost. **Both available tests
+are unusable**, and this is recorded so it is not attempted a fourth time:
+
+* On the long span, 67% of the sample computes those features from the Predexon
+  backfill, whose touch sizes are measured at ratio 1.22 and correlation 0.26
+  against the live book (§1). A null there cannot distinguish "no signal" from
+  "we fed it noise".
+* On the live era, there is not enough history: 500 training windows yield
+  1,367 rows, whose inner holdout is 369 — below the 500 the shrinkage fit
+  needs. `scripts.evaluate` raises rather than fitting an alpha that means
+  nothing.
+
+**It needs calendar time, not compute.** The live-book era began 2026-08-25.
+
 ## 8. Rate limits and cost
 
 ```
