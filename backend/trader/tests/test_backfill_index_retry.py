@@ -53,3 +53,32 @@ def test_the_true_minute_mean_is_stored_not_approximated():
     assert row['mean_price'] == sum(values) / len(values)
     ohlc = (row['open'] + row['high'] + row['low'] + row['close']) / 4.0
     assert abs(row['mean_price'] - ohlc) > 1.0   # 101.0 against 115.0
+
+
+def test_a_rerun_fills_gaps_instead_of_refetching_everything():
+    """A backfill that cannot cheaply fill its own gaps will not have them
+    filled: one dropped hour used to cost a full ~4-hour pass to repair."""
+    import inspect
+
+    src = inspect.getsource(bi.run)
+    assert 'held_hours(store, symbol)' in src
+    assert 'already complete' in src
+    assert bi.COMPLETE_HOUR_MINUTES == 59
+
+
+def test_a_partial_hour_is_re_asked(monkeypatch):
+    """60 one-second-sourced minute bars per hour; fewer means partial."""
+    import pandas as _pd
+
+    full = _pd.Timestamp('2026-10-01 00:00', tz='UTC')
+    part = _pd.Timestamp('2026-10-01 01:00', tz='UTC')
+    rows = ([{'event_time': full + _pd.Timedelta(minutes=i)} for i in range(60)]
+            + [{'event_time': part + _pd.Timedelta(minutes=i)} for i in range(10)])
+
+    class Store:
+        def read(self, *a, **k):
+            return _pd.DataFrame(rows)
+
+    held = bi.held_hours(Store(), 'BTC-USD')
+    assert full in held
+    assert part not in held

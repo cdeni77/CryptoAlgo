@@ -120,6 +120,33 @@ def attach_coinbase_activity(frame: pd.DataFrame, store, symbol: str):
     return frame.merge(cb, on='event_time', how='left')
 
 
+#: An hour of 1-second index values yields 60 minute bars. Fewer means the
+#: hour is partial -- a drop, a truncated response, or a run that stopped --
+#: so it is re-asked. 59 tolerates a single boundary minute.
+COMPLETE_HOUR_MINUTES = 59
+
+
+def held_hours(store, symbol: str) -> set:
+    """Hours already complete for `symbol`, so a re-run fills gaps only.
+
+    Without this the script re-fetched its whole range every time, which made
+    a single dropped hour cost a full pass to repair -- about four hours for
+    three symbols. A backfill that cannot cheaply fill its own gaps will not
+    have them filled.
+    """
+    try:
+        held = store.read('minute_bars', venue=VENUE, symbols=[symbol],
+                          min_quality=None)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.debug('%s: nothing held yet (%s)', symbol, str(exc)[:100])
+        return set()
+    if held is None or not len(held):
+        return set()
+    at = pd.to_datetime(held['event_time'], utc=True)
+    per = at.dt.floor('h').value_counts()
+    return set(per[per >= COMPLETE_HOUR_MINUTES].index)
+
+
 async def run(args) -> int:
     from core.datastore import ResearchStore
     from data_collection.kalshi_client import KalshiClient
@@ -146,7 +173,11 @@ async def run(args) -> int:
                 logger.warning('no index id for %s; skipped', symbol)
                 continue
             batch: list[dict] = []
-            for hour in hours:
+            done = set() if args.force else held_hours(store, symbol)
+            todo = [h for h in hours if h not in done]
+            logger.info('%s: %d hour(s) to fetch, %d already complete',
+                        symbol, len(todo), len(hours) - len(todo))
+            for hour in todo:
                 # **A rate-limited hour is RETRIED, not dropped.** This
                 # used to log a warning and `continue` on the first error.
                 # `/cfbenchmarks/*` costs 50 tokens against a 200/s refill,
@@ -205,6 +236,8 @@ def build_parser():
     p.add_argument('--rate', type=float, default=DEFAULT_RATE)
     p.add_argument('--batch', type=int, default=20000)
     p.add_argument('--research-store', default=os.getenv('RESEARCH_STORE'))
+    p.add_argument('--force', action='store_true',
+                   help='re-fetch hours already held')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('-v', '--verbose', action='store_true')
     return p
