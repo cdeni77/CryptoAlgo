@@ -1,11 +1,8 @@
 /** Routing, and the shell.
  *
- * No react-router. Routing is manual through `window.history.pushState`, and the
- * two maps below are what keep it honest: `RoutePath` derives from `ROUTES`, and
- * `PAGES` is a `Record<RoutePath, ComponentType>` — so adding a route without a
- * component is a `tsc` error rather than a blank screen. The render used to be a
- * chain of `route === '/x' && <XPage />` and this file used to claim that was
- * exhaustive. It was not.
+ * Routing uses `window.history.pushState`, without react-router. `RoutePath`
+ * derives from `ROUTES`, and `PAGES` is a `Record<RoutePath, ComponentType>`, so
+ * a route without a component fails to compile.
  */
 import { useCallback, useEffect, useState } from 'react';
 import type { ComponentType } from 'react';
@@ -30,8 +27,7 @@ export const ROUTES = {
 
 export type RoutePath = keyof typeof ROUTES;
 
-/** A Record, not a lookup with a fallback. A route with no component will not
- *  compile, which is the whole reason this is typed this way. */
+/** A Record, not a lookup with a fallback, so every route must have a page. */
 const PAGES: Record<RoutePath, ComponentType> = {
   '/': LivePage,
   '/decisions': DecisionsPage,
@@ -55,8 +51,7 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  // The header clock ticks on the quarter-hour grid the whole system runs on, so
-  // a stale screen is visible as a stale clock rather than as plausible numbers.
+  // The header clock counts down to the next quarter-hour settlement.
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 1000);
     return () => window.clearInterval(timer);

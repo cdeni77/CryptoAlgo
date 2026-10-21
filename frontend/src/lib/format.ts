@@ -1,10 +1,6 @@
-/** Number and time formatting. Not components, so not in a component module —
- *  a file that exports both cannot hot-reload cleanly, and eslint is right about
- *  it.
+/** Number and time formatting, kept out of component modules for hot reload.
  *
- *  Everything here degrades to an em-dash rather than to `NaN` or `0`. A missing
- *  measurement must never render as a number, which is the same rule the API
- *  follows on the other side of the wire.
+ *  A missing value renders as an em-dash, never as `NaN` or `0`.
  */
 
 export function formatNumber(value: number, digits = 2): string {

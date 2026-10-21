@@ -1,10 +1,7 @@
-"""Gates, and the ledger that makes a trial count possible.
+"""Tests for the promotion gates and the ledger of attempts.
 
-Two invariants. A blocked candidate must not reach `models/forecast.joblib` —
-that path is what the live signal writer loads by name, so it is the single place
-a model becomes real. And every attempt is recorded, passed or blocked, because a
-project that deletes its failures cannot compute its own multiple-testing
-correction.
+A blocked candidate never reaches `models/forecast.joblib`, and every attempt is
+recorded, since the ledger is the trial count.
 """
 
 from __future__ import annotations
@@ -51,17 +48,17 @@ def fold(index=0, skill=0.002, ece=0.009, alpha=0.7, control=0.18,
         model_brier=0.17, baseline_brier=0.175,
         model_ece=ece, baseline_ece=0.021,
         residual_scale=alpha, control_gain_share=control,
-        # A fold that does not report these is a fold whose calibration was not
-        # measured, and both gates fail closed on a missing value — so the
-        # fixture has to supply them like any other measurement.
+        # A fold without these values has no measured calibration, and both gates fail
+        # closed on a missing value, so the fixture supplies them.
         model_max_deviation=deviation, n_non_finite=non_finite,
         stats=stats(**over))
 
 
 def report(skills=(0.002,) * 6, *, deviation=0.02, non_finite=0,
            trade_metrics=None, **over) -> EvaluationReport:
-    """`deviation` and `non_finite` are per-fold; `trade_metrics` stands in for
-    the traded rows; everything else sizes the book."""
+    """A report: `deviation` and `non_finite` are per fold, `trade_metrics` stands in
+    for traded rows, the rest sizes the book.
+    """
     return EvaluationReport(
         folds=[fold(i, skill=s, deviation=deviation, non_finite=non_finite)
                for i, s in enumerate(skills)],
@@ -71,13 +68,10 @@ def report(skills=(0.002,) * 6, *, deviation=0.02, non_finite=0,
 
 
 def beats_the_market() -> dict:
-    """The market measurement a fully-passing candidate must carry.
+    """The market measurement a fully passing candidate must carry.
 
-    Added for the same reason `model_max_deviation` and `n_non_finite` had to be
-    added to `fold()`: a gate reads a measurement, and a fixture that omits it is
-    describing a candidate that was never measured. `market_gate_values` is
-    defined further down with the rest of the market tests; it is a pure
-    function of rows, so calling it here is not a dependency on those tests.
+    A gate reads a measurement, so a fixture that omits it describes an unmeasured
+    candidate. `market_gate_values` is a pure function of rows.
     """
     values = market_gate_values(market_rows(4_000, model_edge=+0.35))
     # `deployed_residual_scale` is the INSTALLED artifact's alpha, supplied by
@@ -127,11 +121,10 @@ def test_skill_is_the_difference_not_the_level():
 
 
 def test_the_standard_error_comes_from_fold_dispersion():
-    """Not from a breadth formula.
+    """The standard error comes from fold dispersion, not a breadth formula.
 
-    Four offsets share a label and the three symbols are ~0.7 correlated within a
-    window, so `N/(1+(N-1)rho)` on this structure is not merely optimistic but
-    degenerate — cross-sectional structure can drive the denominator negative.
+    Offsets share a label and symbols are correlated, so `N/(1+(N-1)rho)` is degenerate
+    here.
     """
     tight = report(skills=(0.002, 0.0021, 0.0019, 0.002, 0.0022, 0.0018))
     loose = report(skills=(0.01, -0.008, 0.012, -0.006, 0.009, -0.005))
@@ -141,14 +134,13 @@ def test_the_standard_error_comes_from_fold_dispersion():
 
 
 def test_five_of_six_is_reported_with_its_p_value():
-    """Because it happens 10.9% of the time under no skill."""
+    """Five of six positive is reported with its p-value (7/64 under no skill)."""
     r = report(skills=(0.002, 0.002, 0.002, 0.002, 0.002, -0.001))
     assert r.folds_positive == 5
     assert r.sign_agreement_p_value == pytest.approx(7 / 64, abs=1e-6)
 
 
 def test_a_gate_with_no_measurement_fails():
-    """"Not measured" fails like every other gate here."""
     gate = Gate(name='x', value=float('nan'), threshold=0.0, direction='min')
     assert not gate.passed
 
@@ -159,17 +151,13 @@ def test_every_gate_carries_a_note_explaining_it():
 
 
 def test_the_forecast_gates_come_before_the_money_gates():
-    """A candidate that fails on skill should not have its Sharpe discussed."""
     names = list(DEFAULT_GATES)
     assert names.index('log_loss_skill') < names.index('realised_edge_lcb')
     assert names.index('calibration_error') < names.index('trades')
 
 
 def test_an_implausible_sharpe_fails_even_though_it_is_high():
-    """Every other gate asks whether the number is good; this asks if it is possible.
-
-    The first full run of this stack reported +12.6 and passed `>= 0.5`.
-    """
+    """A Sharpe above the plausible limit fails, since it signals a bug."""
     good = evaluate_gates(report(sharpe=1.4))
     assert {g.name: g.passed for g in good}['sharpe_implausible']
     absurd = evaluate_gates(report(sharpe=IMPLAUSIBLE_SHARPE + 7))
@@ -282,14 +270,8 @@ def test_the_version_stamp_sorts_chronologically():
 
 
 def test_a_handful_of_unscoreable_rows_is_not_a_failure():
-    """An outage is not a defect, so the gate is a share and not a count.
-
-    A row with no volatility estimate has no forecast. Measured on real bars: one
-    6.5-hour Coinbase outage leaves ~86 rows in 372,532 unscoreable in the two
-    hours afterwards, because the 240-minute lookback cannot be filled. Refusing
-    to evaluate at all because the venue went down in May is not a judgement about
-    the model — and my first version of this gate did exactly that, and killed a
-    whole `scripts.evaluate` run.
+    """A few unscoreable rows (as from an outage) pass, because the gate is a share, not
+    a count.
     """
     gates = {g.name: g for g in evaluate_gates(report(non_finite=4))}
     assert gates['non_finite_share'].passed, (
@@ -301,28 +283,19 @@ def test_a_handful_of_unscoreable_rows_is_not_a_failure():
 
 
 def test_a_large_share_of_unscoreable_rows_does_fail():
-    """Because that is a lookback or an embargo, not the venue.
-
-    What must never happen again is the silence: `np.mean` propagated the NaN into
-    every fold statistic while `np.digitize` filed those rows in the 0.95-1.00
-    reliability bin — the band this system trades — and `scripts/baseline.py` then
-    printed "gate passed: worst-fold calibration error 0.01516 <= 0.02" with five
-    of six folds reading NaN, because `nan > 0.02` is False.
+    """A large share of unscoreable rows fails, since that points to a lookback or
+    embargo problem.
     """
-    # 8,000 unscoreable per fold against 80,000 rows is 9%, well over the 0.1%.
+    # 8,000 unscoreable per fold against 80,000 rows is 9%, well over the 0.1% limit.
     gates = {g.name: g for g in evaluate_gates(report(non_finite=8_000))}
     assert not gates['non_finite_share'].passed
     assert not gates_passed(evaluate_gates(report(non_finite=8_000)))
 
 
 def test_a_nan_calibration_in_one_fold_reaches_the_gate():
-    """The aggregation must not skip the fold it could not measure.
+    """A NaN calibration in one fold reaches the gate, whatever the fold order.
 
-    `max_ece` used the builtin `max`, which is order-dependent with NaN:
-    `max([0.015, nan])` is 0.015 and `max([nan, 0.015])` is nan. So whether an
-    unmeasurable fold was noticed depended on fold ordering. `Gate.passed`
-    already fails closed on a non-finite value; the aggregation has to let it
-    get there.
+    The builtin `max` is order-dependent with NaN, so the aggregation must not use it.
     """
     folds = [fold(0, ece=float('nan')), fold(1), fold(2), fold(3), fold(4), fold(5)]
     subject = EvaluationReport(folds=folds, continuous=stats(),
@@ -332,24 +305,19 @@ def test_a_nan_calibration_in_one_fold_reaches_the_gate():
 
 
 def test_a_model_miscalibrated_only_where_it_trades_is_refused():
-    """The mean ECE averages away the band the money is in.
+    """A model miscalibrated only where it trades is refused.
 
-    Constructed and measured: perfectly calibrated on 190,000 pinned rows and
-    5pp overconfident on the 10,000 it trades gives an aggregate ECE of 0.0044 —
-    a pass with 78% of the budget unused — because those rows contribute
-    0.05 * 10/200 = 0.0025. `calibration_max_deviation` is the gate that sees it.
+    The mean ECE averages that band away, so `calibration_vs_market` is the gate that
+    catches it.
     """
     gates = {g.name: g for g in evaluate_gates(report(deviation=0.05))}
     assert gates['calibration_error'].passed, (
         'the mean ECE is meant to be blind to this; if it is not, the fixture '
         'no longer demonstrates the problem'
     )
-    # The protection now lives in `calibration_vs_market`, not in an absolute
-    # bar. Measured on the venue's own settlement over 33,126 rows, the MARKET
-    # itself misses by 0.063 in its worst populated bin, so any absolute
-    # threshold tight enough to catch a 5pp band error also rejects every model
-    # that merely tracks the price. Asking whether the model is worse than the
-    # market SEPARATES the two, which an absolute number cannot.
+    # The protection is `calibration_vs_market`. The market itself misses its worst
+    # bin by several points, so an absolute bar tight enough to catch this would also
+    # reject every model that tracks the price.
     extra = {'market_windows': 5_000.0, 'model_minus_market': 0.001,
              'baseline_minus_market': 0.0,
              'market_max_deviation': 0.01, 'calibration_vs_market': 0.04}
@@ -358,10 +326,9 @@ def test_a_model_miscalibrated_only_where_it_trades_is_refused():
     assert not relative['calibration_vs_market'].passed, (
         'a model 5pp off where the market is not must still be refused'
     )
-    # and the loosened absolute bar still catches GROSS miscalibration
+    # The loose absolute bar still catches gross miscalibration.
     gross = {g.name: g for g in evaluate_gates(report(deviation=0.15))}
     assert not gross['calibration_max_deviation'].passed
-
 
 
 # ---- the market as the benchmark -----------------------------------------
@@ -369,9 +336,8 @@ def test_a_model_miscalibrated_only_where_it_trades_is_refused():
 def market_rows(n: int, *, model_edge: float = 0.0, windows: int = 4_000):
     """Synthetic `scored_against_market()` rows.
 
-    `model_edge` shifts the model's probability toward the truth relative to the
-    price, so a positive value is a model that genuinely forecasts better than
-    the quote and a negative one is a model that is worse.
+    `model_edge` moves the model toward the truth relative to the price: positive is a
+    better forecaster than the quote, negative a worse one.
     """
     rng = np.random.default_rng(11)
     rows = []
@@ -388,16 +354,10 @@ def market_rows(n: int, *, model_edge: float = 0.0, windows: int = 4_000):
 
 
 class TestTheMarketGates:
-    """The benchmark the other gates do not test.
-
-    `log_loss_skill` asks whether the model beats `F(x/sigma)`. It is not the
-    counterparty — the price is. Measured on the first day of live quotes: market
-    log loss 0.333, baseline 0.429, model 0.430, same sign on all three symbols
-    and all four offsets. Every other gate passed that run.
-    """
+    """Tests the market gates: the counterparty is the price, not `F(x/sigma)`."""
 
     def test_a_model_that_loses_to_the_price_fails_even_passing_everything_else(self):
-        """The regression this pair of gates exists for."""
+        """A model that loses to the price fails even when every other gate passes."""
         others = {g.name: g.passed for g in evaluate_gates(
             report(), extra=market_gate_values(market_rows(4_000, model_edge=-0.35)))}
         assert others['log_loss_skill'], 'the fixture must otherwise be a passing one'
@@ -412,16 +372,13 @@ class TestTheMarketGates:
         assert gates['model_minus_market'] and gates['market_windows']
 
     def test_too_few_windows_fails_however_good_the_comparison_looks(self):
-        """A week of one symbol is an anecdote, and an anecdote that flatters us
-        is the one most likely to be believed."""
         values = market_gate_values(market_rows(300, model_edge=+0.35, windows=100))
         gates = {g.name: g.passed for g in evaluate_gates(report(), extra=values)}
         assert values['model_minus_market'] > 0
         assert not gates['market_windows']
 
     def test_no_quotes_at_all_fails_rather_than_passes(self):
-        """Not measured is not measured good. The whole point of routing this
-        through a gate instead of a script is that a script can go unrun."""
+        """No quotes at all fails: not measured is not a pass."""
         values = market_gate_values([])
         assert values['market_windows'] == 0
         assert not np.isfinite(values['model_minus_market'])
@@ -429,44 +386,33 @@ class TestTheMarketGates:
         assert not gates['market_windows'] and not gates['model_minus_market']
 
     def test_forgetting_to_pass_the_measurement_cannot_promote(self):
-        """`extra` is optional in the signature, so omitting it must fail closed.
-        A benchmark that disappears when a caller forgets it is not a benchmark."""
+        """Omitting `extra` fails closed."""
         gates = {g.name: g.passed for g in evaluate_gates(report())}
         assert not gates['model_minus_market']
         assert not gates['market_windows']
 
     def test_the_market_gates_are_read_before_the_baseline_ones(self):
-        """Ordering is the argument: `log_loss_skill` beating F(x/sigma) is not
-        the question that decides whether this pays."""
         names = list(DEFAULT_GATES)
         assert names.index('model_minus_market') < names.index('log_loss_skill')
         assert names.index('market_windows') < names.index('trades')
 
     def test_the_threshold_is_defined_once(self):
-        """`scripts.market_benchmark` and the gate must not drift apart."""
+        """`scripts.market_benchmark` and the gate share one window threshold."""
         from scripts.market_benchmark import MIN_WINDOWS
 
         assert MIN_WINDOWS == MIN_MARKET_WINDOWS
         assert DEFAULT_GATES['market_windows'][0] == float(MIN_MARKET_WINDOWS)
 
     def test_a_backtest_alone_can_never_satisfy_these(self):
-        """A backtest has no book: `price_source` stands the calibrated baseline
-        in for the market, which answers "beat the baseline" twice rather than
-        answering "beat the price" once. So the report cannot supply these, and
-        `gate_values` must not pretend to."""
+        """A backtest report alone cannot supply the market gates, since it has no book."""
         assert 'model_minus_market' not in report().gate_values()
         assert 'market_windows' not in report().gate_values()
 
 
-# --- the ledger must carry the reliability table ---------------------------
+# --- the ledger carries the reliability table -------------------------------
 #
-# It did not, and the Calibration page's only other source was a best-effort
-# mirror into Postgres at promotion time. On 2026-09-10 a retrain ran on a host
-# with no DATABASE_URL: `publish_to_serving` logged one line and returned, and
-# the reliability table for an INSTALLED artifact was gone. Every other number
-# in the attempt survived on disk -- gates, skill, config, fold count -- so the
-# ledger looked complete while being unable to answer the one question the
-# Calibration page asks. A record of account with a hole in it is not one.
+# The ledger is the record of account, so it must hold the reliability table
+# itself and not depend on the Postgres mirror.
 
 def test_the_ledger_carries_the_deployed_folds_reliability_table():
     import pandas as pd
@@ -483,16 +429,16 @@ def test_the_ledger_carries_the_deployed_folds_reliability_table():
     deployed = type('F', (), {'reliability_table': Table()})()
     rows = reliability_rows(type('R', (), {'folds': [early, deployed]})())
 
-    # The LAST fold: trained on the most history, so the one deployed. Same
-    # choice publish_to_serving makes, and they must not diverge.
+    # The last fold, trained on the most history, is the deployed one.
+    # `publish_to_serving`
+    # makes the same choice.
     assert len(rows) == 2, 'empty bins are dropped, populated ones kept'
     assert rows[0] == {'bin_low': 0.0, 'bin_high': 0.2, 'predicted': 0.10,
                        'observed': 0.12, 'count': 40}
 
 
 def test_reliability_rows_are_strict_json():
-    """`json.dumps` emits a bare NaN, which Python reads back and every strict
-    parser rejects -- including the dashboard's."""
+    """Reliability rows are strict JSON: no bare NaN, which strict parsers reject."""
     import json
     import pandas as pd
     from core.promotion import reliability_rows
@@ -510,22 +456,15 @@ def test_reliability_rows_are_strict_json():
 
 
 def test_a_report_with_no_folds_does_not_raise():
-    """A refused candidate still writes a ledger entry, and a diagnostic that
-    raises inside the writer would destroy the record it exists to keep."""
+    """A report with no folds returns no rows instead of raising, so the ledger entry is
+    still written.
+    """
     from core.promotion import reliability_rows
     assert reliability_rows(type('R', (), {'folds': []})()) == []
     assert reliability_rows(type('R', (), {})()) == []
 
 
 def test_report_provenance_actually_CARRIES_the_reliability_rows():
-    """The wiring, not the helper.
-
-    The three tests above pass with `report_provenance` never calling
-    `reliability_rows` at all — verified by deleting the line and watching them
-    stay green. That is the same defect shape as `complete_cases`, whose
-    `groups` argument was correct, tested, and never passed by its only caller.
-    A helper that works and is not wired in is a helper that does nothing.
-    """
     import pandas as pd
     from core.promotion import report_provenance
 

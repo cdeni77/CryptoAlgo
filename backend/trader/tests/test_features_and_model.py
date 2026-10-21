@@ -1,18 +1,7 @@
-"""The alignment canary, and the null control.
+"""Tests for the alignment canary and the null control.
 
-**The canary.** A feature set equal to the realised outcome must be recovered end
-to end. Nothing in the previous suite checked this, and it is the first thing any
-"why is the skill zero" investigation has to rule out: a one-bar shift between
-panel and target destroys signal silently and reads exactly like no edge.
-Lookahead tests assert the model cannot see the *future*; this asserts it can see
-the *present*, which is the opposite failure and had no guard. A mutation test
-sits beside it — shift the target by one window and the canary must fail — so the
-canary cannot pass for the wrong reason.
-
-**The null control.** On bars with no exploitable structure the pipeline must
-find nothing. A suite that only checks a model can find signal cannot catch a
-pipeline that manufactures it, and manufacturing it is the failure mode this
-whole project exists to avoid.
+A feature equal to the outcome must be recovered, and must fail when shifted by one
+window. Bars with no structure must give no skill.
 """
 
 from __future__ import annotations
@@ -49,10 +38,8 @@ def prepared():
 # ------------------------------------------------------------- the canary
 
 def test_a_perfect_feature_is_recovered_end_to_end(prepared):
-    """Inject the answer as a feature; the model must find it.
-
-    If this fails, no measurement in the system means anything — a broken join
-    and a genuinely unpredictable market are indistinguishable from the outside.
+    """A feature equal to the outcome gives large skill. Otherwise the panel and target
+    are misaligned.
     """
     _, fit, train, test = prepared
     column = FEATURE_GROUPS['geometry'][0]
@@ -73,12 +60,12 @@ def test_a_perfect_feature_is_recovered_end_to_end(prepared):
 
 
 def test_the_canary_fails_when_the_target_is_shifted(prepared):
-    """The mutation. Without it the canary could pass for the wrong reason."""
+    """The canary fails when the feature answers the next window instead."""
     _, fit, train, test = prepared
     column = FEATURE_GROUPS['geometry'][0]
     train = train.copy()
     test = test.copy()
-    # The feature is the answer to the *next* window, not this one.
+    # The feature is the answer to the next window, not this one.
     for frame in (train, test):
         shifted = frame.groupby(['symbol', 'offset'])['outcome'].shift(-1)
         frame[column] = shifted.astype(float)
@@ -98,7 +85,7 @@ def test_the_canary_fails_when_the_target_is_shifted(prepared):
 # --------------------------------------------------------- the null control
 
 def test_the_pipeline_finds_nothing_on_a_null():
-    """Independent random walks. Any skill here is manufactured."""
+    """On independent random walks the pipeline finds no skill."""
     rng = np.random.default_rng(99)
     bars = make_bars(days=40, lead=0.0, seed=7)
     for symbol in bars:
@@ -126,11 +113,7 @@ def test_the_pipeline_finds_nothing_on_a_null():
 # ----------------------------------------------------------------- shape
 
 def test_every_declared_feature_is_produced(prepared):
-    """A group that produced nothing arrives as an all-NaN column of the same shape.
-
-    Which a column-name hash cannot distinguish from a working one, so this is
-    the only place it is visible.
-    """
+    """Every declared feature is populated, since an all-NaN column looks like a working one."""
     _, _, _, test = prepared
     report = population_report(test)
     empty = report[report['populated'] == 0]
@@ -140,11 +123,7 @@ def test_every_declared_feature_is_produced(prepared):
 
 
 def test_the_control_group_is_declared_as_one():
-    """Hour of day cannot forecast direction, and the suite has to know that.
-
-    The previous incarnation of this project ran a 27-cell survey whose best cell
-    was its own control, and that was the most useful result it produced.
-    """
+    """The calendar control group is declared and contains the time-of-day columns."""
     assert CONTROL_GROUPS, 'no control group is declared'
     for group in CONTROL_GROUPS:
         assert group in FEATURE_GROUPS
@@ -154,10 +133,8 @@ def test_the_control_group_is_declared_as_one():
 
 def test_selecting_groups_selects_columns():
     assert set(feature_columns(('geometry',))) == set(FEATURE_GROUPS['geometry'])
-    # The DEFAULT matrix is ALL_GROUPS, which is no longer every declared group:
-    # the book families exist only from 2026-01-08 against five years of bars, so
-    # they are selectable but not default. Defaulting them in would make ~90% of
-    # every feature matrix NaN.
+    # The default matrix is `ALL_GROUPS`, which excludes the book groups because most
+    # bar history has no book.
     from core.features import ALL_GROUPS as _DEFAULTS
     assert len(feature_columns()) == sum(len(FEATURE_GROUPS[g]) for g in _DEFAULTS)
     with pytest.raises(ValueError, match='unknown feature groups'):
@@ -165,7 +142,7 @@ def test_selecting_groups_selects_columns():
 
 
 def test_the_baseline_logit_is_required_before_prediction(prepared):
-    """Recomputing it here would silently use a different baseline."""
+    """Prediction requires the baseline logit column instead of recomputing it."""
     _, fit, train, test = prepared
     model = fit_model(train, fit.baseline, FAST, groups=('geometry',))
     stripped = test.drop(columns=[BASELINE_LOGIT])
@@ -174,11 +151,7 @@ def test_the_baseline_logit_is_required_before_prediction(prepared):
 
 
 def test_an_untrained_correction_reproduces_the_baseline(prepared):
-    """The residual architecture, stated as a property.
-
-    With alpha at zero the model *is* the baseline, so every tree it grows is
-    incremental skill by construction rather than by comparison.
-    """
+    """With `residual_scale` at zero the model reproduces the baseline exactly."""
     _, fit, train, test = prepared
     model = fit_model(train, fit.baseline, FAST, groups=('geometry',))
     model.residual_scale = 0.0
@@ -189,11 +162,7 @@ def test_an_untrained_correction_reproduces_the_baseline(prepared):
 # ------------------------------------------------------- the scoring bundle
 
 def test_the_artifact_carries_what_the_live_path_needs(prepared):
-    """An artifact that can be evaluated and not deployed is a trap.
-
-    Nothing said so until the live path tried to score a window and found no
-    volatility model.
-    """
+    """The artifact carries the scoring bundle the live path needs, so it is deployable."""
     _, fit, train, _ = prepared
     bundle = fit.bundle(FAST)
     model = fit_model(train, fit.baseline, FAST, scoring=bundle)
@@ -201,7 +170,7 @@ def test_the_artifact_carries_what_the_live_path_needs(prepared):
     assert model.provenance()['deployable'] is True
     for symbol in FAST.symbols:
         assert bundle.covers(symbol), symbol
-    # And the frames are deliberately left out: they are hundreds of megabytes.
+    # The frames are left out on purpose: they are hundreds of megabytes.
     assert not hasattr(bundle, 'states')
 
 
@@ -219,10 +188,7 @@ def test_score_live_scores_one_window_per_symbol(prepared):
 
 
 def test_score_live_reports_no_outcome_for_an_unsettled_window(prepared):
-    """A window being decided has not settled.
-
-    Writing a plausible zero would make an unresolved bet look like a loss.
-    """
+    """An unsettled window has NaN outcome, not zero."""
     dataset, fit, _, _ = prepared
     scored = score_live(
         {s: g.reset_index().rename(columns={'index': 'event_time'})
@@ -234,17 +200,10 @@ def test_score_live_reports_no_outcome_for_an_unsettled_window(prepared):
 
 
 def test_the_shrinkage_reads_near_zero_on_a_null():
-    """`residual_scale` is the overfitting detector, so a null must fail its gate.
+    """On a null dataset `residual_scale` stays below the 0.25 gate.
 
-    It read **0.902** on a provably zero-signal dataset and passed
-    `residual_scale >= 0.25`, for two compounding reasons. First, early stopping
-    and the shrinkage fit shared `inner_valid`, so alpha answered "how much of
-    the correction survives on the rows the tree count was chosen for". Second,
-    `_fit_residual_scale` never checked `result.success`: one NaN made the
-    objective NaN everywhere, `minimize_scalar` gave up, and its golden-section
-    bracket point **0.7639320225** was returned as a fitted value — which also
-    clears 0.25. Four of six folds in a five-year BTC walk-forward returned
-    exactly that constant.
+    Early stopping and the shrinkage fit must not share rows, and a failed optimiser
+    must not return its bracket point 0.7639320225 as a fitted value.
     """
     from core.config import Config
     from core.dataset import Dataset, fit_fold
@@ -253,7 +212,7 @@ def test_the_shrinkage_reads_near_zero_on_a_null():
 
     config = Config(n_estimators=120, early_stopping_rounds=15, n_folds=3,
                     seasonality_min_days=5)
-    bars = make_bars(days=70, lead=0.0, seed=11)   # lead=0: nothing to find
+    bars = make_bars(days=70, lead=0.0, seed=11)  # lead=0: nothing to find
     dataset = Dataset.build(bars, config)
     index = dataset.window_index
     fit, train_table = fit_fold(dataset, index[:int(len(index) * 0.85)], config)
@@ -270,18 +229,7 @@ def test_the_shrinkage_reads_near_zero_on_a_null():
 
 
 def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
-    """A NaN must not become 0.7639320225, and must not stop the run either.
-
-    The defect was never the NaN itself — it was reporting scipy's abandoned
-    golden-section bracket point as a fitted alpha, which cleared the
-    `residual_scale >= 0.25` gate on a value that is a search constant. Refusing
-    outright was my first fix and it was wrong in the other direction: one
-    6.5-hour Coinbase outage leaves ~83 rows in 26,488 without a volatility
-    estimate, and that killed an entire evaluation.
-
-    So: drop the unscoreable rows, insist enough remain to mean anything, and
-    still raise if the optimiser does not converge.
-    """
+    """The shrinkage fit drops unscoreable (NaN) rows and needs enough rows to remain."""
     import numpy as np
 
     from core.model import MIN_SHRINKAGE_ROWS, _fit_residual_scale
@@ -298,7 +246,7 @@ def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
         "that is scipy's bracket seed, not a fitted value"
     )
 
-    # A handful of NaNs is an outage, and must change the answer only slightly.
+    # A few NaNs (as from an outage) change the answer only slightly.
     holed = correction.copy()
     holed[:20] = np.nan
     with_holes = _fit_residual_scale(logit, holed, outcome)
@@ -308,7 +256,7 @@ def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
         f'{with_holes:.4f}; that is not an exclusion, that is a different fit'
     )
 
-    # Too few scoreable rows is a data problem and must say so.
+    # Too few scoreable rows is a data problem and raises.
     mostly_nan = correction.copy()
     mostly_nan[MIN_SHRINKAGE_ROWS // 2:] = np.nan
     with pytest.raises(ValueError, match='scoreable rows remain'):
@@ -316,12 +264,7 @@ def test_the_shrinkage_excludes_unscoreable_rows_rather_than_dying():
 
 
 def test_the_shrinkage_raises_when_the_optimiser_does_not_converge(monkeypatch):
-    """The actual bug, pinned directly.
-
-    `minimize_scalar` returning `success=False` was never checked, so its bracket
-    point `0.7639320225` was returned as a fitted alpha. Four of six folds in a
-    five-year BTC walk-forward returned exactly that.
-    """
+    """A non-converged optimiser raises instead of returning its bracket point."""
     import numpy as np
     from scipy import optimize
 

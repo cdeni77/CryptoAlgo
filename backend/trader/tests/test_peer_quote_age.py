@@ -1,25 +1,7 @@
-"""The other venue had no staleness filter, so the gap could span two instants.
+"""Tests that the peer venue's quote gets the same staleness filter as the traded venue.
 
-`attach_quotes` filters the traded venue at `max_age_seconds` (30) — a quote
-older than that is NaN'd, because a book quoted twenty minutes ago is not a
-price this decision could have taken. The PEER venue block computes
-`pm_market_probability` with no age test at all: measured, Polymarket rows reach
-899 seconds of staleness in the store.
-
-`venue_prob_gap` is a DIFFERENCE of the two, and a difference is exactly where a
-timing asymmetry turns into apparent skill. That matters more here than
-anywhere: `cross_venue` is the only load-bearing group in the model — dropping
-it takes skill from +0.00282 to -0.00015 — while scoring +0.000030 ALONE, below
-the clock control. Useless alone and essential combined is what an interaction
-looks like, and also what a leak looks like, and the pattern cannot tell them
-apart.
-
-Measured on the 431,198 rows the model actually sees, Polymarket is 4.0 seconds
-STALER on average, so the leak is not the mean case. But it is fresher by more
-than ten seconds on 6% of rows, and nothing bounds it.
-
-Filtering both sides to the same tolerance is what makes the group's
-contribution interpretable either way.
+`venue_prob_gap` is the difference of the two venues' prices. If only one side were
+age-filtered, a timing difference could look like skill.
 """
 from __future__ import annotations
 
@@ -69,9 +51,7 @@ def test_a_fresh_peer_quote_still_attaches():
 
 
 def test_a_peer_row_with_no_age_recorded_is_kept():
-    """Absence of a stamp is not evidence of staleness — the backfilled
-    fixtures carry rows without one, and dropping them would silently discard
-    the sample rather than filter it."""
+    """A peer row with no recorded age is kept; a missing stamp is not evidence of staleness."""
     peer = _row('polymarket', np.nan, bid=0.20, ask=0.22)
     out = attach_quotes(_windows(), pd.DataFrame([_row('kalshi', 2.0), peer]),
                         max_age_seconds=30.0)

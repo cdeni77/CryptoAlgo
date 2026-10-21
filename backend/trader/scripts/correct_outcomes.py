@@ -1,35 +1,15 @@
-"""Correct `predictions.outcome` against the venue's own settlement.
+"""Correct `predictions.outcome` and settled positions against the venue's settlement.
 
-**The market gates read this column, and it was filled from Coinbase bars.**
-`settle_due` prefers the venue's settlement for the money. `settle_predictions`,
-eleven lines away in the same function with the venue data already in scope,
-does not — and `PgWriter.scored_against_market()` can return no other label. So
-`model_minus_market` and `calibration_vs_market` were computed on our proxy
-while the backtest branch of the same gate substitutes `venue_outcome`. Two
-label conventions under one gate name, chosen by which branch had data.
+The market gates read `predictions.outcome`, which the live loop fills from
+Coinbase bars. The venue's settlement is the true label.
 
-Measured 2026-09-16 on 5,471 settled rows at +12m:
+A separate step, not part of `settle_predictions`: the live loop's venue data
+is keyed by ticker, and mapping a ticker to a window would mean parsing it.
+`venue_settlements` already carries symbol and window_open. Runs hourly in
+`run_live.store_sync_loop`, after `collect_settlements`.
 
-    OUR Coinbase label      model_minus_market  +0.000924
-    VENUE's own settlement  model_minus_market  +0.000188
-    labels disagree on 156 rows                      2.85%
-
-Four fifths of the apparent live edge was self-grading. The disagreement is the
-shape a benign proxy should have — it lives in the near-ties, exactly as the
-96.98% agreement measured across 56,284 windows predicts — but "benign" is a
-statement about the label's bias, not about a statistic computed from it.
-
-**Why a separate step rather than a fix inside `settle_predictions`.** The venue
-dict the live loop holds is keyed by market ticker; predictions are keyed by
-(symbol, window_open), and deriving one from the other means parsing a ticker,
-which is the guess-a-pattern failure `CLAUDE.md` forbids for market resolution.
-`venue_settlements` in the research store already carries symbol and
-window_open, resolved by the venue itself. So this runs hourly in
-`run_live.store_sync_loop`, immediately after `collect_settlements` writes the
-rows it reads — out of the trading path entirely.
-
-Idempotent: it updates only rows whose outcome actually differs, so a re-run
-corrects nothing and the printed count IS the disagreement.
+Idempotent: it updates only rows whose outcome differs, so the printed count
+is the disagreement.
 """
 
 from __future__ import annotations
@@ -49,7 +29,7 @@ logger = logging.getLogger('correct-outcomes')
 
 def venue_labels(store: ResearchStore, *, venue: str = 'kalshi',
                  since: pd.Timestamp | None = None):
-    """`(symbol, window_open, settled_up)` from the venue's own settlements."""
+    """Return `(symbol, window_open, settled_up)` from the venue's own settlements."""
     frame = store.read('venue_settlements')
     if frame is None or not len(frame):
         return []
@@ -59,8 +39,8 @@ def venue_labels(store: ResearchStore, *, venue: str = 'kalshi',
     frame['window_open'] = pd.to_datetime(frame['window_open'], utc=True)
     if since is not None:
         frame = frame[frame['window_open'] >= since]
-    # One row per window. The store keeps revisions; the newest available_time
-    # is the venue's latest word, which is the one to believe.
+    # One row per window: the store keeps revisions, and the newest
+    # available_time wins.
     if 'available_time' in frame.columns:
         frame = (frame.sort_values('available_time')
                       .drop_duplicates(['symbol', 'window_open'], keep='last'))
@@ -108,13 +88,9 @@ def main(argv=None) -> int:
     else:
         logger.info('%d window(s) checked, no disagreement', examined)
 
-    # **Positions too, and this half moves money.** `settle_due` prefers the
-    # venue's settlement only when it already has one; a window that matures
-    # before the venue's row arrives is graded from our Coinbase bars and never
-    # re-graded. Measured 2026-10-03: 130 winners on our books against the
-    # venue's 123 over 216 trades, worth $21.06 — and `account.realized_pnl` is
-    # what the daily-loss and drawdown breakers read, so the brakes were keyed
-    # to a P&L flattered by our own label.
+    # Positions too. A position that matured before the venue's row arrived
+    # was settled from our bars. `account.realized_pnl` feeds the circuit
+    # breakers, so it must use the venue's label.
     seen, fixed, delta = writer.correct_positions_from_venue(labels)
     if fixed:
         logger.warning('re-settled %d position(s) the venue graded differently: '

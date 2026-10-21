@@ -1,14 +1,8 @@
-"""The retroactive forecast test, exactly as DECISION_RULE.md Appendix A/A.1 fixes it.
+"""Run the pre-registered retroactive forecast test against the venue's quotes.
 
-Scores the promoted artifact over every backfilled window and compares it against
-the venue's own quote at the same instant. Runs nothing that is not pre-registered
-and decides nothing that was not decided before the data existed.
-
-The artifact was **force-promoted** (`forced: true, passed: false`, failing
-`sharpe_implausible`, reason "live smoke test; edge not established"). So a
-negative result confirms its own promotion record and is weak news, while a
-positive one is surprising enough that the first hypothesis is a bug in here. The
-checklist is run and printed before the headline number, not after it.
+Scores the promoted artifact over every backfilled window and compares it with
+the venue's quote at the same instant. Runs only pre-registered steps. The bug
+checklist prints before the headline number.
 """
 
 from __future__ import annotations
@@ -31,15 +25,14 @@ from core.promotion import load_live
 
 logger = logging.getLogger('retro')
 
-# The model's own demonstrated out-of-sample skill over F(x/sigma). An edge over
-# the MARKET smaller than the edge it already showed over the BASELINE is not
-# worth acting on. Fixed in Appendix A.1 before any number existed.
+# The model's out-of-sample skill over F(x/sigma). An edge over the market
+# smaller than this is not worth acting on. Fixed before any data existed.
 MATERIAL = 0.001
 CONTROL_OFFSET = 14
 
 
 def branch(result) -> str:
-    """The pre-registered four-way outcome. Appendix A.1, decided in advance."""
+    """Return the pre-registered four-way outcome."""
     if result.lo > 0:
         return 'PASS — lower bound above 0. Apply the bug checklist before believing it.'
     if result.hi < 0:
@@ -52,12 +45,10 @@ def branch(result) -> str:
 
 
 def score_artifact(model: ForecastModel, config, quotes: pd.DataFrame) -> pd.DataFrame:
-    """Run the deployed artifact over the windows the backfill covers.
+    """Score the deployed artifact over the windows the backfill covers.
 
-    The artifact carries `ScoringBundle` — seasonality, volatility models and the
-    baseline, all fitted through ~2025-12-05. The series began 2026-06-17, so
-    every window here is unseen by it. Rebuilding a `FoldFit` from the bundle is
-    what makes this the *deployed* model rather than a refit one.
+    Rebuilds a `FoldFit` from the artifact's `ScoringBundle`, so this is the
+    deployed model, not a refit.
     """
     # `ResearchStore.read` builds its own tz-aware bounds, so hand it naive ones.
     lo = (quotes['window_open'].min() - pd.Timedelta(days=3)).tz_convert(None)
@@ -78,7 +69,7 @@ def score_artifact(model: ForecastModel, config, quotes: pd.DataFrame) -> pd.Dat
 
 
 def checklist(joined: pd.DataFrame) -> bool:
-    """Appendix A: what a bug looks like versus what a result looks like."""
+    """Run the checks that separate a bug from a result. Returns whether all pass."""
     print('\nBUG CHECKLIST (Appendix A) — absolute log loss by offset')
     print(f"{'offset':>7}{'n':>9}{'market_ll':>12}{'model_ll':>11}{'base_ll':>10}"
           f"{'diff':>11}{'base rate':>11}")
@@ -102,10 +93,12 @@ def checklist(joined: pd.DataFrame) -> bool:
 
 
 def control(model, config, quotes, joined) -> None:
-    """(2) A deliberately wrong offset must lose badly, and market_ll at +14m must
-    be low but BOUNDED AWAY FROM ZERO. Near 0.00 means the candle contains the
-    settlement — the off-by-one this control is hunting, which the difference
-    alone would hide because both forecasters share the leaked outcome."""
+    """Run the leak controls.
+
+    A deliberately wrong offset must lose badly. `market_ll` at +14m must be
+    low but bounded away from zero; near 0 means the candle contains the
+    settlement.
+    """
     ctrl = quotes.loc[quotes['offset_minutes'] == CONTROL_OFFSET]
     if ctrl.empty:
         print(f'\nCONTROL: no +{CONTROL_OFFSET}m quotes were backfilled; '

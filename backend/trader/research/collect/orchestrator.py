@@ -1,19 +1,9 @@
 """Rate limiting, failure containment, and the single-writer guarantee.
 
-These three are the parts of collection that have nothing to do with either
-venue's API, and everything to do with not repeating the previous night:
-
-  * Predexon's 1 req/s is an ORG-WIDE bucket. Running probes alongside a
-    backfill made them throttle each other, and the resulting 429s were
-    recorded as "no book" — one of four reasons the coverage numbers came out
-    wrong. `SingleWriterLock` makes "one collector at a time" enforced rather
-    than remembered.
-  * A venue outage, left alone, marches through thousands of pending rows
-    converting them to `error` at full speed. Afterwards nothing distinguishes
-    "the venue was down for two hours" from "these particular windows are
-    broken". `Breaker` stops the run instead.
+Predexon's 1 req/s limit is one bucket for the whole organisation, so
+`SingleWriterLock` allows one collector at a time. `Breaker` stops a run during
+a venue outage, so pending rows are not converted to `error`.
 """
-
 from __future__ import annotations
 
 import errno
@@ -26,15 +16,9 @@ from collections import deque
 class RateLimiter:
     """A single token bucket, spacing calls to at most `per_second`.
 
-    Thread-safe, because the limit is on REQUESTS and not on connections.
-    Fetches here are transfer-bound — a window with a large book takes 1.5-5.4s
-    of which one request is issued, i.e. as little as 0.19 req/s against a
-    1 req/s budget — so several fetches can run at once and still stay inside
-    the limit, provided no two of them are handed the same slot.
-
-    The slot is reserved under the lock and the sleeping happens outside it.
-    Holding the lock while sleeping would serialise the callers and give back
-    exactly the concurrency this exists to allow.
+    Thread-safe, because the limit is on requests, not connections, and
+    fetches are transfer-bound. A slot is reserved under the lock; the sleep
+    happens outside it, so callers do not serialise.
     """
 
     def __init__(self, per_second: float = 1.0):
@@ -56,13 +40,8 @@ class RateLimiter:
 class Breaker:
     """Trips when the trailing window is mostly failures.
 
-    Only genuine request FAILURES count against it. An `empty` result is an
-    answer — the measured empty rate is ~17% on Kalshi — and counting those
-    would trip the breaker inside the first month of a healthy run, which is
-    the same empty-vs-error conflation this whole design exists to prevent.
-
-    Requires a full window before it can trip, so two unlucky requests at
-    startup cannot end a 47-hour job.
+    Only request failures count. An `empty` result is an answer, not a failure.
+    It cannot trip before the window is full.
     """
 
     def __init__(self, threshold: float = 0.25, window: int = 40):
@@ -89,9 +68,7 @@ class Breaker:
 class SingleWriterLock:
     """A pid lockfile, so two collectors cannot share one org-wide bucket.
 
-    A stale lock left by a killed process must not block a restart: the
-    overnight run has to survive a crash without a human deleting a file, so
-    the pid is checked and a dead owner's lock is taken over.
+    A dead owner's lock is taken over, so a crashed run can restart unattended.
     """
 
     def __init__(self, path: str):
@@ -107,9 +84,8 @@ class SingleWriterLock:
         if pid <= 0:
             return False
         if pid == os.getpid():
-            # Our own live lock. Not re-entrant on purpose: acquiring twice
-            # means two collection loops in one process, which shares the
-            # org-wide bucket just as badly as two processes would.
+            # Our own live lock. Not re-entrant: two loops in one process
+            # share the bucket as badly as two processes.
             return True
         try:
             os.kill(pid, 0)

@@ -1,14 +1,7 @@
-"""`_attach_book_features` filled only market_state and market_price.
+"""Tests for the live `cross_venue` and `implied_vol` feature rows.
 
-`CROSS_VENUE` and `IMPLIED_VOL` were declared in FEATURE_GROUPS, fitted into the
-promoted artifact, and never attached live — so nine of forty-nine features
-scored NaN every cycle and LightGBM substituted a learned default.
-
-Dropping the two groups instead is not an option and the measurement says so:
-refitted without them, log_loss_skill goes +0.00307 -> -0.00023 and folds
-positive 6/6 -> 3/6. They forecast nothing ALONE (the group-alone ablation put
-both at or below the clock control) and are load-bearing in combination. Alone
-is not the same question as leave-one-out.
+Both groups are in the fitted artifact, so live must attach them. A missing column
+scores NaN with a learned default direction.
 """
 from __future__ import annotations
 
@@ -32,16 +25,13 @@ def test_cross_venue_gap_is_the_difference_of_the_two_mids():
 
 
 def test_a_missing_polymarket_book_is_absent_not_agreement():
-    """A zeroed gap reads as two venues concurring, which is the opposite of
-    what no book means."""
+    """A missing Polymarket book gives NaN, not zero (which would read as agreement)."""
     row = cross_venue_row(None, _Quote())
     assert np.isnan(row['venue_prob_gap'])
     assert row['pm_available'] == 0.0
 
 
 def test_a_one_sided_polymarket_book_gives_no_mid():
-    """A lone bid says the probability is at least something, which is not a
-    probability."""
     row = cross_venue_row({'best_bid': 56.0, 'best_ask': np.nan}, _Quote())
     assert np.isnan(row['venue_prob_gap'])
 
@@ -57,9 +47,7 @@ def test_implied_vol_carries_the_log_ratio_against_realised():
 
 
 def test_staleness_is_a_feature_not_a_filter():
-    """Coverage is ~15% of the timeline with a five-hour mean gap. A sigma
-    forward-filled from three hours ago is a different claim from a fresh one,
-    and the model has to be able to tell them apart."""
+    """Staleness is carried as a feature; a stale fit is not dropped."""
     fit = {'implied_sigma_per_min': 8.0, 'r2': 0.9, 'n_strikes': 10.0,
            'at': pd.Timestamp('2026-08-28 16:30', tz='UTC')}
     row = implied_vol_row(fit, sigma_per_min=4.0,
@@ -69,8 +57,7 @@ def test_staleness_is_a_feature_not_a_filter():
 
 
 def test_a_fit_older_than_the_cap_is_refused():
-    """MAX_FIT_AGE_MINUTES is 360. Beyond that the sigma describes a different
-    session and forward-filling it is a fabrication."""
+    """A fit older than MAX_FIT_AGE_MINUTES (360) is refused."""
     fit = {'implied_sigma_per_min': 8.0, 'r2': 0.9, 'n_strikes': 10.0,
            'at': pd.Timestamp('2026-08-28 05:00', tz='UTC')}
     row = implied_vol_row(fit, sigma_per_min=4.0,
@@ -86,9 +73,10 @@ def test_no_fit_at_all_is_all_nan_rather_than_an_exception():
 
 
 def test_a_rest_fallback_peer_for_another_window_is_refused_not_raised():
-    """The REST fallback names the window `window_open`, the socket `window`.
-    The refusal's log line read `pm['window']`, so a rollover on the fallback
-    raised KeyError and failed the whole cycle."""
+    """A REST fallback peer for another window is refused without raising.
+
+    The REST fallback stores the window as `window_open`; the socket uses `window`.
+    """
     peer = {'best_bid': 56.0, 'best_ask': 58.0,
             'window_open': pd.Timestamp('2026-10-14 10:00', tz='UTC')}
     row = cross_venue_row(peer, _Quote(0.60, 0.62),

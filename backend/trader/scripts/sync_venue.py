@@ -1,24 +1,14 @@
 """Pull the venue's own ledger into the serving store, and total it up.
 
-**The venue is the account of record; this is what makes it readable.** Our books
-debit a bankroll at the price `decide()` sized at and the fee it predicted from
-the published schedule, then credit a payout decided by an OHLC mean of Coinbase
-standing in for sixty seconds of CF Benchmarks BRTI. Every one of those three is
-an estimate of a number Kalshi already holds. This reads the numbers themselves —
-`/portfolio/fills` and `/portfolio/settlements`, both tiers — writes them to
-`venue_fills` and `venue_settlements`, and prints the P&L they imply beside our
-own so the two can be compared rather than assumed equal.
+The venue is the account of record. This reads `/portfolio/fills` and
+`/portfolio/settlements` from both the live and historical tiers, writes
+`venue_fills` and `venue_settlements`, and prints the venue's P&L beside ours.
 
-The live loop already stores whatever its per-cycle reconcile returns, so on a
-loop that has been up since the first trade this script has nothing to add. It
-exists for the three cases that loop cannot cover: a store built before the ledger
-tables existed, a gap while the loop was down, and anything older than the live
-tier's cutoff — since 2026-02-19 the live endpoints refuse to look back more than
-about three months, and everything before that only exists on the historical
-routes.
+The live loop already stores what each reconcile returns. This covers a gap
+while the loop was down and anything older than the live tier's cutoff.
 
-Read-only against the venue. The client is constructed without `live=True`, so it
-cannot place an order even if something in it tried.
+Read-only against the venue. The client is built without `live=True`, so it
+cannot place an order.
 
     python -m scripts.sync_venue                  # everything both tiers hold
     python -m scripts.sync_venue --days 7         # just the last week
@@ -60,11 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _money(value: Optional[float]) -> str:
-    """Format a dollar figure, or say the venue did not provide one.
+    """Format a dollar figure, or a dash when the venue did not provide one.
 
-    A dash rather than `$0.00`, always. This whole script exists to stop our
-    arithmetic standing in for the venue's, and a missing revenue rendered as zero
-    is that same substitution wearing a currency symbol.
+    Never `$0.00` for a missing value: a missing figure is not zero.
     """
     return '—' if value is None else f'${value:,.2f}'
 
@@ -105,11 +93,8 @@ async def main() -> int:
     print(f'\n  {len(fills)} fill(s), {len(settlements)} settlement(s) read')
 
     writer = PgWriter(args.database_url or os.getenv('DATABASE_URL'))
-    # **The same ownership filter the live loop applies on every cycle.**
-    # Without it this tool -- the one an operator is told to run after any
-    # downtime -- writes every fill the account holds, undoing `persist_venue_ledger`'s
-    # filter and summing two strategies into one equity curve. One foreign row
-    # (KXMVECROSSCATEGORY) had already reached `venue_fills` this way.
+    # The ownership filter the live loop applies: only markets this system
+    # trades enter the equity curve.
     foreign_s = [s for s in settlements if not venue_ledger.is_ours(getattr(s, 'ticker', ''))]
     foreign_f = [f for f in fills if not venue_ledger.is_ours(getattr(f, 'ticker', ''))]
     if foreign_s or foreign_f:
@@ -120,9 +105,8 @@ async def main() -> int:
 
     settlement_rows = []
     for settled in settlements:
-        # Our own position for the same market, so the store keeps both figures
-        # side by side. The join runs through `order_tickets`, which is the only
-        # place a venue ticker is recorded.
+        # Our own position for the same market, joined through `order_tickets`,
+        # the only place a venue ticker is recorded.
         position = None if args.dry_run else writer.position_for_ticker(settled.ticker)
         settlement_rows.append(venue_ledger.settlement_row(settled, position=position))
     fill_rows = [venue_ledger.fill_row(f) for f in fills]
@@ -150,12 +134,11 @@ async def main() -> int:
         print(f'    unresolved        {summary.undecided} '
               '(the venue named no result)')
     if summary.incomplete:
-        # Surfaced, never absorbed. A total that quietly excludes rows is a
-        # different number from a total over everything.
+        # Report incomplete rows; a total that silently excludes rows is wrong.
         print(f'    INCOMPLETE        {summary.incomplete} settlement(s) had a '
               'field missing and are excluded from the P&L above')
 
-    # Ours beside theirs. Not expected to be identical — that is the point.
+    # Ours beside theirs. They are not expected to be identical.
     account = writer.account()
     if account is not None:
         print('\n  our own books, for comparison')
@@ -167,14 +150,8 @@ async def main() -> int:
             gap = summary.realized_pnl - float(account.realized_pnl)
             print(f'    P&L gap           {gap:+,.2f}  (venue minus ours)')
 
-            # **Say how much of the gap is just a shorter book.** The venue
-            # remembers every settlement; our store gets wiped between
-            # experiments on purpose, so it routinely covers a shorter window
-            # and the totals are then not comparable at all. Measured the first
-            # time this ran: the venue held 365 settlements over four days
-            # against a store reset the previous night, and the whole gap was
-            # coverage rather than error. Listing only proxy/fee/fill causes
-            # sends someone hunting a bug that is not there.
+            # Report how much of the gap is coverage: our store is reset between
+            # experiments and often covers a shorter window than the venue.
             ours_from = writer.first_position_time()
             if ours_from is not None and summary.first_settled is not None:
                 theirs = summary.first_settled

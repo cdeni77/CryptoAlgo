@@ -1,37 +1,7 @@
-"""Batch the per-cycle Polymarket requests instead of one per asset.
+"""Tests for batching the per-cycle Polymarket requests.
 
-Measured live: the recorder was making 6 requests a cycle — 3 separate
-`GET {GAMMA}/markets?slug=` lookups and 3 separate `GET {CLOB}/book?token_id=`
-lookups, one pair per asset. `clob.polymarket.com` then 403'd on the book
-lookup for one particular window for over ten minutes straight (18:30-18:41),
-which the existing per-request retry cannot help with — it is built for a
-few-second blip, not a ten-minute one.
-
-Two things verified directly against both live hosts before writing this:
-  * `GET {GAMMA}/markets?slug=A&slug=B` returns all matching markets in one
-    call, so the three per-asset lookups become one.
-  * `POST {CLOB}/books` with `[{"token_id": ...}, ...]` returns every
-    requested book in one call, each tagged with its own `asset_id` so the
-    response can be matched back to the request without relying on order.
-  * That the batch response is unordered was also verified directly, not
-    assumed: `_match_books` below is tested against a reply given in the
-    reverse order it was asked in.
-
-Cutting 6 requests to 2 does not fix a genuine ten-minute outage, but it cuts
-our own footprint by 3x against the specific host that has been blocking us,
-which is the one lever a client actually has over "please stop throttling me".
-
-The ten-minute failure had a second, independent cause worth fixing on its
-own: the token this recorder tried for that window was 17 digits
-(`10042263157051608`), not the market's real ~78-digit CTF token id
-(`100422631570516080548716502776163316714562570823066703621126328689672049562711`,
-confirmed live from both the host and the running container, using the exact
-same parsing code, minutes after the failures started). A market minutes old
-can have gamma serving a placeholder id before the real on-chain token
-attaches, and CLOB legitimately has nothing to serve for it. `_valid_token`
-rejects an implausibly short id before spending a request on it, so a
-still-initializing market gets skipped and re-checked next cycle instead of
-retried against a token that cannot ever work.
+Batch replies are unordered, so books match by `asset_id`; `_valid_token` rejects a
+short placeholder token.
 """
 
 from __future__ import annotations
@@ -44,7 +14,7 @@ from scripts.record_pm_ladder import _match_books, _post, _valid_token
 
 REAL_TOKEN = ('100422631570516080548716502776163316714562570823066703621126'
               '328689672049562711')
-PLACEHOLDER_TOKEN = '10042263157051608'  # observed live: 17 digits, 403s every time
+PLACEHOLDER_TOKEN = '10042263157051608'  # a short placeholder; the CLOB has no book for it
 
 
 def test_a_freshly_opened_markets_placeholder_token_is_rejected():
@@ -62,8 +32,7 @@ def test_a_missing_token_is_rejected():
 
 def test_match_books_pairs_by_asset_id_not_by_response_order():
     wanted = [('BTC-USD', 'tok-btc'), ('ETH-USD', 'tok-eth')]
-    # Deliberately the reverse of `wanted`'s order — the batch endpoint does
-    # not promise to preserve request order, and this is that verified live.
+    # The reverse of `wanted`'s order: the batch endpoint does not keep request order.
     books = [{'asset_id': 'tok-eth', 'bids': []}, {'asset_id': 'tok-btc', 'asks': []}]
     matched = _match_books(wanted, books)
     assert matched['BTC-USD']['asset_id'] == 'tok-btc'
@@ -72,7 +41,7 @@ def test_match_books_pairs_by_asset_id_not_by_response_order():
 
 def test_match_books_drops_a_token_the_batch_response_omitted():
     wanted = [('BTC-USD', 'tok-btc'), ('SOL-USD', 'tok-sol')]
-    books = [{'asset_id': 'tok-btc', 'bids': []}]  # sol's book never came back
+    books = [{'asset_id': 'tok-btc', 'bids': []}]  # SOL's book never came back
     matched = _match_books(wanted, books)
     assert 'BTC-USD' in matched
     assert 'SOL-USD' not in matched

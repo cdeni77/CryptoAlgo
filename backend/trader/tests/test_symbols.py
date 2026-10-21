@@ -1,17 +1,7 @@
-"""The scraper and the readers must agree about what a symbol is.
+"""Tests that the scraper and the readers agree on symbol, venue and timeframe.
 
-They did not, once, and it cost a whole scrape. `run_pipeline` stored whatever
-the venue called the product — `BTC-PERP` for the majors, `AVP-20DEC30-CDE` for
-group B — while the reader asked for the bare profile prefix (`BIP`, `ETP`).
-Nothing matched: zero overlap between the sixteen symbols written and the sixteen
-requested, so every lookup missed and the feature panel came back empty. It
-presents as a data problem — scrape more, the store must be empty — and it is a
-naming problem.
-
-The new system cannot have that bug, because there is no translation step: the
-Coinbase spot product id is the symbol everywhere, from the scrape command
-through the research store to the serving database. This module pins that
-absence, which is the only way an absence stays true.
+The Coinbase spot product id is the symbol everywhere, from the scrape through the
+research store to the serving database, with no translation step.
 """
 
 from __future__ import annotations
@@ -39,7 +29,7 @@ def test_the_scraper_and_the_reader_use_the_same_timeframe_and_dataset():
 
 
 def test_symbols_are_venue_product_ids_with_no_translation():
-    """A symbol that can be scraped can be read, because it is the same string."""
+    """A symbol is the venue product id, so a scraped symbol can be read."""
     for symbol in DEFAULT_CONFIG.symbols:
         assert symbol.endswith('-USD'), symbol
         assert symbol == symbol.upper()
@@ -47,12 +37,12 @@ def test_symbols_are_venue_product_ids_with_no_translation():
 
 
 def test_the_reference_symbol_is_in_the_universe():
-    """`cross_asset` residualises against it, so its absence empties the group."""
+    """The reference symbol is in the universe; `cross_asset` residualises against it."""
     assert REFERENCE_SYMBOL in DEFAULT_CONFIG.symbols
 
 
 def test_every_traded_symbol_maps_to_a_venue_series():
-    """A symbol with no Kalshi series can be forecast and not traded."""
+    """Every symbol maps to a Kalshi series, or live would abstain on it silently."""
     for symbol in DEFAULT_CONFIG.symbols:
         assert SERIES_BY_SYMBOL.get(symbol), (
             f'{symbol} has no Kalshi series, so the live path would abstain on it '
@@ -61,12 +51,12 @@ def test_every_traded_symbol_maps_to_a_venue_series():
 
 
 def test_a_narrowed_universe_keeps_the_reference():
-    """Dropping Bitcoin would silently gut the cross-asset group rather than error."""
+    """A universe without the reference symbol is detectable."""
     narrowed = Config(symbols=('ETH-USD', 'SOL-USD'))
     assert REFERENCE_SYMBOL not in narrowed.symbols, (
         'this test asserts the situation is detectable, not that it is allowed'
     )
-    # `attach_cross_asset` falls back to the mean of the peers, which is defined
-    # but weaker — the point is that it is a documented fallback, not a crash.
+    # `attach_cross_asset` falls back to the mean of the peers, a weaker but defined
+    # result, not a crash.
     from core.features import attach_cross_asset
     assert callable(attach_cross_asset)

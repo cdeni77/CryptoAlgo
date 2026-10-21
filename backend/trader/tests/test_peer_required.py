@@ -1,27 +1,7 @@
-"""Trading without the peer book trades a model missing most of its edge.
+"""Tests for `require_peer_book`, which refuses a row without the peer venue's book.
 
-Measured by refitting with the TRAINING peer deliberately lagged:
-
-    peer lag          log-loss skill        t      folds+
-    0 min (socket)   +0.00294 +/- 0.00064  +4.57    6/6
-    1 min (REST)     +0.00087 +/- 0.00086  +1.01    5/6
-    dropped entirely -0.00015              -0.15    4/6
-
-A ONE-MINUTE lag costs 70% of the skill — most of the way from
-contemporaneous to absent. So `cross_venue`'s contribution is
-CONTEMPORANEITY rather than a durable interaction, which is why it looked
-dead alone (+0.000030, below the clock control) and load-bearing under
-leave-one-out.
-
-That is not a leak: both books are genuinely readable at the decision instant
-over sockets. It is an infrastructure requirement, and it means an outage does
-not degrade one feature gracefully — it removes most of the edge while the loop
-carries on trading.
-
-`--complete-cases` already requires the peer in TRAINING, so refusing a row
-without one live is what makes the two paths agree. Measured over two hours of
-live cycles, 0 of 9 would have abstained, so the guard costs nothing while the
-socket is healthy — which is the point of a guard.
+Training requires the peer (`--complete-cases`), so live refusing it keeps the two
+consistent.
 """
 from __future__ import annotations
 
@@ -57,16 +37,14 @@ def test_a_row_with_a_peer_gap_is_unaffected():
 
 
 def test_the_guard_is_off_by_default_so_past_entries_keep_their_meaning():
-    """Every ledger entry so far was measured without it. Turning it on
-    silently would rewrite what they mean."""
+    """The guard is off by default, so past ledger entries keep their meaning."""
     assert Config().require_peer_book is False
     out = decide(_row(venue_prob_gap=float('nan')), Config(), bankroll=200.0)
     assert out.reason is not Reason.NO_PEER_BOOK
 
 
 def test_a_row_that_never_carried_the_column_is_not_refused():
-    """The column is absent for a configuration that does not use cross_venue
-    at all; absence of the feature is not absence of the book."""
+    """A row with no `venue_prob_gap` column (a config without cross_venue) is not refused."""
     config = Config(require_peer_book=True)
     row = _row()
     row.pop('venue_prob_gap')

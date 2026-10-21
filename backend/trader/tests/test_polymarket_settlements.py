@@ -1,21 +1,6 @@
-"""Polymarket's own settlement is the only independent check on the label.
+"""Tests for collecting Polymarket's own settlements, an independent check on our label.
 
-The collector read `data/pm_markets.jsonl` — a path that exists nowhere in the
-tree — and expected `market_slug`/`winning_side`/`outcomes`, a schema the real
-catalog does not have. So it logged one INFO line, returned nothing and exited
-0, and the store held **zero** Polymarket settlements against 960,519
-Polymarket depth rows. It also never appended to `reached`, the list whose
-declaration says "without this the two are indistinguishable" — so a run that
-worked and found nothing looked exactly like one that never ran.
-
-Polymarket settles on **Chainlink's BTC-USD TWAP-60s**, read `>=` against the
-opening price. Kalshi settles on CF Benchmarks' BRTI. Two independent
-aggregations converging is the strongest available evidence that
-`core/windows.py` builds the target correctly — which is why this mattered.
-
-`A` is UP, established by measurement and not by reading the letter: against
-Kalshi's own settlement on 61,511 shared windows, `A = up` agrees **94.11%**
-and `B = up` agrees 5.89%.
+Polymarket settles on Chainlink's BTC-USD TWAP-60s; outcome `A` is up.
 """
 
 from __future__ import annotations
@@ -65,7 +50,7 @@ def test_result_B_is_down(tmp_path, monkeypatch):
 
 
 def test_the_venue_is_recorded(tmp_path, monkeypatch):
-    """Without this the label join cannot tell two oracles apart."""
+    """The venue is recorded, so the label join can tell the two oracles apart."""
     rows = _run(_catalog(tmp_path, [_market()]), monkeypatch)
     assert rows[0]['venue'] == 'polymarket'
 
@@ -91,10 +76,9 @@ def test_a_missing_catalog_is_not_an_error(tmp_path, monkeypatch):
 
 
 def test_the_branch_records_that_it_answered():
-    """`reached` is how "collected nothing" is told from "never ran"."""
+    """The branch appends to `reached`, so "collected nothing" differs from "never ran"."""
     src = inspect.getsource(cs.run)
     tail = src[src.index('await polymarket('):]
-    # Up to the next branch, not a fixed slice — the justifying comment between
-    # the call and the append is longer than the window I first guessed.
+    # Search up to the next branch, not a fixed slice.
     stop = tail.index('if not rows:') if 'if not rows:' in tail else len(tail)
     assert "reached.append('polymarket')" in tail[:stop]

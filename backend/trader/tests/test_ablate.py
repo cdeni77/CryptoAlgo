@@ -1,10 +1,7 @@
-"""The ablation's own logic, since it is now the control test that matters.
+"""Tests for the group ablation in `scripts.ablate`.
 
-`control_gain_share` gates LightGBM's gain share for the `clock` group, on the
-reasoning that hour-of-day cannot forecast direction. The reasoning is right and
-the measurement does not test it — gain share says where splits were spent, not
-whether a feature forecasts. Measured on real bars the two disagreed completely:
-0.279 gain share against a group that scored -0.000008 on 2 of 6 folds alone.
+Gain share shows where splits were spent, not whether a group forecasts. The ablation
+runs each group alone, which is the real test of the `clock` control.
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ def test_every_group_is_tried_alone_plus_the_full_set_and_the_set_without_contro
         alone = [v for k, v in built.items() if k.startswith(f'{group} alone')]
         assert alone == [(group,)], f'{group} is not tried alone'
 
-    # full set + set-without-control + one per group
+    # Full set, set without the control, and one trial per group.
     assert len(built) == len(groups) + 2
 
 

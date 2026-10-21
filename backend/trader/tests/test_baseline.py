@@ -1,10 +1,6 @@
-"""The null hypothesis, and the two things it must not be allowed to fit.
+"""Tests for the barrier baseline `F(displacement / sigma_remaining)`, the null.
 
-The baseline is `F(displacement / sigma_remaining)`. It is allowed to fit a
-scale factor and a tail thickness, because both are arithmetic — a known bias
-and a known distributional shape. It is *not* allowed to fit a drift, because a
-drift is the alpha under test, and a null that absorbs the finding reports no
-skill for the wrong reason.
+It may fit a scale and a tail thickness, never a drift: drift is the alpha under test.
 """
 
 from __future__ import annotations
@@ -24,8 +20,8 @@ from core.config import Config
 def barrier_table(n=120_000, seed=11, nu=5.0, inflation=None, drift=0.0):
     """A world where the barrier arithmetic is exactly true.
 
-    Known tail thickness, a known per-offset inflation of the reported sigma, and
-    an optional drift. The fit must recover the first two and never the third.
+    Known tail thickness, a known per-offset inflation of the reported sigma, and an
+    optional drift. The fit must recover the first two and never the third.
     """
     rng = np.random.default_rng(seed)
     inflation = inflation or {3: 1.25, 6: 1.20, 9: 1.15, 12: 1.10}
@@ -48,19 +44,10 @@ def test_the_fit_recovers_a_planted_tail_thickness():
 
 
 def test_the_fitted_barrier_beats_an_uncalibrated_one():
-    """What the two parameters are *for*, rather than what values they take.
+    """The fitted barrier calibrates better than a naive Gaussian at unit scale.
 
-    Recovering `1/inflation` is a stronger claim than binary outcomes identify:
-    from signs alone only the composite `z -> P(up)` is determined, and a thicker
-    tail with a larger scale mimics a thinner tail with a smaller one. Measured on
-    this construction, the fit put the whole correction in `nu` (2.93) and left
-    `scale` at 1.001 — which is a correct calibration and a wrong reading of the
-    parameters.
-
-    So the comparison is against a genuinely uncalibrated barrier: a Gaussian at
-    unit scale, which is what a naive implementation writes. `unscaled_log_loss`
-    is *not* that comparison — it is measured at the fitted tail, so it can agree
-    with the fitted loss to eight decimals while both are right.
+    Binary outcomes identify only the composite `z -> P(up)`, not scale and tail
+    separately, so the test compares calibration instead of parameter values.
     """
     table = barrier_table(inflation={3: 1.40, 6: 1.30, 9: 1.25, 12: 1.20},
                           n=200_000)
@@ -76,12 +63,7 @@ def test_the_fitted_barrier_beats_an_uncalibrated_one():
 
 
 def test_a_more_inflated_sigma_yields_a_smaller_scale():
-    """The direction of the correction, on a construction with no confound.
-
-    Uniform inflation across offsets, so there is nothing to trade off against
-    the per-offset structure — only the overall level, which is what makes the
-    comparison clean.
-    """
+    """More sigma inflation yields a smaller fitted scale (uniform inflation, so no confound)."""
     mild = BarrierBaseline.fit(
         barrier_table(inflation={o: 1.05 for o in (3, 6, 9, 12)}, n=120_000),
         Config(baseline_fit_scale_per_offset=False))
@@ -106,12 +88,7 @@ def test_fat_tails_calibrate_better_than_a_gaussian_when_the_tails_are_fat():
 
 
 def test_the_baseline_has_no_drift_to_fit():
-    """A planted drift must show up as *skill available to a model*, not be absorbed.
-
-    With a strong upward drift the baseline stays symmetric, so its mean
-    prediction sits near the no-drift value while the realised base rate does
-    not. That gap is the alpha, and it has to remain visible.
-    """
+    """A planted drift stays visible as a gap between mean prediction and base rate."""
     drifted = barrier_table(drift=1.2, n=120_000)
     fitted = BarrierBaseline.fit(drifted, Config())
     predicted = fitted.probability_for(drifted)
@@ -158,13 +135,10 @@ def test_the_scale_is_fitted_per_offset_only_when_asked():
 
 
 def test_a_student_t_is_standardised_to_unit_variance():
-    """Forgetting `nu/(nu-2)` is a silent, plausible-looking bug.
+    """The Student-t is standardised to unit variance (divided by `sqrt(nu/(nu-2))`).
 
-    A raw Student-t has variance `nu/(nu-2)`, so using it directly divides by a
-    scale larger than one and pushes every probability toward a half — which
-    reads as a conservative baseline rather than as an error. Pinned by
-    comparison against the raw CDF: at one sigma of displacement the standardised
-    value must exceed the unstandardised one, and the gap is large at small nu.
+    Without it every probability moves toward one half, which looks conservative instead
+    of wrong.
     """
     for nu in (3.0, 5.0, 10.0):
         fitted = BarrierBaseline(distribution='student_t', nu=nu, scale={9: 1.0})
@@ -172,7 +146,7 @@ def test_a_student_t_is_standardised_to_unit_variance():
             fitted.probability(np.array([1.0]), np.array([1.0]), np.array([9]))[0])
         raw = float(stats.t.cdf(1.0, df=nu))
         assert standardised > raw + 0.01, (nu, standardised, raw)
-        # And it stays a probability that beats a coin flip in the right direction.
+        # The value also stays a probability above one half, in the right direction.
         assert 0.80 < standardised < 0.95, (nu, standardised)
 
     # In the limit it is the Gaussian.
@@ -193,11 +167,7 @@ def test_attach_baseline_adds_the_logit_the_model_consumes():
 
 
 def test_reliability_bins_are_fixed_not_quantile():
-    """Two runs' calibration tables have to be comparable.
-
-    Quantile edges move when the prediction distribution shifts, and then a
-    worsening calibration and a shifting distribution look the same.
-    """
+    """Reliability bins use fixed edges, so two runs' calibration tables are comparable."""
     y = np.array([0, 1] * 500)
     p = np.linspace(0.01, 0.99, 1000)
     first = reliability(y, p)

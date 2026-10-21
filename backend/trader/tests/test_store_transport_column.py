@@ -1,12 +1,7 @@
-"""Adding a column must not orphan the archive, and two transports are two observations.
+"""Tests for the `transport` column on `venue_ladder`.
 
-Both halves were verified as real failures before this test existed. DuckDB's
-`read_parquet` raises `schema mismatch in glob` across a glob whose files carry
-different columns, so adding `transport` would have made the 3.2MB of
-`venue_ladder` already on disk unreadable. And `read` keeps one row per event
-key, so without `transport` in that key the WS row and the REST row for one
-minute collapse to one — the same silent failure `EVENT_KEY_EXTRA` records for
-`venue_depth`, where 58 overlapping pairs read as zero rows.
+Older files without the column must still read, and the column keeps both transports'
+rows.
 """
 from __future__ import annotations
 
@@ -46,7 +41,6 @@ def test_two_transports_for_one_minute_both_survive_a_read(tmp_path):
 
 
 def test_a_revision_within_one_transport_still_collapses(tmp_path):
-    """The extra key must not disable revision collapsing, only widen it."""
     store = ResearchStore(tmp_path)
     store.write('venue_ladder', pd.DataFrame([
         _row(transport='ws', book_age_ms=1.0, yes_total=1.0),
@@ -58,7 +52,7 @@ def test_a_revision_within_one_transport_still_collapses(tmp_path):
 
 
 def test_a_partition_written_before_the_column_existed_still_reads(tmp_path):
-    """The 3.2MB already on disk has no `transport` column."""
+    """A partition without the `transport` column still reads."""
     store = ResearchStore(tmp_path)
     prepared = store._prepare('venue_ladder', pd.DataFrame([_row()]))  # noqa: SLF001
     legacy = prepared.drop(columns=['transport', 'book_age_ms'])

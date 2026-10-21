@@ -1,37 +1,10 @@
-"""Polymarket short-dated crypto: enumerate the markets, then price them.
+"""Polymarket 15-minute crypto up/down: enumerate the markets, then fetch their books.
 
-**Why this is the most valuable dataset available.** Polymarket runs the same
-instrument — 15-minute BTC/ETH/SOL up/down — with different participants and a
-different settlement source (Chainlink's TWAP-60s data stream rather than CF
-Benchmarks BRTI — confirmed from a live market's own `resolutionSource`, not
-assumed). If the offset structure replicates there, the mechanism is about
-crypto. If it does not, the Kalshi result is about Kalshi.
-
-It also reaches back further than Kalshi does. Measured rather than assumed
-(see COVERAGE_START): the TWAP instrument runs from **2025-10-10** for BTC and
-ETH and **2025-10-28** for SOL, so ~320 days, against Kalshi order books from
-2026-06-19 and Kalshi settlements from 2026-01-06. Two separate numbers used to
-be conflated as "Kalshi's 70 days" — 70 days is the ORDER BOOK; the venue's own
-settlement record goes back more than three times further.
-
-Two stages, because discovery and pricing have different shapes:
-
-    stage 1   page `/v2/polymarket/markets` with tags=crypto, sort=created_asc,
-              following `pagination_key`, keeping every `*-updown-15m-*` slug
-    stage 2   for each market found, pull its price history
-
-Notes established by probing, so they are not rediscovered:
-  * every endpoint used here reports `zero_credit_endpoint` — free, and the only
-    limit is 1 req/s, enforced on an ORG-wide bucket (so nothing else may run
-    against the API at the same time)
-  * offset pagination was removed; `pagination_key` is the only way through
-  * `search` is the ONE endpoint that costs quota, so it is not used
-  * slug pattern is `{asset}-updown-15m-{unix_ts}`, and the timestamp is the
-    window, which is what makes the offsets computable without extra calls
-
-Resumable: both stages skip what is already on disk.
+Stage 1 pages `/v2/polymarket/markets` (tags=15M) by `pagination_key`; stage 2
+fetches each settled market's order book into the same thirteen fields as
+Kalshi. Predexon allows 1 req/s on an org-wide bucket. Both stages resume.
+Run: `python research/collect/_collect_pm.py` (PM_STAGE=discover|price|both).
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -48,35 +21,14 @@ MARKETS_OUT = 'data/pm_markets.jsonl'
 PRICES_OUT = 'data/pm_prices.jsonl'
 MAX_PAGES = int(os.getenv('PM_PAGES', '1200'))
 MAX_PRICED = int(os.getenv('PM_PRICED', '16000'))
-# Where the discovery walk stops going backwards.
-#
-# This said 2026-03-02 and described it as where "Polymarket tick coverage
-# begins". That was never measured and it is wrong by nearly five months.
-# Measured by binary search against `?market_slug=` (an exact-match existence
-# check, so a day costs two requests rather than a page walk):
-#
-#     btc  TWAP era from 2025-10-10   clean edge, continues after
-#     eth  TWAP era from 2025-10-10   clean edge, continues after
-#     sol  TWAP era from 2025-10-28   clean edge, 18 days after btc/eth
-#     any  endpoint era from 2025-09-12, the earlier and different instrument
-#
-# So the usable history is ~320 days rather than the ~178 this constant
-# implied, and the walk was stopping ~4.5 months early. September is used here
-# rather than the 2025-10-10 TWAP edge so the endpoint era is enumerated too:
-# it is the same pages either way, `era` labels every row, and having the rows
-# is what lets the boundary be measured instead of assumed a second time.
+# Where the discovery walk stops going backwards. Set before the first
+# endpoint-era market, so both eras are enumerated and labelled by `era`.
 COVERAGE_START = int(dt.datetime(2025, 9, 1, tzinfo=dt.timezone.utc).timestamp())
-# Empty means every asset. Verified live: one unfiltered page of
-# `/v2/polymarket/markets?tags=15M` already mixes BTC, ETH, SOL, BNB, DOGE,
-# ZEC, XRP and HYPE — filtering to one asset does not shrink the page count,
-# it just re-walks the identical ~4,000-page stream once per asset, keeping a
-# different eighth of it each time. Set PM_ASSET to narrow it deliberately.
+# Empty means every asset. Each page mixes all assets, so filtering by asset
+# does not reduce the page count.
 ASSET_PREFIX = os.getenv('PM_ASSET', '')
-# Where an interrupted walk's pagination_key is parked so a resume can pick
-# up mid-stream instead of re-fetching every already-known page from page 1.
-# Measured cost of not having this: a resume after a bare Predexon 500 took
-# over two hours to re-walk 844 pages it already had, before it could make
-# any forward progress at all.
+# Where an interrupted walk saves its `pagination_key`, so a resume continues
+# mid-stream.
 CURSOR_FILE = 'data/pm_markets_cursor.json'
 
 
@@ -103,13 +55,7 @@ def _clear_cursor() -> None:
 async def get(session, path, params, *, tries=4):
     """One request, retried on transient failure.
 
-    429 (rate limit) and 5xx (the venue's own problem, not ours) both get a
-    retry with backoff. A 500 truncated overnight discovery at page 909 of a
-    walk that needed ~4,000 to reach the coverage boundary — `discover()`
-    treated it as fatal and stopped 84 days short, silently, because this
-    function returned it as an ordinary error on the first try. A genuine
-    4xx (400, 404, ...) still fails immediately: retrying a malformed
-    request produces the same malformed request.
+    Retries 429 and 5xx with backoff. Any other 4xx fails at once.
     """
     last_err = None
     for attempt in range(tries):
@@ -133,41 +79,24 @@ async def get(session, path, params, *, tries=4):
     return None, last_err or '429'
 
 
-# Polymarket has run 15-minute crypto up/down under two different settlement
-# rules, and the slug is the only thing that tells them apart. Both read live
-# from the venue's own `description` and `resolutionSource`:
+# Polymarket has run two settlement rules, told apart only by the slug:
 #
-#   ENDPOINT_ERA  `{asset}-up-or-down-15m-{ts}`, from 2025-09-12
-#       settles on the Chainlink spot stream (data.chain.link/streams/eth-usd)
-#       read AT THE END of the range, against the price at its start.
-#       The earliest one measured $23.66 volume against $0.00 liquidity.
+#   ENDPOINT_ERA  `{asset}-up-or-down-15m-{ts}`: the Chainlink spot stream
+#       read at the end of the range, against the price at its start.
+#   TWAP_ERA      `{asset}-updown-15m-{ts}`: the Chainlink TWAP-60s stream
+#       over the range, against the price at its start.
 #
-#   TWAP_ERA      `{asset}-updown-15m-{ts}`, the current instrument
-#       settles on the Chainlink TWAP-60s stream
-#       (data.chain.link/streams/btc-usd-twap-60s-streams): the TWAP OF THE
-#       RANGE against the price at its start. A live market measured $21,873
-#       of liquidity.
-#
-# These are not two spellings of one instrument. An endpoint reading and a
-# 60-second time-average are different random variables — this repository's own
-# invariant is that a time-average over an interval carries a THIRD of its
-# endpoint's variance — so pooling the eras would silently train on two
-# instruments at once. Only TWAP_ERA matches what `core/windows.py` builds.
-#
-# `is_short` used to test `'updown-15m' in slug`, which excludes the old era by
-# accident: 'updown-15m' is not a substring of 'up-or-down-15m'. Right outcome,
-# wrong reason — and it also meant nothing could measure where the boundary
-# falls, because the rows were never written. Discovery now keeps both and
-# labels each one, so choosing an era is a deliberate downstream filter rather
-# than a substring that happens not to match.
+# These are different instruments. Only TWAP_ERA matches `core/windows.py`.
+# Discovery keeps and labels both; consumers filter on `era`.
 TWAP_ERA = 'twap'
 ENDPOINT_ERA = 'endpoint'
 
 
 def era_of(slug):
-    """Which settlement era a slug belongs to, or None if it is not a 15m
-    up/down market at all. Dash-delimited so neither pattern can match inside
-    the other."""
+    """The settlement era of a slug, or None for a non-15m-up/down market.
+
+    Dash-delimited, so neither pattern matches inside the other.
+    """
     text = slug or ''
     if '-updown-15m-' in text:
         return TWAP_ERA
@@ -180,27 +109,16 @@ def is_short(slug: str, asset_prefix: str) -> bool:
     return era_of(slug) is not None and (slug or '').startswith(asset_prefix)
 
 
-# The first window whose ORDER BOOK can actually be retrieved, which is a
-# different and much later boundary than when the markets themselves exist.
-# Measured by binary search, counting snapshots rather than trusting the
-# market record: btc markets from 2025-10-10 carry real money ($42,033 traded
-# on that first day) and return ZERO orderbook snapshots; 2025-12-30 returns
-# none and 2025-12-31 returns a book.
-#
-# Discovery is deliberately allowed to run back past this — metadata is ~15
-# pages a day and the settlement record is worth having on its own. Pricing is
-# not: it costs one request per market and a pre-coverage market returns
-# nothing, so pricing everything discovered would spend thousands of requests,
-# hours of a 1 req/s bucket, rediscovering a boundary already measured here.
+# The first window whose order book Predexon returns. Earlier markets exist
+# but return no snapshots. Discovery runs past this for settlements; pricing
+# does not, because each earlier market wastes a request.
 BOOK_START = int(dt.datetime(2025, 12, 31, tzinfo=dt.timezone.utc).timestamp())
 
 
 def worth_pricing(market) -> bool:
     """Whether a discovered market can plausibly return a book.
 
-    Cheap local checks only — the point is to not spend a request. The old
-    `up-or-down` era is excluded outright: a different instrument, and one with
-    no retrievable book either.
+    Local checks only, to save a request. Excludes the endpoint era.
     """
     slug = (market or {}).get('market_slug') or ''
     if era_of(slug) != TWAP_ERA:
@@ -230,18 +148,15 @@ async def discover(session) -> int:
     kept = 0
     with open(MARKETS_OUT, 'a') as handle:
         while pages < MAX_PAGES:
-            # `tags=15M` returns 50/50 fifteen-minute markets, ~90 minutes of
-            # them per page across ~8 assets. `sort=created` is newest-first,
-            # which is what we want: walk backwards until the tick coverage
-            # boundary. Comma-ANDing tags returns zero, so this is the filter.
+            # `sort=created` is newest first, so the walk goes backwards.
+            # Comma-joined tags return zero rows.
             params = {'limit': 50, 'tags': '15M', 'sort': 'created'}
             if cursor:
                 params['pagination_key'] = cursor
             payload, err = await get(session, '/v2/polymarket/markets', params)
             if err:
-                # `cursor`/`pages` here are still the ones that produced this
-                # request, not the next one — a resume retries this exact
-                # page rather than restarting the whole walk from page 1.
+                # Save the cursor that produced this request, so a resume
+                # retries this page.
                 print(f'  discovery stopped: {err}', flush=True)
                 _save_cursor(cursor, pages)
                 break
@@ -249,8 +164,7 @@ async def discover(session) -> int:
             if not markets:
                 _clear_cursor()
                 break
-            # Stop once the page has walked back past Polymarket tick coverage
-            # (2026-03-02). Anything older has no price history to fetch.
+            # Stop once the page is older than COVERAGE_START.
             stamps = [int(s.split('-')[-1]) for s in
                       (m.get('market_slug') or '' for m in markets)
                       if s.split('-')[-1].isdigit()]
@@ -288,8 +202,7 @@ async def discover(session) -> int:
             if pages % 25 == 0:
                 print(f'  page {pages}, {kept:,} short-dated found', flush=True)
         else:
-            # MAX_PAGES ran out without an error or the boundary — this is
-            # progress, not a finish, so save where to pick back up.
+            # MAX_PAGES ran out before the boundary: save the cursor.
             _save_cursor(cursor, pages)
     print(f'stage 1 done: {pages} pages, {kept:,} new, {len(seen):,} total',
           flush=True)
@@ -305,13 +218,8 @@ OFFSETS = (3, 6, 9, 12)
 def pack(book: dict) -> list:
     """One Polymarket snapshot in the SAME thirteen fields as the Kalshi book.
 
-    Deliberately identical to `_collect_book.pack` (in this same directory) so the two venues are directly
-    comparable — the whole point of collecting Polymarket is to ask whether the
-    offset structure replicates, and that question dies if the two datasets are
-    shaped differently.
-
-    Prices arrive as dollar floats here and as integer cents on Kalshi, so they
-    are converted to cents to match.
+    Matches `_collect_book.pack`, so the venues are comparable. Polymarket
+    prices are dollars; they are converted to integer cents.
     """
     bids = book.get('bids') or []
     asks = book.get('asks') or []
@@ -344,26 +252,17 @@ def pack(book: dict) -> list:
 
 
 async def price(session) -> int:
-    """The order book across each window, not candlesticks.
+    """The order book across each window.
 
-    Candlesticks come back at FIVE-minute granularity — eight rows for a
-    fifteen-minute market — which cannot resolve offsets at 3, 6, 9 and 12.
-    `interval` takes an integer and did not change it. The order book gives ~35
-    snapshots across the window, which is ample for a mid at each offset, and it
-    carries depth and imbalance as well.
-
-    The slug's trailing unix timestamp is the window OPEN, so offset `m` is
-    simply `slug_ts + m` and the market closes at `slug_ts + 15m`.
+    Not candlesticks: they are five-minute bars and cannot resolve the offsets.
+    The slug's trailing unix stamp is the window open.
     """
     if not os.path.exists(MARKETS_OUT):
         print('stage 2: nothing discovered'); return 0
     markets = [json.loads(l) for l in open(MARKETS_OUT)]
     settled = [m for m in markets
                if m.get('outcomes') and m.get('winning_side') in ('A', 'B')]
-    # Skip what cannot return a book before spending a request on it — see
-    # `worth_pricing`. Reported rather than silent: a large skip count is the
-    # signal that discovery has run well past book coverage, which is fine,
-    # but it should be visible rather than inferred from a low hit rate.
+    # Skip markets that cannot return a book (see `worth_pricing`), and say so.
     markets = [m for m in settled if worth_pricing(m)]
     if len(settled) != len(markets):
         print(f'  skipping {len(settled) - len(markets):,} markets with no '
@@ -384,10 +283,7 @@ async def price(session) -> int:
     written = errors = empty = 0
     with open(PRICES_OUT, 'a') as handle:
         for m in todo:
-            # The slug's trailing stamp is the window OPEN — verified against
-            # the venue's `end_time` (stamp + 15 minutes) and its title. Read as
-            # a close, every window shifts by fifteen minutes: the books are
-            # real and the offsets are wrong, which nothing raises on.
+            # The slug's trailing stamp is the window open, not the close.
             open_ts = int(m['market_slug'].split('-')[-1])
             close = open_ts + 15 * 60
             token = (m['outcomes'][0] or {}).get('token_id')

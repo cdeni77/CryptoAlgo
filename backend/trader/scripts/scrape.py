@@ -1,34 +1,16 @@
 """Scrape one-minute Coinbase spot bars for the three traded underlyings.
 
-**One-minute bars are the whole dataset.** A 15-minute window has fifteen of
-them, four decision offsets read the closes inside it, and the strike and
-settle prices are the opens on its boundaries. Nothing coarser can express the
-problem, and nothing finer is needed: the venue settles on a price at a clock
-time, and a minute is the resolution at which that price is unambiguous.
+One-minute bars are the whole dataset: both ends of every target are
+one-minute means.
 
-**Coinbase spot, not the perp.** This system trades a Kalshi binary on the
-*price of Bitcoin*, so the reference is the deepest, cleanest series available
-for that price. Spot bars are also materially cleaner than the CDE nano perps
-this repo used to trade — a median close-to-open gap of 1.1bp against 14.2bp,
-and no flat-OHLC bars at all — and the nano perp's own index is built from this
-book anyway.
-
-**The size of the ask, stated plainly.** Five years is 2.63 million minutes per
-symbol. At 300 bars a request that is about 8,800 requests per symbol, 26,000
-in total, and a few hours of wall clock. It is resumable: the pipeline fetches
-only what is missing at either end, so an interrupted run continues rather than
-restarting. Run it once, in the background, and check the coverage report
-afterwards.
+**The size of the ask.** Five years is about 2.63 million minutes, or 8,800
+requests, per symbol. The run is resumable: it fetches only what is missing at
+either end. On a populated store, `--backfill-days` also fetches deeper
+history.
 
     python -m scripts.scrape --backfill-days 1825
     python -m scripts.sync_store
     python -m scripts.baseline
-
-**`--backfill-days` on a populated store now actually fetches deeper history.**
-It did not until 2026-08-22: the backfill set its start to the newest stored bar
-whenever anything was stored, discarded the requested start, and logged "already
-up to date". Asking a populated 400-day store for 1,825 days fetched the missing
-hour. `tests/test_backfill_windows.py` pins both directions.
 """
 
 from __future__ import annotations
@@ -48,10 +30,8 @@ from data_collection.timeutil import ensure_naive_utc, utc_now
 
 logger = logging.getLogger('scrape')
 
-# The research store keys on venue, and this label must not collide with
-# anything else. It is a different series from the CDE perps the old `coinbase`
-# label holds, and storing them together made a cross-venue basis a comparison
-# between an instrument and itself.
+# The research store keys on venue. This label must not collide with the
+# `coinbase` label, which holds a different series.
 VENUE_LABEL = 'coinbase_spot'
 TIMEFRAME = '1m'
 
@@ -73,14 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
                              'hours, not a day rounded up.')
     parser.add_argument('--start', type=str, default=None, help='YYYY-MM-DD')
     parser.add_argument('--end', type=str, default=None, help='YYYY-MM-DD')
-    # **Anchored to the trader root, not the cwd.** `./data/trading.db` resolves
-    # against wherever the shell happens to be: from the repo root -- where
-    # docker-compose.yml and .env live, the natural place to stand -- it names a
-    # database that does not exist, and `sqlite3.connect` CREATES it, so a scrape
-    # backfills five years from scratch into a second hidden copy while the real
-    # one goes unread. This is the same hidden-second-copy failure
-    # `core/datastore.py` documents for the research store, which was fixed
-    # there and not here.
+    # Anchored to the trader root, not the cwd: `sqlite3.connect` creates a
+    # missing file, so a relative path would silently start a second database.
     parser.add_argument('--db-path', type=str,
                         default=str(Path(__file__).resolve().parents[1]
                                     / 'data' / 'trading.db'))
@@ -107,28 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def find_gaps(db_path: str, symbol: str, timeframe: str, venue: str,
               *, min_minutes: int) -> list[tuple[datetime, datetime]]:
-    """Runs of consecutive missing minutes in the stored history.
+    """Return runs of consecutive missing minutes in the stored history.
 
-    Read straight from SQLite rather than the research store, because this runs
-    before the sync and the scraper's table is the one with the hole in it.
-
-    `min_minutes=1` — the default — includes isolated single minutes, and that
-    is a correction. This used to default to 2 on the stated grounds that "a
-    single missing minute is usually a minute in which nothing traded, which no
-    amount of re-requesting will produce". That premise was false, and it made
-    this tool skip exactly the holes the scraper was creating:
-
-    * 8,721 of BTC's 10,124 missing minutes were isolated singles;
-    * 98.9% of the gaps between them were *exactly* 301 minutes apart;
-    * the rate was 0.003318 against 1/301 = 0.003322;
-    * and 5,121 of them fell on the identical minute in ETH, against 28.9
-      expected by chance — two independent order books do not go untraded in the
-      same 8,700 minutes.
-
-    They were a `limit=300` request over an inclusive 301-minute span
-    (`CoinbaseRESTClient.get_candles_range`, now fixed). Genuinely untraded
-    minutes do exist and re-requesting them is cheap and idempotent, so the
-    default errs toward asking.
+    Reads SQLite, not the research store, because this runs before the sync.
+    The default `min_minutes=1` includes single minutes: most are fetch
+    losses, not untraded minutes, and re-requesting is cheap and idempotent.
     """
     import sqlite3
 
@@ -169,13 +126,7 @@ def _as_datetime(value) -> datetime:
 
 def coalesce(gaps: list[tuple[datetime, datetime]], *, span_minutes: int
              ) -> list[tuple[datetime, datetime]]:
-    """Merge nearby gaps into spans one request can cover.
-
-    The pagination bug left holes exactly 301 minutes apart, which is one more
-    than a request can span, so those coalesce into nothing — but a store with
-    clustered outages (SOL has 211 multi-minute runs) collapses a long way, and
-    the venue is billed per request either way.
-    """
+    """Merge nearby gaps into spans one request can cover."""
     if not gaps:
         return []
     merged = [gaps[0]]
@@ -192,19 +143,9 @@ async def fill_gaps(pipeline: DataPipeline, symbols: list[str], db_path: str,
                     venue: str, *, min_minutes: int) -> int:
     """Re-request every gap, forcing the fetch, and report what came back.
 
-    Two things used to make this a no-op at scale.
-
-    It called `pipeline.backfill()` without `force`, and `backfill` resumes from
-    the store's own boundaries — so for an *interior* hole the prepend branch was
-    skipped and `append_start` jumped past the requested `end`. Nothing was
-    fetched, and it logged "store already covers ... which spans the request".
-    That is why ~10,000 recoverable minutes per symbol survived every run of the
-    tool built to recover them.
-
-    And it took a `COUNT(*)` over the whole table before and after each gap.
-    Measured on the real store: 141ms a call, 2 calls x 8,721 gaps = **41 minutes
-    of pure counting per symbol**. Counting once per symbol is the same
-    information.
+    `force` is required: without it `backfill` resumes from the store's own
+    boundaries and skips interior holes. Rows are counted once per symbol,
+    not per gap, because a full count is slow.
     """
     from data_collection.coinbase_connector import MAX_CANDLES_PER_REQUEST
 
@@ -215,8 +156,8 @@ async def fill_gaps(pipeline: DataPipeline, symbols: list[str], db_path: str,
             logger.info('%s: no gaps of %d+ minutes', symbol, min_minutes)
             continue
         total = sum(int((b - a).total_seconds() // 60) for a, b in gaps)
-        # A minute either side, so a boundary bar is not missed by an off-by-one
-        # in the range the venue treats as inclusive.
+        # Pad a minute either side, so an inclusive-range off-by-one cannot
+        # miss a boundary bar.
         padded = [(a - timedelta(minutes=1), b + timedelta(minutes=1))
                   for a, b in gaps]
         requests = coalesce(padded, span_minutes=MAX_CANDLES_PER_REQUEST - 1)

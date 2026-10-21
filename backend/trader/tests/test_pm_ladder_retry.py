@@ -1,17 +1,7 @@
-"""A transient 403 must not cost a whole minute of every asset's book.
+"""Tests that the Polymarket ladder recorder retries a transient 403.
 
-Observed live twice: `clob.polymarket.com` returned 403 for all three assets
-in the same cycle, then recovered on its own within a minute or two — the
-signature of a Cloudflare edge-level throttle, not a real permission failure
-(the same host answers the identical request with the same headers seconds
-later). `_get` had no retry at all: one 403 and that asset's minute is gone
-for the cycle, with nothing attempted again until the next poll.
-
-The recovered data is not permanently lost — `_collect_pm.py`'s backfill pulls
-a settled market's order book by historical time range from Predexon's own
-record, so a live gap is recoverable after the fact. But a live recorder
-depending on a manual backfill run to patch its own gaps is not the design;
-this closes the gap at the source instead.
+`clob.polymarket.com` sometimes returns 403 briefly (an edge throttle) and then
+recovers. A bounded retry keeps that minute's book.
 """
 
 from __future__ import annotations
@@ -88,8 +78,7 @@ def test_a_clean_200_is_not_retried(monkeypatch):
 
 
 def test_a_genuine_404_is_not_retried_as_if_it_were_transient(monkeypatch):
-    """A real client error is not the same failure as the observed 403 burst —
-    retrying a bad request just produces the same bad request."""
+    """A 404 is not retried; repeating a bad request gives the same result."""
     monkeypatch.setattr('scripts.record_pm_ladder.asyncio.sleep', _sleepless)
     session = FakeSession([FakeResponse(404, '{"error":"not found"}')])
     with pytest.raises(RuntimeError):

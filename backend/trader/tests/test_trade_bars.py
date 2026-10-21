@@ -1,9 +1,6 @@
-"""Bars folded from the Coinbase trade stream, and when live may use them.
+"""Tests for bars built from the Coinbase trade stream, and when live may use them.
 
-The stream replaces the ~3s REST candle fetch on the decision path, so it must
-produce exactly what REST would, and must never be used for a minute it did
-not see in full: a reconnect, a sequence gap or a late print all send that
-minute back to REST.
+A minute the stream did not see in full goes back to REST.
 """
 from __future__ import annotations
 
@@ -125,7 +122,7 @@ class TestTheSocketMessages:
         assert tape.bar('BTC-USD', A)['close'] == 100.5
 
     @pytest.mark.parametrize('order,gap', [
-        # One counter across the connection: a jump in it is a lost message.
+        # One counter across the connection: a jump is a lost message.
         ([('heartbeats', 1), ('market_trades', 2), ('heartbeats', 3),
           ('market_trades', 5)], True),
         ([('heartbeats', 1), ('market_trades', 2), ('heartbeats', 3),
@@ -195,7 +192,8 @@ class TestStreamBars:
 
     def test_an_unfinished_rest_candle_after_the_anchor_is_replaced(self):
         now = minute_of(time.time()) + 1.0
-        # Fetched 6s after the newest REST candle closed: unsettled.
+        # Fetched 6s after the newest REST candle closed, so that candle may be
+        # incomplete.
         tape, rest, fetched_at, minutes = _scenario(now, fetched_ago=55.0)
         # The newest REST candle was read seconds after it closed and is short.
         rest.loc[rest.index[-1], 'volume'] -= 0.25

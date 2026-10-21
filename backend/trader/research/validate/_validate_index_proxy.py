@@ -1,27 +1,12 @@
 """Does the index proxy call Kalshi's settlement better than our Coinbase label?
 
-Our label (`core/windows.py`) is a Coinbase one-minute OHLC mean at each end of
-the window. Kalshi settles on CF Benchmarks' index, and the two disagree on
-~35% of windows within 1bp of the strike — the near-ties this system trades
-most. `index_proxy_1s` is a per-second median of constituent-exchange mids
-(`core/index_proxy.py`). This asks the only question that justifies keeping it:
-
-    on the windows Kalshi has settled, how often does each estimate agree with
-    the venue, by how far the window finished from its strike?
-
-Both labels use the venue's convention: the strike is the mean over
-`[t0 - 60s, t0)`, the settlement value the mean over `[t1 - 60s, t1)`, and
-`>=` resolves up. For the proxy the means are over its one-second rows; for
-Coinbase over the one-minute bar's `(O+H+L+C)/4`. Only windows where BOTH
-labels exist are compared, so the two columns are scored on identical rows.
-
-The table is bucketed by the Coinbase |move| (the axis of the existing label
-audit) and again by the proxy's own |move|. A proxy that helps should close the
-gap in the narrow buckets and match Coinbase everywhere else.
+Scores both labels (strike = mean over [t0-60s, t0), settle = mean over
+[t1-60s, t1), `>=` is up) on the same Kalshi-settled windows, by |move| bucket.
+Run: `python research/validate/_validate_index_proxy.py` from backend/trader.
 """
 from __future__ import annotations
 
-# See `_validate_label.py`: `core`/`scripts` are rooted at backend/trader/.
+# Put backend/trader on sys.path, so `core` imports when run as a script.
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))

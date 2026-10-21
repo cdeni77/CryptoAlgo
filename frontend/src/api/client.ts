@@ -1,17 +1,8 @@
-/**
- * One HTTP client for the whole app.
- *
- * Every api module used to declare its own `API_BASE` and its own
- * `fetchWithError`, five near-identical copies that had already drifted: three
- * threw `API error 404` with the body discarded, two included it. So a failing
- * request told you different things depending on which screen you were on.
- *
- */
+/** The one HTTP client for the whole app. */
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
-/** Milliseconds before a request is abandoned. A hung fetch never resolves,
- *  which leaves a polling screen stuck on its last value with no indication. */
+/** Milliseconds before a request is abandoned. A hung fetch never resolves. */
 const TIMEOUT_MS = 20_000;
 
 export class ApiError extends Error {
@@ -87,8 +78,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     if (error instanceof DOMException && error.name === 'AbortError') {
       throw new ApiError(0, url, `Timed out after ${TIMEOUT_MS / 1000}s`);
     }
-    // A network-level failure is usually the backend being down or an origin the
-    // API does not allow, and both look identical to fetch.
+    // A network failure is usually a stopped backend or a disallowed origin;
+    // fetch cannot tell them apart.
     throw new ApiError(
       0,
       url,
@@ -99,14 +90,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
-// Paths that target a router's root route MUST carry the trailing slash.
-// FastAPI's `redirect_slashes` answers `/signals` with a 307 whose Location is
-// absolute and built from the *proxied* path, so behind nginx's
-// `proxy_pass http://backend:8000/` (which strips `/api/`) the browser is sent
-// to `/signals/` with no prefix — where the SPA fallback returns index.html with
-// HTTP 200 and `response.json()` throws a parse error attributed to the backend.
-// It also doubled every polled request even when an absolute base made the
-// redirect resolve.
+// A path to a router's root route must carry the trailing slash. Otherwise
+// FastAPI answers with a 307 built from the proxied path, which loses nginx's
+// `/api/` prefix and lands on the SPA's index.html.
 export function get<T>(path: string): Promise<T> {
   return request<T>(path);
 }

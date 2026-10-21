@@ -40,7 +40,7 @@ def _fresh(exchange, bid, ask, at=T0):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('exchange,bid,ask,last', [
-    # Snapshot best bid 62000 is deleted by the update; a new best ask arrives.
+    # The snapshot's best bid 62000 is deleted by the update; a new best ask arrives.
     ('coinbase', 61999.5, 62000.8, 62000.8),
     ('kraken', 62000.3, 62000.5, 62000.5),
     ('bitstamp', 61999.0, 62001.0, 62001.0),
@@ -71,8 +71,9 @@ def test_kraken_asks_for_a_bbo_triggered_ticker():
 
 
 def test_coinbase_subscribes_to_ticker_and_heartbeats_only():
-    """`ticker` carries the touch on every message; `level2` would fold a whole
-    book on the trading process's event loop for the same mid."""
+    """Coinbase uses `ticker` (the touch on every message), not `level2`, to avoid
+    folding a full book.
+    """
     channels = {m['channel'] for m in subscribe_messages('coinbase', SYMBOLS)}
     assert channels == {'ticker', 'heartbeats'}
 
@@ -163,7 +164,9 @@ def test_one_fresh_exchange_is_not_a_proxy():
 
 
 def test_staleness_is_judged_on_the_connection_not_the_quote():
-    """A quiet book is unchanged, not stale, while its socket keeps talking."""
+    """Staleness is judged on the connection: a quiet book is unchanged while its socket
+    keeps talking.
+    """
     state = _fresh('kraken', 99, 101, at=T0)
     state.alive(T0 + 20)                       # heartbeats continue
     assert state.mid('BTC-USD', T0 + 21, max_staleness=5) == 100.0
@@ -252,8 +255,7 @@ def test_a_venue_error_ends_the_connection_with_its_reason():
 
 
 def test_a_coinbase_sequence_gap_keeps_the_connection():
-    """Each ticker message carries the whole touch, so a missed one loses no
-    state and is no reason to rebuild."""
+    """A Coinbase ticker gap keeps the connection, since each message carries the whole touch."""
     messages = FIXTURES['coinbase'][:2] + [dict(FIXTURES['coinbase'][2], sequence_num=9)]
 
     async def drive():

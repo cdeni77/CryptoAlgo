@@ -1,13 +1,7 @@
-"""Fold construction and account accounting — the two places arithmetic hides.
+"""Tests for fold construction in `core.cv` and position accounting in `core.book`.
 
-Cross-validation splits on the window, never on the row: four decision offsets
-share one settlement, so a row-level split puts offset 3 in train and offset 12
-in test, which is not a subtle leak but the answer itself, nine minutes closer.
-
-The book's one trap is annualisation. A strategy trading 3% of available windows
-and scored as though it traded all of them reports a Sharpe inflated by the
-reciprocal of its duty cycle. That happened in this project before — 2.28 became
-1.19 once the 27% duty cycle was accounted for.
+Folds split on the window, never the row. The Sharpe is annualised on trades placed, not
+windows available.
 """
 
 from __future__ import annotations
@@ -35,8 +29,8 @@ def window_index(days=200):
 
 def test_folds_never_overlap_and_honour_the_embargo():
     folds = purged_walk_forward(window_index(), n_folds=6, embargo_minutes=1440)
-    # Anchored blocks accumulate; the embargo property below is what this test
-    # is actually for, and it must hold on every fold however many there are.
+    # Anchored blocks accumulate. The embargo property must hold on every fold,
+    # however many there are.
     assert len(folds) >= 6
     for fold in folds:
         assert_no_leakage(fold)
@@ -44,13 +38,7 @@ def test_folds_never_overlap_and_honour_the_embargo():
 
 
 def test_the_embargo_covers_the_feature_lookback_not_just_the_label():
-    """A fifteen-minute label needs a fifteen-minute purge.
-
-    What needs a day is `log_rv_1440`: a training row immediately after a test
-    block computes it from test-period bars. Purging for the label and forgetting
-    the features is the standard version of this mistake, and it leaks in the
-    direction that inflates measured skill.
-    """
+    """The embargo covers the longest feature lookback (`log_rv_1440`), not only the label."""
     folds = purged_walk_forward(window_index(), n_folds=4, embargo_minutes=1440)
     for fold in folds:
         assert (fold.test_start - fold.train_end) > pd.Timedelta(minutes=1440)
@@ -87,11 +75,7 @@ def test_too_few_windows_is_an_error_not_a_degenerate_fold():
 
 
 def test_rows_are_selected_by_window_membership_not_a_timestamp_slice():
-    """A `>=`/`<` slice on decision_time would split a window across the boundary.
-
-    Offset 3 inside train, offset 12 inside test — the same fifteen minutes on
-    both sides, which is exactly the leak the module exists to prevent.
-    """
+    """Rows are selected by window membership, so a window is never split across train and test."""
     table = pd.DataFrame({
         'window_open': [W, W, W, W, W + pd.Timedelta(minutes=15)],
         'offset': [3, 6, 9, 12, 3],
@@ -102,10 +86,7 @@ def test_rows_are_selected_by_window_membership_not_a_timestamp_slice():
 
 
 def test_effective_observations_counts_windows_not_rows():
-    """Four offsets per window means a row count overstates the sample fourfold.
-
-    And a standard error computed from it is half what it should be.
-    """
+    """Effective observations count windows, not rows (four offsets per window)."""
     table = pd.DataFrame({
         'symbol': ['BTC-USD'] * 4 + ['ETH-USD'] * 4,
         'window_open': [W] * 4 + [W] * 4,
@@ -159,11 +140,7 @@ def test_a_position_settles_exactly_once():
 
 
 def test_settlement_is_keyed_on_symbol_and_window_together():
-    """The three symbols settle at the same instant on different outcomes.
-
-    Keying on the timestamp alone would settle all three against whichever one
-    was looked up.
-    """
+    """Settlement is keyed on (symbol, window), since symbols settle at the same instant."""
     book = Book(config=Config())
     for symbol in ('BTC-USD', 'ETH-USD'):
         book.open_positions.append(make_position(symbol=symbol))
@@ -175,10 +152,7 @@ def test_settlement_is_keyed_on_symbol_and_window_together():
 
 
 def test_equity_carries_open_positions_at_cost():
-    """Marking an open binary at our own forecast books belief as profit.
-
-    Which is how a losing system draws a rising equity curve.
-    """
+    """Open positions are carried at cost, never marked at our own forecast."""
     book = Book(config=Config(), bankroll=90.0)
     book.open_positions.append(make_position(outlay=10.0))
     assert book.equity == pytest.approx(100.0)
@@ -189,15 +163,15 @@ def test_the_bankroll_floor_halts_the_book():
     book = Book(config=config, bankroll=95.0)
     position = make_position(outlay=10.0)
     book.open_positions.append(position)
-    book.bankroll -= position.outlay        # as `record` would have
+    book.bankroll -= position.outlay  # as `record` would have
     assert book.halted_at is None, 'halted before anything settled'
-    book.settle({('BTC-USD', W): False})    # a loss: nothing comes back
+    book.settle({('BTC-USD', W): False})  # a loss: nothing comes back
     assert book.bankroll == pytest.approx(85.0)
     assert book.halted_at is not None, 'below the floor and still trading'
 
 
 def test_the_sharpe_is_annualised_on_trades_placed_not_windows_available():
-    """Scaling by windows instead would inflate it by 1/coverage."""
+    """The Sharpe does not change with the number of windows offered."""
     config = Config()
     book = Book(config=config)
     rng = np.random.default_rng(4)
@@ -223,21 +197,18 @@ def test_the_sharpe_is_annualised_on_trades_placed_not_windows_available():
 
 
 def test_realised_edge_is_measured_not_predicted():
-    """Predicted edge is what the model claimed; realised is what happened.
-
-    The gap between them is the winner's curse, and it comes before any Sharpe.
-    """
+    """Realised edge comes from outcomes, not from the edge the model claimed."""
     config = Config()
     book = Book(config=config)
     for i in range(50):
         window = W + pd.Timedelta(minutes=15 * i)
         book.open_positions.append(make_position(window=window))
         book.bankroll -= 2.66
-        book.settle({('BTC-USD', window): i % 2 == 0})   # a 50% win rate
+        book.settle({('BTC-USD', window): i % 2 == 0})  # a 50% win rate
     stats = summarise(book, windows_available=50)
     assert stats.win_rate == pytest.approx(0.5)
-    assert stats.mean_edge_pp == pytest.approx(2.0, abs=0.01)   # what was claimed
-    assert stats.realised_edge_pp < 0                            # what happened
+    assert stats.mean_edge_pp == pytest.approx(2.0, abs=0.01)  # what was claimed
+    assert stats.realised_edge_pp < 0  # what happened
 
 
 def test_an_empty_book_reports_no_trades_rather_than_a_nan_return():
@@ -255,10 +226,7 @@ def test_the_growth_multiple_is_legible_where_a_percentage_is_not():
 
 
 def test_won_is_the_one_rule_four_places_used_to_duplicate():
-    """`Position.payout`, `PgWriter.settle_position`, and both retro-economics
-    scripts each wrote `settled_up if side is up else not settled_up` fresh —
-    exactly the shape of the bug that once left the paper bankroll never
-    credited a win. This is the one place that rule lives now."""
+    """`won` is the single rule for whether a side won."""
     from core.book import won
     from core.decide import Side
 
@@ -266,7 +234,7 @@ def test_won_is_the_one_rule_four_places_used_to_duplicate():
     assert won(side=Side.UP, settled_up=False) is False
     assert won(side=Side.DOWN, settled_up=False) is True
     assert won(side=Side.DOWN, settled_up=True) is False
-    # Side is a str Enum, so a plain 'up'/'down' string must work identically —
-    # PgWriter stores side as a bare string column, not the enum.
+    # Side is a str Enum, so a plain 'up'/'down' string works the same; PgWriter
+    # stores side as a plain string.
     assert won(side='up', settled_up=True) is True
     assert won(side='down', settled_up=False) is True

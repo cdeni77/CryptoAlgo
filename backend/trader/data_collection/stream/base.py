@@ -1,21 +1,13 @@
-"""What every venue's stream reduces to, so nothing downstream knows the venue.
+"""The venue-neutral book event that every stream adapter produces.
 
-**What a size MEANS travels on the event, not in the reader.** Kalshi sends a
-signed change (`delta_fp: "-5.00"`); Polymarket sends a resulting size. An
-adapter cannot convert the first into the second, because that needs the current
-resting size and only the cache holds it. So `absolute` says which convention
-this event uses and `BookCache` branches on that rather than on `venue`.
-Branching on the venue would work today and quietly make every future venue an
-edit to the cache.
+`absolute` says what a size means. Kalshi sends a signed change; Polymarket
+sends the resulting size. Only the cache holds the current size, so the adapter
+cannot convert. `BookCache` branches on `absolute`, not on `venue`.
 
-An absolute size of 0.0 is a REMOVAL, not a price of zero. Dropping it would
-leave a level resting in the book forever after the venue said it was gone.
+An absolute size of 0.0 removes the level.
 
-**`no` is NO-denominated on BOTH venues.** Kalshi's orderbook is two bid stacks
-and serves it that way; Polymarket serves YES-denominated asks and its adapter
-converts at this boundary. Storing them as served put a 0.51 YES ask in the
-column holding a 0.51 NO bid — same name, opposite meaning, and no exception
-anywhere.
+`no` holds NO bids, NO-denominated, on both venues. The Polymarket adapter
+converts its YES-denominated asks at this boundary.
 """
 from __future__ import annotations
 
@@ -39,8 +31,7 @@ class BookEvent:
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f'kind must be one of {KINDS}, got {self.kind!r}')
-        # A snapshot IS the book. A "signed snapshot" has no meaning, and
-        # honouring the flag would fold a whole book into whatever was there.
+        # A snapshot replaces the book, so its sizes are always absolute.
         if self.kind == 'snapshot' and not self.absolute:
             object.__setattr__(self, 'absolute', True)
 

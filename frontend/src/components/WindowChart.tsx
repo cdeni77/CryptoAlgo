@@ -1,25 +1,8 @@
-/** The price path against the line it has to finish above.
+/** The price path against the strike it has to finish above.
  *
- * This is the picture a barrier problem asks for, and the one the rest of the
- * dashboard abstracts away. Everything else here reports a probability; this
- * reports the thing the probability is about.
- *
- * Three decisions make it readable rather than merely present:
- *
- * **The strike is drawn per window, not once across the chart.** It is reset
- * every fifteen minutes, so a single horizontal line spanning the whole series
- * would be a different number in every window and true in none of them. Each
- * segment spans exactly its own window.
- *
- * **The area between price and its own strike is filled in the two poles.** Teal
- * above, clay below. That is the only encoding on this chart that carries
- * direction, and it is the same one the probability scale uses, so a glance at
- * either says the same thing.
- *
- * **Window boundaries are marked.** The settlement instants are where the whole
- * question resolves, so they are structural rather than incidental — a faint
- * rule every fifteen minutes, which also gives the eye the quarter-hour grid the
- * system runs on.
+ * The strike resets every window, so it is drawn per window. The area between
+ * price and strike uses the two poles, as the probability scale does. A faint
+ * rule marks each settlement instant.
  */
 import {
   Area,
@@ -65,9 +48,8 @@ export function WindowChart({
   height = 200,
 }: {
   bars: MinuteBar[];
-  /** One per window. The window length is read off these rather than passed in:
-   *  the boundaries come from the venue's own open and close times, so a
-   *  configured length could disagree with the data being drawn. */
+  /** One per window. Window boundaries come from these open and close times,
+   *  not from a configured length. */
   strikes: WindowStrike[];
   height?: number;
 }) {
@@ -84,8 +66,7 @@ export function WindowChart({
     .sort((a, b) => a.from - b.from);
 
   const strikeAt = (t: number): number | null => {
-    // Linear scan over at most a few hundred windows, and the series is sorted,
-    // so this is cheaper than building an index and easier to be sure about.
+    // A linear scan: there are at most a few hundred windows.
     for (const w of byWindow) if (t >= w.from && t < w.to) return w.strike;
     return null;
   };
@@ -97,9 +78,8 @@ export function WindowChart({
       t,
       close: b.close,
       strike,
-      // Two series rather than one signed series: recharts fills an area toward
-      // a baseline, and splitting them is what lets each half take its own pole
-      // colour instead of one colour flipping meaning at the crossing.
+      // Two series, not one signed series, so each half takes its own pole
+      // colour. Recharts fills an area toward a baseline.
       above: strike != null && b.close >= strike ? b.close : null,
       below: strike != null && b.close < strike ? b.close : null,
     };
@@ -136,7 +116,7 @@ export function WindowChart({
           tickFormatter={(v) => Number(v).toFixed(digits)}
         />
 
-        {/* Every settlement instant. The quarter-hour grid the system runs on. */}
+        {/* Every settlement instant. */}
         {byWindow.map((w) => (
           <ReferenceLine key={w.to} x={w.to} stroke="var(--rule)" />
         ))}

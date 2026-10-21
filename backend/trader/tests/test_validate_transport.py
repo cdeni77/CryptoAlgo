@@ -1,10 +1,7 @@
-"""The transport comparison must not invent disagreement.
+"""Tests that the transport comparison does not report false disagreement.
 
-`nan == nan` is False, so comparing top-of-book directly scored every
-empty-vs-empty minute as a disagreement. It reported 33% agreement on the NO
-side of a live sample where the two transports had in fact never differed — the
-worst direction for this particular check to be wrong in, because it is the
-evidence the migration is gated on.
+`nan == nan` is False, so a minute where both transports saw an empty side must count as
+agreement, not disagreement.
 """
 from __future__ import annotations
 
@@ -62,8 +59,9 @@ def test_only_one_transport_present_yields_nothing_to_compare(tmp_path):
 
 
 def test_the_skew_between_the_two_samples_is_measured(tmp_path):
-    """The rows are not taken at the same instant, and pretending they are
-    turns the stream's extra freshness into an apparent disagreement."""
+    """The time skew between the two samples is measured, so freshness is not read as
+    disagreement.
+    """
     store = _store(tmp_path, [
         _row('rest', available_time=pd.Timestamp('2026-08-26 12:00:25.000', tz='UTC')),
         _row('ws', available_time=pd.Timestamp('2026-08-26 12:00:25.150', tz='UTC')),

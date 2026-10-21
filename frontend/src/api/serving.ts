@@ -1,10 +1,4 @@
-/** Every request the app makes, in one place.
- *
- * One module rather than one per page: there are nine read-only routes and they
- * share a client, so splitting them across six files is how five copies of
- * `fetchWithError` drifted in the previous version until a failing request said
- * something different depending on which screen you were on.
- */
+/** Every request the app makes, in one place. */
 import { get } from './client';
 import type {
   AccountState,
@@ -31,9 +25,8 @@ export const fetchAccount = () => get<AccountState>('/account');
 export const fetchEquity = (days = 30) =>
   get<{ days: number; points: EquityPoint[] }>(`/account/equity?days=${days}`);
 
-/** The account as the venue's own ledger reports it. See `VenueAccountState`:
- *  this is the account of record, `fetchAccount` is our arithmetic, and both are
- *  shown because the gap between them is worth reading. */
+/** The account as the venue's ledger reports it: the account of record.
+ *  `fetchAccount` is our own arithmetic. See `VenueAccountState`. */
 export const fetchVenueAccount = () => get<VenueAccountState>('/account/venue');
 
 export const fetchVenueEquity = (days = 30) =>

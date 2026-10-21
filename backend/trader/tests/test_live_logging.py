@@ -1,16 +1,5 @@
-"""Steady-state quiet, money always loud.
-
-The live loop emitted ~14 lines per cycle, twice a minute, around the clock.
-Counted over 2,000 lines of real output: ~1,800 were heartbeat — bar counts,
-"Coinbase REST client closed", an unchanging settlement count, a coverage report
-reading 100.0000% every time, and one `no trade (offset_not_traded)` per symbol
-for the two offsets the policy deliberately never enters. The ~20 lines that
-mattered — decisions, fills, refusals, balance drift — were buried in it.
-
-A log nobody can read is a log nobody checks, and this one is the only view of an
-account that trades unattended. These tests pin the rule rather than the levels:
-routine repetition is DEBUG, anything that moves money or departs from the
-expected steady state is INFO or louder.
+"""Tests for live log levels: routine repetition is DEBUG, anything about money is INFO
+or louder.
 """
 
 from __future__ import annotations
@@ -47,7 +36,7 @@ def decision(reason: Reason, *, traded=False, contracts=0):
 
 
 class TestCoverageReporting:
-    """A grid at full coverage says nothing new; a degraded one must shout."""
+    """A grid at full coverage logs at DEBUG; a degraded one logs louder."""
 
     def test_a_nominal_grid_is_not_logged_at_info(self):
         from core.windows import coverage_log_level
@@ -61,16 +50,15 @@ class TestCoverageReporting:
             report(minutes_present=1450)) >= logging.INFO
 
     def test_the_one_boundary_the_live_grid_always_drops_is_not_news(self):
-        """The in-progress window has no settlement yet, so exactly one boundary
-        drops on every live cycle, forever. Treating that as an anomaly is how the
-        first version of this rule kept the noisiest line at INFO."""
+        """One dropped boundary (the window in progress) is expected every cycle, so it
+        is DEBUG.
+        """
         from core.windows import coverage_log_level
 
         assert coverage_log_level(report(dropped=1)) == logging.DEBUG
 
     def test_more_dropped_boundaries_than_the_live_edge_explains_are_news(self):
-        """Two or more means windows are being lost for a reason other than the
-        clock, and each one is a window that cannot be scored at all."""
+        """Two or more dropped boundaries mean lost windows, so they log at INFO or louder."""
         from core.windows import coverage_log_level
 
         assert coverage_log_level(report(dropped=2)) >= logging.INFO
@@ -78,8 +66,9 @@ class TestCoverageReporting:
 
 
 class TestDecisionReporting:
-    """Every decision is recorded to the database regardless; this is only about
-    which ones a human reading the log needs to see."""
+    """Every decision is recorded in the database; this decides only which ones appear
+    in the log.
+    """
 
     def test_a_trade_is_always_logged_at_info(self):
         from scripts.live import decision_log_level
@@ -88,9 +77,7 @@ class TestDecisionReporting:
             decision(Reason.TRADED, traded=True, contracts=4)) == logging.INFO
 
     def test_the_designed_steady_state_is_quiet(self):
-        """`offset_not_traded` fires on every non-entry offset by design — three
-        symbols x two offsets x four windows an hour. It is the single largest
-        source of noise and carries no information."""
+        """`offset_not_traded` fires on every non-entry offset by design, so it is DEBUG."""
         from scripts.live import decision_log_level
 
         assert decision_log_level(
@@ -100,7 +87,7 @@ class TestDecisionReporting:
         Reason.PRICE_OUT_OF_BAND, Reason.EDGE_BELOW_GATE, Reason.ALREADY_ENTERED,
     ])
     def test_ordinary_refusals_are_quiet(self, reason):
-        """Expected outcomes of the gates working. Counted in the cycle summary."""
+        """Ordinary gate refusals are DEBUG; the cycle summary counts them."""
         from scripts.live import decision_log_level
 
         assert decision_log_level(decision(reason)) == logging.DEBUG
@@ -109,25 +96,17 @@ class TestDecisionReporting:
         Reason.HALTED, Reason.BANKROLL_FLOOR, Reason.DISAGREEMENT_IMPLAUSIBLE,
     ])
     def test_refusals_that_signal_a_problem_stay_loud(self, reason):
-        """A latched breaker, a breached floor, or the model disagreeing with the
-        market by an implausible margin are not routine and must not be filtered
-        out with the noise."""
+        """A halt, a breached floor, or an implausible disagreement logs at INFO or louder."""
         from scripts.live import decision_log_level
 
         assert decision_log_level(decision(reason)) >= logging.INFO
 
 
 class TestHeartbeat:
-    """Quiet is the goal; silent is a different failure.
+    """One heartbeat line per 15-minute window shows the loop is still cycling and
+    deciding.
 
-    After the noise was removed the loop emitted nothing at all in steady state,
-    which means the log cannot distinguish "running normally" from "hung". The
-    container healthcheck only proves the process is alive and can reach the
-    database — not that it is still waking on the offsets and deciding.
-
-    One line per 15-minute window is ~96 a day against the ~40,000 it replaced,
-    and it is the line an operator actually wants: is it cycling, is it deciding,
-    what is the bankroll, how late are the decisions landing.
+    Without it a quiet log cannot tell "running" from "hung".
     """
 
     def test_a_heartbeat_is_due_when_the_window_rolls(self):
@@ -143,8 +122,7 @@ class TestHeartbeat:
                              pd.Timestamp('2026-08-25 12:00', tz='UTC')) is False
 
     def test_the_first_cycle_emits_one(self):
-        """With no previous window there is nothing to compare against, and the
-        operator most wants a line right after a restart."""
+        """The first cycle after a restart emits a heartbeat."""
         from scripts.live import heartbeat_due
 
         assert heartbeat_due(pd.Timestamp('2026-08-25 12:00', tz='UTC'), None) is True

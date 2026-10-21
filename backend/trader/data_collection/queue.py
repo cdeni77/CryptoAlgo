@@ -1,8 +1,4 @@
-"""
-Message queue for real-time data flow.
-
-Supports both in-memory queue (development) and Redis (production).
-"""
+"""Message queues for real-time data: in-memory and Redis."""
 
 import asyncio
 import json
@@ -82,11 +78,7 @@ class MessageQueueBase(ABC):
 
 
 class InMemoryQueue(MessageQueueBase):
-    """
-    In-memory message queue for development and testing.
-    
-    Thread-safe using asyncio locks.
-    """
+    """In-memory message queue. Holds one asyncio lock per channel."""
     
     def __init__(self, max_size: int = 10000):
         self.max_size = max_size
@@ -210,11 +202,7 @@ class InMemoryQueue(MessageQueueBase):
 
 
 class RedisQueue(MessageQueueBase):
-    """
-    Redis-based message queue for production.
-    
-    Uses Redis Pub/Sub for real-time messaging and Lists for batch processing.
-    """
+    """Redis queue: Pub/Sub for subscribers, Lists for batch reads."""
     
     def __init__(
         self,

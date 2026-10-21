@@ -1,22 +1,7 @@
-"""The live recorder discarded the fits the model was trained on.
+"""Tests for the `--min-r2` gate in `scripts/record_implied_vol.py`.
 
-`research/collect/implied_vol_backfill.py` applies NO R-squared gate: it keeps
-any fit with at least MIN_STRIKES rungs. Measured on what it actually wrote,
-accepted fits run down to R2 = 0.0367 (BTC), 0.0134 (ETH), 0.0002 (SOL), and
-the 5th percentile is 0.85 / 0.72 / 0.56.
-
-`scripts/record_implied_vol.py` defaulted `--min-r2` to 0.90, so live kept only
-the top of that distribution. Over 67 hours it produced 2,805 BTC fits, 13 ETH
-and ZERO SOL — against training coverage of 22,258 / 5,286 / 3,110.
-
-Two reasons that is the wrong direction, not a conservative one:
-
-  * `--complete-cases` fitted the artifact on rows that all carry a fit. A
-    symbol with no fits has no complete rows, so live scores ETH and SOL out of
-    distribution — or abstains on them entirely.
-  * `iv_r2` IS ONE OF THE FIVE FEATURES. The model saw R2 from 0.0002 to 1.0
-    and learned what a weak fit is worth. Filtering upstream removes the
-    information it was given to make that judgement.
+The backfill has no gate, but live fits more strikes than the backfill had, so the gate
+stays at 0.90 until strike selection matches.
 """
 from __future__ import annotations
 
@@ -33,36 +18,19 @@ def _market(strike, price, close):
 
 
 def test_the_gate_stays_until_the_strike_selection_is_matched():
-    """This asserted 0.0 for part of one day, on the parity argument above, and
-    the parity argument is not wrong — it is incomplete.
+    """The default stays 0.90 while live and backfill select different strikes.
 
-    Removing the gate did not make live match the backfill; it revealed that the
-    two never selected the same STRIKES. Live fits the whole open ladder (17-50
-    rungs) where Predexon's tick series carried only the liquid ones (median 5),
-    so the fits the gate had been suppressing were not merely low-R2, they were
-    wrong by orders of magnitude:
-
-        symbol  training med sigma   live med sigma (gate off)   live med R2
-        BTC          5.4 bp/min            7.5                      0.989
-        ETH         10.3 bp/min           64.2                      0.827
-        SOL          7.8 bp/min        2,243.4                      0.295
-
-    287x on SOL puts `iv_minus_realised` near log(287) = 5.7 where training saw
-    about 0. So the choice is between a KNOWN mismatch that costs ETH and SOL
-    their coverage, and an UNKNOWN one that corrupts the feature the model
-    reads. Take the known, smaller error — and note the gate is what the
-    measured weekend run actually traded.
+    Without the gate, ungated ETH and SOL sigmas were far from the training values,
+    which corrupts `iv_minus_realised`. A known coverage gap is the smaller error.
     """
     assert build_parser().parse_args([]).min_r2 == 0.90
 
 
 def test_a_noisy_ladder_is_kept_and_its_r2_reported():
-    """SOL's near-term ladder fitted at R2=0.54 when this was measured — the
-    backfill would have kept it, live threw it away, and the model has iv_r2
-    precisely so it can decide what a 0.54 fit is worth."""
+    """With `min_r2=0` a noisy but well-formed ladder is kept and its R^2 reported."""
     now = dt.datetime(2026, 8, 31, 12, 0, tzinfo=dt.timezone.utc)
     close = (now + dt.timedelta(minutes=40)).isoformat()
-    # Deliberately non-monotone: a real thin book, not a clean smile.
+    # Not monotone on purpose: a real thin book, not a clean curve.
     noisy = ((95.0, 0.88), (100.0, 0.42), (105.0, 0.55), (110.0, 0.11),
              (115.0, 0.19))
     rows, latest = fits_for([_market(s, p, close) for s, p in noisy],
@@ -74,5 +42,4 @@ def test_a_noisy_ladder_is_kept_and_its_r2_reported():
 
 
 def test_a_threshold_can_still_be_asked_for_explicitly():
-    """The flag remains, for diagnostics. It is the DEFAULT that was wrong."""
     assert build_parser().parse_args(['--min-r2', '0.9']).min_r2 == 0.9

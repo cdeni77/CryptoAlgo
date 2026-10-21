@@ -13,7 +13,4 @@ public names below so existing imports keep working.
     ledger      venue reconciliation, settlement, balance and equity
     state       mutable state shared between these modules
     util        small shared helpers
-
-The history behind the rules in these modules is in
-`docs/decisions/live-trading-history.md`.
 """

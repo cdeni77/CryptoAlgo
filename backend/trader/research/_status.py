@@ -1,18 +1,11 @@
-"""Where the data pipeline actually stands. Run this first thing.
+"""Reports what the data pipeline has collected, from where, and what is running.
 
-Reports what is collected, from where, over what span, and what is still
-running — so the morning question ("is it all there?") is answered by
-measurement rather than by reading the launch script and hoping.
+Run: `python research/_status.py` from backend/trader.
 """
 
 from __future__ import annotations
 
-# This file moved into research// during a repo cleanup; `core`/`scripts`
-# are packages rooted at backend/trader/, which Python does not add to
-# sys.path automatically for a script run from a subdirectory (only the
-# script's OWN directory is added). Without this, every `from core...`
-# import below raises ModuleNotFoundError the moment the file is not sitting
-# directly in backend/trader/.
+# Put backend/trader on sys.path, so `core` imports when run as a script.
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
@@ -46,12 +39,10 @@ def lines(path: str) -> int:
 
 
 def _collection_progress() -> None:
-    """Where collection stands, from the ledger rather than from a log tail.
+    """Collection progress, from the ledger.
 
-    `empty` is a RESULT (the venue answered, no book) and is never retried;
-    `pending` is work not yet attempted. Keeping them apart is the whole point
-    of the table — conflating them is what produced four wrong coverage claims
-    before it existed.
+    `empty` is a result (the venue answered with no book) and is never retried.
+    `pending` is work not yet attempted.
     """
     path = os.path.join('data', 'collection', 'ledger.db')
     if not os.path.exists(path):
@@ -114,9 +105,6 @@ def main() -> int:
     print('\n' + '=' * 96)
     print('COLLECTION ARCHIVES (raw, outside the store)')
     print('=' * 96)
-    # book_full.jsonl / pm_prices.jsonl / pm_markets.jsonl are gone: that
-    # backfill was deleted and replaced by the ledger-driven collection, whose
-    # catalogs and gzipped archive live under data/collection/.
     for path, what in (('data/collection/kalshi_catalog.jsonl', 'Kalshi market catalog'),
                        ('data/collection/pm_catalog.jsonl', 'Polymarket market catalog'),
                        ('data/iv_ladder.jsonl', 'KXBTCD implied-vol ladder')):
@@ -137,17 +125,12 @@ def main() -> int:
         if '|' in line:
             svc, status = line.split('|', 1)
             print(f'  {svc:24s} {status}')
-    # The `_overnight.sh` / `_gap_fill*.sh` chain is gone: it existed to patch
-    # holes in a collection that could not state its own coverage, and the
-    # ledger replaces the whole category. See the collection design doc.
     for name, pattern in (('collection (ledger-driven)', 'run_collection'),
                           ('settlements', 'collect_settlements'),
                           ('depth refresher', '_depth_loop.sh'),
                           ('stream recorder', 'record_stream')):
-        # `pgrep -f X` run through a shell matches the shell's OWN command
-        # line, so every pattern reported "running". Bracketing the first
-        # character makes the pattern not match itself, which is the same trick
-        # `ps | grep [x]` uses.
+        # Bracket the first character, so that `pgrep -f` does not match the
+        # shell's own command line.
         alive = bool(sh(f'pgrep -f "[{pattern[0]}]{pattern[1:]}"'))
         print(f'  {name:28s} {"running" if alive else "not running"}')
 

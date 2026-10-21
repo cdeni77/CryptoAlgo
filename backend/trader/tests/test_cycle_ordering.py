@@ -1,25 +1,7 @@
-"""The venue's balance is adopted AFTER our own settlements are credited.
+"""Tests that `run_cycle` adopts the venue balance after crediting our own settlements.
 
-This is not a style preference. Measured on the first live night, on real money,
-with the two operations the other way round:
-
-    09:15:38  ours $147.03, venue $168.03 (+21.00)   <- venue credited a payout
-    09:16:42  ours $189.03, venue $168.03 (-21.00)   <- we credited the same one
-    09:19:56  ours $160.67, venue $161.07 ( +0.41)   <- reconciled back
-
-The venue credits a settlement the moment it settles, so reading its balance
-first and settling second books every payout twice. The bankroll self-heals on
-the next cycle — no money moved — but Kelly sized off an inflated bankroll for a
-full cycle, and every settlement produced a large spurious drift warning. The
-drift log is the only thing standing between an unrecorded fill and silence, and
-it cannot do that job while it cries wolf on every win.
-
-The test drives the real `run_cycle`, because the thing under test is an ordering
-*inside* it. Asserting a hand-written sequence of the two calls would only test
-the sequence I wrote in the test.
-
-The bars are deliberately stale, so `stale_symbols` sets `offset = None` and the
-cycle returns right after the settle/adopt block — no model, no quotes needed.
+The other order would book each payout twice for one cycle. Stale bars make the real
+`run_cycle` return right after the settle/adopt step.
 """
 
 from __future__ import annotations
@@ -38,13 +20,14 @@ from scripts import live as live_mod
 WINDOW = datetime(2026, 8, 23, 0, 30, tzinfo=timezone.utc)
 SETTLE = WINDOW + timedelta(minutes=15)
 TICKER = 'KXBTC15M-26AUG230045'
-PAYOUT = 10.0          # 10 contracts of a winning YES at settlement
+PAYOUT = 10.0  # 10 contracts of a winning YES at settlement
 CONTRACTS = 10
 
 
 def _stale_bars() -> dict[str, pd.DataFrame]:
-    """The shape `fetch_bars` returns, old enough that `stale_symbols` flags
-    every symbol so the cycle stops right after the settle/adopt block."""
+    """Bars old enough that `stale_symbols` flags every symbol and the cycle stops after
+    settle/adopt.
+    """
     newest = pd.Timestamp('2026-08-23 01:00:00', tz='UTC')  # past SETTLE, still a day old
     stamps = pd.date_range(newest - pd.Timedelta(minutes=60), newest, freq='1min')
     frame = pd.DataFrame({
@@ -56,8 +39,7 @@ def _stale_bars() -> dict[str, pd.DataFrame]:
 
 
 class VenueStub:
-    """Reports a balance that ALREADY includes the payout, which is what the
-    real venue does the instant a market settles."""
+    """Reports a balance that already includes the payout, as the venue does at settlement."""
 
     def __init__(self, balance: float):
         self.balance = balance
@@ -118,15 +100,14 @@ def _run(writer, venue, monkeypatch):
 
 
 def test_a_settled_payout_is_credited_once_not_twice(writer, monkeypatch):
-    """The whole finding, in one assertion.
+    """A settled payout is credited once.
 
-    Bankroll 100, a position whose payout is $10. The venue already reports 104
-    (100 - 6 outlay - 0.2 fee + 10 payout = 103.80, rounded to what it holds).
-    If the balance is adopted before we settle, our figure ends up 103.80 + 10.
+    Bankroll 93.80 after outlay and fee, payout $10, venue reports 103.80. Adopting
+    before settling would give 113.80.
     """
-    writer.update_account(bankroll=93.8)        # outlay and fee already out
+    writer.update_account(bankroll=93.8)  # outlay and fee already out
     _open_a_winning_position(writer)
-    venue = VenueStub(balance=103.8)            # payout already credited
+    venue = VenueStub(balance=103.8)  # payout already credited
 
     _run(writer, venue, monkeypatch)
 
@@ -140,8 +121,7 @@ def test_a_settled_payout_is_credited_once_not_twice(writer, monkeypatch):
 
 
 def test_the_position_is_still_marked_settled(writer, monkeypatch):
-    """Adopting the balance later must not skip our own bookkeeping — the
-    position's outcome and realised PnL are ours to record, not the venue's."""
+    """The position is still marked settled after the venue balance is adopted."""
     writer.update_account(bankroll=93.8)
     _open_a_winning_position(writer)
 
@@ -151,13 +131,12 @@ def test_the_position_is_still_marked_settled(writer, monkeypatch):
 
 
 def test_a_real_disagreement_still_reaches_the_log(writer, monkeypatch, caplog):
-    """The reorder must not silence the alarm it exists to sharpen. A venue
-    balance that disagrees AFTER our credits are in is a genuine drift."""
+    """A venue balance that disagrees after our credits still logs a drift warning."""
     writer.update_account(bankroll=93.8)
     _open_a_winning_position(writer)
 
     with caplog.at_level('WARNING'):
-        # 90.0 is nowhere near 103.80: an unrecorded fill would look like this.
+        # 90.0 is far from 103.80, as an unrecorded fill would look.
         _run(writer, VenueStub(balance=90.0), monkeypatch)
 
     assert any('balance drift' in r.message for r in caplog.records), (
@@ -169,8 +148,7 @@ def test_a_real_disagreement_still_reaches_the_log(writer, monkeypatch, caplog):
 
 
 def test_no_venue_means_no_balance_write(writer, monkeypatch):
-    """Paper mode, and `--no-reconcile`. Our arithmetic stands alone, and the
-    settlement credit must survive."""
+    """With no venue (paper mode or `--no-reconcile`) the settlement credit still applies."""
     writer.update_account(bankroll=93.8)
     _open_a_winning_position(writer)
 

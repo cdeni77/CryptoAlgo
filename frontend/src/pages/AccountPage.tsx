@@ -454,7 +454,7 @@ export function AccountPage() {
               unit="pp"
               digits={2}
               tone={(realisedEdge ?? 0) >= 0 ? 'above' : 'below'}
-              hint="win rate minus mean cost paid. The gap against predicted is the winner's curse."
+              hint="settled P&L per contract, fees included. The gap against predicted is the winner's curse."
             />
           </div>
           {onVenue && ledger!.incomplete > 0 && (

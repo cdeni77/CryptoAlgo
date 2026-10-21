@@ -1,8 +1,7 @@
 """Read-only routes for the dashboard.
 
-Left unauthenticated on purpose: they serve a local dashboard, expose no
-credentials, and gating them would break the frontend's polling for no gain the
-origin policy does not already provide. There is no mutating surface.
+Unauthenticated on purpose: they serve a local dashboard, expose no
+credentials, and mutate nothing. The CORS policy limits callers.
 """
 
 from __future__ import annotations
@@ -30,17 +29,11 @@ def get_equity(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db
 
 @router.get('/account/venue')
 def get_venue_account(db: Session = Depends(get_db)):
-    """The account as the VENUE's ledger reports it, with ours beside it.
+    """The account as the venue's ledger reports it, with ours beside it.
 
-    `/account` is our own arithmetic — a bankroll debited at the price `decide()`
-    sized at, a fee predicted from the published schedule, a payout decided by an
-    OHLC mean of Coinbase standing in for CF Benchmarks BRTI. This is the account
-    of record. Both are served, and neither is silently substituted for the
-    other: `pnl_gap` is the disagreement, and it is a measurement rather than an
-    error to hide.
-
-    `available: false` with a reason when no venue ledger has been stored, which
-    is the normal state of a paper account.
+    The venue's ledger is the account of record; `/account` is our own
+    arithmetic. `pnl_gap` is the disagreement. Returns `available: false` with
+    a reason when no venue ledger is stored, as for a paper account.
     """
     return serving.venue_account_state(db)
 
@@ -48,11 +41,10 @@ def get_venue_account(db: Session = Depends(get_db)):
 @router.get('/account/venue/equity')
 def get_venue_equity(days: int = Query(30, ge=1, le=365),
                      db: Session = Depends(get_db)):
-    """The account chart: realised P&L per settlement, venue cash sampled beside it.
+    """The account chart: realised P&L per settlement, venue cash beside it.
 
-    Built from settlement P&L rather than from balance differences, because
-    nothing in the ledger distinguishes a deposit from a profit — see
-    `controllers.serving.venue_equity_curve`.
+    Built from settlement P&L, not balance differences, because a deposit and a
+    profit look the same in the balance.
     """
     return serving.venue_equity_curve(db, days=days)
 

@@ -1,9 +1,7 @@
-"""The shard is remembered so the book can be read after reconciliation.
+"""Tests that the exchange shard is remembered, so the book can be read after
+reconciliation.
 
-Kalshi shards its exchange by category and balances are LOCAL to a shard, so the
-balance query has to name the right one. The only place it was ever read from
-was the quotes — which is what forced the book to be fetched first, and cost
-about a second of staleness on every order.
+Kalshi balances are local to a shard, so the balance query must name the right one.
 """
 from __future__ import annotations
 
@@ -48,8 +46,7 @@ def test_an_empty_book_does_not_erase_what_was_learned():
 
 
 def test_a_moved_shard_is_logged_loudly_and_adopted(caplog):
-    """A stale shard reads the wrong balance — the failure that once had every
-    order refused `insufficient_balance` while the funds sat elsewhere."""
+    """A changed shard is logged and adopted; a stale shard reads the wrong balance."""
     live.remember_exchange_index(_quotes(0))
     with caplog.at_level('WARNING'):
         assert live.remember_exchange_index(_quotes(2)) == 2
@@ -65,8 +62,9 @@ def test_an_unchanged_shard_is_silent(caplog):
 
 
 def test_reconciliation_never_sits_between_the_book_and_the_order():
-    """On an entry cycle it runs after the orders; elsewhere before the book.
-    The behaviour is tested in `test_decision_first.py`."""
+    """Reconciliation never runs between the book read and the order.
+    `test_decision_first.py` tests the behaviour.
+    """
     import inspect
     source = inspect.getsource(live.run_cycle)
     assert source.index("_phase('bars')") < source.index("_phase('quotes')")
