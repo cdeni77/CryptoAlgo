@@ -966,8 +966,15 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     from core.book_features import (
         CROSS_VENUE as _CV, IMPLIED_VOL as _IV,
         MARKET_PRICE as _MP, MARKET_STATE as _MS)
+    from core.book_flow import BOOK_FLOW as _BF
     from core.index_features import INDEX_PROXY as _IP
-    deferred = tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV) + tuple(_IP)
+    # `_BF` is attached by `book_flow_row` below, after this call. Leaving it
+    # out made `reindex_to_features` warn about all six on EVERY cycle --
+    # noise that reports a gap where there is none, and that buries the real
+    # signal. `_warn_unscoreable_features` runs after the attach and is the
+    # check that can still see a genuinely empty book_flow.
+    deferred = (tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV)
+                + tuple(_IP) + tuple(_BF))
     scored = score_live(bars, model.scoring, config, deferred=deferred,
                         window_open=window_open, offset=offset,
                         groups=model.groups or None)

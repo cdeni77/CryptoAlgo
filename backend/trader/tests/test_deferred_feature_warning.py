@@ -42,3 +42,23 @@ def test_a_column_already_present_is_left_alone(caplog):
         out = reindex_to_features(table, ('spread',), deferred=())
     assert out['spread'].iloc[0] == 2.0
     assert caplog.text == ''
+
+
+def test_book_flow_is_declared_deferred_in_the_live_path():
+    """`book_flow_row` attaches these AFTER `score_live` returns.
+
+    Omitting them made `reindex_to_features` warn about all six on every
+    cycle — 1,312 warnings in 12 hours reporting a gap that did not exist,
+    which is the noise a real gap then hides inside.
+    """
+    import inspect
+
+    from core.book_flow import BOOK_FLOW
+    from scripts import live
+
+    src = inspect.getsource(live)
+    assert 'from core.book_flow import BOOK_FLOW as _BF' in src
+    assert 'tuple(_BF)' in src
+    # and the post-attach check, which is the one that must still fire
+    assert '_warn_unscoreable_features' in src
+    assert len(BOOK_FLOW) == 6
