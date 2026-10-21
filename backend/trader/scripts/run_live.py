@@ -444,7 +444,7 @@ def build_factories(args, gate: TradingGate) -> dict:
     async def book_minutes():
         await align_to_phase(
             next(c for c in COMPONENTS if c.name == 'book_minutes').phase)
-        return await record_book_minutes.run(gate=gate)
+        return await record_book_minutes.run()
 
     async def ladder():
         await align_to_phase(25.0)

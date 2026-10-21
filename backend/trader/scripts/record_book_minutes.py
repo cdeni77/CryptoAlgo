@@ -102,18 +102,35 @@ def sample_once(cache, *, now=None) -> int:
     return kept
 
 
-async def run(args=None, gate=None) -> int:
-    """Sample every minute, forever."""
+async def run(args=None) -> int:
+    """Sample every minute, forever.
+
+    Takes no decision gate. Every other recorder calls the venue and so
+    waits its turn; this one reads an in-process dict, and waiting would
+    only push the sample past `BOOK_SAMPLE_MAX_AGE_SECONDS` and have the
+    minute refused.
+    """
     from livetrade.quotes import _stream_cache                # noqa: SLF001
     from core import heartbeat
 
     late = 0
     while True:
-        # Never start while a decision is in flight. This is an in-process read
-        # of a dict, so the deferral is short, but the rule is the same one
-        # every other recorder follows.
-        if gate is not None:
-            await gate.idle()
+        # **This recorder is NOT gated behind a decision, and that is the
+        # difference that makes it work.** Every other recorder calls the
+        # venue, so it waits its turn. `sample_once` reads an in-process dict
+        # and makes no request, so waiting buys nothing -- and it costs the
+        # minute: a decision cycle runs far longer than
+        # `BOOK_SAMPLE_MAX_AGE_SECONDS`, so the sample lands stale and every
+        # row for that minute is refused.
+        #
+        # The refused minutes are the DECISION minutes, 3/6/9/12, and every
+        # `book_flow` feature differences the book over one or three minutes
+        # onto exactly those. Offset 6 reads offset 3, offset 9 reads 6,
+        # offset 12 reads 9. Gating this loop therefore emptied `book_flow`
+        # on most live decisions while the sampler looked healthy.
+        #
+        # Sampling is synchronous on a single-threaded event loop, so it
+        # cannot interleave with a decision regardless.
         cache = _stream_cache()
         try:
             kept = sample_once(cache)
