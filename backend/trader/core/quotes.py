@@ -95,10 +95,18 @@ QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
 # against the recorded ladder over 8,169 overlapping minutes. It is a
 # RECONSTRUCTION, so it sits below the three live observers and above the
 # candles, which are a summary.
+#
+# `live_minute` is the per-minute sampler reading the same in-process stream
+# cache the decision reads, under a second past each minute. It ranks below
+# `live_touch`, which is the decision instant itself but exists only at
+# 3/6/9/12, and above every observer that samples ~25s into the minute --
+# those hold a LATER book than the decision and `decision_age` scores them
+# negative.
 QUOTE_SOURCE_PRIORITY = tuple(
     s.strip() for s in os.getenv(
         'QUOTE_SOURCE_PRIORITY',
-        'live_touch,live_ws,live,live_ws_replay,candles,backfill').split(',')
+        'live_touch,live_minute,live_ws,live,live_ws_replay,candles,backfill'
+    ).split(',')
     if s.strip())
 
 # A book quoted twenty minutes ago is not a price this decision could have

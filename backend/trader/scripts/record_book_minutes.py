@@ -42,6 +42,21 @@ logger = logging.getLogger('book-minutes')
 #: One window, in minutes. A sample outside 0..WINDOW is not this window's.
 WINDOW_MINUTES = 15
 
+#: `source` for these rows. Its own name, because this sample is taken at a
+#: different instant from every other producer and `venue_depth` already
+#: proves what happens when two instants share one label.
+SOURCE = 'live_minute'
+
+#: Samples waiting to be written, and the cap. ~45 rows a minute across three
+#: symbols, so this holds roughly two hours of a store that cannot be written.
+_PENDING: list = []
+MAX_PENDING = 6000
+
+#: How often to write. Not every minute: the live loop shares this process,
+#: and a parquet write is the kind of blocking work that emptied `book_flow`
+#: when it sat in the decision path.
+FLUSH_EVERY_SAMPLES = 15
+
 #: How often to sample. The task is phase-aligned by `run_live`, so this is the
 #: period, not the offset.
 PERIOD_SECONDS = 60.0
@@ -99,7 +114,72 @@ def sample_once(cache, *, now=None) -> int:
                               yes_levels=yes, no_levels=no,
                               age_seconds=into_minute):
             kept += 1
+            _buffer_row(ticker, symbol, opened, int(offset), into_minute,
+                        yes, no)
     return kept
+
+
+def _buffer_row(ticker, symbol, opened, offset, age, yes, no) -> None:
+    """Queue this sample for `venue_depth`. Never raises.
+
+    **This is the only book sample taken at the instant a decision could have
+    used it.** The ladder recorder runs at +25s past the minute, so
+    `decision_age` scores its rows negative -- seen AFTER the decision -- and
+    refuses 97.8-99.8% of them. Measured, the three per-minute recorders are
+    140,646 rows contributing 1.2% of usable quotes.
+
+    So the pipeline was persisting a sample it cannot use and discarding the
+    one it can. Keeping this one is the only route to depth at non-decision
+    offsets that a decision could actually have had: the venue serves no
+    historical order book, so it exists forward or not at all.
+    """
+    try:
+        from scripts.build_depth import _cumulative, _row            # noqa: PLC0415
+        bid = max((float(p) for p, _ in yes or []), default=None)
+        ask = min(((1.0 - float(p)) for p, _ in no or []), default=None)
+        event_time = opened + dt.timedelta(minutes=offset)
+        _PENDING.append(_row(
+            venue='kalshi', symbol=symbol, event_time=event_time,
+            available_time=event_time + dt.timedelta(seconds=float(age)),
+            market_ticker=ticker, window_open=opened, offset_minutes=offset,
+            yes_bid=bid, yes_ask=ask,
+            yes_bid_size=sum(float(s) for p, s in (yes or []) if float(p) == bid)
+            if bid is not None else 0.0,
+            yes_ask_size=sum(float(s) for p, s in (no or [])
+                             if abs((1.0 - float(p)) - (ask or -1)) < 1e-9)
+            if ask is not None else 0.0,
+            depth_bid_1c=_cumulative(yes, best=bid, within=0.01, invert=False),
+            depth_bid_5c=_cumulative(yes, best=bid, within=0.05, invert=False),
+            depth_ask_1c=_cumulative(no, best=ask, within=0.01, invert=True),
+            depth_ask_5c=_cumulative(no, best=ask, within=0.05, invert=True),
+            depth_bid_total=sum(float(s) for _, s in (yes or [])),
+            depth_ask_total=sum(float(s) for _, s in (no or [])),
+            levels_bid=float(len(yes or [])), levels_ask=float(len(no or [])),
+            source=SOURCE, quote_age_seconds=float(age), transport='ws'))
+        # Bounded: a store that cannot be written must not grow the process
+        # until it dies. Dropping the oldest is right -- the newest minutes
+        # are the ones the next retrain has least of.
+        if len(_PENDING) > MAX_PENDING:
+            del _PENDING[:len(_PENDING) - MAX_PENDING]
+    except Exception as exc:                                      # noqa: BLE001
+        logger.debug('could not buffer %s: %s', ticker, str(exc)[:120])
+
+
+def flush(store=None) -> int:
+    """Write the buffered samples. Returns the count. Never raises."""
+    if not _PENDING:
+        return 0
+    batch, del_count = list(_PENDING), len(_PENDING)
+    try:
+        import pandas as pd                                       # noqa: PLC0415
+        from core.datastore import ResearchStore                  # noqa: PLC0415
+        (store or ResearchStore()).write('venue_depth', pd.DataFrame(batch))
+    except Exception as exc:                                      # noqa: BLE001
+        logger.warning('could not write %d book minute(s): %s',
+                       len(batch), str(exc)[:140])
+        return 0
+    del _PENDING[:del_count]
+    return len(batch)
 
 
 async def run(args=None) -> int:
@@ -113,7 +193,7 @@ async def run(args=None) -> int:
     from livetrade.quotes import _stream_cache                # noqa: SLF001
     from core import heartbeat
 
-    late = 0
+    late = samples = 0
     while True:
         # **This recorder is NOT gated behind a decision, and that is the
         # difference that makes it work.** Every other recorder calls the
@@ -153,6 +233,19 @@ async def run(args=None) -> int:
         # task, and a heartbeat that only fires on success measures the market
         # rather than the loop.
         heartbeat.touch('book_minutes')
+        # **Written off the event loop, and never every minute.** A parquet
+        # write is exactly the blocking work that emptied `book_flow` when it
+        # sat in the decision path, so it goes to a thread and runs once every
+        # `FLUSH_EVERY_SAMPLES` minutes. `flush` never raises: a store that
+        # cannot be written must cost a buffered minute, not the trading loop.
+        samples += 1
+        if samples % FLUSH_EVERY_SAMPLES == 0 and _PENDING:
+            try:
+                written = await asyncio.to_thread(flush)
+                if written:
+                    logger.info('wrote %d book minute(s) to venue_depth', written)
+            except Exception as exc:                          # noqa: BLE001
+                logger.warning('book-minute flush failed: %s', str(exc)[:140])
         # **Sleep to the next MINUTE BOUNDARY, not for a fixed period.**
         # `sleep(60)` runs AFTER the work, so each cycle costs 60s plus
         # however long sampling took, and the phase creeps forward. At ~45ms
