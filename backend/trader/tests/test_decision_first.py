@@ -106,7 +106,7 @@ def run(tmp_path, monkeypatch, venue, *, offset=12, reconciled=True,
         return {s: (make_quote(s), TICKERS[s]) for s in symbols}
 
     def fake_score(bars_, scoring, config, *, window_open, offset, groups=None,
-                   deferred=()):
+                   deferred=(), **kwargs):
         n = len(DEFAULT_CONFIG.symbols)
         return pd.DataFrame({
             'symbol': list(DEFAULT_CONFIG.symbols), 'window_open': [window_open] * n,

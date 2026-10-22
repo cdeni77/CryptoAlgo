@@ -119,7 +119,8 @@ from livetrade.ledger import (                                      # noqa: F401
     settle_due, settle_predictions, venue_exchange_index, venue_settled_up,
 )
 from livetrade.quotes import (                                      # noqa: F401
-    _record_touch, _stream_cache, depth_dollars, fetch_quotes, fresh_quote,
+    _record_touch, _stream_cache, cached_floor_strikes, depth_dollars,
+    fetch_quotes, fresh_quote,
     ladder_from_cache, quote_age_seconds, quote_ladder, resolve_markets,
     stream_quote,
 )
@@ -999,9 +1000,29 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # check that can still see a genuinely empty book_flow.
     deferred = (tuple(_MS) + tuple(_MP) + tuple(_CV) + tuple(_IV)
                 + tuple(_IP) + tuple(_BF))
+    # **The venue's strike, from the cache, BEFORE the features are built.**
+    # `build_dataset` already does this for research (`strike_source=venue`);
+    # the live path could not, so a model trained on venue strikes would have
+    # been scored live on bar-derived ones -- the C6 divergence, and a silent
+    # one, because the drift warning fires above 25bp while the basis is ~1bp.
+    # `cached_floor_strikes` reads what the non-decision cycles already
+    # refreshed, so this costs no round trip in the decision path.
+    venue_strikes = {}
+    if getattr(config, 'strike_source', 'proxy') == 'venue':
+        venue_strikes = cached_floor_strikes(config.symbols, settle_time)
+        missing = [s for s in config.symbols if s not in venue_strikes]
+        if missing:
+            # Falling back to the bar strike for SOME symbols is the mixed
+            # state C6 forbids, so say so rather than let it pass.
+            logger.warning(
+                'strike_source=venue but the venue has published no strike for '
+                '%s; those symbols fall back to the bar-derived strike and are '
+                'scored on a different reference than the model was fitted on',
+                ', '.join(sorted(missing)))
     scored = score_live(bars, model.scoring, config, deferred=deferred,
                         window_open=window_open, offset=offset,
-                        groups=model.groups or None)
+                        groups=model.groups or None,
+                        strikes_by_symbol=venue_strikes or None)
 
     # **The price `decide()` is handed must be the one we will actually pay.**
     # A taker lifts the ask; a MAKER rests at the bid. Handing decide() the ask

@@ -61,6 +61,40 @@ async def _resolve_one(kalshi, symbol: str, settle_time: pd.Timestamp, *,
     return meta
 
 
+def cached_floor_strikes(symbols, settle_time: pd.Timestamp) -> dict:
+    """Each symbol's venue `floor_strike` for this window, from the cache.
+
+    **No network call.** `resolve_markets(refresh=True)` already refreshes this
+    on non-decision cycles, precisely "so a decision never pays to resolve it",
+    so the decision path reads what is already there. Fetching it here instead
+    would put a round trip between the book read and `decided_at`, which is
+    charged to `quote_age_seconds` and judged against a 5-second bound.
+
+    A symbol the venue has not published a strike for is absent, never zero.
+    """
+    out = {}
+    want = pd.Timestamp(settle_time)
+    for symbol in symbols:
+        known = _MARKETS.get(symbol)
+        if not known:
+            continue
+        cached_settle, meta = known
+        # The strike belongs to ONE window; a stale entry from the previous
+        # window would silently price this one against the wrong barrier.
+        if pd.Timestamp(cached_settle) != want:
+            continue
+        value = getattr(meta, 'floor_strike', None)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out[symbol] = value
+    return out
+
+
 async def resolve_markets(kalshi, symbols, settle_time: pd.Timestamp, *,
                           refresh: bool = False) -> dict[str, Quote]:
     """Return each symbol's market for this window, cached or resolved.

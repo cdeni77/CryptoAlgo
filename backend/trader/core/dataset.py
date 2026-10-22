@@ -502,6 +502,22 @@ def _score_windows(
                           deferred=deferred)
 
 
+def _override_series(strikes: Optional[dict], bars_by_symbol: dict):
+    """`build_windows` wants a per-symbol Series indexed like its bars.
+
+    Returns None when nothing is overridden, which is the untouched path.
+    """
+    if not strikes:
+        return None
+    out = {}
+    for symbol, value in strikes.items():
+        bars = bars_by_symbol.get(symbol)
+        if bars is None or bars.empty or value is None or not np.isfinite(value):
+            continue
+        out[symbol] = pd.Series(float(value), index=bars.index, dtype=float)
+    return out or None
+
+
 def score_live(
     bars_by_symbol: dict[str, pd.DataFrame],
     bundle: ScoringBundle,
@@ -511,6 +527,7 @@ def score_live(
     offset: int,
     groups: Optional[Sequence[str]] = None,
     deferred: Sequence[str] = (),
+    strikes_by_symbol: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     """Score exactly one decision point per symbol, from freshly fetched bars.
 
@@ -546,8 +563,16 @@ def score_live(
     # the entire point. Without it `build_windows` trims the in-progress window
     # away and this raised on every live cycle — the loop caught only
     # `KeyboardInterrupt`, so the process died and never placed an order.
+    # **The venue's strike, where the caller has it.** `strike_source='venue'`
+    # must move the STRIKE and the PRICE together: the ten strike-derived
+    # features are fitted on one reference, and mixing a BRTI strike with
+    # Coinbase bars injects a cross-index basis into every one of them. The
+    # override belongs here, before `build_features`, so all ten are built
+    # from the same number -- not patched onto the scored frame afterwards,
+    # which can only reach `z_score` and leaves its nine siblings behind.
     windows, _ = build_window_panel(
         {s: bars_by_symbol[s] for s in states}, config, offsets=(offset,),
+        strikes_by_symbol=_override_series(strikes_by_symbol, bars_by_symbol),
         include_unsettled=True)
     slice_ = windows.loc[windows['window_open'] == window_open]
     if slice_.empty:
