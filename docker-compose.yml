@@ -58,6 +58,16 @@ services:
       # (`trader_data`), and a named volume cannot be mounted by sub-path.
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/trader-data:ro
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+    # **`Up` is not evidence that anything serves.** `--reload` makes the
+    # reloader the container's main process, and it outlives an application
+    # that fails to start, so a dead API reads as a running container and the
+    # restart policy never fires. Ask the port instead.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/live', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ===========================================================================
   # Frontend — React/Vite dashboard

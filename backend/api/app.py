@@ -1,8 +1,12 @@
+import logging
+import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from database import engine
 from jsonsafe import SafeJSONResponse
@@ -68,8 +72,58 @@ def bootstrap_schema() -> None:
             connection.execute(text(statement))
 
 
+logger = logging.getLogger(__name__)
+
+#: How long startup waits for the database before giving up.
+#: A host reboot restarts every container at once through the restart policy,
+#: and Postgres replays its write-ahead log before it accepts connections.
+DATABASE_WAIT_SECONDS = float(os.getenv("DATABASE_WAIT_SECONDS", "120"))
+DATABASE_WAIT_INTERVAL = 2.0
+
+
+def wait_for_database(timeout_seconds: float = None,
+                      interval_seconds: float = DATABASE_WAIT_INTERVAL) -> None:
+    """Block until the database answers, then return.
+
+    **A reboot does not honour `depends_on`.** Compose waits for the database
+    to be healthy only when compose itself starts the stack; the restart
+    policy that brings containers back after a reboot starts them all at once.
+    Postgres then answers "the database system is starting up" until it has
+    recovered.
+
+    Treating that as fatal is what leaves nothing serving: the application
+    exits, but uvicorn's reloader is the container's main process and keeps
+    running, so the container stays `Up` with no application behind it and the
+    proxy returns 502 until somebody restarts it by hand.
+
+    Raises the last error once `timeout_seconds` is spent, so a database that
+    is genuinely unreachable still fails loudly instead of hanging.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = DATABASE_WAIT_SECONDS
+    deadline = time.monotonic() + float(timeout_seconds)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            if attempt > 1:
+                logger.info("the database answered on attempt %d", attempt)
+            return
+        except OperationalError as exc:
+            if time.monotonic() >= deadline:
+                logger.error("the database did not answer within %.0fs",
+                             float(timeout_seconds))
+                raise
+            logger.warning("waiting for the database (attempt %d): %s",
+                           attempt, str(exc).splitlines()[0][:120])
+            time.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    wait_for_database()
     bootstrap_schema()
     yield
 
