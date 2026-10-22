@@ -55,12 +55,30 @@ WINDOW_COLUMNS = (
 
 
 def bar_mean(frame: pd.DataFrame) -> pd.Series:
-    """The average price within each bar: `(O + H + L + C) / 4`.
+    """The average price within each bar.
 
-    A proxy for "the simple average of the sixty seconds". Both ends of the
-    target use it, so most of its bias cancels.
+    **`mean_price` where the source has it, `(O+H+L+C)/4` otherwise.**
+
+    The venue settles on "the simple average of the sixty seconds" of its
+    index. `(O+H+L+C)/4` is a proxy for that, tolerable because both ends of
+    the target use it and most of the bias cancels. But the CF Benchmarks
+    feed publishes the real quantity -- `avg_60s_data`, the venue computing
+    its own 60-second mean -- and `scripts/record_index_stream` and
+    `scripts/backfill_index` both store it as `mean_price`.
+
+    Using the proxy when the actual number is in the next column would throw
+    away the whole reason that feed was built, and it would do it silently:
+    the strike and the settlement value are both this function, so a 1bp
+    error enters the target at both ends.
+
+    A source without the column falls back row by row, so Coinbase bars are
+    unchanged and a partially covered span is not dropped.
     """
-    return (frame['open'] + frame['high'] + frame['low'] + frame['close']) / 4.0
+    ohlc = (frame['open'] + frame['high'] + frame['low'] + frame['close']) / 4.0
+    if 'mean_price' not in frame.columns:
+        return ohlc
+    exact = pd.to_numeric(frame['mean_price'], errors='coerce')
+    return exact.where(np.isfinite(exact), ohlc)
 
 
 class WindowError(ValueError):
