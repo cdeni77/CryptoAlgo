@@ -97,7 +97,10 @@ def load_proxy_minutes(store_root: Path | str, *, symbols: Optional[Sequence[str
         ' QUALIFY row_number() OVER (PARTITION BY symbol, event_time '
         'ORDER BY available_time DESC) = 1) '
         'GROUP BY 1, 2 ORDER BY 1, 2')
-    with duckdb.connect() as con:
+    # Bounded spill: this query folds ~95M one-second rows, which is exactly
+    # the shape that fills a disk when it is killed part-way.
+    from core.datastore import connect as _connect
+    with _connect(root) as con:
         out = con.execute(sql, [str(root / '**' / '*.parquet'), *params]).df()
     out['minute'] = pd.to_datetime(out['minute'], unit='s', utc=True)
     out['last_time'] = pd.to_datetime(out['last_time'], unit='s', utc=True)

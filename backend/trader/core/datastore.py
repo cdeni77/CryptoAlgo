@@ -526,6 +526,35 @@ def _utc_bound(value) -> datetime:
     return stamp.to_pydatetime()
 
 
+
+#: How much a single query may spill to disk before DuckDB fails it.
+#: **A query that cannot finish must FAIL, not fill the disk.** Unbounded,
+#: a killed query leaves its spill behind: 95 orphaned files totalling 352 GB
+#: took the host to 100% while the live trader was running on it, and killed
+#: containers could no longer start. An error is recoverable; a full disk
+#: during live trading is not. Override with `DUCKDB_MAX_TEMP`.
+MAX_TEMP_DIRECTORY = os.getenv('DUCKDB_MAX_TEMP', '32GB')
+
+#: Spill under the store root rather than the working directory, so the files
+#: are somewhere findable and are not scattered by wherever a script was run.
+TEMP_SUBDIR = '.duckdb_tmp'
+
+
+def connect(root: Optional[Path] = None):
+    """A DuckDB connection whose spill is bounded and findable."""
+    con = duckdb.connect()
+    try:
+        con.execute(f"SET max_temp_directory_size='{MAX_TEMP_DIRECTORY}'")
+        if root is not None:
+            tmp = Path(root) / TEMP_SUBDIR
+            tmp.mkdir(parents=True, exist_ok=True)
+            con.execute(f"SET temp_directory='{tmp}'")
+    except Exception as exc:                                  # noqa: BLE001
+        # An older DuckDB without these settings still works; it just spills
+        # without a bound, which is the behaviour this replaces.
+        logger.debug('could not bound the DuckDB spill: %s', str(exc)[:120])
+    return con
+
 class ResearchStore:
     """Parquet-backed research store with point-in-time reads."""
 
@@ -742,7 +771,7 @@ class ResearchStore:
             f"  ) WHERE _rn = 1"
             f") ORDER BY symbol, event_time"
         )
-        with duckdb.connect() as con:
+        with connect(self.root) as con:
             return _in_utc(con.execute(sql, [glob, *params]).df())
 
     def panel(
