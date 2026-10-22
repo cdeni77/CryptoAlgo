@@ -96,8 +96,32 @@ class IndexBars:
             'complete': len(prints) >= FULL_MINUTE_PRINTS,
         }
 
+    def since(self, symbol: str, *, after: int = -1,
+              now: float) -> list[dict]:
+        """Ended minutes after `after`, oldest first. **Non-destructive.**
+
+        The writer and the decision path read the same fold: one persists
+        minutes it has not yet written, the other splices the newest minutes
+        onto the stored history. A `drain` that forgot what it yielded would
+        delete the bar the next decision needs -- the fold is sized by
+        `retain_minutes`, and eviction is the only thing that should remove
+        from it.
+        """
+        out = []
+        for minute in self.complete(symbol, now=now):
+            if minute <= after:
+                continue
+            bar = self.bar(symbol, minute)
+            if bar is not None:
+                out.append(bar)
+        return out
+
     def drain(self, symbol: str, *, now: float) -> Iterable[dict]:
-        """Yield and forget every ended minute's bar."""
+        """Yield and forget every ended minute's bar.
+
+        Only for a standalone run that nothing else reads from. Inside
+        `run_live` use `since`, or the decision path loses the minute.
+        """
         for minute in self.complete(symbol, now=now):
             bar = self.bar(symbol, minute)
             self._prints.pop((symbol, minute), None)
@@ -108,6 +132,45 @@ class IndexBars:
     def depth(self) -> int:
         """How many minutes are held, across every symbol."""
         return len(self._prints)
+
+
+#: What the index does not have and spot does. Verified on both transports
+#: 2026-10-22: the WS frame carries `{type, time, id, value}` and the REST
+#: point `{time, value}` -- no volume field exists on either.
+ACTIVITY_COLUMNS = ('volume', 'quote_volume', 'trade_count')
+
+
+def carry_activity(index, spot):
+    """Put spot's activity columns onto index bars, matched on `event_time`.
+
+    **One definition, because training and live must do this identically.**
+    An index has no volume, so after a migration the bars are a hybrid: BRTI
+    price with Coinbase activity. `signed_volume_15` then takes its sign from
+    the index's returns and its magnitude from spot, and `vwap_gap_15`
+    multiplies one source's price by the other's volume. Those features are
+    defensible only while both paths build them the same way -- two
+    implementations would give them different meanings in training and
+    serving, and nothing would raise.
+
+    A left join: an index minute with no spot bar keeps the index price and a
+    null volume, rather than being dropped. Deciding what to do about the null
+    belongs to `--complete-cases`, not here.
+    """
+    import pandas as pd
+
+    if index is None or not len(index):
+        return index
+    if spot is None or not len(spot):
+        return index
+    have = [c for c in ACTIVITY_COLUMNS if c in spot.columns]
+    if not have:
+        return index
+    right = spot[['event_time', *have]].copy()
+    right['event_time'] = pd.to_datetime(right['event_time'], utc=True)
+    out = index.copy()
+    out['event_time'] = pd.to_datetime(out['event_time'], utc=True)
+    out = out.drop(columns=[c for c in have if c in out.columns])
+    return out.merge(right, on='event_time', how='left')
 
 
 def rows_for_store(bars: Iterable[dict], *, available_time,

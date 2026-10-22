@@ -42,6 +42,22 @@ SILENCE_SECONDS = 30.0
 #: that emptied `book_flow` when it sat in a decision path.
 FLUSH_EVERY_SECONDS = 300.0
 
+#: **Process-wide, like `record_stream.CACHE`.** `run_live` runs this task and
+#: the trading loop in one process, so the decision path can splice the
+#: minutes this has folded but not yet written. Without that, the newest bar a
+#: decision could read would be up to `FLUSH_EVERY_SECONDS` old -- and the bar
+#: a decision needs is the one that closed moments ago.
+#:
+#: A bare `scripts.record_index_stream` fills its own copy and the trading
+#: loop in another process sees an empty one. That is the trap already
+#: recorded for the book cache.
+BARS = None
+
+
+def live_bars():
+    """The in-process fold, or None if this task is not running here."""
+    return BARS
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -63,10 +79,13 @@ async def run(args=None) -> int:
         parse_value_frame, subscribe_params)
     from data_collection.stream.kalshi import KalshiStream
 
+    global BARS
     args = args or build_parser().parse_args([])
     symbols = [s.strip() for s in str(args.symbols).split(',') if s.strip()]
     store = None if args.dry_run else ResearchStore(args.research_store)
-    bars = IndexBars()
+    # Published before the first frame, so a decision that lands during the
+    # 60-second warm-up reads an empty fold rather than a missing attribute.
+    bars = BARS = IndexBars()
     pending: list[dict] = []
     last_flush = time.time()
     partial_logged = False

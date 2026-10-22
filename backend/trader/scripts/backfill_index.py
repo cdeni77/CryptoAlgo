@@ -118,9 +118,13 @@ def attach_coinbase_activity(frame: pd.DataFrame, store, symbol: str):
         return frame
     if not len(cb):
         return frame
-    cb = cb[['event_time', 'volume', 'quote_volume', 'trade_count']].copy()
-    cb['event_time'] = pd.to_datetime(cb['event_time'], utc=True)
-    return frame.merge(cb, on='event_time', how='left')
+    # **`core.index_bars.carry_activity` is the one definition**, shared with
+    # the live path. After a migration the bars are a hybrid -- index price,
+    # spot activity -- and two implementations of that join would give
+    # `signed_volume_15` and `vwap_gap_15` different meanings in training and
+    # serving, with nothing to raise about it.
+    from core.index_bars import carry_activity
+    return carry_activity(frame, cb)
 
 
 #: An hour of 1-second index values yields 60 minute bars. Fewer means the

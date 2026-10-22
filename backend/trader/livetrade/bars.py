@@ -57,6 +57,13 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES, *,
     Only the newest minutes are re-fetched; a symbol with no usable cache gets
     the full window. With `prefer_stream`, the Coinbase trade tape supplies
     the newest minutes and REST serves only the symbols the tape cannot verify.
+
+    **`config.venue` decides the PRICE, never the activity.** On
+    `cfbenchmarks` the prices come from the settlement index and the volume is
+    carried from these spot bars, because the index has none -- verified on
+    both transports, the frame carries only a value. Spot is therefore fetched
+    either way; the index is an overlay on top of it, not a replacement for
+    it.
     """
     out: dict[str, pd.DataFrame] = {}
     symbols = list(config.symbols)
@@ -65,11 +72,88 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES, *,
         symbols = [s for s in symbols if s not in out]
         if not symbols:
             logger.debug('bars from the trade stream for every symbol')
-            return out
+            return await _overlay_index(config, out, minutes)
         if out:
             logger.info('bars from the trade stream for %s, REST for %s',
                         sorted(out), symbols)
     out.update(await _fetch_rest_bars(config, minutes, symbols))
+    return await _overlay_index(config, out, minutes)
+
+
+#: Index history read from the store, kept between cycles. The store holds
+#: everything `scripts/backfill_index` and `scripts/record_index_stream` have
+#: written; only the minutes since the last flush need splicing from memory.
+_INDEX_CACHE: dict[str, pd.DataFrame] = {}
+INDEX_VENUE = 'cfbenchmarks'
+
+
+async def _overlay_index(config: Config, spot: dict[str, pd.DataFrame],
+                         minutes: int) -> dict[str, pd.DataFrame]:
+    """Replace spot prices with the settlement index, keeping spot's activity.
+
+    Returns `spot` untouched unless `config.venue` asks for the index, so the
+    default path is exactly what it was.
+
+    **A symbol with no index history keeps its spot bars and says so.** Half a
+    universe priced on one index and half on another is the cross-index basis
+    C6 exists to prevent, so the fallback is loud rather than silent.
+    """
+    if getattr(config, 'venue', None) != INDEX_VENUE or not spot:
+        return spot
+    try:
+        return await asyncio.to_thread(_index_overlay_sync, config, spot, minutes)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.error('index overlay failed (%s); REFUSING to trade spot prices '
+                     'against a model fitted on the index', str(exc)[:160])
+        return {}
+
+
+def _index_overlay_sync(config: Config, spot: dict[str, pd.DataFrame],
+                        minutes: int) -> dict[str, pd.DataFrame]:
+    from core.datastore import ResearchStore
+    from core.index_bars import carry_activity, rows_for_store
+    from scripts import record_index_stream
+
+    store = ResearchStore()
+    live = record_index_stream.live_bars()
+    now = time.time()
+    floor = pd.Timestamp(now - minutes * 60, unit='s', tz='UTC').floor('min')
+
+    out: dict[str, pd.DataFrame] = {}
+    for symbol, spot_bars in spot.items():
+        history = _INDEX_CACHE.get(symbol)
+        newest = (history['event_time'].max()
+                  if history is not None and len(history) else None)
+        # Re-read only what the cache is missing. The store grows by one
+        # flush at a time, so this is a few minutes after the first cycle.
+        start = floor if newest is None else newest - pd.Timedelta(minutes=2)
+        fresh = store.read('minute_bars', venue=INDEX_VENUE, symbols=[symbol],
+                           start=start, min_quality=None)
+        if fresh is not None and len(fresh):
+            fresh['event_time'] = pd.to_datetime(fresh['event_time'], utc=True)
+            history = (fresh if history is None
+                       else _merge_bars(history, fresh, floor=floor))
+        # Then the minutes folded in this process but not yet flushed.
+        if live is not None:
+            after = -1 if history is None or not len(history) else int(
+                history['event_time'].max().timestamp())
+            spliced = rows_for_store(
+                live.since(symbol, after=after, now=now),
+                available_time=pd.Timestamp(now, unit='s', tz='UTC'))
+            if spliced:
+                frame = pd.DataFrame(spliced)
+                history = (frame if history is None
+                           else _merge_bars(history, frame, floor=floor))
+        if history is None or not len(history):
+            logger.error('%s: no %s history; keeping SPOT prices for it, which '
+                         'mixes two indices across the universe', symbol,
+                         INDEX_VENUE)
+            out[symbol] = spot_bars
+            continue
+        _INDEX_CACHE[symbol] = history
+        out[symbol] = carry_activity(
+            history[history['event_time'] >= floor].reset_index(drop=True),
+            spot_bars)
     return out
 
 
