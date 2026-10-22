@@ -280,3 +280,56 @@ makes the untouched `max_depth` 3 vs 4 arm the more promising next test.
 A group may still be dropped to BUY SAMPLE, because its forecast cost is
 unmeasurable rather than zero. It must not be dropped on the claim that the
 ablation showed it unhelpful. That claim is not supported.
+
+---
+
+## CORRECTION, 2026-10-22 — the run did not match the deployed retrain
+
+This document states "Everything else matches the deployed retrain." **That is
+false.** The `retrain` service passes `--ensemble-size 5`
+(`docker-compose.yml`, the retrain command). Every run recorded above --- the
+ablation, NC2, and the superseded run 1 --- took the library default of **1**.
+The deployed artifact is a five-member ensemble; the measurements are of a
+single booster.
+
+The other retrain flags omitted here are trading-only (`--min-edge-pp`,
+`--bankroll`, `--exclude-price-band`, `--max-entries-per-symbol-window`,
+`--max-positions-per-window`, `--maker-entry`, `--max-stake-dollars`,
+`--compound`) or are gates that read member spread rather than forecast skill
+(`--edge-lower-bound-z`, `--require-member-agreement`). None of them changes a
+log loss. `--ensemble-size` does.
+
+### Why this can change the verdicts
+
+Averaging five boosters removes the share of the error that is the booster's
+own stochasticity -- `bagging_fraction 0.7` and `feature_fraction 0.6` resample
+on every fit -- by up to sqrt(5) = 2.24x on that component.
+
+```
+group            t at ens=1   t if se/1.5   t if se/2.24
+cross_venue           +2.14         +3.23          +4.83
+geometry              +1.23         +1.85          +2.76
+cross_asset           +1.26         +1.90          +2.83
+NOISE (NC2)           +1.46         +2.19          +3.27
+```
+
+The bar is `t > 2.7`. **`cross_venue` crosses it under either shrink**, so
+"all eight groups DROP" is not safe at the configuration we actually ship.
+Note the noise group rises too, which is the point of re-running it alongside:
+a floor that moves with the model class has to be re-measured, not carried
+over.
+
+### Action
+
+Everything above is held as **measured at `ensemble_size=1`** and is not a
+finding about the deployed model. The ablation and the noise calibration are
+being re-run together at `--ensemble-size 5`, in one job so they share a
+dataset build and a sample:
+
+* the eight feature groups, leave-one-out, as pre-registered, and
+* five independent noise groups, giving the floor as a DISTRIBUTION at the
+  deployed configuration.
+
+**Thresholds are unchanged: `delta > 0` and `t > 2.7`.** They were fixed
+before any result and are not being revisited now that a number is known to be
+close to them.
