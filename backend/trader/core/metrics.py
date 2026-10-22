@@ -755,24 +755,52 @@ def market_fold_test(frame: pd.DataFrame) -> tuple[float, int]:
     return weighted_fold_mean(values, weights).p_value, len(values)
 
 
+class NoiseNull(float):
+    """The no-signal distribution of `model_ece - market_ece`.
+
+    **A float**, carrying its spread as an attribute. Every existing use --
+    arithmetic, comparison, serialisation -- keeps working unchanged, which a
+    tuple would have broken silently at each call site that compares the null
+    to a number.
+    """
+
+    def __new__(cls, mean, sd=float('nan'), draws=0):
+        self = super().__new__(cls, float(mean))
+        self.sd = float(sd)
+        self.draws = int(draws)
+        return self
+
+    @property
+    def mean(self) -> float:
+        return float(self)
+
+
 def calibration_noise_null(market, outcome, correction_sd, *,
-                           draws: int = 200, seed: int = 0) -> float:
-    """Mean `model_ece - market_ece` for a correction of the same size and no signal.
+                           draws: int = 200, seed: int = 0) -> NoiseNull:
+    """The `model_ece - market_ece` distribution for a same-sized correction
+    carrying no signal.
 
     ECE uses absolute deviations, so any unbiased perturbation of a calibrated
     forecast raises measured ECE. A zero bar would charge the model for moving
-    at all. The gate subtracts this null, which is generated at the candidate's
-    own correction magnitude.
+    at all. The gate subtracts this null, generated at the candidate's own
+    correction magnitude.
+
+    **The SD is returned, not just the mean.** Subtracting the centre and then
+    gating at zero asks whether the candidate beat a coin flip: under the null
+    the observed value falls above the mean half the time, so a model with no
+    signal fails such a gate about half the time. `calibration_vs_market`
+    failed 12 of 21 promotions on exactly that arithmetic. Reporting the
+    spread lets the threshold be set in units of it rather than at zero.
     """
     market = pd.to_numeric(pd.Series(market), errors='coerce').to_numpy(dtype=float)
     outcome = pd.to_numeric(pd.Series(outcome), errors='coerce').to_numpy(dtype=float)
     keep = np.isfinite(market) & np.isfinite(outcome)
     market, outcome = market[keep], outcome[keep]
     if not len(market) or not np.isfinite(correction_sd) or correction_sd <= 0:
-        return 0.0
+        return NoiseNull(0.0, float('nan'), 0)
     base = _pooled_ece(market, outcome)
     if not np.isfinite(base):
-        return 0.0
+        return NoiseNull(0.0, float('nan'), 0)
     z = logit(clip_prob(market))
     rng = np.random.default_rng(seed)
     out = []
@@ -781,7 +809,11 @@ def calibration_noise_null(market, outcome, correction_sd, *,
                             outcome)
         if np.isfinite(drawn):
             out.append(drawn - base)
-    return float(np.mean(out)) if out else 0.0
+    if not out:
+        return NoiseNull(0.0, float('nan'), 0)
+    return NoiseNull(float(np.mean(out)),
+                     float(np.std(out, ddof=1)) if len(out) > 1 else float('nan'),
+                     len(out))
 
 
 def _pooled_ece(pred, outcome) -> float:
@@ -857,6 +889,7 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
                 'baseline_minus_market': float('nan'),
                 'market_max_deviation': float('nan'),
                 'calibration_noise_null': float('nan'),
+                'calibration_noise_sd': float('nan'),
                 'calibration_vs_market': float('nan')}
     windows = float(frame.drop_duplicates(['symbol', 'window_open']).shape[0])
     overall = market_slice(frame, 'all')
@@ -902,8 +935,11 @@ def market_gate_values(rows: Iterable[Sequence]) -> dict[str, float]:
             'min_folds': float(n_folds),
             'baseline_minus_market': float(overall['baseline_minus_market']),
             'market_max_deviation': market_dev,
-            'calibration_noise_null': float(null),
-            'calibration_vs_market': float(model_ece - market_ece - null)}
+            'calibration_noise_null': float(null.mean),
+            # Reported so the threshold can be read in units of the null's own
+            # spread instead of against an exact zero.
+            'calibration_noise_sd': float(null.sd),
+            'calibration_vs_market': float(model_ece - market_ece - null.mean)}
 
 
 # ---- gates ---------------------------------------------------------------
@@ -1164,6 +1200,13 @@ class Gate:
     threshold: float
     direction: str
     note: str = ''
+    #: The spread of this gate's own null, where one has been measured. NaN
+    #: elsewhere. A threshold is only interpretable against it: a gate set at
+    #: an exact zero on a mean-subtracted statistic is a coin flip under the
+    #: null, which is how `calibration_vs_market` failed 12 of 21 promotions.
+    #: Reported, never used to decide -- changing a threshold needs
+    #: `--accept-gate-change`.
+    sd: float = float('nan')
 
     @property
     def passed(self) -> bool:
@@ -1172,11 +1215,21 @@ class Gate:
         return (self.value >= self.threshold if self.direction == 'min'
                 else self.value <= self.threshold)
 
+    @property
+    def sigmas(self) -> float:
+        """How far past the threshold, in units of this gate's own null."""
+        if not (np.isfinite(self.sd) and self.sd > 0
+                and np.isfinite(self.value)):
+            return float('nan')
+        return (self.value - self.threshold) / self.sd
+
     def line(self) -> str:
         mark = 'pass' if self.passed else 'FAIL'
         comparison = '>=' if self.direction == 'min' else '<='
+        sigma = ('' if not np.isfinite(self.sigmas)
+                 else f' [{self.sigmas:+.2f} sd of its null]')
         return (f'  [{mark}] {self.name:<24} {self.value:>10.5f} {comparison} '
-                f'{self.threshold:<10.5f} {self.note}')
+                f'{self.threshold:<10.5f}{sigma} {self.note}')
 
 
 def evaluate_gates(
@@ -1194,9 +1247,13 @@ def evaluate_gates(
     values = report.gate_values()
     if extra:
         values.update(extra)
+    # Gates whose null has a measured spread, and where that spread lives.
+    SD_FOR = {'calibration_vs_market': 'calibration_noise_sd'}
     return [
         Gate(name=name, value=values.get(name, float('nan')), threshold=threshold,
-             direction=direction, note=GATE_NOTES.get(name, ''))
+             direction=direction, note=GATE_NOTES.get(name, ''),
+             sd=float(values.get(SD_FOR[name], float('nan')))
+             if name in SD_FOR else float('nan'))
         for name, (threshold, direction) in gates.items()
     ]
 

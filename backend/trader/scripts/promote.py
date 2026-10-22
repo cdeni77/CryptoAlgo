@@ -375,10 +375,16 @@ def publish_to_serving(attempt, report) -> None:
             # red FAIL, identical to a gate that was measured and lost. Those
             # are different claims, and `GATE_NOTES` already explains each one
             # in a sentence that never reached a screen.
+            # `sd` and `sigmas` are recorded where the gate's null has a
+            # measured spread. Without them a reader cannot tell a real breach
+            # from a fluctuation: `calibration_vs_market` subtracts its null's
+            # MEAN and gates at zero, which under the null is a coin flip, and
+            # it duly failed 12 of the first 21 promotions.
             gates=[{'name': g.name, 'value': _finite(g.value),
                     'threshold': g.threshold, 'direction': g.direction,
                     'passed': bool(g.passed),
                     'measured': bool(np.isfinite(g.value)),
+                    'sd': _finite(g.sd), 'sigmas': _finite(g.sigmas),
                     'note': g.note or ''} for g in attempt.gates],
             failed_gates=', '.join(g.name for g in attempt.gates if not g.passed),
             # **The multiple-testing context travels with the run.** The
