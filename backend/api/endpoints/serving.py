@@ -22,6 +22,18 @@ def get_account(db: Session = Depends(get_db)):
     return serving.account_state(db)
 
 
+@router.get('/account/models')
+def get_model_performance(all_time: bool = Query(False),
+                          db: Session = Depends(get_db)):
+    """Settled P&L for every model version that has traded, newest first.
+
+    `all_time=true` ignores the dashboard epoch, so a model that traded before
+    the last reset still appears. Read `pnl_per_position` beside `win_rate`: a
+    model trading longshots wins seldom and profitably.
+    """
+    return serving.model_performance(db, all_time=all_time)
+
+
 @router.get('/account/equity')
 def get_equity(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)):
     return {'days': days, 'points': serving.equity_curve(db, days=days)}

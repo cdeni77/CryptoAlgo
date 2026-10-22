@@ -112,6 +112,84 @@ def since_reset(query, model, epoch):
     return query.where(column >= epoch)
 
 
+def model_performance(db: Session, *, all_time: bool = False) -> dict[str, Any]:
+    """Settled P&L per model version, newest first, plus the total.
+
+    Attribution runs `positions.prediction_id -> predictions.model_version`;
+    positions carry no model of their own. A position whose prediction was
+    deleted, or which predates `model_version` being recorded, lands in
+    `unattributed` rather than being dropped -- a per-model table that does
+    not add up to the account is worse than one with a remainder.
+
+    `all_time` ignores the dashboard epoch. Every other serving query is
+    epoch-filtered; this one asks "how did each model do", and a model that
+    traded before the last reset still did so.
+
+    `win_rate` is not a quality measure here. A model trading longshots wins
+    seldom and profitably -- 20261022T171846Z settled 22% and made money --
+    so read `pnl_per_position` beside it.
+    """
+    epoch = reset_epoch(db)
+    if all_time:
+        epoch = None
+
+    # Outer join: a position whose prediction is gone keeps its P&L and lands
+    # in `unattributed`, rather than vanishing from a table that is supposed
+    # to reconcile with the account.
+    rows = since_reset(select(Position), Position, epoch).join(
+        Prediction, Position.prediction_id == Prediction.id, isouter=True
+    ).add_columns(Prediction.model_version)
+    settled, unattributed = {}, {'positions': 0, 'pnl': 0.0}
+    for position, version in db.execute(rows).all():
+        if position.settled_at is None:
+            continue
+        pnl = float(position.pnl or 0.0)
+        if not version:
+            unattributed['positions'] += 1
+            unattributed['pnl'] += pnl
+            continue
+        bucket = settled.setdefault(str(version), {
+            'model_version': str(version), 'positions': 0, 'pnl': 0.0,
+            'wins': 0, 'contracts': 0, 'first_window': None,
+            'last_window': None})
+        bucket['positions'] += 1
+        bucket['pnl'] += pnl
+        bucket['wins'] += 1 if position.settled_up else 0
+        bucket['contracts'] += int(position.contracts or 0)
+        when = position.window_open
+        if when is not None:
+            if bucket['first_window'] is None or when < bucket['first_window']:
+                bucket['first_window'] = when
+            if bucket['last_window'] is None or when > bucket['last_window']:
+                bucket['last_window'] = when
+
+    models = []
+    for bucket in settled.values():
+        n = bucket['positions']
+        models.append({
+            **bucket,
+            'pnl': round(bucket['pnl'], 4),
+            'pnl_per_position': round(bucket['pnl'] / n, 6) if n else None,
+            'pnl_per_contract': (round(bucket['pnl'] / bucket['contracts'], 6)
+                                 if bucket['contracts'] else None),
+            'win_rate': round(bucket['wins'] / n, 4) if n else None,
+        })
+    models.sort(key=lambda m: (m['first_window'] is None, m['first_window']),
+                reverse=True)
+
+    total = round(sum(m['pnl'] for m in models) + unattributed['pnl'], 4)
+    return {
+        'all_time': bool(all_time),
+        'epoch': epoch.isoformat() if epoch is not None else None,
+        'models': models,
+        'unattributed': {'positions': unattributed['positions'],
+                         'pnl': round(unattributed['pnl'], 4)},
+        'total_pnl': total,
+        'total_positions': (sum(m['positions'] for m in models)
+                            + unattributed['positions']),
+    }
+
+
 def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str, Any]:
     epoch = reset_epoch(db)
     row = db.execute(select(Account).order_by(Account.id)).scalars().first()
