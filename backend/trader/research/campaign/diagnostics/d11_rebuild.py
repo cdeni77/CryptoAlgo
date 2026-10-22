@@ -43,7 +43,7 @@ MIN_SIZE = 1e-3
 DAYS = sys.argv[1].split(',') if len(sys.argv) > 1 else [
     '2026-10-02', '2026-10-05', '2026-10-08', '2026-10-11', '2026-10-13']
 
-con = duckdb.connect(); con.execute('PRAGMA threads=16')
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk; con.execute('PRAGMA threads=16')
 t0 = time.time()
 print('=' * 86); print('D11 REBUILD — book reconstruction vs backfill at the decision instant')
 print('=' * 86)

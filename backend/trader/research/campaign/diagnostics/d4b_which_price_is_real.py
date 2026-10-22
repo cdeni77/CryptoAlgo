@@ -25,7 +25,7 @@ for lo, hi in [(0,.10),(.10,.30),(.30,.50),(.50,.70),(.70,.90),(.90,1.01)]:
 print("\nIf the two columns have OPPOSITE signs the D4 pattern is regression to the")
 print("mean from independent noise. If they AGREE the backfill is genuinely biased.")
 
-con = duckdb.connect()
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
 sett = con.execute("""
 with s as (select *, row_number() over (partition by venue,symbol,event_time order by available_time desc) rn
   from read_parquet('data/research/venue_settlements/**/*.parquet', union_by_name=true))

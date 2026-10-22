@@ -137,7 +137,7 @@ def main():
     ap.add_argument('--start', default='2026-09-30')
     ap.add_argument('--end', default='2026-10-14')
     a = ap.parse_args()
-    con = duckdb.connect(); con.execute('PRAGMA threads=12')
+    con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk; con.execute('PRAGMA threads=12')
     days = pd.date_range(a.start, a.end, freq='D').strftime('%Y-%m-%d')
     t0 = time.time()
     for d in days:

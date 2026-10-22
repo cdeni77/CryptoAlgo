@@ -96,7 +96,8 @@ def _markets(store_root: Optional[str]) -> pd.DataFrame:
           and market_ticker is not null
         group by 1 order by 2
     """
-    return duckdb.connect().execute(q).fetchdf()
+    return duckdb.connect(config={'max_temp_directory_size': '32GB'}) \
+        .execute(q).fetchdf()
 
 
 def _already(store) -> set:

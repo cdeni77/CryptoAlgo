@@ -20,7 +20,7 @@ import harness as H
 DAY = sys.argv[1] if len(sys.argv) > 1 else '2026-10-08'
 print(f'overlap day under test: {DAY}  (backfill ends 2026-10-14, tape starts 2026-09-30)')
 
-con = duckdb.connect()
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
 con.execute("PRAGMA threads=4")
 
 # ---- the backfill rows for that day, with their claimed age ---------------

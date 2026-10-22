@@ -14,7 +14,7 @@ was placed, so its depth described a book our own fill had eaten into. Fixed
 import duckdb, numpy as np, pandas as pd
 from sklearn.metrics import log_loss
 
-con=duckdb.connect()
+con=duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
 con.execute("""create view d as
 with x as (select *, row_number() over (
    partition by venue,symbol,event_time,source,offset_minutes order by available_time desc) rn

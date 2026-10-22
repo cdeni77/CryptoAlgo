@@ -27,7 +27,7 @@ unmapped = [f for f in feats if not any(f in v for v in by_group.values())]
 if unmapped:
     print(f"  UNMAPPED to any declared group: {unmapped}")
 
-con = duckdb.connect()
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
 print("\n--- availability of each book-dependent source, by month ---")
 q = con.execute(f"""
 with d as (select *, row_number() over (

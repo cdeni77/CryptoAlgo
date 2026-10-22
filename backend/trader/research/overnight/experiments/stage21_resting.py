@@ -52,7 +52,7 @@ def load():
                          'ask_up', 'ask_down'])
     s['window_open'] = pd.to_datetime(s.window_open, utc=True)
     import duckdb
-    d = duckdb.connect().execute("""
+    d = duckdb.connect(config={'max_temp_directory_size': '32GB'}).execute("""
         select symbol, window_open, offset_minutes, yes_bid, yes_ask
         from read_parquet('data/research/venue_depth/**/*.parquet', union_by_name=true)
         where venue = 'kalshi'

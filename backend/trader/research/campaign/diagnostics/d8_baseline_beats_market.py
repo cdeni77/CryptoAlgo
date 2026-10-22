@@ -31,7 +31,7 @@ oof['window_open'] = pd.to_datetime(oof.window_open, utc=True)
 print(f'E3 OOF: {len(oof):,} rows, {oof.window_open.nunique():,} windows')
 
 # the SOURCE's own staleness: time since the last book change
-con = duckdb.connect()
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
 age = con.execute(f"""
 with x as (select *, row_number() over (
    partition by venue,symbol,event_time,source,offset_minutes order by available_time desc) rn

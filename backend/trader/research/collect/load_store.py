@@ -167,7 +167,7 @@ def summarise_partition(path) -> pd.DataFrame:
     spills to disk, so memory stays bounded.
     """
     import duckdb
-    con = duckdb.connect()
+    con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
     try:
         frame = con.execute(
             _SQL, [str(path), WINDOW_MINUTES - 1, str(path)]).fetch_df()

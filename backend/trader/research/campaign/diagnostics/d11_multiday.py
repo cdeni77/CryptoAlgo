@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE.parent))
 import harness as H
 
 days = pd.date_range('2026-09-30', '2026-10-14', freq='D').strftime('%Y-%m-%d')
-con = duckdb.connect(); con.execute('PRAGMA threads=4')
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk; con.execute('PRAGMA threads=4')
 all_res = []
 for DAY in days:
     try:

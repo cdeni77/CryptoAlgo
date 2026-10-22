@@ -40,3 +40,20 @@ def test_nothing_connects_to_duckdb_unbounded():
         # datastore.connect itself holds the single legitimate call
         allowed = 1 if name.endswith('datastore.py') else 0
         assert len(bare) == allowed, f'{name} has {len(bare)} unbounded duckdb.connect()'
+
+
+def test_no_script_or_research_module_connects_unbounded():
+    """One unbounded caller reintroduces the whole failure while the rest
+    look fixed. 352 GB of orphaned spill took the host to 100% on
+    2026-10-22, with the live trader running on it.
+
+    `core/datastore.connect` holds the single legitimate bare call.
+    """
+    import subprocess
+
+    out = subprocess.run(
+        ['grep', '-rn', 'duckdb.connect()', '--include=*.py',
+         'research/', 'core/', 'scripts/'],
+        capture_output=True, text=True).stdout.strip().splitlines()
+    unbounded = [l for l in out if 'core/datastore.py' not in l]
+    assert not unbounded, 'unbounded duckdb.connect():\n' + '\n'.join(unbounded)

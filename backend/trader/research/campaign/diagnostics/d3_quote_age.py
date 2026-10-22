@@ -12,7 +12,7 @@ from sklearn.metrics import log_loss
 pair = pd.read_parquet('research/campaign/diagnostics/d4_pairs.parquet')
 pair['mid_bf'] = (pair.ask_bf + pair.bid_bf)/2
 pair['mid_lv'] = (pair.ask_lv + pair.bid_lv)/2
-con = duckdb.connect()
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
 sett = con.execute("""
 with s as (select *, row_number() over (partition by venue,symbol,event_time order by available_time desc) rn
   from read_parquet('data/research/venue_settlements/**/*.parquet', union_by_name=true))

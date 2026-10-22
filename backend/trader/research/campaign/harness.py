@@ -70,7 +70,7 @@ def market_prices(*, latency_s: float = DECISION_LATENCY_S,
     Implemented as an ASOF join so the selection is the same rule for every source
     and every offset, rather than a per-source special case.
     """
-    con = duckdb.connect()
+    con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
     con.execute(f"""create or replace view q as
     with x as (select *, row_number() over (
         partition by venue,symbol,event_time,source,offset_minutes
@@ -132,7 +132,7 @@ def stream_prices(**kw) -> pd.DataFrame:
 
 
 def venue_labels() -> pd.DataFrame:
-    con = duckdb.connect()
+    con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk
     df = con.execute(f"""
     with s as (select *, row_number() over (
         partition by venue,symbol,event_time order by available_time desc) rn

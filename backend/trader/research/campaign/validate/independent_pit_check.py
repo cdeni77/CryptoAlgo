@@ -21,7 +21,7 @@ def check(name, ok, detail=''):
     if not ok: fails.append(name)
 
 print('=' * 80); print('INDEPENDENT POINT-IN-TIME VALIDATION of market_v2'); print('=' * 80)
-con = duckdb.connect(); con.execute('PRAGMA threads=8')
+con = duckdb.connect(config={'max_temp_directory_size': '32GB'})  # bounded: a killed query must fail, not fill the disk; con.execute('PRAGMA threads=8')
 man = json.loads(MANIFEST.read_text())
 fz = pd.read_parquet(FROZEN)
 print(f'frozen rows {len(fz):,}   manifest says {man["rows"]:,}')
