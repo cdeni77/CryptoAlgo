@@ -6,6 +6,11 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import type { ComponentType } from 'react';
+import { AlertStrip } from './app/AlertStrip';
+import { StatusHeader } from './app/StatusHeader';
+import { fetchCollectionHealth, fetchLive } from './api/serving';
+import { usePolling } from './hooks/usePolling';
+import { deriveAlerts } from './lib/status';
 import { Rail } from './components/Rail';
 import { TabBar } from './components/TabBar';
 import { AccountPage } from './pages/AccountPage';
@@ -67,6 +72,25 @@ export default function App() {
   const secondsIntoWindow = (now.getUTCMinutes() % 15) * 60 + now.getUTCSeconds();
   const secondsLeft = 15 * 60 - secondsIntoWindow;
 
+  // **Polled at the shell, not per page.** The header and the alert strip are
+  // on every route, and each page fetching its own copy made the same fact
+  // arrive at a different second on each screen. Five seconds: these drive a
+  // banner, not a chart, and `/collection` is the heaviest read on the API.
+  const live = usePolling(fetchLive, 5_000);
+  const collection = usePolling(fetchCollectionHealth, 15_000);
+
+  const account = live.data?.account ?? null;
+  // The newest decision across symbols. Its AGE is the liveness signal; the
+  // fetch succeeding is not.
+  const decisionTimes = (live.data?.windows ?? [])
+    .map((w) => w.decision_time)
+    .filter((t): t is string => Boolean(t))
+    .sort();
+  const lastDecisionAt = decisionTimes.length
+    ? decisionTimes[decisionTimes.length - 1]
+    : null;
+  const alerts = deriveAlerts(account, collection.data ?? null, lastDecisionAt);
+
   return (
     <div className="flex min-h-screen bg-paper">
       <Rail
@@ -82,29 +106,16 @@ export default function App() {
       />
 
       <main className="min-w-0 flex-1">
-        <header className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-rule bg-paper/95 px-4 py-3 backdrop-blur-sm md:gap-6 md:px-8 md:py-4">
-          {/* `min-w-0` on the flex child, or the long hint refuses to shrink and
-              pushes the clock off the right edge instead of truncating. */}
-          <div className="min-w-0">
-            {/* The hint is a full sentence; on a phone it is one line or it is
-                three. Hidden rather than wrapped — the h1 already names the
-                page, and the hint is still the button's title in the rail. */}
-            <div className="eyebrow hidden truncate sm:block">{ROUTES[route].hint}</div>
-            <h1 className="truncate text-base font-semibold text-ink md:text-lg">
-              {ROUTES[route].label}
-            </h1>
-          </div>
-          <div className="shrink-0 text-right">
-            {/* Every time on this dashboard is US Eastern -- the venue's own
-                day boundary, and the zone the account reconciles against. Said
-                here because a clock with no zone is read as the viewer's. */}
-            <div className="eyebrow">next settlement · ET</div>
-            <div className="font-mono text-mid font-medium tabular-nums text-ink">
-              {String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:
-              {String(secondsLeft % 60).padStart(2, '0')}
-            </div>
-          </div>
-        </header>
+        <StatusHeader
+          title={ROUTES[route].label}
+          hint={ROUTES[route].hint}
+          mode={account?.mode ?? null}
+          halted={Boolean(account?.halted)}
+          lastDecisionAt={lastDecisionAt}
+          secondsLeft={secondsLeft}
+        />
+
+        <AlertStrip alerts={alerts} />
 
         {/* `pb-20` clears the fixed tab bar, which would otherwise sit on top of
             the last row of every page. */}
