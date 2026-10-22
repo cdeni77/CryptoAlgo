@@ -250,6 +250,35 @@ export interface VenueDaily {
   total: number;
 }
 
+/** One model version's settled record. `win_rate` is the share of positions
+ *  that MADE MONEY, not the share where the market rose: a `down` position
+ *  settling down is a win. Read it beside `pnl_per_position` — a model can
+ *  win most of its positions and still lose, by losing bigger. */
+export interface ModelRecord {
+  model_version: string;
+  positions: number;
+  pnl: number;
+  wins: number;
+  contracts: number;
+  first_window: string | null;
+  last_window: string | null;
+  pnl_per_position: number | null;
+  pnl_per_contract: number | null;
+  win_rate: number | null;
+}
+
+export interface ModelPerformance {
+  all_time: boolean;
+  /** The dashboard epoch this is bounded by; null when all_time. */
+  epoch: string | null;
+  models: ModelRecord[];
+  /** Positions with no model behind them — they predate `model_version`
+   *  being recorded. Kept so the table reconciles with the account. */
+  unattributed: { positions: number; pnl: number };
+  total_pnl: number;
+  total_positions: number;
+}
+
 export interface VenueAccountState {
   /** False when no venue ledger is stored, as for a paper account. */
   available: boolean;

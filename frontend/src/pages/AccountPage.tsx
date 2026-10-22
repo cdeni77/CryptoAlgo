@@ -43,6 +43,7 @@ import {
   SectionHead,
 } from '../components/Primitives';
 import { DailyPnlCalendar } from '../components/DailyPnlCalendar';
+import { ModelRecords } from '../components/ModelRecords';
 import { go } from '../lib/navigate';
 import { cents } from '../lib/format';
 
@@ -295,6 +296,8 @@ export function AccountPage() {
           )}
         </Panel>
       )}
+
+      <ModelRecords pollMs={LIVE_MS} />
 
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <Panel>

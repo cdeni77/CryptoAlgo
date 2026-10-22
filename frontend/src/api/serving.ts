@@ -8,6 +8,7 @@ import type {
   Funnel,
   LiveState,
   ModelAttempt,
+  ModelPerformance,
   ModelState,
   Position,
   Prediction,
@@ -21,6 +22,11 @@ import type {
 export const fetchLive = () => get<LiveState>('/live');
 
 export const fetchAccount = () => get<AccountState>('/account');
+
+/** Settled P&L per model version. `allTime` ignores the dashboard epoch — a
+ *  model that traded before the last reset still did so. */
+export const fetchModelPerformance = (allTime = false) =>
+  get<ModelPerformance>(`/account/models${allTime ? '?all_time=true' : ''}`);
 
 export const fetchEquity = (days = 30) =>
   get<{ days: number; points: EquityPoint[] }>(`/account/equity?days=${days}`);
