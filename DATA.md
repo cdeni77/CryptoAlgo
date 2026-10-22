@@ -246,6 +246,54 @@ exactly on the 69-day boundary, so a default re-run could no longer see it.
 ~69 days must be filled with `--historical` or the run will report nothing to
 do and look clean.
 
+### `available_time` means different things in the two backfills
+
+Measured 2026-10-21, median lag past the offset minute:
+
+```
+backfill (Predexon)        0.0s      available_time == event_time
+live_touch                 3.0s
+live / live_ws            31.9s
+candles            3,057,014.6s      available_time == when the BACKFILL RAN
+```
+
+`scripts/backfill_candles` stamps the fetch time deliberately for
+`venue_candles`, where open interest is a revised series the venue restates.
+The **quote** rows it writes into `venue_depth` inherit that stamp, where the
+justification does not hold: a bid and ask at minute `m` were knowable at
+minute `m`.
+
+**The research path is unaffected**, and not by luck: `core/quotes.py` uses
+`available_time` only for `live_touch` and judges everything else on
+`quote_age_seconds`, which candle rows carry as 0.0 and 100% populated. They
+are 100% usable at the 5-second bound.
+
+**Anything that joins on `available_time` sees none of them.** The campaign
+harness does exactly that, with an as-of join on
+`available_time <= decision_instant`, so an experiment run through it would
+silently score zero candle quotes and report that as the data.
+
+The two backfills therefore disagree with each other, and the comment at
+`core/quotes.py:120` describes the candle convention rather than Predexon's.
+
+### Candle and live quotes are ALIGNED; the residual is movement, not error
+
+Comparing a candle to the live book at the same offset is a fair comparison,
+and that was checked rather than assumed. Shifting the candle offset against
+the live one, median absolute difference:
+
+```
+shift  -2      -1       0      +1      +2
+     10.0c    7.0c    2.0c    3.0c    7.0c
+```
+
+Offset 0 is the minimum and it degrades symmetrically, so there is no
+off-by-one. The ~2c residual is genuine price movement between the candle's
+minute boundary and the live sample 32 seconds later — the live recorders
+stamp at +31.9s, `live_touch` at +3s. **So a candle is not "wrong" by 2c; it
+describes a different instant.** Any claim that a minute-grid quote is
+inaccurate has to separate that movement from real error.
+
 ### A minute-grid quote is not an executable price — on EITHER source
 
 Measured 2026-10-21 against the live book, on the rows where each overlaps it:
