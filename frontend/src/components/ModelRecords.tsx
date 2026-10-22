@@ -8,7 +8,6 @@ import { useState } from 'react';
 
 import { fetchModelPerformance } from '../api/serving';
 import { usePolling } from '../hooks/usePolling';
-import { ModelDetailPanel } from './ModelDetailPanel';
 import { Failed, Loading, Panel, SectionHead } from './Primitives';
 
 const money = (v: number) => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`;
@@ -27,20 +26,18 @@ function day(iso: string | null): string {
   });
 }
 
-export function ModelRecords({ pollMs }: { pollMs: number }) {
+export function ModelRecords({
+  pollMs,
+  selected,
+  onSelect,
+}: {
+  pollMs: number;
+  /** The model the whole page is filtered to, or null for all. */
+  selected: string | null;
+  onSelect: (version: string | null) => void;
+}) {
   const [allTime, setAllTime] = useState(true);
-  const [selected, setSelected] = useState<string | null>(null);
   const perf = usePolling(() => fetchModelPerformance(allTime), pollMs, [allTime]);
-
-  if (selected) {
-    return (
-      <ModelDetailPanel
-        version={selected}
-        pollMs={pollMs}
-        onClose={() => setSelected(null)}
-      />
-    );
-  }
 
   return (
     <Panel>
@@ -87,8 +84,12 @@ export function ModelRecords({ pollMs }: { pollMs: number }) {
                 {(perf.data?.models ?? []).map((m, i) => (
                   <tr
                     key={m.model_version}
-                    onClick={() => setSelected(m.model_version)}
-                    className="cursor-pointer border-t border-line hover:bg-line/40"
+                    onClick={() =>
+                      onSelect(selected === m.model_version ? null : m.model_version)
+                    }
+                    className={`cursor-pointer border-t border-line hover:bg-line/40 ${
+                      selected === m.model_version ? 'bg-line/60' : ''
+                    }`}
                   >
                     <td className="py-1.5 pr-3 font-mono">
                       {m.model_version}
@@ -170,7 +171,7 @@ export function ModelRecords({ pollMs }: { pollMs: number }) {
             most of its positions and still lose, by losing bigger. Rows with no
             model recorded predate the model being stamped on a prediction and
             are kept so the table reconciles with the account. Select a row
-            for that model on its own.
+            to filter this page to that model; select it again to clear.
           </p>
         </>
       )}

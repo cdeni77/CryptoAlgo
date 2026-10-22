@@ -34,14 +34,6 @@ def get_model_performance(all_time: bool = Query(False),
     return serving.model_performance(db, all_time=all_time)
 
 
-@router.get('/account/models/{version}')
-def get_model_detail(version: str, all_time: bool = Query(True),
-                     limit: int = Query(500, ge=1, le=2000),
-                     db: Session = Depends(get_db)):
-    """One model's settled positions and its own cumulative P&L from zero."""
-    return serving.model_detail(db, version, all_time=all_time, limit=limit)
-
-
 @router.get('/account/equity')
 def get_equity(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)):
     return {'days': days, 'points': serving.equity_curve(db, days=days)}
@@ -125,9 +117,12 @@ def get_funnel(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)
 def get_positions(
     open_only: bool = False,
     limit: int = Query(100, ge=1, le=1000),
+    model_version: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    return {'positions': serving.positions(db, open_only=open_only, limit=limit)}
+    """`model_version` narrows to the positions one model decided."""
+    return {'positions': serving.positions(db, open_only=open_only, limit=limit,
+                                           model_version=model_version)}
 
 
 @router.get('/prices/{symbol}')

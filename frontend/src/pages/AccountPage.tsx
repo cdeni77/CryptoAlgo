@@ -22,6 +22,7 @@
  * by anyone, with no account attribution, so summing it sums the exchange rather
  * than the portfolio.
  */
+import { useState } from 'react';
 import { usePolling } from '../hooks/usePolling';
 import {
   fetchAccount,
@@ -62,19 +63,26 @@ export function AccountPage() {
   // revalidation, and `usePolling` stops the timer entirely when the tab is
   // hidden, so an unwatched dashboard costs nothing.
   //
-  // The one to watch is the venue curve: 475 KB a response, so a second is
-  // ~475 KB/s on the wire for a 30-day series that gains one step per settled
-  // market. It is here for consistency rather than need.
+  // The venue curve used to be the one to watch. It was measured at 475 KB
+  // on 2026-10-20 and had reached 17 MB by 2026-10-22, because it returned
+  // every balance sample and the table grows for ever. It is strided server
+  // side now, to at most 2,000 points and about 340 KB.
   const LIVE_MS = 1_000;
+
+  // The model this page is filtered to, or null for the whole account.
+  // Set from the by-model table; every panel that CAN narrow does.
+  const [model, setModel] = useState<string | null>(null);
 
   const account = usePolling(fetchAccount, LIVE_MS);
   const venue = usePolling(fetchVenueAccount, LIVE_MS);
   const venueCurve = usePolling(() => fetchVenueEquity(30), LIVE_MS);
   const equity = usePolling(() => fetchEquity(90), LIVE_MS);
   const settlements = usePolling(() => fetchVenueSettlements(200), LIVE_MS);
-  const positions = usePolling(() => fetchPositions(false, 200), LIVE_MS);
+  const positions = usePolling(
+    () => fetchPositions(false, 200, model), LIVE_MS, [model]);
   const daily = usePolling(() => fetchVenueDaily(180), LIVE_MS);
-  const openPositions = usePolling(() => fetchPositions(true, 50), LIVE_MS);
+  const openPositions = usePolling(
+    () => fetchPositions(true, 50, model), LIVE_MS, [model]);
 
   if (account.loading) return <Loading what="the account" />;
   if (account.error) return <Failed error={account.error} what="the account" />;
@@ -297,7 +305,30 @@ export function AccountPage() {
         </Panel>
       )}
 
-      <ModelRecords pollMs={LIVE_MS} />
+      {model && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-accent/40 bg-accent/5 px-3 py-2 text-tiny">
+          <span className="text-ink-2">
+            Positions filtered to <span className="font-mono">{model}</span>.
+          </span>
+          {/* Said plainly rather than left to be inferred: the venue ledger
+              is the account of record and knows nothing about our models, so
+              the balance, the venue curve and the day totals stay
+              account-wide however this page is filtered. */}
+          <span className="text-ink-3">
+            The venue ledger, balance and day totals stay account-wide — the
+            venue does not know which model placed an order.
+          </span>
+          <button
+            type="button"
+            onClick={() => setModel(null)}
+            className="ml-auto rounded border border-line px-2 py-0.5 text-ink-2"
+          >
+            Clear
+          </button>
+        </div>
+      )}
+
+      <ModelRecords pollMs={LIVE_MS} selected={model} onSelect={setModel} />
 
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <Panel>

@@ -202,74 +202,6 @@ def model_performance(db: Session, *, all_time: bool = False) -> dict[str, Any]:
     }
 
 
-def model_detail(db: Session, version: str, *,
-                 all_time: bool = True, limit: int = 500) -> dict[str, Any]:
-    """One model's record: its settled positions and its cumulative P&L.
-
-    The curve is this model's OWN P&L from zero, not a slice of the account
-    curve. Two models traded on the same day do not partition the account --
-    they overlap at a handover -- so a per-model series has to be rebuilt from
-    its own positions rather than cut out of the total.
-    """
-    epoch = reset_epoch(db)
-    if all_time:
-        epoch = None
-
-    rows = db.execute(
-        since_reset(select(Position), Position, epoch)
-        .join(Prediction, Position.prediction_id == Prediction.id)
-        .where(Prediction.model_version == str(version))
-        .order_by(Position.window_open)
-    ).scalars().all()
-
-    points, running, wins, contracts, fees = [], 0.0, 0, 0, 0.0
-    out = []
-    for row in rows:
-        settled = row.settled_at is not None
-        pnl = float(row.pnl or 0.0)
-        contracts += int(row.contracts or 0)
-        fees += float(row.fee or 0.0)
-        if settled:
-            running += pnl
-            wins += 1 if pnl > 0 else 0
-            points.append({'window_open': row.window_open,
-                           'settled_at': row.settled_at,
-                           'pnl': round(pnl, 4),
-                           'cumulative_pnl': round(running, 4)})
-        out.append({
-            'symbol': row.symbol, 'side': row.side,
-            'window_open': row.window_open, 'settle_time': row.settle_time,
-            'offset_minutes': row.offset_minutes,
-            'contracts': row.contracts, 'price': row.price,
-            'model_probability': row.model_probability,
-            'edge': row.edge, 'outcome': row.outcome,
-            'settled_at': row.settled_at,
-            'pnl': None if not settled else round(pnl, 4),
-        })
-
-    settled_rows = [r for r in out if r['settled_at'] is not None]
-    n = len(settled_rows)
-    return {
-        'model_version': str(version),
-        'all_time': bool(all_time),
-        'positions': list(reversed(out))[:limit],
-        'curve': points,
-        'summary': {
-            'positions': len(out),
-            'settled': n,
-            'open': len(out) - n,
-            'pnl': round(running, 4),
-            'pnl_per_position': round(running / n, 6) if n else None,
-            'pnl_per_contract': round(running / contracts, 6) if contracts else None,
-            'win_rate': round(wins / n, 4) if n else None,
-            'contracts': contracts,
-            'fees': round(fees, 4),
-            'first_window': out[0]['window_open'] if out else None,
-            'last_window': out[-1]['window_open'] if out else None,
-        },
-    }
-
-
 def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str, Any]:
     epoch = reset_epoch(db)
     row = db.execute(select(Account).order_by(Account.id)).scalars().first()
@@ -586,9 +518,21 @@ def _for_side(probability, side):
         return probability
     return value if str(side) == 'up' else 1.0 - value
 def positions(db: Session, *, open_only: bool = False,
-              limit: int = 100) -> list[dict[str, Any]]:
+              limit: int = 100,
+              model_version: Optional[str] = None) -> list[dict[str, Any]]:
     epoch = reset_epoch(db)
+    # **Naming a model lifts the epoch.** Asking for one model is already an
+    # all-time question: most models stopped trading before the current epoch
+    # began, so keeping the filter returned an empty list for a model the
+    # by-model table showed 89 positions for. The table and this must agree.
+    if model_version:
+        epoch = None
     query = since_reset(select(Position), Position, epoch)
+    if model_version:
+        # Positions carry no model; it lives on the prediction behind them.
+        query = query.join(
+            Prediction, Position.prediction_id == Prediction.id
+        ).where(Prediction.model_version == str(model_version))
     if open_only:
         query = query.where(Position.outcome == Outcome.PENDING.value) \
             .order_by(Position.settle_time)
