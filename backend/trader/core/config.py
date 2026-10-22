@@ -346,6 +346,12 @@ class Config:
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'
+    # 'venue' builds every window from the venue's own `floor_strike` where it
+    # exists, falling back to the Coinbase OHLC mean elsewhere. The strike and
+    # the price series must move TOGETHER: training on a Coinbase close
+    # against a BRTI-derived strike injects a cross-index basis the model was
+    # not fitted with, so this is only correct alongside a BRTI price series.
+    strike_source: str = 'proxy'
     # Two-stage stacking. 'spot_then_market' fits stage 1 (a baseline-init
     # correction on `stack_spot_groups`) on every training row of the fold —
     # five years of clean bars — and stage 2 only on rows carrying a usable
@@ -1004,6 +1010,7 @@ class Config:
             )
         # Typos here would otherwise surface deep inside a fold's fit.
         for name, allowed in (('label_source', ('proxy', 'venue')),
+                              ('strike_source', ('proxy', 'venue')),
                               ('null_quote_age', ('fresh', 'stale')),
                               ('stack_mode', ('off', 'spot_then_market'))):
             if getattr(self, name) not in allowed:

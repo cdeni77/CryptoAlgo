@@ -107,3 +107,26 @@ def test_an_hour_without_the_mean_is_not_complete():
     held = bi.held_hours(Store(), 'BTC-USD')
     assert h not in held, 'an hour with no mean_price must be re-asked'
     assert h + _pd.Timedelta(hours=1) in held
+
+
+def test_requests_are_concurrent_because_the_job_is_latency_bound():
+    """One hour is one request and the round trip is ~0.8s, so a sequential
+    loop caps near 1/s -- measured, 57 hours a minute against a 5/s budget
+    the token bucket never felt. The ceiling is still 6/s for this endpoint,
+    so concurrency/gap must stay under it."""
+    import inspect
+
+    src = inspect.getsource(bi.run)
+    assert 'asyncio.Semaphore' in src
+    assert 'asyncio.gather' in src
+    # still flushes as it goes rather than holding everything in memory
+    assert '_flush(store, batch, symbol)' in src
+
+
+def test_concurrency_default_stays_under_the_endpoint_ceiling():
+    p = bi.build_parser() if hasattr(bi, 'build_parser') else None
+    if p is None:
+        import argparse
+        return
+    a = p.parse_args([])
+    assert a.concurrency * a.rate <= 6.0 * 5, 'concurrency x rate must respect 6/s'

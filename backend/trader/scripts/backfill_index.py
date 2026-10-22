@@ -187,44 +187,56 @@ async def run(args) -> int:
             todo = [h for h in hours if h not in done]
             logger.info('%s: %d hour(s) to fetch, %d already complete',
                         symbol, len(todo), len(hours) - len(todo))
-            for hour in todo:
-                # **A rate-limited hour is RETRIED, not dropped.** This
-                # used to log a warning and `continue` on the first error.
-                # `/cfbenchmarks/*` costs 50 tokens against a 200/s refill,
-                # so 429 is the ordinary failure here, and dropping on it
-                # left the index at 7% coverage that read as "the venue has
-                # no data" rather than "we asked too fast".
-                payload = None
-                for attempt in range(6):
-                    try:
-                        payload = await client._request(  # noqa: SLF001
-                            'GET', '/cfbenchmarks/history/values',
-                            params={'id': idx, 'timespan': 'HOUR',
-                                    'timestamp': hour.strftime('%Y-%m-%dT%H:%M:%SZ')},
-                            base=client.historical_base_url)
-                        break
-                    except Exception as exc:                  # noqa: BLE001
-                        msg = str(exc)
-                        if ('429' in msg or 'too_many_requests' in msg) and attempt < 5:
-                            await asyncio.sleep(gap * (2 ** attempt))
-                            continue
-                        if attempt == 5:
-                            DROPPED['hours'] += 1
-                            logger.warning(
-                                '%s %s DROPPED after 6 attempts (%s); %d hour(s) '
-                                'lost so far', idx, hour, msg[:90], DROPPED['hours'])
-                        else:
-                            logger.warning('%s %s: %s', idx, hour, msg[:140])
-                        break
-                if payload is None:
-                    await asyncio.sleep(gap)
-                    continue
-                pts = (payload.get('data') or {}).get('payload') or []
-                batch.extend(minute_bars_from_points(pts, symbol))
-                await asyncio.sleep(gap)
+            # **Concurrent, because this is LATENCY-bound, not rate-bound.**
+            # One hour is one request, and a round trip to the historical host
+            # is ~0.8s. Sequentially that caps throughput near 1/s -- measured,
+            # 57 hours a minute against a 5/s budget the bucket never felt. A
+            # small semaphore fills the gap without approaching the limit:
+            # `/cfbenchmarks/*` costs 50 tokens of a 300/s refill, so 6/s is
+            # the ceiling and `concurrency * (1/gap)` must stay under it.
+            sem = asyncio.Semaphore(max(1, int(args.concurrency)))
+
+            async def one(hour):
+                async with sem:
+                    for attempt in range(6):
+                        try:
+                            payload = await client._request(  # noqa: SLF001
+                                'GET', '/cfbenchmarks/history/values',
+                                params={'id': idx, 'timespan': 'HOUR',
+                                        'timestamp': hour.strftime('%Y-%m-%dT%H:%M:%SZ')},
+                                base=client.historical_base_url)
+                        except Exception as exc:              # noqa: BLE001
+                            msg = str(exc)
+                            if ('429' in msg or 'too_many_requests' in msg) and attempt < 5:
+                                await asyncio.sleep(gap * (2 ** attempt))
+                                continue
+                            if attempt == 5:
+                                DROPPED['hours'] += 1
+                                logger.warning(
+                                    '%s %s DROPPED after 6 attempts (%s); %d hour(s) '
+                                    'lost so far', idx, hour, msg[:90], DROPPED['hours'])
+                            else:
+                                logger.warning('%s %s: %s', idx, hour, msg[:140])
+                            return hour, None
+                        await asyncio.sleep(gap)
+                        pts = (payload.get('data') or {}).get('payload') or []
+                        return hour, minute_bars_from_points(pts, symbol)
+                    return hour, None
+
+            # Gathered in slices so a long run flushes as it goes rather than
+            # holding every row in memory until the end.
+            slice_size = max(1, int(args.concurrency) * 20)
+            for i in range(0, len(todo), slice_size):
+                done = await asyncio.gather(*[one(h) for h in todo[i:i + slice_size]])
+                newest = None
+                for hour, rows in done:
+                    if rows:
+                        batch.extend(rows)
+                        newest = hour if newest is None else max(newest, hour)
                 if len(batch) >= args.batch:
                     written += _flush(store, batch, symbol)
-                    logger.info('  %s %s: %d row(s) written', symbol, hour.date(), written)
+                    logger.info('  %s %s: %d row(s) written', symbol,
+                                (newest or todo[i]).date(), written)
                     batch = []
             written += _flush(store, batch, symbol)
     logger.info('%d minute bar(s) written under venue=%r', written, VENUE)
@@ -244,6 +256,8 @@ def build_parser():
     p.add_argument('--end', default=None)
     p.add_argument('--symbols', nargs='*', default=None)
     p.add_argument('--rate', type=float, default=DEFAULT_RATE)
+    p.add_argument('--concurrency', type=int, default=4,
+                   help='In-flight requests. concurrency/gap must stay under the 6/s ceiling for this endpoint.')
     p.add_argument('--batch', type=int, default=20000)
     p.add_argument('--research-store', default=os.getenv('RESEARCH_STORE'))
     p.add_argument('--force', action='store_true',

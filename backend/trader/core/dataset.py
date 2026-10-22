@@ -123,12 +123,23 @@ class Dataset:
         depth: Optional[pd.DataFrame] = None,
         ladder_fits: Optional[pd.DataFrame] = None,
         index_proxy: Optional[pd.DataFrame] = None,
+        venue_strikes: Optional[pd.DataFrame] = None,
     ) -> 'Dataset':
         grids = {s: minute_grid(b) for s, b in bars_by_symbol.items()}
         flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
         states = {s: minute_state(g, flat, config) for s, g in grids.items()}
         states = attach_cross_asset(states, reference, config)
-        windows, reports = build_window_panel(bars_by_symbol, config)
+        # The venue's own strike, where the config asks for it. Applied inside
+        # `build_windows` so every strike-derived quantity is computed from it
+        # rather than patched afterwards -- see the comment there.
+        strikes = None
+        if getattr(config, 'strike_source', 'proxy') == 'venue':
+            strikes = venue_strike_series(venue_strikes)
+            kept = sum(int(v.notna().sum()) for v in (strikes or {}).values())
+            logger.info('strike_source=venue: %s window(s) carry the venue strike',
+                        f'{kept:,}')
+        windows, reports = build_window_panel(bars_by_symbol, config,
+                                              strikes_by_symbol=strikes)
         # Quotes and ladder fits are OBSERVED, not fitted, so they attach here
         # rather than per fold — unlike the volatility model, the seasonality
         # factor and the baseline's scale/tail, all three of which must stay
@@ -267,6 +278,34 @@ def complete_cases(windows: pd.DataFrame,
     if not present or not len(windows):
         return windows.iloc[0:0] if not len(windows) else windows
     return windows[windows[present].notna().all(axis=1)]
+
+
+def venue_strike_series(frame: Optional[pd.DataFrame]) -> Optional[dict]:
+    """`venue_strikes` rows -> one strike Series per symbol, keyed by window_open.
+
+    Returns None when nothing usable is present, so the caller falls back to
+    the Coinbase-built strike rather than silently building every window from
+    NaN. A duplicated window keeps the LAST row: the venue restates a market,
+    and an earlier revision is superseded rather than equally valid.
+    """
+    if frame is None or not len(frame):
+        return None
+    need = {'symbol', 'window_open', 'floor_strike'}
+    if not need.issubset(frame.columns):
+        logger.warning('venue_strikes lacks %s; the venue strike cannot be used',
+                       ', '.join(sorted(need - set(frame.columns))))
+        return None
+    f = frame[['symbol', 'window_open', 'floor_strike']].copy()
+    f['window_open'] = pd.to_datetime(f['window_open'], utc=True)
+    f['floor_strike'] = pd.to_numeric(f['floor_strike'], errors='coerce')
+    f = f.dropna(subset=['window_open', 'floor_strike'])
+    if not len(f):
+        return None
+    out = {}
+    for symbol, g in f.groupby('symbol'):
+        g = g.drop_duplicates('window_open', keep='last')
+        out[str(symbol)] = g.set_index('window_open')['floor_strike']
+    return out or None
 
 
 @dataclass

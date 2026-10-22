@@ -43,7 +43,11 @@ logger = logging.getLogger(__name__)
 # computable from bars strictly before it.
 WINDOW_COLUMNS = (
     'symbol', 'window_open', 'settle_time', 'offset', 'decision_time',
-    'strike', 'last_price', 'displacement',
+    # `strike_source` says whether this row was built from the venue's own
+    # `floor_strike` or from our Coinbase OHLC mean. A mixed sample that
+    # cannot distinguish them reads as one measurement, which is the defect
+    # `price_source` exists to prevent on the quote side.
+    'strike', 'strike_source', 'last_price', 'displacement',
     'excursion_up', 'excursion_down',
     'settle_price', 'settle_return', 'outcome',
     'minutes_missing', 'complete',
@@ -140,6 +144,7 @@ def build_windows(
     *,
     offsets: Optional[Sequence[int]] = None,
     include_unsettled: bool = False,
+    strike_override: Optional[pd.Series] = None,
 ) -> tuple[pd.DataFrame, GridReport]:
     """One row per (window, decision offset) for a single symbol's minute bars.
 
@@ -208,6 +213,23 @@ def build_windows(
     window_open = body.index[::window][1:]
     strike = settle_all[:-1]
     settle_price = settle_all[1:]
+
+    # **The venue's own strike replaces ours HERE, before anything derives
+    # from it.** Every strike-derived quantity -- the displacement, the
+    # z-score, both excursions, the path statistics and the outcome -- is
+    # computed below from `strike`, so overriding it at this one point moves
+    # all of them together. `scripts/live.py` records what happens otherwise:
+    # an earlier version overwrote the strike and recomputed only `z_score`,
+    # so `abs_z_score == |z_score|` -- an identity that holds in every
+    # training row -- was violated at inference on every cycle, invisibly.
+    strike_is_venue = np.zeros(len(strike), dtype=bool)
+    if strike_override is not None and len(strike_override):
+        want = pd.Series(np.asarray(strike, dtype=float), index=window_open)
+        have = pd.to_numeric(strike_override, errors='coerce')
+        have = have[~have.index.duplicated(keep='last')].reindex(want.index)
+        use = have.notna().to_numpy()
+        strike = np.where(use, have.to_numpy(dtype=float), want.to_numpy())
+        strike_is_venue = use
     highs, lows, closes = highs[1:], lows[1:], closes[1:]
     means = means[1:]
     n_windows -= 1
@@ -256,6 +278,10 @@ def build_windows(
             'offset': np.int16(offset),
             'decision_time': window_open + pd.Timedelta(minutes=offset),
             'strike': strike,
+            # Which strike this row used. A row that cannot say whether it was
+            # graded against the venue's number or ours is the same defect as
+            # a quote that cannot say whether it was a fill or a backtest.
+            'strike_source': np.where(strike_is_venue, 'venue', 'proxy'),
             'last_price': last_price,
             'displacement': last_price / strike - 1.0,
             'excursion_up': high_so_far / strike - 1.0,
@@ -313,6 +339,7 @@ def build_window_panel(
     *,
     offsets: Optional[Sequence[int]] = None,
     include_unsettled: bool = False,
+    strikes_by_symbol: Optional[dict[str, pd.Series]] = None,
 ) -> tuple[pd.DataFrame, dict[str, GridReport]]:
     """`build_windows` across the universe, concatenated and sorted by decision time.
 
@@ -326,6 +353,7 @@ def build_window_panel(
             logger.warning('%s: no bars, skipped', symbol)
             continue
         table, report = build_windows(bars, symbol, config, offsets=offsets,
+                                      strike_override=(strikes_by_symbol or {}).get(symbol),
                                       include_unsettled=include_unsettled)
         tables.append(table)
         reports[symbol] = report

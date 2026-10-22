@@ -272,6 +272,12 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'out-of-sample stage-1 prediction (default 4)')
     model.add_argument('--stack-intercept', action='store_true', default=None,
                        help='let stage 2 fit an intercept c in [-0.5, 0.5]')
+    model.add_argument('--strike-source', choices=('proxy', 'venue'),
+                       default=None,
+                       help="'venue' builds windows from the venue's own "
+                            'floor_strike. The strike and the price series '
+                            'must move together, so use it only with a '
+                            'BRTI price series.')
     model.add_argument('--label-source', choices=('proxy', 'venue'),
                        default=None,
                        help="'venue' trains on the venue's own settlement "
@@ -396,6 +402,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('assume_maker', 'assume_maker'),
         ('ensemble_size', 'ensemble_size'),
         ('label_source', 'label_source'),
+        ('strike_source', 'strike_source'),
         ('null_quote_age', 'null_quote_age'),
         ('peer_max_quote_age_seconds', 'peer_max_quote_age_seconds'),
         ('decision_latency_seconds', 'decision_latency_seconds'),
@@ -561,6 +568,18 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
     except Exception:                                         # noqa: BLE001
         settlements = None
 
+    # The venue's own strike. Read only when asked for: it is the number the
+    # market settles against, and swapping it in changes every strike-derived
+    # feature, so it is a deliberate configuration rather than a default.
+    venue_strikes = None
+    if getattr(config, 'strike_source', 'proxy') == 'venue':
+        try:
+            venue_strikes = store.read('venue_strikes', start=depth_start, end=end)
+            logger.info('venue_strikes: %s row(s)', f'{len(venue_strikes):,}')
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning('no venue_strikes (%s); windows keep the Coinbase '
+                           'strike despite strike_source=venue', str(exc)[:70])
+
     # The index proxy is read only when its group is asked for: a year of it
     # is ~95M one-second rows, reduced to minute summaries in DuckDB.
     index_proxy = None
@@ -576,7 +595,7 @@ def load_dataset(args: argparse.Namespace, config: Config) -> Dataset:
 
     dataset = Dataset.build(
         bars, config, depth=depth, ladder_fits=ladder_fits,
-        index_proxy=index_proxy,
+        index_proxy=index_proxy, venue_strikes=venue_strikes,
     ).trailing(config.train_window_days)
     if cutoff is not None and len(dataset.windows):
         opens = pd.to_datetime(dataset.windows['window_open'], utc=True)
