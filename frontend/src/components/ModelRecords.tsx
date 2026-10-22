@@ -8,6 +8,7 @@ import { useState } from 'react';
 
 import { fetchModelPerformance } from '../api/serving';
 import { usePolling } from '../hooks/usePolling';
+import { ModelDetailPanel } from './ModelDetailPanel';
 import { Failed, Loading, Panel, SectionHead } from './Primitives';
 
 const money = (v: number) => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`;
@@ -28,7 +29,18 @@ function day(iso: string | null): string {
 
 export function ModelRecords({ pollMs }: { pollMs: number }) {
   const [allTime, setAllTime] = useState(true);
+  const [selected, setSelected] = useState<string | null>(null);
   const perf = usePolling(() => fetchModelPerformance(allTime), pollMs, [allTime]);
+
+  if (selected) {
+    return (
+      <ModelDetailPanel
+        version={selected}
+        pollMs={pollMs}
+        onClose={() => setSelected(null)}
+      />
+    );
+  }
 
   return (
     <Panel>
@@ -73,7 +85,11 @@ export function ModelRecords({ pollMs }: { pollMs: number }) {
               </thead>
               <tbody>
                 {(perf.data?.models ?? []).map((m, i) => (
-                  <tr key={m.model_version} className="border-t border-line">
+                  <tr
+                    key={m.model_version}
+                    onClick={() => setSelected(m.model_version)}
+                    className="cursor-pointer border-t border-line hover:bg-line/40"
+                  >
                     <td className="py-1.5 pr-3 font-mono">
                       {m.model_version}
                       {i === 0 && (
@@ -153,7 +169,8 @@ export function ModelRecords({ pollMs }: { pollMs: number }) {
             settling down is a win. Read it beside per-position: a model can win
             most of its positions and still lose, by losing bigger. Rows with no
             model recorded predate the model being stamped on a prediction and
-            are kept so the table reconciles with the account.
+            are kept so the table reconciles with the account. Select a row
+            for that model on its own.
           </p>
         </>
       )}

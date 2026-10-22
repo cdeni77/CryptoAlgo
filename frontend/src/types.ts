@@ -267,6 +267,51 @@ export interface ModelRecord {
   win_rate: number | null;
 }
 
+/** One settled position inside a model's record. */
+export interface ModelPosition {
+  symbol: string;
+  side: string;
+  window_open: string;
+  settle_time: string;
+  offset_minutes: number;
+  contracts: number;
+  price: number;
+  model_probability: number;
+  edge: number;
+  outcome: string;
+  settled_at: string | null;
+  pnl: number | null;
+}
+
+/** A model's OWN cumulative P&L from zero. Not a slice of the account curve:
+ *  two models overlap at a handover, so they do not partition the account. */
+export interface ModelCurvePoint {
+  window_open: string;
+  settled_at: string;
+  pnl: number;
+  cumulative_pnl: number;
+}
+
+export interface ModelDetail {
+  model_version: string;
+  all_time: boolean;
+  positions: ModelPosition[];
+  curve: ModelCurvePoint[];
+  summary: {
+    positions: number;
+    settled: number;
+    open: number;
+    pnl: number;
+    pnl_per_position: number | null;
+    pnl_per_contract: number | null;
+    win_rate: number | null;
+    contracts: number;
+    fees: number;
+    first_window: string | null;
+    last_window: string | null;
+  };
+}
+
 export interface ModelPerformance {
   all_time: boolean;
   /** The dashboard epoch this is bounded by; null when all_time. */

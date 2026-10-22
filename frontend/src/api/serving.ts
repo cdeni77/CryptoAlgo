@@ -8,6 +8,7 @@ import type {
   Funnel,
   LiveState,
   ModelAttempt,
+  ModelDetail,
   ModelPerformance,
   ModelState,
   Position,
@@ -27,6 +28,12 @@ export const fetchAccount = () => get<AccountState>('/account');
  *  model that traded before the last reset still did so. */
 export const fetchModelPerformance = (allTime = false) =>
   get<ModelPerformance>(`/account/models${allTime ? '?all_time=true' : ''}`);
+
+/** One model's own record: its settled positions and its P&L from zero. */
+export const fetchModelDetail = (version: string, allTime = true) =>
+  get<ModelDetail>(
+    `/account/models/${encodeURIComponent(version)}?all_time=${allTime}`,
+  );
 
 export const fetchEquity = (days = 30) =>
   get<{ days: number; points: EquityPoint[] }>(`/account/equity?days=${days}`);
