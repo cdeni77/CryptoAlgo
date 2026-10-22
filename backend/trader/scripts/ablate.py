@@ -147,9 +147,15 @@ def _score_cells(cells: dict, folds, dataset, config, jobs: int) -> dict:
     """Every (cell, fold) pair, over a process pool when `jobs` > 1.
 
     The cells are independent and each fold is independent inside a cell, so
-    the whole grid is one flat task list. LightGBM is given no thread count and
-    the loop is pandas-bound, so a single run uses one core out of the box --
-    the parallelism has to come from processes, not from the library.
+    the whole grid is one flat task list.
+
+    **Set a thread cap alongside `jobs`.** The work alternates between a
+    single-threaded pandas phase (the dataset build, and slicing each fold) and
+    LightGBM, which takes every core it can see because no `num_threads` is
+    set. Workers that each do that oversubscribe the machine and run slower
+    than one process would: two concurrent runs measured ~10 cores each on a
+    20-core host at load average 32, and each took about 7x longer per fold
+    than a run with the machine to itself.
     """
     tasks = [(label, groups, i) for label, groups in cells.items()
              for i in range(len(folds))]
