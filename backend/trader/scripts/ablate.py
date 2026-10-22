@@ -26,8 +26,8 @@ from core.features import ALL_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS
 from core.metrics import weighted_fold_mean
 from core.model import fit_model
 from scripts._common import (
-    add_data_arguments, config_from_args, load_dataset, log_trial, print_header,
-    setup_logging,
+    add_data_arguments, config_from_args, groups_from_args, load_dataset,
+    log_trial, print_header, setup_logging,
 )
 
 # Derived from `core.features`, never spelled out, so a survey cannot silently
@@ -93,7 +93,12 @@ def main() -> int:
     # ignored and the survey scored families the model does not use. It also
     # selected both book framings at once, which `feature_columns` now refuses
     # outright -- the bug had been masked by dedup.
-    available = tuple(config.groups) if config.groups else tuple(ALL_GROUPS)
+    # **From the ARGS, not the config.** `Config` carries no group selection;
+    # it lives on the parsed arguments, the way every other script reads it.
+    # Reading it off the config instead raised at run time while the
+    # cell-building tests passed, because those exercise `trials` and never
+    # this function.
+    available = tuple(groups_from_args(args) or ALL_GROUPS)
     print(f'  {len(folds)} folds, groups: {", ".join(available)}\n')
     print(f"  {'groups':30s} {'skill':>11s} {'se':>10s} {'t':>7s} {'folds+':>8s} {'trees':>7s}")
 
