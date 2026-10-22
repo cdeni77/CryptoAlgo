@@ -95,3 +95,23 @@ class TestNoDeadFallback:
         assert asyncio.run(biv._candles(Client(), 'KX-T1', start,
                                         start + dt.timedelta(hours=1))) == []
         assert biv.THROTTLED['candles'] == 1
+
+
+class TestAvailableTimeIsThePointInTimeField:
+    """`available_time` answers "when could a decision have seen this".
+
+    `core/book_features.py` joins fits with a backward `merge_asof` on it, so
+    stamping it with the moment the backfill RAN puts every row after every
+    historical decision: nothing matches, and the feature is silently always
+    NaN. Provenance belongs in `source`.
+    """
+
+    def test_it_equals_the_fit_instant_not_the_fetch_time(self):
+        import inspect
+        src = inspect.getsource(biv.hour_rows)
+        assert "row['available_time'] = pd.Timestamp(at)" in src
+        assert "row['available_time'] = fetched_at" not in src
+
+    def test_provenance_is_carried_by_source(self):
+        import inspect
+        assert "row['source'] = 'ladder_candles'" in inspect.getsource(biv.hour_rows)

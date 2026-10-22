@@ -273,15 +273,19 @@ async def hour_rows(client, sem, series, symbol, close_utc, spot_at, fetched_at,
             # The fit was computed from the ladder as of `at`; it could not
             # have been known before then.
             row['event_time'] = pd.Timestamp(at)
-            row['available_time'] = fetched_at
+            # **`available_time` is the FIT INSTANT, not the fetch time.**
+            # It answers "when could a decision have seen this", and
+            # `core/book_features.py` joins on it with a backward `merge_asof`.
+            # Stamping it with the moment the backfill ran puts every row after
+            # every historical decision, so nothing matches and the feature is
+            # silently always NaN -- no error, no warning. Provenance belongs
+            # in `source`, which is the next line and the reason that column
+            # exists; it must not be smuggled into a point-in-time field.
+            row['available_time'] = pd.Timestamp(at)
             # **Stamped, because three pipes write this table and they are not
-            # the same measurement.** Until 2026-10-21 there was no `source`
-            # column, so a backfill that left `available_time` unset was
-            # indistinguishable from a live recording -- `_prepare` defaults it
-            # to `event_time`, and 100% of the pre-August rows read as zero-lag
-            # and looked live. Candles carry no sizes, so unlike the live
-            # recorder this cannot refuse a rung with nothing resting behind
-            # it; that difference has to be visible in the data.
+            # the same measurement.** Candles carry no sizes, so unlike the
+            # live recorder this cannot refuse a rung with nothing resting
+            # behind it; that difference has to be visible in the data.
             row['source'] = 'ladder_candles'
             rows.append(row)
     return rows
