@@ -62,8 +62,28 @@ remaining input.
 
 ### Not blocked, can run any time
 
-* **C2** — venue label vs Coinbase label, bucketed by |move|. Needs only
-  `venue_settlements`, which we hold.
+* ~~**C2** — venue label vs Coinbase label, bucketed by |move|~~
+  **RUN 2026-10-22. PASS.** 77,658 windows carrying both labels, overall
+  disagreement **2.06%**, and it falls monotonically with the move:
+
+  ```
+     |move|     windows  disagree    rate
+      0-1bp       4,073       995   24.4%
+      1-2bp       4,013       360    9.0%
+      2-5bp      11,165       218    2.0%
+     5-10bp      15,502        24    0.2%
+    10-25bp      25,198         3    0.0%
+      25bp+      17,707         1    0.0%
+  ```
+
+  **One disagreement in 17,707 windows above 25bp.** The shape is the whole
+  result: a window-alignment bug would disagree at a flat rate whatever the
+  move, because it would be comparing different windows. This disagrees only
+  where the two oracles are splitting a coin flip, which is the label noise
+  already recorded at ~3% and is harmless to train on. Slightly better than
+  the predicted shape (24.4/9.0 against 34.9/13.9 in the sub-2bp buckets).
+
+  `research/validate/_c2_label_alignment.py`.
 * ~~**C3** — candles vs Predexon~~ **RUN 2026-10-21. Candles win.**
   Measured against the LIVE book on 126,674 / 109,548 overlapping rows:
 

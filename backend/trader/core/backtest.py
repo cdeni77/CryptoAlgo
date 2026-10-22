@@ -33,7 +33,7 @@ from core.book import Book, BookStats, summarise
 from core.config import Config, DEFAULT_CONFIG
 from core.cv import WindowFold, assert_no_leakage, effective_observations, folds_for_config, recency_weights
 from core.dataset import Dataset, apply_fold, fit_fold
-from core.decide import as_maker_prices, Decision, Reason, decide_window, rejection_histogram, stateless_screen
+from core.decide import Decision, Reason, decide_window, rejection_histogram, stateless_screen
 from core.metrics import (EvaluationReport, FoldEvaluation, evaluate_fold, sharpe_moments,
                           trade_gate_values)
 from core.model import ForecastModel, fit_for_config, table_groups
@@ -94,7 +94,9 @@ def run_book(
     #
     # `core.decide.as_maker_prices` implements the optimistic pricing and is
     # kept, tested, for measuring the upper bound explicitly — but it is not
-    # wired in here. `scripts/live.py` DOES price at the bid, because that is
+    # wired in here, and is no longer IMPORTED here either. It was, unused,
+    # which reads as "this module prices at the bid" to anyone scanning the
+    # imports and is how that mistake gets made. `scripts/live.py` DOES price at the bid, because that is
     # the order it actually sends: evaluating the edge at the ask would refuse
     # trades that are profitable at the price being offered. So the two differ
     # on purpose, and in the safe direction — live trades only what clears at

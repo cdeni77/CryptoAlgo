@@ -152,13 +152,6 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                                 f'(default {DEFAULT_CONFIG.max_drawdown_fraction}). '
                                 'Raise it to measure a full period instead of '
                                 'the week before the first latch.')
-    # **Price the entry the way it will be entered.** `--assume-maker` alone
-    # only zeroes the FEE and leaves the backtest lifting the ask, which
-    # understates maker economics by a full spread. This also swaps the entry
-    # to the BID (`core.decide.as_maker_prices`), and implies --assume-maker so
-    # the fee and the price can never disagree. Measured 2026-10-18 on 54,100
-    # live-recorded rows, the SAME model: -$77.25 taker -> +$2,445.76 maker.
-    # It does NOT model whether a resting order fills, which is the whole risk.
     # The depth cap the economics apply. `scripts/live.py` has always had this
     # and the shared parser never did, so the trader's override could set 40
     # while every evaluation measured the 25 default — a strategy sized 37.5%
@@ -182,10 +175,26 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            default=None, metavar='N',
                            help='Total positions allowed per window, across '
                                 'symbols. Must rise with the per-symbol limit.')
+    # **In THIS parser it zeroes the fee and nothing else.** It implies
+    # `assume_maker` (`Config.__post_init__`), and `core/costs.py` then charges
+    # the maker rate, which is 0 for these series. It does NOT move the entry
+    # price: `core.decide.as_maker_prices` exists, is tested, and is called
+    # from nowhere, so `core/backtest.py` keeps lifting the ask. The backtest
+    # therefore pays the WORSE price and no fee, which bounds a real maker
+    # fill from below on price.
+    #
+    # `scripts/live.py` is the one that rests at the bid, because that is the
+    # order it sends. The two differ on purpose and in the safe direction, and
+    # a comment here used to claim this flag swapped the research price too.
+    #
+    # Neither path models whether a resting order FILLS. That is the whole
+    # risk and it is still unmeasured -- see
+    # `research/PREREG_MAKER_FILLS_20261022.md`.
     economics.add_argument('--maker-entry', action='store_true',
-                           help='Rest at the bid instead of lifting the ask, '
-                                'and charge the maker fee. Does not model '
-                                'whether the order fills.')
+                           help='Charge the maker fee (zero for these series). '
+                                'Does NOT move the backtest entry price, which '
+                                'keeps lifting the ask, and does not model '
+                                'whether a resting order fills.')
     economics.add_argument('--exclude-price-band', type=str, default=None,
                            metavar='LO,HI',
                            help='Refuse trades priced inside this band, e.g. '
