@@ -72,6 +72,14 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     # The control. Calendar position cannot forecast direction.
     # `quarter_of_hour` is the quarter of the hour, so it is calendar, not offset.
+    # --- NC2, the noise-only control (RESEARCH_PROTOCOL section 5, item 2) ---
+    #
+    # Information-free columns, so the delta from adding them must be ~0. They
+    # answer two questions at once: whether the measurement can return a null
+    # at all, and whether feature COUNT costs skill by itself. Eleven columns,
+    # matching the largest real group, so the count comparison is like for
+    # like. Opt-in, so no ordinary run can select them.
+    'noise': tuple(f'noise_{i:02d}' for i in range(11)),
     'time_of_day': (
         'quarter_of_hour', 'hour_sin', 'hour_cos',
         'dow_sin', 'dow_cos', 'us_equity_hours',
@@ -123,7 +131,7 @@ BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol',
 QUOTE_DEPTH_FRAMING = ('book_quote', 'book_depth')
 MEANING_FRAMING = ('market_state', 'book_flow')
 # Selectable, never default: everything with a short history.
-OPT_IN_GROUPS = BOOK_GROUPS + ('index_proxy',)
+OPT_IN_GROUPS = BOOK_GROUPS + ('index_proxy', 'noise')
 ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in OPT_IN_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
 CONTROL_GROUPS = ('time_of_day',)
@@ -292,6 +300,59 @@ def attach_cross_asset(
 # --------------------------------------------------------------------------
 # window-level assembly
 # --------------------------------------------------------------------------
+
+#: Odd 64-bit constants. Any odd multiplier makes the mix reversible, so no
+#: two distinct rows collide before the avalanche.
+_NOISE_SALT = np.uint64(0x9E3779B97F4A7C15)
+_NOISE_COLUMN_STRIDE = np.uint64(0xBF58476D1CE4E5B9)
+
+
+def _splitmix64(value: np.ndarray) -> np.ndarray:
+    """Avalanche a counter into a uniform 64-bit value, vectorised.
+
+    A counter-based hash, not a stream: the value depends only on the row's own
+    identity, so a row draws the same noise in every fold, every cell and every
+    run. `hash()` cannot be used -- Python salts it per process, which would
+    redraw the feature on every run and make the control unreproducible.
+    """
+    x = value.astype(np.uint64, copy=True)
+    x ^= x >> np.uint64(30)
+    x *= np.uint64(0xBF58476D1CE4E5B9)
+    x ^= x >> np.uint64(27)
+    x *= np.uint64(0x94D049BB133111EB)
+    x ^= x >> np.uint64(31)
+    return x
+
+
+def _noise_features(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    """Uniform(0,1) columns seeded from each row's identity.
+
+    Keyed on (symbol, window_open, offset) -- the row key, not the position --
+    so the values survive a re-sort, a different fold split and a rebuilt
+    dataset. Nothing about the outcome enters, which is the point.
+    """
+    window_open = pd.DatetimeIndex(frame['window_open']).asi8 // 1_000_000_000
+    offset = pd.to_numeric(frame['offset'], errors='coerce').fillna(-1)
+    symbol = frame['symbol'].astype(str)
+    # A stable symbol code: the sum of the character points, not `hash`.
+    codes = symbol.map(lambda t: sum(ord(c) for c in t)).to_numpy()
+
+    base = (np.asarray(window_open, dtype=np.int64).astype(np.uint64)
+            * _NOISE_SALT
+            + offset.to_numpy(dtype=np.int64).astype(np.uint64) * np.uint64(10007)
+            + codes.astype(np.uint64) * np.uint64(101))
+
+    out = pd.DataFrame(index=frame.index)
+    for i, name in enumerate(columns):
+        # Reduce the stride in Python ints: uint64 multiplication is meant to
+        # wrap here, but numpy warns on each scalar overflow and a warning per
+        # column per fold buries the real ones.
+        stride = np.uint64((i * int(_NOISE_COLUMN_STRIDE)) % (1 << 64))
+        mixed = _splitmix64(base + stride)
+        # 53 bits is the mantissa, so the division is exact.
+        out[name] = (mixed >> np.uint64(11)).astype(np.float64) / float(1 << 53)
+    return out
+
 
 def _clock_features(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
     decision = pd.DatetimeIndex(frame['decision_time'])
@@ -476,6 +537,11 @@ def build_features(
         from core.index_features import proxy_displacement_z
         table['proxy_displacement_z'] = proxy_displacement_z(
             table['proxy_displacement'], table['sigma_remaining'])
+
+    if groups is not None and 'noise' in tuple(groups):
+        for name, values in _noise_features(
+                table, FEATURE_GROUPS['noise']).items():
+            table[name] = values
 
     return reindex_to_features(table, feature_columns(groups), deferred=deferred)
 
