@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+import logging
 import numpy as np
 import pandas as pd
 
@@ -25,6 +26,26 @@ from scripts._common import (
     add_data_arguments, config_from_args, groups_from_args, load_dataset, print_header,
     setup_logging,
 )
+
+
+logger = logging.getLogger('baseline')
+
+
+def _graded_label(test, config):
+    """The outcome to score against, honouring `label_source`.
+
+    Falls back to the proxy row by row where the venue has no settlement, so
+    a partially covered span is still scored rather than dropped.
+    """
+    proxy = test['outcome'].to_numpy(dtype=float)
+    if getattr(config, 'label_source', 'proxy') != 'venue':
+        return proxy
+    if 'venue_outcome' not in test.columns:
+        logger.warning('label_source=venue but venue_outcome never joined; '
+                       'grading on the proxy label')
+        return proxy
+    venue = pd.to_numeric(test['venue_outcome'], errors='coerce').to_numpy(dtype=float)
+    return np.where(np.isfinite(venue), venue, proxy)
 
 
 def main() -> int:
@@ -55,7 +76,15 @@ def main() -> int:
             assert_no_leakage(fold)
             fit, _ = fit_fold(dataset, fold.train, variant, groups=groups)
             test = apply_fold(dataset, fit, fold.test, variant, groups=groups)
-            y_all = test['outcome'].to_numpy(dtype=float)
+            # **`--label-source venue` must be honoured HERE, or a strike
+            # comparison grades each arm on its own label.** `outcome` is
+            # `settle_price >= strike`, so an arm given the venue's strike is
+            # scored against a label derived from that same strike, and the
+            # two arms are not graded on the same question. The campaign
+            # ledger records the identical trap: "grading on our Coinbase
+            # label hands F(x/sigma) free skill, because the label and the
+            # baseline share a source while the market prices on BRTI".
+            y_all = _graded_label(test, config)
             p_all = test['baseline_probability'].to_numpy(dtype=float)
             # A row with no volatility estimate has no forecast. Left in, it
             # makes the fold's mean NaN.
