@@ -16,7 +16,7 @@ same instant as the value it is handed live?**
 | `microstructure` | 7 | close of bar `m-1` | close of bar `m-1` | **exact** |
 | `cross_asset` | 6 | close of bar `m-1` | close of bar `m-1` | **exact** |
 | `offset` | 2 | clock | clock | **exact** |
-| `book_quote` | 4 | `m` (candles) / `m+0.3s` (live_touch) | `m+3s`, book ~34ms old | **live is FRESHER** |
+| `book_quote` | 4 | ~`m` (candles, ~3s early) / `m+3.2s` (live_touch) | `m+3s`, book ~34ms old | live_touch **exact**; candles ~3s early |
 | `book_flow` | 6 | minute grid, as-of `m-1` and `m-3` | minute grid, <=3s past each minute | near |
 | `implied_vol` | 5 | fit at 50/35/20/10 min before the hour | same fits | **exact** |
 | `cross_venue` | 4 | peer book, max age 5s | peer book, max age 5s | near |
@@ -38,15 +38,36 @@ bar could include a late print the training bar never saw.
 
 ## The book snapshot does NOT have parity
 
-| source | what it holds | captured |
+| source | captured at | the book it holds |
 |---|---|---|
-| `candles` | the book during `[m-1, m)` | published later; stamped as-of `m` |
-| `live_touch` | the decision book | `m + 0.285s` (unsized) / `m + 0.423s` (sized) |
-| `live_ws` / `live` | a LATER book | `m + 25s` / `m + 25-52s` |
+| `candles` | stamp `m` | close of `[m-60s, m)` -- about 3s BEFORE the decision |
+| `live_touch` | `m + 3.20s` | a book 0.88s old -- **the decision's own book** |
+| `live_ws` / `live` | `m + 25.3s` | a book as of `m + 25.3s` -- 22s AFTER the decision |
+
+**"Late", not "stale".** A book captured at `m+25s` is not old, it is in the
+FUTURE relative to a decision at `m+3s`. `decision_age` returns a NEGATIVE
+number for it, which the code reads as "seen after the decision". Refusing
+these rows guards against LOOKAHEAD, not against noise -- the opposite
+failure from the one the word "stale" suggests.
 
 Live scores from the in-process stream cache at `m + 3s`, with a book ~34ms
 old. Training scores from whichever source the selector picked: `candles`
-before late August, `live_touch` after.
+before late August, `live_touch` after -- and `live_touch` IS that same
+decision book, so the live era has exact parity.
+
+Measured against `live_touch`, which is the only honest reference because it
+is the book the decision used:
+
+```
+                  median   within 0.5c   >1.5c (the edge gate)
+candles            1.00c      41.1%         31.9%
+backfill           2.00c      16.8%         58.8%
+live_ws            3.00c      15.4%         66.8%
+```
+
+A candle is one cent from the decision book. Comparing candles against
+`live_ws` instead -- a book 22 seconds later -- makes them look twice as bad
+and is the wrong comparison.
 
 Measured on one window (BTC, 2026-10-20 12:00, offset 3) the four sources
 disagree materially, so this is not a rounding question:

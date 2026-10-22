@@ -304,9 +304,12 @@ candles                 72.1%      51.2%     36.0%    1.70c
 backfill (Predexon)     80.1%      60.3%     43.2%    2.30c
 ```
 
-**A 1.5pp edge gate is 1.5c**, so the quote DIFFERS FROM THE PRICE AT THE
-DECISION INSTANT by more than the entire edge the strategy trades on in 51%
-of candle rows and 60% of Predexon rows.
+**Measured against the wrong reference.** The table above compares each
+source with `live_ws`, which is itself captured 22 seconds AFTER the
+decision. Against `live_touch` -- the book the decision actually used --
+candles sit 1.00c away with 31.9% beyond the 1.5c edge gate, and Predexon
+2.00c with 58.8%. A candle close is about three seconds before the decision,
+not thirty.
 
 "Differs from", not "is wrong by" — the section above shows the two are
 correctly aligned and most of that gap is genuine movement between the
