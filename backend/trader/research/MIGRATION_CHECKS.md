@@ -15,13 +15,17 @@ left undone here trades.
 
 ### Blocking
 
-| # | item | blocked by | note |
+| # | item | state | note |
 |---|---|---|---|
-| 1 | BRTI backfill finishes | running | BTC ~10 min, ETH/SOL ~1h each at 155 hours/min |
-| 2 | **C1** — venue strike + BRTI price vs Coinbase | 1 | the gating test; decides whether to migrate at all |
-| 3 | If C1 passes: migrate | 2 | **C6** — all ten strike-derived features AND the price series move together, or none do. `live.py` needs the same switch for parity |
-| 4 | Ablation / prune 48 -> ~15-20 features | 2 | must run on whichever price series we keep: 33 of 48 features are Coinbase-derived, so pruning before C1 risks doing it twice |
-| 5 | `implied_vol` keep or drop | 4 | recovered coverage is BTC 100 / ETH 29 / SOL 4, so keeping it SKEWS the sample, not just caps it |
+| 1 | BRTI backfill finishes | **DONE 2026-10-22** | |
+| 2 | **C1** — venue strike + BRTI price vs Coinbase | **PASSED 2026-10-22** | +0.0033 log loss, t +5.71, 42 of 50 folds |
+| 3 | If C1 passes: migrate | **DEFERRED by the operator** until after the retrain. **C6** still binds when it happens: all ten strike-derived features AND the price series move together, or none do, and `live.py` needs the same switch for parity |
+| 4 | Ablation | **RUN 2026-10-22, then INVALIDATED** | every run used `ensemble_size=1`; the retrain ships 5. Re-running at 5. See the correction in `PREREG_ABLATION_20261022.md` |
+| 5 | `implied_vol` keep or drop | waiting on 4 | recovered coverage is BTC 100 / ETH 29 / SOL 4, so keeping it SKEWS the sample, not just caps it |
+
+**The "prune 48 -> ~15-20 features" framing in item 4 is withdrawn.** NC2
+measured feature COUNT and it is not the problem -- see the correction to the
+capacity claim in C4 below.
 
 ### C4 — RUN 2026-10-22. `cross_venue` binds, not `implied_vol`.
 
@@ -41,9 +45,15 @@ features cost 35%. Together, nine features cost nearly two thirds of it.
 at +181%. That was measured before the rebuild: with the fits repaired and
 reaching back to 2025-12, `implied_vol` is now the cheaper of the two.
 
-Dropping both gives 2.8x the sample AND nine fewer features, which is the
-direction the capacity evidence already points -- optimal tree counts of
-1-41, and overfitting measured at 4x the effect size under study.
+Dropping both gives 2.8x the sample AND nine fewer features.
+
+**The second half of that is no longer a reason.** This paragraph used to
+argue that fewer features is itself the right direction, from optimal tree
+counts of 1-41 and overfitting at 4x the effect under study. NC2 tested it
+directly on 2026-10-22: adding ELEVEN information-free columns did not hurt
+and if anything helped, with the tree count falling 80 to 64. **Feature count
+is not the binding problem**, so drop these groups to BUY SAMPLE, which is
+measured and real, and not for parsimony, which is not supported.
 
 What is NOT measured is whether either group earns that cost in skill. The
 C4 note says it: "That is an ablation, not a judgement call." The sample cost
@@ -72,12 +82,25 @@ remaining input.
   is sampled at the decision instant. That residual is TIMING, and it bounds
   how good any minute-grid quote can be. **Predexon can be retired for
   quotes**, which is what `--quote-sources` already does.
-* **`max_depth` 3 vs 4** — one cheap arm. Measured tree counts were 1-41 and
-  `num_leaves=15` makes depth 4 effectively a full tree, so depth is the
-  binding capacity knob.
-* **NC2 (noise-only features)** — pre-registered and **never run**. It is the
-  direct control for whether feature COUNT hurts here, which is the question
-  item 4 answers indirectly.
+* **`max_depth` 3 vs 4** — one cheap arm, now the MOST promising open test,
+  because NC2 pointed at regularisation strength rather than feature count.
+  `num_leaves=15` makes depth 4 effectively a full tree (16 leaves) while
+  depth 3 caps it at 8, so the arm is 8 leaves against 15 and depth is the
+  binding capacity knob. Pre-registered in `PREREG_DEPTH_20261022.md`.
+  **Blocked on the seed calibration**, which measures the floor for a
+  hyperparameter arm -- a one-scalar arm shares everything but one number and
+  is roughly 3x more precise than a feature-group delta, so the feature floor
+  must NOT be reused for it. Run it with `scripts/config_arm.py`, at
+  `--ensemble-size 5`.
+* ~~**NC2 (noise-only features)**~~ **RUN 2026-10-22.** One noise group scored
+  `+0.000152` at `t +1.46` against real-group deltas spanning `-0.000164` to
+  `+0.000174`, so it outranked six of the eight. Two readings survive and a
+  five-draw calibration at `ensemble_size=5` is running to separate them:
+  chance (`p 0.076`, and across the ten cells run that day seeing one |t| that
+  large was a 55% event) against a real `feature_fraction` regularisation
+  effect. Either way it answers the COUNT question: **more features did not
+  hurt.** Implementation is the opt-in `noise`..`noise5` groups in
+  `core/features.py`.
 
 ### Done this session
 
