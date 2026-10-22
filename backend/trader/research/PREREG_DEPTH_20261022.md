@@ -74,3 +74,42 @@ once the right floor is known.
 
 **Also fixed before running:** every run on 2026-10-22 used
 `ensemble_size=1` while the retrain ships 5. This arm runs at 5.
+
+---
+
+## The floor is measured — seed calibration, 2026-10-22
+
+`model_seed` 17/18/19/20/21, everything else held, at the deployed
+configuration (migrated basis, ensemble 5, seven groups). The true effect is
+zero by construction.
+
+```
+seed      17        18        19        20        21
+skill  +0.000693 +0.000692 +0.000685 +0.000700 +0.000701
+
+paired deltas against seed 17
+  18  -0.000000  se 0.000010  t -0.04   20/40
+  19  -0.000007  se 0.000014  t -0.54   21/40
+  20  +0.000008  se 0.000022  t +0.34   22/40
+  21  +0.000008  se 0.000024  t +0.36   21/40
+
+spread of the four deltas: sd 0.000007
+```
+
+Nothing is significant, which is what a zero effect should look like.
+
+**The floor for a one-scalar arm is `0.000007`.** Five times tighter than the
+feature-group floor (`0.000034`) and twenty times tighter than the
+ensemble-1 figure (`0.000152`) that the first draft of this document wrongly
+borrowed. The depth arm runs with `--noise-floor 0.000007`.
+
+### What it says about where the noise lives
+
+Each arm's own standard error is `0.000188`, **27x** the seed spread. So
+model stochasticity is a negligible part of the measurement error at
+`ensemble_size=5`: the five boosters have already averaged it away, and
+raising the ensemble further buys nothing.
+
+**The remaining error is the data and the folds.** The lever on precision is
+more windows, not more ensembling and not a different fit. That retires the
+"raise ensemble_size" branch of the diagnostic written before this ran.
