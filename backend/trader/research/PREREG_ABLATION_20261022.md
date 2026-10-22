@@ -138,3 +138,31 @@ finding rather than an artefact: the features add nothing beyond the price.
 It would be consistent with the standing result that the model has no
 forecast edge over the market, and with `project-edge-is-vs-backfill-only`.
 Run 1 cannot support that conclusion; run 2 can.
+
+---
+
+## NOTE, 2026-10-22 13:40 — run 2 restarted to pair the folds
+
+Run 2 was stopped at 5 of 9 cells and restarted. **Nothing in the design
+changed**: same cells, same configuration, same sample, same metric, same
+`delta > 0` and `t > 2.7`.
+
+What changed is that `scripts/ablate` now keeps the per-fold skill vectors and
+differences them fold by fold. The printed table reports each cell's aggregate
+and its standard error; the pre-registered quantity is the standard error of
+`delta`, and a delta is paired — every cell scores the same folds on the same
+rows. Differencing two aggregates discards that pairing and reports the error
+of a difference of independent means, which is far too wide here because the
+folds share most of their training windows and move together.
+
+On synthetic vectors with a large shared fold effect, the two routes give the
+same point estimate and standard errors of `0.000041` (paired) against
+`0.000698` (unpaired) — a t of `+11.13` against `+0.66`. The unpaired route
+could only ever return "nothing is significant", which is the same failure mode
+as run 1 and would have been just as wrong.
+
+The five cells scored before the restart are kept as a record. Their point
+estimates (`delta` against `all groups` at `+0.000375`) were cross_venue
+`+0.000239`, geometry `+0.000242`, vol_state `-0.000143`, microstructure
+`+0.000009`, cross_asset `+0.000193`. **No threshold is read from them**; they
+are superseded by the paired run.

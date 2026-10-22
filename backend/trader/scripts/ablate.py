@@ -115,6 +115,87 @@ def _null_for(test, config):
     return test['baseline_probability'].to_numpy(dtype=float)
 
 
+# Set in the parent before the pool forks. The workers inherit the built
+# dataset through copy-on-write rather than rebuilding or pickling it -- the
+# build is 16 minutes and the frame is gigabytes, so neither is affordable.
+_SHARED: dict = {}
+
+
+def _score_one(task):
+    """One (cell, fold) pair: fit, predict, and return the fold's skill.
+
+    A worker, so it must stay a module-level function and read its inputs from
+    `_SHARED`. `fit_model` is seeded and `deterministic` is set, so the result
+    does not depend on which process computes it or in what order.
+    """
+    label, groups, index = task
+    dataset, config, folds = _SHARED['dataset'], _SHARED['config'], _SHARED['folds']
+    fold = folds[index]
+    fit, train = fit_fold(dataset, fold.train, config, groups=groups)
+    test = apply_fold(dataset, fit, fold.test, config, groups=groups)
+    model = fit_model(train, fit.baseline, config, groups=groups)
+    y = _graded_label(test, config)
+    b = _null_for(test, config)
+    m = np.asarray(model.predict(test), dtype=float)
+    keep = np.isfinite(y) & np.isfinite(b) & np.isfinite(m)
+    return (label, index,
+            log_loss(y[keep], b[keep]) - log_loss(y[keep], m[keep]),
+            model.best_iteration or 0, effective_observations(test))
+
+
+def _score_cells(cells: dict, folds, dataset, config, jobs: int) -> dict:
+    """Every (cell, fold) pair, over a process pool when `jobs` > 1.
+
+    The cells are independent and each fold is independent inside a cell, so
+    the whole grid is one flat task list. LightGBM is given no thread count and
+    the loop is pandas-bound, so a single run uses one core out of the box --
+    the parallelism has to come from processes, not from the library.
+    """
+    tasks = [(label, groups, i) for label, groups in cells.items()
+             for i in range(len(folds))]
+    out = {label: ([None] * len(folds), [None] * len(folds), [None] * len(folds))
+           for label in cells}
+    if jobs <= 1:
+        results = (_score_one(t) for t in tasks)
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        _SHARED.update(dataset=dataset, config=config, folds=folds)
+        # fork, so the dataset is shared copy-on-write. spawn would rebuild it
+        # in every worker.
+        ctx = multiprocessing.get_context('fork')
+        pool = ProcessPoolExecutor(max_workers=jobs, mp_context=ctx)
+        with pool:
+            results = list(pool.map(_score_one, tasks, chunksize=1))
+    for label, index, skill, trees, size in results:
+        out[label][0][index] = skill
+        out[label][1][index] = trees
+        out[label][2][index] = size
+    return out
+
+
+def _paired_deltas(per_fold: dict) -> pd.DataFrame:
+    """`skill(all groups) - skill(all minus G)`, differenced fold by fold.
+
+    The cells score the same folds on the same rows, so the difference is
+    paired and its standard error comes from the dispersion of the per-fold
+    differences. Folds are weighted by window count, as the gates weight them.
+    """
+    base = per_fold.get('all groups')
+    if base is None:
+        return pd.DataFrame()
+    out = []
+    for label, (v, sizes) in per_fold.items():
+        if not label.startswith('all minus '):
+            continue
+        d = base[0] - v
+        agg = weighted_fold_mean(d, sizes)
+        out.append({'group': label[len('all minus '):], 'delta': agg.mean,
+                    'se': agg.standard_error, 't': agg.t, 'p': agg.p_value,
+                    'folds_positive': int((d > 0).sum()), 'folds': len(d)})
+    return pd.DataFrame(out).sort_values('t', ascending=False)
+
+
 def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -123,6 +204,10 @@ def main() -> int:
                         help='Leave-one-out: score the full set against the '
                              'full set minus each named group. Two cells '
                              'instead of one per group.')
+    parser.add_argument('--jobs', type=int, default=1,
+                        help='Score (cell, fold) pairs over this many '
+                             'processes. The dataset is built once and shared '
+                             'by fork. Default 1, the serial path.')
     parser.add_argument('--out', type=str, default=None,
                         help='Write the table to ablation.csv in this directory')
     args = parser.parse_args()
@@ -150,22 +235,21 @@ def main() -> int:
     print(f"  {'groups':30s} {'skill':>11s} {'se':>10s} {'t':>7s} {'folds+':>8s} {'trees':>7s}")
 
     rows = []
-    for label, groups in trials(available, args.drop).items():
-        skills, trees, sizes = [], [], []
-        for fold in folds:
-            fit, train = fit_fold(dataset, fold.train, config, groups=groups)
-            test = apply_fold(dataset, fit, fold.test, config, groups=groups)
-            model = fit_model(train, fit.baseline, config, groups=groups)
-            y = _graded_label(test, config)
-            b = _null_for(test, config)
-            m = np.asarray(model.predict(test), dtype=float)
-            # Rows with no volatility estimate carry no forecast; exclude them, as
-            # core/metrics.py does.
-            keep = np.isfinite(y) & np.isfinite(b) & np.isfinite(m)
-            skills.append(log_loss(y[keep], b[keep]) - log_loss(y[keep], m[keep]))
-            trees.append(model.best_iteration or 0)
-            sizes.append(effective_observations(test))
+    # Per-fold skills per cell. A leave-one-out delta is a PAIRED quantity:
+    # every cell scores the same folds, so the standard error must come from
+    # the dispersion of the per-fold differences, not from differencing two
+    # aggregates. Differencing aggregates ignores the pairing and inflates the
+    # error, which hides a real group behind the Bonferroni threshold.
+    per_fold: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    cells = trials(available, args.drop)
+    if args.jobs > 1:
+        print(f'  scoring {len(cells) * len(folds)} (cell, fold) pairs over '
+              f'{args.jobs} processes\n')
+    scored = _score_cells(cells, folds, dataset, config, args.jobs)
+    for label in cells:
+        skills, trees, sizes = scored[label]
         v = np.asarray(skills, dtype=float)
+        per_fold[label] = (v, np.asarray(sizes, dtype=float))
         # The window-weighted aggregation the gates read, so an ablation cell
         # and a promotion report agree.
         weighted = weighted_fold_mean(v, sizes)
@@ -180,6 +264,15 @@ def main() -> int:
                      'folds_positive': int((v > 0).sum()), 'folds': len(v)})
 
     frame = pd.DataFrame(rows)
+    deltas = _paired_deltas(per_fold) if args.drop else pd.DataFrame()
+    if not deltas.empty:
+        print(f"\n  leave-one-out delta = skill(all) - skill(all minus G), "
+              f"paired by fold\n")
+        print(f"  {'group':24s} {'delta':>11s} {'se':>10s} {'t':>7s} {'folds+':>8s}")
+        for row in deltas.to_dict('records'):
+            print(f"  {row['group']:24s} {row['delta']:+11.6f} "
+                  f"{row['se']:10.6f} {row['t']:+7.2f} "
+                  f"{row['folds_positive']:>6d}/{row['folds']}")
     control = frame.loc[frame['groups'].str.startswith(CONTROL)]
     print()
     if not control.empty:
@@ -204,11 +297,18 @@ def main() -> int:
         path.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path / 'ablation.csv', index=False)
         print(f'\n  wrote {path / "ablation.csv"}')
+        if not deltas.empty:
+            deltas.to_csv(path / 'ablation_delta.csv', index=False)
+            print(f'  wrote {path / "ablation_delta.csv"}')
+        folds_frame = pd.DataFrame({k: v[0] for k, v in per_fold.items()})
+        folds_frame.to_csv(path / 'ablation_folds.csv', index=False)
+        print(f'  wrote {path / "ablation_folds.csv"}')
     # One trial line for the run, listing every cell, because each cell counts
     # as a trial.
     log_trial('ablate', args, config, groups=available, dataset=dataset, metrics={
         'folds': len(folds),
         'cells': frame.to_dict('records'),
+        'deltas': deltas.to_dict('records'),
     })
     return 0
 

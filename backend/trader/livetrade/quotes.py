@@ -325,7 +325,16 @@ async def _record_touch(scored: pd.DataFrame, quotes: dict, window_open, offset:
                 # never invent a value, because the backtest reads NULL as fresh.
                 'quote_age_seconds': quote_age_seconds(quote, decided_at),
                 'venue': 'kalshi', 'symbol': symbol, 'event_time': event_time,
-                'available_time': pd.Timestamp.now(tz='UTC'), 'quality': 'valid',
+                # **The DECISION instant, not the write instant.** This row
+                # is written after the orders, so `now()` here would charge the
+                # book for order-placement time. `decision_age` bounds a
+                # `live_touch` row by `available_time - event_time` when the row
+                # carries no `quote_age_seconds` of its own, and that bound must
+                # not include latency the book never had. The book was read at
+                # or before `decided_at`, so it is the conservative instant.
+                'available_time': pd.Timestamp(decided_at) if decided_at is not None
+                else pd.Timestamp.now(tz='UTC'),
+                'quality': 'valid',
                 # Which sampler produced the ladder half of this row.
                 'transport': ladder_source,
                 'market_ticker': quotes[symbol][1], 'window_open': window_open,
