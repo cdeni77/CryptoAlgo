@@ -40,24 +40,12 @@
     "elapsed_fraction",
     "remaining_minutes",
     "spread",
-    "imbalance_touch",
-    "imbalance_5c",
-    "depth_ratio",
-    "book_convexity",
-    "iv_minus_realised",
-    "implied_sigma_per_min",
-    "iv_r2",
-    "iv_n_strikes",
-    "iv_staleness_minutes",
-    "imbalance_change_3",
-    "depth_trend_3",
     "spread_change_3",
-    "imbalance_persistence",
     "mid_change_1",
     "mid_change_3"
   ],
-  "n_features": 55,
-  "n_features_populated": 55,
+  "n_features": 43,
+  "n_features_populated": 43,
   "empty_features": [],
   "groups": [
     "cross_venue",
@@ -66,34 +54,32 @@
     "microstructure",
     "cross_asset",
     "offset",
-    "market_state",
-    "implied_vol",
-    "book_flow"
+    "book_quote"
   ],
-  "residual_scale": 0.2828411655621737,
+  "residual_scale": 0.9999940391390134,
   "init_coefficient": 1.0,
   "intercept": 0.0,
   "ensemble_size": 5,
   "init_score_source": "market",
-  "n_train_rows": 18797,
-  "n_train_windows": 4836,
-  "best_iteration": 11,
-  "train_log_loss": 0.4881371261263617,
-  "inner_log_loss": 0.4581083464892867,
-  "inner_baseline_log_loss": 0.45811505040124795,
-  "inner_log_loss_skill": 6.7039119612255504e-06,
+  "n_train_rows": 154812,
+  "n_train_windows": 24755,
+  "best_iteration": 42,
+  "train_log_loss": 0.46386635737869375,
+  "inner_log_loss": 0.456285445238043,
+  "inner_baseline_log_loss": 0.45706226912592823,
+  "inner_log_loss_skill": 0.0007768238878852474,
   "control_importance_share": 0.0,
   "baseline": {
     "distribution": "student_t",
-    "nu": 4.017106839412566,
+    "nu": 8.263029334122656,
     "scale": {
-      "3": 1.2884861712188818,
-      "6": 1.2297193763880636,
-      "9": 1.1551686471774552,
-      "12": 1.1806081436915294
+      "3": 1.0875554698299958,
+      "6": 1.0165036484519918,
+      "9": 0.985314274705797,
+      "12": 0.9097452295825361
     },
-    "n_fitted": 18797,
-    "fitted_log_loss": 0.4859142916444151
+    "n_fitted": 155445,
+    "fitted_log_loss": 0.47152592714362146
   },
   "deployable": true,
   "config": {
@@ -102,7 +88,7 @@
       "ETH-USD",
       "SOL-USD"
     ],
-    "venue": "coinbase_spot",
+    "venue": "cfbenchmarks",
     "timeframe": "1m",
     "window_minutes": 15,
     "settle_average_minutes": 1.0,
@@ -149,7 +135,9 @@
     "shrinkage_focus_quantile": 0.0,
     "max_residual_scale": 1.0,
     "ensemble_size": 5,
+    "model_seed": 17,
     "label_source": "venue",
+    "strike_source": "venue",
     "stack_mode": "off",
     "stack_spot_groups": [
       "vol_state",
@@ -171,7 +159,7 @@
     "maker_fee_multiplier": 0.0,
     "assume_maker": true,
     "half_spread_cents": 0.5,
-    "starting_bankroll": 500.0,
+    "starting_bankroll": 458.75,
     "kelly_fraction": 0.1,
     "max_stake_fraction": 0.05,
     "depth_fraction": 0.5,
@@ -243,7 +231,9 @@
       "peer_quote_sources",
       "quote_sources",
       "require_member_agreement",
-      "starting_bankroll"
+      "starting_bankroll",
+      "strike_source",
+      "venue"
     ]
   }
 }
