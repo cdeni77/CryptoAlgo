@@ -125,9 +125,13 @@ def model_performance(db: Session, *, all_time: bool = False) -> dict[str, Any]:
     epoch-filtered; this one asks "how did each model do", and a model that
     traded before the last reset still did so.
 
-    `win_rate` is not a quality measure here. A model trading longshots wins
-    seldom and profitably -- 20261022T171846Z settled 22% and made money --
-    so read `pnl_per_position` beside it.
+    A win is a position that MADE MONEY, `pnl > 0`. Not `settled_up`, which is
+    the market's direction and not ours: a `down` position settling down is a
+    win, and counting `settled_up` scored every short backwards -- 417
+    profitable down positions read as losses.
+
+    `win_rate` is still not a quality measure. A model trading longshots wins
+    seldom and profitably, so read `pnl_per_position` beside it.
     """
     epoch = reset_epoch(db)
     if all_time:
@@ -154,7 +158,7 @@ def model_performance(db: Session, *, all_time: bool = False) -> dict[str, Any]:
             'last_window': None})
         bucket['positions'] += 1
         bucket['pnl'] += pnl
-        bucket['wins'] += 1 if position.settled_up else 0
+        bucket['wins'] += 1 if pnl > 0 else 0
         bucket['contracts'] += int(position.contracts or 0)
         when = position.window_open
         if when is not None:

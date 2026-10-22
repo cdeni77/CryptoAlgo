@@ -40,3 +40,13 @@ def test_an_empty_database_is_an_empty_table_not_an_error(client):
     body = client.get('/account/models').json()
     assert isinstance(body['models'], list)
     assert body['total_pnl'] == 0 or isinstance(body['total_pnl'], float)
+
+
+def test_a_win_is_money_made_not_the_market_going_up(client):
+    """`settled_up` is the MARKET's direction. A `down` position settling down
+    is a win, and counting `settled_up` scored every short backwards."""
+    import inspect
+    from controllers import serving
+    src = inspect.getsource(serving.model_performance)
+    assert "pnl > 0" in src
+    assert "position.settled_up" not in src, 'the market is not our outcome'
