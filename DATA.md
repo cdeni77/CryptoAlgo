@@ -664,6 +664,33 @@ book groups cost 51% and `implied_vol` 15%. **Both were wrong, and backwards.**
 
 Window ceilings at the four decision offsets, Kalshi-only quote sources:
 
+**SUPERSEDED 2026-10-22 — the group that binds is `cross_venue`, not
+`implied_vol`.** The table below was measured while `implied_vol` was
+broken: its `available_time` carried the backfill's RUN time, so the fits
+matched nothing before the live era and the feature was silently NaN across
+the whole backfilled span. Repaired, and with the ladder rebuild reaching
+2025-12, it is now the CHEAPER of the two.
+
+Re-measured at offsets 3/6/9/12 over 2025-12 to now (C4):
+
+```
+required                     rows      share
+quote only                 341,944     100.0%
++ implied_vol              222,174      65.0%
++ cross_venue              164,268      48.0%    <- binds harder
++ BOTH                     121,355      35.5%
+```
+
+Four `cross_venue` features cost 52% of the sample; five `implied_vol`
+features cost 35%. Nine features together cost nearly two thirds of it.
+
+Whether either EARNS that cost in skill is a leave-one-out, pre-registered
+in `research/PREREG_ABLATION_20261022.md`. The sample side is measured; the
+skill side is not, and neither number alone decides it.
+
+The original table is kept below as the measurement it was, not deleted,
+because the ledger is the trial count:
+
 ```
 feature set kept                      windows   vs all   earliest
 everything (quote+sizes+peer+IV)       20,839       —    2026-01-07
