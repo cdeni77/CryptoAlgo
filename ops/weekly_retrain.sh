@@ -7,9 +7,11 @@
 #   0 5 * * 0  /home/cdeni/Desktop/Personal/CryptoAlgo/CryptoAlgo/ops/weekly_retrain.sh
 #
 # WHAT IT DOES
-#   1. Runs `scripts.promote` in the one-off `retrain` container: walk-forward,
+#   1. REFRESHES the fetched datasets -- `venue_strikes`, `venue_candles` and
+#      the CF Benchmarks index. None of them is recorded live.
+#   2. Runs `scripts.promote` in the one-off `retrain` container: walk-forward,
 #      gates, and install **whatever the gates say**.
-#   2. Nothing else. The trader is NOT restarted.
+#   3. Nothing else. The trader is NOT restarted.
 #
 # **IT ALWAYS INSTALLS, BY STANDING OPERATOR POLICY (2026-10-21.)**
 #   The compose `retrain` service passes `--force` with a written reason. The
@@ -69,6 +71,27 @@ cd "$REPO" || exit 2
 {
   echo "=== weekly retrain $STAMP ==="
   date -u
+
+  # --- refresh the FETCHED datasets before training on them ---------------
+  # `venue_candles` and `venue_strikes` are NOT recorded live; they only
+  # advance when their backfill runs. Until 2026-10-22 nothing refreshed them
+  # here, so a retrain trained on whatever happened to be in the store --
+  # measured that morning, both were 17 hours behind after a manual run the
+  # night before, and on a normal Sunday would have been a WEEK behind. The
+  # model silently lost the most recent week, which is the week it most needs.
+  #
+  # Each job skips what it already holds, so a re-run is cheap. A failure is
+  # logged and does NOT abort: training on slightly stale data beats not
+  # training, and the gap is visible above the gate output.
+  echo "--- refreshing fetched datasets ---"
+  for job in "backfill_markets --start 2026-10-01" \
+             "backfill_candles --start 2026-10-01" \
+             "backfill_index --start 2026-10-01 --rate 5.0 --concurrency 4"; do
+    echo "+ scripts.$job"
+    docker compose run --rm --no-deps -T -w /app --entrypoint python trader \
+      -u -m scripts.$job || echo "WARNING: $job exited $? -- continuing"
+  done
+  echo "--- refresh done ---"
 
   # `run --rm`, not `up`: one-off, and its exit code is the gate verdict.
   docker compose --profile tools run --rm retrain
