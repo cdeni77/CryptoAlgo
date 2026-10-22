@@ -30,16 +30,13 @@ from scripts._common import (
 )
 from scripts.ablate import _graded_label, _null_for
 
-#: Below this, an effect cannot be told from an information-free feature on
-#: this data. NC2 measured a noise group at +0.000152 with a standard error of
-#: 0.000104, so a delta inside that band is reported as UNRESOLVED however its
-#: t reads. It is a yardstick from one draw, not a constant -- a multi-seed
-#: calibration would replace it with a distribution. It was measured on
-#: the ablation's sample, so it applies to an arm run on THAT sample;
-#: another sample has its own floor and needs its own control.
-NOISE_FLOOR = 0.000152
-
-
+#: A delta smaller than this cannot be told from an irrelevant change, so it
+#: is reported UNRESOLVED however its t reads. There is no safe default: the
+#: band depends on BOTH the sample and the kind of comparison. Feature-group
+#: deltas and one-scalar hyperparameter arms have very different floors,
+#: because the arms of the latter share everything but one number. Pass the
+#: figure a control measured for THIS comparison, or pass nothing and read the
+#: t on its own.
 def _coerce(text: str):
     """`--values 3 4` are ints; a rate like 0.03 is a float."""
     try:
@@ -54,25 +51,33 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__))
     parser.add_argument('--field', required=True,
                         help='The Config field to move, e.g. max_depth')
-    parser.add_argument('--values', nargs=2, required=True,
-                        help='Exactly two values: the baseline, then the arm')
+    parser.add_argument('--values', nargs='+', required=True,
+                        help='Two or more values. The FIRST is the baseline; '
+                             'every other is reported against it.')
+    parser.add_argument('--noise-floor', type=float, default=None,
+                        help='A delta inside this band is UNRESOLVED. Use a '
+                             'control measured for this comparison.')
     parser.add_argument('--out', type=str, default=None)
     args = parser.parse_args()
     setup_logging(args.verbose)
     config = config_from_args(args)
     print_header('Config arm', config)
 
-    low, high = (_coerce(v) for v in args.values)
+    values = [_coerce(v) for v in args.values]
+    if len(values) < 2:
+        raise SystemExit('--values needs at least two')
+    low = values[0]
     groups = tuple(groups_from_args(args) or ALL_GROUPS)
     dataset = load_dataset(args, config)
     folds = folds_for_config(dataset.window_index, config)
     for fold in folds:
         assert_no_leakage(fold)
-    print(f'  {len(folds)} folds, {args.field}: {low} vs {high}, '
+    print(f'  {len(folds)} folds, {args.field}: '
+          f'{" vs ".join(str(v) for v in values)}, '
           f'groups: {", ".join(groups)}\n')
 
     arms = {}
-    for value in (low, high):
+    for value in values:
         armed = config.with_overrides(**{args.field: value})
         skills, sizes, trees = [], [], []
         for fold in folds:
@@ -93,28 +98,37 @@ def main() -> int:
               f'{int((arms[value][0] > 0).sum())}/{len(folds)}  '
               f'{arms[value][2]:.0f} trees')
 
-    delta = arms[high][0] - arms[low][0]
-    paired = weighted_fold_mean(delta, arms[low][1])
-    print(f'\n  paired delta ({args.field} {high} minus {low}): '
-          f'{paired.mean:+.6f}  se {paired.standard_error:.6f}  '
-          f'  t {paired.t:+.2f}  {int((delta > 0).sum())}/{len(folds)} folds')
-    if abs(paired.mean) < NOISE_FLOOR:
-        print(f'\n  UNRESOLVED: |delta| is inside the {NOISE_FLOOR:+.6f} noise '
-              f'band, where an\n  information-free feature scored just as well. '
-              f'The arms cannot be ranked\n  on this evidence, whatever the t '
-              f'reads.')
-    rows = [{'field': args.field, 'low': low, 'high': high,
-             'delta': paired.mean, 'se': paired.standard_error, 't': paired.t,
-             'p': paired.p_value, 'folds_positive': int((delta > 0).sum()),
-             'folds': len(folds),
-             'resolved': bool(abs(paired.mean) >= NOISE_FLOOR)}]
+    print(f'\n  paired deltas against {args.field}={low!r}\n')
+    print(f"  {'arm':>12s} {'delta':>11s} {'se':>10s} {'t':>7s} {'folds+':>8s}")
+    rows = []
+    for value in values[1:]:
+        delta = arms[value][0] - arms[low][0]
+        paired = weighted_fold_mean(delta, arms[low][1])
+        flag = ''
+        if args.noise_floor is not None and abs(paired.mean) < args.noise_floor:
+            flag = '  UNRESOLVED'
+        print(f'  {value!r:>12} {paired.mean:+11.6f} '
+              f'{paired.standard_error:10.6f} {paired.t:+7.2f} '
+              f'{int((delta > 0).sum()):>6d}/{len(folds)}{flag}')
+        rows.append({'field': args.field, 'low': low, 'high': value,
+                     'delta': paired.mean, 'se': paired.standard_error,
+                     't': paired.t, 'p': paired.p_value,
+                     'folds_positive': int((delta > 0).sum()),
+                     'folds': len(folds),
+                     'resolved': (None if args.noise_floor is None
+                                  else bool(abs(paired.mean) >= args.noise_floor))})
+    if len(rows) > 1:
+        spread = np.std([r['delta'] for r in rows], ddof=1)
+        print(f'\n  spread of the {len(rows)} deltas: sd {spread:.6f}')
+        print('  With a true effect of zero, this sd IS the floor for an arm '
+              'of this kind.')
     if args.out:
         from pathlib import Path
         path = Path(args.out)
         path.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(rows).to_csv(path / 'config_arm.csv', index=False)
         pd.DataFrame({f'{args.field}={v}': arms[v][0]
-                      for v in (low, high)}).to_csv(
+                      for v in values}).to_csv(
             path / 'config_arm_folds.csv', index=False)
         print(f'\n  wrote {path / "config_arm.csv"}')
     log_trial('config_arm', args, config, groups=groups, dataset=dataset,

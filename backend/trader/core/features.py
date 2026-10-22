@@ -80,6 +80,13 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     # matching the largest real group, so the count comparison is like for
     # like. Opt-in, so no ordinary run can select them.
     'noise': tuple(f'noise_{i:02d}' for i in range(11)),
+    # Four more independent draws, so the noise effect can be reported as a
+    # DISTRIBUTION rather than the single number NC2 produced. Each group is
+    # salted by its own name, or every group would hold identical columns.
+    'noise2': tuple(f'noise2_{i:02d}' for i in range(11)),
+    'noise3': tuple(f'noise3_{i:02d}' for i in range(11)),
+    'noise4': tuple(f'noise4_{i:02d}' for i in range(11)),
+    'noise5': tuple(f'noise5_{i:02d}' for i in range(11)),
     'time_of_day': (
         'quarter_of_hour', 'hour_sin', 'hour_cos',
         'dow_sin', 'dow_cos', 'us_equity_hours',
@@ -131,7 +138,8 @@ BOOK_GROUPS = ('market_state', 'market_price', 'cross_venue', 'implied_vol',
 QUOTE_DEPTH_FRAMING = ('book_quote', 'book_depth')
 MEANING_FRAMING = ('market_state', 'book_flow')
 # Selectable, never default: everything with a short history.
-OPT_IN_GROUPS = BOOK_GROUPS + ('index_proxy', 'noise')
+NOISE_GROUPS = ('noise', 'noise2', 'noise3', 'noise4', 'noise5')
+OPT_IN_GROUPS = BOOK_GROUPS + ('index_proxy',) + NOISE_GROUPS
 ALL_GROUPS = tuple(g for g in FEATURE_GROUPS if g not in OPT_IN_GROUPS)
 # The control. Named so a survey cannot quietly omit it.
 CONTROL_GROUPS = ('time_of_day',)
@@ -324,7 +332,8 @@ def _splitmix64(value: np.ndarray) -> np.ndarray:
     return x
 
 
-def _noise_features(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+def _noise_features(frame: pd.DataFrame, columns: Sequence[str],
+                    salt: str = '') -> pd.DataFrame:
     """Uniform(0,1) columns seeded from each row's identity.
 
     Keyed on (symbol, window_open, offset) -- the row key, not the position --
@@ -337,10 +346,17 @@ def _noise_features(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame
     # A stable symbol code: the sum of the character points, not `hash`.
     codes = symbol.map(lambda t: sum(ord(c) for c in t)).to_numpy()
 
+    # The group's own salt, from its NAME, so two noise groups are
+    # independent draws rather than the same eleven columns twice.
+    group_salt = np.uint64((sum(ord(c) * (i + 1)
+                                for i, c in enumerate(salt)) * 2654435761)
+                           % (1 << 64))
+
     base = (np.asarray(window_open, dtype=np.int64).astype(np.uint64)
             * _NOISE_SALT
             + offset.to_numpy(dtype=np.int64).astype(np.uint64) * np.uint64(10007)
-            + codes.astype(np.uint64) * np.uint64(101))
+            + codes.astype(np.uint64) * np.uint64(101)
+            + group_salt)
 
     out = pd.DataFrame(index=frame.index)
     for i, name in enumerate(columns):
@@ -538,9 +554,10 @@ def build_features(
         table['proxy_displacement_z'] = proxy_displacement_z(
             table['proxy_displacement'], table['sigma_remaining'])
 
-    if groups is not None and 'noise' in tuple(groups):
-        for name, values in _noise_features(
-                table, FEATURE_GROUPS['noise']).items():
+    for noise_group in (set(groups or ()) & set(NOISE_GROUPS)):
+        drawn = _noise_features(table, FEATURE_GROUPS[noise_group],
+                                salt=noise_group)
+        for name, values in drawn.items():
             table[name] = values
 
     return reindex_to_features(table, feature_columns(groups), deferred=deferred)

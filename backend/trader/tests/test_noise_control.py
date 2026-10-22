@@ -70,3 +70,32 @@ def test_it_carries_no_information_about_anything_real():
     real = np.sin(np.arange(len(f)) / 7.0)        # any structured series
     for column in COLUMNS:
         assert abs(np.corrcoef(out[column], real)[0, 1]) < 0.08
+
+
+# --- the multi-seed calibration ------------------------------------------
+
+from core.features import NOISE_GROUPS, _noise_features as _draw  # noqa: E402
+
+
+def test_every_noise_group_is_an_independent_draw():
+    """Without a per-group salt all five groups hold identical columns, and
+    the 'distribution' would be one number repeated five times."""
+    f = frame(400)
+    drawn = {g: _draw(f, FEATURE_GROUPS[g], salt=g) for g in NOISE_GROUPS}
+    first = {g: d[FEATURE_GROUPS[g][0]].to_numpy() for g, d in drawn.items()}
+    seen = list(NOISE_GROUPS)
+    for i, a in enumerate(seen):
+        for b in seen[i + 1:]:
+            assert not np.allclose(first[a], first[b]), f'{a} == {b}'
+            r = abs(np.corrcoef(first[a], first[b])[0, 1])
+            assert r < 0.12, f'{a} vs {b} correlated at {r:.3f}'
+
+
+def test_all_five_are_opt_in():
+    for g in NOISE_GROUPS:
+        assert g in OPT_IN_GROUPS and g not in ALL_GROUPS
+
+
+def test_the_groups_share_no_column_names():
+    names = [c for g in NOISE_GROUPS for c in FEATURE_GROUPS[g]]
+    assert len(names) == len(set(names)) == 55
