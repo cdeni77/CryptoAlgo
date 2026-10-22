@@ -304,8 +304,20 @@ candles                 72.1%      51.2%     36.0%    1.70c
 backfill (Predexon)     80.1%      60.3%     43.2%    2.30c
 ```
 
-**A 1.5pp edge gate is 1.5c**, so the quote is off by more than the entire
-edge the strategy trades on in 51% of candle rows and 60% of Predexon rows.
+**A 1.5pp edge gate is 1.5c**, so the quote DIFFERS FROM THE PRICE AT THE
+DECISION INSTANT by more than the entire edge the strategy trades on in 51%
+of candle rows and 60% of Predexon rows.
+
+"Differs from", not "is wrong by" — the section above shows the two are
+correctly aligned and most of that gap is genuine movement between the
+candle's minute boundary and the decision 32 seconds later. The candle is an
+accurate quote for its own instant.
+
+**That distinction matters for features and not for economics.** A feature
+reading a slightly earlier book is reading real data. An order cannot be
+filled at a price from 32 seconds ago, so for P&L, fill simulation and
+realised edge the gap is disqualifying whether its cause is error or
+movement.
 
 Candles are strictly better — essentially unbiased (+0.014c against
 Predexon's −0.256c), on the venue's true deci-cent grid, and closer on every
