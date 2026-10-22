@@ -30,11 +30,19 @@ export function SectionHead({
   eyebrow,
   title,
   note,
+  details,
   right,
 }: {
   eyebrow?: string;
   title: string;
   note?: string;
+  /** The long form, behind a disclosure.
+   *
+   *  Several of these notes are the reasoning that justifies the whole
+   *  measurement, and they are worth keeping — but a paragraph above the
+   *  data pushes the data down on every visit, for a sentence most people
+   *  read once. `note` says it in a line; this holds the argument. */
+  details?: string;
   right?: ReactNode;
 }) {
   return (
@@ -46,6 +54,15 @@ export function SectionHead({
         {eyebrow && <div className="eyebrow mb-1">{eyebrow}</div>}
         <h2 className="text-lg font-semibold text-ink">{title}</h2>
         {note && <p className="mt-1 max-w-[62ch] text-tiny text-ink-2">{note}</p>}
+        {details && (
+          <details className="group mt-1 max-w-[72ch]">
+            <summary className="cursor-pointer list-none font-mono text-micro uppercase tracking-wider text-ink-3 hover:text-ink-2">
+              why<span className="group-open:hidden"> ›</span>
+              <span className="hidden group-open:inline"> ⌄</span>
+            </summary>
+            <p className="mt-1 text-tiny text-ink-2">{details}</p>
+          </details>
+        )}
       </div>
       {right && <div className="shrink-0 sm:shrink-0">{right}</div>}
     </div>

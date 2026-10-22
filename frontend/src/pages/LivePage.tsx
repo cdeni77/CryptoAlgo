@@ -8,6 +8,7 @@
  * between are supporting detail.
  */
 import { usePolling } from '../hooks/usePolling';
+import { ExposureStrip } from '../components/ExposureStrip';
 import { fetchFunnel, fetchLive, fetchPrices } from '../api/serving';
 import type { OrderTicket, Prediction } from '../types';
 import { FunnelChart } from '../components/Charts';
@@ -49,21 +50,16 @@ export function LivePage() {
 
   return (
     <div className="space-y-8">
-      {account.mode === 'live' && (
-        <div className="flex items-center gap-3 border-l-2 border-below bg-below-wash px-4 py-2">
-          <Chip tone="below">live</Chip>
-          <span className="text-tiny text-ink">
-            This account holds real money. Positions below are actual exposure,
-            not a simulation.
-          </span>
-        </div>
-      )}
+      {/* Exposure first. The shell header already says real money, so this
+          slot answers "what am I exposed to" rather than repeating it. */}
+      <ExposureStrip account={account} />
 
       <section>
         <SectionHead
           eyebrow={`${state.windows.length} symbols · ${WINDOW_MINUTES}-minute windows`}
           title="Barrier state"
-          note="Displacement from the strike is known exactly. Only the volatility over the minutes that remain has to be forecast — that is the entire estimand, and it is the one quantity this project ever measured as forecastable."
+          note="Displacement is known; only the volatility left to run is forecast."
+          details="Displacement from the strike is known exactly. Only the volatility over the minutes that remain has to be forecast — that is the entire estimand, and it is the one quantity this project ever measured as forecastable."
         />
         {state.windows.length === 0 ? (
           <Empty
