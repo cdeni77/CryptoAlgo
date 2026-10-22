@@ -23,6 +23,33 @@ left undone here trades.
 | 4 | Ablation / prune 48 -> ~15-20 features | 2 | must run on whichever price series we keep: 33 of 48 features are Coinbase-derived, so pruning before C1 risks doing it twice |
 | 5 | `implied_vol` keep or drop | 4 | recovered coverage is BTC 100 / ETH 29 / SOL 4, so keeping it SKEWS the sample, not just caps it |
 
+### C4 — RUN 2026-10-22. `cross_venue` binds, not `implied_vol`.
+
+Rows surviving `--complete-cases` at offsets 3/6/9/12, 2025-12 to now:
+
+```
+quote only          341,944   100.0%
++ implied_vol       222,174    65.0%
++ cross_venue       164,268    48.0%   <- binds harder
++ BOTH              121,355    35.5%
+```
+
+Four `cross_venue` features cost 52% of the sample; five `implied_vol`
+features cost 35%. Together, nine features cost nearly two thirds of it.
+
+**This inverts DATA.md's §7b**, which had `implied_vol` as the dominant cost
+at +181%. That was measured before the rebuild: with the fits repaired and
+reaching back to 2025-12, `implied_vol` is now the cheaper of the two.
+
+Dropping both gives 2.8x the sample AND nine fewer features, which is the
+direction the capacity evidence already points -- optimal tree counts of
+1-41, and overfitting measured at 4x the effect size under study.
+
+What is NOT measured is whether either group earns that cost in skill. The
+C4 note says it: "That is an ablation, not a judgement call." The sample cost
+is now quantified on both sides of it, so the leave-one-out is the only
+remaining input.
+
 ### Not blocked, can run any time
 
 * **C2** — venue label vs Coinbase label, bucketed by |move|. Needs only
