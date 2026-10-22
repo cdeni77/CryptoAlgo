@@ -35,6 +35,11 @@ function tradedFromUrl(): boolean {
 
 export function DecisionsPage() {
   const [tradedOnly, setTradedOnly] = useState(tradedFromUrl);
+  // **Filtered client side, deliberately.** The fetch is already bounded to
+  // the newest 250; narrowing it server side would make "newest 250" mean a
+  // different window per symbol, and the counts beside it would stop being
+  // comparable. This filters what arrived.
+  const [symbol, setSymbol] = useState<string | null>(null);
 
   // **Kept in step with the toggle.** Without this the URL still said
   // `?traded=1` after switching to ALL, so a reload silently put the filter
@@ -54,16 +59,19 @@ export function DecisionsPage() {
   };
   const state = usePolling(() => fetchPredictions(250, tradedOnly), 30_000, [tradedOnly]);
 
-  const rows = state.data?.predictions ?? [];
+  const fetched = state.data?.predictions ?? [];
+  const symbols = [...new Set(fetched.map((r) => r.symbol))].sort();
+  const rows = symbol ? fetched.filter((r) => r.symbol === symbol) : fetched;
   const traded = rows.filter((r) => r.traded).length;
   // **A page, not a total.** `rows` is at most `limit` and is bounded by the
   // dashboard epoch, so "250 decisions" read as the whole population of a
   // table holding 250 of 60,873. And with the TRADED filter on every fetched
   // row is traded, so it printed "250 decisions · 250 traded" — a 100% trade
   // rate on a page whose whole thesis is that abstention is the default.
+  const scope = symbol ? ` · ${symbol.replace('-USD', '')} only` : '';
   const eyebrow = tradedOnly
-    ? `${rows.length} traded · newest first`
-    : `newest ${rows.length} · ${traded} traded`;
+    ? `${rows.length} traded · newest first${scope}`
+    : `newest ${fetched.length} · ${traded} traded${scope}`;
 
   return (
     <div className="space-y-6">
@@ -72,7 +80,28 @@ export function DecisionsPage() {
         title="Decisions"
         note="Abstention is the default action and every refusal is named. The scale shows the forecast as a bar from the 50% pivot, the market as a caret, and break-even as a hairline — a trade exists only when the bar clears the hairline."
         right={
-          <div className="flex border border-rule">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Symbol narrows what arrived; the fetch stays at newest 250. */}
+            <div className="flex border border-rule">
+              {[{ label: 'all', value: null as string | null }].concat(
+                symbols.map((s) => ({ label: s.replace('-USD', ''), value: s })),
+              ).map((option) => (
+                <button
+                  key={option.label}
+                  type="button"
+                  onClick={() => setSymbol(option.value)}
+                  className={[
+                    'px-3 py-1 font-mono text-micro uppercase',
+                    symbol === option.value
+                      ? 'bg-ink text-paper'
+                      : 'text-ink-2 hover:bg-sunken',
+                  ].join(' ')}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex border border-rule">
             {[
               { label: 'all', value: false },
               { label: 'traded', value: true },
@@ -91,6 +120,7 @@ export function DecisionsPage() {
                 {option.label}
               </button>
             ))}
+            </div>
           </div>
         }
       />
