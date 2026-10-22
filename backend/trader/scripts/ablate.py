@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -21,7 +22,7 @@ import pandas as pd
 from core.baseline import log_loss
 from core.cv import assert_no_leakage, effective_observations, folds_for_config
 from core.dataset import apply_fold, fit_fold
-from core.features import CONTROL_GROUPS, FEATURE_GROUPS
+from core.features import ALL_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS
 from core.metrics import weighted_fold_mean
 from core.model import fit_model
 from scripts._common import (
@@ -34,9 +35,30 @@ from scripts._common import (
 CONTROL = CONTROL_GROUPS[0]
 
 
-def trials(groups: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
-    """Return every group alone, the full set, and the full set without the control."""
+def trials(groups: tuple[str, ...],
+           drop: Sequence[str] = ()) -> dict[str, tuple[str, ...]]:
+    """The cells to score.
+
+    Default: the full set, the full set without the control, and every group
+    alone. `drop` instead scores the full set against the full set MINUS each
+    named group -- a leave-one-out, which is the comparison a keep-or-remove
+    decision needs and which costs two cells instead of one per group.
+
+    Alone and leave-one-out answer different questions. Alone asks whether a
+    group forecasts at all; leave-one-out asks whether it adds anything the
+    others do not already carry. A group can score near zero alone and still
+    matter, or forecast well alone and be redundant.
+    """
     out: dict[str, tuple[str, ...]] = {'all groups': groups}
+    if drop:
+        for group in drop:
+            if group not in groups:
+                raise SystemExit(f'--drop {group}: not in the selected groups '
+                                 f'{list(groups)}')
+            rest = tuple(g for g in groups if g != group)
+            if rest:
+                out[f'all minus {group}'] = rest
+        return out
     without = tuple(g for g in groups if g != CONTROL)
     if CONTROL in groups and without:
         out[f'all minus {CONTROL}'] = without
@@ -50,6 +72,10 @@ def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__))
+    parser.add_argument('--drop', nargs='*', default=(),
+                        help='Leave-one-out: score the full set against the '
+                             'full set minus each named group. Two cells '
+                             'instead of one per group.')
     parser.add_argument('--out', type=str, default=None,
                         help='Write the table to ablation.csv in this directory')
     args = parser.parse_args()
@@ -62,12 +88,17 @@ def main() -> int:
     for fold in folds:
         assert_no_leakage(fold)
 
-    available = tuple(g for g in FEATURE_GROUPS if g in set(FEATURE_GROUPS))
+    # **The groups the CONFIG selected, not every group that exists.** This
+    # read `g in set(FEATURE_GROUPS)`, which is always true, so `--groups` was
+    # ignored and the survey scored families the model does not use. It also
+    # selected both book framings at once, which `feature_columns` now refuses
+    # outright -- the bug had been masked by dedup.
+    available = tuple(config.groups) if config.groups else tuple(ALL_GROUPS)
     print(f'  {len(folds)} folds, groups: {", ".join(available)}\n')
     print(f"  {'groups':30s} {'skill':>11s} {'se':>10s} {'t':>7s} {'folds+':>8s} {'trees':>7s}")
 
     rows = []
-    for label, groups in trials(available).items():
+    for label, groups in trials(available, args.drop).items():
         skills, trees, sizes = [], [], []
         for fold in folds:
             fit, train = fit_fold(dataset, fold.train, config, groups=groups)
