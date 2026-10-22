@@ -84,3 +84,26 @@ def test_a_partial_hour_is_re_asked(monkeypatch):
     held = bi.held_hours(Store(), 'BTC-USD')
     assert full in held
     assert part not in held
+
+
+def test_an_hour_without_the_mean_is_not_complete():
+    """Rows written before `mean_price` existed pass the minute count.
+
+    Skipping them keeps a null mean forever — a silent hole in the exact
+    quantity the column was added to capture.
+    """
+    import pandas as _pd
+
+    h = _pd.Timestamp('2026-10-01 00:00', tz='UTC')
+    old = [{'event_time': h + _pd.Timedelta(minutes=i), 'mean_price': None}
+           for i in range(60)]
+    new = [{'event_time': h + _pd.Timedelta(hours=1, minutes=i),
+            'mean_price': 1.0} for i in range(60)]
+
+    class Store:
+        def read(self, *a, **k):
+            return _pd.DataFrame(old + new)
+
+    held = bi.held_hours(Store(), 'BTC-USD')
+    assert h not in held, 'an hour with no mean_price must be re-asked'
+    assert h + _pd.Timedelta(hours=1) in held

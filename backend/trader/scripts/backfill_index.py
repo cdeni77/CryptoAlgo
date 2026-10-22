@@ -145,6 +145,13 @@ def held_hours(store, symbol: str) -> set:
         return set()
     if held is None or not len(held):
         return set()
+    # **An hour missing `mean_price` is NOT complete.** Rows written before
+    # that column existed pass the minute count, so without this they are
+    # skipped forever and keep a null mean -- a silent hole in the exact
+    # quantity the column was added to capture, and one that only a full
+    # refetch could close later.
+    if 'mean_price' in held.columns:
+        held = held[held['mean_price'].notna()]
     at = pd.to_datetime(held['event_time'], utc=True)
     per = at.dt.floor('h').value_counts()
     return set(per[per >= COMPLETE_HOUR_MINUTES].index)
