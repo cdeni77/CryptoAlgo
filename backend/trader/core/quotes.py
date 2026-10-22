@@ -310,8 +310,20 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
     #      such a row's age and sorting nulls last; now that age is no longer
     #      the leading key, it has to be said out loud.
     #   2. `_source_rank` — see QUOTE_SOURCE_PRIORITY. This is the fix.
-    #   3. age — still the tie-break, but only WITHIN one source, which is the
-    #      only comparison where it means one thing.
+    #   3. age bucketed to WHOLE SECONDS — a sub-second difference between two
+    #      rows of the same source is noise, not information.
+    #   4. whether the row carries SIZES. `live_touch` writes two rows per
+    #      decision, one with depth and one without, and the unsized one is
+    #      fresher by a median 140ms. Ranking on raw age therefore handed the
+    #      unsized row the win in 8,013 of 8,013 groups, leaving only 53.2% of
+    #      live-era decision rows with `yes_bid_size`, `depth_*` and
+    #      `bid_at_touch` -- `market_state`'s complete-case column among them.
+    #      Half the live era lost its depth for a seventh of a second.
+    #   5. exact age, as the final tie-break.
+    #
+    # Bucketing before the size preference is what keeps this honest: inside
+    # one second, take the row that says more; across seconds, the fresher row
+    # still wins, because four seconds of staleness is real.
     book['_unusable'] = (~keep).astype(int)
     if 'source' in book.columns:
         rank = {name: i for i, name in enumerate(QUOTE_SOURCE_PRIORITY)}
@@ -319,11 +331,19 @@ def attach_quotes(windows: pd.DataFrame, depth: pd.DataFrame, *,
                                 .fillna(len(rank)).astype(int))
     else:
         book['_source_rank'] = 0
-    book = (book.sort_values(['_unusable', '_source_rank', 'quote_age_seconds'],
+    _age = pd.to_numeric(book.get('quote_age_seconds'), errors='coerce')
+    book['_age_bucket'] = np.floor(_age.fillna(np.inf))
+    _sizes = [c for c in ('yes_bid_size', 'yes_ask_size') if c in book.columns]
+    book['_no_sizes'] = (
+        (~book[_sizes].notna().any(axis=1)).astype(int) if _sizes
+        else 0)
+    book = (book.sort_values(['_unusable', '_source_rank', '_age_bucket',
+                              '_no_sizes', 'quote_age_seconds'],
                              na_position='last')
                 .drop_duplicates(['symbol', 'window_open', 'offset_minutes'],
                                  keep='first')
-                .drop(columns=['_unusable', '_source_rank']))
+                .drop(columns=['_unusable', '_source_rank', '_age_bucket',
+                               '_no_sizes']))
 
     for src, dst in DEPTH_MAP.items():
         book[dst] = pd.to_numeric(book.get(src), errors='coerce').where(keep) \
