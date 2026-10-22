@@ -451,8 +451,14 @@ def positions(db: Session, *, open_only: bool = False,
         charged = {r.ticker: float(r.fees_paid or 0.0)
                    for r in db.execute(select(VenuePosition)).scalars().all()}
         if charged:
+            # Epoch-filtered like everything else the dashboard shows. A
+            # position still open across a reset loses its fee line here,
+            # which is the consistent answer: a reset says "show me from
+            # here", and a pre-reset fee against post-reset P&L reads as a
+            # cost with no trade behind it.
             rows = db.execute(
-                select(OrderTicket).where(OrderTicket.market_ticker.in_(charged))
+                since_reset(select(OrderTicket), OrderTicket, epoch)
+                .where(OrderTicket.market_ticker.in_(charged))
             ).scalars().all()
             by_ticker: dict[str, list] = {}
             for ticket in rows:
@@ -1023,7 +1029,7 @@ def venue_daily_pnl(db: Session, *, days: int = 120) -> dict[str, Any]:
         first = next((d for d in days_out if d['date'] == boundary), None)
         if first is not None and at is not None and boundary in marked_days:
             held = db.execute(
-                select(Position)
+                since_reset(select(Position), Position, epoch)
                 .where(Position.window_open <= at)
                 .where((Position.settled_at.is_(None))
                        | (Position.settled_at > at))
@@ -1132,7 +1138,8 @@ def venue_account_state(db: Session) -> dict[str, Any]:
     booked = {
         str(t.market_ticker)
         for t in db.execute(
-            select(OrderTicket).where(OrderTicket.market_ticker.is_not(None))
+            since_reset(select(OrderTicket), OrderTicket, epoch)
+            .where(OrderTicket.market_ticker.is_not(None))
         ).scalars().all()
     }
     unbooked = 0
