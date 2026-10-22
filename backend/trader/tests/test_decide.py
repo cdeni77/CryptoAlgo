@@ -282,3 +282,83 @@ class TestHowManySymbolsMayHoldOneWindow:
         assert out.reason is Reason.WINDOW_EXPOSURE, (
             'raising the count cap must not let the notional cap through'
         )
+
+
+def _sized(exposure=None, **over):
+    """A traded decision at a generous entry limit, for the sizing tests."""
+    config = Config(max_entries_per_symbol_window=4, kelly_fraction=0.10,
+                    max_stake_dollars=None, **over)
+    return decide(row(), config, bankroll=1000.0,
+                  exposure=exposure or WindowExposure()), config
+
+
+def test_kelly_sizes_the_barrier_so_offsets_top_up_rather_than_stack():
+    """Offsets 3/6/9/12 buy ONE barrier and settle together.
+
+    Sizing each independently stakes `kelly_fraction` once per entry, which at
+    the measured 4.52 entries a window turns a tenth-Kelly into nearly a half
+    on a single correlated outcome.
+    """
+    first, _ = _sized()
+    assert first.traded
+
+    # What the barrier is allowed to hold in total, on this estimate.
+    # `compound` is off by default, so the base is `starting_bankroll`.
+    config = Config(max_entries_per_symbol_window=4, kelly_fraction=0.10,
+                    max_stake_dollars=None)
+    target = (config.kelly_fraction * first.kelly_fraction
+              * config.starting_bankroll)
+
+    # The same barrier, already holding most of that.
+    held = first.stake * 0.6
+    exposure = WindowExposure(
+        stake=held, positions=1, symbols_entered=frozenset({'BTC-USD'}),
+        entry_counts={'BTC-USD': 1}, stakes={'BTC-USD': held},
+        sides={'BTC-USD': 'up'})
+    second, _ = _sized(exposure=exposure)
+    assert second.traded
+    # The barrier ends at its Kelly stake, not at a multiple of it. Contracts
+    # are integral and the fee rounds up, so it lands at or just under.
+    assert held + second.stake <= target + second.fee
+    assert second.stake < first.stake
+
+    # **The counterfactual.** Without the per-symbol stake the same call sizes
+    # as if the barrier were empty, which is the stacking this removes.
+    stacked, _ = _sized(exposure=WindowExposure(
+        stake=held, positions=1, symbols_entered=frozenset({'BTC-USD'}),
+        entry_counts={'BTC-USD': 1}, sides={'BTC-USD': 'up'}))
+    assert stacked.stake == pytest.approx(first.stake)
+    assert held + stacked.stake > target
+
+
+def test_a_barrier_already_at_its_kelly_stake_is_refused():
+    first, _ = _sized()
+    full = first.stake * 1.5
+    again, _ = _sized(exposure=WindowExposure(
+        stake=full, positions=1, symbols_entered=frozenset({'BTC-USD'}),
+        entry_counts={'BTC-USD': 1}, stakes={'BTC-USD': full},
+        sides={'BTC-USD': 'up'}))
+    assert not again.traded
+    assert again.reason is Reason.BARRIER_FUNDED
+
+
+def test_a_different_symbol_is_not_netted_against():
+    """Netting is per BARRIER. ETH in the same window is a correlated bet, not
+    the same one -- `max_window_exposure_fraction` is what caps that."""
+    first, _ = _sized()
+    other, _ = _sized(exposure=WindowExposure(
+        stake=first.stake, positions=1, symbols_entered=frozenset({'ETH-USD'}),
+        entry_counts={'ETH-USD': 1}, stakes={'ETH-USD': first.stake},
+        sides={'ETH-USD': 'up'}))
+    assert other.traded
+    assert other.stake == pytest.approx(first.stake)
+
+
+def test_one_entry_per_barrier_is_unchanged_by_the_netting():
+    """The default config holds one entry per (symbol, window), so nothing is
+    ever held when `decide` runs and the stake must be bit-identical."""
+    plain = decide(row(), Config(), bankroll=1000.0)
+    with_empty = decide(row(), Config(), bankroll=1000.0,
+                        exposure=WindowExposure())
+    assert plain.stake == with_empty.stake
+    assert plain.contracts == with_empty.contracts

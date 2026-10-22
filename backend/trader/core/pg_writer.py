@@ -1237,7 +1237,7 @@ class PgWriter:
         return updated
 
     def entry_counts_for_window(self, window_open: datetime):
-        """Per-symbol entry COUNTS, total stake and total entries for a window.
+        """Per-symbol entry counts, total stake, entries, sides and per-symbol stake.
 
         `entries_for_window` answers "which symbols are in this window" and
         deduplicates by symbol, which is exactly right while one entry per
@@ -1256,6 +1256,10 @@ class PgWriter:
         """
         counts: dict[str, int] = {}
         sides: dict[str, str] = {}
+        #: Per-symbol stake. `decide` nets Kelly against the barrier a symbol
+        #: already holds, so a total alone would leave every later offset
+        #: sizing as if the barrier were empty.
+        stakes: dict[str, float] = {}
         stake = 0.0
         entries = 0
         with self._session() as session:
@@ -1270,7 +1274,9 @@ class PgWriter:
                 counts[symbol] = counts.get(symbol, 0) + 1
                 if row.side is not None:
                     sides.setdefault(symbol, str(row.side))
-                stake += float(row.outlay or 0.0)
+                outlay = float(row.outlay or 0.0)
+                stakes[symbol] = stakes.get(symbol, 0.0) + outlay
+                stake += outlay
                 entries += 1
                 if row.prediction_id is not None:
                     claimed.add(int(row.prediction_id))
@@ -1285,13 +1291,15 @@ class PgWriter:
                 counts[symbol] = counts.get(symbol, 0) + 1
                 if row.side is not None:
                     sides.setdefault(symbol, str(row.side))
-                stake += float(row.expected_cost or 0.0)
+                expected = float(row.expected_cost or 0.0)
+                stakes[symbol] = stakes.get(symbol, 0.0) + expected
+                stake += expected
                 entries += 1
         # **The side must come from the STORE, not only from this cycle's
         # exposure.** A restart, or simply the next cycle, rebuilds
         # `WindowExposure` from here; without the side a window entered UP at
         # +3 would happily be entered DOWN at +9, which is the -$6.29 defect.
-        return counts, stake, entries, sides
+        return counts, stake, entries, sides, stakes
 
     def first_position_time(self) -> Optional[datetime]:
         """When our books start, or None if they hold nothing.

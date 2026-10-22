@@ -52,6 +52,7 @@ class Reason(str, Enum):
     BELOW_MIN_CONTRACTS = 'below_min_contracts'  # Kelly stake under one contract
     FEE_CEILING = 'fee_ceiling'                # negative EV once the order fee rounds up
     WINDOW_EXPOSURE = 'window_exposure'        # too much already at risk this window
+    BARRIER_FUNDED = 'barrier_funded'          # this barrier already holds its Kelly stake
     POSITION_LIMIT = 'position_limit'          # too many correlated legs this window
     ALREADY_ENTERED = 'already_entered'        # entries per (symbol, window) used up
     OPPOSITE_SIDE = 'opposite_side'            # window already held on the other side
@@ -119,6 +120,13 @@ class WindowExposure:
     #: predate it; the check below then falls back to the set, so the default
     #: one-entry rule behaves exactly as it always did.
     entry_counts: Mapping[str, int] = field(default_factory=dict)
+    #: What each symbol already has staked in this window. **Kelly sizes the
+    #: BARRIER, not the order.** Offsets 3/6/9/12 enter the same
+    #: (symbol, window) barrier and settle together, so sizing each one
+    #: independently stakes `kelly_fraction` once per entry. Left empty by
+    #: callers that predate it, which reproduces the old behaviour exactly:
+    #: with one entry per barrier there is nothing to net against.
+    stakes: Mapping[str, float] = field(default_factory=dict)
     #: The side each symbol is already held on in this window. **Once more than
     #: one entry per (symbol, window) is allowed, nothing else stops two
     #: offsets taking OPPOSITE sides** -- and that is not a hedge, it is a
@@ -129,6 +137,10 @@ class WindowExposure:
     #: any second entry at all; with that relaxed the constraint has to be
     #: stated explicitly.
     sides: Mapping[str, str] = field(default_factory=dict)
+
+    def stake_for(self, symbol: str) -> float:
+        """Dollars already committed to this symbol's barrier in this window."""
+        return float(self.stakes.get(symbol, 0.0))
 
     def side_for(self, symbol: str) -> Optional[str]:
         """The side this symbol is already held on, or None."""
@@ -151,6 +163,9 @@ class WindowExposure:
             return self
         counts = dict(self.entry_counts)
         counts[decision.symbol] = self.entries_for(decision.symbol) + 1
+        stakes = dict(self.stakes)
+        stakes[decision.symbol] = (self.stake_for(decision.symbol)
+                                   + decision.stake)
         sides = dict(self.sides)
         if decision.side is not None:
             # First side wins and is never overwritten, so a later opposite
@@ -161,6 +176,7 @@ class WindowExposure:
             positions=self.positions + 1,
             symbols_entered=self.symbols_entered | {decision.symbol},
             entry_counts=counts,
+            stakes=stakes,
             sides=sides,
         )
 
@@ -542,10 +558,27 @@ def decide(
     # The sizing base. Compounding is opt-in: sizing off the starting bankroll
     # keeps the equity curve additive, so its slope is the per-trade edge.
     sizing_base = bankroll if config.compound else config.starting_bankroll
-    stake_target = min(
+    # **Kelly sizes the BARRIER, not the order.** Entry offsets 3/6/9/12 buy
+    # the same (symbol, window) barrier and settle on one outcome, so sizing
+    # each independently stakes `kelly_fraction` once per entry: at the
+    # measured 4.52 entries a window, a tenth-Kelly becomes nearly a half.
+    # This is the TOTAL the barrier should hold on the current estimate; what
+    # it already holds is subtracted below, so a later offset tops up rather
+    # than stacks. With one entry per barrier nothing is held and the target
+    # is unchanged.
+    barrier_target = min(
         config.kelly_fraction * kelly * sizing_base,
         config.max_stake_fraction * sizing_base,
     )
+    held = exposure.stake_for(symbol)
+    stake_target = barrier_target - held
+    if stake_target <= 0.0:
+        # The barrier is already at or above what this offset's edge justifies.
+        # There is no exit path, so an over-funded barrier is left alone rather
+        # than sold down.
+        return refuse(Reason.BARRIER_FUNDED, kelly_fraction=kelly, **common)
+    # The caps below are per ORDER -- what one request may send into the book --
+    # so they apply to the top-up, not to the barrier total.
     if config.max_stake_dollars is not None:
         stake_target = min(stake_target, config.max_stake_dollars)
     # A measured depth at the touch replaces the `max_stake_dollars` guess.

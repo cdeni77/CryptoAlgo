@@ -69,12 +69,15 @@ def test_the_stake_of_every_entry_is_recorded(writer):
     booked, the cap is computed against less than is actually at risk."""
     _open(writer, offset=3, contracts=2, price=0.50)
     _open(writer, offset=6, contracts=3, price=0.60)
-    counts, stake, entries, sides = writer.entry_counts_for_window(
+    counts, stake, entries, sides, stakes = writer.entry_counts_for_window(
         WINDOW.to_pydatetime())
     assert entries == 2
     assert counts['BTC-USD'] == 2
     assert stake == pytest.approx(1.0 + 1.8)
     assert sides['BTC-USD'] == 'up'
+    # Per symbol as well as in total: `decide` nets Kelly against the barrier
+    # this symbol already holds, and a total cannot answer that.
+    assert stakes['BTC-USD'] == pytest.approx(1.0 + 1.8)
 
 
 def test_a_fresh_database_gets_the_new_constraint_from_the_orm(writer):

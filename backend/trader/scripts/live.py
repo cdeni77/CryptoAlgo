@@ -1174,12 +1174,12 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # `max_window_exposure_fraction` caps, so that under-report would quietly
     # raise the real limit. `entry_counts_for_window` pairs on `prediction_id`
     # instead, so each decision is counted exactly once.
-    counts, staked, n_entered, sides = await _db(
+    counts, staked, n_entered, sides, stakes = await _db(
         writer.entry_counts_for_window, wopen)
     entered = frozenset(counts)
     base_exposure = WindowExposure(stake=staked, positions=n_entered,
                                    symbols_entered=entered, entry_counts=counts,
-                                   sides=sides)
+                                   stakes=stakes, sides=sides)
     if entered:
         logger.info('window %s already holds %s ($%.2f); those symbols will refuse',
                     window_open, sorted(entered), staked)
