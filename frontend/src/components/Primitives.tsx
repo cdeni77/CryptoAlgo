@@ -315,7 +315,7 @@ export function DataTable<T>({
             type="button"
             onClick={() => setRequested(Math.max(0, page - 1))}
             disabled={page <= 0}
-            className="rounded px-2 py-1 font-mono text-micro uppercase tracking-wider text-ink-2 transition-colors enabled:hover:bg-raised enabled:hover:text-ink disabled:opacity-30"
+            className="rounded px-2 py-1 font-mono text-micro uppercase tracking-wider text-ink-2 transition-colors enabled:hover:bg-sunken enabled:hover:text-ink disabled:opacity-30"
           >
             ‹ <span className="hidden sm:inline">prev</span>
           </button>
@@ -330,7 +330,7 @@ export function DataTable<T>({
             type="button"
             onClick={() => setRequested(Math.min(pages - 1, page + 1))}
             disabled={page >= pages - 1}
-            className="rounded px-2 py-1 font-mono text-micro uppercase tracking-wider text-ink-2 transition-colors enabled:hover:bg-raised enabled:hover:text-ink disabled:opacity-30"
+            className="rounded px-2 py-1 font-mono text-micro uppercase tracking-wider text-ink-2 transition-colors enabled:hover:bg-sunken enabled:hover:text-ink disabled:opacity-30"
           >
             <span className="hidden sm:inline">next</span> ›
           </button>
@@ -370,7 +370,7 @@ export function PageLink({
         event.preventDefault();
         onNavigate(href);
       }}
-      className="group flex items-center justify-between gap-3 rounded border border-rule bg-raised px-3 py-3 transition-colors hover:border-ink-3 hover:bg-sunken"
+      className="group flex items-center justify-between gap-3 rounded border border-rule bg-surface px-3 py-3 transition-colors hover:border-ink-3 hover:bg-sunken"
     >
       <span className="min-w-0">
         <span className="block text-sm font-semibold text-ink">{title}</span>

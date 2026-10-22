@@ -40,7 +40,7 @@ function Curve({ values }: { values: number[] }) {
         x2={w}
         y1={y(0)}
         y2={y(0)}
-        className="stroke-line"
+        className="stroke-rule"
         strokeWidth={1}
         vectorEffect="non-scaling-stroke"
       />
@@ -88,7 +88,7 @@ export function ModelFocus({
           <button
             type="button"
             onClick={onClear}
-            className="rounded-md border border-line px-2 py-1 text-tiny text-ink-3"
+            className="rounded-md border border-rule px-2 py-1 text-tiny text-ink-3"
           >
             Show the whole account
           </button>

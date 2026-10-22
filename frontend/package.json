@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "npm run typecheck && vite build",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "lint": "npm run check:tokens && eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
     "format": "prettier --write .",
-    "typecheck": "npx tsc --noEmit -p tsconfig.json && npx tsc --noEmit -p tsconfig.node.json"
+    "typecheck": "npx tsc --noEmit -p tsconfig.json && npx tsc --noEmit -p tsconfig.node.json",
+    "check:tokens": "node scripts/check-tokens.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

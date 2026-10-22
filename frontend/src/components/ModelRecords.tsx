@@ -13,8 +13,8 @@ import { Failed, Loading, Panel, SectionHead } from './Primitives';
 const money = (v: number) => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`;
 
 function tone(v: number): string {
-  if (v > 0) return 'text-up';
-  if (v < 0) return 'text-down';
+  if (v > 0) return 'text-above';
+  if (v < 0) return 'text-below';
   return 'text-ink-3';
 }
 
@@ -45,14 +45,14 @@ export function ModelRecords({
         title="By model"
         note="Settled P&L for every model that has traded, newest first."
         right={
-          <div className="flex rounded-md border border-line text-tiny">
+          <div className="flex rounded-md border border-rule text-tiny">
             {([true, false] as const).map((value) => (
               <button
                 key={String(value)}
                 type="button"
                 onClick={() => setAllTime(value)}
                 className={`px-2 py-1 ${
-                  allTime === value ? 'bg-line text-ink-1' : 'text-ink-3'
+                  allTime === value ? 'bg-sunken text-ink' : 'text-ink-3'
                 }`}
               >
                 {value ? 'All time' : 'Since reset'}
@@ -87,14 +87,14 @@ export function ModelRecords({
                     onClick={() =>
                       onSelect(selected === m.model_version ? null : m.model_version)
                     }
-                    className={`cursor-pointer border-t border-line hover:bg-line/40 ${
-                      selected === m.model_version ? 'bg-line/60' : ''
+                    className={`cursor-pointer border-t border-rule hover:bg-sunken ${
+                      selected === m.model_version ? 'bg-sunken' : ''
                     }`}
                   >
                     <td className="py-1.5 pr-3 font-mono">
                       {m.model_version}
                       {i === 0 && (
-                        <span className="ml-2 rounded bg-line px-1 text-ink-3">
+                        <span className="ml-2 rounded bg-sunken px-1 text-ink-3">
                           current
                         </span>
                       )}
@@ -128,7 +128,7 @@ export function ModelRecords({
                 ))}
 
                 {perf.data && perf.data.unattributed.positions > 0 && (
-                  <tr className="border-t border-line text-ink-3">
+                  <tr className="border-t border-rule text-ink-3">
                     <td className="py-1.5 pr-3 italic">no model recorded</td>
                     <td className="py-1.5 pr-3 text-right tabular-nums">
                       {perf.data.unattributed.positions}
@@ -145,7 +145,7 @@ export function ModelRecords({
                 )}
 
                 {perf.data && (
-                  <tr className="border-t border-line font-medium">
+                  <tr className="border-t border-rule font-medium">
                     <td className="py-1.5 pr-3">Total</td>
                     <td className="py-1.5 pr-3 text-right tabular-nums">
                       {perf.data.total_positions}
