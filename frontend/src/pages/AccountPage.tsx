@@ -44,6 +44,7 @@ import {
   SectionHead,
 } from '../components/Primitives';
 import { DailyPnlCalendar } from '../components/DailyPnlCalendar';
+import { ModelFocus } from '../components/ModelFocus';
 import { ModelRecords } from '../components/ModelRecords';
 import { go } from '../lib/navigate';
 import { cents } from '../lib/format';
@@ -78,8 +79,10 @@ export function AccountPage() {
   const venueCurve = usePolling(() => fetchVenueEquity(30), LIVE_MS);
   const equity = usePolling(() => fetchEquity(90), LIVE_MS);
   const settlements = usePolling(() => fetchVenueSettlements(200), LIVE_MS);
+  // 1000 when filtered: 200 is plenty of a live feed but truncates a
+  // model's history, and the curve below is built from these rows.
   const positions = usePolling(
-    () => fetchPositions(false, 200, model), LIVE_MS, [model]);
+    () => fetchPositions(false, model ? 1000 : 200, model), LIVE_MS, [model]);
   const daily = usePolling(() => fetchVenueDaily(180), LIVE_MS);
   const openPositions = usePolling(
     () => fetchPositions(true, 50, model), LIVE_MS, [model]);
@@ -306,26 +309,11 @@ export function AccountPage() {
       )}
 
       {model && (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-accent/40 bg-accent/5 px-3 py-2 text-tiny">
-          <span className="text-ink-2">
-            Positions filtered to <span className="font-mono">{model}</span>.
-          </span>
-          {/* Said plainly rather than left to be inferred: the venue ledger
-              is the account of record and knows nothing about our models, so
-              the balance, the venue curve and the day totals stay
-              account-wide however this page is filtered. */}
-          <span className="text-ink-3">
-            The venue ledger, balance and day totals stay account-wide — the
-            venue does not know which model placed an order.
-          </span>
-          <button
-            type="button"
-            onClick={() => setModel(null)}
-            className="ml-auto rounded border border-line px-2 py-0.5 text-ink-2"
-          >
-            Clear
-          </button>
-        </div>
+        <ModelFocus
+          version={model}
+          positions={positions.data?.positions ?? []}
+          onClear={() => setModel(null)}
+        />
       )}
 
       <ModelRecords pollMs={LIVE_MS} selected={model} onSelect={setModel} />
