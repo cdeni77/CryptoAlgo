@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+import math
+
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
@@ -90,6 +92,12 @@ def reset_epoch(db: Session):
     """
     row = db.execute(select(Account).order_by(Account.id)).scalars().first()
     return getattr(row, 'reset_at', None) if row is not None else None
+
+
+#: The most balance samples a curve returns. A chart resolves far fewer,
+#: and the series is thinned from the newest end so the current balance
+#: survives any stride.
+MAX_BALANCE_POINTS = 2000
 
 
 def since_reset(query, model, epoch):
@@ -1156,8 +1164,12 @@ def venue_account_state(db: Session) -> dict[str, Any]:
     """
     epoch = reset_epoch(db)
     rows = db.execute(since_reset(select(VenueSettlement), VenueSettlement, epoch)).scalars().all()
+    # `.limit(1)`, not just `.first()`. `.first()` takes one row from the
+    # result; without a LIMIT the database still orders and returns every
+    # sample, and the balance table grows by a sample per cycle for ever.
     balance = db.execute(
-        since_reset(select(VenueBalance), VenueBalance, epoch).order_by(VenueBalance.timestamp.desc())
+        since_reset(select(VenueBalance), VenueBalance, epoch)
+        .order_by(VenueBalance.timestamp.desc()).limit(1)
     ).scalars().first()
     account = db.execute(select(Account).order_by(Account.id)).scalars().first()
 
@@ -1352,14 +1364,43 @@ def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
             'cumulative_pnl': total,
         })
 
-    balances = db.execute(
-        since_reset(select(VenueBalance), VenueBalance, epoch).where(VenueBalance.timestamp >= since)
-        .order_by(VenueBalance.timestamp)
-    ).scalars().all()
+    # **Strided, not every row.** The balance is sampled continuously, so a
+    # 30-day window held 140,256 points and the response was 17MB -- on a page
+    # that polls. The cost grows with uptime, so it gets worse unattended. No
+    # chart resolves more than a couple of thousand points; the newest sample
+    # is kept whatever the stride, because that one is the current balance.
+    counted = db.execute(
+        since_reset(select(func.count(VenueBalance.id)), VenueBalance, epoch)
+        .where(VenueBalance.timestamp >= since)
+    ).scalar() or 0
+    stride = max(1, math.ceil(counted / MAX_BALANCE_POINTS))
+    balance_q = (
+        since_reset(select(VenueBalance), VenueBalance, epoch)
+        .where(VenueBalance.timestamp >= since)
+        .order_by(VenueBalance.timestamp))
+    if stride > 1:
+        rn = func.row_number().over(
+            order_by=VenueBalance.timestamp.desc()).label('rn')
+        numbered = (
+            since_reset(select(VenueBalance, rn), VenueBalance, epoch)
+            .where(VenueBalance.timestamp >= since)
+        ).subquery()
+        # Counted from the NEWEST, so row 1 is always the current balance.
+        # Epoch-filtered again although `numbered` already is: the invariant
+        # that every serving select goes through the helper is worth more than
+        # one redundant predicate.
+        balance_q = (since_reset(select(VenueBalance), VenueBalance, epoch)
+                     .join(numbered, VenueBalance.id == numbered.c.id)
+                     .where((numbered.c.rn - 1) % stride == 0)
+                     .order_by(VenueBalance.timestamp))
+    balances = db.execute(balance_q).scalars().all()
 
     return {
         'days': days,
         'points': points,
+        # `balance_stride` says how many samples each point stands for, so a
+        # reader can tell a thinned series from a sparse one.
+        'balance_stride': stride,
         'balances': [{
             'timestamp': b.timestamp, 'balance': b.balance,
             'our_bankroll': b.our_bankroll, 'drift': b.drift,
