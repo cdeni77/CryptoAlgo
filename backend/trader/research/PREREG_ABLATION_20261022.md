@@ -166,3 +166,64 @@ estimates (`delta` against `all groups` at `+0.000375`) were cross_venue
 `+0.000239`, geometry `+0.000242`, vol_state `-0.000143`, microstructure
 `+0.000009`, cross_asset `+0.000193`. **No threshold is read from them**; they
 are superseded by the paired run.
+
+---
+
+## RESULT, 2026-10-22 — all eight groups DROP
+
+```
+all groups (vs market): +0.000334  se 0.000203  t +1.64  26/39 folds
+
+group             delta         se       t  folds+    rho   verdict
+cross_venue    +0.000166  0.000077   +2.14   20/39  0.925   DROP
+geometry       +0.000174  0.000141   +1.23   24/39  0.727   DROP
+cross_asset    +0.000134  0.000106   +1.26   25/39  0.867   DROP
+implied_vol    +0.000039  0.000095   +0.41   24/39  0.893   DROP
+book_quote     -0.000023  0.000082   -0.27   19/39  0.919   DROP
+microstructure -0.000058  0.000106   -0.55   17/39  0.852   DROP
+offset         -0.000111  0.000081   -1.37   16/39  0.918   DROP
+vol_state      -0.000164  0.000112   -1.46   15/39  0.834   DROP
+```
+
+**The threshold was not touched.** `delta > 0` and `t > 2.7`, as fixed before
+the run. The highest t is `cross_venue` at +2.14, which clears an uncorrected
+two-sided 0.05 test but not Bonferroni for eight. Relaxing it after seeing
+that number is precisely the amendment this document exists to prevent.
+
+**Pairing was necessary and was not sufficient.** Measured fold correlation
+averages 0.867, so the paired standard error is 2.8x tighter than
+differencing the aggregates. Every unpaired t is under 0.7 — run 2 would have
+reported "nothing is significant" for the wrong reason a second time. With the
+pairing, the answer is the same but it is now a measurement rather than an
+artefact of the method.
+
+### What this does NOT say
+
+**It does not say the features add nothing collectively.** Leave-one-out
+measures a group's marginal value GIVEN the others. Groups that carry
+overlapping information are each individually dispensable while the union is
+not, and 33 of 48 features derive from the price and the strike, so overlap is
+expected. The evidence about the whole set is the `all groups` cell:
+`+0.000334` at `t +1.64` against the market, which is also not significant --
+consistent with the standing "no forecast edge over the market" result and
+with `project-edge-is-vs-backfill-only`, but not established by this design.
+
+### A caution on `cross_venue`
+
+It has the highest t and the WEAKEST fold agreement: **20 of 39**, a coin
+flip. A positive weighted mean on even fold signs means a minority of folds
+with large magnitude carry it. That is the profile of an unstable estimate,
+not of the most promising group. Any future test of it should be a single
+pre-registered hypothesis, not a survivor of this survey.
+
+### Sample consequence
+
+Dropping `cross_venue` and `implied_vol` takes the training sample from
+121,355 to 341,944 rows -- 2.8x -- at a measured forecast cost of +0.000166
+and +0.000039, neither significant. This is the cheapest available win and it
+comes from a failure, as recorded in advance.
+
+**NC2 is pending and gates the final configuration.** If information-free
+features measurably hurt, the correct action is to shed feature COUNT rather
+than these particular groups, and the group-level verdicts must be re-read in
+that light.
