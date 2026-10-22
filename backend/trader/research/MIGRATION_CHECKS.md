@@ -27,7 +27,24 @@ left undone here trades.
 
 * **C2** — venue label vs Coinbase label, bucketed by |move|. Needs only
   `venue_settlements`, which we hold.
-* **C3** — candles vs Predexon on the 2026-01-07 to 2026-08-13 overlap.
+* ~~**C3** — candles vs Predexon~~ **RUN 2026-10-21. Candles win.**
+  Measured against the LIVE book on 126,674 / 109,548 overlapping rows:
+
+  ```
+                       bias      median |d|   within 0.5c
+  candles            +0.014c        1.8c         28.1%
+  backfill (Predexon) -0.256c       2.0c         17.3%
+    in [0.10,0.90]:  candles 2.0c / 19.0%  vs  Predexon 3.0c / 13.8%
+  ```
+
+  Predexon is 0.0% off the whole-cent grid everywhere; candles are 58-61%
+  off it in the tails, confirming the deci-cent claim. The literal threshold
+  "failed" only because it assumed quantisation was the ONLY difference. It
+  is not: both sources sit ~2c from the live book because both are
+  minute-grid, and a candle close is a 60-second boundary while the live book
+  is sampled at the decision instant. That residual is TIMING, and it bounds
+  how good any minute-grid quote can be. **Predexon can be retired for
+  quotes**, which is what `--quote-sources` already does.
 * **`max_depth` 3 vs 4** — one cheap arm. Measured tree counts were 1-41 and
   `num_leaves=15` makes depth 4 effectively a full tree, so depth is the
   binding capacity knob.
