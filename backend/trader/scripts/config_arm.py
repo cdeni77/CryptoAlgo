@@ -37,6 +37,58 @@ from scripts.ablate import _graded_label, _null_for
 #: because the arms of the latter share everything but one number. Pass the
 #: figure a control measured for THIS comparison, or pass nothing and read the
 #: t on its own.
+# Set in the parent before the pool forks, so workers inherit the built
+# dataset copy-on-write rather than rebuilding it.
+_SHARED: dict = {}
+
+
+def _score_one(task):
+    """One (arm value, fold) pair. A worker, so it reads from `_SHARED`."""
+    value, index = task
+    dataset, config, folds, groups, field = (
+        _SHARED['dataset'], _SHARED['config'], _SHARED['folds'],
+        _SHARED['groups'], _SHARED['field'])
+    armed = config.with_overrides(**{field: value})
+    fold = folds[index]
+    fit, train = fit_fold(dataset, fold.train, armed, groups=groups)
+    test = apply_fold(dataset, fit, fold.test, armed, groups=groups)
+    model = fit_model(train, fit.baseline, armed, groups=groups)
+    y, b = _graded_label(test, armed), _null_for(test, armed)
+    m = np.asarray(model.predict(test), dtype=float)
+    keep = np.isfinite(y) & np.isfinite(b) & np.isfinite(m)
+    return (value, index,
+            log_loss(y[keep], b[keep]) - log_loss(y[keep], m[keep]),
+            effective_observations(test), model.best_iteration or 0)
+
+
+def _score_arms(values, folds, dataset, config, groups, field, jobs):
+    """Every (arm, fold) pair, over a fork pool when `jobs` > 1.
+
+    **Cap the threads per worker**, with OMP_NUM_THREADS. The work alternates
+    between single-threaded pandas and LightGBM, which takes every core it can
+    see because no `num_threads` is set; uncapped workers oversubscribe and
+    run slower than one process would.
+    """
+    _SHARED.update(dataset=dataset, config=config, folds=folds,
+                   groups=groups, field=field)
+    tasks = [(v, i) for v in values for i in range(len(folds))]
+    out = {v: ([None] * len(folds), [None] * len(folds), [None] * len(folds))
+           for v in values}
+    if jobs <= 1:
+        results = (_score_one(t) for t in tasks)
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = multiprocessing.get_context('fork')
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
+            results = list(pool.map(_score_one, tasks, chunksize=1))
+    for value, index, skill, size, trees in results:
+        out[value][0][index] = skill
+        out[value][1][index] = size
+        out[value][2][index] = trees
+    return out
+
+
 def _coerce(text: str):
     """`--values 3 4` are ints; a rate like 0.03 is a float."""
     try:
@@ -54,6 +106,9 @@ def main() -> int:
     parser.add_argument('--values', nargs='+', required=True,
                         help='Two or more values. The FIRST is the baseline; '
                              'every other is reported against it.')
+    parser.add_argument('--jobs', type=int, default=1,
+                        help='Score (arm, fold) pairs over this many '
+                             'processes, sharing one dataset build by fork.')
     parser.add_argument('--noise-floor', type=float, default=None,
                         help='A delta inside this band is UNRESOLVED. Use a '
                              'control measured for this comparison.')
@@ -76,20 +131,14 @@ def main() -> int:
           f'{" vs ".join(str(v) for v in values)}, '
           f'groups: {", ".join(groups)}\n')
 
+    if args.jobs > 1:
+        print(f'  scoring {len(values) * len(folds)} (arm, fold) pairs over '
+              f'{args.jobs} processes\n')
+    scored = _score_arms(values, folds, dataset, config, groups, args.field,
+                         args.jobs)
     arms = {}
     for value in values:
-        armed = config.with_overrides(**{args.field: value})
-        skills, sizes, trees = [], [], []
-        for fold in folds:
-            fit, train = fit_fold(dataset, fold.train, armed, groups=groups)
-            test = apply_fold(dataset, fit, fold.test, armed, groups=groups)
-            model = fit_model(train, fit.baseline, armed, groups=groups)
-            y, b = _graded_label(test, armed), _null_for(test, armed)
-            m = np.asarray(model.predict(test), dtype=float)
-            keep = np.isfinite(y) & np.isfinite(b) & np.isfinite(m)
-            skills.append(log_loss(y[keep], b[keep]) - log_loss(y[keep], m[keep]))
-            sizes.append(effective_observations(test))
-            trees.append(model.best_iteration or 0)
+        skills, sizes, trees = scored[value]
         arms[value] = (np.asarray(skills, float), np.asarray(sizes, float),
                        float(np.mean(trees)))
         agg = weighted_fold_mean(arms[value][0], arms[value][1])
