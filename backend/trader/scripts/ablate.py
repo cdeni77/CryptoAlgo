@@ -22,7 +22,8 @@ import pandas as pd
 from core.baseline import log_loss
 from core.cv import assert_no_leakage, effective_observations, folds_for_config
 from core.dataset import apply_fold, fit_fold
-from core.features import ALL_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS
+from core.features import (ALL_GROUPS, CONTROL_GROUPS, FEATURE_GROUPS,
+                           NOISE_GROUPS)
 from core.metrics import weighted_fold_mean
 from core.model import fit_model
 from scripts._common import (
@@ -204,6 +205,34 @@ def _paired_deltas(per_fold: dict) -> pd.DataFrame:
     return pd.DataFrame(out).sort_values('t', ascending=False)
 
 
+def _require_a_control(groups: Sequence[str], args) -> None:
+    """Refuse a survey that carries no negative control.
+
+    **A guard that a configuration can skip is not a guard.** The control
+    warning below only prints when the control is among the SELECTED groups,
+    so a run that simply did not list `time_of_day` produced no control check
+    and no complaint -- which is how the 2026-10-22 leave-one-out ablation came
+    to be read, and partly acted on, with nothing establishing that the
+    measurement could return a null. `RESEARCH_PROTOCOL` section 5 makes
+    negative controls mandatory; this makes them unskippable.
+
+    `--no-control` exists for the case the protocol allows -- a run whose
+    control IS the thing under test, like the noise calibration -- and it has
+    to be said out loud.
+    """
+    if getattr(args, 'no_control', False):
+        return
+    controls = set(CONTROL_GROUPS) | set(NOISE_GROUPS)
+    if controls & set(groups):
+        return
+    raise SystemExit(
+        f'refusing: none of {sorted(controls)} is in the selected groups '
+        f'{list(groups)}, so nothing in this run can show that the '
+        f'measurement returns a null.\n'
+        f'  Add one (--groups ...,{CONTROL_GROUPS[0]}), or pass --no-control '
+        f'with a reason if the control IS what you are measuring.')
+
+
 def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -212,6 +241,10 @@ def main() -> int:
                         help='Leave-one-out: score the full set against the '
                              'full set minus each named group. Two cells '
                              'instead of one per group.')
+    parser.add_argument('--no-control', action='store_true',
+                        help='Run without a negative control. Only for a run '
+                             'whose control IS the thing measured, such as a '
+                             'noise calibration.')
     parser.add_argument('--jobs', type=int, default=1,
                         help='Score (cell, fold) pairs over this many '
                              'processes. The dataset is built once and shared '
@@ -222,6 +255,10 @@ def main() -> int:
     setup_logging(args.verbose)
     config = config_from_args(args)
     print_header('Ablation', config)
+
+    # Before the dataset: the build is sixteen minutes and the groups are
+    # already on the args, so a refusal here costs nothing.
+    _require_a_control(tuple(groups_from_args(args) or ALL_GROUPS), args)
 
     dataset = load_dataset(args, config)
     folds = folds_for_config(dataset.window_index, config)
