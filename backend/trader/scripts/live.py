@@ -749,6 +749,7 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
         return 0
     now = now or pd.Timestamp.now(tz='UTC')
     cancelled = 0
+    vanished = 0
     for ticket in writer.open_tickets(limit=100):
         order_id = getattr(ticket, 'venue_order_id', None)
         if not order_id:
@@ -768,9 +769,30 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
         try:
             await kalshi.cancel_order(str(order_id))
         except Exception as exc:                               # noqa: BLE001
-            # A cancel that fails because the order already filled or the
-            # market closed is not an error worth stopping the cycle for; it is
-            # the reconcile's job to find the position either way.
+            # **404 means the venue has no such order, so close the ticket.**
+            # These markets settle every 15 minutes and the venue cancels what
+            # is still resting, so an order disappears server-side as a matter
+            # of course. Logging and retrying leaves the ticket `resting`, and
+            # `open_tickets` then returns it on every later cycle forever.
+            #
+            # This sweep runs BEFORE the decision, between the book read and
+            # `decided_at`, so each dead ticket adds a round trip to the quote
+            # age the decision is judged on -- the cost falls on the forecast,
+            # not on the bookkeeping.
+            #
+            # The status is the venue's own word for these orders, and the
+            # note keeps a cancel we performed separate from one we merely
+            # found. `book_resting_fills` has already run, so a fill is booked
+            # before we get here, and the reconcile owns the position either
+            # way.
+            if getattr(exc, 'status', None) == 404:
+                await _db(writer.resolve_ticket, ticket.id, status='cancelled',
+                          note='the venue reported no such order; closed by '
+                               'the sweep, reconcile owns any position')
+                vanished += 1
+                continue
+            # Any other failure is transient as far as we can tell, so leave
+            # the ticket open and try again next cycle.
             logger.info('could not cancel %s (%s); reconcile will settle it',
                         order_id, str(exc)[:100])
             continue
@@ -781,6 +803,8 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
     if cancelled:
         logger.info('cancelled %d resting order(s) unfilled past %.0fs',
                     cancelled, float(cutoff))
+    if vanished:
+        logger.info('closed %d ticket(s) the venue no longer holds', vanished)
     return cancelled
 
 
