@@ -22,6 +22,7 @@ against a Basic-tier ceiling of 20.
 
 from __future__ import annotations
 
+import time
 import argparse
 import asyncio
 import json
@@ -32,6 +33,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from core import heartbeat
+from core.freshness import max_buffer_seconds
 from core.config import DEFAULT_CONFIG, series_to_symbol
 from core.datastore import ResearchStore
 from scripts.record_stream import CACHE
@@ -134,6 +136,11 @@ async def run(args, gate=None) -> int:
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     pem = os.getenv('KALSHI_PRIVATE_KEY') or open(os.environ['KALSHI_PRIVATE_KEY_PATH']).read()
     rows: list[dict] = []
+    # **The buffer has a deadline as well as a size.** A count-only
+    # batch makes the newest stored row sawtooth with the row rate, so
+    # a recorder with an unbroken minute grid reports stale.
+    max_buffer = max_buffer_seconds('venue_ladder')
+    last_write = time.monotonic()
 
     def _flush_on_exit() -> None:
         """Write whatever is buffered before this task goes away.
@@ -276,12 +283,14 @@ async def run(args, gate=None) -> int:
                             })
                             # The same minute, sampled from the stream. Both
                             # rows survive a read because `transport` is part of
-                    if len(rows) >= args.batch_rows:
+                    due = time.monotonic() - last_write >= max_buffer
+                    if rows and (len(rows) >= args.batch_rows or due):
                         await asyncio.to_thread(
                             store.write, 'venue_ladder', pd.DataFrame(rows))
                         logger.info('wrote %d ladder rows (%d levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()
+                        last_write = time.monotonic()
                     # **Sleep to the next aligned mark, not for a fixed
                     # interval.** `sleep(interval)` at the end of the cycle
                     # makes the period `interval + work`, so the sampling phase

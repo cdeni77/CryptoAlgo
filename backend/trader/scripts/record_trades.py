@@ -66,6 +66,7 @@ with a warning rather than written from a partial fetch. They are recoverable by
 
 from __future__ import annotations
 
+import time
 import argparse
 import asyncio
 import logging
@@ -76,6 +77,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from core import heartbeat
+from core.freshness import max_buffer_seconds
 from core.config import DEFAULT_CONFIG, series_to_symbol
 from core.datastore import ResearchStore
 # The one place this repo parses a Kalshi timestamp. Importing it rather than
@@ -277,6 +279,11 @@ async def run(args, gate=None, store=None, client=None) -> int:
     tracked: dict[str, dict] = {}
     watermark: dict[str, int] = {}
     rows: list[dict] = []
+    # **The buffer has a deadline as well as a size.** A count-only
+    # batch makes the newest stored row sawtooth with the row rate, so
+    # a recorder with an unbroken minute grid reports stale.
+    max_buffer = max_buffer_seconds('venue_trades')
+    last_write = time.monotonic()
 
     def _write(batch: list[dict]) -> int:
         """Write a batch and drop exactly those rows, both inside the thread.
@@ -375,9 +382,11 @@ async def run(args, gate=None, store=None, client=None) -> int:
                         # fetched" would re-ask for it every cycle forever.
                         watermark[ticker] = hi
 
-                    if len(rows) >= args.batch_rows:
+                    due = time.monotonic() - last_write >= max_buffer
+                    if rows and (len(rows) >= args.batch_rows or due):
                         batch = list(rows)
                         await asyncio.to_thread(_write, batch)
+                        last_write = time.monotonic()
                         logger.info('wrote %d tape rows across %d market-minutes',
                                     len(batch), len({(r['market_ticker'],
                                                       r['offset_minutes'])

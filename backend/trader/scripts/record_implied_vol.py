@@ -12,6 +12,7 @@ close on the hour, but they price the same underlying's volatility.
 
 from __future__ import annotations
 
+import time
 import argparse
 import asyncio
 import logging
@@ -25,6 +26,7 @@ from typing import Iterable, Optional, Sequence
 import pandas as pd
 
 from core import heartbeat
+from core.freshness import max_buffer_seconds
 from core.datastore import ResearchStore
 
 logger = logging.getLogger('implied-vol')
@@ -244,6 +246,11 @@ async def run(args, gate=None) -> int:
     pem = (os.getenv('KALSHI_PRIVATE_KEY')
            or open(os.environ['KALSHI_PRIVATE_KEY_PATH']).read())
     rows: list[dict] = []
+    # **The buffer has a deadline as well as a size.** A count-only
+    # batch makes the newest stored row sawtooth with the row rate, so
+    # a recorder with an unbroken minute grid reports stale.
+    max_buffer = max_buffer_seconds('venue_implied_vol')
+    last_write = time.monotonic()
 
     def _flush_on_exit() -> None:
         """Write the buffer before this task is cancelled.
@@ -291,7 +298,8 @@ async def run(args, gate=None) -> int:
                             CACHE[symbol] = latest
                         rows.extend(found)
 
-                    if len(rows) >= args.batch_rows:
+                    due = time.monotonic() - last_write >= max_buffer
+                    if rows and (len(rows) >= args.batch_rows or due):
                         await asyncio.to_thread(
                             store.write, 'venue_implied_vol', pd.DataFrame(rows))
                         last = rows[-1]
@@ -303,6 +311,7 @@ async def run(args, gate=None) -> int:
                             last['minutes_to_close'], int(last['n_strikes']),
                             last['r2'])
                         rows.clear()
+                        last_write = time.monotonic()
                     heartbeat.touch('implied_vol')
                     await asyncio.sleep(args.interval)
         except asyncio.CancelledError:

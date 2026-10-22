@@ -81,6 +81,28 @@ EXPECTED_MAX_AGE: dict[str, Optional[float]] = {
     'venue_trades': 900.0,
 }
 
+#: No writer may hold rows longer than this, whatever its row count says.
+MAX_BUFFER_SECONDS = 300.0
+
+
+def max_buffer_seconds(dataset: str) -> float:
+    """How long a recorder may buffer rows before it must write them.
+
+    **A count-triggered batch cannot satisfy a time-based limit.** A recorder
+    that writes every `batch_rows` makes the newest stored row sawtooth with
+    the row RATE, so the visible age crosses `EXPECTED_MAX_AGE` once per batch
+    and reports a recorder with an unbroken minute grid as stale. The lag also
+    grows as the venue goes quiet, which lights the alarm hardest when there is
+    least to see, and an alarm that is always lit is one nobody reads.
+
+    A quarter of the limit, because the buffer is only the first of three lags:
+    the store_sync cycle and the freshness snapshot interval sit on top of it.
+    """
+    limit = EXPECTED_MAX_AGE.get(dataset)
+    if limit is None:
+        return MAX_BUFFER_SECONDS
+    return min(limit / 4.0, MAX_BUFFER_SECONDS)
+
 
 def newest_event_time(store_root: str, dataset: str) -> Optional[datetime]:
     """`max(event_time)` from the most recently written file, or None.

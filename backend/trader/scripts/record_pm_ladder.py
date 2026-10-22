@@ -12,6 +12,7 @@ that does not come back is an abstention.
 
 from __future__ import annotations
 
+import time
 import argparse
 import asyncio
 import json
@@ -22,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from core import heartbeat
+from core.freshness import max_buffer_seconds
 from core.config import DEFAULT_CONFIG
 from core.datastore import ResearchStore
 
@@ -161,6 +163,11 @@ async def run(args, gate=None) -> int:
     config = DEFAULT_CONFIG
     store = ResearchStore(os.getenv('RESEARCH_STORE'))
     rows: list[dict] = []
+    # **The buffer has a deadline as well as a size.** A count-only
+    # batch makes the newest stored row sawtooth with the row rate, so
+    # a recorder with an unbroken minute grid reports stale.
+    max_buffer = max_buffer_seconds('pm_ladder')
+    last_write = time.monotonic()
 
     def _flush_on_exit() -> None:
         """Write the buffer before this task is cancelled.
@@ -266,12 +273,14 @@ async def run(args, gate=None) -> int:
                             'outcomes': str(market_by_symbol[symbol].get('outcomes') or ''),
                             'token_id_up': token,
                         })
-                    if len(rows) >= args.batch_rows:
+                    due = time.monotonic() - last_write >= max_buffer
+                    if rows and (len(rows) >= args.batch_rows or due):
                         await asyncio.to_thread(
                             store.write, 'pm_ladder', pd.DataFrame(rows))
                         logger.info('wrote %d ladder rows (%d bid levels last)',
                                     len(rows), len(json.loads(rows[-1]['yes_levels'])))
                         rows.clear()
+                        last_write = time.monotonic()
                     heartbeat.touch('pm_ladder')
                     await asyncio.sleep(args.interval)
         except asyncio.CancelledError:
