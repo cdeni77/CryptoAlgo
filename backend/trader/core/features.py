@@ -370,6 +370,27 @@ def _noise_features(frame: pd.DataFrame, columns: Sequence[str],
     return out
 
 
+def attach_noise(table: pd.DataFrame,
+                 groups: Optional[Sequence[str]]) -> pd.DataFrame:
+    """Add the selected NC2 noise groups in ONE concat.
+
+    **Not column by column.** Assigning into a frame this wide re-blocks it on
+    every assignment, and pandas raises `DataFrame is highly fragmented` once
+    per column -- a five-group run logged 15,700 of them, with the time to
+    match.
+
+    Iterated in `NOISE_GROUPS` order, not a set's, so the frame is built the
+    same way twice. `reindex_to_features` fixes the final order either way,
+    but a non-deterministic intermediate is a bad habit in a feature builder.
+    """
+    selected = set(groups or ())
+    drawn = [_noise_features(table, FEATURE_GROUPS[g], salt=g)
+             for g in NOISE_GROUPS if g in selected]
+    if not drawn:
+        return table
+    return pd.concat([table, *drawn], axis=1)
+
+
 def _clock_features(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
     decision = pd.DatetimeIndex(frame['decision_time'])
     window_open = pd.DatetimeIndex(frame['window_open'])
@@ -554,11 +575,7 @@ def build_features(
         table['proxy_displacement_z'] = proxy_displacement_z(
             table['proxy_displacement'], table['sigma_remaining'])
 
-    for noise_group in (set(groups or ()) & set(NOISE_GROUPS)):
-        drawn = _noise_features(table, FEATURE_GROUPS[noise_group],
-                                salt=noise_group)
-        for name, values in drawn.items():
-            table[name] = values
+    table = attach_noise(table, groups)
 
     return reindex_to_features(table, feature_columns(groups), deferred=deferred)
 

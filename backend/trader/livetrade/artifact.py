@@ -32,7 +32,21 @@ def config_for_artifact(config, model, *, mode: str):
     for field in ('kelly_fraction', 'min_edge_pp', 'max_stake_dollars',
                   'max_stake_fraction', 'half_spread_cents', 'compound',
                   # The ensemble gates are part of the evaluated policy.
-                  'edge_lower_bound_z', 'require_member_agreement'):
+                  'edge_lower_bound_z', 'require_member_agreement',
+                  # **The PRICE BASIS the artifact was fitted on**, for the
+                  # same reason the init score is adopted: a model fitted on
+                  # one basis is wrong on another. `venue` chooses the price
+                  # series and `strike_source` the barrier, and the two must
+                  # move together -- a BRTI price against a Coinbase OHLC
+                  # strike injects a cross-index basis into all ten
+                  # strike-derived features.
+                  #
+                  # Neither is a flag on `scripts.live`, so without this the
+                  # trader has NO way to follow a migrated artifact: it would
+                  # keep scoring on coinbase_spot for ever while the model was
+                  # fitted on cfbenchmarks, and nothing would say so -- the
+                  # drift warning fires above 25bp and the basis is about 1bp.
+                  'venue', 'strike_source'):
         if field in explicit:
             continue
         value = provenance.get(field)

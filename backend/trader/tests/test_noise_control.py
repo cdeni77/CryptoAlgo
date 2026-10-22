@@ -7,6 +7,8 @@ control at all.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -99,3 +101,51 @@ def test_all_five_are_opt_in():
 def test_the_groups_share_no_column_names():
     names = [c for g in NOISE_GROUPS for c in FEATURE_GROUPS[g]]
     assert len(names) == len(set(names)) == 55
+
+
+# --- the attach must not fragment the frame ------------------------------
+
+from core.features import attach_noise  # noqa: E402
+
+
+def _wide(n_cols=60, n_rows=48):
+    """A frame as wide as the real one, where fragmentation shows up."""
+    base = frame(n_rows)
+    for i in range(n_cols):
+        base[f'pad_{i:03d}'] = np.arange(n_rows, dtype=float)
+    return base.copy()
+
+
+def test_attaching_noise_raises_no_fragmentation_warning():
+    """The defect: 55 per-column assignments logged 15,700 warnings and cost
+    real time on every feature build."""
+    from pandas.errors import PerformanceWarning
+    table = _wide()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', PerformanceWarning)
+        out = attach_noise(table, list(NOISE_GROUPS))
+    assert len(out.columns) == len(table.columns) + 55
+
+
+def test_the_attached_values_are_the_drawn_ones():
+    table = _wide()
+    out = attach_noise(table, ['noise', 'noise3'])
+    for group in ('noise', 'noise3'):
+        expected = _draw(table, FEATURE_GROUPS[group], salt=group)
+        for column in FEATURE_GROUPS[group]:
+            assert np.allclose(out[column], expected[column])
+    # groups not selected must not appear
+    assert not set(FEATURE_GROUPS['noise2']) & set(out.columns)
+
+
+def test_no_noise_group_selected_returns_the_frame_untouched():
+    table = _wide()
+    assert attach_noise(table, ['geometry']) is table
+    assert attach_noise(table, None) is table
+
+
+def test_the_order_does_not_depend_on_set_iteration():
+    table = _wide()
+    a = attach_noise(table, ['noise5', 'noise2', 'noise'])
+    b = attach_noise(table, ['noise', 'noise2', 'noise5'])
+    assert list(a.columns) == list(b.columns)
