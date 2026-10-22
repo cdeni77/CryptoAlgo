@@ -8,6 +8,60 @@ Each check states the test, the threshold, and **what to do if it fails**, so
 it can be executed later without re-deriving the reasoning. They are ordered so
 that an early failure makes the later ones unnecessary.
 
+## Pending before the next retrain
+
+Updated 2026-10-21. The Sunday cron ALWAYS installs, unreviewed, so anything
+left undone here trades.
+
+### Blocking
+
+| # | item | blocked by | note |
+|---|---|---|---|
+| 1 | BRTI backfill finishes | running | BTC ~10 min, ETH/SOL ~1h each at 155 hours/min |
+| 2 | **C1** — venue strike + BRTI price vs Coinbase | 1 | the gating test; decides whether to migrate at all |
+| 3 | If C1 passes: migrate | 2 | **C6** — all ten strike-derived features AND the price series move together, or none do. `live.py` needs the same switch for parity |
+| 4 | Ablation / prune 48 -> ~15-20 features | 2 | must run on whichever price series we keep: 33 of 48 features are Coinbase-derived, so pruning before C1 risks doing it twice |
+| 5 | `implied_vol` keep or drop | 4 | recovered coverage is BTC 100 / ETH 29 / SOL 4, so keeping it SKEWS the sample, not just caps it |
+
+### Not blocked, can run any time
+
+* **C2** — venue label vs Coinbase label, bucketed by |move|. Needs only
+  `venue_settlements`, which we hold.
+* **C3** — candles vs Predexon on the 2026-01-07 to 2026-08-13 overlap.
+* **`max_depth` 3 vs 4** — one cheap arm. Measured tree counts were 1-41 and
+  `num_leaves=15` makes depth 4 effectively a full tree, so depth is the
+  binding capacity knob.
+* **NC2 (noise-only features)** — pre-registered and **never run**. It is the
+  direct control for whether feature COUNT hurts here, which is the question
+  item 4 answers indirectly.
+
+### Done this session
+
+* `venue_strikes` gap closed, 3,692 -> 0, table now reaches 2025-12-10
+* `venue_candles` gap closed; 2026-08-13 recovered (it sat on the 69-day edge)
+* `venue_implied_vol` rebuilt from the venue's own ladders, 23,131 fits,
+  validated against live at 0.01 bp/min
+* `available_time` repaired on those fits — it was the backfill's RUN time, so
+  the feature was silently NaN for the whole backfilled era
+* `book_flow` fixed live: the sampler waited on the decision gate, so decision
+  minutes were refused as stale and every feature's lookback landed on one.
+  All six now score; 0 all-NaN cycles where there were 125 per 12h
+* retrain groups swapped `market_state,book_flow` -> `book_quote`, dropping
+  the 7 depth columns that cannot exist before 2026-08-25
+* throttle counters added to four backfills that were storing a 429 as data
+* `--strike-source venue` plumbed into the research path, which is what makes
+  C1 runnable at all
+
+### Open, not yet triaged
+
+* `market_price` (`market_prob`, `market_minus_baseline`) is NOT in the retrain
+  groups although `--init-score-source market` is set. Deliberate or not is
+  unestablished.
+* 6 ladder-hours produced no fit after throttling. 0.03%, accepted — repairing
+  them would re-ask every legitimately empty ladder too.
+* 4 index hours dropped. The skip logic makes them a one-request repair on the
+  next pass.
+
 ### Order of work
 
 1. **Exact strike + label** — helps every configuration, independent of every
