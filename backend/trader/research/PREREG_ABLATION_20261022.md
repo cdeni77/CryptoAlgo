@@ -227,3 +227,56 @@ comes from a failure, as recorded in advance.
 features measurably hurt, the correct action is to shed feature COUNT rather
 than these particular groups, and the group-level verdicts must be re-read in
 that light.
+
+---
+
+## NC2, the noise-only control — run after the fact, and it limits everything above
+
+```
+all 8 groups + 11 noise columns  +0.000486  t +2.49  30/39  64 trees
+all 8 groups                     +0.000334  t +1.64  26/39  80 trees
+delta(noise)                     +0.000152  se 0.000104  t +1.46  26/39
+```
+
+**Pure noise scores +0.000152. Six of the eight real groups score BELOW
+that.** Only `geometry` (+0.000174) and `cross_venue` (+0.000166) edge above
+it, and neither by a margin that means anything.
+
+### What passes and what does not
+
+The control **passes the threshold test**: at `t +1.46` it does not clear
+`t > 2.7`, so the machinery does not manufacture SIGNIFICANT skill from
+nothing, and the pre-registered rule correctly rejects it. That is the
+reassuring half.
+
+The control **fails the protocol's own standard**. `RESEARCH_PROTOCOL`
+section 5 item 2 says noise-only features "must score ~0". `+0.000152` is not
+~0 when the entire range of real effects is `-0.000164` to `+0.000174`. **The
+measurement's resolution is no finer than the effects it was built to
+measure.** No group-level ranking in this ablation can be trusted at face
+value, including the ones that came back negative.
+
+### Why noise helps, most likely
+
+`feature_fraction` samples the candidate columns at each split, so 11 junk
+columns dilute every split's choice set -- extra regularisation by another
+name. The tree count falls from 80 to 64 when they are added, which is what a
+more regularised fit looks like. Leakage is the alternative explanation and is
+unlikely: the noise is keyed on `(symbol, window_open, offset)` through an
+avalanche hash, folds split on the window, so a test window's values were
+never seen in training.
+
+### The parsimony question is answered, and the answer is NO
+
+`MIGRATION_CHECKS` called NC2 "the direct control for whether feature COUNT
+hurts here". Adding eleven information-free columns did not hurt; it helped,
+insignificantly. **Feature count is not the problem.** The optimal-tree-count
+parsimony argument is not supported, and shedding features is not justified on
+those grounds. If anything this points at regularisation strength -- which
+makes the untouched `max_depth` 3 vs 4 arm the more promising next test.
+
+### Consequence for the retrain
+
+A group may still be dropped to BUY SAMPLE, because its forecast cost is
+unmeasurable rather than zero. It must not be dropped on the claim that the
+ablation showed it unhelpful. That claim is not supported.
