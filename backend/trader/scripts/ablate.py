@@ -68,6 +68,53 @@ def trials(groups: tuple[str, ...],
     return out
 
 
+def _graded_label(test, config):
+    """The outcome to score against, honouring `label_source`.
+
+    `test['outcome']` is the Coinbase proxy. Grading on it while the market
+    prices on BRTI hands the baseline free skill -- the ledger measured
+    `baseline - market` reversing sign between the two labels.
+    """
+    proxy = test['outcome'].to_numpy(dtype=float)
+    if getattr(config, 'label_source', 'proxy') != 'venue':
+        return proxy
+    if 'venue_outcome' not in test.columns:
+        return proxy
+    venue = pd.to_numeric(test['venue_outcome'], errors='coerce').to_numpy(dtype=float)
+    return np.where(np.isfinite(venue), venue, proxy)
+
+
+def _null_for(test, config):
+    """What the model is scored AGAINST, which `init_score_source` decides.
+
+    **A market-initialised model must be scored against the MARKET.** It
+    starts from the market logit and the trees fit a residual, so measuring
+    it against `F(x/sigma)` reports
+
+        [log_loss(baseline) - log_loss(market)] + [log_loss(market) - log_loss(model)]
+
+    where the first term is the market's advantage over the barrier null --
+    identical in every ablation cell -- and only the second is what the
+    features add. The constant swamps the signal and its fold variance sets
+    the standard error, so every group reads as contributing nothing.
+
+    Measured 2026-10-22: with the baseline as the null, all eight groups came
+    back between -0.00014 and +0.00031 against a standard error of 0.00078,
+    and "all groups" scored +0.002237 -- about the size of the market's own
+    advantage over the baseline in the campaign ledger. The ablation was
+    reporting the init score, eight times.
+
+    `core/backtest.py` already documents the same swap for `log_loss_skill`:
+    "a silent swap is how a market-init model comes to be judged as a
+    baseline-init one".
+    """
+    if getattr(config, 'init_score_source', None) == 'market' \
+            and 'market_probability' in test.columns:
+        return pd.to_numeric(test['market_probability'],
+                             errors='coerce').to_numpy(dtype=float)
+    return test['baseline_probability'].to_numpy(dtype=float)
+
+
 def main() -> int:
     parser = add_data_arguments(argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -109,8 +156,8 @@ def main() -> int:
             fit, train = fit_fold(dataset, fold.train, config, groups=groups)
             test = apply_fold(dataset, fit, fold.test, config, groups=groups)
             model = fit_model(train, fit.baseline, config, groups=groups)
-            y = test['outcome'].to_numpy(dtype=float)
-            b = test['baseline_probability'].to_numpy(dtype=float)
+            y = _graded_label(test, config)
+            b = _null_for(test, config)
             m = np.asarray(model.predict(test), dtype=float)
             # Rows with no volatility estimate carry no forecast; exclude them, as
             # core/metrics.py does.

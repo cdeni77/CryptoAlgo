@@ -83,3 +83,58 @@ control exists.
 
 Expected sample: ~121,355 rows at offsets 3/6/9/12, 2025-12 onward, the
 complete-cases intersection of all eight groups (C4, measured 2026-10-22).
+
+
+---
+
+## AMENDMENT, 2026-10-22 07:00 — run 1 is VOID, metric corrected
+
+Run 1 is recorded as a trial and discarded, not reinterpreted. Its result:
+all eight groups between `-0.000144` and `+0.000309` against a standard
+error of `0.000782`, and `all groups` at `+0.002237`. Every group "failed",
+which is the tell.
+
+**The metric could not answer the question.** `scripts/ablate` scored
+`log_loss(baseline) - log_loss(model)` while the run used
+`--init-score-source market`, so the model starts at the market logit and
+the trees fit only a residual. That measures
+
+```
+[log_loss(baseline) - log_loss(market)]  +  [log_loss(market) - log_loss(model)]
+   the market's edge over F(x/sigma)          what the FEATURES add
+   IDENTICAL in all nine cells                the term under test
+```
+
+The constant is the whole of the reported number -- `+0.002237` is about the
+size of `baseline - market` in the campaign ledger -- and its fold variance
+sets the standard error. Eight near-zero deltas are one finding about the
+init score reported eight times, not eight findings about features.
+
+A second defect in the same line: `y = test['outcome']` is the Coinbase
+proxy, so `--label-source venue` was ignored. The same bug was fixed in
+`scripts/baseline.py` earlier the same night.
+
+**Changing a metric after seeing results is what C5 exists to prevent**, so
+this is written down rather than done quietly. The defence is that the
+change is not a choice between metrics that could flatter a result: the
+original cannot detect the quantity under test at all, and that is provable
+from the decomposition above rather than from its numbers.
+
+### Corrected, and fixed before run 2 is scored
+
+* **Metric:** `delta = model_minus_market(all) - model_minus_market(all minus G)`.
+  The null is `market_probability` whenever `init_score_source='market'`,
+  which subtracts the constant and leaves the feature term.
+* **Label:** the venue's settlement, per `--label-source venue`.
+* **Threshold: unchanged.** `delta > 0` and `t > 2.7`, Bonferroni for eight
+  tests. Not relaxed, which is the amendment that would actually be
+  suspect.
+* **Cells, configuration and sample: unchanged.**
+
+### What a null result means NOW
+
+If the groups still come back flat against the market null, that is a real
+finding rather than an artefact: the features add nothing beyond the price.
+It would be consistent with the standing result that the model has no
+forecast edge over the market, and with `project-edge-is-vs-backfill-only`.
+Run 1 cannot support that conclusion; run 2 can.

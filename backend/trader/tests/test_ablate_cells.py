@@ -79,3 +79,51 @@ def test_main_builds_its_cells_without_touching_the_store(monkeypatch):
     with pytest.raises(SystemExit):
         ablate.main()
     assert captured['groups'] == ('vol_state', 'offset')
+
+
+class TestWhatTheAblationScoresAgainst:
+    """A market-initialised model scored against `F(x/sigma)` reports the
+    market's advantage over the barrier null -- a constant in every cell --
+    plus the feature term. The constant swamps the signal and its fold
+    variance sets the standard error, so every group reads as contributing
+    nothing. Measured 2026-10-22 before the fix: all eight groups between
+    -0.00014 and +0.00031 against se 0.00078.
+    """
+
+    def _frame(self):
+        import pandas as pd
+        return pd.DataFrame({
+            'outcome': [1.0, 0.0], 'venue_outcome': [0.0, 1.0],
+            'baseline_probability': [0.60, 0.40],
+            'market_probability': [0.70, 0.30]})
+
+    def test_a_market_init_model_is_scored_against_the_market(self):
+        import dataclasses
+
+        from core.config import DEFAULT_CONFIG
+        from scripts.ablate import _null_for
+        cfg = dataclasses.replace(DEFAULT_CONFIG, init_score_source='market')
+        assert _null_for(self._frame(), cfg).tolist() == [0.70, 0.30]
+
+    def test_a_baseline_init_model_is_still_scored_against_the_baseline(self):
+        from core.config import DEFAULT_CONFIG
+        from scripts.ablate import _null_for
+        assert _null_for(self._frame(), DEFAULT_CONFIG).tolist() == [0.60, 0.40]
+
+    def test_it_falls_back_when_the_market_column_is_absent(self):
+        import dataclasses
+
+        from core.config import DEFAULT_CONFIG
+        from scripts.ablate import _null_for
+        f = self._frame().drop(columns=['market_probability'])
+        cfg = dataclasses.replace(DEFAULT_CONFIG, init_score_source='market')
+        assert _null_for(f, cfg).tolist() == [0.60, 0.40]
+
+    def test_the_label_honours_label_source(self):
+        import dataclasses
+
+        from core.config import DEFAULT_CONFIG
+        from scripts.ablate import _graded_label
+        cfg = dataclasses.replace(DEFAULT_CONFIG, label_source='venue')
+        assert _graded_label(self._frame(), cfg).tolist() == [0.0, 1.0]
+        assert _graded_label(self._frame(), DEFAULT_CONFIG).tolist() == [1.0, 0.0]
