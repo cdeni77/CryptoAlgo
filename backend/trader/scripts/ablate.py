@@ -155,12 +155,14 @@ def _score_cells(cells: dict, folds, dataset, config, jobs: int) -> dict:
              for i in range(len(folds))]
     out = {label: ([None] * len(folds), [None] * len(folds), [None] * len(folds))
            for label in cells}
+    # Before the branch: the serial path calls the same worker, so it needs
+    # the same inputs.
+    _SHARED.update(dataset=dataset, config=config, folds=folds)
     if jobs <= 1:
         results = (_score_one(t) for t in tasks)
     else:
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
-        _SHARED.update(dataset=dataset, config=config, folds=folds)
         # fork, so the dataset is shared copy-on-write. spawn would rebuild it
         # in every worker.
         ctx = multiprocessing.get_context('fork')
