@@ -113,3 +113,50 @@ raising the ensemble further buys nothing.
 **The remaining error is the data and the folds.** The lever on precision is
 more windows, not more ensembling and not a different fit. That retires the
 "raise ensemble_size" branch of the diagnostic written before this ran.
+
+---
+
+## RESULT, 2026-10-22 — no change, `max_depth` stays 4
+
+```
+max_depth=4   skill +0.000693  se 0.000187  t +3.71  29/40  73 trees
+max_depth=3   skill +0.000715  se 0.000179  t +4.00  31/40  87 trees
+
+paired delta (3 against 4): +0.000022  se 0.000025  t +0.88  20/40 folds
+```
+
+Depth 3 wins on the point estimate and fails the pre-registered `|t| > 2.0`
+at **0.88**. **No change.** The installed artifact keeps `max_depth 4`.
+
+Depth 3 grew 87 trees against 73, which is what less capacity per tree
+should do, and was positive on 31 of 40 folds against 29. It may well be
+slightly better. That is not what the threshold asks, and the threshold was
+fixed before any of this was visible.
+
+### The smoke run misled me, and I said so too confidently
+
+A narrow smoke run (one offset, from 2026-08-01) reported `-0.000081` at
+`t -2.80` with 9 of 10 folds favouring depth 3, and this document called that
+"consistent, and possibly resolvable". On the full sample the effect is
+**+0.000022 — four times smaller and the opposite sign**. A wiring check is
+not evidence.
+
+### The noise-floor flag is the wrong statistic, and did not fire
+
+`--noise-floor 0.000007` came from the SPREAD of the four seed deltas. The
+run therefore called this delta resolved, because `0.000022 > 0.000007`,
+while its own `t` said otherwise.
+
+**An sd of four point estimates is not the yardstick for whether one delta is
+real; that delta's own standard error is.** Each seed delta carried `se`
+between `0.000010` and `0.000024`, and this depth delta carries `0.000025` --
+so the depth effect is the size of the noise in an arm whose true effect is
+zero by construction. The flag should compare against a delta's own error,
+or be removed; as written it can only mislead.
+
+### What both arms agree on
+
+Both score `t +3.7` to `+4.0` against the market null, so the edge is robust
+to this knob. With the seed calibration showing fit noise negligible at
+`ensemble_size=5`, neither the model's randomness nor its depth is the
+binding constraint. **The remaining lever is more windows.**
