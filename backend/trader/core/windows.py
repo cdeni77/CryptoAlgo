@@ -77,7 +77,11 @@ def bar_mean(frame: pd.DataFrame) -> pd.Series:
     ohlc = (frame['open'] + frame['high'] + frame['low'] + frame['close']) / 4.0
     if 'mean_price' not in frame.columns:
         return ohlc
-    exact = pd.to_numeric(frame['mean_price'], errors='coerce')
+    # **float64, explicitly.** `to_numeric` keeps a nullable-integer or
+    # object column as a masked integer array, and `.where` then tries to cast
+    # the float fallback into int32 and raises. A store that happens to write
+    # `mean_price` as an integer would otherwise break the whole window build.
+    exact = pd.to_numeric(frame['mean_price'], errors='coerce').astype('float64')
     return exact.where(np.isfinite(exact), ohlc)
 
 

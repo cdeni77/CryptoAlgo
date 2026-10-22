@@ -73,9 +73,12 @@ def test_main_builds_its_cells_without_touching_the_store(monkeypatch):
         raise SystemExit(0)                     # stop before any I/O
 
     monkeypatch.setattr(ablate, 'load_dataset', fake_load)
+    # `--no-control`: this exercises argument plumbing, not the control
+    # guard, and that guard now refuses a group set with no control in it.
     monkeypatch.setattr(
         'sys.argv',
-        ['ablate', '--groups', 'vol_state,offset', '--drop', 'offset'])
+        ['ablate', '--groups', 'vol_state,offset', '--drop', 'offset',
+         '--no-control'])
     with pytest.raises(SystemExit):
         ablate.main()
     assert captured['groups'] == ('vol_state', 'offset')
