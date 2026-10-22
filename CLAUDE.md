@@ -94,8 +94,11 @@ Data that is not captured before these expire is gone for good.
   is refused `model_not_pinned`.
 - A force-installed (gate-blocked) model trades only with
   `--no-require-gates --force --reason "<why>"`.
-- Restart the trader only between +1 and +2 minutes into a window (decisions
-  run at +3/+6/+9/+12). Use `docker compose up -d --force-recreate trader`.
+- Restart the trader between +12 and +14 minutes into a window. Decisions run
+  at +3/+6/+9/+12, so nothing is left to decide in that slot, and the loop has
+  until +3 of the next window to come back. Do not straddle the boundary: the
+  strike and the settlement mean are taken there. Use
+  `docker compose up -d --force-recreate trader`.
 - New models load at the next window boundary without a restart.
 - The production research store is root-owned. Write to it through a one-off
   container (`docker compose run --rm ...`).
