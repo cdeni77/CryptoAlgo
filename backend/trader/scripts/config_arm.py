@@ -34,7 +34,9 @@ from scripts.ablate import _graded_label, _null_for
 #: this data. NC2 measured a noise group at +0.000152 with a standard error of
 #: 0.000104, so a delta inside that band is reported as UNRESOLVED however its
 #: t reads. It is a yardstick from one draw, not a constant -- a multi-seed
-#: calibration would replace it with a distribution.
+#: calibration would replace it with a distribution. It was measured on
+#: the ablation's sample, so it applies to an arm run on THAT sample;
+#: another sample has its own floor and needs its own control.
 NOISE_FLOOR = 0.000152
 
 
