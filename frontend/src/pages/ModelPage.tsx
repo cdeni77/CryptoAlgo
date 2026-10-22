@@ -166,8 +166,26 @@ export function ModelPage() {
 
       {state.forced && state.force_reason && (
         <Panel className="border-warn/50 bg-surface">
-          <div className="eyebrow text-warn">forced past the gates, reason recorded</div>
-          <p className="mt-1 max-w-[80ch] text-tiny text-ink">{state.force_reason}</p>
+          {/* **The fact stays, the essay folds.** That a model was forced past
+              its gates is the most important line on this page and is always
+              visible. The reason is a written argument -- the 2026-10-22 one
+              runs to a dozen sentences -- and in full it pushed every gate
+              and metric below the fold, so the page about whether to trust
+              this model opened with a paragraph instead of a verdict. */}
+          <details className="group">
+            <summary className="flex cursor-pointer list-none items-baseline gap-2">
+              <span className="eyebrow text-warn">
+                forced past the gates, reason recorded
+              </span>
+              <span className="font-mono text-micro uppercase tracking-wider text-ink-3 group-hover:text-ink-2">
+                <span className="group-open:hidden">read ›</span>
+                <span className="hidden group-open:inline">hide ⌄</span>
+              </span>
+            </summary>
+            <p className="mt-2 max-w-[80ch] whitespace-pre-line text-tiny text-ink">
+              {state.force_reason}
+            </p>
+          </details>
         </Panel>
       )}
 
