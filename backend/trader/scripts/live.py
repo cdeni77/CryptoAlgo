@@ -909,6 +909,26 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
                                       refresh=True)
             except Exception as exc:                          # noqa: BLE001
                 logger.debug('market refresh: %s', str(exc)[:120])
+
+        # **Book a resting fill the cycle it is seen, not the next decision.**
+        # The ledger notices an unbooked venue position EVERY cycle and says
+        # so; booking only happened in the decision path, so a fill at +3 sat
+        # unbooked until +6 while the log repeated "an order was filled and
+        # not booked" once a minute. The dashboard showed a position short and
+        # `exposure`, `max_positions_per_window` and
+        # `max_window_exposure_fraction` were all computed without it -- a
+        # position no risk limit binds on, which is the defect
+        # `book_resting_fills` exists for.
+        #
+        # Only between decisions: the decision path has its own call, and this
+        # must never add a round trip to the latency that is charged to
+        # `quote_age_seconds`.
+        if getattr(config, 'maker_entry', False) and kalshi is not None:
+            try:
+                await book_resting_fills(writer, kalshi, config)
+            except Exception:                                 # noqa: BLE001
+                logger.exception('booking resting fills between decisions '
+                                 'raised; the decision path will retry')
         reached = [o for o in sorted(config.decision_offsets) if o <= elapsed]
         if not reached:
             logger.debug('%.1fm into the window; first offset is +%dm',
