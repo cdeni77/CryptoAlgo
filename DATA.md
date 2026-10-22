@@ -167,6 +167,46 @@ held. It was ~3 weeks short at the start until 2026-10-21 (it began
 2026-01-07 while candles reached 2025-12-16); running it from 2025-12-01
 closed a 3,692-market gap to zero.
 
+### `venue_implied_vol` — the inverted strike ladder
+
+A fit per (symbol, hour, offset) from the KXBTCD/KXETHD/KXSOLD ladders.
+`source` names the writer: `live` reads the resting book, `ladder_candles` is
+rebuilt from each strike's own candlesticks, and the Predexon-derived rows
+were purged 2026-10-21.
+
+The rebuild is VALIDATED against the live recorder — 10/10 fits reproduced at
+a median 0.01 bp/min — but its COVERAGE is BTC-only:
+
+```
+              live era    backfilled era
+BTC-USD         96.0%         100.0%
+ETH-USD         95.3%          29.2%
+SOL-USD         23.6%           3.8%
+```
+
+SOL is thin live too, which is the venue. **ETH is not, and the gap is a
+source limit rather than a defect.** The live recorder reads the resting
+book, so every strike is quoted every minute; a candle exists only for a
+minute with ACTIVITY. ETH's hourly ladder is coarse relative to its
+volatility — 20 wide on a ~2,326 price is 0.86% a step against ~0.19% hourly
+sigma, so a step is ~4.5 sigma and only two or three rungs trade in a given
+minute. Usable rungs per fit instant, where a fit needs four: **ETH median
+3.5, BTC median 14**.
+
+Widening the strike window does not help; 22, 40 and 80 rungs all produce
+zero fits on the same hour. The constraint is how many strikes carry a
+two-sided candle at that instant.
+
+**So selecting `implied_vol` under `--complete-cases` does not just cap the
+sample, it skews it to BTC.**
+
+`available_time` must be the FIT INSTANT. `core/book_features` joins with a
+backward `merge_asof` on it, so stamping it with the backfill's run time puts
+every row after every historical decision: nothing matches and the feature is
+silently NaN. Provenance goes in `source`. Repairing such rows needs
+`overwrite=True` — `REVISION_KEY` includes `available_time`, so a plain
+rewrite appends a revision and the read returns the broken one.
+
 ### `venue_candles` — the venue's own per-minute candle
 
 Traded-price OHLC, bid OHLC, ask OHLC, volume, open interest. `price_low` is
