@@ -343,6 +343,12 @@ class Config:
     # Number of boosters averaged. Their spread is what `edge_lower_bound_z` and
     # `require_member_agreement` read; 1 is the single-model behaviour.
     ensemble_size: int = 1
+    # The booster's random draws: bagging rows and sampling columns per split.
+    # Exposed so an arm can move ONLY the seed, where the true effect is zero
+    # by construction. The spread that arm reports is the model's own
+    # stochasticity, which is the share of measurement noise that ensembling
+    # can remove and more data cannot.
+    model_seed: int = 17
     # 'venue' trains on the venue's own settlement where it exists, falling back
     # to the Coinbase-built proxy elsewhere.
     label_source: str = 'proxy'

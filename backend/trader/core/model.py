@@ -614,7 +614,8 @@ def fit_model(
             'bagging_fraction': config.subsample, 'bagging_freq': 1,
             'feature_fraction': config.colsample_bytree,
             'lambda_l2': config.reg_lambda,
-            'deterministic': True, 'seed': 17 + k,
+            'deterministic': True,
+            'seed': int(getattr(config, 'model_seed', 17)) + k,
         }
         # Fresh datasets per member: a constructed Dataset pins seed-derived
         # parameters, and members must differ in their bagging draws.
