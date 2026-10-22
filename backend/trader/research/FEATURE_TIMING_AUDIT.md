@@ -126,3 +126,65 @@ decision could actually have used, and it accrues only forward.
   the replay and transport-validation material and cannot be re-fetched.
 * **Going forward**, persist the <1s sampler so the live era accumulates
   quotes captured the way the decision captures them.
+
+## The other 15 features, audited
+
+### `offset` (2) — exact
+`elapsed_fraction`, `remaining_minutes` are clock arithmetic. No data source,
+no parity question.
+
+### `book_quote` (4) — sound, ~3s early
+From candles across the whole history, 1.00c from the decision book, 100%
+usable at the freshness bound. The 3-second gap is a noise question, not a
+validity one: a candle at `m` is a book a decision at `m+3s` could have seen.
+
+### `implied_vol` (5) — recoverable, but BTC-only
+100% BTC / 29% ETH / 4% SOL in the backfilled era, against 96/95/24 live.
+Keeping it under `--complete-cases` SKEWS the sample toward BTC rather than
+merely shrinking it. See DATA.md.
+
+### `cross_venue` (4) — fine, and the aggregate number lies
+
+Peer freshness looks like it collapses across eras:
+
+```
+2026-01  median 0.5s   91.2% <=5s     sources: backfill
+2026-05         2.5s   65.1%
+2026-08         5.7s   47.0%          backfill + live
+2026-10        14.1s   34.8%          backfill + live + live_touch
+```
+
+It does not. Disaggregated by source in 2026-10:
+
+```
+live_touch   median 0.3s   95.7% <=5s   <- the peer's decision-instant book
+backfill            5.4s   48.1%
+live               31.5s    4.7%        <- the +30s recorder
+```
+
+Polymarket has its OWN `live_touch` and it is fresh. The apparent collapse is
+the aggregate being dragged down by the 31.5s recorder appearing in later
+months -- the same mistake as comparing candles against `live_ws`. The peer
+selector sorts on `_unusable` then age, so it takes `live_touch` where it
+exists.
+
+## Open: the bar parity is UNMEASURED on real data
+
+33 of 48 features rest on the claim that a live bar equals the training bar.
+The rule is shared code, and `tests/test_trade_bars.py::
+test_rest_then_stream_equals_the_rest_candles_it_replaces` asserts the stream
+bar equals the REST candle it replaces -- but that test builds BOTH from the
+same synthetic trade list. It proves the aggregation is equivalent given
+identical trades. It does not prove we saw the trades Coinbase counted.
+
+`reliable()` bounds the risk: a minute is served from the stream only when it
+is final, untainted by a late print, and fully inside one continuous coverage
+interval. Anything else falls back to REST, which IS the training source. But
+bounded is not measured.
+
+**It is directly testable.** The spot trade archive holds the tape, so the
+stream bar for past minutes can be rebuilt and compared against the stored
+`minute_bars` for the same minutes -- the bar-side equivalent of the replay
+validation that proved the ladder rebuild bit-for-bit on 8,169 of 8,169
+minutes. Until that is run, "33 of 48 are identical" is true of the RULE and
+unproven of the DATA.
