@@ -46,7 +46,7 @@ export function StatusHeader({
         <div className="flex shrink-0 items-center gap-3 md:gap-5">
           {/* Real money is stated in words, not implied by a colour. */}
           {mode && (
-            <div className="hidden text-right sm:block">
+            <div className="hidden text-right md:block">
               <div className="eyebrow">mode</div>
               <div
                 className={`font-mono text-tiny font-medium uppercase tracking-wider ${
@@ -67,8 +67,10 @@ export function StatusHeader({
             </div>
           )}
 
-          {/* The age of the newest DECISION, not of the fetch. */}
-          <div className="hidden text-right md:block">
+          {/* The age of the newest DECISION, not of the fetch. Held back to
+              `lg`: at 768 the four slots together crushed the page title to a
+              single letter and an ellipsis. */}
+          <div className="hidden text-right lg:block">
             <div className="eyebrow">last decision</div>
             <div
               className={`font-mono text-tiny tabular-nums ${

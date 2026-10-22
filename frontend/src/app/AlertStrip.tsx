@@ -40,29 +40,36 @@ export function AlertStrip({ alerts }: { alerts: Alert[] }) {
           <div
             key={alert.id}
             role={alert.severity === 'critical' ? 'alert' : 'status'}
-            className={`flex flex-wrap items-start gap-x-3 gap-y-1 rounded border px-3 py-2 ${tone.box}`}
+            className={`rounded border px-3 py-2 ${tone.box}`}
           >
-            {/* A dot AND a word: colour alone cannot carry a state. */}
-            <span className="flex shrink-0 items-center gap-2 pt-0.5">
-              <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} aria-hidden />
-              <span className={`font-mono text-micro uppercase tracking-wider ${tone.label}`}>
+            {/* **Stacked under `sm`, inline above it.** As one flex row the
+                detail was squeezed into a one-word column on a 375px screen
+                and ran the strip down most of the viewport. */}
+            <div className="flex items-baseline gap-2">
+              {/* A dot AND a word: colour alone cannot carry a state. */}
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} aria-hidden />
+              <span
+                className={`shrink-0 font-mono text-micro uppercase tracking-wider ${tone.label}`}
+              >
                 {alert.severity}
               </span>
-            </span>
-            <span className="min-w-0 text-tiny font-medium text-ink">{alert.title}</span>
+              <span className="min-w-0 flex-1 text-tiny font-medium text-ink">
+                {alert.title}
+              </span>
+              {/* Warnings can be set aside for this session; a critical one
+                  cannot, because the condition is still true. */}
+              {alert.severity !== 'critical' && (
+                <button
+                  type="button"
+                  onClick={() => setDismissed((d) => [...d, alert.id])}
+                  className="shrink-0 rounded px-1 font-mono text-micro uppercase tracking-wider text-ink-3 hover:text-ink"
+                >
+                  hide
+                </button>
+              )}
+            </div>
             {alert.detail && (
-              <span className="min-w-0 flex-1 text-tiny text-ink-3">{alert.detail}</span>
-            )}
-            {/* Warnings can be set aside for this session; a critical one
-                cannot, because the condition is still true. */}
-            {alert.severity !== 'critical' && (
-              <button
-                type="button"
-                onClick={() => setDismissed((d) => [...d, alert.id])}
-                className="ml-auto shrink-0 rounded px-1 font-mono text-micro uppercase tracking-wider text-ink-3 hover:text-ink"
-              >
-                hide
-              </button>
+              <p className="mt-0.5 pl-[1.1rem] text-tiny text-ink-3">{alert.detail}</p>
             )}
           </div>
         );
