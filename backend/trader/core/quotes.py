@@ -102,10 +102,19 @@ QUOTE_COLUMNS = (('ask_up', 'ask_down', 'market_probability',
 # 3/6/9/12, and above every observer that samples ~25s into the minute --
 # those hold a LATER book than the decision and `decision_age` scores them
 # negative.
+#
+# `live_ws_replay_t3` is the raw frame archive refolded at the DECISION
+# instant rather than at the recorder's +25s phase. Same applier, same row
+# builder, a clock moved to `m + decision_latency`. It is a reconstruction, so
+# it sits below the two live captures and above every observer that samples
+# late. It exists only for the raw tier's retention window -- the frames are
+# bounded at 60 days, so a phase we did not summarise before they age out is
+# a phase that period can never have.
 QUOTE_SOURCE_PRIORITY = tuple(
     s.strip() for s in os.getenv(
         'QUOTE_SOURCE_PRIORITY',
-        'live_touch,live_minute,live_ws,live,live_ws_replay,candles,backfill'
+        'live_touch,live_minute,live_ws_replay_t3,live_ws,live,'
+        'live_ws_replay,candles,backfill'
     ).split(',')
     if s.strip())
 

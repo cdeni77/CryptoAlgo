@@ -90,3 +90,14 @@ def test_it_outranks_every_late_observer_but_not_the_decision_instant():
     assert p.index('live_touch') < p.index('live_minute')
     for later in ('live_ws', 'live', 'live_ws_replay', 'candles', 'backfill'):
         assert p.index('live_minute') < p.index(later), later
+
+
+def test_a_decision_instant_replay_outranks_every_late_observer():
+    """`live_ws_replay_t3` is the archive refolded at m+3s. It is a
+    reconstruction, so it sits below the live captures -- but above anything
+    sampled 25s into the minute, which holds a LATER book than the decision."""
+    p = list(QUOTE_SOURCE_PRIORITY)
+    assert p.index('live_touch') < p.index('live_ws_replay_t3')
+    assert p.index('live_minute') < p.index('live_ws_replay_t3')
+    for later in ('live_ws', 'live', 'live_ws_replay', 'candles', 'backfill'):
+        assert p.index('live_ws_replay_t3') < p.index(later), later
