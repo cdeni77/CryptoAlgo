@@ -201,6 +201,14 @@ COMPONENTS: tuple[Component, ...] = (
     # per-second sampler. Nothing in trading reads it yet, so it is the safest
     # thing here to disable (`--disable index`).
     Component('index', phase=0.0),
+    # **The settlement index ITSELF**, from the venue, about once a second,
+    # carrying its own 60-second average -- the quantity the markets settle
+    # on rather than a proxy for it. Writes `minute_bars` under
+    # `venue='cfbenchmarks'`, the same table `scripts/backfill_index` fills,
+    # so the backfill and the live feed are one continuous series and the
+    # pipeline switches with `--venue cfbenchmarks` rather than a second code
+    # path. Nothing trades off it until that switch is made.
+    Component('index_stream', phase=0.0),
     # **Marks, every few seconds, off the stream cache.** Not a recorder and
     # not on the minute grid: it reads a book this process already holds and
     # writes what each open position is worth, so the dashboard shows a
@@ -421,7 +429,7 @@ STEP_TIMEOUT_SECONDS = 1800.0
 def build_factories(args, gate: TradingGate) -> dict:
     """One coroutine factory per component, all sharing the gate."""
     from scripts import (mark_positions, record_implied_vol, record_index,
-                         record_book_minutes,
+                         record_book_minutes, record_index_stream,
                          record_ladder, record_pm_ladder, record_pm_stream,
                          record_spot_stream, record_stream, record_trades)
     from scripts import live as live_module
@@ -483,6 +491,13 @@ def build_factories(args, gate: TradingGate) -> dict:
         return await record_index.run(
             _recorder_args(record_index.build_parser), gate=gate)
 
+    async def index_stream():
+        # No gate: it holds a subscription and folds frames in process, so
+        # waiting its turn would only drop prints out of the minute it is
+        # building. Same reason `book_minutes` is ungated.
+        return await record_index_stream.run(
+            _recorder_args(record_index_stream.build_parser))
+
     async def implied_vol():
         await align_to_phase(45.0)
         return await record_implied_vol.run(
@@ -497,6 +512,7 @@ def build_factories(args, gate: TradingGate) -> dict:
             'trades': trades,
             'pm_ladder': pm_ladder, 'pm_stream': pm_stream,
             'spot_stream': spot_stream, 'index': index,
+            'index_stream': index_stream,
             'implied_vol': implied_vol, 'marks': marks,
             'book_minutes': book_minutes,
             'store_sync': store_sync}

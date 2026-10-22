@@ -49,6 +49,10 @@ MAX_AGE: dict[str, float] = {
     'pm_stream': 300.0,
     'spot_stream': 180.0,  # heartbeats every second; stamps every ~5s
     'index': 180.0,        # stamps every ~5s while a proxy is being produced
+    # The venue's own settlement index, ~1 frame/s/symbol. Ninety seconds of
+    # silence is ninety missed prints on three sockets, which is the socket
+    # gone rather than a quiet market -- the index does not stop printing.
+    'index_stream': 90.0,
     'ladder': 300.0,       # 60s cadence
     # The public tape. A 60s poll, and it stamps at the END of each cycle
     # whether or not the cycle produced a row -- a 15-minute market that never
