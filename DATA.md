@@ -246,6 +246,34 @@ exactly on the 69-day boundary, so a default re-run could no longer see it.
 ~69 days must be filled with `--historical` or the run will report nothing to
 do and look clean.
 
+### A minute-grid quote is not an executable price — on EITHER source
+
+Measured 2026-10-21 against the live book, on the rows where each overlaps it:
+
+```
+                      |d|>0.5c   |d|>1.5c   |d|>3c   median
+candles                 72.1%      51.2%     36.0%    1.70c
+backfill (Predexon)     80.1%      60.3%     43.2%    2.30c
+```
+
+**A 1.5pp edge gate is 1.5c**, so the quote is off by more than the entire
+edge the strategy trades on in 51% of candle rows and 60% of Predexon rows.
+
+Candles are strictly better — essentially unbiased (+0.014c against
+Predexon's −0.256c), on the venue's true deci-cent grid, and closer on every
+cut — so they are the right quote source and Predexon can be retired. But the
+improvement does not change the category. The dominant error is SHARED: both
+are minute-grid, and a candle close is a 60-second boundary while a decision
+happens at an instant.
+
+So:
+
+* **for features** (`spread`, `mid_change_1/3`) candles are a real upgrade;
+  bias and grid matter and noise partly averages out over a rolling window;
+* **for economics** — backtest P&L, fill simulation, realised edge — candles
+  inherit the disqualification already recorded for the Predexon backfill.
+  Only the live WS book is a decision-instant price.
+
 ### `venue_trades` — the public tape
 
 One row per `(market, minute, aggressor side)` with `n_prints`, `contracts`,
