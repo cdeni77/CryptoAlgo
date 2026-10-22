@@ -44,8 +44,6 @@ import {
   SectionHead,
 } from '../components/Primitives';
 import { DailyPnlCalendar } from '../components/DailyPnlCalendar';
-import { ModelFocus } from '../components/ModelFocus';
-import { ModelRecords } from '../components/ModelRecords';
 import { go } from '../lib/navigate';
 import { cents } from '../lib/format';
 
@@ -70,22 +68,32 @@ export function AccountPage() {
   // side now, to at most 2,000 points and about 340 KB.
   const LIVE_MS = 1_000;
 
-  // The model this page is filtered to, or null for the whole account.
-  // Set from the by-model table; every panel that CAN narrow does.
-  const [model, setModel] = useState<string | null>(null);
+  // **All time by default.** The dashboard epoch hides earlier trading from
+  // the view; it does not undo it. Measured 2026-10-22, the since-reset view
+  // showed 821 settlements of 2,133 and a 68.2% win rate against a true
+  // 58.6% — a third of the account's history, and a flattering third. The
+  // epoch is still available, labelled, for reading one run in isolation.
+  const [allTime, setAllTime] = useState(true);
+
+  // **No model filter here.** Per-model attribution lives on the Model page.
+  // This page is the account as the venue's ledger reports it, and that
+  // ledger books a settlement against a market, not against whichever model
+  // decided to be there -- so most of this page could never narrow anyway,
+  // and a filter that moves two panels out of ten reads as a broken filter.
 
   const account = usePolling(fetchAccount, LIVE_MS);
-  const venue = usePolling(fetchVenueAccount, LIVE_MS);
-  const venueCurve = usePolling(() => fetchVenueEquity(30), LIVE_MS);
-  const equity = usePolling(() => fetchEquity(90), LIVE_MS);
-  const settlements = usePolling(() => fetchVenueSettlements(200), LIVE_MS);
-  // 1000 when filtered: 200 is plenty of a live feed but truncates a
-  // model's history, and the curve below is built from these rows.
-  const positions = usePolling(
-    () => fetchPositions(false, model ? 1000 : 200, model), LIVE_MS, [model]);
-  const daily = usePolling(() => fetchVenueDaily(180), LIVE_MS);
-  const openPositions = usePolling(
-    () => fetchPositions(true, 50, model), LIVE_MS, [model]);
+  const venue = usePolling(
+    () => fetchVenueAccount(allTime), LIVE_MS, [allTime]);
+  const venueCurve = usePolling(
+    () => fetchVenueEquity(allTime ? 365 : 30, allTime), LIVE_MS, [allTime]);
+  const equity = usePolling(
+    () => fetchEquity(allTime ? 365 : 90, allTime), LIVE_MS, [allTime]);
+  const settlements = usePolling(
+    () => fetchVenueSettlements(200, undefined, allTime), LIVE_MS, [allTime]);
+  const positions = usePolling(() => fetchPositions(false, 200), LIVE_MS);
+  const daily = usePolling(
+    () => fetchVenueDaily(allTime ? 365 : 180, allTime), LIVE_MS, [allTime]);
+  const openPositions = usePolling(() => fetchPositions(true, 50), LIVE_MS);
 
   if (account.loading) return <Loading what="the account" />;
   if (account.error) return <Failed error={account.error} what="the account" />;
@@ -169,7 +177,31 @@ export function AccountPage() {
             : 'No venue ledger yet, so these are our own figures — a bankroll debited at the price we sized at and a payout decided by our own bars. The venue has a ledger once real orders fill.'
         }
         right={
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center gap-3">
+            {/* The scope this page is reporting, said before the numbers
+                rather than inferred from them. */}
+            <div className="flex border border-rule">
+              {([true, false] as const).map((value) => (
+                <button
+                  key={String(value)}
+                  type="button"
+                  onClick={() => setAllTime(value)}
+                  className={[
+                    'px-3 py-1 font-mono text-micro uppercase',
+                    allTime === value
+                      ? 'bg-ink text-paper'
+                      : 'text-ink-2 hover:bg-sunken',
+                  ].join(' ')}
+                  title={
+                    value
+                      ? 'Everything this account has traded'
+                      : 'Only since the dashboard epoch — a slice, not the account'
+                  }
+                >
+                  {value ? 'all time' : 'since reset'}
+                </button>
+              ))}
+            </div>
             <Chip
               tone={onVenue ? 'pass' : 'neutral'}
               title={
@@ -308,15 +340,6 @@ export function AccountPage() {
         </Panel>
       )}
 
-      {model && (
-        <ModelFocus
-          version={model}
-          positions={positions.data?.positions ?? []}
-          onClear={() => setModel(null)}
-        />
-      )}
-
-      <ModelRecords pollMs={LIVE_MS} selected={model} onSelect={setModel} />
 
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <Panel>
@@ -360,7 +383,9 @@ export function AccountPage() {
                 was open and by the midnight boundary — which simply reads as
                 one of them being broken. One number, one definition. */}
             <Metric
-              label={onVenue ? 'p&l · since reset' : 'realised p&l'}
+              label={onVenue
+                ? (allTime ? 'p&l · all time' : 'p&l · since reset')
+                : 'realised p&l'}
               value={
                 onVenue
                   ? (daily.data?.total ?? null)
@@ -492,9 +517,16 @@ export function AccountPage() {
 
       <section>
         <SectionHead
-          eyebrow="as the Kalshi app shows it"
+          eyebrow={allTime
+            ? 'settled p&l, the whole ledger'
+            : 'as the Kalshi app shows it'}
           title="Day by day"
-          note="Each cell is how much the Kalshi balance moved on that Eastern calendar day — the same number, on the same day boundary, as the app. It will not tie to the chart above: that one counts a trade on the day it resolves, this one on the day the cash moved, and a window bought before midnight pays out after it."
+          // The basis changes with the scope, so the caption has to as well:
+          // a panel that describes a balance movement while the cells carry
+          // settled P&L sends the reader to reconcile two different things.
+          note={allTime
+            ? 'Each cell is what the markets that resolved on that Eastern day paid, net of fees. This ties to the chart above — both count a trade on the day it resolves. It will not tie to the Kalshi app day by day, because the app shows when the cash moved, and a window bought before midnight pays out after it.'
+            : 'Each cell is how much the Kalshi balance moved on that Eastern calendar day — the same number, on the same day boundary, as the app. It will not tie to the chart above: that one counts a trade on the day it resolves, this one on the day the cash moved, and a window bought before midnight pays out after it.'}
         />
         <Panel>
           {daily.loading ? (
@@ -506,6 +538,7 @@ export function AccountPage() {
               days={daily.data?.days ?? []}
               timezone={daily.data?.timezone}
               epoch={daily.data?.epoch}
+              basis={daily.data?.basis}
             />
           )}
         </Panel>

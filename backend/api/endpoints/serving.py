@@ -35,50 +35,58 @@ def get_model_performance(all_time: bool = Query(False),
 
 
 @router.get('/account/equity')
-def get_equity(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)):
-    return {'days': days, 'points': serving.equity_curve(db, days=days)}
+def get_equity(days: int = Query(30, ge=1, le=365),
+               all_time: bool = Query(False),
+               db: Session = Depends(get_db)):
+    return {'days': days,
+            'points': serving.equity_curve(db, days=days, all_time=all_time)}
 
 
 @router.get('/account/venue')
-def get_venue_account(db: Session = Depends(get_db)):
+def get_venue_account(all_time: bool = Query(False),
+                      db: Session = Depends(get_db)):
     """The account as the venue's ledger reports it, with ours beside it.
 
     The venue's ledger is the account of record; `/account` is our own
     arithmetic. `pnl_gap` is the disagreement. Returns `available: false` with
     a reason when no venue ledger is stored, as for a paper account.
     """
-    return serving.venue_account_state(db)
+    return serving.venue_account_state(db, all_time=all_time)
 
 
 @router.get('/account/venue/equity')
 def get_venue_equity(days: int = Query(30, ge=1, le=365),
+                     all_time: bool = Query(False),
                      db: Session = Depends(get_db)):
     """The account chart: realised P&L per settlement, venue cash beside it.
 
     Built from settlement P&L, not balance differences, because a deposit and a
     profit look the same in the balance.
     """
-    return serving.venue_equity_curve(db, days=days)
+    return serving.venue_equity_curve(db, days=days, all_time=all_time)
 
 
 @router.get('/venue/settlements')
 def get_venue_settlements(days: Optional[int] = Query(None, ge=1, le=3650),
                           limit: int = Query(200, ge=1, le=1000),
+                          all_time: bool = Query(False),
                           db: Session = Depends(get_db)):
     """Every settled market as the venue paid it: cost, revenue, fee, P&L."""
-    return {'settlements': serving.venue_settlements(db, days=days, limit=limit)}
+    return {'settlements': serving.venue_settlements(
+        db, days=days, limit=limit, all_time=all_time)}
 
 
 @router.get('/account/venue/daily')
 def get_venue_daily(days: int = Query(120, ge=1, le=3650),
+                    all_time: bool = Query(False),
                     db: Session = Depends(get_db)):
     """Realised P&L per Eastern calendar day, from the venue's settlements.
 
     Eastern because that is the boundary Kalshi's own app rolls the trading day
     over on, so the figures here reconcile against the account rather than
-    against UTC. Not bounded by the dashboard epoch -- a calendar is history.
+    against UTC. Bounded by the dashboard epoch unless `all_time` is set.
     """
-    return serving.venue_daily_pnl(db, days=days)
+    return serving.venue_daily_pnl(db, days=days, all_time=all_time)
 
 
 @router.get('/live')

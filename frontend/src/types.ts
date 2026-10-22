@@ -244,10 +244,16 @@ export interface VenueDaily {
   /** The dashboard epoch these days are bounded by; null means the full
    *  ledger. Carried so the surface can say what it shows. */
   epoch: string | null;
+  /** Which measure the cells carry. `account_value` is the change in cash plus
+   *  the venue's own mark, which reconciles against the Kalshi app but is only
+   *  valid while no cash enters or leaves. `settled` is realised P&L, used
+   *  over the full ledger because that range contains deposits. */
+  basis: 'account_value' | 'settled';
   days: VenueDay[];
   first: string | null;
   last: string | null;
   total: number;
+  settled_total: number;
 }
 
 /** One model version's settled record. `win_rate` is the share of positions

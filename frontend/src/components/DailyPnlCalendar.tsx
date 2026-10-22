@@ -33,6 +33,10 @@ export interface DailyPnlCalendarProps {
   timezone?: string;
   /** The epoch the server bounded these days by, if any. */
   epoch?: string | null;
+  /** Which measure the cells carry. The server chooses it: account value over
+   *  the epoch window, settled P&L over the full ledger, because that range
+   *  contains deposits and account value would count them as profit. */
+  basis?: 'account_value' | 'settled';
 }
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -72,7 +76,9 @@ function compact(pnl: number): string {
   return `${sign}${size < 10 ? size.toFixed(1) : Math.round(size)}`;
 }
 
-export function DailyPnlCalendar({ days, timezone, epoch }: DailyPnlCalendarProps) {
+export function DailyPnlCalendar({
+  days, timezone, epoch, basis = 'account_value',
+}: DailyPnlCalendarProps) {
   const byMonth = useMemo(() => {
     const out = new Map<string, Map<number, VenueDay>>();
     for (const day of days) {
@@ -85,10 +91,23 @@ export function DailyPnlCalendar({ days, timezone, epoch }: DailyPnlCalendarProp
   }, [days]);
 
   const months = useMemo(() => [...byMonth.keys()].sort(), [byMonth]);
-  // Opens on the most recent month with data rather than on today's, so a
+  // **The MONTH is remembered, not its position.** An index held across a
+  // change of range silently means a different month: switching the page to
+  // all time grows the list from one month to three, and an index of 0 that
+  // meant October then means August, so the calendar jumps to the oldest data
+  // instead of staying where the reader was.
+  //
+  // Falls back to the most recent month with data rather than to today's, so a
   // calendar whose last session was yesterday does not open blank.
-  const [index, setIndex] = useState(() => Math.max(0, months.length - 1));
-  const key = months[Math.min(index, months.length - 1)];
+  const [picked, setPicked] = useState<string | null>(null);
+  const key = picked != null && months.includes(picked)
+    ? picked
+    : months[months.length - 1];
+  const index = months.indexOf(key);
+  const setIndex = (next: (i: number) => number) => {
+    const at = next(index);
+    if (at >= 0 && at < months.length) setPicked(months[at]);
+  };
 
   if (!months.length) {
     return (
@@ -271,12 +290,26 @@ export function DailyPnlCalendar({ days, timezone, epoch }: DailyPnlCalendarProp
       </div>
 
       <p className="mt-3 text-tiny text-ink-3">
-        Each cell is the change in <strong className="text-ink-2">account
-        value</strong> — cash plus what the open positions are worth, both read
-        from Kalshi — across that {timezone ?? 'US Eastern'} day, on the
-        boundary Kalshi rolls its own trading day. Fees and settlement are
-        already inside it; nothing here is estimated. A blank day settled
-        nothing and is not a break-even day.
+        {basis === 'settled' ? (
+          <>
+            Each cell is <strong className="text-ink-2">realised P&amp;L</strong>{' '}
+            from the venue&rsquo;s own settlements across that{' '}
+            {timezone ?? 'US Eastern'} day, on the boundary Kalshi rolls its own
+            trading day. Over the full ledger this is the only honest measure:
+            account value would also count the deposits and withdrawals this
+            shared account has taken, which the strategy did not earn. A
+            position still open at midnight counts on the day it settles.
+          </>
+        ) : (
+          <>
+            Each cell is the change in <strong className="text-ink-2">account
+            value</strong> — cash plus what the open positions are worth, both
+            read from Kalshi — across that {timezone ?? 'US Eastern'} day, on
+            the boundary Kalshi rolls its own trading day. Fees and settlement
+            are already inside it; nothing here is estimated.
+          </>
+        )}{' '}
+        A blank day settled nothing and is not a break-even day.
         {epoch && (
           <>
             {' '}Bounded at {epoch.slice(0, 10)}, the same window as every other

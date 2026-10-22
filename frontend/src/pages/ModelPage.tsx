@@ -16,7 +16,11 @@
  * the promoter computed (19). The page said the right things and showed the
  * opposite of them.
  */
+import { useState } from 'react';
+import { fetchPositions } from '../api/serving';
 import { usePolling } from '../hooks/usePolling';
+import { ModelFocus } from '../components/ModelFocus';
+import { ModelRecords } from '../components/ModelRecords';
 import { fetchModel, fetchModelHistory } from '../api/serving';
 import {
   Chip,
@@ -84,6 +88,17 @@ function tally(rows: Gate[]): string {
 }
 
 export function ModelPage() {
+  // Which model's own record is open, if any. Lives here rather than on
+  // Account: a model is a property of OUR decisions, and the account page is
+  // the venue's ledger, which books a settlement against a market and has no
+  // idea which model chose to be there.
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const modelPositions = usePolling(
+    () => (selectedModel ? fetchPositions(false, 1000, selectedModel)
+                         : Promise.resolve({ positions: [] })),
+    5_000,
+    [selectedModel],
+  );
   const model = usePolling(fetchModel, 60_000);
   const history = usePolling(() => fetchModelHistory(50), 120_000);
 
@@ -350,6 +365,24 @@ export function ModelPage() {
             />
           )}
         </Panel>
+      </section>
+
+      {/* **What each model actually made.** Everything above is how a
+          candidate was judged BEFORE it traded; this is what happened after.
+          Forecast validity first, realised money second, on one page. */}
+      <section className="space-y-4">
+        {selectedModel && (
+          <ModelFocus
+            version={selectedModel}
+            positions={modelPositions.data?.positions ?? []}
+            onClear={() => setSelectedModel(null)}
+          />
+        )}
+        <ModelRecords
+          pollMs={30_000}
+          selected={selectedModel}
+          onSelect={setSelectedModel}
+        />
       </section>
     </div>
   );

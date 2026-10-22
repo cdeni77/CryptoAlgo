@@ -28,25 +28,33 @@ export const fetchAccount = () => get<AccountState>('/account');
 export const fetchModelPerformance = (allTime = false) =>
   get<ModelPerformance>(`/account/models${allTime ? '?all_time=true' : ''}`);
 
-export const fetchEquity = (days = 30) =>
-  get<{ days: number; points: EquityPoint[] }>(`/account/equity?days=${days}`);
+export const fetchEquity = (days = 30, allTime = false) =>
+  get<{ days: number; points: EquityPoint[] }>(
+    `/account/equity?days=${days}${allTime ? '&all_time=true' : ''}`,
+  );
 
 /** The account as the venue's ledger reports it: the account of record.
  *  `fetchAccount` is our own arithmetic. See `VenueAccountState`. */
-export const fetchVenueAccount = () => get<VenueAccountState>('/account/venue');
+export const fetchVenueAccount = (allTime = false) =>
+  get<VenueAccountState>(`/account/venue${allTime ? '?all_time=true' : ''}`);
 
-export const fetchVenueEquity = (days = 30) =>
-  get<VenueEquityCurve>(`/account/venue/equity?days=${days}`);
-
-export const fetchVenueSettlements = (limit = 200, days?: number) =>
-  get<{ settlements: VenueSettlement[] }>(
-    `/venue/settlements?limit=${limit}${days == null ? '' : `&days=${days}`}`,
+export const fetchVenueEquity = (days = 30, allTime = false) =>
+  get<VenueEquityCurve>(
+    `/account/venue/equity?days=${days}${allTime ? '&all_time=true' : ''}`,
   );
 
-/** Realised P&L per Eastern day. Not bounded by the dashboard epoch — a
- *  calendar is history, and the headline figures above it stay epoch-scoped. */
-export const fetchVenueDaily = (days = 120) =>
-  get<VenueDaily>(`/account/venue/daily?days=${days}`);
+export const fetchVenueSettlements = (limit = 200, days?: number, allTime = false) =>
+  get<{ settlements: VenueSettlement[] }>(
+    `/venue/settlements?limit=${limit}${days == null ? '' : `&days=${days}`}` +
+      (allTime ? '&all_time=true' : ''),
+  );
+
+/** Realised P&L per Eastern day. Epoch-scoped unless `allTime`, and the
+ *  payload's own `epoch` says which scope was served. */
+export const fetchVenueDaily = (days = 120, allTime = false) =>
+  get<VenueDaily>(
+    `/account/venue/daily?days=${days}${allTime ? '&all_time=true' : ''}`,
+  );
 
 export const fetchPredictions = (limit = 100, tradedOnly = false) =>
   get<{ predictions: Prediction[] }>(

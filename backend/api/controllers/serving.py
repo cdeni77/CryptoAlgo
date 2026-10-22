@@ -369,8 +369,13 @@ def account_state(db: Session, *, starting_bankroll: float = 100.0) -> dict[str,
     }
 
 
-def equity_curve(db: Session, *, days: int = 30) -> list[dict[str, Any]]:
+def equity_curve(db: Session, *, days: int = 30,
+                 all_time: bool = False) -> list[dict[str, Any]]:
     epoch = reset_epoch(db)
+    # The venue's ledger did not reset. A dashboard epoch hides earlier
+    # trading from the view; it does not undo it.
+    if all_time:
+        epoch = None
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = db.execute(
         since_reset(select(EquityPoint), EquityPoint, epoch).where(EquityPoint.timestamp >= since)
@@ -909,9 +914,14 @@ def _venue_won(row: VenueSettlement) -> Optional[bool]:
 
 
 def venue_settlements(db: Session, *, days: Optional[int] = None,
-                      limit: int = 200) -> list[dict[str, Any]]:
+                      limit: int = 200,
+                      all_time: bool = False) -> list[dict[str, Any]]:
     """Settled markets as the venue paid them, newest first."""
     epoch = reset_epoch(db)
+    # The venue's ledger did not reset. A dashboard epoch hides earlier
+    # trading from the view; it does not undo it.
+    if all_time:
+        epoch = None
     query = since_reset(select(VenueSettlement), VenueSettlement, epoch)
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -929,21 +939,30 @@ def venue_settlements(db: Session, *, days: Optional[int] = None,
 EASTERN = 'America/New_York'
 
 
-def venue_daily_pnl(db: Session, *, days: int = 120) -> dict[str, Any]:
+def venue_daily_pnl(db: Session, *, days: int = 120,
+                    all_time: bool = False) -> dict[str, Any]:
     """Realised P&L per EASTERN calendar day, from the venue's own settlements.
 
-    **Epoch-scoped, like every other figure on this page.** It was briefly
-    served unfiltered on the reasoning that a calendar exists to show history;
-    that put days from a different configuration beside days from this one,
-    under one month total, with nothing on the surface saying where one ended.
-    The dashboard epoch is exactly the line that separates them, so the
+    **Epoch-scoped by default, like every other figure on this page.** It was
+    briefly served unfiltered on the reasoning that a calendar exists to show
+    history; that put days from a different configuration beside days from this
+    one, under one month total, with nothing on the surface saying where one
+    ended. The dashboard epoch is exactly the line that separates them, so the
     calendar honours it and the page means one thing throughout.
+
+    `all_time` lifts it, for the page that reports the account rather than the
+    current configuration. The scope is the caller's to choose, and `epoch` in
+    the payload says which one was served.
 
     Days with no settlement are omitted rather than sent as zero -- a day the
     system did not trade is not a break-even day, and drawing it flat would put
     a false point on anyone's mental equity curve.
     """
     epoch = reset_epoch(db)
+    # The venue's ledger did not reset. A dashboard epoch hides earlier
+    # trading from the view; it does not undo it.
+    if all_time:
+        epoch = None
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = db.execute(
         since_reset(select(VenueSettlement), VenueSettlement, epoch)
@@ -1144,6 +1163,25 @@ def venue_daily_pnl(db: Session, *, days: int = 120) -> dict[str, Any]:
             if first['cash_change'] is None:
                 first['cash_change'] = round(first['pnl'] + carried, 4)
 
+    # **All time is measured on SETTLEMENTS, not on account value.**
+    #
+    # Account value is the better measure over the epoch window, because it
+    # reconciles against the Kalshi app and already contains fees, netting and
+    # whatever was open at each boundary. It is only valid while no cash enters
+    # or leaves, and over the full ledger cash did: measured 2026-10-22, four
+    # days carry a transfer the strategy did not earn -- +$301.84 on 09-24,
+    # -$96.86 on 09-26, +$116.57 on 09-27, -$12.39 on 10-04. Summing the
+    # account-value column over all time reports $347.98 for an account that
+    # made $42.85, which is the deposits, not the trading.
+    #
+    # The sampler also starts on 2026-09-22, so 29 of the 57 all-time days have
+    # no account value at all and already fall back to settlements. One column
+    # under one total must not hold two bases. Settlements cover the whole
+    # range, cannot contain a transfer, and agree with the headline.
+    if all_time:
+        for day in days_out:
+            day['cash_change'] = None
+
     # The sum of exactly what the cells show, so the header can never disagree
     # with the squares underneath it.
     shown_total = round(sum(
@@ -1155,6 +1193,9 @@ def venue_daily_pnl(db: Session, *, days: int = 120) -> dict[str, Any]:
         # So the surface can say what it is showing rather than imply it is
         # everything. Null when no reset is set, which means the full ledger.
         'epoch': epoch.isoformat() if epoch is not None else None,
+        # Which measure the cells carry, said rather than inferred from
+        # whether `cash_change` happens to be null.
+        'basis': 'settled' if all_time else 'account_value',
         'days': days_out,
         'first': days_out[0]['date'] if days_out else None,
         'last': days_out[-1]['date'] if days_out else None,
@@ -1166,7 +1207,8 @@ def venue_daily_pnl(db: Session, *, days: int = 120) -> dict[str, Any]:
     }
 
 
-def venue_account_state(db: Session) -> dict[str, Any]:
+def venue_account_state(db: Session, *,
+                        all_time: bool = False) -> dict[str, Any]:
     """The account as the venue's ledger reports it, with ours beside it.
 
     Returns `available: False` with a reason rather than zeros when the ledger is
@@ -1175,6 +1217,11 @@ def venue_account_state(db: Session) -> dict[str, Any]:
     `$0.00 realised` is claiming a measurement it does not have.
     """
     epoch = reset_epoch(db)
+    # **The venue's ledger is the account of record, and it did not reset.**
+    # A dashboard epoch hides earlier trading from the view; it does not undo
+    # it. `all_time` asks what this account has actually done.
+    if all_time:
+        epoch = None
     rows = db.execute(since_reset(select(VenueSettlement), VenueSettlement, epoch)).scalars().all()
     # `.limit(1)`, not just `.first()`. `.first()` takes one row from the
     # result; without a LIMIT the database still orders and returns every
@@ -1326,7 +1373,8 @@ def venue_account_state(db: Session) -> dict[str, Any]:
     }
 
 
-def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
+def venue_equity_curve(db: Session, *, days: int = 30,
+                       all_time: bool = False) -> dict[str, Any]:
     """The account chart: realised P&L stepped by settlement, cash sampled beside it.
 
     Two series, because they answer different questions and neither one answers
@@ -1350,6 +1398,10 @@ def venue_equity_curve(db: Session, *, days: int = 30) -> dict[str, Any]:
     is never shown a partial total labelled as the whole.
     """
     epoch = reset_epoch(db)
+    # The curve the account actually traced, not the slice the
+    # dashboard epoch is showing.
+    if all_time:
+        epoch = None
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
     earlier = db.execute(
