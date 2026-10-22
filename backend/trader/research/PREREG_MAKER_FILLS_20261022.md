@@ -94,3 +94,59 @@ once.
 * Reporting Sharpe from a halted book without saying it halted — the
   fill-everything run halted at the bankroll floor after 12 days, and the
   deflated Sharpe was 0.880 against a raw 11.49.
+
+---
+
+## AMENDMENT, 2026-10-22 — the premise above is WRONG, the question survives
+
+**"The backtest books every resting order as filled at the bid" is false.**
+Verified: `core.decide.as_maker_prices` is **never called** anywhere in
+`core/` or `scripts/` -- it is imported by `core/backtest.py` and not used.
+Under `--maker-entry` the backtest **lifts the ASK**, deliberately, and says
+so in its own comment.
+
+What `--maker-entry` actually does to a backtest is zero the FEE:
+`Config.__post_init__` sets `assume_maker` from it (`core/config.py:960`), and
+`core/costs.py` then charges the maker rate, which is 0 for these series. The
+price is untouched.
+
+```
+            fee     price
+backtest    zero    lifts the ask   (conservative on the spread)
+live        zero    rests at the bid (scripts/live.py:1033)
+```
+
+So the backtest pays the WORSE price and no fee. That bounds the maker case
+from below on price, which is what the comment in `core/backtest.py` claims
+and is correct.
+
+### Therefore the +155% is NOT a fill-pricing artefact
+
+The earlier claim in this file, and what I told the operator, attributed
+`Sharpe +11.49` and `realised_edge_pp 3.148` to optimistic maker pricing.
+That attribution is withdrawn. The run was priced at the ask. The remaining
+explanations are the ones its own output already gave: **12 days** of
+continuous book, `HALTED at the bankroll floor`, and a **deflated Sharpe of
+0.880** against the raw 11.49.
+
+### The question that DOES survive, restated
+
+The backtest models **no fill process at all**: every decision that clears the
+gates becomes a position. Under `--maker-entry` those are orders that would
+rest, and a resting order does not always fill.
+
+**So the open question is fill RATE, not fill PRICE:** of the orders the
+backtest counts, how many would a real tape have filled, and are the ones
+that fill a fair sample of the ones we wanted?
+
+Everything below the original "The data" heading stands: the rule, the
+upper-bound caveats, and `taker_book_side == 'ask'` as the selling aggressor,
+which was established from the data and is unaffected by this amendment.
+
+### One consequence worth measuring separately
+
+Live prices at the BID and the backtest at the ask, so **live clears the edge
+gate on trades the backtest refuses**. The divergence is deliberate and
+documented, but it means the backtest understates live's trade COUNT, not
+just its P&L per trade. That is a different comparison from the fill rate and
+needs its own pre-registration.
