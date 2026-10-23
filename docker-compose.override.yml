@@ -12,7 +12,7 @@ services:
       - --place-orders
       - --compound
       - --bankroll
-      - "500"
+      - "1000"
       - --max-stake-dollars
       - "40"
       # **0.5, not 1.5, because a maker pays a different toll.** 1.5pp was
@@ -35,16 +35,24 @@ services:
       - "9"
       - "12"
       - --require-peer-book
-      # A hole in the middle of the book. The fee 0.07*p(1-p) peaks at a coin
-      # flip -- 1.75pp of stake against 0.33pp at 95c -- and the measured signal
-      # there is ~0: on live-recorded quotes the 35-65c band alone lost $393
-      # (-2.38pp/ct) while excluding it took the whole book from -$55 to +$297.
-      # **Must stay identical to the `retrain` service's own flag**, or the
-      # gates score a policy the account does not run -- which is exactly the
-      # drift found on 2026-10-18, where the retrain graded wait_12 at 0.05
-      # Kelly while this traded first-clear across four offsets at 0.10.
-      - --exclude-price-band
-      - "0.35,0.65"
+      # **The 35-65c hole is GONE, because the reason for it was a TAKER
+      # reason.** It read -2.38pp/ct when the fee `0.07*p(1-p)` peaked at a
+      # coin flip and every entry crossed the spread. Resting at the bid costs
+      # neither, and on the current model the band measures +0.914pp/ct over
+      # 766 windows (t=+0.54) against +1.731pp/ct outside it (t=+1.49) -- two
+      # intervals that overlap almost entirely. Live-recorded quotes agree:
+      # +0.617pp/ct over 334 windows at a zero maker fee, -1.579pp/ct as a
+      # taker.
+      #
+      # Neither band is ESTABLISHED: both intervals cross zero, and the
+      # measurement assumes every resting order fills, which is least safe in
+      # the middle where the spread is widest. It is kept open for SAMPLE,
+      # not for edge -- the hole refused 38.9% of trades and 30.2% of stake,
+      # and the open question is whether there is an edge at all.
+      #
+      # If it goes back, it must go back in BOTH places: a flag here that the
+      # `retrain` service does not share makes the gates score a policy the
+      # account does not run, which is the drift found on 2026-10-18.
       # **Rest at the bid instead of lifting the ask.** The venue charges makers
       # nothing and the entry is a full cent better on a measured 1.000c spread
       # -- together ~1.5-2pp per contract, against a model edge of ~1.1-1.5pp,

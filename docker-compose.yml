@@ -498,11 +498,15 @@ services:
   # `decide()` is shared, so the same-side constraint (`OPPOSITE_SIDE`) applies
   # here too: the backtest cannot buy both sides of a window either.
   #
-  # `--exclude-price-band 0.35,0.65` puts a hole in the middle of the book,
-  # where the fee `0.07*p(1-p)` peaks and the measured signal is ~0. On live
-  # quotes that band alone was -$393 (-2.38pp/ct) while excluding it took the
-  # whole book from -$55 to +$297. Symmetric, and `Config.__post_init__`
-  # refuses an off-centre hole for the same reason the outer band is symmetric.
+  # **There is no longer a hole in the middle of the book.** The -2.38pp/ct
+  # that justified one was a TAKER figure: the fee `0.07*p(1-p)` peaks at a
+  # coin flip and every entry crossed the spread. At a zero maker fee the band
+  # measures +0.914pp/ct over 766 windows (t=+0.54), against +1.731pp/ct
+  # outside it (t=+1.49), on intervals that overlap almost entirely. Kept open
+  # for SAMPLE rather than edge -- it refused 38.9% of trades -- and neither
+  # side of the comparison is established.
+  #
+  # The trader's own flag must match this one.
   #
   # **Promoting DOES affect trading, at the next window boundary.** This said
   # "`live.py` calls `load_live` once at startup and never reloads", which was
@@ -558,7 +562,6 @@ services:
         --compound
         --min-edge-pp 0.5
         --bankroll 500
-        --exclude-price-band 0.35,0.65
         --max-entries-per-symbol-window 4
         --max-positions-per-window 12
         --maker-entry
