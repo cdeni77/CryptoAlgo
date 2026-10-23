@@ -558,14 +558,22 @@ def decide(
     # The sizing base. Compounding is opt-in: sizing off the starting bankroll
     # keeps the equity curve additive, so its slope is the per-trade edge.
     sizing_base = bankroll if config.compound else config.starting_bankroll
-    # **Kelly sizes the BARRIER, not the order.** Entry offsets 3/6/9/12 buy
-    # the same (symbol, window) barrier and settle on one outcome, so sizing
-    # each independently stakes `kelly_fraction` once per entry: at the
-    # measured 4.52 entries a window, a tenth-Kelly becomes nearly a half.
-    # This is the TOTAL the barrier should hold on the current estimate; what
-    # it already holds is subtracted below, so a later offset tops up rather
-    # than stacks. With one entry per barrier nothing is held and the target
-    # is unchanged.
+    # **`kelly_fraction` is the budget for the BARRIER, not for an order.**
+    #
+    # Entry offsets 3/6/9/12 buy the same (symbol, window) barrier and settle
+    # on one outcome, so sizing each independently staked `kelly_fraction`
+    # once per entry -- a tenth-Kelly four times over, not a tenth-Kelly.
+    #
+    # This is the TOTAL the barrier may hold on the current estimate. What it
+    # already holds is subtracted below, so the offsets SHARE it: 0.025 four
+    # times, or 0.05 twice, or all of it at one offset, but never more than
+    # once in total.
+    #
+    # Each symbol carries its own budget. The three are correlated rather than
+    # identical, and `max_window_exposure_fraction` is what caps the window.
+    #
+    # With one entry per barrier nothing is ever held, so the stake is
+    # unchanged and single-entry backtests do not move.
     barrier_target = min(
         config.kelly_fraction * kelly * sizing_base,
         config.max_stake_fraction * sizing_base,

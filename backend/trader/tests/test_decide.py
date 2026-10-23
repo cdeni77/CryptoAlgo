@@ -362,3 +362,56 @@ def test_one_entry_per_barrier_is_unchanged_by_the_netting():
                         exposure=WindowExposure())
     assert plain.stake == with_empty.stake
     assert plain.contracts == with_empty.contracts
+
+
+def test_four_offsets_share_one_kelly_budget_rather_than_taking_four():
+    """A symbol may spend its tenth-Kelly across its offsets, never per offset.
+
+    0.025 four times, or 0.05 twice, or all of it at one offset -- but the
+    (symbol, window) barrier settles on ONE outcome, so the total is a
+    tenth-Kelly whatever the split.
+    """
+    config = Config(max_entries_per_symbol_window=4, kelly_fraction=0.10,
+                    max_stake_dollars=None)
+    exposure = WindowExposure()
+    total = 0.0
+    first = None
+    for offset in (3, 6, 9, 12):
+        decision = decide(row(offset=offset), config, bankroll=1000.0,
+                          exposure=exposure)
+        if not decision.traded:
+            # Refused once the budget is spent, which is the point. Either
+            # reason says so: BARRIER_FUNDED when nothing is left, and
+            # BELOW_MIN_CONTRACTS when the remainder cannot buy one contract.
+            assert decision.reason in (Reason.BARRIER_FUNDED,
+                                       Reason.BELOW_MIN_CONTRACTS)
+            continue
+        if first is None:
+            first = decision
+        total += decision.stake
+        exposure = exposure.with_(decision)
+
+    target = (config.kelly_fraction * first.kelly_fraction
+              * config.starting_bankroll)
+    # The whole barrier, across every offset that traded, is one budget.
+    assert total <= target + first.fee
+    # And it is NOT four of them.
+    assert total < 2 * target
+
+
+def test_each_symbol_carries_its_own_budget():
+    """The three symbols are correlated, not identical.
+
+    `max_window_exposure_fraction` is what caps the window; one symbol
+    spending its budget must not shrink another's.
+    """
+    config = Config(max_entries_per_symbol_window=4, kelly_fraction=0.10,
+                    max_stake_dollars=None)
+    alone = decide(row(), config, bankroll=1000.0, exposure=WindowExposure())
+    spent = WindowExposure(
+        stake=alone.stake, positions=1, symbols_entered=frozenset({'ETH-USD'}),
+        entry_counts={'ETH-USD': 4}, stakes={'ETH-USD': alone.stake * 4},
+        sides={'ETH-USD': 'up'})
+    beside = decide(row(), config, bankroll=1000.0, exposure=spent)
+    assert beside.traded
+    assert beside.stake == pytest.approx(alone.stake)
