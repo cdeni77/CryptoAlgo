@@ -116,3 +116,17 @@ def test_the_default_venue_is_untouched(monkeypatch):
                         lambda c, s, m: pytest.fail('overlay ran off-index'))
     out = asyncio.run(bars_mod._overlay_index(Config(), spot, 1500))
     assert out is spot
+
+
+def test_the_repair_is_rate_limited_against_the_token_budget():
+    """`/cfbenchmarks` costs 50 tokens of a 300/s refill.
+
+    The backfill script's own default is 5 requests a second, which spends
+    250 -- 83% of the budget -- and the 429s then land on the trading path.
+    A repair that throttles the loop it exists to repair is not a repair.
+    """
+    import inspect
+    source = inspect.getsource(bars_mod._repair_index_history)
+    assert "'--rate'" in source, 'the repair must set its own rate'
+    assert bars_mod.INDEX_REPAIR_RATE * 50 <= 100, (
+        'the repair must stay inside a sixth of the 300 token/s refill')

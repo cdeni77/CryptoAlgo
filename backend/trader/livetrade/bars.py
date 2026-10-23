@@ -90,6 +90,11 @@ INDEX_VENUE = 'cfbenchmarks'
 #: request per symbol-hour, and a hole the venue genuinely does not have would
 #: otherwise be re-asked every cycle for ever.
 INDEX_REPAIR_COOLDOWN = 600.0
+
+#: Requests a second for the repair. `/cfbenchmarks` costs 50 tokens of a
+#: 300/s refill, so this spends a sixth of the budget and leaves the trading
+#: path its headroom. The script's own default of 5/s spends 83% of it.
+INDEX_REPAIR_RATE = 1.0
 _INDEX_REPAIR_AT = 0.0
 
 
@@ -125,7 +130,13 @@ async def _repair_index_history(config: Config, minutes: int) -> int:
     from scripts import backfill_index
     end = pd.Timestamp.now(tz='UTC').ceil('h')
     start = (end - pd.Timedelta(minutes=minutes)).floor('h')
+    # **A repair must not starve the loop it is repairing.** `/cfbenchmarks`
+    # costs 50 tokens against a 300/s refill, so the script's own 5/s default
+    # spends 250 -- 83% of the whole budget -- and the 429s land on the
+    # trading path. One request a second is 50 tokens, and the hours are few.
     argv = ['--start', start.isoformat(), '--end', end.isoformat(),
+            '--rate', str(INDEX_REPAIR_RATE),
+            '--concurrency', '1',
             '--symbols', *list(config.symbols)]
     written = await backfill_index.run(backfill_index.build_parser().parse_args(argv))
     return int(written or 0)
