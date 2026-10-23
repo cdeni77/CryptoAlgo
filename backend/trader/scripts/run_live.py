@@ -56,6 +56,12 @@ from core import heartbeat
 
 logger = logging.getLogger('run-live')
 
+#: How often the dataset-freshness measurement is published. It must stay
+#: well under the tightest `EXPECTED_MAX_AGE` -- 900s for the minute-grid
+#: recorders -- or their limits are judged against a reading older than the
+#: limit itself and report a healthy recorder as stale.
+FRESHNESS_EVERY = 300.0
+
 BACKOFF_START = 5.0
 BACKOFF_MAX = 300.0
 # A component that ran this long before failing gets a fresh backoff: an hour of
@@ -243,6 +249,10 @@ COMPONENTS: tuple[Component, ...] = (
     Component('pm_ladder', phase=55.0),
     Component('implied_vol', phase=45.0),
     Component('store_sync', phase=50.0),
+    # Its own component, not part of `store_sync`: the measurement has to be
+    # published far more often than the hourly store pass, or the fifteen
+    # minute limits cannot be evaluated at all.
+    Component('freshness', phase=20.0),
 )
 NAMES = tuple(c.name for c in COMPONENTS)
 
@@ -264,6 +274,50 @@ def _recorder_args(build_parser, **over):
     for key, value in over.items():
         setattr(ns, key, value)
     return ns
+
+
+async def freshness_loop(*, every: float = FRESHNESS_EVERY) -> None:
+    """Publish how old each dataset's newest row is, on its OWN cadence.
+
+    **A limit tighter than the publish interval cannot be evaluated.** This
+    measurement used to ride the hourly `store_sync` pass, while
+    `venue_ladder`, `pm_ladder` and `venue_trades` are judged against fifteen
+    minutes. The published ages were then up to an hour behind, so the
+    dashboard reported datasets as STALE that were seconds old -- measured
+    2026-10-23, three rows read 39-43 minutes late while every one of them had
+    written inside the last 82 to 202 seconds.
+
+    A monitor that is usually wrong is the one nobody reads, which is exactly
+    how `venue_ladder` went thirty-one days unnoticed. So it runs on its own
+    timer, well inside the tightest limit.
+
+    It is cheap by construction: one Parquet FOOTER read per dataset, newest
+    partition only -- about ten metadata reads over a 17 GB store.
+
+    **Logged, never fatal, and deliberately outside the container
+    healthcheck.** A dataset can be legitimately behind -- a venue outage, a
+    backfill not yet run -- and failing the healthcheck restarts a process
+    trading real money. Staleness is a thing to be told about, not a thing to
+    restart for.
+    """
+    while True:
+        try:
+            from core import collection_status, freshness
+            from core.datastore import DEFAULT_ROOT
+            # One pass over the footers, not two: `late()` reads the same
+            # document that gets published instead of re-walking the store.
+            document = await asyncio.to_thread(collection_status.publish,
+                                               str(DEFAULT_ROOT))
+            for dataset, age, limit in collection_status.late(document):
+                logger.error(
+                    'STALE DATASET %s: newest row %s, expected within %s. The '
+                    'recorder may be cycling and writing nothing — this is the '
+                    'failure that cost 31 days of venue_ladder.',
+                    dataset, freshness.describe(age), freshness.describe(limit))
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning('freshness check: %s', str(exc)[:200])
+        heartbeat.touch('freshness')
+        await asyncio.sleep(every)
 
 
 async def store_sync_loop(*, every: float = 3600.0) -> None:
@@ -395,22 +449,6 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
         # which the API serves at `/collection` and the dashboard renders --
         # the API cannot import this package or read a Parquet footer, so the
         # measurement has to be made here and published rather than exposed.
-        try:
-            from core import collection_status, freshness
-            from core.datastore import DEFAULT_ROOT
-            # One pass over the footers, not two: `late()` reads the same
-            # document that gets published instead of re-walking the store.
-            document = await asyncio.to_thread(collection_status.publish,
-                                               str(DEFAULT_ROOT))
-            for dataset, age, limit in collection_status.late(document):
-                logger.error(
-                    'STALE DATASET %s: newest row %s, expected within %s. The '
-                    'recorder may be cycling and writing nothing — this is the '
-                    'failure that cost 31 days of venue_ladder.',
-                    dataset, freshness.describe(age), freshness.describe(limit))
-        except Exception as exc:                      # noqa: BLE001
-            logger.warning('freshness check: %s', str(exc)[:200])
-
         # Liveness, recorded where the loop has demonstrably done its
         # job. A stamp written at startup or by the supervisor would
         # prove only that the process exists — which is exactly what
@@ -508,6 +546,10 @@ def build_factories(args, gate: TradingGate) -> dict:
         await align_to_phase(50.0)
         return await store_sync_loop()
 
+    async def freshness():
+        await align_to_phase(20.0)
+        return await freshness_loop()
+
     return {'trade': trade, 'stream': stream, 'ladder': ladder,
             'trades': trades,
             'pm_ladder': pm_ladder, 'pm_stream': pm_stream,
@@ -515,7 +557,8 @@ def build_factories(args, gate: TradingGate) -> dict:
             'index_stream': index_stream,
             'implied_vol': implied_vol, 'marks': marks,
             'book_minutes': book_minutes,
-            'store_sync': store_sync}
+            'store_sync': store_sync,
+            'freshness': freshness}
 
 
 def build_parser() -> argparse.ArgumentParser:

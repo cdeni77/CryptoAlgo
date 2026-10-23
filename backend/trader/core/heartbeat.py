@@ -80,6 +80,11 @@ MAX_AGE: dict[str, float] = {
     # added to end.
     'book_minutes': 200.0,
     'store_sync': 7200.0,  # hourly, so two missed passes
+    # Publishes the dataset-freshness measurement every 300s. Two missed
+    # passes: if this loop stops, every age the dashboard shows freezes and
+    # then reads older and older, which is indistinguishable on the surface
+    # from the recorders themselves dying.
+    'freshness': 900.0,
 }
 
 

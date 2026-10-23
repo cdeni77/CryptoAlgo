@@ -77,10 +77,33 @@ export function CollectionHealthPanel() {
   if (!data) return null;
 
   const { freshness, liveness } = data;
+  // **A limit tighter than the measurement interval cannot be evaluated.**
+  // The age shown is `now - newest row in the snapshot`, so it carries the
+  // snapshot's own lag. When that lag already exceeds a dataset's limit, the
+  // row says nothing about the recorder: measured 2026-10-23, three datasets
+  // read 39-43 minutes late off a 39 minute old snapshot while every one had
+  // written within the last 82 to 202 seconds.
+  //
+  // Reported as UNKNOWN rather than stale. A red flag that is usually wrong
+  // is how `venue_ladder` went thirty-one days unnoticed, which is the exact
+  // failure this panel exists to catch.
+  const measurementAge = freshness.measurement_age_seconds ?? null;
+  const judged = (d: DatasetFreshness): boolean =>
+    measurementAge == null || d.limit_seconds == null
+      ? true
+      : measurementAge <= d.limit_seconds;
+  const staleOf = (d: DatasetFreshness): boolean | null =>
+    judged(d) ? d.stale : null;
+  const reasonOf = (d: DatasetFreshness): string | null =>
+    judged(d)
+      ? d.reason
+      : `the freshness snapshot is ${duration(measurementAge)} old, past this `
+        + `dataset's ${duration(d.limit_seconds)} limit, so its age is `
+        + `snapshot lag rather than a reading`;
   // Three populations, because there are three states. Counting "unknown" as
   // either late or current would put the dead feed back behind a word.
   const rows = [
-    ...freshness.datasets.map((d) => d.stale),
+    ...freshness.datasets.map(staleOf),
     ...liveness.components.map((c) => c.stale),
   ];
   const late = rows.filter((s) => s === true).length;
@@ -129,8 +152,8 @@ export function CollectionHealthPanel() {
                     name={d.dataset}
                     age={d.age_seconds}
                     limit={d.limit_seconds}
-                    stale={d.stale}
-                    reason={d.reason}
+                    stale={staleOf(d)}
+                    reason={reasonOf(d)}
                   />
                 ))}
               </div>
