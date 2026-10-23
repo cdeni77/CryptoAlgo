@@ -476,3 +476,28 @@ class TestTheHighWaterMark:
 
     def test_an_empty_account_has_no_peak(self, writer):
         assert writer.realised_high_water() == 0.0
+
+
+def test_a_throttled_startup_balance_does_not_kill_the_trading_loop():
+    """The venue throttles when every component starts at once.
+
+    A 429 on the startup balance log raised out of `main`, and `supervise`
+    backs off up to BACKOFF_MAX (300s) -- a whole window of decisions lost
+    because an informational line could not be written.
+    """
+    import ast
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent.parent
+              / 'scripts' / 'live.py').read_text()
+    tree = ast.parse(source)
+    guarded = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        body = ast.get_source_segment(source, node) or ''
+        if 'Kalshi balance $%.2f' in body and 'kalshi.balance()' in body:
+            guarded = True
+    assert guarded, (
+        'the startup balance read must be inside a try: a throttle there '
+        'takes down the trading loop')

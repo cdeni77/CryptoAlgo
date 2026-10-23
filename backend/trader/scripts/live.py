@@ -1548,7 +1548,17 @@ async def main(argv: Optional[Sequence[str]] = None, *, gate=None) -> int:
                 'live mode needs Kalshi credentials: KALSHI_KEY_ID and either '
                 'KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_PATH.')
         await kalshi.__aenter__()
-        logger.info('Kalshi balance $%.2f', await kalshi.balance())
+        # **Informational, and never fatal.** Every component starts at once
+        # and the venue throttles; a 429 here used to raise out of `main` and
+        # kill the trading loop, which the supervisor then backs off up to
+        # BACKOFF_MAX. That can cost a whole window of decisions for the sake
+        # of a log line. The loop reads the balance again before it trades.
+        try:
+            logger.info('Kalshi balance $%.2f', await kalshi.balance())
+        except Exception as exc:                          # noqa: BLE001
+            logger.warning('could not read the Kalshi balance at startup: %s; '
+                           'the loop reads it again before trading',
+                           str(exc)[:160])
 
     try:
         with writer.exclusive_trader_lock():
