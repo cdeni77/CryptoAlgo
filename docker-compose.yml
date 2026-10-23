@@ -130,6 +130,21 @@ services:
       context: ./backend/trader
       dockerfile: Dockerfile
     restart: unless-stopped
+    # **A ceiling, so a runaway kills this container and not the host.**
+    # With no limit one leaking process took all 31GB on 2026-10-23: every
+    # component in here wedged while the process stayed `R (running)` at 46%
+    # CPU, and Postgres, the API and the dashboard starved with it. Nothing
+    # restarted, because nothing had died. Paired with `restart:
+    # unless-stopped` a limit turns that silent host-wide stall into a
+    # container the daemon brings straight back.
+    #
+    # 8G against a steady state under 2G: high enough that a legitimate peak
+    # -- a backfill, a wide feature build -- is never killed, low enough that
+    # the host keeps three quarters of its memory.
+    mem_limit: 8g
+    # Equal to `mem_limit`, so the container cannot paper over a leak with
+    # swap. Thrashing is what made the stall silent; dying is louder.
+    memswap_limit: 8g
     environment:
       - COINBASE_API_KEY=${COINBASE_API_KEY:-}
       - COINBASE_API_SECRET=${COINBASE_API_SECRET:-}

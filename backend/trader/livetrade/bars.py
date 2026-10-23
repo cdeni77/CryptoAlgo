@@ -86,6 +86,50 @@ async def fetch_bars(config: Config, minutes: int = FETCH_MINUTES, *,
 _INDEX_CACHE: dict[str, pd.DataFrame] = {}
 INDEX_VENUE = 'cfbenchmarks'
 
+#: Seconds between attempts to repair the index history. The venue costs one
+#: request per symbol-hour, and a hole the venue genuinely does not have would
+#: otherwise be re-asked every cycle for ever.
+INDEX_REPAIR_COOLDOWN = 600.0
+_INDEX_REPAIR_AT = 0.0
+
+
+def _index_is_short(bars: dict[str, pd.DataFrame], config: Config) -> bool:
+    """Whether any symbol has too few priced minutes to build features."""
+    from livetrade.risk import MIN_USABLE_BARS
+    need = int(getattr(config, 'min_usable_bars', MIN_USABLE_BARS))
+    for frame in bars.values():
+        if frame is None or not len(frame):
+            return True
+        if int(pd.to_numeric(frame['close'], errors='coerce').notna().sum()) < need:
+            return True
+    return False
+
+
+async def _repair_index_history(config: Config, minutes: int) -> int:
+    """Fetch index minutes the store is missing, from the venue's own history.
+
+    **The live splice cannot cover a hole that opened before this process.**
+    The index reaches the store two ways: this process folds minutes in
+    memory and flushes them, and `backfill_index` fetches them from CF
+    Benchmarks. A restart loses the first, and the store keeps only what was
+    flushed -- so minutes between the last flush and the restart exist in
+    neither. The overlay then refuses the whole universe rather than price
+    half of it on spot, and the hole does not age out of a 1,500 minute
+    lookback for twenty-five hours.
+
+    Measured 2026-10-23: a 26 minute hole stopped trading for fifty minutes
+    and would have stopped it for a day. `held_hours` skips an hour that is
+    already complete, so this costs a request only for the hours that are
+    short.
+    """
+    from scripts import backfill_index
+    end = pd.Timestamp.now(tz='UTC').ceil('h')
+    start = (end - pd.Timedelta(minutes=minutes)).floor('h')
+    argv = ['--start', start.isoformat(), '--end', end.isoformat(),
+            '--symbols', *list(config.symbols)]
+    written = await backfill_index.run(backfill_index.build_parser().parse_args(argv))
+    return int(written or 0)
+
 
 async def _overlay_index(config: Config, spot: dict[str, pd.DataFrame],
                          minutes: int) -> dict[str, pd.DataFrame]:
@@ -98,14 +142,37 @@ async def _overlay_index(config: Config, spot: dict[str, pd.DataFrame],
     universe priced on one index and half on another is the cross-index basis
     C6 exists to prevent, so the fallback is loud rather than silent.
     """
+    global _INDEX_REPAIR_AT
     if getattr(config, 'venue', None) != INDEX_VENUE or not spot:
         return spot
     try:
-        return await asyncio.to_thread(_index_overlay_sync, config, spot, minutes)
+        out = await asyncio.to_thread(_index_overlay_sync, config, spot, minutes)
     except Exception as exc:                                   # noqa: BLE001
         logger.error('index overlay failed (%s); REFUSING to trade spot prices '
                      'against a model fitted on the index', str(exc)[:160])
         return {}
+    # **Repair the history rather than sit out the lookback.** A short overlay
+    # refuses every symbol, so the cost of not trying is a whole day of no
+    # decisions; the cost of trying is a few requests the venue skips for
+    # hours it already holds.
+    if out and _index_is_short(out, config):
+        now = time.time()
+        if now - _INDEX_REPAIR_AT >= INDEX_REPAIR_COOLDOWN:
+            _INDEX_REPAIR_AT = now
+            try:
+                written = await _repair_index_history(config, minutes)
+            except Exception as exc:                           # noqa: BLE001
+                logger.error('index repair failed (%s); the cycle refuses and '
+                             'the next attempt waits the cooldown',
+                             str(exc)[:160])
+            else:
+                logger.info('index history was short; backfilled %d minute '
+                            'bar(s) from the venue and re-read', written)
+                # The cache holds the short history, so it has to go.
+                _INDEX_CACHE.clear()
+                out = await asyncio.to_thread(
+                    _index_overlay_sync, config, spot, minutes)
+    return out
 
 
 def _index_overlay_sync(config: Config, spot: dict[str, pd.DataFrame],
