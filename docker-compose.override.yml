@@ -35,6 +35,10 @@ services:
       - "9"
       - "12"
       - --require-peer-book
+      - --min-traded-price
+      - "0.10"
+      - --max-traded-price
+      - "0.90"
       # **Tighter than [0.05,0.95], because the model is overconfident at the
       # extremes and that is where the money goes.** Measured 2026-10-24 over
       # the epoch, realised win rate against the price paid:
@@ -59,10 +63,6 @@ services:
       # tradeable and stays wrong, for $93 of stake.
       #
       # Must match the `retrain` service.
-      - --min-traded-price
-      - "0.10"
-      - --max-traded-price
-      - "0.90"
       # **The 35-65c hole is GONE, because the reason for it was a TAKER
       # reason.** It read -2.38pp/ct when the fee `0.07*p(1-p)` peaked at a
       # coin flip and every entry crossed the spread. Resting at the bid costs

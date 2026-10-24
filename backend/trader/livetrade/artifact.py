@@ -46,7 +46,15 @@ def config_for_artifact(config, model, *, mode: str):
                   # keep scoring on coinbase_spot for ever while the model was
                   # fitted on cfbenchmarks, and nothing would say so -- the
                   # drift warning fires above 25bp and the basis is about 1bp.
-                  'venue', 'strike_source'):
+                  'venue', 'strike_source',
+                  # **The tradeable price band**, for the same reason: it is a
+                  # policy `decide()` enforces and the gates score, so an
+                  # artifact graded on a narrower band must not be traded on a
+                  # wider one. Like the two above it is not a flag the operator
+                  # usually sets, so without this the trader would keep the
+                  # Config default while the model was graded on something
+                  # else -- and nothing would say so.
+                  'min_traded_price', 'max_traded_price'):
         if field in explicit:
             continue
         value = provenance.get(field)

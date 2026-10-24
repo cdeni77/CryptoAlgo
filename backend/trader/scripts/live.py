@@ -282,6 +282,20 @@ def build_parser() -> argparse.ArgumentParser:
                              'loaded (as recorded in predictions.model_version); '
                              'rows from any other model are refused '
                              'model_not_pinned but still scored and recorded')
+    # **The band is a POLICY the artifact is graded under, so it is both a
+    # flag and an adopted field.** `decide()` refuses outside it, and the
+    # retrain scores the same refusal -- a band set in one and not the other
+    # grades a policy the account does not run.
+    parser.add_argument('--min-traded-price', type=float, default=None,
+                        metavar='P',
+                        help='Lower edge of the tradeable price band. The band '
+                             'must be symmetric, so this implies '
+                             '--max-traded-price 1-P and Config refuses a '
+                             'mismatch.')
+    parser.add_argument('--max-traded-price', type=float, default=None,
+                        metavar='P',
+                        help='Upper edge of the tradeable price band. Symmetric '
+                             'with --min-traded-price.')
     parser.add_argument('--min-edge-pp', type=float, default=None, metavar='PP',
                         help='Override the edge gate, in probability points '
                              '(promoted policy: 3.0). A NEGATIVE value admits '
@@ -1389,6 +1403,12 @@ def config_from_args(args) -> Config:
     pinned = getattr(args, 'require_model_version', None)
     if pinned:
         overrides['require_model_version'] = str(pinned)
+    lo = getattr(args, 'min_traded_price', None)
+    if lo is not None:
+        overrides['min_traded_price'] = float(lo)
+    hi = getattr(args, 'max_traded_price', None)
+    if hi is not None:
+        overrides['max_traded_price'] = float(hi)
     gate = getattr(args, 'min_edge_pp', None)
     if gate is not None:
         # Not clamped at zero on purpose. A negative gate is the documented way
