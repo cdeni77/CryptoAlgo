@@ -875,6 +875,31 @@ class KalshiClient:
         """
         candidates = await self.markets(
             series_ticker=series_ticker, status='open', limit=200)
+        if not candidates:
+            # **The venue has two status vocabularies and they stopped
+            # agreeing.** The LIST filter takes `open|unopened|closed|settled`;
+            # a market's own `status` reads `initialized|active|finalized`.
+            # `unopened` still matches `initialized` and `settled` matches
+            # `finalized`, but on 2026-10-24 `status=open` began returning
+            # nothing while a market sat `active` with a full orderbook -- so
+            # every window resolved to None and the loop abstained on a
+            # tradeable market, scoring NaN because a market-init model has no
+            # init score without a price.
+            #
+            # `active` is rejected as a filter (400, invalid status filter), so
+            # this asks unfiltered and selects on the market's own status. The
+            # filtered call above is tried first and kept: it is cheaper, and
+            # it starts working by itself if the venue restores the mapping.
+            everything = await self.markets(
+                series_ticker=series_ticker, limit=200)
+            candidates = [m for m in everything
+                          if str(m.get('status') or '').lower() in TRADEABLE_STATUS]
+            if candidates:
+                logger.warning(
+                    '%s: the venue returned 0 markets for status=open but %d '
+                    'with an open status of their own; using the unfiltered '
+                    'list. The filter and the status field disagree.',
+                    series_ticker, len(candidates))
         best, best_gap = None, None
         for market in candidates:
             close = _parse_time(market.get('close_time'))
@@ -1394,6 +1419,12 @@ class KalshiClient:
 
 
 NAN = float('nan')
+
+
+#: A market's OWN status values that mean "orders may rest here now". The list
+#: filter's vocabulary is different, and the two stopped agreeing on
+#: 2026-10-24 -- see `resolve_window_market`.
+TRADEABLE_STATUS = frozenset({'active', 'open'})
 
 
 def parse_orderbook(payload: dict) -> dict:
