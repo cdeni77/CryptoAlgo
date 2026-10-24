@@ -35,6 +35,34 @@ services:
       - "9"
       - "12"
       - --require-peer-book
+      # **Tighter than [0.05,0.95], because the model is overconfident at the
+      # extremes and that is where the money goes.** Measured 2026-10-24 over
+      # the epoch, realised win rate against the price paid:
+      #
+      #   <0.10        6 tr    +8.71pp  t= 0.53   ($1 staked, noise)
+      #   0.10-0.20   65 tr    -9.07pp  t=-2.13
+      #   0.20-0.35  130 tr    -9.25pp  t=-2.35
+      #   middle    1363 tr    +1.09pp  t= 1.12   ($3,735 staked, CALIBRATED)
+      #   0.90-0.95   69 tr    -8.49pp  t=-1.39   ($430 staked)
+      #   >0.95       23 tr    -8.56pp  t=-1.13   ($144 staked)
+      #
+      # Four tail buckets agreeing on -8.5 to -9.3pp is stronger than any one
+      # t. Pooled, the tails are -6.76pp at t=-2.79 and carry -$81.05 of a
+      # -$96.14 loss on 15% of the stake. This is CONFIRMATORY, not a fished
+      # bucket: `overconfidence_abs` already fails as a gate.
+      #
+      # The bad region is actually `<0.35 or >0.90`, which is asymmetric and
+      # `Config` refuses -- the edge is a disagreement about sigma and points
+      # both ways. 0.10 is the symmetric choice that still catches the part
+      # that costs: $574 of the $667 tail stake sits above 0.90, and below
+      # 0.10 there are six trades and one dollar. The 0.10-0.35 band stays
+      # tradeable and stays wrong, for $93 of stake.
+      #
+      # Must match the `retrain` service.
+      - --min-traded-price
+      - "0.10"
+      - --max-traded-price
+      - "0.90"
       # **The 35-65c hole is GONE, because the reason for it was a TAKER
       # reason.** It read -2.38pp/ct when the fee `0.07*p(1-p)` peaked at a
       # coin flip and every entry crossed the spread. Resting at the bid costs

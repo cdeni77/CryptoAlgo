@@ -565,6 +565,8 @@ services:
         --max-entries-per-symbol-window 4
         --max-positions-per-window 12
         --maker-entry
+        --min-traded-price 0.10
+        --max-traded-price 0.90
         --max-stake-dollars 40
         --ensemble-size 5
         --label-source venue
