@@ -1369,14 +1369,21 @@ class KalshiClient:
             'count': f'{int(contracts)}.00',
             'price': f'{price:.4f}',
             **({'time_in_force': time_in_force} if time_in_force else {}),
-            # Required in V2. **`taker_at_cross` CROSSES the spread and `maker`
-            # RESTS**, so this field decides whether a maker order is actually a
-            # maker order — `time_in_force` alone does not. Hardcoding
-            # `taker_at_cross` here while pricing the entry at the bid would send
-            # a crossing order at a price nothing is offering: it would mostly
-            # fail to fill and read as "resting does not work" when what was
-            # wrong was the flag. Caught before any maker order was ever sent.
+            # Required in V2. **This field is SELF-trade prevention and does
+            # NOT decide whether an order rests.** `maker` cancels your own
+            # RESTING order when your taker side would cross it; taker_at_cross
+            # cancels the incoming one. Neither stops the order crossing the
+            # PUBLIC book -- an order priced at or through the ask takes, and is
+            # charged as a taker, whatever this says. The comment here claimed
+            # otherwise for weeks while 60% of fills came back `is_taker: true`.
+            # `post_only` below is the field that actually guarantees it.
             'self_trade_prevention_type': 'maker' if rest else 'taker_at_cross',
+            # **The guarantee.** Undocumented by the venue (listed on
+            # CreateOrderV2 with no description), but post-only universally
+            # means "reject rather than take". Sent only when resting, so a
+            # mispriced limit becomes a loud refusal instead of a silent taker
+            # fill paying the fee and the spread.
+            **({'post_only': True} if rest else {}),
             # Which exchange holds the market. Omitting it defaults to 0, and a
             # market on another exchange is then simply not found — a 404 that
             # names the market rather than the mismatch.

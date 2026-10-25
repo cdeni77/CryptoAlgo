@@ -108,6 +108,20 @@ def order_limit_price(decision: Decision, *, config: Optional[Config] = None) ->
     absurdly far.
     """
     config = config if config is not None else DEFAULT_CONFIG
+    # **A resting order gets no slippage allowance, because it crosses
+    # nothing.** The allowance below bounds how far a TAKER walks the book.
+    # Under `maker_entry` the price handed in is the BID, so adding it prices
+    # the order THROUGH the ask and the venue fills it as a taker -- the
+    # allowance scales with the claimed edge, so the better the model thinks
+    # the trade is, the more certain it is to cross.
+    #
+    # Measured 2026-10-25, with min_edge_pp 0.5 and a ~1c spread: at a claimed
+    # 0.56pp the allowance was 0.06c and 83% of fills rested; at 1.99pp it was
+    # 1.49c, straight through the ask, and the maker share fell to 37%. The
+    # migration tripling the claimed edge is what moved it, and execution cost
+    # ~$115 in fees and spread against +$16 of P&L over the same period.
+    if bool(getattr(config, 'maker_entry', False)):
+        return float(decision.price)
     edge = decision.edge if np.isfinite(decision.edge) else 0.0
     spendable = max(0.0, edge - config.min_edge_pp / 100.0)
     allowance = min(spendable, config.max_slippage_cents / 100.0)
