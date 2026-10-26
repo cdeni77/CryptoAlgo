@@ -62,3 +62,27 @@ def test_post_only_is_sent_only_when_resting():
     src = inspect.getsource(kalshi_client.KalshiClient.place_order)
     assert "'post_only': True} if rest else {}" in src, (
         'a resting order must be sent post_only')
+
+
+def test_post_only_is_sent_when_resting_and_not_when_crossing():
+    import inspect
+
+    from data_collection import kalshi_client
+    src = inspect.getsource(kalshi_client.KalshiClient.place_order)
+    assert "**({'post_only': True} if rest else {})" in src, (
+        'post_only must be sent only on a resting order')
+
+
+def test_a_post_only_refusal_is_an_abstention_not_an_error():
+    """The venue refuses a crossing post-only order with
+    `400 invalid_order: post only cross`. That is the guarantee working: the
+    book moved inside the ~0.4s to the venue and the order would have TAKEN.
+    Before post_only it filled anyway and paid the fee and the spread."""
+    import inspect
+
+    from livetrade import execution
+    src = inspect.getsource(execution)
+    assert "'post only cross' in str(exc).lower()" in src, (
+        'a post-only refusal must be recognised')
+    assert "'post_only_cross'" in src, (
+        'it must be reported as its own outcome, not as a generic refusal')

@@ -478,8 +478,9 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
             # omits the field so the venue applies its own default, which is
             # the documented way to rest. The enum is configurable rather than
             # guessed: a wrong value may be rejected (harmless) or silently
-            # fill as a taker (not), and nothing in this repo has ever recorded
-            # a working one — all 1,556 fills are `is_taker: true`.
+            # fill as a taker (not). Resting DOES work -- `venue_fills` records
+            # 1,388 with `is_taker: false` since 2026-10-18 -- and `post_only`
+            # now makes the venue enforce it.
             _maker = bool(getattr(config, 'maker_entry', False))
             _tif = (getattr(config, 'maker_time_in_force', None) if _maker
                     else 'immediate_or_cancel')
@@ -495,6 +496,20 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
             if not ambiguous:
                 await _db(writer.resolve_ticket, ticket_id, status='skipped',
                           note=str(exc)[:400])
+                # **A post-only refusal is the guarantee working, not a
+                # fault.** The book moved inside the ~0.4s between the quote
+                # and the order, so the order would have TAKEN. Before
+                # `post_only` it filled anyway, paid the fee and gave up the
+                # spread; now it is declined and the next offset tries again.
+                # Logged at INFO so it cannot be mistaken for a broken venue.
+                if 'post only cross' in str(exc).lower():
+                    logger.info(
+                        '%s %s: post-only declined, the book moved and this '
+                        'would have crossed — abstaining rather than paying '
+                        'the taker fee and the spread',
+                        decision.symbol, decision.market_ticker)
+                    return OrderResult(False, 'post_only_cross',
+                                       ticket_id=ticket_id, limit=limit)
                 logger.error('order refused, no position recorded: %s', exc)
                 return OrderResult(False, 'refused', ticket_id=ticket_id, limit=limit)
             # The request may well have reached the venue. Ask it, by our key.

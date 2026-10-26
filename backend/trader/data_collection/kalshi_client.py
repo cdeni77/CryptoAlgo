@@ -1383,6 +1383,19 @@ class KalshiClient:
             # means "reject rather than take". Sent only when resting, so a
             # mispriced limit becomes a loud refusal instead of a silent taker
             # fill paying the fee and the spread.
+            # **The guarantee.** Undocumented by the venue (listed on
+            # CreateOrderV2 with no description) but confirmed by behaviour: a
+            # crossing order is refused `400 invalid_order: post only cross`.
+            #
+            # We post AT our own touch -- a YES bid joins the bid, a YES ask
+            # joins the ask -- which normally rests. It crosses only when the
+            # book moves inside the ~0.4s between reading the quote and the
+            # order landing, or when the book is locked. Those are exactly the
+            # fills that used to come back `is_taker: true`, paying the fee and
+            # giving up the spread, so a refusal here is the system working.
+            #
+            # A refusal is an ABSTENTION, not an error: no position, no cost,
+            # and the next offset tries again three minutes later.
             **({'post_only': True} if rest else {}),
             # Which exchange holds the market. Omitting it defaults to 0, and a
             # market on another exchange is then simply not found — a 404 that
