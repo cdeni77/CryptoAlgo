@@ -13,8 +13,13 @@ services:
       - --compound
       - --bankroll
       - "1000"
+      # **2% of the account in one bet, down from 4%.** $40 was set against a
+      # $500 bankroll -- 8% -- and survived the top-up to $1,000 unchanged.
+      # Per-window sd is $14.62, so the 2-sigma band over the 500-1,000 windows
+      # needed to resolve whether there is an edge at all is +/-$626 to +/-$885
+      # against a ~$980 account: at the old size the measurement cannot finish.
       - --max-stake-dollars
-      - "40"
+      - "20"
       # **0.5, not 1.5, because a maker pays a different toll.** 1.5pp was
       # sized for a TAKER: the fee averages ~1.1pp of stake plus a 0.5c
       # half-spread, so ~1.6pp had to be cleared before a crossing trade paid.
@@ -35,10 +40,19 @@ services:
       - "9"
       - "12"
       - --require-peer-book
-      - --min-traded-price
-      - "0.10"
-      - --max-traded-price
-      - "0.90"
+      # **Pinned, so the Sunday retrain cannot swap the model underneath a
+      # measurement.** The execution fix of 2026-10-26 (post_only, resting at
+      # the bid) is the one change with a verified mechanism and its effect on
+      # P&L is unmeasured; a model changing at the same time would confound it.
+      #
+      # This names the artifact ALREADY INSTALLED. The pin REFUSES any other
+      # model (`model_not_pinned`) -- it does not install one -- so naming a
+      # different version here stops trading rather than switching to it.
+      # 20261022T171846Z scores better on realised_edge_lcb (+1.168 against
+      # -0.231) and running it instead is a deliberate reinstall from
+      # models/.staging, not an edit here.
+      - --require-model-version
+      - "20261025T092755Z"
       # **Tighter than [0.05,0.95], because the model is overconfident at the
       # extremes and that is where the money goes.** Measured 2026-10-24 over
       # the epoch, realised win rate against the price paid:
@@ -146,4 +160,4 @@ services:
       - --no-require-gates
       - --force
       - --reason
-      - "live forward test; gates fail on the market comparison (model_minus_market, model_minus_market_p, calibration_vs_market) and the operator authorised real orders. --require-model-version was REMOVED 2026-10-18, so this no longer names one artifact - whatever the Sunday retrain installs trades at the next window boundary, unreviewed."
+      - "live forward test; gates fail on the market comparison (model_minus_market, model_minus_market_p, calibration_vs_market) and the operator authorised real orders. --require-model-version was removed on 2026-10-18 and RESTORED on 2026-10-26 after the unreviewed Sunday retrain installed an artifact failing realised_edge_lcb; the pin names the installed artifact so the retrain can no longer swap it mid-measurement."
