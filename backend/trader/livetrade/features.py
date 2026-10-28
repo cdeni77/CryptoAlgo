@@ -780,19 +780,33 @@ def decision_input_rows(symbols, window_open, offset, *, decided_at):
 EXPECTED_NAN = {
     # A first difference has no prior value at the first offset of a window.
     'venue_gap_change_5': lambda offsets: min(offsets) if offsets else None,
+    # **A three-minute lookback reaches back past the window open at +3.**
+    # These two are empty at the first offset of EVERY window, warm or cold --
+    # observed at :33, :48, :03, :18 and :33 on a fully warmed loop. Without
+    # them here the cold-cache abstention would refuse every +3 decision and
+    # silently drop the offset, which was tested and rejected: overconfidence
+    # got 50% worse and the edge lower bound 5.5x worse.
+    'spread_change_3': lambda offsets: min(offsets) if offsets else None,
+    'mid_change_3': lambda offsets: min(offsets) if offsets else None,
 }
 
 
 def _warn_unscoreable_features(scored: pd.DataFrame, model,
-                               *, offsets=()) -> None:
-    """Warn when the model wants a feature this row cannot supply.
+                               *, offsets=()) -> list[str]:
+    """Report the features the model wants and this frame cannot supply.
 
-    A NaN feature does not raise, so this warning is the only signal. Absences
-    in `EXPECTED_NAN` at their expected offset log at debug instead.
+    Returns the empty ones, so the caller can ABSTAIN rather than score a
+    LightGBM default in their place -- a cold recorder scores a different model
+    from the one the gates measured, and the first window after a resume is
+    where this system loses its money. Absences in `EXPECTED_NAN` at their
+    expected offset are normal and are not reported.
+
+    A column empty for the WHOLE frame is a cold recorder. A row that merely
+    lacks one value is not, and is not reported here.
     """
     wanted = list(getattr(model, 'features', ()) or ())
     if not wanted or not len(scored):
-        return
+        return []
     offsets = tuple(int(o) for o in (offsets or ()))
     here = pd.to_numeric(scored.get('offset'), errors='coerce').dropna().unique() \
         if 'offset' in scored.columns else ()
@@ -809,10 +823,15 @@ def _warn_unscoreable_features(scored: pd.DataFrame, model,
         empty = [c for c in empty if c not in expected]
     if missing or empty:
         logger.warning(
-            'scoring with features the row cannot supply — missing %s, all-NaN %s. '
-            'LightGBM will substitute its learned default, so this is a different '
-            'model from the one whose gates were measured.',
+            'features the row cannot supply — missing %s, all-NaN %s. '
+            'LightGBM would substitute its learned default, which is a '
+            'different model from the one whose gates were measured, so these '
+            'rows abstain.',
             missing or 'none', empty or 'none')
+    # `missing` is an absent COLUMN -- a feature this artifact never had, which
+    # the frame cannot be blamed for. `empty` is a column that exists and is
+    # cold, which is the warmup case and the one worth abstaining on.
+    return list(empty)
 
 
 def prepare_init_score(scored: pd.DataFrame, model) -> pd.DataFrame:

@@ -785,10 +785,13 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
             await kalshi.cancel_order(str(order_id))
         except Exception as exc:                               # noqa: BLE001
             # **404 means the venue has no such order, so close the ticket.**
-            # These markets settle every 15 minutes and the venue cancels what
-            # is still resting, so an order disappears server-side as a matter
-            # of course. Logging and retrying leaves the ticket `resting`, and
-            # `open_tickets` then returns it on every later cycle forever.
+            # Rare, and worth noticing: it means the order was already gone,
+            # which on a fifteen-minute market is normally the venue clearing
+            # what still rested at close. It is NOT the routine case -- that
+            # was a symptom of cancelling against the wrong path, where every
+            # order 404s and a live one gets written off. Logging and retrying
+            # leaves the ticket `resting`, and `open_tickets` then returns it
+            # on every later cycle forever.
             #
             # This sweep runs BEFORE the decision, between the book read and
             # `decided_at`, so each dead ticket adds a round trip to the quote
@@ -1107,8 +1110,12 @@ async def run_cycle(args, config: Config, writer: PgWriter, model,
     # Liveness, at the point the cycle has demonstrably scored.
     heartbeat.touch('trade')
 
-    _warn_unscoreable_features(scored, model,
-                               offsets=tuple(config.decision_offsets or ()))
+    # **Abstain on a cold feature rather than scoring a substituted model.**
+    # Returns the columns the artifact wants that are empty for this whole
+    # frame -- a recorder that has not warmed up, not a row missing one value.
+    _cold = _warn_unscoreable_features(
+        scored, model, offsets=tuple(config.decision_offsets or ()))
+    scored['features_unavailable'] = bool(_cold)
     for column, values in model.score(scored).items():
         scored[column] = values
 

@@ -44,6 +44,7 @@ class Reason(str, Enum):
     PROBABILITY_INVALID = 'probability_invalid'  # outside [0, 1] after scoring
     NO_QUOTE = 'no_quote'                      # live, and the book was not readable
     NO_PEER_BOOK = 'no_peer_book'              # cross_venue's peer was unavailable
+    FEATURES_UNAVAILABLE = 'features_unavailable'  # a fitted feature is cold, not merely absent
     PRICE_OUT_OF_BAND = 'price_out_of_band'    # tick and spread dominate here
     DISAGREEMENT_IMPLAUSIBLE = 'disagreement_implausible'  # too far from the quote
     EDGE_BELOW_GATE = 'edge_below_gate'        # the forecast does not pay
@@ -488,6 +489,23 @@ def decide(
     has_book = ask_up is not None and ask_down is not None
     if require_quote and not has_book:
         return refuse(Reason.NO_QUOTE)
+    # **A feature the artifact was FITTED on is cold.** LightGBM substitutes a
+    # learned default for a NaN, which silently scores a different model from
+    # the one the gates measured. The stream cache is process-local, so a
+    # restart or an outage empties it: measured over 2026-10-14..27, the first
+    # window after a resume lost 14.1pp per contract across 23 windows while
+    # warm windows made +0.26. Abstaining is the same answer `require_peer_book`
+    # already gives to a missing peer.
+    #
+    # The caller sets this only when the column is empty for the whole frame --
+    # a recorder that is cold, not a row that happens to lack one value.
+    try:
+        cold = get('features_unavailable')
+    except (KeyError, IndexError):
+        cold = None
+    if cold is not None and bool(cold) and not (
+            isinstance(cold, float) and np.isnan(cold)):
+        return refuse(Reason.FEATURES_UNAVAILABLE)
     # The peer book, when the configuration requires it. `cross_venue` skill
     # depends on a contemporaneous peer book, and training already requires it
     # under `--complete-cases`; refusing here makes live match.
