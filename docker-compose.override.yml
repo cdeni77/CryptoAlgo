@@ -30,29 +30,43 @@ services:
       # which is the one thing maker entry was switched on to gather.
       # Must match the `retrain` service, or the gates grade a policy the
       # account does not run.
+      # **3.0, not 0.5.** Below 3pp the claimed edge is smaller than the
+      # measurement floor: backtest realised edge is flat at ~1.4pp for every
+      # bucket under 3pp and steps to 2.73pp above it, and after the ~1.4c
+      # execution correction only the top bucket is positive at all. Live over
+      # 2026-10-26..28 the >=3pp trades made +9.35pp/ct on $765 while the 930
+      # trades below it lost 4.41% of $4,382. The gap holds in 8 of 10 months.
       - --min-edge-pp
-      - "0.5"
+      - "3.0"
       - --kelly-fraction
       - "0.10"
+      # **Every minute 3..12 is scored AND may enter.** The extra offsets are
+      # what make the 3pp gate safe. With four offsets the gate is forced onto
+      # the most extreme claims available and overconfidence_abs FAILS at
+      # 0.0203; with ten, enough candidates clear 3pp that it passes at 0.0099
+      # and realised_edge_lcb goes 1.47 -> 2.61. At a 0.5pp gate the same
+      # extra offsets added nothing but leverage -- they only pay above a gate.
+      - --offsets
+      - "3,4,5,6,7,8,9,10,11,12"
       - --entry-offsets
       - "3"
+      - "4"
+      - "5"
       - "6"
+      - "7"
+      - "8"
       - "9"
+      - "10"
+      - "11"
       - "12"
       - --require-peer-book
-      # **Pinned, so the Sunday retrain cannot swap the model underneath a
-      # measurement.** The execution fix of 2026-10-26 (post_only, resting at
-      # the bid) is the one change with a verified mechanism and its effect on
-      # P&L is unmeasured; a model changing at the same time would confound it.
-      #
-      # This names the artifact ALREADY INSTALLED. The pin REFUSES any other
-      # model (`model_not_pinned`) -- it does not install one -- so naming a
-      # different version here stops trading rather than switching to it.
-      # 20261022T171846Z scores better on realised_edge_lcb (+1.168 against
-      # -0.231) and running it instead is a deliberate reinstall from
-      # models/.staging, not an edit here.
-      - --require-model-version
-      - "20261025T092755Z"
+      # **No pin: promotion must never be blocked.** The Sunday cron installs
+      # by standing policy and the new artifact takes over at the next window
+      # boundary. A pin gated ORDERS but not the SWAP, so an installed-but-
+      # unpinned model was loaded and then refused every decision -- the
+      # account stopped trading and nothing said so. Reviewing a model is a
+      # decision to make from the promotion ledger, not a flag that can halt
+      # the account by accident.
       # **Tighter than [0.05,0.95], because the model is overconfident at the
       # extremes and that is where the money goes.** Measured 2026-10-24 over
       # the epoch, realised win rate against the price paid:
@@ -160,4 +174,4 @@ services:
       - --no-require-gates
       - --force
       - --reason
-      - "live forward test; gates fail on the market comparison (model_minus_market, model_minus_market_p, calibration_vs_market) and the operator authorised real orders. --require-model-version was removed on 2026-10-18 and RESTORED on 2026-10-26 after the unreviewed Sunday retrain installed an artifact failing realised_edge_lcb; the pin names the installed artifact so the retrain can no longer swap it mid-measurement."
+      - "live forward test; gates fail on the market comparison (model_minus_market, model_minus_market_p, calibration_vs_market) and the operator authorised real orders. No --require-model-version: promotion must never be blocked, and a pin gated orders without gating the artifact SWAP, so an unpinned model would load and then refuse every decision -- the account stopping with nothing to say so. The running artifact as of 2026-10-27 is 20261027T211836Z, the first trained on a configuration that matches this override exactly: bankroll, max-stake and require-peer-book had drifted (500/40/off against 1000/20/on) and implied_vol was costing 20,013 evaluated windows under --complete-cases. It fails 3 of 24 gates against the previous artifact's 5, passes realised_edge_lcb at +1.033 where that one failed at -0.231, and ships at deployed_residual_scale 0.698. model_minus_market_p still fails at 0.0646 -- this model does not beat the market price, and trading it is the operator's decision, as before. The Sunday cron installs by standing policy and whatever it installs takes over at the next window boundary; review it in models/promotions/, not by halting the account."
