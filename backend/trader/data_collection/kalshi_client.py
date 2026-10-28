@@ -1157,7 +1157,8 @@ class KalshiClient:
                                  max_pages=max_pages, **params)
         return [parse_trade(raw) for raw in rows]
 
-    async def cancel_order(self, order_id: str) -> dict:
+    async def cancel_order(self, order_id: str, *,
+                           market_ticker: Optional[str] = None) -> dict:
         """Cancel a resting order. Refuses unless constructed with `live=True`.
 
         **A resting order needs an owner for the rest of its life.** An
@@ -1176,8 +1177,20 @@ class KalshiClient:
         if not order_id:
             raise ValueError('order_id is required')
         logger.info('cancelling order %s', order_id)
-        return await self._request('DELETE',
-                                   f'/portfolio/events/orders/{order_id}')
+        # **An order id alone cannot name an order: it does not carry the
+        # shard.** The venue auto-routes a cancel only when `market_ticker`
+        # comes with it, and this account's crypto markets sit on
+        # `exchange_index` 2. Without the ticker the lookup runs against the
+        # wrong shard and answers 404 for an order that is alive -- observed
+        # on 01a17f47, cancelled at 21:36:01, reported gone, and still filling
+        # at 21:40:56. The sweep believed the 404 and closed the ticket.
+        #
+        # `/portfolio/events/orders/{id}` is the V2 resource. The bare
+        # `/portfolio/orders/{id}` is the legacy family and the venue now
+        # answers 410 there, so a cancel sent to it can never succeed.
+        return await self._request(
+            'DELETE', f'/portfolio/events/orders/{order_id}',
+            params=_clean({'market_ticker': market_ticker}))
 
     async def reconcile(self, *, exchange_index: Optional[int] = None) -> dict:
         """Balance, open positions and recent fills, as the venue sees them.

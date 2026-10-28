@@ -782,7 +782,9 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
         if age < float(cutoff):
             continue
         try:
-            await kalshi.cancel_order(str(order_id))
+            await kalshi.cancel_order(
+                str(order_id),
+                market_ticker=getattr(ticket, 'market_ticker', None))
         except Exception as exc:                               # noqa: BLE001
             # **404 means the venue has no such order, so close the ticket.**
             # Rare, and worth noticing: it means the order was already gone,
@@ -803,7 +805,7 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
             # found. `book_resting_fills` has already run, so a fill is booked
             # before we get here, and the reconcile owns the position either
             # way.
-            if getattr(exc, 'status', None) == 404:
+            if getattr(exc, 'status', None) in (404, 410):
                 await _db(writer.resolve_ticket, ticket.id, status='cancelled',
                           note='the venue reported no such order; closed by '
                                'the sweep, reconcile owns any position')
@@ -811,8 +813,11 @@ async def cancel_stale_resting(writer: PgWriter, kalshi, config: Config,
                 continue
             # Any other failure is transient as far as we can tell, so leave
             # the ticket open and try again next cycle.
+            # The whole body, not a prefix. A 100-character cut hid
+            # `410 deprecated` behind `{"error":{"code":"deprecated_v` for
+            # weeks, which reads as noise rather than as a retired endpoint.
             logger.info('could not cancel %s (%s); reconcile will settle it',
-                        order_id, str(exc)[:100])
+                        order_id, str(exc)[:400])
             continue
         await _db(writer.resolve_ticket, ticket.id, status='cancelled',
                   note=f'resting order cancelled after {age:.0f}s unfilled '
