@@ -51,8 +51,17 @@ services:
       # 20261022T171846Z scores better on realised_edge_lcb (+1.168 against
       # -0.231) and running it instead is a deliberate reinstall from
       # models/.staging, not an edit here.
-      - --require-model-version
-      - "20261025T092755Z"
+      # **No pin.** It named 20261025T092755Z, two artifacts behind what the
+      # account actually runs, so a restart would have refused every decision
+      # as `model_not_pinned` and stopped trading in silence. The pin was
+      # removed in the working tree on 2026-10-26 and only committed by
+      # accident on 2026-10-28; reverting that commit brought it back.
+      #
+      # Promotion must never be blocked: the Sunday cron installs by standing
+      # policy and the new artifact takes over at the next window boundary.
+      # To reject one, reinstall the wanted version from models/.staging --
+      # that is what was done on 2026-10-28 when the retrain shipped an
+      # artifact at realised_edge_lcb 0.256 against the incumbent's 1.033.
       # **Tighter than [0.05,0.95], because the model is overconfident at the
       # extremes and that is where the money goes.** Measured 2026-10-24 over
       # the epoch, realised win rate against the price paid:
