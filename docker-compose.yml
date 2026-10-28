@@ -573,8 +573,9 @@ services:
     command: >
       -m scripts.promote
         --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,book_quote,implied_vol
-        --start 2025-10-01
+        --start 2026-08-29
         --complete-cases
+        --min-train-windows 1200
         --entry-offsets 3 6 9 12
         --init-score-source market
         --kelly-fraction 0.10
@@ -589,7 +590,7 @@ services:
         --label-source venue
         --edge-lower-bound-z 1.0
         --require-member-agreement
-        --quote-sources live_touch,live_ws,live,live_ws_replay,candles
+        --quote-sources live_touch,live_ws,live,live_ws_replay
         --peer-quote-sources all
         --force
         --reason "Groups are book_quote, not market_state+book_flow: the 7 depth columns cannot exist before 2026-08-25 because the venue serves no historical order book, and under --complete-cases they pin training to the live era; the 4 quote columns are recoverable to 2025-12-10 from the venue's own candles. Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
