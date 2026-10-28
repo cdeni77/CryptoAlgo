@@ -30,19 +30,6 @@ services:
       # which is the one thing maker entry was switched on to gather.
       # Must match the `retrain` service, or the gates grade a policy the
       # account does not run.
-      # **Pinned to the incumbent, 2026-10-28.** The 20261028T191433Z refit
-      # did not reproduce its own walk-forward: realised_edge_lcb 2.61 in the
-      # validation against 0.256 shipped, overconfidence_abs 0.0303 against a
-      # 0.015 bar, and 4 of 24 gates against the incumbent's 3. Its deflated
-      # Sharpe is +2.66 against an expected best-of-53 null of +4.17, so it is
-      # below what the luckiest of 53 trials would show by chance.
-      #
-      # The pin now gates the SWAP as well as orders (livetrade/artifact.py),
-      # so an unpinned artifact is refused on arrival and this model keeps
-      # trading. Without that guard a pin stopped the account in silence.
-      # Remove this pin, or move it, to adopt a newer artifact.
-      - --require-model-version
-      - "20261027T211836Z"
       - --min-edge-pp
       - "0.5"
       - --kelly-fraction
