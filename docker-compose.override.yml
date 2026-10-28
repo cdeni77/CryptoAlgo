@@ -119,6 +119,13 @@ services:
       # RESULT, not a fault. The gates are scored at the ask on purpose, so
       # they bound this from below rather than banking the assumption.
       - --maker-entry
+      # **Make when we can, take when we can.** post_only refused 23.7% of
+      # orders and left the fills it allowed adversely selected: measured
+      # side by side, resting fills realised -0.48pp per contract against
+      # -0.13pp for crossing fills net of the taker fee. The orders it
+      # refused would have won 95.3% of the time. Still priced at our own
+      # touch, so it rests whenever the book lets it.
+      - --no-post-only
       # Pull an unfilled order after 60s of its OWN age. The forecast is what
       # expires -- `sigma_remaining` is computed for the decision instant -- so
       # a fill arriving minutes later takes an edge that has already moved.
