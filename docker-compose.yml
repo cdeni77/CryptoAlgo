@@ -570,58 +570,29 @@ services:
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
       - ./backend/trader:/app
-    # **`--bankroll` and `--max-stake-dollars` must match the trader's
-    # override.** The gates grade the policy the account runs, or they grade
-    # nothing. The live cap was halved to 20 on a $1,000 account and these two
-    # were left behind at 40 and 500, which graded 8% of book per trade against
-    # the 2% that trades, on half the capital. It also halves the daily-loss
-    # breaker -- 25% of $500 is $125 -- and the walk-forward latched it on a
-    # $125.51 day, ending the money measurement 19 days into a 9-month run
-    # while the forecast metrics went on describing all of it.
-    # `tests/test_deployed_config_parity.py` asserts the pair.
-    #
-    # **`--require-peer-book` matches the trader too.** `--complete-cases`
-    # already demands the peer on every TRAINING row, so without this the
-    # gates scored rows live would refuse -- and a one-minute peer lag costs
-    # ~70% of the model's skill, with no peer at all taking it negative. It is
-    # now in `DECISION_FIELDS`, so it cannot drift again unnoticed.
-    #
-    # **`--halt-resume-hours` is the one deliberate difference from live, and
-    # it makes the backtest CLOSER to the account, not further from it.** Live,
-    # a breaker latches and the operator clears it by hand; the walk-forward
-    # has nobody, so a latch ended the money measurement on the first bad day
-    # in range -- 2026-02-03, the opening day of a week-long selloff, 19 days
-    # into 293 -- while the forecast metrics described the whole span. 24h
-    # simulates that person. The breakers and their thresholds are untouched,
-    # and the run reports `n_halts` so a policy that halts weekly cannot hide
-    # behind a policy that halts once. It is not in `DECISION_FIELDS` because
-    # it is a property of the measurement, not of the trade.
     command: >
       -m scripts.promote
-        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,book_quote
+        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,book_quote,implied_vol
         --start 2025-10-01
         --complete-cases
-        --offsets 3,4,5,6,7,8,9,10,11,12
-        --entry-offsets 3 4 5 6 7 8 9 10 11 12
+        --entry-offsets 3 6 9 12
         --init-score-source market
         --kelly-fraction 0.10
         --compound
-        --min-edge-pp 3.0
-        --bankroll 1000
+        --min-edge-pp 0.5
+        --bankroll 500
         --max-entries-per-symbol-window 4
         --max-positions-per-window 12
         --maker-entry
-        --max-stake-dollars 20
+        --max-stake-dollars 40
         --ensemble-size 5
         --label-source venue
         --edge-lower-bound-z 1.0
         --require-member-agreement
         --quote-sources live_touch,live_ws,live,live_ws_replay,candles
         --peer-quote-sources all
-        --require-peer-book
-        --halt-resume-hours 24
         --force
-        --reason "Groups are book_quote, not market_state+book_flow: the 7 depth columns cannot exist before 2026-08-25 because the venue serves no historical order book, and under --complete-cases they pin training to the live era; the 4 quote columns are recoverable to 2025-12-10 from the venue's own candles. implied_vol is out for the SAME reason and it was missed: its 5 columns are dense only from 2026-09, when the live recorder started, and the ladder_candles backfill before that covers 2-3% of the candle rows. Under --complete-cases those 5 columns cost 38,586 training rows and 20,013 evaluated windows (61,379 -> 41,366) while adding 303 windows worth of nothing, which pins training to the live era exactly as the depth columns did. It goes back in when backfill_implied_vol has run over the full range -- the candle fits score r2 0.97-0.98, so the data is recoverable, it has simply not been built. PARITY, 2026-10-27: --bankroll, --max-stake-dollars and --require-peer-book now match the trader's override exactly (they had drifted to 500/40/off against a live 1000/20/on since 2026-10-26), and --halt-resume-hours 24 simulates the operator who clears a live halt -- without it the walk-forward latched on 2026-02-03, the first day of a crash, and every money figure covered 12 days of a 293-day range. With both, realised_edge_lcb goes -0.251 -> +1.033 and overconfidence_abs 0.01544 -> 0.00252 on an unchanged forecast: those gates were failing on a truncated sample, not on the model. n_halts is 1 over 293 days. Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
+        --reason "Groups are book_quote, not market_state+book_flow: the 7 depth columns cannot exist before 2026-08-25 because the venue serves no historical order book, and under --complete-cases they pin training to the live era; the 4 quote columns are recoverable to 2025-12-10 from the venue's own candles. Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
 
 
 volumes:
