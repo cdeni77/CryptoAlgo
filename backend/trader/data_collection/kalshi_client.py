@@ -1272,6 +1272,7 @@ class KalshiClient:
         client_order_id: Optional[str] = None,
         time_in_force: Optional[str] = 'immediate_or_cancel',
         rest: bool = False,
+        post_only: Optional[bool] = None,
     ) -> dict:
         """Buy `contracts` of `side` at no worse than `limit_price` (dollars).
 
@@ -1409,7 +1410,7 @@ class KalshiClient:
             #
             # A refusal is an ABSTENTION, not an error: no position, no cost,
             # and the next offset tries again three minutes later.
-            **({'post_only': True} if rest else {}),
+            **({'post_only': True} if (rest if post_only is None else post_only) else {}),
             # Which exchange holds the market. Omitting it defaults to 0, and a
             # market on another exchange is then simply not found — a 404 that
             # names the market rather than the mismatch.

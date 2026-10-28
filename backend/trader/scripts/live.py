@@ -187,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Rest at the bid rather than lifting the ask. '
                              'decide() is priced at the resting price, so the '
                              'edge it reports is the one actually available.')
+    parser.add_argument('--no-post-only', dest='maker_post_only',
+                        action='store_false', default=True,
+                        help='Let a maker order the book moved onto fill as a '
+                             'TAKER instead of being refused. Still priced at '
+                             'our own touch, so it rests whenever it can: '
+                             '"make when we can, take when we can". Measured '
+                             'side by side 2026-10-18..25, resting fills '
+                             'realised -0.48pp per contract against -0.13pp '
+                             'for crossing fills net of the taker fee, and '
+                             'post_only refuses 23.7%% of orders.')
     parser.add_argument('--maker-time-in-force', default=None,
                         help="The venue's enum for an order that rests. "
                              'Omitted by default, which lets the venue apply '

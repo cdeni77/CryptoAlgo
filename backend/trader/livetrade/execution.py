@@ -488,7 +488,9 @@ async def place_and_book(args, writer: PgWriter, kalshi: Optional[KalshiClient],
                 ticker=decision.market_ticker, side=decision.side.value,
                 exchange_index=exchange_index,
                 contracts=decision.contracts, limit_price=limit,
-                client_order_id=key, time_in_force=_tif, rest=_maker)
+                client_order_id=key, time_in_force=_tif, rest=_maker,
+                post_only=_maker and bool(
+                    getattr(config, 'maker_post_only', True)))
             answered_at = time.monotonic()
         except (KalshiError, asyncio.TimeoutError, OSError) as exc:
             ambiguous = (not isinstance(exc, KalshiError)

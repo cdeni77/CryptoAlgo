@@ -489,6 +489,19 @@ class Config:
     # Turn it on to project deployment, and label the output as a projection.
     compound: bool = False
     max_window_exposure_fraction: float = 0.08
+    # **Let a later offset take the OPPOSITE side of an open barrier.**
+    #
+    # Off by default: this is an EXIT, not a hedge. Each matched pair settles
+    # at $1 whichever way it resolves, so buying the other side at `q` while
+    # holding the first at `p` locks in `p + q - 1` immediately -- verified on
+    # KXSOL15M-26OCT200745: 2 at 0.55 and 2 at 0.77 recorded exactly -$0.64.
+    #
+    # It is still rational when `1 - q > p_true`, i.e. when the new belief about
+    # the held side is below what the market now charges for it. Whether the
+    # losses it avoids exceed the premium it locks in is the measurement this
+    # flag exists to run. The simulated book settles each position
+    # independently, which is arithmetically identical to the venue's netting.
+    allow_opposite_side: bool = False
     # How many of the three symbols may hold a position in one window.
     #
     # This was 2, justified as "the three symbols' 15-minute returns are ~0.7
@@ -862,6 +875,21 @@ class Config:
     # the night collected no fill data, which was the only reason maker entry
     # was switched on. There is no venue default to fall back to.
     maker_time_in_force: Optional[str] = 'good_till_canceled'
+    # **Refuse a maker order that would cross, or let it take?**
+    #
+    # True sends `post_only`, so an order the book has moved onto is declined
+    # rather than filled as a taker. That guarantee has a price the fee does
+    # not show: measured 2026-10-18..25 with both kinds running side by side,
+    # resting fills realised -0.48pp per contract and crossing fills -0.13pp
+    # net of the taker fee. The maker entry is 8pp better on price and 9.7pp
+    # worse on win rate, because an order only comes to you when the market
+    # has moved against it -- and post_only refuses 23.7% of orders while
+    # leaving the ones it does fill adversely selected.
+    #
+    # False is "make when we can, take when we can": still priced at our own
+    # touch, so it rests whenever the book lets it, but a book that moved in
+    # the ~0.4s before the order lands is taken rather than abandoned.
+    maker_post_only: bool = True
     # **How long an unfilled resting order may live, in SECONDS of its own age.**
     #
     # Age, not an offset into the window. This was `maker_cancel_offset = 9`,
@@ -910,6 +938,19 @@ class Config:
     # **+$3.81** against a -$15.00 limit, so the daily rule saw a good day while
     # the account was down 38.3% from its high and nothing was watching.
     max_drawdown_fraction: float = 0.35
+    # **How long a halted BACKTEST waits before trading again. None latches.**
+    #
+    # Live, a breaker latches and a person clears it by hand (`--clear-halt`).
+    # The walk-forward has no person, so a latch ends the money measurement
+    # wherever the first bad day falls -- measured on 2026-02-03, the opening
+    # day of a week-long selloff, 19 days into a 293-day range, while the
+    # forecast metrics went on describing all of it.
+    #
+    # This simulates the operator and nothing else: the breakers, their
+    # thresholds and live itself are untouched. Default None keeps every
+    # existing backtest bit-identical. What the run then reports is not whether
+    # a halt happened but HOW OFTEN, which is the informative statistic.
+    halt_resume_hours: Optional[float] = None
 
     # ---- provenance ------------------------------------------------------
     # `fee_config_path` used to sit here too, set by `with_fee_assumptions`

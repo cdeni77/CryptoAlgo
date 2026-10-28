@@ -152,6 +152,17 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                                 f'(default {DEFAULT_CONFIG.max_drawdown_fraction}). '
                                 'Raise it to measure a full period instead of '
                                 'the week before the first latch.')
+    # **Simulates the operator who clears a live halt, and nothing else.**
+    # The breakers and their thresholds are untouched; what changes is that the
+    # backtest stops reporting the money for a whole range from the first bad
+    # day in it. Unset, the halt latches exactly as it always did.
+    economics.add_argument('--halt-resume-hours', type=float, default=None,
+                           metavar='H',
+                           help='Resume a halted BACKTEST after H hours, as an '
+                                'operator clears a live halt by hand. Unset, '
+                                'the halt latches and every money figure covers '
+                                'only the span before it. The run reports how '
+                                'many times it halted either way.')
     # The depth cap the economics apply. `scripts/live.py` has always had this
     # and the shared parser never did, so the trader's override could set 40
     # while every evaluation measured the 25 default — a strategy sized 37.5%
@@ -195,6 +206,18 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                                 'Does NOT move the backtest entry price, which '
                                 'keeps lifting the ask, and does not model '
                                 'whether a resting order fills.')
+    economics.add_argument('--no-post-only', dest='maker_post_only',
+                           action='store_false', default=True,
+                           help='LIVE ONLY. Let a maker order that the book '
+                                'moved onto fill as a taker instead of being '
+                                'refused. Still priced at our own touch, so it '
+                                'rests whenever it can: "make when we can, '
+                                'take when we can". post_only refuses 23.7%% '
+                                'of orders and leaves the fills it does allow '
+                                'adversely selected -- measured side by side, '
+                                'resting fills realised -0.48pp per contract '
+                                'against -0.13pp for crossing fills net of the '
+                                'taker fee.')
     economics.add_argument('--exclude-price-band', type=str, default=None,
                            metavar='LO,HI',
                            help='Refuse trades priced inside this band, e.g. '
@@ -299,6 +322,23 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                            default=None,
                            help='refuse unless every ensemble member still '
                                 'beats the cost on the chosen side')
+    # **The flag `config.py` calls "what makes live agree", settable here at
+    # last.** `scripts.live` has had it all along and the shared parser never
+    # did, so the trader could refuse a peer-less decision while every
+    # evaluation scored it -- grading rows the account would not take.
+    economics.add_argument('--allow-opposite-side', action='store_true',
+                           default=None,
+                           help='let a later offset take the OPPOSITE side of '
+                                'an open barrier. This is an EXIT, not a hedge: '
+                                'each matched pair locks in (p + q - 1). Off by '
+                                'default; for measuring whether the losses it '
+                                'avoids beat the premium it pays.')
+    economics.add_argument('--require-peer-book', action='store_true',
+                           default=None,
+                           help='refuse a decision whose cross-venue peer book '
+                                'is missing. `--complete-cases` already demands '
+                                'the peer on every training row, so without '
+                                'this the gates score rows live refuses.')
     model.add_argument('--fold-train-days', type=float, default=None,
                        help='roll the TRAINING window to this many days '
                             '(default: expanding, which is what the Sunday '
@@ -384,6 +424,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('embargo_minutes', 'embargo_minutes'),
         ('recency_half_life_days', 'recency_half_life_days'),
         ('train_window_days', 'train_window_days'),
+        ('maker_post_only', 'maker_post_only'),
         ('starting_bankroll', 'bankroll'), ('kelly_fraction', 'kelly_fraction'),
         ('fold_scheme', 'fold_scheme'),
         ('fold_block_days', 'fold_block_days'),
@@ -408,6 +449,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('min_train_windows', 'min_train_windows'),
         ('exclude_price_band', 'exclude_price_band'),
         ('max_drawdown_fraction', 'max_drawdown_fraction'),
+        ('halt_resume_hours', 'halt_resume_hours'),
         ('assume_maker', 'assume_maker'),
         ('ensemble_size', 'ensemble_size'),
         ('label_source', 'label_source'),
@@ -420,6 +462,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ('stack_intercept', 'stack_intercept'),
         ('edge_lower_bound_z', 'edge_lower_bound_z'),
         ('require_member_agreement', 'require_member_agreement'),
+        ('require_peer_book', 'require_peer_book'),
+        ('allow_opposite_side', 'allow_opposite_side'),
         ('holdout_start', 'holdout_start'),
     ):
         value = getattr(args, attr, None)
