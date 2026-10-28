@@ -141,6 +141,21 @@ async def reload_if_changed(args, base_config: Config, path, model, config,
                      exc_info=not isinstance(exc, SystemExit))
         # A refused artifact stays refused until the file changes again.
         return model, config, current
+    # **A pin keeps the PINNED model running.** It used to gate order placement
+    # only, so an artifact installed by the weekly cron -- which installs by
+    # standing policy -- was swapped in here and every decision after it was
+    # refused `model_not_pinned`. The account stopped trading and nothing said
+    # so: the startup warning had already fired and this line logged success.
+    pinned = getattr(base_config, 'require_model_version', None)
+    arriving = getattr(new_model, 'version', None)
+    if pinned and arriving != pinned:
+        logger.error(
+            'REFUSED artifact %s: orders are pinned to %s, so swapping it in '
+            'would refuse every decision. Still trading %s. Move the pin in '
+            'docker-compose.override.yml to adopt it.',
+            arriving, pinned, getattr(model, 'version', '?'))
+        # `current` so the same file is not re-read every window.
+        return model, config, current
     logger.warning('now trading artifact %s (was %s)',
                    getattr(new_model, 'version', '?'),
                    getattr(model, 'version', '?'))
