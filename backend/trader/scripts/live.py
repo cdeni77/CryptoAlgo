@@ -1402,6 +1402,14 @@ def config_from_args(args) -> Config:
         # maker fee, and pricing the entry one way while charging the other
         # understates the net edge by the whole fee.
         overrides['maker_entry'] = True
+    # `--no-post-only` sets this False. Mapped HERE because of the shadowing
+    # above: it parsed cleanly into `args` and was dropped on the floor, so
+    # every order kept carrying `post_only: true` and the venue kept refusing
+    # the crossing ones. 373 of 373 orders after the flag went live, measured
+    # 2026-10-30. The sixth instance of the pattern this docstring warns about.
+    post_only = getattr(args, 'maker_post_only', None)
+    if post_only is not None:
+        overrides['maker_post_only'] = bool(post_only)
     tif = getattr(args, 'maker_time_in_force', None)
     if tif:
         overrides['maker_time_in_force'] = str(tif)
