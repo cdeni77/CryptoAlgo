@@ -211,6 +211,9 @@ export interface AccountMarks {
 export interface VenueDay {
   /** ISO date in US Eastern, the boundary Kalshi's own app rolls the day on. */
   date: string;
+  /** Realised P&L on the crypto markets that resolved in this Eastern day,
+   *  net of the fee the venue charged. The settled primitive: it books a
+   *  window's whole result on the day it resolves. */
   pnl: number;
   markets: number;
   contracts: number;
@@ -221,38 +224,36 @@ export interface VenueDay {
   incomplete: number;
   /** P&L per contract, in probability points. Null when nothing settled. */
   pp_per_contract: number | null;
-  /** Cash-balance change over the same Eastern day — **the number Kalshi's own
-   *  app shows**. Differs from `pnl` because a window bought before midnight
-   *  pays out after it, so cost lands in one day and revenue in the next; on a
-   *  completed day the two agree within a few cents. It also moves on
-   *  deposits, which is why it is not the primary series. */
-  cash_change: number | null;
-  /** Always 0 now, and kept only so the payload shape is stable. The boundary
-   *  correction it used to carry no longer exists: `cash_change` is a change
-   *  in ACCOUNT VALUE, which already contains whatever was open at each end. */
-  open_value: number | null;
-  /** No position mark was recorded that day, so the figure is cash only and is
-   *  exact only if the book was flat at midnight. True for every day before
-   *  the per-second sampler existed. */
-  unmarked?: boolean;
-  /** The day is still running, so `cash_change` is partial. */
+  /** Unrealised P&L on the open crypto book at the day's two midnights — the
+   *  venue's own mark, less what the open positions cost. Null when no mark
+   *  was recorded close enough to the boundary to be one. */
+  carried_in: number | null;
+  carried_out: number | null;
+  /** `pnl + carried_out - carried_in`: the day as Kalshi shows it, because the
+   *  venue marks to market and a window bought before midnight has already
+   *  shown part of its result. Null when either carry is unknown, and the
+   *  surface then falls back to `pnl` and says so. */
+  pnl_marked: number | null;
+  /** The boundary mark is larger than the open crypto book could be worth, so
+   *  it also holds a position in a series this system does not trade. The
+   *  carry is withheld rather than shown wrong. */
+  foreign_mark: boolean;
+  /** The day is still running, so more can still settle into it. */
   partial: boolean;
 }
 
 export interface VenueDaily {
   timezone: string;
   /** The dashboard epoch these days are bounded by; null means the full
-   *  ledger. Carried so the surface can say what it shows. */
+   *  ledger. */
   epoch: string | null;
-  /** Which measure the cells carry. `account_value` is the change in cash plus
-   *  the venue's own mark, which reconciles against the Kalshi app but is only
-   *  valid while no cash enters or leaves. `settled` is realised P&L, used
-   *  over the full ledger because that range contains deposits. */
-  basis: 'account_value' | 'settled';
   days: VenueDay[];
   first: string | null;
   last: string | null;
+  /** The sum of the cells, so a header can never disagree with the squares
+   *  under it. */
   total: number;
+  /** Settled P&L alone, which the gates and the research surface speak in. */
   settled_total: number;
 }
 

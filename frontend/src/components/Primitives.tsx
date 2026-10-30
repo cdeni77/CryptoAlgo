@@ -188,6 +188,49 @@ export function Chip({
   );
 }
 
+/* --------------------------------------------------------------- segmented */
+
+/** A row of mutually exclusive choices: scope, period, anything with few options.
+ *
+ *  One component rather than markup repeated per surface, so two controls
+ *  sitting beside each other cannot drift into looking like different kinds of
+ *  control. `title` on each option carries what the label has no room for.
+ */
+export function Segmented<T extends string | number>({
+  options,
+  value,
+  onChange,
+  label,
+}: {
+  options: readonly { value: T; label: string; title?: string }[];
+  value: T;
+  onChange: (next: T) => void;
+  /** For screen readers. The visible label, if any, belongs beside it. */
+  label: string;
+}) {
+  return (
+    <div className="flex border border-rule" role="group" aria-label={label}>
+      {options.map((option) => (
+        <button
+          key={String(option.value)}
+          type="button"
+          onClick={() => onChange(option.value)}
+          aria-pressed={value === option.value}
+          title={option.title}
+          className={[
+            'px-3 py-1 font-mono text-micro uppercase',
+            value === option.value
+              ? 'bg-ink text-paper'
+              : 'text-ink-2 hover:bg-sunken',
+          ].join(' ')}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function SideChip({ side }: { side: 'up' | 'down' | null }) {
   if (!side) return <span className="text-ink-3">—</span>;
   return <Chip tone={side === 'up' ? 'above' : 'below'}>{side}</Chip>;

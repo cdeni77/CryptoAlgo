@@ -1,16 +1,26 @@
 /** Realised P&L per day, as a month grid.
  *
+ * **The crypto markets only, marked at both midnights.** A cell is what those
+ * markets settled for, plus what the open book carried across each boundary:
+ * the venue marks to market, so a window bought before midnight has already
+ * shown part of its result by the time it resolves. With that adjustment the
+ * cells agree with the Kalshi app to the cent on every day the account did
+ * nothing else — 22 of 29 measured — and diverge only where it took a deposit
+ * or held a position in a series this system does not trade. Those are not
+ * errors; they are the quantity the account page exists to exclude.
+ *
+ * A day with no boundary mark keeps the settled figure and is drawn dashed, so
+ * a cell that cannot be compared with the app never looks like one that can.
+ *
  * **Seven columns, not five.** A trading-day calendar usually hides the
  * weekend; this system trades BTC/ETH/SOL on a venue that settles every
  * fifteen minutes, seven days a week, and Saturday is an ordinary session.
  * Dropping it would silently discard about 28% of the record.
  *
- * **Bounded by the dashboard epoch**, like every other figure on the Account
- * page. It was briefly unfiltered, which put days from a previous
- * configuration beside days from this one under a single month total with
- * nothing saying where one ended. The month header reports how much of the
- * month is actually in range, so a part-month total is never read as a whole
- * one.
+ * **The whole ledger**, like every other figure on the Account page. The month
+ * header reports how many of the month's days are in range, so a part-month
+ * total — the first month traded, and the current one — is never read as a
+ * whole one.
  *
  * **Days are Eastern, not UTC.** Kalshi's own app rolls the trading day over at
  * midnight ET, so that is the boundary these figures reconcile against.
@@ -31,12 +41,6 @@ export interface DailyPnlCalendarProps {
   days: VenueDay[];
   /** Eastern, from the server. Shown so the day boundary is never a guess. */
   timezone?: string;
-  /** The epoch the server bounded these days by, if any. */
-  epoch?: string | null;
-  /** Which measure the cells carry. The server chooses it: account value over
-   *  the epoch window, settled P&L over the full ledger, because that range
-   *  contains deposits and account value would count them as profit. */
-  basis?: 'account_value' | 'settled';
 }
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -76,9 +80,7 @@ function compact(pnl: number): string {
   return `${sign}${size < 10 ? size.toFixed(1) : Math.round(size)}`;
 }
 
-export function DailyPnlCalendar({
-  days, timezone, epoch, basis = 'account_value',
-}: DailyPnlCalendarProps) {
+export function DailyPnlCalendar({ days, timezone }: DailyPnlCalendarProps) {
   const byMonth = useMemo(() => {
     const out = new Map<string, Map<number, VenueDay>>();
     for (const day of days) {
@@ -124,21 +126,16 @@ export function DailyPnlCalendar({
 
   const present = [...cells.values()];
   // **The month total is the sum of the cells on screen, and nothing else.**
-  // It summed `cash_change ?? 0` while the cells drew `cash_change ?? pnl`, so
-  // a day with settlements but no balance sample was coloured and then left
-  // out of the figure above it — a header that disagrees with the squares it
-  // sits over is the one number a reader will check by hand.
-  //  **The change in account value across the day**, which is cash plus what
-  //  the open book is worth, both from the venue. A window open at midnight
-  //  needs no correction because it is inside the measurement at both ends.
-  //  Falls back to settled P&L on a day with no account-value sample to
-  //  difference against -- the first day in range, and days before the
-  //  sampler existed.
-  const shownFor = (d: VenueDay): number => d.cash_change ?? d.pnl;
+  // A header that disagrees with the squares it sits over is the one number a
+  // reader will check by hand.
+  // The marked figure where there is one, the settled figure where there is
+  // not. One accessor, so the header and the squares cannot disagree.
+  const shownFor = (d: VenueDay): number => d.pnl_marked ?? d.pnl;
   const monthTotal = present.reduce((sum, d) => sum + shownFor(d), 0);
   const contracts = present.reduce((sum, d) => sum + d.contracts, 0);
   const up = present.filter((d) => shownFor(d) > 0).length;
   const down = present.filter((d) => shownFor(d) < 0).length;
+  const unmarked = present.filter((d) => d.pnl_marked == null).length;
 
   const blanks = Array.from({ length: firstWeekday });
   const numbers = Array.from({ length: daysInMonth }, (_, i) => i + 1);
@@ -160,10 +157,11 @@ export function DailyPnlCalendar({
             {MONTHS[month - 1]} {year}
           </div>
           <div className="eyebrow mt-0.5">
-            {/* The DAY COUNT first, because with an epoch mid-month the total
-                below covers part of the month and nothing else would say so. */}
+            {/* The DAY COUNT first. The first month traded and the current
+                one are both partial, and the total below would not say so. */}
             {present.length} of {daysInMonth} days · {up}↑ {down}↓ ·{' '}
             {contracts.toFixed(0)} contracts
+            {unmarked > 0 && ` · ${unmarked} unmarked`}
           </div>
         </div>
         <button
@@ -219,13 +217,11 @@ export function DailyPnlCalendar({
               </div>
             );
           }
-          // **The cell shows CASH CHANGE, the figure Kalshi's own app shows
-          // for that day.** Settled P&L is carried in the tooltip. They differ
-          // because the midnight boundary cuts through open positions — cost
-          // lands in one day, payout in the next — so a day-by-day view that
-          // disagreed with the app was the thing being reconciled against.
-          // Falls back to settled P&L when no balance was sampled that day.
+          // **What those markets settled, plus what crossed the midnights.**
+          // Not the balance movement: that also carries the other markets this
+          // account holds and the deposits it takes.
           const shown = shownFor(day);
+          const marked = day.pnl_marked != null;
           const won = shown > 0;
           const flat = shown === 0;
           return (
@@ -234,15 +230,20 @@ export function DailyPnlCalendar({
               title={
                 `${day.date}\n` +
                 `${shown >= 0 ? '+' : ''}$${shown.toFixed(2)}` +
-                (day.cash_change == null
-                  ? ' — settled p&l; no account value to compare against\n'
-                  : day.partial
-                    ? ' — account value, day still running\n'
-                    : ' — change in account value, as the Kalshi app shows it\n') +
-                (day.unmarked
-                  ? 'measured on cash alone — no position mark was recorded ' +
-                    'that day, so it is exact only if nothing was open at ' +
-                    'midnight\n'
+                (marked
+                  ? (day.partial
+                      ? ' — crypto only, marked to now; the day is still running\n'
+                      : ' — crypto only, marked at both midnights: the figure Kalshi shows\n')
+                  : ' — settled p&l; no boundary mark, so this cannot be compared with the app\n') +
+                (marked
+                  ? `settled ${day.pnl >= 0 ? '+' : ''}${day.pnl.toFixed(2)}` +
+                    `, carried in ${day.carried_in!.toFixed(2)}` +
+                    `, carried out ${day.carried_out!.toFixed(2)}\n`
+                  : '') +
+                (day.foreign_mark
+                  ? 'the venue\u2019s mark was larger than this book could be worth, so it ' +
+                    'held a position in another series; the carry is withheld rather ' +
+                    'than shown wrong\n'
                   : '') +
                 `${day.markets} market(s), ${day.contracts.toFixed(0)} contract(s), ` +
                 `${day.wins}W / ${day.losses}L` +
@@ -256,6 +257,9 @@ export function DailyPnlCalendar({
               }
               className={[
                 'rounded border px-0.5 py-1.5 text-center sm:px-1',
+                // Dashed means "no boundary mark": the figure is settled P&L
+                // and will not tie to the Kalshi app for this day.
+                marked ? '' : 'border-dashed',
                 flat
                   ? 'border-rule bg-sunken'
                   : won
@@ -290,33 +294,16 @@ export function DailyPnlCalendar({
       </div>
 
       <p className="mt-3 text-tiny text-ink-3">
-        {basis === 'settled' ? (
-          <>
-            Each cell is <strong className="text-ink-2">realised P&amp;L</strong>{' '}
-            from the venue&rsquo;s own settlements across that{' '}
-            {timezone ?? 'US Eastern'} day, on the boundary Kalshi rolls its own
-            trading day. Over the full ledger this is the only honest measure:
-            account value would also count the deposits and withdrawals this
-            shared account has taken, which the strategy did not earn. A
-            position still open at midnight counts on the day it settles.
-          </>
-        ) : (
-          <>
-            Each cell is the change in <strong className="text-ink-2">account
-            value</strong> — cash plus what the open positions are worth, both
-            read from Kalshi — across that {timezone ?? 'US Eastern'} day, on
-            the boundary Kalshi rolls its own trading day. Fees and settlement
-            are already inside it; nothing here is estimated.
-          </>
-        )}{' '}
+        Each cell is the <strong className="text-ink-2">crypto markets only</strong>,
+        across that {timezone ?? 'US Eastern'} day: what settled, plus what the
+        open book carried across each midnight. The venue marks to market, so a
+        window bought before midnight has already shown part of its result —
+        that adjustment is why these agree with the Kalshi app day by day. They
+        will still differ where the account moved for a reason the strategy did
+        not earn: a deposit, or a position in a series this system does not
+        trade. A <span className="text-ink-2">dashed</span> cell had no boundary
+        mark, so it carries settled P&amp;L and cannot be compared with the app.{' '}
         A blank day settled nothing and is not a break-even day.
-        {epoch && (
-          <>
-            {' '}Bounded at {epoch.slice(0, 10)}, the same window as every other
-            figure on this page — days before it are not missing, they are out
-            of scope.
-          </>
-        )}
       </p>
     </div>
   );

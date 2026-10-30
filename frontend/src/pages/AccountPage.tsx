@@ -42,6 +42,7 @@ import {
   Panel,
   PageLink,
   SectionHead,
+  Segmented,
 } from '../components/Primitives';
 import { DailyPnlCalendar } from '../components/DailyPnlCalendar';
 import { go } from '../lib/navigate';
@@ -68,12 +69,33 @@ export function AccountPage() {
   // side now, to at most 2,000 points and about 340 KB.
   const LIVE_MS = 1_000;
 
-  // **All time by default.** The dashboard epoch hides earlier trading from
-  // the view; it does not undo it. Measured 2026-10-22, the since-reset view
-  // showed 821 settlements of 2,133 and a 68.2% win rate against a true
-  // 58.6% — a third of the account's history, and a flattering third. The
-  // epoch is still available, labelled, for reading one run in isolation.
-  const [allTime, setAllTime] = useState(true);
+  // **Always the whole ledger.** This page is the account of record, and the
+  // venue's ledger did not reset: the dashboard epoch hides earlier trading
+  // from the view without undoing it, so a scoped total here is a third of
+  // the account's history presented as the account. Other surfaces that ask a
+  // question about the CURRENT configuration still honour the epoch; the
+  // account is not one of them.
+  const ALL_TIME = true;
+
+  // **The chart's own window, and the only time control on the page.**
+  // It moves the curve alone: every other figure here is a lifetime total, and
+  // a control that restated them would be the scope toggle again.
+  //
+  // The curve is cumulative WITHIN its window, which is what makes a short
+  // period worth having: a 7-day view starts at zero seven days ago rather
+  // than carrying the whole ledger into its first pixel.
+  //
+  // `all` is a day count, not a null, because the route takes a number; the
+  // cap is a bound, not a limit anyone reaches.
+  const PERIODS = [
+    { value: 7, label: '7d', title: 'the last seven days' },
+    { value: 30, label: '30d', title: 'the last thirty days' },
+    { value: 90, label: '90d', title: 'the last ninety days' },
+    { value: 3650, label: 'all', title: 'every day the account has traded' },
+  ] as const;
+  const [periodDays, setPeriodDays] = useState<number>(3650);
+  const periodLabel =
+    PERIODS.find((p) => p.value === periodDays)?.label ?? `${periodDays}d`;
 
   // **No model filter here.** Per-model attribution lives on the Model page.
   // This page is the account as the venue's ledger reports it, and that
@@ -82,17 +104,14 @@ export function AccountPage() {
   // and a filter that moves two panels out of ten reads as a broken filter.
 
   const account = usePolling(fetchAccount, LIVE_MS);
-  const venue = usePolling(
-    () => fetchVenueAccount(allTime), LIVE_MS, [allTime]);
+  const venue = usePolling(() => fetchVenueAccount(ALL_TIME), LIVE_MS);
   const venueCurve = usePolling(
-    () => fetchVenueEquity(allTime ? 365 : 30, allTime), LIVE_MS, [allTime]);
-  const equity = usePolling(
-    () => fetchEquity(allTime ? 365 : 90, allTime), LIVE_MS, [allTime]);
+    () => fetchVenueEquity(periodDays, ALL_TIME), LIVE_MS, [periodDays]);
+  const equity = usePolling(() => fetchEquity(365, ALL_TIME), LIVE_MS);
   const settlements = usePolling(
-    () => fetchVenueSettlements(200, undefined, allTime), LIVE_MS, [allTime]);
+    () => fetchVenueSettlements(200, undefined, ALL_TIME), LIVE_MS);
   const positions = usePolling(() => fetchPositions(false, 200), LIVE_MS);
-  const daily = usePolling(
-    () => fetchVenueDaily(allTime ? 365 : 180, allTime), LIVE_MS, [allTime]);
+  const daily = usePolling(() => fetchVenueDaily(365, ALL_TIME), LIVE_MS);
   const openPositions = usePolling(() => fetchPositions(true, 50), LIVE_MS);
 
   if (account.loading) return <Loading what="the account" />;
@@ -178,30 +197,6 @@ export function AccountPage() {
         }
         right={
           <div className="flex flex-wrap items-center gap-3">
-            {/* The scope this page is reporting, said before the numbers
-                rather than inferred from them. */}
-            <div className="flex border border-rule">
-              {([true, false] as const).map((value) => (
-                <button
-                  key={String(value)}
-                  type="button"
-                  onClick={() => setAllTime(value)}
-                  className={[
-                    'px-3 py-1 font-mono text-micro uppercase',
-                    allTime === value
-                      ? 'bg-ink text-paper'
-                      : 'text-ink-2 hover:bg-sunken',
-                  ].join(' ')}
-                  title={
-                    value
-                      ? 'Everything this account has traded'
-                      : 'Only since the dashboard epoch — a slice, not the account'
-                  }
-                >
-                  {value ? 'all time' : 'since reset'}
-                </button>
-              ))}
-            </div>
             <Chip
               tone={onVenue ? 'pass' : 'neutral'}
               title={
@@ -343,6 +338,20 @@ export function AccountPage() {
 
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <Panel>
+          {/* **The period belongs on the chart, not on the page scope.**
+              The curve is the only thing here with a time axis; every other
+              figure is a total. Putting the control next to the axis it moves
+              means changing the window does not silently restate the P&L
+              headline beside it. */}
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <span className="eyebrow">cumulative p&amp;l · {periodLabel}</span>
+            <Segmented
+              label="Chart period"
+              value={periodDays}
+              onChange={setPeriodDays}
+              options={PERIODS}
+            />
+          </div>
           {onVenue ? (
             venueCurve.loading ? (
               <Loading what="the curve" />
@@ -352,15 +361,18 @@ export function AccountPage() {
               <>
                 <VenueAccountChart points={venueCurve.data?.points ?? []} />
                 <p className="mt-2 text-tiny text-ink-3">
-                  Trading profit only, stepped once per market that resolved.
-                  It is not the balance: the balance also moves when you deposit
-                  or withdraw, and that is not the strategy. Over any stretch
-                  with nothing open at either end the two agree.{' '}
-                  {beforeWindow != null && (
+                  Trading profit only, stepped once per market that resolved —
+                  the three crypto series, net of fees. It is not the balance:
+                  the balance also moves on a deposit and on the other markets
+                  this account holds, and neither is the strategy.{' '}
+                  {/* The series restarts at zero at the left edge, so what
+                      settled earlier has to be named or the reader takes the
+                      last point for a lifetime total. */}
+                  {beforeWindow != null && beforeWindow !== 0 && (
                     <>
-                      Cumulative within the last {venueCurve.data?.days ?? 30} days;{' '}
-                      {beforeWindow >= 0 ? '+' : ''}${beforeWindow.toFixed(2)} settled before
-                      that and is not in the series.
+                      Cumulative within this window; {beforeWindow >= 0 ? '+' : ''}
+                      ${beforeWindow.toFixed(2)} settled before it and is not in
+                      the series.
                     </>
                   )}
                 </p>
@@ -383,9 +395,7 @@ export function AccountPage() {
                 was open and by the midnight boundary — which simply reads as
                 one of them being broken. One number, one definition. */}
             <Metric
-              label={onVenue
-                ? (allTime ? 'p&l · all time' : 'p&l · since reset')
-                : 'realised p&l'}
+              label={onVenue ? 'p&l · all time' : 'realised p&l'}
               value={
                 onVenue
                   ? (daily.data?.total ?? null)
@@ -400,7 +410,7 @@ export function AccountPage() {
               }
               hint={
                 onVenue
-                  ? 'the change in account value — cash plus what is open, both from Kalshi — summed over the days below. Fees and settlement are already inside it.'
+                  ? 'the crypto markets only, summed over the days below — what settled, marked at each midnight so a day reads as the venue shows it. Fees are inside it. It excludes deposits and every market outside the three crypto series, so it will not match the Kalshi app’s account total.'
                   : 'our own arithmetic — the venue has not been read'
               }
             />
@@ -517,16 +527,9 @@ export function AccountPage() {
 
       <section>
         <SectionHead
-          eyebrow={allTime
-            ? 'settled p&l, the whole ledger'
-            : 'as the Kalshi app shows it'}
+          eyebrow="crypto markets only, marked at both midnights"
           title="Day by day"
-          // The basis changes with the scope, so the caption has to as well:
-          // a panel that describes a balance movement while the cells carry
-          // settled P&L sends the reader to reconcile two different things.
-          note={allTime
-            ? 'Each cell is what the markets that resolved on that Eastern day paid, net of fees. This ties to the chart above — both count a trade on the day it resolves. It will not tie to the Kalshi app day by day, because the app shows when the cash moved, and a window bought before midnight pays out after it.'
-            : 'Each cell is how much the Kalshi balance moved on that Eastern calendar day — the same number, on the same day boundary, as the app. It will not tie to the chart above: that one counts a trade on the day it resolves, this one on the day the cash moved, and a window bought before midnight pays out after it.'}
+          note="Each cell is the crypto markets only, across that Eastern day: what settled, plus what the open book carried across each midnight. With that adjustment these agree with the Kalshi app to the cent on every day the account did nothing else — and differ only where it took a deposit or held a position in a series this system does not trade."
         />
         <Panel>
           {daily.loading ? (
@@ -537,8 +540,6 @@ export function AccountPage() {
             <DailyPnlCalendar
               days={daily.data?.days ?? []}
               timezone={daily.data?.timezone}
-              epoch={daily.data?.epoch}
-              basis={daily.data?.basis}
             />
           )}
         </Panel>
