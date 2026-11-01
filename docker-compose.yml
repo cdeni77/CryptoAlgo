@@ -581,11 +581,11 @@ services:
         --kelly-fraction 0.10
         --compound
         --min-edge-pp 0.5
-        --bankroll 500
+        --bankroll 400
         --max-entries-per-symbol-window 4
         --max-positions-per-window 12
         --maker-entry
-        --max-stake-dollars 40
+        --max-stake-dollars 20
         --ensemble-size 5
         --label-source venue
         --edge-lower-bound-z 1.0

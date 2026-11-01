@@ -11,8 +11,13 @@ services:
       - live
       - --place-orders
       - --compound
+      # **$400, because the operator withdrew cash for sports bets on
+      # 2026-11-01.** The floor is `starting_bankroll * 0.50`, so a
+      # config claiming 1000 against a real 400 put the floor at 500 and
+      # refused every decision with `bankroll_floor` -- 60 in a row, while
+      # the account looked healthy and the dashboard showed no halt.
       - --bankroll
-      - "1000"
+      - "400"
       # **2% of the account in one bet, down from 4%.** $40 was set against a
       # $500 bankroll -- 8% -- and survived the top-up to $1,000 unchanged.
       # Per-window sd is $14.62, so the 2-sigma band over the 500-1,000 windows
