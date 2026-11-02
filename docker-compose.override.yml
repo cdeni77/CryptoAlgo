@@ -17,7 +17,7 @@ services:
       # refused every decision with `bankroll_floor` -- 60 in a row, while
       # the account looked healthy and the dashboard showed no halt.
       - --bankroll
-      - "400"
+      - "1000"
       # **2% of the account in one bet, down from 4%.** $40 was set against a
       # $500 bankroll -- 8% -- and survived the top-up to $1,000 unchanged.
       # Per-window sd is $14.62, so the 2-sigma band over the 500-1,000 windows
